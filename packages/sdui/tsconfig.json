@@ -1,0 +1,4 @@
+{
+  "extends": "@sumi/typescript-config/react-library.json",
+  "include": ["src"]
+}

@@ -1,0 +1,11 @@
+{
+  "name": "@sumi/api",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "go run ./cmd/server",
+    "build": "go build ./...",
+    "lint": "go vet ./...",
+    "test": "go test ./..."
+  }
+}

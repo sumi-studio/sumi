@@ -78,6 +78,21 @@ sumi-studio/
 - **agent は DB を直接触らない**: ドメイン操作は `@sumi/api-client` 経由で `apps/api` を叩く。権限モデルの強制点を API 層の1箇所に保つため。agent が自前で持つ永続化は自身のメモリストアのみ。
 - **Swift の隔離**: アプリ本体に Swift は存在しない。OS 統合 (widget extension、APNs グルー) のみ `apps/web/src-tauri/gen/apple` 配下に許可する。
 
+## 開発環境セットアップ
+
+必要なもの: Node.js >= 20.19、pnpm 11、Go 1.26+ (`~/.local/go` 等に配置して PATH を通す)
+
+```sh
+make setup   # pnpm install
+make dev     # 全 dev サーバー起動 (web: Vite, agent: tsx watch)
+make build   # 全ビルド
+make lint    # Biome + go vet
+make test    # 全テスト
+make api-dev # Go API サーバー単体起動 (PORT=8080)
+```
+
+API の型を変更する場合は `contracts/openapi.yaml` を編集後、`pnpm --filter @sumi/api-client generate` で TS 型を再生成する。
+
 ## CI/CD
 
 GitHub Actions (`.github/workflows/`) でパスフィルタを使い、変更のあった領域のみ実行する:
