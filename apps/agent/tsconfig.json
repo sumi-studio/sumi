@@ -1,4 +1,0 @@
-{
-  "extends": "@sumi/typescript-config/node-service.json",
-  "include": ["src"]
-}
