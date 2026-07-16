@@ -12,7 +12,7 @@
 | 動的UI (SDUI) | zod スキーマ + component registry |
 | 状態管理 | Zustand + TanStack Query |
 | シェル (デスクトップ / モバイル) | Tauri 2 |
-| エージェント基盤 | TypeScript (pi 由来) |
+| エージェント基盤 | Rust (pi を設計参照) |
 | バックエンド | Go |
 | API 定義 | OpenAPI 3.1 (契約ファースト) |
 | モノレポ | pnpm workspaces + Turborepo |
@@ -43,7 +43,7 @@ sumi-studio/
 │   │   ├── internal/          # handler / service / repository
 │   │   ├── go.mod
 │   │   └── package.json       # turbo から go build/test を呼ぶ薄いラッパー
-│   └── agent/                 # TS — エージェント基盤: agent loop、3層メモリ、ツール実行
+│   └── agent/                 # Rust — エージェント基盤: agent loop、3層メモリ、ツール実行
 │       ├── src/
 │       └── package.json
 ├── packages/                  # 共有パッケージ
