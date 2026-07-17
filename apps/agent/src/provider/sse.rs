@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 const MAX_ERROR_BODY_CHARS: usize = 4_000;
 const MAX_ERROR_BODY_READ_BYTES: usize = MAX_ERROR_BODY_CHARS * 4 + 4;
 const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
+const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 type ByteStream = Pin<Box<dyn Stream<Item = Result<Vec<u8>, String>> + Send>>;
@@ -21,12 +22,12 @@ pub enum SseError {
     IdleTimeout { seconds: u64 },
     #[error("SSE stream cancelled")]
     Cancelled,
-    #[error("SSE stream ended with an incomplete line")]
-    UnexpectedEof,
     #[error("SSE data was not valid UTF-8")]
     InvalidUtf8,
     #[error("SSE line exceeded {limit} bytes")]
     LineTooLong { limit: usize },
+    #[error("SSE event data exceeded {limit} bytes")]
+    EventTooLong { limit: usize },
 }
 
 pub struct SseStream {
@@ -95,6 +96,8 @@ impl SseStream {
 #[derive(Default)]
 struct SseLineParser {
     buffer: Vec<u8>,
+    event_data: Vec<u8>,
+    event_has_data: bool,
     payloads: VecDeque<String>,
     done: bool,
 }
@@ -128,6 +131,8 @@ impl SseLineParser {
             }
             if self.done {
                 self.buffer.clear();
+                self.event_data.clear();
+                self.event_has_data = false;
                 break;
             }
         }
@@ -135,17 +140,46 @@ impl SseLineParser {
     }
 
     fn process_line(&mut self, line: &[u8]) -> Result<(), SseError> {
+        if line.is_empty() {
+            return self.dispatch_event();
+        }
         let Some(mut data) = line.strip_prefix(b"data:") else {
             return Ok(());
         };
         if data.first() == Some(&b' ') {
             data = &data[1..];
         }
-        let payload = std::str::from_utf8(data).map_err(|_| SseError::InvalidUtf8)?;
+        let separator_len = usize::from(self.event_has_data);
+        if self
+            .event_data
+            .len()
+            .saturating_add(separator_len)
+            .saturating_add(data.len())
+            > MAX_SSE_EVENT_BYTES
+        {
+            return Err(SseError::EventTooLong {
+                limit: MAX_SSE_EVENT_BYTES,
+            });
+        }
+        if self.event_has_data {
+            self.event_data.push(b'\n');
+        }
+        self.event_data.extend_from_slice(data);
+        self.event_has_data = true;
+        Ok(())
+    }
+
+    fn dispatch_event(&mut self) -> Result<(), SseError> {
+        if !self.event_has_data {
+            return Ok(());
+        }
+        let data = std::mem::take(&mut self.event_data);
+        self.event_has_data = false;
+        let payload = String::from_utf8(data).map_err(|_| SseError::InvalidUtf8)?;
         if payload == "[DONE]" {
             self.done = true;
         } else {
-            self.payloads.push_back(payload.to_owned());
+            self.payloads.push_back(payload);
         }
         Ok(())
     }
@@ -159,12 +193,20 @@ impl SseLineParser {
     }
 
     fn finish(&mut self) -> Result<(), SseError> {
-        if self.done || self.buffer.iter().all(u8::is_ascii_whitespace) {
+        if self.done {
             self.buffer.clear();
-            Ok(())
-        } else {
-            Err(SseError::UnexpectedEof)
+            self.event_data.clear();
+            self.event_has_data = false;
+            return Ok(());
         }
+        if !self.buffer.is_empty() {
+            if self.buffer.last() == Some(&b'\r') {
+                self.buffer.pop();
+            }
+            let line = std::mem::take(&mut self.buffer);
+            self.process_line(&line)?;
+        }
+        self.dispatch_event()
     }
 }
 
@@ -248,18 +290,19 @@ mod tests {
     }
 
     #[test]
-    fn parses_crlf_and_lf_lines() {
+    fn joins_data_lines_until_the_event_boundary() {
         let (payloads, done) =
-            parser_payloads([b"data: one\r\ndata: two\n\n".as_slice()]).expect("valid SSE");
-        assert_eq!(payloads, ["one", "two"]);
+            parser_payloads([b"data: one\r\ndata: two\n\ndata: separate\n\n".as_slice()])
+                .expect("valid SSE");
+        assert_eq!(payloads, ["one\ntwo", "separate"]);
         assert!(!done);
     }
 
     #[test]
     fn ignores_non_data_lines_and_accepts_optional_space() {
-        let input = b": comment\nevent: message\ndata:no-space\ndata: with-space\n";
+        let input = b": comment\nevent: message\ndata:no-space\ndata: with-space\n\n";
         let (payloads, _) = parser_payloads([input.as_slice()]).expect("valid SSE");
-        assert_eq!(payloads, ["no-space", "with-space"]);
+        assert_eq!(payloads, ["no-space\nwith-space"]);
     }
 
     #[test]
@@ -276,7 +319,7 @@ mod tests {
 
     #[test]
     fn preserves_utf8_split_across_chunks() {
-        let encoded = "data: 日本語\n".as_bytes();
+        let encoded = "data: 日本語\n\n".as_bytes();
         let split = encoded
             .windows(2)
             .position(|window| window[0] >= 0x80 && window[1] >= 0x80)
@@ -296,21 +339,30 @@ mod tests {
     }
 
     #[test]
-    fn clean_and_incomplete_eof_are_distinct() {
+    fn eof_dispatches_a_final_line_without_a_newline() {
         let mut clean = SseLineParser::default();
         clean.push_chunk(b"data: complete\n\n").expect("valid SSE");
         assert_eq!(clean.finish(), Ok(()));
 
-        let mut incomplete = SseLineParser::default();
-        incomplete
-            .push_chunk(b"data: {\"partial\":")
-            .expect("buffered bytes");
-        assert_eq!(incomplete.finish(), Err(SseError::UnexpectedEof));
+        let mut final_line = SseLineParser::default();
+        final_line
+            .push_chunk(b"data: {\"complete\":true}")
+            .expect("buffered final line");
+        final_line.finish().expect("valid EOF");
+        assert_eq!(
+            final_line.next_payload().as_deref(),
+            Some("{\"complete\":true}")
+        );
+
+        let mut done = SseLineParser::default();
+        done.push_chunk(b"data: [DONE]").expect("buffered DONE");
+        done.finish().expect("valid EOF");
+        assert!(done.is_done());
     }
 
     #[test]
     fn rejects_invalid_utf8_after_line_is_complete() {
-        let error = parser_payloads([b"data: \xff\n".as_slice()]).expect_err("invalid UTF-8");
+        let error = parser_payloads([b"data: \xff\n\n".as_slice()]).expect_err("invalid UTF-8");
         assert_eq!(error, SseError::InvalidUtf8);
     }
 
@@ -318,6 +370,7 @@ mod tests {
     fn enforces_sse_line_limit_across_chunks() {
         let mut exact = b"data: ".to_vec();
         exact.resize(MAX_SSE_LINE_BYTES, b'a');
+        exact.push(b'\n');
         exact.push(b'\n');
         let (payloads, _) = parser_payloads([exact]).expect("line at limit is valid");
         assert_eq!(payloads[0].len(), MAX_SSE_LINE_BYTES - b"data: ".len());
@@ -330,6 +383,35 @@ mod tests {
                 limit: MAX_SSE_LINE_BYTES
             }
         );
+    }
+
+    #[test]
+    fn enforces_an_event_limit_across_multiple_data_lines() {
+        let mut parser = SseLineParser::default();
+        let first = format!("data: {}\n", "a".repeat(MAX_SSE_EVENT_BYTES / 2));
+        let second = format!("data: {}\n", "b".repeat(MAX_SSE_EVENT_BYTES / 2));
+        parser
+            .push_chunk(first.as_bytes())
+            .expect("first data line");
+
+        assert_eq!(
+            parser.push_chunk(second.as_bytes()),
+            Err(SseError::EventTooLong {
+                limit: MAX_SSE_EVENT_BYTES
+            })
+        );
+    }
+
+    #[test]
+    fn dispatches_a_complete_pending_event_at_eof() {
+        let mut parser = SseLineParser::default();
+        parser
+            .push_chunk(b"data: complete\n")
+            .expect("complete data line");
+
+        parser.finish().expect("clean EOF");
+
+        assert_eq!(parser.next_payload().as_deref(), Some("complete"));
     }
 
     #[tokio::test]

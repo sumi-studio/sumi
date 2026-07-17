@@ -162,8 +162,8 @@ impl MessageAssembler {
                 {
                     call.name = name.to_owned();
                 }
+                let partial = self.partial_args.entry(index).or_default();
                 if !arguments.is_empty() {
-                    let partial = self.partial_args.entry(index).or_default();
                     partial.push_str(arguments);
                     call.arguments = object_or_empty(parse_streaming(partial));
                 }
@@ -179,6 +179,7 @@ impl MessageAssembler {
 
     pub fn finish(mut self, cancelled: bool) -> Vec<ProviderEvent> {
         let mut events = Vec::new();
+        let mut finalization_error = None;
         if !self.started {
             events.push(ProviderEvent::Start);
         }
@@ -197,7 +198,27 @@ impl MessageAssembler {
                 }
                 AssistantContent::ToolCall(call) => {
                     if let Some(partial) = self.partial_args.get(&index) {
-                        call.arguments = object_or_empty(parse_streaming(partial));
+                        match serde_json::from_str::<Value>(partial) {
+                            Ok(arguments) if arguments.is_object() => {
+                                call.arguments = arguments;
+                            }
+                            Ok(_) => {
+                                finalization_error.get_or_insert_with(|| {
+                                    format!(
+                                        "tool call at content index {index} arguments were not a JSON object"
+                                    )
+                                });
+                                continue;
+                            }
+                            Err(error) => {
+                                finalization_error.get_or_insert_with(|| {
+                                    format!(
+                                        "tool call at content index {index} arguments were not complete JSON: {error}"
+                                    )
+                                });
+                                continue;
+                            }
+                        }
                     }
                     events.push(ProviderEvent::ToolCallEnd {
                         content_index: index,
@@ -209,6 +230,8 @@ impl MessageAssembler {
 
         let (reason, error_message) = if cancelled {
             (StopReason::Aborted, Some("Request was aborted".to_owned()))
+        } else if let Some(error) = finalization_error {
+            (StopReason::Error, Some(error))
         } else if let Some(reason) = self.finish_reason {
             (reason, self.finish_error)
         } else {
@@ -501,5 +524,96 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn incomplete_tool_arguments_are_not_finalized_as_executable_calls() {
+        let mut assembler = MessageAssembler::new("model", "provider");
+        assembler.push_chunk(&json!({
+            "choices":[{"delta":{"tool_calls":[{
+                "index":0,
+                "id":"call-1",
+                "function":{
+                    "name":"read_file",
+                    "arguments":"{\"path\":\"/etc/passw"
+                }
+            }]},"finish_reason":"tool_calls"}]
+        }));
+
+        let events = assembler.finish(false);
+
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::ToolCallEnd { .. }))
+        );
+        let ProviderEvent::Error { error, .. } = events.last().expect("terminal") else {
+            panic!("error");
+        };
+        assert!(
+            error
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("were not complete JSON"))
+        );
+    }
+
+    #[test]
+    fn final_tool_arguments_must_be_a_json_object() {
+        let mut assembler = MessageAssembler::new("model", "provider");
+        assembler.push_chunk(&json!({
+            "choices":[{"delta":{"tool_calls":[{
+                "index":0,
+                "id":"call-1",
+                "function":{"name":"read_file","arguments":"[]"}
+            }]},"finish_reason":"tool_calls"}]
+        }));
+
+        let events = assembler.finish(false);
+
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::ToolCallEnd { .. }))
+        );
+        assert!(matches!(
+            events.last(),
+            Some(ProviderEvent::Error {
+                reason: StopReason::Error,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn missing_or_empty_tool_arguments_do_not_bypass_final_validation() {
+        for function in [
+            json!({"name":"no_args"}),
+            json!({"name":"no_args","arguments":""}),
+        ] {
+            let mut assembler = MessageAssembler::new("model", "provider");
+            assembler.push_chunk(&json!({
+                "choices":[{"delta":{"tool_calls":[{
+                    "index":0,
+                    "id":"call-1",
+                    "function": function
+                }]},"finish_reason":"tool_calls"}]
+            }));
+
+            let events = assembler.finish(false);
+
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, ProviderEvent::ToolCallEnd { .. }))
+            );
+            assert!(matches!(
+                events.last(),
+                Some(ProviderEvent::Error {
+                    reason: StopReason::Error,
+                    ..
+                })
+            ));
+        }
     }
 }

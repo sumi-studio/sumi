@@ -71,7 +71,7 @@ impl ModelSpec {
                 1_048_576,
                 131_072,
                 Compat {
-                    max_tokens_field: MaxTokensField::MaxCompletionTokens,
+                    max_tokens_field: MaxTokensField::MaxTokens,
                     supports_usage_in_streaming: true,
                     thinking_format: ThinkingFormat::Zai,
                     requires_reasoning_content_on_assistant: false,
@@ -393,8 +393,27 @@ fn convert_tool(tool: &ToolDefinition, compat: &Compat) -> Value {
 }
 
 fn normalize_tool_call_id(id: &str) -> String {
-    let source = id.split('|').next().unwrap_or(id);
-    source
+    const MAX_ID_LEN: usize = 40;
+    const HASH_LEN: usize = 16;
+
+    if !id.is_empty()
+        && id.len() <= MAX_ID_LEN
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return id.to_owned();
+    }
+
+    let hash = id
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
+    let suffix = format!("{hash:016x}");
+    let prefix_len = MAX_ID_LEN - 1 - HASH_LEN;
+    let mut prefix: String = id
         .chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
@@ -403,8 +422,12 @@ fn normalize_tool_call_id(id: &str) -> String {
                 '_'
             }
         })
-        .take(40)
-        .collect()
+        .take(prefix_len)
+        .collect();
+    if prefix.is_empty() {
+        prefix.push_str("call");
+    }
+    format!("{prefix}_{suffix}")
 }
 
 fn has_tool_history(messages: &[Message]) -> bool {
@@ -498,7 +521,15 @@ mod tests {
                 .all(|message| message.get("type") != Some(&Value::String("function".to_owned())))
         );
         assert_eq!(request["messages"][1]["content"][0]["text"], "read it");
-        assert_eq!(request["messages"][2]["tool_calls"][0]["id"], "call");
+        let tool_call_id = request["messages"][2]["tool_calls"][0]["id"]
+            .as_str()
+            .expect("tool call id");
+        assert_eq!(
+            request["messages"][3]["tool_call_id"].as_str(),
+            Some(tool_call_id)
+        );
+        assert_ne!(tool_call_id, "call");
+        assert!(tool_call_id.len() <= 40);
         assert_eq!(
             request["messages"][2]["reasoning_content"],
             "I should read."
@@ -520,7 +551,8 @@ mod tests {
             },
         );
 
-        assert!(request.get("max_completion_tokens").is_some());
+        assert_eq!(request["max_tokens"], 131_072);
+        assert!(request.get("max_completion_tokens").is_none());
         assert_eq!(request["thinking"]["type"], "enabled");
         assert_eq!(request["thinking"]["clear_thinking"], false);
         assert_eq!(request["reasoning_effort"], "high");
@@ -558,5 +590,24 @@ mod tests {
 
         assert_eq!(request["messages"][2]["content"], "I should read.");
         assert_eq!(request["messages"][2]["reasoning_content"], "");
+    }
+
+    #[test]
+    fn normalized_tool_call_ids_are_stable_and_collision_resistant() {
+        let first = normalize_tool_call_id("call|a");
+        let second = normalize_tool_call_id("call|b");
+        let long_a = normalize_tool_call_id(&format!("{}a", "x".repeat(40)));
+        let long_b = normalize_tool_call_id(&format!("{}b", "x".repeat(40)));
+
+        assert_eq!(first, normalize_tool_call_id("call|a"));
+        assert_ne!(first, second);
+        assert_ne!(long_a, long_b);
+        for id in [first, second, long_a, long_b] {
+            assert!(id.len() <= 40);
+            assert!(
+                id.bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            );
+        }
     }
 }
