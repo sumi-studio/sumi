@@ -96,13 +96,14 @@ agent⇔api 間のイベントプロトコルは未定のため、**トレイト
 [dependencies]
 anyhow = "1"                # main/バイナリ層のエラー
 thiserror = "2"             # ライブラリ層の型付きエラー
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "sync", "time", "io-util", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "sync", "time", "io-util", "io-std", "fs"] }  # io-std は stdio gateway に必須
 tokio-util = { version = "0.7", features = ["rt"] }   # CancellationToken
 futures-util = "0.3"        # Stream 操作
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.9"                # 設定ファイル読込 (実装時に最新安定を確認)
+toml = "1.1"                # 設定ファイル読込 (2026-07 時点の安定版 1.1.3 を確認済み)
+libc = "0.2"                # Unix: プロセスグループへのシグナル送出 (bash ツール、§8.3)
 schemars = "1"              # ツールパラメータの JSON Schema 導出 (TypeBox 相当)
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate", "json", "chrono"] }
 uuid = { version = "1", features = ["v7", "serde"] }  # v7: 時系列ソート可能ID
@@ -263,7 +264,7 @@ pub struct Usage {
 
 **pi との差分と理由**:
 - `ThinkingContent.thinkingSignature` → `signature_field` に改名。OpenAI互換系ではこのフィールドは「reasoning がどの JSON フィールドで届いたか」を記録して再送時に同じフィールドへ書き戻すために使われている **[事実]** (`pi:ai/src/api/openai-completions.ts:408-424, 996-1003`)。Anthropic の暗号署名の意味は Sumi には不要。
-- `AssistantMessage.interrupted` は Sumi 拡張。pi は aborted メッセージを再送時に丸ごと捨てる **[事実]** (`pi:ai/src/api/transform-messages.ts:698-706`) が、Sumi のハードステアは部分応答を保持する必要があるため、「打ち切られたが再送対象」であることを示すフラグを持つ(第6章)。
+- `AssistantMessage.interrupted` は Sumi 拡張。pi は aborted メッセージを再送時に丸ごと捨てる **[事実]** (`pi:ai/src/api/transform-messages.ts` の aborted スキップ処理) が、Sumi のハードステアは部分応答を保持する必要があるため、「打ち切られたが再送対象」であることを示すフラグを持つ(第6章)。
 - `api`/`responseId`/`diagnostics` フィールドは省略(単一APIなので不要。responseId はログにだけ流す)。
 
 ### 3.2 プロバイダイベント
@@ -316,7 +317,10 @@ pub enum AgentEvent {
     TurnStart,
     TurnEnd { message: Box<Message>, tool_results: Vec<ToolResultMessage> },
     MessageStart { message: Box<Message> },
-    /// assistantストリーミング中のみ。ProviderEvent を素通しで包む
+    /// assistantストリーミング中のみ。ProviderEvent の block 系イベント
+    /// (Text/Thinking/ToolCall の Start/Delta/End) だけを包む。
+    /// ストリーム終端の Done/Error は包まない — 終端の解釈と MessageEnd の
+    /// 発行は常に Session が担う (§6.3.1 のイベント遷移表)
     MessageUpdate { event: ProviderEventJson },
     MessageEnd { message: Box<Message> },
     ToolExecutionStart { tool_call_id: String, tool_name: String, args: serde_json::Value },
@@ -393,7 +397,7 @@ pub struct TypedTool<P: JsonSchema + DeserializeOwned> { /* name, desc, f */ }
 // execute(): serde_json::from_value::<P>(args) → 型付きハンドラ呼び出し
 ```
 
-**引数検証の方針**: pi は TypeBox でスキーマ検証+型強制(数値文字列→数値等)を行う **[事実]** (`pi:ai/src/utils/validation.ts:1148-1180`、`Value.Convert` と自前 coercion)。Rust では `serde_json::from_value` のデシリアライズ失敗をそのまま検証エラーとし、**エラーメッセージにスキーマと受信引数を添えてツール結果 (is_error=true) としてモデルに返す**(pi と同じ回復パターン。モデルが自分で修正して再発行する)。数値/真偽の文字列からの弱い型強制は serde の `#[serde(deserialize_with)]` ヘルパを1つ用意して主要ツールに適用する。**[推測]** Kimi/GLM は比較的正しい JSON を吐くため優先度は低いが、pi がこの coercion を持っているのは実運用で踏んだ証拠なので、M1 の実測でエラー頻度を見て判断。
+**引数検証の方針**: pi は TypeBox で**フル JSON Schema 検証**(コンパイル済み `Check` + constraint 込みエラー列挙)と型強制(`Value.Convert` + 自前 coercion)を行う **[事実]** (`pi:ai/src/utils/validation.ts`、全310行)。Sumi は**意図的な簡略化として「構造的デシリアライズのみ」**とする: `serde_json::from_value` の失敗を検証エラーとし、**エラーメッセージにスキーマと受信引数を添えてツール結果 (is_error=true) としてモデルに返す**(pi と同じ回復パターン)。`minimum` / `minLength` / `pattern` / additionalProperties 等の JSON Schema 制約は**検証しない**(schemars はスキーマの生成のみに使い、検証をうたわない)。数値/真偽の弱い型強制は `#[serde(deserialize_with)]` ヘルパで主要ツールに適用。制約検証が必要になったら(ドメイン操作ツール導入時など) `jsonschema` クレートの追加を ADR で判断する。**[推測→意図的乖離として確定]**
 
 ### 3.5 pi 対照表(型サマリ)
 
@@ -441,7 +445,7 @@ pub struct ModelSpec {
 }
 
 pub struct Compat {
-    /// "max_tokens" | "max_completion_tokens"。Kimi/GLM とも max_tokens
+    /// "max_tokens" | "max_completion_tokens"。Kimi=max_tokens、GLM=max_completion_tokens (pi実測値)
     pub max_tokens_field: MaxTokensField,
     /// stream_options: {include_usage:true} を送るか。既定 true
     pub supports_usage_in_streaming: bool,
@@ -462,8 +466,9 @@ pub struct Compat {
 
 初期プリセット(**[事実]** pi の生成メタデータより移植):
 
-- `kimi-k3` (`pi:ai/src/providers/moonshotai.models.ts:171-189`): `thinking_format=Deepseek`(`thinking: {"type":"enabled"}`)、`requires_reasoning_content_on_assistant=true`、`max_tokens_field=max_tokens`、`supports_strict_mode=false`、`supports_store=false`、`supports_developer_role=false`
-- `glm-5.2` (`pi:ai/src/providers/zai.models.ts:79-98`): `thinking_format=Zai`(`thinking: {"type":"enabled","clear_thinking":false}` + `reasoning_effort` 対応)、`zai_tool_stream=true`、`supports_store=false`、`supports_developer_role=false`
+- `kimi-k3` (`pi:ai/src/providers/moonshotai.models.ts`): `thinking_format=Deepseek`(`thinking: {"type":"enabled"}`)、`requires_reasoning_content_on_assistant=true`、`max_tokens_field=max_tokens`(pi の `useMaxTokens` 判定に Moonshot が含まれる **[事実]** `openai-completions.ts:1272-1273`)、`supports_strict_mode=false`、`supports_store=false`、`supports_developer_role=false`
+- `glm-5.2` (`pi:ai/src/providers/zai.models.ts:79-98`): `thinking_format=Zai`(`thinking: {"type":"enabled","clear_thinking":false}` + `reasoning_effort` 対応)、`zai_tool_stream=true`、`supports_store=false`、`supports_developer_role=false`、**`max_tokens_field=max_completion_tokens`**(z.ai は pi の `useMaxTokens` 判定に含まれず既定側に落ちる **[事実]** 同 :1272-1273)
+- **GLM の base_url 注意**: pi の値 `/api/coding/paas/v4` は**コーディングプラン用エンドポイント**であり、Sumi は規約上使えない(プロバイダ調査参照)。Sumi は直APIの `https://api.z.ai/api/paas/v4` を使う — これは pi 由来ではなくプロバイダ調査由来の値。直APIが `max_completion_tokens` を受理するかは **T8/M1 ライブで確認**し、拒否されたら Compat で `max_tokens` に切替(ランタイム設定)
 - Umans: OpenAI互換を名乗るが実体は上記モデルのプロキシ。**M1 の実測で決める**(まず Kimi/GLM 相当のプリセットを試す)。**[推測]**
 
 pi から**移植しないもの**: Anthropic 型 cache_control(Kimi/GLM は自動キャッシュ)、prompt_cache_key(OpenAI 本家専用)、session affinity ヘッダ、deferredToolsMode "kimi"(ツール凍結原則により遅延ロード不使用)、OpenRouter/Vercel ルーティング、25方言の thinkingFormat のうち上記2種以外。
@@ -478,7 +483,7 @@ pi から**移植しないもの**: Anthropic 型 cache_control(Kimi/GLM は自�
 4. **`requires_reasoning_content_on_assistant`**: 再送する assistant メッセージに reasoning_content が無ければ `""` を補う(:1038-1044)
 5. **tool_calls**: `{id, type:"function", function:{name, arguments: JSON文字列}}`。引数は必ず `serde_json::to_string` で直列化
 6. **tool ロール**: `{"role":"tool","content":text,"tool_call_id":...}`。テキストが空で画像のみなら `"(see attached image)"`、両方空なら `"(no tool output)"` のプレースホルダ(:1073-1075)
-7. **ツール結果内の画像**: tool メッセージには載らないため、直後に user メッセージ `"Attached image(s) from tool result:"` + image_url ブロックとして追送(:1109-1127)。※ Kimi K3 は image 入力可、GLM-5.2 text のみ **[事実]**(モデルメタ)。非対応モデルにはプレースホルダテキストに差替(`transform-messages.ts:521-566`)
+7. **ツール結果内の画像**: tool メッセージには載らないため、直後に user メッセージ `"Attached image(s) from tool result:"` + image_url ブロックとして追送(:1109-1127)。※ Kimi K3 は image 入力可、GLM-5.2 text のみ **[事実]**(モデルメタ)。非対応モデルにはプレースホルダテキストに差替(`transform-messages.ts` の画像差替処理)
 8. **空 assistant のスキップ**: content も tool_calls も無い assistant メッセージは送らない(aborted 応答の残骸対策、:1045-1056)
 9. **tools が空でも履歴にツールコールがあるなら `"tools": []` を送る**(プロキシ互換、:625-628)。※ Sumi はツール凍結原則なので通常発生しないが移植しておく
 10. **サニタイズ**: 送信テキスト全部に不対サロゲート除去を適用。Rust の `String` は常に正しい UTF-8 なので pi の `sanitizeSurrogates` 相当は**受信側**(ツール出力のバイト列→String 変換時の `from_utf8_lossy`)で保証する。加えて `serde_json` は文字列中の生制御文字を正しくエスケープするため pi の repairJson 送信側問題は起きない **[推測、M1で確認]**
@@ -490,7 +495,7 @@ pi から**移植しないもの**: Anthropic 型 cache_control(Kimi/GLM は自�
 **[事実]** 組立ロジックの原典: `pi:ai/src/api/openai-completions.ts:229-511`。移植必須の細部:
 
 - **ブロック管理**: `tool_calls[].index` による Map と `id` による Map の**二重引き**(:239-241, 307-344)。プロバイダによって index だけ・id だけ・両方が来るため。text/thinking ブロックは「現在開いているブロック」1個ずつを保持し、種類が切り替わったら閉じずに保持(同種 delta の続きが来たら継続)
-- **ツール引数の逐次パース**: delta 到着ごとに `partial_args` 文字列へ追記し、`partial_json::parse_streaming` で「常に何かしらのオブジェクト」を得る(UI のツール進行表示用)。確定は `ToolCallEnd` 時に repair 付き厳密パース(:263-274)
+- **ツール引数の逐次パース**: delta 到着ごとに `partial_args` 文字列へ追記し、`partial_json::parse_streaming` で「常に何かしらのオブジェクト」を得る(UI のツール進行表示用)。**確定 (`ToolCallEnd`) も pi と同じく best-effort サルベージ**(parseStreamingJson チェーン、:263-274)であり厳格化しない — サルベージ由来の「静かに不完全な引数」のリスクは Length 一括失敗(#19)が受け持つ、という pi の二段構えをセットで維持する
 - **reasoning フィールド検出**: delta 内の `reasoning_content` → `reasoning` → `reasoning_text` の順で**最初に見つかった非空フィールドだけ**採用(重複返却プロバイダ対策、:394-424)。採用フィールド名を `signature_field` に記録
 - **usage**: `chunk.usage` を都度上書き。**Moonshot は `choices[0].usage` に入れてくる**フォールバックを移植(:362-366)。`prompt_tokens_details.cached_tokens` → cache_read、`completion_tokens_details.reasoning_tokens` → reasoning。`input = prompt_tokens - cached - cache_write`(:1168-1204)
 - **finish_reason マップ**(:1206-1230): `stop|end→Stop`, `length→Length`, `tool_calls|function_call→ToolUse`, `content_filter→Error`, その他→Error(メッセージに finish_reason 原文を残す)
@@ -510,11 +515,11 @@ SSE 層(`sse.rs`)の仕様: reqwest の `bytes_stream()` を行分割し、`data
 
 ### 4.5 コンテキスト溢れ検出(`overflow.rs`)
 
-**[事実]** `pi:ai/src/utils/overflow.ts:379-501` から Sumi に関係するパターンのみ移植:
+**[事実]** `pi:ai/src/utils/overflow.ts`(全165行)から Sumi に関係するパターンのみ移植:
 
 - エラーメッセージパターン: `exceeded model token limit`(Kimi)、`exceeds the context window` / `maximum context length`(OpenAI系プロキシ・Umans想定)、`context_length_exceeded` / `too many tokens` / `token limit exceeded`(汎用)
-- **z.ai は溢れをエラーにせず黙って受けることがある** → 成功応答でも `usage.input + cache_read > context_window` なら溢れ扱い(:483-488)
-- 非溢れ除外パターン(rate limit / too many requests)を先に判定(:415-419)
+- **z.ai は溢れをエラーにせず黙って受けることがある** → 成功応答でも `usage.input + cache_read > context_window` なら溢れ扱い(usage ベース判定)
+- 非溢れ除外パターン(rate limit / too many requests)を先に判定
 - 検出時の動作: リトライせず、3層メモリの緊急溢れ処理(第7.6節)を即時適用して再送
 
 Sumi では 3層メモリが常時 70k 以内に抑えるため溢れは本来起きない(1M ctx モデル)。この検出は**保険+メモリバグの検知器**として入れ、発火したら `tracing::error!` で警報する。
@@ -585,9 +590,11 @@ pi から移す挙動:
 
 **[事実]** 原典: `pi:ai/src/api/transform-messages.ts`。API コール直前に L0 へ適用する純関数として移植:
 
-1. **孤児ツールコールへの合成結果**(:667-729): assistant のツールコールに対応する toolResult が無い場合(abort・クラッシュ・ステア切断)、`"No result provided"` の is_error 結果を合成して挿入。**user メッセージがツールフローを分断した位置にも挿入**。会話末尾の未解決分も同様
-2. **Error/Aborted assistant のスキップ**(:698-706): 再送しない。**ただし Sumi 拡張: `interrupted=true` のものは除く**(第6章のステア部分応答。テキスト/thinking は保持し、未完了ツールコールブロックだけ落とす)
-3. **クロスモデル thinking 降格**(:609-626): モデル切替後は thinking をテキスト化 or 破棄
+1. **孤児ツールコールへの合成結果**: assistant のツールコールに対応する toolResult が無い場合(abort・クラッシュ・ステア切断)、`"No result provided"` の is_error 結果を合成して挿入。**user メッセージがツールフローを分断した位置にも挿入**。会話末尾の未解決分も同様
+2. **Error/Aborted assistant のスキップ**: 再送しない。**ただし Sumi 拡張: `interrupted=true` のものは除く**(第6章のステア部分応答。テキスト/thinking は保持し、未完了ツールコールブロックだけ落とす)
+3. **クロスモデル thinking 降格**: モデル切替後は thinking をテキスト化 or 破棄
+
+(いずれも `transform-messages.ts` 全223行を実読して該当処理を特定すること — 本書の旧行番号は誤りだった)
 
 ---
 
@@ -630,6 +637,17 @@ pi の `steer()` は**キュー投入のみ**で、注入は「現在のツー�
    - 末尾に「[この応答はユーザーの割り込みにより中断された]」マーカーテキストを付加
      し、モデルが「自分は途中で止められた」と認識できるようにする [推測、プロンプト実験で調整]
 ```
+
+### 6.3.1 イベント遷移の確定(二重発行の防止)
+
+プロバイダの終端イベント(`Done`/`Error`)は **UI へ素通ししない**(`MessageUpdate` が包むのは block 系のみ、§3.3)。終端の解釈と `MessageEnd` の発行は常に Session が担うため、「provider の MessageEnd と独自 MessageEnd の二重発行」は構造上起きない。契機の区別は Session 側の状態フラグ(`SteerPending` / `AbortRequested`)で行い、provider の `Aborted` から推測しない。
+
+| 契機 | provider 終端 | Session が発行するイベント | run の継続 |
+|---|---|---|---|
+| 正常完了 | `Done` | `MessageEnd` → (ツール系) → `TurnEnd` | ツール/steering に従い継続 |
+| ハードステア | `Error(Aborted)` を消費 | `MessageEnd`(interrupted=true、§6.3 規則で確定) → `TurnEnd` → `Steered` → 注入 → `TurnStart` | **同一 run を継続(`AgentEnd` なし)** |
+| abort(停止ボタン) | `Error(Aborted)` を消費 | `MessageEnd`(interrupted=true) → `TurnEnd` → `AgentEnd` | 終了(Idle へ) |
+| 実エラー | `Error(Error)` | リトライ判定 → 不可なら `MessageEnd`(error) → `TurnEnd` → `AgentEnd` | 終了 |
 
 **設計根拠**: pi の transform は aborted を捨てる(第5.3節)が、それは「途中応答はノイズ」というコーディングエージェントの割切り。秘書エージェントでは「言いかけたこと」は会話の実体であり、ユーザーもそれを見た上で割り込んでいる。UI に見えているものと L0 が一致することが人格の連続性に直結する。
 
@@ -703,7 +721,7 @@ L2_LIMIT       = 10_000
 ### 7.3 バッチ分割(`batch.rs`)
 
 - open バッチにメッセージを追記し、`est_tokens >= L0_BATCH_MIN` に達したら**次の「きりのいい境界」で seal**
-- きりのいい境界の定義 **[事実]**(pi の cut point 規則を採用、`pi:agent/src/harness/compaction/compaction.ts:265-303`): **user または assistant メッセージの直前のみ**。toolResult の直前では切らない(assistant のツールコールと結果が別バッチに泣き別れると、Compact 入力も再送プレフィックスも壊れるため)。Sumi 追加規則: **interrupted な assistant とそれに続く steering user メッセージの間でも切らない**(中断文脈の一体性)
+- きりのいい境界の定義(pi の cut point 規則を Sumi のメッセージ種別に射影したもの。`pi:agent/src/harness/compaction/compaction.ts` の cut point 判定参照 — pi は bashExecution/custom 等のエントリ種別も cut 対象に含むが **[事実]**、Sumi のメッセージは user/assistant/toolResult の3種なので**結果として user または assistant メッセージの直前のみ**になる): toolResult の直前では切らない(assistant のツールコールと結果が別バッチに泣き別れると、Compact 入力も再送プレフィックスも壊れるため)。Sumi 追加規則: **interrupted な assistant とそれに続く steering user メッセージの間でも切らない**(中断文脈の一体性)
 - thinking ブロックはバッチのトークン計算に**含める**(Kimi では実際に再送されるため。memory.md 未決事項への回答)
 - seal と同時に `compactor` へ非同期ジョブ投入(7.4節)し、状態を Compacting に
 
@@ -799,10 +817,15 @@ transform は**送信用のビューを作る純関数**であり、L0 の保存
 **[事実]** 原典: `pi:agent/src/harness/utils/shell-output.ts`(135行)。運用の知恵が詰まっているので必ず読んでから書く:
 
 - stdout/stderr を**単一ストリームに合流**(時系列維持)
-- **ローリングバッファ**: 上限 100KB(50KB×2)。超えたら先頭チャンクから捨てる → 最後に `truncate_tail` で 50KB/2000行に整える(=「メモリを無限に食わずに末尾を保持」)
+- **ローリングバッファ**: 上限 100KB(50KB×2)。超えたら先頭チャンクから捨てる → 最後に `truncate_tail` で 50KB/2000行に整える(=「メモリを無限に食わずに末尾を保持」)。注意: pi の「100KB」は JS の `text.length`(UTF-16 コード単位)基準 **[事実]** であり、Rust では**バイト基準の仕様移植**とする(忠実移植ではない)。多バイト文字を含む出力での全文退避テストを必須とする
 - **全文退避**: 出力が 50KB を超えた時点でテンポラリファイル(`bash-*.log`)への追記を開始し、ツール結果に**全文パス**を含める。エージェントは必要なら read_file/grep で続きを読める(戦略的忘却と同じ思想)
 - **バイナリサニタイズ**: 制御文字(TAB/LF/CR以外)除去、`\r` 除去(:sanitizeBinaryOutput)。Rust では `from_utf8_lossy` + 同フィルタ
-- 中断: CancellationToken → プロセスグループごと SIGKILL。`cancelled: true` とそれまでの出力を返す(結果は捨てない)
+- 中断(プロセスグループ kill の実装仕様、Unix 前提):
+  1. spawn 時に `std::os::unix::process::CommandExt::process_group(0)` で新しいプロセスグループを作る(tokio::process::Command の `as_std_mut()` 経由)
+  2. cancel 時に `libc::kill(-pgid, SIGKILL)` で**グループ全体**(孫プロセス含む)に送る。`kill_on_drop` は直接の子しか殺さないため使わない
+  3. その後 `child.wait()` で直接の子を回収(ゾンビ防止)
+  4. 非 Unix はビルド対象外(コンテナ内 Linux 前提)だが、フォールバックは `child.kill()`(直接の子のみ、ベストエフォート)
+  5. `cancelled: true` とそれまでの出力を返す(結果は捨てない)
 - 実行シェル: `bash -c`、作業ディレクトリはワークスペースルート、環境変数は最小(PATH, HOME, LANG)
 
 ---
@@ -811,7 +834,7 @@ transform は**送信用のビューを作る純関数**であり、L0 の保存
 
 ### 9.1 フックとしての位置
 
-pi の `beforeToolCall` フック(block 可能)**[事実]**(`pi:agent/src/types.ts:60-63, agent-loop.ts:618-651`)が土台。pi ではフックが同期的に block を返すだけだが、Sumi は「ユーザーに聞いて返事を待つ」**非同期状態機械**をフック内に実装する。
+pi の `beforeToolCall` フック(block 可能)**[事実]**(`pi:agent/src/types.ts`、`agent-loop.ts` の該当 await 箇所)が土台。**pi のフックは Promise を返す非同期フックで、ループ側も await している** — つまり「ユーザーに聞いて返事を待つ」承認待ちは、既存のフック構造にそのまま自然に載る。Sumi はその上に承認の**状態機械**を実装する。
 
 ### 9.2 状態機械
 
@@ -870,7 +893,10 @@ CREATE TABLE messages (
   interrupted INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
 );
-CREATE VIRTUAL TABLE messages_fts USING fts5(text, content=messages); -- 検索用抽出テキスト
+-- 全文検索: contentless FTS5 (content='')。messages に text 列が無いため外部コンテンツ表は使えない。
+-- StoreWriter が payload から表示テキストを抽出し、rowid = messages.rowid で明示 INSERT する。
+-- messages は追記専用なので delete/update 同期は不要。検索結果は rowid で messages に JOIN する。
+CREATE VIRTUAL TABLE messages_fts USING fts5(text, content='');
 
 -- メモリ層の現在形 (再起動復元用)
 CREATE TABLE memory_batches (
@@ -969,6 +995,8 @@ web への転送方針(api の責務、参考): MessageUpdate の delta 系は�
 
 すべて 2026-07-17 時点の `earendil-works/pi` @ `216e672e` を実読した結果 **[事実]**。実装セッションは該当ファイルを**必ず開いてから**書くこと(本表は索引であり、コードの代替ではない)。
 
+> **⚠ 行番号の扱い (2026-07-17 レビューで確定)**: 本書の pi 行番号には**ズレ・誤りが確認されている**(特に transform-messages.ts(全223行)・validation.ts(全310行)・overflow.ts(全165行)への 300 行超の参照は誤り。openai-completions.ts(全1355行)への参照は概ね妥当)。**正典は「ファイルパス+関数/挙動の記述」**であり、行番号は目安にすぎない。実装時は必ずファイルを開いて挙動記述と突き合わせること。
+
 | # | 何を | pi のどこから | なぜ / どう移すか | Sumi の行き先 |
 |---|---|---|---|---|
 | 1 | メッセージ・イベント型体系 | `ai/src/types.ts:321-476` | 1年運用で安定した境界設計。contentIndex 方式のストリーミングイベント、`Done`/`Error` の二終端、「stream は決して throw しない」契約(:301-313 コメント) | `provider/types.rs`(第3章) |
@@ -986,7 +1014,7 @@ web への転送方針(api の責務、参考): MessageUpdate の delta 系は�
 | 13 | 逐次 JSON パース戦略(厳密→repair→partial→repair+partial→{}) | `ai/src/utils/json-parse.ts` 全文 | ストリーミング中のツール引数表示と、確定時の壊れ JSON サルベージ。repairJson(文字列内制御文字エスケープ、不正エスケープの二重化)は Kimi/GLM でも踏む | `provider/partial_json.rs`(テスト含め忠実移植) |
 | 14 | リトライ可否の正規表現パターン集(retryable + non-retryable) | `ai/src/utils/retry.ts` 全文 | 各パターンにコメントで実 issue 番号が付いた運用知識の結晶。quota/billing 系を先に除外する順序も含めて移す | `provider/retry.rs` |
 | 15 | リトライポリシー(3回、2s/4s/8s、中断可能 sleep、エラー assistant を state から除去しログには保持) | `coding-agent/src/core/agent-session.ts:2606-2673` | ポリシーと判定の分離。「溢れはリトライしない」ガードが先頭にある(:2610-2614) | `agent/run.rs` |
-| 16 | コンテキスト溢れ検出パターン(Kimi「exceeded model token limit」、z.ai サイレント溢れの usage 判定、非溢れ除外) | `ai/src/utils/overflow.ts:379-501` | 溢れとレート制限の誤判別は復旧経路を間違える。Kimi/GLM/汎用分のみ抽出 | `provider/overflow.rs` |
+| 16 | コンテキスト溢れ検出パターン(Kimi「exceeded model token limit」、z.ai サイレント溢れの usage 判定、非溢れ除外) | `ai/src/utils/overflow.ts` 全文(165行) | 溢れとレート制限の誤判別は復旧経路を間違える。Kimi/GLM/汎用分のみ抽出 | `provider/overflow.rs` |
 | 17 | エラーボディの正規化(status+body 4000字切詰め) | `ai/src/utils/error-body.ts` | 「403 (no body)」型の情報消失を防ぐ。reqwest 直叩きなので SDK 形状プローブは不要、フォーマットだけ移す | `provider/sse.rs` |
 | 18 | エージェントループ骨格(steering/followUp の 2 キュー、ポーリング位置、イベント発行順) | `agent/src/agent-loop.ts:155-275` | ループの正典。TurnEnd 後 steering→無ければ followUp→無ければ終了、の順序 | `agent/run.rs` |
 | 19 | Length 停止時のツール一括失敗 | 同 :207-215, 383-408 | partial JSON サルベージ由来の「静かに不完全な引数」を実行しない安全弁 | `agent/run.rs` |
