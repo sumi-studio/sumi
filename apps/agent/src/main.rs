@@ -4,6 +4,7 @@ mod approval;
 mod config;
 mod gateway;
 mod memory;
+mod prompts;
 pub mod provider;
 mod store;
 mod tools;
@@ -25,6 +26,7 @@ async fn main() -> Result<()> {
         .init();
 
     let config = config::Config::load().await?;
+    let model_spec = config.model_spec()?;
     let conversation_id = config.conversation_id.clone();
     let mut gateway = StdioGateway::new();
 
@@ -33,7 +35,9 @@ async fn main() -> Result<()> {
         workspace = %config.workspace.display(),
         database_path = %config.database_path.display(),
         model_preset = ?config.model.preset,
-        model_id = ?config.model.id,
+        model_id = %model_spec.id,
+        model_provider = %model_spec.provider,
+        system_prompt_version = prompts::SYSTEM_PROMPT_VERSION,
         system_prompt_configured = !config.system_prompt.is_empty(),
         "sumi-agent starting"
     );

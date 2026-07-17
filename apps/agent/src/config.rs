@@ -6,7 +6,10 @@ use std::{
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::provider::request::{MaxTokensField, ModelSpec, ThinkingFormat};
+
 const DEFAULT_CONVERSATION_ID: &str = "default";
+const DEFAULT_SYSTEM_PROMPT: &str = crate::prompts::SYSTEM_PROMPT;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -24,6 +27,24 @@ pub struct ModelConfig {
     pub id: Option<String>,
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
+    pub context_window: Option<u64>,
+    pub max_tokens: Option<u64>,
+    pub reasoning: Option<bool>,
+    pub supports_images: Option<bool>,
+    pub compat: CompatConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CompatConfig {
+    pub max_tokens_field: Option<String>,
+    pub supports_usage_in_streaming: Option<bool>,
+    pub thinking_format: Option<String>,
+    pub requires_reasoning_content_on_assistant: Option<bool>,
+    pub zai_tool_stream: Option<bool>,
+    pub supports_strict_mode: Option<bool>,
+    pub supports_store: Option<bool>,
+    pub supports_developer_role: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -33,6 +54,7 @@ struct FileConfig {
     workspace: Option<PathBuf>,
     database_path: Option<PathBuf>,
     system_prompt: Option<String>,
+    system_prompt_file: Option<PathBuf>,
     model: ModelConfig,
 }
 
@@ -42,6 +64,7 @@ struct EnvOverrides {
     workspace: Option<PathBuf>,
     database_path: Option<PathBuf>,
     system_prompt: Option<String>,
+    system_prompt_file: Option<PathBuf>,
     model_preset: Option<String>,
     model_id: Option<String>,
     model_base_url: Option<String>,
@@ -54,8 +77,76 @@ impl Config {
             Some(path) => Some(load_file(Path::new(&path)).await?),
             None => None,
         };
+        let file = file.unwrap_or_default();
+        let overrides = EnvOverrides::from_env();
+        let system_prompt = resolve_system_prompt(&file, &overrides).await?;
 
-        Self::resolve(file.unwrap_or_default(), EnvOverrides::from_env())
+        let mut config = Self::resolve(file, overrides)?;
+        config.system_prompt = system_prompt;
+        Ok(config)
+    }
+
+    pub fn model_spec(&self) -> Result<ModelSpec> {
+        let preset = self.model.preset.as_deref().unwrap_or("kimi-k3");
+        let mut spec =
+            ModelSpec::preset(preset).with_context(|| format!("unknown model preset {preset}"))?;
+        if let Some(id) = &self.model.id {
+            spec.id.clone_from(id);
+        }
+        if let Some(base_url) = &self.model.base_url {
+            spec.base_url.clone_from(base_url);
+        }
+        if let Some(api_key_env) = &self.model.api_key_env {
+            spec.api_key_env.clone_from(api_key_env);
+        }
+        if let Some(context_window) = self.model.context_window {
+            spec.context_window = context_window;
+        }
+        if let Some(max_tokens) = self.model.max_tokens {
+            spec.max_tokens = max_tokens;
+        }
+        if let Some(reasoning) = self.model.reasoning {
+            spec.reasoning = reasoning;
+        }
+        if let Some(supports_images) = self.model.supports_images {
+            spec.supports_images = supports_images;
+        }
+
+        let compat = &self.model.compat;
+        if let Some(field) = compat.max_tokens_field.as_deref() {
+            spec.compat.max_tokens_field = match field {
+                "max_tokens" => MaxTokensField::MaxTokens,
+                "max_completion_tokens" => MaxTokensField::MaxCompletionTokens,
+                other => anyhow::bail!("unknown max_tokens_field {other}"),
+            };
+        }
+        if let Some(format) = compat.thinking_format.as_deref() {
+            spec.compat.thinking_format = match format {
+                "off" => ThinkingFormat::Off,
+                "deepseek" => ThinkingFormat::Deepseek,
+                "zai" => ThinkingFormat::Zai,
+                other => anyhow::bail!("unknown thinking_format {other}"),
+            };
+        }
+        if let Some(value) = compat.supports_usage_in_streaming {
+            spec.compat.supports_usage_in_streaming = value;
+        }
+        if let Some(value) = compat.requires_reasoning_content_on_assistant {
+            spec.compat.requires_reasoning_content_on_assistant = value;
+        }
+        if let Some(value) = compat.zai_tool_stream {
+            spec.compat.zai_tool_stream = value;
+        }
+        if let Some(value) = compat.supports_strict_mode {
+            spec.compat.supports_strict_mode = value;
+        }
+        if let Some(value) = compat.supports_store {
+            spec.compat.supports_store = value;
+        }
+        if let Some(value) = compat.supports_developer_role {
+            spec.compat.supports_developer_role = value;
+        }
+        Ok(spec)
     }
 
     fn resolve(mut file: FileConfig, overrides: EnvOverrides) -> Result<Self> {
@@ -93,10 +184,30 @@ impl Config {
             system_prompt: overrides
                 .system_prompt
                 .or(file.system_prompt)
-                .unwrap_or_default(),
+                .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_owned()),
             model: file.model,
         })
     }
+}
+
+async fn resolve_system_prompt(file: &FileConfig, overrides: &EnvOverrides) -> Result<String> {
+    if let Some(prompt) = &overrides.system_prompt {
+        return Ok(prompt.clone());
+    }
+    if let Some(path) = &overrides.system_prompt_file {
+        return tokio::fs::read_to_string(path)
+            .await
+            .with_context(|| format!("failed to read system prompt file {}", path.display()));
+    }
+    if let Some(prompt) = &file.system_prompt {
+        return Ok(prompt.clone());
+    }
+    if let Some(path) = &file.system_prompt_file {
+        return tokio::fs::read_to_string(path)
+            .await
+            .with_context(|| format!("failed to read system prompt file {}", path.display()));
+    }
+    Ok(DEFAULT_SYSTEM_PROMPT.to_owned())
 }
 
 impl EnvOverrides {
@@ -106,6 +217,7 @@ impl EnvOverrides {
             workspace: env::var_os("SUMI_WORKSPACE").map(PathBuf::from),
             database_path: env::var_os("SUMI_DATABASE_PATH").map(PathBuf::from),
             system_prompt: env::var("SUMI_SYSTEM_PROMPT").ok(),
+            system_prompt_file: env::var_os("SUMI_SYSTEM_PROMPT_FILE").map(PathBuf::from),
             model_preset: env::var("SUMI_MODEL_PRESET").ok(),
             model_id: env::var("SUMI_MODEL_ID").ok(),
             model_base_url: env::var("SUMI_MODEL_BASE_URL").ok(),
@@ -135,7 +247,7 @@ workspace = "/workspace"
 system_prompt = "Be useful."
 
 [model]
-preset = "kimi"
+preset = "kimi-k3"
 id = "kimi-k3"
 base_url = "https://example.test/v1"
 api_key_env = "EXAMPLE_API_KEY"
@@ -155,12 +267,46 @@ api_key_env = "EXAMPLE_API_KEY"
         assert_eq!(
             config.model,
             ModelConfig {
-                preset: Some("kimi".to_owned()),
+                preset: Some("kimi-k3".to_owned()),
                 id: Some("kimi-k3".to_owned()),
                 base_url: Some("https://example.test/v1".to_owned()),
                 api_key_env: Some("EXAMPLE_API_KEY".to_owned()),
+                ..ModelConfig::default()
             }
         );
+    }
+
+    #[test]
+    fn embedded_system_prompt_is_the_default() {
+        let config =
+            Config::resolve(FileConfig::default(), EnvOverrides::default()).expect("resolved");
+
+        assert_eq!(config.system_prompt, crate::prompts::SYSTEM_PROMPT);
+        assert!(!config.system_prompt.trim().is_empty());
+    }
+
+    #[tokio::test]
+    async fn environment_prompt_file_overrides_inline_file_config() {
+        let path =
+            std::env::temp_dir().join(format!("sumi-system-prompt-{}.md", uuid::Uuid::now_v7()));
+        tokio::fs::write(&path, "prompt from file")
+            .await
+            .expect("write prompt");
+        let file = FileConfig {
+            system_prompt: Some("inline config prompt".to_owned()),
+            ..FileConfig::default()
+        };
+        let overrides = EnvOverrides {
+            system_prompt_file: Some(path.clone()),
+            ..EnvOverrides::default()
+        };
+
+        let prompt = resolve_system_prompt(&file, &overrides)
+            .await
+            .expect("resolve prompt");
+
+        tokio::fs::remove_file(path).await.expect("remove prompt");
+        assert_eq!(prompt, "prompt from file");
     }
 
     #[test]
@@ -203,5 +349,37 @@ modle = "typo"
         .expect_err("unknown model key must fail");
 
         assert!(error.to_string().contains("unknown field `modle`"));
+    }
+
+    #[test]
+    fn model_preset_values_can_be_overridden_without_recompiling() {
+        let file: FileConfig = toml::from_str(
+            r#"
+[model]
+preset = "glm-5.2"
+id = "custom-glm"
+base_url = "https://proxy.example/v1"
+api_key_env = "CUSTOM_KEY"
+context_window = 200000
+max_tokens = 64000
+
+[model.compat]
+max_tokens_field = "max_tokens"
+zai_tool_stream = false
+"#,
+        )
+        .expect("valid config");
+        let config = Config::resolve(file, EnvOverrides::default()).expect("resolved");
+
+        let spec = config.model_spec().expect("model spec");
+
+        assert_eq!(spec.id, "custom-glm");
+        assert_eq!(spec.base_url, "https://proxy.example/v1");
+        assert_eq!(spec.api_key_env, "CUSTOM_KEY");
+        assert_eq!(spec.provider, "zai");
+        assert_eq!(spec.context_window, 200_000);
+        assert_eq!(spec.max_tokens, 64_000);
+        assert_eq!(spec.compat.max_tokens_field, MaxTokensField::MaxTokens);
+        assert!(!spec.compat.zai_tool_stream);
     }
 }

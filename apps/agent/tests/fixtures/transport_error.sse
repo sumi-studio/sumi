@@ -1,0 +1,1 @@
+data: {"id":"broken-1","model":"kimi-k3","choices":[{"delta":{"content":"partial"},"finish_reason":null}]}
