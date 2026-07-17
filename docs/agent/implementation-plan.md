@@ -102,6 +102,7 @@ futures-util = "0.3"        # Stream 操作
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.9"                # 設定ファイル読込 (実装時に最新安定を確認)
 schemars = "1"              # ツールパラメータの JSON Schema 導出 (TypeBox 相当)
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate", "json", "chrono"] }
 uuid = { version = "1", features = ["v7", "serde"] }  # v7: 時系列ソート可能ID
@@ -891,11 +892,22 @@ CREATE TABLE approval_log (
 );
 
 CREATE TABLE kv ( key TEXT PRIMARY KEY, value TEXT NOT NULL );  -- calib.ratio, ハッシュ類
+
+-- 恒久イベントログ (WS再送の単一の源泉。delta系イベントは含めない — 10.2節)
+CREATE TABLE agent_events (
+  seq INTEGER PRIMARY KEY,      -- 会話内単調増加 (Envelope.seq と同一)
+  conversation_id TEXT NOT NULL,
+  envelope TEXT NOT NULL,       -- Envelope の serde_json 全文
+  created_at TEXT NOT NULL
+);
 ```
 
 ### 10.2 書込み経路と再起動復元
 
-- 書込みは**イベント駆動**: Session のイベントストリームを購読する StoreWriter タスクが MessageEnd / ToolExecutionEnd / MemoryMaintenance / Approval 系を書く。会話ホットパスに同期書込みを置かない(mpsc 経由、ただし**プロセス終了時に flush 待ち**)
+- 書込みは**イベント駆動**で、イベントを二階級に分ける(T13/T17 の整合のため):
+  - **恒久イベント**(MessageStart/End、ToolExecution 系、Approval 系、Turn/Agent 系、Steered、MemoryMaintenance): seq を採番し、StoreWriter が `agent_events` に**追記してから** Gateway へ転送する。Gateway 送出は StoreWriter の下流に置くことで「保存してから送信」を購読順序で保証する(delta を含まないため書込み頻度は低く、ホットパス影響は無視できる)
+  - **揮発イベント**(MessageUpdate の delta 系): 永続化せず Session から Gateway へ直送(seq なし)。再送不可。切断中に流れた分は、再接続後に届く恒久イベント MessageEnd(全文)で回復する — UI は「一瞬止まって全文が出る」体験になる
+  - messages / memory_batches への実体書込みは従来どおり StoreWriter(mpsc 経由、**プロセス終了時に flush 待ち**)
 - 復元: 起動時に memory_batches から L0/L1/L2 を再構成(L0 の本文は messages から引く)。open バッチの途中状態も ord で復元。shelf は summary 列。**復元後の最初の API コールはキャッシュ全ミス**(プロセス再起動の宿命)なのでコンテナは安易に殺さない運用とする
 - リトライで L0 から除去された Error assistant も messages には残る(pi の「state からは除去、session には保持」**[事実]** を踏襲)
 
@@ -918,7 +930,7 @@ pub enum Command {
 
 #[derive(Serialize)]
 pub struct Envelope {
-    pub seq: u64,                    // 会話内単調増加 (再接続時の再送基準)
+    pub seq: Option<u64>,            // 恒久イベントのみ採番 (再送基準)。delta系は None (10.2節)
     pub conversation_id: String,
     pub event: AgentEvent,
 }
@@ -931,7 +943,7 @@ pub trait Gateway: Send {
 ```
 
 - `stdio.rs`: 1行1JSON。開発時は `make agent-repl`(ラッパースクリプト)で人間が直接会話でき、E2E テストは期待イベント列をアサートできる。**M1 からこれで動かす**
-- `ws.rs`(M5): agent がコンテナ内から api へ outbound WebSocket 接続(コンテナへの inbound を開けない)。接続時に `hello {conversation_id, last_sent_seq}`、api は自分の最終受信 seq を返し、agent は差分を再送。**イベントは Store に書いてから送る**ので再送可能
+- `ws.rs`(M5): agent がコンテナ内から api へ outbound WebSocket 接続(コンテナへの inbound を開けない)。接続時に `hello {conversation_id, last_sent_seq}`、api は自分の最終受信 seq を返し、agent は **`agent_events` テーブルから seq 差分を再送**する(恒久イベントのみ。delta は再送しない — 10.2節の二階級設計)
 
 ### 11.2 contracts/agent-events.yaml(スキーマ案)
 
@@ -1000,7 +1012,7 @@ web への転送方針(api の責務、参考): MessageUpdate の delta 系は�
 
 ### M0: 足場(0.5日、〜7/18午前)
 
-- `config.rs`(モデルプリセット3種+環境変数)、モジュールツリーの空実装、`gateway/stdio.rs`、tracing 初期化(JSON ログ + `SUMI_LOG` フィルタ)
+- `config.rs`(設定構造+環境変数のみ。**モデルプリセットの実値は M1 のリクエスト組立と同時に入れる** — M0 では構造体と TOML 読込だけ)、モジュールツリーの空実装、`gateway/stdio.rs`、tracing 初期化(JSON ログ + `SUMI_LOG` フィルタ)
 - **ゲート**: `echo '{"type":"user_message","text":"hi"}' | cargo run` がエコー応答イベントを返す。`cargo clippy -- -D warnings` / `cargo fmt --check` が通る(turbo lint 経由)
 
 ### M1: プロバイダ層(3日、〜7/21)
