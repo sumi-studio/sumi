@@ -25,8 +25,9 @@
 web (React) ⇔ api (Go, WebSocket ゲートウェイ) ⇔ ユーザーごとの agent コンテナ
 ```
 
-- agent ⇔ api 間のイベントプロトコルは contracts/ にスキーマを置く (未定義)
+- agent ⇔ api 間のイベント/コマンドプロトコルは contracts/ にスキーマを置く (現時点では未実装。認証・再送・ACKを含む案は [実装計画 第11章](implementation-plan.md) を参照)
 - agent はドメイン操作を api 経由でのみ行う (ADR 0001 の原則を維持)。agent の直接の持ち物は、ワークスペース内のファイルと、ローカル SQLite の自己状態 (3層メモリ・チャットログ全文・恒久イベント・承認ルール — [実装計画 第10章](implementation-plan.md) 参照)。ドメインデータはここに複製しない
+- agent→api の outbound WebSocket は短命の署名tokenで tenant / agent / conversation / process generation を束縛し、APIは最新generationだけを受理する。API→agent commandもdurable seq・command_id・Received/Applied ACKで再送と重複排除を行い、接続断を権限境界や副作用の二重実行へ波及させない
 
 ## セキュリティ境界
 

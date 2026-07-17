@@ -2,7 +2,7 @@
 
 - Status: Draft v1
 - Date: 2026-07-17
-- 対象: `apps/agent`(Rust スキャフォールド済: tokio + anyhow + tracing、turbo に `@sumi/agent` として接続済み)
+- 対象: `apps/agent`(Rust。現行 `main` には未導入で、別ブランチのスキャフォールドを取り込むか M0 で作成する)
 - 前提資料:
   - [ADR 0002 エージェント基盤の言語と実装方針](../adr/0002-agent-stack.md)
   - [3層メモリ設計](memory.md)
@@ -128,7 +128,7 @@ axum = "0.8"                # SSE フィクスチャ再生用モックサーバ 
 ```
 apps/agent/src/
 ├── main.rs              # 起動、設定読込、Gateway選択、Session起動
-├── config.rs            # 環境変数/設定ファイル (モデル、APIキー、ワークスペースパス、DB)
+├── config.rs            # 環境変数/設定ファイル (モデル、APIキー、短命gateway credential、workspace、DB)
 │
 ├── provider/            # ═══ LLM配管 (pi:ai の縮小移植) ═══
 │   ├── mod.rs           # pub API: stream(model, context, opts) -> ProviderEventStream
@@ -219,6 +219,7 @@ pub struct AssistantMessage {
     pub usage: Usage,
     pub stop_reason: StopReason,
     pub error_message: Option<String>,
+    pub provider_code: Option<String>,        // finish_reason / provider error code (分類用、表示文言と分離)
     /// Sumi拡張: ハードステアで打ち切られた部分応答か (第6章)
     pub interrupted: bool,
     pub timestamp: DateTime<Utc>,
@@ -336,6 +337,12 @@ pub enum AgentEvent {
     ApprovalResolved { request_id: String, decision: ApprovalDecision },
     Steered { mode: SteerMode },                               // 第6章 (UI通知用)
     MemoryMaintenance { kind: MemoryMaintKind },               // デバッグ/可観測性用
+    RetryScheduled {
+        attempt: u32,
+        delay_ms: u64,
+        retry_at: DateTime<Utc>,
+        error_message: String,
+    },
     Error { message: String },
 }
 ```
@@ -503,7 +510,7 @@ pi から**移植しないもの**: Anthropic 型 cache_control(Kimi/GLM は自�
 - **ツール引数の逐次パース**: delta 到着ごとに `partial_args` 文字列へ追記し、`partial_json::parse_streaming` で「常に何かしらのオブジェクト」を得る(UI のツール進行表示用)。**確定 (`ToolCallEnd`) も pi と同じく best-effort サルベージ**(parseStreamingJson チェーン、:263-274)であり厳格化しない — サルベージ由来の「静かに不完全な引数」のリスクは Length 一括失敗(#19)が受け持つ、という pi の二段構えをセットで維持する
 - **reasoning フィールド検出**: delta 内の `reasoning_content` → `reasoning` → `reasoning_text` の順で**最初に見つかった非空フィールドだけ**採用(重複返却プロバイダ対策、:394-424)。採用フィールド名を `signature_field` に記録
 - **usage**: `chunk.usage` を都度上書き。**Moonshot は `choices[0].usage` に入れてくる**フォールバックを移植(:362-366)。`prompt_tokens_details.cached_tokens` → cache_read、`completion_tokens_details.reasoning_tokens` → reasoning。`input = prompt_tokens - cached - cache_write`(:1168-1204)
-- **finish_reason マップ**(:1206-1230): `stop|end→Stop`, `length→Length`, `tool_calls|function_call→ToolUse`, `content_filter→Error`, その他→Error(メッセージに finish_reason 原文を残す)
+- **finish_reason マップ**(:1206-1230 + provider 固有値): `stop|end→Stop`, `length→Length`, `tool_calls|function_call→ToolUse`, `content_filter|sensitive→Error(非リトライ)`, `network_error→Error(リトライ可)`, `model_context_window_exceeded→Error(コンテキスト溢れ)`、その他→Error(メッセージに finish_reason 原文を残す)。分類用の machine-readable `provider_code` を `error_message` とは別に保持し、後段が表示文言の正規表現だけに依存しないようにする
 - **異常終了の検出**: ストリームが finish_reason 無しで終わったら `"Stream ended without finish_reason"` エラー(:482-484)。abort シグナル済みなら Aborted
 - **エラー時のブロック掃除**: エラー確定時、組立途中の scratch(partial_args 等)は最終メッセージに残さない(:489-494)
 - **`responseId`/`responseModel`**: chunk.id / chunk.model をログ用に記録(:350-354)
@@ -516,13 +523,14 @@ SSE 層(`sse.rs`)の仕様: reqwest の `bytes_stream()` を行分割し、`data
 
 - **判定**: error_message に対する正規表現2段構え。(a) 非リトライパターン(quota/billing/insufficient_quota 等)に該当→リトライしない。(b) リトライパターン(overloaded, rate limit, 429/500/502/503/504/524, timeout, connection系, "ended without", "try your request again" 等)に該当→リトライ。**コンテキスト溢れはリトライではなく溢れ処理へ回す**(先に `overflow::is_context_overflow` を判定)
 - **ポリシー**: 最大3回、指数バックオフ 2s/4s/8s(pi 既定値)。バックオフ待機は CancellationToken で中断可能(ステア/abort が来たら即やめる)
-- **実施位置**: プロバイダ層ではなく**エージェントループ側**(pi と同じ)。Error 停止した assistant メッセージを**コンテキストから取り除き**(ログには残す)、同じコンテキストで再ストリーム(`pi:agent-session.ts:2646-2650` の「state からは除去、session 履歴には保持」を Store 設計に反映)
+- **実施位置**: プロバイダ層ではなく**エージェントループ側**(pi と同じ)。各 provider attempt は必ず `MessageStart(assistant) → MessageUpdate* → MessageEnd(assistant)` で閉じる。リトライ可能な Error でも error assistant の `MessageEnd` を発行し、続けて durable な `RetryScheduled { attempt, delay_ms, retry_at, error_message }` を発行してから待機し、次 attempt を新しい `MessageStart` で始める。同一 Turn 内なので retry 間に `TurnEnd` は出さない。error assistant はチャット全文ログには残すが L0 には追加せず、次の API コンテキストから除外する(`pi:agent-session.ts:2646-2650` の「state からは除去、session 履歴には保持」を Store 設計に反映)。これにより retry 成功時も開いた `MessageStart` を残さず、再起動 replay が attempt 境界を一意に復元できる
 
 ### 4.5 コンテキスト溢れ検出(`overflow.rs`)
 
 **[事実]** `pi:ai/src/utils/overflow.ts`(全165行)から Sumi に関係するパターンのみ移植:
 
-- エラーメッセージパターン: `exceeded model token limit`(Kimi)、`exceeds the context window` / `maximum context length`(OpenAI系プロキシ・Umans想定)、`context_length_exceeded` / `too many tokens` / `token limit exceeded`(汎用)
+- provider code / finish_reason の直接分類を正規表現より先に行う: Z.ai の `model_context_window_exceeded` は必ず溢れ、`network_error` は必ずリトライ可、`sensitive` は非リトライ Error
+- エラーメッセージのフォールバックパターン: `exceeded model token limit`(Kimi)、`exceeds the context window` / `maximum context length`(OpenAI系プロキシ・Umans想定)、`context_length_exceeded` / `model_context_window_exceeded` / `too many tokens` / `token limit exceeded`(汎用)
 - **z.ai は溢れをエラーにせず黙って受けることがある** → 成功応答でも `usage.input + cache_read > context_window` なら溢れ扱い(usage ベース判定)
 - 非溢れ除外パターン(rate limit / too many requests)を先に判定
 - 検出時の動作: リトライせず、3層メモリの緊急溢れ処理(第7.6節)を即時適用して再送
@@ -543,7 +551,10 @@ Sumi では 3層メモリが常時 70k 以内に抑えるため溢れは本来�
     TurnStart
     注入待ちメッセージがあれば context に追加し Message イベント発行
     assistant 応答をストリーム (→ 3層メモリが直前に組んだ PromptContext)
-    stopReason が Error/Aborted → リトライ判定 → 不可なら TurnEnd + AgentEnd で脱出
+    stopReason が Error → MessageEnd(error) で attempt を閉じる
+      → リトライ可なら RetryScheduled + backoff + 次の MessageStart
+      → 不可なら TurnEnd + AgentEnd で脱出
+    stopReason が Aborted → steer/abort の契機に従い §6.3.1 の正常形で閉じる
     ツールコールがあれば:
       stopReason==Length なら全ツールを「引数切断の恐れ」で一括失敗させる
       それ以外は順次実行 (承認フック込み)
@@ -678,7 +689,8 @@ pi の `steer()` は**キュー投入のみ**で、注入は「現在のツー�
 | 正常完了 | `Done` | `MessageEnd` → (ツール系) → `TurnEnd` | ツール/steering に従い継続 |
 | ハードステア | `Error(Aborted)` を消費 | `MessageEnd`(interrupted=true、§6.3 規則で確定) → `TurnEnd` → `Steered` → `TurnStart` → `MessageStart/End`(user、注入したステアメッセージ) → 次の assistant ストリーム | **同一 run を継続(`AgentEnd` なし)** |
 | abort(停止ボタン) | `Error(Aborted)` を消費 | `MessageEnd`(interrupted=true) → `TurnEnd` → `AgentEnd` | 終了(Idle へ) |
-| 実エラー | `Error(Error)` | リトライ判定 → 不可なら `MessageEnd`(error) → `TurnEnd` → `AgentEnd` | 終了 |
+| リトライ可能エラー | `Error(Error)` | `MessageEnd`(error) → `RetryScheduled` → backoff → `MessageStart`(次attempt) | **同一 Turn を継続**。error message はログのみで L0 へ入れない |
+| リトライ不可エラー | `Error(Error)` | `MessageEnd`(error) → `TurnEnd` → `AgentEnd` | 終了 |
 
 **設計根拠**: pi の transform は aborted を捨てる(第5.3節)が、それは「途中応答はノイズ」というコーディングエージェントの割切り。秘書エージェントでは「言いかけたこと」は会話の実体であり、ユーザーもそれを見た上で割り込んでいる。UI に見えているものと L0 が一致することが人格の連続性に直結する。
 
@@ -758,7 +770,7 @@ L2_LIMIT       = 10_000
 
 ### 7.4 先回り Compact(`compactor.rs`)
 
-- tokio task のワーカー1本。mpsc は「新しい仕事がある」という wake-up 通知だけに使い、**ジョブの正典は SQLite の `memory_jobs`** とする。L0 seal、L1→L2 要約、L2 統合の予約は、対象状態の更新と `memory_jobs(status='pending')` の INSERT を同一トランザクションで行う。**メインの会話経路とは完全非同期**(TTFT に乗せない)
+- tokio task のワーカー1本。mpsc は「新しい仕事がある」という wake-up 通知だけに使い、**ジョブの正典は SQLite の `memory_jobs`** とする。L0 seal、L1→L2 要約、L2 統合の予約は、対象状態の更新と `memory_jobs(status='pending')` の INSERT を §10.2 の EventWriter 内部投影で同一トランザクションにする。**メインの会話経路とは完全非同期**(TTFT に乗せない)
 - Compact 呼び出しは通常会話と同じ provider 層を使うが、**別モデル指定可**(既定: 会話と同じモデル。安価な `umans-flash`/`kimi-k2.7` への切替を設定で許す)**[要決定→第14章]**
 - プロンプト: pi の構造化チェックポイント形式 **[事実]**(`pi:compaction.ts:383-457` の SUMMARIZATION_PROMPT / UPDATE_SUMMARIZATION_PROMPT)を秘書ドメインに書き換える。骨子:
 
@@ -775,7 +787,7 @@ user: <conversation>バッチ内容の直列化</conversation>
 ```
 
   圧縮率の明示指定は memory.md 未決事項「Mastra で ~50倍圧縮されすぎ問題」への直接対応。max_tokens でも物理上限を掛ける(pi は reserveTokens×0.8 を maxTokens に指定 **[事実]** :470-473)
-- ワーカーは `pending` を原子的に `running` へ claim し、結果を `shelf` と Store に保存する。完了時は `source_version` が予約時と一致する場合だけ `done` にする(CAS)。古い入力に対する遅延結果は破棄し、二重実行されても同じ source/version に結果が1件だけ残る。**この時点では L0 から消さない**(先回り原則)
+- ワーカーは EventWriter の内部 `MemoryJobUpdate` 投影で `pending` を原子的に `running` へ claim し、Compact の生結果も同じ経路で `memory_jobs.result` に保存する。完了時は `source_version` が予約時と一致する場合だけ `done` にする(CAS)。古い入力に対する遅延結果は破棄し、二重実行されても同じ source/version に結果が1件だけ残る。**この時点では L0 から消さない**(先回り原則)。結果を shelf へ公開したり L0/L1/L2 を昇格・差替する操作は、公開 `MemoryMaintenance` イベントと同じ transaction にするため `MemoryTransition` 経由でのみ適用する
 - 失敗時: リトライ2回、それでも駄目なら shelf に「未Compact」マークを残し、溢れ処理時に同期フォールバック(その場で Compact。このときだけ遅延が出る)。Compact 失敗でも会話は止めない
 - 再起動時: `running` のまま残ったジョブを lease timeout 後に `pending` へ戻し、`Compacting` かつ summary のないバッチを再投入する。起動時の整合チェックは「状態だけ Compacting でジョブ無し」も修復する。L0/L1/L2 のどの段階でもプロセス kill 後に再開できることを M4 の fault-injection テストで確認する
 - ワーカーは Umans の同時4セッション制限を食う点に注意(会話ストリーム+Compact で2本)**[事実]**(調査レポート)
@@ -1132,20 +1144,61 @@ CREATE TABLE agent_events (
   envelope TEXT NOT NULL,       -- Envelope の serde_json 全文
   created_at TEXT NOT NULL
 );
+
+-- API→agent command の受信・適用カーソル。command_id と seq の両方で重複を拒否する。
+CREATE TABLE inbound_commands (
+  seq INTEGER PRIMARY KEY,
+  command_id TEXT NOT NULL UNIQUE,
+  payload TEXT NOT NULL,
+  status TEXT NOT NULL,         -- pending | applied
+  received_at TEXT NOT NULL,
+  applied_at TEXT
+);
 ```
 
 ### 10.2 書込み・送出経路と再起動復元
 
-Session から出る**全 AgentEvent は単一 FIFO の `EventWriter` へ送る**。Gateway を書くタスクも EventWriter だけに限定し、恒久イベントと delta の別経路送信を禁止する。イベントは二階級だが順序は一列:
+Session と MemoryMaintainer は、公開イベントだけでなく投影に必要な内部データを同じ FIFO の `EventWriter` へ渡す。公開 `MemoryMaintenance` は `kind` しか持たないため、DB 更新を公開イベントから逆算してはならない:
 
-- **恒久イベント**(MessageStart/End、ToolExecution 系、Approval 系、Turn/Agent 系、Steered、MemoryMaintenance): EventWriter が seq を採番し、`agent_events` と、そのイベントから導出される `messages` / `memory_batches` / `approval_*` の変更を**同一 SQLite トランザクション**で commit する。commit 後にだけ Gateway へ送る
-- **揮発イベント**(MessageUpdate の delta 系): seq 無し・永続化無しだが、同じ FIFO 上で先行する恒久イベントの commit/send 完了を待ってから Gateway へ送る。これにより `MessageUpdate` が `MessageStart` を追い越さない
-- Gateway 切断中の delta は捨ててよい。commit 済み恒久イベントは再接続時に `agent_events` から再送し、最後の MessageEnd(全文)で UI を回復する
-- **`messages` への投影は MessageEnd のトランザクションでのみ行う**(1メッセージ=1 INSERT。これで追記専用が成立し、update は発生しない)。`MessageStart` は `agent_events` に記録するだけで `messages` には何も書かない — assistant の `MessageStart.message` は本文空のスケルトンであり、「開始した」という事実だけが実体。user / toolResult は Start/End を同期的に連続発行するため実質即時に投影される
+```rust
+pub struct EventWrite {
+    pub event: Option<AgentEvent>,  // 内部投影だけのwriteはNone。公開eventがある場合だけseqを採番
+    pub projection: Projection,
+}
+
+pub enum Projection {
+    None,
+    MessageEnd { message: Message, append_to_l0: bool },
+    MemoryJobUpdate {
+        expected_version: u64,
+        job_mutations: Vec<MemoryJobMutation>,
+    },
+    MemoryTransition {
+        expected_version: u64,
+        batch_mutations: Vec<MemoryBatchMutation>,
+        job_mutations: Vec<MemoryJobMutation>,
+    },
+    ApprovalMutation(ApprovalMutation),
+    CommandReceived { envelope: CommandEnvelope },
+    CommandApplied { command_id: String, command_seq: u64 },
+}
+```
+
+`EventWriter` は event と projection の組を検証し、たとえば `MemoryMaintenance` に `MemoryTransition` 以外が付くことや、retryable Error の `MessageEnd` に `append_to_l0=true` が付くことを拒否する。`event=None` は command cursor・memory job lease/result 等の内部投影だけに限定する。これにより公開 wire へ summary 等の内部状態を漏らさず、公開eventがある更新では `agent_events` と投影テーブルを同一 transaction にできる。
+
+ネットワーク停止を DB 書込みへ伝播させないため、永続化と送信を2タスクに分ける:
+
+- **EventWriter (単一の永続化writer)**: 恒久イベント(MessageStart/End、RetryScheduled、ToolExecution 系、Approval 系、Turn/Agent 系、Steered、MemoryMaintenance)へ seq を採番し、`agent_events` と `Projection` が示す `messages` / `memory_batches` / `memory_jobs` / `approval_*` / `inbound_commands` の変更を**同一 SQLite transaction**で commit する。Gateway の成否を待たない
+- **DeliveryPump (GatewayWriter の唯一の所有者)**: EventWriter からの ordered wake-up を受け、commit 済み恒久イベントは `agent_events` を正典として送る。`send` には bounded timeout を設け、失敗・timeout時は `Offline` へ遷移して接続を破棄する。EventWriter はその間も commit を継続する
+- **揮発イベント**(MessageUpdate の delta 系): EventWriter と同じ入力FIFOで先行する恒久イベントの commit 後に DeliveryPump へ渡す。Online 中だけ送信し、Offline・送信queue満杯・再接続catch-up中は捨てる。これにより `MessageUpdate` が `MessageStart` を追い越さず、ネットワークbackpressureが会話状態の永続化を止めない
+- **再接続**: API が返す最終受信 event seq の次から `agent_events` を再送し、DB cursor が最新へ追いつくまで新しい delta は捨てる。catch-up完了後にだけ `Online` へ戻る。最後の MessageEnd(全文)で UI は回復する
+- **`messages` への投影は MessageEnd の transactionでのみ行う**(1メッセージ=1 INSERT。これで追記専用が成立し、update は発生しない)。`MessageStart` は `agent_events` に記録するだけで `messages` には何も書かない。通常の user / assistant / toolResult は `append_to_l0=true`、retryable Error assistant はログだけに残すため `append_to_l0=false`
 - crash が transaction commit 前ならその transaction のイベントと投影状態は両方存在せず、commit 後・Gateway送信前なら再送対象として残る。`MessageStart` 後・`MessageEnd` 前だけは、開始イベントがあり本文投影がない状態を意図的に許す。本文を伴う `MessageEnd` と `messages` の INSERT は必ず同一 transaction に置き、「完了イベントだけ存在して本文がない」状態は作らない
 - **実行中の crash と正常形への復旧**: delta は揮発なので、未確定の生成内容は失われる(仕様として許容。ハードステア/abort による部分応答は §6.3 のとおり MessageEnd を経由するため保存される)。再起動時は `agent_events` を replay して最後の run の durable phase を復元し、**不足している suffix だけ**を新しい seq で追記してから受付を再開する。固定で `MessageEnd → TurnEnd → AgentEnd` を再発行してはならない:
   - assistant の `MessageStart` 後 → 本文空・stop_reason=Error・error_message="process restarted" の合成 `MessageEnd` → `TurnEnd` → `AgentEnd`
-  - assistant の `MessageEnd` 後 → `TurnEnd` → `AgentEnd`
+  - `RetryScheduled` 後 → `retry_at` までの残り時間を待つ(過去なら即時) → 次 attempt の `MessageStart` から同じ Turn を再開。最大attempt到達済みなら `TurnEnd` → `AgentEnd`
+  - retryable Error assistant の `MessageEnd` 後で `RetryScheduled` がまだ無い → 同じ判定とattempt数から不足する `RetryScheduled` を1件だけ追記して再開
+  - 通常またはリトライ不可 assistant の `MessageEnd` 後 → `TurnEnd` → `AgentEnd`
   - `TurnEnd` 後 → `AgentEnd`
   - tool/approval phase 中 → 開いている tool execution / approval を error/cancelled で閉じ、対応するエラーツール結果を MessageStart/End で確定してから `TurnEnd` → `AgentEnd`
   - `AgentEnd` 後 → 追記なし
@@ -1174,6 +1227,13 @@ pub enum Command {
     // これは画面構成書「入力欄はロックしない。打って送信=ステア」と同型
 }
 
+#[derive(Deserialize)]
+pub struct CommandEnvelope {
+    pub seq: u64,                    // APIが会話ごとに採番する単調増加値
+    pub command_id: String,          // 再送を跨いで不変なUUID
+    pub command: Command,
+}
+
 #[derive(Serialize)]
 pub struct Envelope {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1182,14 +1242,30 @@ pub struct Envelope {
     pub event: AgentEvent,
 }
 
+#[derive(Serialize)]
+pub struct CommandAck {
+    pub seq: u64,
+    pub command_id: String,
+    pub status: CommandAckStatus,    // Received | Applied
+}
+
+pub enum CommandAckStatus { Received, Applied }
+
+#[derive(Serialize)]
+#[serde(tag = "frame_type", rename_all = "snake_case")]
+pub enum OutboundFrame {
+    Event { envelope: Envelope },
+    CommandAck { ack: CommandAck },
+}
+
 #[async_trait]
 pub trait GatewayReader: Send {
-    async fn next_command(&mut self) -> anyhow::Result<Command>;
+    async fn next_command(&mut self) -> anyhow::Result<CommandEnvelope>;
 }
 
 #[async_trait]
 pub trait GatewayWriter: Send {
-    async fn send(&mut self, envelope: Envelope) -> anyhow::Result<()>;
+    async fn send(&mut self, frame: OutboundFrame) -> anyhow::Result<()>;
 }
 
 pub trait Gateway: Send {
@@ -1199,9 +1275,21 @@ pub trait Gateway: Send {
 }
 ```
 
-- Gateway は起動時に read/write half へ split する。Reader は command pump だけが所有し、Writer は EventWriter だけが所有する。WebSocket は stream/sink split、stdio は stdin/stdout の分離に対応する。`Mutex<Gateway>` を `next_command().await` 中ずっと保持して送信を塞ぐ実装は禁止する
+- Gateway は起動時に read/write half へ split する。Reader は command pump だけが所有し、Writer は §10.2 の DeliveryPump だけが所有する。WebSocket は stream/sink split、stdio は stdin/stdout の分離に対応する。`Mutex<Gateway>` を `next_command().await` 中ずっと保持して送信を塞ぐ実装は禁止する
 - `stdio.rs`: 1行1JSON。開発時は `make agent-repl`(ラッパースクリプト)で人間が直接会話でき、E2E テストは期待イベント列をアサートできる。**M1 からこれで動かす**
-- `ws.rs`(M5): agent がコンテナ内から api へ outbound WebSocket 接続(コンテナへの inbound を開けない)。接続時に `hello {conversation_id, last_sent_seq}`、api は自分の最終受信 seq を返し、agent は **`agent_events` テーブルから seq 差分を再送**する(恒久イベントのみ。delta は再送しない — 10.2節の二階級設計)
+- `ws.rs`(M5): agent がコンテナ内から api へ outbound WebSocket 接続する(コンテナへの inbound は開けない)。TLS の Upgrade request に `Authorization: Bearer <short-lived-agent-token>` を付ける。token は API/control plane が発行し、`tenant_id / agent_id / conversation_id / generation / exp / audience` を署名対象にする。API は token から conversation を決定し、agent が送る識別子を認可根拠にしない。token は runtime secret として渡し、ログ・イベント・SQLite・executor 環境へ出さない。長命agentが再接続できるよう、root-ownedのrotating credential fileまたはworkload identity交換を `CredentialProvider` として抽象化し、接続ごとに新しいtokenを取得する(起動時envへ固定した短命tokenだけに依存しない)
+- 認証後の hello は `{agent_id, generation, last_sent_event_seq, last_received_command_seq, last_applied_command_seq}`。API は token claim と一致すること、`generation` がその agent の最新世代であることを検証し、古い接続を close/fence する。応答は `{accepted_generation, last_received_event_seq, next_command_seq}`。agent は `agent_events` から event 差分を、API は durable command log から command 差分を再送する
+
+#### 11.1.1 API→agent command の配送保証
+
+API は command を永続化して `seq` と `command_id` を確定してから送信し、`Received` ACK まで同じ envelope を再送する。agent は次の順序で処理する:
+
+1. `seq` に欠番があれば後続を適用せず接続を閉じ、`last_received_command_seq` を含む hello で再接続する。API はその次の seq から再送する
+2. EventWriter の内部投影(`event=None + CommandReceived`)で `inbound_commands` へ `status=pending` を INSERTし、commitした後だけ `Received` ACK を返す。`command_id` または `seq` が既存ならpayload一致を検証し、同じACKを返して再適用しない。不一致はプロトコル違反として接続を閉じる
+3. pending command を seq 順に Session へ渡す。`UserMessage` は user の `MessageEnd`、`ApprovalDecision` は `ApprovalResolved` と同じ EventWriter transaction で `status=applied` にする。`Abort` は EventWriter の内部投影(`event=None + CommandApplied`)をcommitしてから cancel を発火する。commit後・cancel前にprocess crashしても active run 自体が消えるため、Abortの目的は満たされる
+4. commit 後に `Applied` ACK を返す。crash 後は `pending` を再投入し、`applied` はACKだけ再送する
+
+これによりネットワーク上は at-least-once、Session への適用は `command_id` 単位で一度だけになる。UserMessage 由来の run は適用済みcommandの再送では再開始しない。外部ツール自体の exactly-once は別問題なので、domain mutation toolには将来 idempotency key として起点 `command_id` を伝播する。
 
 ### 11.2 contracts/agent-events.yaml(スキーマ案)
 
@@ -1236,12 +1324,43 @@ $defs:
       - { $ref: "#/$defs/ApprovalResolved" }
       - { $ref: "#/$defs/Steered" }
       - { $ref: "#/$defs/MemoryMaintenance" }
+      - { $ref: "#/$defs/RetryScheduled" }
       - { $ref: "#/$defs/Error" }
   Command:
     oneOf:
       - { $ref: "#/$defs/UserMessage" }
       - { $ref: "#/$defs/Abort" }
       - { $ref: "#/$defs/ApprovalDecision" }
+  CommandEnvelope:
+    type: object
+    required: [seq, command_id, command]
+    properties:
+      seq: { type: integer, minimum: 0 }
+      command_id: { type: string, format: uuid }
+      command: { $ref: "#/$defs/Command" }
+    additionalProperties: false
+  CommandAck:
+    type: object
+    required: [seq, command_id, status]
+    properties:
+      seq: { type: integer, minimum: 0 }
+      command_id: { type: string, format: uuid }
+      status: { enum: [received, applied] }
+    additionalProperties: false
+  OutboundFrame:
+    oneOf:
+      - type: object
+        required: [frame_type, envelope]
+        properties:
+          frame_type: { const: event }
+          envelope: { $ref: "#/$defs/Envelope" }
+        additionalProperties: false
+      - type: object
+        required: [frame_type, ack]
+        properties:
+          frame_type: { const: command_ack }
+          ack: { $ref: "#/$defs/CommandAck" }
+        additionalProperties: false
 # 各variantのobject定義は省略。実ファイルではすべて追加する。
 ```
 
@@ -1262,7 +1381,7 @@ web への転送方針(api の責務、参考): MessageUpdate の delta 系は�
 | 3 | Moonshot の usage が `choices[0].usage` に入るフォールバック | 同 :362-366 | Kimi 直APIで usage を取り損ねると 3層メモリの校正が死ぬ | `assembler.rs` |
 | 4 | reasoning フィールド3種の検出と「最初の非空だけ採用」 | 同 :394-424 | reasoning_content/reasoning/reasoning_text の方言+二重返却プロバイダ対策。採用フィールド名を再送に使う | `assembler.rs` + `request.rs` |
 | 5 | usage 解釈(cached_tokens=読み、cache_write 別枠、input=prompt−cached−write) | 同 :1168-1204(OpenRouter PR#409 への言及コメント含む) | キャッシュヒット率の観測(M4 検証ゲート)の正確性の根拠 | `provider/types.rs::Usage::from_raw` |
-| 6 | finish_reason マッピング表 | 同 :1206-1230 | content_filter/network_error→Error+原文保存、等 | `assembler.rs` |
+| 6 | finish_reason マッピング表 | 同 :1206-1230 + provider公式値 | content_filter/sensitive→非リトライError、network_error→リトライ可Error、model_context_window_exceeded→Overflow。原文はprovider_codeへ保存 | `assembler.rs` |
 | 7 | 「finish_reason 無しでストリーム終端 = エラー」 | 同 :482-484 | 静かな切断を成功と誤認しない | `assembler.rs` |
 | 8 | assistant content を必ずプレーン文字列で再送 | 同 :957-1012(コメント含む) | content-block 配列だと DeepSeek 系が構造を鸚鵡返しする実バグ | `request.rs` |
 | 9 | thinking 再送: signature フィールドへの書き戻し、`reasoning_content:""` 補完 | 同 :976-1044 | **Kimi の Preserved Thinking 必須仕様**への対応。litellm はここを落としてバグっている(調査レポート Issue #26156) | `request.rs` |
@@ -1298,15 +1417,16 @@ web への転送方針(api の責務、参考): MessageUpdate の delta 系は�
 
 ### M0: 足場(0.5日、〜7/18午前)
 
+- 現行 `main` に `apps/agent` は無いため、別ブランチの Rust scaffold を先に取り込むか、このマイルストーンで `Cargo.toml` / `package.json` / turbo 接続を作成する。存在しない scaffold を前提に後続タスクへ進まない
 - `config.rs`(設定構造+環境変数のみ。**モデルプリセットの実値は M1 のリクエスト組立と同時に入れる** — M0 では構造体と TOML 読込だけ)、モジュールツリーの空実装、`gateway/stdio.rs`、tracing 初期化(JSON ログ + `SUMI_LOG` フィルタ)
-- **ゲート**: `echo '{"type":"user_message","text":"hi"}' | cargo run` がエコー応答イベントを返す。`cargo clippy -- -D warnings` / `cargo fmt --check` が通る(turbo lint 経由)
+- **ゲート**: `echo '{"seq":1,"command_id":"018f0000-0000-7000-8000-000000000001","command":{"type":"user_message","text":"hi","attachments":[]}}' | cargo run` がエコー応答イベントと command ACK を返す。`cargo clippy -- -D warnings` / `cargo fmt --check` が通る(turbo lint 経由)
 
 ### M1: プロバイダ層(3日、〜7/21)
 
 - `provider/` 全体: 第4章+移植リスト #1〜17。types → sse → assembler → request → retry/overflow の順
 - テスト: (a) **SSE フィクスチャ再生**: 実 API のストリームを `curl` で採取したファイル(Kimi text / Kimi tool call / Kimi reasoning / GLM tool_stream / エラー各種)を axum モックサーバで再生し、イベント列と最終メッセージをスナップショットアサート。(b) partial_json の pi テスト移植。(c) `SUMI_LIVE_TEST=1` でのライブ疎通(Umans/Kimi/GLM 三択)
 - **ゲート**:
-  1. `cargo test` 全緑(フィクスチャ再生で: ツールコール引数の逐次組立、reasoning 分離、usage 取得、finish_reason 全パターン)
+  1. `cargo test` 全緑(フィクスチャ再生で: ツールコール引数の逐次組立、reasoning 分離、usage 取得、標準finish_reasonに加えて Z.ai の `sensitive` / `network_error` / `model_context_window_exceeded` を含む provider 固有パターン)
   2. ライブ: 3プロバイダに対しツールコール1往復+reasoning 付き2ターン会話が完走。**2ターン目で Kimi に reasoning_content を再送しても 400 が返らない**こと
   3. TTFT 計測基盤: `MessageStart(user)受信 → HTTP リクエスト送出` と `送出 → 最初の TextDelta` を tracing span で分離計測し、stdio REPL に表示。**agent 内部オーバーヘッド p95 < 30ms**(モデル側 TTFB は記録のみ)
   4. abort: 生成中に CancellationToken 発火 → 1s 以内に Aborted イベントで正常形クローズ
@@ -1329,7 +1449,10 @@ web への転送方針(api の責務、参考): MessageUpdate の delta 系は�
   1. 10ターン会話 → プロセス kill → 再起動 → 会話が続く(L0 復元)。`messages_fts` で過去発言が検索できる。イベント seq が復元後も単調継続
   2. DB書込みを遅延させても `MessageStart → MessageUpdate* → MessageEnd` の順序が崩れない
   3. 恒久イベントのトランザクション各境界で kill し、`agent_events` と messages/memory の投影が食い違わない。MessageStart後、MessageEnd後、TurnEnd後、tool/approval phase中の各killで、再起動後はdurable phaseに不足するsuffixだけが追記され、MessageEnd/TurnEndの重複なしに正常形へ収束する(10.2節)
-- **チーム同期ポイント**: `contracts/agent-events.yaml` を正典として Envelope/Command/AgentEvent の wire 形をこの時点で凍結し、Rust/Go/TS の型生成と fixture round-trip CI を開始する
+  4. retryable Error が `MessageEnd(error) → RetryScheduled → MessageStart(next attempt)` で閉じ、error assistant は messages に残るが L0 には入らない。各境界でkillしてもattemptを重複・未閉鎖にしない
+  5. GatewayWriterを切断・無応答にしてもEventWriterのdurable commitが継続し、deltaだけが捨てられる。再接続後はAPI cursorから恒久イベントを順序どおりcatch-upする
+  6. `MemoryTransition` のevent/projection transactionへfailpointを入れ、公開MemoryMaintenanceだけ存在する状態・memory_batchesだけ進む状態のどちらも作られない
+- **チーム同期ポイント**: `contracts/agent-events.yaml` を正典として Envelope/AgentEvent と CommandEnvelope/CommandAck の wire 形をこの時点で凍結し、Rust/Go/TS の型生成と fixture round-trip CI を開始する
 
 ### M4: 3層メモリ(3日、〜7/29)
 
@@ -1357,7 +1480,9 @@ web への転送方針(api の責務、参考): MessageUpdate の delta 系は�
   6. 承認待ち中の user_message がソフトステアとして機能し、ApprovalDecision と Abort も即時に処理される
   7. Audit allow後もexecutor sandboxが維持され、内部状態・追加network権限等を暗黙に得ない
   8. web→api→agent の E2E: チャット UI から会話でき、ストリーミング+ツール+ステア+承認カードが見える(api/web 側と合同。**これがデモの完成条件**)
-  9. WS 切断→再接続で seq 差分再送が効く
+  9. WS Upgradeをtoken無し・期限切れ・別conversation claim・古いgenerationで試し、すべて拒否される。新generation接続時は旧接続がfenceされ、旧接続からのevent/command ACKを受理しない
+  10. WS切断境界で同じCommandEnvelopeを重複送信し、UserMessage / ApprovalDecision / Abort が各1回だけ適用される。`Received`前、`Received`後、`Applied`前後のkillでpending回収とACK再送が成立し、seq欠番は適用されない
+  11. WS 切断→再接続で event seq と command seq の双方向差分再送が効く
 
 ### 予備日(8/1): デモシナリオのリハーサル、負荷時の挙動確認(Umans 4セッション制限の回避=デモは直APIキーで)、憲法プロンプトの調整
 
@@ -1395,6 +1520,9 @@ web への転送方針(api の責務、参考): MessageUpdate の delta 系は�
 | **Audit reviewerの誤allow** | prompt injection・scope creep・破壊操作を自動承認 | hard denyとsandboxをモデル外で強制。AutoReviewはNeedsApprovalだけ、モデルallowは今回限り。StrictAutoReview/サンプル二重判定でfalse allow率を測る |
 | **Audit reviewerの停止・parse失敗** | 承認フロー停止または不明な操作を実行 | 3attempt/90秒、schema強制、失敗時はinteractive manual fallback・headless deny。circuit breakerで連続失敗を止める |
 | **SQLite 書込み遅延がホットパスに漏れる** | TTFT 劣化 | 単一 EventWriter で順序と durability を守りつつ、恒久イベントの小さい transaction を計測する。MessageStart commit の p95 を span 監視し、必要なら WAL checkpoint/DB配置を調整 |
+| **Gateway切断が永続化を止める** | 切断中の会話・承認・メモリ更新が失われる | EventWriterとDeliveryPumpを分離し、send timeout後はofflineへ遷移。durable stateはcommit継続、deltaは破棄、再接続時はDB cursorからcatch-up |
+| **agent接続のなりすまし・旧世代の二重稼働** | 他conversationへのevent注入、command奪取、seq競合 | short-lived署名tokenでtenant/agent/conversation/generationを束縛し、APIが最新generationだけを受理して旧接続をfence |
+| **API→agent commandの消失・重複** | user指示の欠落、承認やツール副作用の二重適用 | API側durable command log + seq/command_id + Received/Applied ACK + agent側inbound_commandsによるdedupe。domain mutationへidempotency keyを伝播 |
 | **Kimi の自動キャッシュ TTL(5〜30分、未確定)** | 放置後の会話再開で全ミス→初回 TTFT 悪化 | 仕様上避けられない。実測して既知の挙動としてデモ台本に織り込む(冒頭に1回ウォームアップ発話) |
 | **8/1 に api/web 側が間に合わない** | E2E デモ不成立 | stdio ゲートウェイ+簡易 CLI で agent 単体デモが常に成立する状態を保つ(M2 以降常時)。contracts ドラフトを M3 で先出しして統合期間を確保 |
 
