@@ -273,7 +273,12 @@ fn convert_messages(spec: &ModelSpec, context: &PromptContext) -> Vec<Value> {
 
                 for block in &message.content {
                     match block {
-                        AssistantContent::Text { text: part } => text.push_str(part),
+                        AssistantContent::Text { text: part } => {
+                            if !text.is_empty() {
+                                text.push_str("\n\n");
+                            }
+                            text.push_str(part);
+                        }
                         AssistantContent::Thinking {
                             thinking: part,
                             signature_field,
@@ -623,6 +628,32 @@ mod tests {
 
         assert_eq!(request["messages"][2]["content"], "I should read.");
         assert_eq!(request["messages"][2]["reasoning_content"], "");
+    }
+
+    #[test]
+    fn cross_model_thinking_before_text_keeps_a_separator() {
+        let mut context = context();
+        let Message::Assistant(message) = &mut context.messages[1] else {
+            panic!("assistant");
+        };
+        message.model = "another-model".to_owned();
+        message.content = vec![
+            AssistantContent::Thinking {
+                thinking: "考えた内容".to_owned(),
+                signature_field: "reasoning_content".to_owned(),
+            },
+            AssistantContent::Text {
+                text: "します".to_owned(),
+            },
+        ];
+
+        let request = build_request(
+            &ModelSpec::preset("kimi-k3").expect("preset"),
+            &context,
+            &RequestOptions::default(),
+        );
+
+        assert_eq!(request["messages"][2]["content"], "考えた内容\n\nします");
     }
 
     fn set_tool_result_content(context: &mut PromptContext, content: Vec<UserContent>) {

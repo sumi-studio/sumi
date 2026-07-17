@@ -8,7 +8,7 @@ pub mod retry;
 pub mod sse;
 pub mod types;
 
-use std::env;
+use std::{env, sync::OnceLock, time::Duration};
 
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -22,6 +22,24 @@ use self::{
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// プロセス共有のHTTPクライアント。リクエストごとに生成するとコネクション
+/// プールが使い捨てになり、`Client::new()` はTLS初期化失敗時にpanicして
+/// §3.2 の「必ず終端イベントで返す」契約を破る。ここではResultを保持して
+/// 呼び出し側が Error イベントに変換できるようにする。
+fn http_client() -> Result<&'static reqwest::Client, String> {
+    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|error| format!("failed to build HTTP client: {error}"))
+}
 
 pub fn stream(
     spec: ModelSpec,
@@ -55,10 +73,18 @@ fn stream_with_api_key(
             return;
         };
 
+        let client = match http_client() {
+            Ok(client) => client,
+            Err(error) => {
+                send_all(&tx, assembler.fail(error, false)).await;
+                return;
+            }
+        };
+
         let body = build_request(&spec, &context, &options);
         let request_sent = std::time::Instant::now();
         tracing::debug!(model = %spec.id, "provider request sent");
-        let request = reqwest::Client::new()
+        let request = client
             .post(spec.endpoint())
             .bearer_auth(api_key)
             .json(&body)
@@ -361,15 +387,32 @@ mod tests {
             .expect("429 fixture JSON");
     }
 
+    /// プロセス環境を優先しつつ、SUMI_ENV_FILE の env ファイルからも値を引く。
+    /// ユニットテストバイナリはマルチスレッドで走るため、`load_env_file()`
+    /// (= set_var) を呼ぶと env を読む他テストとデータレースになる
+    /// (edition 2024 で `set_var` が unsafe になった理由)。ここでは
+    /// プロセス環境を変更せずにファイルを直接パースする。
+    fn live_env(name: &str) -> Option<String> {
+        if let Ok(value) = std::env::var(name) {
+            return Some(value);
+        }
+        let path = std::env::var_os("SUMI_ENV_FILE")?;
+        dotenvy::from_path_iter(std::path::Path::new(&path))
+            .ok()?
+            .filter_map(Result::ok)
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value)
+    }
+
     #[tokio::test]
     async fn live_smoke_is_opt_in() {
-        crate::config::load_env_file().expect("load SUMI_ENV_FILE");
-        if std::env::var("SUMI_LIVE_TEST").as_deref() != Ok("1") {
+        if live_env("SUMI_LIVE_TEST").as_deref() != Some("1") {
             return;
         }
-        let preset = std::env::var("SUMI_LIVE_PRESET").unwrap_or_else(|_| "opencode-go".to_owned());
+        let preset = live_env("SUMI_LIVE_PRESET").unwrap_or_else(|| "opencode-go".to_owned());
         let spec = ModelSpec::preset(&preset).expect("SUMI_LIVE_PRESET must name a preset");
-        let mut events = stream(
+        let api_key = live_env(&spec.api_key_env);
+        let mut events = stream_with_api_key(
             spec,
             PromptContext {
                 system_prompt: "Reply briefly.".to_owned(),
@@ -386,6 +429,7 @@ mod tests {
                 ..RequestOptions::default()
             },
             CancellationToken::new(),
+            api_key,
         );
         let mut terminal = None;
         while let Some(event) = events.recv().await {

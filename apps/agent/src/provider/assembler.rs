@@ -162,10 +162,11 @@ impl MessageAssembler {
                 {
                     call.name = name.to_owned();
                 }
+                // 引数の確定パースは finish() の一回だけ。delta ごとに
+                // 蓄積全体を parse_streaming すると O(n²) になる。
                 let partial = self.partial_args.entry(index).or_default();
                 if !arguments.is_empty() {
                     partial.push_str(arguments);
-                    call.arguments = object_or_empty(parse_streaming(partial));
                 }
                 events.push(ProviderEvent::ToolCallDelta {
                     content_index: index,

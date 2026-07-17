@@ -84,13 +84,15 @@ struct EnvOverrides {
 
 impl Config {
     pub async fn load() -> Result<Self> {
-        let file = match env::var_os("SUMI_CONFIG") {
-            Some(path) => Some(load_file(Path::new(&path)).await?),
+        let config_path = env::var_os("SUMI_CONFIG").map(PathBuf::from);
+        let file = match &config_path {
+            Some(path) => Some(load_file(path).await?),
             None => None,
         };
         let file = file.unwrap_or_default();
         let overrides = EnvOverrides::from_env();
-        let system_prompt = resolve_system_prompt(&file, &overrides).await?;
+        let config_dir = config_path.as_deref().and_then(Path::parent);
+        let system_prompt = resolve_system_prompt(&file, &overrides, config_dir).await?;
 
         let mut config = Self::resolve(file, overrides)?;
         config.system_prompt = system_prompt;
@@ -201,24 +203,38 @@ impl Config {
     }
 }
 
-async fn resolve_system_prompt(file: &FileConfig, overrides: &EnvOverrides) -> Result<String> {
+async fn resolve_system_prompt(
+    file: &FileConfig,
+    overrides: &EnvOverrides,
+    config_dir: Option<&Path>,
+) -> Result<String> {
     if let Some(prompt) = &overrides.system_prompt {
         return Ok(prompt.clone());
     }
     if let Some(path) = &overrides.system_prompt_file {
+        // 環境変数指定は他の *_FILE 環境変数と同じくプロセスCWD基準。
         return tokio::fs::read_to_string(path)
             .await
             .with_context(|| format!("failed to read system prompt file {}", path.display()));
     }
-    if let Some(prompt) = &file.system_prompt {
-        return Ok(prompt.clone());
+    match (&file.system_prompt, &file.system_prompt_file) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("config sets both system_prompt and system_prompt_file; keep only one")
+        }
+        (Some(prompt), None) => Ok(prompt.clone()),
+        (None, Some(path)) => {
+            // TOML内の相対パスは設定ファイル自身の場所を基準に解決する。
+            // 起動時のCWDに依存させない。
+            let path = match config_dir {
+                Some(dir) if path.is_relative() => dir.join(path),
+                _ => path.clone(),
+            };
+            tokio::fs::read_to_string(&path)
+                .await
+                .with_context(|| format!("failed to read system prompt file {}", path.display()))
+        }
+        (None, None) => Ok(DEFAULT_SYSTEM_PROMPT.to_owned()),
     }
-    if let Some(path) = &file.system_prompt_file {
-        return tokio::fs::read_to_string(path)
-            .await
-            .with_context(|| format!("failed to read system prompt file {}", path.display()));
-    }
-    Ok(DEFAULT_SYSTEM_PROMPT.to_owned())
 }
 
 impl EnvOverrides {
@@ -312,12 +328,48 @@ api_key_env = "EXAMPLE_API_KEY"
             ..EnvOverrides::default()
         };
 
-        let prompt = resolve_system_prompt(&file, &overrides)
+        let prompt = resolve_system_prompt(&file, &overrides, None)
             .await
             .expect("resolve prompt");
 
         tokio::fs::remove_file(path).await.expect("remove prompt");
         assert_eq!(prompt, "prompt from file");
+    }
+
+    #[tokio::test]
+    async fn inline_and_file_prompt_together_are_rejected() {
+        let file = FileConfig {
+            system_prompt: Some("inline".to_owned()),
+            system_prompt_file: Some(PathBuf::from("prompts/system.md")),
+            ..FileConfig::default()
+        };
+
+        let error = resolve_system_prompt(&file, &EnvOverrides::default(), None)
+            .await
+            .expect_err("both prompt sources must fail");
+
+        assert!(error.to_string().contains("both system_prompt"));
+    }
+
+    #[tokio::test]
+    async fn relative_prompt_file_resolves_from_the_config_directory() {
+        let directory =
+            std::env::temp_dir().join(format!("sumi-config-dir-{}", uuid::Uuid::now_v7()));
+        tokio::fs::create_dir(&directory).await.expect("create dir");
+        tokio::fs::write(directory.join("system.md"), "prompt near config")
+            .await
+            .expect("write prompt");
+        let file = FileConfig {
+            system_prompt_file: Some(PathBuf::from("system.md")),
+            ..FileConfig::default()
+        };
+
+        let prompt = resolve_system_prompt(&file, &EnvOverrides::default(), Some(&directory))
+            .await
+            .expect("resolve prompt");
+
+        tokio::fs::remove_dir_all(directory).await.expect("cleanup");
+        assert_eq!(prompt, "prompt near config");
     }
 
     #[test]

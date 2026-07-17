@@ -6,6 +6,8 @@
 
 conversation_id = "default"
 workspace = "/workspace"
+# 相対パスはこの設定ファイルの場所を基準に解決される。
+# system_prompt (インライン文字列) との同時指定はエラー。
 system_prompt_file = "prompts/system.md"
 
 [model]

@@ -1,3 +1,9 @@
+//! 呼び出し順の契約: エージェントループ (T11) では必ず
+//! `overflow::is_context_overflow` を先に判定してから `is_retryable` を
+//! 呼ぶこと。`\b500\b` 等の数字パターンは "maximum context length is 500
+//! tokens" のような本文中の数字にも一致するため、overflow を先に除外
+//! しないとコンテキスト溢れを無限リトライしうる。
+
 use std::{sync::OnceLock, time::Duration};
 
 use regex::RegexSet;
