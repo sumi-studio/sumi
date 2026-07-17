@@ -869,7 +869,7 @@ pub enum ApprovalDecision { ApproveOnce, ApproveAlways { rule: ApprovalRule }, D
 
 ### 9.3 ポリシー(`policy.rs`)
 
-- 既定: `risk() == ReadOnly` → Auto、`Mutating`(ワークスペース内)→ Auto **[要決定]**(自分の作業机への書込みまで聞くとうるさい。ハッカソン既定は Auto、設定で Ask に上げられる)、`Exec`(bash)→ Ask、将来のドメイン操作(api 書込み系)→ Ask
+- 既定: `risk() == ReadOnly` → Auto、`Mutating`(ワークスペース内、`.sumi` 等の内部状態を除く)→ Auto **[要決定]**(自分の作業机への書込みまで聞くとうるさい。ハッカソン既定は Auto、設定で Ask に上げられる)、`Exec`(bash)→ Ask、将来のドメイン操作(api 書込み系)→ Ask
 - AlwaysAllow ルールの粒度: ツール名 + パターン(bash はコマンド先頭トークン、fs はパスプレフィックス)。ローカル SQLite に保存
 - ルールを api 側(ドメイン)に置くかは M5 で再検討 **[要決定→14章]**。UI の承認カード(画面構成書 C: 「今回のみ/常に許可/拒否」)と decision enum は一致済み
 
@@ -881,7 +881,7 @@ pub enum ApprovalDecision { ApproveOnce, ApproveAlways { rule: ApprovalRule }, D
 
 ## 10. 永続化(`store/`)
 
-SQLite(sqlx、WAL モード)。DB ファイルはワークスペースの永続ボリューム上(`$WORKSPACE/.sumi/agent.db`)。**agent が自前で持ってよい永続化は「自身のメモリストアのみ」という ADR 0001 の原則の範囲内**。チャットログ全文をここに置くか api 側 DB に置くかは **[要決定→14章]**(ハッカソンはローカル SQLite で確定し、イベントを api に流しているので後から api 側へミラー可能)。
+SQLite(sqlx、WAL モード)。DB ファイルはワークスペースの永続ボリューム上(`$WORKSPACE/.sumi/agent.db`)。エージェントのツールから内部状態を読み取れるようにする一方、書き込みは agent ランタイムだけに許可し、`write_file` / `edit_file` だけでなく bash 経由の変更も権限境界で防ぐ。**agent が自前で持ってよい永続化は「自身のメモリストアのみ」という ADR 0001 の原則の範囲内**。チャットログ全文をここに置くか api 側 DB に置くかは **[要決定→14章]**(ハッカソンはローカル SQLite で確定し、イベントを api に流しているので後から api 側へミラー可能)。
 
 ### 10.1 スキーマ(マイグレーション v1)
 
