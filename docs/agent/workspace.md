@@ -26,14 +26,14 @@ web (React) ⇔ api (Go, WebSocket ゲートウェイ) ⇔ ユーザーごとの
 ```
 
 - agent ⇔ api 間のイベントプロトコルは contracts/ にスキーマを置く (未定義)
-- agent はドメイン操作を api 経由でのみ行う (ADR 0001 の原則を維持)。ワークスペース内のファイルとメモリストアだけが agent の直接の持ち物
+- agent はドメイン操作を api 経由でのみ行う (ADR 0001 の原則を維持)。agent の直接の持ち物は、ワークスペース内のファイルと、ローカル SQLite の自己状態 (3層メモリ・チャットログ全文・恒久イベント・承認ルール — [実装計画 第10章](implementation-plan.md) 参照)。ドメインデータはここに複製しない
 
 ## セキュリティ境界
 
 三段構えにする:
 
 1. **アプリ層**: ツール実行前フックによる権限承認フロー (ユーザーへリクエスト → 承認/拒否)。「権限を要求する権限」の実装
-2. **OS 層 (コンテナ内)**: `sumi-agent` と `sumi-tool` を別UIDにし、executor には `/workspace` だけを read/write で見せる。環境変数は `PATH/HOME/LANG` 等へ絞り、agent 親プロセスの `/proc` と内部状態ディレクトリを見せない。`read_file` 等も canonicalize 後のパスが workspace root 配下であることを確認し、symlink 越境を拒否する
+2. **OS 層 (コンテナ内)**: `sumi-agent` と `sumi-tool` を別UIDにし、executor には `/workspace` だけを read/write で見せる。環境変数は `PATH/HOME/LANG` 等へ絞り、agent 親プロセスの `/proc` と内部状態ディレクトリを見せない。`read_file` 等も canonicalize 後のパスが workspace root 配下であることを確認し、symlink 越境を拒否する。外向き network は UID 分離では制限されないため、executor を専用 network namespace (non-loopback インターフェイスなし) で起動して egress を物理的に遮断する — 承認フローとは独立した OS 境界であり、bash からの外部通信は egress プロキシを設計するまで非対応 (実装計画 §8.3)
 3. **テナント層**: ハッカソン〜開発期はユーザーごとの Docker コンテナ、他人同士を同居させる Sumi Cloud では microVM (Firecracker 系) に上げる。microVM はテナント/ホスト間の境界であり、同一ゲスト内の runtime/executor 分離の代替にはしない
 
 ## 段階的展開

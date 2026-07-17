@@ -76,7 +76,7 @@ sumi-studio/
 ### アーキテクチャ上の原則
 
 - **契約は `contracts/` が単一の源泉**: `packages/api-client` (TS) も Go 側 (oapi-codegen 等) も `contracts/openapi.yaml` から一方向に生成する。
-- **agent は DB を直接触らない**: ドメイン操作は `@sumi/api-client` 経由で `apps/api` を叩く。権限モデルの強制点を API 層の1箇所に保つため。agent が自前で持つ永続化は自身のメモリストアのみ。
+- **agent はドメイン DB を直接触らない**: ドメイン操作 (ToDo・リマインダー等) は `@sumi/api-client` 経由で `apps/api` を叩く。権限モデルの強制点を API 層の1箇所に保つため。一方、agent 自身の状態 — 3層メモリ、チャットログ全文、恒久イベントログ、承認ルール — は agent ローカルの SQLite とワークスペースに永続化する (詳細は [docs/agent/](docs/agent/))。ドメインデータの複製はそこに持たない。
 - **Swift の隔離**: アプリ本体に Swift は存在しない。OS 統合 (widget extension、APNs グルー) のみ `apps/web/src-tauri/gen/apple` 配下に許可する。
 
 ## 開発環境セットアップ

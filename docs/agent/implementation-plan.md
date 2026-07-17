@@ -450,7 +450,7 @@ pub struct ModelSpec {
 }
 
 pub struct Compat {
-    /// "max_tokens" | "max_completion_tokens"。Kimi=max_tokens、GLM=max_completion_tokens (pi実測値)
+    /// "max_tokens" | "max_completion_tokens"。Kimi=max_tokens、GLM直API=max_tokens (公式リファレンス準拠)
     pub max_tokens_field: MaxTokensField,
     /// stream_options: {include_usage:true} を送るか。既定 true
     pub supports_usage_in_streaming: bool,
@@ -472,8 +472,8 @@ pub struct Compat {
 初期プリセット(**[事実]** pi の生成メタデータより移植):
 
 - `kimi-k3` (`pi:ai/src/providers/moonshotai.models.ts`): `thinking_format=Deepseek`(`thinking: {"type":"enabled"}`)、`requires_reasoning_content_on_assistant=true`、`max_tokens_field=max_tokens`(pi の `useMaxTokens` 判定に Moonshot が含まれる **[事実]** `openai-completions.ts:1272-1273`)、`supports_strict_mode=false`、`supports_store=false`、`supports_developer_role=false`
-- `glm-5.2` (`pi:ai/src/providers/zai.models.ts:79-98`): `thinking_format=Zai`(`thinking: {"type":"enabled","clear_thinking":false}` + `reasoning_effort` 対応)、`zai_tool_stream=true`、`supports_store=false`、`supports_developer_role=false`、**`max_tokens_field=max_completion_tokens`**(z.ai は pi の `useMaxTokens` 判定に含まれず既定側に落ちる **[事実]** 同 :1272-1273)
-- **GLM の base_url 注意**: pi の値 `/api/coding/paas/v4` は**コーディングプラン用エンドポイント**であり、Sumi は規約上使えない(プロバイダ調査参照)。Sumi は直APIの `https://api.z.ai/api/paas/v4` を使う — これは pi 由来ではなくプロバイダ調査由来の値。直APIが `max_completion_tokens` を受理するかは **T8/M1 ライブで確認**し、拒否されたら Compat で `max_tokens` に切替(ランタイム設定)
+- `glm-5.2` (`pi:ai/src/providers/zai.models.ts:79-98`): `thinking_format=Zai`(`thinking: {"type":"enabled","clear_thinking":false}` + `reasoning_effort` 対応)、`zai_tool_stream=true`、`supports_store=false`、`supports_developer_role=false`、**`max_tokens_field=max_tokens`**(Z.ai 直APIの公式リファレンス(docs.z.ai の Chat Completion、2026-07 確認)は `max_tokens` のみ定義し `max_completion_tokens` の記載がない **[事実]**。pi では z.ai が `useMaxTokens` 判定に含まれず既定の `max_completion_tokens` に落ちる **[事実]** 同 :1272-1273 が、それは**コーディングプラン用エンドポイントに対する値**であり直APIへは流用しない)
+- **GLM の base_url 注意**: pi の値 `/api/coding/paas/v4` は**コーディングプラン用エンドポイント**であり、Sumi は規約上使えない(プロバイダ調査参照)。Sumi は直APIの `https://api.z.ai/api/paas/v4` を使う — これは pi 由来ではなくプロバイダ調査由来の値。同じ理由で compat 値も pi のメタデータを盲目的に流用せず、直API仕様(上記 `max_tokens`)を既定として **M1 ライブで確認**する。差異が出たら Compat フラグで切替(ランタイム設定、再コンパイル不要)
 - Umans: OpenAI互換を名乗るが実体は上記モデルのプロキシ。**M1 の実測で決める**(まず Kimi/GLM 相当のプリセットを試す)。**[推測]**
 
 pi から**移植しないもの**: Anthropic 型 cache_control(Kimi/GLM は自動キャッシュ)、prompt_cache_key(OpenAI 本家専用)、session affinity ヘッダ、deferredToolsMode "kimi"(ツール凍結原則により遅延ロード不使用)、OpenRouter/Vercel ルーティング、25方言の thinkingFormat のうち上記2種以外。
@@ -816,6 +816,15 @@ fn assemble(&mut self) -> PromptContext:
 
 transform は**送信用のビューを作る純関数**であり、L0 の保存形は変えない(ログと記憶の分離)。
 
+### 7.8 単一入出力のサイズ上限
+
+40k/80k は層の**総量**の制御であり、厳密な不変条件ではない。ただし1メッセージはバッチ分割できない最小単位のため、単一の巨大メッセージには別のガードが要る(無制限だと L0 のバッチ・溢れ設計自体が壊れる):
+
+- **ユーザー入力(二段構え)**: (a) **wire 上限 1MB**: Gateway が超過 `user_message` を受理時に拒否し、`Error` イベントで理由を返す(stdio/WS フレーム保護)。(b) **L0 投入上限 50KB**(ツール結果と同じ値): 超過入力は `messages` には**原文全文**を保存した上で、全文を `/workspace/.attachments/` へ退避し、L0 へは先頭 50KB+「[全文 xxxKB: /workspace/.attachments/user-yyy.txt]」の注記付き切詰めビューとして投入する。エージェントは必要なら read_file/grep で続きを読める(戦略的忘却と同じ思想)。切詰めは投入時の純関数とし、再起動時の messages→L0 復元でも同じ関数を通す(保存形は常に原文 — §7.7 の「ログと記憶の分離」と同型)**[推測、上限値は実測調整]**
+- **assistant 出力**: リクエストの max_tokens に**モデル上限ではなく既定 16k トークン**(設定可)を指定する。`ModelSpec.max_tokens`(128k 等)は物理上限であり通常リクエストには使わない。超過は StopReason::Length として顕在化し、既存の経路で処理される(ツールコールは一括失敗 #19、テキストは打ち切りのまま保持)
+- **ツール結果**: 既存の 2000行/50KB 切詰め+全文退避(§8.2)と grep 行長 500 字(§8.1)がこのガードを兼ねており、単一ツール結果が L0 に 50KB を超えて入る経路はない。追加の仕組みは不要
+- 50KB は日本語で ~10k トークン強に相当し得るため、L0 投入時の実サイズは est(§7.5)で計上し、溢れ処理が通常どおり吸収する
+
 ---
 
 ## 8. ツールとワークスペース(`tools/`)
@@ -863,6 +872,7 @@ transform は**送信用のビューを作る純関数**であり、L0 の保存
   5. `cancelled: true` とそれまでの出力を返す(結果は捨てない)
 - 実行シェル: `bash -c`、作業ディレクトリはワークスペースルート、環境変数は最小(PATH, HOME, LANG)
 - executor は agent と別UIDで起動し、APIキー・DBパス等の環境変数を継承しない。`/proc` は executor 用 PID namespace または hidepid 相当で agent 親プロセスを不可視にする。プロセスグループ kill は executor が担当し、runtime は RPC の cancel を送る
+- **network egress**: 別UIDだけでは外向き通信は一切制限されない(同一コンテナ=同一 network namespace)ため、明示の機構で強制する。コンテナ entrypoint(root)が executor プロセスを**専用の network namespace(non-loopback インターフェイスなし)で起動**してから権限降下する — egress は物理的に不可能になり、runtime⇔executor の Unix socket RPC は netns を跨いでも影響を受けない。agent ランタイム自身(`sumi-agent`)はコンテナ既定の netns に残り LLM API へ到達できる。bash から外に出たい用途(curl 等)は、ドメイン許可リスト付き egress プロキシを将来導入するまで**非対応**。開発用にコンテナ設定で netns 分離を外せるが、その場合「network 境界は approval レイヤのみ」であることをログに明示する(§9.2 の「approval と独立した強制境界」はこの netns 分離が実体)**[推測→セキュリティ契約として確定]**
 
 ---
 
@@ -1060,7 +1070,7 @@ JSON Schema:
 
 ## 10. 永続化(`store/`)
 
-SQLite(sqlx、WAL モード)。DB ファイルは永続ボリューム上の agent 専用状態ディレクトリ(`$SUMI_STATE_DIR/agent.db`、コンテナ既定 `/var/lib/sumi/agent.db`)に置き、`sumi-agent` UID だけが read/write できる。`/workspace` を操作する `sumi-tool` executor にはこのディレクトリを見せない。記憶検索が必要なら Store の read-only API を型付きツールとして公開し、生DBパスは渡さない。**agent が自前で持ってよい永続化は「自身のメモリストアのみ」という ADR 0001 の原則の範囲内**。チャットログ全文をここに置くか api 側 DB に置くかは **[要決定→14章]**(ハッカソンはローカル SQLite で確定し、イベントを api に流しているので後から api 側へミラー可能)。
+SQLite(sqlx、WAL モード)。DB ファイルは永続ボリューム上の agent 専用状態ディレクトリ(`$SUMI_STATE_DIR/agent.db`、コンテナ既定 `/var/lib/sumi/agent.db`)に置き、`sumi-agent` UID だけが read/write できる。`/workspace` を操作する `sumi-tool` executor にはこのディレクトリを見せない。記憶検索が必要なら Store の read-only API を型付きツールとして公開し、生DBパスは渡さない。ここに置くのは agent の**自己状態**(メモリ層・チャットログ全文・恒久イベント・承認ルール)だけで、ドメインデータは複製しない — ADR 0001 の原則「agent はドメイン DB を直接触らず、権限モデルの強制点を API 層に保つ」はこの形で維持する(README のアーキテクチャ原則もこの表現に更新済み)。チャットログ全文をここに置くか api 側 DB に置くかは **[要決定→14章]**(ハッカソンはローカル SQLite で確定し、イベントを api に流しているので後から api 側へミラー可能)。
 
 ### 10.1 スキーマ(マイグレーション v1)
 
@@ -1131,7 +1141,9 @@ Session から出る**全 AgentEvent は単一 FIFO の `EventWriter` へ送る*
 - **恒久イベント**(MessageStart/End、ToolExecution 系、Approval 系、Turn/Agent 系、Steered、MemoryMaintenance): EventWriter が seq を採番し、`agent_events` と、そのイベントから導出される `messages` / `memory_batches` / `approval_*` の変更を**同一 SQLite トランザクション**で commit する。commit 後にだけ Gateway へ送る
 - **揮発イベント**(MessageUpdate の delta 系): seq 無し・永続化無しだが、同じ FIFO 上で先行する恒久イベントの commit/send 完了を待ってから Gateway へ送る。これにより `MessageUpdate` が `MessageStart` を追い越さない
 - Gateway 切断中の delta は捨ててよい。commit 済み恒久イベントは再接続時に `agent_events` から再送し、最後の MessageEnd(全文)で UI を回復する
-- crash が transaction commit 前ならイベントと投影状態の両方が存在せず、commit 後・Gateway送信前なら再送対象として残る。`agent_events` だけ存在して `messages` に本文がない状態を作らない
+- **`messages` への投影は MessageEnd のトランザクションでのみ行う**(1メッセージ=1 INSERT。これで追記専用が成立し、update は発生しない)。`MessageStart` は `agent_events` に記録するだけで `messages` には何も書かない — assistant の `MessageStart.message` は本文空のスケルトンであり、「開始した」という事実だけが実体。user / toolResult は Start/End を同期的に連続発行するため実質即時に投影される
+- crash が transaction commit 前ならイベントと投影状態の両方が存在せず、commit 後・Gateway送信前なら再送対象として残る。本文を投影するのは MessageEnd だけなので、「`agent_events` にイベントがあるのに `messages` に対応する本文が無い」状態は構造上作らない
+- **assistant ストリーミング中の crash**(MessageStart commit 後・MessageEnd 前): delta は揮発なので生成途中の内容は失われる(仕様として許容。ハードステア/abort による部分応答は §6.3 のとおり MessageEnd を経由するため保存される)。再起動時、`agent_events` 末尾が正常形(§5.2 の契約)で閉じていなければ、復旧処理が**合成クローズイベント**(本文空・stop_reason=Error・error_message="process restarted" の MessageEnd → TurnEnd → AgentEnd)を新しい seq で追記してから受付を再開する。合成 MessageEnd も通常規則で `messages` へ投影する(UI はエラーとして表示できる)が、空 assistant は transform(§5.3)が再送からスキップするため API へは流れない。三者の整合は「**MessageEnd まで到達した内容だけが実体**」という単一規則で保たれる
 
 復元時は memory_batches から L0/L1/L2 を再構成(L0 の本文は messages から引く)。open バッチの途中状態も ord で復元し、shelf は summary 列から戻す。`memory_jobs` の lease 切れ `running` を `pending` に戻し、`Compacting` なのに対応ジョブ/summaryがない状態を修復してからワーカーを起動する。**復元後の最初の API コールはキャッシュ全ミス**(プロセス再起動の宿命)なのでコンテナは安易に殺さない運用とする。
 
@@ -1302,7 +1314,7 @@ web への転送方針(api の責務、参考): MessageUpdate の delta 系は�
   3. 中断→再開後の Kimi 再送で reasoning のみ部分応答が受理されるか確認(6.3節の未検証点)。駄目なら回避策を実装しコメントに記録
   4. Length 停止のツール一括失敗をフィクスチャで再現
   5. **制御プレーン生存性**: provider stream / bash / retry sleep の各 phase で別コマンドを送り、hard/soft steer と abort がタイムアウトせず処理される
-  6. **executor 境界**: bash から `/var/lib/sumi` と agent の `/proc/<pid>/environ` を読めず、workspace 外への symlink 読み書きも拒否される。一方 `/workspace` 内の通常操作は成功する
+  6. **executor 境界**: bash から `/var/lib/sumi` と agent の `/proc/<pid>/environ` を読めず、workspace 外への symlink 読み書きも拒否される。一方 `/workspace` 内の通常操作は成功する。netns 分離時は bash からの外向き TCP/DNS が失敗し、agent ランタイム自身の LLM API 通信は影響を受けない(§8.3)
 
 ### M3: 永続化(2日、〜7/26)
 
@@ -1310,7 +1322,7 @@ web への転送方針(api の責務、参考): MessageUpdate の delta 系は�
 - **ゲート**:
   1. 10ターン会話 → プロセス kill → 再起動 → 会話が続く(L0 復元)。`messages_fts` で過去発言が検索できる。イベント seq が復元後も単調継続
   2. DB書込みを遅延させても `MessageStart → MessageUpdate* → MessageEnd` の順序が崩れない
-  3. 恒久イベントのトランザクション各境界で kill し、`agent_events` と messages/memory の投影が食い違わない
+  3. 恒久イベントのトランザクション各境界で kill し、`agent_events` と messages/memory の投影が食い違わない。assistant ストリーミング中(MessageStart 後・MessageEnd 前)の kill では、再起動後に合成クローズイベントが追記され、イベントログ・messages・L0 が「その応答は失われた」という一貫状態に収束する(10.2節)
 - **チーム同期ポイント**: `contracts/agent-events.yaml` を正典として Envelope/Command/AgentEvent の wire 形をこの時点で凍結し、Rust/Go/TS の型生成と fixture round-trip CI を開始する
 
 ### M4: 3層メモリ(3日、〜7/29)
@@ -1325,6 +1337,7 @@ web への転送方針(api の責務、参考): MessageUpdate の delta 系は�
   5. 校正: est×ratio と実測 usage の乖離が ±15% 以内に収束
   6. ツールなしの user→assistant 会話だけを繰り返しても、40k到達後の昇格が AgentEnd/Idle 中に適用され、48kのハード上限まで放置されない
   7. L0 Compact / L1→L2 / L2統合の各 `running` 中に kill し、再起動後に lease 回収・再投入・一度だけの適用が成立する
+  8. 50KB 超のユーザー入力貼り付けで、messages に原文全文・L0 に切詰めビュー・workspace に退避ファイルが揃い、以後の昇格・復元が正常に動く(7.8節)
 
 ### M5: 権限承認+WS ゲートウェイ(2日、〜7/31)
 
