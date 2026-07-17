@@ -33,22 +33,6 @@ pub fn parse_streaming(input: &str) -> Value {
     empty_object()
 }
 
-pub fn parse_final(input: &str) -> Result<Value, String> {
-    match serde_json::from_str(input) {
-        Ok(value) => Ok(value),
-        Err(original_error) => {
-            let repaired = repair_json(input);
-            if repaired == input {
-                return Err(original_error.to_string());
-            }
-
-            serde_json::from_str(&repaired).map_err(|repaired_error| {
-                format!("invalid JSON ({original_error}); repair also failed ({repaired_error})")
-            })
-        }
-    }
-}
-
 fn empty_object() -> Value {
     Value::Object(Map::new())
 }
@@ -130,19 +114,115 @@ fn push_escaped_control(output: &mut String, character: char) {
 }
 
 fn parse_partial(input: &str) -> Option<Value> {
-    let mut boundaries: Vec<usize> = input.char_indices().map(|(index, _)| index).collect();
-    boundaries.push(input.len());
+    // Keep the number of serde attempts bounded. Streaming tool arguments can
+    // grow on every delta, so retrying every character prefix makes a single
+    // parse quadratic and a complete stream cubic.
+    if let Some(value) = parse_completed_prefix(input) {
+        return Some(value);
+    }
 
-    for end in boundaries.into_iter().rev() {
-        let prefix = input[..end].trim_end();
-        if let Some(completed) = close_open_structures(prefix)
-            && let Ok(value) = serde_json::from_str(&completed)
-        {
-            return Some(value);
-        }
+    if let Some(number_prefix) = truncate_incomplete_number(input)
+        && let Some(value) = parse_completed_prefix(number_prefix)
+    {
+        return Some(value);
+    }
+
+    if let Some(comma) = last_structural_comma(input)
+        && let Some(value) = parse_completed_prefix(input[..comma].trim_end())
+    {
+        return Some(value);
     }
 
     None
+}
+
+fn parse_completed_prefix(prefix: &str) -> Option<Value> {
+    close_open_structures(prefix).and_then(|completed| serde_json::from_str(&completed).ok())
+}
+
+fn truncate_incomplete_number(input: &str) -> Option<&str> {
+    let trimmed = input.trim_end();
+    let token_start = trimmed
+        .rfind(|character: char| {
+            character.is_ascii_whitespace() || matches!(character, ':' | ',' | '[' | '{')
+        })
+        .map_or(0, |index| index + 1);
+    let token = &trimmed[token_start..];
+    let valid_end = longest_complete_number_prefix(token)?;
+    (valid_end < token.len()).then_some(&trimmed[..token_start + valid_end])
+}
+
+fn longest_complete_number_prefix(token: &str) -> Option<usize> {
+    let bytes = token.as_bytes();
+    let mut index = 0;
+    if bytes.first() == Some(&b'-') {
+        index += 1;
+    }
+
+    match bytes.get(index) {
+        Some(b'0') => index += 1,
+        Some(b'1'..=b'9') => {
+            index += 1;
+            while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+                index += 1;
+            }
+        }
+        _ => return None,
+    }
+    let mut last_complete = index;
+
+    if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        let fraction_start = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        if index > fraction_start {
+            last_complete = index;
+        }
+    }
+
+    if matches!(bytes.get(index), Some(b'e' | b'E')) {
+        index += 1;
+        if matches!(bytes.get(index), Some(b'+' | b'-')) {
+            index += 1;
+        }
+        let exponent_start = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        if index > exponent_start {
+            last_complete = index;
+        }
+    }
+
+    Some(last_complete)
+}
+
+fn last_structural_comma(input: &str) -> Option<usize> {
+    let mut last_comma = None;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (index, character) in input.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+        } else {
+            match character {
+                '"' => in_string = true,
+                ',' => last_comma = Some(index),
+                _ => {}
+            }
+        }
+    }
+
+    last_comma
 }
 
 fn close_open_structures(prefix: &str) -> Option<String> {
@@ -203,7 +283,6 @@ mod tests {
 
         for (input, expected) in cases {
             assert_eq!(parse_streaming(input), expected, "{input}");
-            assert_eq!(parse_final(input), Ok(expected), "{input}");
         }
     }
 
@@ -234,7 +313,7 @@ mod tests {
         ];
 
         for (input, expected) in cases {
-            assert_eq!(parse_final(input), Ok(expected), "{input:?}");
+            assert_eq!(parse_streaming(input), expected, "{input:?}");
         }
     }
 
@@ -248,22 +327,22 @@ mod tests {
         ];
 
         for (input, expected) in cases {
-            assert_eq!(parse_final(input), Ok(expected), "{input}");
+            assert_eq!(parse_streaming(input), expected, "{input}");
         }
-        assert!(parse_final(r#"{"value":"\u12"}"#).is_err());
+        assert_eq!(parse_streaming(r#"{"value":"\u12"}"#), json!({}));
     }
 
     #[test]
     fn preserves_valid_escape_sequences() {
         let input = r#"{"quote":"\"","slash":"\\","line":"\n","unicode":"\u65e5"}"#;
         assert_eq!(
-            parse_final(input),
-            Ok(json!({
+            parse_streaming(input),
+            json!({
                 "quote": "\"",
                 "slash": "\\",
                 "line": "\n",
                 "unicode": "日"
-            }))
+            })
         );
     }
 
@@ -336,9 +415,23 @@ mod tests {
     }
 
     #[test]
-    fn final_parser_does_not_accept_incomplete_json() {
-        for input in [r#"{"name":"Sumi"#, r#"{"ready":"#, "[1,2,"] {
-            assert!(parse_final(input).is_err(), "{input}");
+    fn partial_parser_uses_a_bounded_number_of_candidates() {
+        let input = format!(r#"{{"value":"{}","next":tru"#, "x".repeat(1_000_000));
+        assert_eq!(
+            parse_streaming(&input),
+            json!({"value": "x".repeat(1_000_000)})
+        );
+    }
+
+    #[test]
+    fn recovers_incomplete_numbers() {
+        let cases = [
+            (r#"{"value":1."#, json!({"value": 1})),
+            (r#"{"value":-12.5e+"#, json!({"value": -12.5})),
+            (r#"{"value":12e3"#, json!({"value": 12e3})),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(parse_streaming(input), expected, "{input}");
         }
     }
 

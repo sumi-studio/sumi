@@ -62,6 +62,9 @@ impl SseStream {
 
     pub async fn next_payload(&mut self) -> Result<Option<String>, SseError> {
         loop {
+            if self.cancel.is_cancelled() {
+                return Err(SseError::Cancelled);
+            }
             if let Some(payload) = self.parser.next_payload() {
                 return Ok(Some(payload));
             }
@@ -172,6 +175,7 @@ async fn receive_chunk(
 ) -> Result<Option<Vec<u8>>, SseError> {
     let next_chunk = tokio::time::timeout(idle_timeout, bytes.next());
     tokio::select! {
+        biased;
         _ = cancel.cancelled() => Err(SseError::Cancelled),
         result = next_chunk => match result {
             Ok(Some(Ok(chunk))) => Ok(Some(chunk)),
@@ -345,6 +349,19 @@ mod tests {
         cancel.cancel();
         let pending = stream::pending::<Result<Vec<u8>, String>>();
         let mut stream = SseStream::new(Box::pin(pending), cancel, Duration::from_secs(1));
+        assert_eq!(stream.next_payload().await, Err(SseError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn cancellation_preempts_buffered_payloads_and_done() {
+        let bytes = stream::iter([Ok(
+            b"data: first\n\ndata: second\n\ndata: [DONE]\n\n".to_vec()
+        )]);
+        let cancel = CancellationToken::new();
+        let mut stream = SseStream::new(Box::pin(bytes), cancel.clone(), Duration::from_secs(1));
+
+        assert_eq!(stream.next_payload().await, Ok(Some("first".to_owned())));
+        cancel.cancel();
         assert_eq!(stream.next_payload().await, Err(SseError::Cancelled));
     }
 
