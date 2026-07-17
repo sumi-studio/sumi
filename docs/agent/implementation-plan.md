@@ -4,10 +4,10 @@
 - Date: 2026-07-17
 - 対象: `apps/agent`(Rust スキャフォールド済: tokio + anyhow + tracing、turbo に `@sumi/agent` として接続済み)
 - 前提資料:
-  - [ADR 0002 エージェント基盤の言語と実装方針](docs/adr/0002-agent-stack.md)(origin/docs/agent-design)
-  - [3層メモリ設計 docs/agent/memory.md](origin/docs/agent-design)
-  - [ワークスペース設計 docs/agent/workspace.md](origin/docs/agent-design)
-  - [画面構成書 docs/screen-composition.md]
+  - [ADR 0002 エージェント基盤の言語と実装方針](../adr/0002-agent-stack.md)
+  - [3層メモリ設計](memory.md)
+  - [ワークスペース設計](workspace.md)
+  - [画面構成書](../screen-composition.md)
   - pi 調査レポート(2026-07-17)、モデルプロバイダ調査レポート(2026-07-17)
   - **pi ソースコード実読**: `github.com/earendil-works/pi` @ `216e672e` (2026-07-16)。本書で `pi:` で始まるパスは同リポジトリの `packages/` 配下を指す
 - 締切: ハッカソン 2026-08-01(プレゼン 8/2)。「チャットUIからエージェントと会話でき、ストリーミング+ツール実行+ステアが見える」が最優先
@@ -1117,4 +1117,3 @@ web への転送方針(api の責務、参考): MessageUpdate の delta 系は�
 2. 迷ったら「イベント列が正常形で閉じるか」「キャッシュプレフィックスを壊さないか」「ホットパスに同期 I/O を置いていないか」の3点で自己レビュー
 3. Compat フラグの追加をためらわない。pi が25プロバイダで学んだ教訓は「互換 API の差異は enum とフラグで飼い慣らす」こと
 4. 憲法プロンプト(人格)の執筆は本計画のスコープ外。Founder が書く。実装側はプレースホルダで進める
-
