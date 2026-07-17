@@ -71,20 +71,31 @@ paths:
       description: |
         トーク一覧画面用。各チャットに最終メッセージのプレビューと
         未読数を含む。最終アクティビティの新しい順で返す。
+        続きは `nextCursor` を次リクエストの `cursor` に渡して取得する。
       tags: [chats]
+      parameters:
+        - name: cursor
+          in: query
+          description: このカーソルの続きからチャットを返す (前回レスポンスの `nextCursor`)
+          schema:
+            type: string
+        - name: limit
+          in: query
+          description: 取得件数
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
       responses:
         "200":
-          description: チャット一覧
+          description: チャットのページ
           content:
             application/json:
               schema:
-                type: object
-                required: [items]
-                properties:
-                  items:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/Chat"
+                $ref: "#/components/schemas/ChatPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
     post:
@@ -233,6 +244,25 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /ws/tickets:
+    post:
+      operationId: createWsTicket
+      summary: WebSocket 接続チケットを発行
+      description: |
+        `/ws` 接続用の短命 (60 秒)・使い捨てチケットを発行する。
+        アクセストークンを URL クエリに載せるとログ・履歴に漏れるため、
+        WS の認証は Bearer 認証済みのこのエンドポイントで得たチケットで行う。
+      tags: [system]
+      responses:
+        "201":
+          description: 発行されたチケット
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WsTicket"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   /ws:
     get:
       operationId: connectWebSocket
@@ -246,19 +276,22 @@ paths:
         - サーバー → クライアント: `ServerEvent` (JSON テキストフレーム)
 
         ブラウザの WebSocket API は Authorization ヘッダーを付与できないため、
-        Cognito アクセストークンは `token` クエリパラメータで渡す。
-        接続時に検証し、無効なら 4401 でクローズする。
-        トークン失効時はサーバーが 4401 でクローズするので再接続する。
+        認証は `POST /ws/tickets` で発行した短命・使い捨てチケットを
+        `ticket` クエリパラメータで渡して行う (アクセストークンは URL に載せない)。
+        サーバーは接続確立時にチケットを検証して消費し、
+        無効・期限切れ・使用済みなら 4401 でクローズする。
+        接続後にセッションが失効した場合も 4401 でクローズされるので、
+        チケットを再発行して再接続する。
 
         ステアは専用イベントではなく、streaming 中に `message.send` を
         送ること自体がステアになる (現在の生成を中断して新入力を注入)。
       tags: [system]
       security: []
       parameters:
-        - name: token
+        - name: ticket
           in: query
           required: true
-          description: Cognito アクセストークン (JWT)
+          description: "`POST /ws/tickets` で発行したチケット"
           schema:
             type: string
       responses:
@@ -317,11 +350,23 @@ components:
           type: string
           description: 人間可読な説明
 
+    WsTicket:
+      type: object
+      required: [ticket, expiresAt]
+      properties:
+        ticket:
+          type: string
+          description: "`/ws` の `ticket` クエリパラメータに渡す不透明な文字列"
+        expiresAt:
+          type: string
+          format: date-time
+          description: 有効期限 (発行から 60 秒)。期限内でも一度使うと無効
+
     # ---- チャット ----
 
     Chat:
       type: object
-      required: [id, name, createdAt]
+      required: [id, name, unreadCount, createdAt]
       properties:
         id:
           type: string
@@ -337,7 +382,7 @@ components:
         unreadCount:
           type: integer
           minimum: 0
-          description: 未読メッセージ数。未読ドットの表示判定に使う
+          description: 未読メッセージ数 (未読なしは 0)。未読ドットの表示判定に使う
         createdAt:
           type: string
           format: date-time
@@ -365,6 +410,21 @@ components:
         role:
           type: string
           maxLength: 64
+
+    ChatPage:
+      type: object
+      required: [items, hasMore]
+      properties:
+        items:
+          type: array
+          description: 最終アクティビティの新しい順
+          items:
+            $ref: "#/components/schemas/Chat"
+        nextCursor:
+          type: string
+          description: 続きを取得するためのカーソル。`hasMore` が false なら省略
+        hasMore:
+          type: boolean
 
     MessagePreview:
       type: object
@@ -507,8 +567,12 @@ components:
         blocks:
           type: array
           minItems: 1
+          description: |
+            クライアントが送信できるのはテキストブロックのみ。
+            SDUI カードはサーバー / エージェント起点でのみ生成される
+            (任意の component / props の注入を防ぐ)。
           items:
-            $ref: "#/components/schemas/MessageBlock"
+            $ref: "#/components/schemas/TextBlock"
 
     StreamStopEvent:
       type: object
