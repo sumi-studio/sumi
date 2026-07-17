@@ -1142,8 +1142,14 @@ Session から出る**全 AgentEvent は単一 FIFO の `EventWriter` へ送る*
 - **揮発イベント**(MessageUpdate の delta 系): seq 無し・永続化無しだが、同じ FIFO 上で先行する恒久イベントの commit/send 完了を待ってから Gateway へ送る。これにより `MessageUpdate` が `MessageStart` を追い越さない
 - Gateway 切断中の delta は捨ててよい。commit 済み恒久イベントは再接続時に `agent_events` から再送し、最後の MessageEnd(全文)で UI を回復する
 - **`messages` への投影は MessageEnd のトランザクションでのみ行う**(1メッセージ=1 INSERT。これで追記専用が成立し、update は発生しない)。`MessageStart` は `agent_events` に記録するだけで `messages` には何も書かない — assistant の `MessageStart.message` は本文空のスケルトンであり、「開始した」という事実だけが実体。user / toolResult は Start/End を同期的に連続発行するため実質即時に投影される
-- crash が transaction commit 前ならイベントと投影状態の両方が存在せず、commit 後・Gateway送信前なら再送対象として残る。本文を投影するのは MessageEnd だけなので、「`agent_events` にイベントがあるのに `messages` に対応する本文が無い」状態は構造上作らない
-- **assistant ストリーミング中の crash**(MessageStart commit 後・MessageEnd 前): delta は揮発なので生成途中の内容は失われる(仕様として許容。ハードステア/abort による部分応答は §6.3 のとおり MessageEnd を経由するため保存される)。再起動時、`agent_events` 末尾が正常形(§5.2 の契約)で閉じていなければ、復旧処理が**合成クローズイベント**(本文空・stop_reason=Error・error_message="process restarted" の MessageEnd → TurnEnd → AgentEnd)を新しい seq で追記してから受付を再開する。合成 MessageEnd も通常規則で `messages` へ投影する(UI はエラーとして表示できる)が、空 assistant は transform(§5.3)が再送からスキップするため API へは流れない。三者の整合は「**MessageEnd まで到達した内容だけが実体**」という単一規則で保たれる
+- crash が transaction commit 前ならその transaction のイベントと投影状態は両方存在せず、commit 後・Gateway送信前なら再送対象として残る。`MessageStart` 後・`MessageEnd` 前だけは、開始イベントがあり本文投影がない状態を意図的に許す。本文を伴う `MessageEnd` と `messages` の INSERT は必ず同一 transaction に置き、「完了イベントだけ存在して本文がない」状態は作らない
+- **実行中の crash と正常形への復旧**: delta は揮発なので、未確定の生成内容は失われる(仕様として許容。ハードステア/abort による部分応答は §6.3 のとおり MessageEnd を経由するため保存される)。再起動時は `agent_events` を replay して最後の run の durable phase を復元し、**不足している suffix だけ**を新しい seq で追記してから受付を再開する。固定で `MessageEnd → TurnEnd → AgentEnd` を再発行してはならない:
+  - assistant の `MessageStart` 後 → 本文空・stop_reason=Error・error_message="process restarted" の合成 `MessageEnd` → `TurnEnd` → `AgentEnd`
+  - assistant の `MessageEnd` 後 → `TurnEnd` → `AgentEnd`
+  - `TurnEnd` 後 → `AgentEnd`
+  - tool/approval phase 中 → 開いている tool execution / approval を error/cancelled で閉じ、対応するエラーツール結果を MessageStart/End で確定してから `TurnEnd` → `AgentEnd`
+  - `AgentEnd` 後 → 追記なし
+  合成 MessageEnd も通常規則で `messages` へ投影する(UI はエラーとして表示できる)が、空 assistant は transform(§5.3)が再送からスキップするため API へは流れない。復旧処理は replay で得た phase と、追記しようとする次イベントの組を検証し、完了済みの MessageEnd / TurnEnd を重複発行しない。三者の整合は「**MessageEnd まで到達した内容だけが実体**」という単一規則で保つ
 
 復元時は memory_batches から L0/L1/L2 を再構成(L0 の本文は messages から引く)。open バッチの途中状態も ord で復元し、shelf は summary 列から戻す。`memory_jobs` の lease 切れ `running` を `pending` に戻し、`Compacting` なのに対応ジョブ/summaryがない状態を修復してからワーカーを起動する。**復元後の最初の API コールはキャッシュ全ミス**(プロセス再起動の宿命)なのでコンテナは安易に殺さない運用とする。
 
@@ -1280,7 +1286,7 @@ web への転送方針(api の責務、参考): MessageUpdate の delta 系は�
 | 27 | バッチ/compaction のカット境界規則(user/assistant 直前のみ、toolResult 直前禁止) | `agent/src/harness/compaction/compaction.ts:265-380` | 3層メモリのバッチ境界(7.3節)の根拠 | `memory/batch.rs` |
 | 28 | トークン見積(chars/4)+「直近 usage を錨に末尾だけ見積る」ハイブリッド | 同 :118-264 | 7.5節の校正方式の原型。日本語係数を追加 | `memory/estimate.rs` |
 | 29 | 要約プロンプト構造(固定フォーマット指定、UPDATE 型の差分更新プロンプト、maxTokens 上限、「会話を続けるな」system) | 同 :383-522 | Compact プロンプト設計の出発点。秘書ドメインに書換え | `memory/compactor.rs` |
-| 30 | Kimi K3 / GLM-5.2 の compat 実測値 | `ai/src/providers/moonshotai.models.ts:171-189`, `zai.models.ts:79-98` | pi が実機で当てたフラグ設定。そのまま初期プリセットに | `config.rs` プリセット |
+| 30 | Kimi K3 / GLM-5.2 の compat 実測値 | `ai/src/providers/moonshotai.models.ts:171-189`, `zai.models.ts:79-98` | pi が実機で当てたフラグ設定を初期値にする。ただしエンドポイント固有値は流用せず、GLM 直APIの `max_tokens` のように一次仕様を優先する (§4.1) | `config.rs` プリセット |
 
 **意図的に移植しないもの**(再掲+根拠): マルチプロバイダ層全体、compat の URL 自動検出(明示設定で代替)、Anthropic 型 cache_control / prompt_cache_key / session affinity(Kimi/GLM は自動キャッシュ)、deferredToolsMode(ツール凍結原則)、parallel ツール実行(承認フローと相性が悪い、M5 後に再検討)、pi の SessionManager/JSONL(SQLite で置換)、compaction の実行トリガ設計(同期・閾値式 → Sumi は先回り非同期式)、TUI/RPC/extension 機構。
 
@@ -1322,7 +1328,7 @@ web への転送方針(api の責務、参考): MessageUpdate の delta 系は�
 - **ゲート**:
   1. 10ターン会話 → プロセス kill → 再起動 → 会話が続く(L0 復元)。`messages_fts` で過去発言が検索できる。イベント seq が復元後も単調継続
   2. DB書込みを遅延させても `MessageStart → MessageUpdate* → MessageEnd` の順序が崩れない
-  3. 恒久イベントのトランザクション各境界で kill し、`agent_events` と messages/memory の投影が食い違わない。assistant ストリーミング中(MessageStart 後・MessageEnd 前)の kill では、再起動後に合成クローズイベントが追記され、イベントログ・messages・L0 が「その応答は失われた」という一貫状態に収束する(10.2節)
+  3. 恒久イベントのトランザクション各境界で kill し、`agent_events` と messages/memory の投影が食い違わない。MessageStart後、MessageEnd後、TurnEnd後、tool/approval phase中の各killで、再起動後はdurable phaseに不足するsuffixだけが追記され、MessageEnd/TurnEndの重複なしに正常形へ収束する(10.2節)
 - **チーム同期ポイント**: `contracts/agent-events.yaml` を正典として Envelope/Command/AgentEvent の wire 形をこの時点で凍結し、Rust/Go/TS の型生成と fixture round-trip CI を開始する
 
 ### M4: 3層メモリ(3日、〜7/29)
@@ -1330,7 +1336,7 @@ web への転送方針(api の責務、参考): MessageUpdate の delta 系は�
 - `memory/` 全体(第7章)。batch → estimate → compactor → overflow → ContextAssembler の順
 - テストデータ: 実会話を伸ばすのは非効率なので、**過去メッセージを合成生成する長会話シミュレータ**(スクリプトで 200k トークン相当を投入)を用意
 - **ゲート**:
-  1. シミュレータ投入で L0→L1→L2 の昇格が全段発火し、プロンプト総量が常に 80k 未満(MemoryMaintenance イベントで観測)
+  1. 通常サイズのメッセージを使うシミュレータ投入で L0→L1→L2 の昇格が全段発火し、定常時のプロンプト総量が 80k 未満に戻る(MemoryMaintenance イベントで観測)。単一入出力による一時超過は §7.8 の個別ゲートで検証する
   2. **キャッシュヒット率実測**: 通常ターン(末尾追記のみ)で `usage.cache_read / (input+cache_read) > 0.8` を Kimi 実機で確認。L0 先頭廃棄の直後ターンだけ低下し、次ターンで回復すること
   3. **TTFT 非劣化**: ユーザーメッセージ起点のコール前に溢れ処理・Compact が同期実行されていないことを span で証明(7.6-3 のスキップ規則)
   4. 複数 system メッセージが Kimi/GLM に受理されるか確認(7.1節)。駄目ならフォールバック実装
