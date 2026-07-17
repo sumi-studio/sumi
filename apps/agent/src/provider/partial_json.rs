@@ -245,6 +245,8 @@ fn close_open_structures(prefix: &str) -> Option<String> {
         match character {
             '"' => in_string = true,
             '{' | '[' => stack.push(character),
+            // 閉じ括弧のガードは stack.pop() の副作用で対応する開き括弧を
+            // 消費する。ガード不成立(=対応が取れた)場合も pop 済み。
             '}' if stack.pop() != Some('{') => return None,
             ']' if stack.pop() != Some('[') => return None,
             '}' | ']' => {}
