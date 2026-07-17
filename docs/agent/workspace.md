@@ -17,6 +17,7 @@
 - エージェントループ (apps/agent の Rust プロセス) とツール executor は同じ永続 `/workspace` を共有するが、別の OS sandbox として起動する。agent ランタイムは `sumi-agent` UID、ファイル操作・bash は `sumi-tool` UID とし、Docker 段階では executor を `network_mode=none` の sidecar コンテナ、microVM 段階では専用 mount/PID/network namespace 内のプロセスにする
 - 「エージェントが継続して存在すること」と「プロセスが常駐すること」は分離する。人格・記憶・会話はすべて永続データであり、コンテナは器。**ディスクは永続、コンピュートは寝かせられる**
 - 自由に使える `/workspace` は executor に read/write で渡す。executor の filesystem root は最小 rootfs とし、`/workspace` と明示した read-only runtime file 以外を mount しない。DB・メモリストア・承認ルール・API キー等の内部状態は runtime 側の `/var/lib/sumi` と環境に置き、executor へ mount しない。ツールから記憶を調べる必要がある場合は、生DBではなく read-only の専用ツールを経由する
+- `/workspace` の POSIX 権限契約: `sumi-agent`/`sumi-tool` を共有 group (`sumi-workspace`) の副グループに所属させ、`/workspace` 配下の全ディレクトリに setgid ビットを立てて新規作成物の group 所有を継承させる。両プロセスの umask は `0027` に揃え、既定モードはファイル `0640`・ディレクトリ `2750` とする。所有 UID がどちらでも共有 group 経由で相手が read/write できるため、`0600`/`0700` のような相手 UID を締め出すモードは作らない一方、group 外(other)には触らせない。runtime が生成する `.attachments/<conversation_id>` 等の artifact ディレクトリも同じ group/setgid/umask を継承し、片方の UID だけの排他所有にしない。group だけでは足りない個別許可(片方の UID にだけ read させたいファイル等)は default ACL (`setfacl -d`) で追加する。M2/M4 の fault-injection テストで、`sumi-agent`/`sumi-tool` の双方が相手 UID の作成物を create/read/rename/delete できることを検証する
 - `/workspace/.attachments/<conversation_id>` と `/workspace/.tool-output/<conversation_id>` は runtime が生成する conversation-owned artifact 専用prefixとし、ユーザー作成ファイルとは区別する。conversation reset は旧IDの2prefixだけを tombstone に従って冪等削除し、通常の workspace は残す。backup 復元時も旧IDのprefix削除を先に再適用する
 - executor の起動主体は deployment supervisor とする。Docker では container orchestrator が sidecar を明示的な環境許可リスト (`PATH` / `HOME` / `LANG` / executor generation) と FD/mount allowlist で作成し、runtime に Docker socket を渡さない。microVM/ローカル process では guest supervisor が `env_clear` 後に同じ許可リストだけを設定し、stdio と専用 Unix socket 以外の継承 file descriptor を `close_range`/close-on-exec で閉じて起動する。executor から runtime へ到達できる経路は認証済み専用 IPC だけとし、socket directory 自体も runtime/executor の専用 volume とする
 - リマインダー・アラーム等の自発的動作は、常駐ではなく中央のスケジューラがエージェントを起こす形で実現する (スケジューラの設計は未決)
@@ -61,6 +62,12 @@ web (React) ⇔ api (Go, WebSocket ゲートウェイ) ⇔ ユーザーごとの
 controller の意味を一律の「超過時 kill」にしない。`cpu.max` は1 vCPUへ throttle し、別の `cpu.stat` 差分が120 CPU秒へ達した場合だけ watchdog が停止を要求する。`pids.max` は fork を、disk/inode quota は write を拒否するため、executor は `pids.events` と `EAGAIN`/`EDQUOT`/`ENOSPC` を `ResourceLimit` へ分類する。memory は `memory.events` の max/oom/oom_kill を観測し、wall runtime・CPU-time・output counter は watchdog が強制終了する。停止が必要な経路は process group ではなく supervisor 所有の command child cgroup/PID namespace 全体を `cgroup.kill` 相当で回収し、delegation 不能なら command 専用 executor sandbox を破棄・再作成する。`setsid`/`setpgid` で離脱した descendant も `populated=0` 確認まで残さない。どの経路も wait/reap 後に limit 種別とそれまでの bounded output を返す。process-group kill は low-trust local mode の best-effort fallback に限り、Cloud rollout gate へ数えない。
 
 deployment supervisor は runtime、executor、IPC に同じ世代番号を与え、command ごとの execution cgroup/sandbox も登録する。runtime 終了・heartbeat 喪失時にその世代の登録済み execution boundary と executor sandbox 全体を kill/reap してから新世代を起動する。再起動時に `running` だった tool execution は `indeterminate` として閉じ、同じ tool call を自動再実行しない。ドメイン操作は `command_id/tool_call_id` の idempotency key を apps/api まで伝播する。quota 拒否/throttle、`setsid ... &` でdetachしたdescendantの強制終了、再起動後の回収を fault-injection で確認するまで段階展開しない。
+
+`indeterminate` で閉じた execution の再開・照合契約:
+
+- **可視性**: `indeterminate` は `failed` とは別状態として `tool_executions.state`(実装計画 §10.1)に残り、対応する tool 結果は `MessageStart/End` → `TurnEnd` → `AgentEnd` の恒久イベントで閉じる(実装計画 §10.2)。tool 結果の本文には「結果不明(副作用未確認)」である旨と `tool_call_id`/`idempotency_key` を明記し、UI/API 側が「失敗」と区別してユーザーへ提示できるようにする
+- **照合**: エージェントは自動再実行しない。domain mutation tool は `command_id/tool_call_id` を idempotency key として apps/api に伝播済みのため、ユーザーが確認を求めた場合はエージェントが該当ドメイン API を read-only に照会し、副作用が実際に完了していたかを事後確認する
+- **リトライ**: 照合の結果「未完了」と確定した場合は、**元の execution と同じ `idempotency_key`** で再実行し、ドメイン側の冪等性処理により重複実行させない。ユーザーが照合なしに「もう一度実行して」と明示的に確認した場合に限り、新しい `tool_call_id`/`idempotency_key` を発行した別実行として扱ってよい(既定は同一キー再利用であり、新規キーは明示確認済みリトライの例外)
 
 ## 未決事項
 

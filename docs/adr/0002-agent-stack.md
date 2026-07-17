@@ -19,7 +19,7 @@ ADR 0001 は前提の一つとして「エージェント基盤の有力候補 (
 
 - ランタイム: tokio ベースの常駐プロセス。ユーザーごとのワークスペースコンテナ内で動く (workspace.md)
 - プロバイダ層: OpenAI 互換 Chat Completions、OpenAI Responses、Anthropic Messages 互換の3アダプターを自作し、SSE、ツールコール、reasoning/thinking、usage、終了理由を共通イベントへ正規化する。ハッカソンのデモ経路は Kimi / GLM の Chat Completions を優先し、他2アダプターは共通境界を崩さず並行実装する
-- ドメイン操作は `contracts/openapi.yaml` から生成した Rust クライアント経由で apps/api を叩く (契約ファースト原則は言語非依存に保つ)
+- ドメイン操作は `contracts/openapi.yaml` を正典とする契約ファースト原則(言語非依存)の下で apps/api を叩く。現状 `contracts/openapi.yaml` は `/health` 1本のみのため、当面は `apiclient` モジュールに reqwest の薄い手書きクライアントを置き、ドメイン API が3本を超えて配管コストが無視できなくなった時点で、生成クライアント (progenitor 等) 導入を別 ADR で判断する ([実装計画 §2.1・D8](../agent/implementation-plan.md) 参照)
 
 選定理由:
 

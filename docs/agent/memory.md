@@ -44,6 +44,8 @@ OpenAI Responses の compacted `output[]` window や Anthropic Messages の `com
 
 Compact の完了順は適用順に使わない。各 layer の永続 `next_batch_seq` と一致する `completed` だけを FIFO で適用し、後続が先に完了した場合は棚で待たせる。L0/L1 の membership 更新、要約の昇格、ジョブの `applied` 化、`next_batch_seq` の前進は同じ SQLite transaction で行う。`(kind, batch_seq)` の一意制約と状態の比較更新により、再起動・重複通知・ワーカー二重実行でも同じ結果を二重適用しない。バッチと message の対応は先頭/末尾 ID から推測せず、順序付きの中間表へ全 membership を保存する。
 
+先頭バッチが `failed` のままだと `next_batch_seq` に一致する `completed` が存在せず、以降のバッチが永久に詰まる。これを黙ってスキップせず、次の順で解消する: (a) 自動リトライ(既定2回)を優先し、(b) それでも `failed` なら shelf の「未Compact」マークを手掛かりに手動再処理を促し、(c) 手動再処理も間に合わない場合は溢れ処理側の同期フォールバック(§7.4/§7.6: `failed → running` を CAS で claim し同期的に Compact をやり直す)を安全なフォールバックとして実行し、membership・要約を欠落させずに `completed` へ収束させてから初めて `next_batch_seq` を前進させる(フォールバックと `next_batch_seq` 前進は同一 transaction)。自動リトライの消尽、フォールバックの発動、`next_batch_seq` の前進はいずれも監視通知の対象とする。
+
 ## プロンプトキャッシュとの関係
 
 Kimi/GLM 等の Chat Completions 互換系では**先頭からの連続プレフィックス一致**が重要で、ブロックは照合の粒度にすぎない。Responses / Anthropic Messages でも `sumi_three_layer` mode は「安定した L2/L1 を L0 より前へ置き、通常ターンは末尾追記にする」順序を保つ。`provider_native` mode の cache metadata と compaction block の再送は各 adapter が API 契約どおりに扱う:

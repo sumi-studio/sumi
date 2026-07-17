@@ -416,12 +416,15 @@ opaque reasoning/compaction item は delta ごとに公開イベントへ流さ�
 ```rust
 pub struct ProviderEventStream {
     rx: tokio::sync::mpsc::Receiver<ProviderEvent>,
+    terminal_emitted: bool, // Done/Error を一度でも返したら true
 }
 // 最終結果は Done/Error イベント自体が運ぶ (pi の result() Promise は不要:
 // Rust では for-await ループの終端で最後のイベントから取り出す)
 ```
 
 契約(pi と同一 **[事実]** `pi:ai/src/types.ts:301-313`): **stream 関数は決して panic/Err を返さない**。リクエスト失敗・モデルエラー・実行時失敗はすべてストリーム内の `Error` イベント(stopReason Error/Aborted + error_message 付き AssistantMessage)として届く。この一点が呼び出し側の異常系を劇的に単純化する。
+
+**EOF の終端イベント化**: `next()` は `Done`/`Error` を返すたびに `terminal_emitted` を立てる。`rx.recv()` が `None`(adapter タスクの正常終了・cancel・panic 等で送信側 `Sender` が drop)を返した時点でまだ `terminal_emitted` が立っていなければ、**その1回に限り** `Error(reason=Aborted, error_message="provider stream closed without a terminal event")` を合成して返し、`terminal_emitted` を立てる。既に `Done`/`Error` を返し終えた後の EOF はそのままストリーム終了として扱い、二重に終端イベントを作らない。これにより「stream は必ず正常形の終端イベントで閉じる」契約が adapter の実装ミスに関係なく保たれる。単体テストで (a) 正規の `Done`/`Error` 後に channel が閉じても追加イベントが出ないこと、(b) 終端イベントなしに channel が閉じると合成 `Error` が1件だけ届くこと、の両方を確認する。
 
 ### 3.3 エージェントイベント
 
@@ -794,7 +797,7 @@ pi は JS 単線スレッドで `Agent` のメソッドを直接叩くが、Rust
 - Assistant 中の `UserMessage` → CancellationToken を発火して hard steer
 - Tool 中の `UserMessage` → steering queue へ積む (soft steer)
 - Approval 中の `ApprovalDecision` → 対応する oneshot を解決。`UserMessage` は soft steer
-- Retry (バックオフ待機) 中の `UserMessage` → バックオフ sleep を中断して steering queue へ注入し、即座に次 attempt の API コールへ進む(破棄すべき部分応答が無いため soft 扱い。新しい入力で実質新しいリクエストになるため attempt カウントはリセットする)**[推測、M2 ゲート5 で検証]**
+- Retry (バックオフ待機) 中の `UserMessage` → バックオフ sleep を中断して steering queue へ注入し、即座に次 attempt の API コールへ進む(破棄すべき部分応答が無いため soft 扱い)。リセットするのは次 attempt の**バックオフ遅延段階**(2s/4s/8s の表示上の位置)だけであり、§4.4 の Turn 単位の attempt カウント(最大3回)はステアで巻き戻さず消費し続ける。上限に達したら通常のリトライ不可 Error と同じ経路で Turn を閉じる(繰り返しステアで無制限に API コールを継続させない)**[推測、M2 ゲート5 で検証]**
 - 全 phase の `Abort` → CancellationToken を発火し、承認待ち・retry sleep も終了
 
 run 中の会話可変状態は `RunCore` としてワーカー1個だけが所有し、完了時に `RunCompletion` で Session へ返す。Session は run 中に `RunCore` を直接触らず、制御メッセージだけを送るため、Rust の可変借用を跨いだ共有も mutex の await 保持も発生しない。**この二重 select が hard steer / abort / 承認応答を成立させる必須条件**であり、単に `agent_loop(...).await` してから command loop へ戻る実装は禁止する。**[推測→設計契約として確定]**
@@ -1019,7 +1022,7 @@ transform は**送信用のビューを作る純関数**であり、L0 の保存
 
 40k/80k は層の**総量**の制御であり、厳密な不変条件ではない。ただし1メッセージはバッチ分割できない最小単位のため、単一の巨大メッセージには別のガードが要る(無制限だと L0 のバッチ・溢れ設計自体が壊れる):
 
-- **ユーザー入力(二段構え)**: (a) **wire 上限 1MB**: Gateway が超過 `user_message` を受理時に拒否し、`Error` イベントで理由を返す(stdio/WS フレーム保護)。(b) **L0 投入上限 50KB**(ツール結果と同じ値): 超過入力は `messages.raw_ciphertext` に**原文全文**を保存した上で、全文を runtime-owned な `/workspace/.attachments/<conversation_id>/` へ退避し、L0 へは先頭 50KB+「[全文 xxxKB: /workspace/.attachments/<conversation_id>/user-yyy.txt]」の注記付き切詰めビューとして投入する。エージェントは必要なら read_file/grep で続きを読める(戦略的忘却と同じ思想)。このディレクトリはユーザー作成ファイルと区別する conversation-owned artifact で、reset 時に旧 conversation ID のディレクトリを冪等削除する。切詰めは投入時の純関数とし、再起動時の raw transcript→L0 復元でも同じ関数を通す(保存形は常に原文 — §7.7 の「ログと記憶の分離」と同型)**[推測、上限値は実測調整]**
+- **ユーザー入力(二段構え)**: (a) **wire 上限 1MB**: Gateway が超過 `user_message` を受理時に拒否し、`Error` イベントで理由を返す(stdio/WS フレーム保護)。(b) **L0 投入上限 50KB**(ツール結果と同じ値): 超過入力は `messages.raw_ciphertext` に**原文全文**を保存した上で、全文を runtime-owned な `/workspace/.attachments/<conversation_id>/` へ退避し、L0 へは先頭 50KB+「[全文 xxxKB: /workspace/.attachments/<conversation_id>/user-yyy.txt]」の注記付き切詰めビューとして投入する。エージェントは必要なら read_file/grep で続きを読める(戦略的忘却と同じ思想)。このディレクトリはユーザー作成ファイルと区別する conversation-owned artifact で、reset 時に旧 conversation ID のディレクトリを冪等削除する。切詰めは投入時の純関数とし、再起動時の raw transcript→L0 復元でも同じ関数を通す(保存形は常に原文 — §7.7 の「ログと記憶の分離」と同型)。この切詰めビューは `messages.raw_ciphertext`(全文正本。復旧・export・redaction 前の唯一の原文)にも `messages.payload`(同じ `PublicMessage` の redacted projection。secret 置換のみで切詰めはしない、§10.1)にも対応する列を持たない**別モデル**であり、ContextAssembler(§7.7)が `raw_ciphertext` を復号するたびに算出する runtime-only の値として扱う。DB に切詰め済みテキストを永続化しない**[推測、上限値は実測調整]**
 - **assistant 出力**: リクエストの max_tokens に**モデル上限ではなく既定 16k トークン**(設定可)を指定する。`ModelSpec.max_tokens`(128k 等)は物理上限であり通常リクエストには使わない。超過は StopReason::Length として顕在化し、既存の経路で処理される(ツールコールは一括失敗 #19、テキストは打ち切りのまま保持)
 - **ツール結果**: 既存の 2000行/50KB 切詰め+全文退避(§8.2)と grep 行長 500 字(§8.1)がこのガードを兼ねており、単一ツール結果が L0 に 50KB を超えて入る経路はない。追加の仕組みは不要
 - 50KB は日本語で ~10k トークン強に相当し得るため、L0 投入時の実サイズは est(§7.5)で計上し、溢れ処理が通常どおり吸収する
@@ -1627,7 +1630,7 @@ pub trait Gateway: Send {
 API は command を永続化して `seq` と `command_id` を確定してから送信し、`Received` ACK まで同じ envelope を再送する。agent は次の順序で処理する:
 
 1. `seq` に欠番があれば後続を適用せず接続を閉じ、`last_received_command_seq` を含む hello で再接続する。API はその次の seq から再送する
-2. EventWriter の内部投影(`event=None + CommandReceived`)で command payload を conversation 鍵配下のデータ鍵により暗号化し、`inbound_commands` へ ciphertext/key_ref/keyed HMAC と `status=received, run_phase=received` を INSERTする。commitした後だけ `Received` ACK を返す。`command_id` または `seq` が既存なら HMAC と、必要時に復号したcanonical payloadの一致を検証し、同じACKを返して再適用しない。不一致はプロトコル違反として接続を閉じる。平文payloadをSQLite/tracingへ出さない
+2. EventWriter の内部投影(`event=None + CommandReceived`)で command payload を conversation 鍵配下のデータ鍵により暗号化し、`inbound_commands` へ ciphertext/key_ref/keyed HMAC と `status=received, run_phase=received` を INSERTする。commitした後だけ `Received` ACK を返す。`command_id` が既存なら、まず受信 envelope の `seq` が保存済みの canonical `seq` と一致するかを検証する。一致しなければ(HMAC が一致していても)受理せず、プロトコル違反として接続を閉じるか、受信 seq を無視して保存済み `seq` の ACK を返す。`seq` も一致する場合だけ HMAC と、必要時に復号したcanonical payloadの一致を検証し、同じACKを返して再適用しない。いずれの不一致もプロトコル違反として接続を閉じる。再送処理は受信 seq を ACK・再適用のいずれにも使わず、常に保存済み canonical `seq` だけを使う。平文payloadをSQLite/tracingへ出さない
 3. received command を seq 順に Session へ渡す。`UserMessage` は最初の副作用より前に application kind と run/turn binding を `classified` として保存し、§10.2 の durable phase を進め、`finished` の transaction でだけ `status=applied` にする。`ApprovalDecision` は `ApprovalResolved` と同じ transaction で applied とする。`Abort` は `CommandApplied` と対象 UserMessage の `RunPhase(expected=current, next=cancel_requested)` を同じ EventWriter transaction で commit してから cancel を発火する。commit後・cancel前に crash しても復旧は `cancel_requested` を見て run を閉じ、provider retryやtool再実行へ戻さない
 4. commit 後に `Applied` ACK を返す。crash 後は `received/applying` を durable phase から再開し、`applied` はACKだけ再送する
 
@@ -1796,7 +1799,7 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
   2. **ステア実証**(デモの核): `bash sleep 30` 実行中に user_message → ソフトステア(ツール完走後に注入)。テキスト生成中に user_message → ハードステア(部分応答が interrupted で確定し、続く応答が割込み内容を踏まえる)。両方をスクリプト化した E2E テストで自動判定
   3. 中断→再開後の Kimi 再送で reasoning のみ部分応答が受理されるか確認(6.3節の未検証点)。駄目なら回避策を実装しコメントに記録
   4. Length 停止のツール一括失敗をフィクスチャで再現
-  5. **制御プレーン生存性**: provider stream / bash / retry sleep の各 phase で別コマンドを送り、hard/soft steer と abort がタイムアウトせず処理される。retry sleep 中の steer ではバックオフが中断され attempt カウントがリセットされる(§5.2)
+  5. **制御プレーン生存性**: provider stream / bash / retry sleep の各 phase で別コマンドを送り、hard/soft steer と abort がタイムアウトせず処理される。retry sleep 中の steer ではバックオフだけ中断され、Turn の attempt カウントは維持されたまま次 attempt へ進むことを確認する(§5.2)
 
 ### M3: 永続化(2日、〜7/26)
 
