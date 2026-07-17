@@ -5,6 +5,8 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 const MAX_ERROR_BODY_CHARS: usize = 4_000;
+const MAX_ERROR_BODY_READ_BYTES: usize = MAX_ERROR_BODY_CHARS * 4 + 4;
+const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 type ByteStream = Pin<Box<dyn Stream<Item = Result<Vec<u8>, String>> + Send>>;
@@ -23,6 +25,8 @@ pub enum SseError {
     UnexpectedEof,
     #[error("SSE data was not valid UTF-8")]
     InvalidUtf8,
+    #[error("SSE line exceeded {limit} bytes")]
+    LineTooLong { limit: usize },
 }
 
 pub struct SseStream {
@@ -37,25 +41,23 @@ impl SseStream {
         response: reqwest::Response,
         cancel: CancellationToken,
     ) -> Result<Self, SseError> {
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response
-                .text()
-                .await
-                .map_err(|error| SseError::Transport(error.to_string()))?;
-            return Err(SseError::Http {
-                status,
-                body: truncate_error_body(body.trim()),
-            });
-        }
-
+        let status = response.status();
         let bytes = response.bytes_stream().map(|chunk| {
             chunk
                 .map(|bytes| bytes.to_vec())
                 .map_err(|error| error.to_string())
         });
+        let bytes: ByteStream = Box::pin(bytes);
 
-        Ok(Self::new(Box::pin(bytes), cancel, IDLE_TIMEOUT))
+        if !status.is_success() {
+            let body = read_error_body(bytes, &cancel, IDLE_TIMEOUT).await?;
+            return Err(SseError::Http {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        Ok(Self::new(bytes, cancel, IDLE_TIMEOUT))
     }
 
     pub async fn next_payload(&mut self) -> Result<Option<String>, SseError> {
@@ -67,22 +69,8 @@ impl SseStream {
                 return Ok(None);
             }
 
-            let next_chunk = tokio::time::timeout(self.idle_timeout, self.bytes.next());
-            let chunk = tokio::select! {
-                _ = self.cancel.cancelled() => return Err(SseError::Cancelled),
-                result = next_chunk => match result {
-                    Ok(chunk) => chunk,
-                    Err(_) => {
-                        return Err(SseError::IdleTimeout {
-                            seconds: self.idle_timeout.as_secs(),
-                        });
-                    }
-                },
-            };
-
-            match chunk {
-                Some(Ok(bytes)) => self.parser.push_chunk(&bytes)?,
-                Some(Err(error)) => return Err(SseError::Transport(error)),
+            match receive_chunk(&mut self.bytes, &self.cancel, self.idle_timeout).await? {
+                Some(bytes) => self.parser.push_chunk(&bytes)?,
                 None => {
                     self.parser.finish()?;
                     return Ok(self.parser.next_payload());
@@ -114,14 +102,27 @@ impl SseLineParser {
             return Ok(());
         }
 
-        self.buffer.extend_from_slice(chunk);
-        while let Some(newline) = self.buffer.iter().position(|byte| *byte == b'\n') {
-            let mut line: Vec<u8> = self.buffer.drain(..=newline).collect();
-            line.pop();
-            if line.last() == Some(&b'\r') {
-                line.pop();
+        for segment in chunk.split_inclusive(|byte| *byte == b'\n') {
+            let has_newline = segment.last() == Some(&b'\n');
+            let content = if has_newline {
+                &segment[..segment.len() - 1]
+            } else {
+                segment
+            };
+            if self.buffer.len().saturating_add(content.len()) > MAX_SSE_LINE_BYTES {
+                return Err(SseError::LineTooLong {
+                    limit: MAX_SSE_LINE_BYTES,
+                });
             }
-            self.process_line(&line)?;
+            self.buffer.extend_from_slice(content);
+
+            if has_newline {
+                if self.buffer.last() == Some(&b'\r') {
+                    self.buffer.pop();
+                }
+                let line = std::mem::take(&mut self.buffer);
+                self.process_line(&line)?;
+            }
             if self.done {
                 self.buffer.clear();
                 break;
@@ -164,17 +165,62 @@ impl SseLineParser {
     }
 }
 
-fn truncate_error_body(body: &str) -> String {
+async fn receive_chunk(
+    bytes: &mut ByteStream,
+    cancel: &CancellationToken,
+    idle_timeout: Duration,
+) -> Result<Option<Vec<u8>>, SseError> {
+    let next_chunk = tokio::time::timeout(idle_timeout, bytes.next());
+    tokio::select! {
+        _ = cancel.cancelled() => Err(SseError::Cancelled),
+        result = next_chunk => match result {
+            Ok(Some(Ok(chunk))) => Ok(Some(chunk)),
+            Ok(Some(Err(error))) => Err(SseError::Transport(error)),
+            Ok(None) => Ok(None),
+            Err(_) => Err(SseError::IdleTimeout {
+                seconds: idle_timeout.as_secs(),
+            }),
+        },
+    }
+}
+
+async fn read_error_body(
+    mut bytes: ByteStream,
+    cancel: &CancellationToken,
+    idle_timeout: Duration,
+) -> Result<String, SseError> {
+    let mut body = Vec::with_capacity(MAX_ERROR_BODY_READ_BYTES);
+    let mut source_truncated = false;
+
+    while let Some(chunk) = receive_chunk(&mut bytes, cancel, idle_timeout).await? {
+        let remaining = MAX_ERROR_BODY_READ_BYTES.saturating_sub(body.len());
+        if chunk.len() >= remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            source_truncated = true;
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    let body = String::from_utf8_lossy(&body);
+    Ok(truncate_error_body(body.trim(), source_truncated))
+}
+
+fn truncate_error_body(body: &str, source_truncated: bool) -> String {
     let count = body.chars().count();
-    if count <= MAX_ERROR_BODY_CHARS {
+    if count <= MAX_ERROR_BODY_CHARS && !source_truncated {
         return body.to_owned();
     }
 
     let kept: String = body.chars().take(MAX_ERROR_BODY_CHARS).collect();
-    format!(
-        "{kept}... [truncated {} chars]",
-        count - MAX_ERROR_BODY_CHARS
-    )
+    if source_truncated {
+        format!("{kept}... [truncated]")
+    } else {
+        format!(
+            "{kept}... [truncated {} chars]",
+            count - MAX_ERROR_BODY_CHARS
+        )
+    }
 }
 
 #[cfg(test)]
@@ -264,6 +310,24 @@ mod tests {
         assert_eq!(error, SseError::InvalidUtf8);
     }
 
+    #[test]
+    fn enforces_sse_line_limit_across_chunks() {
+        let mut exact = b"data: ".to_vec();
+        exact.resize(MAX_SSE_LINE_BYTES, b'a');
+        exact.push(b'\n');
+        let (payloads, _) = parser_payloads([exact]).expect("line at limit is valid");
+        assert_eq!(payloads[0].len(), MAX_SSE_LINE_BYTES - b"data: ".len());
+
+        let first = vec![b'a'; MAX_SSE_LINE_BYTES];
+        let error = parser_payloads([first, vec![b'b']]).expect_err("line over limit must fail");
+        assert_eq!(
+            error,
+            SseError::LineTooLong {
+                limit: MAX_SSE_LINE_BYTES
+            }
+        );
+    }
+
     #[tokio::test]
     async fn stream_reports_transport_errors_and_cancellation() {
         let transport = stream::iter([Err("connection reset".to_owned())]);
@@ -300,11 +364,30 @@ mod tests {
 
     #[test]
     fn http_error_body_is_truncated_and_formatted() {
-        let body = truncate_error_body(&"あ".repeat(MAX_ERROR_BODY_CHARS + 7));
+        let body = truncate_error_body(&"あ".repeat(MAX_ERROR_BODY_CHARS + 7), false);
         assert!(body.starts_with(&"あ".repeat(MAX_ERROR_BODY_CHARS)));
         assert!(body.ends_with("... [truncated 7 chars]"));
 
         let error = SseError::Http { status: 429, body };
         assert!(error.to_string().starts_with("429: "));
+    }
+
+    #[tokio::test]
+    async fn error_body_reader_stops_at_byte_limit() {
+        let chunks = stream::iter([Ok(vec![b'a'; MAX_ERROR_BODY_READ_BYTES + 100])]);
+        let body = read_error_body(
+            Box::pin(chunks),
+            &CancellationToken::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("bounded error body");
+
+        assert_eq!(
+            body.strip_suffix("... [truncated]")
+                .expect("truncation marker")
+                .len(),
+            MAX_ERROR_BODY_CHARS
+        );
     }
 }

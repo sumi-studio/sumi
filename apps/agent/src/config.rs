@@ -18,7 +18,7 @@ pub struct Config {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ModelConfig {
     pub preset: Option<String>,
     pub id: Option<String>,
@@ -190,5 +190,18 @@ id = "file-model"
         assert_eq!(config.workspace, PathBuf::from("/env-workspace"));
         assert_eq!(config.database_path, PathBuf::from("/env.db"));
         assert_eq!(config.model.id.as_deref(), Some("env-model"));
+    }
+
+    #[test]
+    fn rejects_unknown_model_keys() {
+        let error = toml::from_str::<FileConfig>(
+            r#"
+[model]
+modle = "typo"
+"#,
+        )
+        .expect_err("unknown model key must fail");
+
+        assert!(error.to_string().contains("unknown field `modle`"));
     }
 }

@@ -123,7 +123,10 @@ impl Usage {
             cache_read,
             cache_write,
             reasoning,
-            total_tokens: input + output + cache_read + cache_write,
+            total_tokens: input
+                .saturating_add(output)
+                .saturating_add(cache_read)
+                .saturating_add(cache_write),
         }
     }
 }
@@ -493,5 +496,17 @@ mod tests {
 
         assert_eq!(usage.input, 0);
         assert_eq!(usage.total_tokens, 10);
+    }
+
+    #[test]
+    fn usage_from_raw_saturates_total_at_u64_max() {
+        let usage = Usage::from_raw(&RawUsage {
+            prompt_tokens: Some(u64::MAX),
+            completion_tokens: Some(1),
+            ..RawUsage::default()
+        });
+
+        assert_eq!(usage.input, u64::MAX);
+        assert_eq!(usage.total_tokens, u64::MAX);
     }
 }
