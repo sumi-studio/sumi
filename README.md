@@ -98,5 +98,5 @@ GitHub Actions (`.github/workflows/`) でパスフィルタを使い、変更の
 
 - `apps/web/**`, `packages/**` の変更 → フロントエンドの Lint / テスト / ビルド
 - `apps/api/**`, `contracts/**` の変更 → API の Lint / テスト / ビルド
-- `apps/agent/**`, `packages/**` の変更 → エージェント基盤の Lint / テスト / ビルド (`apps/agent` 導入後)
+- `apps/agent/**`, `contracts/**` の変更 → エージェント基盤の Lint / テスト / ビルド (`apps/agent` 導入後。`contracts/agent-events.yaml` からの wire 型生成と fixture round-trip 検証を含むため)
 - `infra/**` の変更 → `terraform plan` (apply は手動承認後)
