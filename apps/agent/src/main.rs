@@ -4,7 +4,7 @@ mod approval;
 mod config;
 mod gateway;
 mod memory;
-mod provider;
+pub mod provider;
 mod store;
 mod tools;
 
