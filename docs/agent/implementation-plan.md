@@ -1514,7 +1514,7 @@ pub struct ProviderContextMutation {
 
 - **EventWriter (単一の永続化writer)**: 恒久イベント(MessageStart/End、RetryScheduled、ToolExecution 系、Approval 系、Turn/Agent 系、Steered、MemoryMaintenance)へ seq を採番し、原文 Public event/message の暗号化、redacted projection、`agent_events` と `projections` が示す `messages` / `provider_context` / `memory_*` / `tool_executions` / `approval_*` / `inbound_commands` の変更を**同一 SQLite transaction**で commit する。Gateway の成否を待たない
 - **DeliveryPump (GatewayWriter の唯一の所有者)**: EventWriter からの ordered wake-up を受け、commit 済み恒久イベントは `agent_events` を正典として、認可済み接続には `raw_ciphertext` を復号した Public event を送る。復号不可・redaction-only scope では `envelope` projection だけを送る。`send` には bounded timeout を設け、失敗・timeout時は `Offline` へ遷移して接続を破棄する。EventWriter はその間も commit を継続する
-- **揮発イベント**(MessageUpdate の delta 系): EventWriter と同じ入力FIFOで先行する恒久イベントの commit 後に DeliveryPump へ渡す。Online 中だけ送信し、Offline・送信queue満杯・再接続catch-up中は捨てる。これにより `MessageUpdate` が `MessageStart` を追い越さず、ネットワークbackpressureが会話状態の永続化を止めない
+- **揮発イベント**(MessageUpdate の delta 系): EventWriter と同じ入力FIFOで先行する恒久イベントの commit 後に DeliveryPump へ渡す。Online 中だけ送信し、Offline・送信queue満杯・再接続catch-up中は捨てる。これにより `MessageUpdate` が `MessageStart` を追い越さず、ネットワークbackpressureが会話状態の永続化を止めない。**delta は `PublicProjectionBuilder` を通らない原文のため、raw 復号を認可された接続にだけ送る**。復号不可・redaction-only scope へは揮発イベントを一切送らず、redacted な `MessageEnd` だけで更新する(secret が複数 delta に分割されると delta 単位の置換では防げないため、接続単位の stateful streaming redactor を実装するまで抑止が唯一の安全側)
 - **再接続**: API が返す最終受信 event seq の次から `agent_events` を再送し、DB cursor が最新へ追いつくまで新しい delta は捨てる。catch-up完了後にだけ `Online` へ戻る。最後の MessageEnd(全文)で UI は回復する
 - **`messages` への投影は MessageEnd の transactionでのみ行う**(1メッセージ=1 INSERT)。`MessageStart` は `agent_events` に記録するだけで `messages` には何も書かない。通常の user / assistant / toolResult は `append_to_l0=true`、retryable Error assistant はログだけに残すため `append_to_l0=false`。L0 membership は `memory_batch_messages` へ明示 INSERT し、messages の seq 範囲や role から推測しない
 - `provider_context` は transcript の暗号化 raw 正本からも分離し、同じ MessageEnd transaction で暗号化 INSERT する。L0→L1 の `MemoryTransition` は対応 reasoning のデータ鍵/row を削除する。native compaction は coverage を持つ独立 row とし、置換・mode切替・fingerprint不一致・期限切れ sweeper の同じ冪等 delete 経路で消す
@@ -1752,7 +1752,7 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 
 - 現行 `main` に `apps/agent` は無いため、別ブランチの Rust scaffold を先に取り込むか、このマイルストーンで `Cargo.toml` / `package.json` / turbo 接続を作成する。存在しない scaffold を前提に後続タスクへ進まない
 - `config.rs`(設定構造+環境変数のみ。**モデルプリセットの実値は M1 のリクエスト組立と同時に入れる** — M0 では構造体と TOML 読込だけ)、モジュールツリーの空実装、`gateway/stdio.rs`、tracing 初期化(JSON ログ + `SUMI_LOG` フィルタ)
-- **ゲート**: `echo '{"seq":1,"command_id":"018f0000-0000-7000-8000-000000000001","command":{"type":"user_message","text":"hi","attachments":[]}}' | cargo run --manifest-path apps/agent/Cargo.toml` がエコー応答イベントと command ACK を返す。`cargo clippy --manifest-path apps/agent/Cargo.toml -- -D warnings` / `cargo fmt --manifest-path apps/agent/Cargo.toml --check` と `pnpm turbo run lint --filter=agent` が通る
+- **ゲート**: `echo '{"seq":1,"command_id":"018f0000-0000-7000-8000-000000000001","command":{"type":"user_message","text":"hi","attachments":[]}}' | cargo run --manifest-path apps/agent/Cargo.toml` がエコー応答イベントと command ACK を返す。`cargo clippy --manifest-path apps/agent/Cargo.toml -- -D warnings` / `cargo fmt --manifest-path apps/agent/Cargo.toml --check` と `pnpm turbo run lint --filter=@sumi/agent` が通る(package 名は既存の `@sumi/*` 慣例に合わせ、turbo filter と一致させる)
 
 ### M1: 共通 provider core + Chat Completions(3日、〜7/21)
 
@@ -1840,7 +1840,7 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 3. **resource semantics**: disk/inode/PID の拒否、CPU throttle/CPU-time budget、memory max/OOM、wall runtime、command/workspace output の各経路を個別に発火させ、§8.3/ workspace.md の種別どおり `ResourceLimit`、kill/reap、bounded output へ収束する
 4. **generation recovery**: runtime/provider/tool 実行中に runtime を killし、deployment supervisor が旧 executor generation と登録済み execution cgroup/sandbox を回収する。`setsid` で別sessionへ離脱しstdout/stderrを閉じた descendant も abort/wall/CPU/output quota 後に `/workspace` を変更できないことを fault-injection で確認する。`running` execution は `indeterminate` で一度だけ閉じ、自動再実行しない
 5. **WS production**: token無し・期限切れ・別conversation・古いgenerationを拒否し、新generationで旧接続をfenceする。command重複、ACK前後kill、seq欠番、双方向catch-upを fault-injection で確認する
-6. **data lifecycle**: transcript export、conversation reset/agent deletion、provider context crypto-erase、検索監査、backup tombstone 再適用、redaction fixture の integration test と運用 runbookを揃える
+6. **data lifecycle**: transcript export、conversation reset/agent deletion、provider context crypto-erase、検索監査、backup tombstone 再適用、redaction fixture の integration test と運用 runbookを揃える。redaction fixture には **secret を複数 delta に分割した assistant text / tool arguments のストリーム**を含め、redaction-only 接続が delta を一切受信せず redacted `MessageEnd` だけを受けることを確認する
 
 テスト方針の総括: ユニット(純関数: assembler/truncate/partial_json/batch/estimate)+フィクスチャ再生(プロバイダ層)+スクリプト E2E(stdio ゲートウェイにコマンド列を流しイベント列をアサート)+ライブスモーク(env フラグでオプトイン)。**CI(GitHub Actions の agent パス)ではライブ以外を全部回す**。
 
