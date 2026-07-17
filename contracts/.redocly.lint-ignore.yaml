@@ -1,0 +1,13 @@
+# This file instructs Redocly's linter to ignore the rules contained for specific parts of your API.
+# 意図的な設計のため抑止する警告:
+# - /health は認証・パラメータなしのため 4XX 応答が存在しない
+# - /ws は WebSocket ハンドシェイクのため 101 のみで 2XX を返さない
+# - ClientEvent / ServerEvent は WS メッセージの型生成用で、REST パスからは参照されない
+openapi.yaml:
+  operation-4xx-response:
+    - "#/paths/~1health/get/responses"
+  operation-2xx-response:
+    - "#/paths/~1ws/get/responses"
+  no-unused-components:
+    - "#/components/schemas/ClientEvent"
+    - "#/components/schemas/ServerEvent"

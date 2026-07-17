@@ -2,11 +2,55 @@ openapi: 3.1.0
 info:
   title: Sumi API
   version: 0.1.0
+  license:
+    name: Proprietary
+    url: https://github.com/sumi-studio
+  description: |
+    Sumi のサービス API 契約 (契約ファースト)。
+
+    ## スコープ (MVP)
+
+    - チャット (= エージェントとの会話) の CRUD とトーク一覧
+    - メッセージ履歴の取得 (カーソルページネーション)
+    - 既読位置の更新 (トーク一覧の未読ドット用)
+    - ヘルスチェック
+
+    ## メッセージ送信は WebSocket 経由
+
+    TTFT < 500ms 制約のため、メッセージ送信・トークンストリーミングは
+    HTTP ではなく張りっぱなしの WebSocket (`GET /ws`) で行う。
+    REST はコールドスタート時の履歴取得と CRUD のみを担う。
+    WS で流れるイベントのスキーマは `components/schemas` の
+    `ClientEvent` / `ServerEvent` に定義する (OpenAPI は WS の
+    メッセージフォーマットを表現できないため、スキーマのみ同居させる)。
+
+    ## 認証 (AWS Cognito)
+
+    全エンドポイント (ヘルスチェックを除く) は Cognito User Pool が発行した
+    アクセストークン (JWT) を `Authorization: Bearer` で要求する。
+    サーバーは User Pool の JWKS
+    (`https://cognito-idp.{region}.amazonaws.com/{userPoolId}/.well-known/jwks.json`)
+    で署名を検証し、`sub` クレームをユーザー ID として扱う。
+    サインアップ / ログイン / リフレッシュは Cognito (Hosted UI / SDK) が担うため
+    この API には認証エンドポイントを置かない。
+servers:
+  - url: /v1
+security:
+  - cognitoAuth: []
+tags:
+  - name: system
+    description: 死活監視
+  - name: chats
+    description: チャット。1 チャット = 1 エージェントとのシングルスレッド会話
+  - name: messages
+    description: メッセージ履歴
 paths:
   /health:
     get:
       operationId: getHealth
       summary: Health check
+      tags: [system]
+      security: []
       responses:
         "200":
           description: OK
@@ -19,3 +63,583 @@ paths:
                   status:
                     type: string
                     enum: [ok]
+
+  /chats:
+    get:
+      operationId: listChats
+      summary: トーク一覧 (チャット一覧) を取得
+      description: |
+        トーク一覧画面用。各チャットに最終メッセージのプレビューと
+        未読数を含む。最終アクティビティの新しい順で返す。
+      tags: [chats]
+      responses:
+        "200":
+          description: チャット一覧
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Chat"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      operationId: createChat
+      summary: チャットを作成
+      description: トーク一覧の [＋] に対応。新しいエージェントとのチャットを開始する。
+      tags: [chats]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatCreate"
+      responses:
+        "201":
+          description: 作成されたチャット
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Chat"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /chats/{chatId}:
+    parameters:
+      - $ref: "#/components/parameters/ChatId"
+    get:
+      operationId: getChat
+      summary: チャットを取得
+      tags: [chats]
+      responses:
+        "200":
+          description: チャット
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Chat"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      operationId: updateChat
+      summary: チャットを更新
+      tags: [chats]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatUpdate"
+      responses:
+        "200":
+          description: 更新後のチャット
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Chat"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      operationId: deleteChat
+      summary: チャットを削除
+      description: メッセージ履歴も削除される。
+      tags: [chats]
+      responses:
+        "204":
+          description: 削除完了
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /chats/{chatId}/messages:
+    parameters:
+      - $ref: "#/components/parameters/ChatId"
+    get:
+      operationId: listMessages
+      summary: メッセージ履歴を取得
+      description: |
+        会話は単一スレッドで無限に伸びるため、`before` カーソルで
+        古い方向へ遡る。省略時は最新メッセージから返す。
+        ページ内の並びは時系列昇順 (古い → 新しい)。
+        さらに遡るには `nextCursor` を次リクエストの `before` に渡す。
+        リアルタイムの新着は WS (`ServerEvent`) で受け取り、
+        このエンドポイントは初期ロードと遡りにのみ使う。
+      tags: [messages]
+      parameters:
+        - name: before
+          in: query
+          description: このカーソルより古いメッセージを返す (前回レスポンスの `nextCursor`)
+          schema:
+            type: string
+        - name: limit
+          in: query
+          description: 取得件数
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+      responses:
+        "200":
+          description: メッセージのページ
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessagePage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /chats/{chatId}/read:
+    parameters:
+      - $ref: "#/components/parameters/ChatId"
+    put:
+      operationId: markChatRead
+      summary: 既読位置を更新
+      description: トーク一覧の未読ドット・未読数の解消に使う。
+      tags: [chats]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [lastReadMessageId]
+              properties:
+                lastReadMessageId:
+                  type: string
+                  description: ここまで読んだメッセージの ID
+      responses:
+        "204":
+          description: 更新完了
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /ws:
+    get:
+      operationId: connectWebSocket
+      summary: リアルタイム接続 (WebSocket)
+      description: |
+        アプリ起動時に確立し、張りっぱなしにする WebSocket。
+        メッセージ送信・ステア・停止・トークンストリーミング・新着通知は
+        すべてこの接続上を流れる。
+
+        - クライアント → サーバー: `ClientEvent` (JSON テキストフレーム)
+        - サーバー → クライアント: `ServerEvent` (JSON テキストフレーム)
+
+        ブラウザの WebSocket API は Authorization ヘッダーを付与できないため、
+        Cognito アクセストークンは `token` クエリパラメータで渡す。
+        接続時に検証し、無効なら 4401 でクローズする。
+        トークン失効時はサーバーが 4401 でクローズするので再接続する。
+
+        ステアは専用イベントではなく、streaming 中に `message.send` を
+        送ること自体がステアになる (現在の生成を中断して新入力を注入)。
+      tags: [system]
+      security: []
+      parameters:
+        - name: token
+          in: query
+          required: true
+          description: Cognito アクセストークン (JWT)
+          schema:
+            type: string
+      responses:
+        "101":
+          description: Switching Protocols — WebSocket 接続確立
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+components:
+  securitySchemes:
+    cognitoAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        AWS Cognito User Pool のアクセストークン。
+        JWKS で署名・発行者 (iss)・利用者 (client_id) を検証する。
+
+  parameters:
+    ChatId:
+      name: chatId
+      in: path
+      required: true
+      schema:
+        type: string
+
+  responses:
+    BadRequest:
+      description: リクエストが不正
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: 認証エラー (トークン欠落・無効・失効)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: リソースが存在しない
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: 機械可読なエラーコード (例 `invalid_request`, `not_found`)
+        message:
+          type: string
+          description: 人間可読な説明
+
+    # ---- チャット ----
+
+    Chat:
+      type: object
+      required: [id, name, createdAt]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+          description: 表示名 (例 "Sumi")
+        role:
+          type: string
+          description: 役割の短い表示 (例 "秘書")。トーク一覧で名前の横に出す
+        lastMessage:
+          $ref: "#/components/schemas/MessagePreview"
+          description: トーク一覧のプレビュー用。会話が空なら省略
+        unreadCount:
+          type: integer
+          minimum: 0
+          description: 未読メッセージ数。未読ドットの表示判定に使う
+        createdAt:
+          type: string
+          format: date-time
+
+    ChatCreate:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 64
+        role:
+          type: string
+          maxLength: 64
+
+    ChatUpdate:
+      type: object
+      description: 部分更新。指定したフィールドのみ変更する
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 64
+        role:
+          type: string
+          maxLength: 64
+
+    MessagePreview:
+      type: object
+      required: [text, createdAt]
+      properties:
+        text:
+          type: string
+          description: 最終メッセージのプレーンテキスト要約 (markdown・カードは平文化済み)
+        createdAt:
+          type: string
+          format: date-time
+
+    # ---- メッセージ ----
+    #
+    # メッセージ種別は最初から 3 種:
+    #   テキスト / SDUI カード / システム (権限リクエスト等)。
+    # アシスタントの発話はテキストと SDUI カードがインラインに混在するため、
+    # メッセージ本体は blocks (コンテンツブロックの配列) で表現する。
+
+    Message:
+      type: object
+      required: [id, chatId, role, blocks, createdAt]
+      properties:
+        id:
+          type: string
+          description: 時系列ソート可能な ID (ULID)。履歴カーソルにも使う
+        chatId:
+          type: string
+        role:
+          type: string
+          enum: [user, assistant, system]
+          description: |
+            user = 右寄せ吹き出し / assistant = 全幅の地の文 /
+            system = 権限リクエスト等のシステムカード
+        blocks:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/MessageBlock"
+        createdAt:
+          type: string
+          format: date-time
+
+    MessageBlock:
+      oneOf:
+        - $ref: "#/components/schemas/TextBlock"
+        - $ref: "#/components/schemas/SduiBlock"
+      discriminator:
+        propertyName: type
+        mapping:
+          text: "#/components/schemas/TextBlock"
+          sdui: "#/components/schemas/SduiBlock"
+
+    TextBlock:
+      type: object
+      required: [type, text]
+      properties:
+        type:
+          type: string
+          enum: [text]
+        text:
+          type: string
+          description: user は生テキスト、assistant は markdown ソース (コピー時もこれを使う)
+
+    SduiBlock:
+      type: object
+      required: [type, card]
+      properties:
+        type:
+          type: string
+          enum: [sdui]
+        card:
+          $ref: "#/components/schemas/SduiCard"
+
+    SduiCard:
+      type: object
+      description: |
+        SDUI の宣言データ。`component` で `packages/sdui` の
+        コンポーネントカタログを参照し、`props` をカタログ側の
+        zod スキーマで検証してレンダーする。カタログの中身は
+        この契約では固定しない (実行コードではなくデータのみを運ぶ)。
+      required: [component, props]
+      properties:
+        component:
+          type: string
+          description: カタログ上のコンポーネント名 (例 `reminder`, `confirm`, `permission_request`)
+        props:
+          type: object
+          additionalProperties: true
+
+    MessagePage:
+      type: object
+      required: [items, hasMore]
+      properties:
+        items:
+          type: array
+          description: 時系列昇順 (古い → 新しい)
+          items:
+            $ref: "#/components/schemas/Message"
+        nextCursor:
+          type: string
+          description: さらに古い方向へ遡るためのカーソル。`hasMore` が false なら省略
+        hasMore:
+          type: boolean
+
+    # ---- WebSocket イベント (REST からは参照されない。型生成用) ----
+    #
+    # クライアント → サーバー: ClientEvent
+    # サーバー → クライアント: ServerEvent
+    # いずれも JSON テキストフレーム 1 枚 = イベント 1 個。
+
+    ClientEvent:
+      oneOf:
+        - $ref: "#/components/schemas/MessageSendEvent"
+        - $ref: "#/components/schemas/StreamStopEvent"
+      discriminator:
+        propertyName: type
+        mapping:
+          message.send: "#/components/schemas/MessageSendEvent"
+          stream.stop: "#/components/schemas/StreamStopEvent"
+
+    MessageSendEvent:
+      type: object
+      description: |
+        ユーザーメッセージの送信。対象チャットが streaming 中に送ると
+        ステアになる: サーバーは現在の生成を中断 (`stream.end` /
+        stopReason=steered) し、このメッセージを注入して生成を継続する。
+        クライアントは ack を待たず楽観的に即時描画し、`clientMessageId` で
+        `message.ack` / `error` と突き合わせる (失敗時は再送マークを表示)。
+      required: [type, clientMessageId, chatId, blocks]
+      properties:
+        type:
+          type: string
+          enum: [message.send]
+        clientMessageId:
+          type: string
+          description: クライアント生成の一意 ID。ack との突き合わせと再送時の重複排除に使う
+        chatId:
+          type: string
+        blocks:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/MessageBlock"
+
+    StreamStopEvent:
+      type: object
+      description: 停止ボタン [■]。対象チャットの生成を中断する
+      required: [type, chatId]
+      properties:
+        type:
+          type: string
+          enum: [stream.stop]
+        chatId:
+          type: string
+
+    ServerEvent:
+      oneOf:
+        - $ref: "#/components/schemas/MessageAckEvent"
+        - $ref: "#/components/schemas/MessageCreatedEvent"
+        - $ref: "#/components/schemas/StreamStartEvent"
+        - $ref: "#/components/schemas/StreamDeltaEvent"
+        - $ref: "#/components/schemas/StreamBlockEvent"
+        - $ref: "#/components/schemas/StreamEndEvent"
+        - $ref: "#/components/schemas/ErrorEvent"
+      discriminator:
+        propertyName: type
+        mapping:
+          message.ack: "#/components/schemas/MessageAckEvent"
+          message.created: "#/components/schemas/MessageCreatedEvent"
+          stream.start: "#/components/schemas/StreamStartEvent"
+          stream.delta: "#/components/schemas/StreamDeltaEvent"
+          stream.block: "#/components/schemas/StreamBlockEvent"
+          stream.end: "#/components/schemas/StreamEndEvent"
+          error: "#/components/schemas/ErrorEvent"
+
+    MessageAckEvent:
+      type: object
+      description: message.send の永続化完了。楽観的描画をサーバー確定版に差し替える
+      required: [type, clientMessageId, message]
+      properties:
+        type:
+          type: string
+          enum: [message.ack]
+        clientMessageId:
+          type: string
+        message:
+          $ref: "#/components/schemas/Message"
+
+    MessageCreatedEvent:
+      type: object
+      description: |
+        自分の送信以外で生まれたメッセージの新着通知
+        (エージェント起点の発話、システムメッセージ、他デバイスからの送信)。
+        トーク一覧のプレビュー・未読数の更新にも使う
+      required: [type, message]
+      properties:
+        type:
+          type: string
+          enum: [message.created]
+        message:
+          $ref: "#/components/schemas/Message"
+
+    StreamStartEvent:
+      type: object
+      description: アシスタント応答の生成開始。以降の delta/block はこの messageId 宛て
+      required: [type, chatId, messageId]
+      properties:
+        type:
+          type: string
+          enum: [stream.start]
+        chatId:
+          type: string
+        messageId:
+          type: string
+
+    StreamDeltaEvent:
+      type: object
+      description: |
+        トークンストリーミング。`blockIndex` のテキストブロックに `delta` を
+        追記する。UI は最初の delta から地の文を描画する (スピナーは作らない)
+      required: [type, messageId, blockIndex, delta]
+      properties:
+        type:
+          type: string
+          enum: [stream.delta]
+        messageId:
+          type: string
+        blockIndex:
+          type: integer
+          minimum: 0
+        delta:
+          type: string
+
+    StreamBlockEvent:
+      type: object
+      description: SDUI カード等、完成形で挿入されるブロック。`blockIndex` の位置に置く
+      required: [type, messageId, blockIndex, block]
+      properties:
+        type:
+          type: string
+          enum: [stream.block]
+        messageId:
+          type: string
+        blockIndex:
+          type: integer
+          minimum: 0
+        block:
+          $ref: "#/components/schemas/MessageBlock"
+
+    StreamEndEvent:
+      type: object
+      description: 生成終了。steered の場合は同じ会話で続けて新しい stream.start が来る
+      required: [type, messageId, stopReason]
+      properties:
+        type:
+          type: string
+          enum: [stream.end]
+        messageId:
+          type: string
+        stopReason:
+          type: string
+          enum: [completed, stopped, steered, error]
+
+    ErrorEvent:
+      type: object
+      description: イベント処理の失敗。`clientMessageId` があれば該当送信の失敗 (再送マーク表示)
+      required: [type, code, message]
+      properties:
+        type:
+          type: string
+          enum: [error]
+        code:
+          type: string
+        message:
+          type: string
+        clientMessageId:
+          type: string
