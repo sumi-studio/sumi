@@ -69,7 +69,7 @@ sumi-studio/
 └── README.md
 ```
 
-`apps/agent` の Rust スキャフォールドは現行 `main` にはまだ存在しない。導入後は `Cargo.toml` と turbo 接続用 `package.json` を持ち、agent loop・3層メモリ・ツール実行を配置する。設計と導入手順は [ADR 0002](docs/adr/0002-agent-stack.md) と [エージェント実装計画](docs/agent/implementation-plan.md) を参照。
+`apps/agent` の Rust スキャフォールド(`Cargo.toml` と turbo 接続用 `package.json`)は関連 PR で導入し、agent loop・3層メモリ・ツール実行を配置する。設計と導入手順は [ADR 0002](docs/adr/0002-agent-stack.md) と [エージェント実装計画](docs/agent/implementation-plan.md) を参照。
 
 ### アーキテクチャ上の原則
 

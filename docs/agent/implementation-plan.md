@@ -423,7 +423,8 @@ pub struct ProviderEventStream {
 
 ```rust
 // agent/events.rs
-#[derive(Clone, Debug, Serialize)]
+// Deserialize は agent_events の replay / 再起動復旧 (§10.2) に必須
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
     AgentStart,
@@ -454,7 +455,7 @@ pub enum AgentEvent {
     Error { message: String },
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PublicStreamEvent {
     TextStart { content_index: usize },
@@ -639,7 +640,7 @@ Chat Completions JSON への変換は、**[事実]** 以下すべて `pi:ai/src/
 
 1. **system prompt**: `{"role":"system","content":...}` を先頭にする。L2/L1 は続く user 相当の memory message にし、system/developer role へ昇格させない(第7章)
 2. **assistant content は常にプレーン文字列で送る**(content-block 配列にしない)。配列で送ると一部モデルが構造を鸚鵡返しする事故がある(:987-994 コメント)
-3. **thinking の再送**: 同一モデルなら `signature_field` が示すフィールド(`reasoning_content` 等)へ全ターン分を書き戻す。**Kimi は過去全ターンの reasoning 保持が必須仕様**(調査レポート)。クロスモデル切替時は thinking をプレーンテキストに落とすか捨てる(`pi:ai/src/api/transform-messages.ts:609-626` の分岐を移植)
+3. **thinking の再送**: 同一モデルなら `signature_field` が示すフィールド(`reasoning_content` 等)へ全ターン分を書き戻す。**Kimi は過去全ターンの reasoning 保持が必須仕様**(調査レポート)。クロスモデル切替時は thinking をプレーンテキストに落とすか捨てる(`pi:ai/src/api/transform-messages.ts` のクロスモデル降格分岐を移植。同ファイルへの行番号参照は §12 冒頭の警告どおり誤りが確認されているため、挙動記述で特定する)
 4. **`requires_reasoning_content_on_assistant`**: 再送する assistant メッセージに reasoning_content が無ければ `""` を補う(:1038-1044)
 5. **tool_calls**: `{id, type:"function", function:{name, arguments: JSON文字列}}`。引数は必ず `serde_json::to_string` で直列化
 6. **tool ロール**: `{"role":"tool","content":text,"tool_call_id":...}`。テキストが空で画像のみなら `"(see attached image)"`、両方空なら `"(no tool output)"` のプレースホルダ(:1073-1075)
@@ -785,6 +786,7 @@ pi は JS 単線スレッドで `Agent` のメソッドを直接叩くが、Rust
 - Assistant 中の `UserMessage` → CancellationToken を発火して hard steer
 - Tool 中の `UserMessage` → steering queue へ積む (soft steer)
 - Approval 中の `ApprovalDecision` → 対応する oneshot を解決。`UserMessage` は soft steer
+- Retry (バックオフ待機) 中の `UserMessage` → バックオフ sleep を中断して steering queue へ注入し、即座に次 attempt の API コールへ進む(破棄すべき部分応答が無いため soft 扱い。新しい入力で実質新しいリクエストになるため attempt カウントはリセットする)**[推測、M2 ゲート5 で検証]**
 - 全 phase の `Abort` → CancellationToken を発火し、承認待ち・retry sleep も終了
 
 run 中の会話可変状態は `RunCore` としてワーカー1個だけが所有し、完了時に `RunCompletion` で Session へ返す。Session は run 中に `RunCore` を直接触らず、制御メッセージだけを送るため、Rust の可変借用を跨いだ共有も mutex の await 保持も発生しない。**この二重 select が hard steer / abort / 承認応答を成立させる必須条件**であり、単に `agent_loop(...).await` してから command loop へ戻る実装は禁止する。**[推測→設計契約として確定]**
@@ -823,6 +825,7 @@ pi の `steer()` は**キュー投入のみ**で、注入は「現在のツー�
 | Idle | 通常の prompt | — |
 | Streaming(assistant 生成中) | **ハードステア**: cancel 発火 → 部分応答を確定 → 注入 → ループ再開 | hard |
 | Streaming(ツール実行中) | **ソフトステア**: キュー投入(pi 方式)。実行中ツールは完走させ、次の API コール前に注入 | soft |
+| Streaming(リトライ待機中) | バックオフを中断して注入し、即座に次 attempt へ(§5.2 の Retry 規則) | soft |
 
 ツール実行中もハードにする(ツールを殺す)選択肢は、bash 実行の途中殺しが副作用を持つため既定にしない。**[要決定→第14章]** UI から「停止ボタン([■])」は別コマンド `abort` で、こちらはツールも殺す(CancellationToken 一斉発火)。
 
@@ -856,7 +859,8 @@ pi の `steer()` は**キュー投入のみ**で、注入は「現在のツー�
 |---|---|---|---|
 | 正常完了 | `Done` | `MessageEnd` → (ツール系) → `TurnEnd` | ツール/steering に従い継続 |
 | ハードステア | `Error(Aborted)` を消費 | `MessageEnd`(interrupted=true、§6.3 規則で確定) → `TurnEnd` → `Steered` → `TurnStart` → `MessageStart/End`(user、注入したステアメッセージ) → 次の assistant ストリーム | **同一 run を継続(`AgentEnd` なし)** |
-| abort(停止ボタン) | `Error(Aborted)` を消費 | `MessageEnd`(interrupted=true) → `TurnEnd` → `AgentEnd` | 終了(Idle へ) |
+| abort(停止ボタン、assistant 生成中) | `Error(Aborted)` を消費 | `MessageEnd`(interrupted=true) → `TurnEnd` → `AgentEnd` | 終了(Idle へ) |
+| abort(ツール実行中・承認待ち) | —(assistant ストリーム外) | 実行中ツールへ cancel 伝播(§8.3 の停止仕様)→ 残ツールへ "Operation aborted" のエラー結果を合成(`ToolExecutionEnd` → `MessageStart/End`(toolResult))→ 承認 Pending は Cancelled で block(§9.2)→ `TurnEnd` → `AgentEnd` | 終了(Idle へ) |
 | リトライ可能エラー | `Error(Error)` | `MessageEnd`(error) → `RetryScheduled` → backoff → `MessageStart`(次attempt) | **同一 Turn を継続**。error message はログのみで L0 へ入れない |
 | リトライ不可エラー | `Error(Error)` | `MessageEnd`(error) → `TurnEnd` → `AgentEnd` | 終了 |
 
@@ -1093,7 +1097,8 @@ Pending:
   - 受理: ApproveOnce → 今回だけ実行
           ApproveAlways(rule候補) → ルール安全性を再検証 → 保存+実行
           Deny → block
-  - abort/ハードステア: Pending を Cancelled にし block
+  - abort: Pending を Cancelled にし block (ハードステアは assistant 生成中にしか発生せず承認待ちと重ならない。
+    承認待ち中の user メッセージはソフトステアとしてキューされる — 9.8節)
   - タイムアウト: なし (無限待ち)。ただし待機中も steering は受理される [要決定→14章]
 block 時: pi と同じくエラーツール結果を合成 [事実] (agent-loop.ts:638-644)
   Deny:      "ユーザーがこの操作を拒否した。理由を推測せず、指示を仰ぐこと"
@@ -1130,7 +1135,7 @@ pub enum ApprovalDecision { ApproveOnce, ApproveAlways { rule: ApprovalRule }, D
 
 #### Claude Code
 
-公開リポジトリには実装本体がないため、ローカル配布物 Claude Code `2.1.211` (SHA-256 `8272c8a474ac9ea1bc35f19b9f7c7e7dc4eb6d5ad3e484b19335ac72446b2`)の埋込み Bun/JavaScript と公式文書を照合した **[事実]**。minify済みsymbol名は版ごとに変わるため、本書では安定した概念だけを記す:
+公開リポジトリには実装本体がないため、ローカル配布物 Claude Code `2.1.211` の埋込み Bun/JavaScript と公式文書を照合した **[事実]**。minify済みsymbol名は版ごとに変わるため、本書では安定した概念だけを記す:
 
 - permission ruleは `deny → ask → allow` の順。auto modeでも明示deny/askをclassifierより先に評価する ([Permissions](https://code.claude.com/docs/en/permissions)、[Permission modes](https://code.claude.com/docs/en/permission-modes))
 - safeなread/edit等のfast pathを通し、残りをmain agentとは別モデルのclassifier API callへ送る。通常は高recallのStage 1と、user intentまで精査するStage 2の二段階
@@ -1562,7 +1567,7 @@ pub struct CommandEnvelope {
     pub command: Command,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)] // agent_events から読み戻して再送するため Deserialize も必須 (§10.2)
 pub struct Envelope {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,            // 恒久イベントのみ採番 (再送基準)。delta系は None (10.2節)
