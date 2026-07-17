@@ -481,12 +481,6 @@ PublishScripts/
 *.nupkg
 # NuGet Symbol Packages
 *.snupkg
-# The packages folder can be ignored because of Package Restore
-**/[Pp]ackages/*
-# except build/, which is used as an MSBuild target.
-!**/[Pp]ackages/build/
-# Uncomment if necessary however generally it will be regenerated when needed
-#!**/[Pp]ackages/repositories.config
 # NuGet v3's project.json files produces more ignorable files
 *.nuget.props
 *.nuget.targets
@@ -678,3 +672,13 @@ FodyWeavers.xsd
 # Additional files built by Visual Studio
 
 # End of https://www.toptal.com/developers/gitignore/api/rust,go,terraform,visualstudio,visualstudiocode,webstorm,goland
+
+### Node / monorepo (added for pnpm + Turborepo) ###
+node_modules/
+dist/
+.turbo/
+*.tsbuildinfo
+coverage/
+.env
+.env.*
+!.env.example
