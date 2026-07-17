@@ -642,10 +642,12 @@ pi の `steer()` は**キュー投入のみ**で、注入は「現在のツー�
 
 プロバイダの終端イベント(`Done`/`Error`)は **UI へ素通ししない**(`MessageUpdate` が包むのは block 系のみ、§3.3)。終端の解釈と `MessageEnd` の発行は常に Session が担うため、「provider の MessageEnd と独自 MessageEnd の二重発行」は構造上起きない。契機の区別は Session 側の状態フラグ(`SteerPending` / `AbortRequested`)で行い、provider の `Aborted` から推測しない。
 
+「注入」とは context(L0)への追加を指すが、注入したメッセージは**必ず §5.1 の契約どおり `TurnStart` 後に user の `MessageStart`/`MessageEnd` としてイベント化する**(内部追加だけで済ませて user イベントを落とさないこと。UI とログはこのイベント列だけを信頼する)。
+
 | 契機 | provider 終端 | Session が発行するイベント | run の継続 |
 |---|---|---|---|
 | 正常完了 | `Done` | `MessageEnd` → (ツール系) → `TurnEnd` | ツール/steering に従い継続 |
-| ハードステア | `Error(Aborted)` を消費 | `MessageEnd`(interrupted=true、§6.3 規則で確定) → `TurnEnd` → `Steered` → 注入 → `TurnStart` | **同一 run を継続(`AgentEnd` なし)** |
+| ハードステア | `Error(Aborted)` を消費 | `MessageEnd`(interrupted=true、§6.3 規則で確定) → `TurnEnd` → `Steered` → `TurnStart` → `MessageStart/End`(user、注入したステアメッセージ) → 次の assistant ストリーム | **同一 run を継続(`AgentEnd` なし)** |
 | abort(停止ボタン) | `Error(Aborted)` を消費 | `MessageEnd`(interrupted=true) → `TurnEnd` → `AgentEnd` | 終了(Idle へ) |
 | 実エラー | `Error(Error)` | リトライ判定 → 不可なら `MessageEnd`(error) → `TurnEnd` → `AgentEnd` | 終了 |
 
@@ -658,7 +660,7 @@ pi の `steer()` は**キュー投入のみ**で、注入は「現在のツー�
 
 ### 6.4 abort(停止ボタン)
 
-`abort` コマンド: cancel 一斉発火 → 実行中ツールへ伝播(bash は子プロセス kill、`tokio::process` の kill_on_drop + プロセスグループ)→ 部分応答はハードステアと同じ規則で確定・保持(interrupted=true)→ **再開はしない**(Idle へ)。pi の `agent-session.ts:1530-1535`(abortRetry → agent.abort → waitForIdle)と同じ「リトライ待機も殺す」順序を踏襲 **[事実]**。
+`abort` コマンド: cancel 一斉発火 → 実行中ツールへ伝播(bash は**プロセスグループへの SIGKILL + wait 回収**、§8.3 の5段仕様。`kill_on_drop` は使わない)→ 部分応答はハードステアと同じ規則で確定・保持(interrupted=true)→ **再開はしない**(Idle へ)。pi の `agent-session.ts:1530-1535`(abortRetry → agent.abort → waitForIdle)と同じ「リトライ待機も殺す」順序を踏襲 **[事実]**。
 
 ---
 
