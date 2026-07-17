@@ -12,6 +12,16 @@ const DEFAULT_CONVERSATION_ID: &str = "default";
 const DEFAULT_MODEL_PRESET: &str = "opencode-go";
 const DEFAULT_SYSTEM_PROMPT: &str = crate::prompts::SYSTEM_PROMPT;
 
+pub fn load_env_file() -> Result<()> {
+    let Some(path) = env::var_os("SUMI_ENV_FILE") else {
+        return Ok(());
+    };
+
+    dotenvy::from_path(&path)
+        .with_context(|| format!("failed to load env file {}", Path::new(&path).display()))?;
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub conversation_id: String,
@@ -385,15 +395,18 @@ zai_tool_stream = false
     }
 
     #[test]
-    fn default_model_uses_opencode_go_kimi_k3() {
+    fn default_model_uses_opencode_go_kimi_k2_7_code() {
         let config =
             Config::resolve(FileConfig::default(), EnvOverrides::default()).expect("resolved");
 
         let spec = config.model_spec().expect("model spec");
 
         assert_eq!(spec.provider, "opencode-go");
-        assert_eq!(spec.id, "kimi-k3");
+        assert_eq!(spec.id, "kimi-k2.7-code");
         assert_eq!(spec.base_url, "https://opencode.ai/zen/go/v1");
         assert_eq!(spec.api_key_env, "OPENCODE_GO_API_KEY");
+        assert_eq!(spec.context_window, 262_144);
+        assert_eq!(spec.max_tokens, 32_768);
+        assert!(spec.supports_images);
     }
 }

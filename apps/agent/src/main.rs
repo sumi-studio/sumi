@@ -16,6 +16,8 @@ use gateway::{Envelope, Gateway, GatewayClosed, StdioGateway};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    config::load_env_file()?;
+
     tracing_subscriber::fmt()
         .json()
         .with_writer(io::stderr)

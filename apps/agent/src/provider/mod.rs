@@ -363,6 +363,7 @@ mod tests {
 
     #[tokio::test]
     async fn live_smoke_is_opt_in() {
+        crate::config::load_env_file().expect("load SUMI_ENV_FILE");
         if std::env::var("SUMI_LIVE_TEST").as_deref() != Ok("1") {
             return;
         }
@@ -380,7 +381,10 @@ mod tests {
                 })],
                 tools: vec![],
             },
-            RequestOptions::default(),
+            RequestOptions {
+                max_tokens: Some(64),
+                ..RequestOptions::default()
+            },
             CancellationToken::new(),
         );
         let mut terminal = None;

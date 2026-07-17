@@ -100,12 +100,12 @@ impl ModelSpec {
                 },
             ),
             "opencode-go" => (
-                "kimi-k3",
+                "kimi-k2.7-code",
                 "opencode-go",
                 "https://opencode.ai/zen/go/v1",
                 "OPENCODE_GO_API_KEY",
-                1_048_576,
-                131_072,
+                262_144,
+                32_768,
                 Compat {
                     max_tokens_field: MaxTokensField::MaxTokens,
                     supports_usage_in_streaming: true,
@@ -126,6 +126,8 @@ impl ModelSpec {
             base_url: base_url.to_owned(),
             api_key_env: api_key_env.to_owned(),
             context_window,
+            // This is the default per-request output budget, not the model's
+            // advertised maximum output capability.
             max_tokens,
             reasoning: true,
             supports_images: matches!(name, "kimi-k3" | "opencode-go"),

@@ -1917,6 +1917,7 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
+ "dotenvy",
  "futures-util",
  "libc",
  "regex",
