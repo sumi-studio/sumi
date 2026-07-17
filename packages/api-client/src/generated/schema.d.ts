@@ -21,12 +21,437 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/chats": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * トーク一覧 (チャット一覧) を取得
+         * @description トーク一覧画面用。各チャットに最終メッセージのプレビューと
+         *     未読数を含む。最終アクティビティの新しい順で返す。
+         *     続きは `nextCursor` を次リクエストの `cursor` に渡して取得する。
+         */
+        get: operations["listChats"];
+        put?: never;
+        /**
+         * チャットを作成
+         * @description トーク一覧の [＋] に対応。新しいエージェントとのチャットを開始する。
+         */
+        post: operations["createChat"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/chats/{chatId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                chatId: components["parameters"]["ChatId"];
+            };
+            cookie?: never;
+        };
+        /** チャットを取得 */
+        get: operations["getChat"];
+        put?: never;
+        post?: never;
+        /**
+         * チャットを削除
+         * @description メッセージ履歴も削除される。
+         */
+        delete: operations["deleteChat"];
+        options?: never;
+        head?: never;
+        /** チャットを更新 */
+        patch: operations["updateChat"];
+        trace?: never;
+    };
+    "/chats/{chatId}/messages": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                chatId: components["parameters"]["ChatId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * メッセージ履歴を取得
+         * @description 会話は単一スレッドで無限に伸びるため、`before` カーソルで
+         *     古い方向へ遡る。省略時は最新メッセージから返す。
+         *     ページ内の並びは時系列昇順 (古い → 新しい)。
+         *     さらに遡るには `nextCursor` を次リクエストの `before` に渡す。
+         *     リアルタイムの新着は WS (`ServerEvent`) で受け取り、
+         *     このエンドポイントは初期ロードと遡りにのみ使う。
+         */
+        get: operations["listMessages"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/chats/{chatId}/read": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                chatId: components["parameters"]["ChatId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * 既読位置を更新
+         * @description トーク一覧の未読ドット・未読数の解消に使う。
+         */
+        put: operations["markChatRead"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ws/tickets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * WebSocket 接続チケットを発行
+         * @description `/ws` 接続用の短命 (60 秒)・使い捨てチケットを発行する。
+         *     アクセストークンを URL クエリに載せるとログ・履歴に漏れるため、
+         *     WS の認証は Bearer 認証済みのこのエンドポイントで得たチケットで行う。
+         */
+        post: operations["createWsTicket"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ws": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * リアルタイム接続 (WebSocket)
+         * @description アプリ起動時に確立し、張りっぱなしにする WebSocket。
+         *     メッセージ送信・ステア・停止・トークンストリーミング・新着通知は
+         *     すべてこの接続上を流れる。
+         *
+         *     - クライアント → サーバー: `ClientEvent` (JSON テキストフレーム)
+         *     - サーバー → クライアント: `ServerEvent` (JSON テキストフレーム)
+         *
+         *     ブラウザの WebSocket API は Authorization ヘッダーを付与できないため、
+         *     認証は `POST /ws/tickets` で発行した短命・使い捨てチケットを
+         *     `ticket` クエリパラメータで渡して行う (アクセストークンは URL に載せない)。
+         *     サーバーは接続確立時にチケットを検証して消費し、
+         *     無効・期限切れ・使用済みなら 4401 でクローズする。
+         *     接続後にセッションが失効した場合も 4401 でクローズされるので、
+         *     チケットを再発行して再接続する。
+         *
+         *     ステアは専用イベントではなく、streaming 中に `message.send` を
+         *     送ること自体がステアになる (現在の生成を中断して新入力を注入)。
+         */
+        get: operations["connectWebSocket"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
-    schemas: never;
-    responses: never;
-    parameters: never;
+    schemas: {
+        Error: {
+            /** @description 機械可読なエラーコード (例 `invalid_request`, `not_found`) */
+            code: string;
+            /** @description 人間可読な説明 */
+            message: string;
+        };
+        WsTicket: {
+            /** @description `/ws` の `ticket` クエリパラメータに渡す不透明な文字列 */
+            ticket: string;
+            /**
+             * Format: date-time
+             * @description 有効期限 (発行から 60 秒)。期限内でも一度使うと無効
+             */
+            expiresAt: string;
+        };
+        Chat: {
+            id: string;
+            /** @description 表示名 (例 "Sumi") */
+            name: string;
+            /** @description 役割の短い表示 (例 "秘書")。トーク一覧で名前の横に出す */
+            role?: string;
+            /** @description トーク一覧のプレビュー用。会話が空なら省略 */
+            lastMessage?: components["schemas"]["MessagePreview"];
+            /** @description 未読メッセージ数 (未読なしは 0)。未読ドットの表示判定に使う */
+            unreadCount: number;
+            /** Format: date-time */
+            createdAt: string;
+        };
+        ChatCreate: {
+            name: string;
+            role?: string;
+        };
+        /** @description 部分更新。指定したフィールドのみ変更する */
+        ChatUpdate: {
+            name?: string;
+            role?: string;
+        };
+        ChatPage: {
+            /** @description 最終アクティビティの新しい順 */
+            items: components["schemas"]["Chat"][];
+            /** @description 続きを取得するためのカーソル。`hasMore` が false なら省略 */
+            nextCursor?: string;
+            hasMore: boolean;
+        } & ({
+            /** @constant */
+            hasMore?: true;
+        } | {
+            /** @constant */
+            hasMore?: false;
+        });
+        MessagePreview: {
+            /** @description 最終メッセージのプレーンテキスト要約 (markdown・カードは平文化済み) */
+            text: string;
+            /** Format: date-time */
+            createdAt: string;
+        };
+        Message: {
+            /** @description 時系列ソート可能な ID (ULID)。履歴カーソルにも使う */
+            id: string;
+            chatId: string;
+            /**
+             * @description user = 右寄せ吹き出し / assistant = 全幅の地の文 /
+             *     system = 権限リクエスト等のシステムカード
+             * @enum {string}
+             */
+            role: "user" | "assistant" | "system";
+            blocks: components["schemas"]["MessageBlock"][];
+            /** Format: date-time */
+            createdAt: string;
+        };
+        MessageBlock: components["schemas"]["TextBlock"] | components["schemas"]["SduiBlock"];
+        TextBlock: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "text";
+            /** @description user は生テキスト、assistant は markdown ソース (コピー時もこれを使う) */
+            text: string;
+        };
+        SduiBlock: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "sdui";
+            card: components["schemas"]["SduiCard"];
+        };
+        /**
+         * @description SDUI の宣言データ。`component` で `packages/sdui` の
+         *     コンポーネントカタログを参照し、`props` をカタログ側の
+         *     zod スキーマで検証してレンダーする。カタログの中身は
+         *     この契約では固定しない (実行コードではなくデータのみを運ぶ)。
+         */
+        SduiCard: {
+            /** @description カタログ上のコンポーネント名 (例 `reminder`, `confirm`, `permission_request`) */
+            component: string;
+            props: {
+                [key: string]: unknown;
+            };
+        };
+        MessagePage: {
+            /** @description 時系列昇順 (古い → 新しい) */
+            items: components["schemas"]["Message"][];
+            /** @description さらに古い方向へ遡るためのカーソル。`hasMore` が false なら省略 */
+            nextCursor?: string;
+            hasMore: boolean;
+        };
+        ClientEvent: components["schemas"]["MessageSendEvent"] | components["schemas"]["StreamStopEvent"];
+        /**
+         * @description ユーザーメッセージの送信。対象チャットが streaming 中に送ると
+         *     ステアになる: サーバーは現在の生成を中断 (`stream.end` /
+         *     stopReason=steered) し、このメッセージを注入して生成を継続する。
+         *     クライアントは ack を待たず楽観的に即時描画し、`clientMessageId` で
+         *     `message.ack` / `error` と突き合わせる (失敗時は再送マークを表示)。
+         */
+        MessageSendEvent: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "message.send";
+            /** @description クライアント生成の一意 ID。ack との突き合わせと再送時の重複排除に使う */
+            clientMessageId: string;
+            chatId: string;
+            /**
+             * @description クライアントが送信できるのはテキストブロックのみ。
+             *     SDUI カードはサーバー / エージェント起点でのみ生成される
+             *     (任意の component / props の注入を防ぐ)。
+             */
+            blocks: components["schemas"]["TextBlock"][];
+        };
+        /** @description 停止ボタン [■]。対象チャットの生成を中断する */
+        StreamStopEvent: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "stream.stop";
+            chatId: string;
+        };
+        ServerEvent: components["schemas"]["MessageAckEvent"] | components["schemas"]["MessageCreatedEvent"] | components["schemas"]["StreamStartEvent"] | components["schemas"]["StreamDeltaEvent"] | components["schemas"]["StreamBlockEvent"] | components["schemas"]["StreamEndEvent"] | components["schemas"]["ErrorEvent"];
+        /** @description message.send の永続化完了。楽観的描画をサーバー確定版に差し替える */
+        MessageAckEvent: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "message.ack";
+            clientMessageId: string;
+            message: components["schemas"]["Message"];
+        };
+        /**
+         * @description 自分の送信以外で生まれたメッセージの新着通知
+         *     (エージェント起点の発話、システムメッセージ、他デバイスからの送信)。
+         *     トーク一覧のプレビュー・未読数の更新にも使う
+         */
+        MessageCreatedEvent: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "message.created";
+            message: components["schemas"]["Message"];
+        };
+        /** @description アシスタント応答の生成開始。以降の delta/block はこの messageId 宛て */
+        StreamStartEvent: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "stream.start";
+            chatId: string;
+            messageId: string;
+        };
+        /**
+         * @description トークンストリーミング。`blockIndex` のテキストブロックに `delta` を
+         *     追記する。UI は最初の delta から地の文を描画する (スピナーは作らない)
+         */
+        StreamDeltaEvent: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "stream.delta";
+            messageId: string;
+            blockIndex: number;
+            delta: string;
+        };
+        /** @description SDUI カード等、完成形で挿入されるブロック。`blockIndex` の位置に置く */
+        StreamBlockEvent: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "stream.block";
+            messageId: string;
+            blockIndex: number;
+            block: components["schemas"]["MessageBlock"];
+        };
+        /**
+         * @description 生成終了。`message` はストリーミング中の delta/block を確定・永続化した
+         *     正規のアシスタントメッセージで、`message.id` は `messageId` と一致する。
+         *     クライアントは蓄積していた仮の表示を `message` で置き換え、再送された
+         *     `stream.end` は `message.id` で重複排除する。
+         *     steered の場合は、このイベントの後に同じ会話の新しい `stream.start` が来る。
+         */
+        StreamEndEvent: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "stream.end";
+            messageId: string;
+            /** @enum {string} */
+            stopReason: "completed" | "stopped" | "steered" | "error";
+            /**
+             * @description 永続化済みの最終メッセージ。`id` は `messageId`、`role` は
+             *     `assistant` でなければならない。途中停止やエラー時も、それまでに
+             *     生成された内容を確定した Message を返す
+             */
+            message: components["schemas"]["Message"] & {
+                /** @constant */
+                role?: "assistant";
+            };
+        };
+        /** @description イベント処理の失敗。`clientMessageId` があれば該当送信の失敗 (再送マーク表示) */
+        ErrorEvent: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "error";
+            code: string;
+            message: string;
+            clientMessageId?: string;
+        };
+    };
+    responses: {
+        /** @description リクエストが不正 */
+        BadRequest: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description 認証エラー (トークン欠落・無効・失効) */
+        Unauthorized: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description リソースが存在しない */
+        NotFound: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+    };
+    parameters: {
+        ChatId: string;
+    };
     requestBodies: never;
     headers: never;
     pathItems: never;
@@ -54,6 +479,236 @@ export interface operations {
                     };
                 };
             };
+        };
+    };
+    listChats: {
+        parameters: {
+            query?: {
+                /** @description このカーソルの続きからチャットを返す (前回レスポンスの `nextCursor`) */
+                cursor?: string;
+                /** @description 取得件数 */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description チャットのページ */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    createChat: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChatCreate"];
+            };
+        };
+        responses: {
+            /** @description 作成されたチャット */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Chat"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    getChat: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                chatId: components["parameters"]["ChatId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description チャット */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Chat"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    deleteChat: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                chatId: components["parameters"]["ChatId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 削除完了 */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    updateChat: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                chatId: components["parameters"]["ChatId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChatUpdate"];
+            };
+        };
+        responses: {
+            /** @description 更新後のチャット */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Chat"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    listMessages: {
+        parameters: {
+            query?: {
+                /** @description このカーソルより古いメッセージを返す (前回レスポンスの `nextCursor`) */
+                before?: string;
+                /** @description 取得件数 */
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                chatId: components["parameters"]["ChatId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description メッセージのページ */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MessagePage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    markChatRead: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                chatId: components["parameters"]["ChatId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description ここまで読んだメッセージの ID */
+                    lastReadMessageId: string;
+                };
+            };
+        };
+        responses: {
+            /** @description 更新完了 */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    createWsTicket: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 発行されたチケット */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WsTicket"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    connectWebSocket: {
+        parameters: {
+            query: {
+                /** @description `POST /ws/tickets` で発行したチケット */
+                ticket: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Switching Protocols — WebSocket 接続確立 */
+            101: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
         };
     };
 }
