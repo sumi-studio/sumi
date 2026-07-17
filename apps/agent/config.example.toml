@@ -3,10 +3,10 @@ workspace = "/workspace"
 system_prompt_file = "prompts/system.md"
 
 [model]
-preset = "kimi-k3"
+preset = "opencode-go"
 # id = "kimi-k3"
-# base_url = "https://api.moonshot.ai/v1"
-# api_key_env = "MOONSHOT_API_KEY"
+# base_url = "https://opencode.ai/zen/go/v1"
+# api_key_env = "OPENCODE_GO_API_KEY"
 # context_window = 1048576
 # max_tokens = 131072
 

@@ -366,7 +366,7 @@ mod tests {
         if std::env::var("SUMI_LIVE_TEST").as_deref() != Ok("1") {
             return;
         }
-        let preset = std::env::var("SUMI_LIVE_PRESET").unwrap_or_else(|_| "kimi-k3".to_owned());
+        let preset = std::env::var("SUMI_LIVE_PRESET").unwrap_or_else(|_| "opencode-go".to_owned());
         let spec = ModelSpec::preset(&preset).expect("SUMI_LIVE_PRESET must name a preset");
         let mut events = stream(
             spec,

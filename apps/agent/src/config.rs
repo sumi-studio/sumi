@@ -9,6 +9,7 @@ use serde::Deserialize;
 use crate::provider::request::{MaxTokensField, ModelSpec, ThinkingFormat};
 
 const DEFAULT_CONVERSATION_ID: &str = "default";
+const DEFAULT_MODEL_PRESET: &str = "opencode-go";
 const DEFAULT_SYSTEM_PROMPT: &str = crate::prompts::SYSTEM_PROMPT;
 
 #[derive(Clone, Debug)]
@@ -87,7 +88,7 @@ impl Config {
     }
 
     pub fn model_spec(&self) -> Result<ModelSpec> {
-        let preset = self.model.preset.as_deref().unwrap_or("kimi-k3");
+        let preset = self.model.preset.as_deref().unwrap_or(DEFAULT_MODEL_PRESET);
         let mut spec =
             ModelSpec::preset(preset).with_context(|| format!("unknown model preset {preset}"))?;
         if let Some(id) = &self.model.id {
@@ -381,5 +382,18 @@ zai_tool_stream = false
         assert_eq!(spec.max_tokens, 64_000);
         assert_eq!(spec.compat.max_tokens_field, MaxTokensField::MaxTokens);
         assert!(!spec.compat.zai_tool_stream);
+    }
+
+    #[test]
+    fn default_model_uses_opencode_go_kimi_k3() {
+        let config =
+            Config::resolve(FileConfig::default(), EnvOverrides::default()).expect("resolved");
+
+        let spec = config.model_spec().expect("model spec");
+
+        assert_eq!(spec.provider, "opencode-go");
+        assert_eq!(spec.id, "kimi-k3");
+        assert_eq!(spec.base_url, "https://opencode.ai/zen/go/v1");
+        assert_eq!(spec.api_key_env, "OPENCODE_GO_API_KEY");
     }
 }
