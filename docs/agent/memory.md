@@ -15,28 +15,38 @@
 
 ## プロンプト構成
 
-```
-System Prompt      … 憲法。不変
-Tool Definitions   … 固定 (変更はキャッシュ全壊と同義。凍結を原則とする)
-L2 (10k)           … 最古の記憶。統合済み
-L1 (15k)           … 中間の記憶。バッチ単位の要約
-L0 (40k)           … 生の messages (ユーザー発話・thought chunk・ツールコール/結果)
+```text
+sumi_three_layer (既定):
+  System Prompt      … 憲法。不変
+  Tool Definitions   … 固定 (変更はキャッシュ全壊と同義。凍結を原則とする)
+  L2 (10k)           … 最古の記憶。統合済み。user 相当の履歴データ
+  L1 (15k)           … 中間の記憶。バッチ単位の要約。user 相当の履歴データ
+  L0 (40k)           … 生の公開 messages + 対応する暗号化 reasoning context
+
+provider_native:
+  System Prompt + Tool Definitions + provider の canonical compacted context + coverage 後の transcript suffix
 ```
 
 通常時は合計 ~70k トークン以内を目標とし、Tool Definitions を含めて 80k 未満に保つ。これは通常運用の目標値であり、単一入出力など一時的な超過を禁止する厳密な不変条件ではない。単一入出力のガードは [実装計画 §7.8](implementation-plan.md) で別に定める。
 
+L1/L2 は永続チャットの `Message` ではなく送信専用の `MemoryBlock` として保持し、各プロトコルアダプターが原則 `user` 相当の履歴データへ変換する。`<memory layer="l2">` / `<memory layer="l1">` で会話本文と区別し、「新しいユーザー指示ではなく過去の記憶である」と憲法に一度だけ定義する。
+
+OpenAI Responses の compacted `output[]` window や Anthropic Messages の `compaction` block は、各 API が生成した不透明な provider context として別に往復させるが、3層表現と同時には送らない。conversation ごとに `sumi_three_layer` (既定) と `provider_native` を選び、前者は L2/L1/L0、後者は Responses なら `/responses/compact` が返した retained item を含む canonical `output[]` 全体、Anthropic なら native compaction block 1個と、その coverage より後の transcript suffix だけを送る。native context には「最後に含めた message seq」と provider instance/protocol/model/system/tools/beta の fingerprint を保存し、不一致・期限切れ・別 provider endpoint/account への切替時は破棄して3層表現へ戻す。Sumi の要約から暗号化されたネイティブ item/block/window を捏造しない。
+
 ## 動作仕様
 
 1. **バッチ分割**: L0 は下限 5k トークンでバッチに分割する。メッセージやツールコール/結果の途中では切らず、きりのいい境界で切る
-2. **先回り Compact**: バッチが確定したら耐久ジョブとして保存し、非同期で Compact (LLM 要約) する。結果は棚に保存する。この時点では適用せず、L0 からも消さない。プロセス再起動時は未完了ジョブを再投入する
+2. **先回り Compact**: バッチ確定時に conversation/layer ごとの単調増加 `batch_seq` を採番し、耐久ジョブとして保存して非同期で Compact (LLM 要約) する。状態は `pending → running → completed → applied`、再試行上限超過時は `failed` とする。結果は棚に保存し、この時点では適用せず L0 からも消さない。プロセス再起動時は lease 切れの `running` を `pending` へ戻す
 3. **L0 溢れ**: L0 が 40k を超えたら、処理済みバッチを古い順 (FIFO) に 1〜複数個捨て、対応する Compact 済み版を L1 の末尾に追加する。捨てる個数は 40k を確実に切るまで (ヒステリシスの深さは実測で調整)
 4. **L1 溢れ**: L1 も同じ仕組みでバッチ化・Compact し、15k を溢れたら古い順に L2 へ沈める
 5. **L2 溢れ**: L2 (10k) が溢れたら、L2 全体を LLM でまとめて統合し、置換する
 6. **適用タイミング**: 通常は TurnEnd / AgentEnd 後の Idle 中、または Compact 完了通知を Idle 中に受けた時点で適用する。次の API コール直前は取りこぼし時のフォールバックに限る。ユーザーのメッセージ送信直後 (TTFT が見える瞬間) には走らせない
 
+Compact の完了順は適用順に使わない。各 layer の永続 `next_batch_seq` と一致する `completed` だけを FIFO で適用し、後続が先に完了した場合は棚で待たせる。L0/L1 の membership 更新、要約の昇格、ジョブの `applied` 化、`next_batch_seq` の前進は同じ SQLite transaction で行う。`(kind, batch_seq)` の一意制約と状態の比較更新により、再起動・重複通知・ワーカー二重実行でも同じ結果を二重適用しない。バッチと message の対応は先頭/末尾 ID から推測せず、順序付きの中間表へ全 membership を保存する。
+
 ## プロンプトキャッシュとの関係
 
-OpenAI 互換系のキャッシュは**先頭からの連続プレフィックス一致**で、ブロック (プロバイダにより 128〜256 トークン単位) は照合の粒度にすぎない。この設計はそれに適合する:
+Kimi/GLM 等の Chat Completions 互換系では**先頭からの連続プレフィックス一致**が重要で、ブロックは照合の粒度にすぎない。Responses / Anthropic Messages でも `sumi_three_layer` mode は「安定した L2/L1 を L0 より前へ置き、通常ターンは末尾追記にする」順序を保つ。`provider_native` mode の cache metadata と compaction block の再送は各 adapter が API 契約どおりに扱う:
 
 - 層が深いほど変更頻度が低く、**キャッシュ破壊点が揮発性の順に並ぶ**。通常ターンは末尾追記のみでほぼ全キャッシュがヒットする
 - L0 の先頭バッチを捨てた瞬間だけ、L1 より後ろ (~35k) が再読み込みになる。ヒステリシスを深くするほどイベント頻度は下がり、残る L0 も小さくなるため再読み込み量も減る
@@ -44,7 +54,17 @@ OpenAI 互換系のキャッシュは**先頭からの連続プレフィック�
 
 ## ログとの関係
 
-このメモリは「API に乗せる人格と記憶」の話であり、**チャットログ全文は別途 DB に永続化する**。Sumi 自身もユーザーも、事実確認のためにログを検索・遡行できる。
+このメモリは「API に乗せる人格と記憶」の話であり、**人間可視のチャットログ原文は hidden reasoning を除いて別途 DB に暗号化永続化する**。認可済み復旧/UIは原文を使い、検索・通常exportは同時生成した redacted projection を使う。
+
+原文ログと provider context は同じ扱いにしない。transcript の暗号化 raw 正本にはユーザー発話、最終 assistant テキスト、ツールコール/結果を保存するが、モデルの非公開 chain-of-thought は含めない。FTS・通常export・DBの平文projectionは API key、署名token、既知secretを不可逆redactionしたものに限定する。継続に必要な `reasoning_content`、暗号化 reasoning、Anthropic thinking/redacted_thinking、native compaction item/block/window は provider context として分離し、conversation/provider-context 単位のデータ鍵を agent 鍵で wrap する。reasoning は対応 message の L0 昇格時または30日、native compaction は置換・mode切替・fingerprint不一致または30日のうち最も早い時点で対象データ鍵ごと破棄し、暗号化 transcript と3層メモリを復旧元として残す。
+
+Cloud 版のデータ管理方針はリリースゲートとする:
+
+- 通常の transcript / memory / workspace は、ユーザーが agent を削除するまで保持する。管理者は tenant policy でより短い保持期間を設定できる
+- v1 は1 agent = 1 active conversation = 1 agent.db。会話 export は redaction 済み JSONL、agent export はそれに workspace archive を加える。会話削除は transcript/memory/provider context と conversation鍵を破棄して新しい conversation ID へ reset し、ユーザー作成 workspace は残す。一方、runtime が自動生成した `/workspace/.attachments/<conversation_id>` と `/workspace/.tool-output/<conversation_id>` は conversation-owned として旧IDのprefixごと冪等削除する。agent 削除は agent鍵と配下の workspace鍵/volume も破棄する。deletion tombstone と access audit の正典は削除対象agent volumeの外にあるCloud control planeへ置き、旧conversation IDもtombstoneへ記録する。live DB/volume は24時間以内、backup は30日以内に期限切れにし、復元時は tombstone を先に再適用して自動生成artifactを再露出させない
+- tenant / agent ごとに DB、volume、暗号鍵、認可 scope を分離する。検索・export・管理者アクセスは actor / tenant / query scope / result count を監査ログへ残す
+- Cloud の volume/backup は基盤暗号化に加えて tenant KEK → agent 鍵 → conversation/provider-context/workspace 鍵の階層で envelope encryption を使う。OSS ローカル版はホストの暗号化責任を明記し、Cloud と同じ保証をうたわない
+- redaction はDB平文・FTS・通常exportを作る前に API key、署名 token、既知の secret 形式へ適用する。原文 transcript は conversation 鍵配下の ciphertext としてだけ保存し、raw provider response とツール出力を無制限にログへ複製しない
 
 ## 未決事項
 
@@ -52,4 +72,4 @@ OpenAI 互換系のキャッシュは**先頭からの連続プレフィック�
 - **圧縮率の制御**: 参考にした Mastra Code では大きめのバッチが ~50 倍に圧縮される観察があり、圧縮されすぎが懸念。Compact プロンプトで目標圧縮率を明示的に指定するか
 - **Compact の入力**: バッチ単体ではなく、前後の文脈や L1 の既存内容を読み取り専用で添えて要約品質を上げる案
 - 各層のサイズ (10k/15k/40k) の実測調整
-- thinking 系モデル (Kimi は過去ターンの reasoning_content 全保持が必須仕様) と L0 のサイズ計算・バッチ境界の整合
+- thinking 系モデルの provider context を L0 のサイズ計算へどう加算するか、および30日より長い L0 滞在を許すか

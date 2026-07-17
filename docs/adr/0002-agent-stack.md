@@ -5,12 +5,12 @@
 
 ## コンテキスト
 
-ADR 0001 は前提の一つとして「エージェント基盤の有力候補 (pi) が TypeScript」を挙げていた。pi ([earendil-works/pi](https://github.com/earendil-works/pi)、旧 badlogic/pi-mono) の詳細調査 (2026-07-17) の結果、前提が変わった。
+ADR 0001 は前提の一つとして「エージェント基盤の有力候補 (pi) が TypeScript」を挙げていた。pi ([earendil-works/pi](https://github.com/earendil-works/pi/tree/216e672e)、旧 badlogic/pi-mono) の詳細調査 (2026-07-17) の結果、前提が変わった。
 
 1. **Sumi の核となる要件は pi に存在しない**。3層メモリ ([docs/agent/memory.md](../agent/memory.md)) に相当する長期記憶機構はなく、権限承認フローは「組み込みの権限システムは存在しない」と公式に明言され (思想としても YOLO モードがデフォルト)、ステアはターン境界での注入のみで生成中の割り込みではない。つまり言語を何にしても、Sumi を差別化する部分はすべて自作になる。
 2. pi は本質的にローカル 1 ユーザーのコーディングエージェント向け設計であり、作者自身のマルチユーザー実例 (pi-chat) もユーザーごとにプロセス/microVM を分離する構成をとる。これは Sumi のワークスペース設計 ([docs/agent/workspace.md](../agent/workspace.md)) と同型で、参照価値が高い。
 3. pi の真の価値は LLM 配管 (pi-ai) の完成度と、イベント駆動ループの設計、および 1 年分の運用細部 (ツール結果の切り詰め、ストリーミングイベント設計、reasoning の往復処理等) にある。
-4. Sumi のモデル調達は OpenAI 互換 API (Kimi / GLM / Umans 等) に収斂する見込みのため、pi-ai の 25+ プロバイダ対応は不要。自作すべき配管は **OpenAI 互換 1 プロトコル分**に縮小した。
+4. Sumi のモデル調達は Kimi / GLM / Umans 等の OpenAI 互換 API に加え、OpenAI 本家と Anthropic Messages API 互換へ広げる。pi-ai の 25+ プロバイダ対応をそのまま持つ必要はないが、配管を **OpenAI Chat Completions / OpenAI Responses / Anthropic Messages の3プロトコルアダプター**へ分離し、共通のイベント・メッセージ型へ正規化する必要がある。
 5. 開発は AI 駆動であり、pi を設計参照とした忠実なリライトのコストは計画の質に依存し、言語自体には大きく依存しない。
 
 ## 決定
@@ -18,7 +18,7 @@ ADR 0001 は前提の一つとして「エージェント基盤の有力候補 (
 **エージェント基盤 (apps/agent) は Rust で実装する。pi はコード流用元ではなく設計参照とし、イベント体系・フック設計・運用細部を忠実に移植する。**
 
 - ランタイム: tokio ベースの常駐プロセス。ユーザーごとのワークスペースコンテナ内で動く (workspace.md)
-- プロバイダ層: OpenAI 互換 Chat Completions (SSE ストリーミング、ツールコール、reasoning_content、prefix キャッシュ前提のプロンプト組み立て) のみを自作
+- プロバイダ層: OpenAI 互換 Chat Completions、OpenAI Responses、Anthropic Messages 互換の3アダプターを自作し、SSE、ツールコール、reasoning/thinking、usage、終了理由を共通イベントへ正規化する。ハッカソンのデモ経路は Kimi / GLM の Chat Completions を優先し、他2アダプターは共通境界を崩さず並行実装する
 - ドメイン操作は `contracts/openapi.yaml` から生成した Rust クライアント経由で apps/api を叩く (契約ファースト原則は言語非依存に保つ)
 
 選定理由:
@@ -34,6 +34,6 @@ ADR 0001 は前提の一つとして「エージェント基盤の有力候補 (
 
 ## 引き受けるトレードオフ
 
-- **pi-ai 相当の配管を自作する**。OpenAI 互換に限定して面積を絞り、pi のソースを参照実装として細部 (切り詰め、リトライ、イベント順序、キャッシュ制御) を移植する。実装計画に明文化する
+- **pi-ai 相当の配管を自作する**。3プロトコルに面積を限定し、pi のソースと各社の一次 API 仕様を参照して、切り詰め、リトライ、イベント順序、キャッシュ制御、ネイティブ compaction item/block の往復を実装計画に明文化する
 - **packages/sdui (zod) を直接 import できない**。エージェントが生成する SDUI カードの検証は JSON Schema 経由で行う
 - チームに Rust を書く人間はいない。実装・保守とも AI 駆動が前提であり、それに耐える文書化 (本 ADR、設計文書、実装計画) を維持するコストを引き受ける
