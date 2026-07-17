@@ -1,0 +1,20 @@
+{
+  "name": "sumi",
+  "private": true,
+  "packageManager": "pnpm@11.9.0",
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "lint": "biome check . && turbo run lint",
+    "check-types": "turbo run check-types",
+    "test": "turbo run test",
+    "format": "biome format --write ."
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.3",
+    "turbo": "^2.10.5"
+  }
+}
