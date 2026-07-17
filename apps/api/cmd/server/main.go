@@ -15,7 +15,7 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", handler.Health)
+	mux.HandleFunc("GET /v1/health", handler.Health)
 
 	log.Printf("sumi api listening on :%s", port)
 	if err := http.ListenAndServe(":"+port, mux); err != nil {

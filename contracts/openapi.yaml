@@ -414,6 +414,18 @@ components:
     ChatPage:
       type: object
       required: [items, hasMore]
+      oneOf:
+        - title: 続きあり
+          properties:
+            hasMore:
+              const: true
+          required: [nextCursor]
+        - title: 最終ページ
+          properties:
+            hasMore:
+              const: false
+          not:
+            required: [nextCursor]
       properties:
         items:
           type: array
@@ -681,8 +693,13 @@ components:
 
     StreamEndEvent:
       type: object
-      description: 生成終了。steered の場合は同じ会話で続けて新しい stream.start が来る
-      required: [type, messageId, stopReason]
+      description: |
+        生成終了。`message` はストリーミング中の delta/block を確定・永続化した
+        正規のアシスタントメッセージで、`message.id` は `messageId` と一致する。
+        クライアントは蓄積していた仮の表示を `message` で置き換え、再送された
+        `stream.end` は `message.id` で重複排除する。
+        steered の場合は、このイベントの後に同じ会話の新しい `stream.start` が来る。
+      required: [type, messageId, stopReason, message]
       properties:
         type:
           type: string
@@ -692,6 +709,16 @@ components:
         stopReason:
           type: string
           enum: [completed, stopped, steered, error]
+        message:
+          description: |
+            永続化済みの最終メッセージ。`id` は `messageId`、`role` は
+            `assistant` でなければならない。途中停止やエラー時も、それまでに
+            生成された内容を確定した Message を返す
+          allOf:
+            - $ref: "#/components/schemas/Message"
+            - properties:
+                role:
+                  const: assistant
 
     ErrorEvent:
       type: object
