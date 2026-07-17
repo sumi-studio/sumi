@@ -135,6 +135,28 @@ impl ModelSpec {
         })
     }
 
+    /// Override the model id, re-resolving model-dependent capabilities when
+    /// the id matches a known preset. Multi-model endpoints (OpenCode Go
+    /// serves Kimi K2.7 Code and GLM-5.2 behind one URL) would otherwise keep
+    /// the previous model's thinking format, image support, and token limits.
+    /// Endpoint-level fields (base_url, api_key_env, provider) are preserved.
+    pub fn override_id(&mut self, id: &str) {
+        if self.id == id {
+            return;
+        }
+        if let Some(model) = Self::preset(id) {
+            self.context_window = model.context_window;
+            self.max_tokens = model.max_tokens;
+            self.reasoning = model.reasoning;
+            self.supports_images = model.supports_images;
+            self.compat.thinking_format = model.compat.thinking_format;
+            self.compat.requires_reasoning_content_on_assistant =
+                model.compat.requires_reasoning_content_on_assistant;
+            self.compat.zai_tool_stream = model.compat.zai_tool_stream;
+        }
+        id.clone_into(&mut self.id);
+    }
+
     pub fn endpoint(&self) -> String {
         format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
     }
@@ -307,7 +329,7 @@ fn convert_messages(spec: &ModelSpec, context: &PromptContext) -> Vec<Value> {
                     let Message::ToolResult(tool_result) = &context.messages[index] else {
                         break;
                     };
-                    output.push(convert_tool_result(tool_result));
+                    output.push(convert_tool_result(tool_result, spec.supports_images));
                     if spec.supports_images {
                         images.extend(tool_result.content.iter().filter_map(|content| {
                             let UserContent::Image { data, mime_type } = content else {
@@ -336,6 +358,8 @@ fn convert_messages(spec: &ModelSpec, context: &PromptContext) -> Vec<Value> {
     output
 }
 
+const IMAGE_OMITTED_NOTE: &str = "(image omitted: model does not support image input)";
+
 fn convert_user_content(content: &[UserContent], supports_images: bool) -> Vec<Value> {
     content
         .iter()
@@ -347,13 +371,13 @@ fn convert_user_content(content: &[UserContent], supports_images: bool) -> Vec<V
             }),
             UserContent::Image { .. } => json!({
                 "type": "text",
-                "text": "(image omitted: model does not support image input)",
+                "text": IMAGE_OMITTED_NOTE,
             }),
         })
         .collect()
 }
 
-fn convert_tool_result(message: &ToolResultMessage) -> Value {
+fn convert_tool_result(message: &ToolResultMessage, supports_images: bool) -> Value {
     let text = message
         .content
         .iter()
@@ -367,7 +391,16 @@ fn convert_tool_result(message: &ToolResultMessage) -> Value {
         .content
         .iter()
         .any(|item| matches!(item, UserContent::Image { .. }));
-    let content = if !text.is_empty() {
+    // Images are re-sent in a follow-up user message only when the model
+    // supports them; the tool message itself must not point at attachments
+    // that will never be sent.
+    let content = if has_images && !supports_images {
+        if text.is_empty() {
+            IMAGE_OMITTED_NOTE.to_owned()
+        } else {
+            format!("{text}\n{IMAGE_OMITTED_NOTE}")
+        }
+    } else if !text.is_empty() {
         text
     } else if has_images {
         "(see attached image)".to_owned()
@@ -590,6 +623,76 @@ mod tests {
 
         assert_eq!(request["messages"][2]["content"], "I should read.");
         assert_eq!(request["messages"][2]["reasoning_content"], "");
+    }
+
+    fn set_tool_result_content(context: &mut PromptContext, content: Vec<UserContent>) {
+        let Message::ToolResult(result) = &mut context.messages[2] else {
+            panic!("tool result");
+        };
+        result.content = content;
+    }
+
+    fn image() -> UserContent {
+        UserContent::Image {
+            data: "AAA".to_owned(),
+            mime_type: "image/png".to_owned(),
+        }
+    }
+
+    #[test]
+    fn image_only_tool_result_becomes_omission_note_without_image_support() {
+        let mut context = context();
+        set_tool_result_content(&mut context, vec![image()]);
+        let mut spec = ModelSpec::preset("kimi-k3").expect("preset");
+        spec.supports_images = false;
+
+        let request = build_request(&spec, &context, &RequestOptions::default());
+
+        assert_eq!(request["messages"][3]["content"], IMAGE_OMITTED_NOTE);
+        let request_text = request.to_string();
+        assert!(!request_text.contains("image_url"));
+        assert!(!request_text.contains("see attached image"));
+    }
+
+    #[test]
+    fn mixed_tool_result_keeps_text_and_notes_image_omission() {
+        let mut context = context();
+        set_tool_result_content(
+            &mut context,
+            vec![
+                UserContent::Text {
+                    text: "rendered ok".to_owned(),
+                },
+                image(),
+            ],
+        );
+        let mut spec = ModelSpec::preset("kimi-k3").expect("preset");
+        spec.supports_images = false;
+
+        let request = build_request(&spec, &context, &RequestOptions::default());
+
+        assert_eq!(
+            request["messages"][3]["content"],
+            format!("rendered ok\n{IMAGE_OMITTED_NOTE}")
+        );
+    }
+
+    #[test]
+    fn image_only_tool_result_is_attached_in_follow_up_when_supported() {
+        let mut context = context();
+        set_tool_result_content(&mut context, vec![image()]);
+        let spec = ModelSpec::preset("kimi-k3").expect("preset");
+        assert!(spec.supports_images);
+
+        let request = build_request(&spec, &context, &RequestOptions::default());
+
+        assert_eq!(request["messages"][3]["content"], "(see attached image)");
+        assert_eq!(request["messages"][4]["role"], "user");
+        assert_eq!(request["messages"][4]["content"][1]["type"], "image_url");
+        assert_eq!(
+            request["messages"][4]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,AAA"
+        );
     }
 
     #[test]

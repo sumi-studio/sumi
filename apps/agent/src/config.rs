@@ -102,7 +102,7 @@ impl Config {
         let mut spec =
             ModelSpec::preset(preset).with_context(|| format!("unknown model preset {preset}"))?;
         if let Some(id) = &self.model.id {
-            spec.id.clone_from(id);
+            spec.override_id(id);
         }
         if let Some(base_url) = &self.model.base_url {
             spec.base_url.clone_from(base_url);
@@ -392,6 +392,57 @@ zai_tool_stream = false
         assert_eq!(spec.max_tokens, 64_000);
         assert_eq!(spec.compat.max_tokens_field, MaxTokensField::MaxTokens);
         assert!(!spec.compat.zai_tool_stream);
+    }
+
+    #[test]
+    fn opencode_go_model_id_switch_re_resolves_capabilities() {
+        let file: FileConfig = toml::from_str(
+            r#"
+[model]
+preset = "opencode-go"
+id = "glm-5.2"
+"#,
+        )
+        .expect("valid config");
+        let config = Config::resolve(file, EnvOverrides::default()).expect("resolved");
+
+        let spec = config.model_spec().expect("model spec");
+
+        assert_eq!(spec.id, "glm-5.2");
+        assert_eq!(spec.provider, "opencode-go");
+        assert_eq!(spec.base_url, "https://opencode.ai/zen/go/v1");
+        assert_eq!(spec.api_key_env, "OPENCODE_GO_API_KEY");
+        assert_eq!(spec.compat.thinking_format, ThinkingFormat::Zai);
+        assert!(!spec.compat.requires_reasoning_content_on_assistant);
+        assert!(spec.compat.zai_tool_stream);
+        assert!(!spec.supports_images);
+        assert_eq!(spec.context_window, 1_048_576);
+        assert_eq!(spec.max_tokens, 131_072);
+    }
+
+    #[test]
+    fn explicit_overrides_win_over_id_re_resolution() {
+        let file: FileConfig = toml::from_str(
+            r#"
+[model]
+preset = "opencode-go"
+id = "glm-5.2"
+supports_images = true
+max_tokens = 64000
+
+[model.compat]
+zai_tool_stream = false
+"#,
+        )
+        .expect("valid config");
+        let config = Config::resolve(file, EnvOverrides::default()).expect("resolved");
+
+        let spec = config.model_spec().expect("model spec");
+
+        assert!(spec.supports_images);
+        assert_eq!(spec.max_tokens, 64_000);
+        assert!(!spec.compat.zai_tool_stream);
+        assert_eq!(spec.compat.thinking_format, ThinkingFormat::Zai);
     }
 
     #[test]
