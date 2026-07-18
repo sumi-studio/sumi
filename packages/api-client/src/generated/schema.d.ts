@@ -161,10 +161,11 @@ export interface paths {
          *     ブラウザの WebSocket API は Authorization ヘッダーを付与できないため、
          *     認証は `POST /ws/tickets` で発行した短命・使い捨てチケットを
          *     `ticket` クエリパラメータで渡して行う (アクセストークンは URL に載せない)。
-         *     サーバーは接続確立時にチケットを検証して消費し、
-         *     無効・期限切れ・使用済みなら 4401 でクローズする。
-         *     接続後にセッションが失効した場合も 4401 でクローズされるので、
-         *     チケットを再発行して再接続する。
+         *     サーバーはアップグレード前 (ハンドシェイク時) にチケットを検証して
+         *     消費し、無効・期限切れ・使用済みなら HTTP 401 で拒否する
+         *     (WebSocket 接続は確立されない)。
+         *     接続確立後にセッションが失効した場合はクローズコード 4401 で
+         *     クローズされるので、チケットを再発行して再接続する。
          *
          *     ステアは専用イベントではなく、streaming 中に `message.send` を
          *     送ること自体がステアになる (現在の生成を中断して新入力を注入)。
@@ -328,7 +329,18 @@ export interface components {
              *     SDUI カードはサーバー / エージェント起点でのみ生成される
              *     (任意の component / props の注入を防ぐ)。
              */
-            blocks: components["schemas"]["TextBlock"][];
+            blocks: components["schemas"]["ClientTextBlock"][];
+        };
+        /**
+         * @description クライアント送信用のテキストブロック。`TextBlock` と違い
+         *     空文字を許さない (アシスタント / システム側の表示用
+         *     `TextBlock` には影響しない)。
+         */
+        ClientTextBlock: {
+            /** @enum {string} */
+            type: "text";
+            /** @description ユーザーが入力した生テキスト */
+            text: string;
         };
         /** @description 停止ボタン [■]。対象チャットの生成を中断する */
         StreamStopEvent: {
