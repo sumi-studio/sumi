@@ -50,7 +50,7 @@ web (React) ⇔ api (Go, WebSocketゲートウェイ) ⇔ agent (Rust, ユーザ
                                                    └── ローカル SQLite (ログ・メモリ状態)
 ```
 
-agent⇔api 間のイベントプロトコルは未定のため、**トレイト境界(`Gateway`)として切り**、contracts/ にイベントスキーマを置く前提の設計だけ提示する(第11章)。開発・デモ初期は同じトレイトの stdio (JSON Lines) 実装で CLI から直接会話できるようにし、api 側の進捗と切り離す。
+agent⇔api 間のイベントプロトコルは未定のため、**確立済み接続(`Gateway`)と接続ライフサイクル(`GatewayConnector`/`ConnectionSupervisor`)のトレイト境界として切り**、contracts/ にイベントスキーマを置く前提の設計だけ提示する(第11章)。開発・デモ初期は同じ境界の stdio (JSON Lines) 実装で CLI から直接会話できるようにし、api 側の進捗と切り離す。
 
 ### 1.3 プロセス内アーキテクチャ(データフロー)
 
@@ -114,6 +114,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 async-trait = "0.1"
 regex = "1"                 # retry/overflow パターン判定
+zeroize = "1"               # 復号したmemory summary/credential bufferをDrop時消去
 # M5 で追加: tokio-tungstenite = "0.24" (WSゲートウェイ)
 [dev-dependencies]
 axum = "0.8"                # SSE フィクスチャ再生用モックサーバ (テスト専用)
@@ -121,7 +122,7 @@ axum = "0.8"                # SSE フィクスチャ再生用モックサーバ 
 
 **選定メモ**:
 - SSE パーサは protocol-neutral に自前実装する。Chat Completions の `data:` + `[DONE]` だけでなく、Responses / Anthropic の `event:`、複数 `data:` 行、空行終端、comment/ping、stream 内 error を扱う。`reqwest::bytes_stream()` の上で framing だけを行い、JSON event の意味付けは各 adapter に分離する。リトライ・abort・アイドルタイムアウトは共通 transport に置く。**[推測]**
-- partial JSON パーサ(ストリーミング中のツール引数の逐次パース)は既成クレートに定番がないため、pi の `parseStreamingJson` 戦略(`pi:ai/src/utils/json-parse.ts`)を自前移植する(第12章 #4)。
+- partial JSON パーサ(ストリーミング中のツール引数の**表示専用preview**)は既成クレートに定番がないため、pi の `parseStreamingJson` 戦略(`pi:ai/src/utils/json-parse.ts`)を自前移植する(第12章 #13)。実行に使う確定値はこの出力から作らず、終端時の strict JSON parse だけを正典にする(§4.3)。
 - トークナイザは**持たない**。pi 同様に文字数ヒューリスティック+API実測 usage による校正で賄う(第7.5節)。tiktoken系はKimi/GLMの語彙と一致せずどのみち不正確。**[事実]** pi も `estimateTokens`(chars/4)+直近 usage 実測で運用している(`pi:agent/src/harness/compaction/compaction.ts:169-197, 224-264`)。
 - OpenAPI 生成クライアント: 現状 `contracts/openapi.yaml` は `/health` 1本のみ **[事実]**。当面は `apiclient` モジュールに reqwest の薄い手書きクライアントを置き、API が太り始めた時点で progenitor 等の導入を ADR 化する。**[要決定→第14章]**
 
@@ -142,7 +143,7 @@ apps/agent/src/
 │   │   ├── responses.rs        # OpenAI Responses item/event 変換
 │   │   └── anthropic.rs        # Anthropic Messages content block/event 変換
 │   ├── assembler.rs     # ProviderEvent -> ContentBlock 組み立て
-│   ├── partial_json.rs  # 逐次JSONパース + repair (pi:json-parse.ts 移植)
+│   ├── partial_json.rs  # UI preview専用の逐次JSONパース + repair (確定値には使わない)
 │   ├── retry.rs         # リトライ可否判定 + 指数バックオフ
 │   └── overflow.rs      # コンテキスト溢れ検出 (エラーパターン + usage判定)
 │
@@ -184,7 +185,8 @@ apps/agent/src/
 │   ├── mod.rs           # Gateway トレイト、Command/Envelope 型
 │   ├── wire.rs          # contracts/agent-events.yaml から生成する wire DTO
 │   ├── stdio.rs         # JSON Lines over stdin/stdout (開発・テスト用)
-│   └── ws.rs            # WebSocket クライアント (api への接続、M5)
+│   ├── ws.rs            # WebSocket の1接続 + hello 実装 (M5)
+│   └── supervisor.rs    # GatewayConnector、再接続・再認証・世代交換・catch-up (M5)
 │
 └── apiclient/           # contracts/openapi.yaml 由来の Go API クライアント (薄い手書き)
     └── mod.rs
@@ -281,7 +283,7 @@ pub struct UserMessage {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AssistantMessage {
-    pub content: Vec<AssistantContent>,     // Text | Thinking | ToolCall
+    pub content: Vec<AssistantContent>,     // Text | Thinking | ToolCall | RejectedToolCall
     pub model: String,                      // 生成時のモデルID (クロスモデル再送判定に使う)
     pub provider: String,
     pub usage: Usage,
@@ -295,7 +297,7 @@ pub struct AssistantMessage {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PublicAssistantMessage {
-    pub content: Vec<PublicAssistantContent>, // Text | ToolCall。Thinking は除外
+    pub content: Vec<PublicAssistantContent>, // Text | ToolCall | RejectedToolCall。Thinking は除外
     pub model: String,
     pub provider: String,
     pub usage: Usage,
@@ -311,6 +313,9 @@ pub struct PublicAssistantMessage {
 pub enum PublicAssistantContent {
     Text { text: String, wire_item_index: u32 },
     ToolCall { tool_call: ToolCall, wire_item_index: u32 },
+    /// strict JSON/schema検証に失敗し、承認・実行へ進めなかったcall。
+    /// raw argumentsは保持せず、対応するis_error tool resultと対にする。
+    RejectedToolCall { rejected: RejectedToolCall, wire_item_index: u32 },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -332,14 +337,39 @@ pub enum AssistantContent {
     /// 再送時に同じフィールドへ書き戻す (pi: thinkingSignature の用法)
     Thinking { thinking: String, signature_field: String, wire_item_index: u32 },
     ToolCall { tool_call: ToolCall, wire_item_index: u32 },
+    RejectedToolCall { rejected: RejectedToolCall, wire_item_index: u32 },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
-    pub arguments: serde_json::Value,       // 完成後は必ずObject
+    pub arguments: ValidatedToolArguments,  // strict parse + top-level Object + tool schema通過済み
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ValidatedToolArguments(
+    #[serde(deserialize_with = "deserialize_object_for_durable_replay")]
+    serde_json::Map<String, serde_json::Value>,
+); // fieldはprivate
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolArgsPreview(serde_json::Value); // UI専用。ValidatedToolArgumentsへの変換implを持たない
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RejectedToolCall {
+    pub id: String,
+    pub name: String,
+    pub error: ToolArgumentError,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolArgumentError { InvalidJson, NonObject, SchemaViolation }
+
+// ValidatedToolArgumentsは公開constructorを持たない。live streamではassembler内の
+// try_from_raw(raw, frozen_tool_schema)だけが生成する。custom Deserializeは暗号化済み
+// durable replay専用でObject以外を拒否し、replayされたtoolを自動実行しない。
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -379,7 +409,9 @@ pub enum ProviderEvent {
     ThinkingEnd   { content_index: usize, content: String },
     ToolCallStart { content_index: usize },
     ToolCallDelta { content_index: usize, delta: String },   // 引数JSONの生delta
-    ToolCallEnd   { content_index: usize, tool_call: ToolCall },
+    ToolCallPreview { content_index: usize, preview: ToolArgsPreview },
+    ToolCallEnd   { content_index: usize, tool_call: ToolCall }, // strict検証済みだけ
+    ToolCallRejected { content_index: usize, rejected: RejectedToolCall },
     /// provider が display-safe と明示した reasoning summary のみ (例: Responses の
     /// reasoning summary event)。raw Thinking* とは別 variant で、adapter が明示変換する。
     /// content_index は公開 content 配列とは独立した summary slot の連番
@@ -472,7 +504,9 @@ pub enum PublicStreamEvent {
     TextEnd { content_index: usize, content: String },
     ToolCallStart { content_index: usize },
     ToolCallDelta { content_index: usize, delta: String },
+    ToolCallPreview { content_index: usize, preview: ToolArgsPreview },
     ToolCallEnd { content_index: usize, tool_call: ToolCall },
+    ToolCallRejected { content_index: usize, rejected: RejectedToolCall },
     ReasoningSummaryStart { content_index: usize },
     ReasoningSummaryDelta { content_index: usize, delta: String },
     ReasoningSummaryEnd { content_index: usize, content: String },
@@ -651,7 +685,7 @@ Chat Completions JSON への変換は、**[事実]** 以下すべて `pi:ai/src/
 
 1. **system prompt**: `{"role":"system","content":...}` を先頭にする。L2/L1 は続く user 相当の memory message にし、system/developer role へ昇格させない(第7章)
 2. **assistant content は常にプレーン文字列で送る**(content-block 配列にしない)。配列で送ると一部モデルが構造を鸚鵡返しする事故がある(:987-994 コメント)
-3. **thinking の再送**: 同一モデルなら `signature_field` が示すフィールド(`reasoning_content` 等)へ全ターン分を書き戻す。**Kimi は過去全ターンの reasoning 保持が必須仕様**(調査レポート)。クロスモデル切替時は thinking をプレーンテキストに落とすか捨てる(`pi:ai/src/api/transform-messages.ts` のクロスモデル降格分岐を移植。同ファイルへの行番号参照は §12 冒頭の警告どおり誤りが確認されているため、挙動記述で特定する)
+3. **thinking の再送**: 同一の `provider_instance_id/protocol/model` なら `signature_field` が示すフィールド(`reasoning_content` 等)へ全ターン分を書き戻す。**Kimi は過去全ターンの reasoning 保持が必須仕様**(調査レポート)。クロスモデル、別provider instance、別protocolへの切替時は raw thinking を**常に破棄**し、プレーンテキストやmemory blockへ降格しない。例外は送受信双方の一次仕様がモデル間可搬性と非公開性を明示保証する protocol-scoped な opaque block だけで、通常の `Thinking` とは別型・別 capability・別 trust-domain 契約にする。pi のクロスモデル平文化分岐は移植しない
 4. **`requires_reasoning_content_on_assistant`**: 再送する assistant メッセージに reasoning_content が無ければ `""` を補う(:1038-1044)
 5. **tool_calls**: `{id, type:"function", function:{name, arguments: JSON文字列}}`。引数は必ず `serde_json::to_string` で直列化
 6. **tool ロール**: `{"role":"tool","content":text,"tool_call_id":...}`。テキストが空で画像のみなら `"(see attached image)"`、両方空なら `"(no tool output)"` のプレースホルダ(:1073-1075)
@@ -687,7 +721,7 @@ Chat Completions JSON への変換は、**[事実]** 以下すべて `pi:ai/src/
 **[事実]** 組立ロジックの原典: `pi:ai/src/api/openai-completions.ts:229-511`。移植必須の細部:
 
 - **ブロック管理**: `tool_calls[].index` による Map と `id` による Map の**二重引き**(:239-241, 307-344)。プロバイダによって index だけ・id だけ・両方が来るため。text/thinking ブロックは「現在開いているブロック」1個ずつを保持し、種類が切り替わったら閉じずに保持(同種 delta の続きが来たら継続)
-- **ツール引数の逐次パース**: delta 到着ごとに `partial_args` 文字列へ追記し、`partial_json::parse_streaming` で「常に何かしらのオブジェクト」を得る(UI のツール進行表示用)。**確定 (`ToolCallEnd`) も pi と同じく best-effort サルベージ**(parseStreamingJson チェーン、:263-274)であり厳格化しない — サルベージ由来の「静かに不完全な引数」のリスクは Length 一括失敗(#19)が受け持つ、という pi の二段構えをセットで維持する
+- **ツール引数の逐次パースと確定境界**: delta 到着ごとに生の `raw_args` byte/string bufferへ追記し、その**コピー**を `partial_json::parse_streaming` へ渡してUIの進行表示用previewを得る。repair/partial/`{}` fallbackの戻り値は `PublicStreamEvent::ToolCallPreview` 以外へ流せず、`ToolCall`、承認、`CanonicalAction`、executor入力を構築できない型にする。`ToolCallEnd` では蓄積した生JSON全体を `serde_json::from_str::<serde_json::Value>` で strict parseし、top-level object・ツールschemaも検証する。strict parseまたはschema検証に失敗した場合はraw引数を捨て、`ToolCallRejected { RejectedToolCall }` でstream blockを明示的に閉じ、`PublicAssistantContent::RejectedToolCall`と引数を含まない`is_error=true`の合成tool resultを`MessageStart/End`で確定する。再送transformはこの対を通常の実行可能tool callへ直さず、protocol-neutralな「引数検証に失敗したのでtool callを再生成せよ」というuser相当診断へ変換する。これによりorphan tool resultもrepair済み引数の再送も作らない。**承認要求、`ToolExecutionStart`、executor RPCは発火させない**。Chatの `finish_reason=tool_calls|function_call`、Responsesのarguments done、Anthropicの`content_block_stop`の全終端で同じ検証関数を通す。`finish_reason=length` 時に当該assistant応答内の全ToolCallを一括失敗させる既存guardも独立して維持し、strict parse成功をLength実行許可の代替にしない
 - **reasoning フィールド検出**: delta 内の `reasoning_content` → `reasoning` → `reasoning_text` の順で**最初に見つかった非空フィールドだけ**採用(重複返却プロバイダ対策、:394-424)。採用フィールド名を `signature_field` に記録
 - **usage**: `chunk.usage` を都度上書き。**Moonshot は `choices[0].usage` に入れてくる**フォールバックを移植(:362-366)。`prompt_tokens_details.cached_tokens` → cache_read、`completion_tokens_details.reasoning_tokens` → reasoning。`input = prompt_tokens - cached - cache_write`(:1168-1204)
 - **finish_reason マップ**(:1206-1230 + provider 固有値): `stop|end→Stop`, `length→Length`, `tool_calls|function_call→ToolUse`, `content_filter|sensitive→Error(非リトライ)`, `network_error→Error(リトライ可)`, `model_context_window_exceeded→Error(コンテキスト溢れ)`、その他→Error(メッセージに finish_reason 原文を残す)。分類用の machine-readable `provider_code` を `error_message` とは別に保持し、後段が表示文言の正規表現だけに依存しないようにする
@@ -748,7 +782,7 @@ Sumi では 3層メモリが常時 70k 以内に抑えるため溢れは本来�
 
 移植必須の細部:
 
-- **Length 停止時のツール一括失敗 [事実]** (`pi:agent-loop.ts:207-215, 383-408`): 出力トークン上限で切れたメッセージのツールコールは、partial JSON サルベージにより「パースは通るが黙って不完全」な引数を持ちうる。1つも実行せず全部に `"Tool call was not executed: the response hit the output token limit..."` のエラー結果を返し、モデルに再発行させる
+- **Length 停止時のツール一括失敗 [事実]** (`pi:agent-loop.ts:207-215, 383-408`): 出力トークン上限で切れたメッセージは、個々のtool引数がstrict JSON/schema検証に通っても、後続callや説明を含む応答全体の意図が未完了であり得る。strict終端guardとは独立に1つも実行せず、全部に `"Tool call was not executed: the response hit the output token limit..."` のエラー結果を返してモデルに再発行させる
 - **ツール実行は当面 sequential 固定**。pi の parallel モード(:491-556)は準備だけ順次・実行は並行だが、Sumi は承認フローが挟まるため M5 まで順次で十分。`Tool::risk` と将来の `execution_mode` で拡張余地だけ残す **[推測]**
 - **steering ポーリング位置 [事実]** (:167, :259): ループ開始時(送信待ち中に打った分)と各 TurnEnd 後。Sumi のソフトステア(第6章)はこの機構をそのまま使う
 - **キュー既定 one-at-a-time [事実]** (`pi:agent.ts:222-223`): 複数の割込みを1個ずつ消化し、各々に応答機会を与える
@@ -797,8 +831,8 @@ impl Session {
 pi は JS 単線スレッドで `Agent` のメソッドを直接叩くが、Rust では **制御プレーンと run ワーカーを分離した actor パターン**にする。Session は `tokio::select!` で `commands.recv()` と `ActiveRun.join` を常時ポーリングし、実行中のコマンドを待たせず `control_tx` へ転送する。AgentLoop 側も provider stream、ツール future、承認待ち、retry sleep の各 await を `control_rx.recv()` と `select!` し、次の規則で処理する:
 
 - Assistant 中の `UserMessage` → 対象 attempt の `RunPhase(next=hard_steer_requested)` を先に commit してから(§6.3 手順0、§10.2)CancellationToken を発火して hard steer
-- Tool 中の `UserMessage` → steering queue へ積む (soft steer)
-- Approval 中の `ApprovalDecision` → 対応する oneshot を解決。`UserMessage` は soft steer
+- Tool 中の `UserMessage` → 現在run/次turnへの`soft_steer`分類を先にdurable commitし、steering queueへ積む
+- Approval 中の `ApprovalDecision` → 対応する oneshot を解決。`UserMessage` は現在run/次turnへの`soft_steer`分類を先にdurable commitしてからPendingをCancelledにしqueueへ積む
 - Retry (バックオフ待機) 中の `UserMessage` → `retry_steer` として現在の run/turn への束縛を先に commit し(§10.2)、バックオフ sleep を中断して同じ Turn 内へ user `MessageStart/End` を注入し、即座に次 attempt の API コールへ進む(破棄すべき部分応答が無いため soft 扱い)。リセットするのは次 attempt の**バックオフ遅延段階**(2s/4s/8s の表示上の位置)だけであり、§4.4 の Turn 単位の attempt カウント(最大3回)はステアで巻き戻さず消費し続ける。上限に達したら通常のリトライ不可 Error と同じ経路で Turn を閉じる(繰り返しステアで無制限に API コールを継続させない)**[推測、M2 ゲート5 で検証]**
 - 全 phase の `Abort` → CancellationToken を発火し、承認待ち・retry sleep も終了
 
@@ -806,7 +840,7 @@ run 中の会話可変状態は `RunCore` としてワーカー1個だけが所�
 
 pi から移す挙動:
 - **実行中の prompt() は拒否**(:337-345)。Sumi では「Streaming 中の user_message コマンド = ステア」と解釈するので UI からはエラーにならない(第6章)
-- **run 失敗時の合成エラーメッセージ [事実]** (:494-510): ループが予期せず落ちたら stopReason=Error の assistant メッセージを合成してイベント列を正常形(MessageStart/End → TurnEnd → AgentEnd)で閉じる。**イベント消費者は「必ず正常形で閉じる」ことに依存してよい**という契約
+- **run 失敗時の合成エラーメッセージ [事実]** (:494-510): ループが予期せず落ちたら stopReason=Error の assistant メッセージを合成してイベント列を正常形(MessageStart/End → TurnEnd)まで閉じる。同じrunに適用待ちsoft steerが無ければAgentEnd、あれば保存済み次TurnStartへ継続する(§10.2)。**イベント消費者は「開始済みmessage/turnを必ず正常形で閉じる」ことに依存してよい**という契約
 - `waitForIdle` 相当: run 完了の通知(watch チャネル)
 
 ### 5.3 履歴再送時の正規化(transform)
@@ -815,7 +849,8 @@ pi から移す挙動:
 
 1. **孤児ツールコールへの合成結果**: assistant のツールコールに対応する toolResult が無い場合(abort・クラッシュ・ステア切断)、`"No result provided"` の is_error 結果を合成して挿入。**user メッセージがツールフローを分断した位置にも挿入**。会話末尾の未解決分も同様
 2. **Error/Aborted assistant のスキップ**: 再送しない。**ただし Sumi 拡張: `interrupted=true` のものは除く**(第6章のステア部分応答。テキスト/thinking は保持し、未完了ツールコールブロックだけ落とす)
-3. **クロスモデル thinking 降格**: モデル切替後は thinking をテキスト化 or 破棄
+3. **クロスモデル thinking破棄(Sumi独自差分)**: provider instance/protocol/modelのいずれかが変わったらraw thinkingを常に破棄し、テキストやmemoryへ降格しない。一次仕様が可搬性を明示保証するopaque blockだけを別型/capabilityで扱う(§4.2)
+4. **拒否済みtool callの正規化**: `RejectedToolCall + is_error ToolResultMessage` は実行可能なtool callへ復元せず、raw/repair済みargumentsも再送しない。provider-neutralなuser相当診断1件へ変換し、モデルへtool callの再生成を促す
 
 (いずれも `transform-messages.ts` 全223行を実読して該当処理を特定すること — 本書の旧行番号は誤りだった)
 
@@ -885,6 +920,7 @@ pi の `steer()` は**キュー投入のみ**で、注入は「現在のツー�
 | abort(ツール実行中・承認待ち) | —(assistant ストリーム外) | 実行中ツールへ cancel 伝播(§8.3 の停止仕様)→ 残ツールへ "Operation aborted" のエラー結果を合成(`ToolExecutionEnd` → `MessageStart/End`(toolResult))→ 承認 Pending は Cancelled で block(§9.2)→ `TurnEnd` → `AgentEnd` | 終了(Idle へ) |
 | リトライ可能エラー | `Error(Error)` | `MessageEnd`(error) → `RetryScheduled` → backoff → `MessageStart`(次attempt) | **同一 Turn を継続**。error message はログのみで L0 へ入れない |
 | リトライ待機中ステア | —(直前 attempt は確定済み) | `MessageEnd`(error) → `RetryScheduled` → `Steered`(soft) → `MessageStart/End`(user、現在 Turn へ注入) → `MessageStart`(次attempt) | **同一 Turn を継続**。新しい `TurnStart` は出さず、attempt カウントも維持 |
+| ツール実行/承認待ち中ステア | —(assistant ToolUseは確定済み) | ツールバッチを結果まで確定(承認待ちだけならCancelled+error result) → `TurnEnd` → `Steered`(soft) → 保存済み次`turn_id`の`TurnStart` → `MessageStart/End`(user) → 次のassistantストリーム | **同一 run を継続(`AgentEnd`なし)**。commandは受信時に次turnへdurable bindする |
 | コンテキスト溢れ(エラー検出) | `Error(Error)` | `MessageEnd`(error) → `RetryScheduled`(delay 0) → 溢れ処理を即時適用(§4.5・§7.6)→ `MessageStart`(次attempt) | **同一 Turn を継続**。1 Turn 最大2回、超過はリトライ不可 Error として閉じる |
 | リトライ不可エラー | `Error(Error)` | `MessageEnd`(error) → `TurnEnd` → `AgentEnd` | 終了 |
 
@@ -936,17 +972,19 @@ pub struct ThreeLayerMemory {
 pub struct L0Batch {
     pub id: BatchId,              // uuid v7
     pub batch_seq: u64,           // conversation/layer 内で単調増加。FIFO適用の正典
-    pub messages: Vec<Message>,
+    pub messages: Vec<PublicMessage>, // hidden reasoning/provider context を型として保持しない
     pub est_tokens: u64,
     pub state: BatchState,        // Open | Sealed | Compacting | CompactFailed | Compacted
 }
 
 pub struct L1Entry {
     pub source_batch: BatchId,
-    pub summary: String,          // Compact結果
+    pub summary: DecryptedMemorySummary, // runtime内だけ。DB正本はsummary_ciphertext
     pub est_tokens: u64,
     pub time_range: (DateTime<Utc>, DateTime<Utc>),  // 「いつの記憶か」を要約ヘッダに刻む
 }
+
+pub struct DecryptedMemorySummary(zeroize::Zeroizing<String>); // field private、serialize不可
 ```
 
 サイズ定数(設定で可変、既定値は memory.md 準拠):
@@ -964,19 +1002,35 @@ L2_LIMIT       = 10_000
 
 - open バッチにメッセージを追記し、`est_tokens >= L0_BATCH_MIN` に達したら**次の「きりのいい境界」で seal**
 - きりのいい境界の定義(pi の cut point 規則を Sumi のメッセージ種別に射影したもの。`pi:agent/src/harness/compaction/compaction.ts` の cut point 判定参照 — pi は bashExecution/custom 等のエントリ種別も cut 対象に含むが **[事実]**、Sumi のメッセージは user/assistant/toolResult の3種なので**結果として user または assistant メッセージの直前のみ**になる): toolResult の直前では切らない(assistant のツールコールと結果が別バッチに泣き別れると、Compact 入力も再送プレフィックスも壊れるため)。Sumi 追加規則: **interrupted な assistant とそれに続く steering user メッセージの間でも切らない**(中断文脈の一体性)
-- thinking ブロックはバッチのトークン計算に**含める**(Kimi では実際に再送されるため。memory.md 未決事項への回答)
+- thinking/provider contextは `L0Batch` に入れない。ただし通常会話のcontext上限見積では、対応する暗号化provider contextのサイズを別カウンタとして**含める**(Kimiでは実際に再送されるため)。メモリバッチのseal/Compact入力は `PublicMessage` の見積だけで決め、hidden contentを要約モデルへ渡す口実にしない
 - seal と同時に `compactor` へ非同期ジョブ投入(7.4節)し、状態を Compacting に
 
 ### 7.4 先回り Compact(`compactor.rs`)
 
 - tokio task のワーカー1本。mpsc は「新しい仕事がある」という wake-up 通知だけに使い、**ジョブの正典は SQLite の `memory_jobs`** とする。L0 seal、L1→L2 要約、L2 統合の予約は、対象状態の更新、単調増加 `batch_seq` の採番、`memory_jobs(status='pending')` の INSERT を §10.2 の EventWriter 内部投影で同一トランザクションにする。**メインの会話経路とは完全非同期**(TTFT に乗せない)
-- Compact 呼び出しは通常会話と同じ provider 層を使うが、**別モデル指定可**(既定: 会話と同じモデル。安価な `umans-flash`/`kimi-k2.7` への切替を設定で許す)**[要決定→第14章]**
+- Compact 呼び出しは通常会話と同じ transport/provider 配管を使うが、conversation用の `PromptContext` は受け取らない。入力境界は次の専用型とし、公開会話以外のcontent sourceを型レベルで持てなくする:
+
+```rust
+pub struct CompactionInput(Vec<PublicMessage>); // fieldはprivate
+
+impl CompactionInput {
+    pub fn from_public_batch(
+        batch: &[PublicMessage],
+        recent: Option<&RedactedMemoryProjection>,
+    ) -> Self;
+}
+
+pub async fn compact(model: &CompactModelSpec, input: CompactionInput) -> CompactResult;
+```
+
+  constructorはバッチの`PublicMessage`だけを複製し、任意のrecent-memoryを添える場合も、既存要約の**redacted projection**を履歴データと明示した合成`PublicMessage`へ変換する。`AssistantMessage`、`PromptContext`、`ProviderContextItem`、native compaction window、`Thinking`からの変換implは定義しない。serializerも`CompactionInput`しか受けず、raw hidden reasoning、署名、encrypted reasoning、Anthropic thinking/redacted_thinking、provider contextは会話モデルと同じproviderを使う場合も、別Compact providerを使う場合も送信不能にする。fixtureで全provider context variantをL0へ紐付けてもCompact HTTP bodyへそのbyte列が現れないことを検証する
+- **別モデル指定可**だが、既定は会話と同じモデル。同一tenantのdata-processing/trust-domain policyが許可したCompact providerだけを設定でき、未許可なら起動時に拒否する。これは公開transcriptの送信先制約であり、hidden contentを送ってよいという意味ではない **[要決定→第14章]**
 - プロンプト: pi の構造化チェックポイント形式 **[事実]**(`pi:compaction.ts:383-457` の SUMMARIZATION_PROMPT / UPDATE_SUMMARIZATION_PROMPT)を秘書ドメインに書き換える。骨子:
 
 ```text
 system: あなたは記憶の圧縮係。会話を続けるな。要約だけ出力せよ。
-user: <conversation>バッチ内容の直列化</conversation>
-      <recent-memory>L1末尾エントリ (読み取り専用の文脈)</recent-memory>   ← memory.md 未決事項「Compactの入力」への対応
+user: <conversation>CompactionInput内のPublicMessage列の直列化</conversation>
+      <recent-memory>redacted済みL1末尾を合成PublicMessageとして添付 (読み取り専用)</recent-memory>
       指定フォーマット:
       ## 出来事           (何が起き、何を話したか。時刻付き)
       ## ユーザーについて分かったこと (好み・事実・関係性)
@@ -986,10 +1040,10 @@ user: <conversation>バッチ内容の直列化</conversation>
 ```
 
   圧縮率の明示指定は memory.md 未決事項「Mastra で ~50倍圧縮されすぎ問題」への直接対応。max_tokens でも物理上限を掛ける(pi は reserveTokens×0.8 を maxTokens に指定 **[事実]** :470-473)
-- ワーカーは EventWriter の内部 `MemoryJobUpdate` 投影で `pending` を原子的に `running` へ claim する。予約時に全 source batch の `(id, version)` を `source_versions` へ固定し、完了時は `MemoryTransition` で現在値がすべて一致する場合だけ、Compact result 保存、source batch の `Compacting → Compacted`、job の `running → completed` を**同じ transaction**で進める(CAS)。各 batch mutation は `version = version + 1` とする。古い入力に対する遅延結果は破棄し、`UNIQUE(kind, batch_seq)` により二重実行されても結果は1件だけ残る。**この時点では L0 から消さない**(先回り原則)
+- ワーカーは EventWriter の内部 `MemoryJobUpdate` 投影で `pending` を原子的に `running` へ claim する。予約時に全 source batch の `(id, version)` を `source_versions` へ固定し、完了時は`MemoryProjectionBuilder`がCompact平文結果から暗号化正本+redacted projection+`redaction_version`を生成する。`MemoryTransition` は現在値がすべて一致する場合だけ、それらを `memory_jobs.result_*` と `memory_batches.summary_*` へ保存し、source batch の `Compacting → Compacted`、job の `running → completed` を**同じ transaction**で進める(CAS)。unredacted result/summaryをTEXTへ一時保存する段階は設けない。各 batch mutation は `version = version + 1` とする。古い入力に対する遅延結果は破棄し、`UNIQUE(kind, batch_seq)` により二重実行されても結果は1件だけ残る。**この時点では L0 から消さない**(先回り原則)
 - 適用は layer/kind ごとの `memory_apply_cursors.next_batch_seq` と一致する `completed` job だけを許す。後続 `batch_seq` が先に完了しても棚で待たせる。L0/L1 membership の削除、summary の昇格、job の `applied` 化、cursor の前進を公開 `MemoryMaintenance` と同じ `MemoryTransition` transaction で行う。重複完了通知は `applied` を見て no-op にする
 - 失敗時: リトライ2回、それでも駄目なら `MemoryTransition` で job を `failed`、source batch を `CompactFailed` にし、shelf に「未Compact」マークを残す。この mutation で batch version が進むため、同じ transaction で job の `source_versions` も**遷移後のversion**へ更新する。溢れ処理時の同期フォールバックはそのversionをCASして `failed → running` を claim し、成功時は同じ completion transaction で `CompactFailed → Compacted` と `running → completed` へ進める(このときだけ遅延が出る)。Compact 失敗でも会話は止めない
-- 再起動時: `running` のまま残ったジョブを lease timeout 後に `pending` へ戻し、`Compacting` かつ summary のないバッチを再投入する。`CompactFailed` は自動再投入せず、ハード上限時の同期 fallback だけが再 claim する。起動時の整合チェックは「状態だけ Compacting でジョブ無し」も修復する。L0/L1/L2 のどの段階でもプロセス kill 後に再開できることを M4 の fault-injection テストで確認する
+- 再起動時: `running` のまま残ったジョブを lease timeout 後に `pending` へ戻し、`Compacting` かつ完全な`summary_*`組がないバッチを再投入する。`CompactFailed` は自動再投入せず、ハード上限時の同期 fallback だけが再 claim する。起動時の整合チェックは「状態だけ Compacting でジョブ無し」、正本/projection/versionの一部だけがある不正行、鍵破棄済みで復号不能なcompleted resultを検出する。不正な部分組はtransactionを拒否するため通常生成されない。conversation tombstone/鍵破棄済みなら再Compactせず行をcrypto-erasedとして掃除し、live conversationで鍵だけ欠落した場合はfail-closedで`CompactFailed`へ修復して元のPublicMessageから再投入する。L0/L1/L2 のどの段階でもプロセス kill 後に再開できることを M4 の fault-injection テストで確認する
 - ワーカーは Umans の同時4セッション制限を食う点に注意(会話ストリーム+Compact で2本)**[事実]**(調査レポート)
 
 ### 7.5 トークン見積と校正(`estimate.rs`)
@@ -1034,7 +1088,7 @@ transform は**送信用のビューを作る純関数**であり、L0 の保存
 
 40k/80k は層の**総量**の制御であり、厳密な不変条件ではない。ただし1メッセージはバッチ分割できない最小単位のため、単一の巨大メッセージには別のガードが要る(無制限だと L0 のバッチ・溢れ設計自体が壊れる):
 
-- **ユーザー入力(二段構え)**: (a) **wire 上限 1MB**: API がユーザー入力を command 化する前(§11.1.1 の `seq`/`command_id` 採番より前)にサイズを検証し、超過分は agent へ送らずクライアントへ直接エラーを返す。agent は通常経路では 1MB 超の `user_message` を受け取らない。agent の Gateway 層でも同じ上限を保険として検証するが、この上限に一度でも到達した envelope は「seq を消費してしまうと以後の command が塞がる」ため、`Received` ACK を返さずプロトコル違反として接続を切断する(§11.1.1 の seq 欠番時の扱いと同型)。同じ oversized command が再送され続ける場合は API 側の一次検証が抜けているバグであり、agent 側のリトライでは解決できないため運用アラートで検知する。(b) **L0 投入上限 50KB**(ツール結果と同じ値): 超過入力は `messages.raw_ciphertext` に**原文全文**を保存した上で、全文を runtime-owned な `/workspace/.attachments/<conversation_id>/` へ退避し、L0 へは先頭 50KB+「[全文 xxxKB: /workspace/.attachments/<conversation_id>/user-yyy.txt]」の注記付き切詰めビューとして投入する。エージェントは必要なら read_file/grep で続きを読める(戦略的忘却と同じ思想)。このディレクトリはユーザー作成ファイルと区別する conversation-owned artifact で、reset 時に旧 conversation ID のディレクトリを冪等削除する。切詰めは投入時の純関数とし、再起動時の raw transcript→L0 復元でも同じ関数を通す(保存形は常に原文 — §7.7 の「ログと記憶の分離」と同型)。この切詰めビューは `messages.raw_ciphertext`(全文正本。復旧・export・redaction 前の唯一の原文)にも `messages.payload`(同じ `PublicMessage` の redacted projection。secret 置換のみで切詰めはしない、§10.1)にも対応する列を持たない**別モデル**であり、ContextAssembler(§7.7)が `raw_ciphertext` を復号するたびに算出する runtime-only の値として扱う。DB に切詰め済みテキストを永続化しない**[推測、上限値は実測調整]**
+- **ユーザー入力(二段構え)**: (a) **wire 上限 1MB**: API がユーザー入力を command 化する前(§11.1.1 の `seq`/`command_id` 採番より前)にサイズを検証し、超過分は agent へ送らずクライアントへ直接エラーを返す。agent は通常経路では 1MB 超の `user_message` を受け取らない。agent の Gateway 層でも同じ上限を保険として検証するが、この上限に一度でも到達した envelope は「seq を消費してしまうと以後の command が塞がる」ため、`Received` ACK を返さずプロトコル違反として接続を切断する(§11.1.1 の seq 欠番時の扱いと同型)。同じ oversized command が再送され続ける場合は API 側の一次検証が抜けているバグであり、agent 側のリトライでは解決できないため運用アラートで検知する。(b) **L0 投入上限 50KB**(ツール結果と同じ値): 超過入力は `messages.raw_ciphertext` に**原文全文**を保存した上で、runtimeがexecutorの`put_attachment` RPCへ全文を渡して `/workspace/.attachments/<conversation_id>/` へ退避し、L0 へは先頭 50KB+「[全文 xxxKB: /workspace/.attachments/<conversation_id>/user-yyy.txt]」の注記付き切詰めビューとして投入する。runtimeはworkspaceを直接openせず、エージェントが続きを必要とする場合もread_file/grep executor RPCを使う(戦略的忘却と同じ思想)。このディレクトリはユーザー作成ファイルと区別する conversation-owned artifact で、reset 時に旧 conversation ID のディレクトリをsupervisor/専用削除RPCが冪等削除する。切詰めは投入時の純関数とし、再起動時の raw transcript→L0 復元でも同じ関数を通す(保存形は常に原文 — §7.7 の「ログと記憶の分離」と同型)。この切詰めビューは `messages.raw_ciphertext`(全文正本。復旧・export・redaction 前の唯一の原文)にも `messages.payload`(同じ `PublicMessage` の redacted projection。secret 置換のみで切詰めはしない、§10.1)にも対応する列を持たない**別モデル**であり、ContextAssembler(§7.7)が `raw_ciphertext` を復号するたびに算出する runtime-only の値として扱う。DB に切詰め済みテキストを永続化しない**[推測、上限値は実測調整]**
 - **assistant 出力**: リクエストの max_tokens に**モデル上限ではなく既定 16k トークン**(設定可)を指定する。`ModelSpec.max_tokens`(128k 等)は物理上限であり通常リクエストには使わない。超過は StopReason::Length として顕在化し、既存の経路で処理される(ツールコールは一括失敗 #19、テキストは打ち切りのまま保持)
 - **ツール結果**: 既存の 2000行/50KB 切詰め+全文退避(§8.2)と grep 行長 500 字(§8.1)がこのガードを兼ねており、単一ツール結果が L0 に 50KB を超えて入る経路はない。追加の仕組みは不要
 - 50KB は日本語で ~10k トークン強に相当し得るため、L0 投入時の実サイズは est(§7.5)で計上し、溢れ処理が通常どおり吸収する
@@ -1056,9 +1110,9 @@ transform は**送信用のビューを作る純関数**であり、L0 の保存
 | `grep` | ReadOnly | ripgrep 呼び出し(コンテナに同梱)。行長500字切詰め **[事実]**(`pi:truncate.ts:GREP_MAX_LINE_LENGTH`) |
 | `bash` | Exec | ストリーミング出力、タイムアウト既定120s |
 
-`fs`/`bash` は agent ランタイム自身では実行しない。同じバイナリに `--tool-executor` モードを持たせるが、**リリース時は deployment supervisor が別 sandbox として起動**する。Docker 段階では container orchestrator が runtime コンテナと `network_mode=none` の executor sidecar を作成し、両者は `/workspace` volume と専用 IPC volume だけを共有する。runtime に Docker socket や sidecar 作成権限を渡さない。microVM 段階では guest supervisor が executor を専用 mount/PID/network namespace と `pivot_root`/chroot 相当の最小 root で起動する。executor の rootfs は read-only、capability は全 drop、`no-new-privileges` とし、read/write mount は `/workspace` だけ、必要な interpreter/runtime file は read-only で明示 mount する。非root runtime が `unshare(CLONE_NEWNET)` できる前提や、Docker 既定 seccomp/capability の緩和へ依存しない。
+`fs`/`bash` は agent ランタイム自身では実行しない。同じバイナリに `--tool-executor` モードを持たせるが、**リリース時は deployment supervisor が別 sandbox として起動**する。Docker 段階では container orchestrator が runtime コンテナと `network_mode=none` の executor sidecar を作成し、`/workspace` volumeはexecutorだけ、専用IPC volumeは両者へmountする。runtime にworkspace volume、Docker socket、sidecar 作成権限を渡さない。microVM 段階では guest supervisor が executor を専用 mount/PID/network namespace と `pivot_root`/chroot 相当の最小 root で起動する。executor の rootfs は read-only、capability は全 drop、`no-new-privileges` とし、read/write mount は `/workspace` だけ、必要な interpreter/runtime file は read-only で明示 mount する。非root runtime が `unshare(CLONE_NEWNET)` できる前提や、Docker 既定 seccomp/capability の緩和へ依存しない。
 
-Docker sidecar は container spec で環境を `PATH` / `HOME` / `LANG` / executor generation の許可リストに限定し、host/runtime の FD を継承させない。microVM/ローカル process は guest supervisor が `env_clear` 後に同じ許可リストだけを設定し、stdio と専用 Unix socket 以外の FD を `close_range`/close-on-exec で閉じて exec する。`/var/lib/sumi`、API key、gateway credential、runtime の `/proc` は mount/継承しない。RPC は generation と per-boot nonce を含む JSON Lines とし、専用 socket 以外に runtime へ到達する経路を作らない。
+Docker sidecar は container spec で環境を `PATH` / `HOME` / `LANG` / executor generation の許可リストに限定し、host/runtime の FD を継承させない。microVM/ローカル process は guest supervisor が `env_clear` 後に同じ許可リストだけを設定し、stdio と専用 Unix socket 以外の FD を `close_range`/close-on-exec で閉じて exec する。`/var/lib/sumi`、API key、gateway credential、runtime の `/proc` は mount/継承しない。RPC は generation と per-boot nonce を含む JSON Lines とし、専用 socket 以外に runtime へ到達する経路を作らない。任意bashが`0600`/`0700`を作成できる前提で、後続のread/edit/deleteも同じexecutor UIDのRPCで行う。runtime/executor間の共有groupやumaskで直接相互アクセスを保証しない
 
 `read_file` / `write_file` / `edit_file` / `list_dir` / `glob` / `grep` は workspace dirfd を起点に、すべての path component を `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)` 相当で open する。canonicalize は診断表示にだけ使い、canonicalize 後に path を再 open する TOCTOU 実装は禁止する。新規作成、rename、temporary file、glob/grep の走査にも同じ dirfd policy を適用する。Linux 以外の OSS ローカル版では同等境界を実装できない限り bash を明示的な低信頼モードとして扱う。**[推測→セキュリティ契約として確定]**
 
@@ -1080,7 +1134,7 @@ Docker sidecar は container spec で環境を `PATH` / `HOME` / `LANG` / execut
 
 - stdout/stderr を**単一ストリームに合流**(時系列維持)
 - **ローリングバッファ**: 上限 100KB(50KB×2)。超えたら先頭チャンクから捨てる → 最後に `truncate_tail` で 50KB/2000行に整える(=「メモリを無限に食わずに末尾を保持」)。注意: pi の「100KB」は JS の `text.length`(UTF-16 コード単位)基準 **[事実]** であり、Rust では**バイト基準の仕様移植**とする(忠実移植ではない)。多バイト文字を含む出力での全文退避テストを必須とする
-- **全文退避**: 出力が 50KB を超えた時点で runtime-owned な `/workspace/.tool-output/<conversation_id>/bash-*.log` への追記を開始し、ツール結果に**全文パス**を含める。エージェントは必要なら read_file/grep で続きを読める(戦略的忘却と同じ思想)。ユーザー作成ファイルと区別し、conversation reset/backup 復元時は旧 ID のディレクトリを tombstone に従って冪等削除する
+- **全文退避**: 出力が 50KB を超えた時点でexecutorの`append_tool_output`処理が `/workspace/.tool-output/<conversation_id>/bash-*.log` への追記を開始し、ツール結果に**全文パス**を含める。runtimeはpathを直接openせず、必要ならread_file/grep RPCで続きを読む(戦略的忘却と同じ思想)。artifact RPCは親dirを明示`0700`、fileを明示`0600`へ`fchmod`し、umaskに依存しない。ユーザー作成ファイルと区別し、conversation reset/backup 復元時は旧 ID のディレクトリを tombstone に従ってsupervisor/専用削除RPCが冪等削除する
 - **出力 quota**: rolling buffer とは別に、spawn 直後から stdout+stderr の総バイト数を数える。1 command 10MiB、`/workspace/.tool-output` 合計100MiBを既定上限とし、どちらかへ達したら capture だけを黙って捨てず、§8.3 の execution boundary 全体を停止して `ResourceLimit(OutputBytes)` を返す。partial log は fsync/close し、結果に実測バイト数と limit を含める。上限は tenant policy で引き下げ可
 - **バイナリサニタイズ**: 制御文字(TAB/LF/CR以外)除去、`\r` 除去(:sanitizeBinaryOutput)。Rust では `from_utf8_lossy` + 同フィルタ
 - 中断(execution boundary の実装仕様、Linux 前提):
@@ -1154,7 +1208,7 @@ pub enum ApprovalDecision { ApproveOnce, ApproveAlways { rule: ApprovalRule }, D
 - shell command を可能な限り segment へ分解し、literal token prefix ruleを全segmentへ評価する。複数ruleが一致した場合は `Allow < Prompt < Forbidden` の最も厳しい決定を採る ([exec_policy.rs](https://github.com/openai/codex/blob/315195492c80fdade38e917c18f9584efd599304/codex-rs/core/src/exec_policy.rs#L270-L325)、[policy.rs](https://github.com/openai/codex/blob/315195492c80fdade38e917c18f9584efd599304/codex-rs/execpolicy/src/policy.rs#L228-L250))
 - `python` / `bash` / `sh` / `node` / `env` / `sudo` / `git` 単体等の広すぎる prefix を永続rule候補として拒否する。候補ruleを仮適用し、全segmentが本当に Allow になるか再評価してからユーザーへ提示する ([exec_policy.rs](https://github.com/openai/codex/blob/315195492c80fdade38e917c18f9584efd599304/codex-rs/core/src/exec_policy.rs#L53-L100)、[同](https://github.com/openai/codex/blob/315195492c80fdade38e917c18f9584efd599304/codex-rs/core/src/exec_policy.rs#L895-L956))
 - `AutoReview` は通常、決定論的policyが NeedsApproval とした操作だけを別の Guardian model/session で審査する。child sessionは read-only、approval never、MCP/skills等を無効化し、失敗時はdenyする ([review.rs](https://github.com/openai/codex/blob/315195492c80fdade38e917c18f9584efd599304/codex-rs/core/src/guardian/review.rs#L165-L181)、[review_session.rs](https://github.com/openai/codex/blob/315195492c80fdade38e917c18f9584efd599304/codex-rs/core/src/guardian/review_session.rs#L993-L1075))
-- Guardian には exact action JSON と bounded transcript を渡す。出力は `allow|deny` に risk / user authorization / rationale を添えた strict JSON。timeout・parse失敗は fail-closed ([prompt.rs](https://github.com/openai/codex/blob/315195492c80fdade38e917c18f9584efd599304/codex-rs/core/src/guardian/prompt.rs#L83-L242)、[policy template](https://github.com/openai/codex/blob/315195492c80fdade38e917c18f9584efd599304/codex-rs/core/src/guardian/policy_template.md#L1-L58))
+- Guardian には exact action JSON と bounded transcript を渡す。出力は `allow|deny` に risk / user authorization / rationale を添えた strict JSON。timeout・parse失敗は fail-closed ([prompt.rs](https://github.com/openai/codex/blob/315195492c80fdade38e917c18f9584efd599304/codex-rs/core/src/guardian/prompt.rs#L83-L242)、[policy template](https://github.com/openai/codex/blob/315195492c80fdade38e917c18f9584efd599304/codex-rs/core/src/guardian/policy_template.md#L1-L58))。Sumiはreviewerを別providerへ設定できるため、exact actionをそのまま転送せず§9.6のsecret-aware projectionを挟む
 - Guardian のallowは今回限りで、永続rule追加はユーザーが明示承認する別経路
 
 #### Claude Code
@@ -1183,6 +1237,22 @@ pub struct CanonicalAction {
     pub justification: Option<String>,
 }
 
+pub struct ReviewableAction {
+    pub tool: String,
+    pub operation: String,
+    pub argv: Vec<ReviewToken>,       // Literal | SecretRef { kind, digest } | Omitted
+    pub cwd: ReviewPath,              // component単位にLiteral/SecretRef化
+    pub affected_paths: Vec<ReviewPath>,
+    pub sandbox: SandboxSummary,
+    pub requested_permissions: Vec<Permission>,
+    pub justification: Option<RedactedText>,
+}
+
+pub enum ReviewProjection {
+    Reviewable(ReviewableAction),
+    InsufficientEvidence { reason: String },
+}
+
 pub enum PolicyDecision {
     Allow { matched_rules: Vec<RuleId> },
     NeedsApproval { matched_rules: Vec<RuleId>, reason: String },
@@ -1196,6 +1266,7 @@ pub enum PolicyDecision {
 - shell/interpreter (`bash`, `sh`, `python`, `node` 等)、権限昇格、汎用wrapper、`git` 単体など広域prefixは禁止。`git status` や `npm test` のように操作まで限定した候補だけ許す
 - `ApproveAlways` はユーザーの明示操作時のみ。候補ruleを仮追加したpolicyで元actionの全segmentを再評価し、全てAllowになり、既存Forbidden/NeedsApprovalと競合しない場合だけ保存する
 - Auditモデルのallowは永続化しない。policy/rules変更時はreview cacheを全破棄する
+- `CanonicalAction`はexecutor/決定論的policy用のruntime内部正本であり、reviewer APIへserializeしない。`SecretAwareActionProjector`はargv、環境代入、header、URL query/userinfo、justification、path中のcredentialをRedactor+credential inventoryで分類し、secret値をkindとkeyed digestだけの`SecretRef`へ置換する。同じsecretの同一性比較はできるが値は復元できない。redactionでhost/operation/affected path/permission scope等の判定材料が失われる場合は推測で埋めず`InsufficientEvidence`とする
 - 既定fast path: workspace内read、内部状態を除くworkspace内write/editは sandbox 内でAllow **[要決定D3]**。bash、network、domain mutation、追加権限要求は原則 NeedsApproval
 
 ### 9.5 Audit reviewer (`reviewer.rs`)
@@ -1211,11 +1282,11 @@ pub struct AuditDecision {
 }
 ```
 
-- main conversationとは別の provider call/sessionを使い、reviewer専用モデルを設定可能にする。既定は会話モデルより小さいモデル、未設定時は会話モデルへfallback
+- main conversationとは別の provider call/sessionを使い、reviewer専用モデルを設定可能にする。ただし`ReviewerModelSpec`は`trust_domain_id`とtenant data-processing policyを必須とし、会話providerと同一trust domain、またはtenantが明示許可したaudit trust domainだけを選べる。未許可・不明なprovider/model/base URL/accountへはreview入力を送らず、interactiveは理由付き人間承認、headlessはblockへfallbackする。許可済み範囲では既定を会話モデルより小さいモデルとし、未設定時は会話モデルへfallback
 - tool definitionsは渡さず、reviewer自身はツールを実行できない。将来read-only調査を許す場合も別 sandbox・approval neverに固定する
 - `AutoReview` は NeedsApprovalだけを審査。`StrictAutoReview` はpolicy Allowも再審査する開発/高警戒モード
 - 最大3 attempt、全体timeout 90秒。retry対象はparse失敗と一時的transport/server errorだけ
-- timeout、cancel以外のruntime失敗、schema不一致、空応答は synthetic `High / Unknown / Deny`。interactiveでは理由付きで人間承認へfallbackし、headlessではblock
+- timeout、cancel以外のruntime失敗、schema不一致、空応答、`ReviewProjection::InsufficientEvidence`、reviewer trust-domain不一致は synthetic `High / Unknown / Deny`。interactiveでは**CanonicalActionをローカルのsecret-aware UI表示で**人間承認へfallbackし、headlessではblockする。秘匿を解除してreviewerへ再送するfallbackは禁止する
 - 連続deny 3回または直近50 review中10回denyでcircuit breakerを開き、そのrunのAutoReviewを停止して人間承認へ戻す
 - allow cacheは `policy_hash + CanonicalAction + relevant_context_version` をkeyにし、新しいuser message、policy変更、cwd/repo状態変更でinvalidate。denyは同一turn内だけcache
 
@@ -1231,10 +1302,10 @@ API callの入力順序を固定する:
    - 過去tool callはtool名、sanitized引数、outcome (`ok/error/interrupted/rejected/blocked`)だけ
    - tool result本文、hidden reasoning、他agentの主張をauthorizationとして扱わない。必要なtool evidenceは最大1k tokensの要約として明示的に untrusted 区画へ置く
    - transcript全体10k tokens、tool evidence別枠4k、1 entry最大2k、直近non-user最大40を初期値とする
-4. **Pending exact action**: `CanonicalAction` のJSONを最後に置く
+4. **Pending review projection**: `SecretAwareActionProjector`が作った`ReviewableAction`のJSONを最後に置く。`CanonicalAction`のraw JSONはprovider callへ渡さない。`InsufficientEvidence`ならreviewer call自体を行わずmanual/headless fallbackへ進む
 5. **Retry note**: 前attemptのschema/parseエラーだけを追記し、判定を誘導する説明は入れない
 
-会話全文を無制限に送らない。とくにツール出力中のprompt injectionをユーザー意図と誤認しないことを最優先する。
+会話全文を無制限に送らない。とくにツール出力中のprompt injectionをユーザー意図と誤認しないこと、transcript側だけでなくpending action側からAuthorization header、署名URL、API key、password、tokenを漏らさないことを最優先する。
 
 ### 9.7 ReviewerプロンプトのSumi仕様
 
@@ -1285,7 +1356,7 @@ JSON Schema:
 
 ### 9.8 待機中の会話との整合
 
-承認待ちはツールバッチの途中で停止するため、Session は `Streaming` のまま。`ApprovalDecision` が届けば通常どおり Pending を解決し、対応する `UserMessage` が同時にあればツールバッチ完了 → 次ターン前に注入する。「拒否と同時に言葉で指示する」自然な操作はこの経路で成立する。一方、`ApprovalDecision` を伴わず `UserMessage` だけが届いた場合は、D4(承認待ちは無限待ちだが steering で詰まらないことが前提、§14.1)を満たすため即座に処理する: 対象ツールは実行前で外部副作用がないので、その Pending を決定を待たず `Cancelled` として block し(§9.2)、通常の soft steer 経路(他に実行中のツールがあれば完了後、無ければ直ちに次 API コール前)へ合流させる。Pending 解消後に遅延到着した同一 `request_id` の `ApprovalDecision` は無視する。abort は Pending を破棄して Idle へ。
+承認待ちはツールバッチの途中で停止するため、Session は `Streaming` のまま。`ApprovalDecision` が届けば通常どおり Pending を解決し、対応する `UserMessage` が同時にあればツールバッチ完了 → 次ターン前に注入する。「拒否と同時に言葉で指示する」自然な操作はこの経路で成立する。一方、`ApprovalDecision` を伴わず `UserMessage` だけが届いた場合は、D4(承認待ちは無限待ちだが steering で詰まらないことが前提、§14.1)を満たすため即座に処理する: まず`soft_steer`、現在の`run_id`、保存済み次`turn_id`を`classified/status=applying`としてdurable commitする。対象ツールは実行前で外部副作用がないので、その Pending を決定を待たず `Cancelled` として block し(§9.2)、通常の soft steer 経路(他に実行中のツールがあれば完了後、無ければ直ちに次 API コール前)へ合流させる。Pending 解消後に遅延到着した同一 `request_id` の `ApprovalDecision` は無視する。abort は Pending を破棄して Idle へ。
 
 ---
 
@@ -1293,19 +1364,19 @@ JSON Schema:
 
 SQLite(sqlx、WAL モード)。DB ファイルは永続ボリューム上の agent 専用状態ディレクトリ(`$SUMI_STATE_DIR/agent.db`、コンテナ既定 `/var/lib/sumi/agent.db`)に置き、`sumi-agent` UID だけが read/write できる。`/workspace` を操作する `sumi-tool` executor にはこのディレクトリを見せない。記憶検索が必要なら Store の read-only API を型付きツールとして公開し、生DBパスは渡さない。ここに置くのは agent の**自己状態**(メモリ層・公開チャット transcript・暗号化 provider context・恒久イベント・承認ルール)だけで、ドメインデータは複製しない — ADR 0001 の原則「agent はドメイン DB を直接触らず、権限モデルの強制点を API 層に保つ」はこの形で維持する。
 
-Cloud 版は volume/backup の基盤暗号化に加えて tenant KEK → agent 鍵 → conversation/provider-context/workspace 鍵の階層で envelope encryption する。人間可視 transcript の原文正本 (`messages.raw_ciphertext` と durable event の raw envelope) と `provider_context.ciphertext` は application 層でも別鍵で暗号化する。raw hidden chain-of-thought は transcript 正本にも保存せず、継続に必要な reasoning/compaction item だけを provider context に分離する。reasoning context は対応 message の L0 昇格時または30日、native compaction は置換・mode切替・fingerprint不一致または30日のうち最も早い時点で対象データ鍵ごと crypto-erase し、FTS・通常 export・Audit reviewer の入力から除外する。
+Cloud 版は volume/backup の基盤暗号化に加えて tenant KEK → agent 鍵 → conversation配下の transcript/event/memory-summary 鍵・provider-context鍵・workspace鍵の階層で envelope encryption する。人間可視 transcript の原文正本 (`messages.raw_ciphertext` と durable event の raw envelope)、Compact/L1/L2要約の原文正本 (`memory_batches.summary_ciphertext` / `memory_jobs.result_ciphertext`) と `provider_context.ciphertext` は application 層でも用途別鍵で暗号化する。**要約は元会話のsecretを保持し得るため、unredactedな`summary`/`result`をSQLiteのTEXT、ログ、イベント、FTSへ保存しない**。raw hidden chain-of-thought は transcript/要約正本にも保存せず、継続に必要な reasoning/compaction item だけを provider context に分離する。reasoning context は対応 message の L0 昇格時または30日、native compaction は置換・mode切替・fingerprint不一致または30日のうち最も早い時点で対象データ鍵ごと crypto-erase する。conversation resetはtranscript/event/memory-summary/provider-contextの各conversation data keyを直ちに破棄し、要約も復号不能にしてFTS・通常export・Audit reviewerの入力から除外する。
 
-transcript/memory/workspace は既定で agent 削除まで保持し、tenant policy で短縮可能とする。ユーザーは conversation/agent 単位の削除を実行でき、conversation export は redaction 済み JSONL、agent export はそれに workspace archive を加える。削除は直ちに tombstone と鍵破棄でアクセス不能化する。会話削除では conversation/provider-context 鍵、agent 削除では agent 鍵と配下の workspace 鍵を破棄し、live DB/volume を24時間以内、backup を30日以内に期限切れにする。backup 復元は deletion tombstone を先に再適用する。検索・export・管理者アクセスは actor/tenant/scope/result count を監査ログへ残す。これらの API と運用 runbook がない状態では Cloud release しない。
+transcript/memory/workspace は既定で agent 削除まで保持し、tenant policy で短縮可能とする。ユーザーは conversation/agent 単位の削除を実行でき、conversation export は redaction 済み JSONL、agent export はそれに workspace archive を加える。削除は直ちに tombstone と鍵破棄でアクセス不能化する。会話削除では conversation配下のtranscript/event/memory-summary鍵とprovider-context鍵、agent 削除では agent 鍵と配下の workspace 鍵を破棄し、live DB/volume を24時間以内、backup を30日以内に期限切れにする。backup 復元は deletion tombstone を先に再適用する。検索・export・管理者アクセスは actor/tenant/scope/result count を監査ログへ残す。これらの API と運用 runbook がない状態では Cloud release しない。
 
 ### 10.1 スキーマ(マイグレーション v1)
 
 v1 は第1章の不変条件どおり **1 agent = 1 active conversation = 1 `agent.db`** とする。各行へ同じ `conversation_id` を重複保持する代わりに、DB ルートの `agent_scope` 1行へ tenant/agent/conversation を束縛し、起動・WS再接続・export/delete のたびに認証 claim と完全一致を検証する。したがって message/event/command/batch の seq はこのDB内で一意なら会話内でも一意であり、native provider context を別会話から選ぶ余地はない。将来1 agentに複数会話を持たせる変更は v2 migration とし、暗黙 scope のまま拡張しない。
 
-conversation 削除は transcript/memory/provider context と conversation 鍵を破棄して `agent_scope.conversation_id` を新規IDへ入れ替える「会話リセット」で、ユーザー作成 workspace は残す。runtime が自動生成した `/workspace/.attachments/<conversation_id>` と `/workspace/.tool-output/<conversation_id>` は conversation-owned なので旧 conversation ID の prefix ごと削除する。agent 削除は DB、agent鍵、workspace鍵/volume まで破棄する。この2経路を deletion tombstone の scope で区別する。
+conversation 削除は transcript/memory/provider context と conversation 鍵を破棄して `agent_scope.conversation_id` を新規IDへ入れ替える「会話リセット」で、ユーザー作成 workspace は残す。runtimeがexecutor artifact RPCへ作成を依頼した `/workspace/.attachments/<conversation_id>` と `/workspace/.tool-output/<conversation_id>` は conversation-owned なので、旧generationをfenceしたsupervisorまたは専用削除RPCが旧 conversation ID の prefix ごと削除する。runtime UIDはworkspaceを直接unlinkしない。agent 削除は DB、agent鍵、workspace鍵/volume まで破棄する。この2経路を deletion tombstone の scope で区別する。
 
-保存境界には versioned な純関数 `Redactor` を1つだけ置く。`PublicProjectionBuilder` は hidden provider content を型検査で除外した `PublicMessage` / durable `AgentEvent` から、(a) conversation 鍵配下で即時暗号化する原文正本と、(b) API key、署名 token、既知 secret 形式を `[REDACTED:<kind>]` へ置換した平文 projection の両方を同時に作る。`messages.raw_ciphertext` / `agent_events.raw_ciphertext` は認可済み UI replay と L0 復旧だけに使い、`messages.payload` と `agent_events.envelope` は同じ redacted object から serialize し、`search_text` も redaction 後に導出する。ToolExecution/Approval の args・result・details も durable event の raw ciphertext 以外の投影テーブルでは redacted 値だけを持つ。tracing は raw payload を field に載せず、揮発 `MessageUpdate` もログへ保存しない。暗号化 `provider_context` とユーザーの workspace file 自体はこの不可逆変換をせず、別の鍵・認可・保持期間で保護する。
+保存境界には versioned な純関数 `Redactor` を1つだけ置く。`PublicProjectionBuilder` は hidden provider content を型検査で除外した `PublicMessage` / durable `AgentEvent` から、(a) conversation 鍵配下で即時暗号化する原文正本と、(b) API key、署名 token、既知 secret 形式を `[REDACTED:<kind>]` へ置換した平文 projection の両方を同時に作る。`MemoryProjectionBuilder` も同じ`Redactor`を使い、Compact resultを受け取った直後、平文をDB transactionへ渡す前にmemory-summary data keyで暗号化した正本とredacted projectionを同時生成する。`messages.raw_ciphertext` / `agent_events.raw_ciphertext` は認可済み UI replay と L0 復旧だけに使い、`messages.payload` と `agent_events.envelope` は同じ redacted object から serializeし、`search_text`もredaction後に導出する。要約はContextAssembler/次段Compactが必要な短時間だけ`summary_ciphertext`/`result_ciphertext`を認可済みruntime内で復号し、管理画面・通常exportにはprojectionだけを使う。ToolExecution/Approval の args・result・details も durable event の raw ciphertext 以外の投影テーブルでは redacted 値だけを持つ。tracing は raw payload を field に載せず、揮発 `MessageUpdate` もログへ保存しない。暗号化 `provider_context` とユーザーの workspace file 自体はこの不可逆変換をせず、別の鍵・認可・保持期間で保護する。
 
-EventWriter は `redaction_version` のない公開 projection、または原文正本と redacted projection の片方だけを持つ transcript/event write を拒否する。fixture は user text、tool args/output/details、assistant text、event envelope の各位置に既知 secret を置き、raw ciphertext を除く DB平文/FTS/log/export のいずれにも**平文**が残らず、認可済み復号だけが原文を再構築できることを確認する。将来の検出規則更新は既存行を黙って書換えず、再 redaction migration と audit record で行う。
+EventWriter は `redaction_version` のない公開 projection、または原文正本と redacted projection の片方だけを持つ transcript/event/memory-result write を拒否する。fixture は user text、tool args/output/details、assistant text、event envelopeに加えてCompactが生成したL1/L2要約の各位置に既知secretを置き、ciphertextを除くDB平文/FTS/log/exportのいずれにも**平文**が残らず、認可済み復号だけが原文を再構築できることを確認する。将来の検出規則更新は既存行を黙って書換えず、再 redaction migration と audit record で行う。
 
 例外は crash 復旧に正確な原commandが必要な `inbound_commands` で、redact すると意味が変わるため公開 projectionには使わない。受信 transaction で conversation 鍵配下のcommand用データ鍵により application-level暗号化し、平文はSessionの処理中だけ保持する。重複payload照合用に鍵付きHMACを保存し、通常export/FTS/logから除外する。conversation resetは鍵破棄とrow削除の両方でcrypto-eraseする。
 
@@ -1370,9 +1441,19 @@ CREATE TABLE memory_batches (
   version INTEGER NOT NULL DEFAULT 0, -- mutation ごとに加算。Compact CAS の比較元
   state TEXT NOT NULL,          -- open|sealed|compacting|compact_failed|compacted|promoted|dropped
   est_tokens INTEGER NOT NULL,
-  summary TEXT,                 -- L1/L2 と shelf 結果
+  summary_key_ref TEXT,         -- conversation配下のmemory-summaryデータ鍵
+  summary_ciphertext BLOB,      -- L1/L2 と shelf 結果のunredacted正本
+  summary_projection TEXT,      -- redacted済み表示/export用。context正本には使わない
+  summary_redaction_version INTEGER,
   updated_at TEXT NOT NULL,
-  UNIQUE(layer, batch_seq)
+  UNIQUE(layer, batch_seq),
+  CHECK (
+    (summary_key_ref IS NULL AND summary_ciphertext IS NULL
+      AND summary_projection IS NULL AND summary_redaction_version IS NULL)
+    OR
+    (summary_key_ref IS NOT NULL AND summary_ciphertext IS NOT NULL
+      AND summary_projection IS NOT NULL AND summary_redaction_version IS NOT NULL)
+  )
 );
 
 -- first/last の範囲推測ではなく、append_to_l0 を含む正確な membership を保存する。
@@ -1394,10 +1475,20 @@ CREATE TABLE memory_jobs (
   status TEXT NOT NULL,         -- pending | running | completed | applied | failed
   lease_until TEXT,
   attempts INTEGER NOT NULL DEFAULT 0,
-  result TEXT,
+  result_key_ref TEXT,          -- conversation配下のmemory-summaryデータ鍵
+  result_ciphertext BLOB,       -- Compact resultのunredacted正本
+  result_projection TEXT,       -- redacted済み診断用projection
+  result_redaction_version INTEGER,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  UNIQUE(kind, batch_seq)
+  UNIQUE(kind, batch_seq),
+  CHECK (
+    (result_key_ref IS NULL AND result_ciphertext IS NULL
+      AND result_projection IS NULL AND result_redaction_version IS NULL)
+    OR
+    (result_key_ref IS NOT NULL AND result_ciphertext IS NOT NULL
+      AND result_projection IS NOT NULL AND result_redaction_version IS NOT NULL)
+  )
 );
 
 CREATE TABLE memory_apply_cursors (
@@ -1409,7 +1500,15 @@ CREATE TABLE approval_rules (
   id TEXT PRIMARY KEY, tool TEXT NOT NULL, pattern TEXT NOT NULL, created_at TEXT NOT NULL
 );
 CREATE TABLE approval_log (
-  id TEXT PRIMARY KEY, tool_call_id TEXT, decision TEXT, decided_at TEXT
+  id TEXT PRIMARY KEY,              -- request_id
+  tool_call_id TEXT NOT NULL UNIQUE,
+  run_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  state TEXT NOT NULL,              -- pending|approved_once|approved_always|denied|cancelled
+  request_projection TEXT NOT NULL, -- secret-aware UI/audit用。raw CanonicalActionはagent_events暗号文だけ
+  redaction_version INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  decided_at TEXT
 );
 
 CREATE TABLE kv ( key TEXT PRIMARY KEY, value TEXT NOT NULL );  -- calib.ratio, ハッシュ類
@@ -1473,7 +1572,7 @@ CREATE TABLE data_access_audit (
 );
 ```
 
-conversation reset は control plane、agent DB、conversation-owned workspace artifacts をまたぐ冪等 state machine にする。まず旧 conversation ID を含む tombstone を `requested` で保存してアクセスを無効化し、旧 process generation を fence/停止して conversation/provider-context 鍵を破棄する。次に runtime-owned な `/workspace/.attachments/<old_conversation_id>` と `/workspace/.tool-output/<old_conversation_id>` を race-free な dirfd 起点で再帰削除し、親ディレクトリを fsync する。続いて agent DB の1transactionで conversation-owned な `messages`/FTS、`provider_context`、`memory_*`、`approval_log`、`kv`、`agent_events`、`inbound_commands`、`tool_executions` を消し、`agent_scope.conversation_id` を新規IDへ交換して全seq/cursorを初期化する。agent-scoped の `approval_rules` とユーザー作成 workspace は残す。commit 後に新しい conversation 鍵と process generation を発行し、tombstone を `live_purged` へ進める。途中 crash は tombstone の旧ID/statusから同じartifact削除とDB手順を再開し、backup復元時もtombstoneを先に適用して自動生成artifactを再露出させない。旧generationや旧conversation claimは再受理しない。agent 削除は workspace/agent鍵/agent DB も破棄するが、control-plane tombstone/audit はbackup期限まで残す。
+conversation reset は control plane、agent DB、conversation-owned workspace artifacts をまたぐ冪等 state machine にする。まず旧 conversation ID を含む tombstone を `requested` で保存してアクセスを無効化し、旧 process generation を fence/停止して conversation配下のtranscript/event/memory-summary/provider-context各鍵を破棄する。次にdeployment supervisorのworkspace親dirfd、またはtombstone IDを検証する専用executor削除RPCが `/workspace/.attachments/<old_conversation_id>` と `/workspace/.tool-output/<old_conversation_id>` を race-free な dirfd 起点で再帰削除し、親ディレクトリを fsync する。runtime UIDの直接unlinkに依存しない。続いて agent DB の1transactionで conversation-owned な `messages`/FTS、`provider_context`、`memory_*`、`approval_log`、`kv`、`agent_events`、`inbound_commands`、`tool_executions` を消し、`agent_scope.conversation_id` を新規IDへ交換して全seq/cursorを初期化する。agent-scoped の `approval_rules` とユーザー作成 workspace は残す。commit 後に新しい conversation 鍵と process generation を発行し、tombstone を `live_purged` へ進める。途中 crash は tombstone の旧ID/statusから同じartifact削除とDB手順を再開し、backup復元時もtombstoneを先に適用して自動生成artifactを再露出させない。旧generationや旧conversation claimは再受理しない。agent 削除は workspace/agent鍵/agent DB も破棄するが、control-plane tombstone/audit はbackup期限まで残す。
 
 ### 10.2 書込み・送出経路と再起動復元
 
@@ -1499,12 +1598,12 @@ pub enum Projection {
     },
     MemoryJobUpdate {
         expected_source_versions: HashMap<BatchId, u64>,
-        job_mutations: Vec<MemoryJobMutation>,
+        job_mutations: Vec<MemoryJobMutation>, // resultはEncryptedMemoryResultのみ
     },
     MemoryTransition {
         expected_source_versions: HashMap<BatchId, u64>,
-        batch_mutations: Vec<MemoryBatchMutation>,
-        job_mutations: Vec<MemoryJobMutation>,
+        batch_mutations: Vec<MemoryBatchMutation>, // summaryはEncryptedMemorySummaryのみ
+        job_mutations: Vec<MemoryJobMutation>,     // resultはEncryptedMemoryResultのみ
     },
     ProviderContextMutation(ProviderContextMutation),
     ApprovalMutation(ApprovalMutation),
@@ -1532,19 +1631,21 @@ pub struct ProviderContextMutation {
 }
 ```
 
-`EventWriter` は event と projection batch の組を検証し、重複 variant、競合する expected phase/version、anchor/ordinal 不整合を拒否してから全件を1 transaction で適用する。たとえば user `MessageEnd` は `Projection::MessageEnd + Projection::RunPhase`、assistant `MessageEnd` は `Projection::MessageEnd + 必要なら RunPhase/CommandApplied` を同居させる。`MemoryMaintenance` に `MemoryTransition` がないことや、retryable Error の `MessageEnd` に `append_to_l0=true` が付くことも拒否する。`event=None` は command cursor/classification、memory job lease/result、dedicated native compaction の `ProviderContextMutation` 等の内部投影だけに限定する。これにより公開 wire へ summary 等の内部状態を漏らさず、公開eventがある更新では `agent_events` と複数の投影テーブルを同一 transaction にできる。
+`EventWriter` は event と projection batch の組を検証し、重複 variant、競合する expected phase/version、anchor/ordinal 不整合を拒否してから全件を1 transaction で適用する。たとえば user `MessageEnd` は `Projection::MessageEnd + Projection::RunPhase`、assistant `MessageEnd` は `Projection::MessageEnd + 必要なら RunPhase/CommandApplied` を同居させる。`MemoryMaintenance` に `MemoryTransition` がないこと、memory mutationのsummary/resultが暗号化正本・redacted projection・redaction_versionの完全な組でないこと、retryable Error の `MessageEnd` に `append_to_l0=true` が付くことも拒否する。`event=None` は command cursor/classification、memory job lease/result、dedicated native compaction の `ProviderContextMutation` 等の内部投影だけに限定する。これにより公開 wire へ summary 等の内部状態を漏らさず、公開eventがある更新では `agent_events` と複数の投影テーブルを同一 transaction にできる。
+
+tool callがstrict検証を通ってpolicy/approval段階へ入るときは、外部副作用より前に`tool_executions(state='prepared')`を作る。人間承認が必要なら`ApprovalRequested + ApprovalMutation(state='pending')`を同じtransactionで確定し、承認解決は`ApprovalResolved + ApprovalMutation(terminal state)`で閉じる。実行へ進む場合だけ`ToolExecutionStart + ToolExecutionMutation(prepared→running)`を同じtransactionでcommitし、その後にexecutor RPCを発火する。したがって`prepared`/`pending`は「外部副作用なし」、`running`は「副作用の有無が不明になり得る」という復旧境界になる。`ApprovalRequested`だけ、または`approval_log.pending`だけが存在するtransactionを作ってはならない。
 
 ネットワーク停止を DB 書込みへ伝播させないため、永続化と送信を2タスクに分ける:
 
-- **EventWriter (単一の永続化writer)**: 恒久イベント(MessageStart/End、RetryScheduled、ToolExecutionStart/End、Approval 系、Turn/Agent 系、Steered、MemoryMaintenance)へ seq を採番し、原文 Public event/message の暗号化、redacted projection、`agent_events` と `projections` が示す `messages` / `provider_context` / `memory_*` / `tool_executions` / `approval_*` / `inbound_commands` の変更を**同一 SQLite transaction**で commit する。Gateway の成否を待たない。`AgentEvent::Error` は恒久イベントに含めない — command cursor に載る前の malformed stdio 入力等に対する接続向け即時通知専用で、seq を採番せず永続化もしない。API が採番前に拒否する 1MB 超入力(§7.8・§11.1.1)は agent event ではなく API→web のエラー応答にする。会話状態に影響する異常は必ず合成 assistant メッセージとして `MessageEnd` 経由で残す
-- **DeliveryPump (GatewayWriter の唯一の所有者)**: EventWriter からの ordered wake-up を受け、commit 済み恒久イベントは `agent_events` を正典として、認可済み接続には `raw_ciphertext` を復号した Public event を送る。復号不可・redaction-only scope では `envelope` projection だけを送る。`send` には bounded timeout を設け、失敗・timeout時は `Offline` へ遷移して接続を破棄する。EventWriter はその間も commit を継続する
+- **EventWriter (単一の永続化writer)**: 恒久イベント(MessageStart/End、RetryScheduled、ToolExecutionStart/End、Approval 系、Turn/Agent 系、Steered、MemoryMaintenance)へ seq を採番し、原文 Public event/messageとmemory summary/resultの暗号化、redacted projection、`agent_events` と `projections` が示す `messages` / `provider_context` / `memory_*` / `tool_executions` / `approval_*` / `inbound_commands` の変更を**同一 SQLite transaction**で commit する。Gateway の成否を待たない。`AgentEvent::Error` は恒久イベントに含めない — command cursor に載る前の malformed stdio 入力等に対する接続向け即時通知専用で、seq を採番せず永続化もしない。API が採番前に拒否する 1MB 超入力(§7.8・§11.1.1)は agent event ではなく API→web のエラー応答にする。会話状態に影響する異常は必ず合成 assistant メッセージとして `MessageEnd` 経由で残す
+- **DeliveryPump (outbound順序とcatch-upの唯一の所有者)**: EventWriter からの ordered wake-up を受け、commit 済み恒久イベントは `agent_events` を正典として、認可済み接続には `raw_ciphertext` を復号した Public event を送る。復号不可・redaction-only scope では `envelope` projection だけを送る。raw `GatewayWriter` は§11.1のConnectionSupervisorがepoch単位で所有し、DeliveryPumpはepoch付きbounded channelへだけ送る。send失敗・timeoutをsupervisorへ報告すると当該epochのreader/writerを一緒に破棄して`Offline`へ遷移する。EventWriter はその間も commit を継続する
 - **揮発イベント**(MessageUpdate の delta 系、`ToolExecutionUpdate`): EventWriter と同じ入力FIFOで先行する恒久イベントの commit 後に DeliveryPump へ渡す。Online 中だけ送信し、Offline・送信queue満杯・再接続catch-up中は捨てる。これにより `MessageUpdate`/`ToolExecutionUpdate` が対応する `MessageStart`/`ToolExecutionStart` を追い越さず、ネットワークbackpressureが会話状態の永続化を止めない。**delta は `PublicProjectionBuilder` を通らない原文のため、raw 復号を認可された接続にだけ送る**。復号不可・redaction-only scope へは揮発イベントを一切送らず、redacted な `MessageEnd`/`ToolExecutionEnd` だけで更新する(secret が複数 delta に分割されると delta 単位の置換では防げないため、接続単位の stateful streaming redactor を実装するまで抑止が唯一の安全側)。`ToolExecutionUpdate`(bash 標準出力等の逐次更新)を恒久化すると1回の実行で大量の `agent_events` 行が生じる書込み増幅になるため、`agent_events`・`tool_executions` のどちらにも永続化しない。最終出力は `ToolExecutionEnd` が§8.2 の切詰め+全文退避と同じ規則で1回だけ確定・永続化するため、再接続後の catch-up でも実行完了分の内容は失われない(未完了実行の途中経過だけが再現されない)
-- **再接続**: API が返す最終受信 event seq の次から `agent_events` を再送し、DB cursor が最新へ追いつくまで新しい delta は捨てる。catch-up完了後にだけ `Online` へ戻る。最後の MessageEnd(全文)で UI は回復する
+- **再接続**: ConnectionSupervisorが新credentialで再認証・helloを完了して両halfを同一epochへ交換した後、API が返す最終受信 event seq の次から `agent_events` を再送する。同時にcommand readerはhelloの`next_command_seq`からAPIのdurable command再送を受ける。DB cursor が最新へ追いつくまで新しい delta は捨て、catch-up完了後にだけそのepochを`Online`へ戻す。最後の MessageEnd(全文)で UI は回復する
 - **`messages` への投影は MessageEnd の transactionでのみ行う**(1メッセージ=1 INSERT)。`MessageStart` は `agent_events` に記録するだけで `messages` には何も書かない。通常の user / assistant / toolResult は `append_to_l0=true`、retryable Error assistant はログだけに残すため `append_to_l0=false`。L0 membership は `memory_batch_messages` へ明示 INSERT し、messages の seq 範囲や role から推測しない
 - `provider_context` は transcript の暗号化 raw 正本からも分離し、同じ MessageEnd transaction で暗号化 INSERT する。L0→L1 の `MemoryTransition` は対応 reasoning のデータ鍵/row を削除する。native compaction は coverage を持つ独立 row とし、置換・mode切替・fingerprint不一致・期限切れ sweeper の同じ冪等 delete 経路で消す
 - 復元時の provider context は `provider_instance_id/protocol/model` の完全一致を先に検証し、`ORDER BY COALESCE(message_seq, coverage_through_seq), wire_item_index, item_ordinal, id` で読む。人間可視 Text/ToolCall と reasoning を共通 `wire_item_index` で stable merge して anchor の assistant に戻す。native compaction を選んだ場合、Responses は暗号化した canonical output[] 全体、Anthropic は compaction block を coverage prefix の置換として置き、coverage 後の item だけを元の wire 順で suffix に差し込む。anchor/placement 欠落・重複 `(wire_item_index, ordinal)`・provider instance/protocol/model 不一致は silent reorder せず context を破棄して `sumi_three_layer` へ戻す
 - crash が transaction commit 前ならその transaction のイベントと投影状態は両方存在せず、commit 後・Gateway送信前なら再送対象として残る。`MessageStart` 後・`MessageEnd` 前だけは、開始イベントがあり本文投影がない状態を意図的に許す。本文を伴う `MessageEnd` と `messages` の INSERT は必ず同一 transaction に置き、「完了イベントだけ存在して本文がない」状態は作らない
-- **UserMessage と run の durable phase**: `received` の command を Session が現在の durable state に対して分類し、idle/hard/soft/retry のどれでも注入先の `run_id` と `turn_id` を最初の会話副作用より前に確定して、`application_kind/run_id/turn_id + run_phase=classified + status=applying` を同一 transaction で保存する。新しい turn が必要な idle/hard/通常 soft steer では `turn_id` を先行採番するが、`retry_steer` は発行済み `RetryScheduled` が属する**現在の turn_id**へ束縛する。user メッセージの `message_id` は `command_id` から決定論的に導出する(UUIDv5 相当。再分類や crash 後の replay でも同じ ID になるため、`user_started` 後の復旧が同じ message_id の `MessageEnd` を一意に確定できる)。以後はその分類と実際の注入位置を起点 command に束縛する。Idle 起点は `AgentStart` と `run_started`、保存済み ID の `TurnStart` と `turn_started` を通る。hard/通常 soft steer は保存済みの既存/次 run と次 turn、`retry_steer` は保存済みの既存 run と現在 turn に束縛する。いずれも注入時の user `MessageStart` と `user_started`、user `MessageEnd` と `user_committed`、その指示を取り込む最初の assistant `MessageStart` と `assistant_started` をそれぞれ同じ EventWriter transaction で進める。`retry_steer` は `classified` commit 後にだけ sleep を中断するため、crash 復旧でも保存済み分類を先に注入してから次 attempt へ進める。Idle 起点は `AgentEnd`、steer は対応する最初の assistant MessageEnd/TurnEnd で `finished + status=applied` にする。`Applied` ACK は `finished` commit 後にだけ返す。これにより user MessageEnd 後・assistant MessageStart 前の crash で指示が消えず、再送で run/steer が二重開始もしない
+- **UserMessage と run の durable phase**: `received` の command を Session が現在の durable state に対して分類し、idle/hard/soft/retry のどれでも注入先の `run_id` と `turn_id` を最初の会話副作用より前に確定して、`application_kind/run_id/turn_id + run_phase=classified + status=applying` を同一 transaction で保存する。新しい turn が必要な idle/hard/通常 soft steerでは`turn_id`を先行採番し、**tool実行/approval待ち中のsoft steerも現在runの次turnへこの時点で束縛する**。`retry_steer` だけは発行済み `RetryScheduled` が属する現在の`turn_id`へ束縛する。user メッセージの `message_id` は `command_id` から決定論的に導出する(UUIDv5 相当。再分類や crash 後の replay でも同じ ID になるため、`user_started` 後の復旧が同じ message_id の `MessageEnd` を一意に確定できる)。以後はその分類と実際の注入位置を起点 command に束縛し、run終端処理は同じrunに`classified/applying`のsoft steerが残る限り`AgentEnd`を発行してはならない。Idle 起点は `AgentStart` と `run_started`、保存済み ID の `TurnStart` と `turn_started` を通る。hard/通常 soft steer は保存済みの既存/次 run と次 turn、`retry_steer` は保存済みの既存 run と現在 turn に束縛する。いずれも注入時の user `MessageStart` と `user_started`、user `MessageEnd` と `user_committed`、その指示を取り込む最初の assistant `MessageStart` と `assistant_started` をそれぞれ同じ EventWriter transaction で進める。`retry_steer` は `classified` commit 後にだけ sleep を中断するため、crash 復旧でも保存済み分類を先に注入してから次 attempt へ進める。Idle 起点は `AgentEnd`、steer は対応する最初の assistant MessageEnd/TurnEnd で `finished + status=applied` にする。`Applied` ACK は `finished` commit 後にだけ返す。これにより user MessageEnd 後・assistant MessageStart 前の crash で指示が消えず、再送で run/steer が二重開始もしない
 - **実行中の crash と正常形への復旧**: delta は揮発なので、未確定の生成内容は失われる(仕様として許容。ハードステア/abort による部分応答は §6.3 のとおり MessageEnd を経由するため保存される)。再起動時は `inbound_commands.run_phase` と `agent_events` を突き合わせ、**不足している suffix だけ**を新しい seq で追記してから受付を再開する。固定で `MessageEnd → TurnEnd → AgentEnd` を再発行してはならない:
   - `received` → 副作用はまだ無いので command を再分類し、`classified` を commit する。command は seq 順に処理するため、後続 command の状態を先取りしない
   - `classified` → `application_kind/run_id/turn_id` を再判定せず保存済み値に従う。`idle_run` は保存済み `run_id` の AgentStart、hard/通常 soft steer は保存済みの次 turn の注入待ち位置から開始する。`retry_steer` は保存済みの現在 turn で `Steered`(soft) と `RunPhase(expected=classified, next=turn_started)` を同じ transaction で追記してから user `MessageStart/End` の不足 suffix へ進む(`turn_started` はここでは「active turn への注入準備完了」を表し、新しい `TurnStart` event は伴わない)。`retry_steer` では残りの backoff を再開しない
@@ -1556,14 +1657,14 @@ pub struct ProviderContextMutation {
   - `hard_steer_requested`(§6.3 手順0で commit 済み)→ この attempt は打ち切り予定だったので `assistant_started` と同じリトライ経路へは戻さない。未確定 assistant を本文空・stop_reason=Aborted・interrupted=true の合成 `MessageEnd` で確定し(§6.3 の確定規則と同型)、不足する `TurnEnd` → `Steered`(hard) → 保存済みの次 turn の `TurnStart` → ステアメッセージの user `MessageStart/End` を追記して次 attempt を開始する(ハードステアは run を継続する契約なので `AgentEnd` はしない — §6.3.1)
   - `RetryScheduled` 後 → 同じ run/turn に束縛された未完了 `retry_steer` command があれば、通常の待機/次 attempt より先にその保存済み分類の不足 suffix(`Steered` → user `MessageStart/End`)を適用し、残り時間を待たず次 attempt の `MessageStart` へ進む。無ければ `retry_at` までの残り時間を待つ(過去なら即時) → 次 attempt の `MessageStart` から同じ Turn を再開。最大attempt到達済みなら `TurnEnd` → `AgentEnd`
   - retryable Error またはコンテキスト溢れの assistant `MessageEnd` 後で `RetryScheduled` がまだ無い → 同じ判定とattempt数から不足する `RetryScheduled` を1件だけ追記して再開(溢れの場合は溢れ処理の適用状態を確認し、不足分を適用してから次 attempt へ — §4.5)
-  - `stop_reason=ToolUse` の assistant `MessageEnd` 後 → 応答が含む各 ToolCall について `tool_executions` 行の有無を確認する。1件でも行がある(`ToolExecutionStart` 済み)ツールがあれば次の「tool/approval phase 中」規則に従う。全 ToolCall が未着手(`ToolExecutionStart` 前に crash して行が無い)なら外部副作用は発生していないと確定できるので、各ツールにつき "process restarted before tool execution" の is_error ツール結果を MessageStart/End で確定してから `TurnEnd` → `AgentEnd` へ進む(ツールを自動実行しない点は次項と同じ)。これにより `MessageEnd(stop_reason=ToolUse)` 後・`ToolExecutionStart` 前の crash が「通常の MessageEnd」規則に落ちてツール未実行のまま Turn が閉じることを防ぐ
+  - `stop_reason=ToolUse` の assistant `MessageEnd` 後 → 応答が含む各 ToolCall について`tool_executions`と`approval_log`を確認する。`prepared|running`行または`pending` approvalが1件でもあれば次の「tool/approval phase 中」規則に従う。全 ToolCall に行が無ければpolicy準備前で外部副作用は発生していないと確定できるので、各ツールにつき "process restarted before tool execution" の is_error ツール結果を MessageStart/End で確定してから `TurnEnd` へ進む。その後、同じrunに`classified/applying`のsoft steerがあれば次項の継続規則で保存済みturnへ注入し、無ければ`AgentEnd`へ進む(ツールを自動実行しない点は次項と同じ)。これにより `MessageEnd(stop_reason=ToolUse)` 後・policy準備前の crash が「通常の MessageEnd」規則に落ちてツール未実行のまま Turn が閉じることを防ぐ
   - 通常(ToolUse 以外)またはリトライ不可 assistant の `MessageEnd` 後 → `TurnEnd` → `AgentEnd`
-  - `TurnEnd` 後 → `AgentEnd`
-  - tool/approval phase 中(`ToolExecutionStart` 済みの実行が1件以上ある) → supervisor が旧 executor generation を kill/reap したことを確認し、`running` execution を `indeterminate`、approval を cancelled で閉じる。対応するエラーツール結果を MessageStart/End で確定してから `TurnEnd` → `AgentEnd`。外部副作用の有無が不明なので tool を自動再実行しない
+  - `TurnEnd` 後 → 同じrunに`classified/applying`の通常soft steerがあれば保存済み分類の`Steered` → `TurnStart`以降へ進み、無ければ`AgentEnd`
+  - tool/approval phase 中(`tool_executions.state IN ('prepared','running')`または`approval_log.state='pending'`) → supervisor が旧 executor generation を kill/reap したことを確認する。`running` executionだけを`indeterminate`、`prepared`を`cancelled`、pending approvalを`ApprovalResolved(Cancelled)`と同じtransactionで`cancelled`へ閉じ、各未解決toolのエラー結果を MessageStart/End で確定して`TurnEnd`まで追記する。ここで同じ`run_id`に`application_kind=soft_steer AND status=applying`のcommandがあれば、**保存済みrun/turn bindingを変更せず**`Steered(soft)` → 保存済み`turn_id`の`TurnStart` → command ciphertextから同じmessage_idの`MessageStart/End(user)` → assistant再開の不足suffixへ進み、`AgentEnd`を発行しない。commandはその指示を取り込んだ最初のassistant `MessageEnd/TurnEnd`で`finished`になるまで`applying`のままとし、そのtransaction後だけ`applied`にする。複数soft steerはcommand seq順に各保存済みturnへ適用する。該当commandが無い場合だけ`AgentEnd`で閉じる。外部副作用の有無が不明な`running` tool自体は自動再実行しない
   - `AgentEnd` 後 → 追記なし
   合成 MessageEnd も通常規則で `messages` へ投影する(UI はエラーとして表示できる)が、空 assistant は transform(§5.3)が再送からスキップするため API へは流れない。復旧処理は replay で得た phase と、追記しようとする次イベントの組を検証し、完了済みの MessageEnd / TurnEnd を重複発行しない。三者の整合は「**MessageEnd まで到達した内容だけが実体**」という単一規則で保つ
 
-復元時は memory_batches + memory_batch_messages から L0/L1/L2 を正確な membership 順に再構成し、shelf は `completed` job の result から戻す。`memory_jobs` の lease 切れ `running` を `pending` に戻し、`Compacting` なのに対応ジョブ/summaryがない状態を修復する。適用は `memory_apply_cursors.next_batch_seq` と一致する連続 `completed` job だけを `applied` にし、完了通知順には依存しない。**復元後の最初の API コールはキャッシュ全ミス**(プロセス再起動の宿命)なのでコンテナは安易に殺さない運用とする。
+復元時は memory_batches + memory_batch_messages から L0/L1/L2 を正確な membership 順に再構成する。L1/L2とshelfは`summary_ciphertext`/completed jobの`result_ciphertext`をmemory-summary鍵で復号して戻し、projectionを会話contextの正本として使わない。`memory_jobs` の lease 切れ `running` を `pending` に戻し、`Compacting` なのに対応ジョブ/完全な`summary_*`組がない状態を修復する。鍵破棄済みconversationは復号や再投入をせずtombstone cleanupへ進み、live conversationで復号に失敗したresultは適用せずPublicMessage正本から再Compactする。適用は `memory_apply_cursors.next_batch_seq` と一致する連続 `completed` job だけを `applied` にし、完了通知順には依存しない。**復元後の最初の API コールはキャッシュ全ミス**(プロセス再起動の宿命)なのでコンテナは安易に殺さない運用とする。
 
 検証では EventWriter のDB書込みを意図的に遅延させても `MessageStart → MessageUpdate* → MessageEnd` が崩れないこと、各トランザクション境界へ failpoint を入れて kill/restart してもイベントログと投影状態が一致することを確認する。
 
@@ -1633,16 +1734,38 @@ pub trait GatewayWriter: Send {
     async fn send(&mut self, frame: OutboundFrame) -> anyhow::Result<()>;
 }
 
+#[async_trait]
 pub trait Gateway: Send {
     type Reader: GatewayReader;
     type Writer: GatewayWriter;
+    async fn authenticate_hello(
+        &mut self,
+        hello: AgentHello,
+    ) -> anyhow::Result<ApiHello>;
     fn split(self) -> (Self::Reader, Self::Writer);
+}
+
+#[async_trait]
+pub trait CredentialProvider: Send {
+    async fn fresh_credential(&mut self) -> anyhow::Result<GatewayCredential>;
+}
+
+#[async_trait]
+pub trait GatewayConnector: Send {
+    type Connection: Gateway;
+    async fn connect(
+        &mut self,
+        credential: GatewayCredential,
+    ) -> anyhow::Result<Self::Connection>;
 }
 ```
 
-- Gateway は起動時に read/write half へ split する。Reader は command pump だけが所有し、Writer は §10.2 の DeliveryPump だけが所有する。WebSocket は stream/sink split、stdio は stdin/stdout の分離に対応する。`Mutex<Gateway>` を `next_command().await` 中ずっと保持して送信を塞ぐ実装は禁止する
+- `Gateway`は**確立済み1接続**だけを表し、再接続責務を持たない。`ConnectionSupervisor`が`GatewayConnector + CredentialProvider`を所有し、接続世代(`connection_epoch`)ごとに fresh credential取得 → connect/TLS → 認証hello/応答検証 → read/write splitの順で確立する。hello完了前のhalfをcommand/Delivery pumpへ公開しない
+- supervisorは確立後に同じepochと共有CancellationTokenを持つreader task/writer taskを一組だけ起動する。readerはcommand pump用channelへ、writerはDeliveryPump用channelから転送する。どちらか一方のEOF/send timeout/protocol errorでもepoch tokenをcancelし、**両taskをjoinして両halfを破棄してから**次epochを作る。片方だけを古いsocketへ残したまま新halfへ差し替えない。pumpが見るinstall通知は`{epoch, hello_cursors}`の単一状態遷移であり、古いepochのlate frame/errorは無視する。`Mutex<Gateway>` を `next_command().await` 中ずっと保持して送信を塞ぐ実装は禁止する
+- WebSocket supervisorは切断時に`Offline`へ遷移し、bounded exponential backoff + jitterで再試行する。各attemptでcredentialを再取得して再認証し、helloの`last_received_event_seq/next_command_seq`を検証する。API event cursorからのdurable catch-upとAPI command logからの再送を開始し、event catch-upがDB最新seqへ到達したepochだけを`Online`にする。catch-up中のdeltaは§10.2どおり破棄する。認証拒否・世代fenceは無限に同じtokenを再利用せずcredential refreshへ戻り、conversation/generation claim不一致はfatalとしてsupervisorへ報告する
 - `stdio.rs`: 1行1JSON。開発時は `make agent-repl`(ラッパースクリプト)で人間が直接会話でき、E2E テストは期待イベント列をアサートできる。**M1 からこれで動かす**
-- `ws.rs`(M5): agent がコンテナ内から api へ outbound WebSocket 接続する(コンテナへの inbound は開けない)。TLS の Upgrade request に `Authorization: Bearer <short-lived-agent-token>` を付ける。token は API/control plane が発行し、`tenant_id / agent_id / conversation_id / generation / exp / audience` を署名対象にする。API は token から conversation を決定し、agent が送る識別子を認可根拠にしない。token は runtime secret として渡し、ログ・イベント・SQLite・executor 環境へ出さない。長命agentが再接続できるよう、root-ownedのrotating credential fileまたはworkload identity交換を `CredentialProvider` として抽象化し、接続ごとに新しいtokenを取得する(起動時envへ固定した短命tokenだけに依存しない)
+- `stdio.rs`は再接続しない`SingleConnectionConnector`として同じsupervisor interfaceへ合わせ、`authenticate_hello`はlocal cursorを返す。EOFをプロセス終了として扱う
+- `ws.rs`(M5): agent がコンテナ内から api へ outbound WebSocket 接続する(コンテナへの inbound は開けない)。TLS の Upgrade request に `Authorization: Bearer <short-lived-agent-token>` を付ける。token は API/control plane が発行し、`tenant_id / agent_id / conversation_id / generation / exp / audience` を署名対象にする。API は token から conversation を決定し、agent が送る識別子を認可根拠にしない。token は runtime secret として渡し、ログ・イベント・SQLite・executor 環境へ出さない。長命agentが再接続できるよう、root-ownedのrotating credential fileまたはworkload identity交換を `CredentialProvider` として抽象化し、**supervisorが接続attemptごと**に新しいtokenを取得する(起動時envへ固定した短命tokenだけに依存しない)
 - 認証後の hello は `{agent_id, generation, last_sent_event_seq, last_received_command_seq, last_applied_command_seq}`。API は token claim と一致すること、`generation` がその agent の最新世代であることを検証し、古い接続を close/fence する。応答は `{accepted_generation, last_received_event_seq, next_command_seq}`。agent は `agent_events` から event 差分を、API は durable command log から command 差分を再送する
 
 #### 11.1.1 API→agent command の配送保証
@@ -1755,18 +1878,18 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 | 10 | ツール結果の空/画像プレースホルダ、画像の user メッセージ追送 | 同 :1058-1130 | 「either content or tool_calls」制約を踏まない | `adapters/chat_completions.rs` |
 | 11 | 空 assistant(content 無し tool_calls 無し)のスキップ | 同 :1045-1056 | aborted 残骸で 400 を食らわない | `adapters/chat_completions.rs`/transform |
 | 12 | ツールコール ID の 40 字正規化 | 同 :893-906 | OpenAI 系は 40 字制限。他モデル由来 ID の再送対策 | transform(第5.3節) |
-| 13 | 逐次 JSON パース戦略(厳密→repair→partial→repair+partial→{}) | `ai/src/utils/json-parse.ts` 全文 | ストリーミング中のツール引数表示と、確定時の壊れ JSON サルベージ。repairJson(文字列内制御文字エスケープ、不正エスケープの二重化)は Kimi/GLM でも踏む | `provider/partial_json.rs`(テスト含め忠実移植) |
+| 13 | 逐次 JSON preview戦略(厳密→repair→partial→repair+partial→{}) | `ai/src/utils/json-parse.ts` 全文 | **ストリーミング中のUI表示だけ**へ移植する。repair結果はToolCall確定・承認・実行へ流さない。終端は生bufferのstrict parse+schema検証をSumi独自に必須化する | `provider/partial_json.rs`(previewテスト) + `assembler.rs`(strict終端テスト) |
 | 14 | リトライ可否の正規表現パターン集(retryable + non-retryable) | `ai/src/utils/retry.ts` 全文 | 各パターンにコメントで実 issue 番号が付いた運用知識の結晶。quota/billing 系を先に除外する順序も含めて移す | `provider/retry.rs` |
 | 15 | リトライポリシー(3回、2s/4s/8s、中断可能 sleep、エラー assistant を state から除去しログには保持) | `coding-agent/src/core/agent-session.ts:2606-2673` | ポリシーと判定の分離。「溢れはリトライしない」ガードが先頭にある(:2610-2614) | `agent/run.rs` |
 | 16 | コンテキスト溢れ検出パターン(Kimi「exceeded model token limit」、z.ai サイレント溢れの usage 判定、非溢れ除外) | `ai/src/utils/overflow.ts` 全文(165行) | 溢れとレート制限の誤判別は復旧経路を間違える。Kimi/GLM/汎用分のみ抽出 | `provider/overflow.rs` |
 | 17 | エラーボディの正規化(status+body 4000字切詰め) | `ai/src/utils/error-body.ts` | 「403 (no body)」型の情報消失を防ぐ。reqwest 直叩きなので SDK 形状プローブは不要、フォーマットだけ移す | `provider/transport.rs` |
 | 18 | エージェントループ骨格(steering/followUp の 2 キュー、ポーリング位置、イベント発行順) | `agent/src/agent-loop.ts:155-275` | ループの正典。TurnEnd 後 steering→無ければ followUp→無ければ終了、の順序 | `agent/run.rs` |
-| 19 | Length 停止時のツール一括失敗 | 同 :207-215, 383-408 | partial JSON サルベージ由来の「静かに不完全な引数」を実行しない安全弁 | `agent/run.rs` |
+| 19 | Length 停止時のツール一括失敗 | 同 :207-215, 383-408 | strict parseに成功したcallも応答全体がLengthなら実行しない独立安全弁。各callを`is_error` resultで閉じる | `agent/run.rs` |
 | 20 | beforeToolCall の block→エラーツール結果合成、abort 二重チェック | 同 :602-666 | 承認フローの土台。block reason がそのままモデルへの説明になる | `approval/` + `agent/run.rs` |
 | 21 | ツール実行の onUpdate コールバック(settle 後の更新を無視するガード) | 同 :668-709 | bash ストリーミング表示。遅延 update がイベント順序を壊さない | `tools/mod.rs` |
 | 22 | run 失敗時の合成エラーメッセージでイベント列を正常形で閉じる | `agent/src/agent.ts:494-510` | 消費者(UI/Store)が異常系を特別扱いしなくてよくなる契約 | `agent/mod.rs` |
 | 23 | キュー既定 one-at-a-time | 同 :222-223 | 複数割込みへの応答機会を1個ずつ与える。UX 由来の既定値 | `agent/queue.rs` |
-| 24 | 履歴正規化(孤児ツールコールの合成結果、user 分断時の挿入、Error/Aborted スキップ、クロスモデル thinking 降格) | `ai/src/api/transform-messages.ts` 全文 | 再送安全性の要。Sumi は interrupted 例外を追加(第6章) | `memory/` transform |
+| 24 | 履歴正規化(孤児ツールコールの合成結果、user 分断時の挿入、Error/Aborted スキップ) | `ai/src/api/transform-messages.ts` 全文 | 再送安全性の要。Sumi はinterrupted例外を追加(第6章)する一方、piのクロスモデルthinking平文化は移植せず常に破棄する(§4.2) | `memory/` transform |
 | 25 | 出力切詰め(2000行/50KB 二重上限、head/tail、部分行禁止、メタ情報) | `agent/src/harness/utils/truncate.ts` 全文 | 数値も含め実運用の落とし所。テストケースごと移植 | `tools/truncate.rs` |
 | 26 | bash ローリングバッファ+全文テンポラリ退避+バイナリサニタイズ | `agent/src/harness/utils/shell-output.ts` 全文 | 「メモリ有限・末尾優先・全文はファイルで」パターン | `tools/shell_capture.rs` |
 | 27 | バッチ/compaction のカット境界規則(user/assistant 直前のみ、toolResult 直前禁止) | `agent/src/harness/compaction/compaction.ts:265-380` | 3層メモリのバッチ境界(7.3節)の根拠 | `memory/batch.rs` |
@@ -1793,14 +1916,14 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 - `provider/` の共通 core と `adapters/chat_completions.rs`: 第4章+移植リスト #1〜17。types → transport → assembler → adapter → retry/overflow の順
 - テスト: (a) **SSE フィクスチャ再生**: 実 API のストリームを `curl` で採取したファイル(Kimi text / Kimi tool call / Kimi reasoning / GLM tool_stream / エラー各種)を axum モックサーバで再生し、イベント列と最終メッセージをスナップショットアサート。(b) partial_json の pi テスト移植。(c) `SUMI_LIVE_TEST=1` でのライブ疎通(Umans/Kimi/GLM 三択)
 - **ゲート**:
-  1. `cargo test --manifest-path apps/agent/Cargo.toml` 全緑(フィクスチャ再生で: ツールコール引数の逐次組立、reasoning 分離、usage 取得、標準finish_reasonに加えて Z.ai の `sensitive` / `network_error` / `model_context_window_exceeded` を含む provider 固有パターン)
+  1. `cargo test --manifest-path apps/agent/Cargo.toml` 全緑(フィクスチャ再生で: ツールコール引数の逐次previewと生bufferのstrict終端を分離し、repairならpreview可能だがstrictでは失敗するJSONを確定ToolCallにしない、reasoning 分離、usage 取得、標準finish_reasonに加えて Z.ai の `sensitive` / `network_error` / `model_context_window_exceeded` を含む provider 固有パターン)
   2. ライブ: 3プロバイダに対しツールコール1往復+reasoning 付き2ターン会話が完走。**2ターン目で Kimi に reasoning_content を再送しても 400 が返らない**こと
   3. TTFT 計測基盤: `MessageStart(user)受信 → HTTP リクエスト送出` と `送出 → 最初の TextDelta` を tracing span で分離計測し、stdio REPL に表示。**agent 内部オーバーヘッド p95 < 30ms**(モデル側 TTFB は記録のみ)
   4. abort: 生成中に CancellationToken 発火 → 1s 以内に Aborted イベントで正常形クローズ
 
 ### M1P: Responses + Anthropic Messages adapters(各1.5日、M1後に並行、Cloud release前必須)
 
-- M1 で凍結した `PromptContext → ProviderEvent` 境界の上に `adapters/responses.rs` と `adapters/anthropic.rs` を独立実装する。M2〜M5 のデモ critical path を止めず、別 AI セッションで並行可能にする
+- M1 で凍結した `PromptContext → ProviderEvent` 境界の上に `adapters/responses.rs` と `adapters/anthropic.rs` を独立実装する。adapter/fixture作業はM2〜M5のデモcritical pathを止めず並行できるが、暗号化provider contextのdurable round-tripゲートはM2 durability foundation完成後に結合する
 - OpenAI Responses ゲート:
   1. output text、function call arguments、usage、incomplete/error、encrypted reasoning の公式 SSE fixture を共通イベントへ正規化できる
   2. `/responses/compact` の canonical `output[]` を retained message/tool item と compaction item の順序ごと暗号化保存し、同 provider instance/protocol/model へ配列全体を無加工で再送できる。compaction item だけに prune せず、Sumi の MemoryBlock から不透明 item を捏造しない
@@ -1811,11 +1934,12 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
   3. native compaction 対応 provider では `provider_native` mode で compaction block 1個 + coverage 後の suffix だけを暗号化往復し、同じ prefix の `MemoryBlock`/L0/reasoning と重複しない。非対応の互換 provider と fingerprint 不一致時は `sumi_three_layer` へ戻る
   4. thinking 有効の tool loop で `thinking.signature` と `redacted_thinking.data` を含む直近 assistant content block 列を完全・同順で round-trip する。欠落・改変 fixture が API 相当の400として失敗し、`tool_choice=any/named` と turn途中のthinking mode変更を組立時に拒否する
   5. `cache_creation_input_tokens > 0` の usage fixture で `input + cache_read + cache_write` が prompt 全体と一致し、サイレント溢れ判定・校正 EMA・キャッシュヒット率の三経路が cache_write を落とさない
-- 共通ゲート: provider instance/protocol/model 切替時は opaque provider context を送らず、公開 transcript と L1/L2 だけで会話を継続する。同じ model slug/protocol を持つ別 base URL/account の fixture でも再利用しない。未知 event fixture を入れて silent corruption ではなく明示 Error/ignore policy になる
+- 共通ゲート: provider instance/protocol/model 切替時は opaque provider contextもraw thinkingも送らず、公開 transcript と L1/L2 だけで会話を継続する。切替前thinkingの既知markerが切替後request bodyのtext/memory/reasoning全fieldに現れないことをfixtureで確認する。同じ model slug/protocol を持つ別 base URL/account の fixture でも再利用しない。未知 event fixture を入れて silent corruption ではなく明示 Error/ignore policy になる
 
 ### M2: ループ+ツール+ステア(3日、〜7/24)
 
-- `agent/`(run.rs, Session, queue)+ `tools/`(fs, bash, executor, truncate, shell_capture)+ ハードステア(steer.rs)。移植リスト #18-23, 25-26 + 第6章
+- **先にdurability foundationを完成**する: `store/`の最小migration(`agent_scope`、`messages`、`agent_events`、`inbound_commands`、`tool_executions`、`approval_log`) + 単一EventWriter + `CommandReceived/Classified/RunPhase/MessageEnd/ToolExecutionMutation/ApprovalMutation/CommandApplied`投影 + 起動時suffix復旧を実装する。hard steer手順0、abort、承認待ち、tool実行開始はこのfoundationのcommitを通るまで有効化しない。M2では本物のpolicy/reviewer/UIはまだ作らず、fixture専用のPending action driverで`ApprovalRequested + approval_log.pending`と解決/復旧transactionだけを先に検証する。M5のApprovalBrokerはこの正本へ接続し、M3も別実装へ置換せず機能を追加する
+- その上で`agent/`(run.rs, Session, queue)+ `tools/`(fs, bash, executor, truncate, shell_capture)+ ハードステア(steer.rs)。移植リスト #18-23, 25-26 + 第6章
 - デモは明示的な low-trust local executor mode を許す。Docker sidecar/deployment supervisor/microVM quota の実装は後述 Cloud rollout track とし、未実装のまま Cloud release しない
 - **ゲート**:
   1. stdio REPL で: 「`/workspace/notes` にメモ帳フォルダを作って今日の日付のメモを書いて」→ bash/write ツールが流れる様子がイベントで見える
@@ -1823,14 +1947,17 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
   3. 中断→再開後の Kimi 再送で reasoning のみ部分応答が受理されるか確認(6.3節の未検証点)。駄目なら回避策を実装しコメントに記録
   4. Length 停止のツール一括失敗をフィクスチャで再現
   5. **制御プレーン生存性**: provider stream / bash / retry sleep の各 phase で別コマンドを送り、hard/soft steer と abort がタイムアウトせず処理される。retry sleep 中の steer ではバックオフだけ中断され、Turn の attempt カウントは維持されたまま次 attempt へ進むことを確認する(§5.2)
+  6. **M2 durability必須ゲート**: hard steerの`classified + hard_steer_requested` commit直前/直後、cancel直後、部分`MessageEnd`直後でkill/restartし、commit前は旧attempt再開、commit後は旧attemptを再開せず保存済みturnへ一度だけ注入する。fixture専用Pending action driverで`ApprovalRequested + approval_log.pending` commit直前/直後、実executorで`ToolExecutionStart + running`直前/直後を個別にkillし、classified済みsoft steerがある場合はprepared/pendingをCancelled、runningだけを`indeterminate`で閉じた後も`AgentEnd`を挟まず保存済みrun/turnへ注入され、commandが`applying→applied`へ一度だけ進む
+  7. strict parse失敗、repairだけならobject化できる入力、schema不一致、`finish_reason=length`をprotocol別fixtureで流し、previewは表示されても承認/ToolExecutionStart/executor RPCが0件で、`is_error` tool resultだけが確定する
+  8. executor RPC境界でbashに`0600` file/`0700` dirを作らせ、後続read/edit/deleteが同じexecutor UIDで成功する。`put_attachment`/`append_tool_output`はumaskを`0077`/`0000`へ変えてもfile `0600`/dir `0700`を確定し、runtime側コードがworkspace pathを直接openしないことをmock mount/RPCテストで確認する
 
 ### M3: 永続化(2日、〜7/26)
 
-- `store/` 全体 + EventWriter + 再起動復元。リトライの「state から除去・ログに保持」もここで完成
+- M2のdurability foundationを拡張し、`store/`の残り(`provider_context`、memory job/state、approval、FTS、暗号化/redaction、DeliveryPump) + 全phaseの再起動復元を完成する。リトライの「state から除去・ログに保持」もここで完成する。EventWriterを別実装へ差し替えず、M2で凍結したtransaction契約にprojectionを追加する
 - **ゲート**:
   1. 10ターン会話 → プロセス kill → 再起動 → 会話が続く(L0 復元)。`messages_fts` で過去発言が検索できる。イベント seq が復元後も単調継続
   2. DB書込みを遅延させても `MessageStart → MessageUpdate* → MessageEnd` の順序が崩れない
-  3. `received → classified → run_started → turn_started → user_started → user_committed → assistant_started → finished` の各 transaction 境界で kill し、再起動後は同じ command_id/run_id の不足 suffix だけが追記される。特に分類 commit 前は副作用なしで再分類でき、commit 後は application kind を変えない。user MessageEnd 後・assistant MessageStart 前で指示を失わず、AgentStart/TurnStart/user MessageStart 後でもイベントを重複しない。retry sleep 中の `retry_steer` は分類 commit 前後と user MessageStart/End 前後で kill し、復旧後も `RetryScheduled → Steered → MessageStart/End(user、同一turn) → MessageStart(next attempt)` の順序で一度だけ注入され、残り backoff を待たない。Abort の `cancel_requested` commit 前後でも kill し、commit 後は同じ run が再開されない(10.2節)。tool/approval phase 中の kill では、supervisor 回収後に `running` execution の `indeterminate` 化とエラーツール結果の `MessageStart/End` → `TurnEnd` → `AgentEnd` の閉鎖 suffix が一度だけ追記される
+  3. `received → classified → run_started → turn_started → user_started → user_committed → assistant_started → finished` の各 transaction 境界で kill し、再起動後は同じ command_id/run_id の不足 suffix だけが追記される。特に分類 commit 前は副作用なしで再分類でき、commit 後は application kind を変えない。user MessageEnd 後・assistant MessageStart 前で指示を失わず、AgentStart/TurnStart/user MessageStart 後でもイベントを重複しない。retry sleep 中の `retry_steer` は分類 commit 前後と user MessageStart/End 前後で kill し、復旧後も `RetryScheduled → Steered → MessageStart/End(user、同一turn) → MessageStart(next attempt)` の順序で一度だけ注入され、残り backoff を待たない。Abort の `cancel_requested` commit 前後でも kill し、commit 後は同じ run が再開されない(10.2節)。tool/approval phase 中の killでは、classified soft steerが無い場合だけ`prepared/pending→cancelled`、`running→indeterminate`とエラーツール結果`MessageStart/End` → `TurnEnd` → `AgentEnd`で閉じる。classified soft steerがある場合は`TurnEnd`後に`Steered` → 保存済み次`TurnStart`へ進み、commandのrun/turn bindingを変えず一度だけ適用する
   4. retryable Error が `MessageEnd(error) → RetryScheduled → MessageStart(next attempt)` で閉じ、error assistant は messages に残るが L0 には入らない。各境界でkillしてもattemptを重複・未閉鎖にしない
   5. GatewayWriterを切断・無応答にしてもEventWriterのdurable commitが継続し、deltaだけが捨てられる。再接続後はAPI cursorから恒久イベントを順序どおりcatch-upする
   6. `MemoryTransition` のevent/projection transactionへfailpointを入れ、公開MemoryMaintenanceだけ存在する状態・memory_batchesだけ進む状態のどちらも作られない
@@ -1848,35 +1975,38 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
   4. `sumi_three_layer` mode では L2/L1 が全 protocol で user 相当の memory block として L0 より前へ入り、新しいユーザー命令と誤解されないことを固定 probe で確認する。`provider_native` mode では Responses の canonical output[] または Anthropic の native block と coverage 後の suffix だけになり、同じ prefix の3層表現が併存しないことを確認する
   5. 校正: est×ratio と実測 usage の乖離が ±15% 以内に収束
   6. ツールなしの user→assistant 会話だけを繰り返しても、40k到達後の昇格が AgentEnd/Idle 中に適用され、48kのハード上限まで放置されない
-  7. L0 Compact / L1→L2 / L2統合の各完了で source version CAS、batch `Compacting → Compacted`、job `running → completed`、result 保存が同一 transaction になり、各 `running` 中に kill しても再起動後に lease 回収・再投入・一度だけの適用が成立する。最終失敗は `CompactFailed/failed`、同期fallback成功は `Compacted/completed` へ収束する
+  7. L0 Compact / L1→L2 / L2統合の各完了で source version CAS、batch `Compacting → Compacted`、job `running → completed`、暗号化result/summary+redacted projection保存が同一 transaction になり、各 `running` 中に kill しても再起動後に lease 回収・再投入・一度だけの適用が成立する。最終失敗は `CompactFailed/failed`、同期fallback成功は `Compacted/completed` へ収束する
   8. 50KB 超のユーザー入力貼り付けで、`messages.raw_ciphertext` の認可済み復号は原文全文、`messages.payload/search_text` は secret redaction 済み、L0 は切詰めビュー、`/workspace/.attachments/<conversation_id>` は退避ファイルになる。conversation reset と backup 復元時は旧IDの attachments/tool-output だけが消え、ユーザー作成 workspace は残る(7.8節)
+  9. Compact input型テストで、L0の各PublicMessageにChat/Responses/Anthropicの全provider-context variantを紐付けてもHTTP bodyにraw thinking/signature/encrypted reasoning/native itemが1byteも現れない。同一provider・別Compact providerの両fixtureで確認し、`PromptContext`/`ProviderContextItem`から`CompactionInput`を構築するコードがcompile-failになる
+  10. Compact resultへ既知secretを埋め、`memory_batches.summary_ciphertext`/`memory_jobs.result_ciphertext`の認可済み復号だけが原文を返し、`summary_projection`/`result_projection`/DB dump/log/exportはredacted、各`redaction_version`が必須になることを確認する。job completion transaction各境界のkill/restart、conversation鍵破棄、backup tombstone再適用後に要約を復号・再露出できないことも検証する
 
 ### M5: 権限承認+WS ゲートウェイ(2日、〜7/31)
 
-- `approval/`(CanonicalAction、決定論的policy、Audit reviewer/prompt、ApprovalBroker)+ `gateway/ws.rs`(第11章)+ M3で凍結した contracts の互換性確認 + apiclient 雛形
+- `approval/`(CanonicalAction、secret-aware ReviewableAction、決定論的policy、Audit reviewer/prompt、ApprovalBroker)+ `gateway/ws.rs`/`gateway/supervisor.rs`(第11章)+ M3で凍結した contracts の互換性確認 + apiclient 雛形
 - **ゲート**:
   1. shell fixture (`&&`, pipe, newline, subshell, heredoc, interpreter wrapper)をsegment分解し、全segmentの最も厳しいpolicy結果を採る。解析不能はNeedsApproval
   2. `bash` / `python` / `git` 単体等の広すぎる永続rule候補を拒否し、`git status` 等の限定prefixだけが仮適用後の全segment再評価を通る
   3. User mode: bashが ApprovalRequested を発行 → stdio/WS 経由で decision → 承認で実行/拒否でエラーツール結果。ApproveAlways は安全性検証済みruleだけ保存される
-  4. AutoReview mode: main会話とは別のAPI callへ bounded/sanitized transcript + trusted meta + exact action が渡り、allowは今回だけ実行、denyは人間承認へfallbackする。tool result本文とhidden reasoningがreviewer入力に入らない
-  5. reviewerのtimeout、invalid JSON、transport errorがinteractiveでは理由付きApprovalRequested、headlessではblockになる
-  6. 承認待ち中の user_message がソフトステアとして機能し、ApprovalDecision と Abort も即時に処理される
+  4. AutoReview mode: main会話とは別のAPI callへ bounded/sanitized transcript + trusted meta + `ReviewableAction` が渡り、allowは今回だけ実行、denyは人間承認へfallbackする。tool result本文、hidden reasoning、CanonicalActionのraw JSONがreviewer入力に入らない。Authorization header、署名URL、argv/justification内secretのfixtureはkind+keyed digestへ置換される
+  5. reviewerのtimeout、invalid JSON、transport error、未許可trust domain、secret除去でoperation/scopeを判定不能なactionがinteractiveでは理由付きApprovalRequested、headlessではblockになる。後二者ではreviewer HTTP callが0件で、秘匿を解除した再送も起きない
+  6. 承認待ち中の user_message がソフトステアとして機能し、ApprovalDecision と Abort も即時に処理される。実ApprovalBrokerでも`ApprovalRequested + pending` commit直後をkillし、再起動後にpendingをCancelledで閉じて保存済みsoft steerへ一度だけ継続する(M2のfixture gateを結合テストで再実行)
   7. Audit allow後もexecutor sandboxが維持され、内部状態・追加network権限等を暗黙に得ない
   8. web→api→agent の E2E: チャット UI から会話でき、ストリーミング+ツール+ステア+承認カードが見える(api/web 側と合同。**これがデモの完成条件**)
   9. 1MB 超または non-empty `attachments` の user_message は API が command の seq 採番前に拒否し、直後の正常 command が欠番なく agent へ届く。agent 側の oversized-envelope 保険経路では ACK せず接続を閉じ、運用アラートが上がる
+  10. WSのreader EOF、writer send timeout、token expiry、API再起動を個別に発火し、ConnectionSupervisorが旧epochの両halfをjoin/dropしてからfresh credentialで再認証・helloする。片halfだけ旧epochに残らず、hello cursorからevent/commandを相互catch-upし、durable最新seq到達前のdeltaは捨て、完了後だけOnlineへ戻る
 
 ### 予備日(8/1): デモシナリオのリハーサル、負荷時の挙動確認(Umans 4セッション制限の回避=デモは直APIキーで)、憲法プロンプトの調整
 
-依存関係: デモ critical path の M1→M2→M3→M4→M5 は各節のデモ/core gate だけを対象に直列が基本。M1P は M1 の共通型凍結後に M2〜M5 と並行し、**M3(Store)と M2 後半(ステア磨き込み)も並行可**、**M5 の contracts ドラフトは M3 完了時点で先出し**する。M1P や下記 Cloud rollout gate が8/1へ間に合わなくても Chat Completions のデモは成立するが、3 protocol 対応または Cloud release をうたってはならない。
+依存関係: デモ critical path の M1→M2 durability foundation→M2 loop/tool/steer→M3 store拡張→M4→M5 は各節のデモ/core gateを対象に直列とする。**M2のhard steer/abort/tool副作用とM3のStore作業は並行不可**で、M2 foundationのEventWriter transaction契約を先に凍結する。M1P は M1 の共通型凍結後にM2〜M5と並行でき、**M5 の contracts ドラフトは M3 完了時点で先出し**する。M1P や下記 Cloud rollout gate が8/1へ間に合わなくても Chat Completions のデモは成立するが、3 protocol 対応または Cloud release をうたってはならない。
 
 ### Cloud rollout track(ハッカソン critical path 外、すべて release blocker)
 
 1. **provider release**: M1P の Responses/Anthropic 全ゲートを完了する
-2. **executor deployment**: container orchestrator/deployment supervisor を実装し、Docker sidecar から `/var/lib/sumi`、runtime `/proc`、API key、workspace 外 path を読めず、symlink 差替え競合中も `openat2` policy が越境を拒否することを確認する。`network_mode=none` で executor のTCP/DNSだけが失敗し、runtime のLLM通信は維持する
+2. **executor deployment**: container orchestrator/deployment supervisor を実装し、Docker sidecar から `/var/lib/sumi`、runtime `/proc`、API key、workspace 外 path を読めず、runtime側からはworkspace mount自体が見えず、symlink 差替え競合中もexecutorの`openat2` policyが越境を拒否することを確認する。bashが`0600`/`0700`を作っても後続file toolは同じUIDのRPCで操作でき、artifact RPCはumaskに関係なくfile `0600`/dir `0700`を確定し、supervisor resetは旧prefixだけを削除する。`network_mode=none` で executor のTCP/DNSだけが失敗し、runtime のLLM通信は維持する
 3. **resource semantics**: disk/inode/PID の拒否、CPU throttle/CPU-time budget、memory max/OOM、wall runtime、command/workspace output の各経路を個別に発火させ、§8.3/ workspace.md の種別どおり `ResourceLimit`、kill/reap、bounded output へ収束する
 4. **generation recovery**: runtime/provider/tool 実行中に runtime を killし、deployment supervisor が旧 executor generation と登録済み execution cgroup/sandbox を回収する。`setsid` で別sessionへ離脱しstdout/stderrを閉じた descendant も abort/wall/CPU/output quota 後に `/workspace` を変更できないことを fault-injection で確認する。`running` execution は `indeterminate` で一度だけ閉じ、自動再実行しない
 5. **WS production**: token無し・期限切れ・別conversation・古いgenerationを拒否し、新generationで旧接続をfenceする。command重複、ACK前後kill、seq欠番、双方向catch-up、API 採番前の oversized/non-empty-attachments 拒否後に後続 command が詰まらないことを fault-injection で確認する
-6. **data lifecycle**: transcript export、conversation reset/agent deletion、provider context crypto-erase、検索監査、backup tombstone 再適用、redaction fixture の integration test と運用 runbookを揃える。redaction fixture には **secret を複数 delta に分割した assistant text / tool arguments のストリーム**を含め、redaction-only 接続が delta を一切受信せず redacted `MessageEnd` だけを受けることを確認する
+6. **data lifecycle**: transcript export、conversation reset/agent deletion、provider contextとmemory-summaryのcrypto-erase、検索監査、backup tombstone 再適用、redaction fixture の integration test と運用 runbookを揃える。redaction fixture には **secret を複数 delta に分割した assistant text / tool arguments のストリーム**とCompact resultを含め、redaction-only 接続が delta を一切受信せず redacted `MessageEnd` だけを受け、DB平文projectionから要約secretも復元できないことを確認する
 
 テスト方針の総括: ユニット(純関数: assembler/truncate/partial_json/batch/estimate)+フィクスチャ再生(プロバイダ層)+スクリプト E2E(stdio ゲートウェイにコマンド列を流しイベント列をアサート)+ライブスモーク(env フラグでオプトイン)。**CI(GitHub Actions の agent パス)ではライブ以外を全部回す**。
 
@@ -1889,14 +2019,14 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 | # | 論点 | 選択肢と推奨 |
 |---|---|---|
 | D1 | **暗号化チャット原文の置き場所** | (a) agent ローカル SQLite のみ(推奨・ハッカソン)/ (b) api 側 DB に暗号化ミラー(イベント転送で後付け可能)/ (c) api 側のみ。web の履歴無限スクロールを api が返すなら最終的に (b)。平文projectionは常にredactedとし、M3 までに方針だけ確定 |
-| D2 | **Compact 用モデル** | (a) 会話と同じモデル(品質・一貫性)/ (b) 安価モデル(umans-flash / kimi-k2.7)。コストと「記憶の質は人格の質」のトレードオフ。既定 (a) で設定切替可能にしておく |
+| D2 | **Compact 用モデル** | (a) 会話と同じモデル(品質・一貫性)/ (b) tenantが許可した同一data-processing/trust domain内の安価モデル(umans-flash / kimi-k2.7)。既定(a)。どちらも内部に`Vec<PublicMessage>`だけを持つ専用`CompactionInput`を送り、hidden reasoning/provider contextは送らない。trust domain未設定の別providerは拒否する |
 | D3 | **ワークスペース書込み(write/edit)の承認要否** | 推奨: Auto(自分の机への書込みまで聞くとうるさい)。bash は Ask。デモの見栄え(承認カードを見せたい)なら bash で十分 |
 | D4 | **承認待ちのタイムアウト** | 推奨: 無限待ち+通知タブに滞留(画面構成書と整合)。エージェントは待機中もステア可能なので詰まらない |
 | D5 | **ツール実行中のハードステア** | 推奨: しない(ツール完走→注入)。「今すぐ止めて」は停止ボタン(abort)の仕事、と UI 上の意味を分ける |
 | D6 | **永続許可ruleの置き場所** | ハッカソン: agent ローカル。将来: 権限モデルの強制点を api に一元化する原則に従い api 側へ移す(設定画面での管理も api 経由になる) |
 | D7 | **デモのモデル構成** | 推奨: Kimi K3 直API を主役(reasoning+1M ctx+自動キャッシュ)、GLM-5.2 従量を控え。Umans は開発用(同時4セッション制限がデモの罠)。8/1 までに直APIキーの課金設定を済ませる |
 | D8 | **OpenAPI→Rust クライアント生成** | 現状1エンドポイントなので手書きで開始し、ドメインAPIが3本を超えたら progenitor 導入を ADR 化(推奨) |
-| D9 | **承認reviewer mode / model** | 推奨: 既定User、opt-in AutoReview、開発用StrictAutoReview。reviewerは別モデル指定可、未設定時は会話モデルへfallback。デモでAutoReviewを見せるかは精度評価後に決める |
+| D9 | **承認reviewer mode / model** | 推奨: 既定User、opt-in AutoReview、開発用StrictAutoReview。reviewerはtenantが明示許可したaudit trust domain内だけ別モデル指定可、未設定時は会話モデルへfallback。raw CanonicalActionは送らずsecret-aware ReviewableActionだけを送り、判定不能ならmanual/headless block。デモでAutoReviewを見せるかは精度評価後に決める |
 
 ### 14.2 技術リスクと手当て
 
@@ -1904,17 +2034,21 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 |---|---|---|
 | **memory block を新しい user 命令と誤認** | L1/L2 の事実より記憶タグ内の古い命令を優先する | 憲法で履歴データと定義し、固定 adversarial probe を M4 ゲート4へ入れる。memory block を system/developer へ昇格させない |
 | **3 protocol の event/item 差異を共通型が隠す** | tool/reasoning/終了理由の欠落、silent corruption | adapter fixture を protocol ごとに保持し、未知 event policy と opaque provider context を明示する。wire JSON を共通 Message へ直接 serde しない |
+| **repair済みtool JSONを確定値として実行** | truncated path/content/commandで意図しない承認・副作用 | repair/partial parserはUI preview型に隔離し、ToolCallEndは生bufferのstrict parse+schema検証だけを許可。失敗はis_error resultで閉じ、Length一括失敗も独立維持 |
 | **interrupted 部分応答の再送を Kimi が拒む**(thinking のみ等のエッジ) | ハードステアの体験が濁る | M2 ゲート3 で確認。プレースホルダテキスト補完で回避可能(6.3節) |
 | **Umans が pi の想定と違う方言を話す**(プロキシ実装の癖) | 開発効率低下 | M1 ライブゲートで3プロバイダ全部を通す。Compat は設定ファイルなので再コンパイル不要で調整できる |
 | **トークン見積の日本語係数が外れる** | 層境界の誤判定(溢れの検知漏れ/過剰発火) | usage 校正(7.5節)が自動吸着。加えて溢れ検出(4.5節)が最終防衛線 |
 | **Compact の品質不足**(圧縮されすぎ・人格の断絶) | 「育つ秘書」体験の毀損 | 目標圧縮率のプロンプト明示+L1 文脈の読み取り専用添付(7.4節)。M4 で実会話サンプルの要約を人間レビュー |
+| **Compact経路からhidden content/要約secretが漏れる** | 別providerへのreasoning流出、DB/backup平文残留 | 内部に`Vec<PublicMessage>`だけを持つ`CompactionInput`専用境界でprovider contextを表現不能にし、別providerもtrust-domain制約。summary/resultはmemory-summary鍵の暗号化正本+redacted projectionだけを保存しconversation resetでcrypto-erase |
 | **Audit reviewerの誤allow** | prompt injection・scope creep・破壊操作を自動承認 | hard denyとsandboxをモデル外で強制。AutoReviewはNeedsApprovalだけ、モデルallowは今回限り。StrictAutoReview/サンプル二重判定でfalse allow率を測る |
-| **Audit reviewerの停止・parse失敗** | 承認フロー停止または不明な操作を実行 | 3attempt/90秒、schema強制、失敗時はinteractive manual fallback・headless deny。circuit breakerで連続失敗を止める |
+| **Audit reviewerへのaction secret流出/停止・parse失敗** | credential流出、承認フロー停止または不明な操作を実行 | SecretAwareActionProjector+reviewer trust-domain allowlist。判定材料を秘匿すると不足する場合はcallせずmanual/headless deny。3attempt/90秒、schema強制、circuit breaker |
 | **SQLite 書込み遅延がホットパスに漏れる** | TTFT 劣化 | 単一 EventWriter で順序と durability を守りつつ、恒久イベントの小さい transaction を計測する。MessageStart commit の p95 を span 監視し、必要なら WAL checkpoint/DB配置を調整 |
-| **Gateway切断が永続化を止める** | 切断中の会話・承認・メモリ更新が失われる | EventWriterとDeliveryPumpを分離し、send timeout後はofflineへ遷移。durable stateはcommit継続、deltaは破棄、再接続時はDB cursorからcatch-up |
+| **Gateway切断/half世代ずれが永続化や再接続を止める** | 切断中の更新消失、旧readerと新writerの混在、catch-up不能 | EventWriterとDeliveryPumpを分離し、ConnectionSupervisorが接続ごとにfresh credential+hello、両halfを同一epochで交換。一方の失敗で両方破棄し、durable cursor catch-up後だけOnline |
 | **agent接続のなりすまし・旧世代の二重稼働** | 他conversationへのevent注入、command奪取、seq競合 | short-lived署名tokenでtenant/agent/conversation/generationを束縛し、APIが最新generationだけを受理して旧接続をfence |
 | **API→agent commandの消失・重複** | user指示の欠落、承認やツール副作用の二重適用 | API側durable command log + seq/command_id + Received/Applied ACK + command/run durable phase で suffix 再開。domain mutationへ command_id/tool_call_id idempotency keyを伝播 |
+| **tool/approval中crashでsoft steerが孤児化** | user指示が`applying`のまま消失、AgentEnd後への不正追記 | 受信時に現在run/次turnへdurable bindし、復旧はtoolをindeterminate/CancelledでTurnEndまで閉じた後、pending soft steerがあればAgentEndを出さず保存済みturnへsuffix継続する |
 | **runtime crash 後も executor が生存** | 見えない副作用継続、復旧処理との競合 | generation supervisor が sandbox 全体を kill/reapし、running execution は indeterminate へ閉じて自動再実行しない |
+| **umask/groupでは0600/0700を相互操作できない** | runtimeがartifactを読めない、reset漏れ、誤ったCloud gate | runtimeへworkspaceをmountせず全filesystem操作を同一executor UIDのRPCへ集約。artifact RPCはfchmodでmode確定、削除はfence済みsupervisor/専用RPCが親dirfdから行う |
 | **Kimi の自動キャッシュ TTL(5〜30分、未確定)** | 放置後の会話再開で全ミス→初回 TTFT 悪化 | 仕様上避けられない。実測して既知の挙動としてデモ台本に織り込む(冒頭に1回ウォームアップ発話) |
 | **8/1 に api/web 側が間に合わない** | E2E デモ不成立 | stdio ゲートウェイ+簡易 CLI で agent 単体デモが常に成立する状態を保つ(M2 以降常時)。contracts ドラフトを M3 で先出しして統合期間を確保 |
 
@@ -1931,7 +2065,7 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 - **棚(shelf)**: 先回り Compact の成果物置き場。適用(=L1 への昇格)までの待機場所
 - **憲法**: System Prompt に置く不変の人格核。メモリの風化の影響を受けない
 - **ツール凍結原則**: Tool Definitions の変更はプレフィックスキャッシュ全壊と同義なので、リリース単位でのみ変更する運用
-- **正常形クローズ**: どんな異常でもイベント列が MessageEnd→TurnEnd→AgentEnd で閉じる契約
+- **正常形クローズ**: どんな異常でも開始済みmessage/turnをMessageEnd→TurnEndまで閉じる契約。runに適用待ちcommandが無ければAgentEnd、soft steerがあれば保存済み次Turnへ継続する
 
 ## 付録B: 実装セッションへの申し送り
 
