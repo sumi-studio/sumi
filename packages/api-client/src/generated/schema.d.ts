@@ -360,7 +360,11 @@ export interface components {
              */
             type: "message.ack";
             clientMessageId: string;
-            message: components["schemas"]["Message"];
+            /** @description 確定した送信メッセージ。ack の対象は常にユーザー発話なので role は user に固定 */
+            message: components["schemas"]["Message"] & {
+                /** @constant */
+                role: "user";
+            };
         };
         /**
          * @description 自分の送信以外で生まれたメッセージの新着通知

@@ -667,7 +667,14 @@ components:
         clientMessageId:
           type: string
         message:
-          $ref: "#/components/schemas/Message"
+          description: 確定した送信メッセージ。ack の対象は常にユーザー発話なので role は user に固定
+          allOf:
+            - $ref: "#/components/schemas/Message"
+            - type: object
+              required: [role]
+              properties:
+                role:
+                  const: user
 
     MessageCreatedEvent:
       type: object
