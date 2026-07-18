@@ -219,19 +219,24 @@ export interface components {
             name?: string;
             role?: string;
         };
+        /**
+         * @description `hasMore` が true なら `nextCursor` 必須、false なら `nextCursor` 禁止。
+         *     生成 TypeScript でも判別共用体になるよう、各分岐を完全なオブジェクトとして定義する。
+         */
         ChatPage: {
             /** @description 最終アクティビティの新しい順 */
             items: components["schemas"]["Chat"][];
-            /** @description 続きを取得するためのカーソル。`hasMore` が false なら省略 */
-            nextCursor?: string;
-            hasMore: boolean;
-        } & ({
             /** @constant */
-            hasMore?: true;
+            hasMore: true;
+            /** @description 続きを取得するためのカーソル。次リクエストの `cursor` に渡す */
+            nextCursor: string;
         } | {
+            /** @description 最終アクティビティの新しい順 */
+            items: components["schemas"]["Chat"][];
             /** @constant */
-            hasMore?: false;
-        });
+            hasMore: false;
+            nextCursor?: never;
+        };
         MessagePreview: {
             /** @description 最終メッセージのプレーンテキスト要約 (markdown・カードは平文化済み) */
             text: string;
@@ -283,12 +288,23 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /**
+         * @description `hasMore` が true なら `nextCursor` 必須、false なら `nextCursor` 禁止。
+         *     生成 TypeScript でも判別共用体になるよう、各分岐を完全なオブジェクトとして定義する。
+         */
         MessagePage: {
             /** @description 時系列昇順 (古い → 新しい) */
             items: components["schemas"]["Message"][];
-            /** @description さらに古い方向へ遡るためのカーソル。`hasMore` が false なら省略 */
-            nextCursor?: string;
-            hasMore: boolean;
+            /** @constant */
+            hasMore: true;
+            /** @description さらに古い方向へ遡るためのカーソル。次リクエストの `before` に渡す */
+            nextCursor: string;
+        } | {
+            /** @description 時系列昇順 (古い → 新しい) */
+            items: components["schemas"]["Message"][];
+            /** @constant */
+            hasMore: false;
+            nextCursor?: never;
         };
         ClientEvent: components["schemas"]["MessageSendEvent"] | components["schemas"]["StreamStopEvent"];
         /**

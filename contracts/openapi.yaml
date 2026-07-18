@@ -412,31 +412,36 @@ components:
           maxLength: 64
 
     ChatPage:
-      type: object
-      required: [items, hasMore]
+      description: |
+        `hasMore` が true なら `nextCursor` 必須、false なら `nextCursor` 禁止。
+        生成 TypeScript でも判別共用体になるよう、各分岐を完全なオブジェクトとして定義する。
       oneOf:
         - title: 続きあり
+          type: object
+          required: [items, hasMore, nextCursor]
           properties:
+            items:
+              type: array
+              description: 最終アクティビティの新しい順
+              items:
+                $ref: "#/components/schemas/Chat"
             hasMore:
               const: true
-          required: [nextCursor]
+            nextCursor:
+              type: string
+              description: 続きを取得するためのカーソル。次リクエストの `cursor` に渡す
         - title: 最終ページ
+          type: object
+          required: [items, hasMore]
           properties:
+            items:
+              type: array
+              description: 最終アクティビティの新しい順
+              items:
+                $ref: "#/components/schemas/Chat"
             hasMore:
               const: false
-          not:
-            required: [nextCursor]
-      properties:
-        items:
-          type: array
-          description: 最終アクティビティの新しい順
-          items:
-            $ref: "#/components/schemas/Chat"
-        nextCursor:
-          type: string
-          description: 続きを取得するためのカーソル。`hasMore` が false なら省略
-        hasMore:
-          type: boolean
+            nextCursor: false
 
     MessagePreview:
       type: object
@@ -528,19 +533,36 @@ components:
           additionalProperties: true
 
     MessagePage:
-      type: object
-      required: [items, hasMore]
-      properties:
-        items:
-          type: array
-          description: 時系列昇順 (古い → 新しい)
-          items:
-            $ref: "#/components/schemas/Message"
-        nextCursor:
-          type: string
-          description: さらに古い方向へ遡るためのカーソル。`hasMore` が false なら省略
-        hasMore:
-          type: boolean
+      description: |
+        `hasMore` が true なら `nextCursor` 必須、false なら `nextCursor` 禁止。
+        生成 TypeScript でも判別共用体になるよう、各分岐を完全なオブジェクトとして定義する。
+      oneOf:
+        - title: 続きあり
+          type: object
+          required: [items, hasMore, nextCursor]
+          properties:
+            items:
+              type: array
+              description: 時系列昇順 (古い → 新しい)
+              items:
+                $ref: "#/components/schemas/Message"
+            hasMore:
+              const: true
+            nextCursor:
+              type: string
+              description: さらに古い方向へ遡るためのカーソル。次リクエストの `before` に渡す
+        - title: 最終ページ
+          type: object
+          required: [items, hasMore]
+          properties:
+            items:
+              type: array
+              description: 時系列昇順 (古い → 新しい)
+              items:
+                $ref: "#/components/schemas/Message"
+            hasMore:
+              const: false
+            nextCursor: false
 
     # ---- WebSocket イベント (REST からは参照されない。型生成用) ----
     #
