@@ -116,6 +116,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 async-trait = "0.1"
 regex = "1"                 # retry/overflow パターン判定
 zeroize = "1"               # 復号したmemory summary/credential bufferをDrop時消去
+chacha20poly1305 = "0.10"   # 原文transcript/event/provider-context/データ鍵wrapのAEAD (§10、XChaCha20-Poly1305)
+hmac = "0.12"               # inbound_commands payload HMAC、SecretRefのkeyed digest (§9.4・§10.1)
+sha2 = "0.10"               # HMAC-SHA256、context_fingerprint等のハッシュ
+rand = "0.9"                # データ鍵・nonce生成 (OsRng)
 # M5 で追加: tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 #   (WSゲートウェイ。既定 feature に TLS が無く素の指定では wss:// を張れない。reqwest と rustls 系で統一)
 [dev-dependencies]
@@ -518,7 +522,7 @@ pub enum PublicStreamEvent {
 
 raw `ProviderEvent::Thinking*` は MessageAssembler と暗号化 provider context の runtime 内経路だけで消費し、`AgentEvent` へ変換しない。`AgentEvent::MessageUpdate` は `PublicStreamEvent` だけを受け、raw hidden reasoning / encrypted content / native compaction item を型レベルで表現不能にする。provider が display-safe と明示した reasoning summary だけを `ProviderEvent::ReasoningSummary*` → `PublicStreamEvent::ReasoningSummary*` として変換する(発生源は adapter — §3.2)。summary は揮発 delta 専用の表示であり、`PublicAssistantMessage.content` には含めず永続化しない。これにより揮発 delta からも chain-of-thought が外部へ出ない。
 
-`PublicStreamEvent.content_index` は provider の runtime content 配列(公開しない Thinking block を含む)上の **opaque な相関キー**であり、0始まりの連続した公開配列添字ではない。したがって UI は先行する index 0 を受け取らず `TextStart { content_index: 1 }` から始まる場合を許容し、index の詰め直しや `PublicAssistantMessage.content` への位置対応を推測しない。恒久な `MessageEnd` を受けた時点で、streaming 中の仮表示を Thinking 除外後の `PublicAssistantMessage.content` 全体で置換する。
+`PublicStreamEvent.content_index` は provider の runtime content 配列(公開しない Thinking block を含む)上の **opaque な相関キー**であり、0始まりの連続した公開配列添字ではない。したがって UI は先行する index 0 を受け取らず `TextStart { content_index: 1 }` から始まる場合を許容し、index の詰め直しや `PublicAssistantMessage.content` への位置対応を推測しない。相関キーは **(イベント族, content_index) の組**である — `ReasoningSummary*` の content_index は公開 Text/ToolCall とは独立した summary slot の連番(§3.2)なので、同じ数値でも別ブロックであり、単一の index 空間として混同してはならない。恒久な `MessageEnd` を受けた時点で、streaming 中の仮表示を Thinking 除外後の `PublicAssistantMessage.content` 全体で置換する。
 
 イベント順序の契約(pi と同一 **[事実]** `pi:agent/src/agent-loop.ts:109-274` 実読より):
 
@@ -785,7 +789,7 @@ Sumi では 3層メモリが常時 70k 以内に抑えるため溢れは本来�
 
 移植必須の細部:
 
-- **Length 停止時のツール一括失敗 [事実]** (`pi:agent-loop.ts:207-215, 383-408`): 出力トークン上限で切れたメッセージは、個々のtool引数がstrict JSON/schema検証に通っても、後続callや説明を含む応答全体の意図が未完了であり得る。strict終端guardとは独立に1つも実行せず、全部に `"Tool call was not executed: the response hit the output token limit..."` のエラー結果を返してモデルに再発行させる
+- **Length 停止時のツール一括失敗 [事実]** (`pi:agent-loop.ts:207-215, 383-408`): 出力トークン上限で切れたメッセージは、個々のtool引数がstrict JSON/schema検証に通っても、後続callや説明を含む応答全体の意図が未完了であり得る。strict終端guardとは独立に1つも実行せず、全部に `"Tool call was not executed: the response hit the output token limit..."` のエラー結果を返してモデルに再発行させる。**Sumi 追加ガード**: この一括失敗が同一 run 内で連続2回発生したら、3回目の再発行 API コールへは進まずリトライ不可 Error として Turn を閉じる(§4.5 の溢れ再送上限と同型の暴走ガード。K3 は thinking 常時ON + 既定 max_tokens 16k — §7.8 — のため、長い reasoning の連発で再発行ループが無限に回り得る)
 - **ツール実行は当面 sequential 固定**。pi の parallel モード(:491-556)は準備だけ順次・実行は並行だが、Sumi は承認フローが挟まるため M5 まで順次で十分。`Tool::risk` と将来の `execution_mode` で拡張余地だけ残す **[推測]**
 - **steering ポーリング位置 [事実]** (:167, :259): ループ開始時(送信待ち中に打った分)と各 TurnEnd 後。Sumi のソフトステア(第6章)はこの機構をそのまま使う
 - **キュー既定 one-at-a-time [事実]** (`pi:agent.ts:222-223`): 複数の割込みを1個ずつ消化し、各々に応答機会を与える
@@ -898,8 +902,10 @@ pi の `steer()` は**キュー投入のみ**で、注入は「現在のツー�
    - stop_reason = Aborted, interrupted = true
 3. 部分メッセージを L0 + Store に記録 (MessageEnd イベント発行。durable phase は
    `hard_steer_requested` から通常の steer 注入シーケンスへ進む)
-4. UI 通知: Steered { mode: Hard }
-5. steering メッセージを user メッセージとして L0 に追加
+4. TurnEnd で現在の Turn を閉じ、UI 通知 Steered { mode: Hard } を発行
+   (イベント順序の正典は §6.3.1 の表: MessageEnd → TurnEnd → Steered → TurnStart)
+5. 保存済みの次 turn_id で TurnStart を発行し、steering メッセージを user の
+   MessageStart/End としてイベント化して L0 に追加
 6. ループ再開 (次の API コールへ)。再送時 transform が:
    - interrupted メッセージのテキスト/thinking を assistant メッセージとして再送
      (Kimi の reasoning_content 再送要件も満たす)
@@ -967,7 +973,7 @@ docs/agent/memory.md(Draft v1)を実装仕様に落とす。**pi に相当機構
 tools: 凍結 (変更はキャッシュ全壊)
 ```
 
-- L2/L1 は永続 `Message` に混ぜず、`PromptContext.memory_blocks` に置く。adapter は原則 user 相当の履歴データとして `<memory layer="...">` で包み、先頭の憲法に「新しいユーザー指示ではなく過去の記憶」と定義する。Chat Completions / Responses / Anthropic Messages のいずれでも system/developer へ昇格させない
+- L2/L1 は永続 `Message` に混ぜず、`PromptContext.memory_blocks` に置く。adapter は原則 user 相当の履歴データとして `<memory layer="...">` で包み、先頭の憲法に「新しいユーザー指示ではなく過去の記憶」と定義する。Chat Completions / Responses / Anthropic Messages のいずれでも system/developer へ昇格させない。adapter は包む直前に本文中のタグ偽装列(`</memory` を含む列)を無害化(escape)する — 要約はツール出力由来の敵対的テキストを含み得るため、タグ閉じ偽装で層境界を破らせない(M4 ゲート4 の fixture 対象)
 - compaction 送信モードは conversation ごとに `sumi_three_layer` (既定) と `provider_native` の二者択一にする。`sumi_three_layer` は L2/L1/L0 を送り native compaction context を送らない。`provider_native` は Responses では API が返した最新 canonical `output[]` window 全体、Anthropic では最新 compaction block 1個を coverage prefix の置換として置き、その prefix と重複する L2/L1/L0・reasoning item を送らず、`coverage.through_message_seq` より後の transcript suffix だけを続ける。公開 transcript と3層メモリの保守はどちらのモードでも継続する
 - native context は `provider_instance_id/protocol/model/system/tools/beta` から計算した `context_fingerprint` が一致する場合だけ有効とする。設定変更、別 provider instance/protocol/model への切替、期限切れ、coverage 欠落では破棄して `sumi_three_layer` から再構築する。API 発行 item/block/window を Sumi の要約から捏造しない
 - プレフィックスキャッシュ整合(調査レポートの一般原則): 照合は先頭からの連続一致なので、**揮発性の低い順に並ぶこの構成は通常ターンでほぼ全ヒット**。L0 先頭バッチ廃棄時のみ L1 以降(~35k)が再読み込みになる
@@ -1393,9 +1399,11 @@ JSON Schema:
 
 SQLite(sqlx、WAL モード)。DB ファイルは永続ボリューム上の agent 専用状態ディレクトリ(`$SUMI_STATE_DIR/agent.db`、コンテナ既定 `/var/lib/sumi/agent.db`)に置き、`sumi-agent` UID だけが read/write できる。`/workspace` を操作する `sumi-tool` executor にはこのディレクトリを見せない。記憶検索が必要なら Store の read-only API を型付きツールとして公開し、生DBパスは渡さない。ここに置くのは agent の**自己状態**(メモリ層・公開チャット transcript・暗号化 provider context・恒久イベント・承認ルール)だけで、ドメインデータは複製しない — ADR 0001 の原則「agent はドメイン DB を直接触らず、権限モデルの強制点を API 層に保つ」はこの形で維持する。
 
-Cloud 版は volume/backup の基盤暗号化に加えて tenant KEK → agent 鍵 → conversation配下の transcript/event/memory-summary 鍵・provider-context鍵・workspace鍵の階層で envelope encryption する。人間可視 transcript の原文正本 (`messages.raw_ciphertext` と durable event の raw envelope)、Compact/L1/L2要約の原文正本 (`memory_batches.summary_ciphertext` / `memory_jobs.result_ciphertext`) と `provider_context.ciphertext` は application 層でも用途別鍵で暗号化する。**要約は元会話のsecretを保持し得るため、unredactedな`summary`/`result`をSQLiteのTEXT、ログ、イベント、FTSへ保存しない**。raw hidden chain-of-thought は transcript/要約正本にも保存せず、継続に必要な reasoning/compaction item だけを provider context に分離する。reasoning context は対応 message の L0 昇格時または30日、native compaction は置換・mode切替・fingerprint不一致または30日のうち最も早い時点で対象データ鍵ごと crypto-erase する。conversation resetはtranscript/event/memory-summary/provider-contextの各conversation data keyを直ちに破棄し、要約も復号不能にしてFTS・通常export・Audit reviewerの入力から除外する。
+Cloud 版は volume/backup の基盤暗号化に加えて tenant KEK → agent 鍵 → conversation配下の transcript/event/memory-summary 鍵・provider-context鍵・workspace鍵の階層で envelope encryption する。人間可視 transcript の原文正本 (`messages.raw_ciphertext` と durable event の raw envelope)、Compact/L1/L2要約の原文正本 (`memory_batches.summary_ciphertext` / `memory_jobs.result_ciphertext`) と `provider_context.ciphertext` は application 層でも用途別鍵で暗号化する。**要約は元会話のsecretを保持し得るため、unredactedな`summary`/`result`をSQLiteのTEXT、ログ、イベント、FTSへ保存しない**。raw hidden chain-of-thought は transcript/要約正本にも保存せず、継続に必要な reasoning/compaction item だけを provider context に分離する。reasoning context は対応 message が L0 から離脱(L1 へ昇格)した時点または30日、native compaction は置換・mode切替・fingerprint不一致または30日のうち最も早い時点で対象データ鍵ごと crypto-erase する。conversation resetはtranscript/event/memory-summary/provider-contextの各conversation data keyを直ちに破棄し、要約も復号不能にしてFTS・通常export・Audit reviewerの入力から除外する。
 
 transcript/memory/workspace は既定で agent 削除まで保持し、tenant policy で短縮可能とする。ユーザーは conversation/agent 単位の削除を実行でき、conversation export は redaction 済み JSONL、agent export はそれに workspace archive を加える。削除は直ちに tombstone と鍵破棄でアクセス不能化する。会話削除では conversation配下のtranscript/event/memory-summary鍵とprovider-context鍵、agent 削除では agent 鍵と配下の workspace 鍵を破棄し、live DB/volume を24時間以内、backup を30日以内に期限切れにする。backup 復元は deletion tombstone を先に再適用する。検索・export・管理者アクセスは actor/tenant/scope/result count を監査ログへ残す。これらの API と運用 runbook がない状態では Cloud release しない。
+
+**鍵の供給(Founder 決定 2026-07-18)**: ハッカソンのデモは Cloud 構成(EC2 + Docker、workspace.md の段階表)で行い、OSS ローカル版の鍵管理は現時点でスコープ外とする。開発・デモ環境では agent 鍵(32 byte master key)を deployment 側が環境変数/設定ファイルで **runtime にだけ**渡す — §8.1 の executor 環境許可リストに含めず、gateway credential と同じくログ・イベント・SQLite・executor 環境へ出さない。conversation/用途別データ鍵はランダム生成して agent 鍵で AEAD wrap し SQLite に保存する(crypto-erase は wrap 行の削除で成立し、agent 鍵ローテーションは wrap の掛け直しだけで raw を再暗号化せずに済む)。Cloud 本番は agent 鍵の正典を control plane 管理の tenant KEK 階層(KMS)へ移して環境変数直渡しを廃止する — この移行は Cloud rollout track 6 の release gate に含める。
 
 ### 10.1 スキーマ(マイグレーション v1)
 
@@ -1663,7 +1671,7 @@ pub struct ProviderContextMutation {
 }
 ```
 
-`EventWriter` は event と projection batch の組を検証し、重複 variant、競合する expected phase/version、anchor/ordinal 不整合を拒否してから全件を1 transaction で適用する。たとえば user `MessageEnd` は `Projection::MessageEnd + Projection::RunPhase`、assistant `MessageEnd` は `Projection::MessageEnd + 必要なら RunPhase/CommandApplied` を同居させる。`MemoryMaintenance` に `MemoryTransition` がないこと、memory mutationのsummary/resultが暗号化正本・redacted projection・redaction_versionの完全な組でないこと、retryable Error の `MessageEnd` に `append_to_l0=true` が付くことも拒否する。`event=None` は command cursor/classification、memory job lease/result、dedicated native compaction の `ProviderContextMutation` 等の内部投影だけに限定する。これにより公開 wire へ summary 等の内部状態を漏らさず、公開eventがある更新では `agent_events` と複数の投影テーブルを同一 transaction にできる。
+`EventWriter` は event と projection batch の組を検証し、重複 variant、競合する expected phase/version、anchor/ordinal 不整合を拒否してから全件を1 transaction で適用する。たとえば user `MessageEnd` は `Projection::MessageEnd + Projection::RunPhase`、assistant `MessageEnd` は `Projection::MessageEnd + 必要なら RunPhase/CommandApplied` を同居させる。`MemoryMaintenance` に `MemoryTransition` がないこと、memory mutationのsummary/resultが暗号化正本・redacted projection・redaction_versionの完全な組でないこと、`stop_reason=Error` の `MessageEnd`(リトライ可否を問わず)に `append_to_l0=true` が付くことも拒否する。`event=None` は command cursor/classification、memory job lease/result、dedicated native compaction の `ProviderContextMutation` 等の内部投影だけに限定する。これにより公開 wire へ summary 等の内部状態を漏らさず、公開eventがある更新では `agent_events` と複数の投影テーブルを同一 transaction にできる。
 
 tool callがstrict検証を通ってpolicy/approval段階へ入るときは、外部副作用より前に`tool_executions(state='prepared')`を作る。人間承認が必要なら`ApprovalRequested + ApprovalMutation(state='pending')`を同じtransactionで確定し、承認解決は`ApprovalResolved + ApprovalMutation(terminal state)`で閉じる。実行へ進む場合だけ`ToolExecutionStart + ToolExecutionMutation(prepared→running)`を同じtransactionでcommitし、その後にexecutor RPCを発火する。したがって`prepared`/`pending`は「外部副作用なし」、`running`は「副作用の有無が不明になり得る」という復旧境界になる。`ApprovalRequested`だけ、または`approval_log.pending`だけが存在するtransactionを作ってはならない。
 
@@ -1967,7 +1975,7 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 - **ゲート**:
   1. `cargo test --manifest-path apps/agent/Cargo.toml` 全緑(フィクスチャ再生で: ツールコール引数の逐次previewと生bufferのstrict終端を分離し、repairならpreview可能だがstrictでは失敗するJSONを確定ToolCallにしない、reasoning 分離、usage 取得、標準finish_reasonに加えて Z.ai の `sensitive` / `network_error` / `model_context_window_exceeded` を含む provider 固有パターン)
   2. ライブ: 3プロバイダに対しツールコール1往復+reasoning 付き2ターン会話が完走。**2ターン目で Kimi に reasoning_content を再送しても 400 が返らない**こと
-  3. TTFT 計測基盤: `MessageStart(user)受信 → HTTP リクエスト送出` と `送出 → 最初の TextDelta` を tracing span で分離計測し、stdio REPL に表示。**agent 内部オーバーヘッド p95 < 30ms**(モデル側 TTFB は記録のみ)
+  3. TTFT 計測基盤: `user_message command 受信 → HTTP リクエスト送出` と `送出 → 最初の TextDelta` を tracing span で分離計測し、stdio REPL に表示。**agent 内部オーバーヘッド p95 < 30ms**(モデル側 TTFB は記録のみ)
   4. abort: 生成中に CancellationToken 発火 → 1s 以内に Aborted イベントで正常形クローズ
 
 ### M1P: Responses + Anthropic Messages adapters(各1.5日、M1後に並行、Cloud release前必須)
@@ -2021,7 +2029,7 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
   1. 通常サイズのメッセージを使うシミュレータ投入で L0→L1→L2 の昇格が全段発火し、定常時のプロンプト総量が 80k 未満に戻る(MemoryMaintenance イベントで観測)。単一入出力による一時超過は §7.8 の個別ゲートで検証する
   2. **キャッシュヒット率実測**: 通常ターン(末尾追記のみ)で `usage.cache_read / (input+cache_read+cache_write) > 0.8` を Kimi 実機で確認。L0 先頭廃棄の直後ターンだけ低下し、次ターンで回復すること
   3. **TTFT 非劣化**: ユーザーメッセージ起点のコール前に溢れ処理・Compact が同期実行されていないことを span で証明(7.6-3 のスキップ規則)
-  4. `sumi_three_layer` mode では L2/L1 が全 protocol で user 相当の memory block として L0 より前へ入り、新しいユーザー命令と誤解されないことを固定 probe で確認する。`provider_native` mode では Responses の canonical output[] または Anthropic の native block と coverage 後の suffix だけになり、同じ prefix の3層表現が併存しないことを確認する
+  4. `sumi_three_layer` mode では L2/L1 が全 protocol で user 相当の memory block として L0 より前へ入り、新しいユーザー命令と誤解されないことを固定 probe で確認する。`provider_native` mode では Responses の canonical output[] または Anthropic の native block と coverage 後の suffix だけになり、同じ prefix の3層表現が併存しないことを確認する。adversarial probe には memory 本文へ `</memory>` と偽装 user 命令を埋めた tag-escape fixture を含め、§7.1 の無害化で層境界が破れないことも確認する
   5. 校正: est×ratio と実測 usage の乖離が ±15% 以内に収束
   6. ツールなしの user→assistant 会話だけを繰り返しても、40k到達後の昇格が AgentEnd/Idle 中に適用され、48kのハード上限まで放置されない
   7. L0 Compact / L1→L2 / L2統合の各完了で source version CAS、batch `Compacting → Compacted`、job `running → completed`、暗号化result/summary+redacted projection保存が同一 transaction になり、各 `running` 中に kill しても再起動後に lease 回収・再投入・一度だけの適用が成立する。最終失敗は `CompactFailed/failed`、同期fallback成功は `Compacted/completed` へ収束する
@@ -2055,7 +2063,7 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 3. **resource semantics**: disk/inode/PID の拒否、CPU throttle/CPU-time budget、memory max/OOM、wall runtime、command/workspace output の各経路を個別に発火させ、§8.3/ workspace.md の種別どおり `ResourceLimit`、kill/reap、bounded output へ収束する
 4. **generation recovery**: runtime/provider/tool 実行中に runtime を killし、deployment supervisor が旧 executor generation と登録済み execution cgroup/sandbox を回収する。`setsid` で別sessionへ離脱しstdout/stderrを閉じた descendant も abort/wall/CPU/output quota 後に `/workspace` を変更できないことを fault-injection で確認する。`running` execution は `indeterminate` で一度だけ閉じ、自動再実行しない
 5. **WS production**: token無し・期限切れ・別conversation・古いgenerationを拒否し、新generationで旧接続をfenceする。command重複、ACK前後kill、seq欠番、双方向catch-up、API 採番前の oversized/non-empty-attachments 拒否後に後続 command が詰まらないことを fault-injection で確認する
-6. **data lifecycle**: transcript export、conversation reset/agent deletion、provider contextとmemory-summaryのcrypto-erase、検索監査、backup tombstone 再適用、redaction fixture の integration test と運用 runbookを揃える。redaction fixture には **secret を複数 delta に分割した assistant text / tool arguments のストリーム**とCompact resultを含め、redaction-only 接続が delta を一切受信せず redacted `MessageEnd` だけを受け、DB平文projectionから要約secretも復元できないことを確認する
+6. **data lifecycle**: transcript export、conversation reset/agent deletion、provider contextとmemory-summaryのcrypto-erase、検索監査、backup tombstone 再適用、redaction fixture の integration test と運用 runbookを揃える。redaction fixture には **secret を複数 delta に分割した assistant text / tool arguments のストリーム**とCompact resultを含め、redaction-only 接続が delta を一切受信せず redacted `MessageEnd` だけを受け、DB平文projectionから要約secretも復元できないことを確認する。agent 鍵の供給を環境変数から control plane 管理の tenant KEK 階層(KMS)へ移行する(§10)
 
 テスト方針の総括: ユニット(純関数: assembler/truncate/partial_json/batch/estimate)+フィクスチャ再生(プロバイダ層)+スクリプト E2E(stdio ゲートウェイにコマンド列を流しイベント列をアサート)+ライブスモーク(env フラグでオプトイン)。**CI(GitHub Actions の agent パス)ではライブ以外を全部回す**。
 
@@ -2076,6 +2084,7 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 | D7 | **デモのモデル構成** | 推奨: Kimi K3 直API を主役(reasoning+1M ctx+自動キャッシュ)、GLM-5.2 従量を控え。Umans は開発用(同時4セッション制限がデモの罠)。8/1 までに直APIキーの課金設定を済ませる |
 | D8 | **OpenAPI→Rust クライアント生成** | 現状1エンドポイントなので手書きで開始し、ドメインAPIが3本を超えたら progenitor 導入を ADR 化(推奨) |
 | D9 | **承認reviewer mode / model** | 推奨: 既定User、opt-in AutoReview、開発用StrictAutoReview。reviewerはtenantが明示許可したaudit trust domain内だけ別モデル指定可、未設定時は会話モデルへfallback。raw CanonicalActionは送らずsecret-aware ReviewableActionだけを送り、判定不能ならmanual/headless block。デモでAutoReviewを見せるかは精度評価後に決める |
+| D10 | **provider_native mode の運用** | native compaction の発火条件(閾値・頻度)と conversation ごとの mode 選択導線が未定義。デモ・初期リリースは `sumi_three_layer` 固定でよい(推奨)。M1P の round-trip ゲートとは別に、Cloud release 前に発火 policy を実装側の閾値案から確定する |
 
 ### 14.2 技術リスクと手当て
 
@@ -2101,9 +2110,9 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 | **Kimi の自動キャッシュ TTL(5〜30分、未確定)** | 放置後の会話再開で全ミス→初回 TTFT 悪化 | 仕様上避けられない。実測して既知の挙動としてデモ台本に織り込む(冒頭に1回ウォームアップ発話) |
 | **8/1 に api/web 側が間に合わない** | E2E デモ不成立 | stdio ゲートウェイ+簡易 CLI で agent 単体デモが常に成立する状態を保つ(M2 以降常時)。contracts ドラフトを M3 で先出しして統合期間を確保 |
 
-### 14.3 本計画の前提が崩れたときの縮退順序
+### 14.3 縮退方針
 
-デモ最優先の縮退: M1P の Anthropic adapter > M1P の Responses native compact(Responses text/tool は残す)> M5 の承認(stdio では動く)> M4 の L2 統合(L1 昇格まででも会話は続く)> M3 の FTS 検索。WS 統合と **M1+M2(Chatストリーミング+ツール+ステア)** は削らない。縮退はデモ範囲だけで、Cloud release gate を緩める理由にはしない。
+縮退は計画しない(Founder 決定 2026-07-18)。全スコープを期限内に完了する前提で進め、事前のスコープ削減順序は定義しない。進捗が想定を割った場合はスコープを黙って削らず Founder へ即エスカレーションし、その時点で判断する。いかなる場合も Cloud release gate(M1P・Cloud rollout track)を緩める理由にはしない。
 
 ---
 

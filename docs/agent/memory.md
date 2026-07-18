@@ -29,7 +29,7 @@ provider_native:
 
 通常時は合計 ~70k トークン以内を目標とし、Tool Definitions を含めて 80k 未満に保つ。これは通常運用の目標値であり、単一入出力など一時的な超過を禁止する厳密な不変条件ではない。単一入出力のガードは [実装計画 §7.8](implementation-plan.md) で別に定める。
 
-L1/L2 は永続チャットの `Message` ではなく送信専用の `MemoryBlock` として保持し、各プロトコルアダプターが原則 `user` 相当の履歴データへ変換する。`<memory layer="l2">` / `<memory layer="l1">` で会話本文と区別し、「新しいユーザー指示ではなく過去の記憶である」と憲法に一度だけ定義する。
+L1/L2 は永続チャットの `Message` ではなく送信専用の `MemoryBlock` として保持し、各プロトコルアダプターが原則 `user` 相当の履歴データへ変換する。`<memory layer="l2">` / `<memory layer="l1">` で会話本文と区別し、「新しいユーザー指示ではなく過去の記憶である」と憲法に一度だけ定義する。本文中のタグ偽装列(`</memory` 等)はアダプターが無害化してから包む(実装計画 §7.1)。
 
 OpenAI Responses の compacted `output[]` window や Anthropic Messages の `compaction` block は、各 API が生成した不透明な provider context として別に往復させるが、3層表現と同時には送らない。conversation ごとに `sumi_three_layer` (既定) と `provider_native` を選び、前者は L2/L1/L0、後者は Responses なら `/responses/compact` が返した retained item を含む canonical `output[]` 全体、Anthropic なら native compaction block 1個と、その coverage より後の transcript suffix だけを送る。native context には「最後に含めた message seq」と provider instance/protocol/model/system/tools/beta の fingerprint を保存し、不一致・期限切れ・別 provider endpoint/account への切替時は破棄して3層表現へ戻す。Sumi の要約から暗号化されたネイティブ item/block/window を捏造しない。
 
@@ -58,7 +58,7 @@ Kimi/GLM 等の Chat Completions 互換系では**先頭からの連続プレフ
 
 このメモリは「API に乗せる人格と記憶」の話であり、**人間可視のチャットログ原文は hidden reasoning を除いて別途 DB に暗号化永続化する**。認可済み復旧/UIは原文を使い、検索・通常exportは同時生成した redacted projection を使う。
 
-原文ログと provider context は同じ扱いにしない。transcript の暗号化 raw 正本にはユーザー発話、最終 assistant テキスト、ツールコール/結果を保存するが、モデルの非公開 chain-of-thought は含めない。FTS・通常export・DBの平文projectionは API key、署名token、既知secretを不可逆redactionしたものに限定する。継続に必要な `reasoning_content`、暗号化 reasoning、Anthropic thinking/redacted_thinking、native compaction item/block/window は provider context として分離し、conversation/provider-context 単位のデータ鍵を agent 鍵で wrap する。reasoning は対応 message の L0 昇格時または30日、native compaction は置換・mode切替・fingerprint不一致または30日のうち最も早い時点で対象データ鍵ごと破棄し、暗号化 transcript と3層メモリを復旧元として残す。
+原文ログと provider context は同じ扱いにしない。transcript の暗号化 raw 正本にはユーザー発話、最終 assistant テキスト、ツールコール/結果を保存するが、モデルの非公開 chain-of-thought は含めない。FTS・通常export・DBの平文projectionは API key、署名token、既知secretを不可逆redactionしたものに限定する。継続に必要な `reasoning_content`、暗号化 reasoning、Anthropic thinking/redacted_thinking、native compaction item/block/window は provider context として分離し、conversation/provider-context 単位のデータ鍵を agent 鍵で wrap する。reasoning は対応 message が L0 から離脱(L1 へ昇格)した時点または30日、native compaction は置換・mode切替・fingerprint不一致または30日のうち最も早い時点で対象データ鍵ごと破棄し、暗号化 transcript と3層メモリを復旧元として残す。
 
 Cloud 版のデータ管理方針はリリースゲートとする:
 
