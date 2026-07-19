@@ -588,7 +588,7 @@ pub struct TypedTool<P: JsonSchema + DeserializeOwned> { /* name, desc, f */ }
 // execute(): args.as_object() (ValidatedToolArguments の read-only view) から P へ deserialize → 型付きハンドラ呼び出し
 ```
 
-**引数検証の方針**: pi は TypeBox で**フル JSON Schema 検証**(コンパイル済み `Check` + constraint 込みエラー列挙)と型強制(`Value.Convert` + 自前 coercion)を行う **[事実]** (`pi:ai/src/utils/validation.ts`、全310行)。Sumi も**制約込みのフル検証**で揃える: `schemars` が生成した各ツールの schema を起動時に `jsonschema` クレートでコンパイルし、§4.3 の `ToolCallEnd` 終端検証(strict parse → top-level object → schema)で `minimum` / `minLength` / `pattern` / `additionalProperties` 等の制約まで評価する。この検証を通った値だけが `ValidatedToolArguments` になり、承認・実行へ進む — `ToolCall.arguments` の型注釈、§4.3、承認境界、検証ゲートはすべてこの完全検証を前提にしており、構造的 serde のみでは制約違反引数が承認境界を通過してしまうため、簡略化はしない。検証失敗は**エラーメッセージにスキーマと受信引数を添えてツール結果 (is_error=true) としてモデルに返す**(pi と同じ回復パターン)。数値/真偽の弱い型強制は schema 検証より**前**の正規化として主要ツールに適用する。typed ハンドラ内の `serde_json::from_value::<P>` は検証済み引数の型付けであり、検証の代替ではない。**[検証契約として確定]**
+**引数検証の方針**: pi は TypeBox で**フル JSON Schema 検証**(コンパイル済み `Check` + constraint 込みエラー列挙)と型強制(`Value.Convert` + 自前 coercion)を行う **[事実]** (`pi:ai/src/utils/validation.ts`、全310行)。Sumi も**制約込みのフル検証**で揃える: `schemars` が生成した各ツールの schema を起動時に `jsonschema` クレートでコンパイルし、§4.3 の `ToolCallEnd` 終端検証(strict parse → top-level object → schema)で `minimum` / `minLength` / `pattern` / `additionalProperties` 等の制約まで評価する。この検証を通った値だけが `ValidatedToolArguments` になり、承認・実行へ進む — `ToolCall.arguments` の型注釈、§4.3、承認境界、検証ゲートはすべてこの完全検証を前提にしており、構造的 serde のみでは制約違反引数が承認境界を通過してしまうため、簡略化はしない。検証失敗の扱いは **§4.3 が正典**: raw 引数を破棄し、**受信引数もスキーマ全文も echo しない** `is_error=true` の合成 tool result(失敗した検証パス、エラー種別、違反した制約名だけを含む)で「引数検証に失敗したので tool call を再生成せよ」とモデルへ返す。pi はエラーにスキーマと受信引数を添える **[事実]** が、Sumi は §4.3 の再送・redaction 契約(検証不能な値を transcript/再送へ残さない)に合わせて値を返さない — 本節と §4.3 で保存・再送内容を食い違わせない。数値/真偽の弱い型強制は schema 検証より**前**の正規化として主要ツールに適用する。typed ハンドラ内の `serde_json::from_value::<P>` は検証済み引数の型付けであり、検証の代替ではない。**[検証契約として確定]**
 
 ### 3.5 pi 対照表(型サマリ)
 
@@ -616,7 +616,7 @@ pub struct TypedTool<P: JsonSchema + DeserializeOwned> { /* name, desc, f */ }
 
 | protocol / provider | base_url | モデル | 備考 **[事実]**(各社一次資料+調査レポート+pi モデルメタ) |
 |---|---|---|---|
-| OpenAI互換 Chat Completions / Moonshot (Kimi) | `https://api.moonshot.ai/v1` | `kimi-k3` (1M ctx / 131k out), `kimi-k2.7-code` (256k) | 自動プレフィックスキャッシュ(明示API不要)。reasoning は Preserved Thinking 常時ON |
+| OpenAI互換 Chat Completions / Moonshot (Kimi) | `https://api.moonshot.ai/v1` | `kimi-k3` (1M ctx / out 既定131k・物理上限1,048,576), `kimi-k2.7-code` (256k) | 自動プレフィックスキャッシュ(明示API不要)。reasoning は Preserved Thinking 常時ON |
 | OpenAI互換 Chat Completions / Z.ai (GLM) | `https://api.z.ai/api/paas/v4` | `glm-5.2` (1M ctx / 128k out) | `tool_stream: true` でツールコールもストリーミング。定額プランはバックエンド利用禁止→従量API必須 |
 | OpenAI互換 Chat Completions / Umans | `https://api.code.umans.ai/v1` | `umans-kimi-k2.7`, `umans-glm-5.2`, `umans-flash` | 開発時の保険。同時4セッション制限 |
 | OpenAI Responses | `https://api.openai.com/v1` | 設定で指定(GPT-5.6 系を主対象) | item/event ストリーム、function call、encrypted reasoning、`/responses/compact` の `compaction` item を扱う |
@@ -664,7 +664,7 @@ pub struct ChatCompat {
     pub requires_reasoning_content_on_assistant: bool,
     /// GLM: tool_stream:true を送る
     pub zai_tool_stream: bool,
-    /// tools[].function.strict を送るか (Kimi は不可)
+    /// tools[].function.strict を利用するか (Kimi K3 は対応・省略時 true。MFJS 非互換 schema にだけ明示 false を送る — §4.1 プリセット)
     pub supports_strict_mode: bool,
     /// store:false を送るか (OpenAI 本家のみ true)
     pub supports_store: bool,
@@ -677,7 +677,7 @@ pub struct ChatCompat {
 
 Chat Completions の初期プリセット(pi の生成メタデータを出発点に、各プロバイダ公式ドキュメントで 2026-07 に個別検証):
 
-- `kimi-k3`: **K3 は K2.x と API 方言が異なる**(2026-07-16 リリース。公式 K3 quickstart / Thinking Effort ガイドで確認 **[事実]**): `thinking_format=OpenAIEffort`(top-level `reasoning_effort`。launch 時点は `"max"` のみで thinking は常時有効。**K2.x の `thinking:{"type":"enabled"}` は送らない**)、`max_tokens_field=max_completion_tokens`(既定 131072)、`requires_reasoning_content_on_assistant=true`(reasoning フィールド込みで全 assistant を再送する要件は K3 でも継続)、`temperature`/`top_p`/`seed` は**送らない**(sampling 固定)、`supports_strict_mode=false`、`supports_store=false`、`supports_developer_role=false`。pi の `moonshotai.models.ts` メタデータ(`thinking` 方言、`useMaxTokens` 判定による `max_tokens`)は **K2.x 世代の値**であり K3 へ流用しない。K2.x 系モデルを併用する場合だけ別プリセット(`thinking_format=Deepseek` + `max_tokens`)を立てる
+- `kimi-k3`: **K3 は K2.x と API 方言が異なる**(2026-07-16 リリース。公式 K3 quickstart / Thinking Effort ガイドで確認 **[事実]**): `thinking_format=OpenAIEffort`(top-level `reasoning_effort`。launch 時点は `"max"` のみで thinking は常時有効。**K2.x の `thinking:{"type":"enabled"}` は送らない**)、`max_tokens_field=max_completion_tokens`(既定 131072、物理上限 1,048,576 **[事実]** 公式 K3 quickstart 2026-07 確認)、`requires_reasoning_content_on_assistant=true`(公式仕様は「完全な assistant メッセージを変更せず再送する」ことを要求し、reasoning フィールド込みの全ターン再送は K3 でも継続 **[事実]**)、`temperature`/`top_p`/`seed` は**送らない**(sampling 固定)、`supports_strict_mode=true`(現行 Kimi Tool Use 仕様は `function.strict` をサポートし**省略時 true** **[事実]** 公式 Tool Use ドキュメント 2026-07 確認。ただし schema は MFJS 仕様の JSON Schema subset に限られるため、起動時に schemars 生成 schema の **MFJS 互換判定**を行い、非互換ツールにだけ明示的に `strict:false` を付ける — 省略は true と同義なので「送らない」は回避策にならない。互換判定と strict 挙動は M1 でライブ fixture へ固定する)、`supports_store=false`、`supports_developer_role=false`。pi の `moonshotai.models.ts` メタデータ(`thinking` 方言、`useMaxTokens` 判定による `max_tokens`)は **K2.x 世代の値**であり K3 へ流用しない。K2.x 系モデルを併用する場合だけ別プリセット(`thinking_format=Deepseek` + `max_tokens`)を立てる
 - `glm-5.2` (`pi:ai/src/providers/zai.models.ts:79-98`): `thinking_format=Zai`(`thinking: {"type":"enabled","clear_thinking":false}` + `reasoning_effort` 対応)、`zai_tool_stream=true`、`supports_store=false`、`supports_developer_role=false`、**`max_tokens_field=max_tokens`**(Z.ai 直APIの公式リファレンス(docs.z.ai の Chat Completion、2026-07 確認)は `max_tokens` のみ定義し `max_completion_tokens` の記載がない **[事実]**。pi では z.ai が `useMaxTokens` 判定に含まれず既定の `max_completion_tokens` に落ちる **[事実]** 同 :1272-1273 が、それは**コーディングプラン用エンドポイントに対する値**であり直APIへは流用しない)
 - **GLM の base_url 注意**: pi の値 `/api/coding/paas/v4` は**コーディングプラン用エンドポイント**であり、Sumi は規約上使えない(プロバイダ調査参照)。Sumi は直APIの `https://api.z.ai/api/paas/v4` を使う — これは pi 由来ではなくプロバイダ調査由来の値。同じ理由で compat 値も pi のメタデータを盲目的に流用せず、直API仕様(上記 `max_tokens`)を既定として **M1 ライブで確認**する。差異が出たら Compat フラグで切替(ランタイム設定、再コンパイル不要)
 - Umans: OpenAI互換を名乗るが実体は上記モデルのプロキシ。**M1 の実測で決める**(まず Kimi/GLM 相当のプリセットを試す)。**[推測]**
@@ -696,7 +696,7 @@ Chat Completions JSON への変換は、**[事実]** 以下すべて `pi:ai/src/
 4. **`requires_reasoning_content_on_assistant`**: 再送する assistant メッセージに reasoning_content が無ければ `""` を補う(:1038-1044)
 5. **tool_calls**: `{id, type:"function", function:{name, arguments: JSON文字列}}`。引数は必ず `serde_json::to_string` で直列化
 6. **tool ロール**: `{"role":"tool","content":text,"tool_call_id":...}`。テキストが空で画像のみなら `"(see attached image)"`、両方空なら `"(no tool output)"` のプレースホルダ(:1073-1075)
-7. **ツール結果内の画像**: tool メッセージには載らないため、直後に user メッセージ `"Attached image(s) from tool result:"` + image_url ブロックとして追送(:1109-1127)。※ Kimi K3 は image 入力可(pi モデルメタ。2026-07 の公式 K3 ガイドでは未確認のため **M1 ライブで確認**)、GLM-5.2 text のみ **[事実]**(モデルメタ)。非対応モデルにはプレースホルダテキストに差替(`transform-messages.ts` の画像差替処理)
+7. **ツール結果内の画像**: tool メッセージには載らないため、直後に user メッセージ `"Attached image(s) from tool result:"` + image_url ブロックとして追送(:1109-1127)。※ Kimi K3 は image/video 入力可 **[事実]**(公式 K3 quickstart 2026-07 確認。挙動詳細は M1 ライブ fixture で固定)、GLM-5.2 text のみ **[事実]**(モデルメタ)。非対応モデルにはプレースホルダテキストに差替(`transform-messages.ts` の画像差替処理)
 8. **空 assistant のスキップ**: content も tool_calls も無い assistant メッセージは送らない(aborted 応答の残骸対策、:1045-1056)
 9. **tools が空でも履歴にツールコールがあるなら `"tools": []` を送る**(プロキシ互換、:625-628)。※ Sumi はツール凍結原則なので通常発生しないが移植しておく
 10. **サニタイズ**: 送信テキスト全部に不対サロゲート除去を適用。Rust の `String` は常に正しい UTF-8 なので pi の `sanitizeSurrogates` 相当は**受信側**(ツール出力のバイト列→String 変換時の `from_utf8_lossy`)で保証する。加えて `serde_json` は文字列中の生制御文字を正しくエスケープするため pi の repairJson 送信側問題は起きない **[推測、M1で確認]**
@@ -930,7 +930,7 @@ pi の `steer()` は**キュー投入のみ**で、注入は「現在のツー�
 | リトライ可能エラー | `Error(Error)` | `MessageEnd`(error) → `RetryScheduled` → backoff → `MessageStart`(次attempt) | **同一 Turn を継続**。error message はログのみで L0 へ入れない |
 | リトライ待機中ステア | —(直前 attempt は確定済み) | `MessageEnd`(error) → `RetryScheduled` → `Steered`(soft) → `MessageStart/End`(user、現在 Turn へ注入) → `MessageStart`(次attempt) | **同一 Turn を継続**。新しい `TurnStart` は出さず、attempt カウントも維持 |
 | abort(リトライ待機中) | —(直前 attempt は `MessageEnd`(error) 確定済み) | backoff sleep を中断 → 次 attempt の `MessageStart` を発行しない → 未注入 steer command を `superseded` で差し戻し(§6.5) → `TurnEnd` → `AgentEnd`(発行済み `RetryScheduled` は残るが、`TurnEnd` が後続に存在するため復旧は attempt を再開しない — §10.2 の cancel_requested 規則) | 終了(Idle へ) |
-| ツール実行/承認待ち中ステア | —(assistant ToolUseは確定済み) | ツールバッチを結果まで確定(承認待ちだけならCancelled+error result) → `TurnEnd` → `Steered`(soft) → 保存済み次`turn_id`の`TurnStart` → `MessageStart/End`(user) → 次のassistantストリーム | **同一 run を継続(`AgentEnd`なし)**。commandは受信時に次turnへdurable bindする |
+| ツール実行/承認待ち中ステア | —(assistant ToolUseは確定済み) | **実行中のツールだけ完走**させ、バッチ内の未開始ツール・承認待ちは新しい policy/approval へ入れず Cancelled+error result で確定(§9.8) → `TurnEnd` → `Steered`(soft) → 保存済み次`turn_id`の`TurnStart` → `MessageStart/End`(user) → 次のassistantストリーム | **同一 run を継続(`AgentEnd`なし)**。commandは受信時に次turnへdurable bindする |
 | コンテキスト溢れ(エラー検出) | `Error(Error)` | `MessageEnd`(error) → `RetryScheduled`(delay 0) → 溢れ処理を即時適用(§4.5・§7.6)→ `MessageStart`(次attempt) | **同一 Turn を継続**。1 Turn 最大2回、超過はリトライ不可 Error として閉じる |
 | リトライ不可エラー | `Error(Error)` | `MessageEnd`(error) → `TurnEnd` → `AgentEnd` | 終了 |
 
@@ -1023,8 +1023,8 @@ L2_LIMIT       = 10_000
 ### 7.3 バッチ分割(`batch.rs`)
 
 - open バッチにメッセージを追記し、`est_tokens >= L0_BATCH_MIN` に達したら**次の「きりのいい境界」で seal**
-- きりのいい境界の定義(pi の cut point 規則を Sumi のメッセージ種別に射影したもの。`pi:agent/src/harness/compaction/compaction.ts` の cut point 判定参照 — pi は bashExecution/custom 等のエントリ種別も cut 対象に含むが **[事実]**、Sumi のメッセージは user/assistant/toolResult の3種なので**結果として user または assistant メッセージの直前のみ**になる): toolResult の直前では切らない(assistant のツールコールと結果が別バッチに泣き別れると、Compact 入力も再送プレフィックスも壊れるため)。Sumi 追加規則: **interrupted な assistant とそれに続く steering user メッセージの間でも切らない**(中断文脈の一体性)
-- thinking/provider contextは `L0Batch` に入れない。ただし通常会話のcontext上限見積では、対応する暗号化provider contextのサイズを別カウンタとして**含める**(Kimiでは実際に再送されるため)。メモリバッチのseal/Compact入力は `PublicMessage` の見積だけで決め、hidden contentを要約モデルへ渡す口実にしない
+- きりのいい境界の定義(pi の cut point 規則を Sumi のメッセージ種別に射影したもの。`pi:agent/src/harness/compaction/compaction.ts` の cut point 判定参照 — pi は bashExecution/custom 等のエントリ種別も cut 対象に含むが **[事実]**、Sumi のメッセージは user/assistant/toolResult の3種なので**結果として user または assistant メッセージの直前のみ**になる): toolResult の直前では切らない(assistant のツールコールと結果が別バッチに泣き別れると、Compact 入力も再送プレフィックスも壊れるため)。Sumi 追加規則: 通常の seal 境界は**新しい user turn の先頭(user メッセージの直前)に限定**する — assistant 直前を一般境界として許すと、閾値到達後の user 質問が旧バッチ・回答が新バッチに分かれ、旧 Compact は回答を見ず新 Compact は質問を見ないため L1/L2 で因果関係が系統的に失われる。assistant 直前の seal は次項の**強制 seal(総量ガード超過)時のフォールバックだけ**に許す。**interrupted な assistant とそれに続く steering user メッセージの間でも切らない**(中断文脈の一体性)。tool loop(assistant ToolUse → toolResult 列)・interrupted/steer 対を跨いで切らないことは境界テストで固定する
+- thinking/provider contextは `L0Batch` に入れない。ただし各バッチは対応する暗号化 provider context の推定サイズを **eviction footprint** として別カウンタで保持し、L0 溢れ検知(§7.6 の Σ est)には `public est + footprint` の総量を使う(Kimiでは実際に再送されるため)。seal の下限判定(`L0_BATCH_MIN`)は `PublicMessage` の見積だけで行うが、public est が下限未満でも `public est + footprint` がバッチ強制上限(既定 `L0_BATCH_MIN × 2` **[推測、実測調整]**)を超えたら、次の安全な境界(前項の規則。このフォールバックに限り assistant 直前も可)で**強制 seal**する — 短い本文+大きな hidden reasoning が続くと「open バッチが永遠に seal されず、L0 が総量超過してもsealed/compacted バッチが1つも無く溢れ処理が廃棄できない」状態になるのを防ぐ。Compact 入力(要約モデルへ送る内容)は従来どおり `PublicMessage` だけで構成し、footprint を hidden content を要約モデルへ渡す口実にしない
 - seal と同時に `compactor` へ非同期ジョブ投入(7.4節)し、状態を Compacting に
 
 ### 7.4 先回り Compact(`compactor.rs`)
@@ -1092,7 +1092,7 @@ est(text) = ascii_chars / 4 + non_ascii_chars / 1.5   # 初期係数 [推測]
 
 ### 7.6 溢れ処理(`memory/overflow.rs`)
 
-1. **検知**: L0 追記のたびに `Σ est > L0_LIMIT` を確認 → `pending_apply = true` を立てる。Compact 完了時も MemoryMaintainer から Session へ `MaintenanceReady` を通知する
+1. **検知**: L0 追記のたびに `Σ (public est + eviction footprint) > L0_LIMIT` を確認(§7.3。hidden reasoning を含む実効再送量で判定する)→ `pending_apply = true` を立てる。Compact 完了時も MemoryMaintainer から Session へ `MaintenanceReady` を通知する
 2. **通常の適用タイミング**: TurnEnd / AgentEnd 後に Session が Idle へ戻った直後、または Idle 中に `MaintenanceReady` を受けた時点で、準備済み shelf を適用する。適用は世代番号を確認した短い SQLite トランザクションだけで、LLM 呼び出しは行わない。これにより user→assistant だけの通常会話でも 40k 到達時の処理を次のユーザー送信まで持ち越さない
 3. **API 直前のフォールバック**: Idle 適用が間に合わなかった場合だけ ContextAssembler で適用する。ただし**「ユーザーメッセージ起点の最初のコール」ではスキップ**(TTFT保護)。ツールコール継続・ステア再開・follow-up 起点のコールでは適用する。例外: `Σ est > L0_LIMIT × 1.2`(ハード上限)に達したら無条件適用 **[推測、係数は実測調整]**
 4. **L0→L1**: 先頭から Compacted バッチを `Σ est ≤ L0_DROP_TO` になるまで廃棄し、対応する shelf の要約を L1 末尾へ。shelf 未完(Compacting / CompactFailed)のバッチに当たったら、(a) 完了を待たずそこで止める(次回コールで続き)、(b) ハード上限超過時のみ同期待ち(CompactFailed はこのとき同期 fallback で再 claim — §7.4)。**open バッチは絶対に廃棄しない**。なお Sealed は seal と同一 transaction で Compacting になるため定常状態では観測されず、DB の `promoted|dropped` は適用済み/廃棄済みの記録専用で in-memory の `BatchState` には現れない
@@ -1164,7 +1164,7 @@ Docker sidecar は container spec で環境を `PATH` / `HOME` / `LANG` / execut
 
 - stdout/stderr を**単一ストリームに合流**(時系列維持)
 - **ローリングバッファ**: 上限 100KB(50KB×2)。超えたら先頭チャンクから捨てる → 最後に `truncate_tail` で 50KB/2000行に整える(=「メモリを無限に食わずに末尾を保持」)。注意: pi の「100KB」は JS の `text.length`(UTF-16 コード単位)基準 **[事実]** であり、Rust では**バイト基準の仕様移植**とする(忠実移植ではない)。多バイト文字を含む出力での全文退避テストを必須とする
-- **全文退避**: 出力が 50KB を超えた時点でexecutorの`append_tool_output`処理が `/workspace/.tool-output/<conversation_id>/bash-*.log` への追記を開始し、ツール結果に**全文パス**を含める。runtimeはpathを直接openせず、必要ならread_file/grep RPCで続きを読む(戦略的忘却と同じ思想)。artifact RPCは親dirを明示`0700`、fileを明示`0600`へ`fchmod`し、umaskに依存しない。ユーザー作成ファイルと区別し、conversation reset/backup 復元時は旧 ID のディレクトリを tombstone に従ってsupervisor/専用削除RPCが冪等削除する
+- **全文退避**: 出力が 50KB を超えた最初の時点で、executorの`append_tool_output`処理がまず **rolling buffer に保持済みの出力先頭からの全 prefix を一度だけ** `/workspace/.tool-output/<conversation_id>/bash-*.log` へ flush し、以後の chunk を順次追記する(閾値以後の chunk だけを append すると全文パスの実体が「後半だけ」になり先頭 50KB が欠落する。閾値 50KB < buffer 上限 100KB なので flush 時点で prefix は必ず buffer に完存する)。ツール結果に**全文パス**を含める。「prefix flush → 逐次 append」で全文ログが必ず出力先頭から始まることは、多バイト文字境界のケースと合わせてテストで固定する。runtimeはpathを直接openせず、必要ならread_file/grep RPCで続きを読む(戦略的忘却と同じ思想)。artifact RPCは親dirを明示`0700`、fileを明示`0600`へ`fchmod`し、umaskに依存しない。ユーザー作成ファイルと区別し、conversation reset/backup 復元時は旧 ID のディレクトリを tombstone に従ってsupervisor/専用削除RPCが冪等削除する
 - **出力 quota**: rolling buffer とは別に、spawn 直後から stdout+stderr の総バイト数を数える。1 command 10MiB、`/workspace/.tool-output` 合計100MiBを既定上限とし、どちらかへ達したら capture だけを黙って捨てず、§8.3 の execution boundary 全体を停止して `ResourceLimit(OutputBytes)` を返す。partial log は fsync/close し、結果に実測バイト数と limit を含める。上限は tenant policy で引き下げ可
 - **バイナリサニタイズ**: 制御文字(TAB/LF/CR以外)除去、`\r` 除去(:sanitizeBinaryOutput)。Rust では `from_utf8_lossy` + 同フィルタ
 - 中断(execution boundary の実装仕様、Linux 前提):
@@ -1206,7 +1206,7 @@ Pending:
           ApproveAlways(rule候補) → ルール安全性を再検証 → 保存+実行
           Deny → block
   - abort: Pending を Cancelled にし block (ハードステアは assistant 生成中にしか発生せず承認待ちと重ならない)
-  - user メッセージ(ステア): `ApprovalDecision` を伴わず届いた場合、その決定を待たず Pending を Cancelled にし block してから通常の soft steer 経路で注入する。D4(待機中も steering で詰まらない)を満たすための規則 — 9.8節
+  - user メッセージ(ステア): `ApprovalDecision` を伴わず届いた場合、その決定を待たず Pending を Cancelled にし block する。**同じツールバッチの未開始ツールも新しい Pending へ入れず Cancelled 結果で確定**してから、通常の soft steer 経路で注入する。D4(待機中も steering で詰まらない)を満たすための規則 — 9.8節
   - タイムアウト: なし (無限待ち)。ただし上記のとおり user メッセージが届いた時点で Pending は解消される
 block 時: pi と同じくエラーツール結果を合成 [事実] (agent-loop.ts:638-644)
   Deny:      "ユーザーがこの操作を拒否した。理由を推測せず、指示を仰ぐこと"
@@ -1391,7 +1391,7 @@ JSON Schema:
 
 ### 9.8 待機中の会話との整合
 
-承認待ちはツールバッチの途中で停止するため、Session は `Streaming` のまま。`ApprovalDecision` が届けば通常どおり Pending を解決し、対応する `UserMessage` が同時にあればツールバッチ完了 → 次ターン前に注入する。「拒否と同時に言葉で指示する」自然な操作はこの経路で成立する。一方、`ApprovalDecision` を伴わず `UserMessage` だけが届いた場合は、D4(承認待ちは無限待ちだが steering で詰まらないことが前提、§14.1)を満たすため即座に処理する: まず`soft_steer`、現在の`run_id`、保存済み次`turn_id`を`classified/status=applying`としてdurable commitする。対象ツールは実行前で外部副作用がないので、その Pending を決定を待たず `Cancelled` として block し(§9.2)、通常の soft steer 経路(他に実行中のツールがあれば完了後、無ければ直ちに次 API コール前)へ合流させる。Pending 解消後に遅延到着した同一 `request_id` の `ApprovalDecision` は会話状態を変えない no-op だが、command としては放置しない — §11.1.1 のとおり `CommandApplied`(status=applied) を durable commit して `Applied` ACK を返す(単に無視すると当該 command が `received` のまま残り、seq 順の command cursor と crash 復旧が塞がる)。abort は Pending を破棄して Idle へ(未注入の classified steer command は §6.5 の supersede で差し戻す)。
+承認待ちはツールバッチの途中で停止するため、Session は `Streaming` のまま。`ApprovalDecision` が届けば通常どおり Pending を解決し、対応する `UserMessage` が同時にあればツールバッチ完了 → 次ターン前に注入する。「拒否と同時に言葉で指示する」自然な操作はこの経路で成立する。一方、`ApprovalDecision` を伴わず `UserMessage` だけが届いた場合は、D4(承認待ちは無限待ちだが steering で詰まらないことが前提、§14.1)を満たすため即座に処理する: まず`soft_steer`、現在の`run_id`、保存済み次`turn_id`を`classified/status=applying`としてdurable commitする。対象ツールは実行前で外部副作用がないので、その Pending を決定を待たず `Cancelled` として block する(§9.2)。**さらに、soft steer を classified/applying として確定した時点で、同じツールバッチ内の未開始ツールも policy/approval 段階へ進めず、同じ Cancelled エラー結果("ユーザーの新しい指示により実行前に取り消された")で確定する** — sequential バッチに承認対象が複数あると、次の未開始ツールが新しい Pending へ入るが、steer command は既に消費済みで解除に使えず、タイムアウトもないため再び無限待ちになる(D4 違反)。この規則は承認待ち経由に限らず、ツール実行中に届いた soft steer にも適用する(実行中のツールだけは完走させ、cancel 伝播はしない — abort とは区別する)。バッチを結果まで確定したら `TurnEnd` へ進み、通常の soft steer 経路(次 API コール前の注入)へ合流させる。モデルは Cancelled 結果と直後の user メッセージから、必要なら次ターンでツールを再発行できる。Pending 解消後に遅延到着した同一 `request_id` の `ApprovalDecision` は会話状態を変えない no-op だが、command としては放置しない — §11.1.1 のとおり `CommandApplied`(status=applied) を durable commit して `Applied` ACK を返す(単に無視すると当該 command が `received` のまま残り、seq 順の command cursor と crash 復旧が塞がる)。abort は Pending を破棄して Idle へ(未注入の classified steer command は §6.5 の supersede で差し戻す)。
 
 ---
 
@@ -1399,11 +1399,13 @@ JSON Schema:
 
 SQLite(sqlx、WAL モード)。DB ファイルは永続ボリューム上の agent 専用状態ディレクトリ(`$SUMI_STATE_DIR/agent.db`、コンテナ既定 `/var/lib/sumi/agent.db`)に置き、`sumi-agent` UID だけが read/write できる。`/workspace` を操作する `sumi-tool` executor にはこのディレクトリを見せない。記憶検索が必要なら Store の read-only API を型付きツールとして公開し、生DBパスは渡さない。ここに置くのは agent の**自己状態**(メモリ層・公開チャット transcript・暗号化 provider context・恒久イベント・承認ルール)だけで、ドメインデータは複製しない — ADR 0001 の原則「agent はドメイン DB を直接触らず、権限モデルの強制点を API 層に保つ」はこの形で維持する。
 
-Cloud 版は volume/backup の基盤暗号化に加えて tenant KEK → agent 鍵 → conversation配下の transcript/event/memory-summary 鍵・provider-context鍵・workspace鍵の階層で envelope encryption する。人間可視 transcript の原文正本 (`messages.raw_ciphertext` と durable event の raw envelope)、Compact/L1/L2要約の原文正本 (`memory_batches.summary_ciphertext` / `memory_jobs.result_ciphertext`) と `provider_context.ciphertext` は application 層でも用途別鍵で暗号化する。**要約は元会話のsecretを保持し得るため、unredactedな`summary`/`result`をSQLiteのTEXT、ログ、イベント、FTSへ保存しない**。raw hidden chain-of-thought は transcript/要約正本にも保存せず、継続に必要な reasoning/compaction item だけを provider context に分離する。reasoning context は対応 message が L0 から離脱(L1 へ昇格)した時点または30日、native compaction は置換・mode切替・fingerprint不一致または30日のうち最も早い時点で対象データ鍵ごと crypto-erase する。conversation resetはtranscript/event/memory-summary/provider-contextの各conversation data keyを直ちに破棄し、要約も復号不能にしてFTS・通常export・Audit reviewerの入力から除外する。
+Cloud 版は volume/backup の基盤暗号化に加えて tenant KEK → agent 鍵 → conversation配下の transcript/event/memory-summary 鍵・provider-context鍵・workspace鍵の階層で envelope encryption する。人間可視 transcript の原文正本 (`messages.raw_ciphertext` と durable event の raw envelope)、Compact/L1/L2要約の原文正本 (`memory_batches.summary_ciphertext` / `memory_jobs.result_ciphertext`) と `provider_context.ciphertext` は application 層でも用途別鍵で暗号化する。**要約は元会話のsecretを保持し得るため、unredactedな`summary`/`result`をSQLiteのTEXT、ログ、イベント、FTSへ保存しない**。raw hidden chain-of-thought は transcript/要約正本にも保存せず、継続に必要な reasoning/compaction item だけを provider context に分離する。reasoning context は対応 message が L0 から離脱(L1 へ昇格)した時点で対象データ鍵ごと crypto-erase する。**L0 在籍中の reasoning は経過日数だけを理由に失効させない**(不変条件) — Kimi は過去全ターンの reasoning 込みで完全な assistant メッセージを再送する品質契約のため、reasoning だけ先に消すと L0 に残った assistant 本文が空 reasoning で再送され、長期休眠した会話の品質が不安定になる。30日を超えて L0 に残った reasoning は放置もしない: 期限 sweeper が対応 prefix バッチの強制 seal(§7.3)と Compact を予約し、昇格による L0 離脱と**同一 transaction** で鍵破棄する — 期限だけが先行して本文と reasoning が泣き別れる状態を作らない。native compaction は置換・mode切替・fingerprint不一致または30日のうち最も早い時点で crypto-erase する(こちらは公開 transcript から再構成可能な派生物のため、期限単独の失効を許す)。conversation resetはtranscript/event/memory-summary/provider-contextの各conversation data keyを直ちに破棄し、要約も復号不能にしてFTS・通常export・Audit reviewerの入力から除外する。
 
 transcript/memory/workspace は既定で agent 削除まで保持し、tenant policy で短縮可能とする。ユーザーは conversation/agent 単位の削除を実行でき、conversation export は redaction 済み JSONL、agent export はそれに workspace archive を加える。削除は直ちに tombstone と鍵破棄でアクセス不能化する。会話削除では conversation配下のtranscript/event/memory-summary鍵とprovider-context鍵、agent 削除では agent 鍵と配下の workspace 鍵を破棄し、live DB/volume を24時間以内、backup を30日以内に期限切れにする。backup 復元は deletion tombstone を先に再適用する。検索・export・管理者アクセスは actor/tenant/scope/result count を監査ログへ残す。これらの API と運用 runbook がない状態では Cloud release しない。
 
-**鍵の供給(Founder 決定 2026-07-18)**: ハッカソンのデモは Cloud 構成(EC2 + Docker、workspace.md の段階表)で行い、OSS ローカル版の鍵管理は現時点でスコープ外とする。開発・デモ環境では agent 鍵(32 byte master key)を deployment 側が環境変数/設定ファイルで **runtime にだけ**渡す — §8.1 の executor 環境許可リストに含めず、gateway credential と同じくログ・イベント・SQLite・executor 環境へ出さない。conversation/用途別データ鍵はランダム生成して agent 鍵で AEAD wrap し SQLite に保存する(crypto-erase は wrap 行の削除で成立し、agent 鍵ローテーションは wrap の掛け直しだけで raw を再暗号化せずに済む)。Cloud 本番は agent 鍵の正典を control plane 管理の tenant KEK 階層(KMS)へ移して環境変数直渡しを廃止する — この移行は Cloud rollout track 6 の release gate に含める。
+**鍵の供給(Founder 決定 2026-07-18)**: ハッカソンのデモは Cloud 構成(EC2 + Docker、workspace.md の段階表)で行い、OSS ローカル版の鍵管理は現時点でスコープ外とする。開発・デモ環境では agent 鍵(32 byte master key)を deployment 側が環境変数/設定ファイルで **runtime にだけ**渡す — §8.1 の executor 環境許可リストに含めず、gateway credential と同じくログ・イベント・SQLite・executor 環境へ出さない。conversation/用途別データ鍵はランダム生成して agent 鍵で AEAD wrap し、**§10.1 の `data_keys` 表を wrap の正典として** SQLite に保存する(crypto-erase は該当行の `state='destroyed'` 遷移 + `wrapped_key`/`wrap_nonce` の破棄で成立し、agent 鍵ローテーションは active 行の wrap 掛け直しだけで raw を再暗号化せずに済む)。
+
+**AEAD の AAD 契約**: application 層の暗号化はすべて AAD を伴う。行データの暗号化は `tenant_id, agent_id, conversation_id, table 名, 行 id(または seq), purpose, schema version` を canonical 順で AAD に束縛し、復号時は保存値ではなく**行の実位置から再構成**して検証する — AAD なしでは同一用途鍵配下の ciphertext と key_ref を別の message/provider_context 行へ移しても認証に成功し、履歴や reasoning anchor を静かに差し替えられる。data key の wrap 自体も `key_ref, scope, purpose, conversation_id, wrap_key_id` を AAD に含める。fault fixture に行スワップ(2行間の ciphertext/key_ref 入替)を含め、復号が必ず拒否されることを固定する。Cloud 本番は agent 鍵の正典を control plane 管理の tenant KEK 階層(KMS)へ移して環境変数直渡しを廃止する — この移行は Cloud rollout track 6 の release gate に含める。
 
 ### 10.1 スキーマ(マイグレーション v1)
 
@@ -1425,6 +1427,36 @@ CREATE TABLE agent_scope (
   conversation_id TEXT NOT NULL UNIQUE,
   created_at TEXT NOT NULL
 );
+
+-- §10 の envelope 鍵階層の wrap 正本。全 *_key_ref はこの表を参照する。
+-- crypto-erase = state='destroyed' + wrapped_key/wrap_nonce の破棄 (行は参照整合と監査のため残す。
+-- 暗号文行本体は tombstone 経路が24時間以内に purge する)。
+-- agent 鍵ローテーション = active 行の wrap_key_id/wrap_nonce/wrapped_key の掛け直しのみ。
+CREATE TABLE data_keys (
+  key_ref TEXT PRIMARY KEY,
+  scope TEXT NOT NULL,           -- conversation | agent
+  purpose TEXT NOT NULL,         -- transcript | event | memory_summary | provider_context | command | workspace
+  conversation_id TEXT,          -- scope=conversation のとき必須
+  algorithm TEXT NOT NULL,       -- data key の AEAD 方式+版 (例: "xchacha20-poly1305/v1")
+  wrap_key_id TEXT NOT NULL,     -- wrap に使った agent 鍵の世代ID
+  wrap_nonce BLOB,
+  wrapped_key BLOB,              -- agent 鍵で AEAD wrap した data key (AAD は §10 の契約)
+  state TEXT NOT NULL,           -- active | destroyed
+  created_at TEXT NOT NULL,
+  destroyed_at TEXT,
+  CHECK ((scope = 'conversation') = (conversation_id IS NOT NULL)),
+  CHECK (
+    (state = 'active' AND wrapped_key IS NOT NULL AND wrap_nonce IS NOT NULL
+      AND destroyed_at IS NULL)
+    OR
+    (state = 'destroyed' AND wrapped_key IS NULL AND wrap_nonce IS NULL
+      AND destroyed_at IS NOT NULL)
+  )
+);
+-- messages.raw_key_ref / agent_events.raw_key_ref / provider_context.key_ref /
+-- memory_batches.summary_key_ref / memory_jobs.result_key_ref / inbound_commands.payload_key_ref は
+-- v1 migration で REFERENCES data_keys(key_ref) を付ける。EventWriter は destroyed 鍵への
+-- 新規暗号化 write を拒否し、復号側は destroyed を「crypto-erase 済み」として扱う。
 
 -- 人間可視チャット transcript (通常は追記専用)。
 -- 暗号化 raw は認可済み UI/L0 復旧、payload/search_text は redacted 検索・export 用。
@@ -1673,7 +1705,7 @@ pub struct ProviderContextMutation {
 
 `EventWriter` は event と projection batch の組を検証し、重複 variant、競合する expected phase/version、anchor/ordinal 不整合を拒否してから全件を1 transaction で適用する。たとえば user `MessageEnd` は `Projection::MessageEnd + Projection::RunPhase`、assistant `MessageEnd` は `Projection::MessageEnd + 必要なら RunPhase/CommandApplied` を同居させる。`MemoryMaintenance` に `MemoryTransition` がないこと、memory mutationのsummary/resultが暗号化正本・redacted projection・redaction_versionの完全な組でないこと、`stop_reason=Error` の `MessageEnd`(リトライ可否を問わず)に `append_to_l0=true` が付くことも拒否する。`event=None` は command cursor/classification、memory job lease/result、dedicated native compaction の `ProviderContextMutation` 等の内部投影だけに限定する。これにより公開 wire へ summary 等の内部状態を漏らさず、公開eventがある更新では `agent_events` と複数の投影テーブルを同一 transaction にできる。
 
-tool callがstrict検証を通ってpolicy/approval段階へ入るときは、外部副作用より前に`tool_executions(state='prepared')`を作る。人間承認が必要なら`ApprovalRequested + ApprovalMutation(state='pending')`を同じtransactionで確定し、承認解決は`ApprovalResolved + ApprovalMutation(terminal state)`で閉じる。実行へ進む場合だけ`ToolExecutionStart + ToolExecutionMutation(prepared→running)`を同じtransactionでcommitし、その後にexecutor RPCを発火する。したがって`prepared`/`pending`は「外部副作用なし」、`running`は「副作用の有無が不明になり得る」という復旧境界になる。`ApprovalRequested`だけ、または`approval_log.pending`だけが存在するtransactionを作ってはならない。
+tool callがstrict検証を通ってpolicy/approval段階へ入るときは、外部副作用より前に`tool_executions(state='prepared')`を作る。人間承認が必要なら`ApprovalRequested + ApprovalMutation(state='pending')`を同じtransactionで確定し、承認解決は`ApprovalResolved + ApprovalMutation(terminal state)`で閉じる。実行へ進む場合だけ`ToolExecutionStart + ToolExecutionMutation(prepared→running)`を同じtransactionでcommitし、その後にexecutor RPCを発火する。したがって`prepared`/`pending`は「外部副作用なし」、`running`は「副作用の有無が不明になり得る」という復旧境界になる。`ApprovalRequested`だけ、または`approval_log.pending`だけが存在するtransactionを作ってはならない。実行完了側も同様に、terminal state(succeeded/failed/cancelled/indeterminate)への`ToolExecutionMutation`を運ぶ`ToolExecutionEnd`と、対応するtoolResultの`MessageStart/End`(`messages`投影込み)は**同一EventWriter transaction**でcommitする。したがって「`succeeded`等のterminal行があるのにtoolResult messageが無い」中間状態は存在せず、crash復旧はこの不変条件に依存してよい。
 
 ネットワーク停止を DB 書込みへ伝播させないため、永続化と送信を2タスクに分ける:
 
@@ -1697,10 +1729,10 @@ tool callがstrict検証を通ってpolicy/approval段階へ入るときは、�
   - `hard_steer_requested`(§6.3 手順0で commit 済み)→ この attempt は打ち切り予定だったので `assistant_started` と同じリトライ経路へは戻さない。未確定 assistant を本文空・stop_reason=Aborted・interrupted=true の合成 `MessageEnd` で確定し(§6.3 の確定規則と同型)、不足する `TurnEnd` → `Steered`(hard) → 保存済みの次 turn の `TurnStart` → ステアメッセージの user `MessageStart/End` を追記して次 attempt を開始する(ハードステアは run を継続する契約なので `AgentEnd` はしない — §6.3.1)
   - `RetryScheduled` 後 → 同じ run/turn に束縛された未完了 `retry_steer` command があれば、通常の待機/次 attempt より先にその保存済み分類の不足 suffix(`Steered` → user `MessageStart/End`)を適用し、残り時間を待たず次 attempt の `MessageStart` へ進む。無ければ `retry_at` までの残り時間を待つ(過去なら即時) → 次 attempt の `MessageStart` から同じ Turn を再開。最大attempt到達済みなら `TurnEnd` → `AgentEnd`
   - retryable Error またはコンテキスト溢れの assistant `MessageEnd` 後で `RetryScheduled` がまだ無い → 同じ判定とattempt数から不足する `RetryScheduled` を1件だけ追記して再開(溢れの場合は溢れ処理の適用状態を確認し、不足分を適用してから次 attempt へ — §4.5)
-  - `stop_reason=ToolUse` の assistant `MessageEnd` 後 → 応答が含む各 ToolCall について`tool_executions`と`approval_log`を確認する。`prepared|running`行または`pending` approvalが1件でもあれば次の「tool/approval phase 中」規則に従う。全 ToolCall に行が無ければpolicy準備前で外部副作用は発生していないと確定できるので、各ツールにつき "process restarted before tool execution" の is_error ツール結果を MessageStart/End で確定してから `TurnEnd` へ進む。その後、同じrunに`classified/applying`のsoft steerがあれば次項の継続規則で保存済みturnへ注入し、無ければ`AgentEnd`へ進む(ツールを自動実行しない点は次項と同じ)。これにより `MessageEnd(stop_reason=ToolUse)` 後・policy準備前の crash が「通常の MessageEnd」規則に落ちてツール未実行のまま Turn が閉じることを防ぐ
+  - `stop_reason=ToolUse` の assistant `MessageEnd` 後 → 応答が含む各 ToolCall を`tool_executions`と`approval_log`に対して**1件ずつ個別に分類**し、不足 suffix だけを追記する(バッチ全体を「active 行あり/全行なし」の二分で判定しない — 2ツール中 A だけ terminal で B の行が無い部分完了状態は、その二分のどちらにも該当しなくなるため): (a) **terminal**(succeeded/failed/cancelled/indeterminate)→ §10.2 の不変条件(terminal 遷移と toolResult MessageStart/End は同一 transaction)により結果 message は commit 済みなので何も追記しない。(b) **active**(`prepared|running` 行、または対応 approval が `pending`)→ 次の「tool/approval phase 中」規則でその call を閉じる。(c) **行なし** → policy 準備前で外部副作用は発生していないと確定できるので、"process restarted before tool execution" の is_error ツール結果を MessageStart/End で確定する。**全 ToolCall の結果 message が揃ってから** `TurnEnd` へ進む。その後、同じrunに`classified/applying`のsoft steerがあれば次項の継続規則で保存済みturnへ注入し、無ければ`AgentEnd`へ進む(ツールを自動実行しない点は次項と同じ)。これにより `MessageEnd(stop_reason=ToolUse)` 後の crash が「通常の MessageEnd」規則に落ちてツール未実行のまま Turn が閉じることも、部分完了バッチがどの復旧規則にも該当せず詰まることも防ぐ
   - 通常(ToolUse 以外)またはリトライ不可 assistant の `MessageEnd` 後 → `TurnEnd` → `AgentEnd`
   - `TurnEnd` 後 → 同じrunに`classified/applying`の通常soft steerがあれば保存済み分類の`Steered` → `TurnStart`以降へ進み、無ければ`AgentEnd`(ただし `cancel_requested` が commit 済みの run は継続せず、§6.5 の supersede 後に `AgentEnd`)
-  - tool/approval phase 中(`tool_executions.state IN ('prepared','running')`または`approval_log.state='pending'`) → supervisor が旧 executor generation を kill/reap したことを確認する。`running` executionだけを`indeterminate`、`prepared`を`cancelled`、pending approvalを`ApprovalResolved(Cancelled)`と同じtransactionで`cancelled`へ閉じ、各未解決toolのエラー結果を MessageStart/End で確定して`TurnEnd`まで追記する。ここで同じ`run_id`に`application_kind=soft_steer AND status=applying`のcommandがあれば、**保存済みrun/turn bindingを変更せず**`Steered(soft)` → 保存済み`turn_id`の`TurnStart` → command ciphertextから同じmessage_idの`MessageStart/End(user)` → assistant再開の不足suffixへ進み、`AgentEnd`を発行しない。commandはその指示を取り込んだ最初のassistant `MessageEnd/TurnEnd`で`finished`になるまで`applying`のままとし、そのtransaction後だけ`applied`にする。複数soft steerはcommand seq順に各保存済みturnへ適用する。該当commandが無い場合だけ`AgentEnd`で閉じる。外部副作用の有無が不明な`running` tool自体は自動再実行しない
+  - tool/approval phase 中(前項の個別分類で **active な ToolCall が1件以上**ある場合) → supervisor が旧 executor generation を kill/reap したことを確認する。active な call ごとに `running` executionだけを`indeterminate`、`prepared`を`cancelled`、pending approvalを`ApprovalResolved(Cancelled)`と同じtransactionで`cancelled`へ閉じ、各未解決toolのエラー結果を MessageStart/End で確定する(terminal 済み・行なしの call は前項 (a)/(c) の規則のまま)。全 ToolCall の結果が揃ったら`TurnEnd`まで追記する。ここで同じ`run_id`に`application_kind=soft_steer AND status=applying`のcommandがあれば、**保存済みrun/turn bindingを変更せず**`Steered(soft)` → 保存済み`turn_id`の`TurnStart` → command ciphertextから同じmessage_idの`MessageStart/End(user)` → assistant再開の不足suffixへ進み、`AgentEnd`を発行しない。commandはその指示を取り込んだ最初のassistant `MessageEnd/TurnEnd`で`finished`になるまで`applying`のままとし、そのtransaction後だけ`applied`にする。複数soft steerはcommand seq順に各保存済みturnへ適用する。該当commandが無い場合だけ`AgentEnd`で閉じる。外部副作用の有無が不明な`running` tool自体は自動再実行しない
   - `AgentEnd` 後 → 追記なし
   合成 MessageEnd も通常規則で `messages` へ投影する(UI はエラーとして表示できる)が、空 assistant は transform(§5.3)が再送からスキップするため API へは流れない。復旧処理は replay で得た phase と、追記しようとする次イベントの組を検証し、完了済みの MessageEnd / TurnEnd を重複発行しない。三者の整合は「**MessageEnd まで到達した内容だけが実体**」という単一規則で保つ
 
