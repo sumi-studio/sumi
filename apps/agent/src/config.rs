@@ -50,6 +50,15 @@ struct EnvOverrides {
 
 impl Config {
     pub async fn load() -> Result<Self> {
+        if let Some(path) = env::var_os("SUMI_ENV_FILE") {
+            dotenvy::from_path(&path).with_context(|| {
+                format!(
+                    "failed to load environment file {}",
+                    Path::new(&path).display()
+                )
+            })?;
+        }
+
         let file = match env::var_os("SUMI_CONFIG") {
             Some(path) => Some(load_file(Path::new(&path)).await?),
             None => None,

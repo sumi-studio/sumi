@@ -5,7 +5,9 @@ use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter, Stdin, Stdout,
 };
 
-use super::{Command, Envelope, Gateway, GatewayClosed};
+use super::{
+    CommandEnvelope, CommandRejectReason, Gateway, GatewayClosed, InboundCommand, OutboundFrame,
+};
 
 const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_USER_COMMAND_BYTES: usize = 1024 * 1024;
@@ -43,12 +45,12 @@ impl Default for StdioGateway {
 
 #[async_trait]
 impl Gateway for StdioGateway {
-    async fn next_command(&mut self) -> Result<Command> {
+    async fn next_command(&mut self) -> Result<InboundCommand> {
         read_command(&mut self.input).await
     }
 
-    async fn send(&mut self, envelope: Envelope) -> Result<()> {
-        let mut line = serde_json::to_vec(&envelope).context("failed to encode event JSON")?;
+    async fn send(&mut self, frame: OutboundFrame) -> Result<()> {
+        let mut line = serde_json::to_vec(&frame).context("failed to encode gateway frame JSON")?;
         line.push(b'\n');
         self.output
             .write_all(&line)
@@ -61,21 +63,72 @@ impl Gateway for StdioGateway {
     }
 }
 
-async fn read_command<R>(input: &mut R) -> Result<Command>
+#[derive(serde::Deserialize)]
+struct RawCommandEnvelope {
+    seq: u64,
+    command_id: String,
+    command: Option<Box<serde_json::value::RawValue>>,
+}
+
+async fn read_command<R>(input: &mut R) -> Result<InboundCommand>
 where
     R: AsyncBufRead + Unpin,
 {
     let line = read_frame(input).await?;
-    let command: Command = serde_json::from_slice(&line).map_err(InvalidCommand)?;
-    if matches!(command, Command::UserMessage { .. }) && line.len() > MAX_USER_COMMAND_BYTES {
-        return Err(CommandTooLarge {
-            limit: MAX_USER_COMMAND_BYTES,
-            actual: line.len(),
-        }
-        .into());
+    let raw: RawCommandEnvelope = serde_json::from_slice(&line).map_err(InvalidCommand)?;
+    let Some(raw_command) = raw.command else {
+        return Ok(InboundCommand::Invalid {
+            seq: raw.seq,
+            command_id: raw.command_id,
+            reason: CommandRejectReason::SchemaViolation,
+        });
+    };
+    let command_bytes = raw_command.get().len();
+    let command_value: serde_json::Value =
+        serde_json::from_str(raw_command.get()).map_err(InvalidCommand)?;
+    let command_type = command_value
+        .get("type")
+        .and_then(serde_json::Value::as_str);
+
+    let reason = if command_type == Some("user_message") && command_bytes > MAX_USER_COMMAND_BYTES {
+        Some(CommandRejectReason::Oversized {
+            actual_bytes: command_bytes as u64,
+        })
+    } else if command_type == Some("user_message")
+        && command_value
+            .get("attachments")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|attachments| !attachments.is_empty())
+    {
+        Some(CommandRejectReason::AttachmentsNotEmpty)
+    } else if command_type
+        .is_some_and(|kind| !matches!(kind, "user_message" | "abort" | "approval_decision"))
+    {
+        Some(CommandRejectReason::UnknownCommand)
+    } else {
+        None
+    };
+
+    if let Some(reason) = reason {
+        return Ok(InboundCommand::Invalid {
+            seq: raw.seq,
+            command_id: raw.command_id,
+            reason,
+        });
     }
 
-    Ok(command)
+    match serde_json::from_value(command_value) {
+        Ok(command) => Ok(InboundCommand::Valid(CommandEnvelope {
+            seq: raw.seq,
+            command_id: raw.command_id,
+            command,
+        })),
+        Err(_) => Ok(InboundCommand::Invalid {
+            seq: raw.seq,
+            command_id: raw.command_id,
+            reason: CommandRejectReason::SchemaViolation,
+        }),
+    }
 }
 
 async fn read_frame<R>(input: &mut R) -> Result<Vec<u8>>
@@ -140,45 +193,143 @@ mod tests {
     use tokio::io::BufReader;
 
     use super::*;
+    use crate::gateway::Command;
+
+    fn envelope(command: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "seq": 1,
+            "command_id": "command-1",
+            "command": command,
+        }))
+        .expect("serialize fixture")
+    }
 
     #[tokio::test]
     async fn reads_a_command_at_eof_without_newline() {
-        let mut input = BufReader::new(r#"{"type":"abort"}"#.as_bytes());
+        let bytes = envelope(serde_json::json!({"type": "abort"}));
+        let mut input = BufReader::new(bytes.as_slice());
         assert_eq!(
             read_command(&mut input).await.expect("valid command"),
-            Command::Abort
+            InboundCommand::Valid(CommandEnvelope {
+                seq: 1,
+                command_id: "command-1".to_owned(),
+                command: Command::Abort,
+            })
         );
     }
 
     #[tokio::test]
     async fn reads_crlf_split_across_reader_buffers() {
-        let mut input = BufReader::with_capacity(1, b"{\"type\":\"abort\"}\r\n".as_slice());
+        let mut bytes = envelope(serde_json::json!({"type": "abort"}));
+        bytes.extend_from_slice(b"\r\n");
+        let mut input = BufReader::with_capacity(1, bytes.as_slice());
         assert_eq!(
             read_command(&mut input).await.expect("valid command"),
-            Command::Abort
+            InboundCommand::Valid(CommandEnvelope {
+                seq: 1,
+                command_id: "command-1".to_owned(),
+                command: Command::Abort,
+            })
         );
     }
 
     #[tokio::test]
-    async fn enforces_the_user_command_limit_below_the_transport_limit() {
+    async fn rejects_an_oversized_user_command_without_losing_its_identity() {
         let command = serde_json::json!({
             "type": "user_message",
             "text": "x".repeat(MAX_USER_COMMAND_BYTES),
-        })
-        .to_string();
-        assert!(command.len() < MAX_FRAME_BYTES);
-        let mut input = BufReader::new(command.as_bytes());
+            "attachments": [],
+        });
+        let command_bytes = serde_json::to_vec(&command).expect("serialize command");
+        assert!(command_bytes.len() > MAX_USER_COMMAND_BYTES);
+        let bytes = envelope(command);
+        assert!(bytes.len() < MAX_FRAME_BYTES);
+        let mut input = BufReader::new(bytes.as_slice());
 
-        let error = read_command(&mut input)
+        let inbound = read_command(&mut input)
             .await
-            .expect_err("oversized user command must fail");
+            .expect("outer envelope remains valid");
         assert_eq!(
-            error.downcast_ref::<CommandTooLarge>(),
-            Some(&CommandTooLarge {
-                limit: MAX_USER_COMMAND_BYTES,
-                actual: command.len(),
-            })
+            inbound,
+            InboundCommand::Invalid {
+                seq: 1,
+                command_id: "command-1".to_owned(),
+                reason: CommandRejectReason::Oversized {
+                    actual_bytes: command_bytes.len() as u64,
+                },
+            }
         );
+    }
+
+    #[tokio::test]
+    async fn classifies_non_empty_attachments_for_terminal_rejection() {
+        let bytes = envelope(serde_json::json!({
+            "type": "user_message",
+            "text": "inspect this",
+            "attachments": [{"name": "secret.txt"}],
+        }));
+        let mut input = BufReader::new(bytes.as_slice());
+
+        assert_eq!(
+            read_command(&mut input)
+                .await
+                .expect("outer envelope remains valid"),
+            InboundCommand::Invalid {
+                seq: 1,
+                command_id: "command-1".to_owned(),
+                reason: CommandRejectReason::AttachmentsNotEmpty,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn retains_identity_for_unknown_and_missing_commands() {
+        let unknown = envelope(serde_json::json!({"type": "future_command"}));
+        let mut input = BufReader::new(unknown.as_slice());
+        assert_eq!(
+            read_command(&mut input)
+                .await
+                .expect("unknown typed command"),
+            InboundCommand::Invalid {
+                seq: 1,
+                command_id: "command-1".to_owned(),
+                reason: CommandRejectReason::UnknownCommand,
+            }
+        );
+
+        let missing = br#"{"seq":2,"command_id":"command-2"}"#;
+        let mut input = BufReader::new(missing.as_slice());
+        assert_eq!(
+            read_command(&mut input)
+                .await
+                .expect("missing command body"),
+            InboundCommand::Invalid {
+                seq: 2,
+                command_id: "command-2".to_owned(),
+                reason: CommandRejectReason::SchemaViolation,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn measures_the_raw_command_bytes_before_json_compaction() {
+        let whitespace = " ".repeat(MAX_USER_COMMAND_BYTES);
+        let input = format!(
+            r#"{{"seq":1,"command_id":"command-1","command":{{{whitespace}"type":"user_message","text":"small","attachments":[]}}}}"#
+        );
+        assert!(input.len() < MAX_FRAME_BYTES);
+        let mut input = BufReader::new(input.as_bytes());
+
+        assert!(matches!(
+            read_command(&mut input)
+                .await
+                .expect("outer envelope remains valid"),
+            InboundCommand::Invalid {
+                seq: 1,
+                reason: CommandRejectReason::Oversized { .. },
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -201,7 +352,9 @@ mod tests {
     #[tokio::test]
     async fn drains_an_oversized_frame_before_reading_the_next_command() {
         let mut bytes = vec![b' '; MAX_FRAME_BYTES + 100];
-        bytes.extend_from_slice(b"\n{\"type\":\"abort\"}\n");
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&envelope(serde_json::json!({"type": "abort"})));
+        bytes.push(b'\n');
         let mut input = BufReader::new(bytes.as_slice());
 
         let error = read_command(&mut input)
@@ -218,7 +371,44 @@ mod tests {
             read_command(&mut input)
                 .await
                 .expect("reader resynchronizes at the next line"),
-            Command::Abort
+            InboundCommand::Valid(CommandEnvelope {
+                seq: 1,
+                command_id: "command-1".to_owned(),
+                command: Command::Abort,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn continues_after_an_oversized_user_command() {
+        let mut bytes = envelope(serde_json::json!({
+            "type": "user_message",
+            "text": "x".repeat(MAX_USER_COMMAND_BYTES),
+            "attachments": [],
+        }));
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&envelope(serde_json::json!({"type": "abort"})));
+        bytes.push(b'\n');
+        let mut input = BufReader::new(bytes.as_slice());
+
+        assert!(matches!(
+            read_command(&mut input)
+                .await
+                .expect("oversized command is a typed rejection"),
+            InboundCommand::Invalid {
+                reason: CommandRejectReason::Oversized { .. },
+                ..
+            }
+        ));
+        assert_eq!(
+            read_command(&mut input)
+                .await
+                .expect("next command remains readable"),
+            InboundCommand::Valid(CommandEnvelope {
+                seq: 1,
+                command_id: "command-1".to_owned(),
+                command: Command::Abort,
+            })
         );
     }
 }

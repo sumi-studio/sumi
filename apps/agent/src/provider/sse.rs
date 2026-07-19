@@ -101,6 +101,8 @@ impl SseStream {
 #[derive(Default)]
 struct SseLineParser {
     line_buffer: Vec<u8>,
+    ignore_lf_after_cr: bool,
+    saw_first_line: bool,
     event_name: Option<String>,
     data_lines: Vec<String>,
     event_bytes: usize,
@@ -109,29 +111,42 @@ struct SseLineParser {
 
 impl SseLineParser {
     fn push_chunk(&mut self, chunk: &[u8]) -> Result<(), SseError> {
-        for segment in chunk.split_inclusive(|byte| *byte == b'\n') {
-            let has_newline = segment.last() == Some(&b'\n');
-            let content = if has_newline {
-                &segment[..segment.len() - 1]
-            } else {
-                segment
-            };
-            if self.line_buffer.len().saturating_add(content.len()) > MAX_SSE_LINE_BYTES {
-                return Err(SseError::LineTooLong {
-                    limit: MAX_SSE_LINE_BYTES,
-                });
-            }
-            self.line_buffer.extend_from_slice(content);
-
-            if has_newline {
-                if self.line_buffer.last() == Some(&b'\r') {
-                    self.line_buffer.pop();
+        for byte in chunk {
+            if self.ignore_lf_after_cr {
+                self.ignore_lf_after_cr = false;
+                if *byte == b'\n' {
+                    continue;
                 }
-                let line = std::mem::take(&mut self.line_buffer);
-                self.process_line(&line)?;
+            }
+
+            match *byte {
+                b'\r' => {
+                    self.finish_line()?;
+                    self.ignore_lf_after_cr = true;
+                }
+                b'\n' => self.finish_line()?,
+                _ => {
+                    if self.line_buffer.len() >= MAX_SSE_LINE_BYTES {
+                        return Err(SseError::LineTooLong {
+                            limit: MAX_SSE_LINE_BYTES,
+                        });
+                    }
+                    self.line_buffer.push(*byte);
+                }
             }
         }
         Ok(())
+    }
+
+    fn finish_line(&mut self) -> Result<(), SseError> {
+        let mut line = std::mem::take(&mut self.line_buffer);
+        if !self.saw_first_line {
+            self.saw_first_line = true;
+            if line.starts_with(&[0xef, 0xbb, 0xbf]) {
+                line.drain(..3);
+            }
+        }
+        self.process_line(&line)
     }
 
     fn process_line(&mut self, line: &[u8]) -> Result<(), SseError> {
@@ -305,6 +320,43 @@ mod tests {
             [SseEvent {
                 event: None,
                 data: "one\ntwo".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn accepts_a_leading_bom_and_all_sse_line_endings() {
+        for (input, expected) in [
+            (b"\xef\xbb\xbfdata: lf\n\n".as_slice(), "lf"),
+            (b"\xef\xbb\xbfdata: crlf\r\n\r\n".as_slice(), "crlf"),
+            (b"\xef\xbb\xbfdata: cr\r\r".as_slice(), "cr"),
+        ] {
+            let events = parser_events([input]).expect("valid SSE line ending");
+            assert_eq!(
+                events,
+                [SseEvent {
+                    event: None,
+                    data: expected.to_owned(),
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn treats_a_crlf_split_across_chunks_as_one_line_ending() {
+        let events = parser_events([
+            b"event: message\r".as_slice(),
+            b"\ndata: split\r".as_slice(),
+            b"\n\r".as_slice(),
+            b"\n".as_slice(),
+        ])
+        .expect("valid split CRLF");
+
+        assert_eq!(
+            events,
+            [SseEvent {
+                event: Some("message".to_owned()),
+                data: "split".to_owned(),
             }]
         );
     }

@@ -40,6 +40,62 @@ where
     }
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct CommandEnvelope {
+    pub seq: u64,
+    pub command_id: String,
+    pub command: Command,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum InboundCommand {
+    Valid(CommandEnvelope),
+    Invalid {
+        seq: u64,
+        command_id: String,
+        reason: CommandRejectReason,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommandRejectReason {
+    UnknownCommand,
+    SchemaViolation,
+    AttachmentsNotEmpty,
+    Oversized { actual_bytes: u64 },
+}
+
+impl CommandRejectReason {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::UnknownCommand => "unknown_command",
+            Self::SchemaViolation => "schema_violation",
+            Self::AttachmentsNotEmpty => "attachments_not_empty",
+            Self::Oversized { .. } => "oversized",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandAckStatus {
+    #[expect(dead_code, reason = "emitted after durable receipt in T11")]
+    Received,
+    Applied,
+    #[expect(dead_code, reason = "emitted by abort handling in T11")]
+    Superseded,
+    Rejected,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct CommandAck {
+    pub seq: u64,
+    pub command_id: String,
+    pub status: CommandAckStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reject_reason: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct Envelope {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -48,14 +104,21 @@ pub struct Envelope {
     pub event: serde_json::Value,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(tag = "frame_type", rename_all = "snake_case")]
+pub enum OutboundFrame {
+    Event { envelope: Envelope },
+    CommandAck { ack: CommandAck },
+}
+
 #[derive(Debug, Error)]
 #[error("gateway input closed")]
 pub struct GatewayClosed;
 
 #[async_trait]
 pub trait Gateway: Send {
-    async fn next_command(&mut self) -> Result<Command>;
-    async fn send(&mut self, envelope: Envelope) -> Result<()>;
+    async fn next_command(&mut self) -> Result<InboundCommand>;
+    async fn send(&mut self, frame: OutboundFrame) -> Result<()>;
 }
 
 #[cfg(test)]
@@ -78,13 +141,42 @@ mod tests {
 
     #[test]
     fn transient_envelope_omits_null_sequence() {
-        let encoded = serde_json::to_value(Envelope {
-            seq: None,
-            conversation_id: "conversation-1".to_owned(),
-            event: json!({"type": "text_delta"}),
+        let encoded = serde_json::to_value(OutboundFrame::Event {
+            envelope: Envelope {
+                seq: None,
+                conversation_id: "conversation-1".to_owned(),
+                event: json!({"type": "text_delta"}),
+            },
         })
         .expect("serialize envelope");
 
-        assert_eq!(encoded.get("seq"), None);
+        assert_eq!(encoded["frame_type"], "event");
+        assert_eq!(encoded["envelope"].get("seq"), None);
+    }
+
+    #[test]
+    fn command_ack_uses_the_contract_wire_shape() {
+        let encoded = serde_json::to_value(OutboundFrame::CommandAck {
+            ack: CommandAck {
+                seq: 7,
+                command_id: "command-7".to_owned(),
+                status: CommandAckStatus::Rejected,
+                reject_reason: Some("oversized".to_owned()),
+            },
+        })
+        .expect("serialize ACK");
+
+        assert_eq!(
+            encoded,
+            json!({
+                "frame_type": "command_ack",
+                "ack": {
+                    "seq": 7,
+                    "command_id": "command-7",
+                    "status": "rejected",
+                    "reject_reason": "oversized",
+                }
+            })
+        );
     }
 }

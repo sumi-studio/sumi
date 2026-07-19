@@ -185,6 +185,9 @@ pub struct ToolCall {
     pub arguments: ValidatedToolArguments,
 }
 
+/// Live construction is reserved for the schema-validating assembler.
+/// Deserialization only restores object-shaped transcript data and does not
+/// grant permission to execute a replayed tool call.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct ValidatedToolArguments(Map<String, Value>);
@@ -323,8 +326,7 @@ pub struct CompletionTokensDetails {
     pub reasoning_tokens: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ProviderEvent {
     Start,
     TextStart {
@@ -395,13 +397,13 @@ impl ProviderEvent {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProviderOutput {
     pub message: AssistantMessage,
     pub provider_context: Vec<ProviderContextFragment>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProviderContextFragment {
     pub wire_item_index: Option<u32>,
     pub payload: ProviderContextPayload,
@@ -722,86 +724,6 @@ mod tests {
         assert_eq!(
             serde_json::to_value(StopReason::ToolUse).expect("serialize"),
             json!("tool_use")
-        );
-    }
-
-    #[test]
-    fn provider_events_round_trip_with_stable_tags() {
-        let events = vec![
-            ProviderEvent::Start,
-            ProviderEvent::TextStart { content_index: 0 },
-            ProviderEvent::TextDelta {
-                content_index: 0,
-                delta: "hel".to_owned(),
-            },
-            ProviderEvent::TextEnd {
-                content_index: 0,
-                content: "hello".to_owned(),
-            },
-            ProviderEvent::ThinkingStart { content_index: 1 },
-            ProviderEvent::ThinkingDelta {
-                content_index: 1,
-                delta: "hmm".to_owned(),
-            },
-            ProviderEvent::ThinkingEnd {
-                content_index: 1,
-                content: "hmm".to_owned(),
-            },
-            ProviderEvent::ToolCallStart { content_index: 2 },
-            ProviderEvent::ToolCallDelta {
-                content_index: 2,
-                delta: r#"{"path":"#.to_owned(),
-            },
-            ProviderEvent::ToolCallPreview {
-                content_index: 2,
-                preview: ToolArgsPreview::new(json!({"path": "notes"})),
-            },
-            ProviderEvent::ToolCallEnd {
-                content_index: 2,
-                tool_call: tool_call(),
-            },
-            ProviderEvent::ReasoningSummaryStart { content_index: 0 },
-            ProviderEvent::ReasoningSummaryDelta {
-                content_index: 0,
-                delta: "summary".to_owned(),
-            },
-            ProviderEvent::ReasoningSummaryEnd {
-                content_index: 0,
-                content: "summary".to_owned(),
-            },
-            ProviderEvent::Done {
-                reason: StopReason::ToolUse,
-                output: provider_output(),
-            },
-            ProviderEvent::Error {
-                reason: StopReason::Error,
-                output: ProviderOutput {
-                    message: AssistantMessage {
-                        stop_reason: StopReason::Error,
-                        error_message: Some("provider failed".to_owned()),
-                        provider_code: Some("provider_error".to_owned()),
-                        ..assistant_message()
-                    },
-                    provider_context: Vec::new(),
-                },
-            },
-        ];
-
-        for event in &events {
-            assert_round_trip(event);
-        }
-
-        assert_eq!(
-            serde_json::to_value(&events[2]).expect("serialize")["type"],
-            "text_delta"
-        );
-        assert_eq!(
-            serde_json::to_value(&events[9]).expect("serialize")["type"],
-            "tool_call_preview"
-        );
-        assert_eq!(
-            serde_json::to_value(&events[10]).expect("serialize")["type"],
-            "tool_call_end"
         );
     }
 
