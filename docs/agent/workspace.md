@@ -51,26 +51,28 @@ web (React) ⇔ api (Go, WebSocket ゲートウェイ) ⇔ tenantごとのmicroV
 
 Cloud release 前に、microVM で次の quota を強制し、Dockerハーネスでも同じ分類・復旧契約を再現できることを release gate とする。既定値は製品既定であり tenant plan ごとに下げられる:
 
-| 資源 | 既定上限 | Docker | microVM |
-|---|---:|---|---|
-| `/workspace` disk / inode | 2 GiB / 200,000 | project quota または上限付き volume | guest filesystem quota |
-| PID | 64 | cgroup `pids.max` | guest cgroup |
-| CPU bandwidth / command CPU-time | 1 vCPU cap / 120 CPU秒 | cgroup `cpu.max` + `cpu.stat` watcher | vCPU割当 + guest cgroup watcher |
-| memory | 512 MiB | cgroup `memory.max`/`memory.events` | guest cgroup |
-| 1 command wall runtime | 120秒 | executor watchdog + per-execution cgroup kill / sandbox recycle | guest watchdog + per-execution cgroup kill / PID namespace recycle |
-| 1 command output / conversation artifact合計 | 10 MiB / 100 MiB | capture counter + artifact volume quota | 同左 |
+| 資源 | 既定上限 | 適用境界 | Docker | microVM | 超過時の境界 |
+|---|---:|---|---|---|---|
+| `/workspace` disk / inode | 2 GiB / 200,000 | tenant executor の workspace volume。runtime DB・artifact volume・guest rootfsは別quota | project quota または上限付き volume | guest filesystem project quota | writeを拒否しexecutor sandboxは継続。整合性を確認できなければexecutorだけrecycle |
+| PID | 64 | command child cgroup/PID namespace。runtime・artifact broker・supervisorは保護されたsibling | cgroup `pids.max` | guest command cgroup | forkを拒否。既存commandが停止不能ならcommand child、delegation不能ならexecutor sandboxをrecycle |
+| CPU bandwidth / command CPU-time | 1 vCPU cap / 120 CPU秒 | command child cgroup | cgroup `cpu.max` + `cpu.stat` watcher | vCPU割当内のguest command cgroup watcher | bandwidthはthrottle、CPU-time超過はcommand child、delegation不能ならexecutor sandboxをrecycle |
+| memory | 512 MiB | **command child cgroup**。runtime・artifact broker・supervisorには及ばない | command childの`memory.max`/`memory.events` | guest command child cgroup | command childをkill。delegation不能ならexecutor sandboxをrecycle |
+| 1 command wall runtime | 120秒 | command child cgroup/PID namespace | executor watchdog + per-execution cgroup kill / sandbox recycle | guest watchdog + per-execution cgroup kill / PID namespace recycle | command child、delegation不能ならexecutor sandboxをrecycle |
+| 1 command output / conversation artifact合計 | 10 MiB / 100 MiB | capture stream / conversation artifact volume。workspaceとは別quota | capture counter + artifact volume quota | 同左 | command出力を停止 / artifact writeを拒否。broker全体やmicroVMは停止しない |
 
-controller の意味を一律の「超過時 kill」にしない。`cpu.max` は1 vCPUへ throttle し、別の `cpu.stat` 差分が120 CPU秒へ達した場合だけ watchdog が停止を要求する。`pids.max` は fork を、disk/inode quota は write を拒否するため、executor は `pids.events` と `EAGAIN`/`EDQUOT`/`ENOSPC` を `ResourceLimit` へ分類する。memory は `memory.events` の max/oom/oom_kill を観測し、wall runtime・CPU-time・output counter は watchdog が強制終了する。停止が必要な経路は process group ではなく supervisor 所有の command child cgroup/PID namespace 全体を `cgroup.kill` 相当で回収し、delegation 不能なら command 専用 executor sandbox を破棄・再作成する。`setsid`/`setpgid` で離脱した descendant も `populated=0` 確認まで残さない。どの経路も wait/reap 後に limit 種別とそれまでの bounded output を返す。process-group kill は開発用 low-trust local harness の best-effort fallbackに限り、release gateへ数えない。
+tenant microVM 自体には上表とは別の aggregate memory/PID/disk/inode envelopeを設定し、その容量は「runtime・artifact broker・supervisor・DB/IPC用の予約容量」と「executor/command上限」の合計を下回らせない。runtime・broker・supervisorはcommand cgroupの外に置き、`memory.min`/`memory.low`相当とPID予約で保護する。aggregate envelopeへ達する前にcommand childまたはexecutor sandboxを回収する設計とし、保護領域まで枯渇して制御不能になった場合だけ旧generation全体をfenceしてmicroVMをrecycleする。
 
-deployment supervisor は runtime、executor、artifact broker、IPC に同じ世代番号を与え、command ごとの execution cgroup/sandbox も登録する。runtime 終了・heartbeat 喪失時にその世代の登録済み execution boundary と executor sandbox 全体を kill/reapし、旧generationのbroker credential/key leaseを失効させてから新世代を起動する。再起動時に `running` だった tool execution は `indeterminate` として閉じ、同じ tool call を自動再実行しない。ドメイン操作は `command_id/tool_call_id` の idempotency key を apps/api まで伝播する。quota 拒否/throttle、`setsid ... &` でdetachしたdescendantの強制終了、再起動後の回収を fault-injection で確認するまでCloud releaseしない。
+controller の意味を一律の「超過時 kill」にしない。`cpu.max` は1 vCPUへ throttle し、別の `cpu.stat` 差分が120 CPU秒へ達した場合だけ watchdog が停止を要求する。`pids.max` は fork を、disk/inode quota は write を拒否するため、executor は `pids.events` と `EAGAIN`/`EDQUOT`/`ENOSPC` を `ResourceLimit` へ分類する。memory はcommand childの `memory.events` の max/oom/oom_kill を観測し、wall runtime・CPU-time・output counter は watchdog が強制終了する。停止が必要な経路は process group ではなく supervisor 所有の command child cgroup/PID namespace 全体を `cgroup.kill` 相当で回収し、delegation 不能なら command 専用 executor sandbox を破棄・再作成する。`setsid`/`setpgid` で離脱した descendant も `populated=0` 確認まで残さない。どの経路も wait/reap 後に limit 種別とそれまでの bounded output を返す。process-group kill は開発用 low-trust local harness の best-effort fallbackに限り、release gateへ数えない。
+
+deployment supervisor は runtime、executor、artifact broker、IPC に同じ世代番号を与え、command ごとの execution cgroup/sandbox も登録する。runtime 終了・heartbeat 喪失時にその世代の登録済み execution boundary と executor sandbox 全体を kill/reapし、旧generationのbroker credential/key leaseを失効させてから新世代を起動する。ドメイン操作に加え、workspaceの`write_file`/`edit_file`/`delete`とbrokerの`append_tool_output`へも`command_id/tool_call_id`から導出した`idempotency_key`を伝播する。executor/brokerはkeyとrequest hash、処理状態、結果receiptをdurable journalへ保存し、同じkey・同じrequestの再送には保存済み結果を返し、同じkey・異なるrequestは拒否する。`append_tool_output`はchunk seq/offsetもkeyに含め、再送で重複追記しない。quota 拒否/throttle、`setsid ... &` でdetachしたdescendantの強制終了、再起動後の回収を fault-injection で確認するまでCloud releaseしない。
 
 workspace境界のfault-injectionでは、bashが`0600`ファイル/`0700`ディレクトリを作っても後続`read_file`/`edit_file`/削除がexecutor RPC経由で成功すること、同じpathをruntime UIDから直接openできずruntime mount tableにもworkspaceが無いことを確認する。runtime起点artifactは呼出し元umaskを`0077`/`0000`へ変えても最終modeがfile `0600`/dir `0700`になること、runtime/executor/bashのmount tableにartifact volumeがなく、bash子からbroker socket/FDへ到達できないことを確認する。broker volume内のconversation ID位置・kind位置・子孫へ通常symlinkを置くfixtureは全操作で拒否し、reset中にkillしてもbrokerが旧conversation subtreeだけをno-followで再削除してユーザーworkspaceと他conversationを残すこともrelease gateとする。
 
 `indeterminate` で閉じた execution の再開・照合契約:
 
-- **可視性**: `indeterminate` は `failed` とは別状態として `tool_executions.state`(実装計画 §10.1)に残り、対応する tool 結果は `MessageStart/End` → `TurnEnd` の恒久イベントで閉じる。同じrunに適用待ちsoft steerが無ければ`AgentEnd`、あれば保存済み次`TurnStart`へ継続する(実装計画 §10.2)。tool 結果の本文には「結果不明(副作用未確認)」である旨と `tool_call_id`/`idempotency_key` を明記し、UI/API 側が「失敗」と区別してユーザーへ提示できるようにする
-- **照合**: エージェントは自動再実行しない。domain mutation tool は `command_id/tool_call_id` を idempotency key として apps/api に伝播済みのため、ユーザーが確認を求めた場合はエージェントが該当ドメイン API を read-only に照会し、副作用が実際に完了していたかを事後確認する
-- **リトライ**: 照合の結果「未完了」と確定した場合は、**元の execution と同じ `idempotency_key`** で再実行し、ドメイン側の冪等性処理により重複実行させない。ユーザーが照合なしに「もう一度実行して」と明示的に確認した場合に限り、新しい `tool_call_id`/`idempotency_key` を発行した別実行として扱ってよい(既定は同一キー再利用であり、新規キーは明示確認済みリトライの例外)
+- **可視性**: `indeterminate` は `failed` とは別状態として `tool_executions.state`(実装計画 §10.1)に残す。再起動後のrecovery workerが照合結果を確定し、対応するtool結果を `MessageStart/End` → `TurnEnd` のdurable terminal eventで必ず閉じる。同じrunに適用待ちsoft steerが無ければ`AgentEnd`、あれば保存済み次`TurnStart`へ継続する(実装計画 §10.2)。tool 結果には完了・未完了・補償済み・結果不明の別と `tool_call_id`/`idempotency_key` を明記し、UI/API 側が「失敗」と区別して提示できるようにする
+- **照合**: recovery workerはexecutor/brokerのdurable receiptを取得した上でread-after-restartを行う。workspace mutationは対象pathの存在、content hash/version、delete tombstoneを、`append_tool_output`はartifact handleのcommitted offset/hashを照合し、domain mutationは該当APIをread-onlyに照会する。receiptと実体が一致した場合だけ完了、前状態のまま一致した場合だけ未完了と確定し、どちらにも一致しない状態は自動再実行せず`indeterminate`のままdurable terminal eventで閉じる
+- **リトライと補償**: 未完了と確定した操作は、**元の execution と同じ `idempotency_key`** で冪等再試行する。再試行不能な部分適用は、write/editならjournalに保存したpreimage/versionへ条件付き復元、deleteなら同一filesystem内のquarantine renameから復元、appendならbrokerが記録した最後のcommitted offsetへtruncateする補償操作を同じkey配下で実行し、そのreceiptもdurable化する。preimage等がなく安全に補償できない操作は自動で推測せず、結果不明として閉じて手動解決へ送る。ユーザーが照合なしに「もう一度実行して」と明示的に確認した場合に限り、新しい `tool_call_id`/`idempotency_key` を発行した別実行として扱ってよい
 
 ## 責務境界と運用既定
 

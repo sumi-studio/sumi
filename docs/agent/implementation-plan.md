@@ -1,7 +1,7 @@
 # Sumi エージェント基盤 Rust 実装計画書
 
 - Status: Draft v1
-- Date: 2026-07-17
+- Last updated: 2026-07-19
 - 対象: `apps/agent`(Rust。スキャフォールドは作業ブランチに作成済みで `main` へは未マージ)
 - 前提資料:
   - [ADR 0002 エージェント基盤の言語と実装方針](../adr/0002-agent-stack.md)
@@ -463,7 +463,7 @@ opaque reasoning/compaction item は delta ごとに公開イベントへ流さ�
 
 ```rust
 pub struct ProviderEventStream {
-    rx: tokio::sync::mpsc::Receiver<ProviderEvent>,
+    rx: Option<tokio::sync::mpsc::Receiver<ProviderEvent>>,
     terminal_emitted: bool, // Done/Error を一度でも返したら true。以後 next() は fuse (下記)
 }
 // 最終結果は Done/Error イベント自体が運ぶ (pi の result() Promise は不要:
@@ -472,7 +472,7 @@ pub struct ProviderEventStream {
 
 契約(pi と同一 **[事実]** `pi:ai/src/types.ts:301-313`): **stream 関数は決して panic/Err を返さない**。リクエスト失敗・モデルエラー・実行時失敗はすべてストリーム内の `Error` イベント(stopReason Error/Aborted + error_message 付き AssistantMessage)として届く。この一点が呼び出し側の異常系を劇的に単純化する。
 
-**EOF の終端イベント化**: `next()` は `Done`/`Error` を返すたびに `terminal_emitted` を立てる。`rx.recv()` が `None`(adapter タスクの正常終了・cancel・panic 等で送信側 `Sender` が drop)を返した時点でまだ `terminal_emitted` が立っていなければ、**その1回に限り**終端 `Error` を合成して返し、`terminal_emitted` を立てる。合成時の分類は EOF を一律 `Aborted` にしない: この stream に紐づく `CancellationToken` の発火(または Session 起点の abort/hard steer)が確認できる場合だけ `stopReason=Aborted` とし、それ以外(adapter タスクの panic・実装ミス等)は `stopReason=Error, error_message="provider stream ended without a terminal event"` の**リトライ可能エラー**として合成する — `Aborted` は §4.4/§5 のリトライに乗らないため、意図しない sender drop を Aborted に分類するとユーザーの turn が無応答で閉じる。エラーメッセージは §4.4 のリトライパターン(`ended without`)に一致させる。既に `Done`/`Error` を返し終えた後の EOF はそのままストリーム終了として扱い、二重に終端イベントを作らない。**terminal 後の fuse**: `terminal_emitted` は EOF 合成の抑止だけでは足りない — adapter の実装ミスで `Done` の後に delta や二回目の終端が channel に積まれると、そのまま呼び出し側へ素通りする。`terminal_emitted` が立った後の `next()` は channel に残ったイベントを呼び出し側へ返さず、warn ログとともに読み捨てて `None` だけを返す(受信側の契約として fuse する)。これにより「stream は必ず正常形の終端イベントでちょうど一度閉じる」契約が adapter の実装ミスに関係なく保たれる。単体テストで (a) 正規の `Done`/`Error` 後に channel が閉じても追加イベントが出ないこと、(b) 終端イベントなしに channel が閉じると合成終端が1件だけ届き、cancel 発火済みなら `Aborted`・未発火なら retryable `Error` に分類されること、(c) 正規の終端後に adapter が delta や二回目の終端を送っても呼び出し側へ届かないこと、の3点を確認する。
+**EOF の終端イベント化**: `next()` は `Done`/`Error` を返すたびに `terminal_emitted` を立てる。`rx.recv()` が `None`(adapter タスクの正常終了・cancel・panic 等で送信側 `Sender` が drop)を返した時点でまだ `terminal_emitted` が立っていなければ、**その1回に限り**終端 `Error` を合成して返し、`terminal_emitted` を立てる。合成時の分類は EOF を一律 `Aborted` にしない: この stream に紐づく `CancellationToken` の発火(または Session 起点の abort/hard steer)が確認できる場合だけ `stopReason=Aborted` とし、それ以外(adapter タスクの panic・実装ミス等)は `stopReason=Error, error_message="provider stream ended without a terminal event"` の**リトライ可能エラー**として合成する — `Aborted` は §4.4/§5 のリトライに乗らないため、意図しない sender drop を Aborted に分類するとユーザーの turn が無応答で閉じる。エラーメッセージは §4.4 のリトライパターン(`ended without`)に一致させる。既に `Done`/`Error` を返し終えた後の EOF はそのままストリーム終了として扱い、二重に終端イベントを作らない。**terminal 後の fuse**: `terminal_emitted` は EOF 合成の抑止だけでは足りない — adapter の実装ミスで `Done` の後に delta や二回目の終端が channel に積まれると、そのまま呼び出し側へ素通りする。`Done`/`Error` を返す直前に `rx.take()` で Receiver を切り離す。検出時点ですでに queued な違反イベントを監査する場合だけ、固定上限件数の `try_recv()` で非同期に待たず warn を記録してから Receiver を drop し、上限を超えた分は件数不明として集約warnする。`terminal_emitted` が立った後の `next()` は Receiver を参照せず即座に `None` を返し、`recv().await` や channel close 待ちを行わない。これにより「stream は必ず正常形の終端イベントでちょうど一度閉じる」契約が adapter の実装ミスに関係なく保たれる。単体テストで (a) 正規の `Done`/`Error` 後に Sender が開いたままでも次の `next()` が即座に `None` を返すこと、(b) 終端イベントなしに channel が閉じると合成終端が1件だけ届き、cancel 発火済みなら `Aborted`・未発火なら retryable `Error` に分類されること、(c) 正規の終端時点で queued な delta や二回目の終端が呼び出し側へ届かず、検査が固定上限で終わること、の3点を確認する。
 
 ### 3.3 エージェントイベント
 
@@ -2583,8 +2583,8 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 | 19 | status: `applying → superseded`(`run_phase` は `classified`/`turn_started` のまま) | 未注入 steer | abort の終端処理 | 行17と同じ batch 群で `CommandSuperseded`。`Superseded` ACK(原文の正典は API command log) | §6.5 |
 | 20 | (`run_phase` 遷移なし) status: `received → applied` | — | owner 不在時の `Abort` command 受理(Idle。C.3) | no-op の `CommandApplied(run_id=None)` のみ。cancel は発火しない | §11.1.1-4 |
 | 21 | (`run_phase` 遷移なし) status: `received → applied` | — | terminal/unknown request、または後続Abort cutoff内の未適用`ApprovalDecision` | `ApprovalResolved`を発行せずno-opの`CommandApplied(run_id=None)`。unknownは監査warn、abort-preemptedは監査reasonを残す | §5.2・§9.8・§11.1.1-4 |
-| 22 | status: `received → superseded`(`run_phase=received`維持) | 未分類UserMessage | 後続Abortのcutoff(`command.seq < abort.seq`) | `CommandSuperseded(run_id=Some(aborted_run)|None for Idle)`。分類・注入せず入力欄へ差し戻す | §5.2・§6.5 |
-| 23 | status: `applying → superseded`(`run_phase=classified|run_started|turn_started`維持) | idle startup | user注入前の後続Abort cutoff | 開始済みなら`TurnEnd`→`AgentEnd`で正常形クローズし、`CommandSuperseded(run_id=Some(startup.run_id))`とAbortの`CommandApplied(run_id=Some)`を同じEventBatchへ載せる。provider cancelは不要 | §5.2・§6.5・§11.1.1-4 |
+| 22 | status: `received → superseded`(`run_phase=received`維持) | 未分類UserMessage | 後続Abortのcutoff(`command.seq < abort.seq`) | `CommandSuperseded(run_id=Some(aborted_run)\|None for Idle)`。分類・注入せず入力欄へ差し戻す | §5.2・§6.5 |
+| 23 | status: `applying → superseded`(`run_phase=classified\|run_started\|turn_started`維持) | idle startup | user注入前の後続Abort cutoff | 開始済みなら`TurnEnd`→`AgentEnd`で正常形クローズし、`CommandSuperseded(run_id=Some(startup.run_id))`とAbortの`CommandApplied(run_id=Some)`を同じEventBatchへ載せる。provider cancelは不要 | §5.2・§6.5・§11.1.1-4 |
 
 補足:
 
