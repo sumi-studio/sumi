@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-07-15
+- Amended-by: [ADR 0002](0002-agent-stack.md) — 前提5(pi が TypeScript)、リポジトリ構成の「agent (TS エージェント基盤)」、および「`@sumi/api-client` 経由」の各記述は ADR 0002 により置換された(agent は Rust、ドメイン操作は契約ファーストの Rust `apiclient` 経由)。本文は歴史的記録としてそのまま残す
 
 ## コンテキスト
 
