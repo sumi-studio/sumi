@@ -219,8 +219,12 @@ pub enum Message {
     ToolResult(ToolResultMessage),
 }
 
-/// UI と復旧に使う、人間可視内容だけの transcript 形。
-/// Assistant の Text/ToolCall は持つが Thinking と opaque provider context は持たない。
+/// UI と復旧に使う、人間可視内容の transcript 形。
+/// Assistant の Text/ToolCall に加え、平文 Thinking (Chat reasoning_content /
+/// Anthropic thinking 本文) を会話内容として持つ (Founder 決定 2026-07-19: 表示・永続の
+/// 区別は機密性ではなく wire 上の形式で引く — 平文で届くものは会話内容、opaque は継続 item)。
+/// opaque provider context (Responses encrypted reasoning、Anthropic redacted_thinking・
+/// thinking signature、native compaction) は持たない。
 /// runtime Message から保存直前に純関数で導出し、暗号化 raw 正本と redacted projection に分ける。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
@@ -268,8 +272,9 @@ pub enum ProviderContextPayload {
         block: serde_json::Value,
         coverage: NativeCompactionCoverage,
     },
-    /// Chat reasoning、Responses encrypted reasoning、Anthropic thinking/redacted_thinking
-    /// の完全な wire item/block。公開 transcript には出さず暗号化保存する。
+    /// opaque な reasoning 継続 item のみ: Responses encrypted reasoning、Anthropic
+    /// redacted_thinking と thinking signature。平文 reasoning 本文は §3.1 の
+    /// PublicAssistantContent::Thinking として transcript 側に置き、ここには入れない。
     EncryptedReasoning { protocol: ApiProtocol, item: serde_json::Value },
 }
 
@@ -303,7 +308,7 @@ pub struct AssistantMessage {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PublicAssistantMessage {
-    pub content: Vec<PublicAssistantContent>, // Text | ToolCall | RejectedToolCall。Thinking は除外
+    pub content: Vec<PublicAssistantContent>, // Text | Thinking(平文) | ToolCall | RejectedToolCall。opaque は除外
     pub model: String,
     pub provider: String,
     pub usage: Usage,
@@ -318,6 +323,9 @@ pub struct PublicAssistantMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PublicAssistantContent {
     Text { text: String, wire_item_index: u32 },
+    /// 平文 reasoning。表示・永続とも本文と同じ暗号化+redaction 経路に乗る。
+    /// signature_field は Chat 再送時の書き戻し先 (§4.2-3)
+    Thinking { thinking: String, signature_field: String, wire_item_index: u32 },
     ToolCall { tool_call: ToolCall, wire_item_index: u32 },
     /// strict JSON/schema検証に失敗し、承認・実行へ進めなかったcall。
     /// raw argumentsは保持せず、対応するis_error tool resultと対にする。
@@ -393,7 +401,7 @@ pub struct Usage {
 }
 ```
 
-`Message` は provider 呼出し中と L0 の runtime view、`PublicMessage` は UI と復旧に必要な人間可視内容の正本とする。保存時は `PublicMessage` を conversation 鍵で即時暗号化した raw 正本と、FTS・通常 export 用の redacted projection に分ける。再起動時は復号した `PublicMessage + ProviderContextItem` から L0 の送信 view を復元する。raw Thinking を暗号化 transcript、`agent_events.envelope`、`messages.payload` のいずれにも含めない。
+`Message` は provider 呼出し中と L0 の runtime view、`PublicMessage` は UI と復旧に必要な人間可視内容の正本とする。保存時は `PublicMessage` を conversation 鍵で即時暗号化した raw 正本と、FTS・通常 export 用の redacted projection に分ける。再起動時は復号した `PublicMessage + ProviderContextItem` から L0 の送信 view を復元する。平文 Thinking は本文と同じく raw 正本に含め、`messages.payload`/`agent_events.envelope` へは Redactor 通過後の redacted 値として載せる。opaque provider context(encrypted reasoning、redacted_thinking、signature、native compaction)はいずれにも含めない。
 
 **pi との差分と理由**:
 - `ThinkingContent.thinkingSignature` → `signature_field` に改名。OpenAI互換系ではこのフィールドは「reasoning がどの JSON フィールドで届いたか」を記録して再送時に同じフィールドへ書き戻すために使われている **[事実]** (`pi:ai/src/api/openai-completions.ts:408-424, 996-1003`)。Responses の encrypted reasoning と Anthropic の署名/compaction block はこの文字列へ押し込まず、protocol-scoped な `ProviderContextItem` として扱う。
@@ -446,7 +454,7 @@ pub struct ProviderContextFragment {
 
 **pi との差分**: pi は全イベントに `partial: AssistantMessage`(組立途中のメッセージ全体)を同乗させる **[事実]**。Rust では毎イベントの clone が高くつくため、**ストリーム消費側(AgentLoop)が同じロジックでメッセージを組み立てる**方式にし、partial の同乗はやめる。組み立てロジックは `assembler.rs` に一元化し、プロバイダ層とループが同一の `MessageAssembler` 構造体を共有する(イベント列→メッセージの純関数として単体テスト可能にする)。**[推測]**
 
-opaque reasoning/compaction item は delta ごとに公開イベントへ流さず、adapter 内で検証・収集して terminal `ProviderOutput` に載せる。adapter は公開 Text/ToolCall と reasoning に同じ flatten 済み `wire_item_index` を付ける。Chat adapter の `AssistantContent::Thinking` は Session が公開形へ落とす直前に `wire_item_index/signature_field/wire value` を持つ `EncryptedReasoning` fragment へ変換する。Session は runtime `AssistantMessage` から `PublicMessage` を導出し、確定する assistant の `message_id/message_seq` と同じ wire slot 内の `ordinal` を各 payload に付けて暗号化し、同じ `MessageEnd` transaction の `Projection::MessageEnd.provider_context` へ渡す。EventWriter は anchor が MessageEnd と一致し `(wire_item_index, ordinal)` が重複しないことを検証する。通常応答の idempotency key は `message_id:wire_item_index:ordinal:kind`、dedicated compaction は request id + coverage + fingerprint から作る。復元時は公開 content と provider context を `wire_item_index, ordinal` で stable merge し、Thinking と opaque item を元の assistant に戻す。これで Kimi の全ターン reasoning 再送や Responses item の相対配置を含め、公開 transcript へ hidden content を混ぜずに応答と継続 item の対応・順序を保った原子的な保存経路を確保する。
+opaque reasoning/compaction item は delta ごとに公開イベントへ流さず、adapter 内で検証・収集して terminal `ProviderOutput` に載せる。adapter は公開 Text/ToolCall と reasoning に同じ flatten 済み `wire_item_index` を付ける。Chat adapter の `AssistantContent::Thinking`(平文 reasoning_content)は `PublicAssistantContent::Thinking` として公開形に残し、provider context へは移さない。Anthropic も thinking 本文を同様に公開形へ残し、`signature` と `redacted_thinking` だけを `EncryptedReasoning` fragment として収集する(再送時は `wire_item_index` で本文と合流 — §4.2.2)。Session は runtime `AssistantMessage` から `PublicMessage` を導出し、確定する assistant の `message_id/message_seq` と同じ wire slot 内の `ordinal` を各 payload に付けて暗号化し、同じ `MessageEnd` transaction の `Projection::MessageEnd.provider_context` へ渡す。EventWriter は anchor が MessageEnd と一致し `(wire_item_index, ordinal)` が重複しないことを検証する。通常応答の idempotency key は `message_id:wire_item_index:ordinal:kind`、dedicated compaction は request id + coverage + fingerprint から作る。復元時は公開 content と provider context を `wire_item_index, ordinal` で stable merge し、opaque item(signature 等)を元の assistant に戻す。これで Kimi の全ターン reasoning 再送や Responses item の相対配置を含め、公開 transcript へ opaque content を混ぜずに応答と継続 item の対応・順序を保った原子的な保存経路を確保する。
 
 通常応答と別 HTTP call になる Responses `/responses/compact` は `compact_native() -> NativeCompactionResult { items, coverage }` で ordered `output[]` 全体を返す。保持された message/tool item を compaction item だけへ縮退してはならず、この配列を canonical next context window として暗号化保存・順序どおり再送する。MemoryMaintainer は `event=None + Projection::ProviderContextMutation` を EventWriter へ渡し、同じ fingerprint の旧 native window の失効と新 window の暗号化 INSERT を1 transaction で行う。Anthropic の応答内 compaction block は通常どおり terminal `ProviderOutput` 経路を使う。
 
@@ -480,7 +488,7 @@ pub enum AgentEvent {
     TurnStart,
     TurnEnd { message: Box<PublicMessage>, tool_results: Vec<ToolResultMessage> },
     MessageStart { message_id: String, message: Box<PublicMessage> },
-    /// assistantストリーミング中のみ。公開可能な Text/ToolCall と、
+    /// assistantストリーミング中のみ。公開可能な Text/ToolCall、平文 Thinking と、
     /// provider が display-safe と明示した reasoning summary だけを包む。
     /// ストリーム終端の Done/Error は包まない — 終端の解釈と MessageEnd の
     /// 発行は常に Session が担う (§6.3.1 のイベント遷移表)
@@ -509,6 +517,9 @@ pub enum PublicStreamEvent {
     TextStart { content_index: usize },
     TextDelta { content_index: usize, delta: String },
     TextEnd { content_index: usize, content: String },
+    ThinkingStart { content_index: usize },
+    ThinkingDelta { content_index: usize, delta: String },
+    ThinkingEnd { content_index: usize, content: String },
     ToolCallStart { content_index: usize },
     ToolCallDelta { content_index: usize, delta: String },
     ToolCallPreview { content_index: usize, preview: ToolArgsPreview },
@@ -520,9 +531,9 @@ pub enum PublicStreamEvent {
 }
 ```
 
-raw `ProviderEvent::Thinking*` は MessageAssembler と暗号化 provider context の runtime 内経路だけで消費し、`AgentEvent` へ変換しない。`AgentEvent::MessageUpdate` は `PublicStreamEvent` だけを受け、raw hidden reasoning / encrypted content / native compaction item を型レベルで表現不能にする。provider が display-safe と明示した reasoning summary だけを `ProviderEvent::ReasoningSummary*` → `PublicStreamEvent::ReasoningSummary*` として変換する(発生源は adapter — §3.2)。summary は揮発 delta 専用の表示であり、`PublicAssistantMessage.content` には含めず永続化しない。これにより揮発 delta からも chain-of-thought が外部へ出ない。
+**平文 reasoning** の `ProviderEvent::Thinking*`(Chat reasoning_content、Anthropic thinking 本文)は `PublicStreamEvent::Thinking*` へ変換して表示に流す(Founder 決定 2026-07-19: プロバイダが平文で返すものは表示してよい — wire 形式自体がプロバイダの表示可否の意思表示であり、Kimi/GLM は自社UIでも reasoning_content を表示している)。**opaque な継続 item**(Responses encrypted reasoning、Anthropic redacted_thinking・signature)には `PublicStreamEvent` に対応 variant が無く、型レベルで wire へ出せない。Responses の display-safe な reasoning summary は従来どおり `ReasoningSummary*` として変換する(発生源は adapter — §3.2)。summary は揮発 delta 専用で `PublicAssistantMessage.content` に含めないが、平文 Thinking は `PublicAssistantContent::Thinking` として永続し、`MessageEnd` の全文置換・再接続 replay でも表示が復元される。Thinking delta の redaction は本文 delta と同じ規則(§10.2 — raw delta は認可済み接続のみ、redaction-only scope には送らない)。
 
-`PublicStreamEvent.content_index` は provider の runtime content 配列(公開しない Thinking block を含む)上の **opaque な相関キー**であり、0始まりの連続した公開配列添字ではない。したがって UI は先行する index 0 を受け取らず `TextStart { content_index: 1 }` から始まる場合を許容し、index の詰め直しや `PublicAssistantMessage.content` への位置対応を推測しない。相関キーは **(イベント族, content_index) の組**である — `ReasoningSummary*` の content_index は公開 Text/ToolCall とは独立した summary slot の連番(§3.2)なので、同じ数値でも別ブロックであり、単一の index 空間として混同してはならない。同じ `message_id` の恒久な `MessageEnd` を受けた時点で、streaming 中の仮表示を Thinking 除外後の `PublicAssistantMessage.content` 全体で置換する。
+`PublicStreamEvent.content_index` は provider の runtime content 配列上の **opaque な相関キー**であり、0始まりの連続した公開配列添字ではない。したがって UI は先行する index 0 を受け取らず `TextStart { content_index: 1 }` から始まる場合を許容し、index の詰め直しや `PublicAssistantMessage.content` への位置対応を推測しない。相関キーは **(イベント族, content_index) の組**である — `ReasoningSummary*` の content_index は公開 Text/ToolCall とは独立した summary slot の連番(§3.2)なので、同じ数値でも別ブロックであり、単一の index 空間として混同してはならない。同じ `message_id` の恒久な `MessageEnd` を受けた時点で、streaming 中の仮表示を opaque 除外後の `PublicAssistantMessage.content` 全体(平文 Thinking を含む)で置換する。
 
 `MessageStart/Update/End` は durable な `messages.id`(§10.2)を `message_id` として必ず運ぶ。user メッセージの `message_id` は起点 `command_id` からの決定論的導出(UUIDv5、§10.2)であり、その namespace 定数を contracts に明記して、API/web が command 受理時点で同じ ID を先行計算できるようにする。楽観表示したユーザーメッセージと永続イベントの照合、同文連投の区別、再接続 replay の重複排除はすべてこの ID で行い、表示順や本文一致に依存しない。`MessageUpdate` の delta も `message_id` で相関するため、「streaming 中のメッセージは常に1件だけ」という暗黙の順序仮定に依存しない。
 
@@ -704,7 +715,7 @@ Chat Completions JSON への変換は、**[事実]** 以下すべて `pi:ai/src/
 
 1. **system prompt**: `{"role":"system","content":...}` を先頭にする。L2/L1 は続く user 相当の memory message にし、system/developer role へ昇格させない(第7章)
 2. **assistant content は常にプレーン文字列で送る**(content-block 配列にしない)。配列で送ると一部モデルが構造を鸚鵡返しする事故がある(:987-994 コメント)
-3. **thinking の再送**: 同一の `provider_instance_id/protocol/model` なら `signature_field` が示すフィールド(`reasoning_content` 等)へ全ターン分を書き戻す。**Kimi は過去全ターンの reasoning 保持が必須仕様**(調査レポート)。クロスモデル、別provider instance、別protocolへの切替時は raw thinking を**常に破棄**し、プレーンテキストやmemory blockへ降格しない。例外は送受信双方の一次仕様がモデル間可搬性と非公開性を明示保証する protocol-scoped な opaque block だけで、通常の `Thinking` とは別型・別 capability・別 trust-domain 契約にする。pi のクロスモデル平文化分岐は移植しない
+3. **thinking の再送**: 同一の `provider_instance_id/protocol/model` なら、transcript の `PublicAssistantContent::Thinking` から `signature_field` が示すフィールド(`reasoning_content` 等)へ全ターン分を書き戻す(平文 reasoning の再送正本は transcript — 専用の provider context row は持たない)。**Kimi は過去全ターンの reasoning 保持が必須仕様**(調査レポート)。クロスモデル、別provider instance、別protocolへの切替時は thinking を**送信 view から常に除外**し、プレーンテキストやmemory blockへ降格して送らない(transcript の `Thinking` content は表示・記録用にそのまま残る — 除外は再送 view に対する操作であって削除ではない)。例外は送受信双方の一次仕様がモデル間可搬性と非公開性を明示保証する protocol-scoped な opaque block だけで、通常の `Thinking` とは別型・別 capability・別 trust-domain 契約にする。pi のクロスモデル平文化分岐は移植しない
 4. **`requires_reasoning_content_on_assistant`**: 再送する assistant メッセージに reasoning_content が無ければ `""` を補う(:1038-1044)
 5. **tool_calls**: `{id, type:"function", function:{name, arguments: JSON文字列}}`。引数は必ず `serde_json::to_string` で直列化
 6. **tool ロール**: `{"role":"tool","content":text,"tool_call_id":...}`。テキストが空で画像のみなら `"(see attached image)"`、両方空なら `"(no tool output)"` のプレースホルダ(:1073-1075)
@@ -731,7 +742,7 @@ Chat Completions JSON への変換は、**[事実]** 以下すべて `pi:ai/src/
 - 憲法は top-level `system`、会話は `user` / `assistant` の交互 turn へ変換する。`sumi_three_layer` では L2/L1 を先頭の user 相当 memory block とし、`provider_native` の置換規則は第7章に従う。隣接 user turn は API 契約に従って結合する
 - tool call は assistant の `tool_use` block、結果は続く user message の `tool_result` block にする。orphan tool result は §5.3 の共通 transform で補修してから変換する
 - `message_start → content_block_start/delta/stop → message_delta → message_stop` を正規順として検証し、`input_json_delta` は partial JSON parser へ渡す。`ping` は無視し、stream 内 `error` は Error にする
-- thinking 有効時は `thinking` の `thinking/signature` と `redacted_thinking.data` を完全な wire block として元の content block 順で収集し、公開 transcript へ出さず暗号化する。tool-use 継続では直近 assistant turn の全 `thinking` / `redacted_thinking` block を値・順序とも変更せず戻してから `tool_use` を置く。`signature_delta` も block 確定まで保持し、欠落・改変・並べ替えを fail-closed にする
+- thinking 有効時は `thinking` 本文を `PublicAssistantContent::Thinking` として公開 transcript へ残し、`signature` と `redacted_thinking.data` だけを opaque provider context として元の content block 順で収集・暗号化する。tool-use 継続では transcript の thinking 本文と保存済み signature を `wire_item_index` で合流させ、直近 assistant turn の全 `thinking` / `redacted_thinking` block を値・順序とも変更せず戻してから `tool_use` を置く。`signature_delta` も block 確定まで保持し、欠落・改変・並べ替えを fail-closed にする
 - thinking を有効にした assistant turn（tool loop 全体）では mode を途中変更せず、`tool_choice` は `auto` または `none` だけを許す。強制 `any` / named tool はリクエスト組立時に拒否する
 - native compaction を有効にした場合、API が返した compaction block と beta/version 情報に入力の最後の transcript seq を coverage として付け、`ProviderContextItem` として暗号化保存する。同じ provider instance/protocol/model/context fingerprint だけへ再送し、非対応の Anthropic-compatible provider では Sumi の client-side `MemoryBlock` のみを使う
 
@@ -867,8 +878,8 @@ pi から移す挙動:
 **[事実]** 原典: `pi:ai/src/api/transform-messages.ts`。API コール直前に L0 へ適用する純関数として移植:
 
 1. **孤児ツールコールへの合成結果**: assistant のツールコールに対応する toolResult が無い場合(abort・クラッシュ・ステア切断)、`"No result provided"` の is_error 結果を合成して挿入。**user メッセージがツールフローを分断した位置にも挿入**。会話末尾の未解決分も同様
-2. **Error/Aborted assistant のスキップ**: 再送しない。**ただし Sumi 拡張: `interrupted=true` のものは除く**(第6章のステア部分応答。テキスト/thinking は保持し、未完了ツールコールブロックだけ落とす)
-3. **クロスモデル thinking破棄(Sumi独自差分)**: provider instance/protocol/modelのいずれかが変わったらraw thinkingを常に破棄し、テキストやmemoryへ降格しない。一次仕様が可搬性を明示保証するopaque blockだけを別型/capabilityで扱う(§4.2)
+2. **Error/Aborted assistant のスキップ**: 再送しない。**ただし Sumi 拡張: `interrupted=true` のものは除く**(第6章のステア部分応答。テキスト/thinking は保持する。未実行ツールコールは §6.3 手順2が保存時に全て破棄済みのため、ここには現れない)
+3. **クロスモデル thinking再送除外(Sumi独自差分)**: provider instance/protocol/modelのいずれかが変わったら thinking を送信 view から常に除外し、テキストやmemoryへ降格して送らない(transcript の `Thinking` content は表示用に残る)。一次仕様が可搬性を明示保証するopaque blockだけを別型/capabilityで扱う(§4.2)
 4. **拒否済みtool callの正規化**: `RejectedToolCall + is_error ToolResultMessage` は実行可能なtool callへ復元せず、raw/repair済みargumentsも再送しない。provider-neutralなuser相当診断1件へ変換し、モデルへtool callの再生成を促す
 
 (いずれも `transform-messages.ts` 全223行を実読して該当処理を特定すること — 本書の旧行番号は誤りだった)
@@ -923,7 +934,9 @@ pi の `steer()` は**キュー投入のみ**で、注入は「現在のツー�
    `RunPhase(expected=hard_steer_requested, next=finished)` + `CommandApplied` により
    閉じる** — run の所有権はここで steer command へ移るため、先行 command は idle 起点で
    あっても `AgentEnd` を待たずこの部分 MessageEnd で `finished + status=applied` になる
-   (§10.2 の「Idle 起点は AgentEnd で finished」の唯一の例外)。これを怠ると applied
+   (§10.2 の run owner 規則 (b) の owner 引継ぎの一例。soft/retry steer の引継ぎでも
+   同様に `AgentEnd` を待たず閉じるため、「Idle 起点は AgentEnd で finished」の例外は
+   hard steer に限らない)。これを怠ると applied
    cursor が `applying` のまま詰まり、以後の再起動が §10.2 の hard-steer 復旧を再実行する
 4. TurnEnd で現在の Turn を閉じ、UI 通知 Steered { mode: Hard } を発行
    (イベント順序の正典は §6.3.1 の表: MessageEnd → TurnEnd → Steered → TurnStart)
@@ -951,7 +964,7 @@ pi の `steer()` は**キュー投入のみ**で、注入は「現在のツー�
 | abort(停止ボタン、assistant 生成中) | `Error(Aborted)` を消費 | `MessageEnd`(interrupted=true) → 未注入 steer command を `superseded` で差し戻し(§6.5) → `TurnEnd` → `AgentEnd` | 終了(Idle へ) |
 | abort(ツール実行中・承認待ち) | —(assistant ストリーム外) | 実行中ツールへ cancel 伝播(§8.3 の停止仕様)→ 残ツールへ "Operation aborted" のエラー結果を合成(`ToolExecutionEnd` → `MessageStart/End`(toolResult))→ 承認 Pending は Cancelled で block(§9.2)→ 未注入 steer command を `superseded` で差し戻し(§6.5)→ `TurnEnd` → `AgentEnd` | 終了(Idle へ) |
 | リトライ可能エラー | `Error(Error)` | `MessageEnd`(error) → `RetryScheduled` → backoff → `MessageStart`(次attempt) | **同一 Turn を継続**。error message はログのみで L0 へ入れない |
-| リトライ待機中ステア | —(直前 attempt は確定済み) | 旧owner close(owner引継ぎ、§10.2)→ `MessageEnd`(error) → `RetryScheduled` → `Steered`(soft) → `MessageStart/End`(user、現在 Turn へ注入) → `MessageStart`(次attempt) | **同一 Turn を継続**。新しい `TurnStart` は出さず、attempt カウントも維持 |
+| リトライ待機中ステア | —(直前 attempt は確定済み) | (`MessageEnd`(error) → `RetryScheduled` は sleep 前に発行済み — §4.4。ここで再発行しない)旧owner close(owner引継ぎ、§10.2)→ `Steered`(soft) → `MessageStart/End`(user、現在 Turn へ注入) → `MessageStart`(次attempt) | **同一 Turn を継続**。新しい `TurnStart` は出さず、attempt カウントも維持 |
 | abort(リトライ待機中) | —(直前 attempt は `MessageEnd`(error) 確定済み) | backoff sleep を中断 → 次 attempt の `MessageStart` を発行しない → 未注入 steer command を `superseded` で差し戻し(§6.5) → `TurnEnd` → `AgentEnd`(発行済み `RetryScheduled` は残るが、`TurnEnd` が後続に存在するため復旧は attempt を再開しない — §10.2 の cancel_requested 規則) | 終了(Idle へ) |
 | ツール実行/承認待ち中ステア | —(assistant ToolUseは確定済み) | 旧owner close(owner引継ぎ、§10.2・§9.8)→ **実行中のツールだけ完走**させ、バッチ内の未開始ツール・承認待ちは新しい policy/approval へ入れず Cancelled+error result で確定(§9.8) → `TurnEnd` → `Steered`(soft) → 保存済み次`turn_id`の`TurnStart` → `MessageStart/End`(user) → 次のassistantストリーム | **同一 run を継続(`AgentEnd`なし)**。commandは受信時に次turnへdurable bindし、この steer が新しい owner になる |
 | コンテキスト溢れ(エラー検出) | `Error(Error)` | `MessageEnd`(error) → `RetryScheduled`(delay 0) → 溢れ処理を即時適用(§4.5・§7.6)→ `MessageStart`(次attempt) | **同一 Turn を継続**。1 Turn 最大2回、超過はリトライ不可 Error として閉じる |
@@ -1017,7 +1030,7 @@ pub struct ThreeLayerMemory {
 pub struct L0Batch {
     pub id: BatchId,              // uuid v7
     pub batch_seq: u64,           // conversation/layer 内で単調増加。FIFO適用の正典
-    pub messages: Vec<PublicMessage>, // hidden reasoning/provider context を型として保持しない
+    pub messages: Vec<PublicMessage>, // 平文 Thinking は含む。opaque provider context を型として保持しない
     pub est_tokens: u64,
     pub state: BatchState,        // Open | Sealed | Compacting | CompactFailed | Compacted
 }
@@ -1047,7 +1060,7 @@ L2_LIMIT       = 10_000
 
 - open バッチにメッセージを追記し、`est_tokens >= L0_BATCH_MIN` に達したら**次の「きりのいい境界」で seal**
 - きりのいい境界の定義(pi の cut point 規則を Sumi のメッセージ種別に射影したもの。`pi:agent/src/harness/compaction/compaction.ts` の cut point 判定参照 — pi は bashExecution/custom 等のエントリ種別も cut 対象に含むが **[事実]**、Sumi のメッセージは user/assistant/toolResult の3種なので**結果として user または assistant メッセージの直前のみ**になる): toolResult の直前では切らない(assistant のツールコールと結果が別バッチに泣き別れると、Compact 入力も再送プレフィックスも壊れるため)。Sumi 追加規則: 通常の seal 境界は**新しい user turn の先頭(user メッセージの直前)に限定**する — assistant 直前を一般境界として許すと、閾値到達後の user 質問が旧バッチ・回答が新バッチに分かれ、旧 Compact は回答を見ず新 Compact は質問を見ないため L1/L2 で因果関係が系統的に失われる。assistant 直前の seal は次項の**強制 seal(総量ガード超過)時のフォールバックだけ**に許す。**interrupted な assistant とそれに続く steering user メッセージの間でも切らない**(中断文脈の一体性)。tool loop(assistant ToolUse → toolResult 列)・interrupted/steer 対を跨いで切らないことは境界テストで固定する
-- thinking/provider contextは `L0Batch` に入れない。ただし各バッチは対応する暗号化 provider context の推定サイズを **eviction footprint** として別カウンタで保持し、L0 溢れ検知(§7.6 の Σ est)には `public est + footprint` の総量を使う(Kimiでは実際に再送されるため)。seal の下限判定(`L0_BATCH_MIN`)は `PublicMessage` の見積だけで行うが、public est が下限未満でも `public est + footprint` がバッチ強制上限(既定 `L0_BATCH_MIN × 2` **[推測、実測調整]**)を超えたら、次の安全な境界(前項の規則。このフォールバックに限り assistant 直前も可)で**強制 seal**する — 短い本文+大きな hidden reasoning が続くと「open バッチが永遠に seal されず、L0 が総量超過してもsealed/compacted バッチが1つも無く溢れ処理が廃棄できない」状態になるのを防ぐ。Compact 入力(要約モデルへ送る内容)は従来どおり `PublicMessage` だけで構成し、footprint を hidden content を要約モデルへ渡す口実にしない
+- 平文 Thinking は `PublicMessage` の一部として public est に直接計上する(Kimi では実際に再送されるため)。opaque provider context(encrypted reasoning 等)は `L0Batch` に入れず、各バッチが推定サイズを **eviction footprint** として別カウンタで保持し、L0 溢れ検知(§7.6 の Σ est)には `public est + footprint` の総量を使う。seal の下限判定(`L0_BATCH_MIN`)は `PublicMessage` の見積だけで行うが、public est が下限未満でも `public est + footprint` がバッチ強制上限(既定 `L0_BATCH_MIN × 2` **[推測、実測調整]**)を超えたら、次の安全な境界(前項の規則。このフォールバックに限り assistant 直前も可)で**強制 seal**する — 短い本文+大きな opaque reasoning が続くと「open バッチが永遠に seal されず、L0 が総量超過してもsealed/compacted バッチが1つも無く溢れ処理が廃棄できない」状態になるのを防ぐ。Compact 入力(要約モデルへ送る内容)は従来どおり `PublicMessage` だけで構成し、footprint を opaque content を要約モデルへ渡す口実にしない
 - seal と同時に `compactor` へ非同期ジョブ投入(7.4節)し、状態を Compacting に
 
 ### 7.4 先回り Compact(`compactor.rs`)
@@ -1069,14 +1082,14 @@ impl CompactionInput {
     /// 次段 Compact の入力にすると L2 が世代を経るごとに [REDACTED] へ劣化するため。
     /// 各要約は time_range 付きの「過去の記憶の要約 (履歴データ)」合成 PublicMessage に変換する。
     /// DecryptedMemorySummary は CompactionInput 経路の出力からしか生成されないため、
-    /// この constructor を経由しても hidden reasoning / provider context は構造上混入しない。
+    /// この constructor を経由しても Thinking / opaque provider context は構造上混入しない。
     pub fn from_decrypted_summaries(entries: &[L1Entry]) -> Self;
 }
 
 pub async fn compact(model: &CompactModelSpec, input: CompactionInput) -> CompactResult;
 ```
 
-  constructorはバッチの`PublicMessage`だけを複製し、任意のrecent-memoryを添える場合も、既存要約の**redacted projection**を履歴データと明示した合成`PublicMessage`へ変換する。`AssistantMessage`、`PromptContext`、`ProviderContextItem`、native compaction window、`Thinking`からの変換implは定義しない。serializerも`CompactionInput`しか受けず、raw hidden reasoning、署名、encrypted reasoning、Anthropic thinking/redacted_thinking、provider contextは会話モデルと同じproviderを使う場合も、別Compact providerを使う場合も送信不能にする。fixtureで全provider context variantをL0へ紐付けてもCompact HTTP bodyへそのbyte列が現れないことを検証する
+  constructorはバッチの`PublicMessage`だけを複製し、その際 `PublicAssistantContent::Thinking` は**除去する**(理由は機密性ではなく要約品質とトークン量 — 推論過程を事実として長期記憶へ焼き込まず、K3 の巨大な thinking で Compact 入力を膨らませない)。任意のrecent-memoryを添える場合も、既存要約の**redacted projection**を履歴データと明示した合成`PublicMessage`へ変換する。`AssistantMessage`、`PromptContext`、`ProviderContextItem`、native compaction window、`Thinking`からの変換implは定義しない。serializerも`CompactionInput`しか受けず、Thinking本文(constructorで除去済み)、署名、encrypted reasoning、Anthropic redacted_thinking、provider contextは会話モデルと同じproviderを使う場合も、別Compact providerを使う場合も送信不能にする。fixtureで全provider context variantをL0へ紐付けてもCompact HTTP bodyへそのbyte列が現れないことを検証する
 - **別モデル指定可**だが、既定は会話と同じモデル。同一tenantのdata-processing/trust-domain policyが許可したCompact providerだけを設定でき、未許可なら起動時に拒否する。これは公開transcriptの送信先制約であり、hidden contentを送ってよいという意味ではない **[要決定→第14章]**
 - プロンプト: pi の構造化チェックポイント形式 **[事実]**(`pi:compaction.ts:383-457` の SUMMARIZATION_PROMPT / UPDATE_SUMMARIZATION_PROMPT)を秘書ドメインに書き換える。骨子:
 
@@ -1116,8 +1129,8 @@ est(text) = ascii_chars / 4 + non_ascii_chars / 1.5   # 初期係数 [推測]
 
 ### 7.6 溢れ処理(`memory/overflow.rs`)
 
-1. **検知**: L0 追記のたびに `Σ (public est + eviction footprint) > L0_LIMIT` を確認(§7.3。hidden reasoning を含む実効再送量で判定する)→ `pending_apply = true` を立てる。Compact 完了時も MemoryMaintainer から Session へ `MaintenanceReady` を通知する
-2. **通常の適用タイミング**: TurnEnd / AgentEnd 後に Session が Idle へ戻った直後、または Idle 中に `MaintenanceReady` を受けた時点で、準備済み shelf を適用する。適用は世代番号を確認した短い SQLite トランザクションだけで、LLM 呼び出しは行わない。これにより user→assistant だけの通常会話でも 40k 到達時の処理を次のユーザー送信まで持ち越さない
+1. **検知**: L0 追記のたびに `Σ (public est + eviction footprint) > L0_LIMIT` を確認(§7.3。opaque reasoning を含む実効再送量で判定する)→ `pending_apply = true` を立てる。Compact 完了時も MemoryMaintainer から Session へ `MaintenanceReady` を通知する
+2. **通常の適用タイミング**: TurnEnd / AgentEnd 後に Session が Idle へ戻った直後、または Idle 中に `MaintenanceReady` を受けた時点で、準備済み shelf を適用する。適用は世代番号を確認した短い SQLite トランザクションだけで、LLM 呼び出しは行わない。これにより user→assistant だけの通常会話でも 40k 到達時の処理を次のユーザー送信まで持ち越さない。**期限 sweeper(§10)が強制 seal + Compact を予約したバッチは、`Σ est` が `L0_LIMIT` 未満でも `pending_apply` を立て、この同じ Idle 適用で古い順に L0→L1 昇格させる**(30日超バッチは定義上 L0 の先頭 prefix なので FIFO cursor 順と矛盾しない)。これが §10 の「昇格による L0 離脱と同一 transaction で opaque reasoning を鍵破棄する」を発火させる適用経路であり、溢れ以外に昇格が起きない長期低流量会話でも期限処理が成立する
 3. **API 直前のフォールバック**: Idle 適用が間に合わなかった場合だけ ContextAssembler で適用する。ただし**「ユーザーメッセージ起点の最初のコール」ではスキップ**(TTFT保護)。ツールコール継続・ステア再開・follow-up 起点のコールでは適用する。例外: `Σ est > L0_LIMIT × 1.2`(ハード上限)に達したら無条件適用 **[推測、係数は実測調整]**
 4. **L0→L1**: 先頭から Compacted バッチを `Σ est ≤ L0_DROP_TO` になるまで廃棄し、対応する shelf の要約を L1 末尾へ。shelf 未完(Compacting / CompactFailed)のバッチに当たったら、(a) 完了を待たずそこで止める(次回コールで続き)、(b) ハード上限超過時のみ同期待ち(CompactFailed はこのとき同期 fallback で再 claim — §7.4)。**open バッチは絶対に廃棄しない**。なお Sealed は seal と同一 transaction で Compacting になるため定常状態では観測されず、DB の `promoted|dropped` は適用済み/廃棄済みの記録専用で in-memory の `BatchState` には現れない
 5. **L1→L2**: L1 溢れも同じ形。L1 エントリを古い順にまとめて(~4k分)「要約の要約」ジョブを非同期投入(入力は §7.4 の `from_decrypted_summaries` — 復号した unredacted 正本。redacted projection を次段入力にしない) → 完了後の次回適用で L1 から除去し L2 末尾へ連結
@@ -1131,7 +1144,7 @@ fn assemble(&mut self) -> PromptContext:
   1. Idle 適用から漏れた pending_apply があればフォールバック適用 (7.6-3 の条件判定込み)
   2. memory_blocks = [L2, L1]、messages = L0全バッチのmessages
   3. messagesへ transform適用 (孤児ツール結果合成・interrupted処理・Error/Abortedスキップ) ← 第5.3節
-  4. sumi_three_layer: L0滞在中かつprovider_instance/protocol/model一致のreasoning contextだけ取得し、native compactionは除外
+  4. sumi_three_layer: L0滞在中かつprovider_instance/protocol/model一致のopaque reasoning contextだけ取得し、native compactionは除外(平文 Thinking は L0 の PublicMessage 内にある)
   5. provider_native: fingerprint一致の最新native contextを取得する。Responsesはcanonical output[]全体、Anthropicはcompaction block 1個を置き、memory_blocksを空、messagesをcoverage後のsuffixだけにする
   6. PromptContext { 憲法, memory_blocks, messages, provider_context, tools凍結 }
 ```
@@ -1365,7 +1378,7 @@ API callの入力順序を固定する:
    - user messageを優先し、最初と最新を必ず保持
    - assistant proseは「直後のuser同意が何を指すか」の解釈用
    - 過去tool callはtool名、sanitized引数、outcome (`ok/error/interrupted/rejected/blocked`)だけ
-   - tool result本文、hidden reasoning、他agentの主張をauthorizationとして扱わない。必要なtool evidenceは最大1k tokensの要約として明示的に untrusted 区画へ置く
+   - tool result本文、assistant の Thinking(平文でも)、他agentの主張をauthorizationとして扱わない(除外理由は機密性ではなく、authorization の証拠にならず injection 面を広げるだけのため — Claude Code も同じ理由で hidden reasoning を渡さない)。必要なtool evidenceは最大1k tokensの要約として明示的に untrusted 区画へ置く
    - transcript全体10k tokens、tool evidence別枠4k、1 entry最大2k、直近non-user最大40を初期値とする
 4. **Pending review projection**: `SecretAwareActionProjector`が作った`ReviewableAction`のJSONを最後に置く。`CanonicalAction`のraw JSONはprovider callへ渡さない。`InsufficientEvidence`ならreviewer call自体を行わずmanual/headless fallbackへ進む
 5. **Retry note**: 前attemptのschema/parseエラーだけを追記し、判定を誘導する説明は入れない
@@ -1429,7 +1442,7 @@ JSON Schema:
 
 SQLite(sqlx、WAL モード)。DB ファイルは永続ボリューム上の agent 専用状態ディレクトリ(`$SUMI_STATE_DIR/agent.db`、コンテナ既定 `/var/lib/sumi/agent.db`)に置き、`sumi-agent` UID だけが read/write できる。`/workspace` を操作する `sumi-tool` executor にはこのディレクトリを見せない。記憶検索が必要なら Store の read-only API を型付きツールとして公開し、生DBパスは渡さない。ここに置くのは agent の**自己状態**(メモリ層・公開チャット transcript・暗号化 provider context・恒久イベント・承認ルール)だけで、ドメインデータは複製しない — ADR 0001 の原則「agent はドメイン DB を直接触らず、権限モデルの強制点を API 層に保つ」はこの形で維持する。
 
-Cloud 版は volume/backup の基盤暗号化に加えて tenant KEK → agent 鍵 → conversation配下の transcript/event/memory-summary 鍵・provider-context鍵・workspace鍵の階層で envelope encryption する。人間可視 transcript の原文正本 (`messages.raw_ciphertext` と durable event の raw envelope)、Compact/L1/L2要約の原文正本 (`memory_batches.summary_ciphertext` / `memory_jobs.result_ciphertext`) と `provider_context.ciphertext` は application 層でも用途別鍵で暗号化する。**要約は元会話のsecretを保持し得るため、unredactedな`summary`/`result`をSQLiteのTEXT、ログ、イベント、FTSへ保存しない**。raw hidden chain-of-thought は transcript/要約正本にも保存せず、継続に必要な reasoning/compaction item だけを provider context に分離する。reasoning context は対応 message が L0 から離脱(L1 へ昇格)した時点で対象データ鍵ごと crypto-erase する。**L0 在籍中の reasoning は経過日数だけを理由に失効させない**(不変条件) — Kimi は過去全ターンの reasoning 込みで完全な assistant メッセージを再送する品質契約のため、reasoning だけ先に消すと L0 に残った assistant 本文が空 reasoning で再送され、長期休眠した会話の品質が不安定になる。30日を超えて L0 に残った reasoning は放置もしない: 期限 sweeper が対応 prefix バッチの強制 seal(§7.3)と Compact を予約し、昇格による L0 離脱と**同一 transaction** で鍵破棄する — 期限だけが先行して本文と reasoning が泣き別れる状態を作らない。native compaction は置換・mode切替・fingerprint不一致または30日のうち最も早い時点で crypto-erase する(こちらは公開 transcript から再構成可能な派生物のため、期限単独の失効を許す)。conversation resetはtranscript/event/memory-summary/provider-contextの各conversation data keyを直ちに破棄し、要約も復号不能にしてFTS・通常export・Audit reviewerの入力から除外する。
+Cloud 版は volume/backup の基盤暗号化に加えて tenant KEK → agent 鍵 → conversation配下の transcript/event/memory-summary 鍵・provider-context鍵・workspace鍵の階層で envelope encryption する。人間可視 transcript の原文正本 (`messages.raw_ciphertext` と durable event の raw envelope)、Compact/L1/L2要約の原文正本 (`memory_batches.summary_ciphertext` / `memory_jobs.result_ciphertext`) と `provider_context.ciphertext` は application 層でも用途別鍵で暗号化する。**要約は元会話のsecretを保持し得るため、unredactedな`summary`/`result`をSQLiteのTEXT、ログ、イベント、FTSへ保存しない**。平文 reasoning(Chat reasoning_content、Anthropic thinking 本文)は transcript 正本の一部として本文と同じ暗号化+redaction 経路に乗せる — Kimi の全ターン reasoning 再送も transcript を正本に行い、L0 離脱後も表示・復旧に使える。**opaque な継続 item**(Responses encrypted reasoning、Anthropic redacted_thinking/signature、native compaction)だけを provider context に分離する。opaque reasoning context は対応 message が L0 から離脱(L1 へ昇格)した時点で対象データ鍵ごと crypto-erase する。**L0 在籍中の opaque reasoning は経過日数だけを理由に失効させない**(不変条件 — 再送要件のため)。30日を超えて L0 に残った opaque reasoning は放置もしない: 期限 sweeper が対応 prefix バッチの強制 seal(§7.3)と Compact を予約し、昇格による L0 離脱と**同一 transaction** で鍵破棄する — 期限だけが先行して本文と reasoning が泣き別れる状態を作らない。native compaction は置換・mode切替・fingerprint不一致または30日のうち最も早い時点で crypto-erase する(こちらは公開 transcript から再構成可能な派生物のため、期限単独の失効を許す)。conversation resetはtranscript/event/memory-summary/provider-contextの各conversation data keyを直ちに破棄し、要約も復号不能にしてFTS・通常export・Audit reviewerの入力から除外する。
 
 transcript/memory/workspace は既定で agent 削除まで保持し、tenant policy で短縮可能とする。ユーザーは conversation/agent 単位の削除を実行でき、conversation export は redaction 済み JSONL、agent export はそれに workspace archive を加える。削除は直ちに tombstone と鍵破棄でアクセス不能化する。会話削除では conversation配下のtranscript/event/memory-summary鍵とprovider-context鍵、agent 削除では agent 鍵と配下の workspace 鍵を破棄し、live DB/volume を24時間以内、backup を30日以内に期限切れにする。backup 復元は deletion tombstone を先に再適用する。検索・export・管理者アクセスは actor/tenant/scope/result count を監査ログへ残す。これらの API と運用 runbook がない状態では Cloud release しない。
 
@@ -1499,9 +1512,9 @@ CREATE TABLE messages (
   seq INTEGER NOT NULL UNIQUE,  -- 会話内の単調増加。coverage/order の正典
   role TEXT NOT NULL,           -- user | assistant | tool_result
   raw_key_ref TEXT NOT NULL,     -- conversation 配下の transcript データ鍵
-  raw_ciphertext BLOB NOT NULL,  -- 原文 PublicMessage。hidden thinking/provider context は含めない
+  raw_ciphertext BLOB NOT NULL,  -- 原文 PublicMessage (平文 Thinking 込み)。opaque provider context は含めない
   payload TEXT NOT NULL,         -- 同じ PublicMessage の redacted projection
-  search_text TEXT NOT NULL,    -- FTS/delete 同期用に抽出済み表示テキストを保持
+  search_text TEXT NOT NULL,    -- FTS/delete 同期用に抽出済み表示テキストを保持 (既定で Thinking 本文は含めない — 検索ノイズ/サイズの製品判断)
   redaction_version INTEGER NOT NULL,
   interrupted INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
@@ -1770,7 +1783,7 @@ tool callがstrict検証を通ってpolicy/approval段階へ入るときは、�
 - **揮発イベント**(MessageUpdate の delta 系、`ToolExecutionUpdate`): EventWriter と同じ入力FIFOで先行する恒久イベントの commit 後に DeliveryPump へ渡す。Online 中だけ送信し、Offline・送信queue満杯・再接続catch-up中は捨てる。これにより `MessageUpdate`/`ToolExecutionUpdate` が対応する `MessageStart`/`ToolExecutionStart` を追い越さず、ネットワークbackpressureが会話状態の永続化を止めない。**delta は `PublicProjectionBuilder` を通らない原文のため、raw 復号を認可された接続にだけ送る**。復号不可・redaction-only scope へは揮発イベントを一切送らず、redacted な `MessageEnd`/`ToolExecutionEnd` だけで更新する(secret が複数 delta に分割されると delta 単位の置換では防げないため、接続単位の stateful streaming redactor を実装するまで抑止が唯一の安全側)。`ToolExecutionUpdate`(bash 標準出力等の逐次更新)を恒久化すると1回の実行で大量の `agent_events` 行が生じる書込み増幅になるため、`agent_events`・`tool_executions` のどちらにも永続化しない。最終出力は `ToolExecutionEnd` が§8.2 の切詰め+全文退避と同じ規則で1回だけ確定・永続化するため、再接続後の catch-up でも実行完了分の内容は失われない(未完了実行の途中経過だけが再現されない)
 - **再接続**: ConnectionSupervisorが新credentialで再認証・helloを完了して両halfを同一epochへ交換した後、API が返す最終受信 event seq の次から `agent_events` を再送する。同時にcommand readerはhelloの`next_command_seq`からAPIのdurable command再送を受ける。DB cursor が最新へ追いつくまで新しい delta は捨て、catch-up完了後にだけそのepochを`Online`へ戻す。最後の MessageEnd(全文)で UI は回復する
 - **`messages` への投影は MessageEnd の transactionでのみ行う**(1メッセージ=1 INSERT)。`MessageStart` は `agent_events` に記録するだけで `messages` には何も書かない。通常の user / assistant / toolResult は `append_to_l0=true`、retryable Error assistant はログだけに残すため `append_to_l0=false`。L0 membership は `memory_batch_messages` へ明示 INSERT し、messages の seq 範囲や role から推測しない
-- `provider_context` は transcript の暗号化 raw 正本からも分離し、同じ MessageEnd transaction で暗号化 INSERT する。L0→L1 の `MemoryTransition` は対応 reasoning のデータ鍵/row を削除する。native compaction は coverage を持つ独立 row とし、置換・mode切替・fingerprint不一致・期限切れ sweeper の同じ冪等 delete 経路で消す
+- `provider_context` は transcript の暗号化 raw 正本からも分離し、同じ MessageEnd transaction で暗号化 INSERT する。L0→L1 の `MemoryTransition` は対応する opaque reasoning のデータ鍵/row を削除する(平文 Thinking は transcript の一部として残る)。native compaction は coverage を持つ独立 row とし、置換・mode切替・fingerprint不一致・期限切れ sweeper の同じ冪等 delete 経路で消す
 - 復元時の provider context は `provider_instance_id/protocol/model` の完全一致を先に検証し、`ORDER BY COALESCE(message_seq, coverage_through_seq), wire_item_index, item_ordinal, id` で読む。人間可視 Text/ToolCall と reasoning を共通 `wire_item_index` で stable merge して anchor の assistant に戻す。anchor の解決は `ContextMessage::Persisted { id, seq }` との完全一致でだけ行い(§3.4 — transform が挿入・除外を行うため配列位置では戻せない)、transform が anchor 先 message を再送から除外した場合は対応する provider_context item も同じ再送から除外する。native compaction を選んだ場合、Responses は暗号化した canonical output[] 全体、Anthropic は compaction block を coverage prefix の置換として置き、coverage 後の item だけを元の wire 順で suffix に差し込む。anchor/placement 欠落・重複 `(wire_item_index, ordinal)`・provider instance/protocol/model 不一致は silent reorder せず context を破棄して `sumi_three_layer` へ戻す
 - crash が transaction commit 前ならその transaction のイベントと投影状態は両方存在せず、commit 後・Gateway送信前なら再送対象として残る。`MessageStart` 後・`MessageEnd` 前だけは、開始イベントがあり本文投影がない状態を意図的に許す。本文を伴う `MessageEnd` と `messages` の INSERT は必ず同一 transaction に置き、「完了イベントだけ存在して本文がない」状態は作らない
 - **UserMessage と run の durable phase**: `received` の command を Session が現在の durable state に対して分類し、idle/hard/soft/retry のどれでも注入先の `run_id` と `turn_id` を最初の会話副作用より前に確定して、`application_kind/run_id/turn_id + run_phase=classified + status=applying` を同一 transaction で保存する。新しい turn が必要な idle/hard/通常 soft steerでは`turn_id`を先行採番し、**tool実行/approval待ち中のsoft steerも現在runの次turnへこの時点で束縛する**。`retry_steer` だけは発行済み `RetryScheduled` が属する現在の`turn_id`へ束縛する。user メッセージの `message_id` は `command_id` から決定論的に導出する(UUIDv5 相当。再分類や crash 後の replay でも同じ ID になるため、`user_started` 後の復旧が同じ message_id の `MessageEnd` を一意に確定できる)。`UserMessage.timestamp` は command payload に含まれないため、**`inbound_commands.received_at` を正典 timestamp とする** — 初回注入も crash 後の `MessageEnd` 再構築も同じ値を使い、復旧時に現在時刻を再採番して先行 `MessageStart` と食い違う事故を防ぐ。以後はその分類と実際の注入位置を起点 command に束縛し、run終端処理は同じrunに未注入(`run_phase` が `classified`/`turn_started` のまま、まだ `user_started` に達していない)の steer command が残る限り`AgentEnd`を発行してはならない(ユーザー起因の abort だけは例外で、§6.5 が同じ終端処理内で未注入 steer を `superseded` へ閉じてから `AgentEnd` する — applying を残したまま `AgentEnd` する経路は引き続き存在しない)。Idle 起点は `AgentStart` と `run_started`、保存済み ID の `TurnStart` と `turn_started` を通る。hard/通常 soft steer は保存済みの既存/次 run と次 turn、`retry_steer` は保存済みの既存 run と現在 turn に束縛する。いずれも注入時の user `MessageStart` と `user_started`、user `MessageEnd` と `user_committed`、その指示を取り込む最初の assistant `MessageStart` と `assistant_started` をそれぞれ同じ EventWriter transaction で進める。`retry_steer` は `classified` commit 後にだけ sleep を中断するため、crash 復旧でも保存済み分類を先に注入してから次 attempt へ進める。
@@ -2053,7 +2066,7 @@ $defs:
 # このファイルに正典として明記して API/web が同じ ID を先行計算できるようにする。
 ```
 
-web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/ToolCall delta はそのまま流す(TTFT 最優先)。raw Thinking delta は転送せず、provider が display-safe と明示した `ReasoningSummary*` だけを UI 側で折り畳み表示する。契約変更は必ず `contracts/agent-events.yaml` → wire DTO 再生成 → fixture/互換性テストの順に行う。内部 `ProviderEvent` に variant を追加しても自動で wire に出さず、公開 contract と明示変換を更新しない限りビルドまたは CI を通さない。**[推測→契約ファースト原則として確定]**
+web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/ToolCall delta はそのまま流す(TTFT 最優先)。平文 reasoning の `Thinking*` delta も認可済み接続へ流し、UI 側で折り畳み表示する(Responses は `ReasoningSummary*` を同様に表示)。opaque reasoning はそもそも `PublicStreamEvent` に存在しない。契約変更は必ず `contracts/agent-events.yaml` → wire DTO 再生成 → fixture/互換性テストの順に行う。内部 `ProviderEvent` に variant を追加しても自動で wire に出さず、公開 contract と明示変換を更新しない限りビルドまたは CI を通さない。**[推測→契約ファースト原則として確定]**
 
 ---
 
@@ -2117,7 +2130,7 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 - **ゲート**:
   1. `cargo test --manifest-path apps/agent/Cargo.toml` 全緑(フィクスチャ再生で: ツールコール引数の逐次previewと生bufferのstrict終端を分離し、repairならpreview可能だがstrictでは失敗するJSONを確定ToolCallにしない、reasoning 分離、usage 取得、標準finish_reasonに加えて Z.ai の `sensitive` / `network_error` / `model_context_window_exceeded` を含む provider 固有パターン)
   2. ライブ: 3プロバイダに対しツールコール1往復+reasoning 付き2ターン会話が完走。**2ターン目で Kimi に reasoning_content を再送しても 400 が返らない**こと
-  3. TTFT 計測基盤: `user_message command 受信 → HTTP リクエスト送出` と `送出 → 最初の TextDelta` を tracing span で分離計測し、stdio REPL に表示。**agent 内部オーバーヘッド p95 < 30ms**(モデル側 TTFB は記録のみ)
+  3. TTFT 計測基盤: `user_message command 受信 → HTTP リクエスト送出` と `送出 → 最初の公開 delta(Thinking または Text)` を tracing span で分離計測し、stdio REPL に表示。**agent 内部オーバーヘッド p95 < 30ms**(モデル側 TTFB は記録のみ)
   4. abort: 生成中に CancellationToken 発火 → 1s 以内に Aborted イベントで正常形クローズ
 
 ### M1P: Responses + Anthropic Messages adapters(M1後に並行、Cloud release前必須)
@@ -2177,7 +2190,7 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
   6. ツールなしの user→assistant 会話だけを繰り返しても、40k到達後の昇格が AgentEnd/Idle 中に適用され、48kのハード上限まで放置されない
   7. L0 Compact / L1→L2 / L2統合の各完了で source version CAS、batch `Compacting → Compacted`、job `running → completed`、暗号化result/summary+redacted projection保存が同一 transaction になり、各 `running` 中に kill しても再起動後に lease 回収・再投入・一度だけの適用が成立する。最終失敗は `CompactFailed/failed`、同期fallback成功は `Compacted/completed` へ収束する
   8. 50KB 超のユーザー入力貼り付けで、`messages.raw_ciphertext` の認可済み復号は原文全文、`messages.payload/search_text` は secret redaction 済み、L0 は切詰めビュー、`/workspace/.attachments/<conversation_id>` は退避ファイルになる。conversation reset と backup 復元時は旧IDの attachments/tool-output だけが消え、ユーザー作成 workspace は残る(7.8節)
-  9. Compact input型テストで、L0の各PublicMessageにChat/Responses/Anthropicの全provider-context variantを紐付けてもHTTP bodyにraw thinking/signature/encrypted reasoning/native itemが1byteも現れない。同一provider・別Compact providerの両fixtureで確認し、`PromptContext`/`ProviderContextItem`から`CompactionInput`を構築するコードがcompile-failになる。`from_decrypted_summaries` 経由の compact_l1/consolidate_l2 fixture でも HTTP body に provider context の byte 列が現れず、L2 へ昇格した要約が redacted projection 由来でない(unredacted 正本由来である)ことを確認する
+  9. Compact input型テストで、L0の各PublicMessageにChat/Responses/Anthropicの全provider-context variantと平文 `Thinking` contentを紐付けてもHTTP bodyにthinking本文/signature/encrypted reasoning/native itemが1byteも現れない(平文 Thinking は constructor が除去 — §7.4)。同一provider・別Compact providerの両fixtureで確認し、`PromptContext`/`ProviderContextItem`から`CompactionInput`を構築するコードがcompile-failになる。`from_decrypted_summaries` 経由の compact_l1/consolidate_l2 fixture でも HTTP body に provider context の byte 列が現れず、L2 へ昇格した要約が redacted projection 由来でない(unredacted 正本由来である)ことを確認する
   10. Compact resultへ既知secretを埋め、`memory_batches.summary_ciphertext`/`memory_jobs.result_ciphertext`の認可済み復号だけが原文を返し、`summary_projection`/`result_projection`/DB dump/log/exportはredacted、各`redaction_version`が必須になることを確認する。job completion transaction各境界のkill/restart、conversation鍵破棄、backup tombstone再適用後に要約を復号・再露出できないことも検証する
 
 ### M5: 権限承認+WS ゲートウェイ
@@ -2187,7 +2200,7 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
   1. shell fixture (`&&`, pipe, newline, subshell, heredoc, interpreter wrapper)をsegment分解し、全segmentの最も厳しいpolicy結果を採る。解析不能はNeedsApproval
   2. `bash` / `python` / `git` 単体等の広すぎる永続rule候補を拒否し、`git status` 等の限定prefixだけが仮適用後の全segment再評価を通る
   3. User mode: bashが ApprovalRequested を発行 → stdio/WS 経由で decision → 承認で実行/拒否でエラーツール結果。ApproveAlways は安全性検証済みruleだけ保存される
-  4. AutoReview mode: main会話とは別のAPI callへ bounded/sanitized transcript + trusted meta + `ReviewableAction` が渡り、allowは今回だけ実行、denyは人間承認へfallbackする。tool result本文、hidden reasoning、CanonicalActionのraw JSONがreviewer入力に入らない。Authorization header、署名URL、argv/justification内secretのfixtureはkind+keyed digestへ置換される
+  4. AutoReview mode: main会話とは別のAPI callへ bounded/sanitized transcript + trusted meta + `ReviewableAction` が渡り、allowは今回だけ実行、denyは人間承認へfallbackする。tool result本文、assistant Thinking、CanonicalActionのraw JSONがreviewer入力に入らない。Authorization header、署名URL、argv/justification内secretのfixtureはkind+keyed digestへ置換される
   5. reviewerのtimeout、invalid JSON、transport error、未許可trust domain、secret除去でoperation/scopeを判定不能なactionがinteractiveでは理由付きApprovalRequested、headlessではblockになる。後二者ではreviewer HTTP callが0件で、秘匿を解除した再送も起きない
   6. 承認待ち中の user_message がソフトステアとして機能し、ApprovalDecision と Abort も即時に処理される。実ApprovalBrokerでも`ApprovalRequested + pending` commit直後をkillし、再起動後にpendingをCancelledで閉じて保存済みsoft steerへ一度だけ継続する(M2のfixture gateを結合テストで再実行)
   7. Audit allow後もexecutor sandboxが維持され、内部状態・追加network権限等を暗黙に得ない
@@ -2219,7 +2232,7 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 | # | 論点 | 選択肢と推奨 |
 |---|---|---|
 | D1 | **暗号化チャット原文の置き場所** | (a) agent ローカル SQLite のみ(推奨・ハッカソン)/ (b) api 側 DB に暗号化ミラー(イベント転送で後付け可能)/ (c) api 側のみ。web の履歴無限スクロールを api が返すなら最終的に (b)。平文projectionは常にredactedとし、M3 までに方針だけ確定 |
-| D2 | **Compact 用モデル** | (a) 会話と同じモデル(品質・一貫性)/ (b) tenantが許可した同一data-processing/trust domain内の安価モデル(umans-flash / kimi-k2.7)。既定(a)。どちらも内部に`Vec<PublicMessage>`だけを持つ専用`CompactionInput`を送り、hidden reasoning/provider contextは送らない。trust domain未設定の別providerは拒否する |
+| D2 | **Compact 用モデル** | (a) 会話と同じモデル(品質・一貫性)/ (b) tenantが許可した同一data-processing/trust domain内の安価モデル(umans-flash / kimi-k2.7)。既定(a)。どちらも内部に`Vec<PublicMessage>`だけを持つ専用`CompactionInput`を送り、Thinking(constructorが除去)/opaque provider contextは送らない。trust domain未設定の別providerは拒否する |
 | D3 | **ワークスペース書込み(write/edit)の承認要否** | 推奨: Auto(自分の机への書込みまで聞くとうるさい)。bash は Ask。デモの見栄え(承認カードを見せたい)なら bash で十分 |
 | D4 | **承認待ちのタイムアウト** | 推奨: 無限待ち+通知タブに滞留(画面構成書と整合)。エージェントは待機中もステア可能なので詰まらない。§9.8 のとおり承認待ち中の user メッセージは(質問であっても)Pending を Cancelled にして承認カードを閉じ、モデルが必要なら tool call を再発行する — **Founder 確認済みの想定挙動(2026-07-18)** |
 | D5 | **ツール実行中のハードステア** | 推奨: しない(ツール完走→注入)。「今すぐ止めて」は停止ボタン(abort)の仕事、と UI 上の意味を分ける |

@@ -21,7 +21,7 @@ sumi_three_layer (既定):
   Tool Definitions   … 固定 (変更はキャッシュ全壊と同義。凍結を原則とする)
   L2 (10k)           … 最古の記憶。統合済み。user 相当の履歴データ
   L1 (15k)           … 中間の記憶。バッチ単位の要約。user 相当の履歴データ
-  L0 (40k)           … 生の公開 messages + 対応する暗号化 reasoning context
+  L0 (40k)           … 生の公開 messages (平文 reasoning 込み) + 対応する暗号化 opaque provider context
 
 provider_native:
   System Prompt + Tool Definitions + provider の canonical compacted context + coverage 後の transcript suffix
@@ -44,7 +44,7 @@ OpenAI Responses の compacted `output[]` window や Anthropic Messages の `com
 
 Compact の完了順は適用順に使わない。各 layer の永続 `next_batch_seq` と一致する `completed` だけを FIFO で適用し、後続が先に完了した場合は棚で待たせる。L0/L1 の membership 更新、要約の昇格、ジョブの `applied` 化、`next_batch_seq` の前進は同じ SQLite transaction で行う。`(kind, batch_seq)` の一意制約と状態の比較更新により、再起動・重複通知・ワーカー二重実行でも同じ結果を二重適用しない。バッチと message の対応は先頭/末尾 ID から推測せず、順序付きの中間表へ全 membership を保存する。
 
-先頭バッチが `failed` のままだと `next_batch_seq` に一致する `completed` が存在せず、以降のバッチが永久に詰まる。これを黙ってスキップせず、次の順で解消する: (a) 自動リトライ(既定2回)を優先し、(b) それでも `failed` なら shelf の「未Compact」マークを手掛かりに手動再処理を促し、(c) 手動再処理も間に合わない場合は溢れ処理側の同期フォールバック(§7.4/§7.6: `failed → running` を CAS で claim し同期的に Compact をやり直す)を安全なフォールバックとして実行し、membership・要約を欠落させずに `completed` へ収束させてから初めて `next_batch_seq` を前進させる(フォールバックと `next_batch_seq` 前進は同一 transaction)。自動リトライの消尽、フォールバックの発動、`next_batch_seq` の前進はいずれも監視通知の対象とする。
+先頭バッチが `failed` のままだと `next_batch_seq` に一致する `completed` が存在せず、以降のバッチが永久に詰まる。これを黙ってスキップせず、次の順で解消する: (a) 自動リトライ(既定2回)を優先し、(b) それでも `failed` なら shelf の「未Compact」マークを手掛かりに手動再処理を促し、(c) 手動再処理も間に合わない場合は溢れ処理側の同期フォールバック(§7.4/§7.6: `failed → running` を CAS で claim し同期的に Compact をやり直す)を安全なフォールバックとして実行し、membership・要約を欠落させずに `completed` へ収束させてから初めて `next_batch_seq` を前進させる(実装計画 §7.4 のとおり、フォールバックの completion と `next_batch_seq` の前進は連続する別 transaction でよい — completion 後に crash しても通常の cursor 適用規則がそこから再開する)。自動リトライの消尽、フォールバックの発動、`next_batch_seq` の前進はいずれも監視通知の対象とする。
 
 ## プロンプトキャッシュとの関係
 
@@ -56,9 +56,9 @@ Kimi/GLM 等の Chat Completions 互換系では**先頭からの連続プレフ
 
 ## ログとの関係
 
-このメモリは「API に乗せる人格と記憶」の話であり、**人間可視のチャットログ原文は hidden reasoning を除いて別途 DB に暗号化永続化する**。認可済み復旧/UIは原文を使い、検索・通常exportは同時生成した redacted projection を使う。
+このメモリは「API に乗せる人格と記憶」の話であり、**人間可視のチャットログ原文は opaque provider context を除いて別途 DB に暗号化永続化する**。認可済み復旧/UIは原文を使い、検索・通常exportは同時生成した redacted projection を使う。
 
-原文ログと provider context は同じ扱いにしない。transcript の暗号化 raw 正本にはユーザー発話、最終 assistant テキスト、ツールコール/結果を保存するが、モデルの非公開 chain-of-thought は含めない。FTS・通常export・DBの平文projectionは API key、署名token、既知secretを不可逆redactionしたものに限定する。継続に必要な `reasoning_content`、暗号化 reasoning、Anthropic thinking/redacted_thinking、native compaction item/block/window は provider context として分離し、conversation/provider-context 単位のデータ鍵を agent 鍵で wrap する。reasoning は対応 message が L0 から離脱(L1 へ昇格)した時点で対象データ鍵ごと破棄する。**L0 在籍中の reasoning は経過日数だけを理由に失効させない**(Kimi は過去全ターンの reasoning 込みで完全な assistant メッセージの再送を求めるため、reasoning だけ先に消すと長期休眠会話の品質が壊れる)— 30日を超えて L0 に残った分は期限 sweeper が対応バッチの強制 seal + Compact を予約し、昇格による L0 離脱と同一 transaction で破棄する(実装計画 §10.1)。native compaction は公開 transcript から再構成可能な派生物のため、置換・mode切替・fingerprint不一致または30日のうち最も早い時点で対象データ鍵ごと破棄する。いずれも暗号化 transcript と3層メモリを復旧元として残す。
+原文ログと provider context は同じ扱いにしない。区別の基準は機密性ではなく **wire 上の形式**とする(Founder 決定 2026-07-19: プロバイダが平文で返す reasoning は会話内容であり、表示・永続する)。transcript の暗号化 raw 正本にはユーザー発話、最終 assistant テキスト、**平文 reasoning(Chat 系 `reasoning_content`、Anthropic `thinking` 本文)**、ツールコール/結果を保存する。FTS・通常export・DBの平文projectionは API key、署名token、既知secretを不可逆redactionしたものに限定し、reasoning 本文にも同じ redaction を適用する(既定では検索用 `search_text` に reasoning を含めない — 検索ノイズとサイズの製品判断)。**opaque なもの** — Responses の暗号化 reasoning、Anthropic の `redacted_thinking` と thinking `signature`、native compaction item/block/window — だけを provider context として分離し、conversation/provider-context 単位のデータ鍵を agent 鍵で wrap する。opaque reasoning は対応 message が L0 から離脱(L1 へ昇格)した時点で対象データ鍵ごと破棄する(平文 reasoning は transcript の一部として通常の保持期間に従い、L0 離脱後も表示・復旧に使える)。**L0 在籍中の opaque reasoning は経過日数だけを理由に失効させない**(再送要件のため)— 30日を超えて L0 に残った分は期限 sweeper が対応バッチの強制 seal + Compact を予約し、昇格による L0 離脱と同一 transaction で破棄する(実装計画 §10.1)。native compaction は公開 transcript から再構成可能な派生物のため、置換・mode切替・fingerprint不一致または30日のうち最も早い時点で対象データ鍵ごと破棄する。いずれも暗号化 transcript と3層メモリを復旧元として残す。
 
 Cloud 版のデータ管理方針はリリースゲートとする:
 
@@ -74,4 +74,4 @@ Cloud 版のデータ管理方針はリリースゲートとする:
 - **圧縮率の制御**: 参考にした Mastra Code では大きめのバッチが ~50 倍に圧縮される観察があり、圧縮されすぎが懸念。Compact プロンプトで目標圧縮率を明示的に指定するか。なお目標圧縮率 (1/8〜1/15) と上限 (~800 トークン、実装計画 §7.4) はバッチ粒度と結合しており、粒度を 10k へ広げると上限側が先に効いて実質 1/12 固定になる — 上のバッチ粒度の未決と同時に決める
 - **Compact の入力**: バッチ単体ではなく、前後の文脈や L1 の既存内容を読み取り専用で添えて要約品質を上げる案(実装計画 §7.4 が `<recent-memory>` 添付として暫定回答済み。実測評価が残り)
 - 各層のサイズ (10k/15k/40k) の実測調整
-- thinking 系モデルの provider context を L0 のサイズ計算へどう加算するか(バッチのトークン計算へ「含める」は実装計画 §7.3 で暫定回答済み)。30日より長い L0 滞在は「滞在自体は許すが、sweeper が30日超のバッチを強制 seal + Compact で昇格させ、離脱と同一 transaction で reasoning を破棄する」で暫定回答済み(実装計画 §10.1)
+- thinking 系モデルの reasoning を L0 のサイズ計算へどう加算するか(平文 reasoning は PublicMessage の一部として直接計上、opaque provider context は footprint として「含める」— 実装計画 §7.3 で暫定回答済み)。30日より長い L0 滞在は「滞在自体は許すが、sweeper が30日超のバッチを強制 seal + Compact で昇格させ、離脱と同一 transaction で opaque reasoning を破棄する」で暫定回答済み(実装計画 §10.1)
