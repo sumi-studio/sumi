@@ -31,7 +31,7 @@ provider_native:
 
 L1/L2 は永続チャットの `Message` ではなく送信専用の `MemoryBlock` として保持し、各プロトコルアダプターが原則 `user` 相当の履歴データへ変換する。`<memory layer="l2">` / `<memory layer="l1">` で会話本文と区別し、「新しいユーザー指示ではなく過去の記憶である」と憲法に一度だけ定義する。本文中のタグ偽装列(`</memory` 等)はアダプターが無害化してから包む(実装計画 §7.1)。
 
-OpenAI Responses の compacted `output[]` window や Anthropic Messages の `compaction` block は、各 API が生成した不透明な provider context として別に往復させるが、3層表現と同時には送らない。conversation ごとに `sumi_three_layer` (既定) と `provider_native` を選び、前者は L2/L1/L0、後者は Responses なら `/responses/compact` が返した retained item を含む canonical `output[]` 全体、Anthropic なら native compaction block 1個と、その coverage より後の transcript suffix だけを送る。native context には「最後に含めた message seq」と provider instance/protocol/model/system/tools/beta の fingerprint を保存し、不一致・期限切れ・別 provider endpoint/account への切替時は破棄して3層表現へ戻す。Sumi の要約から暗号化されたネイティブ item/block/window を捏造しない。
+OpenAI Responses の compacted `output[]` window や Anthropic Messages の `compaction` block は、各 API が生成した不透明な provider context として別に往復させるが、3層表現と同時には送らない。conversation ごとに `sumi_three_layer` (既定) と `provider_native` を選び、前者は L2/L1/L0、後者は Responses なら `/responses/compact` が返した retained item を含む canonical `output[]` 全体、Anthropic なら native compaction block 1個と、その coverage より後の transcript suffix だけを送る。native context には「最後に含めた message seq」と provider instance/protocol/model/system/tools/beta の fingerprint を保存し、不一致・別 provider endpoint/account への切替時は破棄して3層表現へ戻す。Sumi の要約から暗号化されたネイティブ item/block/window を捏造しない。
 
 ## 動作仕様
 
@@ -58,7 +58,7 @@ Kimi/GLM 等の Chat Completions 互換系では**先頭からの連続プレフ
 
 このメモリは「API に乗せる人格と記憶」の話であり、**人間可視のチャットログ原文は opaque provider context を除いて別途 DB に暗号化永続化する**。認可済み復旧/UIは原文を使い、検索・通常exportは同時生成した redacted projection を使う。
 
-原文ログと provider context は同じ扱いにしない。区別の基準は機密性ではなく **wire 上の形式**とする(Founder 決定 2026-07-19: プロバイダが平文で返す reasoning は会話内容であり、表示・永続する)。transcript の暗号化 raw 正本にはユーザー発話、最終 assistant テキスト、**平文 reasoning(Chat 系 `reasoning_content`、Anthropic `thinking` 本文)**、ツールコール/結果を保存する。FTS・通常export・DBの平文projectionは API key、署名token、既知secretを不可逆redactionしたものに限定し、reasoning 本文にも同じ redaction を適用する(既定では検索用 `search_text` に reasoning を含めない — 検索ノイズとサイズの製品判断)。**opaque なもの** — Responses の暗号化 reasoning、Anthropic の `redacted_thinking` と thinking `signature`、native compaction item/block/window — だけを provider context として分離し、conversation/provider-context 単位のデータ鍵を agent 鍵で wrap する。opaque reasoning は対応 message が L0 から離脱(L1 へ昇格)した時点で対象データ鍵ごと破棄する(平文 reasoning は transcript の一部として通常の保持期間に従い、L0 離脱後も表示・復旧に使える)。**L0 在籍中の opaque reasoning は経過日数だけを理由に失効させない**(再送要件のため)— 30日を超えて L0 に残った分は期限 sweeper が対応バッチの強制 seal + Compact を予約し、昇格による L0 離脱と同一 transaction で破棄する(実装計画 §10.1)。native compaction は公開 transcript から再構成可能な派生物のため、置換・mode切替・fingerprint不一致または30日のうち最も早い時点で対象データ鍵ごと破棄する。いずれも暗号化 transcript と3層メモリを復旧元として残す。
+原文ログと provider context は同じ扱いにしない。区別の基準は機密性ではなく **wire 上の形式**とする(Founder 決定 2026-07-19: プロバイダが平文で返す reasoning は会話内容であり、表示・永続する)。transcript の暗号化 raw 正本にはユーザー発話、最終 assistant テキスト、**平文 reasoning(Chat 系 `reasoning_content`、Anthropic `thinking` 本文)**、ツールコール/結果を保存する。FTS・通常export・DBの平文projectionは API key、署名token、既知secretを不可逆redactionしたものに限定し、reasoning 本文にも同じ redaction を適用する(既定では検索用 `search_text` に reasoning を含めない — 検索ノイズとサイズの製品判断)。**opaque なもの** — Responses の暗号化 reasoning、Anthropic の `redacted_thinking` と thinking `signature`、native compaction item/block/window — だけを provider context として分離し、conversation/provider-context 単位のデータ鍵を agent 鍵で wrap する。opaque reasoning は対応 message が容量管理により L0 から離脱(L1 へ昇格)した時点で対象データ鍵ごと破棄する(平文 reasoning は transcript の一部として通常の保持期間に従い、L0 離脱後も表示・復旧に使える)。**L0 在籍中は再送要件を優先し、経過日数だけを理由に失効・強制昇格させない**(Founder 決定 2026-07-19)。native compaction は置換・mode切替・fingerprint不一致のうち最も早い時点で対象データ鍵ごと破棄する。いずれも暗号化 transcript と3層メモリを復旧元として残す。
 
 Cloud 版のデータ管理方針はリリースゲートとする:
 
@@ -74,4 +74,4 @@ Cloud 版のデータ管理方針はリリースゲートとする:
 - **圧縮率の制御**: 参考にした Mastra Code では大きめのバッチが ~50 倍に圧縮される観察があり、圧縮されすぎが懸念。Compact プロンプトで目標圧縮率を明示的に指定するか。なお目標圧縮率 (1/8〜1/15) と上限 (~800 トークン、実装計画 §7.4) はバッチ粒度と結合しており、粒度を 10k へ広げると上限側が先に効いて実質 1/12 固定になる — 上のバッチ粒度の未決と同時に決める
 - **Compact の入力**: バッチ単体ではなく、前後の文脈や L1 の既存内容を読み取り専用で添えて要約品質を上げる案(実装計画 §7.4 が `<recent-memory>` 添付として暫定回答済み。実測評価が残り)
 - 各層のサイズ (10k/15k/40k) の実測調整
-- thinking 系モデルの reasoning を L0 のサイズ計算へどう加算するか(平文 reasoning は PublicMessage の一部として直接計上、opaque provider context は footprint として「含める」— 実装計画 §7.3 で暫定回答済み)。30日より長い L0 滞在は「滞在自体は許すが、sweeper が30日超のバッチを強制 seal + Compact で昇格させ、離脱と同一 transaction で opaque reasoning を破棄する」で暫定回答済み(実装計画 §10.1)
+- thinking 系モデルの reasoning を L0 のサイズ計算へどう加算するか(平文 reasoning は PublicMessage の一部として直接計上、opaque provider context は footprint として「含める」— 実装計画 §7.3 で暫定回答済み)。L0 の滞在期間には時間上限を設けず、容量条件に達するまで生の文脈と再送に必要な provider context を一体で保持する
