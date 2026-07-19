@@ -35,6 +35,12 @@ impl StdioGateway {
     }
 }
 
+impl Default for StdioGateway {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl Gateway for StdioGateway {
     async fn next_command(&mut self) -> Result<Command> {
