@@ -2094,15 +2094,15 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 
 ## 13. マイルストーンと検証ゲート
 
-締切 2026-08-01。今日 7/17 から実働 ~14日。**各 M の終わりに「動くもの+検証ゲート」**。順序は指定案(M1 最小ループ → M2 ステア+永続化 → M3 3層メモリ → M4 ワークスペースツール → M5 権限承認)を一部入れ替える: **ツール(旧M4)を M2 に前倒し**する。理由: (a) デモの最優先要素「ストリーミング+ツール実行+ステア」を最速で成立させる、(b) ステアの検証には「実行に時間のかかるツール」が必要(bash sleep が最良のテストベンチ)、(c) 3層メモリの検証には長い会話が必要でツールがあると会話を伸ばしやすい。
+締切 2026-08-01。実装開始 7/19 から実働 ~13.5日(2026-07-19 改訂: 当初の 7/17 起点計画を、設計文書 PR #6 の長期化により2日後ろ倒し。各 M の期間は変えず期日のみ順延、独立した予備日は消滅 — 以降の遅延は §14.3 のとおりスコープを黙って削らず Founder へ即エスカレーション)。**各 M の終わりに「動くもの+検証ゲート」**。順序は指定案(M1 最小ループ → M2 ステア+永続化 → M3 3層メモリ → M4 ワークスペースツール → M5 権限承認)を一部入れ替える: **ツール(旧M4)を M2 に前倒し**する。理由: (a) デモの最優先要素「ストリーミング+ツール実行+ステア」を最速で成立させる、(b) ステアの検証には「実行に時間のかかるツール」が必要(bash sleep が最良のテストベンチ)、(c) 3層メモリの検証には長い会話が必要でツールがあると会話を伸ばしやすい。
 
-### M0: 足場(0.5日、〜7/18午前)
+### M0: 足場(0.5日、〜7/19)
 
 - 現行 `main` に `apps/agent` は無いため、別ブランチの Rust scaffold を先に取り込むか、このマイルストーンで `Cargo.toml` / `package.json` / turbo 接続を作成する。存在しない scaffold を前提に後続タスクへ進まない
 - `config.rs`(設定構造+環境変数のみ。**モデルプリセットの実値は M1 のリクエスト組立と同時に入れる** — M0 では構造体と TOML 読込だけ)、モジュールツリーの空実装、`gateway/stdio.rs`、tracing 初期化(JSON ログ + `SUMI_LOG` フィルタ)
 - **ゲート**: `echo '{"seq":1,"command_id":"018f0000-0000-7000-8000-000000000001","command":{"type":"user_message","text":"hi","attachments":[]}}' | cargo run --manifest-path apps/agent/Cargo.toml` がエコー応答イベントと command ACK を返す。`cargo clippy --manifest-path apps/agent/Cargo.toml -- -D warnings` / `cargo fmt --manifest-path apps/agent/Cargo.toml --check` と `pnpm turbo run lint --filter=@sumi/agent` が通る(package 名は既存の `@sumi/*` 慣例に合わせ、turbo filter と一致させる)
 
-### M1: 共通 provider core + Chat Completions(3日、〜7/21)
+### M1: 共通 provider core + Chat Completions(3日、〜7/22)
 
 - `provider/` の共通 core と `adapters/chat_completions.rs`: 第4章+移植リスト #1〜17。types → transport → assembler → adapter → retry/overflow の順
 - テスト: (a) **SSE フィクスチャ再生**: 実 API のストリームを `curl` で採取したファイル(Kimi text / Kimi tool call / Kimi reasoning / GLM tool_stream / エラー各種)を axum モックサーバで再生し、イベント列と最終メッセージをスナップショットアサート。(b) partial_json の pi テスト移植。(c) `SUMI_LIVE_TEST=1` でのライブ疎通(Umans/Kimi/GLM 三択)
@@ -2127,7 +2127,7 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
   5. `cache_creation_input_tokens > 0` の usage fixture で `input + cache_read + cache_write` が prompt 全体と一致し、サイレント溢れ判定・校正 EMA・キャッシュヒット率の三経路が cache_write を落とさない
 - 共通ゲート: provider instance/protocol/model 切替時は opaque provider contextもraw thinkingも送らず、公開 transcript と L1/L2 だけで会話を継続する。切替前thinkingの既知markerが切替後request bodyのtext/memory/reasoning全fieldに現れないことをfixtureで確認する。同じ model slug/protocol を持つ別 base URL/account の fixture でも再利用しない。未知 event fixture を入れて silent corruption ではなく明示 Error/ignore policy になる
 
-### M2: ループ+ツール+ステア(3日、〜7/24)
+### M2: ループ+ツール+ステア(3日、〜7/25)
 
 - **先にdurability foundationを完成**する: `store/`の最小migration(`agent_scope`、`messages`、`agent_events`、`inbound_commands`、`tool_executions`、`approval_log`) + 単一EventWriter + `CommandReceived/Classified/RunPhase/MessageEnd/ToolExecutionMutation/ApprovalMutation/CommandApplied`投影 + 起動時suffix復旧を実装する。hard steer手順0、abort、承認待ち、tool実行開始はこのfoundationのcommitを通るまで有効化しない。M2では本物のpolicy/reviewer/UIはまだ作らず、fixture専用のPending action driverで`ApprovalRequested + approval_log.pending`と解決/復旧transactionだけを先に検証する。M5のApprovalBrokerはこの正本へ接続し、M3も別実装へ置換せず機能を追加する
 - その上で`agent/`(run.rs, Session, queue)+ `tools/`(fs, bash, executor, truncate, shell_capture)+ ハードステア(steer.rs)。移植リスト #18-23, 25-26 + 第6章
@@ -2142,7 +2142,7 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
   7. strict parse失敗、repairだけならobject化できる入力、schema不一致、`finish_reason=length`をprotocol別fixtureで流し、previewは表示されても承認/ToolExecutionStart/executor RPCが0件で、`is_error` tool resultだけが確定する
   8. executor RPC境界でbashに`0600` file/`0700` dirを作らせ、後続read/edit/deleteが同じexecutor UIDで成功する。`put_attachment`/`append_tool_output`はumaskを`0077`/`0000`へ変えてもfile `0600`/dir `0700`を確定し、runtime側コードがworkspace pathを直接openしないことをmock mount/RPCテストで確認する
 
-### M3: 永続化(2日、〜7/26)
+### M3: 永続化(2日、〜7/27)
 
 - M2のdurability foundationを拡張し、`store/`の残り(`provider_context`、memory job/state、approval、FTS、暗号化/redaction、DeliveryPump) + 全phaseの再起動復元を完成する。リトライの「state から除去・ログに保持」もここで完成する。EventWriterを別実装へ差し替えず、M2で凍結したtransaction契約にprojectionを追加する
 - **ゲート**:
@@ -2155,7 +2155,7 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
   7. `append_to_l0=false` の retry error を通常 message 間へ挟み、再起動後も `memory_batch_messages` の membership が完全一致する
 - **チーム同期ポイント**: `contracts/agent-events.yaml` を正典として Envelope/AgentEvent と CommandEnvelope/CommandAck の wire 形をこの時点で凍結し、Rust/Go/TS の型生成と fixture round-trip CI を開始する
 
-### M4: 3層メモリ(3日、〜7/29)
+### M4: 3層メモリ(3日、〜7/30)
 
 - `memory/` 全体(第7章)。batch → estimate → compactor → overflow → ContextAssembler の順
 - テストデータ: 実会話を伸ばすのは非効率なので、**過去メッセージを合成生成する長会話シミュレータ**(スクリプトで 200k トークン相当を投入)を用意
@@ -2171,7 +2171,7 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
   9. Compact input型テストで、L0の各PublicMessageにChat/Responses/Anthropicの全provider-context variantを紐付けてもHTTP bodyにraw thinking/signature/encrypted reasoning/native itemが1byteも現れない。同一provider・別Compact providerの両fixtureで確認し、`PromptContext`/`ProviderContextItem`から`CompactionInput`を構築するコードがcompile-failになる。`from_decrypted_summaries` 経由の compact_l1/consolidate_l2 fixture でも HTTP body に provider context の byte 列が現れず、L2 へ昇格した要約が redacted projection 由来でない(unredacted 正本由来である)ことを確認する
   10. Compact resultへ既知secretを埋め、`memory_batches.summary_ciphertext`/`memory_jobs.result_ciphertext`の認可済み復号だけが原文を返し、`summary_projection`/`result_projection`/DB dump/log/exportはredacted、各`redaction_version`が必須になることを確認する。job completion transaction各境界のkill/restart、conversation鍵破棄、backup tombstone再適用後に要約を復号・再露出できないことも検証する
 
-### M5: 権限承認+WS ゲートウェイ(2日、〜7/31)
+### M5: 権限承認+WS ゲートウェイ(2日、〜8/1)
 
 - `approval/`(CanonicalAction、secret-aware ReviewableAction、決定論的policy、Audit reviewer/prompt、ApprovalBroker)+ `gateway/ws.rs`/`gateway/supervisor.rs`(第11章)+ M3で凍結した contracts の互換性確認 + apiclient 雛形
 - **ゲート**:
@@ -2186,7 +2186,7 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
   9. 1MB 超または non-empty `attachments` の user_message は API が command の seq 採番前に拒否し、直後の正常 command が欠番なく agent へ届く。agent 側の oversized-envelope 保険経路では ACK せず接続を閉じ、運用アラートが上がる
   10. WSのreader EOF、writer send timeout、token expiry、API再起動を個別に発火し、ConnectionSupervisorが旧epochの両halfをjoin/dropしてからfresh credentialで再認証・helloする。片halfだけ旧epochに残らず、hello cursorからevent/commandを相互catch-upし、durable最新seq到達前のdeltaは捨て、完了後だけOnlineへ戻る
 
-### 予備日(8/1): デモシナリオのリハーサル、負荷時の挙動確認(Umans 4セッション制限の回避=デモは直APIキーで)、憲法プロンプトの調整
+### リハーサル(8/1、M5 完了後の同日中): デモシナリオのリハーサル、負荷時の挙動確認(Umans 4セッション制限の回避=デモは直APIキーで)、憲法プロンプトの調整。開始の後ろ倒しにより独立した予備日は消滅しており、これ以上の遅延バッファは存在しない
 
 依存関係: デモ critical path の M1→M2 durability foundation→M2 loop/tool/steer→M3 store拡張→M4→M5 は各節のデモ/core gateを対象に直列とする。**M2のhard steer/abort/tool副作用とM3のStore作業は並行不可**で、M2 foundationのEventWriter transaction契約を先に凍結する。M1P は M1 の共通型凍結後にM2〜M5と並行でき、**M5 の contracts ドラフトは M3 完了時点で先出し**する。M1P や下記 Cloud rollout gate が8/1へ間に合わなくても Chat Completions のデモは成立するが、3 protocol 対応または Cloud release をうたってはならない。
 
