@@ -2,7 +2,7 @@
 
 - Status: Draft v1
 - Date: 2026-07-17
-- 対象: `apps/agent`(Rust。現行 `main` には未導入で、別ブランチのスキャフォールドを取り込むか M0 で作成する)
+- 対象: `apps/agent`(Rust。スキャフォールドは作業ブランチに作成済みで `main` へは未マージ)
 - 前提資料:
   - [ADR 0002 エージェント基盤の言語と実装方針](../adr/0002-agent-stack.md)
   - [3層メモリ設計](memory.md)
@@ -105,6 +105,7 @@ reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], defau
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.1"                # 設定ファイル読込 (2026-07 時点の安定版 1.1.3 を確認済み)
+dotenvy = "0.15"            # SUMI_ENV_FILE で明示指定した env ファイルの読込 (ローカル開発用。暗黙の .env 自動探索はしない)
 libc = "0.2"                # Unix: low-trust local fallback の process-group signal (bash ツール、§8.3)
 schemars = "1"              # ツールパラメータの JSON Schema 導出 (TypeBox 相当。生成のみで検証はしない)
 jsonschema = "0.26"         # ツール引数の制約込み schema 検証 (§3.4・§4.3。版は実装時に最新安定へ更新)
@@ -642,6 +643,7 @@ pub struct TypedTool<P: JsonSchema + DeserializeOwned> { /* name, desc, f */ }
 | OpenAI互換 Chat Completions / Moonshot (Kimi) | `https://api.moonshot.ai/v1` | `kimi-k3` (1M ctx / out 既定131k・物理上限1,048,576), `kimi-k2.7-code` (256k) | 自動プレフィックスキャッシュ(明示API不要)。reasoning は Preserved Thinking 常時ON |
 | OpenAI互換 Chat Completions / Z.ai (GLM) | `https://api.z.ai/api/paas/v4` | `glm-5.2` (1M ctx / 128k out) | `tool_stream: true` でツールコールもストリーミング。定額プランはバックエンド利用禁止→従量API必須 |
 | OpenAI互換 Chat Completions / Umans | `https://api.code.umans.ai/v1` | `umans-kimi-k2.7`, `umans-glm-5.2`, `umans-flash` | 開発時の保険。同時4セッション制限 |
+| OpenAI互換 Chat Completions / OpenCode Zen (Go) | `https://opencode.ai/zen/go/v1` | `kimi-k2.7-code` (256k ctx / out 既定32k) ほか | **検証用の当面の既定**(Founder 決定 2026-07-17: 契約済み枠の活用)。実体は各モデルへのゲートウェイであり、方言・Compat フラグは直結先の値を流用せず M1 のライブ fixture で個別に固定する **[推測]** |
 | OpenAI Responses | `https://api.openai.com/v1` | 設定で指定(GPT-5.6 系を主対象) | item/event ストリーム、function call、encrypted reasoning、`/responses/compact` の `compaction` item を扱う |
 | Anthropic Messages 互換 | provider ごとに設定 | 設定で指定 | `system` は messages 外、user/assistant turn、content block、tool_use/tool_result、named SSE event、compaction block を扱う |
 
@@ -2365,7 +2367,7 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 
 ### M0: 足場
 
-- 現行 `main` に `apps/agent` は無いため、別ブランチの Rust scaffold を先に取り込むか、このマイルストーンで `Cargo.toml` / `package.json` / turbo 接続を作成する。存在しない scaffold を前提に後続タスクへ進まない
+- Rust scaffold(`Cargo.toml` / `package.json` / turbo 接続)は作業ブランチに作成済み(`main` へは未マージ)。後続タスクは scaffold を取り込んだ状態から始め、存在しない scaffold を前提に進まない
 - `config.rs`(設定構造+環境変数のみ。**モデルプリセットの実値は M1 のリクエスト組立と同時に入れる** — M0 では構造体と TOML 読込だけ)、モジュールツリーの空実装、`gateway/stdio.rs`、tracing 初期化(JSON ログ + `SUMI_LOG` フィルタ)
 - **ゲート**: `echo '{"seq":1,"command_id":"018f0000-0000-7000-8000-000000000001","command":{"type":"user_message","text":"hi","attachments":[]}}' | cargo run --manifest-path apps/agent/Cargo.toml` がエコー応答イベントと command ACK を返す。`cargo clippy --manifest-path apps/agent/Cargo.toml -- -D warnings` / `cargo fmt --manifest-path apps/agent/Cargo.toml --check` と `pnpm turbo run lint --filter=@sumi/agent` が通る(package 名は既存の `@sumi/*` 慣例に合わせ、turbo filter と一致させる)
 
