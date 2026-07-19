@@ -75,6 +75,7 @@ sumi-studio/
 
 - **契約は `contracts/` が単一の源泉**: `packages/api-client` (TS)、Go 側 (oapi-codegen 等)、agent の Rust クライアントはいずれも `contracts/openapi.yaml` を正典とする。Rust は初期のみ薄い手書き実装を許すが、契約から逸脱させない。
 - **agent はドメイン DB を直接触らない**: ドメイン操作 (ToDo・リマインダー等) は `contracts/openapi.yaml` 由来の Rust クライアント経由で `apps/api` を叩く。API が小さい初期段階は薄い reqwest 実装とし、生成導入後も契約を単一の源泉に保つ。権限モデルの強制点を API 層の1箇所に保つため。一方、agent 自身の状態 — 3層メモリ、hidden reasoning を除く暗号化チャット原文と redacted 検索投影、恒久イベントログ、承認ルール — は agent ローカルの SQLite とワークスペースに永続化する (詳細は [docs/agent/](docs/agent/))。ドメインデータの複製はそこに持たない。
+- **エージェントのツール定義はリリース単位で凍結**: agent の Tool Definitions の変更は LLM プロバイダ側プレフィックスキャッシュの全壊(コスト・レイテンシの悪化)と同義のため、ツールの追加・変更は随時行わず、リリース単位でまとめて反映する。詳細は[エージェント実装計画](docs/agent/implementation-plan.md)の第8章を参照。
 - **Swift の隔離**: アプリ本体に Swift は存在しない。OS 統合 (widget extension、APNs グルー) のみ `apps/web/src-tauri/gen/apple` 配下に許可する。
 
 ## 開発環境セットアップ

@@ -455,7 +455,7 @@ opaque reasoning/compaction item は delta ごとに公開イベントへ流さ�
 ```rust
 pub struct ProviderEventStream {
     rx: tokio::sync::mpsc::Receiver<ProviderEvent>,
-    terminal_emitted: bool, // Done/Error を一度でも返したら true
+    terminal_emitted: bool, // Done/Error を一度でも返したら true。以後 next() は fuse (下記)
 }
 // 最終結果は Done/Error イベント自体が運ぶ (pi の result() Promise は不要:
 // Rust では for-await ループの終端で最後のイベントから取り出す)
@@ -463,7 +463,7 @@ pub struct ProviderEventStream {
 
 契約(pi と同一 **[事実]** `pi:ai/src/types.ts:301-313`): **stream 関数は決して panic/Err を返さない**。リクエスト失敗・モデルエラー・実行時失敗はすべてストリーム内の `Error` イベント(stopReason Error/Aborted + error_message 付き AssistantMessage)として届く。この一点が呼び出し側の異常系を劇的に単純化する。
 
-**EOF の終端イベント化**: `next()` は `Done`/`Error` を返すたびに `terminal_emitted` を立てる。`rx.recv()` が `None`(adapter タスクの正常終了・cancel・panic 等で送信側 `Sender` が drop)を返した時点でまだ `terminal_emitted` が立っていなければ、**その1回に限り**終端 `Error` を合成して返し、`terminal_emitted` を立てる。合成時の分類は EOF を一律 `Aborted` にしない: この stream に紐づく `CancellationToken` の発火(または Session 起点の abort/hard steer)が確認できる場合だけ `stopReason=Aborted` とし、それ以外(adapter タスクの panic・実装ミス等)は `stopReason=Error, error_message="provider stream ended without a terminal event"` の**リトライ可能エラー**として合成する — `Aborted` は §4.4/§5 のリトライに乗らないため、意図しない sender drop を Aborted に分類するとユーザーの turn が無応答で閉じる。エラーメッセージは §4.4 のリトライパターン(`ended without`)に一致させる。既に `Done`/`Error` を返し終えた後の EOF はそのままストリーム終了として扱い、二重に終端イベントを作らない。これにより「stream は必ず正常形の終端イベントで閉じる」契約が adapter の実装ミスに関係なく保たれる。単体テストで (a) 正規の `Done`/`Error` 後に channel が閉じても追加イベントが出ないこと、(b) 終端イベントなしに channel が閉じると合成終端が1件だけ届き、cancel 発火済みなら `Aborted`・未発火なら retryable `Error` に分類されること、の両方を確認する。
+**EOF の終端イベント化**: `next()` は `Done`/`Error` を返すたびに `terminal_emitted` を立てる。`rx.recv()` が `None`(adapter タスクの正常終了・cancel・panic 等で送信側 `Sender` が drop)を返した時点でまだ `terminal_emitted` が立っていなければ、**その1回に限り**終端 `Error` を合成して返し、`terminal_emitted` を立てる。合成時の分類は EOF を一律 `Aborted` にしない: この stream に紐づく `CancellationToken` の発火(または Session 起点の abort/hard steer)が確認できる場合だけ `stopReason=Aborted` とし、それ以外(adapter タスクの panic・実装ミス等)は `stopReason=Error, error_message="provider stream ended without a terminal event"` の**リトライ可能エラー**として合成する — `Aborted` は §4.4/§5 のリトライに乗らないため、意図しない sender drop を Aborted に分類するとユーザーの turn が無応答で閉じる。エラーメッセージは §4.4 のリトライパターン(`ended without`)に一致させる。既に `Done`/`Error` を返し終えた後の EOF はそのままストリーム終了として扱い、二重に終端イベントを作らない。**terminal 後の fuse**: `terminal_emitted` は EOF 合成の抑止だけでは足りない — adapter の実装ミスで `Done` の後に delta や二回目の終端が channel に積まれると、そのまま呼び出し側へ素通りする。`terminal_emitted` が立った後の `next()` は channel に残ったイベントを呼び出し側へ返さず、warn ログとともに読み捨てて `None` だけを返す(受信側の契約として fuse する)。これにより「stream は必ず正常形の終端イベントでちょうど一度閉じる」契約が adapter の実装ミスに関係なく保たれる。単体テストで (a) 正規の `Done`/`Error` 後に channel が閉じても追加イベントが出ないこと、(b) 終端イベントなしに channel が閉じると合成終端が1件だけ届き、cancel 発火済みなら `Aborted`・未発火なら retryable `Error` に分類されること、(c) 正規の終端後に adapter が delta や二回目の終端を送っても呼び出し側へ届かないこと、の3点を確認する。
 
 ### 3.3 エージェントイベント
 
@@ -479,13 +479,13 @@ pub enum AgentEvent {
     AgentEnd,
     TurnStart,
     TurnEnd { message: Box<PublicMessage>, tool_results: Vec<ToolResultMessage> },
-    MessageStart { message: Box<PublicMessage> },
+    MessageStart { message_id: String, message: Box<PublicMessage> },
     /// assistantストリーミング中のみ。公開可能な Text/ToolCall と、
     /// provider が display-safe と明示した reasoning summary だけを包む。
     /// ストリーム終端の Done/Error は包まない — 終端の解釈と MessageEnd の
     /// 発行は常に Session が担う (§6.3.1 のイベント遷移表)
-    MessageUpdate { event: PublicStreamEvent },
-    MessageEnd { message: Box<PublicMessage> },
+    MessageUpdate { message_id: String, event: PublicStreamEvent },
+    MessageEnd { message_id: String, message: Box<PublicMessage> },
     ToolExecutionStart { tool_call_id: String, tool_name: String, args: serde_json::Value },
     ToolExecutionUpdate { tool_call_id: String, partial: serde_json::Value },
     ToolExecutionEnd { tool_call_id: String, result: serde_json::Value, is_error: bool },
@@ -522,7 +522,9 @@ pub enum PublicStreamEvent {
 
 raw `ProviderEvent::Thinking*` は MessageAssembler と暗号化 provider context の runtime 内経路だけで消費し、`AgentEvent` へ変換しない。`AgentEvent::MessageUpdate` は `PublicStreamEvent` だけを受け、raw hidden reasoning / encrypted content / native compaction item を型レベルで表現不能にする。provider が display-safe と明示した reasoning summary だけを `ProviderEvent::ReasoningSummary*` → `PublicStreamEvent::ReasoningSummary*` として変換する(発生源は adapter — §3.2)。summary は揮発 delta 専用の表示であり、`PublicAssistantMessage.content` には含めず永続化しない。これにより揮発 delta からも chain-of-thought が外部へ出ない。
 
-`PublicStreamEvent.content_index` は provider の runtime content 配列(公開しない Thinking block を含む)上の **opaque な相関キー**であり、0始まりの連続した公開配列添字ではない。したがって UI は先行する index 0 を受け取らず `TextStart { content_index: 1 }` から始まる場合を許容し、index の詰め直しや `PublicAssistantMessage.content` への位置対応を推測しない。相関キーは **(イベント族, content_index) の組**である — `ReasoningSummary*` の content_index は公開 Text/ToolCall とは独立した summary slot の連番(§3.2)なので、同じ数値でも別ブロックであり、単一の index 空間として混同してはならない。恒久な `MessageEnd` を受けた時点で、streaming 中の仮表示を Thinking 除外後の `PublicAssistantMessage.content` 全体で置換する。
+`PublicStreamEvent.content_index` は provider の runtime content 配列(公開しない Thinking block を含む)上の **opaque な相関キー**であり、0始まりの連続した公開配列添字ではない。したがって UI は先行する index 0 を受け取らず `TextStart { content_index: 1 }` から始まる場合を許容し、index の詰め直しや `PublicAssistantMessage.content` への位置対応を推測しない。相関キーは **(イベント族, content_index) の組**である — `ReasoningSummary*` の content_index は公開 Text/ToolCall とは独立した summary slot の連番(§3.2)なので、同じ数値でも別ブロックであり、単一の index 空間として混同してはならない。同じ `message_id` の恒久な `MessageEnd` を受けた時点で、streaming 中の仮表示を Thinking 除外後の `PublicAssistantMessage.content` 全体で置換する。
+
+`MessageStart/Update/End` は durable な `messages.id`(§10.2)を `message_id` として必ず運ぶ。user メッセージの `message_id` は起点 `command_id` からの決定論的導出(UUIDv5、§10.2)であり、その namespace 定数を contracts に明記して、API/web が command 受理時点で同じ ID を先行計算できるようにする。楽観表示したユーザーメッセージと永続イベントの照合、同文連投の区別、再接続 replay の重複排除はすべてこの ID で行い、表示順や本文一致に依存しない。`MessageUpdate` の delta も `message_id` で相関するため、「streaming 中のメッセージは常に1件だけ」という暗黙の順序仮定に依存しない。
 
 イベント順序の契約(pi と同一 **[事実]** `pi:agent/src/agent-loop.ts:109-274` 実読より):
 
@@ -1140,7 +1142,7 @@ transform は**送信用のビューを作る純関数**であり、L0 の保存
 
 40k/80k は層の**総量**の制御であり、厳密な不変条件ではない。ただし1メッセージはバッチ分割できない最小単位のため、単一の巨大メッセージには別のガードが要る(無制限だと L0 のバッチ・溢れ設計自体が壊れる):
 
-- **ユーザー入力(二段構え)**: (a) **wire 上限 1MB**: API がユーザー入力を command 化する前(§11.1.1 の `seq`/`command_id` 採番より前)にサイズを検証し、超過分は agent へ送らずクライアントへ直接エラーを返す。agent は通常経路では 1MB 超の `user_message` を受け取らない。agent の Gateway 層でも同じ上限を保険として検証するが、この上限に一度でも到達した envelope は「seq を消費してしまうと以後の command が塞がる」ため、`Received` ACK を返さずプロトコル違反として接続を切断する(§11.1.1 の seq 欠番時の扱いと同型)。同じ oversized command が再送され続ける場合は API 側の一次検証が抜けているバグであり、agent 側のリトライでは解決できないため運用アラートで検知する。(b) **L0 投入上限 50KB**(ツール結果と同じ値): 超過入力は `messages.raw_ciphertext` に**原文全文**を保存した上で、runtimeがexecutorの`put_attachment` RPCへ全文を渡して `/workspace/.attachments/<conversation_id>/` へ退避し、L0 へは先頭 50KB+「[全文 xxxKB: /workspace/.attachments/<conversation_id>/user-<message_id>.txt]」の注記付き切詰めビューとして投入する。SQLite の `MessageEnd` commit と executor 側 artifact write は永続化境界が別なので、順序と冪等性を契約にする: ファイル名は `message_id` から決定論的に導出し、`put_attachment` は全置換 write + fsync の冪等 RPC とする。書込みは **`MessageEnd` commit の後**でよい — 原文の正典は `messages.raw_ciphertext` であり、executor 障害が user メッセージの永続化を塞いではならない(commit を executor 可用性に結合すると、executor 停止中は 50KB 超入力の会話全体が詰まる)。ただし **assistant 再開前**に完了を検証し、欠落していれば crash 復旧と ContextAssembler が `messages.raw_ciphertext` の原文から同じ RPC で再生成する — L0 が存在しない全文パスを参照したまま走らせない。先行して書かれた孤児ファイルは無害で、再送時に同一パスへ上書きされる。runtimeはworkspaceを直接openせず、エージェントが続きを必要とする場合もread_file/grep executor RPCを使う(戦略的忘却と同じ思想)。このディレクトリはユーザー作成ファイルと区別する conversation-owned artifact で、reset 時に旧 conversation ID のディレクトリをsupervisor/専用削除RPCが冪等削除する。切詰めは投入時の純関数とし、再起動時の raw transcript→L0 復元でも同じ関数を通す(保存形は常に原文 — §7.7 の「ログと記憶の分離」と同型)。この切詰めビューは `messages.raw_ciphertext`(全文正本。復旧・export・redaction 前の唯一の原文)にも `messages.payload`(同じ `PublicMessage` の redacted projection。secret 置換のみで切詰めはしない、§10.1)にも対応する列を持たない**別モデル**であり、ContextAssembler(§7.7)が `raw_ciphertext` を復号するたびに算出する runtime-only の値として扱う。DB に切詰め済みテキストを永続化しない**[推測、上限値は実測調整]**
+- **ユーザー入力(二段構え)**: (a) **wire 上限 1MB**: API がユーザー入力を command 化する前(§11.1.1 の `seq`/`command_id` 採番より前)にサイズを検証し、超過分は agent へ送らずクライアントへ直接エラーを返す。agent は通常経路では 1MB 超の `user_message` を受け取らない。agent の Gateway 層でも同じ上限を保険として検証する。超過 envelope でも外形(`seq`/`command_id`)が読めるなら、接続切断ではなく §11.1.1 手順2の terminal 拒否に載せる — seq を消費して `Rejected` ACK を返し、`inbound_commands` へは本文 ciphertext を保存せず外形・実測サイズ・reject 理由だけを記録する。切断で応じると、API 側の一次検証が一度でも漏れた envelope が永久再送される poison pill になり、そのseqで後続 command 全体が止まる。read framing には transport 上限(既定 4MiB **[推測、実測調整]**)を別に置き、それすら超えて外形を安全に読めないフレームだけをプロトコル違反として切断する。oversized の `Rejected` 発生は API 一次検証のバグを意味するため運用アラートで検知する。(b) **L0 投入上限 50KB**(ツール結果と同じ値): 超過入力は `messages.raw_ciphertext` に**原文全文**を保存した上で、runtimeがexecutorの`put_attachment` RPCへ全文を渡して `/workspace/.attachments/<conversation_id>/` へ退避し、L0 へは先頭 50KB+「[全文 xxxKB: /workspace/.attachments/<conversation_id>/user-<message_id>.txt]」の注記付き切詰めビューとして投入する。SQLite の `MessageEnd` commit と executor 側 artifact write は永続化境界が別なので、順序と冪等性を契約にする: ファイル名は `message_id` から決定論的に導出し、`put_attachment` は全置換 write + fsync の冪等 RPC とする。書込みは **`MessageEnd` commit の後**でよい — 原文の正典は `messages.raw_ciphertext` であり、executor 障害が user メッセージの永続化を塞いではならない(commit を executor 可用性に結合すると、executor 停止中は 50KB 超入力の会話全体が詰まる)。ただし **assistant 再開前**に完了を検証し、欠落していれば crash 復旧と ContextAssembler が `messages.raw_ciphertext` の原文から同じ RPC で再生成する — L0 が存在しない全文パスを参照したまま走らせない。先行して書かれた孤児ファイルは無害で、再送時に同一パスへ上書きされる。runtimeはworkspaceを直接openせず、エージェントが続きを必要とする場合もread_file/grep executor RPCを使う(戦略的忘却と同じ思想)。このディレクトリはユーザー作成ファイルと区別する conversation-owned artifact で、reset 時に旧 conversation ID のディレクトリをsupervisor/専用削除RPCが冪等削除する。切詰めは投入時の純関数とし、再起動時の raw transcript→L0 復元でも同じ関数を通す(保存形は常に原文 — §7.7 の「ログと記憶の分離」と同型)。この切詰めビューは `messages.raw_ciphertext`(全文正本。復旧・export・redaction 前の唯一の原文)にも `messages.payload`(同じ `PublicMessage` の redacted projection。secret 置換のみで切詰めはしない、§10.1)にも対応する列を持たない**別モデル**であり、ContextAssembler(§7.7)が `raw_ciphertext` を復号するたびに算出する runtime-only の値として扱う。DB に切詰め済みテキストを永続化しない**[推測、上限値は実測調整]**
 - **assistant 出力**: リクエストの max_tokens に**モデル上限ではなく既定 16k トークン**(設定可)を指定する。`ModelSpec.max_tokens`(128k 等)は物理上限であり通常リクエストには使わない。超過は StopReason::Length として顕在化し、既存の経路で処理される(ツールコールは一括失敗 #19、テキストは打ち切りのまま保持)
 - **ツール結果**: 既存の 2000行/50KB 切詰め+全文退避(§8.2)と grep 行長 500 字(§8.1)がこのガードを兼ねており、単一ツール結果が L0 に 50KB を超えて入る経路はない。追加の仕組みは不要
 - 50KB は日本語で ~10k トークン強に相当し得るため、L0 投入時の実サイズは est(§7.5)で計上し、溢れ処理が通常どおり吸収する
@@ -1168,7 +1170,7 @@ Docker sidecar は container spec で環境を `PATH` / `HOME` / `LANG` / execut
 
 `read_file` / `write_file` / `edit_file` / `list_dir` / `glob` / `grep` は workspace dirfd を起点に、すべての path component を `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)` 相当で open する。canonicalize は診断表示にだけ使い、canonicalize 後に path を再 open する TOCTOU 実装は禁止する。新規作成、rename、temporary file、glob/grep の走査にも同じ dirfd policy を適用する。Linux 以外の OSS ローカル版では同等境界を実装できない限り bash を明示的な低信頼モードとして扱う。**[推測→セキュリティ契約として確定]**
 
-ドメイン操作ツール(ToDo 作成等、apiclient 経由)は contracts が太ってから追加(M5 以降)。ツール追加=キャッシュ全壊なので、**リリース単位でまとめて凍結**する運用を README に明記する。
+ドメイン操作ツール(ToDo 作成等、apiclient 経由)は contracts が太ってから追加(M5 以降)。ツール追加=キャッシュ全壊なので、**リリース単位でまとめて凍結**する運用とする(README「アーキテクチャ上の原則」に明記済み)。
 
 ### 8.2 出力切詰め(`truncate.rs`)— pi 忠実移植
 
@@ -1187,7 +1189,7 @@ Docker sidecar は container spec で環境を `PATH` / `HOME` / `LANG` / execut
 - stdout/stderr を**単一ストリームに合流**(時系列維持)
 - **ローリングバッファ**: 上限 100KB(50KB×2)。超えたら先頭チャンクから捨てる → 最後に `truncate_tail` で 50KB/2000行に整える(=「メモリを無限に食わずに末尾を保持」)。注意: pi の「100KB」は JS の `text.length`(UTF-16 コード単位)基準 **[事実]** であり、Rust では**バイト基準の仕様移植**とする(忠実移植ではない)。多バイト文字を含む出力での全文退避テストを必須とする
 - **全文退避**: 出力が 50KB を超えた最初の時点で、executorの`append_tool_output`処理がまず **rolling buffer に保持済みの出力先頭からの全 prefix を一度だけ** `/workspace/.tool-output/<conversation_id>/bash-*.log` へ flush し、以後の chunk を順次追記する(閾値以後の chunk だけを append すると全文パスの実体が「後半だけ」になり先頭 50KB が欠落する。閾値 50KB < buffer 上限 100KB なので flush 時点で prefix は必ず buffer に完存する)。ツール結果に**全文パス**を含める。「prefix flush → 逐次 append」で全文ログが必ず出力先頭から始まることは、多バイト文字境界のケースと合わせてテストで固定する。runtimeはpathを直接openせず、必要ならread_file/grep RPCで続きを読む(戦略的忘却と同じ思想)。artifact RPCは親dirを明示`0700`、fileを明示`0600`へ`fchmod`し、umaskに依存しない。ユーザー作成ファイルと区別し、conversation reset/backup 復元時は旧 ID のディレクトリを tombstone に従ってsupervisor/専用削除RPCが冪等削除する
-- **出力 quota**: rolling buffer とは別に、spawn 直後から stdout+stderr の総バイト数を数える。1 command 10MiB、`/workspace/.tool-output` 合計100MiBを既定上限とし、どちらかへ達したら capture だけを黙って捨てず、§8.3 の execution boundary 全体を停止して `ResourceLimit(OutputBytes)` を返す。partial log は fsync/close し、結果に実測バイト数と limit を含める。上限は tenant policy で引き下げ可
+- **出力 quota**: rolling buffer とは別に、spawn 直後から stdout+stderr の総バイト数を数える。1 command 10MiB を既定上限とし、達したら capture だけを黙って捨てず、execution boundary 全体を停止して `ResourceLimit(OutputBytes)` を返す。partial log は fsync/close し、結果に実測バイト数と limit を含める。`/workspace/.tool-output` 合計は既定 100MiB を**GC 高水位**とする — 長命 conversation では通常利用だけで到達するため、恒久停止条件にしない。flush/append で高水位を超える時点で executor がまず GC を行い、実行中 execution に属さない閉じたログを古い順に低水位(既定 80MiB)まで削除してから書込みを続ける。GC 後もなお超える場合(実行中 command 群だけで上限を食い潰す異常)だけ `ResourceLimit(OutputBytes)` で停止する。全文ログは正典ではない best-effort な作業ファイルであり(transcript の正本は切詰めビューと注記、§8.2)、GC で消えたパスへの `read_file` は通常の not-found ツールエラーとして返り、エージェントは必要なら command を再実行して取り直す(戦略的忘却と同じ思想)。GC 発生は metrics に載せ、頻発は quota 見直しのシグナルとする。上限は tenant policy で引き下げ可
 - **バイナリサニタイズ**: 制御文字(TAB/LF/CR以外)除去、`\r` 除去(:sanitizeBinaryOutput)。Rust では `from_utf8_lossy` + 同フィルタ
 - 中断(execution boundary の実装仕様、Linux 前提):
   1. Cloud の Docker/microVM は command ごとに supervisor 所有の child cgroup と PID namespace（または同等に全 descendant を列挙不能でも一括停止できる sandbox）を作る。cgroup delegation が使えない構成では command 専用 executor sandbox 自体を使い捨てにする
@@ -1196,7 +1198,7 @@ Docker sidecar は container spec で環境を `PATH` / `HOME` / `LANG` / execut
   4. 非 Linux は Cloud のビルド対象外。ローカル fallback は `child.kill()` を最終手段とし、起動ログとテスト結果に low-trust を残す
   5. `cancelled: true` または種別付き `ResourceLimit` と、それまでの bounded output を返す(結果は捨てない)
 - 実行シェル: `bash -c`、作業ディレクトリは `/workspace`、環境変数は `env_clear` 後の最小許可リスト(PATH, HOME, LANG)
-- resource limit の既定は workspace disk 2GiB/inode 200,000、PID 64、CPU bandwidth 1 core、command CPU-time 120秒、memory 512MiB、wall runtime 120秒、command output 10MiB、tool-output 合計100MiB。Docker は cgroup v2 + project quota/上限付き volume、microVM は vCPU/memory 割当 + guest cgroup/filesystem quota で強制する。`cpu.max` は throttle 用であり、それ自体を超過killとみなさない。`cpu.stat` のcommand差分、wall timer、output counter は watchdog が execution boundary の一括停止を要求する。PID/disk/inode は controller/filesystem の拒否 (`pids.events`, `EAGAIN`, `EDQUOT`, `ENOSPC`)、memory は `memory.events` を検出し、execution cgroup/sandbox が残れば全停止してから wait/reap、種別付き `ResourceLimit` result で閉じる
+- resource limit の既定は workspace disk 2GiB/inode 200,000、PID 64、CPU bandwidth 1 core、command CPU-time 120秒、memory 512MiB、wall runtime 120秒、command output 10MiB、tool-output 合計100MiB(GC 高水位 — 上記「出力 quota」)。Docker は cgroup v2 + project quota/上限付き volume、microVM は vCPU/memory 割当 + guest cgroup/filesystem quota で強制する。`cpu.max` は throttle 用であり、それ自体を超過killとみなさない。`cpu.stat` のcommand差分、wall timer、output counter は watchdog が execution boundary の一括停止を要求する。PID/disk/inode は controller/filesystem の拒否 (`pids.events`, `EAGAIN`, `EDQUOT`, `ENOSPC`)、memory は `memory.events` を検出し、execution cgroup/sandbox が残れば全停止してから wait/reap、種別付き `ResourceLimit` result で閉じる
 - deployment supervisor は runtime/executor/IPC に同じ世代番号を与え、command ごとの execution cgroup/sandbox も登録する。runtime 終了・heartbeat timeout・IPC 破断時にその generation の登録済み execution boundary と executor sandbox 全体を `cgroup.kill`/sandbox recycle で kill/reap する。`tool_executions` が `running` のままなら再起動時に `indeterminate` へ遷移し、同じ tool call を自動再実行しない。domain mutation tool は `command_id/tool_call_id` を idempotency key として apps/api へ渡す
 - **network egress**: Docker executor sidecar は `network_mode=none`、microVM executor は interface のない専用 netns とし、runtime は別 network sandbox から LLM API へ到達する。bash から外に出たい用途(curl 等)は、ドメイン許可リスト付き egress proxy を将来導入するまで**非対応**。network 分離を外す開発モードは明示的な低信頼モードとして起動ログとテスト結果へ残す。**[推測→セキュリティ契約として確定]**
 
@@ -1736,6 +1738,16 @@ pub enum Projection {
     CommandApplied { command_id: String, command_seq: u64, run_id: String },
     /// abort による未注入 steer の差し戻し (§6.5)。applied と同様に終端で cursor を前進させる
     CommandSuperseded { command_id: String, command_seq: u64, run_id: String },
+    /// 外形は正当だが本文が検証不能な command の terminal 拒否 (§11.1.1 手順2)。
+    /// applied/superseded と同様に終端で cursor を前進させる。raw_command は
+    /// EventWriter が command 用データ鍵で暗号化して保存する (Oversized §7.8 では
+    /// None — 本文を保存せず外形・実測サイズ・理由のみ記録する)
+    CommandRejected {
+        command_id: String,
+        command_seq: u64,
+        reason: CommandRejectReason,
+        raw_command: Option<Box<serde_json::value::RawValue>>,
+    },
 }
 
 pub struct ProviderContextMutation {
@@ -1802,7 +1814,10 @@ pub enum Command {
 }
 
 /// 将来の添付契約の予約型。v1 の wire schema は `attachments.maxItems = 0` とし、
-/// 空配列以外を API が command の seq 採番前に拒否する。
+/// 空配列以外を API が command の seq 採番前に拒否する。Rust 側の保険は serde 型では
+/// 効かない (`Vec<Attachment>` は非空配列を普通に受理する) ため、生成 wire 型の
+/// `attachments` には「要素が1つでも現れたら Err」の custom deserializer を与え、
+/// 失敗は §11.1.1 手順2の terminal 拒否へ落とす。非空配列 fixture を round-trip CI に置く。
 #[derive(Deserialize)]
 #[serde(transparent)]
 pub struct Attachment(pub serde_json::Value);
@@ -1826,7 +1841,11 @@ pub struct Envelope {
 pub struct CommandAck {
     pub seq: u64,
     pub command_id: String,
-    pub status: CommandAckStatus,    // Received | Applied
+    pub status: CommandAckStatus,
+    /// Rejected のみ Some。ユーザー提示用の分類コード (unknown_command |
+    /// schema_violation | attachments_not_empty | oversized)。自由文を入れない
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reject_reason: Option<String>,
 }
 
 /// Superseded: abort により未注入のまま差し戻された steer (§6.5)。API は command log を
@@ -1842,9 +1861,34 @@ pub enum OutboundFrame {
     CommandAck { ack: CommandAck },
 }
 
+/// 受信 command の二段階 parse の結果。reader はまず外形
+/// `{seq, command_id, command: RawValue}` だけを parse し、次に `command` を型付き
+/// `Command` として検証する。二段目の失敗は `Invalid` として `seq`/`command_id` を
+/// 保持したまま返す — §11.1.1 手順2の拒否処理が `Rejected` ACK と
+/// `Projection::CommandRejected` を発行できるのはこの形で受け取れたときだけ。
+pub enum InboundCommand {
+    Valid(CommandEnvelope),
+    Invalid {
+        seq: u64,
+        command_id: String,
+        reason: CommandRejectReason,
+        /// 暗号化保存用の受信本文。Oversized (§7.8) では保持せず None
+        raw_command: Option<Box<serde_json::value::RawValue>>,
+    },
+}
+
+pub enum CommandRejectReason {
+    UnknownCommand,
+    SchemaViolation,
+    AttachmentsNotEmpty,
+    Oversized { actual_bytes: u64 },
+}
+
 #[async_trait]
 pub trait GatewayReader: Send {
-    async fn next_command(&mut self) -> anyhow::Result<CommandEnvelope>;
+    /// Err は外形 (seq/command_id) すら parse できないプロトコル違反のみ。
+    /// 呼び出し側 (supervisor) はその epoch を閉じて再接続する
+    async fn next_command(&mut self) -> anyhow::Result<InboundCommand>;
 }
 
 #[async_trait]
@@ -1884,14 +1928,14 @@ pub trait GatewayConnector: Send {
 - `stdio.rs`: 1行1JSON。開発時は `make agent-repl`(ラッパースクリプト)で人間が直接会話でき、E2E テストは期待イベント列をアサートできる。**M1 からこれで動かす**
 - `stdio.rs`は再接続しない`SingleConnectionConnector`として同じsupervisor interfaceへ合わせ、`authenticate_hello`はlocal cursorを返す。EOFをプロセス終了として扱う
 - `ws.rs`(M5): agent がコンテナ内から api へ outbound WebSocket 接続する(コンテナへの inbound は開けない)。TLS の Upgrade request に `Authorization: Bearer <short-lived-agent-token>` を付ける。token は API/control plane が発行し、`tenant_id / agent_id / conversation_id / generation / exp / audience` を署名対象にする。API は token から conversation を決定し、agent が送る識別子を認可根拠にしない。token は runtime secret として渡し、ログ・イベント・SQLite・executor 環境へ出さない。長命agentが再接続できるよう、root-ownedのrotating credential fileまたはworkload identity交換を `CredentialProvider` として抽象化し、**supervisorが接続attemptごと**に新しいtokenを取得する(起動時envへ固定した短命tokenだけに依存しない)
-- 認証後の hello は `{agent_id, generation, last_sent_event_seq, last_received_command_seq, last_applied_command_seq}`。API は token claim と一致すること、`generation` がその agent の最新世代であることを検証し、古い接続を close/fence する。応答は `{accepted_generation, last_received_event_seq, next_command_seq}`。agent は `agent_events` から event 差分を、API は durable command log から command 差分を再送する
+- 認証後の hello は `{agent_id, generation, last_sent_event_seq, last_received_command_seq, last_applied_command_seq}`。API は token claim と一致すること、`generation` がその agent の最新世代であることを検証し、古い接続を close/fence する。応答は `{accepted_generation, last_received_event_seq, next_command_seq}`。agent は `agent_events` から event 差分を、API は durable command log から command 差分(terminal ACK 未記録の command を含む — §11.1.1)を再送する
 
 #### 11.1.1 API→agent command の配送保証
 
-API は command を永続化して `seq` と `command_id` を確定してから送信し、`Received` ACK まで同じ envelope を再送する。**`UserMessage` の wire 上限 1MB 検証(§7.8)はこの seq 採番より前に行う** — 採番後に拒否すると、その seq を消費できないまま同じ envelope が再送され続け、後続 command 全体を永久に塞ぐ。agent は次の順序で処理する:
+API は command を永続化して `seq` と `command_id` を確定してから送信し、**terminal ACK(`applied`/`superseded`/`rejected`)を durable に記録するまで再送責務を負う**。live 接続中は `Received` ACK で定期再送を止めてよい(`UserMessage` は run 完了まで長時間 `applying` に留まるため、terminal 待ちのタイマー再送はしない)が、**再接続のたびに terminal ACK 未記録の command を seq 順に必ず再送する**。agent は手順5どおり終端済み command には保存済み ACK だけを返すため、この再送が適用を重複させることはない。terminal ACK の送信失敗は writer epoch の破棄(§11.1)→再接続→再送で回復し、「agent は送ったが API に届く前に切断された」窓も同じ経路で閉じる — 特に `Superseded` は §6.5 の入力欄差し戻しのトリガであり、この保証なしでは差し戻しが永久に失われる。**`UserMessage` の wire 上限 1MB 検証(§7.8)はこの seq 採番より前に行う** — 採番後に拒否すると、その seq を消費できないまま同じ envelope が再送され続け、後続 command 全体を永久に塞ぐ(この防波堤が漏れた場合は、agent 側の保険検証が外形の読める超過 envelope を手順2で terminal 拒否して回復する)。agent は次の順序で処理する:
 
 1. `seq` に欠番があれば後続を適用せず接続を閉じ、`last_received_command_seq` を含む hello で再接続する。API はその次の seq から再送する
-2. envelope から `seq`/`command_id` は取れるが `Command` として検証不能な場合(未知 variant、`attachments` 非空、schema 違反等 — API 一次検証の漏れや、API 側だけ新 command を有効化したローリング更新で起こり得る)は、**seq を消費して terminal に拒否する**: `inbound_commands` へ ciphertext と reject 理由を `status=rejected, run_phase=received` で commit し、`Rejected` ACK を返す。以後の再送・再接続でも同じ `Rejected` を再送するだけで適用しない。ACK せず接続を閉じる扱いにすると API が同じ seq を永久に再送し続け、後続 command 全体が止まる。envelope 外形自体が壊れていて `seq` を特定できない場合だけ、採番を信頼できないためプロトコル違反として接続を閉じる。将来の command 追加は hello の protocol/capability negotiation(agent が受理可能な command 集合を申告し、API が未対応 command を採番前に拒否する)で塞ぐ
+2. envelope から `seq`/`command_id` は取れるが `Command` として検証不能な場合(`InboundCommand::Invalid` — 未知 variant、`attachments` 非空、schema 違反、1MB 超過等。API 一次検証の漏れや、API 側だけ新 command を有効化したローリング更新で起こり得る)は、**seq を消費して terminal に拒否する**: `Projection::CommandRejected` により `inbound_commands` へ ciphertext と reject 理由を `status=rejected, run_phase=received` で commit し(Oversized は本文 ciphertext を保存せず外形・実測サイズのみ — §7.8)、`reject_reason` 付き `Rejected` ACK を返す。以後の再送・再接続でも同じ `Rejected` を再送するだけで適用しない。ACK せず接続を閉じる扱いにすると API が同じ seq を永久に再送し続け、後続 command 全体が止まる。envelope 外形自体が壊れていて `seq` を特定できない場合だけ、採番を信頼できないためプロトコル違反として接続を閉じる。将来の command 追加は hello の protocol/capability negotiation(agent が受理可能な command 集合を申告し、API が未対応 command を採番前に拒否する)で塞ぐ
 3. 検証を通った command は、EventWriter の内部投影(`event=None + CommandReceived`)で command payload を conversation 鍵配下のデータ鍵により暗号化し、`inbound_commands` へ ciphertext/key_ref/keyed HMAC と `status=received, run_phase=received` を INSERTする。commitした後だけ `Received` ACK を返す。`command_id` が既存なら、まず受信 envelope の `seq` が保存済みの canonical `seq` と一致するかを検証する。`seq` が一致する場合だけ HMAC と、必要時に復号した canonical payload の一致を検証し、すべて一致した正当な再送に限って保存済み canonical `seq` の同じ ACK を返して再適用しない。`seq`・HMAC・payload のいずれかが不一致なら受理も ACK もせず、プロトコル違反として接続を閉じる。平文payloadをSQLite/tracingへ出さない
 4. received command を seq 順に Session へ渡す。`UserMessage` は最初の副作用より前に application kind と run/turn binding を `classified` として保存し、§10.2 の durable phase を進め、`finished` の transaction でだけ `status=applied` にする。`ApprovalDecision` は `ApprovalResolved` と同じ transaction で applied とする。対象 request が既に terminal(resolved/cancelled)なら `ApprovalResolved` を再発行せず、no-op の `CommandApplied`(status=applied) だけを commit して `Applied` ACK を返す(§9.8 の遅延到着分)。`Abort` は `CommandApplied` と対象 UserMessage の `RunPhase(expected=current, next=cancel_requested)` を同じ EventWriter transaction で commit してから cancel を発火する。同じ run の未注入 steer command は abort の終端処理で `CommandSuperseded` により閉じ、`Superseded` ACK を返す(§6.5)。commit後・cancel前に crash しても復旧は `cancel_requested` を見て run を閉じ、provider retryやtool再実行へ戻さない
 5. commit 後に `Applied` ACK を返す。crash 後は `received/applying` を durable phase から再開し、`applied`/`superseded`/`rejected` はACKだけ再送する
@@ -1969,8 +2013,18 @@ $defs:
     properties:
       seq: { type: integer, minimum: 0 }
       command_id: { type: string, format: uuid }
-      status: { enum: [received, applied, superseded] }
+      status: { enum: [received, applied, superseded, rejected] }
+      # rejected のみ許可 (下の if/then)。ユーザー提示用の分類コード
+      reject_reason: { enum: [unknown_command, schema_violation, attachments_not_empty, oversized] }
     additionalProperties: false
+    if:
+      properties:
+        status: { const: rejected }
+    then:
+      required: [reject_reason]
+    else:
+      properties:
+        reject_reason: false
   OutboundFrame:
     oneOf:
       - type: object
@@ -1985,7 +2039,10 @@ $defs:
           frame_type: { const: command_ack }
           ack: { $ref: "#/$defs/CommandAck" }
         additionalProperties: false
-# 各variantのobject定義は省略。実ファイルではすべて追加する。
+# 各variantのobject定義は省略。実ファイルではすべて追加する。MessageStart/MessageUpdate/
+# MessageEnd には required の message_id (string) を含める (§3.3)。user メッセージの
+# message_id は command_id からの UUIDv5 導出 (§10.2) であり、その namespace 定数も
+# このファイルに正典として明記して API/web が同じ ID を先行計算できるようにする。
 ```
 
 web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/ToolCall delta はそのまま流す(TTFT 最優先)。raw Thinking delta は転送せず、provider が display-safe と明示した `ReasoningSummary*` だけを UI 側で折り畳み表示する。契約変更は必ず `contracts/agent-events.yaml` → wire DTO 再生成 → fixture/互換性テストの順に行う。内部 `ProviderEvent` に variant を追加しても自動で wire に出さず、公開 contract と明示変換を更新しない限りビルドまたは CI を通さない。**[推測→契約ファースト原則として確定]**
