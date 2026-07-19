@@ -63,15 +63,15 @@ Kimi/GLM 等の Chat Completions 互換系では**先頭からの連続プレフ
 Cloud 版のデータ管理方針はリリースゲートとする:
 
 - 通常の transcript / memory / workspace は、ユーザーが agent を削除するまで保持する。管理者は tenant policy でより短い保持期間を設定できる
-- v1 は1 agent = 1 active conversation = 1 agent.db。会話 export は redaction 済み JSONL と認可済みconversation artifact archive、agent export はそれに workspace archive を加える。会話削除は transcript/memory/provider context と conversation鍵を破棄して新しい conversation ID へ reset し、ユーザー作成 workspace は残す。一方、専用artifact brokerだけがmountする `/var/lib/sumi-artifacts/<conversation_id>` は conversation-owned として旧IDのsubtreeごと冪等削除する。agent 削除は agent鍵と配下の workspace鍵/volume・artifact volume も破棄する。deletion tombstone と access audit の正典は削除対象agent volumeの外にあるCloud control planeへ置き、旧conversation IDもtombstoneへ記録する。live DB/volume は24時間以内、backup は30日以内に期限切れにし、復元時は tombstone を先に再適用して自動生成artifactを再露出させない
+- 製品契約は1 agent = 1 active conversation = 1 agent.db。会話 export は redaction 済み JSONL と認可済みconversation artifact archive、agent export はそれに workspace archive を加える。会話削除は transcript/memory/provider context と conversation鍵を破棄して新しい conversation ID へ reset し、ユーザー作成 workspace は残す。一方、専用artifact brokerだけがmountする `/var/lib/sumi-artifacts/<conversation_id>` は conversation-owned として旧IDのsubtreeごと冪等削除する。agent 削除は agent鍵と配下の workspace鍵/volume・artifact volume も破棄する。deletion tombstone と access audit の正典は削除対象agent volumeの外にあるCloud control planeへ置き、旧conversation IDもtombstoneへ記録する。live DB/volume は24時間以内、backup は30日以内に期限切れにし、復元時は tombstone を先に再適用して自動生成artifactを再露出させない
 - tenant / agent ごとに DB、volume、暗号鍵、認可 scope を分離する。検索・export・管理者アクセスは actor / tenant / query scope / result count を監査ログへ残す
 - Cloud の volume/backup は基盤暗号化に加えて tenant KEK → agent 鍵 → conversation/provider-context/artifact/workspace 鍵の階層で envelope encryption を使う。artifact brokerはconversation単位のartifact鍵で内容を暗号化し、reset時はsubtree削除に先立って鍵を破棄する。OSS ローカル版はホストの暗号化責任を明記し、Cloud と同じ保証をうたわない
 - redaction はDB平文・FTS・通常exportを作る前に API key、署名 token、既知の secret 形式へ適用する。原文 transcript は conversation 鍵配下の ciphertext としてだけ保存し、raw provider response とツール出力を無制限にログへ複製しない
 
-## 未決事項
+## 製品既定と実測校正
 
-- **バッチ粒度**: 5k は周辺文脈が Compact に入りにくい。10k までは許容の感触があるが、L0 溢れ時の再読み込み増とのトレードオフを実測で決める
-- **圧縮率の制御**: 参考にした Mastra Code では大きめのバッチが ~50 倍に圧縮される観察があり、圧縮されすぎが懸念。Compact プロンプトで目標圧縮率を明示的に指定するか。なお目標圧縮率 (1/8〜1/15) と上限 (~800 トークン、実装計画 §7.4) はバッチ粒度と結合しており、粒度を 10k へ広げると上限側が先に効いて実質 1/12 固定になる — 上のバッチ粒度の未決と同時に決める
-- **Compact の入力**: バッチ単体ではなく、前後の文脈や L1 の既存内容を読み取り専用で添えて要約品質を上げる案(実装計画 §7.4 が `<recent-memory>` 添付として暫定回答済み。実測評価が残り)
-- 各層のサイズ (10k/15k/40k) の実測調整
-- thinking 系モデルの reasoning を L0 のサイズ計算へどう加算するか(平文 reasoning は PublicMessage の一部として直接計上、opaque provider context は footprint として「含める」— 実装計画 §7.3 で暫定回答済み)。L0 の滞在期間には時間上限を設けず、容量条件に達するまで生の文脈と再送に必要な provider context を一体で保持する
+- **バッチ粒度**: safe boundaryで5k tokens以上になった最初の位置を既定seal点とする。単一message/tool pairは分割しない
+- **圧縮率**: Compact promptで入力の1/8〜1/15を目標にし、出力上限を約800 tokensにする。過剰圧縮率と重要事項のrecallをM4で計測するが、計測待ちを理由に機能を無効化しない
+- **Compact入力**: 対象batchに加え、既存L1末尾のredacted projectionを`<recent-memory>`として読み取り専用で添える。opaque provider contextとThinkingは型境界で除外する
+- **層サイズ**: L2/L1/L0を10k/15k/40k、通常prompt目標を80k未満とする。実測値は設定調整に使えるが、3層の昇格・永続化・復旧契約は変えない
+- **reasoning計上**: 平文reasoningはPublicMessageの一部として直接計上し、opaque provider contextはreplay wire footprintとして加算する。L0に時間上限は設けず、容量条件に達するまで生の文脈と再送に必要なprovider contextを一体で保持する
