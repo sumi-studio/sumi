@@ -63,9 +63,9 @@ Kimi/GLM 等の Chat Completions 互換系では**先頭からの連続プレフ
 Cloud 版のデータ管理方針はリリースゲートとする:
 
 - 通常の transcript / memory / workspace は、ユーザーが agent を削除するまで保持する。管理者は tenant policy でより短い保持期間を設定できる
-- v1 は1 agent = 1 active conversation = 1 agent.db。会話 export は redaction 済み JSONL、agent export はそれに workspace archive を加える。会話削除は transcript/memory/provider context と conversation鍵を破棄して新しい conversation ID へ reset し、ユーザー作成 workspace は残す。一方、runtime が自動生成した `/workspace/.attachments/<conversation_id>` と `/workspace/.tool-output/<conversation_id>` は conversation-owned として旧IDのprefixごと冪等削除する。agent 削除は agent鍵と配下の workspace鍵/volume も破棄する。deletion tombstone と access audit の正典は削除対象agent volumeの外にあるCloud control planeへ置き、旧conversation IDもtombstoneへ記録する。live DB/volume は24時間以内、backup は30日以内に期限切れにし、復元時は tombstone を先に再適用して自動生成artifactを再露出させない
+- v1 は1 agent = 1 active conversation = 1 agent.db。会話 export は redaction 済み JSONL と認可済みconversation artifact archive、agent export はそれに workspace archive を加える。会話削除は transcript/memory/provider context と conversation鍵を破棄して新しい conversation ID へ reset し、ユーザー作成 workspace は残す。一方、専用artifact brokerだけがmountする `/var/lib/sumi-artifacts/<conversation_id>` は conversation-owned として旧IDのsubtreeごと冪等削除する。agent 削除は agent鍵と配下の workspace鍵/volume・artifact volume も破棄する。deletion tombstone と access audit の正典は削除対象agent volumeの外にあるCloud control planeへ置き、旧conversation IDもtombstoneへ記録する。live DB/volume は24時間以内、backup は30日以内に期限切れにし、復元時は tombstone を先に再適用して自動生成artifactを再露出させない
 - tenant / agent ごとに DB、volume、暗号鍵、認可 scope を分離する。検索・export・管理者アクセスは actor / tenant / query scope / result count を監査ログへ残す
-- Cloud の volume/backup は基盤暗号化に加えて tenant KEK → agent 鍵 → conversation/provider-context/workspace 鍵の階層で envelope encryption を使う。OSS ローカル版はホストの暗号化責任を明記し、Cloud と同じ保証をうたわない
+- Cloud の volume/backup は基盤暗号化に加えて tenant KEK → agent 鍵 → conversation/provider-context/artifact/workspace 鍵の階層で envelope encryption を使う。artifact brokerはconversation単位のartifact鍵で内容を暗号化し、reset時はsubtree削除に先立って鍵を破棄する。OSS ローカル版はホストの暗号化責任を明記し、Cloud と同じ保証をうたわない
 - redaction はDB平文・FTS・通常exportを作る前に API key、署名 token、既知の secret 形式へ適用する。原文 transcript は conversation 鍵配下の ciphertext としてだけ保存し、raw provider response とツール出力を無制限にログへ複製しない
 
 ## 未決事項
