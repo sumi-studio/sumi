@@ -108,7 +108,7 @@ toml = "1.1"                # 設定ファイル読込 (2026-07 時点の安定�
 dotenvy = "0.15"            # SUMI_ENV_FILE で明示指定した env ファイルの読込 (ローカル開発用。暗黙の .env 自動探索はしない)
 libc = "0.2"                # Unix: low-trust local fallback の process-group signal (bash ツール、§8.3)
 schemars = "1"              # ツールパラメータの JSON Schema 導出 (TypeBox 相当。生成のみで検証はしない)
-jsonschema = "0.26"         # ツール引数の制約込み schema 検証 (§3.4・§4.3。版は実装時に最新安定へ更新)
+jsonschema = { version = "0.48", default-features = false } # ツール引数の制約込み schema 検証。remote $ref は解決しない (§3.4・§4.3)
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate", "json", "chrono"] }
 uuid = { version = "1", features = ["v7", "v5", "serde"] }  # v7: 時系列ソート可能ID。v5: command_id→message_id の決定論的導出 (§10.2、new_v5 は v5 feature 必須)
 chrono = { version = "0.4", features = ["serde"] }

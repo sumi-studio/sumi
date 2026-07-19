@@ -7,14 +7,20 @@ publish = false
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
+chacha20poly1305 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
 futures-util = "0.3"
+hmac = "0.12"
+jsonschema = { version = "0.48", default-features = false }
 libc = "0.2"
+rand = "0.9"
 regex = "1"
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate", "json", "chrono"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "sync", "time", "io-util", "io-std", "fs"] }
@@ -22,7 +28,8 @@ tokio-util = { version = "0.7", features = ["rt"] }
 toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-uuid = { version = "1", features = ["v7", "serde"] }
+uuid = { version = "1", features = ["v7", "v5", "serde"] }
+zeroize = "1"
 
 [dev-dependencies]
 axum = "0.8"

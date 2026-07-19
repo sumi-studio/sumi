@@ -11,7 +11,7 @@ mod tools;
 use std::io;
 
 use anyhow::Result;
-use gateway::{Envelope, Gateway, GatewayClosed, StdioGateway};
+use gateway::{Envelope, Gateway, GatewayClosed, InvalidCommand, StdioGateway};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -42,6 +42,20 @@ async fn main() -> Result<()> {
         let command = match gateway.next_command().await {
             Ok(command) => command,
             Err(error) if error.downcast_ref::<GatewayClosed>().is_some() => break,
+            Err(error) if error.downcast_ref::<InvalidCommand>().is_some() => {
+                tracing::warn!(%error, "rejected invalid stdio command");
+                gateway
+                    .send(Envelope {
+                        seq: None,
+                        conversation_id: conversation_id.clone(),
+                        event: serde_json::json!({
+                            "type": "error",
+                            "message": "invalid command",
+                        }),
+                    })
+                    .await?;
+                continue;
+            }
             Err(error) => return Err(error),
         };
 

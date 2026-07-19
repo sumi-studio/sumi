@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 const MAX_ERROR_BODY_CHARS: usize = 4_000;
 const MAX_ERROR_BODY_READ_BYTES: usize = MAX_ERROR_BODY_CHARS * 4 + 4;
 const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
+const MAX_SSE_EVENT_BYTES: usize = 4 * MAX_SSE_LINE_BYTES;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 type ByteStream = Pin<Box<dyn Stream<Item = Result<Vec<u8>, String>> + Send>>;
@@ -27,6 +28,14 @@ pub enum SseError {
     InvalidUtf8,
     #[error("SSE line exceeded {limit} bytes")]
     LineTooLong { limit: usize },
+    #[error("SSE event exceeded {limit} bytes")]
+    EventTooLong { limit: usize },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SseEvent {
+    pub event: Option<String>,
+    pub data: String,
 }
 
 pub struct SseStream {
@@ -60,23 +69,20 @@ impl SseStream {
         Ok(Self::new(bytes, cancel, IDLE_TIMEOUT))
     }
 
-    pub async fn next_payload(&mut self) -> Result<Option<String>, SseError> {
+    pub async fn next_event(&mut self) -> Result<Option<SseEvent>, SseError> {
         loop {
             if self.cancel.is_cancelled() {
                 return Err(SseError::Cancelled);
             }
-            if let Some(payload) = self.parser.next_payload() {
-                return Ok(Some(payload));
-            }
-            if self.parser.is_done() {
-                return Ok(None);
+            if let Some(event) = self.parser.next_event() {
+                return Ok(Some(event));
             }
 
             match receive_chunk(&mut self.bytes, &self.cancel, self.idle_timeout).await? {
                 Some(bytes) => self.parser.push_chunk(&bytes)?,
                 None => {
                     self.parser.finish()?;
-                    return Ok(self.parser.next_payload());
+                    return Ok(self.parser.next_event());
                 }
             }
         }
@@ -94,17 +100,15 @@ impl SseStream {
 
 #[derive(Default)]
 struct SseLineParser {
-    buffer: Vec<u8>,
-    payloads: VecDeque<String>,
-    done: bool,
+    line_buffer: Vec<u8>,
+    event_name: Option<String>,
+    data_lines: Vec<String>,
+    event_bytes: usize,
+    events: VecDeque<SseEvent>,
 }
 
 impl SseLineParser {
     fn push_chunk(&mut self, chunk: &[u8]) -> Result<(), SseError> {
-        if self.done {
-            return Ok(());
-        }
-
         for segment in chunk.split_inclusive(|byte| *byte == b'\n') {
             let has_newline = segment.last() == Some(&b'\n');
             let content = if has_newline {
@@ -112,55 +116,94 @@ impl SseLineParser {
             } else {
                 segment
             };
-            if self.buffer.len().saturating_add(content.len()) > MAX_SSE_LINE_BYTES {
+            if self.line_buffer.len().saturating_add(content.len()) > MAX_SSE_LINE_BYTES {
                 return Err(SseError::LineTooLong {
                     limit: MAX_SSE_LINE_BYTES,
                 });
             }
-            self.buffer.extend_from_slice(content);
+            self.line_buffer.extend_from_slice(content);
 
             if has_newline {
-                if self.buffer.last() == Some(&b'\r') {
-                    self.buffer.pop();
+                if self.line_buffer.last() == Some(&b'\r') {
+                    self.line_buffer.pop();
                 }
-                let line = std::mem::take(&mut self.buffer);
+                let line = std::mem::take(&mut self.line_buffer);
                 self.process_line(&line)?;
-            }
-            if self.done {
-                self.buffer.clear();
-                break;
             }
         }
         Ok(())
     }
 
     fn process_line(&mut self, line: &[u8]) -> Result<(), SseError> {
-        let Some(mut data) = line.strip_prefix(b"data:") else {
+        if line.is_empty() {
+            self.dispatch_event();
             return Ok(());
-        };
-        if data.first() == Some(&b' ') {
-            data = &data[1..];
         }
-        let payload = std::str::from_utf8(data).map_err(|_| SseError::InvalidUtf8)?;
-        if payload == "[DONE]" {
-            self.done = true;
-        } else {
-            self.payloads.push_back(payload.to_owned());
+        if line.first() == Some(&b':') {
+            return Ok(());
+        }
+
+        let (field, mut value) = line
+            .iter()
+            .position(|byte| *byte == b':')
+            .map_or((line, &b""[..]), |separator| {
+                (&line[..separator], &line[separator + 1..])
+            });
+        if value.first() == Some(&b' ') {
+            value = &value[1..];
+        }
+
+        match field {
+            b"event" => {
+                let event = std::str::from_utf8(value).map_err(|_| SseError::InvalidUtf8)?;
+                self.event_name = Some(event.to_owned());
+            }
+            b"data" => {
+                let data = std::str::from_utf8(value).map_err(|_| SseError::InvalidUtf8)?;
+                let separator = usize::from(!self.data_lines.is_empty());
+                if self
+                    .event_bytes
+                    .saturating_add(separator)
+                    .saturating_add(data.len())
+                    > MAX_SSE_EVENT_BYTES
+                {
+                    return Err(SseError::EventTooLong {
+                        limit: MAX_SSE_EVENT_BYTES,
+                    });
+                }
+                self.event_bytes += separator + data.len();
+                self.data_lines.push(data.to_owned());
+            }
+            _ => {}
         }
         Ok(())
     }
 
-    fn next_payload(&mut self) -> Option<String> {
-        self.payloads.pop_front()
+    fn dispatch_event(&mut self) {
+        if self.data_lines.is_empty() {
+            self.event_name = None;
+            self.event_bytes = 0;
+            return;
+        }
+
+        self.events.push_back(SseEvent {
+            event: self.event_name.take(),
+            data: self.data_lines.join("\n"),
+        });
+        self.data_lines.clear();
+        self.event_bytes = 0;
     }
 
-    fn is_done(&self) -> bool {
-        self.done && self.payloads.is_empty()
+    fn next_event(&mut self) -> Option<SseEvent> {
+        self.events.pop_front()
     }
 
     fn finish(&mut self) -> Result<(), SseError> {
-        if self.done || self.buffer.iter().all(u8::is_ascii_whitespace) {
-            self.buffer.clear();
+        if self.line_buffer.iter().all(u8::is_ascii_whitespace)
+            && self.data_lines.is_empty()
+            && self.event_name.is_none()
+        {
+            self.line_buffer.clear();
             Ok(())
         } else {
             Err(SseError::UnexpectedEof)
@@ -198,7 +241,14 @@ async fn read_error_body(
 
     while let Some(chunk) = receive_chunk(&mut bytes, cancel, idle_timeout).await? {
         let remaining = MAX_ERROR_BODY_READ_BYTES.saturating_sub(body.len());
-        if chunk.len() >= remaining {
+        if remaining == 0 {
+            if !chunk.is_empty() {
+                source_truncated = true;
+                break;
+            }
+            continue;
+        }
+        if chunk.len() > remaining {
             body.extend_from_slice(&chunk[..remaining]);
             source_truncated = true;
             break;
@@ -233,33 +283,43 @@ mod tests {
 
     use super::*;
 
-    fn parser_payloads(
+    fn parser_events(
         chunks: impl IntoIterator<Item = impl AsRef<[u8]>>,
-    ) -> Result<(Vec<String>, bool), SseError> {
+    ) -> Result<Vec<SseEvent>, SseError> {
         let mut parser = SseLineParser::default();
         for chunk in chunks {
             parser.push_chunk(chunk.as_ref())?;
         }
-        let mut payloads = Vec::new();
-        while let Some(payload) = parser.next_payload() {
-            payloads.push(payload);
+        let mut events = Vec::new();
+        while let Some(event) = parser.next_event() {
+            events.push(event);
         }
-        Ok((payloads, parser.is_done()))
+        Ok(events)
     }
 
     #[test]
-    fn parses_crlf_and_lf_lines() {
-        let (payloads, done) =
-            parser_payloads([b"data: one\r\ndata: two\n\n".as_slice()]).expect("valid SSE");
-        assert_eq!(payloads, ["one", "two"]);
-        assert!(!done);
+    fn joins_multiple_data_lines_at_blank_line() {
+        let events = parser_events([b"data: one\r\ndata: two\n\n".as_slice()]).expect("valid SSE");
+        assert_eq!(
+            events,
+            [SseEvent {
+                event: None,
+                data: "one\ntwo".to_owned(),
+            }]
+        );
     }
 
     #[test]
-    fn ignores_non_data_lines_and_accepts_optional_space() {
-        let input = b": comment\nevent: message\ndata:no-space\ndata: with-space\n";
-        let (payloads, _) = parser_payloads([input.as_slice()]).expect("valid SSE");
-        assert_eq!(payloads, ["no-space", "with-space"]);
+    fn preserves_event_name_and_ignores_comments() {
+        let input = b": comment\nevent: message\ndata:no-space\ndata: with-space\n\n";
+        let events = parser_events([input.as_slice()]).expect("valid SSE");
+        assert_eq!(
+            events,
+            [SseEvent {
+                event: Some("message".to_owned()),
+                data: "no-space\nwith-space".to_owned(),
+            }]
+        );
     }
 
     #[test]
@@ -270,29 +330,45 @@ mod tests {
             b"\"hello\"}\n\ndata: second".as_slice(),
             b"\n\n".as_slice(),
         ];
-        let (payloads, _) = parser_payloads(chunks).expect("valid SSE");
-        assert_eq!(payloads, [r#"{"text":"hello"}"#, "second"]);
+        let events = parser_events(chunks).expect("valid SSE");
+        assert_eq!(
+            events,
+            [
+                SseEvent {
+                    event: None,
+                    data: r#"{"text":"hello"}"#.to_owned(),
+                },
+                SseEvent {
+                    event: None,
+                    data: "second".to_owned(),
+                }
+            ]
+        );
     }
 
     #[test]
     fn preserves_utf8_split_across_chunks() {
-        let encoded = "data: 日本語\n".as_bytes();
+        let encoded = "data: 日本語\n\n".as_bytes();
         let split = encoded
             .windows(2)
             .position(|window| window[0] >= 0x80 && window[1] >= 0x80)
             .expect("multibyte sequence")
             + 1;
-        let (payloads, _) =
-            parser_payloads([&encoded[..split], &encoded[split..]]).expect("valid UTF-8");
-        assert_eq!(payloads, ["日本語"]);
+        let events = parser_events([&encoded[..split], &encoded[split..]]).expect("valid UTF-8");
+        assert_eq!(events[0].data, "日本語");
     }
 
     #[test]
-    fn done_terminates_and_ignores_later_data() {
+    fn done_marker_is_left_to_the_protocol_adapter() {
         let input = b"data: before\n\ndata: [DONE]\n\ndata: after\n\n";
-        let (payloads, done) = parser_payloads([input.as_slice()]).expect("valid SSE");
-        assert_eq!(payloads, ["before"]);
-        assert!(done);
+        let events = parser_events([input.as_slice()]).expect("valid SSE");
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.data.as_str())
+                .collect::<Vec<_>>(),
+            ["before", "[DONE]", "after"]
+        );
     }
 
     #[test]
@@ -310,7 +386,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_utf8_after_line_is_complete() {
-        let error = parser_payloads([b"data: \xff\n".as_slice()]).expect_err("invalid UTF-8");
+        let error = parser_events([b"data: \xff\n".as_slice()]).expect_err("invalid UTF-8");
         assert_eq!(error, SseError::InvalidUtf8);
     }
 
@@ -318,16 +394,32 @@ mod tests {
     fn enforces_sse_line_limit_across_chunks() {
         let mut exact = b"data: ".to_vec();
         exact.resize(MAX_SSE_LINE_BYTES, b'a');
-        exact.push(b'\n');
-        let (payloads, _) = parser_payloads([exact]).expect("line at limit is valid");
-        assert_eq!(payloads[0].len(), MAX_SSE_LINE_BYTES - b"data: ".len());
+        exact.extend_from_slice(b"\n\n");
+        let events = parser_events([exact]).expect("line at limit is valid");
+        assert_eq!(events[0].data.len(), MAX_SSE_LINE_BYTES - b"data: ".len());
 
         let first = vec![b'a'; MAX_SSE_LINE_BYTES];
-        let error = parser_payloads([first, vec![b'b']]).expect_err("line over limit must fail");
+        let error = parser_events([first, vec![b'b']]).expect_err("line over limit must fail");
         assert_eq!(
             error,
             SseError::LineTooLong {
                 limit: MAX_SSE_LINE_BYTES
+            }
+        );
+    }
+
+    #[test]
+    fn enforces_sse_event_limit_across_data_lines() {
+        let line = format!(
+            "data: {}\n",
+            "a".repeat(MAX_SSE_LINE_BYTES - b"data: ".len())
+        );
+        let input = format!("{line}{line}{line}{line}{line}\n");
+        let error = parser_events([input.as_bytes()]).expect_err("event over limit must fail");
+        assert_eq!(
+            error,
+            SseError::EventTooLong {
+                limit: MAX_SSE_EVENT_BYTES
             }
         );
     }
@@ -341,7 +433,7 @@ mod tests {
             Duration::from_secs(1),
         );
         assert_eq!(
-            stream.next_payload().await,
+            stream.next_event().await,
             Err(SseError::Transport("connection reset".to_owned()))
         );
 
@@ -349,20 +441,26 @@ mod tests {
         cancel.cancel();
         let pending = stream::pending::<Result<Vec<u8>, String>>();
         let mut stream = SseStream::new(Box::pin(pending), cancel, Duration::from_secs(1));
-        assert_eq!(stream.next_payload().await, Err(SseError::Cancelled));
+        assert_eq!(stream.next_event().await, Err(SseError::Cancelled));
     }
 
     #[tokio::test]
-    async fn cancellation_preempts_buffered_payloads_and_done() {
+    async fn cancellation_preempts_buffered_events() {
         let bytes = stream::iter([Ok(
             b"data: first\n\ndata: second\n\ndata: [DONE]\n\n".to_vec()
         )]);
         let cancel = CancellationToken::new();
         let mut stream = SseStream::new(Box::pin(bytes), cancel.clone(), Duration::from_secs(1));
 
-        assert_eq!(stream.next_payload().await, Ok(Some("first".to_owned())));
+        assert_eq!(
+            stream.next_event().await,
+            Ok(Some(SseEvent {
+                event: None,
+                data: "first".to_owned(),
+            }))
+        );
         cancel.cancel();
-        assert_eq!(stream.next_payload().await, Err(SseError::Cancelled));
+        assert_eq!(stream.next_event().await, Err(SseError::Cancelled));
     }
 
     #[tokio::test]
@@ -374,7 +472,7 @@ mod tests {
             Duration::from_millis(5),
         );
         assert_eq!(
-            stream.next_payload().await,
+            stream.next_event().await,
             Err(SseError::IdleTimeout { seconds: 0 })
         );
     }
@@ -406,5 +504,21 @@ mod tests {
                 .len(),
             MAX_ERROR_BODY_CHARS
         );
+    }
+
+    #[tokio::test]
+    async fn exact_error_body_read_limit_reports_known_character_count() {
+        let source = "😀".repeat(MAX_ERROR_BODY_CHARS + 1);
+        assert_eq!(source.len(), MAX_ERROR_BODY_READ_BYTES);
+        let chunks = stream::iter([Ok(source.into_bytes())]);
+        let body = read_error_body(
+            Box::pin(chunks),
+            &CancellationToken::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("bounded error body");
+
+        assert!(body.ends_with("... [truncated 1 chars]"));
     }
 }
