@@ -214,7 +214,7 @@ mod tests {
             InboundCommand::Valid(CommandEnvelope {
                 seq: 1,
                 command_id: "command-1".to_owned(),
-                command: Command::Abort,
+                command: Command::Abort {},
             })
         );
     }
@@ -229,7 +229,7 @@ mod tests {
             InboundCommand::Valid(CommandEnvelope {
                 seq: 1,
                 command_id: "command-1".to_owned(),
-                command: Command::Abort,
+                command: Command::Abort {},
             })
         );
     }
@@ -395,7 +395,7 @@ mod tests {
             InboundCommand::Valid(CommandEnvelope {
                 seq: 1,
                 command_id: "command-1".to_owned(),
-                command: Command::Abort,
+                command: Command::Abort {},
             })
         );
     }
@@ -428,7 +428,7 @@ mod tests {
             InboundCommand::Valid(CommandEnvelope {
                 seq: 1,
                 command_id: "command-1".to_owned(),
-                command: Command::Abort,
+                command: Command::Abort {},
             })
         );
     }

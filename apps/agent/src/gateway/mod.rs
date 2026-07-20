@@ -17,9 +17,10 @@ pub enum Command {
         #[serde(deserialize_with = "deserialize_empty_attachments")]
         attachments: Vec<Attachment>,
     },
-    Abort,
+    Abort {},
     ApprovalDecision {
         request_id: String,
+        #[serde(deserialize_with = "reject_unimplemented_approval_decision")]
         decision: serde_json::Value,
     },
 }
@@ -38,6 +39,18 @@ where
     } else {
         Err(de::Error::custom("attachments must be empty"))
     }
+}
+
+fn reject_unimplemented_approval_decision<'de, D>(
+    deserializer: D,
+) -> Result<serde_json::Value, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    serde::de::IgnoredAny::deserialize(deserializer)?;
+    Err(de::Error::custom(
+        "approval decisions require the typed approval contract",
+    ))
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -149,6 +162,33 @@ mod tests {
         .expect_err("attachments must be present even while only empty arrays are supported");
 
         assert!(error.to_string().contains("missing field `attachments`"));
+    }
+
+    #[test]
+    fn abort_rejects_unknown_fields() {
+        let error = serde_json::from_value::<Command>(json!({
+            "type": "abort",
+            "extra": true
+        }))
+        .expect_err("abort has no payload fields");
+
+        assert!(error.to_string().contains("unknown field `extra`"));
+    }
+
+    #[test]
+    fn approval_decision_rejects_untyped_values() {
+        let error = serde_json::from_value::<Command>(json!({
+            "type": "approval_decision",
+            "request_id": "request-1",
+            "decision": {"totally_unknown": true}
+        }))
+        .expect_err("approval decisions require their typed wire contract");
+
+        assert!(
+            error
+                .to_string()
+                .contains("approval decisions require the typed approval contract")
+        );
     }
 
     #[test]
