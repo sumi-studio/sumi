@@ -831,6 +831,22 @@ mod tests {
         assert_eq!(audit_queued_events(&mut rx, 32), (32, true));
     }
 
+    #[test]
+    fn terminal_queue_audit_reports_no_more_at_or_below_limit() {
+        for queued in [32, 10] {
+            let (tx, mut rx) = mpsc::channel(queued);
+            for content_index in 0..queued {
+                tx.try_send(ProviderEvent::TextDelta {
+                    content_index,
+                    delta: "late".to_owned(),
+                })
+                .expect("queue test event");
+            }
+
+            assert_eq!(audit_queued_events(&mut rx, 32), (queued, false));
+        }
+    }
+
     #[tokio::test]
     async fn provider_stream_synthesizes_one_terminal_event_on_eof() {
         let (tx, rx) = mpsc::channel(1);
