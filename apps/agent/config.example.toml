@@ -28,3 +28,4 @@ preset = "opencode-go"
 # thinking_format = "deepseek"
 # requires_reasoning_content_on_assistant = true
 # zai_tool_stream = false
+# supports_required_tool_choice = false

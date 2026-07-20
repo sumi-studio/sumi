@@ -589,10 +589,15 @@ async fn finish_terminal(
         .await;
         return;
     }
-    for event in terminal.events {
+    let mut terminal_events = terminal.events.into_iter();
+    while let Some(event) = terminal_events.next() {
         let permit = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
+                apply_abort_snapshot_closers(
+                    assembler,
+                    std::iter::once(&event).chain(terminal_events.as_slice()),
+                );
                 finish_failure(
                     priority_terminal_tx,
                     assembler,
@@ -687,6 +692,23 @@ async fn finish_terminal(
             provider_context: Vec::new(),
         },
     });
+}
+
+fn apply_abort_snapshot_closers<'a>(
+    assembler: &mut MessageAssembler,
+    events: impl IntoIterator<Item = &'a ProviderEvent>,
+) {
+    for event in events {
+        if !matches!(
+            event,
+            ProviderEvent::TextEnd { .. } | ProviderEvent::ThinkingEnd { .. }
+        ) {
+            continue;
+        }
+        if let Err(error) = assembler.apply(event) {
+            tracing::error!(%error, "failed to apply provider-approved abort snapshot closer");
+        }
+    }
 }
 
 async fn finish_failure(
@@ -862,7 +884,13 @@ fn adapter_error(error: &ChatAdapterError) -> (String, String) {
 
 #[cfg(test)]
 mod tests {
-    use std::{convert::Infallible, env};
+    use std::{
+        convert::Infallible,
+        env, fs, io,
+        os::unix::fs::PermissionsExt,
+        path::{Path, PathBuf},
+        process::{Command, Output},
+    };
 
     use axum::{
         Router,
@@ -877,6 +905,304 @@ mod tests {
         AssistantContent, RejectedToolCall, ToolArgumentError, ToolCall, ToolDefinition,
         ToolResultMessage, UserContent, ValidatedToolArguments,
     };
+
+    struct CaptureCommandFixture {
+        root: PathBuf,
+        state: PathBuf,
+        bin: PathBuf,
+    }
+
+    impl CaptureCommandFixture {
+        fn new() -> Self {
+            let base = env::temp_dir().join(format!("sumi-capture-test-{}", uuid::Uuid::now_v7()));
+            let root = base.join("repo");
+            let state = base.join("state");
+            let bin = base.join("bin");
+            fs::create_dir_all(&root).expect("create fake repository");
+            fs::create_dir_all(&state).expect("create fake command state");
+            fs::create_dir_all(&bin).expect("create fake command directory");
+
+            write_executable(
+                &bin.join("git"),
+                r#"#!/bin/sh
+set -eu
+{
+  printf '%s\n' git
+  for argument in "$@"; do
+    printf '%s\n' "$argument"
+  done
+} >>"$FAKE_STATE/git.log"
+case ${1-} in
+  rev-parse)
+    [ "$#" -eq 2 ]
+    [ "$2" = "--show-toplevel" ]
+    printf '%s\n' "$FAKE_REPO_ROOT"
+    ;;
+  -C)
+    [ "$#" -eq 7 ]
+    [ "$2" = "$FAKE_REPO_ROOT" ]
+    [ "$3" = "check-ignore" ]
+    [ "$4" = "--quiet" ]
+    [ "$5" = "--no-index" ]
+    [ "$6" = "--" ]
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+"#,
+            );
+            write_executable(
+                &bin.join("mktemp"),
+                r#"#!/bin/sh
+set -eu
+[ "$#" -eq 1 ]
+printf '%s\n' "$1" >>"$FAKE_STATE/mktemp.log"
+case "$1" in
+  /tmp/sumi-opencode-curl.XXXXXX)
+    path="$FAKE_STATE/curl.config"
+    ;;
+  "$FAKE_REPO_ROOT"/target/provider-captures/opencode-go/opencode-kimi-k2-7-code.XXXXXX.tmp)
+    path="$FAKE_REPO_ROOT/target/provider-captures/opencode-go/opencode-kimi-k2-7-code.fixture.tmp"
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+: >"$path"
+printf '%s\n' "$path"
+"#,
+            );
+            write_executable(
+                &bin.join("curl"),
+                r#"#!/bin/sh
+set -eu
+{
+  printf '%s\n' curl
+  for argument in "$@"; do
+    printf '%s\n' "$argument"
+  done
+} >"$FAKE_STATE/curl.log"
+[ "${1-}" = "--disable" ]
+config=
+output=
+previous=
+for argument in "$@"; do
+  case "$previous" in
+    --config) config=$argument ;;
+    --output) output=$argument ;;
+  esac
+  previous=$argument
+done
+[ "$config" = "$FAKE_STATE/curl.config" ]
+[ -f "$config" ]
+[ -n "$output" ]
+printf '%s\n' 'data: {"fixture":true}' >"$output"
+if [ "$FAKE_CURL_MODE" = "failure" ]; then
+  printf '%s\n' 'fake curl failure' >&2
+  exit 22
+fi
+"#,
+            );
+
+            Self { root, state, bin }
+        }
+
+        fn run(&self, api_key: &str, curl_mode: &str) -> Output {
+            let path = format!("{}:/usr/bin:/bin", self.bin.display());
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(opencode_capture_script())
+                .current_dir(&self.root)
+                .env("PATH", path)
+                .env("FAKE_REPO_ROOT", &self.root)
+                .env("FAKE_STATE", &self.state)
+                .env("FAKE_CURL_MODE", curl_mode)
+                .env("OPENCODE_GO_API_KEY", api_key)
+                .output()
+                .expect("execute documented capture command")
+        }
+
+        fn diagnostics(output: &Output) -> String {
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        }
+
+        fn capture_files(&self) -> Vec<PathBuf> {
+            files_below(&self.root.join("target/provider-captures"))
+        }
+
+        fn assert_exact_curl_command(&self) {
+            let arguments = fs::read_to_string(self.state.join("curl.log"))
+                .expect("fake curl invocation log")
+                .lines()
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                arguments,
+                vec![
+                    "curl".to_owned(),
+                    "--disable".to_owned(),
+                    "--config".to_owned(),
+                    self.state.join("curl.config").display().to_string(),
+                    "--silent".to_owned(),
+                    "--show-error".to_owned(),
+                    "--no-buffer".to_owned(),
+                    "--fail-with-body".to_owned(),
+                    "--max-time".to_owned(),
+                    "60".to_owned(),
+                    "--output".to_owned(),
+                    self.root
+                        .join("target/provider-captures/opencode-go/opencode-kimi-k2-7-code.fixture.tmp")
+                        .display()
+                        .to_string(),
+                    "https://opencode.ai/zen/go/v1/chat/completions".to_owned(),
+                    "--data-binary".to_owned(),
+                    concat!(
+                        "{\"max_tokens\":64,\"messages\":[{\"content\":[{\"text\":",
+                        "\"Reply with exactly fixture-ok\",\"type\":\"text\"}],\"role\":",
+                        "\"user\"}],\"model\":\"kimi-k2.7-code\",\"stream\":true,",
+                        "\"stream_options\":{\"include_usage\":true}}"
+                    )
+                    .to_owned(),
+                ]
+            );
+        }
+    }
+
+    impl Drop for CaptureCommandFixture {
+        fn drop(&mut self) {
+            if let Some(base) = self.root.parent().map(Path::to_path_buf) {
+                let _ = fs::remove_dir_all(base);
+            }
+        }
+    }
+
+    fn write_executable(path: &Path, contents: &str) {
+        fs::write(path, contents).expect("write fake command");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .expect("mark fake command executable");
+    }
+
+    fn opencode_capture_script() -> &'static str {
+        let readme = include_str!("../../tests/fixtures/README.md");
+        let (_, fenced) = readme
+            .split_once("```sh\n")
+            .expect("README capture shell fence");
+        fenced
+            .split_once("\n```")
+            .expect("README capture shell fence end")
+            .0
+    }
+
+    fn files_below(path: &Path) -> Vec<PathBuf> {
+        let Ok(entries) = fs::read_dir(path) else {
+            return Vec::new();
+        };
+        let mut files = Vec::new();
+        for entry in entries {
+            let path = entry.expect("capture directory entry").path();
+            if path.is_dir() {
+                files.extend(files_below(&path));
+            } else {
+                files.push(path);
+            }
+        }
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn documented_opencode_capture_exact_command_preserves_success_and_curl_failure() {
+        let api_key = "sk-current.OpenCode_key~9";
+        let success = CaptureCommandFixture::new();
+        let output = success.run(api_key, "success");
+        assert!(
+            output.status.success(),
+            "documented capture failed: {}",
+            CaptureCommandFixture::diagnostics(&output)
+        );
+        success.assert_exact_curl_command();
+        let files = success.capture_files();
+        assert_eq!(
+            files.len(),
+            1,
+            "success must publish exactly one raw capture"
+        );
+        assert!(
+            files[0]
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".raw.sse"))
+        );
+        assert!(!success.state.join("curl.config").exists());
+        assert!(!CaptureCommandFixture::diagnostics(&output).contains(api_key));
+        assert!(
+            !fs::read_to_string(success.state.join("curl.log"))
+                .expect("curl log")
+                .contains(api_key)
+        );
+
+        let failure = CaptureCommandFixture::new();
+        let output = failure.run(api_key, "failure");
+        assert!(!output.status.success(), "curl failure must fail closed");
+        failure.assert_exact_curl_command();
+        assert!(
+            failure.capture_files().is_empty(),
+            "curl failure must not publish raw or final captures"
+        );
+        assert!(!failure.state.join("curl.config").exists());
+        assert!(!CaptureCommandFixture::diagnostics(&output).contains(api_key));
+        assert!(
+            !fs::read_to_string(failure.state.join("curl.log"))
+                .expect("curl log")
+                .contains(api_key)
+        );
+    }
+
+    #[test]
+    fn documented_opencode_capture_rejects_unsafe_keys_before_any_external_command() {
+        for api_key in [
+            "",
+            "sk-safe\nheader = X-Evil: injected",
+            "sk-quote\"injected",
+            "sk-backslash\\injected",
+            "sk-carriage\rreturn",
+            "sk with space",
+            "sk-tab\tinjected",
+            "sk-non-ascii-\u{00e9}",
+        ] {
+            let fixture = CaptureCommandFixture::new();
+            let output = fixture.run(api_key, "success");
+            assert!(
+                !output.status.success(),
+                "unsafe API key unexpectedly passed validation: {api_key:?}"
+            );
+            assert!(
+                fixture.capture_files().is_empty(),
+                "unsafe API key created a raw or final capture: {api_key:?}"
+            );
+            assert!(
+                !fixture.state.join("curl.config").exists(),
+                "unsafe API key created a curl config: {api_key:?}"
+            );
+            for log in ["git.log", "mktemp.log", "curl.log"] {
+                assert!(
+                    !fixture.state.join(log).exists(),
+                    "unsafe API key reached external command recorded in {log}: {api_key:?}"
+                );
+            }
+            if !api_key.is_empty() {
+                assert!(
+                    !CaptureCommandFixture::diagnostics(&output).contains(api_key),
+                    "unsafe API key leaked to command output"
+                );
+            }
+        }
+    }
 
     async fn serve_fixture(
         status: StatusCode,
@@ -949,6 +1275,47 @@ mod tests {
                         .body(Body::from_stream(prefix.chain(stalled)))
                         .expect("response")
                 }
+            }),
+        );
+        serve_router(app).await
+    }
+
+    async fn serve_reset_error_body(
+        status: StatusCode,
+        prefix: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move || async move {
+                let prefix =
+                    stream::once(async move { Ok::<String, io::Error>(prefix.to_owned()) });
+                let reset = stream::once(async {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    Err::<String, io::Error>(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "fixture reset error body",
+                    ))
+                });
+                Response::builder()
+                    .status(status)
+                    .header("content-type", "application/json")
+                    .body(Body::from_stream(prefix.chain(reset)))
+                    .expect("response")
+            }),
+        );
+        serve_router(app).await
+    }
+
+    async fn serve_stalled_error_body(status: StatusCode) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move || async move {
+                let stalled = stream::pending::<Result<String, Infallible>>();
+                Response::builder()
+                    .status(status)
+                    .header("content-type", "application/json")
+                    .body(Body::from_stream(stalled))
+                    .expect("response")
             }),
         );
         serve_router(app).await
@@ -1618,6 +1985,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_status_survives_error_body_reset_for_overflow_and_nonretryable_4xx() {
+        for (status, expected_code) in [
+            (StatusCode::PAYLOAD_TOO_LARGE, "http_413"),
+            (StatusCode::BAD_REQUEST, "http_400"),
+        ] {
+            let (base_url, server) = serve_reset_error_body(status, r#"{"error":"partial"#).await;
+            let mut spec = ModelSpec::preset("kimi-k3").expect("preset");
+            spec.base_url = base_url;
+            let mut stream = stream_with_api_key(
+                spec,
+                empty_context(),
+                RequestOptions::default(),
+                CancellationToken::new(),
+                Some("test-key".to_owned()),
+            );
+            let mut events = Vec::new();
+            while let Some(event) = stream.recv().await {
+                events.push(event);
+            }
+            server.abort();
+
+            assert_eq!(event_types(&events), ["start", "error"]);
+            let message = reconstruct_terminal(&events);
+            assert_eq!(message.stop_reason, StopReason::Error);
+            assert_eq!(message.provider_code.as_deref(), Some(expected_code));
+            assert!(
+                message
+                    .error_message
+                    .as_deref()
+                    .is_some_and(|error| error.contains(r#"{"error":"partial"#)),
+                "bounded partial error body was not retained: {:?}",
+                message.error_message
+            );
+            assert!(!retry::is_retryable(&message));
+
+            if status == StatusCode::PAYLOAD_TOO_LARGE {
+                assert_eq!(
+                    overflow::classify_context_overflow(&message, None),
+                    Some(overflow::OverflowClassification::ImmediateRecovery(
+                        overflow::OverflowSource::ProviderCode,
+                    ))
+                );
+            } else {
+                assert_eq!(overflow::classify_context_overflow(&message, None), None);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_cancellation_preempts_non_success_error_body_read() {
+        let (base_url, server) = serve_stalled_error_body(StatusCode::PAYLOAD_TOO_LARGE).await;
+        let cancel = CancellationToken::new();
+        let mut spec = ModelSpec::preset("kimi-k3").expect("preset");
+        spec.base_url = base_url;
+        let mut events = stream_with_api_key(
+            spec,
+            empty_context(),
+            RequestOptions::default(),
+            cancel.clone(),
+            Some("test-key".to_owned()),
+        );
+        assert!(matches!(events.recv().await, Some(ProviderEvent::Start)));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancel.cancel();
+        let terminal = assert_aborted_within_one_second(&mut events).await;
+        let ProviderEvent::Error { output, .. } = terminal else {
+            panic!("explicit cancellation must close with Error(Aborted)")
+        };
+        assert_eq!(output.message.stop_reason, StopReason::Aborted);
+        assert_eq!(output.message.provider_code.as_deref(), Some("cancelled"));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn no_identity_parallel_tool_continuation_closes_with_error_without_executable_call() {
         const BODY: &str = concat!(
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
@@ -1959,6 +2400,110 @@ mod tests {
             Err(assembler::AssemblerError::TerminalAlreadyEmitted),
             "producer accepted exactly one terminal"
         );
+    }
+
+    #[tokio::test]
+    async fn saturated_lane_cancellation_preserves_kimi_reasoning_closed_at_terminal() {
+        let spec = ModelSpec::preset("kimi-k3").expect("preset");
+        let (tx, rx) = mpsc::channel(5);
+        let partial_events = [
+            ProviderEvent::TextStart { content_index: 0 },
+            ProviderEvent::TextDelta {
+                content_index: 0,
+                delta: "visible".to_owned(),
+            },
+            ProviderEvent::ThinkingStart {
+                content_index: 1,
+                signature_field: "reasoning_content".to_owned(),
+            },
+            ProviderEvent::ThinkingDelta {
+                content_index: 1,
+                delta: "first ".to_owned(),
+            },
+            ProviderEvent::ThinkingDelta {
+                content_index: 1,
+                delta: "second".to_owned(),
+            },
+        ];
+        for event in &partial_events {
+            tx.send(event.clone()).await.expect("fill ordered lane");
+        }
+        let (priority_tx, priority_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let committed = Arc::new(SuccessTerminalCommit::new());
+        let producer_cancel = cancel.clone();
+        let producer_committed = committed.clone();
+        let producer_spec = spec.clone();
+        let producer = tokio::spawn(async move {
+            let mut assembler = MessageAssembler::new();
+            assembler.apply(&ProviderEvent::Start).expect("Start");
+            for event in &partial_events {
+                assembler.apply(event).expect("producer partial event");
+            }
+            finish_terminal(
+                &tx,
+                &priority_tx,
+                &mut assembler,
+                &producer_spec,
+                ChatTerminal {
+                    events: vec![
+                        ProviderEvent::TextEnd {
+                            content_index: 0,
+                            content: "visible".to_owned(),
+                        },
+                        ProviderEvent::ThinkingEnd {
+                            content_index: 1,
+                            content: "first second".to_owned(),
+                        },
+                    ],
+                    usage: Usage::default(),
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                    provider_code: Some("stop".to_owned()),
+                },
+                &producer_cancel,
+                producer_committed.as_ref(),
+            )
+            .await;
+        });
+
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        producer.await.expect("producer");
+        assert!(!committed.is_committed());
+
+        let mut stream = ProviderEventStream::with_priority_terminal(
+            rx,
+            priority_rx,
+            cancel,
+            spec.provider.clone(),
+            spec.origin(),
+            ResponseBudget::default(),
+            committed,
+        );
+        assert!(matches!(stream.recv().await, Some(ProviderEvent::Start)));
+        let terminal = stream.recv().await.expect("priority Aborted");
+        let ProviderEvent::Error {
+            reason: StopReason::Aborted,
+            output,
+        } = terminal
+        else {
+            panic!("pre-permit cancellation must emit Aborted")
+        };
+        assert!(matches!(
+            output.message.content.as_slice(),
+            [
+                types::AssistantContent::Text { text, .. },
+                types::AssistantContent::Thinking {
+                    thinking,
+                    signature_field,
+                    ..
+                }
+            ] if text == "visible"
+                && thinking == "first second"
+                && signature_field == "reasoning_content"
+        ));
+        assert!(stream.recv().await.is_none(), "terminal must fuse");
     }
 
     #[tokio::test]
@@ -2436,6 +2981,47 @@ mod tests {
     #[ignore = "T25 live Umans direct gate; requires non-empty UMANS_API_KEY"]
     async fn live_umans_direct_two_turn_tool_reasoning_gate() {
         run_live_chat_tool_roundtrip("umans").await;
+    }
+
+    #[tokio::test]
+    async fn live_direct_provider_release_gate() {
+        if env::var("SUMI_LIVE_TEST").as_deref() != Ok("1") {
+            return;
+        }
+
+        for preset in ["kimi-k3", "glm-5.2", "umans"] {
+            run_live_chat_tool_roundtrip(preset).await;
+        }
+    }
+
+    #[test]
+    fn live_release_opt_in_without_credentials_fails_before_network() {
+        let output = Command::new(env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "provider::tests::live_direct_provider_release_gate",
+                "--nocapture",
+            ])
+            .env("SUMI_LIVE_TEST", "1")
+            .env_remove("SUMI_ENV_FILE")
+            .env_remove("MOONSHOT_API_KEY")
+            .env_remove("ZAI_API_KEY")
+            .env_remove("UMANS_API_KEY")
+            .output()
+            .expect("run isolated live release dispatcher");
+        assert!(
+            !output.status.success(),
+            "credential-free live release opt-in must not report green"
+        );
+        let diagnostics = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            diagnostics.contains("kimi-k3 live gate requires MOONSHOT_API_KEY"),
+            "unexpected dispatcher failure: {diagnostics}"
+        );
     }
 
     async fn run_live_chat_tool_roundtrip(preset: &str) {

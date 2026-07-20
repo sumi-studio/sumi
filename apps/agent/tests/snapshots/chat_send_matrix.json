@@ -13,7 +13,7 @@
               "arguments": "{\"path\":\"a.txt\"}",
               "name": "read_file"
             },
-            "id": "call_with_noise_a3a299491294bc26",
+            "id": "call|with+noise",
             "type": "function"
           }
         ]
@@ -21,7 +21,7 @@
       {
         "content": "hello",
         "role": "tool",
-        "tool_call_id": "call_with_noise_a3a299491294bc26"
+        "tool_call_id": "call|with+noise"
       }
     ],
     "model": "kimi-k3",
@@ -156,7 +156,7 @@
               "arguments": "{\"path\":\"a.txt\"}",
               "name": "read_file"
             },
-            "id": "call_with_noise_a3a299491294bc26",
+            "id": "call|with+noise",
             "type": "function"
           }
         ]
@@ -164,7 +164,7 @@
       {
         "content": "hello",
         "role": "tool",
-        "tool_call_id": "call_with_noise_a3a299491294bc26"
+        "tool_call_id": "call|with+noise"
       }
     ],
     "model": "kimi-k3",
@@ -201,7 +201,7 @@
               "arguments": "{\"path\":\"a.txt\"}",
               "name": "read_file"
             },
-            "id": "call_with_noise_a3a299491294bc26",
+            "id": "call|with+noise",
             "type": "function"
           }
         ]
@@ -209,7 +209,7 @@
       {
         "content": "hello",
         "role": "tool",
-        "tool_call_id": "call_with_noise_a3a299491294bc26"
+        "tool_call_id": "call|with+noise"
       }
     ],
     "model": "kimi-k3",

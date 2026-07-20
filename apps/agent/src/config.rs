@@ -61,6 +61,7 @@ pub struct CompatConfig {
     pub requires_reasoning_content_on_assistant: Option<bool>,
     pub zai_tool_stream: Option<bool>,
     pub supports_strict_mode: Option<bool>,
+    pub supports_required_tool_choice: Option<bool>,
     pub supports_store: Option<bool>,
     pub supports_developer_role: Option<bool>,
     pub allows_sampling_parameters: Option<bool>,
@@ -180,6 +181,9 @@ impl Config {
         }
         if let Some(value) = compat.supports_strict_mode {
             spec.compat.supports_strict_mode = value;
+        }
+        if let Some(value) = compat.supports_required_tool_choice {
+            spec.compat.supports_required_tool_choice = value;
         }
         if let Some(value) = compat.supports_store {
             spec.compat.supports_store = value;
@@ -475,6 +479,64 @@ modle = "typo"
         .expect_err("unknown model key must fail");
 
         assert!(error.to_string().contains("unknown field `modle`"));
+    }
+
+    #[test]
+    fn rejects_unknown_compat_keys() {
+        let error = toml::from_str::<FileConfig>(
+            r#"
+[model]
+preset = "kimi-k3"
+
+[model.compat]
+supports_required_tools_choice = false
+"#,
+        )
+        .expect_err("unknown compat key must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field `supports_required_tools_choice`")
+        );
+    }
+
+    #[test]
+    fn required_tool_choice_can_be_disabled_for_a_supporting_preset() {
+        let file: FileConfig = toml::from_str(
+            r#"
+[model]
+preset = "kimi-k3"
+
+[model.compat]
+supports_required_tool_choice = false
+"#,
+        )
+        .expect("valid config");
+        let config = Config::resolve(file, EnvOverrides::default()).expect("resolved");
+
+        let spec = config.model_spec().expect("model spec");
+
+        assert!(!spec.compat.supports_required_tool_choice);
+    }
+
+    #[test]
+    fn required_tool_choice_can_be_enabled_for_opencode() {
+        let file: FileConfig = toml::from_str(
+            r#"
+[model]
+preset = "opencode-go"
+
+[model.compat]
+supports_required_tool_choice = true
+"#,
+        )
+        .expect("valid config");
+        let config = Config::resolve(file, EnvOverrides::default()).expect("resolved");
+
+        let spec = config.model_spec().expect("model spec");
+
+        assert!(spec.compat.supports_required_tool_choice);
     }
 
     #[test]

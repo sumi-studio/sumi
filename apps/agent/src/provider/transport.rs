@@ -317,8 +317,18 @@ async fn read_error_body(
 ) -> Result<String, SseError> {
     let mut body = Vec::with_capacity(MAX_ERROR_BODY_READ_BYTES);
     let mut source_truncated = false;
+    let mut read_diagnostic = None;
 
-    while let Some(chunk) = receive_chunk(&mut bytes, cancel, idle_timeout).await? {
+    loop {
+        let chunk = match receive_chunk(&mut bytes, cancel, idle_timeout).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(SseError::Cancelled) => return Err(SseError::Cancelled),
+            Err(error) => {
+                read_diagnostic = Some(error.to_string());
+                break;
+            }
+        };
         let remaining = MAX_ERROR_BODY_READ_BYTES.saturating_sub(body.len());
         if remaining == 0 {
             if !chunk.is_empty() {
@@ -336,7 +346,14 @@ async fn read_error_body(
     }
 
     let body = String::from_utf8_lossy(&body);
-    Ok(truncate_error_body(body.trim(), source_truncated))
+    let body = truncate_error_body(body.trim(), source_truncated);
+    Ok(match read_diagnostic {
+        Some(diagnostic) if body.is_empty() => {
+            format!("[error body read incomplete: {diagnostic}]")
+        }
+        Some(diagnostic) => format!("{body} [error body read incomplete: {diagnostic}]"),
+        None => body,
+    })
 }
 
 fn truncate_error_body(body: &str, source_truncated: bool) -> String {
@@ -704,5 +721,43 @@ mod tests {
         .expect("bounded error body");
 
         assert!(body.ends_with("... [truncated 1 chars]"));
+    }
+
+    #[tokio::test]
+    async fn error_body_reader_preserves_partial_and_diagnostic_on_transport_failure() {
+        let chunks = stream::iter([Ok(b"partial".to_vec()), Err("connection reset".to_owned())]);
+        let body = read_error_body(
+            Box::pin(chunks),
+            &CancellationToken::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("status remains authoritative after body reset");
+
+        assert!(body.starts_with("partial"));
+        assert!(body.contains("error body read incomplete"));
+        assert!(body.contains("connection reset"));
+    }
+
+    #[tokio::test]
+    async fn error_body_reader_preserves_status_on_idle_but_cancel_remains_authoritative() {
+        let pending = stream::pending::<Result<Vec<u8>, String>>();
+        let body = read_error_body(
+            Box::pin(pending),
+            &CancellationToken::new(),
+            Duration::from_millis(5),
+        )
+        .await
+        .expect("status remains authoritative after body idle timeout");
+        assert!(body.contains("error body read incomplete"));
+        assert!(body.contains("idle"));
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let pending = stream::pending::<Result<Vec<u8>, String>>();
+        assert_eq!(
+            read_error_body(Box::pin(pending), &cancel, Duration::ZERO).await,
+            Err(SseError::Cancelled)
+        );
     }
 }

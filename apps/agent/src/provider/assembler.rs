@@ -1229,7 +1229,8 @@ fn rejection_category(error: ToolArgumentError) -> &'static str {
 }
 
 fn safe_instance_path(path: &str, property_names: &HashSet<String>) -> String {
-    path.split('/')
+    let sanitized = path
+        .split('/')
         .map(|segment| {
             if segment.is_empty()
                 || segment.parse::<usize>().is_ok()
@@ -1243,7 +1244,12 @@ fn safe_instance_path(path: &str, property_names: &HashSet<String>) -> String {
             }
         })
         .collect::<Vec<_>>()
-        .join("/")
+        .join("/");
+    if is_safe_instance_path(&sanitized) {
+        sanitized
+    } else {
+        "/*".to_owned()
+    }
 }
 
 fn unescape_pointer(segment: &str) -> String {
@@ -2372,6 +2378,62 @@ mod tests {
         assert_eq!(
             safe_instance_path("/known/0/secret-key", &allowed),
             "/known/0/*"
+        );
+    }
+
+    #[test]
+    fn overlong_numeric_instance_path_collapses_to_safe_rejection() {
+        let raw_path = format!("/{}", vec!["0"; 513].join("/"));
+        let safe_path = safe_instance_path(&raw_path, &HashSet::new());
+        assert_eq!(safe_path, "/*");
+        assert!(is_safe_instance_path(&safe_path));
+
+        let ToolArgumentOutcome::Rejected {
+            rejected,
+            synthetic_result,
+        } = rejected_outcome(
+            "call-deep".to_owned(),
+            "nested_tool".to_owned(),
+            RejectionDetail {
+                error: ToolArgumentError::SchemaViolation,
+                instance_path: safe_path,
+                constraint: "type".to_owned(),
+            },
+            timestamp(),
+        )
+        else {
+            panic!("schema violation must reject the tool call")
+        };
+        let event = ProviderEvent::ToolCallRejected {
+            content_index: 0,
+            rejected,
+            synthetic_result,
+        };
+        let mut assembler = MessageAssembler::new();
+        assembler.apply(&ProviderEvent::Start).expect("start");
+        assembler
+            .apply(&ProviderEvent::ToolCallStart { content_index: 0 })
+            .expect("tool start");
+        assembler
+            .apply(&event)
+            .expect("bounded rejection must remain a tool rejection");
+        let synthetic_results = assembler.synthetic_results();
+        assert_eq!(synthetic_results.len(), 1);
+        assert!(synthetic_results[0].is_error);
+        assert_eq!(synthetic_results[0].details["instance_path"], json!("/*"));
+        let message = assembler
+            .finish(metadata(StopReason::ToolUse))
+            .expect("schema rejection must close as ToolUse, not provider Error");
+        assert_eq!(message.stop_reason, StopReason::ToolUse);
+        assert!(matches!(
+            message.content.as_slice(),
+            [AssistantContent::RejectedToolCall { rejected, .. }]
+                if rejected.error == ToolArgumentError::SchemaViolation
+        ));
+        assert!(
+            !serde_json::to_string(&event)
+                .expect("serialize rejection")
+                .contains(&raw_path)
         );
     }
 

@@ -308,6 +308,6 @@ Cloud release (T25〜T29): M1P・M0〜M5 と依存が満たされた範囲で並
 ## 補足
 
 - **OpenCode Zen (Go)**: 検証用の当面の既定(D7 と §4 の表)。クォータはドル換算($12/5h、$30/週、$60/月)。疎通確認: `curl https://opencode.ai/zen/go/v1/chat/completions -H "Authorization: Bearer $OPENCODE_GO_API_KEY" -H "Content-Type: application/json" -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"Reply with OK"}]}'`。ゲートウェイ実体なので Compat は直結先の値を流用せず M1 ライブ fixture で個別固定
-- ライブ検証はフィクスチャテストと完全分離し、キーが無くても通常テストは止めない(`SUMI_LIVE_TEST=1` オプトイン)。CI(GitHub Actions の agent パス)ではライブ以外を全部回す
+- ライブ検証はフィクスチャテストと完全分離し、キーが無くても通常テストは止めない(`SUMI_LIVE_TEST=1` オプトイン)。`SUMI_LIVE_TEST=1 cargo test --manifest-path apps/agent/Cargo.toml`ではnon-ignored T25 dispatcherがdirect Moonshot `kimi-k3`→direct Z.ai `glm-5.2`→Umansを順に実行し、credential不足/空を失敗にする。4つのprovider別ignored gateは明示的な開発実行用であり、OpenCodeはT25 direct証拠を代替しない。CI(GitHub Actions の agent パス)ではライブ以外を全部回す
 - 各タスク後の状態は常に main 相当の品質(全テスト緑)を保つ。マイルストーンは日付ではなく品質ゲートで区切る
 - 憲法プロンプト(人格)の執筆はスコープ外(Founder が書く)。実装はプレースホルダで進める(付録B-4)

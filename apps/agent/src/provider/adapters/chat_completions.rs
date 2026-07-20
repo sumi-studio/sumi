@@ -479,7 +479,7 @@ fn convert_messages(spec: &ModelSpec, context: &PromptContext) -> Vec<Value> {
                         | AssistantContent::RejectedToolCall { .. } => {}
                         AssistantContent::ToolCall { tool_call, .. } => {
                             tool_calls.push(json!({
-                                "id": normalize_tool_call_id(&tool_call.id),
+                                "id": tool_call.id,
                                 "type": "function",
                                 "function": {
                                     "name": tool_call.name,
@@ -614,7 +614,7 @@ fn convert_tool_result(message: &ToolResultMessage, supports_images: bool) -> Va
     json!({
         "role": "tool",
         "content": content,
-        "tool_call_id": normalize_tool_call_id(&message.tool_call_id),
+        "tool_call_id": message.tool_call_id,
     })
 }
 
@@ -1121,41 +1121,6 @@ fn collect_mfjs_refs<'a>(value: &'a Value, references: &mut Vec<&'a str>) {
         }
         _ => {}
     }
-}
-
-fn normalize_tool_call_id(id: &str) -> String {
-    const MAX_ID_LEN: usize = 40;
-    const HASH_LEN: usize = 16;
-    if !id.is_empty()
-        && id.len() <= MAX_ID_LEN
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-    {
-        return id.to_owned();
-    }
-    let hash = id
-        .as_bytes()
-        .iter()
-        .fold(0xcbf29ce484222325_u64, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-        });
-    let suffix = format!("{hash:016x}");
-    let mut prefix: String = id
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .take(MAX_ID_LEN - 1 - HASH_LEN)
-        .collect();
-    if prefix.is_empty() {
-        prefix.push_str("call");
-    }
-    format!("{prefix}_{suffix}")
 }
 
 fn has_tool_history(messages: &[ContextMessage]) -> bool {
@@ -2287,6 +2252,32 @@ mod tests {
         ))
         .expect("send matrix snapshot");
         assert_eq!(send_snapshot_matrix(), expected);
+    }
+
+    #[test]
+    fn same_origin_tool_call_and_result_ids_are_preserved_byte_for_byte() {
+        let spec = ModelSpec::preset("kimi-k3").expect("preset");
+        let request =
+            build_request(&spec, &context(), &RequestOptions::default()).expect("request");
+        let messages = request["messages"].as_array().expect("messages");
+        let assistant = messages
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .expect("assistant message");
+        let tool_result = messages
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .expect("tool result message");
+        let call_id = assistant["tool_calls"][0]["id"]
+            .as_str()
+            .expect("tool call id");
+        let result_id = tool_result["tool_call_id"]
+            .as_str()
+            .expect("tool result id");
+
+        assert_eq!(call_id.as_bytes(), b"call|with+noise");
+        assert_eq!(result_id.as_bytes(), b"call|with+noise");
+        assert_eq!(call_id.as_bytes(), result_id.as_bytes());
     }
 
     #[test]
