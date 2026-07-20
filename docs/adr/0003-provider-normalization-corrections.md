@@ -37,6 +37,12 @@ overflow、transportの各境界から再検証した。レビュー指摘への
    未使用placeholderを作らない。HTTP 429 fixtureはSSEではなくJSON bodyとして保持する。
 8. モデル世代を一括で同じthinking方言とみなさない。Kimi K3、K2.6、K2.7 Code、
    OpenCode Zen Goは別compatで、gateway値はlive fixtureなしに直APIから推測しない。
+   2026-07-20のproduction request A/Bでは、OpenCode Goだけが文字列
+   `tool_choice:"required"`付きtool requestをHTTP 400
+   `invalid_request_error`(`param=null`)で拒否し、他条件が同一の省略時は
+   tool call 1件、reasoning、2ターン目のtextまで完走した。この実測に限定して
+   OpenCode presetは`"required"`だけを送信前拒否する。Kimi/GLM/Umansの既存透過、
+   および未測定の`"auto"`・named/object形は変更しない。
 9. SSE event上限を複数deltaで迂回できないよう、tool argumentの累積raw bufferも
    4MiBで制限する。超過は`TooLarge`としてrawを即時破棄し、通常の拒否対で閉じる。
 10. Kimi strict判定はMoonshotAI/walle v0.1.13

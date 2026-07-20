@@ -853,7 +853,8 @@ fn adapter_error(error: &ChatAdapterError) -> (String, String) {
         ChatAdapterError::UnsupportedProtocol
         | ChatAdapterError::InvalidMaxTokens { .. }
         | ChatAdapterError::ReasoningRequired
-        | ChatAdapterError::InvalidReasoningEffort(_) => {
+        | ChatAdapterError::InvalidReasoningEffort(_)
+        | ChatAdapterError::RequiredToolChoiceUnsupported => {
             (error.to_string(), "invalid_provider_request".to_owned())
         }
     }
@@ -1244,7 +1245,7 @@ mod tests {
         let raw = include_str!("../../tests/fixtures/opencode_kimi_k2_7_code_text.sse");
         assert_eq!(
             raw.lines().filter(|line| line.starts_with("data:")).count(),
-            36
+            23
         );
         let done = raw.find("data: [DONE]").expect("DONE marker");
         let post_done = raw[done..]
@@ -1256,9 +1257,9 @@ mod tests {
             panic!("OpenCode capture must finish with Done")
         };
         assert_eq!(output.message.usage.input, 13);
-        assert_eq!(output.message.usage.output, 32);
-        assert_eq!(output.message.usage.reasoning, 27);
-        assert_eq!(output.message.usage.total_tokens, 45);
+        assert_eq!(output.message.usage.output, 19);
+        assert_eq!(output.message.usage.reasoning, 14);
+        assert_eq!(output.message.usage.total_tokens, 32);
         let expected: serde_json::Value = serde_json::from_str(include_str!(
             "../../tests/snapshots/opencode_kimi_k2_7_code_text.events.json"
         ))
@@ -1294,7 +1295,8 @@ mod tests {
     }
 
     #[test]
-    fn adapter_normalization_p95_smoke_is_under_30ms() {
+    #[ignore = "controlled-host performance smoke; run explicitly with --ignored"]
+    fn controlled_host_adapter_normalization_p95_smoke_is_under_30ms() {
         let payload = r#"{"choices":[{"delta":{"content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2}}"#;
         let registry = FrozenToolSchemaRegistry::compile(&[]).expect("registry");
         let mut samples = Vec::with_capacity(100);
@@ -2413,140 +2415,149 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_chat_tool_roundtrip_when_opted_in() {
-        if env::var("SUMI_LIVE_TEST").as_deref() != Ok("1") {
-            return;
-        }
+    #[ignore = "live OpenCode Go gate; requires non-empty OPENCODE_GO_API_KEY"]
+    async fn live_opencode_go_two_turn_tool_reasoning_gate() {
+        run_live_chat_tool_roundtrip("opencode-go").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "T25 live Moonshot direct gate; requires non-empty MOONSHOT_API_KEY"]
+    async fn live_kimi_k3_direct_two_turn_tool_reasoning_gate() {
+        run_live_chat_tool_roundtrip("kimi-k3").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "T25 live Z.ai direct gate; requires non-empty ZAI_API_KEY"]
+    async fn live_glm_5_2_direct_two_turn_tool_reasoning_gate() {
+        run_live_chat_tool_roundtrip("glm-5.2").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "T25 live Umans direct gate; requires non-empty UMANS_API_KEY"]
+    async fn live_umans_direct_two_turn_tool_reasoning_gate() {
+        run_live_chat_tool_roundtrip("umans").await;
+    }
+
+    async fn run_live_chat_tool_roundtrip(preset: &str) {
         if let Some(path) = env::var_os("SUMI_ENV_FILE") {
             dotenvy::from_path(path).expect("load SUMI_ENV_FILE for live test");
         }
 
-        let selected = env::var("SUMI_LIVE_PRESETS")
-            .unwrap_or_else(|_| "kimi-k3,glm-5.2,umans,opencode-go".to_owned());
-        for preset in selected
-            .split(',')
-            .map(str::trim)
-            .filter(|preset| !preset.is_empty())
-        {
-            let spec =
-                ModelSpec::preset(preset).unwrap_or_else(|| panic!("unknown preset {preset}"));
-            let Ok(api_key) = env::var(&spec.api_key_env) else {
-                continue;
-            };
-            if api_key.is_empty() {
-                continue;
-            }
+        let spec = ModelSpec::preset(preset).unwrap_or_else(|| panic!("unknown preset {preset}"));
+        let api_key = env::var(&spec.api_key_env)
+            .unwrap_or_else(|_| panic!("{preset} live gate requires {}", spec.api_key_env));
+        assert!(
+            !api_key.trim().is_empty(),
+            "{preset} live gate requires non-empty {}",
+            spec.api_key_env
+        );
 
-            let tool = ToolDefinition {
-                name: "echo_value".to_owned(),
-                description: "Return the supplied value unchanged.".to_owned(),
-                parameters: serde_json::json!({
-                    "type":"object",
-                    "properties":{"value":{"type":"string"}},
-                    "required":["value"],
-                    "additionalProperties":false
-                }),
-            };
-            let user = types::UserMessage {
-                content: vec![types::UserContent::Text {
-                    text: "Call echo_value once with value live-smoke-ok.".to_owned(),
-                }],
-                timestamp: Utc::now(),
-            };
-            let first_context = PromptContext {
-                system_prompt: "Use the requested tool exactly once.".to_owned(),
-                memory_blocks: vec![],
-                messages: vec![types::ContextMessage::Synthetic {
-                    message: types::Message::User(user.clone()),
-                }],
-                provider_context: vec![],
-                tools: vec![tool.clone()],
-            };
-            let first = run_live_request(
-                spec.clone(),
-                first_context,
-                RequestOptions {
-                    max_tokens: Some(4_096),
-                    tool_choice: Some(serde_json::json!("required")),
-                    ..RequestOptions::default()
-                },
-                api_key.clone(),
-            )
-            .await;
-            assert_eq!(first.stop_reason, StopReason::ToolUse, "{preset}");
-            let calls: Vec<_> = first
+        let tool = ToolDefinition {
+            name: "echo_value".to_owned(),
+            description: "Return the supplied value unchanged.".to_owned(),
+            parameters: serde_json::json!({
+                "type":"object",
+                "properties":{"value":{"type":"string"}},
+                "required":["value"],
+                "additionalProperties":false
+            }),
+        };
+        let user = types::UserMessage {
+            content: vec![types::UserContent::Text {
+                text: "Call echo_value once with value live-smoke-ok.".to_owned(),
+            }],
+            timestamp: Utc::now(),
+        };
+        let first_context = PromptContext {
+            system_prompt: "Use the requested tool exactly once.".to_owned(),
+            memory_blocks: vec![],
+            messages: vec![types::ContextMessage::Synthetic {
+                message: types::Message::User(user.clone()),
+            }],
+            provider_context: vec![],
+            tools: vec![tool.clone()],
+        };
+        let first = run_live_request(
+            spec.clone(),
+            first_context,
+            RequestOptions {
+                max_tokens: Some(4_096),
+                ..RequestOptions::default()
+            },
+            api_key.clone(),
+        )
+        .await;
+        assert_eq!(first.stop_reason, StopReason::ToolUse, "{preset}");
+        let calls: Vec<_> = first
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                types::AssistantContent::ToolCall { tool_call, .. } => Some(tool_call),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1, "{preset}");
+        assert_eq!(
+            calls[0].arguments.as_object().get("value"),
+            Some(&serde_json::json!("live-smoke-ok")),
+            "{preset}"
+        );
+        assert!(
+            first
                 .content
                 .iter()
-                .filter_map(|content| match content {
-                    types::AssistantContent::ToolCall { tool_call, .. } => Some(tool_call),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(calls.len(), 1, "{preset}");
-            assert_eq!(
-                calls[0].arguments.as_object().get("value"),
-                Some(&serde_json::json!("live-smoke-ok")),
-                "{preset}"
-            );
-            if preset == "kimi-k3" {
-                assert!(
-                    first
-                        .content
-                        .iter()
-                        .any(|content| matches!(content, types::AssistantContent::Thinking { .. })),
-                    "Kimi live fixture did not expose replayable reasoning"
-                );
-            }
+                .any(|content| matches!(content, types::AssistantContent::Thinking { .. })),
+            "{preset} live gate did not expose replayable reasoning"
+        );
 
-            let second_context = PromptContext {
-                system_prompt: "Use the requested tool exactly once.".to_owned(),
-                memory_blocks: vec![],
-                messages: vec![
-                    types::ContextMessage::Synthetic {
-                        message: types::Message::User(user),
-                    },
-                    types::ContextMessage::Synthetic {
-                        message: types::Message::Assistant(first.clone()),
-                    },
-                    types::ContextMessage::Synthetic {
-                        message: types::Message::ToolResult(types::ToolResultMessage {
-                            tool_call_id: calls[0].id.clone(),
-                            tool_name: calls[0].name.clone(),
-                            content: vec![types::UserContent::Text {
-                                text: "live-smoke-ok".to_owned(),
-                            }],
-                            details: serde_json::json!({}),
-                            is_error: false,
-                            timestamp: Utc::now(),
-                        }),
-                    },
-                ],
-                provider_context: vec![],
-                tools: vec![tool],
-            };
-            let second = run_live_request(
-                spec,
-                second_context,
-                RequestOptions {
-                    max_tokens: Some(4_096),
-                    ..RequestOptions::default()
+        let second_context = PromptContext {
+            system_prompt: "Use the requested tool exactly once.".to_owned(),
+            memory_blocks: vec![],
+            messages: vec![
+                types::ContextMessage::Synthetic {
+                    message: types::Message::User(user),
                 },
-                api_key,
-            )
-            .await;
-            assert!(
-                matches!(second.stop_reason, StopReason::Stop | StopReason::Length),
-                "{preset}: {:?}",
-                second.error_message
-            );
-            assert!(
-                second.content.iter().any(|content| matches!(
-                    content,
-                    types::AssistantContent::Text { text, .. } if !text.is_empty()
-                )),
-                "{preset}"
-            );
-        }
+                types::ContextMessage::Synthetic {
+                    message: types::Message::Assistant(first.clone()),
+                },
+                types::ContextMessage::Synthetic {
+                    message: types::Message::ToolResult(types::ToolResultMessage {
+                        tool_call_id: calls[0].id.clone(),
+                        tool_name: calls[0].name.clone(),
+                        content: vec![types::UserContent::Text {
+                            text: "live-smoke-ok".to_owned(),
+                        }],
+                        details: serde_json::json!({}),
+                        is_error: false,
+                        timestamp: Utc::now(),
+                    }),
+                },
+            ],
+            provider_context: vec![],
+            tools: vec![tool],
+        };
+        let second = run_live_request(
+            spec,
+            second_context,
+            RequestOptions {
+                max_tokens: Some(4_096),
+                ..RequestOptions::default()
+            },
+            api_key,
+        )
+        .await;
+        assert!(
+            matches!(second.stop_reason, StopReason::Stop | StopReason::Length),
+            "{preset}: {:?}",
+            second.error_message
+        );
+        assert!(
+            second.content.iter().any(|content| matches!(
+                content,
+                types::AssistantContent::Text { text, .. } if !text.is_empty()
+            )),
+            "{preset}"
+        );
     }
 
     async fn run_live_request(

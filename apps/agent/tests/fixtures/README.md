@@ -10,17 +10,18 @@ under `../snapshots/`.
 The near-term live default is OpenCode Zen Go. Its capture preserves the
 provider's `reasoning_content` deltas, usage/cost placement, `[DONE]`, and the
 post-DONE cost trailer; `[DONE]` remains the canonical normalized terminal.
-Capture only after explicitly opting in to a credential file:
+The request body is the complete `build_request` output fixed by
+`opencode_live_capture_request` in `chat_send_matrix.json`; the provenance test
+keeps the recorded body equal to that production builder output. Capture only
+after explicitly loading the `opencode-go` credential from the local OpenCode
+auth store without printing it:
 
 ```sh
-set -a
-. "$SUMI_ENV_FILE"
-set +a
 curl -sS -N --max-time 60 \
   -H "Authorization: Bearer $OPENCODE_GO_API_KEY" \
   -H "Content-Type: application/json" \
   https://opencode.ai/zen/go/v1/chat/completions \
-  --data-binary '{"model":"kimi-k2.7-code","messages":[{"role":"user","content":"Reply with exactly fixture-ok"}],"stream":true,"stream_options":{"include_usage":true},"max_tokens":64}'
+  --data-binary '{"max_tokens":64,"messages":[{"content":[{"text":"Reply with exactly fixture-ok","type":"text"}],"role":"user"}],"model":"kimi-k2.7-code","stream":true,"stream_options":{"include_usage":true}}'
 ```
 
 Moonshot direct, Z.ai direct, and Umans raw/live evidence remains mandatory but
@@ -43,5 +44,9 @@ capture command with a `$..._API_KEY` placeholder, sanitization operations, and
 SHA-256 of the pre-sanitized capture in `provenance.json`. Never store or print
 the credential or Authorization header.
 
-`SUMI_LIVE_TEST=1` remains a separate optional integration test. It is not a
-substitute for checked-in raw capture provenance.
+Provider-specific live gates are ignored by the ordinary test suite and must be
+selected explicitly with `cargo test <live_gate_name> -- --ignored`. A selected
+gate requires its preset's non-empty credential environment variable and fails
+when the credential is missing; `SUMI_ENV_FILE` may explicitly name a dotenv
+file to load. Live tests are not substitutes for checked-in raw capture
+provenance.

@@ -43,6 +43,7 @@ pub struct ChatCompat {
     pub requires_reasoning_content_on_assistant: bool,
     pub zai_tool_stream: bool,
     pub supports_strict_mode: bool,
+    pub supports_required_tool_choice: bool,
     pub supports_store: bool,
     pub supports_developer_role: bool,
     pub allows_sampling_parameters: bool,
@@ -91,6 +92,7 @@ impl ModelSpec {
                     requires_reasoning_content_on_assistant: true,
                     zai_tool_stream: false,
                     supports_strict_mode: true,
+                    supports_required_tool_choice: true,
                     supports_store: false,
                     supports_developer_role: false,
                     allows_sampling_parameters: false,
@@ -111,6 +113,7 @@ impl ModelSpec {
                     requires_reasoning_content_on_assistant: false,
                     zai_tool_stream: true,
                     supports_strict_mode: false,
+                    supports_required_tool_choice: true,
                     supports_store: false,
                     supports_developer_role: false,
                     allows_sampling_parameters: true,
@@ -131,6 +134,7 @@ impl ModelSpec {
                     requires_reasoning_content_on_assistant: false,
                     zai_tool_stream: false,
                     supports_strict_mode: false,
+                    supports_required_tool_choice: true,
                     supports_store: false,
                     supports_developer_role: false,
                     allows_sampling_parameters: true,
@@ -151,6 +155,7 @@ impl ModelSpec {
                     requires_reasoning_content_on_assistant: false,
                     zai_tool_stream: false,
                     supports_strict_mode: false,
+                    supports_required_tool_choice: false,
                     supports_store: false,
                     supports_developer_role: false,
                     allows_sampling_parameters: true,
@@ -250,6 +255,8 @@ pub enum ChatAdapterError {
     ReasoningRequired,
     #[error("unsupported reasoning_effort {0}; this model requires max")]
     InvalidReasoningEffort(String),
+    #[error("tool_choice=\"required\" is unsupported by this provider preset")]
+    RequiredToolChoiceUnsupported,
     #[error("invalid Chat Completions chunk: {0}")]
     InvalidChunk(String),
     #[error("provider returned an error: {message}")]
@@ -293,6 +300,14 @@ pub fn build_request(
         return Err(ChatAdapterError::UnsupportedProtocol);
     }
     let output_tokens = requested_output_tokens(spec, options)?;
+    if !spec.compat.supports_required_tool_choice
+        && matches!(
+            options.tool_choice.as_ref(),
+            Some(Value::String(tool_choice)) if tool_choice == "required"
+        )
+    {
+        return Err(ChatAdapterError::RequiredToolChoiceUnsupported);
+    }
     if spec.compat.thinking_format == ThinkingFormat::OpenAiEffort {
         if !spec.reasoning {
             return Err(ChatAdapterError::ReasoningRequired);
@@ -2233,7 +2248,35 @@ mod tests {
                     max_tokens: Some(64),
                     ..RequestOptions::default()
                 }
-            ).expect("OpenCode live capture request")
+            ).expect("OpenCode live capture request"),
+            "opencode_tool_live_gate_first_turn": build_request(
+                &opencode,
+                &PromptContext {
+                    system_prompt: "Use the requested tool exactly once.".to_owned(),
+                    memory_blocks: vec![],
+                    messages: vec![synthetic(Message::User(UserMessage {
+                        content: vec![UserContent::Text {
+                            text: "Call echo_value once with value live-smoke-ok.".to_owned(),
+                        }],
+                        timestamp: Utc::now(),
+                    }))],
+                    provider_context: vec![],
+                    tools: vec![ToolDefinition {
+                        name: "echo_value".to_owned(),
+                        description: "Return the supplied value unchanged.".to_owned(),
+                        parameters: json!({
+                            "type":"object",
+                            "properties":{"value":{"type":"string"}},
+                            "required":["value"],
+                            "additionalProperties":false
+                        }),
+                    }],
+                },
+                &RequestOptions {
+                    max_tokens: Some(4_096),
+                    ..RequestOptions::default()
+                }
+            ).expect("OpenCode live tool gate request")
         })
     }
 
@@ -2244,6 +2287,76 @@ mod tests {
         ))
         .expect("send matrix snapshot");
         assert_eq!(send_snapshot_matrix(), expected);
+    }
+
+    #[test]
+    fn opencode_capture_provenance_request_matches_production_builder() {
+        let provenance: Value =
+            serde_json::from_str(include_str!("../../../tests/fixtures/provenance.json"))
+                .expect("fixture provenance");
+        assert_eq!(
+            provenance["fixtures"]["opencode_kimi_k2_7_code_text.sse"]["request_body"],
+            send_snapshot_matrix()["opencode_live_capture_request"]
+        );
+    }
+
+    #[test]
+    fn opencode_rejects_only_live_proven_unsupported_required_tool_choice() {
+        let context = simple_context(
+            vec![Message::User(UserMessage {
+                content: vec![UserContent::Text {
+                    text: "Call read_file.".to_owned(),
+                }],
+                timestamp: Utc::now(),
+            })],
+            vec![tool_definition()],
+        );
+        let required = RequestOptions {
+            tool_choice: Some(json!("required")),
+            ..RequestOptions::default()
+        };
+        assert!(matches!(
+            build_request(
+                &ModelSpec::preset("opencode-go").expect("OpenCode preset"),
+                &context,
+                &required
+            ),
+            Err(ChatAdapterError::RequiredToolChoiceUnsupported)
+        ));
+
+        let omitted = build_request(
+            &ModelSpec::preset("opencode-go").expect("OpenCode preset"),
+            &context,
+            &RequestOptions::default(),
+        )
+        .expect("omitted tool choice remains supported");
+        assert!(omitted.get("tool_choice").is_none());
+
+        for tool_choice in [
+            json!("auto"),
+            json!({"type":"function","function":{"name":"read_file"}}),
+        ] {
+            let request = build_request(
+                &ModelSpec::preset("opencode-go").expect("OpenCode preset"),
+                &context,
+                &RequestOptions {
+                    tool_choice: Some(tool_choice.clone()),
+                    ..RequestOptions::default()
+                },
+            )
+            .expect("unmeasured tool choice shape retains existing pass-through behavior");
+            assert_eq!(request["tool_choice"], tool_choice);
+        }
+
+        for preset in ["kimi-k3", "glm-5.2", "umans"] {
+            let request = build_request(
+                &ModelSpec::preset(preset).expect("direct preset"),
+                &context,
+                &required,
+            )
+            .unwrap_or_else(|error| panic!("{preset} required tool choice changed: {error}"));
+            assert_eq!(request["tool_choice"], json!("required"), "{preset}");
+        }
     }
 
     #[test]

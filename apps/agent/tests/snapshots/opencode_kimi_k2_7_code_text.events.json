@@ -5,31 +5,18 @@
     "signature_field": "reasoning_content",
     "type": "thinking_start"
   },
-  { "content_index": 0, "delta": "The", "type": "thinking_delta" },
-  { "content_index": 0, "delta": " user", "type": "thinking_delta" },
-  { "content_index": 0, "delta": " wants", "type": "thinking_delta" },
-  { "content_index": 0, "delta": " me", "type": "thinking_delta" },
-  { "content_index": 0, "delta": " to", "type": "thinking_delta" },
-  { "content_index": 0, "delta": " reply", "type": "thinking_delta" },
-  { "content_index": 0, "delta": " with", "type": "thinking_delta" },
+  { "content_index": 0, "delta": "We", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " need", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " answer", "type": "thinking_delta" },
   { "content_index": 0, "delta": " exactly", "type": "thinking_delta" },
   { "content_index": 0, "delta": " '", "type": "thinking_delta" },
   { "content_index": 0, "delta": "fixture", "type": "thinking_delta" },
   { "content_index": 0, "delta": "-", "type": "thinking_delta" },
   { "content_index": 0, "delta": "ok", "type": "thinking_delta" },
   { "content_index": 0, "delta": "'.", "type": "thinking_delta" },
-  { "content_index": 0, "delta": " I", "type": "thinking_delta" },
-  { "content_index": 0, "delta": " should", "type": "thinking_delta" },
-  { "content_index": 0, "delta": " not", "type": "thinking_delta" },
-  { "content_index": 0, "delta": " add", "type": "thinking_delta" },
-  { "content_index": 0, "delta": " any", "type": "thinking_delta" },
-  { "content_index": 0, "delta": " other", "type": "thinking_delta" },
-  { "content_index": 0, "delta": " text", "type": "thinking_delta" },
-  { "content_index": 0, "delta": ",", "type": "thinking_delta" },
-  { "content_index": 0, "delta": " punctuation", "type": "thinking_delta" },
-  { "content_index": 0, "delta": ",", "type": "thinking_delta" },
-  { "content_index": 0, "delta": " or", "type": "thinking_delta" },
-  { "content_index": 0, "delta": " formatting", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " No", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " extra", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " content", "type": "thinking_delta" },
   { "content_index": 0, "delta": ".", "type": "thinking_delta" },
   { "content_index": 1, "type": "text_start" },
   { "content_index": 1, "delta": "fixture", "type": "text_delta" },
@@ -37,7 +24,7 @@
   { "content_index": 1, "delta": "ok", "type": "text_delta" },
   { "content": "fixture-ok", "content_index": 1, "type": "text_end" },
   {
-    "content": "The user wants me to reply with exactly 'fixture-ok'. I should not add any other text, punctuation, or formatting.",
+    "content": "We need answer exactly 'fixture-ok'. No extra content.",
     "content_index": 0,
     "type": "thinking_end"
   },
@@ -47,7 +34,7 @@
         "content": [
           {
             "signature_field": "reasoning_content",
-            "thinking": "The user wants me to reply with exactly 'fixture-ok'. I should not add any other text, punctuation, or formatting.",
+            "thinking": "We need answer exactly 'fixture-ok'. No extra content.",
             "type": "thinking",
             "wire_item_index": 0
           },
@@ -69,9 +56,9 @@
           "cache_read": 0,
           "cache_write": 0,
           "input": 13,
-          "output": 32,
-          "reasoning": 27,
-          "total_tokens": 45
+          "output": 19,
+          "reasoning": 14,
+          "total_tokens": 32
         }
       },
       "provider_context": []

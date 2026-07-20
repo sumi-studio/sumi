@@ -105,6 +105,42 @@
     "stream": true,
     "stream_options": { "include_usage": true }
   },
+  "opencode_tool_live_gate_first_turn": {
+    "max_tokens": 4096,
+    "messages": [
+      {
+        "content": "Use the requested tool exactly once.",
+        "role": "system"
+      },
+      {
+        "content": [
+          {
+            "text": "Call echo_value once with value live-smoke-ok.",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "model": "kimi-k2.7-code",
+    "stream": true,
+    "stream_options": { "include_usage": true },
+    "tools": [
+      {
+        "function": {
+          "description": "Return the supplied value unchanged.",
+          "name": "echo_value",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": { "value": { "type": "string" } },
+            "required": ["value"],
+            "type": "object"
+          }
+        },
+        "type": "function"
+      }
+    ]
+  },
   "thinking_replay": {
     "max_completion_tokens": 16384,
     "messages": [

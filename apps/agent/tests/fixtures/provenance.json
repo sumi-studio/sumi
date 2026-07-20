@@ -89,23 +89,30 @@
       "case": "reasoning_and_text_with_post_done_cost_trailer",
       "live_capture_status": "captured_and_sanitized",
       "endpoint_origin": "https://opencode.ai/zen/go/v1",
-      "captured_at": "2026-07-20T08:37:41Z",
-      "raw_capture_bytes": 7237,
-      "raw_capture_sha256": "19d9976b6c347ab1ac72e153b64f01a3522eb9092e4db31e2d66178508843eb5",
-      "capture_command": "curl -sS -N --max-time 60 -H 'Authorization: Bearer $OPENCODE_GO_API_KEY' -H 'Content-Type: application/json' https://opencode.ai/zen/go/v1/chat/completions --data-binary '{\"model\":\"kimi-k2.7-code\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly fixture-ok\"}],\"stream\":true,\"stream_options\":{\"include_usage\":true},\"max_tokens\":64}'",
+      "captured_at": "2026-07-20T13:09:49.806Z",
+      "raw_capture_bytes": 4486,
+      "raw_capture_sha256": "6eb84863feb46a3091e48e25e3ab43f6a9fb309598875ae763fd1d4066467e9c",
+      "credential_source": "OpenCode auth store opencode-go entry (credential not stored)",
+      "request_body_source": "production build_request output fixed by chat_send_matrix.json opencode_live_capture_request and its provenance consistency test",
+      "capture_command": "curl -sS -N --fail-with-body --max-time 120 -H 'Authorization: Bearer $OPENCODE_GO_API_KEY' -H 'Content-Type: application/json' https://opencode.ai/zen/go/v1/chat/completions --data-binary @/tmp/sumi-opencode-production-request.json --output /tmp/sumi-opencode-production-capture.raw.sse",
       "request_body": {
-        "model": "kimi-k2.7-code",
+        "max_tokens": 64,
         "messages": [
           {
             "role": "user",
-            "content": "Reply with exactly fixture-ok"
+            "content": [
+              {
+                "text": "Reply with exactly fixture-ok",
+                "type": "text"
+              }
+            ]
           }
         ],
+        "model": "kimi-k2.7-code",
         "stream": true,
         "stream_options": {
           "include_usage": true
-        },
-        "max_tokens": 64
+        }
       },
       "sanitization": [
         "response id replaced with chatcmpl-<response-id>",
