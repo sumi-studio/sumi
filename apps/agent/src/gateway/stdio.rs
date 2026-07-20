@@ -175,6 +175,15 @@ where
         if newline.is_some() {
             break;
         }
+        let minimum_content_bytes =
+            actual_bytes.saturating_sub(usize::from(previous_byte == Some(b'\r')));
+        if minimum_content_bytes > MAX_FRAME_BYTES {
+            return Err(CommandTooLarge {
+                limit: MAX_FRAME_BYTES,
+                actual: minimum_content_bytes,
+            }
+            .into());
+        }
     }
 
     let content_bytes = actual_bytes.saturating_sub(terminator_bytes);
@@ -191,7 +200,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use tokio::io::BufReader;
+    use tokio::io::{AsyncWriteExt, BufReader};
 
     use super::*;
     use crate::gateway::Command;
@@ -371,31 +380,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drains_an_oversized_frame_before_reading_the_next_command() {
-        let mut bytes = vec![b' '; MAX_FRAME_BYTES + 100];
-        bytes.push(b'\n');
-        bytes.extend_from_slice(&envelope(serde_json::json!({"type": "abort"})));
-        bytes.push(b'\n');
-        let mut input = BufReader::new(bytes.as_slice());
+    async fn accepts_a_max_size_frame_when_crlf_is_split_after_the_grace_byte() {
+        let mut bytes = vec![b' '; MAX_FRAME_BYTES];
+        bytes.extend_from_slice(b"\r\n");
+        let mut input = BufReader::with_capacity(MAX_FRAME_BYTES + 1, bytes.as_slice());
 
-        let error = read_command(&mut input)
+        let frame = read_frame(&mut input)
             .await
-            .expect_err("oversized input must fail");
+            .expect("maximum frame with CRLF is valid");
+        assert_eq!(frame.len(), MAX_FRAME_BYTES);
+    }
+
+    #[tokio::test]
+    async fn rejects_an_unterminated_oversized_frame_while_the_writer_is_open() {
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        let writer_task = tokio::spawn(async move {
+            writer
+                .write_all(&vec![b' '; MAX_FRAME_BYTES + 1])
+                .await
+                .expect("write oversized frame");
+            std::future::pending::<()>().await;
+        });
+        let mut input = BufReader::new(reader);
+
+        let error =
+            tokio::time::timeout(std::time::Duration::from_secs(1), read_command(&mut input))
+                .await
+                .expect("oversized frame must not wait for newline or EOF")
+                .expect_err("oversized input must fail");
+        writer_task.abort();
         assert_eq!(
             error.downcast_ref::<CommandTooLarge>(),
             Some(&CommandTooLarge {
                 limit: MAX_FRAME_BYTES,
-                actual: MAX_FRAME_BYTES + 100,
-            })
-        );
-        assert_eq!(
-            read_command(&mut input)
-                .await
-                .expect("reader resynchronizes at the next line"),
-            InboundCommand::Valid(CommandEnvelope {
-                seq: 1,
-                command_id: "command-1".to_owned(),
-                command: Command::Abort {},
+                actual: MAX_FRAME_BYTES + 1,
             })
         );
     }
