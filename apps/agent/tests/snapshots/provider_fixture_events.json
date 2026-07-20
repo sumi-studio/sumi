@@ -1,0 +1,228 @@
+{
+  "kimi_text": [
+    { "type": "start" },
+    { "content_index": 0, "type": "text_start" },
+    { "content_index": 0, "delta": "hello", "type": "text_delta" },
+    { "content": "hello", "content_index": 0, "type": "text_end" },
+    {
+      "output": {
+        "message": {
+          "content": [
+            { "text": "hello", "type": "text", "wire_item_index": 0 }
+          ],
+          "error_message": null,
+          "interrupted": false,
+          "model": "kimi-k3",
+          "origin": {
+            "model": "kimi-k3",
+            "protocol": "open_ai_chat_completions",
+            "provider_instance_id": "<provider_instance_id>"
+          },
+          "provider": "moonshot",
+          "provider_code": "stop",
+          "stop_reason": "stop",
+          "timestamp": "<timestamp>",
+          "usage": {
+            "cache_read": 0,
+            "cache_write": 0,
+            "input": 5,
+            "output": 2,
+            "reasoning": 0,
+            "total_tokens": 7
+          }
+        },
+        "provider_context": []
+      },
+      "reason": "stop",
+      "type": "done"
+    }
+  ],
+  "kimi_reasoning": [
+    { "type": "start" },
+    {
+      "content_index": 0,
+      "signature_field": "reasoning_content",
+      "type": "thinking_start"
+    },
+    { "content_index": 0, "delta": "consider", "type": "thinking_delta" },
+    { "content_index": 1, "type": "text_start" },
+    { "content_index": 1, "delta": "answer", "type": "text_delta" },
+    { "content": "answer", "content_index": 1, "type": "text_end" },
+    { "content": "consider", "content_index": 0, "type": "thinking_end" },
+    {
+      "output": {
+        "message": {
+          "content": [
+            {
+              "signature_field": "reasoning_content",
+              "thinking": "consider",
+              "type": "thinking",
+              "wire_item_index": 0
+            },
+            { "text": "answer", "type": "text", "wire_item_index": 1 }
+          ],
+          "error_message": null,
+          "interrupted": false,
+          "model": "kimi-k3",
+          "origin": {
+            "model": "kimi-k3",
+            "protocol": "open_ai_chat_completions",
+            "provider_instance_id": "<provider_instance_id>"
+          },
+          "provider": "moonshot",
+          "provider_code": "stop",
+          "stop_reason": "stop",
+          "timestamp": "<timestamp>",
+          "usage": {
+            "cache_read": 0,
+            "cache_write": 0,
+            "input": 0,
+            "output": 0,
+            "reasoning": 0,
+            "total_tokens": 0
+          }
+        },
+        "provider_context": []
+      },
+      "reason": "stop",
+      "type": "done"
+    }
+  ],
+  "kimi_toolcall": [
+    { "type": "start" },
+    { "content_index": 0, "type": "tool_call_start" },
+    { "content_index": 0, "delta": "{\"path\":", "type": "tool_call_delta" },
+    { "content_index": 0, "preview": {}, "type": "tool_call_preview" },
+    { "content_index": 0, "delta": "\"a.txt\"}", "type": "tool_call_delta" },
+    {
+      "content_index": 0,
+      "preview": { "path": "a.txt" },
+      "type": "tool_call_preview"
+    },
+    {
+      "content_index": 0,
+      "tool_call": {
+        "arguments": { "path": "a.txt" },
+        "id": "call-1",
+        "name": "read_file"
+      },
+      "type": "tool_call_end"
+    },
+    {
+      "output": {
+        "message": {
+          "content": [
+            {
+              "tool_call": {
+                "arguments": { "path": "a.txt" },
+                "id": "call-1",
+                "name": "read_file"
+              },
+              "type": "tool_call",
+              "wire_item_index": 0
+            }
+          ],
+          "error_message": null,
+          "interrupted": false,
+          "model": "kimi-k3",
+          "origin": {
+            "model": "kimi-k3",
+            "protocol": "open_ai_chat_completions",
+            "provider_instance_id": "<provider_instance_id>"
+          },
+          "provider": "moonshot",
+          "provider_code": "tool_calls",
+          "stop_reason": "tool_use",
+          "timestamp": "<timestamp>",
+          "usage": {
+            "cache_read": 0,
+            "cache_write": 0,
+            "input": 0,
+            "output": 0,
+            "reasoning": 0,
+            "total_tokens": 0
+          }
+        },
+        "provider_context": []
+      },
+      "reason": "tool_use",
+      "type": "done"
+    }
+  ],
+  "glm_tool_stream": [
+    { "type": "start" },
+    {
+      "content_index": 0,
+      "signature_field": "reasoning",
+      "type": "thinking_start"
+    },
+    { "content_index": 0, "delta": "think", "type": "thinking_delta" },
+    { "content_index": 1, "type": "tool_call_start" },
+    {
+      "content_index": 1,
+      "delta": "{\"command\":\"pwd\"}",
+      "type": "tool_call_delta"
+    },
+    {
+      "content_index": 1,
+      "preview": { "command": "pwd" },
+      "type": "tool_call_preview"
+    },
+    { "content": "think", "content_index": 0, "type": "thinking_end" },
+    {
+      "content_index": 1,
+      "tool_call": {
+        "arguments": { "command": "pwd" },
+        "id": "call-2",
+        "name": "bash"
+      },
+      "type": "tool_call_end"
+    },
+    {
+      "output": {
+        "message": {
+          "content": [
+            {
+              "signature_field": "reasoning",
+              "thinking": "think",
+              "type": "thinking",
+              "wire_item_index": 0
+            },
+            {
+              "tool_call": {
+                "arguments": { "command": "pwd" },
+                "id": "call-2",
+                "name": "bash"
+              },
+              "type": "tool_call",
+              "wire_item_index": 1
+            }
+          ],
+          "error_message": null,
+          "interrupted": false,
+          "model": "glm-5.2",
+          "origin": {
+            "model": "glm-5.2",
+            "protocol": "open_ai_chat_completions",
+            "provider_instance_id": "<provider_instance_id>"
+          },
+          "provider": "zai",
+          "provider_code": "tool_calls",
+          "stop_reason": "tool_use",
+          "timestamp": "<timestamp>",
+          "usage": {
+            "cache_read": 0,
+            "cache_write": 0,
+            "input": 0,
+            "output": 0,
+            "reasoning": 0,
+            "total_tokens": 0
+          }
+        },
+        "provider_context": []
+      },
+      "reason": "tool_use",
+      "type": "done"
+    }
+  ]
+}

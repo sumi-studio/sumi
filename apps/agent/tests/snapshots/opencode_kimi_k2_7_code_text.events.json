@@ -1,0 +1,82 @@
+[
+  { "type": "start" },
+  {
+    "content_index": 0,
+    "signature_field": "reasoning_content",
+    "type": "thinking_start"
+  },
+  { "content_index": 0, "delta": "The", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " user", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " wants", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " me", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " to", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " reply", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " with", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " exactly", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " '", "type": "thinking_delta" },
+  { "content_index": 0, "delta": "fixture", "type": "thinking_delta" },
+  { "content_index": 0, "delta": "-", "type": "thinking_delta" },
+  { "content_index": 0, "delta": "ok", "type": "thinking_delta" },
+  { "content_index": 0, "delta": "'.", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " I", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " should", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " not", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " add", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " any", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " other", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " text", "type": "thinking_delta" },
+  { "content_index": 0, "delta": ",", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " punctuation", "type": "thinking_delta" },
+  { "content_index": 0, "delta": ",", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " or", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " formatting", "type": "thinking_delta" },
+  { "content_index": 0, "delta": ".", "type": "thinking_delta" },
+  { "content_index": 1, "type": "text_start" },
+  { "content_index": 1, "delta": "fixture", "type": "text_delta" },
+  { "content_index": 1, "delta": "-", "type": "text_delta" },
+  { "content_index": 1, "delta": "ok", "type": "text_delta" },
+  { "content": "fixture-ok", "content_index": 1, "type": "text_end" },
+  {
+    "content": "The user wants me to reply with exactly 'fixture-ok'. I should not add any other text, punctuation, or formatting.",
+    "content_index": 0,
+    "type": "thinking_end"
+  },
+  {
+    "output": {
+      "message": {
+        "content": [
+          {
+            "signature_field": "reasoning_content",
+            "thinking": "The user wants me to reply with exactly 'fixture-ok'. I should not add any other text, punctuation, or formatting.",
+            "type": "thinking",
+            "wire_item_index": 0
+          },
+          { "text": "fixture-ok", "type": "text", "wire_item_index": 1 }
+        ],
+        "error_message": null,
+        "interrupted": false,
+        "model": "kimi-k2.7-code",
+        "origin": {
+          "model": "kimi-k2.7-code",
+          "protocol": "open_ai_chat_completions",
+          "provider_instance_id": "<provider_instance_id>"
+        },
+        "provider": "opencode-go",
+        "provider_code": "stop",
+        "stop_reason": "stop",
+        "timestamp": "<timestamp>",
+        "usage": {
+          "cache_read": 0,
+          "cache_write": 0,
+          "input": 13,
+          "output": 32,
+          "reasoning": 27,
+          "total_tokens": 45
+        }
+      },
+      "provider_context": []
+    },
+    "reason": "stop",
+    "type": "done"
+  }
+]

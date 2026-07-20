@@ -16,7 +16,10 @@ preset = "opencode-go"
 # base_url = "https://opencode.ai/zen/go/v1"
 # api_key_env = "OPENCODE_GO_API_KEY"
 # context_window = 262144
-# max_tokens = 32768 # Default request output budget; model context is 262144.
+# max_output_tokens = 32768
+# default_output_tokens = 16384 # Normal request budget; model context is 262144.
+# Cumulative wire/content/event/tool/preview-work limits are derived from the
+# actual request output-token budget; unrepresentable limits fail at config load.
 
 # Provider measurements can override preset compatibility without recompiling.
 # [model.compat]

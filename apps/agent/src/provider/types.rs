@@ -5,9 +5,10 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use futures_util::Stream;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::{Deserialize, Deserializer, Serialize, de};
+use serde_json::{Map, Value};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
@@ -15,6 +16,82 @@ pub enum Message {
     User(UserMessage),
     Assistant(AssistantMessage),
     ToolResult(ToolResultMessage),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "role", rename_all = "snake_case")]
+pub enum PublicMessage {
+    User(UserMessage),
+    Assistant(PublicAssistantMessage),
+    ToolResult(ToolResultMessage),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryLayer {
+    L1,
+    L2,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MemoryBlock {
+    pub layer: MemoryLayer,
+    pub text: String,
+    pub time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiProtocol {
+    OpenAiChatCompletions,
+    OpenAiResponses,
+    AnthropicMessages,
+}
+
+/// Non-secret identity of the provider boundary that produced an assistant
+/// message. Plaintext reasoning may only be replayed to this exact origin.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderOrigin {
+    pub provider_instance_id: String,
+    pub protocol: ApiProtocol,
+    pub model: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProviderContextItem {
+    pub origin_message: Option<ProviderContextAnchor>,
+    pub wire_item_index: Option<u32>,
+    pub ordinal: u32,
+    pub payload: ProviderContextPayload,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderContextAnchor {
+    pub message_id: String,
+    pub message_seq: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProviderContextPayload {
+    OpenAiCompactedWindow {
+        items: Vec<Value>,
+        coverage: NativeCompactionCoverage,
+    },
+    AnthropicCompaction {
+        block: Value,
+        coverage: NativeCompactionCoverage,
+    },
+    EncryptedReasoning {
+        protocol: ApiProtocol,
+        item: Value,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeCompactionCoverage {
+    pub through_message_seq: u64,
+    pub context_fingerprint: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -35,9 +112,25 @@ pub struct AssistantMessage {
     pub content: Vec<AssistantContent>,
     pub model: String,
     pub provider: String,
+    pub origin: ProviderOrigin,
     pub usage: Usage,
     pub stop_reason: StopReason,
     pub error_message: Option<String>,
+    pub provider_code: Option<String>,
+    pub interrupted: bool,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PublicAssistantMessage {
+    pub content: Vec<PublicAssistantContent>,
+    pub model: String,
+    pub provider: String,
+    pub origin: ProviderOrigin,
+    pub usage: Usage,
+    pub stop_reason: StopReason,
+    pub error_message: Option<String>,
+    pub provider_code: Option<String>,
     pub interrupted: bool,
     pub timestamp: DateTime<Utc>,
 }
@@ -57,19 +150,118 @@ pub struct ToolResultMessage {
 pub enum AssistantContent {
     Text {
         text: String,
+        wire_item_index: u32,
     },
     Thinking {
         thinking: String,
         signature_field: String,
+        wire_item_index: u32,
     },
-    ToolCall(ToolCall),
+    ToolCall {
+        tool_call: ToolCall,
+        wire_item_index: u32,
+    },
+    RejectedToolCall {
+        rejected: RejectedToolCall,
+        wire_item_index: u32,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PublicAssistantContent {
+    Text {
+        text: String,
+        wire_item_index: u32,
+    },
+    Thinking {
+        thinking: String,
+        signature_field: String,
+        wire_item_index: u32,
+    },
+    ToolCall {
+        tool_call: ToolCall,
+        wire_item_index: u32,
+    },
+    RejectedToolCall {
+        rejected: RejectedToolCall,
+        wire_item_index: u32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
-    pub arguments: Value,
+    pub arguments: ValidatedToolArguments,
+}
+
+/// Live construction is reserved for the schema-validating assembler.
+/// Deserialization only restores object-shaped transcript data and does not
+/// grant permission to execute a replayed tool call.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct ValidatedToolArguments(Map<String, Value>);
+
+impl ValidatedToolArguments {
+    pub(super) fn from_schema_validated(arguments: Map<String, Value>) -> Self {
+        Self(arguments)
+    }
+
+    pub fn as_object(&self) -> &Map<String, Value> {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ValidatedToolArguments {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match Value::deserialize(deserializer)? {
+            Value::Object(arguments) => Ok(Self(arguments)),
+            _ => Err(de::Error::custom(
+                "validated tool arguments must be a JSON object",
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ToolArgsPreview(Value);
+
+impl ToolArgsPreview {
+    pub(crate) fn new(value: Value) -> Self {
+        Self(value)
+    }
+
+    pub fn as_value(&self) -> &Value {
+        &self.0
+    }
+}
+
+impl PartialEq<Value> for ToolArgsPreview {
+    fn eq(&self, other: &Value) -> bool {
+        self.0 == *other
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectedToolCall {
+    pub id: String,
+    pub name: String,
+    pub error: ToolArgumentError,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolArgumentError {
+    InvalidJson,
+    NonObject,
+    SchemaViolation,
+    IncompleteResponse,
+    TooLarge,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,7 +343,7 @@ pub struct CompletionTokensDetails {
     pub reasoning_tokens: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProviderEvent {
     Start,
@@ -168,6 +360,7 @@ pub enum ProviderEvent {
     },
     ThinkingStart {
         content_index: usize,
+        signature_field: String,
     },
     ThinkingDelta {
         content_index: usize,
@@ -184,47 +377,271 @@ pub enum ProviderEvent {
         content_index: usize,
         delta: String,
     },
+    ToolCallPreview {
+        content_index: usize,
+        preview: ToolArgsPreview,
+    },
     ToolCallEnd {
         content_index: usize,
         tool_call: ToolCall,
     },
+    ToolCallRejected {
+        content_index: usize,
+        rejected: RejectedToolCall,
+        synthetic_result: ToolResultMessage,
+    },
+    ReasoningSummaryStart {
+        content_index: usize,
+    },
+    ReasoningSummaryDelta {
+        content_index: usize,
+        delta: String,
+    },
+    ReasoningSummaryEnd {
+        content_index: usize,
+        content: String,
+    },
     Done {
         reason: StopReason,
-        message: AssistantMessage,
+        output: ProviderOutput,
     },
     Error {
         reason: StopReason,
-        error: AssistantMessage,
+        output: ProviderOutput,
     },
 }
 
+impl ProviderEvent {
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::Done { .. } | Self::Error { .. })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ProviderOutput {
+    pub message: AssistantMessage,
+    pub provider_context: Vec<ProviderContextFragment>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ProviderContextFragment {
+    pub wire_item_index: Option<u32>,
+    pub payload: ProviderContextPayload,
+}
+
 pub struct ProviderEventStream {
-    rx: mpsc::Receiver<ProviderEvent>,
+    rx: Option<mpsc::Receiver<ProviderEvent>>,
+    priority_terminal_rx: Option<mpsc::Receiver<ProviderEvent>>,
+    cancel: CancellationToken,
+    provider: String,
+    origin: ProviderOrigin,
+    start_emitted: bool,
+    terminal_emitted: bool,
 }
 
 impl ProviderEventStream {
-    pub fn new(rx: mpsc::Receiver<ProviderEvent>) -> Self {
-        Self { rx }
+    pub fn new(
+        rx: mpsc::Receiver<ProviderEvent>,
+        cancel: CancellationToken,
+        provider: impl Into<String>,
+        origin: ProviderOrigin,
+    ) -> Self {
+        Self {
+            rx: Some(rx),
+            priority_terminal_rx: None,
+            cancel,
+            provider: provider.into(),
+            origin,
+            start_emitted: false,
+            terminal_emitted: false,
+        }
+    }
+
+    pub(crate) fn with_priority_terminal(
+        rx: mpsc::Receiver<ProviderEvent>,
+        priority_terminal_rx: mpsc::Receiver<ProviderEvent>,
+        cancel: CancellationToken,
+        provider: impl Into<String>,
+        origin: ProviderOrigin,
+    ) -> Self {
+        Self {
+            rx: Some(rx),
+            priority_terminal_rx: Some(priority_terminal_rx),
+            cancel,
+            provider: provider.into(),
+            origin,
+            start_emitted: false,
+            terminal_emitted: false,
+        }
     }
 
     pub async fn recv(&mut self) -> Option<ProviderEvent> {
-        self.rx.recv().await
+        futures_util::future::poll_fn(|cx| Pin::new(&mut *self).poll_next(cx)).await
     }
+
+    fn accept_event(&mut self, event: ProviderEvent) -> ProviderEvent {
+        if event.is_terminal() {
+            self.fuse();
+        }
+        event
+    }
+
+    fn synthesize_terminal(&mut self) -> ProviderEvent {
+        let cancelled = self.cancel.is_cancelled();
+        let reason = if cancelled {
+            StopReason::Aborted
+        } else {
+            StopReason::Error
+        };
+        let error_message = if cancelled {
+            "provider stream cancelled"
+        } else {
+            "provider stream ended without a terminal event"
+        };
+        let provider_code = if cancelled {
+            "cancelled"
+        } else {
+            "stream_ended_without_terminal_event"
+        };
+
+        let event = ProviderEvent::Error {
+            reason,
+            output: ProviderOutput {
+                message: AssistantMessage {
+                    content: Vec::new(),
+                    model: self.origin.model.clone(),
+                    provider: self.provider.clone(),
+                    origin: self.origin.clone(),
+                    usage: Usage::default(),
+                    stop_reason: reason,
+                    error_message: Some(error_message.to_owned()),
+                    provider_code: Some(provider_code.to_owned()),
+                    interrupted: cancelled,
+                    timestamp: Utc::now(),
+                },
+                provider_context: Vec::new(),
+            },
+        };
+        self.fuse();
+        event
+    }
+
+    fn fuse(&mut self) {
+        self.terminal_emitted = true;
+        self.priority_terminal_rx.take();
+        if let Some(mut rx) = self.rx.take() {
+            const AUDIT_LIMIT: usize = 32;
+            let (ignored, more_queued) = audit_queued_events(&mut rx, AUDIT_LIMIT);
+            if ignored > 0 {
+                tracing::warn!(
+                    ignored,
+                    audit_limit = AUDIT_LIMIT,
+                    more_queued,
+                    "discarded provider events queued after terminal event"
+                );
+            }
+        }
+    }
+}
+
+fn audit_queued_events(
+    rx: &mut mpsc::Receiver<ProviderEvent>,
+    audit_limit: usize,
+) -> (usize, bool) {
+    let mut ignored = 0;
+    while ignored < audit_limit && rx.try_recv().is_ok() {
+        ignored += 1;
+    }
+    let more_queued = ignored == audit_limit && rx.try_recv().is_ok();
+    (ignored, more_queued)
 }
 
 impl Stream for ProviderEventStream {
     type Item = ProviderEvent;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.rx.poll_recv(cx)
+        if self.terminal_emitted {
+            return Poll::Ready(None);
+        }
+        if !self.start_emitted {
+            self.start_emitted = true;
+            return Poll::Ready(Some(ProviderEvent::Start));
+        }
+
+        if let Some(priority_rx) = self.priority_terminal_rx.as_mut() {
+            match priority_rx.poll_recv(cx) {
+                Poll::Ready(Some(event)) => {
+                    debug_assert!(event.is_terminal());
+                    return Poll::Ready(Some(self.accept_event(event)));
+                }
+                Poll::Ready(None) => self.priority_terminal_rx = None,
+                Poll::Pending => {}
+            }
+        }
+
+        if self.cancel.is_cancelled() {
+            // Once cancellation is visible, queued deltas must not race ahead of
+            // the producer's priority Aborted terminal. Polling the priority
+            // receiver above registers this task's waker for that terminal.
+            return if self.priority_terminal_rx.is_some() {
+                Poll::Pending
+            } else {
+                Poll::Ready(Some(self.synthesize_terminal()))
+            };
+        }
+
+        if self.rx.is_none() {
+            return if self.priority_terminal_rx.is_some() {
+                Poll::Pending
+            } else {
+                Poll::Ready(Some(self.synthesize_terminal()))
+            };
+        }
+        let polled = self
+            .rx
+            .as_mut()
+            .expect("receiver checked above")
+            .poll_recv(cx);
+        match polled {
+            Poll::Ready(Some(ProviderEvent::Start)) => {
+                tracing::warn!("discarded duplicate producer Start event");
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Poll::Ready(Some(event)) => Poll::Ready(Some(self.accept_event(event))),
+            Poll::Ready(None) => {
+                self.rx = None;
+                if self.priority_terminal_rx.is_some() {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(Some(self.synthesize_terminal()))
+                }
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PromptContext {
     pub system_prompt: String,
-    pub messages: Vec<Message>,
+    pub memory_blocks: Vec<MemoryBlock>,
+    pub messages: Vec<ContextMessage>,
+    pub provider_context: Vec<ProviderContextItem>,
     pub tools: Vec<ToolDefinition>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum ContextMessage {
+    Persisted {
+        id: String,
+        seq: u64,
+        message: Message,
+    },
+    Synthetic {
+        message: Message,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -251,7 +668,20 @@ mod tests {
         ToolCall {
             id: "call-1".to_owned(),
             name: "read_file".to_owned(),
-            arguments: json!({"path": "notes.txt"}),
+            arguments: ValidatedToolArguments::from_schema_validated(
+                json!({"path": "notes.txt"})
+                    .as_object()
+                    .expect("object")
+                    .clone(),
+            ),
+        }
+    }
+
+    fn origin() -> ProviderOrigin {
+        ProviderOrigin {
+            provider_instance_id: "moonshot:https://api.moonshot.ai/v1".to_owned(),
+            protocol: ApiProtocol::OpenAiChatCompletions,
+            model: "kimi-k3".to_owned(),
         }
     }
 
@@ -261,14 +691,20 @@ mod tests {
                 AssistantContent::Thinking {
                     thinking: "I should inspect the file.".to_owned(),
                     signature_field: "reasoning_content".to_owned(),
+                    wire_item_index: 0,
                 },
                 AssistantContent::Text {
                     text: "I'll inspect it.".to_owned(),
+                    wire_item_index: 1,
                 },
-                AssistantContent::ToolCall(tool_call()),
+                AssistantContent::ToolCall {
+                    tool_call: tool_call(),
+                    wire_item_index: 2,
+                },
             ],
             model: "kimi-k3".to_owned(),
             provider: "moonshot".to_owned(),
+            origin: origin(),
             usage: Usage {
                 input: 90,
                 output: 12,
@@ -279,8 +715,16 @@ mod tests {
             },
             stop_reason: StopReason::ToolUse,
             error_message: None,
+            provider_code: Some("tool_calls".to_owned()),
             interrupted: false,
             timestamp: timestamp(),
+        }
+    }
+
+    fn provider_output() -> ProviderOutput {
+        ProviderOutput {
+            message: assistant_message(),
+            provider_context: Vec::new(),
         }
     }
 
@@ -346,12 +790,17 @@ mod tests {
         let content = [
             AssistantContent::Text {
                 text: "hello".to_owned(),
+                wire_item_index: 0,
             },
             AssistantContent::Thinking {
                 thinking: "hmm".to_owned(),
                 signature_field: "reasoning".to_owned(),
+                wire_item_index: 1,
             },
-            AssistantContent::ToolCall(tool_call()),
+            AssistantContent::ToolCall {
+                tool_call: tool_call(),
+                wire_item_index: 2,
+            },
         ];
 
         for item in &content {
@@ -377,69 +826,20 @@ mod tests {
     }
 
     #[test]
-    fn provider_events_round_trip_with_stable_tags() {
-        let events = vec![
-            ProviderEvent::Start,
-            ProviderEvent::TextStart { content_index: 0 },
-            ProviderEvent::TextDelta {
-                content_index: 0,
-                delta: "hel".to_owned(),
-            },
-            ProviderEvent::TextEnd {
-                content_index: 0,
-                content: "hello".to_owned(),
-            },
-            ProviderEvent::ThinkingStart { content_index: 1 },
-            ProviderEvent::ThinkingDelta {
-                content_index: 1,
-                delta: "hmm".to_owned(),
-            },
-            ProviderEvent::ThinkingEnd {
-                content_index: 1,
-                content: "hmm".to_owned(),
-            },
-            ProviderEvent::ToolCallStart { content_index: 2 },
-            ProviderEvent::ToolCallDelta {
-                content_index: 2,
-                delta: r#"{"path":"#.to_owned(),
-            },
-            ProviderEvent::ToolCallEnd {
-                content_index: 2,
-                tool_call: tool_call(),
-            },
-            ProviderEvent::Done {
-                reason: StopReason::ToolUse,
-                message: assistant_message(),
-            },
-            ProviderEvent::Error {
-                reason: StopReason::Error,
-                error: AssistantMessage {
-                    stop_reason: StopReason::Error,
-                    error_message: Some("provider failed".to_owned()),
-                    ..assistant_message()
-                },
-            },
-        ];
-
-        for event in &events {
-            assert_round_trip(event);
-        }
-
-        assert_eq!(
-            serde_json::to_value(&events[2]).expect("serialize")["type"],
-            "text_delta"
-        );
-        assert_eq!(
-            serde_json::to_value(&events[9]).expect("serialize")["type"],
-            "tool_call_end"
-        );
-    }
-
-    #[test]
     fn prompt_context_and_tool_definition_round_trip() {
         let context = PromptContext {
             system_prompt: "Be useful.".to_owned(),
-            messages: vec![Message::Assistant(assistant_message())],
+            memory_blocks: vec![MemoryBlock {
+                layer: MemoryLayer::L1,
+                text: "The user prefers concise replies.".to_owned(),
+                time_range: None,
+            }],
+            messages: vec![ContextMessage::Persisted {
+                id: "message-1".to_owned(),
+                seq: 1,
+                message: Message::Assistant(assistant_message()),
+            }],
+            provider_context: Vec::new(),
             tools: vec![ToolDefinition {
                 name: "read_file".to_owned(),
                 description: "Read a workspace file.".to_owned(),
@@ -453,6 +853,128 @@ mod tests {
 
         assert_round_trip(&context);
         assert_round_trip(&context.tools[0]);
+    }
+
+    #[test]
+    fn validated_tool_arguments_reject_non_objects_on_replay() {
+        assert!(serde_json::from_value::<ValidatedToolArguments>(json!({"path": "ok"})).is_ok());
+        for invalid in [
+            json!(["not", "an", "object"]),
+            json!("command"),
+            json!(null),
+        ] {
+            let error = serde_json::from_value::<ValidatedToolArguments>(invalid)
+                .expect_err("non-object arguments must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("validated tool arguments must be a JSON object")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_stream_fuses_after_terminal_event() {
+        use futures_util::StreamExt;
+
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(ProviderEvent::Done {
+            reason: StopReason::ToolUse,
+            output: provider_output(),
+        })
+        .await
+        .expect("terminal event");
+        tx.send(ProviderEvent::TextDelta {
+            content_index: 0,
+            delta: "late".to_owned(),
+        })
+        .await
+        .expect("queued invalid event");
+
+        let mut stream =
+            ProviderEventStream::new(rx, CancellationToken::new(), "moonshot", origin());
+        assert!(matches!(stream.next().await, Some(ProviderEvent::Start)));
+        assert!(matches!(
+            stream.next().await,
+            Some(ProviderEvent::Done { .. })
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), stream.next())
+                .await
+                .expect("fused stream returns immediately")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn terminal_queue_audit_reports_when_more_events_remain() {
+        let (tx, mut rx) = mpsc::channel(34);
+        for content_index in 0..34 {
+            tx.try_send(ProviderEvent::TextDelta {
+                content_index,
+                delta: "late".to_owned(),
+            })
+            .expect("queue test event");
+        }
+
+        assert_eq!(audit_queued_events(&mut rx, 32), (32, true));
+    }
+
+    #[test]
+    fn terminal_queue_audit_reports_no_more_at_or_below_limit() {
+        for queued in [32, 10] {
+            let (tx, mut rx) = mpsc::channel(queued);
+            for content_index in 0..queued {
+                tx.try_send(ProviderEvent::TextDelta {
+                    content_index,
+                    delta: "late".to_owned(),
+                })
+                .expect("queue test event");
+            }
+
+            assert_eq!(audit_queued_events(&mut rx, 32), (queued, false));
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_stream_synthesizes_one_terminal_event_on_eof() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(tx);
+        let mut stream =
+            ProviderEventStream::new(rx, CancellationToken::new(), "moonshot", origin());
+
+        assert!(matches!(stream.recv().await, Some(ProviderEvent::Start)));
+        let event = stream.recv().await.expect("synthetic terminal event");
+        match event {
+            ProviderEvent::Error { reason, output } => {
+                assert_eq!(reason, StopReason::Error);
+                assert_eq!(
+                    output.message.error_message.as_deref(),
+                    Some("provider stream ended without a terminal event")
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert!(stream.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_stream_classifies_cancelled_eof_as_aborted() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let (tx, rx) = mpsc::channel(1);
+        drop(tx);
+        let mut stream = ProviderEventStream::new(rx, cancel, "moonshot", origin());
+
+        assert!(matches!(stream.recv().await, Some(ProviderEvent::Start)));
+        assert!(matches!(
+            stream.recv().await,
+            Some(ProviderEvent::Error {
+                reason: StopReason::Aborted,
+                ..
+            })
+        ));
+        assert!(stream.recv().await.is_none());
     }
 
     #[test]

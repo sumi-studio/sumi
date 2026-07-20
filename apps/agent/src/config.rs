@@ -6,21 +6,15 @@ use std::{
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::provider::request::{MaxTokensField, ModelSpec, ThinkingFormat};
+use crate::provider::{
+    adapters::chat_completions::{MaxTokensField, ModelSpec, ThinkingFormat},
+    assembler::ResponseBudget,
+    types::ApiProtocol,
+};
 
 const DEFAULT_CONVERSATION_ID: &str = "default";
 const DEFAULT_MODEL_PRESET: &str = "opencode-go";
 const DEFAULT_SYSTEM_PROMPT: &str = crate::prompts::SYSTEM_PROMPT;
-
-pub fn load_env_file() -> Result<()> {
-    let Some(path) = env::var_os("SUMI_ENV_FILE") else {
-        return Ok(());
-    };
-
-    dotenvy::from_path(&path)
-        .with_context(|| format!("failed to load env file {}", Path::new(&path).display()))?;
-    Ok(())
-}
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -33,13 +27,26 @@ pub struct Config {
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
+/// Runtime TOML example:
+///
+/// ```toml
+/// [model]
+/// preset = "kimi-k3"
+/// id = "kimi-k3"
+/// base_url = "https://api.moonshot.ai/v1"
+/// account_scope = "production"
+/// max_output_tokens = 1048576
+/// default_output_tokens = 16384
+/// ```
 pub struct ModelConfig {
     pub preset: Option<String>,
     pub id: Option<String>,
     pub base_url: Option<String>,
+    pub account_scope: Option<String>,
     pub api_key_env: Option<String>,
     pub context_window: Option<u64>,
-    pub max_tokens: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    pub default_output_tokens: Option<u64>,
     pub reasoning: Option<bool>,
     pub supports_images: Option<bool>,
     pub compat: CompatConfig,
@@ -56,6 +63,7 @@ pub struct CompatConfig {
     pub supports_strict_mode: Option<bool>,
     pub supports_store: Option<bool>,
     pub supports_developer_role: Option<bool>,
+    pub allows_sampling_parameters: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -84,6 +92,15 @@ struct EnvOverrides {
 
 impl Config {
     pub async fn load() -> Result<Self> {
+        if let Some(path) = env::var_os("SUMI_ENV_FILE") {
+            dotenvy::from_path(&path).with_context(|| {
+                format!(
+                    "failed to load environment file {}",
+                    Path::new(&path).display()
+                )
+            })?;
+        }
+
         let config_path = env::var_os("SUMI_CONFIG").map(PathBuf::from);
         let file = match &config_path {
             Some(path) => Some(load_file(path).await?),
@@ -104,10 +121,13 @@ impl Config {
         let mut spec =
             ModelSpec::preset(preset).with_context(|| format!("unknown model preset {preset}"))?;
         if let Some(id) = &self.model.id {
-            spec.override_id(id);
+            spec.set_model_id(id);
         }
         if let Some(base_url) = &self.model.base_url {
             spec.base_url.clone_from(base_url);
+        }
+        if let Some(account_scope) = &self.model.account_scope {
+            spec.account_scope.clone_from(account_scope);
         }
         if let Some(api_key_env) = &self.model.api_key_env {
             spec.api_key_env.clone_from(api_key_env);
@@ -115,8 +135,11 @@ impl Config {
         if let Some(context_window) = self.model.context_window {
             spec.context_window = context_window;
         }
-        if let Some(max_tokens) = self.model.max_tokens {
-            spec.max_tokens = max_tokens;
+        if let Some(max_output_tokens) = self.model.max_output_tokens {
+            spec.max_output_tokens = max_output_tokens;
+        }
+        if let Some(default_output_tokens) = self.model.default_output_tokens {
+            spec.default_output_tokens = default_output_tokens;
         }
         if let Some(reasoning) = self.model.reasoning {
             spec.reasoning = reasoning;
@@ -138,6 +161,8 @@ impl Config {
                 "off" => ThinkingFormat::Off,
                 "deepseek" => ThinkingFormat::Deepseek,
                 "zai" => ThinkingFormat::Zai,
+                "openai_effort" => ThinkingFormat::OpenAiEffort,
+                "provider_default" => ThinkingFormat::ProviderDefault,
                 other => anyhow::bail!("unknown thinking_format {other}"),
             };
         }
@@ -158,6 +183,27 @@ impl Config {
         }
         if let Some(value) = compat.supports_developer_role {
             spec.compat.supports_developer_role = value;
+        }
+        if let Some(value) = compat.allows_sampling_parameters {
+            spec.compat.allows_sampling_parameters = value;
+        }
+        if spec.protocol != ApiProtocol::OpenAiChatCompletions {
+            anyhow::bail!("CP2 supports only open_ai_chat_completions presets");
+        }
+        validate_model_base_url(&spec.base_url)?;
+        if spec.context_window == 0 {
+            anyhow::bail!("context_window must be greater than zero");
+        }
+        if spec.default_output_tokens == 0 || spec.default_output_tokens > spec.max_output_tokens {
+            anyhow::bail!(
+                "default_output_tokens must be within 1..={}",
+                spec.max_output_tokens
+            );
+        }
+        if ResponseBudget::for_output_tokens(spec.max_output_tokens).is_none() {
+            anyhow::bail!(
+                "max_output_tokens cannot be represented by the provider response budget"
+            );
         }
         Ok(spec)
     }
@@ -201,6 +247,20 @@ impl Config {
             model: file.model,
         })
     }
+}
+
+fn validate_model_base_url(base_url: &str) -> Result<()> {
+    let url = reqwest::Url::parse(base_url).context("model base_url must be an absolute URL")?;
+    if !matches!(url.scheme(), "http" | "https") {
+        anyhow::bail!("model base_url must use http or https");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("model base_url must not contain credentials");
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        anyhow::bail!("model base_url must not contain a query or fragment");
+    }
+    Ok(())
 }
 
 async fn resolve_system_prompt(
@@ -424,7 +484,8 @@ id = "custom-glm"
 base_url = "https://proxy.example/v1"
 api_key_env = "CUSTOM_KEY"
 context_window = 200000
-max_tokens = 64000
+max_output_tokens = 64000
+default_output_tokens = 12000
 
 [model.compat]
 max_tokens_field = "max_tokens"
@@ -441,13 +502,14 @@ zai_tool_stream = false
         assert_eq!(spec.api_key_env, "CUSTOM_KEY");
         assert_eq!(spec.provider, "zai");
         assert_eq!(spec.context_window, 200_000);
-        assert_eq!(spec.max_tokens, 64_000);
+        assert_eq!(spec.max_output_tokens, 64_000);
+        assert_eq!(spec.default_output_tokens, 12_000);
         assert_eq!(spec.compat.max_tokens_field, MaxTokensField::MaxTokens);
         assert!(!spec.compat.zai_tool_stream);
     }
 
     #[test]
-    fn opencode_go_model_id_switch_re_resolves_capabilities() {
+    fn opencode_model_override_keeps_gateway_specific_compat() {
         let file: FileConfig = toml::from_str(
             r#"
 [model]
@@ -464,12 +526,12 @@ id = "glm-5.2"
         assert_eq!(spec.provider, "opencode-go");
         assert_eq!(spec.base_url, "https://opencode.ai/zen/go/v1");
         assert_eq!(spec.api_key_env, "OPENCODE_GO_API_KEY");
-        assert_eq!(spec.compat.thinking_format, ThinkingFormat::Zai);
+        assert_eq!(spec.compat.thinking_format, ThinkingFormat::ProviderDefault);
         assert!(!spec.compat.requires_reasoning_content_on_assistant);
-        assert!(spec.compat.zai_tool_stream);
+        assert!(!spec.compat.zai_tool_stream);
         assert!(!spec.supports_images);
-        assert_eq!(spec.context_window, 1_048_576);
-        assert_eq!(spec.max_tokens, 131_072);
+        assert_eq!(spec.context_window, 262_144);
+        assert_eq!(spec.max_output_tokens, 32_768);
     }
 
     #[test]
@@ -480,7 +542,7 @@ id = "glm-5.2"
 preset = "opencode-go"
 id = "glm-5.2"
 supports_images = true
-max_tokens = 64000
+max_output_tokens = 64000
 
 [model.compat]
 zai_tool_stream = false
@@ -492,9 +554,9 @@ zai_tool_stream = false
         let spec = config.model_spec().expect("model spec");
 
         assert!(spec.supports_images);
-        assert_eq!(spec.max_tokens, 64_000);
+        assert_eq!(spec.max_output_tokens, 64_000);
         assert!(!spec.compat.zai_tool_stream);
-        assert_eq!(spec.compat.thinking_format, ThinkingFormat::Zai);
+        assert_eq!(spec.compat.thinking_format, ThinkingFormat::ProviderDefault);
     }
 
     #[test]
@@ -509,7 +571,45 @@ zai_tool_stream = false
         assert_eq!(spec.base_url, "https://opencode.ai/zen/go/v1");
         assert_eq!(spec.api_key_env, "OPENCODE_GO_API_KEY");
         assert_eq!(spec.context_window, 262_144);
-        assert_eq!(spec.max_tokens, 32_768);
-        assert!(spec.supports_images);
+        assert_eq!(spec.max_output_tokens, 32_768);
+        assert_eq!(spec.default_output_tokens, 16_384);
+        assert!(!spec.supports_images);
+    }
+
+    #[test]
+    fn model_base_url_rejects_credentials_queries_and_non_http_schemes() {
+        for base_url in [
+            "https://user:secret@example.test/v1",
+            "https://example.test/v1?token=secret",
+            "https://example.test/v1#fragment",
+            "file:///tmp/provider",
+            "not-a-url",
+        ] {
+            let config = Config {
+                conversation_id: "test".to_owned(),
+                workspace: PathBuf::from("/workspace"),
+                database_path: PathBuf::from("/workspace/agent.db"),
+                system_prompt: String::new(),
+                model: ModelConfig {
+                    preset: Some("kimi-k3".to_owned()),
+                    base_url: Some(base_url.to_owned()),
+                    ..ModelConfig::default()
+                },
+            };
+            assert!(config.model_spec().is_err(), "{base_url}");
+        }
+    }
+
+    #[test]
+    fn zero_context_window_is_rejected() {
+        let mut config =
+            Config::resolve(FileConfig::default(), EnvOverrides::default()).expect("resolved");
+        config.model.context_window = Some(0);
+
+        let error = config
+            .model_spec()
+            .expect_err("zero context window must fail");
+
+        assert!(error.to_string().contains("context_window"));
     }
 }

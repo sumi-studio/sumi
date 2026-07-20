@@ -3,3 +3,5 @@ data: {"id":"reason-1","model":"kimi-k3","choices":[{"delta":{"reasoning_content
 data: {"id":"reason-1","model":"kimi-k3","choices":[{"delta":{},"finish_reason":"stop"}]}
 
 data: [DONE]
+
+: fixture eof

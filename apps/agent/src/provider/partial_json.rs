@@ -1,8 +1,14 @@
 use serde_json::{Map, Value};
 
+use super::types::ToolArgsPreview;
+
 const VALID_ESCAPES: &[char] = &['"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u'];
 
-pub fn parse_streaming(input: &str) -> Value {
+pub fn parse_streaming(input: &str) -> ToolArgsPreview {
+    ToolArgsPreview::new(parse_streaming_value(input))
+}
+
+fn parse_streaming_value(input: &str) -> Value {
     if input.trim().is_empty() {
         return empty_object();
     }
@@ -18,14 +24,12 @@ pub fn parse_streaming(input: &str) -> Value {
         return value;
     }
 
-    if repaired == input
-        && let Some(value) = parse_partial(input)
-    {
+    if let Some(value) = parse_partial(&repaired) {
         return value;
     }
 
-    if repaired != input
-        && let Some(value) = parse_partial(&repaired)
+    if let Some(truncated) = truncate_incomplete_unicode_escape(&repaired)
+        && let Some(value) = parse_partial(truncated)
     {
         return value;
     }
@@ -150,6 +154,23 @@ fn truncate_incomplete_number(input: &str) -> Option<&str> {
     let token = &trimmed[token_start..];
     let valid_end = longest_complete_number_prefix(token)?;
     (valid_end < token.len()).then_some(&trimmed[..token_start + valid_end])
+}
+
+fn truncate_incomplete_unicode_escape(input: &str) -> Option<&str> {
+    let escape = input.rfind("\\u")?;
+    let suffix = &input[escape + 2..];
+    if suffix.len() >= 4 || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    let preceding_backslashes = input[..escape]
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'\\')
+        .count();
+    preceding_backslashes
+        .is_multiple_of(2)
+        .then_some(&input[..escape])
 }
 
 fn longest_complete_number_prefix(token: &str) -> Option<usize> {
@@ -409,6 +430,7 @@ mod tests {
             (r#"{"path":"a\q"#, json!({"path": r"a\q"})),
             ("{\"text\":\"line\nbreak", json!({"text": "line\nbreak"})),
             (r#"{"path":"trailing\"#, json!({"path": "trailing\\"})),
+            (r#"{"text":"a\u30"#, json!({"text": "a"})),
         ];
 
         for (input, expected) in cases {

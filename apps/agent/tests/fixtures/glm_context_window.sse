@@ -1,0 +1,5 @@
+data: {"id":"context-1","model":"glm-5.2","choices":[{"delta":{},"finish_reason":"model_context_window_exceeded"}],"usage":{"prompt_tokens":1000000,"completion_tokens":0}}
+
+data: [DONE]
+
+: fixture terminator
