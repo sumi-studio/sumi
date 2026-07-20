@@ -489,7 +489,9 @@ pub enum AgentEvent {
     AgentStart,
     AgentEnd,
     TurnStart,
-    TurnEnd { message: Box<PublicMessage>, tool_results: Vec<ToolResultMessage> },
+    /// 通常は最終messageをSomeで運ぶ。durableなidle turnがuser_started前に
+    /// Abort/supersedeされた真の空turnだけNoneを許す。合成messageを捏造しない。
+    TurnEnd { message: Option<Box<PublicMessage>>, tool_results: Vec<ToolResultMessage> },
     MessageStart { message_id: String, message: Box<PublicMessage> },
     /// assistantストリーミング中のみ。公開可能な Text/ToolCall、平文 Thinking と、
     /// provider が display-safe と明示した reasoning summary だけを包む。
@@ -993,7 +995,7 @@ pi の `steer()` は**キュー投入のみ**で、注入は「現在のツー�
 
 abort 受理時、`seq < abort.seq`で **`user_started` へ達していない** UserMessage(`received`、分類済みidle startup、hard/soft/retry steerの全種)が残っている場合、それを注入も黙殺もしない。「MessageEnd まで到達した内容だけが実体」(§10.2)の規則どおり、この command はまだ会話の実体ではないため、**会話へ入れずにフロントへ差し戻す**:
 
-1. abort の終端処理と同じ EventWriter transaction 群で、対象を `status=superseded` の終端状態へ閉じる(`Projection::CommandSuperseded`)。分類前commandは`application_kind/run_id/turn_id=NULL, run_phase=received`のまま閉じる。分類済みidle startupは`classified|run_started|turn_started`の保存値を維持し、`TurnStart`済みなら`TurnEnd`、`AgentStart`済みなら`AgentEnd`を同じ正常形クローズへ載せる。steerは従来どおり保存済みrun/turnを維持する。複数あればcommand seq順に全件。Abortより後のseqには触れない
+1. abort の終端処理と同じ EventWriter transaction 群で、対象を `status=superseded` の終端状態へ閉じる(`Projection::CommandSuperseded`)。分類前commandは`application_kind/run_id/turn_id=NULL, run_phase=received`のまま閉じる。分類済みidle startupは`classified|run_started|turn_started`の保存値を維持し、`TurnStart`済みなら`TurnEnd(message=None, tool_results=[])`、`AgentStart`済みなら`AgentEnd`を同じ正常形クローズへ載せる。この`None`は`user_started`前に閉じた真の空turnだけを表し、存在しないassistant messageを合成しない。通常/provider/tool経路の`TurnEnd.message`は必ず`Some`である。steerは従来どおり保存済みrun/turnを維持する。複数あればcommand seq順に全件。Abortより後のseqには触れない
 2. API へ `Superseded` ACK を返す。API は durable command log を superseded と記録し、**保存済みの原文テキストを web へ返す**。web は入力欄上の保持 UI に復元し、ユーザーが送信し直せば**新しい `command_id` の通常 command** になる。agent は payload を echo しない(原文の正典は API 側 command log)
 3. 判定境界は `user_started`: それより前(`received`/`classified`/`turn_started`)なら supersede。`user_started` 以降は user メッセージが会話に存在するため差し戻さず、`MessageEnd` まで確定して未応答のまま `finished` で閉じる(§10.2 の cancel_requested 復旧と同じ扱い)
 4. supersede が abort の `AgentEnd` に先行するため、「未注入(§10.2)の steer group が残る限り `AgentEnd` を発行しない」不変条件と矛盾しない — `AgentEnd` 時点で未注入の steer は存在しない。run owner(§10.2)が存在する場合はownerを`cancel_requested → finished`へ閉じる。owner未成立のidle startupではstartup commandのrun bindingをAbortのcommit先とし、上記正常形クローズ後にsupersedeする
@@ -2586,7 +2588,7 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 | 20 | (`run_phase` 遷移なし) status: `received → applied` | — | owner 不在時の `Abort` command 受理(Idle。C.3) | no-op の `CommandApplied(run_id=None)` のみ。cancel は発火しない | §11.1.1-4 |
 | 21 | (`run_phase` 遷移なし) status: `received → applied` | — | terminal/unknown request、または後続Abort cutoff内の未適用`ApprovalDecision` | `ApprovalResolved`を発行せずno-opの`CommandApplied(run_id=None)`。unknownは監査warn、abort-preemptedは監査reasonを残す | §5.2・§9.8・§11.1.1-4 |
 | 22 | status: `received → superseded`(`run_phase=received`維持) | 未分類UserMessage | 後続Abortのcutoff(`command.seq < abort.seq`) | `CommandSuperseded(run_id=Some(aborted_run)\|None for Idle)`。分類・注入せず入力欄へ差し戻す | §5.2・§6.5 |
-| 23 | status: `applying → superseded`(`run_phase=classified\|run_started\|turn_started`維持) | idle startup | user注入前の後続Abort cutoff | 開始済みなら`TurnEnd`→`AgentEnd`で正常形クローズし、`CommandSuperseded(run_id=Some(startup.run_id))`とAbortの`CommandApplied(run_id=Some)`を同じEventBatchへ載せる。provider cancelは不要 | §5.2・§6.5・§11.1.1-4 |
+| 23 | status: `applying → superseded`(`run_phase=classified\|run_started\|turn_started`維持) | idle startup | user注入前の後続Abort cutoff | 開始済みなら`TurnEnd(message=None, tool_results=[])`→`AgentEnd`で真の空turnを正常形クローズし、合成messageは作らない。`CommandSuperseded(run_id=Some(startup.run_id))`とAbortの`CommandApplied(run_id=Some)`を同じEventBatchへ載せる。`TurnEnd.message=None`はこの`user_started`前境界だけで、通常/provider/tool経路は`Some`必須。provider cancelは不要 | §5.2・§6.5・§11.1.1-4 |
 
 補足:
 

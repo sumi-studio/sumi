@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 const DEFAULT_CONVERSATION_ID: &str = "default";
+const DEFAULT_STATE_DIR: &str = "/var/lib/sumi";
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -31,7 +32,7 @@ pub struct ModelConfig {
 struct FileConfig {
     conversation_id: Option<String>,
     workspace: Option<PathBuf>,
-    database_path: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
     system_prompt: Option<String>,
     model: ModelConfig,
 }
@@ -40,7 +41,7 @@ struct FileConfig {
 struct EnvOverrides {
     conversation_id: Option<String>,
     workspace: Option<PathBuf>,
-    database_path: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
     system_prompt: Option<String>,
     model_preset: Option<String>,
     model_id: Option<String>,
@@ -75,9 +76,10 @@ impl Config {
             .unwrap_or_else(env::current_dir)
             .context("failed to resolve workspace path")?;
         let database_path = overrides
-            .database_path
-            .or(file.database_path)
-            .unwrap_or_else(|| workspace.join(".sumi/agent.db"));
+            .state_dir
+            .or(file.state_dir)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR))
+            .join("agent.db");
 
         if let Some(value) = overrides.model_preset {
             file.model.preset = Some(value);
@@ -113,7 +115,7 @@ impl EnvOverrides {
         Self {
             conversation_id: env::var("SUMI_CONVERSATION_ID").ok(),
             workspace: env::var_os("SUMI_WORKSPACE").map(PathBuf::from),
-            database_path: env::var_os("SUMI_DATABASE_PATH").map(PathBuf::from),
+            state_dir: env::var_os("SUMI_STATE_DIR").map(PathBuf::from),
             system_prompt: env::var("SUMI_SYSTEM_PROMPT").ok(),
             model_preset: env::var("SUMI_MODEL_PRESET").ok(),
             model_id: env::var("SUMI_MODEL_ID").ok(),
@@ -136,11 +138,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_toml_and_derives_database_path() {
+    fn parses_toml_and_derives_database_path_from_state_dir() {
         let file: FileConfig = toml::from_str(
             r#"
 conversation_id = "conversation-1"
 workspace = "/workspace"
+state_dir = "/state"
 system_prompt = "Be useful."
 
 [model]
@@ -156,10 +159,7 @@ api_key_env = "EXAMPLE_API_KEY"
 
         assert_eq!(config.conversation_id, "conversation-1");
         assert_eq!(config.workspace, PathBuf::from("/workspace"));
-        assert_eq!(
-            config.database_path,
-            PathBuf::from("/workspace/.sumi/agent.db")
-        );
+        assert_eq!(config.database_path, PathBuf::from("/state/agent.db"));
         assert_eq!(config.system_prompt, "Be useful.");
         assert_eq!(
             config.model,
@@ -178,7 +178,7 @@ api_key_env = "EXAMPLE_API_KEY"
             r#"
 conversation_id = "from-file"
 workspace = "/file-workspace"
-database_path = "/file.db"
+state_dir = "/file-state"
 
 [model]
 id = "file-model"
@@ -188,7 +188,7 @@ id = "file-model"
         let overrides = EnvOverrides {
             conversation_id: Some("from-env".to_owned()),
             workspace: Some(PathBuf::from("/env-workspace")),
-            database_path: Some(PathBuf::from("/env.db")),
+            state_dir: Some(PathBuf::from("/env-state")),
             model_id: Some("env-model".to_owned()),
             ..EnvOverrides::default()
         };
@@ -197,8 +197,26 @@ id = "file-model"
 
         assert_eq!(config.conversation_id, "from-env");
         assert_eq!(config.workspace, PathBuf::from("/env-workspace"));
-        assert_eq!(config.database_path, PathBuf::from("/env.db"));
+        assert_eq!(config.database_path, PathBuf::from("/env-state/agent.db"));
         assert_eq!(config.model.id.as_deref(), Some("env-model"));
+    }
+
+    #[test]
+    fn default_database_path_is_isolated_from_workspace() {
+        let file: FileConfig = toml::from_str(
+            r#"
+workspace = "/workspace/customer-data"
+"#,
+        )
+        .expect("valid config");
+
+        let config = Config::resolve(file, EnvOverrides::default()).expect("resolved config");
+
+        assert_eq!(
+            config.database_path,
+            PathBuf::from("/var/lib/sumi/agent.db")
+        );
+        assert!(!config.database_path.starts_with(&config.workspace));
     }
 
     #[test]
