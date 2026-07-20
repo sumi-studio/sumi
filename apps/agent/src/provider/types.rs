@@ -498,19 +498,29 @@ impl ProviderEventStream {
         self.terminal_emitted = true;
         if let Some(mut rx) = self.rx.take() {
             const AUDIT_LIMIT: usize = 32;
-            let mut ignored = 0;
-            while ignored < AUDIT_LIMIT && rx.try_recv().is_ok() {
-                ignored += 1;
-            }
+            let (ignored, more_queued) = audit_queued_events(&mut rx, AUDIT_LIMIT);
             if ignored > 0 {
                 tracing::warn!(
                     ignored,
                     audit_limit = AUDIT_LIMIT,
+                    more_queued,
                     "discarded provider events queued after terminal event"
                 );
             }
         }
     }
+}
+
+fn audit_queued_events(
+    rx: &mut mpsc::Receiver<ProviderEvent>,
+    audit_limit: usize,
+) -> (usize, bool) {
+    let mut ignored = 0;
+    while ignored < audit_limit && rx.try_recv().is_ok() {
+        ignored += 1;
+    }
+    let more_queued = ignored == audit_limit && rx.try_recv().is_ok();
+    (ignored, more_queued)
 }
 
 impl Stream for ProviderEventStream {
@@ -805,6 +815,20 @@ mod tests {
                 .expect("fused stream returns immediately")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn terminal_queue_audit_reports_when_more_events_remain() {
+        let (tx, mut rx) = mpsc::channel(34);
+        for content_index in 0..34 {
+            tx.try_send(ProviderEvent::TextDelta {
+                content_index,
+                delta: "late".to_owned(),
+            })
+            .expect("queue test event");
+        }
+
+        assert_eq!(audit_queued_events(&mut rx, 32), (32, true));
     }
 
     #[tokio::test]

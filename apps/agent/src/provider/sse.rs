@@ -8,6 +8,7 @@ const MAX_ERROR_BODY_CHARS: usize = 4_000;
 const MAX_ERROR_BODY_READ_BYTES: usize = MAX_ERROR_BODY_CHARS * 4 + 4;
 const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 4 * MAX_SSE_LINE_BYTES;
+const MAX_SSE_QUEUED_BYTES: usize = 2 * MAX_SSE_EVENT_BYTES;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 type ByteStream = Pin<Box<dyn Stream<Item = Result<Vec<u8>, String>> + Send>>;
@@ -30,6 +31,8 @@ pub enum SseError {
     LineTooLong { limit: usize },
     #[error("SSE event exceeded {limit} bytes")]
     EventTooLong { limit: usize },
+    #[error("queued SSE events exceeded {limit} bytes")]
+    EventQueueTooLarge { limit: usize },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,9 +107,10 @@ struct SseLineParser {
     ignore_lf_after_cr: bool,
     saw_first_line: bool,
     event_name: Option<String>,
-    data_lines: Vec<String>,
-    event_bytes: usize,
+    data: String,
+    has_data: bool,
     events: VecDeque<SseEvent>,
+    queued_bytes: usize,
 }
 
 impl SseLineParser {
@@ -151,8 +155,7 @@ impl SseLineParser {
 
     fn process_line(&mut self, line: &[u8]) -> Result<(), SseError> {
         if line.is_empty() {
-            self.dispatch_event();
-            return Ok(());
+            return self.dispatch_event();
         }
         if line.first() == Some(&b':') {
             return Ok(());
@@ -175,9 +178,10 @@ impl SseLineParser {
             }
             b"data" => {
                 let data = std::str::from_utf8(value).map_err(|_| SseError::InvalidUtf8)?;
-                let separator = usize::from(!self.data_lines.is_empty());
+                let separator = usize::from(self.has_data);
                 if self
-                    .event_bytes
+                    .data
+                    .len()
                     .saturating_add(separator)
                     .saturating_add(data.len())
                     > MAX_SSE_EVENT_BYTES
@@ -186,36 +190,50 @@ impl SseLineParser {
                         limit: MAX_SSE_EVENT_BYTES,
                     });
                 }
-                self.event_bytes += separator + data.len();
-                self.data_lines.push(data.to_owned());
+                if self.has_data {
+                    self.data.push('\n');
+                }
+                self.data.push_str(data);
+                self.has_data = true;
             }
             _ => {}
         }
         Ok(())
     }
 
-    fn dispatch_event(&mut self) {
-        if self.data_lines.is_empty() {
+    fn dispatch_event(&mut self) -> Result<(), SseError> {
+        if !self.has_data {
             self.event_name = None;
-            self.event_bytes = 0;
-            return;
+            return Ok(());
         }
 
-        self.events.push_back(SseEvent {
+        let event = SseEvent {
             event: self.event_name.take(),
-            data: self.data_lines.join("\n"),
-        });
-        self.data_lines.clear();
-        self.event_bytes = 0;
+            data: std::mem::take(&mut self.data),
+        };
+        self.has_data = false;
+        let charge = event_memory_charge(&event);
+        if self.queued_bytes.saturating_add(charge) > MAX_SSE_QUEUED_BYTES {
+            return Err(SseError::EventQueueTooLarge {
+                limit: MAX_SSE_QUEUED_BYTES,
+            });
+        }
+        self.queued_bytes += charge;
+        self.events.push_back(event);
+        Ok(())
     }
 
     fn next_event(&mut self) -> Option<SseEvent> {
-        self.events.pop_front()
+        let event = self.events.pop_front()?;
+        self.queued_bytes = self
+            .queued_bytes
+            .saturating_sub(event_memory_charge(&event));
+        Some(event)
     }
 
     fn finish(&mut self) -> Result<(), SseError> {
         if self.line_buffer.iter().all(u8::is_ascii_whitespace)
-            && self.data_lines.is_empty()
+            && !self.has_data
             && self.event_name.is_none()
         {
             self.line_buffer.clear();
@@ -224,6 +242,17 @@ impl SseLineParser {
             Err(SseError::UnexpectedEof)
         }
     }
+}
+
+fn event_memory_charge(event: &SseEvent) -> usize {
+    std::mem::size_of::<SseEvent>()
+        .saturating_add(event.data.capacity())
+        .saturating_add(
+            event
+                .event
+                .as_ref()
+                .map_or(0, |event_name| event_name.capacity()),
+        )
 }
 
 async fn receive_chunk(
@@ -473,6 +502,37 @@ mod tests {
             SseError::EventTooLong {
                 limit: MAX_SSE_EVENT_BYTES
             }
+        );
+    }
+
+    #[test]
+    fn empty_data_lines_are_charged_to_the_event_limit() {
+        let mut parser = SseLineParser {
+            data: "\n".repeat(MAX_SSE_EVENT_BYTES),
+            has_data: true,
+            ..SseLineParser::default()
+        };
+
+        assert_eq!(
+            parser.process_line(b"data:"),
+            Err(SseError::EventTooLong {
+                limit: MAX_SSE_EVENT_BYTES
+            })
+        );
+    }
+
+    #[test]
+    fn bounds_events_queued_from_one_chunk() {
+        let minimum_charge = std::mem::size_of::<SseEvent>();
+        let event_count = MAX_SSE_QUEUED_BYTES / minimum_charge + 1;
+        let chunk = "data:\n\n".repeat(event_count);
+        let mut parser = SseLineParser::default();
+
+        assert_eq!(
+            parser.push_chunk(chunk.as_bytes()),
+            Err(SseError::EventQueueTooLarge {
+                limit: MAX_SSE_QUEUED_BYTES
+            })
         );
     }
 

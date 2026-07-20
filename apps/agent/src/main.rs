@@ -77,7 +77,7 @@ async fn main() -> Result<()> {
                         },
                     })
                     .await?;
-                continue;
+                return Err(error);
             }
             Err(error) => return Err(error),
         };

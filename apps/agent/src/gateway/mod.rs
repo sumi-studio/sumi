@@ -14,7 +14,7 @@ pub use stdio::{InvalidCommand, StdioGateway};
 pub enum Command {
     UserMessage {
         text: String,
-        #[serde(default, deserialize_with = "deserialize_empty_attachments")]
+        #[serde(deserialize_with = "deserialize_empty_attachments")]
         attachments: Vec<Attachment>,
     },
     Abort,
@@ -137,6 +137,17 @@ mod tests {
         .expect_err("attachments are not supported");
 
         assert!(error.to_string().contains("attachments must be empty"));
+    }
+
+    #[test]
+    fn user_message_requires_attachments_field() {
+        let error = serde_json::from_value::<Command>(json!({
+            "type": "user_message",
+            "text": "inspect this"
+        }))
+        .expect_err("attachments must be present even while only empty arrays are supported");
+
+        assert!(error.to_string().contains("missing field `attachments`"));
     }
 
     #[test]

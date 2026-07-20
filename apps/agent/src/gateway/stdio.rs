@@ -283,6 +283,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn classifies_missing_attachments_as_a_schema_violation() {
+        let bytes = envelope(serde_json::json!({
+            "type": "user_message",
+            "text": "inspect this",
+        }));
+        let mut input = BufReader::new(bytes.as_slice());
+
+        assert_eq!(
+            read_command(&mut input)
+                .await
+                .expect("outer envelope remains valid"),
+            InboundCommand::Invalid {
+                seq: 1,
+                command_id: "command-1".to_owned(),
+                reason: CommandRejectReason::SchemaViolation,
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn retains_identity_for_unknown_and_missing_commands() {
         let unknown = envelope(serde_json::json!({"type": "future_command"}));
         let mut input = BufReader::new(unknown.as_slice());
