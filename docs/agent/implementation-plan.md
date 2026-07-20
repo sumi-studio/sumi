@@ -939,12 +939,13 @@ pi から移す挙動:
 
 ### 5.3 履歴再送時の正規化(transform)
 
-**[事実]** 原典: `pi:ai/src/api/transform-messages.ts`。API コール直前に L0 へ適用する純関数として移植:
+**[事実]** 原典: `pi:ai/src/api/transform-messages.ts`。API コール直前に L0 へ適用する純関数として移植する。transformは履歴だけから送信先を推測せず、選択済み`ModelSpec::origin()`から呼出し直前に導出したdestination `ProviderOrigin(provider_instance_id/protocol/model)`を明示入力に取る。保存済みmessageのoriginやcache済み派生値をdestinationとして代用しない:
 
 1. **孤児ツールコールへの合成結果**: assistant のツールコールに対応する toolResult が無い場合(abort・クラッシュ・ステア切断)、`"No result provided"` の is_error 結果を合成して挿入。**user メッセージがツールフローを分断した位置にも挿入**。会話末尾の未解決分も同様
 2. **Error/Aborted assistant のスキップ**: 再送しない。**ただし Sumi 拡張: `interrupted=true` のものは除く**(第6章のステア部分応答。テキスト/thinking は保持する。未実行ツールコールは §6.3 手順2が保存時に全て破棄済みのため、ここには現れない)
-3. **クロスモデル thinking再送除外(Sumi独自差分)**: provider instance/protocol/modelのいずれかが変わったら thinking を送信 view から常に除外し、テキストやmemoryへ降格して送らない(transcript の `Thinking` content は表示用に残る)。一次仕様が可搬性を明示保証するopaque blockだけを別型/capabilityで扱う(§4.2)
+3. **destination-originによるthinking再送(Sumi独自差分)**: 生成元とdestinationの`provider_instance_id/protocol/model`が完全一致するときだけthinkingをbyte-preserveする。3要素のいずれか1つでも変わったら送信viewから常に除外し、テキストやmemoryへ降格して送らない(transcript の `Thinking` content は表示用に残る)。一次仕様が可搬性を明示保証するopaque blockだけを別型/capabilityで扱う(§4.2)
 4. **拒否済みtool callの正規化**: `RejectedToolCall + is_error ToolResultMessage` は実行可能なtool callへ復元せず、raw/repair済みargumentsも再送しない。provider-neutralなuser相当診断1件へ変換し、モデルへtool callの再生成を促す
+5. **destination制約下のtool call ID対正規化**: origin完全一致のassistant tool flowではtool call IDと対応result IDをbyte-preserveする。origin不一致でもdestination protocolにID wire制約がなければ変更しない。**origin不一致かつdestination protocolの制約に適合させる必要がある場合だけ**(OpenAI互換の40字上限等)、同じassistant tool flow内の各call IDと対応result IDを同一のbounded mappingで上限内IDへ写す。mappingの保持数はそのflowのtool call数を超えず、user/次assistantのflow境界で破棄してturn間で再利用しない。call/resultを別々にtruncateして対応を壊したり、transcript全体の無制限mapを持ったりしない
 
 (いずれも `transform-messages.ts` 全223行を実読して該当処理を特定すること — 本書の旧行番号は誤りだった)
 
@@ -2385,13 +2386,13 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 | 3 | Moonshot の usage が `choices[0].usage` に入るフォールバック | 同 :362-366 | Kimi 直APIで usage を取り損ねると 3層メモリの校正が死ぬ | `assembler.rs` |
 | 4 | reasoning フィールド3種の検出と「最初の非空だけ採用」 | 同 :394-424 | reasoning_content/reasoning/reasoning_text の方言+二重返却プロバイダ対策。採用フィールド名を再送に使う | `assembler.rs` + `adapters/chat_completions.rs` |
 | 5 | usage 解釈(cached_tokens=読み、cache_write 別枠、input=prompt−cached−write) | 同 :1168-1204(OpenRouter PR#409 への言及コメント含む) | キャッシュヒット率の観測(M4 検証ゲート)の正確性の根拠 | `provider/types.rs::Usage::from_raw` |
-| 6 | finish_reason マッピング表 | 同 :1206-1230 + provider公式値 | content_filter/sensitive→非リトライError、network_error→リトライ可Error、model_context_window_exceeded→Overflow。原文はprovider_codeへ保存 | `assembler.rs` |
+| 6 | finish_reason マッピング表 | 同 :1206-1230 + provider公式値 | content_filter/sensitive→非リトライError、network_error→リトライ可Error、model_context_window_exceeded→Overflow。原文はprovider_codeへ保存 | `adapters/chat_completions.rs` |
 | 7 | 「finish_reason 無しでストリーム終端 = エラー」 | 同 :482-484 | 静かな切断を成功と誤認しない | `assembler.rs` |
 | 8 | assistant content を必ずプレーン文字列で再送 | 同 :957-1012(コメント含む) | content-block 配列だと DeepSeek 系が構造を鸚鵡返しする実バグ | `adapters/chat_completions.rs` |
 | 9 | thinking 再送: signature フィールドへの書き戻し、`reasoning_content:""` 補完 | 同 :976-1044 | **Kimi の Preserved Thinking 必須仕様**への対応。litellm はここを落としてバグっている(調査レポート Issue #26156) | `adapters/chat_completions.rs` |
 | 10 | ツール結果の空/画像プレースホルダ、画像の user メッセージ追送 | 同 :1058-1130 | 「either content or tool_calls」制約を踏まない | `adapters/chat_completions.rs` |
 | 11 | 空 assistant(content 無し tool_calls 無し)のスキップ | 同 :1045-1056 | aborted 残骸で 400 を食らわない | `adapters/chat_completions.rs`/transform |
-| 12 | ツールコール ID の 40 字正規化 | 同 :893-906 | OpenAI 系は 40 字制限。他モデル由来 ID の再送対策 | transform(第5.3節) |
+| 12 | destination-origin付きツールコール ID 対正規化 | 同 :893-906 | same-originのcall/result IDはbyte-preserve。cross-originかつdestination protocolにwire制約がある場合だけ、同一flow-local bounded mappingで対を同じ上限内IDへ写し、mappingはturn間で再利用しない(OpenAI互換は40字上限) | transform(第5.3節) |
 | 13 | 逐次 JSON preview戦略(厳密→repair→partial→repair+partial→{}) | `ai/src/utils/json-parse.ts` 全文 | **ストリーミング中のUI表示だけ**へ移植する。repair結果はToolCall確定・承認・実行へ流さない。終端は生bufferのstrict parse+schema検証をSumi独自に必須化する | `provider/partial_json.rs`(previewテスト) + `assembler.rs`(strict終端テスト) |
 | 14 | リトライ可否の正規表現パターン集(retryable + non-retryable) | `ai/src/utils/retry.ts` 全文 | 各パターンにコメントで実 issue 番号が付いた運用知識の結晶。quota/billing 系を先に除外する順序も含めて移す | `provider/retry.rs` |
 | 15 | リトライポリシー(3回、2s/4s/8s、中断可能 sleep、エラー assistant を state から除去しログには保持) | `coding-agent/src/core/agent-session.ts:2606-2673` | ポリシーと判定の分離。「溢れはリトライしない」ガードが先頭にある(:2610-2614) | `agent/run.rs` |

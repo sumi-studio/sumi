@@ -286,7 +286,7 @@ async fn run_chat_stream(
                     RESPONSE_HEADER_TIMEOUT.as_secs()
                 ),
                 "response_header_timeout",
-                false,
+                cancel.is_cancelled(),
             )
             .await;
             return;
@@ -358,7 +358,7 @@ async fn run_chat_stream(
                             receive.usage().clone(),
                             message,
                             &code,
-                            false,
+                            cancel.is_cancelled(),
                         )
                         .await;
                         return;
@@ -1699,6 +1699,115 @@ fi
         assert!(matches!(
             await_request(std::future::ready(Ok::<_, ()>(())), &cancel, Duration::ZERO,).await,
             RequestWait::Cancelled
+        ));
+    }
+
+    #[tokio::test]
+    async fn response_header_timeout_aborts_when_already_cancelled_preserving_partial() {
+        let spec = ModelSpec::preset("kimi-k3").expect("preset");
+        let (priority_tx, mut priority_rx) = mpsc::channel(1);
+        let mut assembler = MessageAssembler::new();
+        assembler.apply(&ProviderEvent::Start).expect("Start");
+        assembler
+            .apply(&ProviderEvent::TextStart { content_index: 0 })
+            .expect("text start");
+        assembler
+            .apply(&ProviderEvent::TextDelta {
+                content_index: 0,
+                delta: "partial".to_owned(),
+            })
+            .expect("text delta");
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        finish_failure(
+            &priority_tx,
+            &mut assembler,
+            &spec,
+            Usage {
+                input: 5,
+                output: 2,
+                total_tokens: 7,
+                ..Default::default()
+            },
+            format!(
+                "provider response headers timed out after {} seconds",
+                RESPONSE_HEADER_TIMEOUT.as_secs()
+            ),
+            "response_header_timeout",
+            cancel.is_cancelled(),
+        )
+        .await;
+
+        let event = priority_rx.recv().await.expect("priority terminal");
+        let ProviderEvent::Error { reason, output } = event else {
+            panic!("expected Error terminal, got {event:?}")
+        };
+        assert_eq!(reason, StopReason::Aborted);
+        assert_eq!(output.message.stop_reason, StopReason::Aborted);
+        assert!(output.message.interrupted);
+        assert_eq!(
+            output.message.provider_code.as_deref(),
+            Some("response_header_timeout")
+        );
+        assert!(!retry::is_retryable(&output.message));
+        assert!(matches!(
+            output.message.content.as_slice(),
+            [types::AssistantContent::Text { text, .. }] if text == "partial"
+        ));
+    }
+
+    #[tokio::test]
+    async fn adapter_push_json_error_aborts_when_already_cancelled_preserving_partial() {
+        let spec = ModelSpec::preset("kimi-k3").expect("preset");
+        let (priority_tx, mut priority_rx) = mpsc::channel(1);
+        let schemas = FrozenToolSchemaRegistry::compile(&[]).expect("registry");
+        let mut receive = ChatReceiveState::with_budget(schemas, ResponseBudget::default());
+        let mut assembler = MessageAssembler::new();
+        assembler.apply(&ProviderEvent::Start).expect("Start");
+
+        let events = receive
+            .push_json(r#"{"choices":[{"delta":{"content":"partial"}}]}"#)
+            .expect("valid partial chunk");
+        for event in events {
+            assembler.apply(&event).expect("assemble partial");
+        }
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let error = receive
+            .push_json("this is not valid json")
+            .expect_err("invalid chunk must fail parsing");
+        close_partial(&mut receive, &mut assembler);
+        let (message, code) = adapter_error(&error);
+        finish_failure(
+            &priority_tx,
+            &mut assembler,
+            &spec,
+            receive.usage().clone(),
+            message,
+            &code,
+            cancel.is_cancelled(),
+        )
+        .await;
+
+        let event = priority_rx.recv().await.expect("priority terminal");
+        let ProviderEvent::Error { reason, output } = event else {
+            panic!("expected Error terminal, got {event:?}")
+        };
+        assert_eq!(reason, StopReason::Aborted);
+        assert_eq!(output.message.stop_reason, StopReason::Aborted);
+        assert!(output.message.interrupted);
+        assert_eq!(
+            output.message.provider_code.as_deref(),
+            Some("invalid_sse_json")
+        );
+        assert!(!retry::is_retryable(&output.message));
+        assert!(matches!(
+            output.message.content.as_slice(),
+            [types::AssistantContent::Text { text, .. }] if text == "partial"
         ));
     }
 
