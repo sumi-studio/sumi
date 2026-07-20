@@ -108,7 +108,7 @@ toml = "1.1"                # 設定ファイル読込 (2026-07 時点の安定�
 dotenvy = "0.15"            # SUMI_ENV_FILE で明示指定した env ファイルの読込 (ローカル開発用。暗黙の .env 自動探索はしない)
 libc = "0.2"                # Unix: low-trust local fallback の process-group signal (bash ツール、§8.3)
 schemars = "1"              # ツールパラメータの JSON Schema 導出 (TypeBox 相当。生成のみで検証はしない)
-jsonschema = "0.26"         # ツール引数の制約込み schema 検証 (§3.4・§4.3。版は実装時に最新安定へ更新)
+jsonschema = { version = "0.48", default-features = false } # ツール引数の制約込み schema 検証。remote $ref は解決しない (§3.4・§4.3)
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate", "json", "chrono"] }
 uuid = { version = "1", features = ["v7", "v5", "serde"] }  # v7: 時系列ソート可能ID。v5: command_id→message_id の決定論的導出 (§10.2、new_v5 は v5 feature 必須)
 chrono = { version = "0.4", features = ["serde"] }
@@ -359,7 +359,7 @@ pub enum AssistantContent {
 pub struct ToolCall {
     pub id: String,
     pub name: String,
-    pub arguments: ValidatedToolArguments,  // strict parse + top-level Object + tool schema通過済み
+    pub arguments: ValidatedToolArguments,  // live受信時はstrict parse + Object + tool schema通過済み
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -384,8 +384,10 @@ pub enum ToolArgumentError { InvalidJson, NonObject, SchemaViolation }
 
 // ValidatedToolArgumentsは公開constructorを持たない。live streamではassembler内の
 // try_from_raw(raw, frozen_tool_schema)だけが生成する。custom Deserializeは暗号化済み
-// durable replay専用でObject以外を拒否し、replayされたtoolを自動実行しない。
-// read-only view (as_object()) は公開してよい — 制限するのは構築経路だけ (§3.4 ToolCtx)。
+// durable replay専用でObject以外を拒否するが、schema provenanceまでは復元できない。
+// replayされたToolCallはtranscript/再送用データであって実行capabilityではなく、
+// ToolCtxへ渡さない。実行へ戻す必要が生じた場合は凍結schemaで再検証する。
+// read-only view (as_object()) は公開してよい — previewからの構築経路を閉じる (§3.4)。
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -592,7 +594,7 @@ pub trait Tool: Send + Sync {
 
 pub struct ToolCtx<'a> {
     pub call_id: &'a str,
-    pub args: &'a ValidatedToolArguments, // §4.3 の終端検証を通過した値しか構築できない型。注釈ではなく型で保証する
+    pub args: &'a ValidatedToolArguments, // live attemptの§4.3終端検証値だけ。durable replay値は再検証なしに渡さない
     pub cancel: CancellationToken,      // abort 伝播
     pub on_update: Arc<dyn Fn(serde_json::Value) + Send + Sync>, // await を跨ぐ部分結果通知
     pub workspace: &'a WorkspacePaths,
@@ -612,7 +614,7 @@ pub struct TypedTool<P: JsonSchema + DeserializeOwned> { /* name, desc, f */ }
 // execute(): args.as_object() (ValidatedToolArguments の read-only view) から P へ deserialize → 型付きハンドラ呼び出し
 ```
 
-**引数検証の方針**: pi は TypeBox で**フル JSON Schema 検証**(コンパイル済み `Check` + constraint 込みエラー列挙)と型強制(`Value.Convert` + 自前 coercion)を行う **[事実]** (`pi:ai/src/utils/validation.ts`、全310行)。Sumi も**制約込みのフル検証**で揃える: `schemars` が生成した各ツールの schema を起動時に `jsonschema` クレートでコンパイルし、§4.3 の `ToolCallEnd` 終端検証(strict parse → top-level object → schema)で `minimum` / `minLength` / `pattern` / `additionalProperties` 等の制約まで評価する。この検証を通った値だけが `ValidatedToolArguments` になり、承認・実行へ進む — `ToolCall.arguments` の型注釈、§4.3、承認境界、検証ゲートはすべてこの完全検証を前提にしており、構造的 serde のみでは制約違反引数が承認境界を通過してしまうため、簡略化はしない。検証失敗の扱いは **§4.3 が正典**: raw 引数を破棄し、**受信引数もスキーマ全文も echo しない** `is_error=true` の合成 tool result(失敗した検証パス、エラー種別、違反した制約名だけを含む)で「引数検証に失敗したので tool call を再生成せよ」とモデルへ返す。pi はエラーにスキーマと受信引数を添える **[事実]** が、Sumi は §4.3 の再送・redaction 契約(検証不能な値を transcript/再送へ残さない)に合わせて値を返さない — 本節と §4.3 で保存・再送内容を食い違わせない。数値/真偽の弱い型強制は schema 検証より**前**の正規化として主要ツールに適用する。typed ハンドラ内の `serde_json::from_value::<P>` は検証済み引数の型付けであり、検証の代替ではない。**[検証契約として確定]**
+**引数検証の方針**: pi は TypeBox で**フル JSON Schema 検証**(コンパイル済み `Check` + constraint 込みエラー列挙)と型強制(`Value.Convert` + 自前 coercion)を行う **[事実]** (`pi:ai/src/utils/validation.ts`、全310行)。Sumi も**制約込みのフル検証**で揃える: `schemars` が生成した各ツールの schema を起動時に `jsonschema` クレートでコンパイルし、§4.3 の `ToolCallEnd` 終端検証(strict parse → top-level object → schema)で `minimum` / `minLength` / `pattern` / `additionalProperties` 等の制約まで評価する。この検証を通ったlive値だけが承認・実行へ進む。`ValidatedToolArguments` の非公開constructorはpreview/repair値からの直接構築を型で防ぐ一方、durable replay用DeserializeはObject性しか検証できないため、型名だけをschema provenanceの証明として扱わない。replay値はtranscript/再送専用とし、実行境界はlive assembler由来であることをcontrol-flowで限定する。将来replay値を実行候補へ戻す経路を追加する場合は、凍結schemaで再検証してからlive実行経路へ載せる。構造的serdeのみでは制約違反引数が承認境界を通過するため、これを検証の代替にはしない。検証失敗の扱いは **§4.3 が正典**: raw 引数を破棄し、**受信引数もスキーマ全文も echo しない** `is_error=true` の合成 tool result(失敗した検証パス、エラー種別、違反した制約名だけを含む)で「引数検証に失敗したので tool call を再生成せよ」とモデルへ返す。pi はエラーにスキーマと受信引数を添える **[事実]** が、Sumi は §4.3 の再送・redaction 契約(検証不能な値を transcript/再送へ残さない)に合わせて値を返さない — 本節と §4.3 で保存・再送内容を食い違わせない。数値/真偽の弱い型強制は schema 検証より**前**の正規化として主要ツールに適用する。typed ハンドラ内の `serde_json::from_value::<P>` は検証済み引数の型付けであり、検証の代替ではない。**[検証契約として確定]**
 
 ### 3.5 pi 対照表(型サマリ)
 
