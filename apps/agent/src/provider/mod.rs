@@ -8,7 +8,12 @@ pub mod retry;
 pub mod transport;
 pub mod types;
 
-use std::{env, future::Future, sync::OnceLock, time::Duration};
+use std::{
+    env,
+    future::Future,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use adapters::chat_completions::{
     ChatAdapterError, ChatReceiveState, ChatTerminal, ModelSpec, RequestOptions, build_request,
@@ -22,7 +27,7 @@ use tracing::Instrument;
 use transport::{SseError, SseStream};
 use types::{
     AssistantMessage, PromptContext, ProviderEvent, ProviderEventStream, ProviderOutput,
-    StopReason, Usage,
+    StopReason, SuccessTerminalCommit, Usage,
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
@@ -33,6 +38,12 @@ enum RequestWait<T, E> {
     Response(Result<T, E>),
     Cancelled,
     TimedOut,
+}
+
+struct ProducerChannels {
+    normal: mpsc::Sender<ProviderEvent>,
+    priority_terminal: mpsc::Sender<ProviderEvent>,
+    success_terminal_committed: Arc<SuccessTerminalCommit>,
 }
 
 async fn await_request<F, T, E>(
@@ -85,7 +96,13 @@ fn stream_with_api_key(
     let (priority_terminal_tx, priority_terminal_rx) = mpsc::channel(1);
     let origin = spec.origin();
     let provider = spec.provider.clone();
+    let stream_budget = requested_output_tokens(&spec, &options)
+        .ok()
+        .and_then(ResponseBudget::for_output_tokens)
+        .unwrap_or_default();
+    let success_terminal_committed = Arc::new(SuccessTerminalCommit::new());
     let stream_cancel = cancel.clone();
+    let producer_terminal_committed = success_terminal_committed.clone();
     let span = tracing::info_span!(
         "provider_request",
         provider = %spec.provider,
@@ -100,14 +117,25 @@ fn stream_with_api_key(
                 options,
                 stream_cancel,
                 api_key,
-                tx,
-                priority_terminal_tx,
+                ProducerChannels {
+                    normal: tx,
+                    priority_terminal: priority_terminal_tx,
+                    success_terminal_committed: producer_terminal_committed,
+                },
             )
             .await;
         }
         .instrument(span),
     );
-    ProviderEventStream::with_priority_terminal(rx, priority_terminal_rx, cancel, provider, origin)
+    ProviderEventStream::with_priority_terminal(
+        rx,
+        priority_terminal_rx,
+        cancel,
+        provider,
+        origin,
+        stream_budget,
+        success_terminal_committed,
+    )
 }
 
 async fn run_chat_stream(
@@ -116,9 +144,13 @@ async fn run_chat_stream(
     options: RequestOptions,
     cancel: CancellationToken,
     api_key: Option<String>,
-    tx: mpsc::Sender<ProviderEvent>,
-    priority_terminal_tx: mpsc::Sender<ProviderEvent>,
+    channels: ProducerChannels,
 ) {
+    let ProducerChannels {
+        normal: tx,
+        priority_terminal: priority_terminal_tx,
+        success_terminal_committed,
+    } = channels;
     let output_tokens = match requested_output_tokens(&spec, &options) {
         Ok(output_tokens) => output_tokens,
         Err(error) => {
@@ -308,6 +340,7 @@ async fn run_chat_stream(
                     &spec,
                     &mut receive,
                     &cancel,
+                    &success_terminal_committed,
                 )
                 .await;
                 return;
@@ -407,6 +440,7 @@ async fn run_chat_stream(
                             &spec,
                             terminal,
                             &cancel,
+                            &success_terminal_committed,
                         )
                         .await;
                     }
@@ -467,11 +501,21 @@ async fn finish_chat(
     spec: &ModelSpec,
     receive: &mut ChatReceiveState,
     cancel: &CancellationToken,
+    success_terminal_committed: &SuccessTerminalCommit,
 ) {
     let usage = receive.usage().clone();
     match receive.finish(Utc::now()) {
         Ok(terminal) => {
-            finish_terminal(tx, priority_terminal_tx, assembler, spec, terminal, cancel).await
+            finish_terminal(
+                tx,
+                priority_terminal_tx,
+                assembler,
+                spec,
+                terminal,
+                cancel,
+                success_terminal_committed,
+            )
+            .await
         }
         Err(error) => {
             close_partial(receive, assembler);
@@ -506,49 +550,49 @@ async fn finish_terminal(
     spec: &ModelSpec,
     terminal: ChatTerminal,
     cancel: &CancellationToken,
+    success_terminal_committed: &SuccessTerminalCommit,
 ) {
-    for event in &terminal.events {
-        if let Err(error) = assembler.apply(event) {
-            finish_failure(
-                priority_terminal_tx,
-                assembler,
-                spec,
-                terminal.usage.clone(),
-                error.to_string(),
-                "normalized_event_contract_violation",
-                false,
-            )
-            .await;
-            return;
-        }
-    }
     if matches!(
         terminal.stop_reason,
         StopReason::Error | StopReason::Aborted
     ) {
-        let message = build_terminal_message(
+        for event in &terminal.events {
+            if let Err(error) = assembler.apply(event) {
+                finish_failure(
+                    priority_terminal_tx,
+                    assembler,
+                    spec,
+                    terminal.usage.clone(),
+                    error.to_string(),
+                    "normalized_event_contract_violation",
+                    false,
+                )
+                .await;
+                return;
+            }
+        }
+        let error_message = terminal
+            .error_message
+            .unwrap_or_else(|| "provider returned an error terminal".to_owned());
+        let provider_code = terminal
+            .provider_code
+            .unwrap_or_else(|| "provider_error".to_owned());
+        finish_failure(
+            priority_terminal_tx,
             assembler,
             spec,
             terminal.usage,
-            terminal.stop_reason,
-            terminal.error_message,
-            terminal.provider_code,
+            error_message,
+            &provider_code,
             terminal.stop_reason == StopReason::Aborted,
-        );
-        let reason = message.stop_reason;
-        let _ = priority_terminal_tx.try_send(ProviderEvent::Error {
-            reason,
-            output: ProviderOutput {
-                message,
-                provider_context: Vec::new(),
-            },
-        });
+        )
+        .await;
         return;
     }
     for event in terminal.events {
-        match send_ordered(tx, event, cancel).await {
-            SendResult::Sent => {}
-            SendResult::Cancelled => {
+        let permit = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
                 finish_failure(
                     priority_terminal_tx,
                     assembler,
@@ -561,47 +605,88 @@ async fn finish_terminal(
                 .await;
                 return;
             }
-            SendResult::Closed => return,
-        }
-    }
-
-    let message = build_terminal_message(
-        assembler,
-        spec,
-        terminal.usage.clone(),
-        terminal.stop_reason,
-        terminal.error_message,
-        terminal.provider_code,
-        false,
-    );
-    let reason = message.stop_reason;
-    let output = ProviderOutput {
-        message,
-        provider_context: Vec::new(),
-    };
-    let event = if matches!(
-        reason,
-        StopReason::Stop | StopReason::Length | StopReason::ToolUse
-    ) {
-        ProviderEvent::Done { reason, output }
-    } else {
-        ProviderEvent::Error { reason, output }
-    };
-    match send_ordered(tx, event, cancel).await {
-        SendResult::Sent | SendResult::Closed => {}
-        SendResult::Cancelled => {
+            permit = tx.reserve() => match permit {
+                Ok(permit) => permit,
+                Err(_) => return,
+            }
+        };
+        if let Err(error) = assembler.apply(&event) {
+            drop(permit);
             finish_failure(
                 priority_terminal_tx,
                 assembler,
                 spec,
                 terminal.usage.clone(),
+                error.to_string(),
+                "normalized_event_contract_violation",
+                false,
+            )
+            .await;
+            return;
+        }
+        permit.send(event);
+    }
+
+    let permit = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            finish_failure(
+                priority_terminal_tx,
+                assembler,
+                spec,
+                terminal.usage,
                 "provider request cancelled".to_owned(),
                 "cancelled",
                 true,
             )
             .await;
+            return;
         }
-    }
+        permit = tx.reserve() => match permit {
+            Ok(permit) => permit,
+            Err(_) => return,
+        }
+    };
+    let metadata = TerminalMetadata {
+        provider: spec.provider.clone(),
+        origin: spec.origin(),
+        usage: terminal.usage.clone(),
+        stop_reason: terminal.stop_reason,
+        error_message: terminal.error_message,
+        provider_code: terminal.provider_code,
+        interrupted: false,
+        timestamp: Utc::now(),
+    };
+    let message = match assembler.prepare_finish(metadata) {
+        Ok(message) => message,
+        Err(error) => {
+            drop(permit);
+            finish_failure(
+                priority_terminal_tx,
+                assembler,
+                spec,
+                terminal.usage,
+                error.to_string(),
+                "normalized_event_contract_violation",
+                false,
+            )
+            .await;
+            return;
+        }
+    };
+
+    // From this release-store onward the reserved slot is guaranteed to
+    // receive this Done without another await. The stream therefore treats a
+    // later cancellation as subordinate to the already committed success.
+    success_terminal_committed.commit();
+    assembler.commit_prepared_terminal();
+    permit.send(ProviderEvent::Done {
+        reason: terminal.stop_reason,
+        output: ProviderOutput {
+            message,
+            provider_context: Vec::new(),
+        },
+    });
 }
 
 async fn finish_failure(
@@ -613,64 +698,68 @@ async fn finish_failure(
     provider_code: &str,
     cancelled: bool,
 ) {
-    let reason = if cancelled {
+    let Ok(permit) = priority_terminal_tx.try_reserve() else {
+        return;
+    };
+    let requested_reason = if cancelled {
         StopReason::Aborted
     } else {
         StopReason::Error
     };
-    let message = build_terminal_message(
-        assembler,
-        spec,
-        usage,
-        reason,
-        Some(error_message),
-        Some(provider_code.to_owned()),
-        cancelled,
-    );
-    let _ = priority_terminal_tx.try_send(ProviderEvent::Error {
+    let metadata = TerminalMetadata {
+        provider: spec.provider.clone(),
+        origin: spec.origin(),
+        usage: usage.clone(),
+        stop_reason: requested_reason,
+        error_message: Some(error_message),
+        provider_code: Some(provider_code.to_owned()),
+        interrupted: cancelled,
+        timestamp: Utc::now(),
+    };
+    let message = match assembler.prepare_finish(metadata) {
+        Ok(message) => {
+            if requested_reason == StopReason::Aborted {
+                if let Err(error) =
+                    assembler.commit_prepared_error_terminal(requested_reason, &message.content)
+                {
+                    tracing::error!(%error, "failed to commit normalized provider failure");
+                    assembler.commit_prepared_terminal();
+                }
+            } else {
+                assembler.commit_prepared_terminal();
+            }
+            message
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to finalize normalized provider events");
+            AssistantMessage {
+                content: if requested_reason == StopReason::Aborted {
+                    assembler.authoritative_abort_content().unwrap_or_default()
+                } else {
+                    assembler
+                        .authoritative_error_content()
+                        .unwrap_or_else(|_| assembler.completed_content())
+                },
+                model: spec.id.clone(),
+                provider: spec.provider.clone(),
+                origin: spec.origin(),
+                usage,
+                stop_reason: StopReason::Error,
+                error_message: Some("provider event assembly failed".to_owned()),
+                provider_code: Some("normalized_event_contract_violation".to_owned()),
+                interrupted: false,
+                timestamp: Utc::now(),
+            }
+        }
+    };
+    let reason = message.stop_reason;
+    permit.send(ProviderEvent::Error {
         reason,
         output: ProviderOutput {
             message,
             provider_context: Vec::new(),
         },
     });
-}
-
-fn build_terminal_message(
-    assembler: &mut MessageAssembler,
-    spec: &ModelSpec,
-    usage: Usage,
-    stop_reason: StopReason,
-    error_message: Option<String>,
-    provider_code: Option<String>,
-    interrupted: bool,
-) -> AssistantMessage {
-    let fallback_usage = usage.clone();
-    let metadata = TerminalMetadata {
-        provider: spec.provider.clone(),
-        origin: spec.origin(),
-        usage,
-        stop_reason,
-        error_message: error_message.clone(),
-        provider_code: provider_code.clone(),
-        interrupted,
-        timestamp: Utc::now(),
-    };
-    assembler.finish(metadata).unwrap_or_else(|error| {
-        tracing::error!(%error, "failed to finalize normalized provider events");
-        AssistantMessage {
-            content: assembler.completed_content(),
-            model: spec.id.clone(),
-            provider: spec.provider.clone(),
-            origin: spec.origin(),
-            usage: fallback_usage,
-            stop_reason: StopReason::Error,
-            error_message: Some(format!("provider event assembly failed: {error}")),
-            provider_code: Some("normalized_event_contract_violation".to_owned()),
-            interrupted,
-            timestamp: Utc::now(),
-        }
-    })
 }
 
 enum EmitResult {
@@ -744,6 +833,7 @@ fn adapter_error(error: &ChatAdapterError) -> (String, String) {
         ),
         ChatAdapterError::InvalidChunk(_) => (error.to_string(), "invalid_sse_json".to_owned()),
         ChatAdapterError::MultipleChoices(_)
+        | ChatAdapterError::MissingToolDeltaIdentity
         | ChatAdapterError::ConflictingToolIdentity
         | ChatAdapterError::ConflictingToolFormats
         | ChatAdapterError::LegacyFunctionCallUnsupported
@@ -782,7 +872,10 @@ mod tests {
     use futures_util::{StreamExt, stream};
 
     use super::*;
-    use crate::provider::types::ToolDefinition;
+    use crate::provider::types::{
+        AssistantContent, RejectedToolCall, ToolArgumentError, ToolCall, ToolDefinition,
+        ToolResultMessage, UserContent, ValidatedToolArguments,
+    };
 
     async fn serve_fixture(
         status: StatusCode,
@@ -1050,6 +1143,100 @@ mod tests {
         ))
         .expect("provider event snapshot JSON");
         assert_eq!(serde_json::Value::Object(actual), expected);
+    }
+
+    #[tokio::test]
+    async fn draft_2020_12_unevaluated_items_rejection_stays_tool_use_and_redacted() {
+        const RAW_ARGUMENT_SECRET: &str = "raw-argument-secret";
+        const SCHEMA_TEXT_SECRET: &str = "schema-text-secret";
+        const INVALID_TOOL_CALL: &str = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,",
+            "\"id\":\"call-array\",\"function\":{\"name\":\"array_tool\",",
+            "\"arguments\":\"{\\\"items\\\":[\\\"ok\\\",\\\"raw-argument-secret\\\"]}\"}}]},",
+            "\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let context = PromptContext {
+            tools: vec![ToolDefinition {
+                name: "array_tool".to_owned(),
+                description: String::new(),
+                parameters: serde_json::json!({
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "description": SCHEMA_TEXT_SECRET,
+                    "type": "object",
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "prefixItems": [{"type": "string"}],
+                            "unevaluatedItems": false
+                        }
+                    },
+                    "required": ["items"]
+                }),
+            }],
+            ..empty_context()
+        };
+
+        let events = replay_with_context("kimi-k3", INVALID_TOOL_CALL, context).await;
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::Error { .. }))
+        );
+        let rejection = events
+            .iter()
+            .find_map(|event| match event {
+                ProviderEvent::ToolCallRejected {
+                    rejected,
+                    synthetic_result,
+                    ..
+                } => Some((rejected, synthetic_result)),
+                _ => None,
+            })
+            .expect("schema-invalid arguments must emit ToolCallRejected");
+        assert_eq!(rejection.0.error, ToolArgumentError::SchemaViolation);
+        assert_eq!(
+            rejection.1.details["instance_path"],
+            serde_json::json!("/items")
+        );
+        assert_eq!(
+            rejection.1.details["constraint"],
+            serde_json::json!("schema")
+        );
+        let serialized_result =
+            serde_json::to_string(rejection.1).expect("serialize safe synthetic result");
+        for sensitive in [RAW_ARGUMENT_SECRET, SCHEMA_TEXT_SECRET, "unevaluatedItems"] {
+            assert!(
+                !serialized_result.contains(sensitive),
+                "synthetic result leaked {sensitive}"
+            );
+        }
+
+        let terminal = reconstruct_terminal(&events);
+        assert_eq!(terminal.stop_reason, StopReason::ToolUse);
+        assert_eq!(terminal.provider_code.as_deref(), Some("tool_calls"));
+        assert!(matches!(
+            terminal.content.as_slice(),
+            [AssistantContent::RejectedToolCall { rejected, .. }]
+                if rejected.id == "call-array"
+                    && rejected.name == "array_tool"
+                    && rejected.error == ToolArgumentError::SchemaViolation
+        ));
+        let serialized_terminal =
+            serde_json::to_string(&terminal).expect("serialize terminal assistant message");
+        for sensitive in [RAW_ARGUMENT_SECRET, SCHEMA_TEXT_SECRET, "unevaluatedItems"] {
+            assert!(
+                !serialized_terminal.contains(sensitive),
+                "terminal message leaked {sensitive}"
+            );
+        }
+        assert!(matches!(
+            events.last(),
+            Some(ProviderEvent::Done {
+                reason: StopReason::ToolUse,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
@@ -1429,6 +1616,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_identity_parallel_tool_continuation_closes_with_error_without_executable_call() {
+        const BODY: &str = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
+            "{\"index\":0,\"id\":\"call-a\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\"}},",
+            "{\"index\":1,\"id\":\"call-b\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\"}}",
+            "]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
+            "{\"function\":{\"arguments\":\"\\\"b.txt\\\"}\"}}",
+            "]}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let context = PromptContext {
+            tools: vec![ToolDefinition {
+                name: "read_file".to_owned(),
+                description: String::new(),
+                parameters: serde_json::json!({
+                    "type":"object",
+                    "properties":{"path":{"type":"string"}},
+                    "required":["path"]
+                }),
+            }],
+            ..empty_context()
+        };
+        let events = replay_with_context("kimi-k3", BODY, context).await;
+        let Some(ProviderEvent::Error { output, .. }) = events.last() else {
+            panic!("missing tool delta identity must close with Error")
+        };
+        assert_eq!(
+            output.message.provider_code.as_deref(),
+            Some("invalid_provider_stream")
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::ToolCallEnd { .. }))
+        );
+        assert!(
+            !output
+                .message
+                .content
+                .iter()
+                .any(|content| matches!(content, types::AssistantContent::ToolCall { .. }))
+        );
+        assert_eq!(event_types(&events), ["start", "error"]);
+        assert_eq!(reconstruct_terminal(&events), output.message);
+    }
+
+    #[tokio::test]
     async fn raw_failure_streams_preserve_complete_terminal_columns() {
         const MISSING_FINISH: &str = concat!(
             "data: {\"id\":\"missing-finish\",\"model\":\"kimi-k3\",",
@@ -1568,6 +1803,498 @@ mod tests {
             [types::AssistantContent::Text { text, .. }] if text == "partial"
         ));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_done_waits_for_full_ordered_lane_emits_valid_aborted_once() {
+        let spec = ModelSpec::preset("kimi-k3").expect("preset");
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(ProviderEvent::ReasoningSummaryStart { content_index: 0 })
+            .await
+            .expect("fill normal lane");
+        let (priority_tx, priority_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let committed = Arc::new(SuccessTerminalCommit::new());
+        let producer_cancel = cancel.clone();
+        let producer_committed = committed.clone();
+        let producer_spec = spec.clone();
+        let producer = tokio::spawn(async move {
+            let mut assembler = MessageAssembler::new();
+            assembler.apply(&ProviderEvent::Start).expect("Start");
+            finish_terminal(
+                &tx,
+                &priority_tx,
+                &mut assembler,
+                &producer_spec,
+                ChatTerminal {
+                    events: Vec::new(),
+                    usage: Usage::default(),
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                    provider_code: Some("stop".to_owned()),
+                },
+                &producer_cancel,
+                producer_committed.as_ref(),
+            )
+            .await;
+            assembler
+        });
+
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        let mut producer_assembler = producer.await.expect("producer");
+        assert!(
+            !committed.is_committed(),
+            "Done must not commit without an ordered-lane permit"
+        );
+
+        let mut stream = ProviderEventStream::with_priority_terminal(
+            rx,
+            priority_rx,
+            cancel,
+            spec.provider.clone(),
+            spec.origin(),
+            ResponseBudget::default(),
+            committed,
+        );
+        let mut consumer = MessageAssembler::new();
+        let start = stream.recv().await.expect("Start");
+        consumer.apply(&start).expect("consumer Start");
+        let terminal = stream.recv().await.expect("Aborted");
+        let ProviderEvent::Error {
+            reason: StopReason::Aborted,
+            output,
+        } = &terminal
+        else {
+            panic!("pre-commit cancellation must emit Aborted")
+        };
+        assert_eq!(output.message.stop_reason, StopReason::Aborted);
+        assert!(output.message.interrupted);
+        assert_eq!(
+            consumer
+                .apply(&terminal)
+                .expect("consumer accepts terminal"),
+            Some(output.message.clone())
+        );
+        assert!(stream.recv().await.is_none(), "terminal must fuse");
+        assert_eq!(
+            producer_assembler.apply(&terminal),
+            Err(assembler::AssemblerError::TerminalAlreadyEmitted),
+            "producer committed exactly one well-formed failure terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_terminal_event_permit_does_not_commit_unsent_rejection() {
+        let spec = ModelSpec::preset("kimi-k3").expect("preset");
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(ProviderEvent::ToolCallStart { content_index: 0 })
+            .await
+            .expect("fill ordered lane");
+        let (priority_tx, priority_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let committed = Arc::new(SuccessTerminalCommit::new());
+        let producer_cancel = cancel.clone();
+        let producer_committed = committed.clone();
+        let producer_spec = spec.clone();
+        let producer = tokio::spawn(async move {
+            let mut assembler = MessageAssembler::new();
+            assembler.apply(&ProviderEvent::Start).expect("Start");
+            assembler
+                .apply(&ProviderEvent::ToolCallStart { content_index: 0 })
+                .expect("tool start");
+            finish_terminal(
+                &tx,
+                &priority_tx,
+                &mut assembler,
+                &producer_spec,
+                ChatTerminal {
+                    events: vec![rejected_tool_event(0)],
+                    usage: Usage::default(),
+                    stop_reason: StopReason::ToolUse,
+                    error_message: None,
+                    provider_code: Some("tool_calls".to_owned()),
+                },
+                &producer_cancel,
+                producer_committed.as_ref(),
+            )
+            .await;
+            assembler
+        });
+
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        let mut producer_assembler = producer.await.expect("producer");
+        assert!(!committed.is_committed());
+
+        let mut stream = ProviderEventStream::with_priority_terminal(
+            rx,
+            priority_rx,
+            cancel,
+            spec.provider.clone(),
+            spec.origin(),
+            ResponseBudget::default(),
+            committed,
+        );
+        let start = stream.recv().await.expect("Start");
+        assert!(matches!(start, ProviderEvent::Start));
+        let terminal = stream.recv().await.expect("Aborted");
+        let ProviderEvent::Error {
+            reason: StopReason::Aborted,
+            output,
+        } = &terminal
+        else {
+            panic!("pre-permit cancellation must emit Aborted")
+        };
+        assert!(
+            output.message.content.is_empty(),
+            "unsent rejected tool content must not enter the authoritative snapshot"
+        );
+        assert!(!matches!(terminal, ProviderEvent::ToolCallRejected { .. }));
+        assert!(stream.recv().await.is_none(), "terminal must fuse");
+        assert_eq!(
+            producer_assembler.apply(&terminal),
+            Err(assembler::AssemblerError::TerminalAlreadyEmitted),
+            "producer accepted exactly one terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_rejection_is_committed_once_after_permit_before_done() {
+        let spec = ModelSpec::preset("kimi-k3").expect("preset");
+        let (tx, mut rx) = mpsc::channel(1);
+        let tool_start = ProviderEvent::ToolCallStart { content_index: 0 };
+        tx.send(tool_start.clone())
+            .await
+            .expect("fill ordered lane");
+        let (priority_tx, _priority_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let committed = Arc::new(SuccessTerminalCommit::new());
+        let producer_committed = committed.clone();
+        let producer_spec = spec.clone();
+        let rejection = rejected_tool_event(0);
+        let producer = tokio::spawn(async move {
+            let mut assembler = MessageAssembler::new();
+            assembler.apply(&ProviderEvent::Start).expect("Start");
+            assembler.apply(&tool_start).expect("tool start");
+            finish_terminal(
+                &tx,
+                &priority_tx,
+                &mut assembler,
+                &producer_spec,
+                ChatTerminal {
+                    events: vec![rejection],
+                    usage: Usage::default(),
+                    stop_reason: StopReason::ToolUse,
+                    error_message: None,
+                    provider_code: Some("tool_calls".to_owned()),
+                },
+                &cancel,
+                producer_committed.as_ref(),
+            )
+            .await;
+        });
+
+        let mut consumer = MessageAssembler::new();
+        consumer.apply(&ProviderEvent::Start).expect("Start");
+        let start = rx.recv().await.expect("tool start");
+        consumer.apply(&start).expect("consumer tool start");
+        let rejection = rx.recv().await.expect("tool rejection");
+        let ProviderEvent::ToolCallRejected {
+            synthetic_result, ..
+        } = &rejection
+        else {
+            panic!("rejection must precede Done")
+        };
+        assert_eq!(synthetic_result.tool_call_id, "call-rejected");
+        assert!(synthetic_result.is_error);
+        consumer.apply(&rejection).expect("consumer tool rejection");
+        let done = rx.recv().await.expect("Done");
+        let ProviderEvent::Done { output, .. } = &done else {
+            panic!("Done must follow rejection")
+        };
+        assert_eq!(
+            consumer.apply(&done).expect("consumer Done"),
+            Some(output.message.clone())
+        );
+        producer.await.expect("producer");
+        assert!(committed.is_committed());
+        assert!(rx.try_recv().is_err(), "synthetic result is delivered once");
+    }
+
+    #[tokio::test]
+    async fn cancellation_discards_unread_terminal_tool_and_rejection_events() {
+        assert_abort_reconciles_terminal_tool_events(false).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_reconciles_already_consumed_terminal_tool_and_rejection_events() {
+        assert_abort_reconciles_terminal_tool_events(true).await;
+    }
+
+    async fn assert_abort_reconciles_terminal_tool_events(consume_terminal_event: bool) {
+        for terminal_event in [validated_tool_event(2), rejected_tool_event(2)] {
+            let spec = ModelSpec::preset("kimi-k3").expect("preset");
+            let (tx, rx) = mpsc::channel(1);
+            let observer_tx = tx.clone();
+            let (priority_tx, priority_rx) = mpsc::channel(1);
+            let cancel = CancellationToken::new();
+            let committed = Arc::new(SuccessTerminalCommit::new());
+            let producer_spec = spec.clone();
+            let producer_cancel = cancel.clone();
+            let producer_committed = committed.clone();
+            let prefix = durable_text_thinking_tool_prefix();
+            let producer_prefix = prefix.clone();
+            let prefix_ready = Arc::new(tokio::sync::Notify::new());
+            let producer_ready = prefix_ready.clone();
+            let producer = tokio::spawn(async move {
+                let mut assembler = MessageAssembler::new();
+                assembler.apply(&ProviderEvent::Start).expect("Start");
+                for event in producer_prefix {
+                    assembler.apply(&event).expect("producer prefix");
+                }
+                producer_ready.notified().await;
+                finish_terminal(
+                    &tx,
+                    &priority_tx,
+                    &mut assembler,
+                    &producer_spec,
+                    ChatTerminal {
+                        events: vec![terminal_event],
+                        usage: Usage::default(),
+                        stop_reason: StopReason::ToolUse,
+                        error_message: None,
+                        provider_code: Some("tool_calls".to_owned()),
+                    },
+                    &producer_cancel,
+                    producer_committed.as_ref(),
+                )
+                .await;
+                assembler
+            });
+            let mut stream = ProviderEventStream::with_priority_terminal(
+                rx,
+                priority_rx,
+                cancel.clone(),
+                spec.provider.clone(),
+                spec.origin(),
+                ResponseBudget::default(),
+                committed.clone(),
+            );
+            let mut consumer = MessageAssembler::new();
+            consumer
+                .apply(&stream.recv().await.expect("Start"))
+                .expect("consumer Start");
+            for event in prefix {
+                observer_tx
+                    .send(event.clone())
+                    .await
+                    .expect("ordered prefix");
+                let received = stream.recv().await.expect("ordered prefix");
+                assert_eq!(received, event);
+                consumer.apply(&received).expect("consumer prefix");
+            }
+            prefix_ready.notify_one();
+            if consume_terminal_event {
+                let event = stream.recv().await.expect("ordered terminal tool event");
+                consumer.apply(&event).expect("consumer tool event");
+            } else {
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while observer_tx.capacity() != 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("terminal event admitted to full ordered lane");
+            }
+            cancel.cancel();
+            let terminal = stream.recv().await.expect("priority Aborted");
+            let producer_assembler = producer.await.expect("producer");
+            let ProviderEvent::Error {
+                reason: StopReason::Aborted,
+                output,
+            } = &terminal
+            else {
+                panic!("pre-success cancellation must abort")
+            };
+            assert_eq!(output.message.content, retained_text_and_thinking());
+            assert!(
+                consumer
+                    .apply(&terminal)
+                    .expect("abort reconciliation")
+                    .is_some()
+            );
+            assert_eq!(consumer.completed_content(), retained_text_and_thinking());
+            assert!(consumer.synthetic_results().is_empty());
+            assert!(producer_assembler.synthetic_results().is_empty());
+            assert!(!committed.is_committed());
+            assert!(stream.recv().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_text_and_tool_events_keep_order_before_done() {
+        let spec = ModelSpec::preset("kimi-k3").expect("preset");
+        let (tx, mut rx) = mpsc::channel(3);
+        let (priority_tx, _priority_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let committed = SuccessTerminalCommit::new();
+        let text_start = ProviderEvent::TextStart { content_index: 0 };
+        let text_delta = ProviderEvent::TextDelta {
+            content_index: 0,
+            delta: "answer".to_owned(),
+        };
+        let tool_start = ProviderEvent::ToolCallStart { content_index: 1 };
+        let tool_delta = ProviderEvent::ToolCallDelta {
+            content_index: 1,
+            delta: r#"{"path":"a.txt"}"#.to_owned(),
+        };
+        let mut arguments = serde_json::Map::new();
+        arguments.insert("path".to_owned(), serde_json::json!("a.txt"));
+        let mut assembler = MessageAssembler::new();
+        for event in [
+            ProviderEvent::Start,
+            text_start.clone(),
+            text_delta.clone(),
+            tool_start.clone(),
+            tool_delta.clone(),
+        ] {
+            assembler.apply(&event).expect("producer prefix");
+        }
+
+        finish_terminal(
+            &tx,
+            &priority_tx,
+            &mut assembler,
+            &spec,
+            ChatTerminal {
+                events: vec![
+                    ProviderEvent::TextEnd {
+                        content_index: 0,
+                        content: "answer".to_owned(),
+                    },
+                    ProviderEvent::ToolCallEnd {
+                        content_index: 1,
+                        tool_call: ToolCall {
+                            id: "call-valid".to_owned(),
+                            name: "read_file".to_owned(),
+                            arguments: ValidatedToolArguments::from_schema_validated(arguments),
+                        },
+                    },
+                ],
+                usage: Usage::default(),
+                stop_reason: StopReason::ToolUse,
+                error_message: None,
+                provider_code: Some("tool_calls".to_owned()),
+            },
+            &cancel,
+            &committed,
+        )
+        .await;
+
+        let events = [
+            rx.recv().await.expect("text end"),
+            rx.recv().await.expect("tool end"),
+            rx.recv().await.expect("Done"),
+        ];
+        assert_eq!(event_types(&events), ["text_end", "tool_call_end", "done"]);
+        let mut consumer = MessageAssembler::new();
+        for event in [
+            ProviderEvent::Start,
+            text_start,
+            text_delta,
+            tool_start,
+            tool_delta,
+        ] {
+            consumer.apply(&event).expect("consumer prefix");
+        }
+        for event in &events {
+            consumer.apply(event).expect("consumer terminal sequence");
+        }
+        assert!(committed.is_committed());
+    }
+
+    fn rejected_tool_event(content_index: usize) -> ProviderEvent {
+        ProviderEvent::ToolCallRejected {
+            content_index,
+            rejected: RejectedToolCall {
+                id: "call-rejected".to_owned(),
+                name: "read_file".to_owned(),
+                error: ToolArgumentError::InvalidJson,
+            },
+            synthetic_result: ToolResultMessage {
+                tool_call_id: "call-rejected".to_owned(),
+                tool_name: "read_file".to_owned(),
+                content: vec![UserContent::Text {
+                    text: "Tool arguments were rejected. Regenerate the tool call with complete, schema-valid arguments."
+                        .to_owned(),
+                }],
+                details: serde_json::json!({
+                    "category": "invalid_json",
+                    "instance_path": "",
+                    "constraint": "json_syntax"
+                }),
+                is_error: true,
+                timestamp: Utc::now(),
+            },
+        }
+    }
+
+    fn validated_tool_event(content_index: usize) -> ProviderEvent {
+        ProviderEvent::ToolCallEnd {
+            content_index,
+            tool_call: ToolCall {
+                id: "call-valid".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: ValidatedToolArguments::from_schema_validated(
+                    serde_json::json!({"path": "a.txt"})
+                        .as_object()
+                        .expect("object")
+                        .clone(),
+                ),
+            },
+        }
+    }
+
+    fn durable_text_thinking_tool_prefix() -> Vec<ProviderEvent> {
+        vec![
+            ProviderEvent::TextStart { content_index: 0 },
+            ProviderEvent::TextDelta {
+                content_index: 0,
+                delta: "kept text".to_owned(),
+            },
+            ProviderEvent::TextEnd {
+                content_index: 0,
+                content: "kept text".to_owned(),
+            },
+            ProviderEvent::ThinkingStart {
+                content_index: 1,
+                signature_field: "reasoning_content".to_owned(),
+            },
+            ProviderEvent::ThinkingDelta {
+                content_index: 1,
+                delta: "kept thinking".to_owned(),
+            },
+            ProviderEvent::ThinkingEnd {
+                content_index: 1,
+                content: "kept thinking".to_owned(),
+            },
+            ProviderEvent::ToolCallStart { content_index: 2 },
+        ]
+    }
+
+    fn retained_text_and_thinking() -> Vec<types::AssistantContent> {
+        vec![
+            types::AssistantContent::Text {
+                text: "kept text".to_owned(),
+                wire_item_index: 0,
+            },
+            types::AssistantContent::Thinking {
+                thinking: "kept thinking".to_owned(),
+                signature_field: "reasoning_content".to_owned(),
+                wire_item_index: 1,
+            },
+        ]
     }
 
     #[tokio::test]

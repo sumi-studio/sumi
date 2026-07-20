@@ -259,6 +259,8 @@ pub enum ChatAdapterError {
     },
     #[error("multiple Chat Completions choices are unsupported, got {0}")]
     MultipleChoices(usize),
+    #[error("tool call delta requires an index or non-empty provider id")]
+    MissingToolDeltaIdentity,
     #[error("conflicting tool call identity in streamed delta")]
     ConflictingToolIdentity,
     #[error("chunk mixed modern tool_calls with legacy function_call")]
@@ -416,6 +418,7 @@ fn convert_messages(spec: &ModelSpec, context: &PromptContext) -> Vec<Value> {
     }
 
     let messages: Vec<&Message> = context.messages.iter().map(context_message).collect();
+    let origin = spec.origin();
     let mut index = 0;
     while index < messages.len() {
         match messages[index] {
@@ -433,7 +436,7 @@ fn convert_messages(spec: &ModelSpec, context: &PromptContext) -> Vec<Value> {
                 let mut thinking_field: Option<&str> = None;
                 let mut replayed_thinking = String::new();
                 let mut tool_calls = Vec::new();
-                let same_origin = message.origin == spec.origin();
+                let same_origin = message.origin == origin;
 
                 for block in &message.content {
                     match block {
@@ -1367,8 +1370,16 @@ impl ChatReceiveState {
                     limit: self.budget.max_content_bytes,
                 })
         })?;
-        let id = chunk.id.filter(|id| !id.is_empty());
-        let model = chunk.model.filter(|model| !model.is_empty());
+        let id = if self.response_id.is_none() {
+            chunk.id.filter(|id| !id.is_empty())
+        } else {
+            None
+        };
+        let model = if self.response_model.is_none() {
+            chunk.model.filter(|model| !model.is_empty())
+        } else {
+            None
+        };
         let additional_content = chunk_content_bytes
             .checked_add(id.as_ref().map_or(0, String::len))
             .and_then(|bytes| bytes.checked_add(model.as_ref().map_or(0, String::len)))
@@ -1462,7 +1473,7 @@ impl ChatReceiveState {
                     && self.text.is_none(),
             );
         let mut preview_work = 0_usize;
-        for (position, tool_delta) in delta.tool_calls.iter().enumerate() {
+        for tool_delta in &delta.tool_calls {
             let (slot, index_to_record) = resolve_tool_identity_overlay(
                 ToolIdentityOverlay {
                     base_indexes: &self.tool_by_stream_index,
@@ -1473,7 +1484,6 @@ impl ChatReceiveState {
                     pending_slots_with_index: &pending_slots_with_index,
                 },
                 tool_delta,
-                position as u64,
             )?;
             let slot = slot.unwrap_or_else(|| {
                 let slot = next_slot;
@@ -1607,8 +1617,8 @@ impl ChatReceiveState {
             });
         }
 
-        for (position, tool_delta) in delta.tool_calls.into_iter().enumerate() {
-            let slot = self.tool_slot(&tool_delta, position as u64, events)?;
+        for tool_delta in delta.tool_calls {
+            let slot = self.tool_slot(&tool_delta, events)?;
             let Some(_) = self.tools.get(slot).and_then(Option::as_ref) else {
                 continue;
             };
@@ -1645,7 +1655,6 @@ impl ChatReceiveState {
     fn tool_slot(
         &mut self,
         delta: &ChatToolDelta,
-        fallback_index: u64,
         events: &mut Vec<ProviderEvent>,
     ) -> Result<usize, ChatAdapterError> {
         let id = delta.id.as_deref().filter(|id| !id.is_empty());
@@ -1654,7 +1663,6 @@ impl ChatReceiveState {
             &self.tool_by_id,
             &self.tool_slots_with_stream_index,
             delta,
-            fallback_index,
         )?;
 
         let slot = if let Some(slot) = slot {
@@ -1789,11 +1797,11 @@ fn resolve_tool_identity(
     id_map: &HashMap<String, usize>,
     slots_with_index: &HashSet<usize>,
     delta: &ChatToolDelta,
-    fallback_index: u64,
 ) -> Result<(Option<usize>, Option<u64>), ChatAdapterError> {
-    let id = delta.id.as_deref().filter(|id| !id.is_empty());
+    let identity = required_tool_delta_identity(delta)?;
+    let id = identity.id;
     let id_slot = id.and_then(|id| id_map.get(id).copied());
-    if let Some(stream_index) = delta.index {
+    if let Some(stream_index) = identity.stream_index {
         let index_slot = index_map.get(&stream_index).copied();
         if let (Some(index_slot), Some(id_slot)) = (index_slot, id_slot)
             && index_slot != id_slot
@@ -1810,11 +1818,27 @@ fn resolve_tool_identity(
         // parallel tool deltas.
         Ok((id_slot, None))
     } else {
-        Ok((
-            index_map.get(&fallback_index).copied(),
-            Some(fallback_index),
-        ))
+        unreachable!("required_tool_delta_identity rejected a missing identity")
     }
+}
+
+#[derive(Clone, Copy)]
+struct ToolDeltaIdentity<'a> {
+    stream_index: Option<u64>,
+    id: Option<&'a str>,
+}
+
+fn required_tool_delta_identity(
+    delta: &ChatToolDelta,
+) -> Result<ToolDeltaIdentity<'_>, ChatAdapterError> {
+    let identity = ToolDeltaIdentity {
+        stream_index: delta.index,
+        id: delta.id.as_deref().filter(|id| !id.is_empty()),
+    };
+    if identity.stream_index.is_none() && identity.id.is_none() {
+        return Err(ChatAdapterError::MissingToolDeltaIdentity);
+    }
+    Ok(identity)
 }
 
 struct ToolIdentityOverlay<'a> {
@@ -1829,9 +1853,9 @@ struct ToolIdentityOverlay<'a> {
 fn resolve_tool_identity_overlay(
     overlay: ToolIdentityOverlay<'_>,
     delta: &ChatToolDelta,
-    fallback_index: u64,
 ) -> Result<(Option<usize>, Option<u64>), ChatAdapterError> {
-    let id = delta.id.as_deref().filter(|id| !id.is_empty());
+    let identity = required_tool_delta_identity(delta)?;
+    let id = identity.id;
     let id_slot = id.and_then(|id| {
         overlay
             .ids
@@ -1839,7 +1863,7 @@ fn resolve_tool_identity_overlay(
             .or_else(|| overlay.base_ids.get(id))
             .copied()
     });
-    if let Some(stream_index) = delta.index {
+    if let Some(stream_index) = identity.stream_index {
         let index_slot = overlay
             .indexes
             .get(&stream_index)
@@ -1862,14 +1886,7 @@ fn resolve_tool_identity_overlay(
     } else if id.is_some() {
         Ok((id_slot, None))
     } else {
-        Ok((
-            overlay
-                .indexes
-                .get(&fallback_index)
-                .or_else(|| overlay.base_indexes.get(&fallback_index))
-                .copied(),
-            Some(fallback_index),
-        ))
+        unreachable!("required_tool_delta_identity rejected a missing identity")
     }
 }
 
@@ -2773,6 +2790,76 @@ mod tests {
     }
 
     #[test]
+    fn response_identity_budget_charges_only_first_non_empty_values() {
+        let registry = FrozenToolSchemaRegistry::compile(&[]).expect("registry");
+        let mut receive = ChatReceiveState::with_budget(
+            registry,
+            ResponseBudget {
+                max_content_bytes: 10,
+                ..ResponseBudget::default()
+            },
+        );
+
+        receive
+            .push_json(r#"{"id":"resp","model":"mod","choices":[{"delta":{"content":"a"}}]}"#)
+            .expect("first normal response chunk");
+        for content in ["b", "c"] {
+            receive
+                .push_json(&format!(
+                    r#"{{"id":"resp","model":"mod","choices":[{{"delta":{{"content":"{content}"}}}}]}}"#
+                ))
+                .expect("repeated identity does not consume retained-state budget");
+        }
+        receive
+            .push_json(r#"{"id":"replacement","model":"replacement","choices":[]}"#)
+            .expect("later identity does not replace or grow retained state");
+
+        assert_eq!(receive.response_id.as_deref(), Some("resp"));
+        assert_eq!(receive.response_model.as_deref(), Some("mod"));
+        assert_eq!(receive.text.as_ref().expect("text").content, "abc");
+        assert_eq!(receive.content_bytes, 10);
+        assert!(matches!(
+            receive.push_json(r#"{"choices":[{"delta":{"content":"x"}}]}"#),
+            Err(ChatAdapterError::ResponseLimitExceeded {
+                resource: "content_bytes",
+                limit: 10
+            })
+        ));
+        assert_eq!(receive.content_bytes, 10);
+        assert_eq!(receive.text.as_ref().expect("text").content, "abc");
+    }
+
+    #[test]
+    fn response_identity_budget_rejects_first_retained_values_one_byte_over() {
+        let registry = FrozenToolSchemaRegistry::compile(&[]).expect("registry");
+        let mut receive = ChatReceiveState::with_budget(
+            registry,
+            ResponseBudget {
+                max_content_bytes: 6,
+                ..ResponseBudget::default()
+            },
+        );
+
+        assert!(matches!(
+            receive.push_json(r#"{"id":"resp","model":"mod","choices":[]}"#),
+            Err(ChatAdapterError::ResponseLimitExceeded {
+                resource: "content_bytes",
+                limit: 6
+            })
+        ));
+        assert!(receive.response_id.is_none());
+        assert!(receive.response_model.is_none());
+        assert_eq!(receive.content_bytes, 0);
+
+        receive
+            .push_json(r#"{"id":"resp","model":"mo","choices":[]}"#)
+            .expect("identity at the exact boundary remains committable");
+        assert_eq!(receive.response_id.as_deref(), Some("resp"));
+        assert_eq!(receive.response_model.as_deref(), Some("mo"));
+        assert_eq!(receive.content_bytes, 6);
+    }
+
+    #[test]
     fn budget_failures_leave_semantic_state_and_counters_transactional() {
         let registry = FrozenToolSchemaRegistry::compile(&[]).expect("registry");
 
@@ -3216,6 +3303,156 @@ mod tests {
             .collect::<Vec<_>>();
         paths.sort_unstable();
         assert_eq!(paths, ["a.txt", "b.txt"]);
+    }
+
+    #[test]
+    fn every_tool_delta_requires_a_stable_identity() {
+        let registry = FrozenToolSchemaRegistry::compile(&[tool_definition()]).expect("registry");
+        for payload in [
+            r#"{"choices":[{"delta":{"tool_calls":[{"function":{"name":"read_file","arguments":"{\"path\":\"a.txt\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"id":"","function":{"name":"read_file","arguments":"{\"path\":\"a.txt\"}"}}]}}]}"#,
+        ] {
+            let mut receive = ChatReceiveState::new(registry.clone());
+            assert!(matches!(
+                receive.push_json(payload),
+                Err(ChatAdapterError::MissingToolDeltaIdentity)
+            ));
+            assert!(receive.tools.is_empty());
+            assert!(receive.tool_by_stream_index.is_empty());
+            assert!(receive.tool_by_id.is_empty());
+            assert_eq!(receive.next_content_index, 0);
+            assert_eq!(receive.content_bytes, 0);
+            assert_eq!(receive.event_count, 0);
+            assert_eq!(receive.preview_work_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn no_identity_parallel_continuation_is_rejected_without_aliasing_first_tool() {
+        let registry = FrozenToolSchemaRegistry::compile(&[tool_definition()]).expect("registry");
+        let mut receive = ChatReceiveState::new(registry);
+        receive
+            .push_json(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-a","function":{"name":"read_file","arguments":"{\"path\":"}},{"index":1,"id":"call-b","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}"#,
+            )
+            .expect("initial parallel tools");
+        let before = (
+            receive.tools[0]
+                .as_ref()
+                .expect("tool A")
+                .accumulator
+                .raw_len(),
+            receive.tools[1]
+                .as_ref()
+                .expect("tool B")
+                .accumulator
+                .raw_len(),
+            receive.content_bytes,
+            receive.event_count,
+            receive.preview_work_bytes,
+            receive.next_content_index,
+        );
+
+        assert!(matches!(
+            receive.push_json(
+                r#"{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"\"b.txt\"}"}}]}}]}"#
+            ),
+            Err(ChatAdapterError::MissingToolDeltaIdentity)
+        ));
+        assert_eq!(
+            (
+                receive.tools[0]
+                    .as_ref()
+                    .expect("tool A")
+                    .accumulator
+                    .raw_len(),
+                receive.tools[1]
+                    .as_ref()
+                    .expect("tool B")
+                    .accumulator
+                    .raw_len(),
+                receive.content_bytes,
+                receive.event_count,
+                receive.preview_work_bytes,
+                receive.next_content_index,
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn invalid_later_tool_delta_rolls_back_the_whole_chunk() {
+        let registry = FrozenToolSchemaRegistry::compile(&[tool_definition()]).expect("registry");
+        let mut receive = ChatReceiveState::new(registry);
+        receive
+            .push_json(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-a","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}"#,
+            )
+            .expect("initial tool");
+        let before = (
+            receive.tools[0]
+                .as_ref()
+                .expect("tool A")
+                .accumulator
+                .raw_len(),
+            receive.content_bytes,
+            receive.event_count,
+            receive.preview_work_bytes,
+            receive.next_content_index,
+        );
+
+        assert!(matches!(
+            receive.push_json(
+                r#"{"id":"discarded-id","model":"discarded-model","choices":[{"delta":{"content":"discarded","tool_calls":[{"index":0,"function":{"arguments":"\"a.txt\"}"}},{"function":{"arguments":"discarded"}}]}}]}"#
+            ),
+            Err(ChatAdapterError::MissingToolDeltaIdentity)
+        ));
+        assert_eq!(
+            (
+                receive.tools[0]
+                    .as_ref()
+                    .expect("tool A")
+                    .accumulator
+                    .raw_len(),
+                receive.content_bytes,
+                receive.event_count,
+                receive.preview_work_bytes,
+                receive.next_content_index,
+            ),
+            before
+        );
+        assert!(receive.text.is_none());
+        assert!(receive.response_id.is_none());
+        assert!(receive.response_model.is_none());
+    }
+
+    #[test]
+    fn index_only_and_id_only_tool_deltas_remain_valid() {
+        let registry = FrozenToolSchemaRegistry::compile(&[tool_definition()]).expect("registry");
+        let mut receive = ChatReceiveState::new(registry);
+        receive
+            .push_json(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-a","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}"#,
+            )
+            .expect("initial indexed tool");
+        receive
+            .push_json(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.txt\""}}]}}]}"#,
+            )
+            .expect("index-only continuation");
+        receive
+            .push_json(
+                r#"{"choices":[{"delta":{"tool_calls":[{"id":"call-a","function":{"arguments":"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            )
+            .expect("id-only continuation");
+
+        let terminal = receive.finish(Utc::now()).expect("terminal");
+        assert!(terminal.events.iter().any(|event| matches!(
+            event,
+            ProviderEvent::ToolCallEnd { tool_call, .. }
+                if tool_call.id == "call-a"
+                    && tool_call.arguments.as_object().get("path") == Some(&json!("a.txt"))
+        )));
     }
 
     #[test]

@@ -137,6 +137,9 @@ impl Config {
         }
         if let Some(max_output_tokens) = self.model.max_output_tokens {
             spec.max_output_tokens = max_output_tokens;
+            if self.model.default_output_tokens.is_none() {
+                spec.default_output_tokens = spec.default_output_tokens.min(max_output_tokens);
+            }
         }
         if let Some(default_output_tokens) = self.model.default_output_tokens {
             spec.default_output_tokens = default_output_tokens;
@@ -557,6 +560,48 @@ zai_tool_stream = false
         assert_eq!(spec.max_output_tokens, 64_000);
         assert!(!spec.compat.zai_tool_stream);
         assert_eq!(spec.compat.thinking_format, ThinkingFormat::ProviderDefault);
+    }
+
+    #[test]
+    fn inherited_default_output_tokens_clamps_to_overridden_maximum() {
+        let file: FileConfig = toml::from_str(
+            r#"
+[model]
+preset = "opencode-go"
+max_output_tokens = 8000
+"#,
+        )
+        .expect("valid config");
+        let config = Config::resolve(file, EnvOverrides::default()).expect("resolved");
+
+        let spec = config.model_spec().expect("model spec");
+
+        assert_eq!(spec.max_output_tokens, 8_000);
+        assert_eq!(spec.default_output_tokens, 8_000);
+    }
+
+    #[test]
+    fn explicit_default_output_tokens_above_overridden_maximum_is_rejected() {
+        let file: FileConfig = toml::from_str(
+            r#"
+[model]
+preset = "opencode-go"
+max_output_tokens = 8000
+default_output_tokens = 16000
+"#,
+        )
+        .expect("valid config");
+        let config = Config::resolve(file, EnvOverrides::default()).expect("resolved");
+
+        let error = config
+            .model_spec()
+            .expect_err("explicit invalid default must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("default_output_tokens must be within 1..=8000")
+        );
     }
 
     #[test]

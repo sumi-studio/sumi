@@ -2,7 +2,10 @@ use std::sync::OnceLock;
 
 use regex::RegexSet;
 
-use super::types::{AssistantMessage, StopReason};
+use super::{
+    retry::retryable_machine_code,
+    types::{AssistantMessage, StopReason},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OverflowSource {
@@ -22,27 +25,24 @@ pub fn classify_context_overflow(
     message: &AssistantMessage,
     context_window: Option<u64>,
 ) -> Option<OverflowClassification> {
-    match message.provider_code.as_deref() {
-        Some(
-            "model_context_window_exceeded"
-            | "context_length_exceeded"
-            | "request_too_large"
-            | "413"
-            | "http_413",
-        ) => {
-            return Some(OverflowClassification::ImmediateRecovery(
-                OverflowSource::ProviderCode,
-            ));
+    if message.stop_reason == StopReason::Error {
+        match message.provider_code.as_deref() {
+            Some(
+                "model_context_window_exceeded"
+                | "context_length_exceeded"
+                | "request_too_large"
+                | "413"
+                | "http_413",
+            ) => {
+                return Some(OverflowClassification::ImmediateRecovery(
+                    OverflowSource::ProviderCode,
+                ));
+            }
+            // These machine-readable codes are authoritative even when the
+            // display message contains broad fallback words such as "tokens".
+            Some(code) if authoritative_non_overflow_code(code) => return None,
+            _ => {}
         }
-        // These machine-readable codes are authoritative even when the
-        // display message contains broad fallback words such as "tokens".
-        Some(code)
-            if message.stop_reason == StopReason::Error
-                && authoritative_non_overflow_code(code) =>
-        {
-            return None;
-        }
-        _ => {}
     }
 
     if message.stop_reason == StopReason::Error
@@ -78,30 +78,11 @@ pub fn classify_context_overflow(
 }
 
 fn authoritative_non_overflow_code(code: &str) -> bool {
-    matches!(
-        code,
-        "network_error"
-            | "request_error"
-            | "transport_error"
-            | "idle_timeout"
-            | "response_header_timeout"
-            | "sensitive"
-            | "content_filter"
-            | "cancelled"
-            | "invalid_provider_stream"
-            | "429"
-            | "500"
-            | "502"
-            | "503"
-            | "504"
-            | "524"
-            | "http_429"
-            | "http_500"
-            | "http_502"
-            | "http_503"
-            | "http_504"
-            | "http_524"
-    )
+    retryable_machine_code(code)
+        || matches!(
+            code,
+            "sensitive" | "content_filter" | "cancelled" | "invalid_provider_stream"
+        )
 }
 
 fn ninety_nine_percent_ceiling(value: u64) -> u64 {
@@ -250,6 +231,7 @@ mod tests {
         );
         for code in [
             "network_error",
+            "unexpected_sse_eof",
             "sensitive",
             "content_filter",
             "http_429",
@@ -300,6 +282,61 @@ mod tests {
                 "{code}"
             );
         }
+    }
+
+    #[test]
+    fn overflow_provider_codes_require_error_stop_reason() {
+        let stop_usage = Usage {
+            input: 101,
+            ..Usage::default()
+        };
+        assert_eq!(
+            classify_context_overflow(
+                &message(
+                    StopReason::Stop,
+                    Some("model_context_window_exceeded"),
+                    Some("maximum context length is 100 tokens"),
+                    stop_usage,
+                ),
+                Some(100),
+            ),
+            Some(OverflowClassification::DeferredApply(
+                OverflowSource::StopUsage
+            ))
+        );
+
+        let length_usage = Usage {
+            input: 99,
+            output: 0,
+            ..Usage::default()
+        };
+        assert_eq!(
+            classify_context_overflow(
+                &message(
+                    StopReason::Length,
+                    Some("request_too_large"),
+                    Some("maximum context length is 100 tokens"),
+                    length_usage,
+                ),
+                Some(100),
+            ),
+            Some(OverflowClassification::ImmediateRecovery(
+                OverflowSource::LengthUsage
+            ))
+        );
+
+        assert_eq!(
+            classify_context_overflow(
+                &message(
+                    StopReason::Stop,
+                    Some("http_413"),
+                    Some("too many tokens"),
+                    Usage::default(),
+                ),
+                Some(100),
+            ),
+            None
+        );
     }
 
     #[test]

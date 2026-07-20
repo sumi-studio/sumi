@@ -97,18 +97,26 @@ pub enum AssemblerError {
     UnfinishedContent,
     #[error("terminal event variant does not match its stop reason")]
     TerminalVariantMismatch,
+    #[error("rejected tool call and synthetic result do not form a canonical safe pair")]
+    InvalidRejectedToolPair,
     #[error("response content exceeded the {limit}-byte cumulative budget")]
     ResponseContentBudgetExceeded { limit: usize },
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ScratchBlock {
     Text(String),
     Thinking {
         content: String,
         signature_field: String,
     },
-    Tool(String),
+    Tool(ToolScratch),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ToolScratch {
+    Raw(String),
+    Overflow,
 }
 
 /// Reconstructs durable assistant content exclusively from normalized
@@ -120,6 +128,7 @@ pub struct MessageAssembler {
     terminal: bool,
     scratch: HashMap<usize, ScratchBlock>,
     completed: BTreeMap<usize, AssistantContent>,
+    synthetic_results: BTreeMap<usize, ToolResultMessage>,
     budget: ResponseBudget,
     content_bytes: usize,
 }
@@ -208,7 +217,7 @@ impl MessageAssembler {
                 if (*reason == StopReason::Aborted) != output.message.interrupted {
                     return Err(AssemblerError::TerminalVariantMismatch);
                 }
-                self.accept_authoritative_error_content(&output.message.content)?;
+                self.accept_authoritative_error_content(*reason, &output.message.content)?;
                 self.terminal = true;
                 self.scratch.clear();
                 Ok(Some(output.message.clone()))
@@ -227,24 +236,56 @@ impl MessageAssembler {
         &mut self,
         metadata: TerminalMetadata,
     ) -> Result<AssistantMessage, AssemblerError> {
+        let message = self.prepare_finish(metadata)?;
+        if message.stop_reason == StopReason::Aborted {
+            self.commit_prepared_error_terminal(message.stop_reason, &message.content)?;
+        } else {
+            self.commit_prepared_terminal();
+        }
+        Ok(message)
+    }
+
+    pub(crate) fn prepare_finish(
+        &self,
+        metadata: TerminalMetadata,
+    ) -> Result<AssistantMessage, AssemblerError> {
         self.ensure_started()?;
         if self.terminal {
             return Err(AssemblerError::TerminalAlreadyEmitted);
         }
-        if metadata.origin.model.is_empty() {
+        if metadata.provider.is_empty()
+            || metadata.origin.provider_instance_id.is_empty()
+            || metadata.origin.model.is_empty()
+        {
             return Err(AssemblerError::TerminalOriginMismatch);
         }
-        if matches!(
-            metadata.stop_reason,
-            StopReason::Stop | StopReason::Length | StopReason::ToolUse
-        ) && !self.scratch.is_empty()
-        {
-            return Err(AssemblerError::UnfinishedContent);
+        match metadata.stop_reason {
+            StopReason::Stop | StopReason::Length | StopReason::ToolUse => {
+                if metadata.interrupted {
+                    return Err(AssemblerError::TerminalVariantMismatch);
+                }
+                if !self.scratch.is_empty() {
+                    return Err(AssemblerError::UnfinishedContent);
+                }
+            }
+            StopReason::Error => {
+                if metadata.interrupted {
+                    return Err(AssemblerError::TerminalVariantMismatch);
+                }
+            }
+            StopReason::Aborted => {
+                if !metadata.interrupted {
+                    return Err(AssemblerError::TerminalVariantMismatch);
+                }
+            }
         }
-        self.terminal = true;
-        self.scratch.clear();
+        let content = if metadata.stop_reason == StopReason::Aborted {
+            self.authoritative_abort_content()?
+        } else {
+            self.completed_content()
+        };
         Ok(AssistantMessage {
-            content: self.completed_content(),
+            content,
             model: metadata.origin.model.clone(),
             provider: metadata.provider,
             origin: metadata.origin,
@@ -257,8 +298,81 @@ impl MessageAssembler {
         })
     }
 
+    pub(crate) fn commit_prepared_terminal(&mut self) {
+        debug_assert!(self.started);
+        debug_assert!(!self.terminal);
+        self.terminal = true;
+        self.scratch.clear();
+    }
+
+    pub(crate) fn commit_prepared_error_terminal(
+        &mut self,
+        reason: StopReason,
+        content: &[AssistantContent],
+    ) -> Result<(), AssemblerError> {
+        self.accept_authoritative_error_content(reason, content)?;
+        self.commit_prepared_terminal();
+        Ok(())
+    }
+
     pub fn completed_content(&self) -> Vec<AssistantContent> {
         self.completed.values().cloned().collect()
+    }
+
+    pub fn synthetic_results(&self) -> Vec<ToolResultMessage> {
+        self.synthetic_results.values().cloned().collect()
+    }
+
+    pub(crate) fn authoritative_error_content(
+        &self,
+    ) -> Result<Vec<AssistantContent>, AssemblerError> {
+        let mut content = self.completed.clone();
+        for (content_index, scratch) in &self.scratch {
+            let wire_item_index = wire_item_index(*content_index)?;
+            let block = match scratch {
+                ScratchBlock::Text(text) => AssistantContent::Text {
+                    text: text.clone(),
+                    wire_item_index,
+                },
+                ScratchBlock::Thinking {
+                    content,
+                    signature_field,
+                } => AssistantContent::Thinking {
+                    thinking: content.clone(),
+                    signature_field: signature_field.clone(),
+                    wire_item_index,
+                },
+                ScratchBlock::Tool(_) => continue,
+            };
+            content.insert(*content_index, block);
+        }
+        Ok(content.into_values().collect())
+    }
+
+    pub(crate) fn authoritative_abort_content(
+        &self,
+    ) -> Result<Vec<AssistantContent>, AssemblerError> {
+        let mut content = BTreeMap::new();
+        for (content_index, block) in &self.completed {
+            if matches!(
+                block,
+                AssistantContent::Text { .. } | AssistantContent::Thinking { .. }
+            ) {
+                content.insert(*content_index, block.clone());
+            }
+        }
+        for (content_index, scratch) in &self.scratch {
+            if let ScratchBlock::Text(text) = scratch {
+                content.insert(
+                    *content_index,
+                    AssistantContent::Text {
+                        text: text.clone(),
+                        wire_item_index: wire_item_index(*content_index)?,
+                    },
+                );
+            }
+        }
+        Ok(content.into_values().collect())
     }
 
     fn apply_non_terminal(&mut self, event: &ProviderEvent) -> Result<(), AssemblerError> {
@@ -270,27 +384,35 @@ impl MessageAssembler {
                 content_index,
                 delta,
             } => {
-                self.reserve_content(delta.len())?;
-                match self.scratch.get_mut(content_index) {
-                    Some(ScratchBlock::Text(content)) => {
-                        content.push_str(delta);
-                        Ok(())
-                    }
+                match self.scratch.get(content_index) {
+                    Some(ScratchBlock::Text(_)) => Ok(()),
                     Some(_) => Err(AssemblerError::ContentFamilyMismatch(*content_index)),
                     None => Err(AssemblerError::MissingContentStart(*content_index)),
-                }
+                }?;
+                let next_content_bytes = self.checked_content_bytes(delta.len())?;
+                let Some(ScratchBlock::Text(content)) = self.scratch.get_mut(content_index) else {
+                    unreachable!("text scratch was validated above");
+                };
+                content.push_str(delta);
+                self.content_bytes = next_content_bytes;
+                Ok(())
             }
             ProviderEvent::TextEnd {
                 content_index,
                 content,
             } => {
-                let ScratchBlock::Text(accumulated) = self.take_block(*content_index)? else {
-                    return Err(AssemblerError::ContentFamilyMismatch(*content_index));
+                match self.scratch.get(content_index) {
+                    Some(ScratchBlock::Text(accumulated)) if accumulated == content => {}
+                    Some(ScratchBlock::Text(_)) => {
+                        return Err(AssemblerError::ContentMismatch(*content_index));
+                    }
+                    Some(_) => {
+                        return Err(AssemblerError::ContentFamilyMismatch(*content_index));
+                    }
+                    None => return Err(AssemblerError::MissingContentStart(*content_index)),
                 };
-                if accumulated != *content {
-                    return Err(AssemblerError::ContentMismatch(*content_index));
-                }
                 let wire_item_index = wire_item_index(*content_index)?;
+                self.scratch.remove(content_index);
                 self.completed.insert(
                     *content_index,
                     AssistantContent::Text {
@@ -304,44 +426,56 @@ impl MessageAssembler {
                 content_index,
                 signature_field,
             } => {
-                self.reserve_content(signature_field.len())?;
+                self.ensure_block_index_available(*content_index)?;
+                let next_content_bytes = self.checked_content_bytes(signature_field.len())?;
                 self.start_block(
                     *content_index,
                     ScratchBlock::Thinking {
                         content: String::new(),
                         signature_field: signature_field.clone(),
                     },
-                )
+                )?;
+                self.content_bytes = next_content_bytes;
+                Ok(())
             }
             ProviderEvent::ThinkingDelta {
                 content_index,
                 delta,
             } => {
-                self.reserve_content(delta.len())?;
-                match self.scratch.get_mut(content_index) {
-                    Some(ScratchBlock::Thinking { content, .. }) => {
-                        content.push_str(delta);
-                        Ok(())
-                    }
+                match self.scratch.get(content_index) {
+                    Some(ScratchBlock::Thinking { .. }) => Ok(()),
                     Some(_) => Err(AssemblerError::ContentFamilyMismatch(*content_index)),
                     None => Err(AssemblerError::MissingContentStart(*content_index)),
-                }
+                }?;
+                let next_content_bytes = self.checked_content_bytes(delta.len())?;
+                let Some(ScratchBlock::Thinking { content, .. }) =
+                    self.scratch.get_mut(content_index)
+                else {
+                    unreachable!("thinking scratch was validated above");
+                };
+                content.push_str(delta);
+                self.content_bytes = next_content_bytes;
+                Ok(())
             }
             ProviderEvent::ThinkingEnd {
                 content_index,
                 content,
             } => {
-                let ScratchBlock::Thinking {
-                    content: accumulated,
-                    signature_field,
-                } = self.take_block(*content_index)?
-                else {
-                    return Err(AssemblerError::ContentFamilyMismatch(*content_index));
+                let signature_field = match self.scratch.get(content_index) {
+                    Some(ScratchBlock::Thinking {
+                        content: accumulated,
+                        signature_field,
+                    }) if accumulated == content => signature_field.clone(),
+                    Some(ScratchBlock::Thinking { .. }) => {
+                        return Err(AssemblerError::ContentMismatch(*content_index));
+                    }
+                    Some(_) => {
+                        return Err(AssemblerError::ContentFamilyMismatch(*content_index));
+                    }
+                    None => return Err(AssemblerError::MissingContentStart(*content_index)),
                 };
-                if accumulated != *content {
-                    return Err(AssemblerError::ContentMismatch(*content_index));
-                }
                 let wire_item_index = wire_item_index(*content_index)?;
+                self.scratch.remove(content_index);
                 self.completed.insert(
                     *content_index,
                     AssistantContent::Thinking {
@@ -352,15 +486,29 @@ impl MessageAssembler {
                 );
                 Ok(())
             }
-            ProviderEvent::ToolCallStart { content_index } => {
-                self.start_block(*content_index, ScratchBlock::Tool(String::new()))
-            }
+            ProviderEvent::ToolCallStart { content_index } => self.start_block(
+                *content_index,
+                ScratchBlock::Tool(ToolScratch::Raw(String::new())),
+            ),
             ProviderEvent::ToolCallDelta {
                 content_index,
                 delta,
             } => match self.scratch.get_mut(content_index) {
-                Some(ScratchBlock::Tool(raw)) => {
-                    raw.push_str(delta);
+                Some(ScratchBlock::Tool(tool)) => {
+                    if let ToolScratch::Raw(raw) = tool {
+                        if raw
+                            .len()
+                            .checked_add(delta.len())
+                            .is_none_or(|next| next > MAX_TOOL_ARGUMENT_BYTES)
+                        {
+                            // Replacing the state drops the allocation now.
+                            // Later deltas remain observable events but retain
+                            // no raw bytes in this assembler/shadow.
+                            *tool = ToolScratch::Overflow;
+                        } else {
+                            raw.push_str(delta);
+                        }
+                    }
                     Ok(())
                 }
                 Some(_) => Err(AssemblerError::ContentFamilyMismatch(*content_index)),
@@ -377,11 +525,15 @@ impl MessageAssembler {
                 content_index,
                 tool_call,
             } => {
-                if !matches!(self.scratch.get(content_index), Some(ScratchBlock::Tool(_))) {
-                    return match self.scratch.get(content_index) {
-                        Some(_) => Err(AssemblerError::ContentFamilyMismatch(*content_index)),
-                        None => Err(AssemblerError::MissingContentStart(*content_index)),
-                    };
+                match self.scratch.get(content_index) {
+                    Some(ScratchBlock::Tool(ToolScratch::Raw(_))) => {}
+                    Some(ScratchBlock::Tool(ToolScratch::Overflow)) => {
+                        return Err(AssemblerError::TerminalContentMismatch);
+                    }
+                    Some(_) => {
+                        return Err(AssemblerError::ContentFamilyMismatch(*content_index));
+                    }
+                    None => return Err(AssemblerError::MissingContentStart(*content_index)),
                 }
                 let durable_bytes = tool_call
                     .id
@@ -395,11 +547,9 @@ impl MessageAssembler {
                     .ok_or(AssemblerError::ResponseContentBudgetExceeded {
                         limit: self.budget.max_content_bytes,
                     })?;
-                self.reserve_content(durable_bytes)?;
-                let ScratchBlock::Tool(_) = self.take_block(*content_index)? else {
-                    return Err(AssemblerError::ContentFamilyMismatch(*content_index));
-                };
                 let wire_item_index = wire_item_index(*content_index)?;
+                let next_content_bytes = self.checked_content_bytes(durable_bytes)?;
+                self.scratch.remove(content_index);
                 self.completed.insert(
                     *content_index,
                     AssistantContent::ToolCall {
@@ -407,29 +557,36 @@ impl MessageAssembler {
                         wire_item_index,
                     },
                 );
+                self.content_bytes = next_content_bytes;
                 Ok(())
             }
             ProviderEvent::ToolCallRejected {
                 content_index,
                 rejected,
-                synthetic_result: _,
+                synthetic_result,
             } => {
-                if !matches!(self.scratch.get(content_index), Some(ScratchBlock::Tool(_))) {
-                    return match self.scratch.get(content_index) {
-                        Some(_) => Err(AssemblerError::ContentFamilyMismatch(*content_index)),
-                        None => Err(AssemblerError::MissingContentStart(*content_index)),
-                    };
+                validate_rejected_tool_pair(rejected, synthetic_result)?;
+                match self.scratch.get(content_index) {
+                    Some(ScratchBlock::Tool(ToolScratch::Overflow))
+                        if rejected.error == ToolArgumentError::TooLarge => {}
+                    Some(ScratchBlock::Tool(ToolScratch::Raw(_)))
+                        if rejected.error != ToolArgumentError::TooLarge => {}
+                    Some(ScratchBlock::Tool(_)) => {
+                        return Err(AssemblerError::TerminalContentMismatch);
+                    }
+                    Some(_) => {
+                        return Err(AssemblerError::ContentFamilyMismatch(*content_index));
+                    }
+                    None => return Err(AssemblerError::MissingContentStart(*content_index)),
                 }
                 let durable_bytes = rejected.id.len().checked_add(rejected.name.len()).ok_or(
                     AssemblerError::ResponseContentBudgetExceeded {
                         limit: self.budget.max_content_bytes,
                     },
                 )?;
-                self.reserve_content(durable_bytes)?;
-                let ScratchBlock::Tool(_) = self.take_block(*content_index)? else {
-                    return Err(AssemblerError::ContentFamilyMismatch(*content_index));
-                };
                 let wire_item_index = wire_item_index(*content_index)?;
+                let next_content_bytes = self.checked_content_bytes(durable_bytes)?;
+                self.scratch.remove(content_index);
                 self.completed.insert(
                     *content_index,
                     AssistantContent::RejectedToolCall {
@@ -437,6 +594,9 @@ impl MessageAssembler {
                         wire_item_index,
                     },
                 );
+                self.synthetic_results
+                    .insert(*content_index, synthetic_result.clone());
+                self.content_bytes = next_content_bytes;
                 Ok(())
             }
             // Summaries are display-only and intentionally use a separate
@@ -463,9 +623,7 @@ impl MessageAssembler {
         content_index: usize,
         block: ScratchBlock,
     ) -> Result<(), AssemblerError> {
-        if self.completed.contains_key(&content_index) {
-            return Err(AssemblerError::DuplicateContentIndex(content_index));
-        }
+        self.ensure_block_index_available(content_index)?;
         match self.scratch.entry(content_index) {
             Entry::Vacant(entry) => {
                 entry.insert(block);
@@ -475,13 +633,16 @@ impl MessageAssembler {
         }
     }
 
-    fn take_block(&mut self, content_index: usize) -> Result<ScratchBlock, AssemblerError> {
-        self.scratch
-            .remove(&content_index)
-            .ok_or(AssemblerError::MissingContentStart(content_index))
+    fn ensure_block_index_available(&self, content_index: usize) -> Result<(), AssemblerError> {
+        if self.completed.contains_key(&content_index) || self.scratch.contains_key(&content_index)
+        {
+            Err(AssemblerError::DuplicateContentIndex(content_index))
+        } else {
+            Ok(())
+        }
     }
 
-    fn reserve_content(&mut self, additional: usize) -> Result<(), AssemblerError> {
+    fn checked_content_bytes(&self, additional: usize) -> Result<usize, AssemblerError> {
         let Some(next) = self.content_bytes.checked_add(additional) else {
             return Err(AssemblerError::ResponseContentBudgetExceeded {
                 limit: self.budget.max_content_bytes,
@@ -492,16 +653,25 @@ impl MessageAssembler {
                 limit: self.budget.max_content_bytes,
             });
         }
-        self.content_bytes = next;
-        Ok(())
+        Ok(next)
     }
 
     fn accept_authoritative_error_content(
         &mut self,
+        reason: StopReason,
         content: &[AssistantContent],
     ) -> Result<(), AssemblerError> {
+        let aborted = reason == StopReason::Aborted;
         let mut authoritative = BTreeMap::new();
         for block in content {
+            if aborted
+                && matches!(
+                    block,
+                    AssistantContent::ToolCall { .. } | AssistantContent::RejectedToolCall { .. }
+                )
+            {
+                return Err(AssemblerError::TerminalContentMismatch);
+            }
             let content_index = assistant_content_index(block);
             if authoritative.insert(content_index, block.clone()).is_some() {
                 return Err(AssemblerError::TerminalContentMismatch);
@@ -509,13 +679,26 @@ impl MessageAssembler {
         }
 
         for (content_index, completed) in &self.completed {
+            if aborted
+                && matches!(
+                    completed,
+                    AssistantContent::ToolCall { .. } | AssistantContent::RejectedToolCall { .. }
+                )
+            {
+                if authoritative.contains_key(content_index) {
+                    return Err(AssemblerError::TerminalContentMismatch);
+                }
+                continue;
+            }
             if authoritative.get(content_index) != Some(completed) {
                 return Err(AssemblerError::TerminalContentMismatch);
             }
         }
         for (content_index, scratch) in &self.scratch {
             let Some(block) = authoritative.get(content_index) else {
-                if matches!(scratch, ScratchBlock::Tool(_)) {
+                if matches!(scratch, ScratchBlock::Tool(_))
+                    || (aborted && matches!(scratch, ScratchBlock::Thinking { .. }))
+                {
                     continue;
                 }
                 return Err(AssemblerError::TerminalContentMismatch);
@@ -538,6 +721,12 @@ impl MessageAssembler {
             });
         }
         self.completed = authoritative;
+        self.synthetic_results.retain(|content_index, _| {
+            matches!(
+                self.completed.get(content_index),
+                Some(AssistantContent::RejectedToolCall { .. })
+            )
+        });
         self.content_bytes = durable_bytes;
         Ok(())
     }
@@ -613,12 +802,20 @@ fn scratch_is_prefix_of(scratch: &ScratchBlock, content: &AssistantContent) -> b
                 ..
             },
         ) => authoritative_field == signature_field && thinking.starts_with(prefix),
-        (ScratchBlock::Tool(raw), AssistantContent::ToolCall { tool_call, .. }) => {
-            serde_json::from_str::<Value>(raw)
-                .ok()
-                .is_none_or(|value| value == Value::Object(tool_call.arguments.as_object().clone()))
-        }
-        (ScratchBlock::Tool(_), AssistantContent::RejectedToolCall { .. }) => true,
+        (
+            ScratchBlock::Tool(ToolScratch::Raw(raw)),
+            AssistantContent::ToolCall { tool_call, .. },
+        ) => serde_json::from_str::<Value>(raw)
+            .ok()
+            .is_none_or(|value| value == Value::Object(tool_call.arguments.as_object().clone())),
+        (
+            ScratchBlock::Tool(ToolScratch::Raw(_)),
+            AssistantContent::RejectedToolCall { rejected, .. },
+        ) => rejected.error != ToolArgumentError::TooLarge,
+        (
+            ScratchBlock::Tool(ToolScratch::Overflow),
+            AssistantContent::RejectedToolCall { rejected, .. },
+        ) => rejected.error == ToolArgumentError::TooLarge,
         _ => false,
     }
 }
@@ -736,6 +933,53 @@ struct RejectionDetail {
     instance_path: String,
     constraint: String,
 }
+
+const REJECTION_DIAGNOSTIC_TEXT: &str =
+    "Tool arguments were rejected. Regenerate the tool call with complete, schema-valid arguments.";
+
+// This is intentionally a narrow diagnostic vocabulary, not a mirror of every
+// JSON Schema draft keyword. Validator labels outside this set are collapsed to
+// `schema` so provider-controlled schema text cannot widen the rejection wire
+// contract.
+const SAFE_SCHEMA_CONSTRAINTS: &[&str] = &[
+    "known_tool_schema",
+    "schema",
+    "type",
+    "enum",
+    "const",
+    "required",
+    "properties",
+    "additionalProperties",
+    "unevaluatedProperties",
+    "dependentRequired",
+    "propertyNames",
+    "minProperties",
+    "maxProperties",
+    "items",
+    "prefixItems",
+    "contains",
+    "minContains",
+    "maxContains",
+    "minItems",
+    "maxItems",
+    "uniqueItems",
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "multipleOf",
+    "minLength",
+    "maxLength",
+    "pattern",
+    "format",
+    "allOf",
+    "anyOf",
+    "oneOf",
+    "not",
+    "if",
+    "then",
+    "else",
+];
 
 impl ToolArgumentAccumulator {
     pub fn new() -> Self {
@@ -873,6 +1117,7 @@ fn rejected_outcome(
     detail: RejectionDetail,
     timestamp: DateTime<Utc>,
 ) -> ToolArgumentOutcome {
+    let constraint = canonical_rejection_constraint(detail.error, &detail.constraint);
     let rejected = RejectedToolCall {
         id: call_id.clone(),
         name: tool_name.clone(),
@@ -882,13 +1127,12 @@ fn rejected_outcome(
         tool_call_id: call_id,
         tool_name,
         content: vec![UserContent::Text {
-            text: "Tool arguments were rejected. Regenerate the tool call with complete, schema-valid arguments."
-                .to_owned(),
+            text: REJECTION_DIAGNOSTIC_TEXT.to_owned(),
         }],
         details: json!({
             "category": rejection_category(detail.error),
             "instance_path": detail.instance_path,
-            "constraint": detail.constraint,
+            "constraint": constraint,
         }),
         is_error: true,
         timestamp,
@@ -896,6 +1140,81 @@ fn rejected_outcome(
     ToolArgumentOutcome::Rejected {
         rejected,
         synthetic_result,
+    }
+}
+
+fn validate_rejected_tool_pair(
+    rejected: &RejectedToolCall,
+    synthetic_result: &ToolResultMessage,
+) -> Result<(), AssemblerError> {
+    let valid_content = matches!(
+        synthetic_result.content.as_slice(),
+        [UserContent::Text { text }] if text == REJECTION_DIAGNOSTIC_TEXT
+    );
+    let valid_details = synthetic_result.details.as_object().is_some_and(|details| {
+        let instance_path = details.get("instance_path").and_then(Value::as_str);
+        let constraint = details.get("constraint").and_then(Value::as_str);
+        details.len() == 3
+            && details
+                .get("category")
+                .and_then(Value::as_str)
+                .is_some_and(|category| category == rejection_category(rejected.error))
+            && instance_path.is_some_and(|path| {
+                if rejected.error == ToolArgumentError::SchemaViolation {
+                    is_safe_instance_path(path)
+                } else {
+                    path.is_empty()
+                }
+            })
+            && constraint
+                .is_some_and(|constraint| is_canonical_constraint(rejected.error, constraint))
+    });
+    if synthetic_result.tool_call_id == rejected.id
+        && synthetic_result.tool_name == rejected.name
+        && synthetic_result.is_error
+        && valid_content
+        && valid_details
+    {
+        Ok(())
+    } else {
+        Err(AssemblerError::InvalidRejectedToolPair)
+    }
+}
+
+fn is_safe_instance_path(path: &str) -> bool {
+    path.len() <= 1024
+        && (path.is_empty()
+            || (path.starts_with('/')
+                && path.split('/').skip(1).all(|segment| {
+                    !segment.is_empty() && segment.len() <= 128 && is_safe_path_segment(segment)
+                })))
+}
+
+fn is_safe_path_segment(segment: &str) -> bool {
+    segment == "*"
+        || segment.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | '~')
+        })
+}
+
+fn is_canonical_constraint(error: ToolArgumentError, constraint: &str) -> bool {
+    constraint == canonical_rejection_constraint(error, constraint)
+}
+
+fn canonical_rejection_constraint(
+    error: ToolArgumentError,
+    validator_constraint: &str,
+) -> &'static str {
+    match error {
+        ToolArgumentError::InvalidJson => "json_syntax",
+        ToolArgumentError::NonObject => "object",
+        ToolArgumentError::IncompleteResponse => "complete_response",
+        ToolArgumentError::TooLarge => "max_argument_bytes",
+        ToolArgumentError::SchemaViolation => SAFE_SCHEMA_CONSTRAINTS
+            .iter()
+            .copied()
+            .find(|constraint| *constraint == validator_constraint)
+            .unwrap_or("schema"),
     }
 }
 
@@ -914,7 +1233,9 @@ fn safe_instance_path(path: &str, property_names: &HashSet<String>) -> String {
         .map(|segment| {
             if segment.is_empty()
                 || segment.parse::<usize>().is_ok()
-                || property_names.contains(&unescape_pointer(segment))
+                || (property_names.contains(&unescape_pointer(segment))
+                    && is_safe_path_segment(segment)
+                    && segment.len() <= 128)
             {
                 segment.to_owned()
             } else {
@@ -990,6 +1311,41 @@ mod tests {
             }),
         }])
         .expect("schema")
+    }
+
+    fn rejected_tool_event(
+        content_index: usize,
+        id: &str,
+        error: ToolArgumentError,
+    ) -> ProviderEvent {
+        ProviderEvent::ToolCallRejected {
+            content_index,
+            rejected: RejectedToolCall {
+                id: id.to_owned(),
+                name: "read_file".to_owned(),
+                error,
+            },
+            synthetic_result: ToolResultMessage {
+                tool_call_id: id.to_owned(),
+                tool_name: "read_file".to_owned(),
+                content: vec![UserContent::Text {
+                    text: REJECTION_DIAGNOSTIC_TEXT.to_owned(),
+                }],
+                details: json!({
+                    "category": rejection_category(error),
+                    "instance_path": "",
+                    "constraint": match error {
+                        ToolArgumentError::InvalidJson => "json_syntax",
+                        ToolArgumentError::NonObject => "object",
+                        ToolArgumentError::SchemaViolation => "required",
+                        ToolArgumentError::IncompleteResponse => "complete_response",
+                        ToolArgumentError::TooLarge => "max_argument_bytes",
+                    },
+                }),
+                is_error: true,
+                timestamp: timestamp(),
+            },
+        }
     }
 
     #[test]
@@ -1119,13 +1475,267 @@ mod tests {
                 synthetic_result: ToolResultMessage {
                     tool_call_id: String::new(),
                     tool_name: String::new(),
-                    content: Vec::new(),
-                    details: json!({}),
+                    content: vec![UserContent::Text {
+                        text: REJECTION_DIAGNOSTIC_TEXT.to_owned(),
+                    }],
+                    details: json!({
+                        "category": "invalid_json",
+                        "instance_path": "",
+                        "constraint": "json_syntax",
+                    }),
                     is_error: true,
                     timestamp: timestamp(),
                 },
             })
             .expect("zero-byte durable rejection fits zero budget");
+    }
+
+    #[test]
+    fn rejected_tool_pair_validation_is_exact_and_transactional() {
+        let valid = rejected_tool_event(0, "call-1", ToolArgumentError::InvalidJson);
+        let mut accepted = MessageAssembler::new();
+        for event in [
+            ProviderEvent::Start,
+            ProviderEvent::ToolCallStart { content_index: 0 },
+        ] {
+            accepted.apply(&event).expect("prefix");
+        }
+        accepted.apply(&valid).expect("canonical pair");
+        assert_eq!(accepted.synthetic_results().len(), 1);
+
+        let mut invalid = Vec::new();
+        for mutation in [
+            "id",
+            "name",
+            "is_error",
+            "content",
+            "details",
+            "category",
+            "instance_path",
+            "constraint",
+        ] {
+            let mut event = valid.clone();
+            let ProviderEvent::ToolCallRejected {
+                synthetic_result, ..
+            } = &mut event
+            else {
+                unreachable!("rejection helper")
+            };
+            match mutation {
+                "id" => synthetic_result.tool_call_id = "other-call".to_owned(),
+                "name" => synthetic_result.tool_name = "other_tool".to_owned(),
+                "is_error" => synthetic_result.is_error = false,
+                "content" => {
+                    synthetic_result.content = vec![UserContent::Text {
+                        text: "raw arguments: {\"secret\":\"leak\"}".to_owned(),
+                    }]
+                }
+                "details" => synthetic_result.details["raw_arguments"] = json!({"secret": "leak"}),
+                "category" => synthetic_result.details["category"] = json!("schema_violation"),
+                "instance_path" => {
+                    synthetic_result.details["instance_path"] = json!("/{\"secret\":\"leak\"}")
+                }
+                "constraint" => {
+                    synthetic_result.details["constraint"] = json!("raw={\"secret\":\"leak\"}")
+                }
+                _ => unreachable!(),
+            }
+            invalid.push((mutation, event));
+        }
+
+        for (mutation, event) in invalid {
+            let mut assembler = MessageAssembler::new();
+            assembler.apply(&ProviderEvent::Start).expect("start");
+            assembler
+                .apply(&ProviderEvent::ToolCallStart { content_index: 0 })
+                .expect("tool start");
+            assembler
+                .apply(&ProviderEvent::ToolCallDelta {
+                    content_index: 0,
+                    delta: "untrusted raw".to_owned(),
+                })
+                .expect("tool delta");
+            let scratch = assembler.scratch.clone();
+            let completed = assembler.completed.clone();
+            let synthetic_results = assembler.synthetic_results.clone();
+            let content_bytes = assembler.content_bytes;
+
+            assert_eq!(
+                assembler.apply(&event),
+                Err(AssemblerError::InvalidRejectedToolPair),
+                "{mutation}"
+            );
+            assert_eq!(assembler.scratch, scratch, "{mutation}");
+            assert_eq!(assembler.completed, completed, "{mutation}");
+            assert_eq!(assembler.synthetic_results, synthetic_results, "{mutation}");
+            assert_eq!(assembler.content_bytes, content_bytes, "{mutation}");
+        }
+    }
+
+    #[test]
+    fn provider_error_retains_completed_tools_and_safe_rejection_results() {
+        let mut assembler = MessageAssembler::new();
+        for event in [
+            ProviderEvent::Start,
+            ProviderEvent::ToolCallStart { content_index: 0 },
+            rejected_tool_event(0, "call-rejected", ToolArgumentError::InvalidJson),
+        ] {
+            assembler.apply(&event).expect("provider error prefix");
+        }
+        let message = assembler
+            .finish(TerminalMetadata {
+                error_message: Some("provider failed after rejection".to_owned()),
+                provider_code: Some("provider_error".to_owned()),
+                ..metadata(StopReason::Error)
+            })
+            .expect("provider Error");
+        assert!(matches!(
+            message.content.as_slice(),
+            [AssistantContent::RejectedToolCall { .. }]
+        ));
+        assert_eq!(assembler.synthetic_results().len(), 1);
+    }
+
+    #[test]
+    fn aborted_snapshot_keeps_open_text_but_only_completed_thinking() {
+        let mut assembler = MessageAssembler::new();
+        for event in [
+            ProviderEvent::Start,
+            ProviderEvent::ThinkingStart {
+                content_index: 0,
+                signature_field: "reasoning_content".to_owned(),
+            },
+            ProviderEvent::ThinkingDelta {
+                content_index: 0,
+                delta: "unsigned partial".to_owned(),
+            },
+            ProviderEvent::TextStart { content_index: 1 },
+            ProviderEvent::TextDelta {
+                content_index: 1,
+                delta: "visible partial".to_owned(),
+            },
+        ] {
+            assembler.apply(&event).expect("prefix");
+        }
+        assert_eq!(
+            assembler.authoritative_abort_content().expect("snapshot"),
+            vec![AssistantContent::Text {
+                text: "visible partial".to_owned(),
+                wire_item_index: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn every_assembler_tool_scratch_has_an_independent_four_mib_bound() {
+        let first = "x".repeat(MAX_TOOL_ARGUMENT_BYTES / 2);
+        let second = "y".repeat(MAX_TOOL_ARGUMENT_BYTES - first.len());
+        let mut exact = MessageAssembler::new();
+        exact.apply(&ProviderEvent::Start).expect("start");
+        exact
+            .apply(&ProviderEvent::ToolCallStart { content_index: 0 })
+            .expect("tool start");
+        for delta in [first, second] {
+            exact
+                .apply(&ProviderEvent::ToolCallDelta {
+                    content_index: 0,
+                    delta,
+                })
+                .expect("exact-bound delta");
+        }
+        assert!(matches!(
+            exact.scratch.get(&0),
+            Some(ScratchBlock::Tool(ToolScratch::Raw(raw)))
+                if raw.len() == MAX_TOOL_ARGUMENT_BYTES
+        ));
+
+        exact
+            .apply(&ProviderEvent::ToolCallDelta {
+                content_index: 0,
+                delta: "overflow".to_owned(),
+            })
+            .expect("first over-bound delta enters overflow state");
+        assert_eq!(
+            exact.scratch.get(&0),
+            Some(&ScratchBlock::Tool(ToolScratch::Overflow))
+        );
+        exact
+            .apply(&ProviderEvent::ToolCallDelta {
+                content_index: 0,
+                delta: "later-secret-must-not-be-retained".to_owned(),
+            })
+            .expect("later overflow delta");
+        assert_eq!(
+            exact.scratch.get(&0),
+            Some(&ScratchBlock::Tool(ToolScratch::Overflow))
+        );
+
+        exact
+            .apply(&ProviderEvent::ToolCallStart { content_index: 1 })
+            .expect("independent tool start");
+        exact
+            .apply(&ProviderEvent::ToolCallDelta {
+                content_index: 1,
+                delta: "{}".to_owned(),
+            })
+            .expect("independent tool remains bounded raw");
+        assert_eq!(
+            exact.scratch.get(&1),
+            Some(&ScratchBlock::Tool(ToolScratch::Raw("{}".to_owned())))
+        );
+    }
+
+    #[test]
+    fn producer_and_consumer_shadows_close_overflow_only_as_too_large_rejection() {
+        let events = [
+            ProviderEvent::Start,
+            ProviderEvent::ToolCallStart { content_index: 4 },
+            ProviderEvent::ToolCallDelta {
+                content_index: 4,
+                delta: "x".repeat(MAX_TOOL_ARGUMENT_BYTES),
+            },
+            ProviderEvent::ToolCallDelta {
+                content_index: 4,
+                delta: "!".to_owned(),
+            },
+            ProviderEvent::ToolCallDelta {
+                content_index: 4,
+                delta: "ignored-later-delta".to_owned(),
+            },
+            rejected_tool_event(4, "call-overflow", ToolArgumentError::TooLarge),
+        ];
+        let mut producer = MessageAssembler::new();
+        let mut consumer_shadow = MessageAssembler::new();
+        for event in &events {
+            producer.apply(event).expect("producer event");
+            consumer_shadow.apply(event).expect("consumer shadow event");
+        }
+        assert_eq!(
+            producer.completed_content(),
+            consumer_shadow.completed_content()
+        );
+        assert!(matches!(
+            producer.completed_content().as_slice(),
+            [AssistantContent::RejectedToolCall { rejected, .. }]
+                if rejected.error == ToolArgumentError::TooLarge
+        ));
+
+        let mut invalid = MessageAssembler::new();
+        for event in &events[..5] {
+            invalid.apply(event).expect("overflow prefix");
+        }
+        assert_eq!(
+            invalid.apply(&rejected_tool_event(
+                4,
+                "call-overflow",
+                ToolArgumentError::InvalidJson,
+            )),
+            Err(AssemblerError::TerminalContentMismatch)
+        );
+        assert_eq!(
+            invalid.scratch.get(&4),
+            Some(&ScratchBlock::Tool(ToolScratch::Overflow))
+        );
     }
 
     #[test]
@@ -1452,6 +2062,132 @@ mod tests {
     }
 
     #[test]
+    fn rejected_deltas_and_ends_leave_partial_state_and_budget_unchanged() {
+        let mut assembler = MessageAssembler::with_budget(ResponseBudget {
+            max_content_bytes: 5,
+            ..ResponseBudget::default()
+        });
+        assembler.apply(&ProviderEvent::Start).expect("start");
+        assembler
+            .apply(&ProviderEvent::TextStart { content_index: 0 })
+            .expect("text start");
+
+        assert_eq!(
+            assembler.apply(&ProviderEvent::ThinkingDelta {
+                content_index: 0,
+                delta: "wrong".to_owned(),
+            }),
+            Err(AssemblerError::ContentFamilyMismatch(0))
+        );
+        assert_eq!(assembler.content_bytes, 0);
+        assert_eq!(
+            assembler.scratch.get(&0),
+            Some(&ScratchBlock::Text(String::new()))
+        );
+
+        assembler
+            .apply(&ProviderEvent::TextDelta {
+                content_index: 0,
+                delta: "hello".to_owned(),
+            })
+            .expect("accepted partial");
+        assert_eq!(
+            assembler.apply(&ProviderEvent::TextDelta {
+                content_index: 0,
+                delta: "!".to_owned(),
+            }),
+            Err(AssemblerError::ResponseContentBudgetExceeded { limit: 5 })
+        );
+        assert_eq!(assembler.content_bytes, 5);
+        assert_eq!(
+            assembler.scratch.get(&0),
+            Some(&ScratchBlock::Text("hello".to_owned()))
+        );
+
+        assert_eq!(
+            assembler.apply(&ProviderEvent::ThinkingEnd {
+                content_index: 0,
+                content: "hello".to_owned(),
+            }),
+            Err(AssemblerError::ContentFamilyMismatch(0))
+        );
+        assert_eq!(
+            assembler.apply(&ProviderEvent::TextEnd {
+                content_index: 0,
+                content: "mismatch".to_owned(),
+            }),
+            Err(AssemblerError::ContentMismatch(0))
+        );
+        assert_eq!(assembler.content_bytes, 5);
+        assert_eq!(
+            assembler.scratch.get(&0),
+            Some(&ScratchBlock::Text("hello".to_owned()))
+        );
+        assembler
+            .apply(&ProviderEvent::TextEnd {
+                content_index: 0,
+                content: "hello".to_owned(),
+            })
+            .expect("matching end still succeeds");
+    }
+
+    #[test]
+    fn rejected_start_and_wire_index_conversion_are_transactional() {
+        let mut duplicate = MessageAssembler::with_budget(ResponseBudget {
+            max_content_bytes: 5,
+            ..ResponseBudget::default()
+        });
+        duplicate.apply(&ProviderEvent::Start).expect("start");
+        duplicate
+            .apply(&ProviderEvent::ThinkingStart {
+                content_index: 0,
+                signature_field: "sig".to_owned(),
+            })
+            .expect("thinking start");
+        assert_eq!(
+            duplicate.apply(&ProviderEvent::ThinkingStart {
+                content_index: 0,
+                signature_field: "xx".to_owned(),
+            }),
+            Err(AssemblerError::DuplicateContentIndex(0))
+        );
+        assert_eq!(duplicate.content_bytes, 3);
+        duplicate
+            .apply(&ProviderEvent::ThinkingDelta {
+                content_index: 0,
+                delta: "hi".to_owned(),
+            })
+            .expect("duplicate start did not consume budget");
+
+        let content_index = usize::try_from(u64::from(u32::MAX) + 1)
+            .expect("wire overflow index is representable on supported targets");
+        let mut overflow = MessageAssembler::new();
+        overflow.apply(&ProviderEvent::Start).expect("start");
+        overflow
+            .apply(&ProviderEvent::TextStart { content_index })
+            .expect("text start");
+        overflow
+            .apply(&ProviderEvent::TextDelta {
+                content_index,
+                delta: "partial".to_owned(),
+            })
+            .expect("partial");
+        assert_eq!(
+            overflow.apply(&ProviderEvent::TextEnd {
+                content_index,
+                content: "partial".to_owned(),
+            }),
+            Err(AssemblerError::WireItemIndexOverflow(content_index))
+        );
+        assert_eq!(overflow.content_bytes, "partial".len());
+        assert_eq!(
+            overflow.scratch.get(&content_index),
+            Some(&ScratchBlock::Text("partial".to_owned()))
+        );
+        assert!(overflow.completed.is_empty());
+    }
+
+    #[test]
     fn preview_repair_never_becomes_validated_arguments() {
         let registry = schema_registry();
         let mut accumulator = ToolArgumentAccumulator::new();
@@ -1483,6 +2219,59 @@ mod tests {
                 expected,
             );
         }
+    }
+
+    #[test]
+    fn schema_rejection_preserves_known_constraint_and_normalizes_unknown_constraint() {
+        let registry = schema_registry();
+        let mut known = ToolArgumentAccumulator::new();
+        known.append(r#"{"path":""}"#);
+        let known = known.finish("call-known", "read_file", &registry, timestamp());
+        let ToolArgumentOutcome::Rejected {
+            rejected,
+            synthetic_result,
+        } = known
+        else {
+            panic!("known schema violation must be rejected")
+        };
+        assert_eq!(synthetic_result.details["instance_path"], json!("/path"));
+        assert_eq!(synthetic_result.details["constraint"], json!("minLength"));
+
+        let event = ProviderEvent::ToolCallRejected {
+            content_index: 0,
+            rejected,
+            synthetic_result,
+        };
+        let mut assembler = MessageAssembler::new();
+        assembler.apply(&ProviderEvent::Start).expect("start");
+        assembler
+            .apply(&ProviderEvent::ToolCallStart { content_index: 0 })
+            .expect("tool start");
+        assembler.apply(&event).expect("known canonical constraint");
+
+        let raw_keyword = "unknown-".repeat(512);
+        let unknown = rejected_outcome(
+            "call-unknown".to_owned(),
+            "read_file".to_owned(),
+            RejectionDetail {
+                error: ToolArgumentError::SchemaViolation,
+                instance_path: "/path".to_owned(),
+                constraint: raw_keyword.clone(),
+            },
+            timestamp(),
+        );
+        let ToolArgumentOutcome::Rejected {
+            synthetic_result, ..
+        } = unknown
+        else {
+            panic!("unknown schema constraint must be rejected")
+        };
+        assert_eq!(synthetic_result.details["constraint"], json!("schema"));
+        assert!(
+            !serde_json::to_string(&synthetic_result)
+                .expect("serialize synthetic result")
+                .contains(&raw_keyword)
+        );
     }
 
     #[test]

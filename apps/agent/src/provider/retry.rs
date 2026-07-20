@@ -18,14 +18,7 @@ pub fn is_retryable(message: &AssistantMessage) -> bool {
         return false;
     }
     match message.provider_code.as_deref() {
-        Some(
-            "network_error"
-            | "request_error"
-            | "transport_error"
-            | "unexpected_sse_eof"
-            | "idle_timeout"
-            | "response_header_timeout",
-        ) => return true,
+        Some(code) if retryable_machine_code(code) && !transient_status_code(code) => return true,
         Some("model_context_window_exceeded" | "sensitive" | "content_filter" | "cancelled") => {
             return false;
         }
@@ -44,6 +37,18 @@ pub fn is_retryable(message: &AssistantMessage) -> bool {
         return false;
     }
     retryable_patterns().is_match(error)
+}
+
+pub(crate) fn retryable_machine_code(code: &str) -> bool {
+    matches!(
+        code,
+        "network_error"
+            | "request_error"
+            | "transport_error"
+            | "unexpected_sse_eof"
+            | "idle_timeout"
+            | "response_header_timeout"
+    ) || transient_status_code(code)
 }
 
 fn transient_status_code(code: &str) -> bool {
@@ -235,6 +240,10 @@ mod tests {
         assert!(is_retryable(&error_with_code(
             "billing quota exceeded",
             Some("network_error")
+        )));
+        assert!(is_retryable(&error_with_code(
+            "maximum context length is 131072 tokens",
+            Some("unexpected_sse_eof")
         )));
         for code in [
             "model_context_window_exceeded",

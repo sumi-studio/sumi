@@ -1,14 +1,20 @@
 use std::{
     pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
 };
 
 use chrono::{DateTime, Utc};
-use futures_util::Stream;
+use futures_util::{Stream, task::AtomicWaker};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+use super::assembler::{MessageAssembler, ResponseBudget};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
@@ -429,12 +435,41 @@ pub struct ProviderContextFragment {
     pub payload: ProviderContextPayload,
 }
 
+pub(crate) struct SuccessTerminalCommit {
+    committed: AtomicBool,
+    waker: AtomicWaker,
+}
+
+impl SuccessTerminalCommit {
+    pub(crate) fn new() -> Self {
+        Self {
+            committed: AtomicBool::new(false),
+            waker: AtomicWaker::new(),
+        }
+    }
+
+    pub(crate) fn commit(&self) {
+        self.committed.store(true, Ordering::Release);
+        self.waker.wake();
+    }
+
+    pub(crate) fn is_committed(&self) -> bool {
+        self.committed.load(Ordering::Acquire)
+    }
+
+    fn register(&self, waker: &std::task::Waker) {
+        self.waker.register(waker);
+    }
+}
+
 pub struct ProviderEventStream {
     rx: Option<mpsc::Receiver<ProviderEvent>>,
     priority_terminal_rx: Option<mpsc::Receiver<ProviderEvent>>,
     cancel: CancellationToken,
     provider: String,
     origin: ProviderOrigin,
+    shadow: MessageAssembler,
+    success_terminal_committed: Arc<SuccessTerminalCommit>,
     start_emitted: bool,
     terminal_emitted: bool,
 }
@@ -452,6 +487,8 @@ impl ProviderEventStream {
             cancel,
             provider: provider.into(),
             origin,
+            shadow: MessageAssembler::new(),
+            success_terminal_committed: Arc::new(SuccessTerminalCommit::new()),
             start_emitted: false,
             terminal_emitted: false,
         }
@@ -463,6 +500,8 @@ impl ProviderEventStream {
         cancel: CancellationToken,
         provider: impl Into<String>,
         origin: ProviderOrigin,
+        budget: ResponseBudget,
+        success_terminal_committed: Arc<SuccessTerminalCommit>,
     ) -> Self {
         Self {
             rx: Some(rx),
@@ -470,6 +509,8 @@ impl ProviderEventStream {
             cancel,
             provider: provider.into(),
             origin,
+            shadow: MessageAssembler::with_budget(budget),
+            success_terminal_committed,
             start_emitted: false,
             terminal_emitted: false,
         }
@@ -481,9 +522,62 @@ impl ProviderEventStream {
 
     fn accept_event(&mut self, event: ProviderEvent) -> ProviderEvent {
         if event.is_terminal() {
+            return self.accept_terminal(event);
+        }
+        if let Err(error) = self.shadow.apply(&event) {
+            tracing::warn!(%error, "provider stream shadow rejected normalized event");
+            let terminal = self.error_terminal(
+                StopReason::Error,
+                "provider stream emitted an invalid normalized event",
+                "invalid_provider_event",
+                false,
+            );
             self.fuse();
+            return terminal;
         }
         event
+    }
+
+    fn accept_terminal(&mut self, event: ProviderEvent) -> ProviderEvent {
+        let accepted = if self.terminal_matches_expected(&event) {
+            match self.shadow.apply(&event) {
+                Ok(Some(_)) => event,
+                Ok(None) => {
+                    tracing::warn!("provider stream terminal did not finalize shadow assembler");
+                    self.invalid_terminal()
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "provider stream shadow rejected terminal event");
+                    self.invalid_terminal()
+                }
+            }
+        } else {
+            tracing::warn!("provider stream rejected terminal from unexpected provider origin");
+            self.invalid_terminal()
+        };
+        self.fuse();
+        accepted
+    }
+
+    fn terminal_matches_expected(&self, event: &ProviderEvent) -> bool {
+        let message = match event {
+            ProviderEvent::Done { output, .. } | ProviderEvent::Error { output, .. } => {
+                &output.message
+            }
+            _ => return false,
+        };
+        message.provider == self.provider
+            && message.model == self.origin.model
+            && message.origin == self.origin
+    }
+
+    fn invalid_terminal(&mut self) -> ProviderEvent {
+        self.error_terminal(
+            StopReason::Error,
+            "provider stream emitted an invalid terminal event",
+            "invalid_provider_terminal",
+            false,
+        )
     }
 
     fn synthesize_terminal(&mut self) -> ProviderEvent {
@@ -504,11 +598,38 @@ impl ProviderEventStream {
             "stream_ended_without_terminal_event"
         };
 
+        let event = self.error_terminal(reason, error_message, provider_code, cancelled);
+        self.fuse();
+        event
+    }
+
+    fn error_terminal(
+        &mut self,
+        reason: StopReason,
+        error_message: &str,
+        provider_code: &str,
+        interrupted: bool,
+    ) -> ProviderEvent {
+        let content = match if reason == StopReason::Aborted {
+            self.shadow.authoritative_abort_content()
+        } else {
+            self.shadow.authoritative_error_content()
+        } {
+            Ok(content) => content,
+            Err(error) => {
+                tracing::warn!(%error, "provider stream shadow could not snapshot open content");
+                if reason == StopReason::Aborted {
+                    Vec::new()
+                } else {
+                    self.shadow.completed_content()
+                }
+            }
+        };
         let event = ProviderEvent::Error {
             reason,
             output: ProviderOutput {
                 message: AssistantMessage {
-                    content: Vec::new(),
+                    content,
                     model: self.origin.model.clone(),
                     provider: self.provider.clone(),
                     origin: self.origin.clone(),
@@ -516,13 +637,15 @@ impl ProviderEventStream {
                     stop_reason: reason,
                     error_message: Some(error_message.to_owned()),
                     provider_code: Some(provider_code.to_owned()),
-                    interrupted: cancelled,
+                    interrupted,
                     timestamp: Utc::now(),
                 },
                 provider_context: Vec::new(),
             },
         };
-        self.fuse();
+        if let Err(error) = self.shadow.apply(&event) {
+            tracing::warn!(%error, "provider stream shadow rejected synthesized terminal event");
+        }
         event
     }
 
@@ -565,33 +688,44 @@ impl Stream for ProviderEventStream {
         }
         if !self.start_emitted {
             self.start_emitted = true;
+            if let Err(error) = self.shadow.apply(&ProviderEvent::Start) {
+                tracing::warn!(%error, "provider stream shadow rejected synthetic Start");
+            }
             return Poll::Ready(Some(ProviderEvent::Start));
         }
 
-        if let Some(priority_rx) = self.priority_terminal_rx.as_mut() {
-            match priority_rx.poll_recv(cx) {
-                Poll::Ready(Some(event)) => {
-                    debug_assert!(event.is_terminal());
-                    return Poll::Ready(Some(self.accept_event(event)));
+        let mut success_committed = self.success_terminal_committed.is_committed();
+        if !success_committed {
+            self.success_terminal_committed.register(cx.waker());
+            success_committed = self.success_terminal_committed.is_committed();
+        }
+        if !success_committed {
+            if let Some(priority_rx) = self.priority_terminal_rx.as_mut() {
+                match priority_rx.poll_recv(cx) {
+                    Poll::Ready(Some(event)) => {
+                        debug_assert!(event.is_terminal());
+                        return Poll::Ready(Some(self.accept_event(event)));
+                    }
+                    Poll::Ready(None) => self.priority_terminal_rx = None,
+                    Poll::Pending => {}
                 }
-                Poll::Ready(None) => self.priority_terminal_rx = None,
-                Poll::Pending => {}
+            }
+
+            if self.cancel.is_cancelled() {
+                // Before a successful terminal commit, cancellation abandons
+                // the normal backlog and waits only for the authoritative
+                // priority terminal. A committed success instead drains the
+                // ordered lane below even when cancellation becomes visible.
+                return if self.priority_terminal_rx.is_some() {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(Some(self.synthesize_terminal()))
+                };
             }
         }
 
-        if self.cancel.is_cancelled() {
-            // Once cancellation is visible, queued deltas must not race ahead of
-            // the producer's priority Aborted terminal. Polling the priority
-            // receiver above registers this task's waker for that terminal.
-            return if self.priority_terminal_rx.is_some() {
-                Poll::Pending
-            } else {
-                Poll::Ready(Some(self.synthesize_terminal()))
-            };
-        }
-
         if self.rx.is_none() {
-            return if self.priority_terminal_rx.is_some() {
+            return if !success_committed && self.priority_terminal_rx.is_some() {
                 Poll::Pending
             } else {
                 Poll::Ready(Some(self.synthesize_terminal()))
@@ -611,7 +745,7 @@ impl Stream for ProviderEventStream {
             Poll::Ready(Some(event)) => Poll::Ready(Some(self.accept_event(event))),
             Poll::Ready(None) => {
                 self.rx = None;
-                if self.priority_terminal_rx.is_some() {
+                if !success_committed && self.priority_terminal_rx.is_some() {
                     Poll::Pending
                 } else {
                     Poll::Ready(Some(self.synthesize_terminal()))
@@ -657,6 +791,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::provider::assembler::MessageAssembler;
 
     fn timestamp() -> DateTime<Utc> {
         Utc.timestamp_millis_opt(1_700_000_000_000)
@@ -721,9 +856,24 @@ mod tests {
         }
     }
 
-    fn provider_output() -> ProviderOutput {
+    fn empty_terminal_output(
+        provider: &str,
+        origin: ProviderOrigin,
+        reason: StopReason,
+    ) -> ProviderOutput {
         ProviderOutput {
-            message: assistant_message(),
+            message: AssistantMessage {
+                content: Vec::new(),
+                model: origin.model.clone(),
+                provider: provider.to_owned(),
+                origin,
+                usage: Usage::default(),
+                stop_reason: reason,
+                error_message: None,
+                provider_code: Some("stop".to_owned()),
+                interrupted: reason == StopReason::Aborted,
+                timestamp: timestamp(),
+            },
             provider_context: Vec::new(),
         }
     }
@@ -879,8 +1029,8 @@ mod tests {
 
         let (tx, rx) = mpsc::channel(4);
         tx.send(ProviderEvent::Done {
-            reason: StopReason::ToolUse,
-            output: provider_output(),
+            reason: StopReason::Stop,
+            output: empty_terminal_output("moonshot", origin(), StopReason::Stop),
         })
         .await
         .expect("terminal event");
@@ -904,6 +1054,316 @@ mod tests {
                 .expect("fused stream returns immediately")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn exact_expected_terminal_origin_is_accepted_and_fused() {
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(ProviderEvent::Done {
+            reason: StopReason::Stop,
+            output: empty_terminal_output("moonshot", origin(), StopReason::Stop),
+        })
+        .await
+        .expect("terminal");
+        let mut stream =
+            ProviderEventStream::new(rx, CancellationToken::new(), "moonshot", origin());
+        let mut consumer = MessageAssembler::new();
+        let start = stream.recv().await.expect("Start");
+        consumer.apply(&start).expect("consumer Start");
+        let terminal = stream.recv().await.expect("terminal");
+        assert!(matches!(terminal, ProviderEvent::Done { .. }));
+        assert!(
+            consumer
+                .apply(&terminal)
+                .expect("trusted terminal")
+                .is_some()
+        );
+        assert!(stream.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_nonterminal_is_replaced_by_one_sanitized_terminal() {
+        let (tx, rx) = mpsc::channel(3);
+        tx.send(ProviderEvent::TextDelta {
+            content_index: 0,
+            delta: "must-not-cross".to_owned(),
+        })
+        .await
+        .expect("malformed event");
+        let mut leaked = empty_terminal_output("moonshot", origin(), StopReason::Stop);
+        leaked.message.content = vec![AssistantContent::Text {
+            text: "queued leak".to_owned(),
+            wire_item_index: 0,
+        }];
+        leaked.provider_context = vec![ProviderContextFragment {
+            wire_item_index: Some(0),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiChatCompletions,
+                item: json!({"secret": "queued"}),
+            },
+        }];
+        tx.send(ProviderEvent::Done {
+            reason: StopReason::Stop,
+            output: leaked,
+        })
+        .await
+        .expect("queued terminal");
+
+        let mut stream =
+            ProviderEventStream::new(rx, CancellationToken::new(), "moonshot", origin());
+        let mut consumer = MessageAssembler::new();
+        consumer
+            .apply(&stream.recv().await.expect("Start"))
+            .expect("consumer Start");
+        let terminal = stream.recv().await.expect("sanitized terminal");
+        let ProviderEvent::Error { reason, output } = &terminal else {
+            panic!("malformed event must become Error")
+        };
+        assert_eq!(*reason, StopReason::Error);
+        assert_eq!(
+            output.message.provider_code.as_deref(),
+            Some("invalid_provider_event")
+        );
+        assert!(output.message.content.is_empty());
+        assert!(output.provider_context.is_empty());
+        assert_eq!(output.message.provider, "moonshot");
+        assert_eq!(output.message.origin, origin());
+        assert!(
+            consumer
+                .apply(&terminal)
+                .expect("downstream accepts sanitized terminal")
+                .is_some()
+        );
+        assert!(stream.recv().await.is_none(), "firewall terminal must fuse");
+    }
+
+    #[tokio::test]
+    async fn family_and_budget_violations_keep_only_last_trusted_shadow_snapshot() {
+        for malformed in [
+            ProviderEvent::ThinkingDelta {
+                content_index: 0,
+                delta: "wrong-family".to_owned(),
+            },
+            ProviderEvent::TextDelta {
+                content_index: 0,
+                delta: "over".to_owned(),
+            },
+        ] {
+            let (tx, rx) = mpsc::channel(4);
+            tx.send(ProviderEvent::TextStart { content_index: 0 })
+                .await
+                .expect("text start");
+            tx.send(ProviderEvent::TextDelta {
+                content_index: 0,
+                delta: "ok".to_owned(),
+            })
+            .await
+            .expect("trusted delta");
+            tx.send(malformed.clone()).await.expect("malformed event");
+            let (_priority_tx, priority_rx) = mpsc::channel(1);
+            let mut stream = ProviderEventStream::with_priority_terminal(
+                rx,
+                priority_rx,
+                CancellationToken::new(),
+                "moonshot",
+                origin(),
+                ResponseBudget {
+                    max_content_bytes: 2,
+                    ..ResponseBudget::default()
+                },
+                Arc::new(SuccessTerminalCommit::new()),
+            );
+            let mut consumer = MessageAssembler::with_budget(ResponseBudget {
+                max_content_bytes: 2,
+                ..ResponseBudget::default()
+            });
+            for _ in 0..3 {
+                let event = stream.recv().await.expect("trusted prefix");
+                consumer.apply(&event).expect("consumer trusted prefix");
+            }
+            let terminal = stream.recv().await.expect("firewall terminal");
+            let ProviderEvent::Error { output, .. } = &terminal else {
+                panic!("violation must become Error")
+            };
+            assert_eq!(
+                output.message.content,
+                vec![AssistantContent::Text {
+                    text: "ok".to_owned(),
+                    wire_item_index: 0,
+                }]
+            );
+            assert!(output.provider_context.is_empty());
+            assert!(
+                consumer
+                    .apply(&terminal)
+                    .expect("consumer terminal")
+                    .is_some()
+            );
+            assert!(stream.recv().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_expected_metadata_mismatches_fail_closed_without_leaking_payload() {
+        let expected = origin();
+        let cases = [
+            (
+                "moonshot",
+                ProviderOrigin {
+                    provider_instance_id: "moonshot:https://other.example/v1".to_owned(),
+                    ..expected.clone()
+                },
+            ),
+            (
+                "moonshot",
+                ProviderOrigin {
+                    protocol: ApiProtocol::OpenAiResponses,
+                    ..expected.clone()
+                },
+            ),
+            ("other-provider", expected.clone()),
+            (
+                "moonshot",
+                ProviderOrigin {
+                    model: "other-model".to_owned(),
+                    ..expected.clone()
+                },
+            ),
+        ];
+        for (provider, untrusted_origin) in cases {
+            let (tx, rx) = mpsc::channel(1);
+            let mut output = empty_terminal_output(provider, untrusted_origin, StopReason::Stop);
+            output.message.content = vec![AssistantContent::Text {
+                text: "untrusted terminal content".to_owned(),
+                wire_item_index: 0,
+            }];
+            output.provider_context = vec![ProviderContextFragment {
+                wire_item_index: Some(0),
+                payload: ProviderContextPayload::EncryptedReasoning {
+                    protocol: ApiProtocol::OpenAiChatCompletions,
+                    item: json!({"secret": "untrusted"}),
+                },
+            }];
+            tx.send(ProviderEvent::Done {
+                reason: StopReason::Stop,
+                output,
+            })
+            .await
+            .expect("untrusted terminal");
+
+            let mut stream = ProviderEventStream::new(
+                rx,
+                CancellationToken::new(),
+                "moonshot",
+                expected.clone(),
+            );
+            let mut consumer = MessageAssembler::new();
+            consumer
+                .apply(&stream.recv().await.expect("Start"))
+                .expect("consumer Start");
+            let terminal = stream.recv().await.expect("sanitized terminal");
+            let ProviderEvent::Error { reason, output } = &terminal else {
+                panic!("mismatch must become Error")
+            };
+            assert_eq!(*reason, StopReason::Error);
+            assert_eq!(output.message.provider, "moonshot");
+            assert_eq!(output.message.origin, expected);
+            assert!(output.message.content.is_empty());
+            assert!(output.provider_context.is_empty());
+            assert_eq!(
+                output.message.provider_code.as_deref(),
+                Some("invalid_provider_terminal")
+            );
+            assert!(
+                consumer
+                    .apply(&terminal)
+                    .expect("sanitized terminal is assembler-valid")
+                    .is_some()
+            );
+            assert!(stream.recv().await.is_none(), "mismatch must fuse");
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_done_wins_over_later_cancellation_before_consumer_receive() {
+        let (tx, rx) = mpsc::channel(1);
+        let (_priority_tx, priority_rx) = mpsc::channel(1);
+        let committed = Arc::new(SuccessTerminalCommit::new());
+        tx.send(ProviderEvent::Done {
+            reason: StopReason::Stop,
+            output: empty_terminal_output("moonshot", origin(), StopReason::Stop),
+        })
+        .await
+        .expect("queued Done");
+        committed.commit();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut stream = ProviderEventStream::with_priority_terminal(
+            rx,
+            priority_rx,
+            cancel,
+            "moonshot",
+            origin(),
+            ResponseBudget::default(),
+            committed,
+        );
+        let mut consumer = MessageAssembler::new();
+        let start = stream.recv().await.expect("Start");
+        consumer.apply(&start).expect("consumer Start");
+        let terminal = stream.recv().await.expect("Done");
+        assert!(matches!(terminal, ProviderEvent::Done { .. }));
+        assert!(
+            consumer
+                .apply(&terminal)
+                .expect("consumer accepts Done")
+                .is_some()
+        );
+        assert!(stream.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn precommit_cancellation_uses_one_well_formed_priority_aborted_terminal() {
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(ProviderEvent::TextStart { content_index: 0 })
+            .await
+            .expect("normal backlog");
+        let (priority_tx, priority_rx) = mpsc::channel(1);
+        priority_tx
+            .send(ProviderEvent::Error {
+                reason: StopReason::Aborted,
+                output: empty_terminal_output("moonshot", origin(), StopReason::Aborted),
+            })
+            .await
+            .expect("priority Aborted");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut stream = ProviderEventStream::with_priority_terminal(
+            rx,
+            priority_rx,
+            cancel,
+            "moonshot",
+            origin(),
+            ResponseBudget::default(),
+            Arc::new(SuccessTerminalCommit::new()),
+        );
+        let mut consumer = MessageAssembler::new();
+        let start = stream.recv().await.expect("Start");
+        consumer.apply(&start).expect("consumer Start");
+        let terminal = stream.recv().await.expect("Aborted");
+        assert!(matches!(
+            terminal,
+            ProviderEvent::Error {
+                reason: StopReason::Aborted,
+                ..
+            }
+        ));
+        assert!(
+            consumer
+                .apply(&terminal)
+                .expect("consumer accepts Aborted")
+                .is_some()
+        );
+        assert!(stream.recv().await.is_none());
     }
 
     #[test]
@@ -956,6 +1416,76 @@ mod tests {
             other => panic!("unexpected event: {other:?}"),
         }
         assert!(stream.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn synthesized_eof_replays_completed_content_without_terminal_mismatch() {
+        let (tx, rx) = mpsc::channel(4);
+        for event in [
+            ProviderEvent::TextStart { content_index: 0 },
+            ProviderEvent::TextDelta {
+                content_index: 0,
+                delta: "accepted".to_owned(),
+            },
+            ProviderEvent::TextEnd {
+                content_index: 0,
+                content: "accepted".to_owned(),
+            },
+        ] {
+            tx.send(event).await.expect("event");
+        }
+        drop(tx);
+
+        let mut stream =
+            ProviderEventStream::new(rx, CancellationToken::new(), "moonshot", origin());
+        let mut consumer = MessageAssembler::new();
+        let mut terminal = None;
+        while let Some(event) = stream.recv().await {
+            if let Some(message) = consumer.apply(&event).expect("consumer replay") {
+                terminal = Some(message);
+            }
+        }
+
+        assert_eq!(
+            terminal.expect("terminal").content,
+            vec![AssistantContent::Text {
+                text: "accepted".to_owned(),
+                wire_item_index: 0,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn synthesized_eof_replays_open_content_without_terminal_mismatch() {
+        let (tx, rx) = mpsc::channel(2);
+        tx.send(ProviderEvent::TextStart { content_index: 3 })
+            .await
+            .expect("start");
+        tx.send(ProviderEvent::TextDelta {
+            content_index: 3,
+            delta: "partial".to_owned(),
+        })
+        .await
+        .expect("delta");
+        drop(tx);
+
+        let mut stream =
+            ProviderEventStream::new(rx, CancellationToken::new(), "moonshot", origin());
+        let mut consumer = MessageAssembler::new();
+        let mut terminal = None;
+        while let Some(event) = stream.recv().await {
+            if let Some(message) = consumer.apply(&event).expect("consumer replay") {
+                terminal = Some(message);
+            }
+        }
+
+        assert_eq!(
+            terminal.expect("terminal").content,
+            vec![AssistantContent::Text {
+                text: "partial".to_owned(),
+                wire_item_index: 3,
+            }]
+        );
     }
 
     #[tokio::test]
