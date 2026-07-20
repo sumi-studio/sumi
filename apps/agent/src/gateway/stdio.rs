@@ -64,6 +64,7 @@ impl Gateway for StdioGateway {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawCommandEnvelope {
     seq: u64,
     command_id: String,

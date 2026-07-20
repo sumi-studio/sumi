@@ -41,6 +41,7 @@ where
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct CommandEnvelope {
     pub seq: u64,
     pub command_id: String,
