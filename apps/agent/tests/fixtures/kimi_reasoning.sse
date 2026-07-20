@@ -1,0 +1,7 @@
+data: {"id":"reason-1","model":"kimi-k3","choices":[{"delta":{"reasoning_content":"consider","content":"answer"},"finish_reason":null}]}
+
+data: {"id":"reason-1","model":"kimi-k3","choices":[{"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+: fixture eof

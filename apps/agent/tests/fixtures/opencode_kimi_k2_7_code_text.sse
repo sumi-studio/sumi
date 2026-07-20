@@ -1,0 +1,45 @@
+data: {"id":"chatcmpl-<response-id>","object":"chat.completion.chunk","created":0,"model":"kimi-k2.7-code","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":""}}]}
+
+data: {"id":"chatcmpl-<response-id>","object":"chat.completion.chunk","created":0,"model":"kimi-k2.7-code","choices":[{"index":0,"finish_reason":null,"delta":{"reasoning_content":"We"}}]}
+
+data: {"id":"chatcmpl-<response-id>","object":"chat.completion.chunk","created":0,"model":"kimi-k2.7-code","choices":[{"index":0,"finish_reason":null,"delta":{"reasoning_content":" need"}}]}
+
+data: {"id":"chatcmpl-<response-id>","object":"chat.completion.chunk","created":0,"model":"kimi-k2.7-code","choices":[{"index":0,"finish_reason":null,"delta":{"reasoning_content":" answer"}}]}
+
+data: {"id":"chatcmpl-<response-id>","object":"chat.completion.chunk","created":0,"model":"kimi-k2.7-code","choices":[{"index":0,"finish_reason":null,"delta":{"reasoning_content":" exactly"}}]}
+
+data: {"id":"chatcmpl-<response-id>","object":"chat.completion.chunk","created":0,"model":"kimi-k2.7-code","choices":[{"index":0,"finish_reason":null,"delta":{"reasoning_content":" '"}}]}
+
+data: {"id":"chatcmpl-<response-id>","object":"chat.completion.chunk","created":0,"model":"kimi-k2.7-code","choices":[{"index":0,"finish_reason":null,"delta":{"reasoning_content":"fixture"}}]}
+
+data: {"id":"chatcmpl-<response-id>","object":"chat.completion.chunk","created":0,"model":"kimi-k2.7-code","choices":[{"index":0,"finish_reason":null,"delta":{"reasoning_content":"-"}}]}
+
+data: {"id":"chatcmpl-<response-id>","object":"chat.completion.chunk","created":0,"model":"kimi-k2.7-code","choices":[{"index":0,"finish_reason":null,"delta":{"reasoning_content":"ok"}}]}
+
+data: {"id":"chatcmpl-<response-id>","object":"chat.completion.chunk","created":0,"model":"kimi-k2.7-code","choices":[{"index":0,"finish_reason":null,"delta":{"reasoning_content":"'."}}]}
+
+data: {"id":"chatcmpl-<response-id>","object":"chat.completion.chunk","created":0,"model":"kimi-k2.7-code","choices":[{"index":0,"finish_reason":null,"delta":{"reasoning_content":" No"}}]}
+
+data: {"id":"chatcmpl-<response-id>","object":"chat.completion.chunk","created":0,"model":"kimi-k2.7-code","choices":[{"index":0,"finish_reason":null,"delta":{"reasoning_content":" extra"}}]}
+
+data: {"id":"chatcmpl-<response-id>","object":"chat.completion.chunk","created":0,"model":"kimi-k2.7-code","choices":[{"index":0,"finish_reason":null,"delta":{"reasoning_content":" content"}}]}
+
+data: {"id":"chatcmpl-<response-id>","object":"chat.completion.chunk","created":0,"model":"kimi-k2.7-code","choices":[{"index":0,"finish_reason":null,"delta":{"reasoning_content":"."}}]}
+
+data: {"id":"chatcmpl-<response-id>","object":"chat.completion.chunk","created":0,"model":"kimi-k2.7-code","choices":[{"index":0,"finish_reason":null,"delta":{"reasoning_content":""}}]}
+
+data: {"id":"chatcmpl-<response-id>","object":"chat.completion.chunk","created":0,"model":"kimi-k2.7-code","choices":[{"index":0,"finish_reason":null,"delta":{"content":"fixture"}}]}
+
+data: {"id":"chatcmpl-<response-id>","object":"chat.completion.chunk","created":0,"model":"kimi-k2.7-code","choices":[{"index":0,"finish_reason":null,"delta":{"content":"-"}}]}
+
+data: {"id":"chatcmpl-<response-id>","object":"chat.completion.chunk","created":0,"model":"kimi-k2.7-code","choices":[{"index":0,"finish_reason":null,"delta":{"content":"ok"}}]}
+
+data: {"id":"chatcmpl-<response-id>","object":"chat.completion.chunk","created":0,"model":"kimi-k2.7-code","choices":[{"index":0,"finish_reason":"stop","delta":{}}]}
+
+data: {"choices":[],"x-opencode-type":"inference-cost","cost":"0.00008835","normalizedUsage":{"inputTokens":13,"outputTokens":19,"reasoningTokens":14,"cacheReadTokens":0,"cacheWrite5mTokens":0,"cacheWrite1hTokens":0}}
+
+data: {"id":"chatcmpl-<response-id>","object":"chat.completion.chunk","created":0,"model":"kimi-k2.7-code","choices":[],"usage":{"prompt_tokens":13,"completion_tokens":19,"total_tokens":32,"completion_tokens_details":{"reasoning_tokens":14}}}
+
+data: [DONE]
+
+data: {"choices":[],"cost":"0"}

@@ -1,0 +1,31 @@
+# Local secrets can be stored in apps/agent/.env.local:
+# OPENCODE_GO_API_KEY=...
+#
+# Load it explicitly with SUMI_ENV_FILE=.env.local. Existing process
+# environment variables take precedence over values in the file.
+
+conversation_id = "default"
+workspace = "/workspace"
+# 相対パスはこの設定ファイルの場所を基準に解決される。
+# system_prompt (インライン文字列) との同時指定はエラー。
+system_prompt_file = "prompts/system.md"
+
+[model]
+preset = "opencode-go"
+# id = "kimi-k2.7-code"
+# base_url = "https://opencode.ai/zen/go/v1"
+# api_key_env = "OPENCODE_GO_API_KEY"
+# context_window = 262144
+# max_output_tokens = 32768
+# default_output_tokens = 16384 # Normal request budget; model context is 262144.
+# Cumulative wire/content/event/tool/preview-work limits are derived from the
+# actual request output-token budget; unrepresentable limits fail at config load.
+
+# Provider measurements can override preset compatibility without recompiling.
+# [model.compat]
+# max_tokens_field = "max_tokens"
+# supports_usage_in_streaming = true
+# thinking_format = "deepseek"
+# requires_reasoning_content_on_assistant = true
+# zai_tool_stream = false
+# supports_required_tool_choice = false

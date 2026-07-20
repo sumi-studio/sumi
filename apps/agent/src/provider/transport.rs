@@ -6,6 +6,9 @@ use tokio_util::sync::CancellationToken;
 
 const MAX_ERROR_BODY_CHARS: usize = 4_000;
 const MAX_ERROR_BODY_READ_BYTES: usize = MAX_ERROR_BODY_CHARS * 4 + 4;
+const ERROR_BODY_TRUNCATED_MARKER: &str = "... [truncated]";
+const ERROR_BODY_DIAGNOSTIC_PREFIX: &str = "[error body read incomplete: ";
+const ERROR_BODY_DIAGNOSTIC_SUFFIX: &str = "]";
 const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 4 * MAX_SSE_LINE_BYTES;
 const MAX_SSE_QUEUED_BYTES: usize = 2 * MAX_SSE_EVENT_BYTES;
@@ -23,8 +26,6 @@ pub enum SseError {
     IdleTimeout { seconds: u64 },
     #[error("SSE stream cancelled")]
     Cancelled,
-    #[error("SSE stream ended with an incomplete line")]
-    UnexpectedEof,
     #[error("SSE data was not valid UTF-8")]
     InvalidUtf8,
     #[error("SSE line exceeded {limit} bytes")]
@@ -33,6 +34,10 @@ pub enum SseError {
     EventTooLong { limit: usize },
     #[error("queued SSE events exceeded {limit} bytes")]
     EventQueueTooLarge { limit: usize },
+    #[error("provider response exceeded {limit} raw wire bytes")]
+    ResponseTooLong { limit: usize },
+    #[error("SSE stream ended before the current event was terminated")]
+    UnexpectedEof,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,12 +51,15 @@ pub struct SseStream {
     parser: SseLineParser,
     cancel: CancellationToken,
     idle_timeout: Duration,
+    max_wire_bytes: usize,
+    wire_bytes: usize,
 }
 
 impl SseStream {
     pub async fn from_response(
         response: reqwest::Response,
         cancel: CancellationToken,
+        max_wire_bytes: usize,
     ) -> Result<Self, SseError> {
         let status = response.status();
         let bytes = response.bytes_stream().map(|chunk| {
@@ -69,7 +77,12 @@ impl SseStream {
             });
         }
 
-        Ok(Self::new(bytes, cancel, IDLE_TIMEOUT))
+        Ok(Self::new_with_wire_limit(
+            bytes,
+            cancel,
+            IDLE_TIMEOUT,
+            max_wire_bytes,
+        ))
     }
 
     pub async fn next_event(&mut self) -> Result<Option<SseEvent>, SseError> {
@@ -82,7 +95,20 @@ impl SseStream {
             }
 
             match receive_chunk(&mut self.bytes, &self.cancel, self.idle_timeout).await? {
-                Some(bytes) => self.parser.push_chunk(&bytes)?,
+                Some(bytes) => {
+                    let Some(next) = self.wire_bytes.checked_add(bytes.len()) else {
+                        return Err(SseError::ResponseTooLong {
+                            limit: self.max_wire_bytes,
+                        });
+                    };
+                    if next > self.max_wire_bytes {
+                        return Err(SseError::ResponseTooLong {
+                            limit: self.max_wire_bytes,
+                        });
+                    }
+                    self.wire_bytes = next;
+                    self.parser.push_chunk(&bytes)?;
+                }
                 None => {
                     self.parser.finish()?;
                     return Ok(self.parser.next_event());
@@ -91,12 +117,24 @@ impl SseStream {
         }
     }
 
+    #[cfg(test)]
     fn new(bytes: ByteStream, cancel: CancellationToken, idle_timeout: Duration) -> Self {
+        Self::new_with_wire_limit(bytes, cancel, idle_timeout, usize::MAX)
+    }
+
+    fn new_with_wire_limit(
+        bytes: ByteStream,
+        cancel: CancellationToken,
+        idle_timeout: Duration,
+        max_wire_bytes: usize,
+    ) -> Self {
         Self {
             bytes,
             parser: SseLineParser::default(),
             cancel,
             idle_timeout,
+            max_wire_bytes,
+            wire_bytes: 0,
         }
     }
 }
@@ -282,8 +320,18 @@ async fn read_error_body(
 ) -> Result<String, SseError> {
     let mut body = Vec::with_capacity(MAX_ERROR_BODY_READ_BYTES);
     let mut source_truncated = false;
+    let mut read_diagnostic = None;
 
-    while let Some(chunk) = receive_chunk(&mut bytes, cancel, idle_timeout).await? {
+    loop {
+        let chunk = match receive_chunk(&mut bytes, cancel, idle_timeout).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(SseError::Cancelled) => return Err(SseError::Cancelled),
+            Err(error) => {
+                read_diagnostic = Some(error.to_string());
+                break;
+            }
+        };
         let remaining = MAX_ERROR_BODY_READ_BYTES.saturating_sub(body.len());
         if remaining == 0 {
             if !chunk.is_empty() {
@@ -301,24 +349,89 @@ async fn read_error_body(
     }
 
     let body = String::from_utf8_lossy(&body);
-    Ok(truncate_error_body(body.trim(), source_truncated))
+    Ok(format_error_body(
+        body.trim(),
+        source_truncated,
+        read_diagnostic.as_deref(),
+    ))
 }
 
 fn truncate_error_body(body: &str, source_truncated: bool) -> String {
+    truncate_error_body_to_limit(body, source_truncated, MAX_ERROR_BODY_CHARS)
+}
+
+fn format_error_body(body: &str, source_truncated: bool, read_diagnostic: Option<&str>) -> String {
+    let Some(diagnostic) = read_diagnostic else {
+        return truncate_error_body(body, source_truncated);
+    };
+
+    let separator_len = usize::from(!body.is_empty());
+    let minimum_diagnostic_len = ERROR_BODY_DIAGNOSTIC_PREFIX.chars().count()
+        + ERROR_BODY_TRUNCATED_MARKER.chars().count()
+        + ERROR_BODY_DIAGNOSTIC_SUFFIX.chars().count();
+    let body_limit = if body.is_empty() {
+        0
+    } else {
+        MAX_ERROR_BODY_CHARS
+            .saturating_sub(separator_len)
+            .saturating_sub(minimum_diagnostic_len)
+    };
+    let body = truncate_error_body_to_limit(body, source_truncated, body_limit);
+    let separator = if body.is_empty() { "" } else { " " };
+    let diagnostic_limit = MAX_ERROR_BODY_CHARS
+        .saturating_sub(body.chars().count())
+        .saturating_sub(separator.chars().count());
+    let diagnostic = format_error_body_diagnostic(diagnostic, diagnostic_limit);
+    let formatted = format!("{body}{separator}{diagnostic}");
+    debug_assert!(formatted.chars().count() <= MAX_ERROR_BODY_CHARS);
+    formatted
+}
+
+fn truncate_error_body_to_limit(body: &str, source_truncated: bool, max_chars: usize) -> String {
     let count = body.chars().count();
-    if count <= MAX_ERROR_BODY_CHARS && !source_truncated {
+    if count <= max_chars && !source_truncated {
         return body.to_owned();
     }
 
-    let kept: String = body.chars().take(MAX_ERROR_BODY_CHARS).collect();
     if source_truncated {
-        format!("{kept}... [truncated]")
-    } else {
-        format!(
-            "{kept}... [truncated {} chars]",
-            count - MAX_ERROR_BODY_CHARS
-        )
+        let prefix_limit = max_chars.saturating_sub(ERROR_BODY_TRUNCATED_MARKER.chars().count());
+        let kept = bounded_char_prefix(body, prefix_limit);
+        return format!("{kept}{ERROR_BODY_TRUNCATED_MARKER}");
     }
+
+    let mut kept_chars = count.min(max_chars);
+    loop {
+        let suffix = format!("... [truncated {} chars]", count - kept_chars);
+        let prefix_limit = max_chars.saturating_sub(suffix.chars().count());
+        let kept = bounded_char_prefix(body, kept_chars.min(prefix_limit));
+        let actual_kept_chars = kept.chars().count();
+        if actual_kept_chars == kept_chars {
+            return format!("{kept}{suffix}");
+        }
+        kept_chars = actual_kept_chars;
+    }
+}
+
+fn format_error_body_diagnostic(diagnostic: &str, max_chars: usize) -> String {
+    let wrapper_len =
+        ERROR_BODY_DIAGNOSTIC_PREFIX.chars().count() + ERROR_BODY_DIAGNOSTIC_SUFFIX.chars().count();
+    let content_limit = max_chars.saturating_sub(wrapper_len);
+    if diagnostic.chars().count() <= content_limit {
+        return format!("{ERROR_BODY_DIAGNOSTIC_PREFIX}{diagnostic}{ERROR_BODY_DIAGNOSTIC_SUFFIX}");
+    }
+
+    let prefix_limit = content_limit.saturating_sub(ERROR_BODY_TRUNCATED_MARKER.chars().count());
+    let kept = bounded_char_prefix(diagnostic, prefix_limit);
+    format!(
+        "{ERROR_BODY_DIAGNOSTIC_PREFIX}{kept}{ERROR_BODY_TRUNCATED_MARKER}{ERROR_BODY_DIAGNOSTIC_SUFFIX}"
+    )
+}
+
+fn bounded_char_prefix(value: &str, max_chars: usize) -> &str {
+    value
+        .char_indices()
+        .nth(max_chars)
+        .map_or(value, |(end, _)| &value[..end])
 }
 
 #[cfg(test)]
@@ -453,16 +566,20 @@ mod tests {
     }
 
     #[test]
-    fn clean_and_incomplete_eof_are_distinct() {
+    fn eof_requires_a_complete_blank_line_terminated_event() {
         let mut clean = SseLineParser::default();
         clean.push_chunk(b"data: complete\n\n").expect("valid SSE");
         assert_eq!(clean.finish(), Ok(()));
 
-        let mut incomplete = SseLineParser::default();
-        incomplete
-            .push_chunk(b"data: {\"partial\":")
-            .expect("buffered bytes");
-        assert_eq!(incomplete.finish(), Err(SseError::UnexpectedEof));
+        let mut final_line = SseLineParser::default();
+        final_line
+            .push_chunk(b"data: {\"complete\":true}")
+            .expect("buffered final line");
+        assert_eq!(final_line.finish(), Err(SseError::UnexpectedEof));
+
+        let mut done = SseLineParser::default();
+        done.push_chunk(b"data: [DONE]").expect("buffered DONE");
+        assert_eq!(done.finish(), Err(SseError::UnexpectedEof));
     }
 
     #[test]
@@ -557,6 +674,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_wire_budget_counts_sse_framing_at_exact_boundary() {
+        let raw = b"data: ok\n\n".to_vec();
+        let exact_stream = stream::iter([Ok(raw.clone())]);
+        let mut exact = SseStream::new_with_wire_limit(
+            Box::pin(exact_stream),
+            CancellationToken::new(),
+            Duration::from_secs(1),
+            raw.len(),
+        );
+        assert_eq!(
+            exact.next_event().await,
+            Ok(Some(SseEvent {
+                event: None,
+                data: "ok".to_owned(),
+            }))
+        );
+
+        let over_stream = stream::iter([Ok(raw.clone())]);
+        let mut over = SseStream::new_with_wire_limit(
+            Box::pin(over_stream),
+            CancellationToken::new(),
+            Duration::from_secs(1),
+            raw.len() - 1,
+        );
+        assert_eq!(
+            over.next_event().await,
+            Err(SseError::ResponseTooLong {
+                limit: raw.len() - 1,
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn cancellation_preempts_buffered_events() {
         let bytes = stream::iter([Ok(
             b"data: first\n\ndata: second\n\ndata: [DONE]\n\n".to_vec()
@@ -592,8 +742,18 @@ mod tests {
     #[test]
     fn http_error_body_is_truncated_and_formatted() {
         let body = truncate_error_body(&"あ".repeat(MAX_ERROR_BODY_CHARS + 7), false);
-        assert!(body.starts_with(&"あ".repeat(MAX_ERROR_BODY_CHARS)));
-        assert!(body.ends_with("... [truncated 7 chars]"));
+        // Reserving suffix space changes the reported omitted count: retaining
+        // 3,969 source characters leaves 31 characters omitted in total.
+        let suffix = "... [truncated 31 chars]";
+        assert_eq!(
+            body,
+            format!(
+                "{}{}",
+                "あ".repeat(MAX_ERROR_BODY_CHARS - suffix.chars().count()),
+                suffix
+            )
+        );
+        assert_eq!(body.chars().count(), MAX_ERROR_BODY_CHARS);
 
         let error = SseError::Http { status: 429, body };
         assert!(error.to_string().starts_with("429: "));
@@ -601,7 +761,9 @@ mod tests {
 
     #[tokio::test]
     async fn error_body_reader_stops_at_byte_limit() {
-        let chunks = stream::iter([Ok(vec![b'a'; MAX_ERROR_BODY_READ_BYTES + 100])]);
+        let mut source = "😀".repeat(MAX_ERROR_BODY_CHARS + 2).into_bytes();
+        source.extend([b'x'; 100]);
+        let chunks = stream::iter([Ok(source)]);
         let body = read_error_body(
             Box::pin(chunks),
             &CancellationToken::new(),
@@ -610,12 +772,16 @@ mod tests {
         .await
         .expect("bounded error body");
 
+        let kept = body
+            .strip_suffix(ERROR_BODY_TRUNCATED_MARKER)
+            .expect("truncation marker");
         assert_eq!(
-            body.strip_suffix("... [truncated]")
-                .expect("truncation marker")
-                .len(),
-            MAX_ERROR_BODY_CHARS
+            kept.chars().count(),
+            MAX_ERROR_BODY_CHARS - ERROR_BODY_TRUNCATED_MARKER.chars().count()
         );
+        assert!(body.starts_with('😀'));
+        assert!(!body.contains('\u{fffd}'));
+        assert_eq!(body.chars().count(), MAX_ERROR_BODY_CHARS);
     }
 
     #[tokio::test]
@@ -631,6 +797,86 @@ mod tests {
         .await
         .expect("bounded error body");
 
-        assert!(body.ends_with("... [truncated 1 chars]"));
+        assert!(body.contains("... [truncated "));
+        assert!(body.ends_with(" chars]"));
+        assert_eq!(body.chars().count(), MAX_ERROR_BODY_CHARS);
+    }
+
+    #[tokio::test]
+    async fn error_body_reader_preserves_partial_and_diagnostic_on_transport_failure() {
+        let chunks = stream::iter([Ok(b"partial".to_vec()), Err("connection reset".to_owned())]);
+        let body = read_error_body(
+            Box::pin(chunks),
+            &CancellationToken::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("status remains authoritative after body reset");
+
+        assert!(body.starts_with("partial"));
+        assert!(body.contains("error body read incomplete"));
+        assert!(body.contains("connection reset"));
+    }
+
+    #[tokio::test]
+    async fn error_body_and_large_transport_diagnostic_share_one_character_limit() {
+        let partial_body = "🙂".repeat(MAX_ERROR_BODY_CHARS - 1);
+        let diagnostic = "transport故障".repeat(MAX_ERROR_BODY_READ_BYTES);
+        let read = || {
+            stream::iter([
+                Ok(partial_body.as_bytes().to_vec()),
+                Err(diagnostic.clone()),
+            ])
+        };
+        let first = read_error_body(
+            Box::pin(read()),
+            &CancellationToken::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("HTTP status remains authoritative");
+        let second = read_error_body(
+            Box::pin(read()),
+            &CancellationToken::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("HTTP status remains authoritative");
+
+        assert_eq!(first, second);
+        assert!(first.chars().count() <= MAX_ERROR_BODY_CHARS);
+        assert_eq!(first.chars().count(), MAX_ERROR_BODY_CHARS);
+        assert!(first.starts_with('🙂'));
+        assert!(first.contains(" chars] "));
+        assert!(first.contains(ERROR_BODY_DIAGNOSTIC_PREFIX));
+        assert!(first.ends_with("... [truncated]]"));
+
+        let error = SseError::Http {
+            status: 503,
+            body: first,
+        };
+        assert!(matches!(error, SseError::Http { status: 503, .. }));
+    }
+
+    #[tokio::test]
+    async fn error_body_reader_preserves_status_on_idle_but_cancel_remains_authoritative() {
+        let pending = stream::pending::<Result<Vec<u8>, String>>();
+        let body = read_error_body(
+            Box::pin(pending),
+            &CancellationToken::new(),
+            Duration::from_millis(5),
+        )
+        .await
+        .expect("status remains authoritative after body idle timeout");
+        assert!(body.contains("error body read incomplete"));
+        assert!(body.contains("idle"));
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let pending = stream::pending::<Result<Vec<u8>, String>>();
+        assert_eq!(
+            read_error_body(Box::pin(pending), &cancel, Duration::ZERO).await,
+            Err(SseError::Cancelled)
+        );
     }
 }

@@ -1,0 +1,101 @@
+{
+  "sensitive": [
+    { "type": "start" },
+    {
+      "output": {
+        "message": {
+          "content": [],
+          "error_message": "provider stopped response: sensitive",
+          "interrupted": false,
+          "model": "glm-5.2",
+          "origin": {
+            "model": "glm-5.2",
+            "protocol": "open_ai_chat_completions",
+            "provider_instance_id": "<provider_instance_id>"
+          },
+          "provider": "zai",
+          "provider_code": "sensitive",
+          "stop_reason": "error",
+          "timestamp": "<timestamp>",
+          "usage": {
+            "cache_read": 0,
+            "cache_write": 0,
+            "input": 4,
+            "output": 1,
+            "reasoning": 0,
+            "total_tokens": 5
+          }
+        },
+        "provider_context": []
+      },
+      "reason": "error",
+      "type": "error"
+    }
+  ],
+  "network_error": [
+    { "type": "start" },
+    {
+      "output": {
+        "message": {
+          "content": [],
+          "error_message": "provider stopped response: network_error",
+          "interrupted": false,
+          "model": "glm-5.2",
+          "origin": {
+            "model": "glm-5.2",
+            "protocol": "open_ai_chat_completions",
+            "provider_instance_id": "<provider_instance_id>"
+          },
+          "provider": "zai",
+          "provider_code": "network_error",
+          "stop_reason": "error",
+          "timestamp": "<timestamp>",
+          "usage": {
+            "cache_read": 0,
+            "cache_write": 0,
+            "input": 5,
+            "output": 2,
+            "reasoning": 0,
+            "total_tokens": 7
+          }
+        },
+        "provider_context": []
+      },
+      "reason": "error",
+      "type": "error"
+    }
+  ],
+  "model_context_window_exceeded": [
+    { "type": "start" },
+    {
+      "output": {
+        "message": {
+          "content": [],
+          "error_message": "provider stopped response: model_context_window_exceeded",
+          "interrupted": false,
+          "model": "glm-5.2",
+          "origin": {
+            "model": "glm-5.2",
+            "protocol": "open_ai_chat_completions",
+            "provider_instance_id": "<provider_instance_id>"
+          },
+          "provider": "zai",
+          "provider_code": "model_context_window_exceeded",
+          "stop_reason": "error",
+          "timestamp": "<timestamp>",
+          "usage": {
+            "cache_read": 0,
+            "cache_write": 0,
+            "input": 1000000,
+            "output": 0,
+            "reasoning": 0,
+            "total_tokens": 1000000
+          }
+        },
+        "provider_context": []
+      },
+      "reason": "error",
+      "type": "error"
+    }
+  ]
+}
