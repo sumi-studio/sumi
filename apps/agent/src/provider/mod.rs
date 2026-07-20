@@ -12,7 +12,7 @@ use std::{
     env,
     future::Future,
     sync::{Arc, OnceLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use adapters::chat_completions::{
@@ -35,7 +35,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
 
 enum RequestWait<T, E> {
-    Response(Result<T, E>),
+    Response {
+        response: Result<T, E>,
+        request_sent_at: Instant,
+    },
     Cancelled,
     TimedOut,
 }
@@ -46,19 +49,53 @@ struct ProducerChannels {
     success_terminal_committed: Arc<SuccessTerminalCommit>,
 }
 
-async fn await_request<F, T, E>(
+async fn await_request<F, T, E, O>(
     request: F,
     cancel: &CancellationToken,
     timeout: Duration,
+    on_first_poll: O,
 ) -> RequestWait<T, E>
 where
     F: Future<Output = Result<T, E>>,
+    O: FnOnce(Instant),
 {
     tokio::select! {
         biased;
         _ = cancel.cancelled() => RequestWait::Cancelled,
-        response = request => RequestWait::Response(response),
+        result = async move {
+            let request_sent_at = Instant::now();
+            on_first_poll(request_sent_at);
+            (request.await, request_sent_at)
+        } => RequestWait::Response {
+            response: result.0,
+            request_sent_at: result.1,
+        },
         _ = tokio::time::sleep(timeout) => RequestWait::TimedOut,
+    }
+}
+
+struct TtftObservation {
+    request_sent_at: Instant,
+    first_public_delta_sent: bool,
+}
+
+impl TtftObservation {
+    fn new(request_sent_at: Instant) -> Self {
+        Self {
+            request_sent_at,
+            first_public_delta_sent: false,
+        }
+    }
+
+    fn observe_emit(&mut self, is_public_delta: bool, result: &EmitResult) {
+        if is_public_delta && !self.first_public_delta_sent && matches!(result, EmitResult::Sent) {
+            self.first_public_delta_sent = true;
+            tracing::info!(
+                phase = "request_sent_to_first_public_delta",
+                elapsed_ms = self.request_sent_at.elapsed().as_millis() as u64,
+                "provider first public delta"
+            );
+        }
     }
 }
 
@@ -254,59 +291,66 @@ async fn run_chat_stream(
         }
     };
 
-    let request_started = std::time::Instant::now();
-    tracing::info!(phase = "request_sent", "provider request sent");
     let request = client
         .post(spec.endpoint())
         .bearer_auth(api_key)
         .json(&body)
         .send();
-    let response = match await_request(request, &cancel, RESPONSE_HEADER_TIMEOUT).await {
-        RequestWait::Cancelled => {
-            finish_failure(
-                &priority_terminal_tx,
-                &mut assembler,
-                &spec,
-                receive.usage().clone(),
-                "provider request cancelled".to_owned(),
-                "cancelled",
-                true,
-            )
-            .await;
-            return;
-        }
-        RequestWait::TimedOut => {
-            finish_failure(
-                &priority_terminal_tx,
-                &mut assembler,
-                &spec,
-                receive.usage().clone(),
-                format!(
-                    "provider response headers timed out after {} seconds",
-                    RESPONSE_HEADER_TIMEOUT.as_secs()
-                ),
-                "response_header_timeout",
-                cancel.is_cancelled(),
-            )
-            .await;
-            return;
-        }
-        RequestWait::Response(response) => match response {
-            Ok(response) => response,
-            Err(error) => {
+    let (response, request_sent_at) =
+        match await_request(request, &cancel, RESPONSE_HEADER_TIMEOUT, |_| {
+            tracing::info!(phase = "request_sent", "provider request sent")
+        })
+        .await
+        {
+            RequestWait::Cancelled => {
                 finish_failure(
                     &priority_terminal_tx,
                     &mut assembler,
                     &spec,
                     receive.usage().clone(),
-                    error.to_string(),
-                    "request_error",
+                    "provider request cancelled".to_owned(),
+                    "cancelled",
+                    true,
+                )
+                .await;
+                return;
+            }
+            RequestWait::TimedOut => {
+                finish_failure(
+                    &priority_terminal_tx,
+                    &mut assembler,
+                    &spec,
+                    receive.usage().clone(),
+                    format!(
+                        "provider response headers timed out after {} seconds",
+                        RESPONSE_HEADER_TIMEOUT.as_secs()
+                    ),
+                    "response_header_timeout",
                     cancel.is_cancelled(),
                 )
                 .await;
                 return;
             }
-        },
+            RequestWait::Response {
+                response,
+                request_sent_at,
+            } => (response, request_sent_at),
+        };
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            finish_failure(
+                &priority_terminal_tx,
+                &mut assembler,
+                &spec,
+                receive.usage().clone(),
+                error.to_string(),
+                "request_error",
+                cancel.is_cancelled(),
+            )
+            .await;
+            return;
+        }
     };
 
     let mut transport =
@@ -329,7 +373,7 @@ async fn run_chat_stream(
             }
         };
 
-    let mut saw_public_delta = false;
+    let mut ttft = TtftObservation::new(request_sent_at);
     loop {
         match transport.next_event().await {
             Ok(Some(event)) if event.data == "[DONE]" => {
@@ -364,24 +408,15 @@ async fn run_chat_stream(
                         return;
                     }
                 };
-                if !saw_public_delta
-                    && events.iter().any(|event| {
-                        matches!(
-                            event,
-                            ProviderEvent::TextDelta { .. } | ProviderEvent::ThinkingDelta { .. }
-                        )
-                    })
-                {
-                    saw_public_delta = true;
-                    tracing::info!(
-                        phase = "request_sent_to_first_public_delta",
-                        elapsed_ms = request_started.elapsed().as_millis() as u64,
-                        "provider first public delta"
-                    );
-                }
                 let mut events = events.into_iter();
                 while let Some(event) = events.next() {
-                    match emit(&tx, &mut assembler, event, &cancel).await {
+                    let is_public_delta = matches!(
+                        &event,
+                        ProviderEvent::TextDelta { .. } | ProviderEvent::ThinkingDelta { .. }
+                    );
+                    let emit_result = emit(&tx, &mut assembler, event, &cancel).await;
+                    ttft.observe_emit(is_public_delta, &emit_result);
+                    match emit_result {
                         EmitResult::Sent => {}
                         EmitResult::Closed => return,
                         EmitResult::Cancelled => {
@@ -861,6 +896,7 @@ fn adapter_error(error: &ChatAdapterError) -> (String, String) {
         | ChatAdapterError::LegacyFunctionCallUnsupported
         | ChatAdapterError::MissingToolCall
         | ChatAdapterError::IncompleteToolIdentity
+        | ChatAdapterError::AmbiguousToolName { .. }
         | ChatAdapterError::UnexpectedToolCall
         | ChatAdapterError::EventsAfterFinishReason => {
             (error.to_string(), "invalid_provider_stream".to_owned())
@@ -874,6 +910,7 @@ fn adapter_error(error: &ChatAdapterError) -> (String, String) {
         ),
         ChatAdapterError::UnsupportedProtocol
         | ChatAdapterError::InvalidMaxTokens { .. }
+        | ChatAdapterError::InvalidTemperature(_)
         | ChatAdapterError::ReasoningRequired
         | ChatAdapterError::InvalidReasoningEffort(_)
         | ChatAdapterError::RequiredToolChoiceUnsupported => {
@@ -885,6 +922,7 @@ fn adapter_error(error: &ChatAdapterError) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::Cell,
         convert::Infallible,
         env, fs, io,
         os::unix::fs::PermissionsExt,
@@ -1683,22 +1721,88 @@ fi
     }
 
     #[tokio::test]
-    async fn response_header_wait_is_bounded_and_cancel_first() {
+    async fn response_header_wait_is_bounded_and_precancel_does_not_record_request_sent() {
         let cancel = CancellationToken::new();
+        let first_poll_count = Cell::new(0);
         assert!(matches!(
             await_request(
                 std::future::pending::<Result<(), ()>>(),
                 &cancel,
                 Duration::from_millis(1),
+                |_| first_poll_count.set(first_poll_count.get() + 1),
             )
             .await,
             RequestWait::TimedOut
         ));
+        assert_eq!(first_poll_count.get(), 1);
 
         cancel.cancel();
         assert!(matches!(
-            await_request(std::future::ready(Ok::<_, ()>(())), &cancel, Duration::ZERO,).await,
+            await_request(
+                std::future::ready(Ok::<_, ()>(())),
+                &cancel,
+                Duration::ZERO,
+                |_| first_poll_count.set(first_poll_count.get() + 1),
+            )
+            .await,
             RequestWait::Cancelled
+        ));
+        assert_eq!(
+            first_poll_count.get(),
+            1,
+            "pre-cancelled biased select must not record request_sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn normalized_but_unsent_public_delta_does_not_record_ttft() {
+        let registry = FrozenToolSchemaRegistry::compile(&[]).expect("registry");
+        let mut receive = ChatReceiveState::new(registry);
+        let events = receive
+            .push_json(r#"{"choices":[{"delta":{"content":"hello"}}]}"#)
+            .expect("normalized chunk");
+        let delta = events
+            .into_iter()
+            .find(|event| matches!(event, ProviderEvent::TextDelta { .. }))
+            .expect("normalized text delta");
+
+        let (tx, _rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut assembler = MessageAssembler::new();
+        assembler.apply(&ProviderEvent::Start).expect("Start");
+        assembler
+            .apply(&ProviderEvent::TextStart { content_index: 0 })
+            .expect("TextStart");
+        let result = emit(&tx, &mut assembler, delta, &cancel).await;
+        assert!(matches!(result, EmitResult::Cancelled));
+
+        let mut ttft = TtftObservation::new(Instant::now());
+        ttft.observe_emit(true, &result);
+        assert!(!ttft.first_public_delta_sent);
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut assembler = MessageAssembler::new();
+        assembler.apply(&ProviderEvent::Start).expect("Start");
+        assembler
+            .apply(&ProviderEvent::TextStart { content_index: 0 })
+            .expect("TextStart");
+        let result = emit(
+            &tx,
+            &mut assembler,
+            ProviderEvent::TextDelta {
+                content_index: 0,
+                delta: "sent".to_owned(),
+            },
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(matches!(result, EmitResult::Sent));
+        ttft.observe_emit(true, &result);
+        assert!(ttft.first_public_delta_sent);
+        assert!(matches!(
+            rx.recv().await,
+            Some(ProviderEvent::TextDelta { delta, .. }) if delta == "sent"
         ));
     }
 

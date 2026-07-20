@@ -877,6 +877,10 @@ impl FrozenToolSchemaRegistry {
     fn validator(&self, tool_name: &str) -> Option<&FrozenToolSchema> {
         self.validators.get(tool_name)
     }
+
+    pub(crate) fn contains(&self, tool_name: &str) -> bool {
+        self.validators.contains_key(tool_name)
+    }
 }
 
 fn collect_property_names(value: &Value, output: &mut HashSet<String>) {

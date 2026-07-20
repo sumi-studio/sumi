@@ -255,7 +255,7 @@ Cloud release (T25〜T29): M1P・M0〜M5 と依存が満たされた範囲で並
 - 読む: §4.2.1〜§4.2.2、§10.1 provider_context、§13 M1P/Cloud track 1
 - 変更対象: `apps/agent/src/provider/adapters/`、`apps/agent/src/store/`、provider fixture/live test
 - やること: Responses encrypted reasoning/ordered compact outputとAnthropic signature/redacted thinking/compaction blockを、暗号化provider_contextへMessageEndと同一transactionで保存し、再起動後に同じprovider instance/protocol/model/fingerprintへ順序不変で再送する。異なるtrust domainへの送信はfail-closed。公式fixtureとライブ3経路を分離する。さらにT8から引き継いだMoonshot直API(Kimi text/tool/reasoning)、Z.ai直API(GLM tool stream/provider固有finish reason)、Umans(text/tool/reasoning)のcurl raw captureをsanitization前SHA-256・時刻・endpoint・command・sanitization操作付きで固定する
-- 受け入れ: M1Pのdurable round-trip・tool-use継続・cache usage・native compaction全ゲート。kill/restartを挟んだ2ターン目が成功し、公開transcript/FTS/exportにopaque byteが出ない。加えてdirect Moonshot/Z.ai/Umansの`SUMI_LIVE_TEST=1` 2ターン+tool 1往復を全て完走し、Kimi reasoning_content再送が400にならない。credential不足skip、OpenCode gateway capture、synthetic fixtureはこのdirect証拠の代替不可
+- 受け入れ: M1Pのdurable round-trip・tool-use継続・cache usage・native compaction全ゲート。kill/restartを挟んだ2ターン目が成功し、公開transcript/FTS/exportにopaque byteが出ない。`SUMI_LIVE_TEST=1`がdirect Moonshot/Z.ai/Umans release dispatcherを選んだ場合は、3経路の2ターン+tool 1往復を全て完走し、Kimi reasoning_content再送が400にならないことを必須とし、credentialの不足・空値はlive gate失敗にする。credential不要の通常テスト・公式fixtureテストはlive実行と分離し、live未選択時はskipできる。OpenCode gateway captureとsynthetic fixtureはこのdirect証拠の代替不可
 - コミット: `agent: provider context durable round-trip (Cloud provider release)`
 
 ### T26: executor/artifact production deployment 【owner: platform/runtime、要T13,T17】

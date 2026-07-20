@@ -251,6 +251,8 @@ pub enum ChatAdapterError {
     UnsupportedProtocol,
     #[error("max_tokens must be within 1..={max}, got {requested}")]
     InvalidMaxTokens { requested: u64, max: u64 },
+    #[error("temperature must be finite, got {0}")]
+    InvalidTemperature(f64),
     #[error("this model requires reasoning to remain enabled")]
     ReasoningRequired,
     #[error("unsupported reasoning_effort {0}; this model requires max")]
@@ -278,6 +280,13 @@ pub enum ChatAdapterError {
     MissingToolCall,
     #[error("tool call finished without a provider id or function name")]
     IncompleteToolIdentity,
+    #[error(
+        "streamed tool name is ambiguous: standard fragments resolve to {standard}, cumulative chunks resolve to {cumulative}"
+    )]
+    AmbiguousToolName {
+        standard: String,
+        cumulative: String,
+    },
     #[error("finish_reason stop was emitted after tool call deltas")]
     UnexpectedToolCall,
     #[error("stream ended without finish_reason")]
@@ -298,6 +307,11 @@ pub fn build_request(
 ) -> Result<Value, ChatAdapterError> {
     if spec.protocol != ApiProtocol::OpenAiChatCompletions {
         return Err(ChatAdapterError::UnsupportedProtocol);
+    }
+    if let Some(temperature) = options.temperature
+        && !temperature.is_finite()
+    {
+        return Err(ChatAdapterError::InvalidTemperature(temperature));
     }
     let output_tokens = requested_output_tokens(spec, options)?;
     if !spec.compat.supports_required_tool_choice
@@ -1221,7 +1235,7 @@ struct ThinkingState {
 struct ToolState {
     content_index: usize,
     id: String,
-    name: String,
+    name_chunks: Vec<String>,
     accumulator: ToolArgumentAccumulator,
 }
 
@@ -1614,7 +1628,7 @@ impl ChatReceiveState {
             }
             if let Some(function) = tool_delta.function {
                 if let Some(name) = function.name.filter(|name| !name.is_empty()) {
-                    append_fragment(&mut state.name, &name);
+                    state.name_chunks.push(name);
                 }
                 if let Some(arguments) = function.arguments.filter(|value| !value.is_empty()) {
                     let preview = state.accumulator.append(&arguments);
@@ -1654,7 +1668,7 @@ impl ChatReceiveState {
             self.tools.push(Some(ToolState {
                 content_index,
                 id: delta.id.clone().unwrap_or_default(),
-                name: String::new(),
+                name_chunks: Vec::new(),
                 accumulator: ToolArgumentAccumulator::new(),
             }));
             events.push(ProviderEvent::ToolCallStart { content_index });
@@ -1694,10 +1708,28 @@ impl ChatReceiveState {
                 .tools
                 .iter()
                 .flatten()
-                .any(|tool| tool.id.trim().is_empty() || tool.name.trim().is_empty())
+                .any(|tool| tool.id.trim().is_empty() || tool.name_chunks.is_empty())
         {
             return Err(ChatAdapterError::IncompleteToolIdentity);
         }
+        let resolved_tool_names = match stop_reason {
+            StopReason::ToolUse => self
+                .tools
+                .iter()
+                .flatten()
+                .map(|tool| resolve_tool_name(&tool.name_chunks, &self.schemas))
+                .collect::<Result<Vec<_>, _>>()?,
+            // Length rejects every call independently of schema validity, so
+            // preserve the raw standard-fragment view for diagnostics without
+            // resolving it to an executable tool.
+            StopReason::Length => self
+                .tools
+                .iter()
+                .flatten()
+                .map(|tool| tool.name_chunks.concat())
+                .collect(),
+            _ => Vec::new(),
+        };
         let terminal_event_count = usize::from(self.text.is_some())
             .checked_add(usize::from(self.thinking.is_some()))
             .and_then(|count| {
@@ -1727,9 +1759,12 @@ impl ChatReceiveState {
             stop_reason,
             StopReason::Stop | StopReason::ToolUse | StopReason::Length
         ) {
-            for tool in std::mem::take(&mut self.tools).into_iter().flatten() {
+            for (tool, name) in std::mem::take(&mut self.tools)
+                .into_iter()
+                .flatten()
+                .zip(resolved_tool_names)
+            {
                 let id = tool.id;
-                let name = tool.name;
                 let outcome = if stop_reason == StopReason::Length {
                     tool.accumulator.reject_incomplete(id, name, timestamp)
                 } else {
@@ -1952,12 +1987,45 @@ fn reasoning_for_field<'a>(delta: &'a ChatDelta, field: &str) -> Option<&'a str>
     .filter(|value| !value.is_empty())
 }
 
-fn append_fragment(target: &mut String, fragment: &str) {
-    if target.is_empty() || fragment.starts_with(target.as_str()) {
-        target.clear();
-        target.push_str(fragment);
-    } else if !target.starts_with(fragment) {
-        target.push_str(fragment);
+fn resolve_tool_name(
+    chunks: &[String],
+    schemas: &FrozenToolSchemaRegistry,
+) -> Result<String, ChatAdapterError> {
+    let standard = chunks.concat();
+    let cumulative = chunks
+        .split_first()
+        .filter(|(_, rest)| {
+            chunks
+                .windows(2)
+                .all(|window| window[1].starts_with(&window[0]))
+                && rest.iter().all(|chunk| !chunk.is_empty())
+        })
+        .and_then(|_| chunks.last())
+        .cloned();
+
+    let standard_registered = schemas.contains(&standard);
+    let cumulative_registered = cumulative
+        .as_deref()
+        .is_some_and(|name| schemas.contains(name));
+
+    match (
+        standard_registered,
+        cumulative_registered,
+        cumulative.as_deref(),
+    ) {
+        (true, true, Some(cumulative)) if cumulative != standard => {
+            Err(ChatAdapterError::AmbiguousToolName {
+                standard,
+                cumulative: cumulative.to_owned(),
+            })
+        }
+        (true, _, _) => Ok(standard),
+        (false, true, Some(cumulative)) => Ok(cumulative.to_owned()),
+        // A provider may hallucinate a tool name. Keep the deterministic
+        // wire-fragment interpretation and let the frozen schema validator
+        // emit the normal ToolCallRejected/synthetic result pair.
+        (false, false, _) => Ok(standard),
+        (false, true, None) => unreachable!("registered cumulative name must exist"),
     }
 }
 
@@ -2095,6 +2163,13 @@ mod tests {
                 "required": ["path"],
                 "additionalProperties": false
             }),
+        }
+    }
+
+    fn tool_definition_named(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_owned(),
+            ..tool_definition()
         }
     }
 
@@ -2529,6 +2604,63 @@ mod tests {
                 Err(ChatAdapterError::InvalidMaxTokens { .. })
             ));
         }
+    }
+
+    fn assert_invalid_temperature(temperature: f64) {
+        let spec = ModelSpec::preset("glm-5.2").expect("preset");
+        assert!(matches!(
+            build_request(
+                &spec,
+                &simple_context(Vec::new(), Vec::new()),
+                &RequestOptions {
+                    temperature: Some(temperature),
+                    ..RequestOptions::default()
+                },
+            ),
+            Err(ChatAdapterError::InvalidTemperature(value))
+                if value.to_bits() == temperature.to_bits()
+        ));
+    }
+
+    #[test]
+    fn nan_temperature_is_rejected_before_json_construction() {
+        assert_invalid_temperature(f64::NAN);
+    }
+
+    #[test]
+    fn positive_infinite_temperature_is_rejected_before_json_construction() {
+        assert_invalid_temperature(f64::INFINITY);
+    }
+
+    #[test]
+    fn negative_infinite_temperature_is_rejected_before_json_construction() {
+        assert_invalid_temperature(f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn finite_temperature_is_passed_through_only_when_sampling_is_allowed() {
+        let context = simple_context(Vec::new(), Vec::new());
+        let request = build_request(
+            &ModelSpec::preset("glm-5.2").expect("sampling preset"),
+            &context,
+            &RequestOptions {
+                temperature: Some(0.7),
+                ..RequestOptions::default()
+            },
+        )
+        .expect("finite sampling temperature");
+        assert_eq!(request["temperature"], json!(0.7));
+
+        let request = build_request(
+            &ModelSpec::preset("kimi-k3").expect("fixed-sampling preset"),
+            &context,
+            &RequestOptions {
+                temperature: Some(0.7),
+                ..RequestOptions::default()
+            },
+        )
+        .expect("finite disallowed temperature is omitted");
+        assert!(request.get("temperature").is_none());
     }
 
     #[test]
@@ -3624,6 +3756,106 @@ mod tests {
             event,
             ProviderEvent::ToolCallEnd { tool_call, .. } if tool_call.name == "read_file"
         )));
+    }
+
+    fn finish_streamed_tool_name(
+        registered_names: &[&str],
+        chunks: &[&str],
+    ) -> Result<ChatTerminal, ChatAdapterError> {
+        let tools = registered_names
+            .iter()
+            .map(|name| tool_definition_named(name))
+            .collect::<Vec<_>>();
+        let registry = FrozenToolSchemaRegistry::compile(&tools).expect("registry");
+        let mut receive = ChatReceiveState::new(registry);
+        for (index, name) in chunks.iter().enumerate() {
+            let mut function = json!({"name": name});
+            if index == 0 {
+                function["arguments"] = json!("{\"path\":\"a.txt\"}");
+            }
+            receive
+                .push_json(
+                    &json!({
+                        "choices": [{
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "id": (index == 0).then_some("call-1"),
+                                    "function": function
+                                }]
+                            }
+                        }]
+                    })
+                    .to_string(),
+                )
+                .expect("tool name chunk");
+        }
+        receive
+            .push_json(r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#)
+            .expect("finish chunk");
+        receive.finish(Utc::now())
+    }
+
+    #[test]
+    fn fragmented_tool_name_resolves_uniquely_with_shorter_and_longer_names_registered() {
+        let terminal =
+            finish_streamed_tool_name(&["foo", "foofoo"], &["fo", "o"]).expect("terminal");
+        assert!(terminal.events.iter().any(|event| matches!(
+            event,
+            ProviderEvent::ToolCallEnd { tool_call, .. } if tool_call.name == "foo"
+        )));
+    }
+
+    #[test]
+    fn cumulative_tool_name_resolves_uniquely_with_shorter_and_longer_names_registered() {
+        let terminal =
+            finish_streamed_tool_name(&["foo", "foofoo"], &["foo", "foofoo"]).expect("terminal");
+        assert!(terminal.events.iter().any(|event| matches!(
+            event,
+            ProviderEvent::ToolCallEnd { tool_call, .. } if tool_call.name == "foofoo"
+        )));
+    }
+
+    #[test]
+    fn repeated_name_chunks_fail_closed_when_interpretations_are_distinct_registered_tools() {
+        assert!(matches!(
+            finish_streamed_tool_name(&["foo", "foofoo"], &["foo", "foo"]),
+            Err(ChatAdapterError::AmbiguousToolName {
+                standard,
+                cumulative
+            }) if standard == "foofoo" && cumulative == "foo"
+        ));
+    }
+
+    #[test]
+    fn unknown_tool_name_emits_rejection_pair_without_executable_tool_call() {
+        let terminal = finish_streamed_tool_name(&["foo", "foofoo"], &["foofoo", "foo"])
+            .expect("unknown tool names remain a normal rejected tool call");
+        assert_eq!(terminal.stop_reason, StopReason::ToolUse);
+        assert!(
+            !terminal
+                .events
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::ToolCallEnd { .. }))
+        );
+        let rejected = terminal
+            .events
+            .iter()
+            .find_map(|event| match event {
+                ProviderEvent::ToolCallRejected {
+                    rejected,
+                    synthetic_result,
+                    ..
+                } => Some((rejected, synthetic_result)),
+                _ => None,
+            })
+            .expect("unknown tool call rejection");
+        assert_eq!(rejected.0.id, "call-1");
+        assert_eq!(rejected.0.name, "foofoofoo");
+        assert_eq!(rejected.0.error, ToolArgumentError::SchemaViolation);
+        assert!(rejected.1.is_error);
+        assert_eq!(rejected.1.tool_call_id, rejected.0.id);
+        assert_eq!(rejected.1.tool_name, rejected.0.name);
     }
 
     #[test]
