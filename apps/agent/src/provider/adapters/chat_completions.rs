@@ -9,241 +9,12 @@ use crate::provider::{
     assembler::{
         FrozenToolSchemaRegistry, ResponseBudget, ToolArgumentAccumulator, ToolArgumentOutcome,
     },
+    model::{ChatCompat, MaxTokensField, ModelSpec, RequestOptions, ThinkingFormat},
     types::{
         ApiProtocol, AssistantContent, ContextMessage, MemoryLayer, Message, PromptContext,
-        ProviderEvent, ProviderOrigin, RawUsage, StopReason, ToolDefinition, ToolResultMessage,
-        Usage, UserContent,
+        ProviderEvent, RawUsage, StopReason, ToolDefinition, ToolResultMessage, Usage, UserContent,
     },
 };
-
-const DEFAULT_OUTPUT_TOKENS: u64 = 16_384;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MaxTokensField {
-    MaxTokens,
-    MaxCompletionTokens,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ThinkingFormat {
-    Off,
-    Deepseek,
-    Zai,
-    OpenAiEffort,
-    /// Gateway dialect has not been proven by a live fixture. Do not send a
-    /// provider-specific thinking control object.
-    ProviderDefault,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ChatCompat {
-    pub max_tokens_field: MaxTokensField,
-    pub supports_usage_in_streaming: bool,
-    pub thinking_format: ThinkingFormat,
-    pub requires_reasoning_content_on_assistant: bool,
-    pub zai_tool_stream: bool,
-    pub supports_strict_mode: bool,
-    pub supports_required_tool_choice: bool,
-    pub supports_store: bool,
-    pub supports_developer_role: bool,
-    pub allows_sampling_parameters: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ModelSpec {
-    pub id: String,
-    pub provider: String,
-    pub base_url: String,
-    pub account_scope: String,
-    pub api_key_env: String,
-    pub context_window: u64,
-    pub max_output_tokens: u64,
-    pub default_output_tokens: u64,
-    pub reasoning: bool,
-    pub supports_images: bool,
-    pub protocol: ApiProtocol,
-    pub compat: ChatCompat,
-}
-
-impl ModelSpec {
-    pub fn preset(name: &str) -> Option<Self> {
-        let (
-            id,
-            provider,
-            base_url,
-            api_key_env,
-            context_window,
-            max_output_tokens,
-            supports_images,
-            compat,
-        ) = match name {
-            "kimi-k3" => (
-                "kimi-k3",
-                "moonshot",
-                "https://api.moonshot.ai/v1",
-                "MOONSHOT_API_KEY",
-                1_048_576,
-                1_048_576,
-                true,
-                ChatCompat {
-                    max_tokens_field: MaxTokensField::MaxCompletionTokens,
-                    supports_usage_in_streaming: true,
-                    thinking_format: ThinkingFormat::OpenAiEffort,
-                    requires_reasoning_content_on_assistant: true,
-                    zai_tool_stream: false,
-                    supports_strict_mode: true,
-                    supports_required_tool_choice: true,
-                    supports_store: false,
-                    supports_developer_role: false,
-                    allows_sampling_parameters: false,
-                },
-            ),
-            "glm-5.2" => (
-                "glm-5.2",
-                "zai",
-                "https://api.z.ai/api/paas/v4",
-                "ZAI_API_KEY",
-                1_000_000,
-                131_072,
-                false,
-                ChatCompat {
-                    max_tokens_field: MaxTokensField::MaxTokens,
-                    supports_usage_in_streaming: true,
-                    thinking_format: ThinkingFormat::Zai,
-                    requires_reasoning_content_on_assistant: false,
-                    zai_tool_stream: true,
-                    supports_strict_mode: false,
-                    supports_required_tool_choice: true,
-                    supports_store: false,
-                    supports_developer_role: false,
-                    allows_sampling_parameters: true,
-                },
-            ),
-            "umans" | "umans-kimi-k2.7" => (
-                "umans-kimi-k2.7",
-                "umans",
-                "https://api.code.umans.ai/v1",
-                "UMANS_API_KEY",
-                262_144,
-                32_768,
-                false,
-                ChatCompat {
-                    max_tokens_field: MaxTokensField::MaxTokens,
-                    supports_usage_in_streaming: true,
-                    thinking_format: ThinkingFormat::ProviderDefault,
-                    requires_reasoning_content_on_assistant: false,
-                    zai_tool_stream: false,
-                    supports_strict_mode: false,
-                    supports_required_tool_choice: true,
-                    supports_store: false,
-                    supports_developer_role: false,
-                    allows_sampling_parameters: true,
-                },
-            ),
-            "opencode-go" | "opencode-zen-go" => (
-                "kimi-k2.7-code",
-                "opencode-go",
-                "https://opencode.ai/zen/go/v1",
-                "OPENCODE_GO_API_KEY",
-                262_144,
-                32_768,
-                false,
-                ChatCompat {
-                    max_tokens_field: MaxTokensField::MaxTokens,
-                    supports_usage_in_streaming: true,
-                    thinking_format: ThinkingFormat::ProviderDefault,
-                    requires_reasoning_content_on_assistant: false,
-                    zai_tool_stream: false,
-                    supports_strict_mode: false,
-                    supports_required_tool_choice: false,
-                    supports_store: false,
-                    supports_developer_role: false,
-                    allows_sampling_parameters: true,
-                },
-            ),
-            _ => return None,
-        };
-
-        Some(Self {
-            id: id.to_owned(),
-            provider: provider.to_owned(),
-            base_url: base_url.to_owned(),
-            account_scope: "default".to_owned(),
-            api_key_env: api_key_env.to_owned(),
-            context_window,
-            max_output_tokens,
-            default_output_tokens: DEFAULT_OUTPUT_TOKENS.min(max_output_tokens),
-            reasoning: true,
-            supports_images,
-            protocol: ApiProtocol::OpenAiChatCompletions,
-            compat,
-        })
-    }
-
-    pub fn endpoint(&self) -> String {
-        format!("{}/chat/completions", normalize_base_url(&self.base_url))
-    }
-
-    pub fn origin(&self) -> ProviderOrigin {
-        ProviderOrigin {
-            provider_instance_id: self.provider_instance_id(),
-            protocol: self.protocol,
-            model: self.id.clone(),
-        }
-    }
-
-    pub fn provider_instance_id(&self) -> String {
-        let endpoint = provider_instance_endpoint(&self.base_url);
-        let protocol = protocol_tag(self.protocol);
-        format!(
-            "v1|{}|{}|{}|{}",
-            identity_part(&self.provider),
-            identity_part(&endpoint),
-            identity_part(&self.account_scope),
-            identity_part(protocol)
-        )
-    }
-
-    pub fn set_model_id(&mut self, id: impl Into<String>) {
-        self.id = id.into();
-    }
-}
-
-fn normalize_base_url(base_url: &str) -> String {
-    base_url.trim().trim_end_matches('/').to_owned()
-}
-
-fn provider_instance_endpoint(base_url: &str) -> String {
-    let normalized = normalize_base_url(base_url);
-    let Ok(mut url) = reqwest::Url::parse(&normalized) else {
-        return "invalid-url".to_owned();
-    };
-    url.set_query(None);
-    url.set_fragment(None);
-    let _ = url.set_username("");
-    let _ = url.set_password(None);
-    url.to_string().trim_end_matches('/').to_owned()
-}
-
-fn identity_part(value: &str) -> String {
-    format!("{}:{value}", value.len())
-}
-
-const fn protocol_tag(protocol: ApiProtocol) -> &'static str {
-    match protocol {
-        ApiProtocol::OpenAiChatCompletions => "open_ai_chat_completions",
-        ApiProtocol::OpenAiResponses => "open_ai_responses",
-        ApiProtocol::AnthropicMessages => "anthropic_messages",
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct RequestOptions {
-    pub max_tokens: Option<u64>,
-    pub temperature: Option<f64>,
-    pub tool_choice: Option<Value>,
-    pub reasoning_effort: Option<String>,
-}
 
 #[derive(Debug, Error)]
 pub enum ChatAdapterError {
@@ -251,6 +22,8 @@ pub enum ChatAdapterError {
     UnsupportedProtocol,
     #[error("max_tokens must be within 1..={max}, got {requested}")]
     InvalidMaxTokens { requested: u64, max: u64 },
+    #[error("temperature must be finite, got {0}")]
+    InvalidTemperature(f64),
     #[error("this model requires reasoning to remain enabled")]
     ReasoningRequired,
     #[error("unsupported reasoning_effort {0}; this model requires max")]
@@ -278,6 +51,13 @@ pub enum ChatAdapterError {
     MissingToolCall,
     #[error("tool call finished without a provider id or function name")]
     IncompleteToolIdentity,
+    #[error(
+        "streamed tool name is ambiguous: standard fragments resolve to {standard}, cumulative chunks resolve to {cumulative}"
+    )]
+    AmbiguousToolName {
+        standard: String,
+        cumulative: String,
+    },
     #[error("finish_reason stop was emitted after tool call deltas")]
     UnexpectedToolCall,
     #[error("stream ended without finish_reason")]
@@ -299,8 +79,16 @@ pub fn build_request(
     if spec.protocol != ApiProtocol::OpenAiChatCompletions {
         return Err(ChatAdapterError::UnsupportedProtocol);
     }
+    let compat = spec
+        .chat_compat()
+        .ok_or(ChatAdapterError::UnsupportedProtocol)?;
+    if let Some(temperature) = options.temperature
+        && !temperature.is_finite()
+    {
+        return Err(ChatAdapterError::InvalidTemperature(temperature));
+    }
     let output_tokens = requested_output_tokens(spec, options)?;
-    if !spec.compat.supports_required_tool_choice
+    if !compat.supports_required_tool_choice
         && matches!(
             options.tool_choice.as_ref(),
             Some(Value::String(tool_choice)) if tool_choice == "required"
@@ -308,7 +96,7 @@ pub fn build_request(
     {
         return Err(ChatAdapterError::RequiredToolChoiceUnsupported);
     }
-    if spec.compat.thinking_format == ThinkingFormat::OpenAiEffort {
+    if compat.thinking_format == ThinkingFormat::OpenAiEffort {
         if !spec.reasoning {
             return Err(ChatAdapterError::ReasoningRequired);
         }
@@ -327,20 +115,20 @@ pub fn build_request(
     );
     request.insert("stream".to_owned(), json!(true));
 
-    if spec.compat.supports_usage_in_streaming {
+    if compat.supports_usage_in_streaming {
         request.insert("stream_options".to_owned(), json!({"include_usage": true}));
     }
-    if spec.compat.supports_store {
+    if compat.supports_store {
         request.insert("store".to_owned(), json!(false));
     }
 
-    let max_tokens_key = match spec.compat.max_tokens_field {
+    let max_tokens_key = match compat.max_tokens_field {
         MaxTokensField::MaxTokens => "max_tokens",
         MaxTokensField::MaxCompletionTokens => "max_completion_tokens",
     };
     request.insert(max_tokens_key.to_owned(), json!(output_tokens));
 
-    if spec.compat.allows_sampling_parameters
+    if compat.allows_sampling_parameters
         && let Some(temperature) = options.temperature
     {
         request.insert("temperature".to_owned(), json!(temperature));
@@ -360,17 +148,17 @@ pub fn build_request(
                 context
                     .tools
                     .iter()
-                    .map(|tool| convert_tool(tool, &spec.compat))
+                    .map(|tool| convert_tool(tool, compat))
                     .collect(),
             ),
         );
-        if spec.compat.zai_tool_stream {
+        if compat.zai_tool_stream {
             request.insert("tool_stream".to_owned(), json!(true));
         }
     }
 
     if spec.reasoning {
-        match spec.compat.thinking_format {
+        match compat.thinking_format {
             ThinkingFormat::Off | ThinkingFormat::ProviderDefault => {}
             ThinkingFormat::Deepseek => {
                 request.insert("thinking".to_owned(), json!({"type": "enabled"}));
@@ -408,9 +196,12 @@ pub fn requested_output_tokens(
 }
 
 fn convert_messages(spec: &ModelSpec, context: &PromptContext) -> Vec<Value> {
+    let compat = spec
+        .chat_compat()
+        .expect("convert_messages is called only after protocol validation");
     let mut output = Vec::new();
     if !context.system_prompt.is_empty() {
-        let role = if spec.reasoning && spec.compat.supports_developer_role {
+        let role = if spec.reasoning && compat.supports_developer_role {
             "developer"
         } else {
             "system"
@@ -504,7 +295,7 @@ fn convert_messages(spec: &ModelSpec, context: &PromptContext) -> Vec<Value> {
                 if !tool_calls.is_empty() {
                     assistant.insert("tool_calls".to_owned(), Value::Array(tool_calls));
                 }
-                if spec.compat.requires_reasoning_content_on_assistant
+                if compat.requires_reasoning_content_on_assistant
                     && !assistant.contains_key("reasoning_content")
                 {
                     assistant.insert("reasoning_content".to_owned(), json!(""));
@@ -1221,7 +1012,7 @@ struct ThinkingState {
 struct ToolState {
     content_index: usize,
     id: String,
-    name: String,
+    name_chunks: Vec<String>,
     accumulator: ToolArgumentAccumulator,
 }
 
@@ -1614,7 +1405,7 @@ impl ChatReceiveState {
             }
             if let Some(function) = tool_delta.function {
                 if let Some(name) = function.name.filter(|name| !name.is_empty()) {
-                    append_fragment(&mut state.name, &name);
+                    state.name_chunks.push(name);
                 }
                 if let Some(arguments) = function.arguments.filter(|value| !value.is_empty()) {
                     let preview = state.accumulator.append(&arguments);
@@ -1654,7 +1445,7 @@ impl ChatReceiveState {
             self.tools.push(Some(ToolState {
                 content_index,
                 id: delta.id.clone().unwrap_or_default(),
-                name: String::new(),
+                name_chunks: Vec::new(),
                 accumulator: ToolArgumentAccumulator::new(),
             }));
             events.push(ProviderEvent::ToolCallStart { content_index });
@@ -1694,10 +1485,25 @@ impl ChatReceiveState {
                 .tools
                 .iter()
                 .flatten()
-                .any(|tool| tool.id.trim().is_empty() || tool.name.trim().is_empty())
+                .any(|tool| tool.id.trim().is_empty() || tool.name_chunks.is_empty())
         {
             return Err(ChatAdapterError::IncompleteToolIdentity);
         }
+        let resolved_tool_names = match stop_reason {
+            StopReason::ToolUse => self
+                .tools
+                .iter()
+                .flatten()
+                .map(|tool| resolve_tool_name(&tool.name_chunks, &self.schemas))
+                .collect::<Result<Vec<_>, _>>()?,
+            StopReason::Length => self
+                .tools
+                .iter()
+                .flatten()
+                .map(|tool| tool.name_chunks.concat())
+                .collect(),
+            _ => Vec::new(),
+        };
         let terminal_event_count = usize::from(self.text.is_some())
             .checked_add(usize::from(self.thinking.is_some()))
             .and_then(|count| {
@@ -1727,9 +1533,12 @@ impl ChatReceiveState {
             stop_reason,
             StopReason::Stop | StopReason::ToolUse | StopReason::Length
         ) {
-            for tool in std::mem::take(&mut self.tools).into_iter().flatten() {
+            for (tool, name) in std::mem::take(&mut self.tools)
+                .into_iter()
+                .flatten()
+                .zip(resolved_tool_names)
+            {
                 let id = tool.id;
-                let name = tool.name;
                 let outcome = if stop_reason == StopReason::Length {
                     tool.accumulator.reject_incomplete(id, name, timestamp)
                 } else {
@@ -1952,12 +1761,42 @@ fn reasoning_for_field<'a>(delta: &'a ChatDelta, field: &str) -> Option<&'a str>
     .filter(|value| !value.is_empty())
 }
 
-fn append_fragment(target: &mut String, fragment: &str) {
-    if target.is_empty() || fragment.starts_with(target.as_str()) {
-        target.clear();
-        target.push_str(fragment);
-    } else if !target.starts_with(fragment) {
-        target.push_str(fragment);
+fn resolve_tool_name(
+    chunks: &[String],
+    schemas: &FrozenToolSchemaRegistry,
+) -> Result<String, ChatAdapterError> {
+    let standard = chunks.concat();
+    let cumulative = chunks
+        .split_first()
+        .filter(|(_, rest)| {
+            chunks
+                .windows(2)
+                .all(|window| window[1].starts_with(&window[0]))
+                && rest.iter().all(|chunk| !chunk.is_empty())
+        })
+        .and_then(|_| chunks.last())
+        .cloned();
+
+    let standard_registered = schemas.contains(&standard);
+    let cumulative_registered = cumulative
+        .as_deref()
+        .is_some_and(|name| schemas.contains(name));
+
+    match (
+        standard_registered,
+        cumulative_registered,
+        cumulative.as_deref(),
+    ) {
+        (true, true, Some(cumulative)) if cumulative != standard => {
+            Err(ChatAdapterError::AmbiguousToolName {
+                standard,
+                cumulative: cumulative.to_owned(),
+            })
+        }
+        (true, _, _) => Ok(standard),
+        (false, true, Some(cumulative)) => Ok(cumulative.to_owned()),
+        (false, false, _) => Ok(standard),
+        (false, true, None) => unreachable!("registered cumulative name must exist"),
     }
 }
 
@@ -2095,6 +1934,13 @@ mod tests {
                 "required": ["path"],
                 "additionalProperties": false
             }),
+        }
+    }
+
+    fn tool_definition_named(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_owned(),
+            ..tool_definition()
         }
     }
 
@@ -2363,7 +2209,10 @@ mod tests {
         )
         .expect("request");
 
-        assert_eq!(request["max_completion_tokens"], DEFAULT_OUTPUT_TOKENS);
+        assert_eq!(
+            request["max_completion_tokens"],
+            crate::provider::model::DEFAULT_OUTPUT_TOKENS
+        );
         assert_eq!(request["reasoning_effort"], "max");
         assert!(request.get("thinking").is_none());
         assert!(request.get("temperature").is_none());
@@ -2529,6 +2378,63 @@ mod tests {
                 Err(ChatAdapterError::InvalidMaxTokens { .. })
             ));
         }
+    }
+
+    fn assert_invalid_temperature(temperature: f64) {
+        let spec = ModelSpec::preset("glm-5.2").expect("preset");
+        assert!(matches!(
+            build_request(
+                &spec,
+                &simple_context(Vec::new(), Vec::new()),
+                &RequestOptions {
+                    temperature: Some(temperature),
+                    ..RequestOptions::default()
+                },
+            ),
+            Err(ChatAdapterError::InvalidTemperature(value))
+                if value.to_bits() == temperature.to_bits()
+        ));
+    }
+
+    #[test]
+    fn nan_temperature_is_rejected_before_json_construction() {
+        assert_invalid_temperature(f64::NAN);
+    }
+
+    #[test]
+    fn positive_infinite_temperature_is_rejected_before_json_construction() {
+        assert_invalid_temperature(f64::INFINITY);
+    }
+
+    #[test]
+    fn negative_infinite_temperature_is_rejected_before_json_construction() {
+        assert_invalid_temperature(f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn finite_temperature_is_passed_through_only_when_sampling_is_allowed() {
+        let context = simple_context(Vec::new(), Vec::new());
+        let request = build_request(
+            &ModelSpec::preset("glm-5.2").expect("sampling preset"),
+            &context,
+            &RequestOptions {
+                temperature: Some(0.7),
+                ..RequestOptions::default()
+            },
+        )
+        .expect("finite sampling temperature");
+        assert_eq!(request["temperature"], json!(0.7));
+
+        let request = build_request(
+            &ModelSpec::preset("kimi-k3").expect("fixed-sampling preset"),
+            &context,
+            &RequestOptions {
+                temperature: Some(0.7),
+                ..RequestOptions::default()
+            },
+        )
+        .expect("finite disallowed temperature is omitted");
+        assert!(request.get("temperature").is_none());
     }
 
     #[test]
@@ -3624,6 +3530,106 @@ mod tests {
             event,
             ProviderEvent::ToolCallEnd { tool_call, .. } if tool_call.name == "read_file"
         )));
+    }
+
+    fn finish_streamed_tool_name(
+        registered_names: &[&str],
+        chunks: &[&str],
+    ) -> Result<ChatTerminal, ChatAdapterError> {
+        let tools = registered_names
+            .iter()
+            .map(|name| tool_definition_named(name))
+            .collect::<Vec<_>>();
+        let registry = FrozenToolSchemaRegistry::compile(&tools).expect("registry");
+        let mut receive = ChatReceiveState::new(registry);
+        for (index, name) in chunks.iter().enumerate() {
+            let mut function = json!({"name": name});
+            if index == 0 {
+                function["arguments"] = json!("{\"path\":\"a.txt\"}");
+            }
+            receive
+                .push_json(
+                    &json!({
+                        "choices": [{
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "id": (index == 0).then_some("call-1"),
+                                    "function": function
+                                }]
+                            }
+                        }]
+                    })
+                    .to_string(),
+                )
+                .expect("tool name chunk");
+        }
+        receive
+            .push_json(r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#)
+            .expect("finish chunk");
+        receive.finish(Utc::now())
+    }
+
+    #[test]
+    fn fragmented_tool_name_resolves_uniquely_with_shorter_and_longer_names_registered() {
+        let terminal =
+            finish_streamed_tool_name(&["foo", "foofoo"], &["fo", "o"]).expect("terminal");
+        assert!(terminal.events.iter().any(|event| matches!(
+            event,
+            ProviderEvent::ToolCallEnd { tool_call, .. } if tool_call.name == "foo"
+        )));
+    }
+
+    #[test]
+    fn cumulative_tool_name_resolves_uniquely_with_shorter_and_longer_names_registered() {
+        let terminal =
+            finish_streamed_tool_name(&["foo", "foofoo"], &["foo", "foofoo"]).expect("terminal");
+        assert!(terminal.events.iter().any(|event| matches!(
+            event,
+            ProviderEvent::ToolCallEnd { tool_call, .. } if tool_call.name == "foofoo"
+        )));
+    }
+
+    #[test]
+    fn repeated_name_chunks_fail_closed_when_interpretations_are_distinct_registered_tools() {
+        assert!(matches!(
+            finish_streamed_tool_name(&["foo", "foofoo"], &["foo", "foo"]),
+            Err(ChatAdapterError::AmbiguousToolName {
+                standard,
+                cumulative
+            }) if standard == "foofoo" && cumulative == "foo"
+        ));
+    }
+
+    #[test]
+    fn unknown_tool_name_emits_rejection_pair_without_executable_tool_call() {
+        let terminal = finish_streamed_tool_name(&["foo", "foofoo"], &["foofoo", "foo"])
+            .expect("unknown tool names remain a normal rejected tool call");
+        assert_eq!(terminal.stop_reason, StopReason::ToolUse);
+        assert!(
+            !terminal
+                .events
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::ToolCallEnd { .. }))
+        );
+        let rejected = terminal
+            .events
+            .iter()
+            .find_map(|event| match event {
+                ProviderEvent::ToolCallRejected {
+                    rejected,
+                    synthetic_result,
+                    ..
+                } => Some((rejected, synthetic_result)),
+                _ => None,
+            })
+            .expect("unknown tool call rejection");
+        assert_eq!(rejected.0.id, "call-1");
+        assert_eq!(rejected.0.name, "foofoofoo");
+        assert_eq!(rejected.0.error, ToolArgumentError::SchemaViolation);
+        assert!(rejected.1.is_error);
+        assert_eq!(rejected.1.tool_call_id, rejected.0.id);
+        assert_eq!(rejected.1.tool_name, rejected.0.name);
     }
 
     #[test]

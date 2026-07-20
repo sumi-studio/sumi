@@ -150,8 +150,8 @@ Cloud release (T25〜T29): M1P・M0〜M5 と依存が満たされた範囲で並
 
 - 読む: §5.3、#11〜#12、#24、pi: `ai/src/api/transform-messages.ts` **全文**(全223行。計画書の旧行番号は誤り)
 - 作る: `src/memory/transform.rs`(mod 宣言は memory/mod.rs に最小追記)
-- やること: 純関数 `transform(&[ContextMessage]) -> Vec<ContextMessage>`(anchor identity を壊さない — §3.4 の Persisted/Synthetic)。孤児ツールコールへの合成結果挿入(user 分断位置・末尾未解決も)、Error/Aborted スキップ(**interrupted=true は保持**。未実行 ToolCall は §6.3 手順2が保存時に破棄済み)、**クロスモデル/別instance/別protocol の thinking は送信 view から除外**(pi の平文化分岐は移植しない)、**`RejectedToolCall`+is_error 対→protocol-neutral な user 相当診断1件へ変換**(実行可能 tool call へ復元しない)、ID 40字正規化
-- 受け入れ: テーブルテスト15ケース以上(abort直後/ステア分断/多重孤児/interrupted テキスト空/RejectedToolCall 対/anchor 保持)
+- やること: 純関数 `transform(&[ContextMessage], destination: &ProviderOrigin) -> Vec<ContextMessage>`。`destination` は選択済み `ModelSpec::origin()` から呼出し直前に導出し、保存済みmessageのoriginやcache値で代用しない。anchor identity を壊さない(§3.4 の Persisted/Synthetic)。孤児ツールコールへの合成結果挿入(user 分断位置・末尾未解決も)、Error/Aborted スキップ(**interrupted=true は保持**。未実行 ToolCall は §6.3 手順2が保存時に破棄済み)、**生成元とdestinationの`provider_instance_id/protocol/model`が完全一致するassistant flowではthinkingとtool call/result IDをbyte-preserve**する。3要素のいずれかが不一致ならthinkingだけを送信viewから除外する(pi の平文化分岐は移植しない)。tool call/result IDは、**origin不一致かつdestination protocolのwire制約に適合させる必要がある場合だけ**、同じassistant tool flow内のcall/result対へ同一のbounded mappingを適用して正規化する。mappingはそのflowのID数を上限として閉じ、次turnへ再利用しない。制約のないdestinationやsame-originのIDは書き換えない。**`RejectedToolCall`+is_error 対→protocol-neutral な user 相当診断1件へ変換**(実行可能 tool call へ復元しない)
+- 受け入れ: テーブルテスト15ケース以上(abort直後/ステア分断/多重孤児/interrupted テキスト空/RejectedToolCall 対/anchor 保持)。加えてorigin完全一致でthinkingとcall/result IDがbyte一致、`provider_instance_id`のみ・`protocol`のみ・`model`のみの各不一致でthinking markerが消えること、cross-originかつ40字制約destinationで長いIDのcall/result対が同じ上限内IDへ写ること、連続turnでmapping stateを再利用しないこと、制約なしcross-originではIDを保持することを固定する
 - コミット: `agent: 履歴再送の正規化 transform (pi transform-messages 移植+Sumi拡張)`
 
 ### T15: agent/ ループ+Session actor 【要T8,T12,T13,T14】
@@ -255,7 +255,7 @@ Cloud release (T25〜T29): M1P・M0〜M5 と依存が満たされた範囲で並
 - 読む: §4.2.1〜§4.2.2、§10.1 provider_context、§13 M1P/Cloud track 1
 - 変更対象: `apps/agent/src/provider/adapters/`、`apps/agent/src/store/`、provider fixture/live test
 - やること: Responses encrypted reasoning/ordered compact outputとAnthropic signature/redacted thinking/compaction blockを、暗号化provider_contextへMessageEndと同一transactionで保存し、再起動後に同じprovider instance/protocol/model/fingerprintへ順序不変で再送する。異なるtrust domainへの送信はfail-closed。公式fixtureとライブ3経路を分離する。さらにT8から引き継いだMoonshot直API(Kimi text/tool/reasoning)、Z.ai直API(GLM tool stream/provider固有finish reason)、Umans(text/tool/reasoning)のcurl raw captureをsanitization前SHA-256・時刻・endpoint・command・sanitization操作付きで固定する
-- 受け入れ: M1Pのdurable round-trip・tool-use継続・cache usage・native compaction全ゲート。kill/restartを挟んだ2ターン目が成功し、公開transcript/FTS/exportにopaque byteが出ない。加えてdirect Moonshot/Z.ai/Umansの`SUMI_LIVE_TEST=1` 2ターン+tool 1往復を全て完走し、Kimi reasoning_content再送が400にならない。credential不足skip、OpenCode gateway capture、synthetic fixtureはこのdirect証拠の代替不可
+- 受け入れ: M1Pのdurable round-trip・tool-use継続・cache usage・native compaction全ゲート。kill/restartを挟んだ2ターン目が成功し、公開transcript/FTS/exportにopaque byteが出ない。`SUMI_LIVE_TEST=1`がdirect Moonshot/Z.ai/Umans release dispatcherを選んだ場合は、3経路の2ターン+tool 1往復を全て完走し、Kimi reasoning_content再送が400にならないことを必須とし、credentialの不足・空値はlive gate失敗にする。credential不要の通常テスト・公式fixtureテストはlive実行と分離し、live未選択時はskipできる。OpenCode gateway captureとsynthetic fixtureはこのdirect証拠の代替不可
 - コミット: `agent: provider context durable round-trip (Cloud provider release)`
 
 ### T26: executor/artifact production deployment 【owner: platform/runtime、要T13,T17】

@@ -2,6 +2,7 @@
 
 pub mod adapters;
 pub mod assembler;
+pub mod model;
 pub mod overflow;
 pub mod partial_json;
 pub mod retry;
@@ -12,32 +13,79 @@ use std::{
     env,
     future::Future,
     sync::{Arc, OnceLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+use adapters::anthropic::{
+    AnthropicAdapterError, AnthropicReceiveState, AnthropicTerminal,
+    build_request as build_anthropic_request, request_coverage as anthropic_request_coverage,
+    requested_output_tokens as anthropic_requested_output_tokens,
+};
 use adapters::chat_completions::{
-    ChatAdapterError, ChatReceiveState, ChatTerminal, ModelSpec, RequestOptions, build_request,
-    requested_output_tokens,
+    ChatAdapterError, ChatReceiveState, ChatTerminal, build_request,
+    requested_output_tokens as chat_requested_output_tokens,
+};
+pub use adapters::responses::NativeCompactionResult;
+use adapters::responses::{
+    ResponsesAdapterError, ResponsesReceiveState, ResponsesTerminal, build_compact_request,
+    build_request as build_responses_request,
+    derive_compaction_coverage as responses_compaction_coverage, parse_compact_response,
+    requested_output_tokens as responses_requested_output_tokens, validate_event_name,
 };
 use assembler::{FrozenToolSchemaRegistry, MessageAssembler, ResponseBudget, TerminalMetadata};
 use chrono::Utc;
+use futures_util::StreamExt;
+pub use model::{
+    AnthropicCompat, ChatCompat, ModelSpec, ProtocolCompat, RequestOptions, ResponsesCompat,
+};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use transport::{SseError, SseStream};
 use types::{
-    AssistantMessage, PromptContext, ProviderEvent, ProviderEventStream, ProviderOutput,
-    StopReason, SuccessTerminalCommit, Usage,
+    ApiProtocol, AssistantMessage, PromptContext, ProviderEvent, ProviderEventStream,
+    ProviderOutput, StopReason, SuccessTerminalCommit, Usage,
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
+const RESPONSE_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_PROVIDER_ERROR_BODY_BYTES: usize = 16_000;
 
 enum RequestWait<T, E> {
     Response(Result<T, E>),
     Cancelled,
     TimedOut,
+}
+
+enum ObservedRequestWait<T, E> {
+    Response {
+        response: Result<T, E>,
+        request_sent_at: Instant,
+    },
+    Cancelled,
+    TimedOut,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum NativeCompactionError {
+    #[error("native compaction was cancelled")]
+    Cancelled,
+    #[error("native compaction request is invalid: {0}")]
+    InvalidRequest(String),
+    #[error("native compaction transport failed: {0}")]
+    Transport(String),
+    #[error("native compaction response headers timed out")]
+    HeaderTimeout,
+    #[error("native compaction response body was idle for 120 seconds")]
+    BodyIdleTimeout,
+    #[error("{status}: {body}")]
+    Http { status: u16, body: String },
+    #[error("native compaction response exceeded {limit} bytes")]
+    ResponseLimitExceeded { limit: usize },
+    #[error("native compaction response is invalid: {0}")]
+    InvalidResponse(String),
 }
 
 struct ProducerChannels {
@@ -59,6 +107,56 @@ where
         _ = cancel.cancelled() => RequestWait::Cancelled,
         response = request => RequestWait::Response(response),
         _ = tokio::time::sleep(timeout) => RequestWait::TimedOut,
+    }
+}
+
+async fn await_observed_request<F, T, E, O>(
+    request: F,
+    cancel: &CancellationToken,
+    timeout: Duration,
+    on_first_poll: O,
+) -> ObservedRequestWait<T, E>
+where
+    F: Future<Output = Result<T, E>>,
+    O: FnOnce(Instant),
+{
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => ObservedRequestWait::Cancelled,
+        result = async move {
+            let request_sent_at = Instant::now();
+            on_first_poll(request_sent_at);
+            (request.await, request_sent_at)
+        } => ObservedRequestWait::Response {
+            response: result.0,
+            request_sent_at: result.1,
+        },
+        _ = tokio::time::sleep(timeout) => ObservedRequestWait::TimedOut,
+    }
+}
+
+struct TtftObservation {
+    request_sent_at: Instant,
+    first_public_delta_sent: bool,
+}
+
+impl TtftObservation {
+    fn new(request_sent_at: Instant) -> Self {
+        Self {
+            request_sent_at,
+            first_public_delta_sent: false,
+        }
+    }
+
+    fn observe_emit(&mut self, is_public_delta: bool, result: &EmitResult) {
+        if is_public_delta && !self.first_public_delta_sent && matches!(result, EmitResult::Sent) {
+            self.first_public_delta_sent = true;
+            tracing::info!(
+                phase = "request_sent_to_first_public_delta",
+                elapsed_ms = self.request_sent_at.elapsed().as_millis() as u64,
+                "provider first public delta"
+            );
+        }
     }
 }
 
@@ -85,7 +183,137 @@ pub fn stream(
     stream_with_api_key(spec, context, options, cancel, api_key)
 }
 
+pub async fn compact_native(
+    spec: ModelSpec,
+    context: PromptContext,
+    cancel: CancellationToken,
+) -> Result<NativeCompactionResult, NativeCompactionError> {
+    responses_compaction_coverage(&spec, &context)
+        .map_err(|error| NativeCompactionError::InvalidRequest(error.to_string()))?;
+    let api_key = env::var(&spec.api_key_env)
+        .ok()
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| {
+            NativeCompactionError::InvalidRequest(format!(
+                "missing API key environment variable {}",
+                spec.api_key_env
+            ))
+        })?;
+    compact_native_with_api_key(spec, context, cancel, api_key).await
+}
+
+async fn compact_native_with_api_key(
+    spec: ModelSpec,
+    context: PromptContext,
+    cancel: CancellationToken,
+    api_key: String,
+) -> Result<NativeCompactionResult, NativeCompactionError> {
+    let coverage = responses_compaction_coverage(&spec, &context)
+        .map_err(|error| NativeCompactionError::InvalidRequest(error.to_string()))?;
+    let body = build_compact_request(&spec, &context)
+        .map_err(|error| NativeCompactionError::InvalidRequest(error.to_string()))?;
+    let client = http_client().map_err(NativeCompactionError::Transport)?;
+    let request = client
+        .post(spec.compact_endpoint())
+        .bearer_auth(api_key)
+        .json(&body)
+        .send();
+    let response = match await_request(request, &cancel, RESPONSE_HEADER_TIMEOUT).await {
+        RequestWait::Cancelled => return Err(NativeCompactionError::Cancelled),
+        RequestWait::TimedOut => return Err(NativeCompactionError::HeaderTimeout),
+        RequestWait::Response(Err(error)) => {
+            return Err(NativeCompactionError::Transport(error.to_string()));
+        }
+        RequestWait::Response(Ok(response)) => response,
+    };
+    let status = response.status();
+    let max_bytes = ResponseBudget::for_output_tokens(spec.max_output_tokens)
+        .ok_or_else(|| {
+            NativeCompactionError::InvalidRequest(
+                "max output budget cannot be represented on this platform".into(),
+            )
+        })?
+        .max_wire_bytes;
+    let success = status.is_success();
+    let body_limit = if success {
+        max_bytes
+    } else {
+        MAX_PROVIDER_ERROR_BODY_BYTES
+    };
+    let bytes = collect_bounded_body(response, body_limit, !success, &cancel).await?;
+    if !status.is_success() {
+        let body = String::from_utf8_lossy(&bytes)
+            .chars()
+            .take(4_000)
+            .collect();
+        return Err(NativeCompactionError::Http {
+            status: status.as_u16(),
+            body,
+        });
+    }
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| NativeCompactionError::InvalidResponse(error.to_string()))?;
+    parse_compact_response(value, coverage)
+        .map_err(|error| NativeCompactionError::InvalidResponse(error.to_string()))
+}
+
+async fn collect_bounded_body(
+    response: reqwest::Response,
+    limit: usize,
+    truncate: bool,
+    cancel: &CancellationToken,
+) -> Result<Vec<u8>, NativeCompactionError> {
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(NativeCompactionError::Cancelled),
+            chunk = stream.next() => chunk,
+            _ = tokio::time::sleep(RESPONSE_BODY_IDLE_TIMEOUT) => {
+                return Err(NativeCompactionError::BodyIdleTimeout);
+            }
+        };
+        let Some(chunk) = next else {
+            return Ok(body);
+        };
+        let chunk = chunk.map_err(|error| NativeCompactionError::Transport(error.to_string()))?;
+        let next_len = body
+            .len()
+            .checked_add(chunk.len())
+            .ok_or(NativeCompactionError::ResponseLimitExceeded { limit })?;
+        if next_len > limit {
+            if truncate {
+                body.extend_from_slice(&chunk[..limit.saturating_sub(body.len())]);
+                return Ok(body);
+            }
+            return Err(NativeCompactionError::ResponseLimitExceeded { limit });
+        }
+        body.extend_from_slice(&chunk);
+    }
+}
+
 fn stream_with_api_key(
+    spec: ModelSpec,
+    context: PromptContext,
+    options: RequestOptions,
+    cancel: CancellationToken,
+    api_key: Option<String>,
+) -> ProviderEventStream {
+    match spec.protocol {
+        ApiProtocol::OpenAiChatCompletions => {
+            stream_chat_with_api_key(spec, context, options, cancel, api_key)
+        }
+        ApiProtocol::OpenAiResponses => {
+            stream_responses_with_api_key(spec, context, options, cancel, api_key)
+        }
+        ApiProtocol::AnthropicMessages => {
+            stream_anthropic_with_api_key(spec, context, options, cancel, api_key)
+        }
+    }
+}
+
+fn stream_chat_with_api_key(
     spec: ModelSpec,
     context: PromptContext,
     options: RequestOptions,
@@ -96,7 +324,7 @@ fn stream_with_api_key(
     let (priority_terminal_tx, priority_terminal_rx) = mpsc::channel(1);
     let origin = spec.origin();
     let provider = spec.provider.clone();
-    let stream_budget = requested_output_tokens(&spec, &options)
+    let stream_budget = chat_requested_output_tokens(&spec, &options)
         .ok()
         .and_then(ResponseBudget::for_output_tokens)
         .unwrap_or_default();
@@ -138,6 +366,811 @@ fn stream_with_api_key(
     )
 }
 
+fn stream_responses_with_api_key(
+    spec: ModelSpec,
+    context: PromptContext,
+    options: RequestOptions,
+    cancel: CancellationToken,
+    api_key: Option<String>,
+) -> ProviderEventStream {
+    let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+    let (priority_terminal_tx, priority_terminal_rx) = mpsc::channel(1);
+    let origin = spec.origin();
+    let provider = spec.provider.clone();
+    let stream_budget = responses_requested_output_tokens(&spec, &options)
+        .ok()
+        .and_then(ResponseBudget::for_output_tokens)
+        .unwrap_or_default();
+    let success_terminal_committed = Arc::new(SuccessTerminalCommit::new());
+    let producer_terminal_committed = success_terminal_committed.clone();
+    let stream_cancel = cancel.clone();
+    let span = tracing::info_span!(
+        "provider_request",
+        provider = %spec.provider,
+        model = %spec.id,
+        protocol = "open_ai_responses"
+    );
+    tokio::spawn(
+        async move {
+            run_responses_stream(
+                spec,
+                context,
+                options,
+                stream_cancel,
+                api_key,
+                ProducerChannels {
+                    normal: tx,
+                    priority_terminal: priority_terminal_tx,
+                    success_terminal_committed: producer_terminal_committed,
+                },
+            )
+            .await;
+        }
+        .instrument(span),
+    );
+    ProviderEventStream::with_priority_terminal(
+        rx,
+        priority_terminal_rx,
+        cancel,
+        provider,
+        origin,
+        stream_budget,
+        success_terminal_committed,
+    )
+}
+
+fn stream_anthropic_with_api_key(
+    spec: ModelSpec,
+    context: PromptContext,
+    options: RequestOptions,
+    cancel: CancellationToken,
+    api_key: Option<String>,
+) -> ProviderEventStream {
+    let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+    let (priority_terminal_tx, priority_terminal_rx) = mpsc::channel(1);
+    let origin = spec.origin();
+    let provider = spec.provider.clone();
+    let stream_budget = anthropic_requested_output_tokens(&spec, &options)
+        .ok()
+        .and_then(ResponseBudget::for_output_tokens)
+        .unwrap_or_default();
+    let success_terminal_committed = Arc::new(SuccessTerminalCommit::new());
+    let producer_terminal_committed = success_terminal_committed.clone();
+    let stream_cancel = cancel.clone();
+    let span = tracing::info_span!(
+        "provider_request",
+        provider = %spec.provider,
+        model = %spec.id,
+        protocol = "anthropic_messages"
+    );
+    tokio::spawn(
+        async move {
+            run_anthropic_stream(
+                spec,
+                context,
+                options,
+                stream_cancel,
+                api_key,
+                ProducerChannels {
+                    normal: tx,
+                    priority_terminal: priority_terminal_tx,
+                    success_terminal_committed: producer_terminal_committed,
+                },
+            )
+            .await;
+        }
+        .instrument(span),
+    );
+    ProviderEventStream::with_priority_terminal(
+        rx,
+        priority_terminal_rx,
+        cancel,
+        provider,
+        origin,
+        stream_budget,
+        success_terminal_committed,
+    )
+}
+
+async fn run_anthropic_stream(
+    spec: ModelSpec,
+    context: PromptContext,
+    options: RequestOptions,
+    cancel: CancellationToken,
+    api_key: Option<String>,
+    channels: ProducerChannels,
+) {
+    let ProducerChannels {
+        normal: tx,
+        priority_terminal: priority_terminal_tx,
+        success_terminal_committed,
+    } = channels;
+    let mut assembler = MessageAssembler::new();
+    let _ = assembler.apply(&ProviderEvent::Start);
+    let output_tokens = match anthropic_requested_output_tokens(&spec, &options) {
+        Ok(tokens) => tokens,
+        Err(error) => {
+            finish_anthropic_error(
+                &priority_terminal_tx,
+                &mut assembler,
+                &spec,
+                Usage::default(),
+                error,
+                cancel.is_cancelled(),
+                Vec::new(),
+            )
+            .await;
+            return;
+        }
+    };
+    let Some(budget) = ResponseBudget::for_output_tokens(output_tokens) else {
+        finish_failure(
+            &priority_terminal_tx,
+            &mut assembler,
+            &spec,
+            Usage::default(),
+            "requested output budget cannot be represented on this platform".into(),
+            "invalid_provider_request",
+            cancel.is_cancelled(),
+        )
+        .await;
+        return;
+    };
+    assembler = MessageAssembler::with_budget(budget);
+    let _ = assembler.apply(&ProviderEvent::Start);
+    let schemas = match FrozenToolSchemaRegistry::compile(&context.tools) {
+        Ok(schemas) => schemas,
+        Err(error) => {
+            finish_failure(
+                &priority_terminal_tx,
+                &mut assembler,
+                &spec,
+                Usage::default(),
+                error.to_string(),
+                "invalid_tool_schema",
+                cancel.is_cancelled(),
+            )
+            .await;
+            return;
+        }
+    };
+    let coverage = match anthropic_request_coverage(&spec, &context) {
+        Ok(coverage) => coverage,
+        Err(error) => {
+            finish_anthropic_error(
+                &priority_terminal_tx,
+                &mut assembler,
+                &spec,
+                Usage::default(),
+                error,
+                cancel.is_cancelled(),
+                Vec::new(),
+            )
+            .await;
+            return;
+        }
+    };
+    let mut receive =
+        AnthropicReceiveState::with_budget(schemas, budget, coverage, spec.id.clone());
+    let Some(api_key) = api_key.filter(|key| !key.is_empty()) else {
+        finish_failure(
+            &priority_terminal_tx,
+            &mut assembler,
+            &spec,
+            Usage::default(),
+            format!("missing API key environment variable {}", spec.api_key_env),
+            "missing_api_key",
+            cancel.is_cancelled(),
+        )
+        .await;
+        return;
+    };
+    let body = match build_anthropic_request(&spec, &context, &options) {
+        Ok(body) => body,
+        Err(error) => {
+            finish_anthropic_error(
+                &priority_terminal_tx,
+                &mut assembler,
+                &spec,
+                receive.usage().clone(),
+                error,
+                cancel.is_cancelled(),
+                Vec::new(),
+            )
+            .await;
+            return;
+        }
+    };
+    let client = match http_client() {
+        Ok(client) => client,
+        Err(error) => {
+            finish_failure(
+                &priority_terminal_tx,
+                &mut assembler,
+                &spec,
+                receive.usage().clone(),
+                error,
+                "http_client_initialization_failed",
+                cancel.is_cancelled(),
+            )
+            .await;
+            return;
+        }
+    };
+    let mut request = client
+        .post(spec.endpoint())
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01");
+    if let Some(compat) = spec.anthropic_compat()
+        && !compat.beta_headers.is_empty()
+    {
+        request = request.header("anthropic-beta", compat.beta_headers.join(","));
+    }
+    let (response, request_sent_at) = match await_observed_request(
+        request.json(&body).send(),
+        &cancel,
+        RESPONSE_HEADER_TIMEOUT,
+        |_| tracing::info!(phase = "request_sent", "provider request sent"),
+    )
+    .await
+    {
+        ObservedRequestWait::Cancelled => {
+            finish_failure_with_context(
+                &priority_terminal_tx,
+                &mut assembler,
+                &spec,
+                receive.usage().clone(),
+                "provider request cancelled".into(),
+                "cancelled",
+                true,
+                receive.verified_reasoning_context(),
+            )
+            .await;
+            return;
+        }
+        ObservedRequestWait::TimedOut => {
+            finish_failure_with_context(
+                &priority_terminal_tx,
+                &mut assembler,
+                &spec,
+                receive.usage().clone(),
+                format!(
+                    "provider response headers timed out after {} seconds",
+                    RESPONSE_HEADER_TIMEOUT.as_secs()
+                ),
+                "response_header_timeout",
+                cancel.is_cancelled(),
+                receive.verified_reasoning_context(),
+            )
+            .await;
+            return;
+        }
+        ObservedRequestWait::Response {
+            response: Ok(response),
+            request_sent_at,
+        } => (response, request_sent_at),
+        ObservedRequestWait::Response {
+            response: Err(error),
+            ..
+        } => {
+            if cancel.is_cancelled() {
+                finish_failure_with_context(
+                    &priority_terminal_tx,
+                    &mut assembler,
+                    &spec,
+                    receive.usage().clone(),
+                    error.to_string(),
+                    "request_error",
+                    true,
+                    receive.verified_reasoning_context(),
+                )
+                .await;
+            } else {
+                finish_failure(
+                    &priority_terminal_tx,
+                    &mut assembler,
+                    &spec,
+                    receive.usage().clone(),
+                    error.to_string(),
+                    "request_error",
+                    cancel.is_cancelled(),
+                )
+                .await;
+            }
+            return;
+        }
+    };
+    let mut transport =
+        match SseStream::from_response(response, cancel.clone(), budget.max_wire_bytes).await {
+            Ok(transport) => transport,
+            Err(error) => {
+                let cancelled = matches!(error, SseError::Cancelled) || cancel.is_cancelled();
+                if cancelled {
+                    finish_failure_with_context(
+                        &priority_terminal_tx,
+                        &mut assembler,
+                        &spec,
+                        receive.usage().clone(),
+                        error.to_string(),
+                        &transport_error_code(&error),
+                        true,
+                        receive.verified_reasoning_context(),
+                    )
+                    .await;
+                } else {
+                    finish_failure(
+                        &priority_terminal_tx,
+                        &mut assembler,
+                        &spec,
+                        receive.usage().clone(),
+                        error.to_string(),
+                        &transport_error_code(&error),
+                        false,
+                    )
+                    .await;
+                }
+                return;
+            }
+        };
+
+    let mut ttft = TtftObservation::new(request_sent_at);
+    loop {
+        match transport.next_event().await {
+            Ok(Some(event)) => {
+                let pushed = match receive.push_named(event.event.as_deref(), &event.data) {
+                    Ok(pushed) => pushed,
+                    Err(error) => {
+                        close_anthropic_partial(&mut receive, &mut assembler);
+                        finish_anthropic_error(
+                            &priority_terminal_tx,
+                            &mut assembler,
+                            &spec,
+                            receive.usage().clone(),
+                            error,
+                            cancel.is_cancelled(),
+                            receive.verified_reasoning_context(),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                for normalized in pushed.events {
+                    let is_public_delta = matches!(
+                        &normalized,
+                        ProviderEvent::TextDelta { .. } | ProviderEvent::ThinkingDelta { .. }
+                    );
+                    let emit_result = emit(&tx, &mut assembler, normalized, &cancel).await;
+                    ttft.observe_emit(is_public_delta, &emit_result);
+                    match emit_result {
+                        EmitResult::Sent => {}
+                        EmitResult::Closed => return,
+                        EmitResult::Cancelled => {
+                            close_anthropic_partial(&mut receive, &mut assembler);
+                            finish_failure_with_context(
+                                &priority_terminal_tx,
+                                &mut assembler,
+                                &spec,
+                                receive.usage().clone(),
+                                "provider request cancelled".into(),
+                                "cancelled",
+                                true,
+                                receive.verified_reasoning_context(),
+                            )
+                            .await;
+                            return;
+                        }
+                        EmitResult::ContractViolation(error) => {
+                            finish_failure_with_context(
+                                &priority_terminal_tx,
+                                &mut assembler,
+                                &spec,
+                                receive.usage().clone(),
+                                error,
+                                "normalized_event_contract_violation",
+                                cancel.is_cancelled(),
+                                receive.verified_reasoning_context(),
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                }
+                if let Some(terminal) = pushed.terminal {
+                    finish_anthropic_terminal(
+                        &tx,
+                        &priority_terminal_tx,
+                        &mut assembler,
+                        &spec,
+                        terminal,
+                        &cancel,
+                        &success_terminal_committed,
+                    )
+                    .await;
+                    return;
+                }
+            }
+            Ok(None) => {
+                let error = receive
+                    .finish_eof()
+                    .expect_err("loop returns immediately after message_stop");
+                close_anthropic_partial(&mut receive, &mut assembler);
+                if cancel.is_cancelled() {
+                    finish_failure_with_context(
+                        &priority_terminal_tx,
+                        &mut assembler,
+                        &spec,
+                        receive.usage().clone(),
+                        error.to_string(),
+                        "stream_ended_without_terminal_event",
+                        true,
+                        receive.verified_reasoning_context(),
+                    )
+                    .await;
+                } else {
+                    finish_anthropic_error(
+                        &priority_terminal_tx,
+                        &mut assembler,
+                        &spec,
+                        receive.usage().clone(),
+                        error,
+                        false,
+                        receive.verified_reasoning_context(),
+                    )
+                    .await;
+                }
+                return;
+            }
+            Err(error) => {
+                close_anthropic_partial(&mut receive, &mut assembler);
+                let cancelled = matches!(error, SseError::Cancelled) || cancel.is_cancelled();
+                if cancelled {
+                    finish_failure_with_context(
+                        &priority_terminal_tx,
+                        &mut assembler,
+                        &spec,
+                        receive.usage().clone(),
+                        error.to_string(),
+                        &transport_error_code(&error),
+                        true,
+                        receive.verified_reasoning_context(),
+                    )
+                    .await;
+                } else {
+                    finish_failure_with_context(
+                        &priority_terminal_tx,
+                        &mut assembler,
+                        &spec,
+                        receive.usage().clone(),
+                        error.to_string(),
+                        &transport_error_code(&error),
+                        false,
+                        receive.verified_reasoning_context(),
+                    )
+                    .await;
+                }
+                return;
+            }
+        }
+    }
+}
+
+async fn run_responses_stream(
+    spec: ModelSpec,
+    context: PromptContext,
+    options: RequestOptions,
+    cancel: CancellationToken,
+    api_key: Option<String>,
+    channels: ProducerChannels,
+) {
+    let ProducerChannels {
+        normal: tx,
+        priority_terminal: priority_terminal_tx,
+        success_terminal_committed,
+    } = channels;
+    let mut assembler = MessageAssembler::new();
+    let _ = assembler.apply(&ProviderEvent::Start);
+    let output_tokens = match responses_requested_output_tokens(&spec, &options) {
+        Ok(tokens) => tokens,
+        Err(error) => {
+            finish_responses_error(
+                &priority_terminal_tx,
+                &mut assembler,
+                &spec,
+                Usage::default(),
+                error,
+                cancel.is_cancelled(),
+                Vec::new(),
+            )
+            .await;
+            return;
+        }
+    };
+    let Some(budget) = ResponseBudget::for_output_tokens(output_tokens) else {
+        finish_failure(
+            &priority_terminal_tx,
+            &mut assembler,
+            &spec,
+            Usage::default(),
+            "requested output budget cannot be represented on this platform".to_owned(),
+            "invalid_provider_request",
+            cancel.is_cancelled(),
+        )
+        .await;
+        return;
+    };
+    assembler = MessageAssembler::with_budget(budget);
+    let _ = assembler.apply(&ProviderEvent::Start);
+    let schemas = match FrozenToolSchemaRegistry::compile(&context.tools) {
+        Ok(schemas) => schemas,
+        Err(error) => {
+            finish_failure(
+                &priority_terminal_tx,
+                &mut assembler,
+                &spec,
+                Usage::default(),
+                error.to_string(),
+                "invalid_tool_schema",
+                cancel.is_cancelled(),
+            )
+            .await;
+            return;
+        }
+    };
+    let mut receive = ResponsesReceiveState::with_budget(schemas, budget);
+    let Some(api_key) = api_key.filter(|key| !key.is_empty()) else {
+        finish_failure(
+            &priority_terminal_tx,
+            &mut assembler,
+            &spec,
+            Usage::default(),
+            format!("missing API key environment variable {}", spec.api_key_env),
+            "missing_api_key",
+            cancel.is_cancelled(),
+        )
+        .await;
+        return;
+    };
+    let body = match build_responses_request(&spec, &context, &options) {
+        Ok(body) => body,
+        Err(error) => {
+            finish_responses_error(
+                &priority_terminal_tx,
+                &mut assembler,
+                &spec,
+                receive.usage().clone(),
+                error,
+                cancel.is_cancelled(),
+                receive.provider_context(),
+            )
+            .await;
+            return;
+        }
+    };
+    let client = match http_client() {
+        Ok(client) => client,
+        Err(error) => {
+            finish_failure(
+                &priority_terminal_tx,
+                &mut assembler,
+                &spec,
+                receive.usage().clone(),
+                error,
+                "http_client_initialization_failed",
+                cancel.is_cancelled(),
+            )
+            .await;
+            return;
+        }
+    };
+    let request = client
+        .post(spec.endpoint())
+        .bearer_auth(api_key)
+        .json(&body)
+        .send();
+    let (response, request_sent_at) =
+        match await_observed_request(request, &cancel, RESPONSE_HEADER_TIMEOUT, |_| {
+            tracing::info!(phase = "request_sent", "provider request sent")
+        })
+        .await
+        {
+            ObservedRequestWait::Cancelled => {
+                finish_failure_with_context(
+                    &priority_terminal_tx,
+                    &mut assembler,
+                    &spec,
+                    receive.usage().clone(),
+                    "provider request cancelled".to_owned(),
+                    "cancelled",
+                    true,
+                    receive.provider_context(),
+                )
+                .await;
+                return;
+            }
+            ObservedRequestWait::TimedOut => {
+                finish_failure_with_context(
+                    &priority_terminal_tx,
+                    &mut assembler,
+                    &spec,
+                    receive.usage().clone(),
+                    format!(
+                        "provider response headers timed out after {} seconds",
+                        RESPONSE_HEADER_TIMEOUT.as_secs()
+                    ),
+                    "response_header_timeout",
+                    cancel.is_cancelled(),
+                    receive.provider_context(),
+                )
+                .await;
+                return;
+            }
+            ObservedRequestWait::Response {
+                response: Ok(response),
+                request_sent_at,
+            } => (response, request_sent_at),
+            ObservedRequestWait::Response {
+                response: Err(error),
+                ..
+            } => {
+                finish_failure_with_context(
+                    &priority_terminal_tx,
+                    &mut assembler,
+                    &spec,
+                    receive.usage().clone(),
+                    error.to_string(),
+                    "request_error",
+                    cancel.is_cancelled(),
+                    receive.provider_context(),
+                )
+                .await;
+                return;
+            }
+        };
+    let mut transport =
+        match SseStream::from_response(response, cancel.clone(), budget.max_wire_bytes).await {
+            Ok(transport) => transport,
+            Err(error) => {
+                finish_failure_with_context(
+                    &priority_terminal_tx,
+                    &mut assembler,
+                    &spec,
+                    receive.usage().clone(),
+                    error.to_string(),
+                    &transport_error_code(&error),
+                    matches!(error, SseError::Cancelled) || cancel.is_cancelled(),
+                    receive.provider_context(),
+                )
+                .await;
+                return;
+            }
+        };
+
+    let mut ttft = TtftObservation::new(request_sent_at);
+    loop {
+        match transport.next_event().await {
+            Ok(Some(event)) => {
+                if let Err(error) = validate_event_name(event.event.as_deref(), &event.data) {
+                    close_responses_partial(&mut receive, &mut assembler);
+                    finish_responses_error(
+                        &priority_terminal_tx,
+                        &mut assembler,
+                        &spec,
+                        receive.usage().clone(),
+                        error,
+                        cancel.is_cancelled(),
+                        receive.provider_context(),
+                    )
+                    .await;
+                    return;
+                }
+                let pushed = match receive.push_json(&event.data) {
+                    Ok(pushed) => pushed,
+                    Err(error) => {
+                        close_responses_partial(&mut receive, &mut assembler);
+                        finish_responses_error(
+                            &priority_terminal_tx,
+                            &mut assembler,
+                            &spec,
+                            receive.usage().clone(),
+                            error,
+                            cancel.is_cancelled(),
+                            receive.provider_context(),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                for normalized in pushed.events {
+                    let is_public_delta = matches!(
+                        &normalized,
+                        ProviderEvent::TextDelta { .. } | ProviderEvent::ThinkingDelta { .. }
+                    );
+                    let emit_result = emit(&tx, &mut assembler, normalized, &cancel).await;
+                    ttft.observe_emit(is_public_delta, &emit_result);
+                    match emit_result {
+                        EmitResult::Sent => {}
+                        EmitResult::Closed => return,
+                        EmitResult::Cancelled => {
+                            close_responses_partial(&mut receive, &mut assembler);
+                            finish_failure_with_context(
+                                &priority_terminal_tx,
+                                &mut assembler,
+                                &spec,
+                                receive.usage().clone(),
+                                "provider request cancelled".to_owned(),
+                                "cancelled",
+                                true,
+                                receive.provider_context(),
+                            )
+                            .await;
+                            return;
+                        }
+                        EmitResult::ContractViolation(error) => {
+                            finish_failure_with_context(
+                                &priority_terminal_tx,
+                                &mut assembler,
+                                &spec,
+                                receive.usage().clone(),
+                                error,
+                                "normalized_event_contract_violation",
+                                cancel.is_cancelled(),
+                                receive.provider_context(),
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                }
+                if let Some(terminal) = pushed.terminal {
+                    finish_responses_terminal(
+                        &tx,
+                        &priority_terminal_tx,
+                        &mut assembler,
+                        &spec,
+                        terminal,
+                        &cancel,
+                        &success_terminal_committed,
+                    )
+                    .await;
+                    return;
+                }
+            }
+            Ok(None) => {
+                let error = receive
+                    .finish_eof()
+                    .expect_err("loop returns immediately after a terminal response");
+                close_responses_partial(&mut receive, &mut assembler);
+                finish_responses_error(
+                    &priority_terminal_tx,
+                    &mut assembler,
+                    &spec,
+                    receive.usage().clone(),
+                    error,
+                    cancel.is_cancelled(),
+                    receive.provider_context(),
+                )
+                .await;
+                return;
+            }
+            Err(error) => {
+                close_responses_partial(&mut receive, &mut assembler);
+                finish_failure_with_context(
+                    &priority_terminal_tx,
+                    &mut assembler,
+                    &spec,
+                    receive.usage().clone(),
+                    error.to_string(),
+                    &transport_error_code(&error),
+                    matches!(error, SseError::Cancelled) || cancel.is_cancelled(),
+                    receive.provider_context(),
+                )
+                .await;
+                return;
+            }
+        }
+    }
+}
+
 async fn run_chat_stream(
     spec: ModelSpec,
     context: PromptContext,
@@ -151,7 +1184,7 @@ async fn run_chat_stream(
         priority_terminal: priority_terminal_tx,
         success_terminal_committed,
     } = channels;
-    let output_tokens = match requested_output_tokens(&spec, &options) {
+    let output_tokens = match chat_requested_output_tokens(&spec, &options) {
         Ok(output_tokens) => output_tokens,
         Err(error) => {
             let mut assembler = MessageAssembler::new();
@@ -164,7 +1197,7 @@ async fn run_chat_stream(
                 Usage::default(),
                 message,
                 &code,
-                false,
+                cancel.is_cancelled(),
             )
             .await;
             return;
@@ -180,7 +1213,7 @@ async fn run_chat_stream(
             Usage::default(),
             "requested output budget cannot be represented on this platform".to_owned(),
             "invalid_provider_request",
-            false,
+            cancel.is_cancelled(),
         )
         .await;
         return;
@@ -200,7 +1233,7 @@ async fn run_chat_stream(
                 Usage::default(),
                 error.to_string(),
                 "invalid_tool_schema",
-                false,
+                cancel.is_cancelled(),
             )
             .await;
             return;
@@ -216,7 +1249,7 @@ async fn run_chat_stream(
             Usage::default(),
             format!("missing API key environment variable {}", spec.api_key_env),
             "missing_api_key",
-            false,
+            cancel.is_cancelled(),
         )
         .await;
         return;
@@ -231,7 +1264,7 @@ async fn run_chat_stream(
                 Usage::default(),
                 error,
                 "http_client_initialization_failed",
-                false,
+                cancel.is_cancelled(),
             )
             .await;
             return;
@@ -247,66 +1280,73 @@ async fn run_chat_stream(
                 Usage::default(),
                 error.to_string(),
                 "invalid_provider_request",
-                false,
+                cancel.is_cancelled(),
             )
             .await;
             return;
         }
     };
 
-    let request_started = std::time::Instant::now();
-    tracing::info!(phase = "request_sent", "provider request sent");
     let request = client
         .post(spec.endpoint())
         .bearer_auth(api_key)
         .json(&body)
         .send();
-    let response = match await_request(request, &cancel, RESPONSE_HEADER_TIMEOUT).await {
-        RequestWait::Cancelled => {
-            finish_failure(
-                &priority_terminal_tx,
-                &mut assembler,
-                &spec,
-                receive.usage().clone(),
-                "provider request cancelled".to_owned(),
-                "cancelled",
-                true,
-            )
-            .await;
-            return;
-        }
-        RequestWait::TimedOut => {
-            finish_failure(
-                &priority_terminal_tx,
-                &mut assembler,
-                &spec,
-                receive.usage().clone(),
-                format!(
-                    "provider response headers timed out after {} seconds",
-                    RESPONSE_HEADER_TIMEOUT.as_secs()
-                ),
-                "response_header_timeout",
-                false,
-            )
-            .await;
-            return;
-        }
-        RequestWait::Response(response) => match response {
-            Ok(response) => response,
-            Err(error) => {
+    let (response, request_sent_at) =
+        match await_observed_request(request, &cancel, RESPONSE_HEADER_TIMEOUT, |_| {
+            tracing::info!(phase = "request_sent", "provider request sent")
+        })
+        .await
+        {
+            ObservedRequestWait::Cancelled => {
                 finish_failure(
                     &priority_terminal_tx,
                     &mut assembler,
                     &spec,
                     receive.usage().clone(),
-                    error.to_string(),
-                    "request_error",
+                    "provider request cancelled".to_owned(),
+                    "cancelled",
+                    true,
+                )
+                .await;
+                return;
+            }
+            ObservedRequestWait::TimedOut => {
+                finish_failure(
+                    &priority_terminal_tx,
+                    &mut assembler,
+                    &spec,
+                    receive.usage().clone(),
+                    format!(
+                        "provider response headers timed out after {} seconds",
+                        RESPONSE_HEADER_TIMEOUT.as_secs()
+                    ),
+                    "response_header_timeout",
                     cancel.is_cancelled(),
                 )
                 .await;
                 return;
             }
-        },
+            ObservedRequestWait::Response {
+                response,
+                request_sent_at,
+            } => (response, request_sent_at),
+        };
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            finish_failure(
+                &priority_terminal_tx,
+                &mut assembler,
+                &spec,
+                receive.usage().clone(),
+                error.to_string(),
+                "request_error",
+                cancel.is_cancelled(),
+            )
+            .await;
+            return;
+        }
     };
 
     let mut transport =
@@ -329,7 +1369,7 @@ async fn run_chat_stream(
             }
         };
 
-    let mut saw_public_delta = false;
+    let mut ttft = TtftObservation::new(request_sent_at);
     loop {
         match transport.next_event().await {
             Ok(Some(event)) if event.data == "[DONE]" => {
@@ -358,30 +1398,21 @@ async fn run_chat_stream(
                             receive.usage().clone(),
                             message,
                             &code,
-                            false,
+                            cancel.is_cancelled(),
                         )
                         .await;
                         return;
                     }
                 };
-                if !saw_public_delta
-                    && events.iter().any(|event| {
-                        matches!(
-                            event,
-                            ProviderEvent::TextDelta { .. } | ProviderEvent::ThinkingDelta { .. }
-                        )
-                    })
-                {
-                    saw_public_delta = true;
-                    tracing::info!(
-                        phase = "request_sent_to_first_public_delta",
-                        elapsed_ms = request_started.elapsed().as_millis() as u64,
-                        "provider first public delta"
-                    );
-                }
                 let mut events = events.into_iter();
                 while let Some(event) = events.next() {
-                    match emit(&tx, &mut assembler, event, &cancel).await {
+                    let is_public_delta = matches!(
+                        &event,
+                        ProviderEvent::TextDelta { .. } | ProviderEvent::ThinkingDelta { .. }
+                    );
+                    let emit_result = emit(&tx, &mut assembler, event, &cancel).await;
+                    ttft.observe_emit(is_public_delta, &emit_result);
+                    match emit_result {
                         EmitResult::Sent => {}
                         EmitResult::Closed => return,
                         EmitResult::Cancelled => {
@@ -421,7 +1452,7 @@ async fn run_chat_stream(
                                 receive.usage().clone(),
                                 error,
                                 "normalized_event_contract_violation",
-                                false,
+                                cancel.is_cancelled(),
                             )
                             .await;
                             return;
@@ -543,6 +1574,328 @@ fn close_partial(receive: &mut ChatReceiveState, assembler: &mut MessageAssemble
     }
 }
 
+fn close_responses_partial(receive: &mut ResponsesReceiveState, assembler: &mut MessageAssembler) {
+    for event in receive.fail() {
+        if let Err(error) = assembler.apply(&event) {
+            tracing::error!(%error, "failed to close partial Responses output");
+            break;
+        }
+    }
+}
+
+fn close_anthropic_partial(receive: &mut AnthropicReceiveState, assembler: &mut MessageAssembler) {
+    for event in receive.fail() {
+        if let Err(error) = assembler.apply(&event) {
+            tracing::error!(%error, "failed to close partial Anthropic output");
+            break;
+        }
+    }
+}
+
+async fn finish_anthropic_error(
+    priority_terminal_tx: &mpsc::Sender<ProviderEvent>,
+    assembler: &mut MessageAssembler,
+    spec: &ModelSpec,
+    usage: Usage,
+    error: AnthropicAdapterError,
+    cancelled: bool,
+    provider_context: Vec<types::ProviderContextFragment>,
+) {
+    let (message, code) = anthropic_adapter_error(&error);
+    finish_failure_with_context(
+        priority_terminal_tx,
+        assembler,
+        spec,
+        usage,
+        message,
+        &code,
+        cancelled,
+        provider_context,
+    )
+    .await;
+}
+
+async fn finish_anthropic_terminal(
+    tx: &mpsc::Sender<ProviderEvent>,
+    priority_terminal_tx: &mpsc::Sender<ProviderEvent>,
+    assembler: &mut MessageAssembler,
+    spec: &ModelSpec,
+    terminal: AnthropicTerminal,
+    cancel: &CancellationToken,
+    success_terminal_committed: &SuccessTerminalCommit,
+) {
+    let cancel_context = terminal
+        .provider_context
+        .iter()
+        .filter(|fragment| {
+            matches!(
+                &fragment.payload,
+                types::ProviderContextPayload::EncryptedReasoning {
+                    protocol: ApiProtocol::AnthropicMessages,
+                    ..
+                }
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for event in terminal.events {
+        match emit(tx, assembler, event, cancel).await {
+            EmitResult::Sent => {}
+            EmitResult::Closed => return,
+            EmitResult::Cancelled => {
+                finish_failure_with_context(
+                    priority_terminal_tx,
+                    assembler,
+                    spec,
+                    terminal.usage,
+                    "provider request cancelled".into(),
+                    "cancelled",
+                    true,
+                    cancel_context.clone(),
+                )
+                .await;
+                return;
+            }
+            EmitResult::ContractViolation(error) => {
+                finish_failure_with_context(
+                    priority_terminal_tx,
+                    assembler,
+                    spec,
+                    terminal.usage,
+                    error,
+                    "normalized_event_contract_violation",
+                    cancel.is_cancelled(),
+                    terminal.provider_context.clone(),
+                )
+                .await;
+                return;
+            }
+        }
+    }
+    if terminal.reason == StopReason::Error {
+        finish_failure_with_context(
+            priority_terminal_tx,
+            assembler,
+            spec,
+            terminal.usage,
+            terminal
+                .error_message
+                .unwrap_or_else(|| "provider returned an error terminal".into()),
+            terminal
+                .provider_code
+                .as_deref()
+                .unwrap_or("provider_error"),
+            cancel.is_cancelled(),
+            terminal.provider_context,
+        )
+        .await;
+        return;
+    }
+    let permit = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            finish_failure_with_context(
+                priority_terminal_tx,
+                assembler,
+                spec,
+                terminal.usage,
+                "provider request cancelled".into(),
+                "cancelled",
+                true,
+                cancel_context,
+            )
+            .await;
+            return;
+        }
+        permit = tx.reserve() => match permit {
+            Ok(permit) => permit,
+            Err(_) => return,
+        }
+    };
+    let metadata = TerminalMetadata {
+        provider: spec.provider.clone(),
+        origin: spec.origin(),
+        usage: terminal.usage.clone(),
+        stop_reason: terminal.reason,
+        error_message: terminal.error_message,
+        provider_code: terminal.provider_code,
+        interrupted: false,
+        timestamp: Utc::now(),
+    };
+    let message = match assembler.prepare_finish(metadata) {
+        Ok(message) => message,
+        Err(error) => {
+            drop(permit);
+            finish_failure_with_context(
+                priority_terminal_tx,
+                assembler,
+                spec,
+                terminal.usage,
+                error.to_string(),
+                "normalized_event_contract_violation",
+                cancel.is_cancelled(),
+                terminal.provider_context,
+            )
+            .await;
+            return;
+        }
+    };
+    success_terminal_committed.commit();
+    assembler.commit_prepared_terminal();
+    permit.send(ProviderEvent::Done {
+        reason: terminal.reason,
+        output: ProviderOutput {
+            message,
+            provider_context: terminal.provider_context,
+        },
+    });
+}
+
+async fn finish_responses_error(
+    priority_terminal_tx: &mpsc::Sender<ProviderEvent>,
+    assembler: &mut MessageAssembler,
+    spec: &ModelSpec,
+    usage: Usage,
+    error: ResponsesAdapterError,
+    cancelled: bool,
+    provider_context: Vec<types::ProviderContextFragment>,
+) {
+    let (message, code) = responses_adapter_error(&error);
+    finish_failure_with_context(
+        priority_terminal_tx,
+        assembler,
+        spec,
+        usage,
+        message,
+        &code,
+        cancelled,
+        provider_context,
+    )
+    .await;
+}
+
+async fn finish_responses_terminal(
+    tx: &mpsc::Sender<ProviderEvent>,
+    priority_terminal_tx: &mpsc::Sender<ProviderEvent>,
+    assembler: &mut MessageAssembler,
+    spec: &ModelSpec,
+    terminal: ResponsesTerminal,
+    cancel: &CancellationToken,
+    success_terminal_committed: &SuccessTerminalCommit,
+) {
+    for event in terminal.events {
+        match emit(tx, assembler, event, cancel).await {
+            EmitResult::Sent => {}
+            EmitResult::Closed => return,
+            EmitResult::Cancelled => {
+                finish_failure_with_context(
+                    priority_terminal_tx,
+                    assembler,
+                    spec,
+                    terminal.usage,
+                    "provider request cancelled".to_owned(),
+                    "cancelled",
+                    true,
+                    terminal.provider_context.clone(),
+                )
+                .await;
+                return;
+            }
+            EmitResult::ContractViolation(error) => {
+                finish_failure_with_context(
+                    priority_terminal_tx,
+                    assembler,
+                    spec,
+                    terminal.usage,
+                    error,
+                    "normalized_event_contract_violation",
+                    cancel.is_cancelled(),
+                    terminal.provider_context.clone(),
+                )
+                .await;
+                return;
+            }
+        }
+    }
+    if terminal.reason == StopReason::Error {
+        finish_failure_with_context(
+            priority_terminal_tx,
+            assembler,
+            spec,
+            terminal.usage,
+            terminal
+                .error_message
+                .unwrap_or_else(|| "provider returned an error terminal".to_owned()),
+            terminal
+                .provider_code
+                .as_deref()
+                .unwrap_or("provider_error"),
+            cancel.is_cancelled(),
+            terminal.provider_context,
+        )
+        .await;
+        return;
+    }
+    let permit = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            finish_failure_with_context(
+                priority_terminal_tx,
+                assembler,
+                spec,
+                terminal.usage,
+                "provider request cancelled".to_owned(),
+                "cancelled",
+                true,
+                terminal.provider_context.clone(),
+            )
+            .await;
+            return;
+        }
+        permit = tx.reserve() => match permit {
+            Ok(permit) => permit,
+            Err(_) => return,
+        }
+    };
+    let metadata = TerminalMetadata {
+        provider: spec.provider.clone(),
+        origin: spec.origin(),
+        usage: terminal.usage.clone(),
+        stop_reason: terminal.reason,
+        error_message: terminal.error_message,
+        provider_code: terminal.provider_code,
+        interrupted: false,
+        timestamp: Utc::now(),
+    };
+    let message = match assembler.prepare_finish(metadata) {
+        Ok(message) => message,
+        Err(error) => {
+            drop(permit);
+            finish_failure_with_context(
+                priority_terminal_tx,
+                assembler,
+                spec,
+                terminal.usage,
+                error.to_string(),
+                "normalized_event_contract_violation",
+                cancel.is_cancelled(),
+                terminal.provider_context,
+            )
+            .await;
+            return;
+        }
+    };
+    success_terminal_committed.commit();
+    assembler.commit_prepared_terminal();
+    permit.send(ProviderEvent::Done {
+        reason: terminal.reason,
+        output: ProviderOutput {
+            message,
+            provider_context: terminal.provider_context,
+        },
+    });
+}
+
 async fn finish_terminal(
     tx: &mpsc::Sender<ProviderEvent>,
     priority_terminal_tx: &mpsc::Sender<ProviderEvent>,
@@ -565,7 +1918,7 @@ async fn finish_terminal(
                     terminal.usage.clone(),
                     error.to_string(),
                     "normalized_event_contract_violation",
-                    false,
+                    cancel.is_cancelled(),
                 )
                 .await;
                 return;
@@ -584,7 +1937,7 @@ async fn finish_terminal(
             terminal.usage,
             error_message,
             &provider_code,
-            terminal.stop_reason == StopReason::Aborted,
+            cancel.is_cancelled() || terminal.stop_reason == StopReason::Aborted,
         )
         .await;
         return;
@@ -624,7 +1977,7 @@ async fn finish_terminal(
                 terminal.usage.clone(),
                 error.to_string(),
                 "normalized_event_contract_violation",
-                false,
+                cancel.is_cancelled(),
             )
             .await;
             return;
@@ -673,7 +2026,7 @@ async fn finish_terminal(
                 terminal.usage,
                 error.to_string(),
                 "normalized_event_contract_violation",
-                false,
+                cancel.is_cancelled(),
             )
             .await;
             return;
@@ -719,6 +2072,33 @@ async fn finish_failure(
     error_message: String,
     provider_code: &str,
     cancelled: bool,
+) {
+    finish_failure_with_context(
+        priority_terminal_tx,
+        assembler,
+        spec,
+        usage,
+        error_message,
+        provider_code,
+        cancelled,
+        Vec::new(),
+    )
+    .await;
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "terminal normalization keeps the existing failure contract plus opaque context"
+)]
+async fn finish_failure_with_context(
+    priority_terminal_tx: &mpsc::Sender<ProviderEvent>,
+    assembler: &mut MessageAssembler,
+    spec: &ModelSpec,
+    usage: Usage,
+    error_message: String,
+    provider_code: &str,
+    cancelled: bool,
+    provider_context: Vec<types::ProviderContextFragment>,
 ) {
     let Ok(permit) = priority_terminal_tx.try_reserve() else {
         return;
@@ -779,7 +2159,7 @@ async fn finish_failure(
         reason,
         output: ProviderOutput {
             message,
-            provider_context: Vec::new(),
+            provider_context,
         },
     });
 }
@@ -861,6 +2241,7 @@ fn adapter_error(error: &ChatAdapterError) -> (String, String) {
         | ChatAdapterError::LegacyFunctionCallUnsupported
         | ChatAdapterError::MissingToolCall
         | ChatAdapterError::IncompleteToolIdentity
+        | ChatAdapterError::AmbiguousToolName { .. }
         | ChatAdapterError::UnexpectedToolCall
         | ChatAdapterError::EventsAfterFinishReason => {
             (error.to_string(), "invalid_provider_stream".to_owned())
@@ -874,6 +2255,7 @@ fn adapter_error(error: &ChatAdapterError) -> (String, String) {
         ),
         ChatAdapterError::UnsupportedProtocol
         | ChatAdapterError::InvalidMaxTokens { .. }
+        | ChatAdapterError::InvalidTemperature(_)
         | ChatAdapterError::ReasoningRequired
         | ChatAdapterError::InvalidReasoningEffort(_)
         | ChatAdapterError::RequiredToolChoiceUnsupported => {
@@ -882,9 +2264,61 @@ fn adapter_error(error: &ChatAdapterError) -> (String, String) {
     }
 }
 
+fn responses_adapter_error(error: &ResponsesAdapterError) -> (String, String) {
+    match error {
+        ResponsesAdapterError::Provider { code, message } => (
+            message.clone(),
+            code.clone().unwrap_or_else(|| "provider_error".to_owned()),
+        ),
+        ResponsesAdapterError::InvalidEvent(_) => {
+            (error.to_string(), "invalid_provider_stream".to_owned())
+        }
+        ResponsesAdapterError::ResponseLimitExceeded { .. } => {
+            (error.to_string(), "response_limit_exceeded".to_owned())
+        }
+        ResponsesAdapterError::MissingTerminal => (
+            error.to_string(),
+            "stream_ended_without_terminal_event".to_owned(),
+        ),
+        ResponsesAdapterError::UnsupportedProtocol
+        | ResponsesAdapterError::InvalidMaxTokens { .. }
+        | ResponsesAdapterError::InvalidContext(_) => {
+            (error.to_string(), "invalid_provider_request".to_owned())
+        }
+        ResponsesAdapterError::InvalidCompactResponse(_) => {
+            (error.to_string(), "invalid_compact_response".to_owned())
+        }
+    }
+}
+
+fn anthropic_adapter_error(error: &AnthropicAdapterError) -> (String, String) {
+    match error {
+        AnthropicAdapterError::Provider { code, message } => (
+            message.clone(),
+            code.clone().unwrap_or_else(|| "provider_error".into()),
+        ),
+        AnthropicAdapterError::InvalidEvent(_) => {
+            (error.to_string(), "invalid_provider_stream".into())
+        }
+        AnthropicAdapterError::ResponseLimitExceeded { .. } => {
+            (error.to_string(), "response_limit_exceeded".into())
+        }
+        AnthropicAdapterError::MissingTerminal => (
+            error.to_string(),
+            "stream_ended_without_terminal_event".into(),
+        ),
+        AnthropicAdapterError::UnsupportedProtocol
+        | AnthropicAdapterError::InvalidMaxTokens { .. }
+        | AnthropicAdapterError::InvalidContext(_) => {
+            (error.to_string(), "invalid_provider_request".into())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::Cell,
         convert::Infallible,
         env, fs, io,
         os::unix::fs::PermissionsExt,
@@ -902,8 +2336,8 @@ mod tests {
 
     use super::*;
     use crate::provider::types::{
-        AssistantContent, RejectedToolCall, ToolArgumentError, ToolCall, ToolDefinition,
-        ToolResultMessage, UserContent, ValidatedToolArguments,
+        AssistantContent, ContextMessage, Message, RejectedToolCall, ToolArgumentError, ToolCall,
+        ToolDefinition, ToolResultMessage, UserContent, UserMessage, ValidatedToolArguments,
     };
 
     struct CaptureCommandFixture {
@@ -1342,6 +2776,22 @@ fi
         }
     }
 
+    fn persisted_context(seq: u64) -> PromptContext {
+        PromptContext {
+            messages: vec![ContextMessage::Persisted {
+                id: format!("message-{seq}"),
+                seq,
+                message: Message::User(UserMessage {
+                    content: vec![UserContent::Text {
+                        text: "compact this".into(),
+                    }],
+                    timestamp: Utc::now(),
+                }),
+            }],
+            ..empty_context()
+        }
+    }
+
     async fn replay(preset: &str, body: &'static str) -> Vec<ProviderEvent> {
         replay_with_context(preset, body, empty_context()).await
     }
@@ -1699,6 +3149,423 @@ fi
         assert!(matches!(
             await_request(std::future::ready(Ok::<_, ()>(())), &cancel, Duration::ZERO,).await,
             RequestWait::Cancelled
+        ));
+    }
+
+    #[tokio::test]
+    async fn observed_response_header_wait_records_only_an_actually_polled_request() {
+        let cancel = CancellationToken::new();
+        let first_poll_count = Cell::new(0);
+        assert!(matches!(
+            await_observed_request(
+                std::future::pending::<Result<(), ()>>(),
+                &cancel,
+                Duration::from_millis(1),
+                |_| first_poll_count.set(first_poll_count.get() + 1),
+            )
+            .await,
+            ObservedRequestWait::TimedOut
+        ));
+        assert_eq!(first_poll_count.get(), 1);
+
+        cancel.cancel();
+        assert!(matches!(
+            await_observed_request(
+                std::future::ready(Ok::<_, ()>(())),
+                &cancel,
+                Duration::ZERO,
+                |_| first_poll_count.set(first_poll_count.get() + 1),
+            )
+            .await,
+            ObservedRequestWait::Cancelled
+        ));
+        assert_eq!(first_poll_count.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn all_protocols_pre_cancel_before_request_poll_converge_to_aborted() {
+        for preset in ["kimi-k3", "openai-responses", "anthropic"] {
+            let spec = ModelSpec::preset(preset).expect("preset");
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+            let mut events = stream_with_api_key(
+                spec,
+                PromptContext {
+                    messages: vec![ContextMessage::Synthetic {
+                        message: Message::User(UserMessage {
+                            content: vec![UserContent::Text {
+                                text: "pre-cancel".into(),
+                            }],
+                            timestamp: Utc::now(),
+                        }),
+                    }],
+                    ..empty_context()
+                },
+                RequestOptions::default(),
+                cancel,
+                Some("test-key".into()),
+            );
+            assert!(matches!(events.recv().await, Some(ProviderEvent::Start)));
+            let terminal = events.recv().await.expect("terminal");
+            assert!(
+                matches!(
+                    terminal,
+                ProviderEvent::Error {
+                    reason: StopReason::Aborted,
+                    ref output,
+                } if output.message.interrupted
+                ),
+                "{preset}: {terminal:?}"
+            );
+            assert!(events.recv().await.is_none(), "{preset} stream must fuse");
+        }
+    }
+
+    async fn assert_preflight_cancelled(
+        preset: &str,
+        options: RequestOptions,
+        api_key: Option<String>,
+        expected_code: &str,
+    ) {
+        let mut spec = ModelSpec::preset(preset).expect("preset");
+        spec.base_url = "http://127.0.0.1:9".to_owned();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut events = stream_with_api_key(spec, empty_context(), options, cancel, api_key);
+        assert!(matches!(events.recv().await, Some(ProviderEvent::Start)));
+        let terminal = events.recv().await.expect("terminal");
+        assert!(
+            matches!(
+                terminal,
+                ProviderEvent::Error {
+                    reason: StopReason::Aborted,
+                    ref output,
+                } if output.message.interrupted
+                    && output.message.provider_code.as_deref() == Some(expected_code)
+            ),
+            "{preset}: {terminal:?}"
+        );
+        assert!(events.recv().await.is_none(), "{preset} stream must fuse");
+    }
+
+    #[tokio::test]
+    async fn all_protocols_pre_cancelled_missing_key_preserves_failure_code_and_aborts() {
+        for preset in ["kimi-k3", "openai-responses", "anthropic"] {
+            assert_preflight_cancelled(preset, RequestOptions::default(), None, "missing_api_key")
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn all_protocols_pre_cancelled_invalid_max_preserves_failure_code_and_aborts() {
+        for preset in ["kimi-k3", "openai-responses", "anthropic"] {
+            assert_preflight_cancelled(
+                preset,
+                RequestOptions {
+                    max_tokens: Some(u64::MAX),
+                    ..RequestOptions::default()
+                },
+                Some("test-key".to_owned()),
+                "invalid_provider_request",
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn all_protocol_terminal_errors_observed_after_cancel_converge_to_aborted() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let success = SuccessTerminalCommit::new();
+
+        let chat = ModelSpec::preset("kimi-k3").unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        let (priority, mut terminal_rx) = mpsc::channel(1);
+        let mut assembler = MessageAssembler::new();
+        assembler.apply(&ProviderEvent::Start).unwrap();
+        finish_terminal(
+            &tx,
+            &priority,
+            &mut assembler,
+            &chat,
+            ChatTerminal {
+                events: vec![],
+                usage: Usage::default(),
+                stop_reason: StopReason::Error,
+                error_message: Some("late error".into()),
+                provider_code: Some("late_error".into()),
+            },
+            &cancel,
+            &success,
+        )
+        .await;
+        assert!(matches!(
+            terminal_rx.recv().await,
+            Some(ProviderEvent::Error {
+                reason: StopReason::Aborted,
+                ..
+            })
+        ));
+
+        let responses = ModelSpec::preset("openai-responses").unwrap();
+        let (priority, mut terminal_rx) = mpsc::channel(1);
+        let mut assembler = MessageAssembler::new();
+        assembler.apply(&ProviderEvent::Start).unwrap();
+        finish_responses_terminal(
+            &tx,
+            &priority,
+            &mut assembler,
+            &responses,
+            ResponsesTerminal {
+                events: vec![],
+                reason: StopReason::Error,
+                usage: Usage::default(),
+                error_message: Some("late error".into()),
+                provider_code: Some("late_error".into()),
+                provider_context: vec![],
+            },
+            &cancel,
+            &success,
+        )
+        .await;
+        assert!(matches!(
+            terminal_rx.recv().await,
+            Some(ProviderEvent::Error {
+                reason: StopReason::Aborted,
+                ..
+            })
+        ));
+
+        let anthropic = ModelSpec::preset("anthropic").unwrap();
+        let (priority, mut terminal_rx) = mpsc::channel(1);
+        let mut assembler = MessageAssembler::new();
+        assembler.apply(&ProviderEvent::Start).unwrap();
+        finish_anthropic_terminal(
+            &tx,
+            &priority,
+            &mut assembler,
+            &anthropic,
+            AnthropicTerminal {
+                events: vec![],
+                reason: StopReason::Error,
+                usage: Usage::default(),
+                error_message: Some("late error".into()),
+                provider_code: Some("late_error".into()),
+                provider_context: vec![],
+            },
+            &cancel,
+            &success,
+        )
+        .await;
+        assert!(matches!(
+            terminal_rx.recv().await,
+            Some(ProviderEvent::Error {
+                reason: StopReason::Aborted,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn chat_terminal_prepare_finish_contract_error_uses_failure_fallback() {
+        let mut spec = ModelSpec::preset("kimi-k3").expect("preset");
+        spec.id.clear();
+        let (tx, _rx) = mpsc::channel(1);
+        let (priority_tx, mut priority_rx) = mpsc::channel(1);
+        let mut assembler = MessageAssembler::new();
+        assembler.apply(&ProviderEvent::Start).expect("Start");
+        let cancel = CancellationToken::new();
+        let committed = SuccessTerminalCommit::new();
+
+        finish_terminal(
+            &tx,
+            &priority_tx,
+            &mut assembler,
+            &spec,
+            ChatTerminal {
+                events: Vec::new(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                provider_code: Some("stop".to_owned()),
+            },
+            &cancel,
+            &committed,
+        )
+        .await;
+
+        let ProviderEvent::Error { reason, output } =
+            priority_rx.recv().await.expect("priority terminal")
+        else {
+            panic!("expected Error terminal")
+        };
+        assert_eq!(reason, StopReason::Error);
+        assert_eq!(output.message.stop_reason, StopReason::Error);
+        assert!(!output.message.interrupted);
+        assert_eq!(
+            output.message.provider_code.as_deref(),
+            Some("normalized_event_contract_violation")
+        );
+        assert!(!committed.is_committed());
+    }
+
+    #[tokio::test]
+    async fn normalized_but_unsent_public_delta_does_not_record_ttft() {
+        let registry = FrozenToolSchemaRegistry::compile(&[]).expect("registry");
+        let mut receive = ChatReceiveState::new(registry);
+        let events = receive
+            .push_json(r#"{"choices":[{"delta":{"content":"hello"}}]}"#)
+            .expect("normalized chunk");
+        let delta = events
+            .into_iter()
+            .find(|event| matches!(event, ProviderEvent::TextDelta { .. }))
+            .expect("normalized text delta");
+
+        let (tx, _rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut assembler = MessageAssembler::new();
+        assembler.apply(&ProviderEvent::Start).expect("Start");
+        assembler
+            .apply(&ProviderEvent::TextStart { content_index: 0 })
+            .expect("TextStart");
+        let result = emit(&tx, &mut assembler, delta, &cancel).await;
+        assert!(matches!(result, EmitResult::Cancelled));
+
+        let mut ttft = TtftObservation::new(Instant::now());
+        ttft.observe_emit(true, &result);
+        assert!(!ttft.first_public_delta_sent);
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut assembler = MessageAssembler::new();
+        assembler.apply(&ProviderEvent::Start).expect("Start");
+        assembler
+            .apply(&ProviderEvent::TextStart { content_index: 0 })
+            .expect("TextStart");
+        let result = emit(
+            &tx,
+            &mut assembler,
+            ProviderEvent::TextDelta {
+                content_index: 0,
+                delta: "sent".to_owned(),
+            },
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(matches!(result, EmitResult::Sent));
+        ttft.observe_emit(true, &result);
+        assert!(ttft.first_public_delta_sent);
+        assert!(matches!(
+            rx.recv().await,
+            Some(ProviderEvent::TextDelta { delta, .. }) if delta == "sent"
+        ));
+    }
+
+    #[tokio::test]
+    async fn response_header_timeout_aborts_when_already_cancelled_preserving_partial() {
+        let spec = ModelSpec::preset("kimi-k3").expect("preset");
+        let (priority_tx, mut priority_rx) = mpsc::channel(1);
+        let mut assembler = MessageAssembler::new();
+        assembler.apply(&ProviderEvent::Start).expect("Start");
+        assembler
+            .apply(&ProviderEvent::TextStart { content_index: 0 })
+            .expect("text start");
+        assembler
+            .apply(&ProviderEvent::TextDelta {
+                content_index: 0,
+                delta: "partial".to_owned(),
+            })
+            .expect("text delta");
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        finish_failure(
+            &priority_tx,
+            &mut assembler,
+            &spec,
+            Usage {
+                input: 5,
+                output: 2,
+                total_tokens: 7,
+                ..Default::default()
+            },
+            format!(
+                "provider response headers timed out after {} seconds",
+                RESPONSE_HEADER_TIMEOUT.as_secs()
+            ),
+            "response_header_timeout",
+            cancel.is_cancelled(),
+        )
+        .await;
+
+        let ProviderEvent::Error { reason, output } =
+            priority_rx.recv().await.expect("priority terminal")
+        else {
+            panic!("expected Error terminal")
+        };
+        assert_eq!(reason, StopReason::Aborted);
+        assert_eq!(output.message.stop_reason, StopReason::Aborted);
+        assert!(output.message.interrupted);
+        assert_eq!(
+            output.message.provider_code.as_deref(),
+            Some("response_header_timeout")
+        );
+        assert!(!retry::is_retryable(&output.message));
+        assert!(matches!(
+            output.message.content.as_slice(),
+            [types::AssistantContent::Text { text, .. }] if text == "partial"
+        ));
+    }
+
+    #[tokio::test]
+    async fn adapter_push_json_error_aborts_when_already_cancelled_preserving_partial() {
+        let spec = ModelSpec::preset("kimi-k3").expect("preset");
+        let (priority_tx, mut priority_rx) = mpsc::channel(1);
+        let schemas = FrozenToolSchemaRegistry::compile(&[]).expect("registry");
+        let mut receive = ChatReceiveState::with_budget(schemas, ResponseBudget::default());
+        let mut assembler = MessageAssembler::new();
+        assembler.apply(&ProviderEvent::Start).expect("Start");
+        for event in receive
+            .push_json(r#"{"choices":[{"delta":{"content":"partial"}}]}"#)
+            .expect("valid partial chunk")
+        {
+            assembler.apply(&event).expect("assemble partial");
+        }
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let error = receive
+            .push_json("this is not valid json")
+            .expect_err("invalid chunk must fail parsing");
+        close_partial(&mut receive, &mut assembler);
+        let (message, code) = adapter_error(&error);
+        finish_failure(
+            &priority_tx,
+            &mut assembler,
+            &spec,
+            receive.usage().clone(),
+            message,
+            &code,
+            cancel.is_cancelled(),
+        )
+        .await;
+
+        let ProviderEvent::Error { reason, output } =
+            priority_rx.recv().await.expect("priority terminal")
+        else {
+            panic!("expected Error terminal")
+        };
+        assert_eq!(reason, StopReason::Aborted);
+        assert_eq!(output.message.stop_reason, StopReason::Aborted);
+        assert!(output.message.interrupted);
+        assert_eq!(
+            output.message.provider_code.as_deref(),
+            Some("invalid_sse_json")
+        );
+        assert!(!retry::is_retryable(&output.message));
+        assert!(matches!(
+            output.message.content.as_slice(),
+            [types::AssistantContent::Text { text, .. }] if text == "partial"
         ));
     }
 
@@ -3177,6 +5044,285 @@ fi
         })
         .await
         .expect("live provider request timed out")
+    }
+
+    #[tokio::test]
+    async fn responses_dispatch_normalizes_fixture_and_preserves_context() {
+        let fixture = include_str!("../../tests/fixtures/openai_responses_official.sse");
+        let app = Router::new().route(
+            "/responses",
+            post(move || async move {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(fixture))
+                    .expect("response")
+            }),
+        );
+        let (base_url, server) = serve_router(app).await;
+        let mut spec = ModelSpec::preset("openai-responses").expect("Responses preset");
+        spec.base_url = base_url;
+        let context = PromptContext {
+            system_prompt: "constitution".into(),
+            memory_blocks: vec![],
+            messages: vec![],
+            provider_context: vec![],
+            tools: vec![ToolDefinition {
+                name: "weather".into(),
+                description: "Weather".into(),
+                parameters: serde_json::json!({
+                    "type":"object",
+                    "properties":{"city":{"type":"string"}},
+                    "required":["city"],
+                    "additionalProperties":false
+                }),
+            }],
+        };
+        let mut stream = stream_with_api_key(
+            spec,
+            context,
+            RequestOptions::default(),
+            CancellationToken::new(),
+            Some("test-key".into()),
+        );
+        let mut events = Vec::new();
+        while let Some(event) = stream.recv().await {
+            events.push(event);
+        }
+        server.abort();
+        assert!(matches!(events.first(), Some(ProviderEvent::Start)));
+        let terminal = events.last().expect("terminal");
+        let ProviderEvent::Done {
+            reason: StopReason::ToolUse,
+            output,
+        } = terminal
+        else {
+            panic!("unexpected terminal: {terminal:?}");
+        };
+        assert_eq!(output.provider_context.len(), 1);
+        assert_eq!(output.message.usage.cache_read, 5);
+        assert!(output.message.content.iter().any(
+            |content| matches!(content, AssistantContent::ToolCall { tool_call, .. } if tool_call.name == "weather")
+        ));
+    }
+
+    #[tokio::test]
+    async fn responses_cancel_and_eof_terminals_preserve_only_item_done_reasoning() {
+        let fixture = include_str!("../../tests/fixtures/openai_responses_official.sse");
+        let prefix = fixture
+            .lines()
+            .take_while(|line| !line.contains("sequence_number\":13"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for cancel_after_prefix in [false, true] {
+            let body = prefix.clone();
+            let app = Router::new().route(
+                "/responses",
+                post(move || {
+                    let body = body.clone();
+                    async move {
+                        let prefix = stream::iter([Ok::<String, Infallible>(body)]);
+                        let response_body = if cancel_after_prefix {
+                            Body::from_stream(
+                                prefix.chain(stream::pending::<Result<String, Infallible>>()),
+                            )
+                        } else {
+                            Body::from_stream(
+                                prefix.chain(stream::empty::<Result<String, Infallible>>()),
+                            )
+                        };
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "text/event-stream")
+                            .body(response_body)
+                            .expect("response")
+                    }
+                }),
+            );
+            let (base_url, server) = serve_router(app).await;
+            let mut spec = ModelSpec::preset("openai-responses").unwrap();
+            spec.base_url = base_url;
+            let cancel = CancellationToken::new();
+            let mut events = stream_with_api_key(
+                spec,
+                empty_context(),
+                RequestOptions::default(),
+                cancel.clone(),
+                Some("test-key".into()),
+            );
+            let mut terminal = None;
+            while let Some(event) = events.recv().await {
+                if cancel_after_prefix && matches!(event, ProviderEvent::ReasoningSummaryEnd { .. })
+                {
+                    cancel.cancel();
+                }
+                if matches!(
+                    event,
+                    ProviderEvent::Done { .. } | ProviderEvent::Error { .. }
+                ) {
+                    terminal = Some(event);
+                    break;
+                }
+            }
+            server.abort();
+            let ProviderEvent::Error { reason, output } = terminal.expect("error terminal") else {
+                panic!("unexpected terminal")
+            };
+            assert_eq!(
+                reason,
+                if cancel_after_prefix {
+                    StopReason::Aborted
+                } else {
+                    StopReason::Error
+                }
+            );
+            assert_eq!(output.provider_context.len(), 1);
+            assert!(matches!(
+                &output.provider_context[0].payload,
+                types::ProviderContextPayload::EncryptedReasoning { item, .. }
+                    if item["id"] == "rs_fixture"
+                        && item["encrypted_content"] == "opaque-reasoning"
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_native_rejects_unprovable_coverage_before_credentials() {
+        let spec = ModelSpec::preset("openai-responses").expect("Responses preset");
+        let error = compact_native(spec, empty_context(), CancellationToken::new())
+            .await
+            .expect_err("empty history cannot prove persisted compaction coverage");
+        assert!(matches!(
+            error,
+            NativeCompactionError::InvalidRequest(ref message)
+                if message.contains("persisted")
+        ));
+    }
+
+    #[tokio::test]
+    async fn anthropic_failure_terminal_preserves_verified_reasoning_context() {
+        let spec = ModelSpec::preset("anthropic").expect("Anthropic preset");
+        let mut assembler = MessageAssembler::new();
+        assembler.apply(&ProviderEvent::Start).unwrap();
+        let verified = types::ProviderContextFragment {
+            wire_item_index: Some(0),
+            payload: types::ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::AnthropicMessages,
+                item: serde_json::json!({
+                    "type":"thinking_signature",
+                    "signature":"verified",
+                }),
+            },
+        };
+        let (tx, mut rx) = mpsc::channel(1);
+        finish_anthropic_error(
+            &tx,
+            &mut assembler,
+            &spec,
+            Usage::default(),
+            AnthropicAdapterError::MissingTerminal,
+            false,
+            vec![verified.clone()],
+        )
+        .await;
+        let ProviderEvent::Error { output, .. } = rx.recv().await.expect("terminal") else {
+            panic!("expected error terminal")
+        };
+        assert_eq!(output.provider_context, vec![verified]);
+    }
+
+    #[tokio::test]
+    async fn compact_native_preserves_order_and_has_typed_cancel_and_http_errors() {
+        let compact_body = serde_json::json!({
+            "id":"resp_compact",
+            "object":"response.compaction",
+            "output":[
+                {"id":"m1","type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},
+                {"id":"cmp1","type":"compaction","encrypted_content":"opaque"}
+            ],
+            "usage":{"input_tokens":8,"output_tokens":2,"total_tokens":10}
+        })
+        .to_string();
+        let app = Router::new().route(
+            "/responses/compact",
+            post(move || {
+                let compact_body = compact_body.clone();
+                async move {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .body(Body::from(compact_body))
+                        .expect("response")
+                }
+            }),
+        );
+        let (base_url, server) = serve_router(app).await;
+        let mut spec = ModelSpec::preset("openai-responses").expect("Responses preset");
+        spec.base_url = base_url;
+        let mut context = persisted_context(9);
+        context.messages.insert(
+            0,
+            ContextMessage::Synthetic {
+                message: Message::User(UserMessage {
+                    content: vec![UserContent::Text {
+                        text: "leading synthetic compact input".into(),
+                    }],
+                    timestamp: Utc::now(),
+                }),
+            },
+        );
+        let coverage =
+            responses_compaction_coverage(&spec, &context).expect("derived test coverage");
+        let result = compact_native_with_api_key(
+            spec.clone(),
+            context,
+            CancellationToken::new(),
+            "test-key".into(),
+        )
+        .await
+        .expect("compact");
+        assert_eq!(result.coverage(), &coverage);
+        assert_eq!(result.items()[0]["type"], "message");
+        assert_eq!(result.items()[1]["type"], "compaction");
+        server.abort();
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let cancel_context = persisted_context(10);
+        let error = compact_native_with_api_key(spec, cancel_context, cancelled, "test-key".into())
+            .await
+            .expect_err("cancelled");
+        assert!(matches!(error, NativeCompactionError::Cancelled));
+
+        let app = Router::new().route(
+            "/responses/compact",
+            post(|| async {
+                Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Body::from("bad compact request"))
+                    .expect("response")
+            }),
+        );
+        let (base_url, server) = serve_router(app).await;
+        let mut spec = ModelSpec::preset("openai-responses").expect("Responses preset");
+        spec.base_url = base_url;
+        let http_context = persisted_context(11);
+        let error = compact_native_with_api_key(
+            spec,
+            http_context,
+            CancellationToken::new(),
+            "test-key".into(),
+        )
+        .await
+        .expect_err("HTTP error");
+        server.abort();
+        assert!(matches!(
+            error,
+            NativeCompactionError::Http {
+                status: 400,
+                ref body
+            } if body == "bad compact request"
+        ));
     }
 
     async fn assert_aborted_within_one_second(events: &mut ProviderEventStream) -> ProviderEvent {

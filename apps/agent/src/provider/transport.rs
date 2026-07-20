@@ -6,6 +6,9 @@ use tokio_util::sync::CancellationToken;
 
 const MAX_ERROR_BODY_CHARS: usize = 4_000;
 const MAX_ERROR_BODY_READ_BYTES: usize = MAX_ERROR_BODY_CHARS * 4 + 4;
+const ERROR_BODY_TRUNCATED_MARKER: &str = "... [truncated]";
+const ERROR_BODY_DIAGNOSTIC_PREFIX: &str = "[error body read incomplete: ";
+const ERROR_BODY_DIAGNOSTIC_SUFFIX: &str = "]";
 const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 4 * MAX_SSE_LINE_BYTES;
 const MAX_SSE_QUEUED_BYTES: usize = 2 * MAX_SSE_EVENT_BYTES;
@@ -346,31 +349,89 @@ async fn read_error_body(
     }
 
     let body = String::from_utf8_lossy(&body);
-    let body = truncate_error_body(body.trim(), source_truncated);
-    Ok(match read_diagnostic {
-        Some(diagnostic) if body.is_empty() => {
-            format!("[error body read incomplete: {diagnostic}]")
-        }
-        Some(diagnostic) => format!("{body} [error body read incomplete: {diagnostic}]"),
-        None => body,
-    })
+    Ok(format_error_body(
+        body.trim(),
+        source_truncated,
+        read_diagnostic.as_deref(),
+    ))
 }
 
 fn truncate_error_body(body: &str, source_truncated: bool) -> String {
+    truncate_error_body_to_limit(body, source_truncated, MAX_ERROR_BODY_CHARS)
+}
+
+fn format_error_body(body: &str, source_truncated: bool, read_diagnostic: Option<&str>) -> String {
+    let Some(diagnostic) = read_diagnostic else {
+        return truncate_error_body(body, source_truncated);
+    };
+
+    let separator_len = usize::from(!body.is_empty());
+    let minimum_diagnostic_len = ERROR_BODY_DIAGNOSTIC_PREFIX.chars().count()
+        + ERROR_BODY_TRUNCATED_MARKER.chars().count()
+        + ERROR_BODY_DIAGNOSTIC_SUFFIX.chars().count();
+    let body_limit = if body.is_empty() {
+        0
+    } else {
+        MAX_ERROR_BODY_CHARS
+            .saturating_sub(separator_len)
+            .saturating_sub(minimum_diagnostic_len)
+    };
+    let body = truncate_error_body_to_limit(body, source_truncated, body_limit);
+    let separator = if body.is_empty() { "" } else { " " };
+    let diagnostic_limit = MAX_ERROR_BODY_CHARS
+        .saturating_sub(body.chars().count())
+        .saturating_sub(separator.chars().count());
+    let diagnostic = format_error_body_diagnostic(diagnostic, diagnostic_limit);
+    let formatted = format!("{body}{separator}{diagnostic}");
+    debug_assert!(formatted.chars().count() <= MAX_ERROR_BODY_CHARS);
+    formatted
+}
+
+fn truncate_error_body_to_limit(body: &str, source_truncated: bool, max_chars: usize) -> String {
     let count = body.chars().count();
-    if count <= MAX_ERROR_BODY_CHARS && !source_truncated {
+    if count <= max_chars && !source_truncated {
         return body.to_owned();
     }
 
-    let kept: String = body.chars().take(MAX_ERROR_BODY_CHARS).collect();
     if source_truncated {
-        format!("{kept}... [truncated]")
-    } else {
-        format!(
-            "{kept}... [truncated {} chars]",
-            count - MAX_ERROR_BODY_CHARS
-        )
+        let prefix_limit = max_chars.saturating_sub(ERROR_BODY_TRUNCATED_MARKER.chars().count());
+        let kept = bounded_char_prefix(body, prefix_limit);
+        return format!("{kept}{ERROR_BODY_TRUNCATED_MARKER}");
     }
+
+    let mut kept_chars = count.min(max_chars);
+    loop {
+        let suffix = format!("... [truncated {} chars]", count - kept_chars);
+        let prefix_limit = max_chars.saturating_sub(suffix.chars().count());
+        let kept = bounded_char_prefix(body, kept_chars.min(prefix_limit));
+        let actual_kept_chars = kept.chars().count();
+        if actual_kept_chars == kept_chars {
+            return format!("{kept}{suffix}");
+        }
+        kept_chars = actual_kept_chars;
+    }
+}
+
+fn format_error_body_diagnostic(diagnostic: &str, max_chars: usize) -> String {
+    let wrapper_len =
+        ERROR_BODY_DIAGNOSTIC_PREFIX.chars().count() + ERROR_BODY_DIAGNOSTIC_SUFFIX.chars().count();
+    let content_limit = max_chars.saturating_sub(wrapper_len);
+    if diagnostic.chars().count() <= content_limit {
+        return format!("{ERROR_BODY_DIAGNOSTIC_PREFIX}{diagnostic}{ERROR_BODY_DIAGNOSTIC_SUFFIX}");
+    }
+
+    let prefix_limit = content_limit.saturating_sub(ERROR_BODY_TRUNCATED_MARKER.chars().count());
+    let kept = bounded_char_prefix(diagnostic, prefix_limit);
+    format!(
+        "{ERROR_BODY_DIAGNOSTIC_PREFIX}{kept}{ERROR_BODY_TRUNCATED_MARKER}{ERROR_BODY_DIAGNOSTIC_SUFFIX}"
+    )
+}
+
+fn bounded_char_prefix(value: &str, max_chars: usize) -> &str {
+    value
+        .char_indices()
+        .nth(max_chars)
+        .map_or(value, |(end, _)| &value[..end])
 }
 
 #[cfg(test)]
@@ -681,8 +742,18 @@ mod tests {
     #[test]
     fn http_error_body_is_truncated_and_formatted() {
         let body = truncate_error_body(&"あ".repeat(MAX_ERROR_BODY_CHARS + 7), false);
-        assert!(body.starts_with(&"あ".repeat(MAX_ERROR_BODY_CHARS)));
-        assert!(body.ends_with("... [truncated 7 chars]"));
+        // Reserving suffix space changes the reported omitted count: retaining
+        // 3,969 source characters leaves 31 characters omitted in total.
+        let suffix = "... [truncated 31 chars]";
+        assert_eq!(
+            body,
+            format!(
+                "{}{}",
+                "あ".repeat(MAX_ERROR_BODY_CHARS - suffix.chars().count()),
+                suffix
+            )
+        );
+        assert_eq!(body.chars().count(), MAX_ERROR_BODY_CHARS);
 
         let error = SseError::Http { status: 429, body };
         assert!(error.to_string().starts_with("429: "));
@@ -690,7 +761,9 @@ mod tests {
 
     #[tokio::test]
     async fn error_body_reader_stops_at_byte_limit() {
-        let chunks = stream::iter([Ok(vec![b'a'; MAX_ERROR_BODY_READ_BYTES + 100])]);
+        let mut source = "😀".repeat(MAX_ERROR_BODY_CHARS + 2).into_bytes();
+        source.extend([b'x'; 100]);
+        let chunks = stream::iter([Ok(source)]);
         let body = read_error_body(
             Box::pin(chunks),
             &CancellationToken::new(),
@@ -699,12 +772,16 @@ mod tests {
         .await
         .expect("bounded error body");
 
+        let kept = body
+            .strip_suffix(ERROR_BODY_TRUNCATED_MARKER)
+            .expect("truncation marker");
         assert_eq!(
-            body.strip_suffix("... [truncated]")
-                .expect("truncation marker")
-                .len(),
-            MAX_ERROR_BODY_CHARS
+            kept.chars().count(),
+            MAX_ERROR_BODY_CHARS - ERROR_BODY_TRUNCATED_MARKER.chars().count()
         );
+        assert!(body.starts_with('😀'));
+        assert!(!body.contains('\u{fffd}'));
+        assert_eq!(body.chars().count(), MAX_ERROR_BODY_CHARS);
     }
 
     #[tokio::test]
@@ -720,7 +797,9 @@ mod tests {
         .await
         .expect("bounded error body");
 
-        assert!(body.ends_with("... [truncated 1 chars]"));
+        assert!(body.contains("... [truncated "));
+        assert!(body.ends_with(" chars]"));
+        assert_eq!(body.chars().count(), MAX_ERROR_BODY_CHARS);
     }
 
     #[tokio::test]
@@ -737,6 +816,46 @@ mod tests {
         assert!(body.starts_with("partial"));
         assert!(body.contains("error body read incomplete"));
         assert!(body.contains("connection reset"));
+    }
+
+    #[tokio::test]
+    async fn error_body_and_large_transport_diagnostic_share_one_character_limit() {
+        let partial_body = "🙂".repeat(MAX_ERROR_BODY_CHARS - 1);
+        let diagnostic = "transport故障".repeat(MAX_ERROR_BODY_READ_BYTES);
+        let read = || {
+            stream::iter([
+                Ok(partial_body.as_bytes().to_vec()),
+                Err(diagnostic.clone()),
+            ])
+        };
+        let first = read_error_body(
+            Box::pin(read()),
+            &CancellationToken::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("HTTP status remains authoritative");
+        let second = read_error_body(
+            Box::pin(read()),
+            &CancellationToken::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("HTTP status remains authoritative");
+
+        assert_eq!(first, second);
+        assert!(first.chars().count() <= MAX_ERROR_BODY_CHARS);
+        assert_eq!(first.chars().count(), MAX_ERROR_BODY_CHARS);
+        assert!(first.starts_with('🙂'));
+        assert!(first.contains(" chars] "));
+        assert!(first.contains(ERROR_BODY_DIAGNOSTIC_PREFIX));
+        assert!(first.ends_with("... [truncated]]"));
+
+        let error = SseError::Http {
+            status: 503,
+            body: first,
+        };
+        assert!(matches!(error, SseError::Http { status: 503, .. }));
     }
 
     #[tokio::test]
