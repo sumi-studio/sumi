@@ -1496,6 +1496,9 @@ impl ChatReceiveState {
                 .flatten()
                 .map(|tool| resolve_tool_name(&tool.name_chunks, &self.schemas))
                 .collect::<Result<Vec<_>, _>>()?,
+            // Length rejects every call independently of schema validity, so
+            // preserve the raw standard-fragment view for diagnostics without
+            // resolving it to an executable tool.
             StopReason::Length => self
                 .tools
                 .iter()
@@ -1795,6 +1798,9 @@ fn resolve_tool_name(
         }
         (true, _, _) => Ok(standard),
         (false, true, Some(cumulative)) => Ok(cumulative.to_owned()),
+        // A provider may hallucinate a tool name. Keep the deterministic
+        // wire-fragment interpretation and let the frozen schema validator
+        // emit the normal ToolCallRejected/synthetic result pair.
         (false, false, _) => Ok(standard),
         (false, true, None) => unreachable!("registered cumulative name must exist"),
     }

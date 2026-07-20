@@ -54,12 +54,6 @@ const RESPONSE_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_PROVIDER_ERROR_BODY_BYTES: usize = 16_000;
 
 enum RequestWait<T, E> {
-    Response(Result<T, E>),
-    Cancelled,
-    TimedOut,
-}
-
-enum ObservedRequestWait<T, E> {
     Response {
         response: Result<T, E>,
         request_sent_at: Instant,
@@ -94,44 +88,28 @@ struct ProducerChannels {
     success_terminal_committed: Arc<SuccessTerminalCommit>,
 }
 
-async fn await_request<F, T, E>(
-    request: F,
-    cancel: &CancellationToken,
-    timeout: Duration,
-) -> RequestWait<T, E>
-where
-    F: Future<Output = Result<T, E>>,
-{
-    tokio::select! {
-        biased;
-        _ = cancel.cancelled() => RequestWait::Cancelled,
-        response = request => RequestWait::Response(response),
-        _ = tokio::time::sleep(timeout) => RequestWait::TimedOut,
-    }
-}
-
-async fn await_observed_request<F, T, E, O>(
+async fn await_request<F, T, E, O>(
     request: F,
     cancel: &CancellationToken,
     timeout: Duration,
     on_first_poll: O,
-) -> ObservedRequestWait<T, E>
+) -> RequestWait<T, E>
 where
     F: Future<Output = Result<T, E>>,
     O: FnOnce(Instant),
 {
     tokio::select! {
         biased;
-        _ = cancel.cancelled() => ObservedRequestWait::Cancelled,
+        _ = cancel.cancelled() => RequestWait::Cancelled,
         result = async move {
             let request_sent_at = Instant::now();
             on_first_poll(request_sent_at);
             (request.await, request_sent_at)
-        } => ObservedRequestWait::Response {
+        } => RequestWait::Response {
             response: result.0,
             request_sent_at: result.1,
         },
-        _ = tokio::time::sleep(timeout) => ObservedRequestWait::TimedOut,
+        _ = tokio::time::sleep(timeout) => RequestWait::TimedOut,
     }
 }
 
@@ -218,13 +196,19 @@ async fn compact_native_with_api_key(
         .bearer_auth(api_key)
         .json(&body)
         .send();
-    let response = match await_request(request, &cancel, RESPONSE_HEADER_TIMEOUT).await {
+    let response = match await_request(request, &cancel, RESPONSE_HEADER_TIMEOUT, |_| {}).await {
         RequestWait::Cancelled => return Err(NativeCompactionError::Cancelled),
         RequestWait::TimedOut => return Err(NativeCompactionError::HeaderTimeout),
-        RequestWait::Response(Err(error)) => {
+        RequestWait::Response {
+            response: Err(error),
+            ..
+        } => {
             return Err(NativeCompactionError::Transport(error.to_string()));
         }
-        RequestWait::Response(Ok(response)) => response,
+        RequestWait::Response {
+            response: Ok(response),
+            ..
+        } => response,
     };
     let status = response.status();
     let max_bytes = ResponseBudget::for_output_tokens(spec.max_output_tokens)
@@ -606,7 +590,7 @@ async fn run_anthropic_stream(
     {
         request = request.header("anthropic-beta", compat.beta_headers.join(","));
     }
-    let (response, request_sent_at) = match await_observed_request(
+    let (response, request_sent_at) = match await_request(
         request.json(&body).send(),
         &cancel,
         RESPONSE_HEADER_TIMEOUT,
@@ -614,7 +598,7 @@ async fn run_anthropic_stream(
     )
     .await
     {
-        ObservedRequestWait::Cancelled => {
+        RequestWait::Cancelled => {
             finish_failure_with_context(
                 &priority_terminal_tx,
                 &mut assembler,
@@ -628,7 +612,7 @@ async fn run_anthropic_stream(
             .await;
             return;
         }
-        ObservedRequestWait::TimedOut => {
+        RequestWait::TimedOut => {
             finish_failure_with_context(
                 &priority_terminal_tx,
                 &mut assembler,
@@ -645,11 +629,11 @@ async fn run_anthropic_stream(
             .await;
             return;
         }
-        ObservedRequestWait::Response {
+        RequestWait::Response {
             response: Ok(response),
             request_sent_at,
         } => (response, request_sent_at),
-        ObservedRequestWait::Response {
+        RequestWait::Response {
             response: Err(error),
             ..
         } => {
@@ -968,12 +952,12 @@ async fn run_responses_stream(
         .json(&body)
         .send();
     let (response, request_sent_at) =
-        match await_observed_request(request, &cancel, RESPONSE_HEADER_TIMEOUT, |_| {
+        match await_request(request, &cancel, RESPONSE_HEADER_TIMEOUT, |_| {
             tracing::info!(phase = "request_sent", "provider request sent")
         })
         .await
         {
-            ObservedRequestWait::Cancelled => {
+            RequestWait::Cancelled => {
                 finish_failure_with_context(
                     &priority_terminal_tx,
                     &mut assembler,
@@ -987,7 +971,7 @@ async fn run_responses_stream(
                 .await;
                 return;
             }
-            ObservedRequestWait::TimedOut => {
+            RequestWait::TimedOut => {
                 finish_failure_with_context(
                     &priority_terminal_tx,
                     &mut assembler,
@@ -1004,11 +988,11 @@ async fn run_responses_stream(
                 .await;
                 return;
             }
-            ObservedRequestWait::Response {
+            RequestWait::Response {
                 response: Ok(response),
                 request_sent_at,
             } => (response, request_sent_at),
-            ObservedRequestWait::Response {
+            RequestWait::Response {
                 response: Err(error),
                 ..
             } => {
@@ -1293,12 +1277,12 @@ async fn run_chat_stream(
         .json(&body)
         .send();
     let (response, request_sent_at) =
-        match await_observed_request(request, &cancel, RESPONSE_HEADER_TIMEOUT, |_| {
+        match await_request(request, &cancel, RESPONSE_HEADER_TIMEOUT, |_| {
             tracing::info!(phase = "request_sent", "provider request sent")
         })
         .await
         {
-            ObservedRequestWait::Cancelled => {
+            RequestWait::Cancelled => {
                 finish_failure(
                     &priority_terminal_tx,
                     &mut assembler,
@@ -1311,7 +1295,7 @@ async fn run_chat_stream(
                 .await;
                 return;
             }
-            ObservedRequestWait::TimedOut => {
+            RequestWait::TimedOut => {
                 finish_failure(
                     &priority_terminal_tx,
                     &mut assembler,
@@ -1327,7 +1311,7 @@ async fn run_chat_stream(
                 .await;
                 return;
             }
-            ObservedRequestWait::Response {
+            RequestWait::Response {
                 response,
                 request_sent_at,
             } => (response, request_sent_at),
@@ -3133,22 +3117,197 @@ fi
     }
 
     #[tokio::test]
-    async fn response_header_wait_is_bounded_and_cancel_first() {
+    async fn response_header_wait_is_bounded_and_precancel_does_not_record_request_sent() {
         let cancel = CancellationToken::new();
+        let first_poll_count = Cell::new(0);
         assert!(matches!(
             await_request(
                 std::future::pending::<Result<(), ()>>(),
                 &cancel,
                 Duration::from_millis(1),
+                |_| first_poll_count.set(first_poll_count.get() + 1),
             )
             .await,
             RequestWait::TimedOut
         ));
+        assert_eq!(first_poll_count.get(), 1);
 
         cancel.cancel();
         assert!(matches!(
-            await_request(std::future::ready(Ok::<_, ()>(())), &cancel, Duration::ZERO,).await,
+            await_request(
+                std::future::ready(Ok::<_, ()>(())),
+                &cancel,
+                Duration::ZERO,
+                |_| first_poll_count.set(first_poll_count.get() + 1),
+            )
+            .await,
             RequestWait::Cancelled
+        ));
+        assert_eq!(
+            first_poll_count.get(),
+            1,
+            "pre-cancelled biased select must not record request_sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn normalized_but_unsent_public_delta_does_not_record_ttft() {
+        let registry = FrozenToolSchemaRegistry::compile(&[]).expect("registry");
+        let mut receive = ChatReceiveState::new(registry);
+        let events = receive
+            .push_json(r#"{"choices":[{"delta":{"content":"hello"}}]}"#)
+            .expect("normalized chunk");
+        let delta = events
+            .into_iter()
+            .find(|event| matches!(event, ProviderEvent::TextDelta { .. }))
+            .expect("normalized text delta");
+
+        let (tx, _rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut assembler = MessageAssembler::new();
+        assembler.apply(&ProviderEvent::Start).expect("Start");
+        assembler
+            .apply(&ProviderEvent::TextStart { content_index: 0 })
+            .expect("TextStart");
+        let result = emit(&tx, &mut assembler, delta, &cancel).await;
+        assert!(matches!(result, EmitResult::Cancelled));
+
+        let mut ttft = TtftObservation::new(Instant::now());
+        ttft.observe_emit(true, &result);
+        assert!(!ttft.first_public_delta_sent);
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut assembler = MessageAssembler::new();
+        assembler.apply(&ProviderEvent::Start).expect("Start");
+        assembler
+            .apply(&ProviderEvent::TextStart { content_index: 0 })
+            .expect("TextStart");
+        let result = emit(
+            &tx,
+            &mut assembler,
+            ProviderEvent::TextDelta {
+                content_index: 0,
+                delta: "sent".to_owned(),
+            },
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(matches!(result, EmitResult::Sent));
+        ttft.observe_emit(true, &result);
+        assert!(ttft.first_public_delta_sent);
+        assert!(matches!(
+            rx.recv().await,
+            Some(ProviderEvent::TextDelta { delta, .. }) if delta == "sent"
+        ));
+    }
+
+    #[tokio::test]
+    async fn response_header_timeout_aborts_when_already_cancelled_preserving_partial() {
+        let spec = ModelSpec::preset("kimi-k3").expect("preset");
+        let (priority_tx, mut priority_rx) = mpsc::channel(1);
+        let mut assembler = MessageAssembler::new();
+        assembler.apply(&ProviderEvent::Start).expect("Start");
+        assembler
+            .apply(&ProviderEvent::TextStart { content_index: 0 })
+            .expect("text start");
+        assembler
+            .apply(&ProviderEvent::TextDelta {
+                content_index: 0,
+                delta: "partial".to_owned(),
+            })
+            .expect("text delta");
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        finish_failure(
+            &priority_tx,
+            &mut assembler,
+            &spec,
+            Usage {
+                input: 5,
+                output: 2,
+                total_tokens: 7,
+                ..Default::default()
+            },
+            format!(
+                "provider response headers timed out after {} seconds",
+                RESPONSE_HEADER_TIMEOUT.as_secs()
+            ),
+            "response_header_timeout",
+            cancel.is_cancelled(),
+        )
+        .await;
+
+        let event = priority_rx.recv().await.expect("priority terminal");
+        let ProviderEvent::Error { reason, output } = event else {
+            panic!("expected Error terminal, got {event:?}")
+        };
+        assert_eq!(reason, StopReason::Aborted);
+        assert_eq!(output.message.stop_reason, StopReason::Aborted);
+        assert!(output.message.interrupted);
+        assert_eq!(
+            output.message.provider_code.as_deref(),
+            Some("response_header_timeout")
+        );
+        assert!(!retry::is_retryable(&output.message));
+        assert!(matches!(
+            output.message.content.as_slice(),
+            [types::AssistantContent::Text { text, .. }] if text == "partial"
+        ));
+    }
+
+    #[tokio::test]
+    async fn adapter_push_json_error_aborts_when_already_cancelled_preserving_partial() {
+        let spec = ModelSpec::preset("kimi-k3").expect("preset");
+        let (priority_tx, mut priority_rx) = mpsc::channel(1);
+        let schemas = FrozenToolSchemaRegistry::compile(&[]).expect("registry");
+        let mut receive = ChatReceiveState::with_budget(schemas, ResponseBudget::default());
+        let mut assembler = MessageAssembler::new();
+        assembler.apply(&ProviderEvent::Start).expect("Start");
+
+        let events = receive
+            .push_json(r#"{"choices":[{"delta":{"content":"partial"}}]}"#)
+            .expect("valid partial chunk");
+        for event in events {
+            assembler.apply(&event).expect("assemble partial");
+        }
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let error = receive
+            .push_json("this is not valid json")
+            .expect_err("invalid chunk must fail parsing");
+        close_partial(&mut receive, &mut assembler);
+        let (message, code) = adapter_error(&error);
+        finish_failure(
+            &priority_tx,
+            &mut assembler,
+            &spec,
+            receive.usage().clone(),
+            message,
+            &code,
+            cancel.is_cancelled(),
+        )
+        .await;
+
+        let event = priority_rx.recv().await.expect("priority terminal");
+        let ProviderEvent::Error { reason, output } = event else {
+            panic!("expected Error terminal, got {event:?}")
+        };
+        assert_eq!(reason, StopReason::Aborted);
+        assert_eq!(output.message.stop_reason, StopReason::Aborted);
+        assert!(output.message.interrupted);
+        assert_eq!(
+            output.message.provider_code.as_deref(),
+            Some("invalid_sse_json")
+        );
+        assert!(!retry::is_retryable(&output.message));
+        assert!(matches!(
+            output.message.content.as_slice(),
+            [types::AssistantContent::Text { text, .. }] if text == "partial"
         ));
     }
 
@@ -3157,27 +3316,27 @@ fi
         let cancel = CancellationToken::new();
         let first_poll_count = Cell::new(0);
         assert!(matches!(
-            await_observed_request(
+            await_request(
                 std::future::pending::<Result<(), ()>>(),
                 &cancel,
                 Duration::from_millis(1),
                 |_| first_poll_count.set(first_poll_count.get() + 1),
             )
             .await,
-            ObservedRequestWait::TimedOut
+            RequestWait::TimedOut
         ));
         assert_eq!(first_poll_count.get(), 1);
 
         cancel.cancel();
         assert!(matches!(
-            await_observed_request(
+            await_request(
                 std::future::ready(Ok::<_, ()>(())),
                 &cancel,
                 Duration::ZERO,
                 |_| first_poll_count.set(first_poll_count.get() + 1),
             )
             .await,
-            ObservedRequestWait::Cancelled
+            RequestWait::Cancelled
         ));
         assert_eq!(first_poll_count.get(), 1);
     }
@@ -3407,166 +3566,6 @@ fi
             Some("normalized_event_contract_violation")
         );
         assert!(!committed.is_committed());
-    }
-
-    #[tokio::test]
-    async fn normalized_but_unsent_public_delta_does_not_record_ttft() {
-        let registry = FrozenToolSchemaRegistry::compile(&[]).expect("registry");
-        let mut receive = ChatReceiveState::new(registry);
-        let events = receive
-            .push_json(r#"{"choices":[{"delta":{"content":"hello"}}]}"#)
-            .expect("normalized chunk");
-        let delta = events
-            .into_iter()
-            .find(|event| matches!(event, ProviderEvent::TextDelta { .. }))
-            .expect("normalized text delta");
-
-        let (tx, _rx) = mpsc::channel(1);
-        let cancel = CancellationToken::new();
-        cancel.cancel();
-        let mut assembler = MessageAssembler::new();
-        assembler.apply(&ProviderEvent::Start).expect("Start");
-        assembler
-            .apply(&ProviderEvent::TextStart { content_index: 0 })
-            .expect("TextStart");
-        let result = emit(&tx, &mut assembler, delta, &cancel).await;
-        assert!(matches!(result, EmitResult::Cancelled));
-
-        let mut ttft = TtftObservation::new(Instant::now());
-        ttft.observe_emit(true, &result);
-        assert!(!ttft.first_public_delta_sent);
-
-        let (tx, mut rx) = mpsc::channel(1);
-        let mut assembler = MessageAssembler::new();
-        assembler.apply(&ProviderEvent::Start).expect("Start");
-        assembler
-            .apply(&ProviderEvent::TextStart { content_index: 0 })
-            .expect("TextStart");
-        let result = emit(
-            &tx,
-            &mut assembler,
-            ProviderEvent::TextDelta {
-                content_index: 0,
-                delta: "sent".to_owned(),
-            },
-            &CancellationToken::new(),
-        )
-        .await;
-        assert!(matches!(result, EmitResult::Sent));
-        ttft.observe_emit(true, &result);
-        assert!(ttft.first_public_delta_sent);
-        assert!(matches!(
-            rx.recv().await,
-            Some(ProviderEvent::TextDelta { delta, .. }) if delta == "sent"
-        ));
-    }
-
-    #[tokio::test]
-    async fn response_header_timeout_aborts_when_already_cancelled_preserving_partial() {
-        let spec = ModelSpec::preset("kimi-k3").expect("preset");
-        let (priority_tx, mut priority_rx) = mpsc::channel(1);
-        let mut assembler = MessageAssembler::new();
-        assembler.apply(&ProviderEvent::Start).expect("Start");
-        assembler
-            .apply(&ProviderEvent::TextStart { content_index: 0 })
-            .expect("text start");
-        assembler
-            .apply(&ProviderEvent::TextDelta {
-                content_index: 0,
-                delta: "partial".to_owned(),
-            })
-            .expect("text delta");
-
-        let cancel = CancellationToken::new();
-        cancel.cancel();
-        finish_failure(
-            &priority_tx,
-            &mut assembler,
-            &spec,
-            Usage {
-                input: 5,
-                output: 2,
-                total_tokens: 7,
-                ..Default::default()
-            },
-            format!(
-                "provider response headers timed out after {} seconds",
-                RESPONSE_HEADER_TIMEOUT.as_secs()
-            ),
-            "response_header_timeout",
-            cancel.is_cancelled(),
-        )
-        .await;
-
-        let ProviderEvent::Error { reason, output } =
-            priority_rx.recv().await.expect("priority terminal")
-        else {
-            panic!("expected Error terminal")
-        };
-        assert_eq!(reason, StopReason::Aborted);
-        assert_eq!(output.message.stop_reason, StopReason::Aborted);
-        assert!(output.message.interrupted);
-        assert_eq!(
-            output.message.provider_code.as_deref(),
-            Some("response_header_timeout")
-        );
-        assert!(!retry::is_retryable(&output.message));
-        assert!(matches!(
-            output.message.content.as_slice(),
-            [types::AssistantContent::Text { text, .. }] if text == "partial"
-        ));
-    }
-
-    #[tokio::test]
-    async fn adapter_push_json_error_aborts_when_already_cancelled_preserving_partial() {
-        let spec = ModelSpec::preset("kimi-k3").expect("preset");
-        let (priority_tx, mut priority_rx) = mpsc::channel(1);
-        let schemas = FrozenToolSchemaRegistry::compile(&[]).expect("registry");
-        let mut receive = ChatReceiveState::with_budget(schemas, ResponseBudget::default());
-        let mut assembler = MessageAssembler::new();
-        assembler.apply(&ProviderEvent::Start).expect("Start");
-        for event in receive
-            .push_json(r#"{"choices":[{"delta":{"content":"partial"}}]}"#)
-            .expect("valid partial chunk")
-        {
-            assembler.apply(&event).expect("assemble partial");
-        }
-
-        let cancel = CancellationToken::new();
-        cancel.cancel();
-        let error = receive
-            .push_json("this is not valid json")
-            .expect_err("invalid chunk must fail parsing");
-        close_partial(&mut receive, &mut assembler);
-        let (message, code) = adapter_error(&error);
-        finish_failure(
-            &priority_tx,
-            &mut assembler,
-            &spec,
-            receive.usage().clone(),
-            message,
-            &code,
-            cancel.is_cancelled(),
-        )
-        .await;
-
-        let ProviderEvent::Error { reason, output } =
-            priority_rx.recv().await.expect("priority terminal")
-        else {
-            panic!("expected Error terminal")
-        };
-        assert_eq!(reason, StopReason::Aborted);
-        assert_eq!(output.message.stop_reason, StopReason::Aborted);
-        assert!(output.message.interrupted);
-        assert_eq!(
-            output.message.provider_code.as_deref(),
-            Some("invalid_sse_json")
-        );
-        assert!(!retry::is_retryable(&output.message));
-        assert!(matches!(
-            output.message.content.as_slice(),
-            [types::AssistantContent::Text { text, .. }] if text == "partial"
-        ));
     }
 
     #[tokio::test]
