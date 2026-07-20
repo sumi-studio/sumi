@@ -10,7 +10,7 @@
 
 ## 共通ルール (全タスクの前提。毎回プロンプト先頭に貼る)
 
-```
+```text
 リポジトリ /home/yohaku/sumi、対象 apps/agent (Rust, edition 2024)。作業開始前に対象ブランチを確認すること。
 設計の正典は docs/agent/implementation-plan.md (PR #6 マージ済み版)。担当範囲の章と、§12 の該当移植項目、§13 の該当マイルストーンゲートを必ず読むこと。
 pi のソースは /home/yohaku/pi-reference/packages/ にある。移植項目は該当ファイルを実読してから書く(計画書の表は索引であってコードの代替ではない)。
@@ -39,7 +39,7 @@ pi のソースは /home/yohaku/pi-reference/packages/ にある。移植項目�
 
 **マイルストーン順序 (§13 が正典)**:
 
-```
+```text
 M1  (T5〜T8):   共通 provider core + Chat Completions adapter
 M1P (T9〜T10):  Responses + Anthropic adapters (M1後、M2〜M5と並行可。release必須)
 M2  (T11〜T16): durability foundation → ループ+ツール+ステア
