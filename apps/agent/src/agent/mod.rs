@@ -39,7 +39,7 @@ mod provider_projection;
 mod queue;
 mod run;
 
-use durable_bridge::{CommittedOutput, DurableBridge, DurableRunBinding};
+use durable_bridge::{CommittedOutput, DurableBridge, DurableRunBinding, RunOutput};
 use queue::MessageQueue;
 
 pub(crate) use events::{
@@ -184,10 +184,11 @@ pub(crate) trait RunWorker: Send + Sync + 'static {
         core: RunCore,
         initial: AdmittedCommand,
         controls: mpsc::Receiver<RunControl>,
-        events: mpsc::Sender<AgentEvent>,
+        events: mpsc::Sender<RunOutput>,
     ) -> WorkerFuture;
 }
 
+#[cfg(test)]
 impl<F, Fut> RunWorker for F
 where
     F: Fn(RunCore, AdmittedCommand, mpsc::Receiver<RunControl>, mpsc::Sender<AgentEvent>) -> Fut
@@ -201,15 +202,61 @@ where
         core: RunCore,
         initial: AdmittedCommand,
         controls: mpsc::Receiver<RunControl>,
-        events: mpsc::Sender<AgentEvent>,
+        events: mpsc::Sender<RunOutput>,
     ) -> WorkerFuture {
-        Box::pin((self)(core, initial, controls, events))
+        let mut binding = core
+            .durable_binding
+            .clone()
+            .expect("Session must bind RunCore before starting a worker");
+        let mut emitted_turn = false;
+        let (fixture_tx, mut fixture_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let future = (self)(core, initial, controls, fixture_tx);
+        Box::pin(async move {
+            tokio::pin!(future);
+            loop {
+                tokio::select! {
+                    biased;
+                    completion = &mut future => {
+                        while let Ok(event) = fixture_rx.try_recv() {
+                            if matches!(event, AgentEvent::TurnStart) {
+                                if emitted_turn {
+                                    binding.turn_id = Uuid::now_v7().to_string();
+                                }
+                                emitted_turn = true;
+                            }
+                            if events.send(RunOutput { binding: binding.clone(), event }).await.is_err() {
+                                break;
+                            }
+                        }
+                        return completion;
+                    }
+                    event = fixture_rx.recv() => {
+                        let Some(event) = event else {
+                            drop(events);
+                            return future.await;
+                        };
+                        if matches!(event, AgentEvent::TurnStart) {
+                            if emitted_turn {
+                                binding.turn_id = Uuid::now_v7().to_string();
+                            }
+                            emitted_turn = true;
+                        }
+                        if events.send(RunOutput { binding: binding.clone(), event }).await.is_err() {
+                            return RunCompletion::Failed {
+                                core: RunCore::new(),
+                                failure: WorkerFailure::EventChannelClosed,
+                            };
+                        }
+                    }
+                }
+            }
+        })
     }
 }
 
 pub(crate) struct ActiveRun {
     control_tx: mpsc::Sender<RunControl>,
-    events_rx: mpsc::Receiver<AgentEvent>,
+    events_rx: mpsc::Receiver<RunOutput>,
     completion_rx: oneshot::Receiver<RunCompletion>,
     join: JoinHandle<()>,
     bridge: DurableBridge,
@@ -340,7 +387,7 @@ impl<G: Gateway + 'static> Session<G> {
             enum Selected {
                 Completion(std::result::Result<RunCompletion, oneshot::error::RecvError>),
                 Command(Result<InboundCommand>),
-                Event(Option<AgentEvent>),
+                Event(Option<RunOutput>),
             }
 
             let selected = {
@@ -579,8 +626,7 @@ impl<G: Gateway + 'static> Session<G> {
                 Some(failure)
             }
         };
-        while let Ok(event) = active.events_rx.try_recv() {
-            let output = active.bridge.output(event);
+        while let Ok(output) = active.events_rx.try_recv() {
             let committed = active.bridge.commit(&self.writer, output).await?;
             self.send_committed(committed, Some(active.bridge.command_id().to_owned()))
                 .await?;
@@ -611,10 +657,9 @@ impl<G: Gateway + 'static> Session<G> {
         }
     }
 
-    async fn persist_active_event(&mut self, event: AgentEvent) -> Result<(), SessionFailure> {
+    async fn persist_active_event(&mut self, output: RunOutput) -> Result<(), SessionFailure> {
         let committed = {
             let active = self.active.as_mut().expect("event requires active run");
-            let output = active.bridge.output(event);
             active.bridge.commit(&self.writer, output).await?
         };
         let command_id = self

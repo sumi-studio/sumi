@@ -13,6 +13,7 @@ use tokio::sync::{Notify, mpsc};
 
 use super::*;
 use crate::{
+    agent::DurableRunBinding,
     gateway::{CommandEnvelope, CommandId},
     provider::types::{
         ApiProtocol, AssistantContent, AssistantMessage, ProviderContextFragment,
@@ -495,16 +496,23 @@ fn pending_sequences(core: &mut RunCore) -> Vec<u64> {
     sequences
 }
 
+fn bound_core(seq: u64) -> RunCore {
+    let command = admitted_user(seq);
+    let mut core = RunCore::new();
+    core.durable_binding = Some(DurableRunBinding::idle(&command));
+    core
+}
+
 async fn run_fixture(driver: Arc<FixtureDriver>) -> (RunCompletion, Vec<AgentEvent>) {
     let worker = SequentialRunWorker::new(driver);
     let (_control_tx, control_rx) = mpsc::channel(8);
     let (events_tx, mut events_rx) = mpsc::channel(256);
     let completion = worker
-        .run(RunCore::new(), admitted_user(1), control_rx, events_tx)
+        .run(bound_core(1), admitted_user(1), control_rx, events_tx)
         .await;
     let mut events = Vec::new();
     while let Some(event) = events_rx.recv().await {
-        events.push(event);
+        events.push(event.event);
     }
     (completion, events)
 }
@@ -590,16 +598,31 @@ async fn nonempty_provider_context_fails_closed_instead_of_being_dropped() {
     ];
     let driver = Arc::new(FixtureDriver::new(vec![Script::Events(events)]));
     let (completion, emitted) = run_fixture(driver).await;
+    assert_completed(completion);
+    let end = emitted
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::MessageEnd {
+                message_id,
+                message,
+            } if message_id == "assistant-0" => Some(message.as_ref()),
+            _ => None,
+        })
+        .expect("synthetic assistant close");
     assert!(matches!(
-        completion,
-        RunCompletion::Failed {
-            failure: WorkerFailure::Error(ref message),
-            ..
-        } if message.contains("T17 durable hand-off")
+        end,
+        PublicMessage::Assistant(assistant)
+            if assistant.stop_reason == StopReason::Error
+                && assistant.error_message.as_deref().is_some_and(|message| {
+                    message.contains("T17 durable hand-off")
+                        && message.contains("refusing to persist opaque context")
+                })
     ));
-    assert!(!emitted.iter().any(|event| {
-        matches!(event, AgentEvent::MessageEnd { message_id, .. } if message_id == "assistant-0")
-    }));
+    assert!(matches!(
+        emitted[emitted.len() - 2],
+        AgentEvent::TurnEnd { .. }
+    ));
+    assert!(matches!(emitted.last(), Some(AgentEvent::AgentEnd)));
 }
 
 #[tokio::test]
@@ -621,7 +644,7 @@ async fn retry_wait_control_is_injected_mid_turn_before_next_attempt() {
     let (events_tx, mut events_rx) = mpsc::channel(256);
     let completion = tokio::spawn(async move {
         worker
-            .run(RunCore::new(), admitted_user(1), control_rx, events_tx)
+            .run(bound_core(1), admitted_user(1), control_rx, events_tx)
             .await
     });
     driver.retry_waiting.notified().await;
@@ -633,7 +656,7 @@ async fn retry_wait_control_is_injected_mid_turn_before_next_attempt() {
     assert_completed(completion);
     let mut events = Vec::new();
     while let Some(event) = events_rx.recv().await {
-        events.push(event);
+        events.push(event.event);
     }
     let retry = events
         .iter()
@@ -1092,7 +1115,7 @@ async fn provider_start_failure_recovers_received_controls_and_next_run_consumes
         .expect("second received control");
     let (events_tx, mut events_rx) = mpsc::channel(256);
     let first = first_worker
-        .run(RunCore::new(), admitted_user(1), control_rx, events_tx)
+        .run(bound_core(1), admitted_user(1), control_rx, events_tx)
         .await;
     while events_rx.recv().await.is_some() {}
     let core = recovered_core(first);
@@ -1157,7 +1180,7 @@ async fn closed_error_recovers_cross_kind_controls_without_reordering_or_preempt
         .expect("later user");
     let (events_tx, mut events_rx) = mpsc::channel(256);
     let completion = worker
-        .run(RunCore::new(), admitted_user(1), control_rx, events_tx)
+        .run(bound_core(1), admitted_user(1), control_rx, events_tx)
         .await;
     while events_rx.recv().await.is_some() {}
     let core = recovered_core(completion);
@@ -1209,7 +1232,7 @@ async fn deferred_t16_control_blocks_later_user_at_every_safe_point() {
         .expect("later user");
     let (events_tx, mut events_rx) = mpsc::channel(256);
     let completion = worker
-        .run(RunCore::new(), admitted_user(1), control_rx, events_tx)
+        .run(bound_core(1), admitted_user(1), control_rx, events_tx)
         .await;
     while events_rx.recv().await.is_some() {}
     let mut core = recovered_core(completion);
@@ -1242,7 +1265,7 @@ async fn event_failure_race_recovers_every_control_accepted_before_receiver_clos
     let (events_tx, events_rx) = mpsc::channel(1);
     drop(events_rx);
     let completion = worker
-        .run(RunCore::new(), admitted_user(1), control_rx, events_tx)
+        .run(bound_core(1), admitted_user(1), control_rx, events_tx)
         .await;
     assert!(matches!(
         &completion,
@@ -1265,7 +1288,7 @@ async fn initial_command_is_recovered_before_each_fallible_injection_boundary() 
         let driver = Arc::new(FixtureDriver::new(vec![Script::StartFailure("unused")]));
         let (_control_tx, control_rx) = mpsc::channel(1);
         let (events_tx, mut events_rx) = mpsc::channel(8);
-        let mut runner = Runner::new(RunCore::new(), driver, control_rx, events_tx);
+        let mut runner = Runner::new(bound_core(1), driver, control_rx, events_tx);
         runner
             .claim_ordered_initial(admitted_user(1))
             .expect("claim initial");
@@ -1348,7 +1371,7 @@ async fn claimed_followups_survive_turn_steer_and_injection_event_failures() {
     let cases = ["turn_start", "steered", "message_start"];
     for case in cases {
         let driver = Arc::new(FixtureDriver::new(Vec::new()));
-        let mut core = RunCore::new();
+        let mut core = bound_core(1);
         core.queue_followup(admitted_user(2)).expect("followup");
         let (_control_tx, control_rx) = mpsc::channel(1);
         let (events_tx, events_rx) = mpsc::channel(1);
@@ -1408,7 +1431,7 @@ async fn retry_wait_channel_close_and_cancelled_hook_never_start_another_attempt
         };
         let (events_tx, mut events_rx) = mpsc::channel(64);
         let completion = worker
-            .run(RunCore::new(), admitted_user(1), control_rx, events_tx)
+            .run(bound_core(1), admitted_user(1), control_rx, events_tx)
             .await;
         while events_rx.recv().await.is_some() {}
         assert!(matches!(

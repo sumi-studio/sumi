@@ -15,7 +15,7 @@ use crate::{
 use super::{AdmittedCommand, AgentEvent};
 
 #[derive(Clone, Debug)]
-pub(super) struct DurableRunBinding {
+pub(crate) struct DurableRunBinding {
     pub command_id: String,
     pub command_seq: u64,
     pub run_id: String,
@@ -35,7 +35,7 @@ impl DurableRunBinding {
 
 /// Private, metadata-bound worker output. Public events deliberately carry no
 /// durable identities; this value binds them before EventWriter sees them.
-pub(super) struct RunOutput {
+pub(crate) struct RunOutput {
     pub binding: DurableRunBinding,
     pub event: AgentEvent,
 }
@@ -54,6 +54,8 @@ pub(super) struct DurableBridge {
     pending_tool_end: HashMap<String, (Value, bool)>,
     last_assistant: Option<PublicMessage>,
     length_not_started: HashSet<String>,
+    pending_rejected_end: Option<(String, PublicMessage, HashSet<String>)>,
+    pending_rejected_results: Vec<(String, PublicMessage)>,
     startup_agent_pending: bool,
     startup_turn_pending: bool,
 }
@@ -69,15 +71,10 @@ impl DurableBridge {
             pending_tool_end: HashMap::new(),
             last_assistant: None,
             length_not_started: HashSet::new(),
+            pending_rejected_end: None,
+            pending_rejected_results: Vec::new(),
             startup_agent_pending: false,
             startup_turn_pending: false,
-        }
-    }
-
-    pub(super) fn output(&self, event: AgentEvent) -> RunOutput {
-        RunOutput {
-            binding: self.binding.clone(),
-            event,
         }
     }
 
@@ -91,9 +88,20 @@ impl DurableBridge {
         output: RunOutput,
     ) -> Result<Vec<CommittedOutput>> {
         if output.binding.command_id != self.binding.command_id
+            || output.binding.command_seq != self.binding.command_seq
             || output.binding.run_id != self.binding.run_id
         {
             bail!("run output durable binding changed while the worker was active");
+        }
+        let next_turn = matches!(output.event, AgentEvent::TurnStart)
+            && !self.turn_open
+            && self.phase != RunPhase::RunStarted;
+        if next_turn {
+            if output.binding.turn_id == self.binding.turn_id {
+                bail!("next TurnStart reused the prior durable turn binding");
+            }
+        } else if output.binding.turn_id != self.binding.turn_id {
+            bail!("run output durable turn binding changed outside TurnStart");
         }
         let event = output.event;
         match event {
@@ -162,7 +170,7 @@ impl DurableBridge {
                     self.turn_open = true;
                     return Ok(Vec::new());
                 } else {
-                    self.binding.turn_id = Uuid::now_v7().to_string();
+                    self.binding.turn_id = output.binding.turn_id;
                 }
                 self.turn_open = true;
                 self.commit_single(
@@ -349,22 +357,36 @@ impl DurableBridge {
         }
         self.assistant_open = None;
         self.length_not_started.clear();
-        if let PublicMessage::Assistant(assistant) = &message
-            && assistant.stop_reason == StopReason::Length
-        {
-            self.length_not_started
-                .extend(assistant.content.iter().filter_map(|item| match item {
-                    PublicAssistantContent::ToolCall { tool_call, .. } => {
-                        Some(tool_call.id.clone())
-                    }
-                    _ => None,
-                }));
+        let mut rejected = HashSet::new();
+        if let PublicMessage::Assistant(assistant) = &message {
+            if assistant.stop_reason == StopReason::Length {
+                self.length_not_started
+                    .extend(assistant.content.iter().filter_map(|item| match item {
+                        PublicAssistantContent::ToolCall { tool_call, .. } => {
+                            Some(tool_call.id.clone())
+                        }
+                        _ => None,
+                    }));
+            }
+            rejected.extend(assistant.content.iter().filter_map(|item| match item {
+                PublicAssistantContent::RejectedToolCall { rejected, .. } => {
+                    Some(rejected.id.clone())
+                }
+                _ => None,
+            }));
         }
         let append_to_l0 = !matches!(
             &message,
             PublicMessage::Assistant(assistant) if assistant.stop_reason == StopReason::Error
         );
         self.last_assistant = Some(message.clone());
+        if !rejected.is_empty() {
+            if self.pending_rejected_end.is_some() || !self.pending_rejected_results.is_empty() {
+                bail!("a rejected assistant pair is already pending");
+            }
+            self.pending_rejected_end = Some((message_id, message, rejected));
+            return Ok(Vec::new());
+        }
         self.commit_single(
             writer,
             DurableEvent::message_in_turn(
@@ -494,6 +516,18 @@ impl DurableBridge {
                     idempotency_key: format!("{}:{tool_call_id}:not-started", self.binding.run_id),
                     error_code: "length_guard",
                 }));
+            } else if let Some((_, _, pending_ids)) = self.pending_rejected_end.as_mut()
+                && pending_ids.remove(&tool_call_id)
+            {
+                if !result.is_error {
+                    bail!("RejectedToolCall synthetic ToolResult must be is_error=true");
+                }
+                self.pending_rejected_results
+                    .push((message_id.clone(), message.clone()));
+                if !pending_ids.is_empty() {
+                    return Ok(Vec::new());
+                }
+                return self.commit_rejected_pair_batch(writer).await;
             } else {
                 bail!(
                     "tool result has neither execution lifecycle nor Length not-started disposition"
@@ -529,6 +563,78 @@ impl DurableBridge {
                 injected_commands,
             },
             public_prefix,
+        )
+        .await
+    }
+
+    async fn commit_rejected_pair_batch(
+        &mut self,
+        writer: &EventWriter,
+    ) -> Result<Vec<CommittedOutput>> {
+        let (assistant_id, assistant, pending_ids) = self
+            .pending_rejected_end
+            .take()
+            .ok_or_else(|| anyhow!("rejected result has no pending assistant"))?;
+        if !pending_ids.is_empty() {
+            bail!("rejected assistant pair is incomplete");
+        }
+        let append_to_l0 = !matches!(
+            &assistant,
+            PublicMessage::Assistant(value) if value.stop_reason == StopReason::Error
+        );
+        let mut writes = vec![EventWrite {
+            event: Some(DurableEvent::message_in_turn(
+                "message_end",
+                &assistant_id,
+                &assistant,
+                Some(self.binding.run_id.clone()),
+                Some(self.binding.turn_id.clone()),
+            )?),
+            projections: vec![Projection::MessageEnd {
+                message_id: assistant_id.clone(),
+                role: "assistant",
+                message: assistant.clone(),
+                append_to_l0,
+            }],
+        }];
+        let mut public = vec![AgentEvent::MessageEnd {
+            message_id: assistant_id,
+            message: Box::new(assistant),
+        }];
+        for (message_id, message) in self.pending_rejected_results.drain(..) {
+            writes.push(EventWrite {
+                event: Some(DurableEvent::message(
+                    "message_start",
+                    &message_id,
+                    &message,
+                )?),
+                projections: Vec::new(),
+            });
+            writes.push(EventWrite {
+                event: Some(DurableEvent::message("message_end", &message_id, &message)?),
+                projections: vec![Projection::MessageEnd {
+                    message_id: message_id.clone(),
+                    role: "tool_result",
+                    message: message.clone(),
+                    append_to_l0: true,
+                }],
+            });
+            public.push(AgentEvent::MessageStart {
+                message_id: message_id.clone(),
+                message: Box::new(message.clone()),
+            });
+            public.push(AgentEvent::MessageEnd {
+                message_id,
+                message: Box::new(message),
+            });
+        }
+        self.commit_batch(
+            writer,
+            EventBatch {
+                writes,
+                injected_commands: Vec::new(),
+            },
+            public,
         )
         .await
     }

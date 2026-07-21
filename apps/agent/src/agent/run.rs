@@ -30,8 +30,8 @@ use crate::{
 
 use super::{
     AdmittedCommand, AgentEvent, ProjectedProviderEvent, ProviderEventProjector,
-    ProviderTerminalKind, RunCompletion, RunControl, RunCore, RunWorker, SteerMode, WorkerFailure,
-    WorkerFuture,
+    ProviderTerminalKind, RunCompletion, RunControl, RunCore, RunOutput, RunWorker, SteerMode,
+    WorkerFailure, WorkerFuture,
 };
 
 const LENGTH_TOOL_FAILURE: &str = "Tool call was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.";
@@ -122,7 +122,7 @@ impl RunWorker for SequentialRunWorker {
         core: RunCore,
         initial: AdmittedCommand,
         controls: mpsc::Receiver<RunControl>,
-        events: mpsc::Sender<AgentEvent>,
+        events: mpsc::Sender<RunOutput>,
     ) -> WorkerFuture {
         let driver = self.driver.clone();
         Box::pin(async move {
@@ -137,7 +137,7 @@ struct Runner {
     core: RunCore,
     driver: Arc<dyn RunDriver>,
     controls: mpsc::Receiver<RunControl>,
-    events: mpsc::Sender<AgentEvent>,
+    events: mpsc::Sender<RunOutput>,
     context: Vec<PublicMessage>,
     attempt_sequence: usize,
     ordinary_retries: usize,
@@ -151,7 +151,7 @@ impl Runner {
         mut core: RunCore,
         driver: Arc<dyn RunDriver>,
         controls: mpsc::Receiver<RunControl>,
-        events: mpsc::Sender<AgentEvent>,
+        events: mpsc::Sender<RunOutput>,
     ) -> Self {
         let context = std::mem::take(&mut core.runtime_context);
         Self {
@@ -357,7 +357,7 @@ impl Runner {
 
                     // A provider terminal carrying executable calls always
                     // continues with a fresh turn after every result settles.
-                    self.emit(AgentEvent::TurnStart).await?;
+                    self.start_next_turn().await?;
                     if self.claim_pending_user()? {
                         self.inject_in_flight().await?;
                     }
@@ -439,10 +439,15 @@ impl Runner {
                 }
                 ProjectedProviderEvent::Terminal(terminal) => {
                     if !terminal.provider_context().is_empty() {
-                        return Err(WorkerFailure::Error(
-                            "provider terminal context requires the T17 durable hand-off; refusing to drop it"
-                                .to_owned(),
-                        ));
+                        rejected_results.clear();
+                        return self
+                            .close_broken_attempt(
+                                &attempt.message_id,
+                                message_started,
+                                "provider terminal context requires the T17 durable hand-off; refusing to persist opaque context"
+                                    .to_owned(),
+                            )
+                            .await;
                     }
                     let kind = terminal.kind();
                     let internal =
@@ -817,7 +822,7 @@ impl Runner {
         if !self.claim_pending_user()? {
             return Ok(false);
         }
-        self.emit(AgentEvent::TurnStart).await?;
+        self.start_next_turn().await?;
         self.inject_in_flight().await?;
         Ok(true)
     }
@@ -901,10 +906,21 @@ impl Runner {
     }
 
     async fn emit(&mut self, event: AgentEvent) -> Result<(), WorkerFailure> {
+        let binding = self.core.durable_binding.clone().ok_or_else(|| {
+            WorkerFailure::Error("RunCore has no durable worker binding".to_owned())
+        })?;
         self.events
-            .send(event)
+            .send(RunOutput { binding, event })
             .await
             .map_err(|_| WorkerFailure::EventChannelClosed)
+    }
+
+    async fn start_next_turn(&mut self) -> Result<(), WorkerFailure> {
+        let binding = self.core.durable_binding.as_mut().ok_or_else(|| {
+            WorkerFailure::Error("RunCore has no durable worker binding".to_owned())
+        })?;
+        binding.turn_id = Uuid::now_v7().to_string();
+        self.emit(AgentEvent::TurnStart).await
     }
 }
 
