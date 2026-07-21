@@ -9,8 +9,9 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::provider::{
-    adapters::chat_completions::{MaxTokensField, ModelSpec, ThinkingFormat},
+    ModelSpec, ProtocolCompat,
     assembler::ResponseBudget,
+    model::{MaxTokensField, ThinkingFormat},
     types::ApiProtocol,
 };
 
@@ -155,50 +156,57 @@ impl Config {
             spec.supports_images = supports_images;
         }
 
-        let compat = &self.model.compat;
-        if let Some(field) = compat.max_tokens_field.as_deref() {
-            spec.compat.max_tokens_field = match field {
-                "max_tokens" => MaxTokensField::MaxTokens,
-                "max_completion_tokens" => MaxTokensField::MaxCompletionTokens,
-                other => anyhow::bail!("unknown max_tokens_field {other}"),
-            };
+        let compat_config = &self.model.compat;
+        if let ProtocolCompat::Chat(compat) = &mut spec.compat {
+            if let Some(field) = compat_config.max_tokens_field.as_deref() {
+                compat.max_tokens_field = match field {
+                    "max_tokens" => MaxTokensField::MaxTokens,
+                    "max_completion_tokens" => MaxTokensField::MaxCompletionTokens,
+                    other => anyhow::bail!("unknown max_tokens_field {other}"),
+                };
+            }
+            if let Some(format) = compat_config.thinking_format.as_deref() {
+                compat.thinking_format = match format {
+                    "off" => ThinkingFormat::Off,
+                    "deepseek" => ThinkingFormat::Deepseek,
+                    "zai" => ThinkingFormat::Zai,
+                    "openai_effort" => ThinkingFormat::OpenAiEffort,
+                    "provider_default" => ThinkingFormat::ProviderDefault,
+                    other => anyhow::bail!("unknown thinking_format {other}"),
+                };
+            }
+            if let Some(value) = compat_config.supports_usage_in_streaming {
+                compat.supports_usage_in_streaming = value;
+            }
+            if let Some(value) = compat_config.requires_reasoning_content_on_assistant {
+                compat.requires_reasoning_content_on_assistant = value;
+            }
+            if let Some(value) = compat_config.zai_tool_stream {
+                compat.zai_tool_stream = value;
+            }
+            if let Some(value) = compat_config.supports_strict_mode {
+                compat.supports_strict_mode = value;
+            }
+            if let Some(value) = compat_config.supports_required_tool_choice {
+                compat.supports_required_tool_choice = value;
+            }
+            if let Some(value) = compat_config.supports_store {
+                compat.supports_store = value;
+            }
+            if let Some(value) = compat_config.supports_developer_role {
+                compat.supports_developer_role = value;
+            }
+            if let Some(value) = compat_config.allows_sampling_parameters {
+                compat.allows_sampling_parameters = value;
+            }
+        } else if *compat_config != CompatConfig::default() {
+            anyhow::bail!("Chat compatibility overrides require a Chat protocol preset");
         }
-        if let Some(format) = compat.thinking_format.as_deref() {
-            spec.compat.thinking_format = match format {
-                "off" => ThinkingFormat::Off,
-                "deepseek" => ThinkingFormat::Deepseek,
-                "zai" => ThinkingFormat::Zai,
-                "openai_effort" => ThinkingFormat::OpenAiEffort,
-                "provider_default" => ThinkingFormat::ProviderDefault,
-                other => anyhow::bail!("unknown thinking_format {other}"),
-            };
-        }
-        if let Some(value) = compat.supports_usage_in_streaming {
-            spec.compat.supports_usage_in_streaming = value;
-        }
-        if let Some(value) = compat.requires_reasoning_content_on_assistant {
-            spec.compat.requires_reasoning_content_on_assistant = value;
-        }
-        if let Some(value) = compat.zai_tool_stream {
-            spec.compat.zai_tool_stream = value;
-        }
-        if let Some(value) = compat.supports_strict_mode {
-            spec.compat.supports_strict_mode = value;
-        }
-        if let Some(value) = compat.supports_required_tool_choice {
-            spec.compat.supports_required_tool_choice = value;
-        }
-        if let Some(value) = compat.supports_store {
-            spec.compat.supports_store = value;
-        }
-        if let Some(value) = compat.supports_developer_role {
-            spec.compat.supports_developer_role = value;
-        }
-        if let Some(value) = compat.allows_sampling_parameters {
-            spec.compat.allows_sampling_parameters = value;
-        }
-        if spec.protocol != ApiProtocol::OpenAiChatCompletions {
-            anyhow::bail!("CP2 supports only open_ai_chat_completions presets");
+        match (&spec.protocol, &spec.compat) {
+            (ApiProtocol::OpenAiChatCompletions, ProtocolCompat::Chat(_))
+            | (ApiProtocol::OpenAiResponses, ProtocolCompat::Responses(_))
+            | (ApiProtocol::AnthropicMessages, ProtocolCompat::Anthropic(_)) => {}
+            _ => anyhow::bail!("model protocol/compat variant mismatch"),
         }
         validate_model_base_url(&spec.base_url)?;
         if spec.context_window == 0 {
@@ -795,7 +803,12 @@ supports_required_tool_choice = false
 
         let spec = config.model_spec().expect("model spec");
 
-        assert!(!spec.compat.supports_required_tool_choice);
+        assert!(
+            !spec
+                .chat_compat()
+                .expect("Chat compat")
+                .supports_required_tool_choice
+        );
     }
 
     #[test]
@@ -814,7 +827,39 @@ supports_required_tool_choice = true
 
         let spec = config.model_spec().expect("model spec");
 
-        assert!(spec.compat.supports_required_tool_choice);
+        assert!(
+            spec.chat_compat()
+                .expect("Chat compat")
+                .supports_required_tool_choice
+        );
+    }
+
+    #[test]
+    fn rejects_chat_compat_overrides_for_non_chat_presets() {
+        for preset in ["anthropic", "openai-responses"] {
+            let file = FileConfig {
+                model: ModelConfig {
+                    preset: Some(preset.to_owned()),
+                    compat: CompatConfig {
+                        supports_store: Some(true),
+                        ..CompatConfig::default()
+                    },
+                    ..ModelConfig::default()
+                },
+                ..FileConfig::default()
+            };
+            let config = Config::resolve(file, EnvOverrides::default()).expect("resolved config");
+
+            let error = config
+                .model_spec()
+                .expect_err("Chat compat overrides must fail for non-Chat presets");
+
+            assert_eq!(
+                error.to_string(),
+                "Chat compatibility overrides require a Chat protocol preset",
+                "preset={preset}"
+            );
+        }
     }
 
     #[test]
@@ -847,8 +892,9 @@ zai_tool_stream = false
         assert_eq!(spec.context_window, 200_000);
         assert_eq!(spec.max_output_tokens, 64_000);
         assert_eq!(spec.default_output_tokens, 12_000);
-        assert_eq!(spec.compat.max_tokens_field, MaxTokensField::MaxTokens);
-        assert!(!spec.compat.zai_tool_stream);
+        let compat = spec.chat_compat().expect("Chat compat");
+        assert_eq!(compat.max_tokens_field, MaxTokensField::MaxTokens);
+        assert!(!compat.zai_tool_stream);
     }
 
     #[test]
@@ -869,9 +915,10 @@ id = "glm-5.2"
         assert_eq!(spec.provider, "opencode-go");
         assert_eq!(spec.base_url, "https://opencode.ai/zen/go/v1");
         assert_eq!(spec.api_key_env, "OPENCODE_GO_API_KEY");
-        assert_eq!(spec.compat.thinking_format, ThinkingFormat::ProviderDefault);
-        assert!(!spec.compat.requires_reasoning_content_on_assistant);
-        assert!(!spec.compat.zai_tool_stream);
+        let compat = spec.chat_compat().expect("Chat compat");
+        assert_eq!(compat.thinking_format, ThinkingFormat::ProviderDefault);
+        assert!(!compat.requires_reasoning_content_on_assistant);
+        assert!(!compat.zai_tool_stream);
         assert!(!spec.supports_images);
         assert_eq!(spec.context_window, 262_144);
         assert_eq!(spec.max_output_tokens, 32_768);
@@ -898,8 +945,9 @@ zai_tool_stream = false
 
         assert!(spec.supports_images);
         assert_eq!(spec.max_output_tokens, 64_000);
-        assert!(!spec.compat.zai_tool_stream);
-        assert_eq!(spec.compat.thinking_format, ThinkingFormat::ProviderDefault);
+        let compat = spec.chat_compat().expect("Chat compat");
+        assert!(!compat.zai_tool_stream);
+        assert_eq!(compat.thinking_format, ThinkingFormat::ProviderDefault);
     }
 
     #[test]

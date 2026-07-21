@@ -1007,6 +1007,14 @@ impl ToolArgumentAccumulator {
         self.raw.len()
     }
 
+    pub fn is_prefix_of(&self, complete: &str) -> bool {
+        !self.too_large && complete.starts_with(&self.raw)
+    }
+
+    pub fn matches_raw(&self, complete: &str) -> bool {
+        !self.too_large && self.raw == complete
+    }
+
     pub fn finish(
         self,
         call_id: impl Into<String>,

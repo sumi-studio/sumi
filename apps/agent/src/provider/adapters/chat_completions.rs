@@ -9,241 +9,12 @@ use crate::provider::{
     assembler::{
         FrozenToolSchemaRegistry, ResponseBudget, ToolArgumentAccumulator, ToolArgumentOutcome,
     },
+    model::{ChatCompat, MaxTokensField, ModelSpec, RequestOptions, ThinkingFormat},
     types::{
         ApiProtocol, AssistantContent, ContextMessage, MemoryLayer, Message, PromptContext,
-        ProviderEvent, ProviderOrigin, RawUsage, StopReason, ToolDefinition, ToolResultMessage,
-        Usage, UserContent,
+        ProviderEvent, RawUsage, StopReason, ToolDefinition, ToolResultMessage, Usage, UserContent,
     },
 };
-
-const DEFAULT_OUTPUT_TOKENS: u64 = 16_384;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MaxTokensField {
-    MaxTokens,
-    MaxCompletionTokens,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ThinkingFormat {
-    Off,
-    Deepseek,
-    Zai,
-    OpenAiEffort,
-    /// Gateway dialect has not been proven by a live fixture. Do not send a
-    /// provider-specific thinking control object.
-    ProviderDefault,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ChatCompat {
-    pub max_tokens_field: MaxTokensField,
-    pub supports_usage_in_streaming: bool,
-    pub thinking_format: ThinkingFormat,
-    pub requires_reasoning_content_on_assistant: bool,
-    pub zai_tool_stream: bool,
-    pub supports_strict_mode: bool,
-    pub supports_required_tool_choice: bool,
-    pub supports_store: bool,
-    pub supports_developer_role: bool,
-    pub allows_sampling_parameters: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ModelSpec {
-    pub id: String,
-    pub provider: String,
-    pub base_url: String,
-    pub account_scope: String,
-    pub api_key_env: String,
-    pub context_window: u64,
-    pub max_output_tokens: u64,
-    pub default_output_tokens: u64,
-    pub reasoning: bool,
-    pub supports_images: bool,
-    pub protocol: ApiProtocol,
-    pub compat: ChatCompat,
-}
-
-impl ModelSpec {
-    pub fn preset(name: &str) -> Option<Self> {
-        let (
-            id,
-            provider,
-            base_url,
-            api_key_env,
-            context_window,
-            max_output_tokens,
-            supports_images,
-            compat,
-        ) = match name {
-            "kimi-k3" => (
-                "kimi-k3",
-                "moonshot",
-                "https://api.moonshot.ai/v1",
-                "MOONSHOT_API_KEY",
-                1_048_576,
-                1_048_576,
-                true,
-                ChatCompat {
-                    max_tokens_field: MaxTokensField::MaxCompletionTokens,
-                    supports_usage_in_streaming: true,
-                    thinking_format: ThinkingFormat::OpenAiEffort,
-                    requires_reasoning_content_on_assistant: true,
-                    zai_tool_stream: false,
-                    supports_strict_mode: true,
-                    supports_required_tool_choice: true,
-                    supports_store: false,
-                    supports_developer_role: false,
-                    allows_sampling_parameters: false,
-                },
-            ),
-            "glm-5.2" => (
-                "glm-5.2",
-                "zai",
-                "https://api.z.ai/api/paas/v4",
-                "ZAI_API_KEY",
-                1_000_000,
-                131_072,
-                false,
-                ChatCompat {
-                    max_tokens_field: MaxTokensField::MaxTokens,
-                    supports_usage_in_streaming: true,
-                    thinking_format: ThinkingFormat::Zai,
-                    requires_reasoning_content_on_assistant: false,
-                    zai_tool_stream: true,
-                    supports_strict_mode: false,
-                    supports_required_tool_choice: true,
-                    supports_store: false,
-                    supports_developer_role: false,
-                    allows_sampling_parameters: true,
-                },
-            ),
-            "umans" | "umans-kimi-k2.7" => (
-                "umans-kimi-k2.7",
-                "umans",
-                "https://api.code.umans.ai/v1",
-                "UMANS_API_KEY",
-                262_144,
-                32_768,
-                false,
-                ChatCompat {
-                    max_tokens_field: MaxTokensField::MaxTokens,
-                    supports_usage_in_streaming: true,
-                    thinking_format: ThinkingFormat::ProviderDefault,
-                    requires_reasoning_content_on_assistant: false,
-                    zai_tool_stream: false,
-                    supports_strict_mode: false,
-                    supports_required_tool_choice: true,
-                    supports_store: false,
-                    supports_developer_role: false,
-                    allows_sampling_parameters: true,
-                },
-            ),
-            "opencode-go" | "opencode-zen-go" => (
-                "kimi-k2.7-code",
-                "opencode-go",
-                "https://opencode.ai/zen/go/v1",
-                "OPENCODE_GO_API_KEY",
-                262_144,
-                32_768,
-                false,
-                ChatCompat {
-                    max_tokens_field: MaxTokensField::MaxTokens,
-                    supports_usage_in_streaming: true,
-                    thinking_format: ThinkingFormat::ProviderDefault,
-                    requires_reasoning_content_on_assistant: false,
-                    zai_tool_stream: false,
-                    supports_strict_mode: false,
-                    supports_required_tool_choice: false,
-                    supports_store: false,
-                    supports_developer_role: false,
-                    allows_sampling_parameters: true,
-                },
-            ),
-            _ => return None,
-        };
-
-        Some(Self {
-            id: id.to_owned(),
-            provider: provider.to_owned(),
-            base_url: base_url.to_owned(),
-            account_scope: "default".to_owned(),
-            api_key_env: api_key_env.to_owned(),
-            context_window,
-            max_output_tokens,
-            default_output_tokens: DEFAULT_OUTPUT_TOKENS.min(max_output_tokens),
-            reasoning: true,
-            supports_images,
-            protocol: ApiProtocol::OpenAiChatCompletions,
-            compat,
-        })
-    }
-
-    pub fn endpoint(&self) -> String {
-        format!("{}/chat/completions", normalize_base_url(&self.base_url))
-    }
-
-    pub fn origin(&self) -> ProviderOrigin {
-        ProviderOrigin {
-            provider_instance_id: self.provider_instance_id(),
-            protocol: self.protocol,
-            model: self.id.clone(),
-        }
-    }
-
-    pub fn provider_instance_id(&self) -> String {
-        let endpoint = provider_instance_endpoint(&self.base_url);
-        let protocol = protocol_tag(self.protocol);
-        format!(
-            "v1|{}|{}|{}|{}",
-            identity_part(&self.provider),
-            identity_part(&endpoint),
-            identity_part(&self.account_scope),
-            identity_part(protocol)
-        )
-    }
-
-    pub fn set_model_id(&mut self, id: impl Into<String>) {
-        self.id = id.into();
-    }
-}
-
-fn normalize_base_url(base_url: &str) -> String {
-    base_url.trim().trim_end_matches('/').to_owned()
-}
-
-fn provider_instance_endpoint(base_url: &str) -> String {
-    let normalized = normalize_base_url(base_url);
-    let Ok(mut url) = reqwest::Url::parse(&normalized) else {
-        return "invalid-url".to_owned();
-    };
-    url.set_query(None);
-    url.set_fragment(None);
-    let _ = url.set_username("");
-    let _ = url.set_password(None);
-    url.to_string().trim_end_matches('/').to_owned()
-}
-
-fn identity_part(value: &str) -> String {
-    format!("{}:{value}", value.len())
-}
-
-const fn protocol_tag(protocol: ApiProtocol) -> &'static str {
-    match protocol {
-        ApiProtocol::OpenAiChatCompletions => "open_ai_chat_completions",
-        ApiProtocol::OpenAiResponses => "open_ai_responses",
-        ApiProtocol::AnthropicMessages => "anthropic_messages",
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct RequestOptions {
-    pub max_tokens: Option<u64>,
-    pub temperature: Option<f64>,
-    pub tool_choice: Option<Value>,
-    pub reasoning_effort: Option<String>,
-}
 
 #[derive(Debug, Error)]
 pub enum ChatAdapterError {
@@ -308,13 +79,16 @@ pub fn build_request(
     if spec.protocol != ApiProtocol::OpenAiChatCompletions {
         return Err(ChatAdapterError::UnsupportedProtocol);
     }
+    let compat = spec
+        .chat_compat()
+        .ok_or(ChatAdapterError::UnsupportedProtocol)?;
     if let Some(temperature) = options.temperature
         && !temperature.is_finite()
     {
         return Err(ChatAdapterError::InvalidTemperature(temperature));
     }
     let output_tokens = requested_output_tokens(spec, options)?;
-    if !spec.compat.supports_required_tool_choice
+    if !compat.supports_required_tool_choice
         && matches!(
             options.tool_choice.as_ref(),
             Some(Value::String(tool_choice)) if tool_choice == "required"
@@ -322,7 +96,7 @@ pub fn build_request(
     {
         return Err(ChatAdapterError::RequiredToolChoiceUnsupported);
     }
-    if spec.compat.thinking_format == ThinkingFormat::OpenAiEffort {
+    if compat.thinking_format == ThinkingFormat::OpenAiEffort {
         if !spec.reasoning {
             return Err(ChatAdapterError::ReasoningRequired);
         }
@@ -341,20 +115,20 @@ pub fn build_request(
     );
     request.insert("stream".to_owned(), json!(true));
 
-    if spec.compat.supports_usage_in_streaming {
+    if compat.supports_usage_in_streaming {
         request.insert("stream_options".to_owned(), json!({"include_usage": true}));
     }
-    if spec.compat.supports_store {
+    if compat.supports_store {
         request.insert("store".to_owned(), json!(false));
     }
 
-    let max_tokens_key = match spec.compat.max_tokens_field {
+    let max_tokens_key = match compat.max_tokens_field {
         MaxTokensField::MaxTokens => "max_tokens",
         MaxTokensField::MaxCompletionTokens => "max_completion_tokens",
     };
     request.insert(max_tokens_key.to_owned(), json!(output_tokens));
 
-    if spec.compat.allows_sampling_parameters
+    if compat.allows_sampling_parameters
         && let Some(temperature) = options.temperature
     {
         request.insert("temperature".to_owned(), json!(temperature));
@@ -374,17 +148,17 @@ pub fn build_request(
                 context
                     .tools
                     .iter()
-                    .map(|tool| convert_tool(tool, &spec.compat))
+                    .map(|tool| convert_tool(tool, compat))
                     .collect(),
             ),
         );
-        if spec.compat.zai_tool_stream {
+        if compat.zai_tool_stream {
             request.insert("tool_stream".to_owned(), json!(true));
         }
     }
 
     if spec.reasoning {
-        match spec.compat.thinking_format {
+        match compat.thinking_format {
             ThinkingFormat::Off | ThinkingFormat::ProviderDefault => {}
             ThinkingFormat::Deepseek => {
                 request.insert("thinking".to_owned(), json!({"type": "enabled"}));
@@ -422,9 +196,12 @@ pub fn requested_output_tokens(
 }
 
 fn convert_messages(spec: &ModelSpec, context: &PromptContext) -> Vec<Value> {
+    let compat = spec
+        .chat_compat()
+        .expect("convert_messages is called only after protocol validation");
     let mut output = Vec::new();
     if !context.system_prompt.is_empty() {
-        let role = if spec.reasoning && spec.compat.supports_developer_role {
+        let role = if spec.reasoning && compat.supports_developer_role {
             "developer"
         } else {
             "system"
@@ -518,7 +295,7 @@ fn convert_messages(spec: &ModelSpec, context: &PromptContext) -> Vec<Value> {
                 if !tool_calls.is_empty() {
                     assistant.insert("tool_calls".to_owned(), Value::Array(tool_calls));
                 }
-                if spec.compat.requires_reasoning_content_on_assistant
+                if compat.requires_reasoning_content_on_assistant
                     && !assistant.contains_key("reasoning_content")
                 {
                     assistant.insert("reasoning_content".to_owned(), json!(""));
@@ -672,7 +449,7 @@ struct MfjsValidationState {
 /// to MoonshotAI/walle v0.1.13 (196bb0ca9c2f2271cfa9623108308f0780e411ee).
 /// `false` means "not proven safe", so the request explicitly disables the
 /// provider's default strict mode while local frozen-schema validation remains.
-fn is_mfjs_strict_safe(schema: &Value) -> bool {
+pub(crate) fn is_mfjs_strict_safe(schema: &Value) -> bool {
     let Ok(encoded) = serde_json::to_vec(schema) else {
         return false;
     };
@@ -2438,7 +2215,10 @@ mod tests {
         )
         .expect("request");
 
-        assert_eq!(request["max_completion_tokens"], DEFAULT_OUTPUT_TOKENS);
+        assert_eq!(
+            request["max_completion_tokens"],
+            crate::provider::model::DEFAULT_OUTPUT_TOKENS
+        );
         assert_eq!(request["reasoning_effort"], "max");
         assert!(request.get("thinking").is_none());
         assert!(request.get("temperature").is_none());
