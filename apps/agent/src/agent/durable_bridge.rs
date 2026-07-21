@@ -112,8 +112,12 @@ impl DurableBridge {
             AgentEvent::ToolExecutionUpdate {
                 ref tool_call_id, ..
             } => {
-                if !self.pending_tool_end.contains_key(tool_call_id) {
-                    bail!("volatile tool update has no prerequisite durable ToolExecutionStart");
+                match self.pending_tool_end.get(tool_call_id) {
+                    Some((result, _)) if result.is_null() => {}
+                    Some(_) => bail!("volatile tool update arrived after ToolExecutionEnd"),
+                    None => {
+                        bail!("volatile tool update has no prerequisite durable ToolExecutionStart")
+                    }
                 }
                 Ok(vec![CommittedOutput { event, seq: None }])
             }

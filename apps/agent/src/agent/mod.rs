@@ -653,29 +653,14 @@ impl<G: Gateway + 'static> Session<G> {
                 };
             }
         };
-        if let Err(error) = active.join.await {
+        if let Err(error) = (&mut active.join).await {
             return Err(worker_join_failure(error));
         }
         let (core, worker_failure) = match completion {
             RunCompletion::Completed(core) => (core, None),
             RunCompletion::Failed { core, failure } => (core, Some(failure)),
         };
-        let mut delivery_failure = None;
-        while let Ok(output) = active.events_rx.try_recv() {
-            let committed = match active.bridge.commit(&self.writer, output).await {
-                Ok(committed) => committed,
-                Err(error) => {
-                    self.durable_core_invalidated = true;
-                    return Err(error.into());
-                }
-            };
-            if delivery_failure.is_none() {
-                delivery_failure = self
-                    .send_committed(committed, Some(active.bridge.command_id().to_owned()))
-                    .await
-                    .err();
-            }
-        }
+        let delivery_failure = self.drain_disconnected_outputs(&mut active, true).await?;
         // A completed RunCore includes every output already produced by the
         // worker. Do not expose it until the disconnected bounded event lane
         // has been drained into SQLite, even when Gateway delivery was lost.
@@ -748,8 +733,15 @@ impl<G: Gateway + 'static> Session<G> {
         tokio::task::yield_now().await;
         match active.completion_rx.try_recv() {
             Ok(RunCompletion::Completed(core) | RunCompletion::Failed { core, .. }) => {
-                self.core = Some(core);
-                let _ = active.join.await;
+                if (&mut active.join).await.is_err() {
+                    return;
+                }
+                // The caller already holds the primary Session failure. Commit
+                // the suffix, but do not re-enter a failed Gateway during shutdown.
+                match self.drain_disconnected_outputs(&mut active, false).await {
+                    Ok(_) => self.core = Some(core),
+                    Err(_) => self.durable_core_invalidated = true,
+                }
             }
             Err(oneshot::error::TryRecvError::Closed) => {
                 let _ = active.join.await;
@@ -759,6 +751,30 @@ impl<G: Gateway + 'static> Session<G> {
                 let _ = active.join.await;
             }
         }
+    }
+
+    async fn drain_disconnected_outputs(
+        &mut self,
+        active: &mut ActiveRun,
+        deliver: bool,
+    ) -> Result<Option<SessionFailure>, SessionFailure> {
+        let mut delivery_failure = None;
+        while let Ok(output) = active.events_rx.try_recv() {
+            let committed = match active.bridge.commit(&self.writer, output).await {
+                Ok(committed) => committed,
+                Err(error) => {
+                    self.durable_core_invalidated = true;
+                    return Err(error.into());
+                }
+            };
+            if deliver && delivery_failure.is_none() {
+                delivery_failure = self
+                    .send_committed(committed, Some(active.bridge.command_id().to_owned()))
+                    .await
+                    .err();
+            }
+        }
+        Ok(delivery_failure)
     }
 
     async fn persist_active_event(&mut self, output: RunOutput) -> Result<(), SessionFailure> {

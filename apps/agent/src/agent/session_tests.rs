@@ -126,6 +126,34 @@ impl Gateway for FailFirstEventGateway {
     }
 }
 
+struct ShutdownDrainGateway {
+    commands: mpsc::Receiver<InboundCommand>,
+    release_worker: Arc<Notify>,
+    worker_ready: Arc<Notify>,
+    failed_event: bool,
+}
+
+#[async_trait]
+impl Gateway for ShutdownDrainGateway {
+    async fn next_command(&mut self) -> Result<InboundCommand> {
+        self.commands
+            .recv()
+            .await
+            .ok_or_else(|| GatewayClosed.into())
+    }
+
+    async fn send(&mut self, frame: OutboundFrame) -> Result<()> {
+        if matches!(frame, OutboundFrame::Event { .. }) && !self.failed_event {
+            self.failed_event = true;
+            self.release_worker.notify_one();
+            self.worker_ready.notified().await;
+            tokio::task::yield_now().await;
+            return Err(anyhow!("fixture gateway send failure racing completion"));
+        }
+        Ok(())
+    }
+}
+
 fn completed(result: SessionResult) -> RunCore {
     match result {
         SessionResult::Completed(core) => core,
@@ -926,6 +954,98 @@ async fn active_gateway_send_failure_aborts_and_awaits_worker() {
         !running.load(Ordering::SeqCst),
         "worker must be joined before return"
     );
+}
+
+#[tokio::test]
+async fn shutdown_drains_ready_completion_outputs_before_recovering_core_after_gateway_failure() {
+    let store = Store::session_test_store("shutdown-ready-completion-drain-session")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (commands_tx, commands) = mpsc::channel(1);
+    let release_worker = Arc::new(Notify::new());
+    let worker_ready = Arc::new(Notify::new());
+    let gateway = ShutdownDrainGateway {
+        commands,
+        release_worker: release_worker.clone(),
+        worker_ready: worker_ready.clone(),
+        failed_event: false,
+    };
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        move |mut core: RunCore,
+              initial: AdmittedCommand,
+              mut controls: mpsc::Receiver<RunControl>,
+              events: mpsc::Sender<AgentEvent>| {
+            let release_worker = release_worker.clone();
+            let worker_ready = worker_ready.clone();
+            async move {
+                let Command::UserMessage { text, .. } = &initial.envelope().command else {
+                    panic!("idle fixture requires user command")
+                };
+                let user_context = PublicMessage::User(UserMessage {
+                    content: vec![UserContent::Text { text: text.clone() }],
+                    timestamp: initial.received_at(),
+                });
+                emit_idle_injection(&events, &initial).await;
+                release_worker.notified().await;
+                let assistant = bridge_assistant(StopReason::Stop);
+                for event in [
+                    AgentEvent::MessageStart {
+                        message_id: "shutdown-drain-assistant".to_owned(),
+                        message: Box::new(assistant.clone()),
+                    },
+                    AgentEvent::MessageEnd {
+                        message_id: "shutdown-drain-assistant".to_owned(),
+                        message: Box::new(assistant.clone()),
+                    },
+                    AgentEvent::TurnEnd {
+                        message: Some(Box::new(assistant.clone())),
+                        tool_results: Vec::new(),
+                    },
+                    AgentEvent::AgentEnd,
+                ] {
+                    events.send(event).await.expect("session event receiver");
+                }
+                core.runtime_context = vec![user_context, assistant];
+                core.mark_mutated();
+                controls.close();
+                worker_ready.notify_one();
+                RunCompletion::Completed(core)
+            }
+        },
+    );
+    let task = tokio::spawn(
+        Session::start(store, gateway, RunCore::new(), worker)
+            .await
+            .expect("session")
+            .run(),
+    );
+    commands_tx.send(user(1)).await.expect("initial command");
+
+    let (failure, ownership) = failed(task.await.expect("session join"));
+    assert!(matches!(
+        failure,
+        SessionFailure::Gateway {
+            operation: "send",
+            ..
+        }
+    ));
+    let RunOwnership::Recovered(core) = ownership else {
+        panic!("fully drained shutdown completion must remain recoverable")
+    };
+    assert_eq!(core.mutation_epoch(), 1);
+    assert_eq!(core.runtime_context.len(), 2);
+    let durable_messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+        .fetch_one(&pool)
+        .await
+        .expect("durable message count");
+    assert_eq!(durable_messages, 2);
+    let durable_tail: Vec<String> =
+        sqlx::query_scalar("SELECT event_type FROM agent_events ORDER BY seq DESC LIMIT 2")
+            .fetch_all(&pool)
+            .await
+            .expect("durable shutdown tail");
+    assert_eq!(durable_tail, vec!["agent_end", "turn_end"]);
 }
 
 #[tokio::test]
@@ -2722,4 +2842,88 @@ async fn normal_tool_lifecycle_is_prepared_started_finished_and_paired() {
         lifecycle,
         vec!["tool_execution_start", "tool_execution_end"]
     );
+}
+
+#[tokio::test]
+async fn tool_execution_update_after_end_is_rejected_while_result_pairing_is_pending() {
+    let store = Store::session_test_store("tool-update-after-end-session")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (gateway, commands, _frames) = gateway();
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |core: RunCore,
+         initial: AdmittedCommand,
+         _controls: mpsc::Receiver<RunControl>,
+         events: mpsc::Sender<AgentEvent>| async move {
+            emit_idle_injection(&events, &initial).await;
+            let call = ToolCall {
+                id: "ended-call".to_owned(),
+                name: "fixture-tool".to_owned(),
+                arguments: serde_json::from_value::<ValidatedToolArguments>(
+                    serde_json::json!({"safe":true}),
+                )
+                .expect("validated arguments"),
+            };
+            let mut tool_use = match bridge_assistant(StopReason::ToolUse) {
+                PublicMessage::Assistant(message) => message,
+                _ => unreachable!(),
+            };
+            tool_use.content.push(PublicAssistantContent::ToolCall {
+                tool_call: call.clone(),
+                wire_item_index: 0,
+            });
+            let result = ToolResultMessage {
+                tool_call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                content: Vec::new(),
+                details: serde_json::json!({"ok":true}),
+                is_error: false,
+                timestamp: Utc::now(),
+            };
+            for event in [
+                AgentEvent::MessageStart {
+                    message_id: "ended-call-assistant".to_owned(),
+                    message: Box::new(bridge_assistant(StopReason::Stop)),
+                },
+                AgentEvent::MessageEnd {
+                    message_id: "ended-call-assistant".to_owned(),
+                    message: Box::new(PublicMessage::Assistant(tool_use)),
+                },
+                AgentEvent::ToolExecutionStart {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name,
+                    args: serde_json::json!({"safe":true}),
+                },
+                AgentEvent::ToolExecutionEnd {
+                    tool_call_id: call.id.clone(),
+                    result: serde_json::to_value(result).expect("tool result"),
+                    is_error: false,
+                },
+                AgentEvent::ToolExecutionUpdate {
+                    tool_call_id: call.id,
+                    partial: serde_json::json!({"late":true}),
+                },
+            ] {
+                events.send(event).await.expect("session event receiver");
+            }
+            RunCompletion::Completed(core)
+        },
+    );
+    let task = tokio::spawn(
+        Session::start(store, gateway, RunCore::new(), worker)
+            .await
+            .expect("session")
+            .run(),
+    );
+    commands.send(user(1)).await.expect("command");
+    let (failure, ownership) = failed(task.await.expect("session join"));
+    assert!(failure.to_string().contains("after ToolExecutionEnd"));
+    assert!(matches!(ownership, RunOwnership::Lost));
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM tool_executions WHERE tool_call_id='ended-call'")
+            .fetch_one(&pool)
+            .await
+            .expect("running tool audit row");
+    assert_eq!(state, "running");
 }
