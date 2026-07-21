@@ -27,36 +27,55 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     ArtifactBroker, ArtifactBrokerClient, ArtifactOperation, ArtifactResponse, ExecutorOperation,
-    InputRoute, MAX_RPC_LINE_BYTES, RpcError, RpcFrame, RpcIdentity, RpcLifecycleTracker,
-    RpcRequest, decode_rpc_line, encode_rpc_frame, resolve_input,
+    ExecutorResponse, InputRoute, MAX_RPC_LINE_BYTES, RpcError, RpcFrame, RpcIdentity,
+    RpcLifecycleTracker, RpcRequest, decode_rpc_line, encode_rpc_frame, resolve_input,
 };
 use crate::tools::{
     ToolError,
     bash::{BashExecutionResult, LowTrustLocalBash},
-    fs::{GrepMatch, WorkspaceFs},
-    truncate::TruncationResult,
+    fs::WorkspaceFs,
 };
 
 const UPDATE_CHANNEL_CAPACITY: usize = 32;
 const BROKER_CONNECTION_CAPACITY: usize = 32;
 const BROKER_BLOCKING_WORK_CAPACITY: usize = 8;
 const BROKER_EXCHANGE_DEADLINE: Duration = Duration::from_secs(2);
-const EXECUTOR_WRITE_DEADLINE: Duration = Duration::from_millis(100);
+const EXECUTOR_UPDATE_WRITE_DEADLINE: Duration = Duration::from_millis(5);
+const EXECUTOR_TERMINAL_WRITE_DEADLINE: Duration = Duration::from_secs(2);
+// Service stdout is a nonblocking pipe in production. Keeping each volatile
+// update within PIPE_BUF makes a timed-out write all-or-nothing, so dropping
+// progress can never leave a partial JSON frame ahead of the terminal.
+const MAX_ATOMIC_UPDATE_FRAME_BYTES: usize = 4_096;
 const EXECUTOR_REAP_DEADLINE: Duration = Duration::from_secs(2);
+type BashUpdateCallback = Arc<dyn Fn(Value) + Send + Sync>;
 
-#[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ExecutorResponse {
-    ReadFile { result: TruncationResult },
-    Written,
-    Edited,
-    Removed,
-    Listed { entries: Vec<String> },
-    Globbed { paths: Vec<String> },
-    Grepped { matches: Vec<GrepMatch> },
-    Artifact { response: ArtifactResponse },
-    Bash { result: BashExecutionResult },
-    CancelAccepted,
+#[cfg(test)]
+pub(super) struct ExecutorTestControls {
+    cancel_stop_delay: Duration,
+    cancel_ingested: Option<oneshot::Sender<()>>,
+}
+
+#[cfg(test)]
+impl ExecutorTestControls {
+    pub(super) fn observe_cancel(
+        cancel_stop_delay: Duration,
+        cancel_ingested: oneshot::Sender<()>,
+    ) -> Self {
+        Self {
+            cancel_stop_delay,
+            cancel_ingested: Some(cancel_ingested),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Default for ExecutorTestControls {
+    fn default() -> Self {
+        Self {
+            cancel_stop_delay: Duration::ZERO,
+            cancel_ingested: None,
+        }
+    }
 }
 
 enum ActiveControl {
@@ -86,8 +105,18 @@ struct WriterMessage {
 }
 
 struct ExecutorWriter {
-    sender: mpsc::Sender<WriterMessage>,
-    failed: CancellationToken,
+    updates: mpsc::Sender<WriterMessage>,
+    terminals: mpsc::Sender<WriterMessage>,
+    // A terminal ACK is the service's sequential exchange boundary. Hold this
+    // gate while admitting progress so no update can race the terminal fence
+    // after the writer has selected it.
+    terminal_started: Arc<Mutex<bool>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProgressWriteGuarantee {
+    MayWritePartial,
+    AtomicAllOrNothing,
 }
 
 struct NonblockingStdout {
@@ -189,45 +218,179 @@ impl AsyncWrite for NonblockingStdout {
 }
 
 impl ExecutorWriter {
-    fn start<W>(mut write: W) -> (Self, JoinHandle<()>)
+    fn start<W>(write: W) -> (Self, JoinHandle<()>)
     where
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let (sender, mut receiver) = mpsc::channel::<WriterMessage>(UPDATE_CHANNEL_CAPACITY);
-        let failed = CancellationToken::new();
-        let failed_task = failed.clone();
+        Self::start_with_progress_guarantee(write, ProgressWriteGuarantee::MayWritePartial)
+    }
+
+    fn start_atomic_progress<W>(write: W) -> (Self, JoinHandle<()>)
+    where
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::start_with_progress_guarantee(write, ProgressWriteGuarantee::AtomicAllOrNothing)
+    }
+
+    fn start_with_progress_guarantee<W>(
+        mut write: W,
+        progress_write_guarantee: ProgressWriteGuarantee,
+    ) -> (Self, JoinHandle<()>)
+    where
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let (updates, mut update_receiver) =
+            mpsc::channel::<WriterMessage>(UPDATE_CHANNEL_CAPACITY);
+        // Progress is volatile. A dedicated terminal slot ensures queued
+        // progress can never consume the capacity needed by authoritative
+        // completion.
+        let (terminals, mut terminal_receiver) = mpsc::channel::<WriterMessage>(1);
+        let terminal_started = Arc::new(Mutex::new(false));
+        let writer_terminal_started = terminal_started.clone();
         let task = tokio::spawn(async move {
-            while let Some(message) = receiver.recv().await {
-                let result = match timeout(EXECUTOR_WRITE_DEADLINE, async {
-                    write.write_all(&message.bytes).await?;
-                    write.flush().await
-                })
-                .await
-                {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(error)) => Err(error.to_string()),
-                    Err(_) => Err("executor output write deadline elapsed".to_owned()),
+            let mut terminal_started = false;
+            loop {
+                let message = if terminal_started {
+                    terminal_receiver.recv().await
+                } else {
+                    tokio::select! {
+                        biased;
+                        message = terminal_receiver.recv() => message,
+                        message = update_receiver.recv() => message,
+                    }
                 };
+                let Some(message) = message else {
+                    return;
+                };
+                let terminal = message.acknowledgement.is_some();
+                terminal_started |= terminal;
+                if terminal {
+                    // Progress admitted before the terminal was selected is
+                    // volatile and must not be written after the authoritative
+                    // frame. New progress is blocked by the shared gate until
+                    // this terminal has been acknowledged.
+                    while update_receiver.try_recv().is_ok() {}
+                }
+                let deadline = if terminal {
+                    EXECUTOR_TERMINAL_WRITE_DEADLINE
+                } else {
+                    EXECUTOR_UPDATE_WRITE_DEADLINE
+                };
+                let result = if !terminal
+                    && progress_write_guarantee == ProgressWriteGuarantee::MayWritePartial
+                {
+                    // Poll exactly one write future. If it remains Pending until
+                    // the deadline, AsyncWrite has accepted no bytes and this
+                    // volatile frame can be dropped without poisoning JSONL.
+                    // Once Ready reports a prefix or error, the transport epoch
+                    // is no longer safe for a later authoritative terminal.
+                    match timeout(deadline, write.write(&message.bytes)).await {
+                        Ok(Ok(written)) if written == message.bytes.len() => {
+                            match timeout(deadline, write.flush()).await {
+                                Ok(Ok(())) => Ok(()),
+                                Ok(Err(error)) => Err(error.to_string()),
+                                Err(_) => Err("executor output flush deadline elapsed".to_owned()),
+                            }
+                        }
+                        Ok(Ok(_)) => Err("executor output write was partial".to_owned()),
+                        Ok(Err(error)) => Err(error.to_string()),
+                        Err(_) => {
+                            tracing::warn!(
+                                "dropping volatile executor progress update: write deadline elapsed before accepting bytes"
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    match timeout(deadline, async {
+                        write.write_all(&message.bytes).await?;
+                        write.flush().await
+                    })
+                    .await
+                    {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(error)) => Err(error.to_string()),
+                        Err(_) => Err("executor output write deadline elapsed".to_owned()),
+                    }
+                };
+                if terminal {
+                    // Re-enable progress before sending the ACK. The service
+                    // cannot begin its next request until that ACK is observed,
+                    // so no next-request update can be drained in this epoch.
+                    if let Ok(mut started) = writer_terminal_started.lock() {
+                        *started = false;
+                    }
+                    terminal_started = false;
+                }
                 if let Some(acknowledgement) = message.acknowledgement {
                     let _ = acknowledgement.send(result.clone());
                 }
                 if result.is_err() {
-                    failed_task.cancel();
-                    return;
+                    if terminal {
+                        return;
+                    }
+                    if progress_write_guarantee == ProgressWriteGuarantee::AtomicAllOrNothing {
+                        tracing::warn!(
+                            "dropping volatile executor progress update: atomic write unavailable"
+                        );
+                    } else {
+                        tracing::warn!(
+                            "executor progress write failed; permanently closing writer epoch"
+                        );
+                        // A generic AsyncWrite transport may have accepted a
+                        // prefix before stalling or failing. Appending a later
+                        // frame would turn that prefix into corrupt JSONL.
+                        return;
+                    }
                 }
             }
         });
-        (Self { sender, failed }, task)
+        (
+            Self {
+                updates,
+                terminals,
+                terminal_started,
+            },
+            task,
+        )
     }
 
     fn try_update<T: Serialize>(&self, frame: &RpcFrame<T>) -> Result<(), ToolError> {
-        let bytes = encode_rpc_frame(frame)?;
-        self.sender
-            .try_send(WriterMessage {
-                bytes,
-                acknowledgement: None,
-            })
-            .map_err(|_| io_error("executor output queue unavailable"))
+        let bytes = match encode_rpc_frame(frame) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(error = %error, "dropping volatile executor progress update: encode failed");
+                return Ok(());
+            }
+        };
+        if bytes.len() > MAX_ATOMIC_UPDATE_FRAME_BYTES {
+            tracing::warn!(
+                "dropping volatile executor progress update: frame exceeds atomic pipe write"
+            );
+            return Ok(());
+        }
+        let terminal_started = self
+            .terminal_started
+            .lock()
+            .map_err(|_| ToolError::Protocol("executor writer state lock poisoned".to_owned()))?;
+        if *terminal_started {
+            tracing::warn!("dropping volatile executor progress update: terminal in flight");
+            return Ok(());
+        }
+        match self.updates.try_send(WriterMessage {
+            bytes,
+            acknowledgement: None,
+        }) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!("dropping volatile executor progress update: writer queue full");
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::warn!("dropping volatile executor progress update: writer unavailable");
+                Ok(())
+            }
+        }
     }
 
     async fn terminal(
@@ -255,17 +418,29 @@ impl ExecutorWriter {
             Err(error) => return Err(error),
         };
         let (acknowledgement, received) = oneshot::channel();
-        timeout(
-            EXECUTOR_WRITE_DEADLINE,
-            self.sender.send(WriterMessage {
+        {
+            let mut terminal_started = self.terminal_started.lock().map_err(|_| {
+                ToolError::Protocol("executor writer state lock poisoned".to_owned())
+            })?;
+            *terminal_started = true;
+        }
+        let sent = timeout(
+            EXECUTOR_TERMINAL_WRITE_DEADLINE,
+            self.terminals.send(WriterMessage {
                 bytes,
                 acknowledgement: Some(acknowledgement),
             }),
         )
         .await
-        .map_err(|_| io_error("executor output queue deadline elapsed"))?
-        .map_err(|_| io_error("executor output writer unavailable"))?;
-        timeout(EXECUTOR_WRITE_DEADLINE, received)
+        .map_err(|_| io_error("executor output queue deadline elapsed"))
+        .and_then(|result| result.map_err(|_| io_error("executor output writer unavailable")));
+        if let Err(error) = sent {
+            if let Ok(mut terminal_started) = self.terminal_started.lock() {
+                *terminal_started = false;
+            }
+            return Err(error);
+        }
+        timeout(EXECUTOR_TERMINAL_WRITE_DEADLINE, received)
             .await
             .map_err(|_| io_error("executor terminal write deadline elapsed"))?
             .map_err(|_| io_error("executor output writer stopped"))?
@@ -313,7 +488,17 @@ pub async fn run_tool_executor_mode() -> Result<()> {
     let broker = ArtifactBrokerClient::new(broker_socket, identity.clone(), conversation_id);
     let stdin = nonblocking_stdin().context("failed to take ownership of executor stdin")?;
     let stdout = nonblocking_stdout().context("failed to take ownership of executor stdout")?;
-    run_executor_service(stdin, stdout, identity, workspace, fs, broker).await
+    run_executor_service_with_writer(
+        stdin,
+        ExecutorWriter::start_atomic_progress(stdout),
+        identity,
+        workspace,
+        fs,
+        broker,
+        #[cfg(test)]
+        ExecutorTestControls::default(),
+    )
+    .await
 }
 
 pub async fn run_artifact_broker_mode() -> Result<()> {
@@ -433,7 +618,7 @@ async fn serve_broker_connection(
     Ok(())
 }
 
-async fn run_executor_service<R, W>(
+pub(super) async fn run_executor_service<R, W>(
     read: R,
     write: W,
     identity: RpcIdentity,
@@ -445,10 +630,70 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (writer, writer_task) = ExecutorWriter::start(write);
-    let result = run_executor_loop(read, &writer, identity, workspace, fs, broker).await;
+    run_executor_service_with_writer(
+        read,
+        ExecutorWriter::start(write),
+        identity,
+        workspace,
+        fs,
+        broker,
+        #[cfg(test)]
+        ExecutorTestControls::default(),
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(super) async fn run_executor_service_with_cancel_delay<R, W>(
+    read: R,
+    write: W,
+    identity: RpcIdentity,
+    workspace: PathBuf,
+    fs: WorkspaceFs,
+    broker: ArtifactBrokerClient,
+    test_controls: ExecutorTestControls,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    run_executor_service_with_writer(
+        read,
+        ExecutorWriter::start(write),
+        identity,
+        workspace,
+        fs,
+        broker,
+        test_controls,
+    )
+    .await
+}
+
+async fn run_executor_service_with_writer<R>(
+    read: R,
+    (writer, writer_task): (ExecutorWriter, JoinHandle<()>),
+    identity: RpcIdentity,
+    workspace: PathBuf,
+    fs: WorkspaceFs,
+    broker: ArtifactBrokerClient,
+    #[cfg(test)] test_controls: ExecutorTestControls,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let result = run_executor_loop(
+        read,
+        &writer,
+        identity,
+        workspace,
+        fs,
+        broker,
+        #[cfg(test)]
+        test_controls,
+    )
+    .await;
     writer_task.abort();
-    let _ = timeout(EXECUTOR_WRITE_DEADLINE, writer_task).await;
+    let _ = timeout(EXECUTOR_TERMINAL_WRITE_DEADLINE, writer_task).await;
     result
 }
 
@@ -459,6 +704,7 @@ async fn run_executor_loop<R>(
     workspace: PathBuf,
     fs: WorkspaceFs,
     broker: ArtifactBrokerClient,
+    #[cfg(test)] mut test_controls: ExecutorTestControls,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
@@ -494,21 +740,27 @@ where
                     request.request_id,
                     execution_id,
                     command,
+                    #[cfg(test)]
+                    ExecutorTestControls {
+                        cancel_stop_delay: test_controls.cancel_stop_delay,
+                        cancel_ingested: test_controls.cancel_ingested.take(),
+                    },
                 )
                 .await?;
             }
-            ExecutorOperation::Cancel { .. } => {
+            ExecutorOperation::Cancel { execution_id } => {
                 lifecycle.begin_request(&request.request_id)?;
                 lifecycle.accept_terminal(&request.request_id)?;
+                let result = if lifecycle.execution_is_completed(&execution_id) {
+                    Ok(ExecutorResponse::CancelTooLate {})
+                } else {
+                    Err(RpcError {
+                        code: "protocol".to_owned(),
+                        resource_limit: None,
+                    })
+                };
                 writer
-                    .terminal(
-                        &identity,
-                        request.request_id,
-                        Err(RpcError {
-                            code: "protocol".to_owned(),
-                            resource_limit: None,
-                        }),
-                    )
+                    .terminal(&identity, request.request_id, result)
                     .await?;
             }
             operation => {
@@ -535,16 +787,16 @@ async fn run_bash_request<R>(
     request_id: String,
     execution_id: String,
     command: String,
+    #[cfg(test)] mut test_controls: ExecutorTestControls,
 ) -> Result<()>
 where
     R: AsyncBufRead + Unpin,
 {
     let cancel = CancellationToken::new();
-    let (updates_tx, mut updates_rx) = mpsc::channel::<Value>(UPDATE_CHANNEL_CAPACITY);
-    let on_update = Arc::new(move |value| {
-        let _ = updates_tx.try_send(value);
-    });
+    let (on_update, mut updates_rx) = bounded_bash_updates();
     let bash = LowTrustLocalBash::new(workspace.to_path_buf(), broker);
+    #[cfg(test)]
+    let bash = bash.with_cancel_stop_delay(test_controls.cancel_stop_delay);
     let execution = bash.execute(&command, &execution_id, cancel.clone(), on_update);
     tokio::pin!(execution);
     // Keep one persistent read future alive across select iterations. Recreating
@@ -565,18 +817,13 @@ where
     let exit = loop {
         tokio::select! {
             biased;
-            _ = writer.failed.cancelled() => {
-                break BashExit::Fatal {
-                    error: io_error("executor output writer failed"),
-                    response: None,
-                    completed: None,
-                };
-            }
             next = control_rx.recv(), if !control_reader_done || !control_rx.is_empty() => {
                 match classify_active_control(next, identity, &execution_id, lifecycle) {
-                    ActiveControl::Cancel(cancel_request_id) => break BashExit::Cancelled {
-                        cancel_request_id,
-                        completed: None,
+                    ActiveControl::Cancel(cancel_request_id) => {
+                        break BashExit::Cancelled {
+                            cancel_request_id,
+                            completed: None,
+                        }
                     },
                     ActiveControl::Fatal { error, response } => break BashExit::Fatal {
                         error,
@@ -598,9 +845,11 @@ where
                         &execution_id,
                         lifecycle,
                     ) {
-                        ActiveControl::Cancel(cancel_request_id) => break BashExit::Cancelled {
-                            cancel_request_id,
-                            completed: Some(result),
+                        ActiveControl::Cancel(cancel_request_id) => {
+                            break BashExit::Cancelled {
+                                cancel_request_id,
+                                completed: Some(result),
+                            }
                         },
                         ActiveControl::Fatal { error, response } => break BashExit::Fatal {
                             error,
@@ -614,28 +863,21 @@ where
                 }
             }
             update = updates_rx.recv() => {
-                if let Some(value) = update {
-                    if let Err(error) = lifecycle.accept_update(&request_id) {
-                        break BashExit::Fatal {
-                            error,
-                            response: None,
-                            completed: None,
-                        };
-                    }
-                    let frame = RpcFrame::<ExecutorResponse>::Update {
-                        generation: identity.generation,
-                        nonce: identity.nonce.clone(),
-                        request_id: request_id.clone(),
+                if let Some(value) = update
+                    && let Err(error) = forward_bash_update(
+                        writer,
+                        identity,
+                        lifecycle,
+                        &request_id,
                         value,
+                    )
+                {
+                    tracing::warn!("executor output queue unavailable; closing service epoch");
+                    break BashExit::Fatal {
+                        error,
+                        response: None,
+                        completed: None,
                     };
-                    if let Err(error) = writer.try_update(&frame) {
-                        tracing::warn!("executor output queue unavailable; closing service epoch");
-                        break BashExit::Fatal {
-                            error,
-                            response: None,
-                            completed: None,
-                        };
-                    }
                 }
             }
         }
@@ -674,6 +916,13 @@ where
                     }
                 },
             };
+            drain_completed_bash_updates(
+                writer,
+                identity,
+                lifecycle,
+                &request_id,
+                &mut updates_rx,
+            )?;
             lifecycle.accept_terminal(&request_id)?;
             writer
                 .terminal(
@@ -692,6 +941,13 @@ where
             Err(error.into())
         }
         BashExit::Completed(result) => {
+            drain_completed_bash_updates(
+                writer,
+                identity,
+                lifecycle,
+                &request_id,
+                &mut updates_rx,
+            )?;
             lifecycle.accept_terminal(&request_id)?;
             writer
                 .terminal(
@@ -709,21 +965,27 @@ where
             completed,
         } => {
             cancel.cancel();
+            #[cfg(test)]
+            signal_cancel_ingested(&mut test_controls.cancel_ingested);
             let result = match completed {
                 Some(result) => result,
                 None => match timeout(EXECUTOR_REAP_DEADLINE, &mut execution).await {
                     Ok(Ok(result)) => Ok(result),
-                    Ok(Err(reap_error)) => {
+                    Ok(Err(_reap_error)) => {
                         lifecycle.accept_terminal(&request_id)?;
                         writer
                             .terminal(
                                 identity,
                                 cancel_request_id,
-                                Ok(ExecutorResponse::CancelAccepted),
+                                Err(bounded_error("rpc_indeterminate")),
                             )
                             .await?;
                         writer
-                            .terminal(identity, request_id, Err(rpc_error(reap_error)))
+                            .terminal(
+                                identity,
+                                request_id,
+                                Err(bounded_error("rpc_indeterminate")),
+                            )
                             .await?;
                         return Err(anyhow::anyhow!(
                             "executor cancellation failed before cleanup was proven"
@@ -736,7 +998,7 @@ where
                             .terminal(
                                 identity,
                                 cancel_request_id,
-                                Ok(ExecutorResponse::CancelAccepted),
+                                Err(bounded_error("rpc_indeterminate")),
                             )
                             .await?;
                         writer
@@ -755,13 +1017,21 @@ where
                     }
                 },
             };
+            drain_completed_bash_updates(
+                writer,
+                identity,
+                lifecycle,
+                &request_id,
+                &mut updates_rx,
+            )?;
             lifecycle.accept_terminal(&request_id)?;
+            let cancel_response = match &result {
+                Ok(result) if result.cancelled => Ok(ExecutorResponse::CancelAccepted {}),
+                Ok(_) => Ok(ExecutorResponse::CancelTooLate {}),
+                Err(_) => Err(bounded_error("rpc_indeterminate")),
+            };
             writer
-                .terminal(
-                    identity,
-                    cancel_request_id,
-                    Ok(ExecutorResponse::CancelAccepted),
-                )
+                .terminal(identity, cancel_request_id, cancel_response)
                 .await?;
             writer
                 .terminal(
@@ -775,6 +1045,115 @@ where
             Ok(())
         }
     }
+}
+
+fn bounded_bash_updates() -> (BashUpdateCallback, mpsc::Receiver<Value>) {
+    let (updates_tx, updates_rx) = mpsc::channel::<Value>(UPDATE_CHANNEL_CAPACITY);
+    let on_update = Arc::new(move |value| match updates_tx.try_send(value) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            tracing::warn!("dropping volatile executor progress update: callback queue full");
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            tracing::warn!("dropping volatile executor progress update: callback queue closed");
+        }
+    });
+    (on_update, updates_rx)
+}
+
+#[cfg(test)]
+fn signal_cancel_ingested(cancel_ingested: &mut Option<oneshot::Sender<()>>) {
+    if let Some(sender) = cancel_ingested.take() {
+        let _ = sender.send(());
+    }
+}
+
+fn forward_bash_update(
+    writer: &ExecutorWriter,
+    identity: &RpcIdentity,
+    lifecycle: &RpcLifecycleTracker,
+    request_id: &str,
+    value: Value,
+) -> Result<(), ToolError> {
+    let output = match &value {
+        Value::Object(fields) if fields.len() == 1 => fields.get("output").and_then(Value::as_str),
+        _ => None,
+    };
+    let Some(output) = output else {
+        return forward_single_bash_update(writer, identity, lifecycle, request_id, value);
+    };
+
+    // Bash emits at most one bounded reader chunk per callback, but JSON
+    // escaping and frame metadata can still push that update beyond PIPE_BUF.
+    // Split only the output value, measuring the actual encoded frame at UTF-8
+    // boundaries so every attempted progress write remains atomic.
+    let mut pending = vec![output];
+    while let Some(chunk) = pending.pop() {
+        let value = serde_json::json!({"output": chunk});
+        let frame = bash_update_frame(identity, request_id, value.clone());
+        if encode_rpc_frame(&frame).is_ok_and(|bytes| bytes.len() <= MAX_ATOMIC_UPDATE_FRAME_BYTES)
+        {
+            forward_single_bash_update(writer, identity, lifecycle, request_id, value)?;
+            continue;
+        }
+
+        let midpoint = chunk.len() / 2;
+        let split = (1..=midpoint)
+            .rev()
+            .find(|index| chunk.is_char_boundary(*index));
+        let Some(split) = split else {
+            // Metadata alone can make even one scalar unwriteable. Preserve
+            // volatile-update semantics and let try_update drop it explicitly.
+            forward_single_bash_update(writer, identity, lifecycle, request_id, value)?;
+            continue;
+        };
+        let (left, right) = chunk.split_at(split);
+        pending.push(right);
+        pending.push(left);
+    }
+    Ok(())
+}
+
+fn bash_update_frame(
+    identity: &RpcIdentity,
+    request_id: &str,
+    value: Value,
+) -> RpcFrame<ExecutorResponse> {
+    RpcFrame::Update {
+        generation: identity.generation,
+        nonce: identity.nonce.clone(),
+        request_id: request_id.to_owned(),
+        value,
+    }
+}
+
+fn forward_single_bash_update(
+    writer: &ExecutorWriter,
+    identity: &RpcIdentity,
+    lifecycle: &RpcLifecycleTracker,
+    request_id: &str,
+    value: Value,
+) -> Result<(), ToolError> {
+    lifecycle.accept_update(request_id)?;
+    let frame = bash_update_frame(identity, request_id, value);
+    writer.try_update(&frame)
+}
+
+fn drain_completed_bash_updates(
+    writer: &ExecutorWriter,
+    identity: &RpcIdentity,
+    lifecycle: &RpcLifecycleTracker,
+    request_id: &str,
+    updates_rx: &mut mpsc::Receiver<Value>,
+) -> Result<(), ToolError> {
+    // LowTrustLocalBash resolves only after its pipe reader and every callback
+    // invocation complete. No producer can enqueue another value beyond this
+    // point, so a nonblocking drain is a stable synchronization boundary, not
+    // a racy snapshot.
+    while let Ok(value) = updates_rx.try_recv() {
+        forward_bash_update(writer, identity, lifecycle, request_id, value)?;
+    }
+    Ok(())
 }
 
 async fn take_queued_control_after_completion<F, T>(
@@ -917,7 +1296,7 @@ async fn execute_non_bash(
         ExecutorOperation::WriteFile { path, content, .. } => {
             resolve_input("write_file", &path)?;
             fs.write_file(path.as_ref(), content.as_bytes())?;
-            Ok(ExecutorResponse::Written)
+            Ok(ExecutorResponse::Written {})
         }
         ExecutorOperation::EditFile {
             path,
@@ -927,12 +1306,12 @@ async fn execute_non_bash(
         } => {
             resolve_input("edit_file", &path)?;
             fs.edit_file(path.as_ref(), &old_string, &new_string)?;
-            Ok(ExecutorResponse::Edited)
+            Ok(ExecutorResponse::Edited {})
         }
         ExecutorOperation::RemoveFile { path, .. } => {
             resolve_input("remove_file", &path)?;
             fs.remove_file(path.as_ref())?;
-            Ok(ExecutorResponse::Removed)
+            Ok(ExecutorResponse::Removed {})
         }
         ExecutorOperation::ListDir { path, .. } => {
             resolve_input("list_dir", &path)?;
@@ -1161,6 +1540,116 @@ fn required_path(name: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::executor::decode_rpc_frame;
+
+    struct PrefixThenStall {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        prefix: usize,
+        wrote_prefix: bool,
+    }
+
+    struct AtomicBlockedThenWrite {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        allow_write: Arc<Mutex<bool>>,
+    }
+
+    struct UpdatePendingTerminalWrite {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        pending_polled: Option<oneshot::Sender<()>>,
+    }
+
+    impl AsyncWrite for UpdatePendingTerminalWrite {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _context: &mut TaskContext<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let frame: Value = serde_json::from_slice(buffer).expect("encoded RPC frame");
+            if frame["type"] == "update" {
+                if let Some(sender) = self.pending_polled.take() {
+                    let _ = sender.send(());
+                }
+                return Poll::Pending;
+            }
+            self.bytes.lock().unwrap().extend_from_slice(buffer);
+            Poll::Ready(Ok(buffer.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _context: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for AtomicBlockedThenWrite {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut TaskContext<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if !*self.allow_write.lock().unwrap() {
+                return Poll::Pending;
+            }
+            self.bytes.lock().unwrap().extend_from_slice(buffer);
+            Poll::Ready(Ok(buffer.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _context: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for PrefixThenStall {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _context: &mut TaskContext<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.wrote_prefix {
+                return Poll::Pending;
+            }
+            let length = self.prefix.min(buffer.len());
+            self.bytes
+                .lock()
+                .unwrap()
+                .extend_from_slice(&buffer[..length]);
+            self.wrote_prefix = true;
+            Poll::Ready(Ok(length))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _context: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     struct QueueControlOnSecondPoll {
         polls: usize,
@@ -1179,6 +1668,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn update_callback_burst_drops_overflow_without_reordering_delivery() {
+        let (callback, mut receiver) = bounded_bash_updates();
+        for index in 0..=UPDATE_CHANNEL_CAPACITY {
+            callback(serde_json::json!({"index": index}));
+        }
+
+        let received = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(received.len(), UPDATE_CHANNEL_CAPACITY);
+        assert_eq!(received[0]["index"], 0);
+        assert_eq!(received[UPDATE_CHANNEL_CAPACITY - 1]["index"], 31);
+    }
+
+    #[test]
+    fn service_preserves_post_commit_indeterminate_error_code() {
+        assert_eq!(
+            rpc_error(ToolError::RpcIndeterminate(
+                "mutation committed before directory sync failed".to_owned(),
+            ))
+            .code,
+            "rpc_indeterminate"
+        );
+    }
+
     #[tokio::test]
     async fn completion_repolls_control_reader_before_settling() {
         let (sender, mut receiver) = mpsc::channel(1);
@@ -1194,6 +1707,381 @@ mod tests {
 
         assert_eq!(control.unwrap(), "cancel");
         assert!(!reader_done);
+    }
+
+    #[tokio::test]
+    async fn completed_bash_updates_are_emitted_before_terminal() {
+        let identity = RpcIdentity {
+            generation: 7,
+            nonce: "boot-nonce".to_owned(),
+        };
+        let (read_side, write_side) = tokio::io::duplex(4096);
+        let (writer, writer_task) = ExecutorWriter::start(write_side);
+        let mut lifecycle = RpcLifecycleTracker::default();
+        lifecycle
+            .begin_execution("request-1", "execution-1")
+            .expect("begin execution");
+        let (updates_tx, mut updates_rx) = mpsc::channel(UPDATE_CHANNEL_CAPACITY);
+        updates_tx
+            .send(serde_json::json!({"output": "first"}))
+            .await
+            .expect("queue first update");
+        updates_tx
+            .send(serde_json::json!({"output": "second"}))
+            .await
+            .expect("queue second update");
+        drop(updates_tx);
+
+        drain_completed_bash_updates(&writer, &identity, &lifecycle, "request-1", &mut updates_rx)
+            .expect("drain completed updates");
+        lifecycle
+            .accept_terminal("request-1")
+            .expect("accept terminal");
+        writer
+            .terminal(
+                &identity,
+                "request-1".to_owned(),
+                Ok(ExecutorResponse::Written {}),
+            )
+            .await
+            .expect("write terminal");
+
+        let mut read = BufReader::new(read_side);
+        let mut delivered = Vec::new();
+        loop {
+            let frame = decode_rpc_frame::<ExecutorResponse>(
+                &read_frame(&mut read)
+                    .await
+                    .expect("read frame")
+                    .expect("frame"),
+                &identity,
+            )
+            .expect("decode frame");
+            match frame {
+                RpcFrame::Update { value, .. } => delivered.push(value["output"].clone()),
+                RpcFrame::Terminal { .. } => break,
+            }
+        }
+        assert!(
+            delivered == Vec::<Value>::new()
+                || delivered == vec![serde_json::json!("first")]
+                || delivered == vec![serde_json::json!("first"), serde_json::json!("second")]
+        );
+        writer_task.abort();
+    }
+
+    #[tokio::test]
+    async fn terminal_fence_drops_old_updates_and_reenables_next_exchange() {
+        let identity = RpcIdentity {
+            generation: 7,
+            nonce: "boot-nonce".to_owned(),
+        };
+        let (read_side, write_side) = tokio::io::duplex(4096);
+        let (writer, writer_task) = ExecutorWriter::start(write_side);
+
+        writer
+            .try_update(&RpcFrame::<ExecutorResponse>::Update {
+                generation: identity.generation,
+                nonce: identity.nonce.clone(),
+                request_id: "request-1".to_owned(),
+                value: serde_json::json!({"output": "stale"}),
+            })
+            .expect("queue stale progress");
+        timeout(
+            Duration::from_secs(1),
+            writer.terminal(
+                &identity,
+                "request-1".to_owned(),
+                Ok(ExecutorResponse::Written {}),
+            ),
+        )
+        .await
+        .expect("first terminal timeout")
+        .expect("write first terminal");
+
+        let mut read = BufReader::new(read_side);
+        let first = decode_rpc_frame::<ExecutorResponse>(
+            &read_frame(&mut read)
+                .await
+                .expect("read first frame")
+                .expect("first frame"),
+            &identity,
+        )
+        .expect("decode first frame");
+        assert!(matches!(
+            first,
+            RpcFrame::Terminal { request_id, .. } if request_id == "request-1"
+        ));
+
+        writer
+            .try_update(&RpcFrame::<ExecutorResponse>::Update {
+                generation: identity.generation,
+                nonce: identity.nonce.clone(),
+                request_id: "request-2".to_owned(),
+                value: serde_json::json!({"output": "fresh"}),
+            })
+            .expect("queue next-request progress");
+        let second = decode_rpc_frame::<ExecutorResponse>(
+            &read_frame(&mut read)
+                .await
+                .expect("read second frame")
+                .expect("second frame"),
+            &identity,
+        )
+        .expect("decode second frame");
+        assert!(matches!(
+            second,
+            RpcFrame::Update {
+                request_id,
+                value,
+                ..
+            } if request_id == "request-2" && value["output"] == "fresh"
+        ));
+
+        timeout(
+            Duration::from_secs(1),
+            writer.terminal(
+                &identity,
+                "request-2".to_owned(),
+                Ok(ExecutorResponse::Written {}),
+            ),
+        )
+        .await
+        .expect("second terminal timeout")
+        .expect("write second terminal");
+        let third = decode_rpc_frame::<ExecutorResponse>(
+            &read_frame(&mut read)
+                .await
+                .expect("read third frame")
+                .expect("third frame"),
+            &identity,
+        )
+        .expect("decode third frame");
+        assert!(matches!(
+            third,
+            RpcFrame::Terminal { request_id, .. } if request_id == "request-2"
+        ));
+        writer_task.abort();
+    }
+
+    #[tokio::test]
+    async fn oversized_bash_progress_is_split_into_atomic_utf8_frames() {
+        let identity = RpcIdentity {
+            generation: 7,
+            nonce: "boot-nonce".to_owned(),
+        };
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let transport = AtomicBlockedThenWrite {
+            bytes: bytes.clone(),
+            allow_write: Arc::new(Mutex::new(true)),
+        };
+        let (writer, writer_task) = ExecutorWriter::start_atomic_progress(transport);
+        let mut lifecycle = RpcLifecycleTracker::default();
+        lifecycle
+            .begin_execution("request-1", "execution-1")
+            .expect("begin execution");
+        let output = "界\"\\\n".repeat(2_000);
+
+        forward_bash_update(
+            &writer,
+            &identity,
+            &lifecycle,
+            "request-1",
+            serde_json::json!({"output": output}),
+        )
+        .expect("forward oversized progress");
+
+        let delivered = timeout(Duration::from_secs(1), async {
+            loop {
+                let delivered = bytes.lock().unwrap().clone();
+                let reconstructed = delivered
+                    .split(|byte| *byte == b'\n')
+                    .filter(|line| !line.is_empty())
+                    .map(|line| {
+                        let RpcFrame::Update { value, .. } =
+                            decode_rpc_frame::<ExecutorResponse>(line, &identity)
+                                .expect("decode update")
+                        else {
+                            panic!("unexpected terminal")
+                        };
+                        value["output"].as_str().expect("output string").to_owned()
+                    })
+                    .collect::<String>();
+                if reconstructed == output {
+                    break delivered;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("split progress delivery");
+
+        let frames = delivered
+            .split_inclusive(|byte| *byte == b'\n')
+            .collect::<Vec<_>>();
+        assert!(frames.len() > 1);
+        assert!(
+            frames
+                .iter()
+                .all(|frame| frame.len() <= MAX_ATOMIC_UPDATE_FRAME_BYTES)
+        );
+        writer_task.abort();
+    }
+
+    #[tokio::test]
+    async fn pending_zero_byte_progress_timeout_preserves_terminal() {
+        let identity = RpcIdentity {
+            generation: 7,
+            nonce: "boot-nonce".to_owned(),
+        };
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (pending_polled, pending_polled_rx) = oneshot::channel();
+        let transport = UpdatePendingTerminalWrite {
+            bytes: bytes.clone(),
+            pending_polled: Some(pending_polled),
+        };
+        let (writer, writer_task) = ExecutorWriter::start(transport);
+        writer
+            .try_update(&RpcFrame::<ExecutorResponse>::Update {
+                generation: identity.generation,
+                nonce: identity.nonce.clone(),
+                request_id: "request-1".to_owned(),
+                value: serde_json::json!({"output": "dropped progress"}),
+            })
+            .expect("enqueue progress");
+        timeout(Duration::from_secs(1), pending_polled_rx)
+            .await
+            .expect("progress write was not polled")
+            .expect("progress writer stopped before polling transport");
+        assert!(bytes.lock().unwrap().is_empty());
+
+        // The transport keeps every update write Pending while accepting a
+        // terminal immediately. Terminal acknowledgement therefore proves the
+        // zero-byte update future timed out and was dropped without poisoning
+        // the writer epoch.
+        writer
+            .terminal(
+                &identity,
+                "request-1".to_owned(),
+                Ok(ExecutorResponse::Written {}),
+            )
+            .await
+            .expect("zero-byte progress timeout must not poison terminal delivery");
+        let delivered = bytes.lock().unwrap().clone();
+        let frame = decode_rpc_frame::<ExecutorResponse>(
+            delivered.strip_suffix(b"\n").expect("terminal newline"),
+            &identity,
+        )
+        .expect("decode terminal");
+        assert!(matches!(
+            frame,
+            RpcFrame::Terminal {
+                result: Ok(ExecutorResponse::Written {}),
+                ..
+            }
+        ));
+        writer_task.abort();
+    }
+
+    #[tokio::test]
+    async fn partial_progress_write_permanently_closes_writer_epoch() {
+        let identity = RpcIdentity {
+            generation: 7,
+            nonce: "boot-nonce".to_owned(),
+        };
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let prefix = 7;
+        let transport = PrefixThenStall {
+            bytes: bytes.clone(),
+            prefix,
+            wrote_prefix: false,
+        };
+        let (writer, writer_task) = ExecutorWriter::start(transport);
+        writer
+            .try_update(&RpcFrame::<ExecutorResponse>::Update {
+                generation: identity.generation,
+                nonce: identity.nonce.clone(),
+                request_id: "request-1".to_owned(),
+                value: serde_json::json!({"output": "progress"}),
+            })
+            .expect("enqueue progress");
+
+        timeout(Duration::from_millis(100), writer_task)
+            .await
+            .expect("writer epoch stops within its update deadline")
+            .expect("writer task");
+        assert!(
+            writer
+                .try_update(&RpcFrame::<ExecutorResponse>::Update {
+                    generation: identity.generation,
+                    nonce: identity.nonce.clone(),
+                    request_id: "request-1".to_owned(),
+                    value: serde_json::json!({"output": "later progress"}),
+                })
+                .is_ok(),
+            "volatile backpressure must not fail the Bash side-effect path"
+        );
+        assert!(
+            writer
+                .terminal(
+                    &identity,
+                    "request-1".to_owned(),
+                    Ok(ExecutorResponse::Written {}),
+                )
+                .await
+                .is_err(),
+            "terminal must not be appended after a partial progress frame"
+        );
+        assert_eq!(bytes.lock().unwrap().len(), prefix);
+    }
+
+    #[tokio::test]
+    async fn atomic_progress_backpressure_drops_update_and_preserves_terminal() {
+        let identity = RpcIdentity {
+            generation: 7,
+            nonce: "boot-nonce".to_owned(),
+        };
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let allow_write = Arc::new(Mutex::new(false));
+        let transport = AtomicBlockedThenWrite {
+            bytes: bytes.clone(),
+            allow_write: allow_write.clone(),
+        };
+        let (writer, writer_task) = ExecutorWriter::start_atomic_progress(transport);
+        writer
+            .try_update(&RpcFrame::<ExecutorResponse>::Update {
+                generation: identity.generation,
+                nonce: identity.nonce.clone(),
+                request_id: "request-1".to_owned(),
+                value: serde_json::json!({"output": "dropped progress"}),
+            })
+            .expect("enqueue progress");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(bytes.lock().unwrap().is_empty());
+
+        *allow_write.lock().unwrap() = true;
+        writer
+            .terminal(
+                &identity,
+                "request-1".to_owned(),
+                Ok(ExecutorResponse::Written {}),
+            )
+            .await
+            .expect("authoritative terminal survives atomic progress drop");
+        let delivered = bytes.lock().unwrap().clone();
+        let frame = decode_rpc_frame::<ExecutorResponse>(
+            delivered.strip_suffix(b"\n").expect("terminal newline"),
+            &identity,
+        )
+        .expect("decode terminal");
+        assert!(matches!(
+            frame,
+            RpcFrame::Terminal {
+                result: Ok(ExecutorResponse::Written {}),
+                ..
+            }
+        ));
+        writer_task.abort();
     }
 
     #[test]

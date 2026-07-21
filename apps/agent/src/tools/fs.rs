@@ -22,7 +22,7 @@ use std::{
 };
 
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
@@ -34,10 +34,10 @@ use super::{
 };
 
 const MAX_SCAN_BYTES: u64 = 10 * 1024 * 1024;
-const MAX_SCAN_ENTRIES: usize = 4_096;
+pub(crate) const MAX_SCAN_ENTRIES: usize = 4_096;
 const MAX_SCAN_DEPTH: usize = 128;
-const MAX_GREP_MATCHES: usize = 4_096;
-const MAX_GREP_SERIALIZED_BYTES: usize = 50 * 1024;
+pub(crate) const MAX_GREP_MATCHES: usize = 4_096;
+pub(crate) const MAX_GREP_SERIALIZED_BYTES: usize = 50 * 1024;
 const OPENAT2_UNAVAILABLE: &str = "workspace filesystem requires Linux openat2(2) (available since Linux 5.6) with the required beneath/no-symlink resolve policy; the syscall is missing or blocked by seccomp";
 /// `edit_file` is a whole-file unique-replacement operation. Keep its snapshot
 /// inside the same explicit 10 MiB local-input envelope used by bounded scans.
@@ -69,12 +69,19 @@ struct OpenHow {
     resolve: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GrepMatch {
     pub path: String,
     pub line_number: u64,
     pub line: String,
     pub line_truncated: bool,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WorkspaceGrepEnvelope<'a> {
+    Grepped { matches: &'a [GrepMatch] },
 }
 
 /// Workspace operations rooted at an opened directory file descriptor.
@@ -234,6 +241,15 @@ impl WorkspaceFs {
     }
 
     pub fn write_file(&self, path: &Path, content: &[u8]) -> Result<(), ToolError> {
+        self.write_file_with_post_rename_hook(path, content, || Ok(()))
+    }
+
+    fn write_file_with_post_rename_hook(
+        &self,
+        path: &Path,
+        content: &[u8],
+        post_rename: impl FnOnce() -> Result<(), ToolError>,
+    ) -> Result<(), ToolError> {
         let relative = self.relative(path)?;
         let (parent, name) = split_parent_name(&relative)?;
         let parent_fd = self.open_beneath(
@@ -268,27 +284,33 @@ impl WorkspaceFs {
             return Err(ToolError::Io(std::io::Error::last_os_error()));
         }
         let mut temporary_file = File::from(unsafe { OwnedFd::from_raw_fd(raw) });
-        let write_result = (|| -> Result<(), ToolError> {
-            temporary_file.write_all(content)?;
-            let chmod = unsafe { libc::fchmod(temporary_file.as_raw_fd(), 0o600) };
-            if chmod != 0 {
-                return Err(ToolError::Io(std::io::Error::last_os_error()));
-            }
-            temporary_file.sync_all()?;
-            let renamed = unsafe {
-                libc::renameat(
-                    parent_fd.as_raw_fd(),
-                    temporary.as_ptr(),
-                    parent_fd.as_raw_fd(),
-                    name.as_ptr(),
-                )
-            };
-            if renamed != 0 {
-                return Err(ToolError::Io(std::io::Error::last_os_error()));
-            }
-            File::from(parent_fd.try_clone()?).sync_all()?;
-            Ok(())
-        })();
+        let write_result =
+            (|| -> Result<(), ToolError> {
+                temporary_file.write_all(content)?;
+                let chmod = unsafe { libc::fchmod(temporary_file.as_raw_fd(), 0o600) };
+                if chmod != 0 {
+                    return Err(ToolError::Io(std::io::Error::last_os_error()));
+                }
+                temporary_file.sync_all()?;
+                let renamed = unsafe {
+                    libc::renameat(
+                        parent_fd.as_raw_fd(),
+                        temporary.as_ptr(),
+                        parent_fd.as_raw_fd(),
+                        name.as_ptr(),
+                    )
+                };
+                if renamed != 0 {
+                    return Err(ToolError::Io(std::io::Error::last_os_error()));
+                }
+                post_rename().map_err(|error| post_commit_error("write_file rename", error))?;
+                File::from(parent_fd.try_clone().map_err(|error| {
+                    post_commit_error("write_file rename", ToolError::Io(error))
+                })?)
+                .sync_all()
+                .map_err(|error| post_commit_error("write_file rename", ToolError::Io(error)))?;
+                Ok(())
+            })();
         if write_result.is_err() {
             unsafe {
                 libc::unlinkat(parent_fd.as_raw_fd(), temporary.as_ptr(), 0);
@@ -526,14 +548,14 @@ impl WorkspaceFs {
                             temporary_ownership = EditTemporaryOwnership::Removed;
                         } else {
                             temporary_ownership = EditTemporaryOwnership::Unknown;
-                            return Err(ToolError::Protocol(format!(
+                            return Err(ToolError::RpcIndeterminate(format!(
                                 "edit_file atomic install became indeterminate; rollback completed but the verified replacement could not be removed from {} ({})",
                                 temporary.to_string_lossy(),
                                 std::io::Error::last_os_error(),
                             )));
                         }
                     } else {
-                        return Err(ToolError::Protocol(format!(
+                        return Err(ToolError::RpcIndeterminate(format!(
                             "edit_file atomic install became indeterminate; rollback completed but preserved an unknown temporary/quarantine inode at {}: expected replacement={}:{} actual={:?}",
                             temporary.to_string_lossy(),
                             replacement_metadata.dev(),
@@ -553,7 +575,7 @@ impl WorkspaceFs {
                         "quarantine ownership could not be confirmed and no cleanup was attempted"
                             .to_owned()
                     };
-                    return Err(ToolError::Protocol(format!(
+                    return Err(ToolError::RpcIndeterminate(format!(
                         "edit_file atomic install became indeterminate; rollback failed ({}) and {preservation}",
                         std::io::Error::last_os_error(),
                     )));
@@ -573,7 +595,10 @@ impl WorkspaceFs {
                 )));
             }
             if unsafe { libc::unlinkat(parent_fd.as_raw_fd(), temporary.as_ptr(), 0) } != 0 {
-                return Err(ToolError::Io(std::io::Error::last_os_error()));
+                return Err(post_commit_error(
+                    "edit_file exchange",
+                    ToolError::Io(std::io::Error::last_os_error()),
+                ));
             }
             temporary_ownership = EditTemporaryOwnership::Removed;
             Ok(())
@@ -604,18 +629,21 @@ impl WorkspaceFs {
             }
         }
         replacement_result?;
-        File::from(parent_fd).sync_all()?;
+        File::from(parent_fd)
+            .sync_all()
+            .map_err(|error| post_commit_error("edit_file exchange", ToolError::Io(error)))?;
         Ok(())
     }
 
     pub fn remove_file(&self, path: &Path) -> Result<(), ToolError> {
-        self.remove_file_with_hook(path, || {})
+        self.remove_file_with_hooks(path, || {}, || Ok(()))
     }
 
-    fn remove_file_with_hook(
+    fn remove_file_with_hooks(
         &self,
         path: &Path,
         before_quarantine: impl FnOnce(),
+        post_unlink: impl FnOnce() -> Result<(), ToolError>,
     ) -> Result<(), ToolError> {
         let relative = self.relative(path)?;
         let (parent, name) = split_parent_name(&relative)?;
@@ -677,12 +705,14 @@ impl WorkspaceFs {
                 )
             };
             if restored != 0 {
-                return Err(ToolError::Protocol(format!(
+                return Err(ToolError::RpcIndeterminate(format!(
                     "remove_file target changed and could not be restored: {}",
                     std::io::Error::last_os_error()
                 )));
             }
-            File::from(parent_fd).sync_all()?;
+            File::from(parent_fd).sync_all().map_err(|error| {
+                post_commit_error("remove_file quarantine rollback", ToolError::Io(error))
+            })?;
             return match identity_matches {
                 Ok(false) => Err(ToolError::Protocol(
                     "remove_file target changed before deletion".to_owned(),
@@ -694,9 +724,15 @@ impl WorkspaceFs {
 
         let removed = unsafe { libc::unlinkat(parent_fd.as_raw_fd(), quarantine.as_ptr(), 0) };
         if removed != 0 {
-            return Err(ToolError::Io(std::io::Error::last_os_error()));
+            return Err(post_commit_error(
+                "remove_file quarantine rename",
+                ToolError::Io(std::io::Error::last_os_error()),
+            ));
         }
-        File::from(parent_fd).sync_all()?;
+        post_unlink().map_err(|error| post_commit_error("remove_file unlink", error))?;
+        File::from(parent_fd)
+            .sync_all()
+            .map_err(|error| post_commit_error("remove_file unlink", ToolError::Io(error)))?;
         Ok(())
     }
 
@@ -754,7 +790,10 @@ impl WorkspaceFs {
         )?;
         let metadata = File::from(metadata_fd.try_clone()?).metadata()?;
         let mut matches = Vec::new();
-        let mut serialized_bytes = 2usize;
+        let mut serialized_bytes =
+            serde_json::to_vec(&WorkspaceGrepEnvelope::Grepped { matches: &[] })
+                .map_err(|error| ToolError::Protocol(format!("grep encode failed: {error}")))?
+                .len();
         if metadata.is_dir() {
             let mut budget = WalkBudget {
                 max_bytes: Some(MAX_SCAN_BYTES),
@@ -848,6 +887,10 @@ impl WorkspaceFs {
             RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
         )
     }
+}
+
+fn post_commit_error(boundary: &str, error: ToolError) -> ToolError {
+    ToolError::RpcIndeterminate(format!("{boundary} committed before failure: {error}"))
 }
 
 fn split_parent_name(path: &Path) -> Result<(PathBuf, &OsStr), ToolError> {
@@ -1404,7 +1447,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(ToolError::Protocol(message))
+            Err(ToolError::RpcIndeterminate(message))
                 if message.contains("original was preserved in quarantine")
         ));
         assert!(!root.path.join("note.txt").exists());
@@ -1453,7 +1496,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(ToolError::Protocol(message)) if message.contains("indeterminate")
+            Err(ToolError::RpcIndeterminate(message)) if message.contains("indeterminate")
         ));
         assert_eq!(
             std::fs::read(root.path.join("note.txt")).expect("restored original"),
@@ -1549,15 +1592,19 @@ mod tests {
         std::fs::write(root.path.join("replacement.txt"), b"replacement")
             .expect("write replacement");
 
-        let result = fs.remove_file_with_hook(Path::new("note.txt"), || {
-            std::fs::rename(root.path.join("note.txt"), root.path.join("original.txt"))
-                .expect("move validated inode aside");
-            std::fs::rename(
-                root.path.join("replacement.txt"),
-                root.path.join("note.txt"),
-            )
-            .expect("replace validated path");
-        });
+        let result = fs.remove_file_with_hooks(
+            Path::new("note.txt"),
+            || {
+                std::fs::rename(root.path.join("note.txt"), root.path.join("original.txt"))
+                    .expect("move validated inode aside");
+                std::fs::rename(
+                    root.path.join("replacement.txt"),
+                    root.path.join("note.txt"),
+                )
+                .expect("replace validated path");
+            },
+            || Ok(()),
+        );
 
         assert!(matches!(result, Err(ToolError::Protocol(_))));
         assert_eq!(
@@ -1583,14 +1630,18 @@ mod tests {
             .expect("write second original");
         let outside = root.path.with_extension("outside");
         std::fs::write(&outside, b"outside").expect("write outside target");
-        let result = fs.remove_file_with_hook(Path::new("linked.txt"), || {
-            std::fs::rename(
-                root.path.join("linked.txt"),
-                root.path.join("linked-original.txt"),
-            )
-            .expect("move second validated inode aside");
-            symlink(&outside, root.path.join("linked.txt")).expect("install escape symlink");
-        });
+        let result = fs.remove_file_with_hooks(
+            Path::new("linked.txt"),
+            || {
+                std::fs::rename(
+                    root.path.join("linked.txt"),
+                    root.path.join("linked-original.txt"),
+                )
+                .expect("move second validated inode aside");
+                symlink(&outside, root.path.join("linked.txt")).expect("install escape symlink");
+            },
+            || Ok(()),
+        );
         assert!(result.is_err());
         assert!(
             std::fs::symlink_metadata(root.path.join("linked.txt"))
@@ -1603,6 +1654,42 @@ mod tests {
             b"outside"
         );
         std::fs::remove_file(outside).expect("remove outside fixture");
+    }
+
+    #[test]
+    fn committed_write_remove_and_sync_failpoints_are_indeterminate() {
+        let root = TempWorkspace::new();
+        let fs = WorkspaceFs::open(&root.path).expect("workspace fs");
+
+        let write = fs.write_file_with_post_rename_hook(Path::new("written.txt"), b"new", || {
+            Err(ToolError::Io(std::io::Error::other(
+                "injected post-rename failure",
+            )))
+        });
+        assert!(matches!(write, Err(ToolError::RpcIndeterminate(_))));
+        assert_eq!(
+            std::fs::read(root.path.join("written.txt")).unwrap(),
+            b"new"
+        );
+
+        fs.write_file(Path::new("removed.txt"), b"old").unwrap();
+        let remove = fs.remove_file_with_hooks(
+            Path::new("removed.txt"),
+            || {},
+            || {
+                Err(ToolError::Io(std::io::Error::other(
+                    "injected post-unlink failure",
+                )))
+            },
+        );
+        assert!(matches!(remove, Err(ToolError::RpcIndeterminate(_))));
+        assert!(!root.path.join("removed.txt").exists());
+
+        let sync = post_commit_error(
+            "injected directory sync",
+            ToolError::Io(std::io::Error::other("sync failed")),
+        );
+        assert!(matches!(sync, ToolError::RpcIndeterminate(_)));
     }
 
     #[test]

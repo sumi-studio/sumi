@@ -22,12 +22,11 @@ use super::protocol::{
 };
 use crate::tools::{
     ResourceLimit, ToolError,
+    fs::{MAX_GREP_MATCHES, MAX_GREP_SERIALIZED_BYTES},
     truncate::{GREP_MAX_LINE_LENGTH, truncate_line_total},
 };
 
 const MAX_SCAN_BYTES: u64 = 10 * 1024 * 1024;
-const MAX_GREP_MATCHES: usize = 4_096;
-const MAX_GREP_SERIALIZED_BYTES: usize = 50 * 1024;
 const MAX_TRACKED_ARTIFACTS: usize = 4_096;
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 const RESOLVE_NO_SYMLINKS: u64 = 0x04;
@@ -41,6 +40,7 @@ struct OpenHow {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactGrepMatch {
     pub line_number: u64,
     pub line: String,
@@ -48,7 +48,7 @@ pub struct ArtifactGrepMatch {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ArtifactResponse {
     Begun { handle: String, offset: u64 },
     Appended { offset: u64 },

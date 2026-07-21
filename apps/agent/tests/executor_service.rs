@@ -367,7 +367,7 @@ async fn executor_routes_workspace_and_artifact_reads_and_grep() {
     .unwrap();
     let handle = begun["result"]["Ok"]["handle"].as_str().unwrap();
 
-    let mut child = fixture.executor();
+    let mut child = fixture.executor_with_stderr(Stdio::piped());
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
     send_request(
@@ -475,6 +475,85 @@ async fn bash_cancel_emits_one_terminal_per_request_and_no_late_update() {
     assert!(status.success());
 }
 
+#[tokio::test]
+async fn slow_progress_consumer_drops_overflow_but_receives_authoritative_terminal() {
+    let fixture = Fixture::new().await;
+    let mut child = fixture.executor_with_stderr(Stdio::piped());
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    assert_ne!(
+        unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_SETPIPE_SZ, 4_096) },
+        -1,
+        "shrink executor stdout pipe for deterministic backpressure"
+    );
+    let mut stdout = BufReader::new(stdout);
+    let marker = fixture.workspace.join("bash-slow-progress.complete");
+    send_request(
+        &mut stdin,
+        &request(
+            "bash-slow-progress",
+            json!({
+                "type":"bash",
+                "command":"head -c 524288 /dev/zero | tr '\\0' x; printf complete > bash-slow-progress.complete",
+                "execution_id":"bash-slow-progress",
+            }),
+        ),
+    )
+    .await;
+
+    // Keep stdout unread while the command emits substantially more than the
+    // internal capture queue and the 4 KiB executor pipe. The marker is
+    // written by the command itself, so this wait observes command progress
+    // without using timing as synchronization.
+    assert_eq!(wait_for_nonempty_file(&marker).await, "complete");
+
+    let mut delivered = Vec::new();
+    let terminal = timeout(Duration::from_secs(15), async {
+        loop {
+            let frame = read_frame(&mut stdout).await;
+            if frame["type"] == "terminal" {
+                break frame;
+            }
+            if let Some(output) = frame["value"]["output"].as_str() {
+                delivered.push(output.to_owned());
+            }
+        }
+    })
+    .await
+    .expect("volatile progress must not delay authoritative completion");
+    let result = &terminal["result"]["Ok"]["result"];
+    assert_eq!(result["cancelled"], false);
+    assert_eq!(result["exit_code"], 0);
+    assert_eq!(result["observed_bytes"], 524288);
+    assert_eq!(result["truncation"]["total_bytes"], 524288);
+    assert_eq!(result["truncation"]["truncated"], true);
+    assert_eq!(result["truncation"]["truncated_by"], "bytes");
+    let complete = result["output"].as_str().unwrap();
+    assert_eq!(complete.len(), 50 * 1024);
+    assert!(complete.bytes().all(|byte| byte == b'x'));
+    assert!(
+        delivered
+            .iter()
+            .all(|chunk| chunk.bytes().all(|byte| byte == b'x'))
+    );
+    assert!(delivered.iter().map(String::len).sum::<usize>() <= 524288);
+
+    drop(stdin);
+    assert!(child.wait().await.unwrap().success());
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .await
+        .unwrap();
+    assert!(
+        stderr.contains("dropping volatile executor progress update"),
+        "test did not drive either bounded progress queue beyond capacity: {stderr}"
+    );
+}
+
 async fn run_bash_reap_timeout_case(matching_cancel: bool) -> [Value; 2] {
     let mut fixture = Fixture::new().await;
     fixture.broker.start_kill().unwrap();
@@ -560,7 +639,7 @@ async fn run_bash_reap_timeout_case(matching_cancel: bool) -> [Value; 2] {
 async fn bash_reap_timeout_emits_bounded_terminals_then_closes_epoch() {
     let cancelled = run_bash_reap_timeout_case(true).await;
     assert_eq!(cancelled[0]["request_id"], "control-reap-timeout");
-    assert_eq!(cancelled[0]["result"]["Ok"]["type"], "cancel_accepted");
+    assert_eq!(cancelled[0]["result"]["Err"]["code"], "rpc_indeterminate");
     assert_eq!(cancelled[1]["request_id"], "bash-reap-timeout");
     assert_eq!(cancelled[1]["result"]["Err"]["code"], "rpc_indeterminate");
 
@@ -608,7 +687,10 @@ async fn unconsumed_executor_stdout_cannot_block_cancel_and_reap() {
         .read_to_string(&mut stderr)
         .await
         .unwrap();
-    assert!(stderr.contains("executor output"), "{stderr}");
+    assert!(
+        stderr.contains("executor output") || stderr.contains("terminal write deadline"),
+        "{stderr}"
+    );
     assert!(!stderr.contains(secret_id), "{stderr}");
     drop(stdout);
 }
@@ -718,13 +800,14 @@ async fn active_bash_control_failures_cancel_and_reap_the_process_group() {
 
 #[tokio::test]
 async fn queued_cancel_is_settled_before_simultaneous_bash_completion() {
-    for iteration in 0..20 {
-        let fixture = Fixture::new().await;
+    let fixture = Fixture::new().await;
+    let mut child = fixture.executor();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    for iteration in 0..100 {
         let release = fixture.workspace.join(format!("release-{iteration}"));
         let ready = fixture.workspace.join(format!("ready-{iteration}"));
-        let mut child = fixture.executor();
-        let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let pid_path = fixture.workspace.join(format!("pid-{iteration}"));
         let execution_id = format!("completion-race-{iteration}");
         send_request(
             &mut stdin,
@@ -732,42 +815,82 @@ async fn queued_cancel_is_settled_before_simultaneous_bash_completion() {
                 &format!("bash-{iteration}"),
                 json!({
                     "type":"bash",
-                    "command":format!("touch ready-{iteration}; while [ ! -e release-{iteration} ]; do :; done"),
+                    "command":format!("echo $$ > pid-{iteration}; touch ready-{iteration}; while [ ! -e release-{iteration} ]; do :; done"),
                     "execution_id":execution_id,
                 }),
             ),
         )
         .await;
         wait_for_nonempty_or_existing_file(&ready).await;
-        send_request(
-            &mut stdin,
-            &request(
-                &format!("cancel-{iteration}"),
-                json!({"type":"cancel","execution_id":execution_id}),
-            ),
-        )
-        .await;
-        std::fs::write(&release, b"release").unwrap();
+        if iteration % 2 == 0 {
+            send_request(
+                &mut stdin,
+                &request(
+                    &format!("cancel-{iteration}"),
+                    json!({"type":"cancel","execution_id":execution_id}),
+                ),
+            )
+            .await;
+            let process_group = wait_for_nonempty_file(&pid_path)
+                .await
+                .trim()
+                .parse::<i32>()
+                .expect("bash process group id");
+            timeout(Duration::from_secs(5), async {
+                while process_group_exists(process_group) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancel must be ingested before release");
+            std::fs::write(&release, b"release").unwrap();
+        } else {
+            std::fs::write(&release, b"release").unwrap();
+            send_request(
+                &mut stdin,
+                &request(
+                    &format!("cancel-{iteration}"),
+                    json!({"type":"cancel","execution_id":execution_id}),
+                ),
+            )
+            .await;
+        }
 
         let first = read_frame(&mut stdout).await;
         let second = read_frame(&mut stdout).await;
         let frames = [first, second];
-        assert!(
-            frames.iter().any(|frame| {
-                frame["request_id"] == format!("cancel-{iteration}")
-                    && frame["result"]["Ok"]["type"] == "cancel_accepted"
-            }),
-            "iteration {iteration}: {frames:?}"
-        );
-        assert!(
-            frames
-                .iter()
-                .any(|frame| frame["request_id"] == format!("bash-{iteration}")),
-            "iteration {iteration}: {frames:?}"
-        );
-        drop(stdin);
-        assert!(child.wait().await.unwrap().success());
+        let cancel = frames
+            .iter()
+            .find(|frame| frame["request_id"] == format!("cancel-{iteration}"))
+            .unwrap_or_else(|| panic!("iteration {iteration}: {frames:?}"));
+        let bash = frames
+            .iter()
+            .find(|frame| frame["request_id"] == format!("bash-{iteration}"))
+            .unwrap_or_else(|| panic!("iteration {iteration}: {frames:?}"));
+        let physically_cancelled = bash["result"]["Ok"]["result"]["cancelled"] == true;
+        if iteration % 2 == 0 {
+            // send_request fully writes and flushes Cancel before release is
+            // created, so this branch must be a physical cancellation rather
+            // than a completion race observed by the service.
+            assert!(physically_cancelled, "iteration {iteration}: {frames:?}");
+            assert_eq!(
+                cancel["result"]["Ok"]["type"], "cancel_accepted",
+                "iteration {iteration}: {frames:?}"
+            );
+        } else {
+            assert_eq!(
+                cancel["result"]["Ok"]["type"],
+                if physically_cancelled {
+                    "cancel_accepted"
+                } else {
+                    "cancel_too_late"
+                },
+                "iteration {iteration}: {frames:?}"
+            );
+        }
     }
+    drop(stdin);
+    assert!(child.wait().await.unwrap().success());
 }
 
 async fn wait_for_nonempty_or_existing_file(path: &Path) {

@@ -5,6 +5,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::super::{ResourceLimit, ToolError};
+use super::ArtifactResponse;
+use crate::tools::{bash::BashExecutionResult, fs::GrepMatch, truncate::TruncationResult};
 
 pub const MAX_RPC_LINE_BYTES: usize = 1024 * 1024;
 pub const MAX_RPC_READ_BYTES: usize = 50 * 1024;
@@ -148,6 +150,22 @@ pub enum ExecutorOperation {
     Cancel {
         execution_id: String,
     },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExecutorResponse {
+    ReadFile { result: TruncationResult },
+    Written {},
+    Edited {},
+    Removed {},
+    Listed { entries: Vec<String> },
+    Globbed { paths: Vec<String> },
+    Grepped { matches: Vec<GrepMatch> },
+    Artifact { response: ArtifactResponse },
+    Bash { result: BashExecutionResult },
+    CancelAccepted {},
+    CancelTooLate {},
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -453,6 +471,11 @@ impl RpcLifecycleTracker {
         Ok(())
     }
 
+    pub fn execution_is_completed(&self, execution_id: &str) -> bool {
+        self.completed_executions
+            .contains(&rpc_id_digest(execution_id))
+    }
+
     pub fn accept_update(&self, request_id: &str) -> Result<(), ToolError> {
         if self.active_requests.contains(request_id) {
             if self.active_cancel_requests.contains(request_id) {
@@ -581,6 +604,11 @@ fn validate_workspace_input(value: &str, field: &str) -> Result<(), ToolError> {
 fn validate_executor_execution_id(execution_id: &str) -> Result<(), ToolError> {
     validate_artifact_handle_component(execution_id)?;
     validate_rpc_id(execution_id, "execution_id")
+}
+
+pub(super) fn validate_conversation_id(conversation_id: &str) -> Result<(), ToolError> {
+    validate_artifact_handle_component(conversation_id)?;
+    validate_rpc_id(conversation_id, "conversation_id")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

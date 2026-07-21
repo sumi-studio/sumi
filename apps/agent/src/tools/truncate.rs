@@ -36,6 +36,7 @@ impl Default for TruncationOptions {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TruncationResult {
     pub content: String,
     pub truncated: bool,
@@ -48,6 +49,56 @@ pub struct TruncationResult {
     pub first_line_exceeds_limit: bool,
     pub max_lines: usize,
     pub max_bytes: usize,
+}
+
+impl TruncationResult {
+    pub(crate) fn is_consistent(&self, retained: RetainedOutput) -> bool {
+        if self.output_bytes != self.content.len()
+            || !semantic_line_count_is_consistent(&self.content, self.output_lines)
+            || self.output_bytes > self.max_bytes
+            || self.output_lines > self.max_lines
+            || self.total_bytes < self.output_bytes
+            || self.total_lines < self.output_lines
+            || (retained == RetainedOutput::Head && self.last_line_partial)
+            || (self.first_line_exceeds_limit
+                && (retained != RetainedOutput::Head
+                    || !self.content.is_empty()
+                    || self.output_lines != 0
+                    || self.output_bytes != 0
+                    || self.truncated_by != Some(TruncatedBy::Bytes)))
+            || (self.last_line_partial
+                && (retained != RetainedOutput::Tail
+                    || self.output_lines != 1
+                    || self.truncated_by != Some(TruncatedBy::Bytes)))
+        {
+            return false;
+        }
+
+        if self.truncated {
+            matches!(
+                self.truncated_by,
+                Some(TruncatedBy::Bytes) if self.total_bytes > self.max_bytes
+            ) || matches!(
+                self.truncated_by,
+                Some(TruncatedBy::Lines) if self.total_lines > self.max_lines
+            )
+        } else {
+            self.truncated_by.is_none()
+                && self.total_bytes == self.output_bytes
+                && self.total_lines == self.output_lines
+                && (!self.content.is_empty() || self.output_lines == 0)
+                && !self.last_line_partial
+                && !self.first_line_exceeds_limit
+        }
+    }
+}
+
+fn semantic_line_count_is_consistent(content: &str, output_lines: usize) -> bool {
+    if content.is_empty() {
+        output_lines == 0
+    } else {
+        output_lines == content.split('\n').count() - usize::from(content.ends_with('\n'))
+    }
 }
 
 pub fn truncate_head(content: &str, options: TruncationOptions) -> TruncationResult {
@@ -473,6 +524,23 @@ mod tests {
             assert_eq!(result.total_bytes, 0);
             assert_eq!(result.output_bytes, 0);
         }
+
+        let mut impossible = truncate_head("", options(10, 10));
+        impossible.output_lines = 1;
+        assert!(!impossible.is_consistent(RetainedOutput::Head));
+    }
+
+    #[test]
+    fn truncation_reason_requires_the_corresponding_producer_limit_to_be_exceeded() {
+        let mut line_limited = truncate_head("a\nb", options(100, 1));
+        assert!(line_limited.is_consistent(RetainedOutput::Head));
+        line_limited.truncated_by = Some(TruncatedBy::Bytes);
+        assert!(!line_limited.is_consistent(RetainedOutput::Head));
+
+        let mut byte_limited = truncate_head("abcdef", options(3, 10));
+        assert!(byte_limited.is_consistent(RetainedOutput::Head));
+        byte_limited.truncated_by = Some(TruncatedBy::Lines);
+        assert!(!byte_limited.is_consistent(RetainedOutput::Head));
     }
 
     #[test]
