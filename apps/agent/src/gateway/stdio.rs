@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use serde::{Deserialize, Deserializer, de::IgnoredAny};
+use serde::{
+    Deserialize, Deserializer,
+    de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor},
+};
 use thiserror::Error;
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter, Stdin, Stdout,
@@ -130,7 +133,7 @@ where
         .take()
         .ok_or_else(|| anyhow!("valid-size command payload was not retained"))?;
     let sensitive_payload = SensitiveCommandPayload::new(raw_command.to_vec());
-    let command_value: serde_json::Value = match serde_json::from_slice(&raw_command) {
+    let command_value = match parse_command_value(&raw_command) {
         Ok(value) => value,
         Err(_) => {
             return Ok(InboundCommand::Invalid {
@@ -184,6 +187,100 @@ where
             raw_command: RejectedCommandPayload::Present(sensitive_payload),
             payload_digest: None,
         }),
+    }
+}
+
+fn parse_command_value(bytes: &[u8]) -> serde_json::Result<serde_json::Value> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let value = DuplicateCheckedValue::deserialize(&mut deserializer)?.0;
+    deserializer.end()?;
+    Ok(value)
+}
+
+struct DuplicateCheckedValue(serde_json::Value);
+
+impl<'de> Deserialize<'de> for DuplicateCheckedValue {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DuplicateCheckedValueVisitor)
+    }
+}
+
+struct DuplicateCheckedValueVisitor;
+
+impl<'de> Visitor<'de> for DuplicateCheckedValueVisitor {
+    type Value = DuplicateCheckedValue;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E> {
+        Ok(DuplicateCheckedValue(value.into()))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E> {
+        Ok(DuplicateCheckedValue(value.into()))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E> {
+        Ok(DuplicateCheckedValue(value.into()))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .map(DuplicateCheckedValue)
+            .ok_or_else(|| E::custom("non-finite JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E> {
+        Ok(DuplicateCheckedValue(value.into()))
+    }
+
+    fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E> {
+        Ok(DuplicateCheckedValue(value.into()))
+    }
+
+    fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(DuplicateCheckedValue(serde_json::Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(DuplicateCheckedValue(serde_json::Value::Null))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or_default());
+        while let Some(value) = sequence.next_element::<DuplicateCheckedValue>()? {
+            values.push(value.0);
+        }
+        Ok(DuplicateCheckedValue(serde_json::Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut object: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = serde_json::Map::with_capacity(object.size_hint().unwrap_or_default());
+        while let Some(key) = object.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(de::Error::custom(format_args!(
+                    "duplicate object key {key:?}"
+                )));
+            }
+            let value = object.next_value::<DuplicateCheckedValue>()?;
+            values.insert(key, value.0);
+        }
+        Ok(DuplicateCheckedValue(serde_json::Value::Object(values)))
     }
 }
 
@@ -655,6 +752,13 @@ mod tests {
         .expect("serialize fixture")
     }
 
+    fn raw_envelope(command: &str) -> Vec<u8> {
+        format!(
+            r#"{{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command":{command}}}"#
+        )
+        .into_bytes()
+    }
+
     #[tokio::test]
     async fn reads_a_command_at_eof_without_newline() {
         let bytes = envelope(serde_json::json!({"type": "abort"}));
@@ -819,6 +923,62 @@ mod tests {
                 payload_digest: None,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_command_keys_before_semantic_classification() {
+        for command in [
+            r#"{"type":"user_message","text":"first","text":"second","attachments":[]}"#,
+            r#"{"type":"user_message","text":"first","te\u0078t":"second","attachments":[]}"#,
+            r#"{"type":"user_message","text":"first","attachments":[{"name":"first","name":"second"}]}"#,
+            r#"{"type":"approval_decision","request_id":"request-1","decision":{"approve_always":{"rule":{"path":"first","path":"second"}}}}"#,
+        ] {
+            let bytes = raw_envelope(command);
+            let mut input = BufReader::with_capacity(3, bytes.as_slice());
+
+            assert_eq!(
+                read_test_command(&mut input)
+                    .await
+                    .expect("duplicate-key command retains its outer identity"),
+                InboundCommand::Invalid {
+                    seq: 1,
+                    command_id: CommandId::parse("00000000-0000-4000-8000-000000000001")
+                        .expect("canonical test UUID"),
+                    reason: CommandRejectReason::SchemaViolation,
+                    raw_command: RejectedCommandPayload::Present(SensitiveCommandPayload::new(
+                        command.as_bytes().to_vec(),
+                    )),
+                    payload_digest: None,
+                },
+                "command: {command}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn preserves_unknown_and_attachment_classification_precedence_for_unique_keys() {
+        let cases = [
+            (
+                r#"{"type":"future_command","attachments":[{"name":"unsupported"}]}"#,
+                CommandRejectReason::UnknownCommand,
+            ),
+            (
+                r#"{"type":"user_message","text":7,"attachments":[{"name":"unsupported"}]}"#,
+                CommandRejectReason::AttachmentsNotEmpty,
+            ),
+        ];
+
+        for (command, expected_reason) in cases {
+            let bytes = raw_envelope(command);
+            let mut input = BufReader::new(bytes.as_slice());
+            let InboundCommand::Invalid { reason, .. } = read_test_command(&mut input)
+                .await
+                .expect("semantic rejection retains its outer identity")
+            else {
+                panic!("command must be rejected: {command}");
+            };
+            assert_eq!(reason, expected_reason, "command: {command}");
+        }
     }
 
     #[tokio::test]

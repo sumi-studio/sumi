@@ -196,6 +196,43 @@ fn malformed_command_value_is_durably_rejected_and_replays_the_same_ack() {
 }
 
 #[test]
+fn duplicate_command_keys_are_rejected_and_changed_raw_replay_fails_authentication() {
+    let database_path = fresh_database_path();
+    let original = b"{\"seq\":1,\"command_id\":\"00000000-0000-4000-8000-000000000043\",\"command\":{\"type\":\"user_message\",\"text\":\"original\",\"text\":\"stable\",\"attachments\":[]}}\n";
+
+    for attempt in 0..2 {
+        let (success, frames, stderr) = run_agent_at(&database_path, original);
+        assert!(
+            success,
+            "duplicate-key command attempt {attempt} must be terminally rejected; stderr: {stderr}"
+        );
+        assert_eq!(frames.len(), 1, "stderr: {stderr}");
+        assert_eq!(frames[0]["ack"]["seq"], 1);
+        assert_eq!(
+            frames[0]["ack"]["command_id"],
+            "00000000-0000-4000-8000-000000000043"
+        );
+        assert_eq!(frames[0]["ack"]["status"], "rejected");
+        assert_eq!(frames[0]["ack"]["reject_reason"], "schema_violation");
+    }
+
+    let changed = b"{\"seq\":1,\"command_id\":\"00000000-0000-4000-8000-000000000043\",\"command\":{\"type\":\"user_message\",\"text\":\"changed!\",\"text\":\"stable\",\"attachments\":[]}}\n";
+    let (success, frames, stderr) = run_agent_at(&database_path, changed);
+    assert!(
+        !success,
+        "changed first duplicate must not authenticate as the same command; stderr: {stderr}"
+    );
+    assert!(
+        frames.is_empty(),
+        "changed duplicate-key replay must not receive an ACK; stderr: {stderr}"
+    );
+    assert!(stderr.contains("digest mismatch"), "stderr: {stderr}");
+
+    std::fs::remove_dir_all(database_path.parent().expect("database state directory"))
+        .expect("remove duplicate-key fixture");
+}
+
+#[test]
 fn oversized_command_replay_uses_incremental_keyed_digest_without_persisting_body() {
     let database_path = fresh_database_path();
     let command = |fill: char| {
