@@ -327,4 +327,8 @@ pub struct RequestOptions {
     pub temperature: Option<f64>,
     pub tool_choice: Option<Value>,
     pub reasoning_effort: Option<String>,
+    /// Opt in to provider-native compaction. The canonical default remains
+    /// `sumi_three_layer`; T17 will wire the durable conversation mode into
+    /// this request option.
+    pub native_compaction: bool,
 }

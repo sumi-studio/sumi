@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::Utc;
 use serde_json::{Map, Value, json};
@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::provider::{
+    adapters::chat_completions::is_mfjs_strict_safe,
     assembler::{
         FrozenToolSchemaRegistry, ResponseBudget, ToolArgumentAccumulator, ToolArgumentOutcome,
     },
@@ -24,6 +25,8 @@ pub enum ResponsesAdapterError {
     UnsupportedProtocol,
     #[error("max_output_tokens must be within 1..={max}, got {requested}")]
     InvalidMaxTokens { requested: u64, max: u64 },
+    #[error("temperature must be finite, got {0}")]
+    InvalidTemperature(f64),
     #[error("invalid Responses request context: {0}")]
     InvalidContext(String),
     #[error("invalid Responses stream event: {0}")]
@@ -126,12 +129,17 @@ pub fn build_request(
     if !compat.supports_streaming {
         return Err(ResponsesAdapterError::UnsupportedProtocol);
     }
+    if let Some(temperature) = options.temperature
+        && !temperature.is_finite()
+    {
+        return Err(ResponsesAdapterError::InvalidTemperature(temperature));
+    }
     let mut request = Map::new();
     request.insert("model".to_owned(), json!(spec.id));
     request.insert("instructions".to_owned(), json!(context.system_prompt));
     request.insert(
         "input".to_owned(),
-        Value::Array(convert_input(spec, context)?),
+        Value::Array(convert_input(spec, context, options.native_compaction)?),
     );
     request.insert("stream".to_owned(), json!(true));
     request.insert(
@@ -178,7 +186,10 @@ pub fn build_compact_request(
     let mut request = Map::new();
     request.insert("model".into(), json!(spec.id));
     request.insert("instructions".into(), json!(context.system_prompt));
-    request.insert("input".into(), Value::Array(convert_input(spec, context)?));
+    request.insert(
+        "input".into(),
+        Value::Array(convert_input(spec, context, true)?),
+    );
     if compat.supports_store {
         request.insert("store".into(), json!(false));
     }
@@ -302,20 +313,34 @@ fn ensure_responses_spec(spec: &ModelSpec) -> Result<&ResponsesCompat, Responses
 }
 
 fn convert_tool(tool: &ToolDefinition) -> Value {
+    // OpenAI Responses defaults to strict generation, but only the same
+    // conservative MFJS subset proven by Chat can safely rely on that
+    // default. Explicitly disable it for arbitrary schemas while preserving
+    // the strict request for schemas that pass the predicate.
+    let strict = is_mfjs_strict_safe(&tool.parameters);
     json!({
         "type": "function",
         "name": tool.name,
         "description": tool.description,
         "parameters": tool.parameters,
-        "strict": true,
+        "strict": strict,
     })
 }
 
 fn convert_input(
     spec: &ModelSpec,
     context: &PromptContext,
+    native_compaction: bool,
 ) -> Result<Vec<Value>, ResponsesAdapterError> {
+    let compat = ensure_responses_spec(spec)?;
+    let replay_encrypted_reasoning = spec.reasoning && compat.supports_encrypted_reasoning;
     let mut output = Vec::new();
+    let has_foreign_native = context.provider_context.iter().any(|item| {
+        matches!(
+            item.payload,
+            ProviderContextPayload::AnthropicCompaction { .. }
+        )
+    });
     let compacted = context
         .provider_context
         .iter()
@@ -326,40 +351,20 @@ fn convert_input(
             _ => None,
         })
         .collect::<Vec<_>>();
-    if compacted.len() > 1 {
-        return Err(ResponsesAdapterError::InvalidContext(
-            "multiple OpenAI native compacted windows".into(),
-        ));
-    }
-    let (coverage_seq, mut native_items) = if let Some((items, coverage)) = compacted.first() {
-        if !context.memory_blocks.is_empty() {
-            return Err(ResponsesAdapterError::InvalidContext(
-                "native compacted window cannot coexist with memory blocks".into(),
-            ));
+    let native = if native_compaction && compat.supports_native_compact && !has_foreign_native {
+        match prepare_native_window(spec, context, &compacted) {
+            Ok(native) => native,
+            Err(error) => {
+                tracing::warn!(reason = %error, "discarded stale Responses native context");
+                None
+            }
         }
-        if coverage.context_fingerprint != context_fingerprint(spec, context)? {
-            return Err(ResponsesAdapterError::InvalidContext(
-                "native compacted window context fingerprint mismatch".into(),
-            ));
-        }
-        if items.is_empty() {
-            return Err(ResponsesAdapterError::InvalidContext(
-                "native compacted window must not be empty".into(),
-            ));
-        }
-        let mut validated = Vec::with_capacity(items.len());
-        for item in *items {
-            validate_canonical_item(item).map_err(|error| {
-                ResponsesAdapterError::InvalidContext(format!(
-                    "invalid native compacted window item: {error}"
-                ))
-            })?;
-            validated.push(item.clone());
-        }
-        (Some(coverage.through_message_seq), Some(validated))
     } else {
-        (None, None)
+        None
     };
+    let (coverage_seq, mut native_items) = native
+        .map(|(coverage, items)| (Some(coverage), Some(items)))
+        .unwrap_or((None, None));
     for memory in &context.memory_blocks {
         let layer = match memory.layer {
             MemoryLayer::L1 => "l1",
@@ -382,12 +387,16 @@ fn convert_input(
     for item in &context.provider_context {
         match &item.payload {
             ProviderContextPayload::OpenAiCompactedWindow { .. } => {}
-            ProviderContextPayload::AnthropicCompaction { .. } => {
-                return Err(ResponsesAdapterError::InvalidContext(
-                    "Anthropic provider context cannot be sent to Responses".into(),
-                ));
-            }
+            // Native context from another protocol is stale by definition. It is
+            // discarded while the durable public transcript is rebuilt below.
+            ProviderContextPayload::AnthropicCompaction { .. } => {}
             ProviderContextPayload::EncryptedReasoning { .. } => {
+                if !replay_encrypted_reasoning {
+                    // Encrypted reasoning is only replayable when both the model
+                    // request asks for reasoning and the compat capability is on.
+                    // Otherwise fall back to the durable public transcript view.
+                    continue;
+                }
                 let anchor = item.origin_message.as_ref().ok_or_else(|| {
                     ResponsesAdapterError::InvalidContext(
                         "encrypted reasoning is missing an origin anchor".into(),
@@ -529,23 +538,8 @@ fn convert_input(
                     }
                 }
 
-                let mut public = assistant.content.iter().collect::<Vec<_>>();
-                public.sort_by_key(|content| match content {
-                    AssistantContent::Text {
-                        wire_item_index, ..
-                    }
-                    | AssistantContent::Thinking {
-                        wire_item_index, ..
-                    }
-                    | AssistantContent::ToolCall {
-                        wire_item_index, ..
-                    }
-                    | AssistantContent::RejectedToolCall {
-                        wire_item_index, ..
-                    } => *wire_item_index,
-                });
-                let mut opaque_iter = opaque.into_iter().peekable();
-                for content in public {
+                let mut public = BTreeMap::<u32, &AssistantContent>::new();
+                for content in &assistant.content {
                     let wire = match content {
                         AssistantContent::Text {
                             wire_item_index, ..
@@ -560,9 +554,19 @@ fn convert_input(
                             wire_item_index, ..
                         } => *wire_item_index,
                     };
+                    if public.insert(wire, content).is_some()
+                        || opaque.keys().any(|(opaque_wire, _)| *opaque_wire == wire)
+                    {
+                        return Err(ResponsesAdapterError::InvalidContext(
+                            "duplicate or ambiguous Responses wire_item_index".into(),
+                        ));
+                    }
+                }
+                let mut opaque_iter = opaque.into_iter().peekable();
+                for (wire, content) in public {
                     while opaque_iter
                         .peek()
-                        .is_some_and(|((index, _), _)| *index <= wire)
+                        .is_some_and(|((index, _), _)| *index < wire)
                     {
                         let (_, item) = opaque_iter.next().expect("peeked item");
                         output.push(item);
@@ -576,7 +580,7 @@ fn convert_input(
                             "id":format!("msg_sumi_{}_{}", anchor.as_ref().map_or(0, |a| a.message_seq), wire_item_index),
                             "status":"completed",
                             "role":"assistant",
-                            "content":[{"type":"output_text","text":text,"annotations":[]}],
+                            "content":[{"type":"output_text","text":text,"annotations":[],"logprobs":[]}],
                         })),
                         AssistantContent::ToolCall { tool_call, .. } => output.push(json!({
                             "type":"function_call",
@@ -592,7 +596,9 @@ fn convert_input(
                         }
                     }
                 }
-                output.extend(opaque_iter.map(|(_, item)| item));
+                for (_, item) in opaque_iter {
+                    output.push(item);
+                }
             }
             Message::ToolResult(result) => {
                 let text = result
@@ -636,6 +642,95 @@ fn convert_input(
     Ok(output)
 }
 
+fn prepare_native_window(
+    spec: &ModelSpec,
+    context: &PromptContext,
+    compacted: &[(&Vec<Value>, &NativeCompactionCoverage)],
+) -> Result<Option<(u64, Vec<Value>)>, String> {
+    let Some((items, coverage)) = compacted.first().copied() else {
+        return Ok(None);
+    };
+    if compacted.len() != 1 {
+        return Err("multiple OpenAI native compacted windows".into());
+    }
+    let native_item = context
+        .provider_context
+        .iter()
+        .find(|item| {
+            matches!(
+                item.payload,
+                ProviderContextPayload::OpenAiCompactedWindow { .. }
+            )
+        })
+        .expect("compacted entry came from provider_context");
+    if native_item.origin_message.is_some() || native_item.wire_item_index.is_some() {
+        return Err("native compacted window has reasoning placement metadata".into());
+    }
+    if coverage.through_message_seq == 0 {
+        return Err("native compacted window coverage must be greater than zero".into());
+    }
+    if !context.memory_blocks.is_empty() {
+        return Err("native compacted window cannot coexist with memory blocks".into());
+    }
+    if coverage.context_fingerprint
+        != context_fingerprint(spec, context).map_err(|error| error.to_string())?
+    {
+        return Err("native compacted window context fingerprint mismatch".into());
+    }
+    if items.is_empty() {
+        return Err("native compacted window must not be empty".into());
+    }
+    let mut validated = Vec::with_capacity(items.len());
+    for item in items {
+        validate_canonical_item(item)
+            .map_err(|error| format!("invalid native compacted window item: {error}"))?;
+        validated.push(item.clone());
+    }
+    validate_native_suffix(&context.messages, coverage.through_message_seq)?;
+    Ok(Some((coverage.through_message_seq, validated)))
+}
+
+fn validate_native_suffix(messages: &[ContextMessage], coverage: u64) -> Result<(), String> {
+    let mut persisted_started = false;
+    let mut previous = None;
+    let mut suffix_started = false;
+    for message in messages {
+        let ContextMessage::Persisted { seq, .. } = message else {
+            if persisted_started {
+                return Err(
+                    "native suffix contains synthetic content after persisted history".into(),
+                );
+            }
+            continue;
+        };
+        persisted_started = true;
+        if *seq == 0 || previous.is_some_and(|value: u64| value.checked_add(1) != Some(*seq)) {
+            return Err(
+                "persisted native replay sequence is gapped, duplicated, or reordered".into(),
+            );
+        }
+        if *seq > coverage {
+            if !suffix_started
+                && *seq != coverage.checked_add(1).ok_or("native coverage overflow")?
+            {
+                return Err("native suffix must begin exactly at coverage + 1".into());
+            }
+            suffix_started = true;
+        } else if suffix_started {
+            return Err("covered history appears after the native suffix".into());
+        }
+        previous = Some(*seq);
+    }
+    let max_seq = previous
+        .ok_or_else(|| "native compacted window requires persisted replay history".to_owned())?;
+    if coverage > max_seq {
+        return Err(
+            "native compacted window coverage exceeds the latest persisted message sequence".into(),
+        );
+    }
+    Ok(())
+}
+
 fn escape_memory_text(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -651,7 +746,7 @@ enum OutputSlot {
         active_part: Option<TextPart>,
     },
     Tool {
-        id: String,
+        id: Option<String>,
         call_id: String,
         name: String,
         accumulator: ToolArgumentAccumulator,
@@ -686,11 +781,13 @@ struct SummaryPart {
 pub struct ResponsesReceiveState {
     schemas: FrozenToolSchemaRegistry,
     slots: BTreeMap<u32, OutputSlot>,
-    output_identities: BTreeMap<u32, (String, String)>,
+    output_identities: BTreeMap<u32, (Option<String>, String)>,
     completed_items: BTreeMap<u32, Value>,
     next_output_index: u32,
     next_summary_slot: usize,
     next_sequence_number: u64,
+    output_item_ids: HashSet<String>,
+    function_call_ids: HashSet<String>,
     reasoning_fragments: Vec<(String, ProviderContextFragment)>,
     usage: Usage,
     budget: ResponseBudget,
@@ -704,6 +801,17 @@ pub struct ResponsesReceiveState {
     terminal: bool,
 }
 
+#[derive(Clone, Debug)]
+struct ResponsesStateSnapshot {
+    response_id: Option<String>,
+    response_model: Option<String>,
+    usage: Usage,
+    content_bytes: usize,
+    event_count: usize,
+    preview_work_bytes: usize,
+    reasoning_fragments: Vec<(String, ProviderContextFragment)>,
+}
+
 impl ResponsesReceiveState {
     pub fn with_budget(schemas: FrozenToolSchemaRegistry, budget: ResponseBudget) -> Self {
         Self {
@@ -714,6 +822,8 @@ impl ResponsesReceiveState {
             next_output_index: 0,
             next_summary_slot: 0,
             next_sequence_number: 0,
+            output_item_ids: HashSet::new(),
+            function_call_ids: HashSet::new(),
             reasoning_fragments: Vec::new(),
             usage: Usage::default(),
             budget,
@@ -726,6 +836,28 @@ impl ResponsesReceiveState {
             saw_tool: false,
             terminal: false,
         }
+    }
+
+    fn snapshot(&self) -> ResponsesStateSnapshot {
+        ResponsesStateSnapshot {
+            response_id: self.response_id.clone(),
+            response_model: self.response_model.clone(),
+            usage: self.usage.clone(),
+            content_bytes: self.content_bytes,
+            event_count: self.event_count,
+            preview_work_bytes: self.preview_work_bytes,
+            reasoning_fragments: self.reasoning_fragments.clone(),
+        }
+    }
+
+    fn restore(&mut self, snapshot: ResponsesStateSnapshot) {
+        self.response_id = snapshot.response_id;
+        self.response_model = snapshot.response_model;
+        self.usage = snapshot.usage;
+        self.content_bytes = snapshot.content_bytes;
+        self.event_count = snapshot.event_count;
+        self.preview_work_bytes = snapshot.preview_work_bytes;
+        self.reasoning_fragments = snapshot.reasoning_fragments;
     }
 
     pub fn usage(&self) -> &Usage {
@@ -873,6 +1005,16 @@ impl ResponsesReceiveState {
             .and_then(Value::as_object)
             .ok_or_else(|| ResponsesAdapterError::InvalidEvent("item must be an object".into()))?;
         let item_type = required_str(item, "type")?;
+        let id = match item_type {
+            "function_call" => optional_non_null_string(item, "id")?,
+            _ => Some(required_str(item, "id")?),
+        };
+        if id.is_some_and(|id| self.output_item_ids.contains(id)) {
+            return Err(ResponsesAdapterError::InvalidEvent(format!(
+                "duplicate output item id {}",
+                id.expect("checked present")
+            )));
+        }
         let mut events = Vec::new();
         let mut event_add = 0;
         let mut is_tool = false;
@@ -885,7 +1027,7 @@ impl ResponsesReceiveState {
                     content_index: index as usize,
                 });
                 OutputSlot::Text {
-                    id: required_str(item, "id")?.to_owned(),
+                    id: id.expect("message id required").to_owned(),
                     content: String::new(),
                     next_content_index: 0,
                     active_part: None,
@@ -904,9 +1046,15 @@ impl ResponsesReceiveState {
                         "function_call added item must begin with empty arguments".into(),
                     ));
                 }
+                let call_id = required_str(item, "call_id")?;
+                if self.function_call_ids.contains(call_id) {
+                    return Err(ResponsesAdapterError::InvalidEvent(
+                        "duplicate function_call call_id".into(),
+                    ));
+                }
                 OutputSlot::Tool {
-                    id: required_str(item, "id")?.to_owned(),
-                    call_id: required_str(item, "call_id")?.to_owned(),
+                    id: id.map(str::to_owned),
+                    call_id: call_id.to_owned(),
                     name: required_str(item, "name")?.to_owned(),
                     accumulator,
                     done: false,
@@ -918,12 +1066,14 @@ impl ResponsesReceiveState {
                         "reasoning added item must begin with an empty summary".into(),
                     ));
                 }
+                validate_reasoning_content(item).map_err(ResponsesAdapterError::InvalidEvent)?;
+                let _ = optional_encrypted_content(item)?;
                 let summary_slot = self.next_summary_slot;
                 next_summary_slot = Some(summary_slot.checked_add(1).ok_or_else(|| {
                     ResponsesAdapterError::InvalidEvent("summary slot exceeds usize".into())
                 })?);
                 OutputSlot::Reasoning {
-                    id: required_str(item, "id")?.to_owned(),
+                    id: id.expect("reasoning id required").to_owned(),
                     summary_slot,
                     summary: String::new(),
                     started: false,
@@ -947,12 +1097,16 @@ impl ResponsesReceiveState {
         if let Some(next_summary_slot) = next_summary_slot {
             self.next_summary_slot = next_summary_slot;
         }
+        if let Some(id) = id {
+            self.output_item_ids.insert(id.to_owned());
+        }
+        if let OutputSlot::Tool { call_id, .. } = &slot {
+            self.function_call_ids.insert(call_id.clone());
+        }
         self.tool_count = tool_count;
         self.saw_tool |= is_tool;
-        self.output_identities.insert(
-            index,
-            (required_str(item, "id")?.to_owned(), item_type.to_owned()),
-        );
+        self.output_identities
+            .insert(index, (id.map(str::to_owned), item_type.to_owned()));
         self.slots.insert(index, slot);
         self.next_output_index = self.next_output_index.checked_add(1).ok_or_else(|| {
             ResponsesAdapterError::InvalidEvent("output index exceeds u32".into())
@@ -1262,7 +1416,7 @@ impl ResponsesReceiveState {
         &mut self,
         object: &Map<String, Value>,
     ) -> Result<ResponsesPush, ResponsesAdapterError> {
-        validate_reasoning_summary_event(object)?;
+        validate_reasoning_summary_part_event(object)?;
         let index = output_index(object)?;
         self.validate_item_id(index, object, "reasoning")?;
         let summary_index = nested_index(object, "summary_index")?;
@@ -1332,7 +1486,7 @@ impl ResponsesReceiveState {
         &mut self,
         object: &Map<String, Value>,
     ) -> Result<ResponsesPush, ResponsesAdapterError> {
-        validate_reasoning_summary_event(object)?;
+        validate_reasoning_summary_text_event(object)?;
         let index = output_index(object)?;
         self.validate_item_id(index, object, "reasoning")?;
         let summary_index = nested_index(object, "summary_index")?;
@@ -1360,7 +1514,7 @@ impl ResponsesReceiveState {
         &mut self,
         object: &Map<String, Value>,
     ) -> Result<ResponsesPush, ResponsesAdapterError> {
-        validate_reasoning_summary_event(object)?;
+        validate_reasoning_summary_part_event(object)?;
         let index = output_index(object)?;
         self.validate_item_id(index, object, "reasoning")?;
         let summary_index = nested_index(object, "summary_index")?;
@@ -1453,7 +1607,7 @@ impl ResponsesReceiveState {
                         "function_call done has no matching item".into(),
                     ));
                 };
-                if required_str(item, "id")? != id
+                if optional_non_null_string(item, "id")? != id.as_deref()
                     || required_str(item, "call_id")? != call_id
                     || required_str(item, "name")? != name
                     || !accumulator.matches_raw(string_field(item, "arguments")?)
@@ -1473,6 +1627,7 @@ impl ResponsesReceiveState {
             }
             "reasoning" => {
                 let final_summary = reasoning_summary_text(item)?;
+                validate_reasoning_content(item).map_err(ResponsesAdapterError::InvalidEvent)?;
                 let Some(OutputSlot::Reasoning {
                     id,
                     summary_slot,
@@ -1501,15 +1656,12 @@ impl ResponsesReceiveState {
                 };
                 let started = *started;
                 let summary_slot = *summary_slot;
-                self.reserve_events(usize::from(started))?;
+                let encrypted = optional_encrypted_content(item)?;
+                self.commit_charges(encrypted.map_or(0, str::len), usize::from(started), 0)?;
                 self.completed_items
                     .insert(index, Value::Object(item.clone()));
                 self.slots.remove(&index);
-                if item
-                    .get("encrypted_content")
-                    .and_then(Value::as_str)
-                    .is_some_and(|content| !content.is_empty())
-                {
+                if encrypted.is_some() {
                     self.reasoning_fragments.push((
                         required_str(item, "id")?.to_owned(),
                         ProviderContextFragment {
@@ -1543,95 +1695,150 @@ impl ResponsesReceiveState {
         &mut self,
         object: &Map<String, Value>,
     ) -> Result<ResponsesPush, ResponsesAdapterError> {
-        self.observe_response_identity(object)?;
-        if self
-            .slots
-            .values()
-            .any(|slot| !matches!(slot, OutputSlot::Tool { done: true, .. }))
-        {
-            return Err(ResponsesAdapterError::InvalidEvent(
-                "terminal response arrived with unfinished output items".into(),
-            ));
-        }
         let response = object
             .get("response")
             .and_then(Value::as_object)
             .ok_or_else(|| {
                 ResponsesAdapterError::InvalidEvent("response must be an object".into())
             })?;
-        self.usage = response
-            .get("usage")
-            .map(parse_usage)
-            .transpose()?
-            .unwrap_or_default();
-        let status = required_str(response, "status")?;
-        self.validate_terminal_output(response)?;
-        let reason = match status {
-            "completed" if self.saw_tool => StopReason::ToolUse,
-            "completed" => StopReason::Stop,
-            "incomplete" => StopReason::Length,
-            other => {
-                return Err(ResponsesAdapterError::InvalidEvent(format!(
-                    "terminal event has unsupported status {other}"
-                )));
+        // Usage is an independently received accounting sideband. Once its
+        // schema and invariants validate, retain it even if the semantic
+        // terminal payload fails validation below.
+        let usage = parse_terminal_usage(response.get("usage"), &self.usage)?;
+        let snapshot = self.snapshot();
+        let result = (|| -> Result<ResponsesPush, ResponsesAdapterError> {
+            self.observe_response_identity(object)?;
+            if self
+                .slots
+                .values()
+                .any(|slot| !matches!(slot, OutputSlot::Tool { done: true, .. }))
+            {
+                return Err(ResponsesAdapterError::InvalidEvent(
+                    "terminal response arrived with unfinished output items".into(),
+                ));
             }
-        };
-        backfill_reasoning_fragments(response, &mut self.reasoning_fragments)?;
-        let mut events = Vec::new();
-        self.reserve_events(self.slots.len().saturating_add(1))?;
-        let tool_slots = std::mem::take(&mut self.slots);
-        for (index, slot) in tool_slots {
-            let OutputSlot::Tool {
-                call_id,
-                name,
-                accumulator,
-                done: true,
-                ..
-            } = slot
-            else {
-                unreachable!("unfinished slots rejected above")
-            };
-            let outcome = if reason == StopReason::Length {
-                accumulator.reject_incomplete(call_id, name, Utc::now())
-            } else {
-                accumulator.finish(call_id, name, &self.schemas, Utc::now())
-            };
-            events.push(match outcome {
-                ToolArgumentOutcome::Validated(tool_call) => ProviderEvent::ToolCallEnd {
-                    content_index: index as usize,
-                    tool_call,
+            let status = required_str(response, "status")?;
+            self.validate_terminal_output(response)?;
+            let incomplete_reason = response
+                .get("incomplete_details")
+                .and_then(Value::as_object)
+                .and_then(|details| details.get("reason"))
+                .and_then(Value::as_str);
+            let reason = match status {
+                "completed" if self.saw_tool => StopReason::ToolUse,
+                "completed" => StopReason::Stop,
+                "incomplete" => match incomplete_reason {
+                    Some("max_output_tokens" | "max_tokens") => StopReason::Length,
+                    Some("content_filter") => StopReason::Error,
+                    Some(other) => {
+                        return Err(ResponsesAdapterError::InvalidEvent(format!(
+                            "unsupported incomplete response reason {other}"
+                        )));
+                    }
+                    None => {
+                        return Err(ResponsesAdapterError::InvalidEvent(
+                            "incomplete response is missing incomplete_details.reason".into(),
+                        ));
+                    }
                 },
-                ToolArgumentOutcome::Rejected {
-                    rejected,
-                    synthetic_result,
-                } => ProviderEvent::ToolCallRejected {
-                    content_index: index as usize,
-                    rejected,
-                    synthetic_result,
-                },
-            });
-        }
-        self.terminal = true;
-        Ok(ResponsesPush {
-            events: Vec::new(),
-            terminal: Some(ResponsesTerminal {
-                events,
-                reason,
-                usage: self.usage.clone(),
-                error_message: None,
-                provider_code: if reason == StopReason::Length {
-                    response
-                        .get("incomplete_details")
-                        .and_then(Value::as_object)
-                        .and_then(|details| details.get("reason"))
+                other => {
+                    return Err(ResponsesAdapterError::InvalidEvent(format!(
+                        "terminal event has unsupported status {other}"
+                    )));
+                }
+            };
+            let (error_message, provider_code) = if reason == StopReason::Error {
+                let details = response
+                    .get("incomplete_details")
+                    .and_then(Value::as_object);
+                let error = response.get("error").and_then(Value::as_object);
+                (
+                    details
+                        .and_then(|details| details.get("message"))
                         .and_then(Value::as_str)
-                        .map(str::to_owned)
+                        .or_else(|| {
+                            error
+                                .and_then(|error| error.get("message"))
+                                .and_then(Value::as_str)
+                        })
+                        .unwrap_or("Responses response was filtered by content policy")
+                        .to_owned(),
+                    details
+                        .and_then(|details| details.get("code"))
+                        .and_then(Value::as_str)
+                        .or_else(|| {
+                            error
+                                .and_then(|error| error.get("code"))
+                                .and_then(Value::as_str)
+                        })
+                        .unwrap_or("content_filter")
+                        .to_owned(),
+                )
+            } else {
+                (String::new(), String::new())
+            };
+            let (provider_context, opaque_bytes) =
+                backfilled_reasoning_fragments(response, &self.reasoning_fragments)?;
+            let mut events = Vec::new();
+            self.commit_charges(opaque_bytes, self.slots.len().saturating_add(1), 0)?;
+            self.reasoning_fragments = provider_context;
+            let tool_slots = std::mem::take(&mut self.slots);
+            for (index, slot) in tool_slots {
+                let OutputSlot::Tool {
+                    call_id,
+                    name,
+                    accumulator,
+                    done: true,
+                    ..
+                } = slot
+                else {
+                    unreachable!("unfinished slots rejected above")
+                };
+                let outcome = if reason == StopReason::Length {
+                    accumulator.reject_incomplete(call_id, name, Utc::now())
                 } else {
-                    None
-                },
-                provider_context: self.provider_context(),
-            }),
-        })
+                    accumulator.finish(call_id, name, &self.schemas, Utc::now())
+                };
+                events.push(match outcome {
+                    ToolArgumentOutcome::Validated(tool_call) => ProviderEvent::ToolCallEnd {
+                        content_index: index as usize,
+                        tool_call,
+                    },
+                    ToolArgumentOutcome::Rejected {
+                        rejected,
+                        synthetic_result,
+                    } => ProviderEvent::ToolCallRejected {
+                        content_index: index as usize,
+                        rejected,
+                        synthetic_result,
+                    },
+                });
+            }
+            self.terminal = true;
+            self.usage = usage.clone();
+            Ok(ResponsesPush {
+                events: Vec::new(),
+                terminal: Some(ResponsesTerminal {
+                    events,
+                    reason,
+                    usage: self.usage.clone(),
+                    error_message: (reason == StopReason::Error).then_some(error_message),
+                    provider_code: if reason == StopReason::Error {
+                        Some(provider_code)
+                    } else if reason == StopReason::Length {
+                        incomplete_reason.map(str::to_owned)
+                    } else {
+                        None
+                    },
+                    provider_context: self.provider_context(),
+                }),
+            })
+        })();
+        if result.is_err() {
+            self.restore(snapshot);
+            self.usage = usage.clone();
+        }
+        result
     }
 
     fn validate_item_id(
@@ -1643,7 +1850,8 @@ impl ResponsesReceiveState {
         let item_id = required_str(object, "item_id")?;
         if !matches!(
             self.output_identities.get(&index),
-            Some((id, kind)) if id == item_id && kind == expected_type
+            Some((id, kind)) if id.as_deref().is_none_or(|id| id == item_id)
+                && kind == expected_type
         ) {
             return Err(ResponsesAdapterError::InvalidEvent(
                 "typed event item_id/type does not match output slot".into(),
@@ -1681,7 +1889,9 @@ impl ResponsesReceiveState {
                     "terminal response output index is missing".into(),
                 ));
             };
-            if required_str(item, "id")? != id || required_str(item, "type")? != kind {
+            if optional_non_null_string(item, "id")? != id.as_deref()
+                || required_str(item, "type")? != kind
+            {
                 return Err(ResponsesAdapterError::InvalidEvent(
                     "terminal response output identity/order does not match stream".into(),
                 ));
@@ -1704,43 +1914,48 @@ impl ResponsesReceiveState {
         &mut self,
         object: &Map<String, Value>,
     ) -> Result<ResponsesPush, ResponsesAdapterError> {
-        self.observe_response_identity(object)?;
         let response = object
             .get("response")
             .and_then(Value::as_object)
             .ok_or_else(|| {
                 ResponsesAdapterError::InvalidEvent("response must be an object".into())
             })?;
-        self.usage = response
-            .get("usage")
-            .map(parse_usage)
-            .transpose()?
-            .unwrap_or_default();
-        let error = response.get("error").and_then(Value::as_object);
-        let code = error
-            .and_then(|error| error.get("code"))
-            .and_then(Value::as_str)
-            .unwrap_or("provider_error")
-            .to_owned();
-        let message = error
-            .and_then(|error| error.get("message"))
-            .and_then(Value::as_str)
-            .unwrap_or("provider response failed")
-            .to_owned();
-        self.reserve_events(self.slots.len().saturating_add(1))?;
-        let events = self.fail();
-        self.terminal = true;
-        Ok(ResponsesPush {
-            events: Vec::new(),
-            terminal: Some(ResponsesTerminal {
-                events,
-                reason: StopReason::Error,
-                usage: self.usage.clone(),
-                error_message: Some(message),
-                provider_code: Some(code),
-                provider_context: self.provider_context(),
-            }),
-        })
+        let usage = parse_terminal_usage(response.get("usage"), &self.usage)?;
+        let snapshot = self.snapshot();
+        let result = (|| -> Result<ResponsesPush, ResponsesAdapterError> {
+            self.observe_response_identity(object)?;
+            let error = response.get("error").and_then(Value::as_object);
+            let code = error
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_str)
+                .unwrap_or("provider_error")
+                .to_owned();
+            let message = error
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("provider response failed")
+                .to_owned();
+            self.reserve_events(self.slots.len().saturating_add(1))?;
+            let events = self.fail();
+            self.terminal = true;
+            self.usage = usage.clone();
+            Ok(ResponsesPush {
+                events: Vec::new(),
+                terminal: Some(ResponsesTerminal {
+                    events,
+                    reason: StopReason::Error,
+                    usage: self.usage.clone(),
+                    error_message: Some(message),
+                    provider_code: Some(code),
+                    provider_context: self.provider_context(),
+                }),
+            })
+        })();
+        if result.is_err() {
+            self.restore(snapshot);
+            self.usage = usage;
+        }
+        result
     }
 
     fn observe_response_identity(
@@ -1754,9 +1969,26 @@ impl ResponsesReceiveState {
                 ResponsesAdapterError::InvalidEvent("response must be an object".into())
             })?;
         let id = required_str(response, "id")?;
-        let model = required_str(response, "model")?;
-        if self.response_id.as_deref().is_some_and(|known| known != id)
-            || self
+        let model = response
+            .get("model")
+            .map(|model| {
+                model
+                    .as_str()
+                    .filter(|model| !model.is_empty())
+                    .ok_or_else(|| {
+                        ResponsesAdapterError::InvalidEvent(
+                            "response.model must be a non-empty string when present".into(),
+                        )
+                    })
+            })
+            .transpose()?;
+        if self.response_id.as_deref().is_some_and(|known| known != id) {
+            return Err(ResponsesAdapterError::InvalidEvent(
+                "response identity changed during stream".into(),
+            ));
+        }
+        if let Some(model) = model
+            && self
                 .response_model
                 .as_deref()
                 .is_some_and(|known| known != model)
@@ -1765,9 +1997,19 @@ impl ResponsesReceiveState {
                 "response identity changed during stream".into(),
             ));
         }
-        if self.response_id.is_none() {
-            self.commit_charges(id.len().saturating_add(model.len()), 0, 0)?;
+        let new_id = self.response_id.is_none();
+        let new_model = self.response_model.is_none().then_some(model).flatten();
+        let identity_charge = (if new_id { id.len() } else { 0 })
+            .checked_add(new_model.map_or(0, str::len))
+            .ok_or(ResponsesAdapterError::ResponseLimitExceeded {
+                resource: "content_bytes",
+                limit: self.budget.max_content_bytes,
+            })?;
+        self.commit_charges(identity_charge, 0, 0)?;
+        if new_id {
             self.response_id = Some(id.to_owned());
+        }
+        if let Some(model) = new_model {
             self.response_model = Some(model.to_owned());
         }
         Ok(())
@@ -1852,6 +2094,19 @@ fn string_field<'a>(
         .ok_or_else(|| ResponsesAdapterError::InvalidEvent(format!("{field} must be a string")))
 }
 
+fn optional_non_null_string<'a>(
+    object: &'a Map<String, Value>,
+    field: &str,
+) -> Result<Option<&'a str>, ResponsesAdapterError> {
+    match object.get(field) {
+        None => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(ResponsesAdapterError::InvalidEvent(format!(
+            "{field} must be a string when present"
+        ))),
+    }
+}
+
 fn output_index(object: &Map<String, Value>) -> Result<u32, ResponsesAdapterError> {
     let value = object
         .get("output_index")
@@ -1886,27 +2141,26 @@ fn terminal_item_matches_completed(
     {
         return Ok(false);
     }
-    let terminal_encrypted = terminal
-        .get("encrypted_content")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty());
-    let completed_encrypted = completed
-        .get("encrypted_content")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty());
+    let terminal_encrypted = optional_encrypted_content(terminal)?;
+    let completed_encrypted = optional_encrypted_content(completed)?;
     if terminal_encrypted.is_none() || completed_encrypted.is_some() {
         return Ok(false);
     }
     let mut terminal_without_backfill = terminal.clone();
     terminal_without_backfill.remove("encrypted_content");
-    let mut completed_without_empty = completed.clone();
-    if completed_without_empty
-        .get("encrypted_content")
-        .is_some_and(|value| value.is_null() || value.as_str() == Some(""))
-    {
-        completed_without_empty.remove("encrypted_content");
+    Ok(terminal_without_backfill == *completed)
+}
+
+fn optional_encrypted_content(
+    object: &Map<String, Value>,
+) -> Result<Option<&str>, ResponsesAdapterError> {
+    match object.get("encrypted_content") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if !value.is_empty() => Ok(Some(value)),
+        Some(_) => Err(ResponsesAdapterError::InvalidEvent(
+            "encrypted_content must be a non-empty string when present".into(),
+        )),
     }
-    Ok(terminal_without_backfill == completed_without_empty)
 }
 
 fn ensure_assistant_message_item(item: &Map<String, Value>) -> Result<(), ResponsesAdapterError> {
@@ -1981,22 +2235,28 @@ fn reasoning_summary_text(item: &Map<String, Value>) -> Result<String, Responses
     Ok(parts.join("\n\n"))
 }
 
-fn validate_reasoning_summary_event(
+fn validate_reasoning_summary_part_event(
     object: &Map<String, Value>,
 ) -> Result<(), ResponsesAdapterError> {
-    if let Some(part) = object.get("part") {
-        let part = part.as_object().ok_or_else(|| {
+    let part = object
+        .get("part")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
             ResponsesAdapterError::InvalidEvent("reasoning summary part must be an object".into())
         })?;
-        if required_str(part, "type")? != "summary_text" {
-            return Err(ResponsesAdapterError::InvalidEvent(
-                "unsupported known reasoning summary part variant".into(),
-            ));
-        }
-        let _ = string_field(part, "text")?;
-    } else if let Some(text) = object.get("text")
-        && !text.is_string()
-    {
+    if required_str(part, "type")? != "summary_text" {
+        return Err(ResponsesAdapterError::InvalidEvent(
+            "unsupported known reasoning summary part variant".into(),
+        ));
+    }
+    let _ = string_field(part, "text")?;
+    Ok(())
+}
+
+fn validate_reasoning_summary_text_event(
+    object: &Map<String, Value>,
+) -> Result<(), ResponsesAdapterError> {
+    if !object.get("text").is_some_and(Value::is_string) {
         return Err(ResponsesAdapterError::InvalidEvent(
             "reasoning summary text must be a string".into(),
         ));
@@ -2008,49 +2268,79 @@ fn parse_usage(value: &Value) -> Result<Usage, ResponsesAdapterError> {
     let usage = value
         .as_object()
         .ok_or_else(|| ResponsesAdapterError::InvalidEvent("usage must be an object".into()))?;
-    let input_total = usage
-        .get("input_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or_default();
-    let output = usage
-        .get("output_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or_default();
-    let cache_read = usage
-        .get("input_tokens_details")
-        .and_then(Value::as_object)
-        .and_then(|details| details.get("cached_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or_default();
-    let cache_write = usage
-        .get("input_tokens_details")
-        .and_then(Value::as_object)
-        .and_then(|details| details.get("cache_write_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or_default();
-    let reasoning = usage
-        .get("output_tokens_details")
-        .and_then(Value::as_object)
-        .and_then(|details| details.get("reasoning_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or_default();
+    let input_total = required_u64(usage, "input_tokens")?;
+    let output = required_u64(usage, "output_tokens")?;
+    let total_tokens = required_u64(usage, "total_tokens")?;
+    let cache_read = optional_usage_detail(usage, "input_tokens_details", "cached_tokens")?;
+    let cache_write = 0;
+    let reasoning = optional_usage_detail(usage, "output_tokens_details", "reasoning_tokens")?;
+    let uncached_input = input_total.checked_sub(cache_read).ok_or_else(|| {
+        ResponsesAdapterError::InvalidEvent("cached tokens exceed input_tokens".into())
+    })?;
+    if reasoning > output {
+        return Err(ResponsesAdapterError::InvalidEvent(
+            "reasoning_tokens exceeds output_tokens".into(),
+        ));
+    }
+    let expected_total = input_total.checked_add(output).ok_or_else(|| {
+        ResponsesAdapterError::InvalidEvent("usage token total exceeds u64".into())
+    })?;
+    if total_tokens != expected_total {
+        return Err(ResponsesAdapterError::InvalidEvent(
+            "total_tokens must equal input_tokens + output_tokens".into(),
+        ));
+    }
     Ok(Usage {
-        input: input_total
-            .saturating_sub(cache_read)
-            .saturating_sub(cache_write),
+        input: uncached_input,
         output,
         cache_read,
         cache_write,
         reasoning,
-        total_tokens: usage
-            .get("total_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or_else(|| input_total.saturating_add(output)),
+        total_tokens,
+    })
+}
+
+fn parse_terminal_usage(
+    value: Option<&Value>,
+    current: &Usage,
+) -> Result<Usage, ResponsesAdapterError> {
+    match value {
+        None | Some(Value::Null) => Ok(current.clone()),
+        Some(value) => parse_usage(value),
+    }
+}
+
+fn optional_usage_detail(
+    usage: &Map<String, Value>,
+    details_field: &str,
+    token_field: &str,
+) -> Result<u64, ResponsesAdapterError> {
+    let Some(details) = usage.get(details_field) else {
+        return Ok(0);
+    };
+    let details = details.as_object().ok_or_else(|| {
+        ResponsesAdapterError::InvalidEvent(format!("{details_field} must be an object"))
+    })?;
+    match details.get(token_field) {
+        None => Ok(0),
+        Some(value) => value.as_u64().ok_or_else(|| {
+            ResponsesAdapterError::InvalidEvent(format!(
+                "{details_field}.{token_field} must be a non-negative integer"
+            ))
+        }),
+    }
+}
+
+fn required_u64(object: &Map<String, Value>, field: &str) -> Result<u64, ResponsesAdapterError> {
+    object.get(field).and_then(Value::as_u64).ok_or_else(|| {
+        ResponsesAdapterError::InvalidEvent(format!(
+            "{field} must be a present non-negative integer"
+        ))
     })
 }
 
 fn item_identity_bytes(item: &Map<String, Value>) -> Result<usize, ResponsesAdapterError> {
-    let mut total = required_str(item, "id")?.len();
+    let mut total = item.get("id").and_then(Value::as_str).map_or(0, str::len);
     for field in ["call_id", "name"] {
         if let Some(value) = item.get(field).and_then(Value::as_str) {
             total = total.checked_add(value.len()).ok_or(
@@ -2064,13 +2354,16 @@ fn item_identity_bytes(item: &Map<String, Value>) -> Result<usize, ResponsesAdap
     Ok(total)
 }
 
-fn backfill_reasoning_fragments(
+fn backfilled_reasoning_fragments(
     response: &Map<String, Value>,
-    fragments: &mut Vec<(String, ProviderContextFragment)>,
-) -> Result<(), ResponsesAdapterError> {
-    let Some(output) = response.get("output").and_then(Value::as_array) else {
-        return Ok(());
-    };
+    fragments: &[(String, ProviderContextFragment)],
+) -> Result<(Vec<(String, ProviderContextFragment)>, usize), ResponsesAdapterError> {
+    let output = response
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ResponsesAdapterError::InvalidEvent("response.output must be an array".into())
+        })?;
     let mut encrypted = HashMap::new();
     for (index, item) in output.iter().enumerate() {
         let Some(item) = item.as_object() else {
@@ -2084,36 +2377,64 @@ fn backfill_reasoning_fragments(
                 "unsupported known output item variant {item_type}"
             )));
         }
-        if item_type == "reasoning"
-            && item
-                .get("encrypted_content")
-                .and_then(Value::as_str)
-                .is_some_and(|content| !content.is_empty())
+        let encrypted_content = if item_type == "reasoning" {
+            optional_encrypted_content(item)?
+        } else {
+            None
+        };
+        if let Some(encrypted_content) = encrypted_content
+            && encrypted
+                .insert(
+                    required_str(item, "id")?.to_owned(),
+                    (
+                        u32::try_from(index).map_err(|_| {
+                            ResponsesAdapterError::InvalidEvent(
+                                "terminal output index exceeds u32".into(),
+                            )
+                        })?,
+                        item.clone(),
+                        encrypted_content.len(),
+                    ),
+                )
+                .is_some()
         {
-            encrypted.insert(
-                required_str(item, "id")?.to_owned(),
-                (
-                    u32::try_from(index).map_err(|_| {
-                        ResponsesAdapterError::InvalidEvent(
-                            "terminal output index exceeds u32".into(),
-                        )
-                    })?,
-                    item.clone(),
-                ),
-            );
+            return Err(ResponsesAdapterError::InvalidEvent(
+                "duplicate encrypted reasoning id in terminal output".into(),
+            ));
         }
     }
-    for (id, fragment) in fragments.iter_mut() {
-        let Some((_, item)) = encrypted.remove(id) else {
-            continue;
+    let mut result = fragments.to_vec();
+    let mut seen = HashSet::new();
+    for (id, fragment) in &mut result {
+        if !seen.insert(id.clone()) {
+            return Err(ResponsesAdapterError::InvalidEvent(
+                "duplicate retained reasoning fragment id".into(),
+            ));
+        }
+        let Some((index, item, _)) = encrypted.remove(id) else {
+            return Err(ResponsesAdapterError::InvalidEvent(
+                "retained encrypted reasoning is orphaned from terminal output".into(),
+            ));
         };
+        if fragment.wire_item_index != Some(index) {
+            return Err(ResponsesAdapterError::InvalidEvent(
+                "retained encrypted reasoning placement changed at terminal".into(),
+            ));
+        }
         fragment.payload = ProviderContextPayload::EncryptedReasoning {
             protocol: ApiProtocol::OpenAiResponses,
             item: Value::Object(item),
         };
     }
-    for (id, (index, item)) in encrypted {
-        fragments.push((
+    let mut additional_bytes = 0usize;
+    for (id, (index, item, encrypted_len)) in encrypted {
+        additional_bytes = additional_bytes.checked_add(encrypted_len).ok_or(
+            ResponsesAdapterError::ResponseLimitExceeded {
+                resource: "content_bytes",
+                limit: usize::MAX,
+            },
+        )?;
+        result.push((
             id,
             ProviderContextFragment {
                 wire_item_index: Some(index),
@@ -2124,8 +2445,11 @@ fn backfill_reasoning_fragments(
             },
         ));
     }
-    fragments.sort_by_key(|(_, fragment)| fragment.wire_item_index);
-    Ok(())
+    result.sort_by_key(|(_, fragment)| fragment.wire_item_index);
+    // Multiple persisted opaque fragments may share a wire_item_index as long
+    // as their ordinals differ; the request builder enforces the (wire, ordinal)
+    // pair, so the terminal backfill does not duplicate that check here.
+    Ok((result, additional_bytes))
 }
 
 fn validate_canonical_item(item: &Value) -> Result<(), String> {
@@ -2138,6 +2462,11 @@ fn validate_canonical_item(item: &Value) -> Result<(), String> {
         .ok_or_else(|| "output item type must be a string".to_owned())?;
     match item_type {
         "message" => {
+            ensure_only_fields(
+                object,
+                &["id", "type", "role", "content", "status", "phase"],
+                "message",
+            )?;
             let role = object
                 .get("role")
                 .and_then(Value::as_str)
@@ -2150,47 +2479,68 @@ fn validate_canonical_item(item: &Value) -> Result<(), String> {
                 .and_then(Value::as_array)
                 .ok_or_else(|| "message content must be an array".to_owned())?;
             for part in content {
-                let part = part
-                    .as_object()
-                    .ok_or_else(|| "message content part must be an object".to_owned())?;
-                let part_type = part
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| "message content part type must be a string".to_owned())?;
-                match part_type {
-                    "input_text" | "output_text" => {
-                        if !part.get("text").is_some_and(Value::is_string) {
-                            return Err(format!("{part_type} text must be a string"));
-                        }
-                    }
-                    "refusal" => {
-                        if !part.get("refusal").is_some_and(Value::is_string) {
-                            return Err("refusal content must be a string".into());
-                        }
-                    }
-                    "input_image" => {
-                        if !part.get("image_url").is_some_and(Value::is_string) {
-                            return Err("input_image image_url must be a string".into());
-                        }
-                    }
-                    other => {
-                        return Err(format!(
-                            "unsupported compacted message content variant {other}"
-                        ));
-                    }
-                }
+                validate_message_content_part(part)?;
+            }
+            validate_optional_status(object, "message", false)?;
+            if let Some(phase) = object.get("phase")
+                && !phase.is_null()
+                && !matches!(phase.as_str(), Some("commentary" | "final_answer"))
+            {
+                return Err("message phase is invalid".into());
             }
         }
         "function_call" => {
-            for field in ["call_id", "name", "arguments"] {
-                if !object.get(field).is_some_and(Value::is_string) {
-                    return Err(format!("function_call {field} must be a string"));
+            ensure_only_fields(
+                object,
+                &[
+                    "arguments",
+                    "call_id",
+                    "name",
+                    "type",
+                    "id",
+                    "caller",
+                    "namespace",
+                    "status",
+                ],
+                "function_call",
+            )?;
+            if let Some(id) = object.get("id")
+                && !id.is_string()
+            {
+                return Err("function_call id must be a string when present".into());
+            }
+            for field in ["call_id", "name"] {
+                if object
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                {
+                    return Err(format!("function_call {field} must be a non-empty string"));
                 }
             }
+            if !object.get("arguments").is_some_and(Value::is_string) {
+                return Err("function_call arguments must be a string".into());
+            }
+            if let Some(namespace) = object.get("namespace")
+                && !namespace.is_string()
+            {
+                return Err("function_call namespace must be a string when present".into());
+            }
+            validate_optional_status(object, "function_call", false)?;
+            validate_optional_caller(object.get("caller"), "function_call", true)?;
         }
         "function_call_output" => {
-            if !object.get("call_id").is_some_and(Value::is_string) {
-                return Err("function_call_output call_id must be a string".into());
+            ensure_only_fields(
+                object,
+                &["call_id", "output", "type", "id", "caller", "status"],
+                "function_call_output",
+            )?;
+            if object
+                .get("call_id")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                return Err("function_call_output call_id must be a non-empty string".into());
             }
             let output = object
                 .get("output")
@@ -2202,8 +2552,28 @@ fn validate_canonical_item(item: &Value) -> Result<(), String> {
             } else if !output.is_string() {
                 return Err("function_call_output output must be a string or content array".into());
             }
+            if let Some(id) = object.get("id")
+                && !id.is_null()
+                && !id.is_string()
+            {
+                return Err("function_call_output id must be null or a string".into());
+            }
+            validate_optional_status(object, "function_call_output", true)?;
+            validate_optional_caller(object.get("caller"), "function_call_output", true)?;
         }
         "reasoning" => {
+            ensure_only_fields(
+                object,
+                &[
+                    "id",
+                    "summary",
+                    "type",
+                    "content",
+                    "encrypted_content",
+                    "status",
+                ],
+                "reasoning",
+            )?;
             if !object.get("id").is_some_and(Value::is_string)
                 || !object.get("summary").is_some_and(Value::is_array)
             {
@@ -2216,6 +2586,7 @@ fn validate_canonical_item(item: &Value) -> Result<(), String> {
                 let part = part
                     .as_object()
                     .ok_or_else(|| "reasoning summary part must be an object".to_owned())?;
+                ensure_only_fields(part, &["text", "type"], "reasoning summary part")?;
                 if part.get("type").and_then(Value::as_str) != Some("summary_text")
                     || !part.get("text").is_some_and(Value::is_string)
                 {
@@ -2224,35 +2595,301 @@ fn validate_canonical_item(item: &Value) -> Result<(), String> {
                     );
                 }
             }
-            if let Some(content) = object.get("content") {
-                let content = content
-                    .as_array()
-                    .ok_or_else(|| "reasoning content must be an array".to_owned())?;
-                for part in content {
-                    let part = part
-                        .as_object()
-                        .ok_or_else(|| "reasoning content part must be an object".to_owned())?;
-                    if part.get("type").and_then(Value::as_str) != Some("reasoning_text")
-                        || !part.get("text").is_some_and(Value::is_string)
-                    {
+            validate_reasoning_content(object)?;
+            if let Some(encrypted) = object.get("encrypted_content") {
+                match encrypted {
+                    Value::Null => {}
+                    Value::String(encrypted) if !encrypted.is_empty() => {}
+                    _ => {
                         return Err(
-                            "reasoning content part must be reasoning_text with string text".into(),
+                            "reasoning encrypted_content must be null or a non-empty string".into(),
                         );
                     }
                 }
             }
+            validate_optional_status(object, "reasoning", false)?;
         }
         "compaction" => {
-            if !object.get("id").is_some_and(Value::is_string)
-                || object
-                    .get("encrypted_content")
-                    .and_then(Value::as_str)
-                    .is_none_or(|content| content.is_empty())
+            ensure_only_fields(
+                object,
+                &["encrypted_content", "type", "id", "created_by"],
+                "compaction",
+            )?;
+            if let Some(id) = object.get("id")
+                && !id.is_null()
+                && !id.is_string()
+            {
+                return Err("compaction id must be null or a string when present".into());
+            }
+            if object
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .is_none_or(|content| content.is_empty())
             {
                 return Err("compaction encrypted_content must be non-empty".into());
             }
+            if let Some(created_by) = object.get("created_by")
+                && !created_by.is_string()
+            {
+                return Err("compaction created_by must be a string when present".into());
+            }
         }
         other => return Err(format!("unsupported compact output item variant {other}")),
+    }
+    Ok(())
+}
+
+fn validate_message_content_part(part: &Value) -> Result<(), String> {
+    let part = part
+        .as_object()
+        .ok_or_else(|| "message content part must be an object".to_owned())?;
+    let part_type = part
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "message content part type must be a string".to_owned())?;
+    match part_type {
+        "input_text" => {
+            ensure_only_fields(
+                part,
+                &["type", "text", "prompt_cache_breakpoint"],
+                "input_text",
+            )?;
+            require_string(part, "text", "input_text")?;
+            validate_prompt_cache_breakpoint(part.get("prompt_cache_breakpoint"), "input_text")
+        }
+        "output_text" => {
+            ensure_only_fields(
+                part,
+                &["type", "text", "annotations", "logprobs"],
+                "output_text",
+            )?;
+            require_string(part, "text", "output_text")?;
+            validate_annotations(part.get("annotations"))?;
+            validate_logprobs(part.get("logprobs"))
+        }
+        "text" | "summary_text" | "reasoning_text" => {
+            ensure_only_fields(part, &["type", "text"], part_type)?;
+            require_string(part, "text", part_type)
+        }
+        "refusal" => {
+            ensure_only_fields(part, &["type", "refusal"], "refusal")?;
+            require_string(part, "refusal", "refusal")
+        }
+        "input_image" => validate_input_image(part, "message"),
+        "computer_screenshot" => validate_computer_screenshot(part),
+        "input_file" => validate_input_file(part, "message"),
+        other => Err(format!(
+            "unsupported compacted message content variant {other}"
+        )),
+    }
+}
+
+fn require_string(object: &Map<String, Value>, field: &str, parent: &str) -> Result<(), String> {
+    if object.get(field).is_some_and(Value::is_string) {
+        Ok(())
+    } else {
+        Err(format!("{parent} {field} must be a string"))
+    }
+}
+
+fn validate_nullable_string(
+    object: &Map<String, Value>,
+    field: &str,
+    parent: &str,
+) -> Result<(), String> {
+    if let Some(value) = object.get(field)
+        && !value.is_null()
+        && !value.is_string()
+    {
+        return Err(format!("{parent} {field} must be null or a string"));
+    }
+    Ok(())
+}
+
+fn validate_input_image(part: &Map<String, Value>, parent: &str) -> Result<(), String> {
+    let label = format!("{parent} input_image");
+    ensure_only_fields(
+        part,
+        &[
+            "type",
+            "image_url",
+            "file_id",
+            "detail",
+            "prompt_cache_breakpoint",
+        ],
+        &label,
+    )?;
+    validate_nullable_string(part, "image_url", &label)?;
+    validate_nullable_string(part, "file_id", &label)?;
+    if !matches!(
+        part.get("detail").and_then(Value::as_str),
+        Some("auto" | "low" | "high" | "original")
+    ) {
+        return Err(format!(
+            "{label} detail must be auto, low, high, or original"
+        ));
+    }
+    validate_prompt_cache_breakpoint(part.get("prompt_cache_breakpoint"), &label)
+}
+
+fn validate_computer_screenshot(part: &Map<String, Value>) -> Result<(), String> {
+    ensure_only_fields(
+        part,
+        &[
+            "type",
+            "image_url",
+            "file_id",
+            "detail",
+            "prompt_cache_breakpoint",
+        ],
+        "computer_screenshot",
+    )?;
+    for field in ["image_url", "file_id"] {
+        if !part.contains_key(field) {
+            return Err(format!("computer_screenshot {field} is required"));
+        }
+        validate_nullable_string(part, field, "computer_screenshot")?;
+    }
+    if !matches!(
+        part.get("detail").and_then(Value::as_str),
+        Some("auto" | "low" | "high" | "original")
+    ) {
+        return Err("computer_screenshot detail must be auto, low, high, or original".into());
+    }
+    validate_prompt_cache_breakpoint(part.get("prompt_cache_breakpoint"), "computer_screenshot")
+}
+
+fn validate_annotations(value: Option<&Value>) -> Result<(), String> {
+    let annotations = value
+        .and_then(Value::as_array)
+        .ok_or_else(|| "output_text annotations must be an array".to_owned())?;
+    for annotation in annotations {
+        let annotation = annotation
+            .as_object()
+            .ok_or_else(|| "output_text annotation must be an object".to_owned())?;
+        match annotation.get("type").and_then(Value::as_str) {
+            Some("file_citation") => {
+                ensure_only_fields(
+                    annotation,
+                    &["type", "file_id", "index", "filename"],
+                    "file_citation",
+                )?;
+                require_string(annotation, "file_id", "file_citation")?;
+                require_u64(annotation, "index", "file_citation")?;
+                require_string(annotation, "filename", "file_citation")?;
+            }
+            Some("url_citation") => {
+                ensure_only_fields(
+                    annotation,
+                    &["type", "url", "start_index", "end_index", "title"],
+                    "url_citation",
+                )?;
+                require_string(annotation, "url", "url_citation")?;
+                require_u64(annotation, "start_index", "url_citation")?;
+                require_u64(annotation, "end_index", "url_citation")?;
+                require_string(annotation, "title", "url_citation")?;
+            }
+            Some("container_file_citation") => {
+                ensure_only_fields(
+                    annotation,
+                    &[
+                        "type",
+                        "container_id",
+                        "file_id",
+                        "start_index",
+                        "end_index",
+                        "filename",
+                    ],
+                    "container_file_citation",
+                )?;
+                for field in ["container_id", "file_id", "filename"] {
+                    require_string(annotation, field, "container_file_citation")?;
+                }
+                for field in ["start_index", "end_index"] {
+                    require_u64(annotation, field, "container_file_citation")?;
+                }
+            }
+            Some("file_path") => {
+                ensure_only_fields(annotation, &["type", "file_id", "index"], "file_path")?;
+                require_string(annotation, "file_id", "file_path")?;
+                require_u64(annotation, "index", "file_path")?;
+            }
+            Some(other) => return Err(format!("unsupported output_text annotation {other}")),
+            None => return Err("output_text annotation type must be a string".into()),
+        }
+    }
+    Ok(())
+}
+
+fn validate_logprobs(value: Option<&Value>) -> Result<(), String> {
+    let logprobs = value
+        .and_then(Value::as_array)
+        .ok_or_else(|| "output_text logprobs must be an array".to_owned())?;
+    for logprob in logprobs {
+        validate_logprob(logprob, false)?;
+    }
+    Ok(())
+}
+
+fn validate_logprob(value: &Value, top: bool) -> Result<(), String> {
+    let label = if top { "top_logprob" } else { "logprob" };
+    let value = value
+        .as_object()
+        .ok_or_else(|| format!("{label} must be an object"))?;
+    let allowed = if top {
+        &["token", "logprob", "bytes"][..]
+    } else {
+        &["token", "logprob", "bytes", "top_logprobs"][..]
+    };
+    ensure_only_fields(value, allowed, label)?;
+    require_string(value, "token", label)?;
+    if !value.get("logprob").is_some_and(Value::is_number) {
+        return Err(format!("{label} logprob must be a number"));
+    }
+    let bytes = value
+        .get("bytes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("{label} bytes must be an array"))?;
+    if bytes.iter().any(|byte| byte.as_i64().is_none()) {
+        return Err(format!("{label} bytes must contain integers"));
+    }
+    if !top {
+        let top_logprobs = value
+            .get("top_logprobs")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "logprob top_logprobs must be an array".to_owned())?;
+        for top_logprob in top_logprobs {
+            validate_logprob(top_logprob, true)?;
+        }
+    }
+    Ok(())
+}
+
+fn require_u64(object: &Map<String, Value>, field: &str, parent: &str) -> Result<(), String> {
+    if object.get(field).and_then(Value::as_u64).is_some() {
+        Ok(())
+    } else {
+        Err(format!("{parent} {field} must be a non-negative integer"))
+    }
+}
+
+fn validate_reasoning_content(object: &Map<String, Value>) -> Result<(), String> {
+    let Some(content) = object.get("content") else {
+        return Ok(());
+    };
+    let content = content
+        .as_array()
+        .ok_or_else(|| "reasoning content must be an array".to_owned())?;
+    for part in content {
+        let part = part
+            .as_object()
+            .ok_or_else(|| "reasoning content part must be an object".to_owned())?;
+        ensure_only_fields(part, &["text", "type"], "reasoning content part")?;
+        if part.get("type").and_then(Value::as_str) != Some("reasoning_text")
+            || !part.get("text").is_some_and(Value::is_string)
+        {
+            return Err("reasoning content part must be reasoning_text with string text".into());
+        }
     }
     Ok(())
 }
@@ -2262,21 +2899,143 @@ fn validate_input_content_part(part: &Value, parent: &str) -> Result<(), String>
         .as_object()
         .ok_or_else(|| format!("{parent} content part must be an object"))?;
     match part.get("type").and_then(Value::as_str) {
-        Some("input_text") if part.get("text").is_some_and(Value::is_string) => Ok(()),
-        Some("input_image") if part.get("image_url").is_some_and(Value::is_string) => Ok(()),
-        Some("input_text") => Err(format!("{parent} input_text text must be a string")),
-        Some("input_image") => Err(format!("{parent} input_image image_url must be a string")),
+        Some("input_text") => {
+            ensure_only_fields(
+                part,
+                &["type", "text", "prompt_cache_breakpoint"],
+                &format!("{parent} input_text"),
+            )?;
+            require_string(part, "text", &format!("{parent} input_text"))?;
+            validate_prompt_cache_breakpoint(part.get("prompt_cache_breakpoint"), parent)
+        }
+        Some("input_image") => validate_input_image(part, parent),
+        Some("input_file") => validate_input_file(part, parent),
         Some(other) => Err(format!("{parent} unsupported content variant {other}")),
         None => Err(format!("{parent} content part type must be a string")),
     }
+}
+
+fn validate_input_file(part: &Map<String, Value>, parent: &str) -> Result<(), String> {
+    ensure_only_fields(
+        part,
+        &[
+            "type",
+            "detail",
+            "file_data",
+            "file_id",
+            "file_url",
+            "filename",
+            "prompt_cache_breakpoint",
+        ],
+        &format!("{parent} input_file"),
+    )?;
+    validate_nullable_string(part, "file_id", &format!("{parent} input_file"))?;
+    for field in ["file_data", "file_url", "filename"] {
+        if let Some(value) = part.get(field)
+            && !value.is_string()
+        {
+            return Err(format!("{parent} input_file {field} must be a string"));
+        }
+    }
+    if let Some(detail) = part.get("detail")
+        && !matches!(detail.as_str(), Some("auto" | "low" | "high"))
+    {
+        return Err(format!(
+            "{parent} input_file detail must be auto, low, or high"
+        ));
+    }
+    validate_prompt_cache_breakpoint(part.get("prompt_cache_breakpoint"), parent)
+}
+
+fn ensure_only_fields(
+    object: &Map<String, Value>,
+    allowed: &[&str],
+    label: &str,
+) -> Result<(), String> {
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err(format!("{label} contains unsupported property {field}"));
+    }
+    Ok(())
+}
+
+fn validate_optional_status(
+    object: &Map<String, Value>,
+    label: &str,
+    nullable: bool,
+) -> Result<(), String> {
+    if let Some(status) = object.get("status")
+        && !(nullable && status.is_null())
+        && !matches!(
+            status.as_str(),
+            Some("in_progress" | "completed" | "incomplete")
+        )
+    {
+        return Err(format!("{label} status is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_optional_caller(
+    value: Option<&Value>,
+    label: &str,
+    nullable: bool,
+) -> Result<(), String> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if nullable && value.is_null() {
+        return Ok(());
+    }
+    let caller = value
+        .as_object()
+        .ok_or_else(|| format!("{label} caller must be an object"))?;
+    match caller.get("type").and_then(Value::as_str) {
+        Some("direct") => ensure_only_fields(caller, &["type"], "direct caller"),
+        Some("program") => {
+            ensure_only_fields(caller, &["caller_id", "type"], "program caller")?;
+            if caller
+                .get("caller_id")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                return Err("program caller caller_id must be a non-empty string".into());
+            }
+            Ok(())
+        }
+        _ => Err(format!("{label} caller type is invalid")),
+    }
+}
+
+fn validate_prompt_cache_breakpoint(value: Option<&Value>, parent: &str) -> Result<(), String> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value.is_null() {
+        return Ok(());
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("{parent} prompt_cache_breakpoint must be null or an object"))?;
+    ensure_only_fields(object, &["mode"], "prompt_cache_breakpoint")?;
+    if object.get("mode").and_then(Value::as_str) != Some("explicit") {
+        return Err(format!(
+            "{parent} prompt_cache_breakpoint mode must be explicit"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::provider::types::{
-        AssistantMessage, ToolArgsPreview, ToolCall, ToolDefinition, UserMessage,
-        ValidatedToolArguments,
+        AssistantContent, AssistantMessage, ContextMessage, MemoryLayer, Message,
+        NativeCompactionCoverage, ProviderContextAnchor, ProviderContextItem,
+        ProviderContextPayload, StopReason, ToolArgsPreview, ToolCall, ToolDefinition, Usage,
+        UserContent, UserMessage, ValidatedToolArguments,
     };
 
     fn spec() -> ModelSpec {
@@ -2348,6 +3107,104 @@ mod tests {
         );
         assert_eq!(body["input"][1]["type"], "message");
         assert!(body.get("previous_response_id").is_none());
+    }
+
+    #[test]
+    fn request_tool_strict_mode_follows_mfjs_safe_subset() {
+        let mut context = PromptContext {
+            system_prompt: "constitution".into(),
+            memory_blocks: vec![],
+            messages: vec![ContextMessage::Synthetic {
+                message: Message::User(UserMessage {
+                    content: vec![UserContent::Text {
+                        text: "hello".into(),
+                    }],
+                    timestamp: Utc::now(),
+                }),
+            }],
+            provider_context: vec![],
+            tools: vec![],
+        };
+        context.tools = vec![
+            ToolDefinition {
+                name: "safe".into(),
+                description: "safe schema".into(),
+                parameters: json!({
+                    "type":"object",
+                    "properties":{"city":{"type":"string"}},
+                    "required":["city"],
+                    "additionalProperties":false
+                }),
+            },
+            ToolDefinition {
+                name: "unsafe".into(),
+                description: "schema outside MFJS strict subset".into(),
+                parameters: json!({
+                    "type":"object",
+                    "properties":{"city":{"type":"string","pattern":".*"}},
+                    "required":["city"],
+                    "additionalProperties":false
+                }),
+            },
+        ];
+        let body = build_request(&spec(), &context, &RequestOptions::default()).expect("request");
+        assert_eq!(body["tools"][0]["strict"], true);
+        assert_eq!(body["tools"][1]["strict"], false);
+    }
+
+    #[test]
+    fn non_finite_temperature_is_rejected_before_responses_json_construction() {
+        for temperature in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let error = build_request(
+                &spec(),
+                &PromptContext {
+                    system_prompt: "constitution".into(),
+                    memory_blocks: vec![],
+                    messages: vec![ContextMessage::Synthetic {
+                        message: Message::User(UserMessage {
+                            content: vec![UserContent::Text {
+                                text: "hello".into(),
+                            }],
+                            timestamp: Utc::now(),
+                        }),
+                    }],
+                    provider_context: vec![],
+                    tools: vec![],
+                },
+                &RequestOptions {
+                    temperature: Some(temperature),
+                    ..RequestOptions::default()
+                },
+            )
+            .expect_err("non-finite temperature");
+            assert!(
+                matches!(error, ResponsesAdapterError::InvalidTemperature(value)
+                if value.to_bits() == temperature.to_bits())
+            );
+        }
+        let finite = build_request(
+            &spec(),
+            &PromptContext {
+                system_prompt: "constitution".into(),
+                memory_blocks: vec![],
+                messages: vec![ContextMessage::Synthetic {
+                    message: Message::User(UserMessage {
+                        content: vec![UserContent::Text {
+                            text: "hello".into(),
+                        }],
+                        timestamp: Utc::now(),
+                    }),
+                }],
+                provider_context: vec![],
+                tools: vec![],
+            },
+            &RequestOptions {
+                temperature: Some(0.7),
+                ..RequestOptions::default()
+            },
+        )
+        .expect("finite Responses temperature");
+        assert_eq!(finite["temperature"], json!(0.7));
     }
 
     #[test]
@@ -2827,7 +3684,7 @@ mod tests {
         }
         let terminal = state
             .push_json(
-                r#"{"type":"response.incomplete","sequence_number":3,"response":{"id":"resp_incomplete","model":"gpt-5.6","status":"incomplete","output":[{"id":"fc","type":"function_call","call_id":"call","name":"weather","arguments":"{\"city\":\"Tokyo\"}"}],"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":1,"output_tokens":1}}}"#,
+                r#"{"type":"response.incomplete","sequence_number":3,"response":{"id":"resp_incomplete","model":"gpt-5.6","status":"incomplete","output":[{"id":"fc","type":"function_call","call_id":"call","name":"weather","arguments":"{\"city\":\"Tokyo\"}"}],"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2}}}"#,
             )
             .expect("incomplete terminal")
             .terminal
@@ -2838,6 +3695,53 @@ mod tests {
             [ProviderEvent::ToolCallRejected { rejected, .. }]
                 if rejected.error == crate::provider::types::ToolArgumentError::IncompleteResponse
         ));
+    }
+
+    #[test]
+    fn incomplete_content_filter_is_error_and_never_length_rejection() {
+        let mut state = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+        for payload in [
+            r#"{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"fc","type":"function_call","call_id":"call","name":"weather","arguments":""}}"#,
+            r#"{"type":"response.function_call_arguments.delta","sequence_number":1,"item_id":"fc","output_index":0,"delta":"{\"city\":\"Tokyo\"}"}"#,
+            r#"{"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":{"id":"fc","type":"function_call","call_id":"call","name":"weather","arguments":"{\"city\":\"Tokyo\"}"}}"#,
+        ] {
+            state.push_json(payload).expect("tool event");
+        }
+        let terminal = state
+            .push_json(
+                r#"{"type":"response.incomplete","sequence_number":3,"response":{"id":"resp_filter","model":"gpt-5.6","status":"incomplete","output":[{"id":"fc","type":"function_call","call_id":"call","name":"weather","arguments":"{\"city\":\"Tokyo\"}"}],"incomplete_details":{"reason":"content_filter","message":"blocked by policy"},"usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2}}}"#,
+            )
+            .expect("content-filter terminal")
+            .terminal
+            .expect("terminal");
+        assert_eq!(terminal.reason, StopReason::Error);
+        assert_eq!(terminal.provider_code.as_deref(), Some("content_filter"));
+        assert_eq!(terminal.error_message.as_deref(), Some("blocked by policy"));
+        assert!(matches!(
+            terminal.events.as_slice(),
+            [ProviderEvent::ToolCallEnd { .. }]
+        ));
+    }
+
+    #[test]
+    fn incomplete_unknown_or_missing_reason_fails_closed() {
+        for details in [r#""reason":"provider_specific""#, r#""#] {
+            let mut state =
+                ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+            let incomplete_details = if details.is_empty() {
+                String::new()
+            } else {
+                format!(",\"incomplete_details\":{{{details}}}")
+            };
+            let payload = format!(
+                r#"{{"type":"response.incomplete","sequence_number":0,"response":{{"id":"resp_bad","model":"gpt-5.6","status":"incomplete","output":[]{} }}}}"#,
+                incomplete_details
+            );
+            let error = state
+                .push_json(&payload)
+                .expect_err("invalid incomplete reason");
+            assert!(error.to_string().contains("incomplete"));
+        }
     }
 
     #[test]
@@ -2856,7 +3760,13 @@ mod tests {
             json!({
                 "object":"response.compaction",
                 "output":items,
-                "usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13}
+                "usage":{
+                    "input_tokens":10,
+                    "input_tokens_details":{"cached_tokens":0},
+                    "output_tokens":3,
+                    "output_tokens_details":{"reasoning_tokens":0},
+                    "total_tokens":13
+                }
             }),
             coverage.clone(),
         )
@@ -2908,20 +3818,32 @@ mod tests {
             },
         });
 
-        let input = convert_input(&spec, &context).expect("valid native replay");
+        let input = convert_input(&spec, &context, true).expect("valid native replay");
         assert_eq!(input[0]["content"][0]["text"], "leading-synthetic");
         assert_eq!(&input[1..=window.len()], window.as_slice());
         assert_eq!(input.len(), window.len() + 3);
         assert_eq!(input[window.len() + 1]["content"][0]["text"], "message-9");
         assert_eq!(input[window.len() + 2]["content"][0]["text"], "message-10");
 
-        let request = build_request(&spec, &context, &RequestOptions::default())
-            .expect("request reuses canonical replay ordering");
+        let default_request = build_request(&spec, &context, &RequestOptions::default())
+            .expect("default three-layer request");
+        assert!(!default_request.to_string().contains("opaque"));
+        assert!(default_request.to_string().contains("message-7"));
+
+        let request = build_request(
+            &spec,
+            &context,
+            &RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
+        )
+        .expect("request reuses canonical replay ordering");
         assert_eq!(request["input"], Value::Array(input));
     }
 
     #[test]
-    fn native_compacted_window_rejects_duplicates_coexistence_and_bad_coverage() {
+    fn stale_native_context_falls_back_to_durable_three_layer_view() {
         let spec = spec();
         let mut context = PromptContext {
             system_prompt: "system".into(),
@@ -2943,7 +3865,8 @@ mod tests {
             },
         };
         context.provider_context = vec![native.clone(), native.clone()];
-        assert!(convert_input(&spec, &context).is_err());
+        let fallback = convert_input(&spec, &context, true).expect("duplicate fallback");
+        assert!(!Value::Array(fallback).to_string().contains("opaque"));
 
         context.provider_context = vec![native.clone()];
         context
@@ -2953,7 +3876,8 @@ mod tests {
                 text: "memory".into(),
                 time_range: None,
             });
-        assert!(convert_input(&spec, &context).is_err());
+        let fallback = convert_input(&spec, &context, true).expect("coexistence fallback");
+        assert!(Value::Array(fallback).to_string().contains("memory"));
         context.memory_blocks.clear();
 
         if let ProviderContextPayload::OpenAiCompactedWindow { coverage, .. } =
@@ -2961,13 +3885,15 @@ mod tests {
         {
             coverage.context_fingerprint = "wrong".into();
         }
-        assert!(convert_input(&spec, &context).is_err());
+        let fallback = convert_input(&spec, &context, true).expect("fingerprint fallback");
+        assert!(!Value::Array(fallback).to_string().contains("opaque"));
 
         context.provider_context = vec![native];
-        context.messages = vec![persisted_user(9), persisted_user(9)];
-        assert!(convert_input(&spec, &context).is_err());
-        context.messages = vec![persisted_user(9), persisted_user(8)];
-        assert!(convert_input(&spec, &context).is_err());
+        context.messages = vec![persisted_user(10)];
+        let fallback = convert_input(&spec, &context, true).expect("suffix gap fallback");
+        let fallback = Value::Array(fallback).to_string();
+        assert!(fallback.contains("message-10"));
+        assert!(!fallback.contains("opaque"));
         context.messages = vec![
             persisted_user(9),
             ContextMessage::Synthetic {
@@ -2977,7 +3903,8 @@ mod tests {
                 }),
             },
         ];
-        assert!(convert_input(&spec, &context).is_err());
+        let fallback = convert_input(&spec, &context, true).expect("placement fallback");
+        assert!(!Value::Array(fallback).to_string().contains("opaque"));
     }
 
     #[test]
@@ -2989,6 +3916,8 @@ mod tests {
             json!({"id":"r","type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":1}]}),
             json!({"type":"function_call_output","call_id":"c","output":[{"type":"future","text":"x"}]}),
             json!({"type":"function_call_output","call_id":"c","output":[{"type":"input_text","text":1}]}),
+            json!({"id":"r","type":"reasoning","summary":[],"encrypted_content":""}),
+            json!({"id":"r","type":"reasoning","summary":[],"encrypted_content":7}),
         ] {
             assert!(validate_canonical_item(&invalid).is_err(), "{invalid}");
         }
@@ -3001,6 +3930,438 @@ mod tests {
             }))
             .is_ok()
         );
+        assert!(
+            validate_canonical_item(&json!({
+                "id":"r",
+                "type":"reasoning",
+                "summary":[],
+                "encrypted_content":null,
+            }))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn native_replay_requires_both_opt_in_and_compat_capability() {
+        let mut spec = spec();
+        let mut context = PromptContext {
+            system_prompt: "system".into(),
+            memory_blocks: vec![],
+            messages: vec![persisted_user(1), persisted_user(2)],
+            provider_context: vec![],
+            tools: vec![],
+        };
+        let coverage = NativeCompactionCoverage {
+            through_message_seq: 1,
+            context_fingerprint: context_fingerprint(&spec, &context).unwrap(),
+        };
+        context.provider_context.push(ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 0,
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({"id":"cmp","type":"compaction","encrypted_content":"NATIVE"})],
+                coverage,
+            },
+        });
+        if let ProtocolCompat::Responses(compat) = &mut spec.compat {
+            compat.supports_native_compact = false;
+        }
+        let request = build_request(
+            &spec,
+            &context,
+            &RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
+        )
+        .expect("capability loss falls back");
+        let request = request.to_string();
+        assert!(!request.contains("NATIVE"));
+        assert!(request.contains("message-1"));
+        assert!(request.contains("message-2"));
+    }
+
+    #[test]
+    fn foreign_native_context_forces_three_layer_fallback() {
+        let spec = spec();
+        let mut context = PromptContext {
+            system_prompt: "system".into(),
+            memory_blocks: vec![],
+            messages: vec![persisted_user(1)],
+            provider_context: vec![],
+            tools: vec![],
+        };
+        context.provider_context.push(ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 0,
+            payload: ProviderContextPayload::AnthropicCompaction {
+                block: json!({"type":"compaction","content":"FOREIGN_NATIVE"}),
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 1,
+                    context_fingerprint: "foreign".into(),
+                },
+            },
+        });
+        let request = build_request(
+            &spec,
+            &context,
+            &RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
+        )
+        .expect("foreign native state falls back");
+        assert!(!request.to_string().contains("FOREIGN_NATIVE"));
+        assert!(request.to_string().contains("message-1"));
+    }
+
+    #[test]
+    fn usage_schema_and_accounting_invariants_fail_closed() {
+        let valid = json!({
+            "input_tokens":10,
+            "input_tokens_details":{"cached_tokens":3},
+            "output_tokens":4,
+            "output_tokens_details":{"reasoning_tokens":1},
+            "total_tokens":14
+        });
+        assert_eq!(
+            parse_usage(&valid).unwrap(),
+            Usage {
+                input: 7,
+                output: 4,
+                cache_read: 3,
+                cache_write: 0,
+                reasoning: 1,
+                total_tokens: 14,
+            }
+        );
+        assert_eq!(
+            parse_usage(&json!({
+                "input_tokens":2,
+                "output_tokens":3,
+                "total_tokens":5
+            }))
+            .unwrap(),
+            Usage {
+                input: 2,
+                output: 3,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                total_tokens: 5,
+            }
+        );
+        for invalid in [
+            json!({}),
+            json!({"input_tokens":"10","input_tokens_details":{"cached_tokens":0},"output_tokens":0,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":10}),
+            json!({"input_tokens":10,"input_tokens_details":null,"output_tokens":0,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":10}),
+            json!({"input_tokens":1,"input_tokens_details":{"cached_tokens":2},"output_tokens":0,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":1}),
+            json!({"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":2},"total_tokens":2}),
+            json!({"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":3}),
+        ] {
+            assert!(parse_usage(&invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn encrypted_reasoning_ids_types_and_budget_are_transactional() {
+        for malformed in ["\"\"", "7"] {
+            let mut state =
+                ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+            state.push_json(
+                r#"{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"r","type":"reasoning","summary":[]}}"#,
+            ).unwrap();
+            let done = format!(
+                r#"{{"type":"response.output_item.done","sequence_number":1,"output_index":0,"item":{{"id":"r","type":"reasoning","summary":[],"encrypted_content":{malformed}}}}}"#
+            );
+            assert!(state.push_json(&done).is_err());
+            assert!(state.provider_context().is_empty());
+        }
+
+        let mut nullable = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+        nullable.push_json(
+            r#"{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"r","type":"reasoning","summary":[]}}"#,
+        ).unwrap();
+        nullable.push_json(
+            r#"{"type":"response.output_item.done","sequence_number":1,"output_index":0,"item":{"id":"r","type":"reasoning","summary":[],"encrypted_content":null}}"#,
+        ).expect("official nullable encrypted_content is equivalent to absence");
+        assert!(nullable.provider_context().is_empty());
+
+        let mut duplicate =
+            ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+        duplicate.push_json(
+            r#"{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"same","type":"reasoning","summary":[]}}"#,
+        ).unwrap();
+        assert!(duplicate.push_json(
+            r#"{"type":"response.output_item.added","sequence_number":1,"output_index":1,"item":{"id":"same","type":"reasoning","summary":[]}}"#,
+        ).is_err());
+
+        let budget = ResponseBudget {
+            max_content_bytes: 1,
+            max_wire_bytes: usize::MAX,
+            max_events: usize::MAX,
+            max_preview_work_bytes: usize::MAX,
+            max_tool_calls: usize::MAX,
+        };
+        let mut state = ResponsesReceiveState::with_budget(schemas(), budget);
+        state.push_json(
+            r#"{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"r","type":"reasoning","summary":[]}}"#,
+        ).unwrap();
+        assert!(matches!(
+            state.push_json(
+                r#"{"type":"response.output_item.done","sequence_number":1,"output_index":0,"item":{"id":"r","type":"reasoning","summary":[],"encrypted_content":"x"}}"#,
+            ),
+            Err(ResponsesAdapterError::ResponseLimitExceeded { resource: "content_bytes", .. })
+        ));
+        assert!(state.provider_context().is_empty());
+        state.push_json(
+            r#"{"type":"response.output_item.done","sequence_number":1,"output_index":0,"item":{"id":"r","type":"reasoning","summary":[]}}"#,
+        ).expect("failed opaque charge did not mutate semantic state");
+        let terminal = r#"{"type":"response.completed","sequence_number":2,"response":{"id":"resp","model":"gpt-5.6","status":"completed","output":[{"id":"r","type":"reasoning","summary":[],"encrypted_content":"x"}],"usage":{"input_tokens":0,"input_tokens_details":{"cached_tokens":0},"output_tokens":0,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":0}}}"#;
+        assert!(matches!(
+            state.push_json(terminal),
+            Err(ResponsesAdapterError::ResponseLimitExceeded {
+                resource: "content_bytes",
+                ..
+            })
+        ));
+        assert!(state.provider_context().is_empty());
+    }
+
+    #[test]
+    fn replay_rejects_duplicate_public_indexes_and_orders_trailing_opaque_items() {
+        let spec = spec();
+        let assistant = |content| {
+            Message::Assistant(crate::provider::types::AssistantMessage {
+                content,
+                model: spec.id.clone(),
+                provider: spec.provider.clone(),
+                origin: spec.origin(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                provider_code: None,
+                interrupted: false,
+                timestamp: Utc::now(),
+            })
+        };
+        let mut context = PromptContext {
+            system_prompt: "system".into(),
+            memory_blocks: vec![],
+            messages: vec![ContextMessage::Persisted {
+                id: "assistant".into(),
+                seq: 1,
+                message: assistant(vec![
+                    AssistantContent::Text {
+                        text: "a".into(),
+                        wire_item_index: 0,
+                    },
+                    AssistantContent::Text {
+                        text: "b".into(),
+                        wire_item_index: 0,
+                    },
+                ]),
+            }],
+            provider_context: vec![],
+            tools: vec![],
+        };
+        assert!(build_request(&spec, &context, &RequestOptions::default()).is_err());
+
+        context.messages[0] = ContextMessage::Persisted {
+            id: "assistant".into(),
+            seq: 1,
+            message: assistant(vec![AssistantContent::Text {
+                text: "a".into(),
+                wire_item_index: 0,
+            }]),
+        };
+        context.provider_context.push(ProviderContextItem {
+            origin_message: Some(ProviderContextAnchor {
+                message_id: "assistant".into(),
+                message_seq: 1,
+            }),
+            wire_item_index: Some(1),
+            ordinal: 1,
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiResponses,
+                item: json!({
+                    "id":"reasoning-b",
+                    "type":"reasoning",
+                    "summary":[],
+                    "encrypted_content":"opaque-b"
+                }),
+            },
+        });
+        context.provider_context.push(ProviderContextItem {
+            origin_message: Some(ProviderContextAnchor {
+                message_id: "assistant".into(),
+                message_seq: 1,
+            }),
+            wire_item_index: Some(1),
+            ordinal: 0,
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiResponses,
+                item: json!({
+                    "id":"reasoning-a",
+                    "type":"reasoning",
+                    "summary":[],
+                    "encrypted_content":"opaque-a"
+                }),
+            },
+        });
+        let request = build_request(&spec, &context, &RequestOptions::default())
+            .expect("trailing opaque reasoning has an explicit stable placement");
+        let input = request["input"].as_array().unwrap();
+        assert_eq!(input[1]["id"], "reasoning-a");
+        assert_eq!(input[2]["id"], "reasoning-b");
+
+        context.provider_context[1].ordinal = 1;
+        assert!(matches!(
+            build_request(&spec, &context, &RequestOptions::default()),
+            Err(ResponsesAdapterError::InvalidContext(message))
+                if message.contains("duplicate encrypted reasoning placement")
+        ));
+
+        context.provider_context[1].ordinal = 0;
+        context.provider_context[1].wire_item_index = None;
+        assert!(matches!(
+            build_request(&spec, &context, &RequestOptions::default()),
+            Err(ResponsesAdapterError::InvalidContext(message))
+                if message.contains("missing wire_item_index")
+        ));
+        context.provider_context[1].wire_item_index = Some(1);
+        context.provider_context[1].origin_message = None;
+        assert!(matches!(
+            build_request(&spec, &context, &RequestOptions::default()),
+            Err(ResponsesAdapterError::InvalidContext(message))
+                if message.contains("missing an origin anchor")
+        ));
+    }
+
+    #[test]
+    fn terminal_null_usage_preserves_observed_usage_until_validation_succeeds() {
+        let observed = Usage {
+            input: 7,
+            output: 3,
+            cache_read: 2,
+            cache_write: 0,
+            reasoning: 1,
+            total_tokens: 12,
+        };
+        let mut failed = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+        failed.usage = observed.clone();
+        let terminal = failed
+            .push_json(
+                r#"{"type":"response.failed","sequence_number":0,"response":{"id":"resp","model":"gpt-5.6","status":"failed","output":[],"error":{"code":"server_error","message":"failed"},"usage":null}}"#,
+            )
+            .unwrap()
+            .terminal
+            .unwrap();
+        assert_eq!(terminal.usage, observed);
+
+        let mut malformed =
+            ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+        malformed.usage = observed.clone();
+        assert!(malformed
+            .push_json(
+                r#"{"type":"response.incomplete","sequence_number":0,"response":{"id":"resp","model":"gpt-5.6","status":"incomplete","output":[],"incomplete_details":{},"usage":null}}"#,
+            )
+            .is_err());
+        assert_eq!(malformed.usage, observed);
+    }
+
+    #[test]
+    fn incomplete_terminal_retains_valid_usage_across_reason_validation_failures() {
+        let received = Usage {
+            input: 7,
+            output: 3,
+            cache_read: 2,
+            cache_write: 0,
+            reasoning: 1,
+            total_tokens: 12,
+        };
+        let usage = r#""usage":{"input_tokens":9,"input_tokens_details":{"cached_tokens":2},"output_tokens":3,"output_tokens_details":{"reasoning_tokens":1},"total_tokens":12}"#;
+        for details in [
+            r#""incomplete_details":{}"#,
+            r#""incomplete_details":{"reason":"future_reason"}"#,
+        ] {
+            let mut state =
+                ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+            let payload = format!(
+                r#"{{"type":"response.incomplete","sequence_number":0,"response":{{"id":"resp","model":"gpt-5.6","status":"incomplete","output":[],{details},{usage}}}}}"#
+            );
+            assert!(state.push_json(&payload).is_err());
+            assert_eq!(state.usage, received);
+            assert!(!state.terminal);
+            assert!(state.response_id.is_none());
+            assert!(state.provider_context().is_empty());
+            assert_eq!(state.next_sequence_number, 0);
+        }
+    }
+
+    #[test]
+    fn failed_terminal_retains_valid_usage_when_later_reservation_fails() {
+        let mut state = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+        state.budget.max_events = 0;
+        let payload = r#"{"type":"response.failed","sequence_number":0,"response":{"id":"resp","model":"gpt-5.6","status":"failed","output":[],"error":{"code":"server_error","message":"failed"},"usage":{"input_tokens":4,"input_tokens_details":{"cached_tokens":1},"output_tokens":2,"output_tokens_details":{"reasoning_tokens":1},"total_tokens":6}}}"#;
+        assert!(matches!(
+            state.push_json(payload),
+            Err(ResponsesAdapterError::ResponseLimitExceeded {
+                resource: "event_count",
+                ..
+            })
+        ));
+        assert_eq!(
+            state.usage,
+            Usage {
+                input: 3,
+                output: 2,
+                cache_read: 1,
+                cache_write: 0,
+                reasoning: 1,
+                total_tokens: 6,
+            }
+        );
+        assert!(state.response_id.is_none());
+        assert!(state.response_model.is_none());
+        assert!(!state.terminal);
+        assert!(state.provider_context().is_empty());
+        assert_eq!(state.next_sequence_number, 0);
+    }
+
+    #[test]
+    fn parallel_function_calls_reject_duplicate_pairing_identities_transactionally() {
+        let mut state = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+        state
+            .push_json(
+                r#"{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"fc-a","type":"function_call","call_id":"call-a","name":"weather","arguments":""}}"#,
+            )
+            .unwrap();
+        assert!(state
+            .push_json(
+                r#"{"type":"response.output_item.added","sequence_number":1,"output_index":1,"item":{"id":"fc-b","type":"function_call","call_id":"call-a","name":"weather","arguments":""}}"#,
+            )
+            .is_err());
+        state
+            .push_json(
+                r#"{"type":"response.output_item.added","sequence_number":1,"output_index":1,"item":{"id":"fc-b","type":"function_call","call_id":"call-b","name":"weather","arguments":""}}"#,
+            )
+            .expect("rejected duplicate did not consume sequence, slot, or identity");
+
+        let mut duplicate_item =
+            ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+        duplicate_item
+            .push_json(
+                r#"{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"fc","type":"function_call","call_id":"call-a","name":"weather","arguments":""}}"#,
+            )
+            .unwrap();
+        assert!(duplicate_item
+            .push_json(
+                r#"{"type":"response.output_item.added","sequence_number":1,"output_index":1,"item":{"id":"fc","type":"function_call","call_id":"call-b","name":"weather","arguments":""}}"#,
+            )
+            .is_err());
     }
 
     #[test]
@@ -3028,5 +4389,586 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(events, vec![0, 1]);
+    }
+
+    #[test]
+    fn terminal_validation_failure_rolls_back_identity_counters_and_slots() {
+        let mut state = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+        for payload in [
+            r#"{"type":"response.created","sequence_number":0,"response":{"id":"resp","model":"gpt-5.6","status":"in_progress","output":[]}}"#,
+            r#"{"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"fc","type":"function_call","call_id":"call","name":"weather","arguments":""}}"#,
+            r#"{"type":"response.function_call_arguments.delta","sequence_number":2,"item_id":"fc","output_index":0,"delta":"{\"city\":\"Tokyo\"}"}"#,
+            r#"{"type":"response.output_item.done","sequence_number":3,"output_index":0,"item":{"id":"fc","type":"function_call","call_id":"call","name":"weather","arguments":"{\"city\":\"Tokyo\"}"}}"#,
+        ] {
+            state.push_json(payload).expect("setup");
+        }
+        let snapshot = (
+            state.response_id.clone(),
+            state.response_model.clone(),
+            state.content_bytes,
+            state.event_count,
+            state.preview_work_bytes,
+            state.slots.len(),
+        );
+        let bad = r#"{"type":"response.completed","sequence_number":4,"response":{"id":"other","model":"gpt-5.6","status":"completed","output":[{"id":"fc","type":"function_call","call_id":"call","name":"weather","arguments":"{\"city\":\"Tokyo\"}"}],"usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2}}}"#;
+        assert!(state.push_json(bad).is_err());
+        assert!(!state.terminal);
+        assert_eq!(
+            (
+                state.response_id.clone(),
+                state.response_model.clone(),
+                state.content_bytes,
+                state.event_count,
+                state.preview_work_bytes,
+                state.slots.len()
+            ),
+            snapshot
+        );
+        assert_eq!(state.usage.input, 1);
+        assert_eq!(state.usage.output, 1);
+        assert_eq!(state.usage.total_tokens, 2);
+        let good = r#"{"type":"response.completed","sequence_number":4,"response":{"id":"resp","model":"gpt-5.6","status":"completed","output":[{"id":"fc","type":"function_call","call_id":"call","name":"weather","arguments":"{\"city\":\"Tokyo\"}"}],"usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2}}}"#;
+        let terminal = state
+            .push_json(good)
+            .expect("retry under same sequence number")
+            .terminal
+            .expect("terminal");
+        assert_eq!(terminal.reason, StopReason::ToolUse);
+        assert!(state.terminal);
+    }
+
+    #[test]
+    fn response_failed_preserves_state_on_usage_validation_error_and_retries() {
+        let mut state = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+        state
+            .push_json(
+                r#"{"type":"response.created","sequence_number":0,"response":{"id":"resp","model":"gpt-5.6","status":"in_progress","output":[]}}"#,
+            )
+            .unwrap();
+        let snapshot = (
+            state.response_id.clone(),
+            state.response_model.clone(),
+            state.content_bytes,
+            state.event_count,
+            state.preview_work_bytes,
+        );
+        let bad = r#"{"type":"response.failed","sequence_number":1,"response":{"id":"resp","model":"gpt-5.6","status":"failed","output":[],"error":{"code":"server_error","message":"failed"},"usage":{"input_tokens":"bad"}}}"#;
+        assert!(state.push_json(bad).is_err());
+        assert!(!state.terminal);
+        assert_eq!(
+            (
+                state.response_id.clone(),
+                state.response_model.clone(),
+                state.content_bytes,
+                state.event_count,
+                state.preview_work_bytes
+            ),
+            snapshot
+        );
+        let good = r#"{"type":"response.failed","sequence_number":1,"response":{"id":"resp","model":"gpt-5.6","status":"failed","output":[],"error":{"code":"server_error","message":"failed"}}}"#;
+        let terminal = state
+            .push_json(good)
+            .expect("retry under same sequence number")
+            .terminal
+            .expect("terminal");
+        assert_eq!(terminal.reason, StopReason::Error);
+        assert_eq!(terminal.provider_code.as_deref(), Some("server_error"));
+        assert!(state.terminal);
+    }
+
+    #[test]
+    fn encrypted_reasoning_is_omitted_when_reasoning_or_capability_disabled() {
+        let spec = spec();
+        let anchor = ProviderContextAnchor {
+            message_id: "assistant-1".into(),
+            message_seq: 1,
+        };
+        let context = || PromptContext {
+            system_prompt: "system".into(),
+            memory_blocks: vec![],
+            messages: vec![ContextMessage::Persisted {
+                id: anchor.message_id.clone(),
+                seq: anchor.message_seq,
+                message: Message::Assistant(AssistantMessage {
+                    content: vec![AssistantContent::Text {
+                        text: "public".into(),
+                        wire_item_index: 1,
+                    }],
+                    model: spec.id.clone(),
+                    provider: spec.provider.clone(),
+                    origin: spec.origin(),
+                    usage: Usage::default(),
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                    provider_code: None,
+                    interrupted: false,
+                    timestamp: Utc::now(),
+                }),
+            }],
+            provider_context: vec![ProviderContextItem {
+                origin_message: Some(anchor.clone()),
+                wire_item_index: Some(0),
+                ordinal: 0,
+                payload: ProviderContextPayload::EncryptedReasoning {
+                    protocol: ApiProtocol::OpenAiResponses,
+                    item: json!({
+                        "id": "er",
+                        "type": "reasoning",
+                        "summary": [],
+                        "encrypted_content": "OPAQUE"
+                    }),
+                },
+            }],
+            tools: vec![],
+        };
+
+        let enabled =
+            build_request(&spec, &context(), &RequestOptions::default()).expect("enabled");
+        assert!(enabled.to_string().contains("OPAQUE"));
+
+        let mut no_reasoning = spec.clone();
+        no_reasoning.reasoning = false;
+        let request = build_request(&no_reasoning, &context(), &RequestOptions::default())
+            .expect("reasoning disabled");
+        assert!(!request.to_string().contains("OPAQUE"));
+        assert!(request.to_string().contains("public"));
+
+        let mut no_capability = spec.clone();
+        if let ProtocolCompat::Responses(compat) = &mut no_capability.compat {
+            compat.supports_encrypted_reasoning = false;
+        }
+        let request = build_request(&no_capability, &context(), &RequestOptions::default())
+            .expect("capability disabled");
+        assert!(!request.to_string().contains("OPAQUE"));
+        assert!(request.to_string().contains("public"));
+    }
+
+    #[test]
+    fn native_coverage_greater_than_max_seq_falls_back_to_durable_messages() {
+        let spec = spec();
+        let mut context = PromptContext {
+            system_prompt: "system".into(),
+            memory_blocks: vec![],
+            messages: vec![persisted_user(7), persisted_user(8)],
+            provider_context: vec![],
+            tools: vec![],
+        };
+        let native = ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 0,
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({
+                    "id": "cmp",
+                    "type": "compaction",
+                    "encrypted_content": "STALE"
+                })],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 9,
+                    context_fingerprint: context_fingerprint(&spec, &context).unwrap(),
+                },
+            },
+        };
+        context.provider_context.push(native);
+        let request = build_request(
+            &spec,
+            &context,
+            &RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
+        )
+        .expect("coverage too high fallback");
+        assert!(!request.to_string().contains("STALE"));
+        assert!(request.to_string().contains("message-7"));
+        assert!(request.to_string().contains("message-8"));
+    }
+
+    #[test]
+    fn duplicate_output_item_ids_are_rejected_across_variants_transactionally() {
+        let mut state = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+        state
+            .push_json(
+                r#"{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"same","type":"message","role":"assistant","content":[]}}"#,
+            )
+            .unwrap();
+        let before = (
+            state.output_item_ids.len(),
+            state.output_identities.len(),
+            state.next_output_index,
+        );
+        let err = state
+            .push_json(
+                r#"{"type":"response.output_item.added","sequence_number":1,"output_index":1,"item":{"id":"same","type":"reasoning","summary":[]}}"#,
+            )
+            .expect_err("duplicate id across variants");
+        assert!(err.to_string().contains("duplicate output item id"));
+        assert_eq!(
+            (
+                state.output_item_ids.len(),
+                state.output_identities.len(),
+                state.next_output_index
+            ),
+            before
+        );
+        state
+            .push_json(
+                r#"{"type":"response.output_item.added","sequence_number":1,"output_index":1,"item":{"id":"different","type":"reasoning","summary":[]}}"#,
+            )
+            .expect("retry under same sequence number");
+    }
+
+    #[test]
+    fn duplicate_message_output_item_id_is_rejected() {
+        let mut state = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+        state
+            .push_json(
+                r#"{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"m","type":"message","role":"assistant","content":[]}}"#,
+            )
+            .unwrap();
+        assert!(state
+            .push_json(
+                r#"{"type":"response.output_item.added","sequence_number":1,"output_index":1,"item":{"id":"m","type":"message","role":"assistant","content":[]}}"#,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn reasoning_summary_part_shapes_are_transactional_and_retryable() {
+        let mut state = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+        state
+            .push_json(
+                r#"{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"r","type":"reasoning","summary":[]}}"#,
+            )
+            .unwrap();
+
+        let before_added = (
+            state.next_sequence_number,
+            state.next_summary_slot,
+            state.content_bytes,
+            state.event_count,
+        );
+        assert!(state
+            .push_json(
+                r#"{"type":"response.reasoning_summary_part.added","sequence_number":1,"item_id":"r","output_index":0,"summary_index":0}"#,
+            )
+            .is_err());
+        assert_eq!(
+            (
+                state.next_sequence_number,
+                state.next_summary_slot,
+                state.content_bytes,
+                state.event_count,
+            ),
+            before_added
+        );
+        state
+            .push_json(
+                r#"{"type":"response.reasoning_summary_part.added","sequence_number":1,"item_id":"r","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}"#,
+            )
+            .expect("valid retry at the same sequence");
+        state
+            .push_json(
+                r#"{"type":"response.reasoning_summary_text.delta","sequence_number":2,"item_id":"r","output_index":0,"summary_index":0,"delta":"checked"}"#,
+            )
+            .unwrap();
+        state
+            .push_json(
+                r#"{"type":"response.reasoning_summary_text.done","sequence_number":3,"item_id":"r","output_index":0,"summary_index":0,"text":"checked"}"#,
+            )
+            .unwrap();
+
+        let before_done = (
+            state.next_sequence_number,
+            state.content_bytes,
+            state.event_count,
+        );
+        assert!(state
+            .push_json(
+                r#"{"type":"response.reasoning_summary_part.done","sequence_number":4,"item_id":"r","output_index":0,"summary_index":0,"text":"checked"}"#,
+            )
+            .is_err());
+        assert_eq!(
+            (
+                state.next_sequence_number,
+                state.content_bytes,
+                state.event_count,
+            ),
+            before_done
+        );
+        state
+            .push_json(
+                r#"{"type":"response.reasoning_summary_part.done","sequence_number":4,"item_id":"r","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":"checked"}}"#,
+            )
+            .expect("valid done retry at the same sequence");
+    }
+
+    #[test]
+    fn reasoning_item_content_is_validated_before_stream_state_or_context_mutation() {
+        let mut state = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+        assert!(state
+            .push_json(
+                r#"{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"r","type":"reasoning","summary":[],"content":{"type":"reasoning_text","text":"x"}}}"#,
+            )
+            .is_err());
+        assert_eq!(state.next_sequence_number, 0);
+        assert_eq!(state.next_output_index, 0);
+        assert!(state.slots.is_empty());
+        state
+            .push_json(
+                r#"{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"r","type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"x"}]}}"#,
+            )
+            .expect("valid added retry at the same sequence");
+
+        let before_done = (
+            state.next_sequence_number,
+            state.content_bytes,
+            state.event_count,
+            state.completed_items.len(),
+            state.reasoning_fragments.len(),
+        );
+        assert!(state
+            .push_json(
+                r#"{"type":"response.output_item.done","sequence_number":1,"output_index":0,"item":{"id":"r","type":"reasoning","summary":[],"content":[{"type":"future_reasoning","text":"x"}],"encrypted_content":"opaque"}}"#,
+            )
+            .is_err());
+        assert_eq!(
+            (
+                state.next_sequence_number,
+                state.content_bytes,
+                state.event_count,
+                state.completed_items.len(),
+                state.reasoning_fragments.len(),
+            ),
+            before_done
+        );
+        state
+            .push_json(
+                r#"{"type":"response.output_item.done","sequence_number":1,"output_index":0,"item":{"id":"r","type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"x"}],"encrypted_content":"opaque"}}"#,
+            )
+            .expect("valid done retry at the same sequence");
+        assert_eq!(state.completed_items.len(), 1);
+        assert_eq!(state.reasoning_fragments.len(), 1);
+    }
+
+    #[test]
+    fn canonical_official_optional_ids_and_tool_output_shapes() {
+        validate_canonical_item(&json!({
+            "type":"compaction",
+            "encrypted_content":"opaque"
+        }))
+        .expect("compaction id is optional");
+        validate_canonical_item(&json!({
+            "type":"function_call",
+            "call_id":"call",
+            "name":"tool",
+            "arguments":""
+        }))
+        .expect("function_call id is optional and empty arguments are valid");
+        validate_canonical_item(&json!({
+            "type":"function_call_output",
+            "call_id":"call",
+            "output":[{"type":"input_file"}]
+        }))
+        .expect("input_file fields are optional in the official shape");
+        validate_canonical_item(&json!({
+            "type":"function_call_output",
+            "call_id":"call",
+            "output":[{
+                "type":"input_file",
+                "detail":"high",
+                "file_id":null,
+                "file_url":"https://example.test/file.pdf",
+                "prompt_cache_breakpoint":{"mode":"explicit"}
+            }]
+        }))
+        .expect("all documented input_file fields and nullable file_id are valid");
+        validate_canonical_item(&json!({
+            "type":"compaction",
+            "id":null,
+            "encrypted_content":"opaque"
+        }))
+        .expect("compaction Optional id accepts null");
+
+        for item in [
+            json!({"type":"compaction","id":7,"encrypted_content":"opaque"}),
+            json!({"type":"function_call","id":null,"call_id":"call","name":"tool","arguments":""}),
+            json!({"type":"function_call","id":7,"call_id":"call","name":"tool","arguments":""}),
+        ] {
+            assert!(validate_canonical_item(&item).is_err(), "{item}");
+        }
+
+        validate_canonical_item(&json!({
+            "type":"function_call_output",
+            "call_id":"call",
+            "output":[{"type":"input_file","file_id":"file-123"}]
+        }))
+        .expect("input_file with file_id is valid");
+        validate_canonical_item(&json!({
+            "type":"function_call_output",
+            "call_id":"call",
+            "output":[{"type":"input_file","file_data":"ZGF0YQ==","filename":"a.txt"}]
+        }))
+        .expect("input_file with file_data is valid");
+        for item in [
+            json!({"type":"function_call_output","call_id":"","output":"x"}),
+            json!({"type":"function_call_output","call_id":"call","output":[{"type":"input_file","file_id":7}]}),
+            json!({"type":"function_call_output","call_id":"call","output":[{"type":"input_file","file_id":"file-123","unexpected":"x"}]}),
+            json!({"type":"function_call_output","call_id":"call","output":[{"type":"input_file","detail":null}]}),
+            json!({"type":"function_call_output","call_id":"call","output":[{"type":"input_file","detail":"original"}]}),
+            json!({"type":"function_call_output","call_id":"call","output":[{"type":"input_file","prompt_cache_breakpoint":{"mode":"future"}}]}),
+        ] {
+            assert!(validate_canonical_item(&item).is_err(), "{item}");
+        }
+
+        for item in [
+            json!({"type":"function_call","id":"fc","call_id":"","name":"tool","arguments":""}),
+            json!({"type":"function_call","id":"fc","call_id":"call","name":"","arguments":""}),
+            json!({"type":"function_call","id":"fc","call_id":"call","name":"tool","arguments":null}),
+        ] {
+            assert!(validate_canonical_item(&item).is_err(), "{item}");
+        }
+    }
+
+    #[test]
+    fn canonical_variants_reject_unknown_fields_recursively() {
+        for item in [
+            json!({"id":"r","type":"reasoning","summary":[],"future":true}),
+            json!({"id":"r","type":"reasoning","summary":[{"type":"summary_text","text":"x","future":true}]}),
+            json!({"id":"r","type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"x","future":true}]}),
+            json!({"type":"function_call","call_id":"c","name":"f","arguments":"{}","future":true}),
+            json!({"type":"function_call_output","call_id":"c","output":"x","future":true}),
+            json!({"type":"compaction","encrypted_content":"x","future":true}),
+        ] {
+            assert!(validate_canonical_item(&item).is_err(), "{item}");
+        }
+    }
+
+    #[test]
+    fn streamed_function_call_without_optional_item_id_uses_output_index_identity() {
+        let mut state = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+        for event in [
+            r#"{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"type":"function_call","call_id":"call","name":"weather","arguments":""}}"#,
+            r#"{"type":"response.function_call_arguments.delta","sequence_number":1,"item_id":"provider-local","output_index":0,"delta":"{\"city\":\"Tokyo\"}"}"#,
+            r#"{"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":{"type":"function_call","call_id":"call","name":"weather","arguments":"{\"city\":\"Tokyo\"}"}}"#,
+            r#"{"type":"response.completed","sequence_number":3,"response":{"id":"resp","model":"gpt-5.6","status":"completed","output":[{"type":"function_call","call_id":"call","name":"weather","arguments":"{\"city\":\"Tokyo\"}"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}"#,
+        ] {
+            state.push_json(event).expect("valid id-less function call");
+        }
+    }
+
+    #[test]
+    fn queued_response_establishes_model_only_when_supplied_later() {
+        let mut state = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+        state
+            .push_json(
+                r#"{"type":"response.queued","sequence_number":0,"response":{"id":"resp","status":"queued","created_at":1,"updated_at":1}}"#,
+            )
+            .expect("official queued response omits model");
+        assert_eq!(state.response_id.as_deref(), Some("resp"));
+        assert!(state.response_model.is_none());
+        state
+            .push_json(
+                r#"{"type":"response.in_progress","sequence_number":1,"response":{"id":"resp","model":"gpt-5.6","status":"in_progress","created_at":1}}"#,
+            )
+            .expect("later response event establishes model");
+        assert_eq!(state.response_model.as_deref(), Some("gpt-5.6"));
+        assert!(state
+            .push_json(
+                r#"{"type":"response.in_progress","sequence_number":2,"response":{"id":"resp","model":"other","status":"in_progress","created_at":1}}"#,
+            )
+            .is_err());
+        assert_eq!(state.response_model.as_deref(), Some("gpt-5.6"));
+        assert_eq!(state.next_sequence_number, 2);
+    }
+
+    #[test]
+    fn canonical_compaction_preserves_official_created_by_shape() {
+        let item = json!({
+            "type":"compaction",
+            "id":"cmp_123",
+            "encrypted_content":"opaque",
+            "created_by":"system"
+        });
+        validate_canonical_item(&item).expect("optional non-null created_by is accepted");
+        let result = parse_compact_response(
+            json!({"object":"response.compaction","output":[item]}),
+            NativeCompactionCoverage {
+                through_message_seq: 1,
+                context_fingerprint: "fingerprint".into(),
+            },
+        )
+        .expect("official compaction response");
+        assert_eq!(result.items[0]["created_by"], "system");
+        for invalid in [
+            json!({"type":"compaction","encrypted_content":"opaque","created_by":null}),
+            json!({"type":"compaction","encrypted_content":"opaque","created_by":7}),
+        ] {
+            assert!(validate_canonical_item(&invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn canonical_message_content_accepts_official_image_annotations_and_logprobs() {
+        validate_canonical_item(&json!({
+            "id":"msg",
+            "type":"message",
+            "role":"assistant",
+            "status":"completed",
+            "content":[
+                {
+                    "type":"input_image",
+                    "detail":"original",
+                    "file_id":"file_123",
+                    "image_url":null,
+                    "prompt_cache_breakpoint":{"mode":"explicit"}
+                },
+                {
+                    "type":"output_text",
+                    "text":"answer",
+                    "annotations":[
+                        {"type":"file_citation","file_id":"file_123","index":0,"filename":"a.txt"},
+                        {"type":"url_citation","url":"https://example.test","start_index":0,"end_index":6,"title":"source"},
+                        {"type":"container_file_citation","container_id":"ctr","file_id":"file_456","start_index":0,"end_index":6,"filename":"b.txt"},
+                        {"type":"file_path","file_id":"file_789","index":1}
+                    ],
+                    "logprobs":[{
+                        "token":"answer",
+                        "logprob":-0.1,
+                        "bytes":[97],
+                        "top_logprobs":[{"token":"answer","logprob":-0.1,"bytes":[97]}]
+                    }]
+                }
+            ]
+        }))
+        .expect("documented nested content variants are accepted");
+
+        validate_canonical_item(&json!({
+            "type":"function_call_output",
+            "call_id":"call",
+            "output":[{"type":"input_image","detail":"auto","file_id":"file_123"}]
+        }))
+        .expect("file-backed input_image does not require image_url");
+        for image in [
+            json!({"type":"input_image","detail":"auto"}),
+            json!({"type":"input_image","detail":"high","file_id":"file_123","image_url":"https://example.test/image.png"}),
+        ] {
+            validate_canonical_item(&json!({
+                "type":"function_call_output",
+                "call_id":"call",
+                "output":[image]
+            }))
+            .expect("official schema does not impose an exactly-one source constraint");
+        }
+
+        for invalid in [
+            json!({"type":"message","role":"user","content":[{"type":"input_image","file_id":"file_123"}]}),
+            json!({"type":"message","role":"user","content":[{"type":"input_image","detail":"auto","file_id":"file_123","future":true}]}),
+            json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"x","annotations":[],"logprobs":[],"future":true}]}),
+            json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"x","annotations":[{"type":"file_path","file_id":"f","index":0,"future":true}],"logprobs":[]}]}),
+            json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"x","annotations":[],"logprobs":[{"token":"x","logprob":0,"bytes":[],"top_logprobs":[],"future":true}]}]}),
+        ] {
+            assert!(validate_canonical_item(&invalid).is_err(), "{invalid}");
+        }
     }
 }

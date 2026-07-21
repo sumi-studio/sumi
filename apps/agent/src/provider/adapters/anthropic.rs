@@ -27,6 +27,8 @@ pub enum AnthropicAdapterError {
     UnsupportedProtocol,
     #[error("max_tokens must be within 1..={max}, got {requested}")]
     InvalidMaxTokens { requested: u64, max: u64 },
+    #[error("temperature must be finite, got {0}")]
+    InvalidTemperature(f64),
     #[error("invalid Anthropic request context: {0}")]
     InvalidContext(String),
     #[error("invalid Anthropic stream event: {0}")]
@@ -43,6 +45,8 @@ pub enum AnthropicAdapterError {
     },
     #[error("Anthropic stream ended before message_stop")]
     MissingTerminal,
+    #[error("native compaction failed: {code}")]
+    NativeCompactionFailed { code: String },
 }
 
 #[derive(Debug)]
@@ -82,6 +86,11 @@ pub fn build_request(
     options: &RequestOptions,
 ) -> Result<Value, AnthropicAdapterError> {
     let compat = ensure_anthropic_spec(spec)?;
+    if let Some(temperature) = options.temperature
+        && !temperature.is_finite()
+    {
+        return Err(AnthropicAdapterError::InvalidTemperature(temperature));
+    }
     let mut request = Map::new();
     request.insert("model".into(), json!(spec.id));
     request.insert(
@@ -105,14 +114,21 @@ pub fn build_request(
         ));
     }
     request.insert("max_tokens".into(), json!(max_tokens));
-    let messages = convert_messages(spec, context)?;
+    let messages = convert_messages(spec, context, options.native_compaction)?;
     if messages.is_empty() {
         return Err(AnthropicAdapterError::InvalidContext(
             "Anthropic request requires at least one conversation turn".into(),
         ));
     }
     request.insert("messages".into(), Value::Array(messages));
-    if compat.supports_native_compact {
+    let has_request_coverage = match request_coverage(spec, context, options.native_compaction) {
+        Ok(coverage) => coverage.is_some(),
+        Err(error) => {
+            tracing::warn!(reason = %error, "omitted unanchored Anthropic native compaction request");
+            false
+        }
+    };
+    if has_request_coverage {
         request.insert(
             "context_management".into(),
             json!({"edits":[{"type":"compact_20260112"}]}),
@@ -156,11 +172,14 @@ fn ensure_anthropic_spec(spec: &ModelSpec) -> Result<&AnthropicCompat, Anthropic
 }
 
 fn normalize_tool_choice(choice: &Value, thinking: bool) -> Result<Value, AnthropicAdapterError> {
-    let kind = match choice {
-        Value::String(value) => value.as_str(),
-        Value::Object(object) => object.get("type").and_then(Value::as_str).ok_or_else(|| {
-            AnthropicAdapterError::InvalidContext("tool_choice.type must be a string".into())
-        })?,
+    let (kind, object) = match choice {
+        Value::String(value) => (value.as_str(), None),
+        Value::Object(object) => (
+            object.get("type").and_then(Value::as_str).ok_or_else(|| {
+                AnthropicAdapterError::InvalidContext("tool_choice.type must be a string".into())
+            })?,
+            Some(object),
+        ),
         _ => {
             return Err(AnthropicAdapterError::InvalidContext(
                 "tool_choice must be a string or object".into(),
@@ -175,6 +194,40 @@ fn normalize_tool_choice(choice: &Value, thinking: bool) -> Result<Value, Anthro
     if thinking && !matches!(kind, "auto" | "none") {
         return Err(AnthropicAdapterError::InvalidContext(
             "thinking-enabled Anthropic requests only allow tool_choice auto or none".into(),
+        ));
+    }
+    if let Some(object) = object {
+        let allowed = match kind {
+            "auto" | "any" => &["type", "disable_parallel_tool_use"][..],
+            "tool" => &["type", "name", "disable_parallel_tool_use"][..],
+            "none" => &["type"][..],
+            _ => unreachable!("kind validated above"),
+        };
+        if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+            return Err(AnthropicAdapterError::InvalidContext(
+                "tool_choice contains fields outside its official shape".into(),
+            ));
+        }
+        if let Some(value) = object.get("disable_parallel_tool_use")
+            && !value.is_boolean()
+        {
+            return Err(AnthropicAdapterError::InvalidContext(
+                "tool_choice.disable_parallel_tool_use must be a boolean".into(),
+            ));
+        }
+        if kind == "tool"
+            && object
+                .get("name")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+        {
+            return Err(AnthropicAdapterError::InvalidContext(
+                "tool_choice type=tool requires a non-empty name".into(),
+            ));
+        }
+    } else if kind == "tool" {
+        return Err(AnthropicAdapterError::InvalidContext(
+            "tool_choice type=tool requires an object with a non-empty name".into(),
         ));
     }
     Ok(match choice {
@@ -201,7 +254,9 @@ fn convert_tool(tool: &ToolDefinition, compat: &AnthropicCompat) -> Value {
 fn convert_messages(
     spec: &ModelSpec,
     context: &PromptContext,
+    native_compaction: bool,
 ) -> Result<Vec<Value>, AnthropicAdapterError> {
+    let compat = ensure_anthropic_spec(spec)?;
     let mut messages = Vec::<Value>::new();
     for memory in &context.memory_blocks {
         let layer = match memory.layer {
@@ -218,20 +273,29 @@ fn convert_messages(
         );
     }
 
-    let native = context
-        .provider_context
-        .iter()
-        .filter_map(|item| match &item.payload {
-            ProviderContextPayload::AnthropicCompaction { block, coverage } => {
-                Some((item, block, coverage))
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if native.len() > 1 {
-        return Err(AnthropicAdapterError::InvalidContext(
-            "multiple Anthropic native compaction blocks".into(),
-        ));
+    let has_foreign_native = context.provider_context.iter().any(|item| {
+        matches!(
+            item.payload,
+            ProviderContextPayload::OpenAiCompactedWindow { .. }
+        )
+    });
+    let mut native = if native_compaction && compat.supports_native_compact && !has_foreign_native {
+        context
+            .provider_context
+            .iter()
+            .filter_map(|item| match &item.payload {
+                ProviderContextPayload::AnthropicCompaction { block, coverage } => {
+                    Some((item, block, coverage))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if let Err(error) = validate_native_replay(spec, context, &native) {
+        tracing::warn!(reason = %error, "discarded stale Anthropic native context");
+        native.clear();
     }
     let (coverage_seq, mut native_block) = if let Some((_, block, coverage)) = native.first() {
         if !context.memory_blocks.is_empty() {
@@ -267,11 +331,9 @@ fn convert_messages(
                     .or_default()
                     .push(item);
             }
-            ProviderContextPayload::OpenAiCompactedWindow { .. } => {
-                return Err(AnthropicAdapterError::InvalidContext(
-                    "foreign provider context cannot be sent to Anthropic".into(),
-                ));
-            }
+            // A native window from another protocol is stale provider state;
+            // omit it and rebuild from durable public context.
+            ProviderContextPayload::OpenAiCompactedWindow { .. } => {}
             ProviderContextPayload::AnthropicCompaction { .. } => {}
         }
     }
@@ -530,6 +592,98 @@ fn convert_messages(
     Ok(messages)
 }
 
+fn validate_native_replay(
+    spec: &ModelSpec,
+    context: &PromptContext,
+    native: &[(&ProviderContextItem, &Value, &NativeCompactionCoverage)],
+) -> Result<(), AnthropicAdapterError> {
+    let Some((item, block, coverage)) = native.first().copied() else {
+        return Ok(());
+    };
+    if native.len() != 1 {
+        return Err(AnthropicAdapterError::InvalidContext(
+            "multiple Anthropic native compaction blocks".into(),
+        ));
+    }
+    if item.origin_message.is_some() || item.wire_item_index.is_some() {
+        return Err(AnthropicAdapterError::InvalidContext(
+            "Anthropic native compaction has reasoning placement metadata".into(),
+        ));
+    }
+    if coverage.through_message_seq == 0 {
+        return Err(AnthropicAdapterError::InvalidContext(
+            "Anthropic native coverage must be greater than zero".into(),
+        ));
+    }
+    if !context.memory_blocks.is_empty() {
+        return Err(AnthropicAdapterError::InvalidContext(
+            "native compaction cannot coexist with memory blocks".into(),
+        ));
+    }
+    validate_compaction_block(block)?;
+    if coverage.context_fingerprint != context_fingerprint(spec, context)? {
+        return Err(AnthropicAdapterError::InvalidContext(
+            "native compaction context fingerprint mismatch".into(),
+        ));
+    }
+    validate_native_suffix(&context.messages, coverage.through_message_seq)
+}
+
+fn validate_native_suffix(
+    messages: &[ContextMessage],
+    coverage: u64,
+) -> Result<(), AnthropicAdapterError> {
+    let mut persisted_started = false;
+    let mut previous = None;
+    let mut suffix_started = false;
+    for message in messages {
+        let ContextMessage::Persisted { seq, .. } = message else {
+            if persisted_started {
+                return Err(AnthropicAdapterError::InvalidContext(
+                    "native compaction suffix contains synthetic content after persisted history"
+                        .into(),
+                ));
+            }
+            continue;
+        };
+        persisted_started = true;
+        if *seq == 0 || previous.is_some_and(|value: u64| value.checked_add(1) != Some(*seq)) {
+            return Err(AnthropicAdapterError::InvalidContext(
+                "persisted native replay sequence is gapped, duplicated, or reordered".into(),
+            ));
+        }
+        if *seq > coverage {
+            if !suffix_started
+                && *seq
+                    != coverage.checked_add(1).ok_or_else(|| {
+                        AnthropicAdapterError::InvalidContext("native coverage overflow".into())
+                    })?
+            {
+                return Err(AnthropicAdapterError::InvalidContext(
+                    "native suffix must begin exactly at coverage + 1".into(),
+                ));
+            }
+            suffix_started = true;
+        } else if suffix_started {
+            return Err(AnthropicAdapterError::InvalidContext(
+                "covered history appears after the native suffix".into(),
+            ));
+        }
+        previous = Some(*seq);
+    }
+    let max_seq = previous.ok_or_else(|| {
+        AnthropicAdapterError::InvalidContext(
+            "native compaction requires persisted replay history".into(),
+        )
+    })?;
+    if coverage > max_seq {
+        return Err(AnthropicAdapterError::InvalidContext(
+            "native compaction coverage exceeds the latest persisted message sequence".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn anthropic_user_content(content: &UserContent, supports_images: bool) -> Value {
     match content {
         UserContent::Text { text } => json!({"type":"text","text":text}),
@@ -590,27 +744,41 @@ fn validate_reasoning_item(value: &Value) -> Result<(), AnthropicAdapterError> {
     let object = value.as_object().ok_or_else(|| {
         AnthropicAdapterError::InvalidContext("reasoning payload must be an object".into())
     })?;
-    match object.get("type").and_then(Value::as_str) {
-        Some("thinking_signature")
-            if object
-                .get("signature")
-                .and_then(Value::as_str)
-                .is_some_and(|value| !value.is_empty()) =>
-        {
-            Ok(())
+    let (allowed, field) = match object.get("type").and_then(Value::as_str) {
+        Some("thinking_signature") => (&["type", "signature"][..], "signature"),
+        Some("redacted_thinking") => (&["type", "data"][..], "data"),
+        _ => {
+            return Err(AnthropicAdapterError::InvalidContext(
+                "invalid Anthropic reasoning payload type".into(),
+            ));
         }
-        Some("redacted_thinking")
-            if object
-                .get("data")
-                .and_then(Value::as_str)
-                .is_some_and(|value| !value.is_empty()) =>
-        {
-            Ok(())
-        }
-        _ => Err(AnthropicAdapterError::InvalidContext(
-            "invalid Anthropic reasoning payload".into(),
-        )),
+    };
+    ensure_only_fields(object, allowed, "Anthropic reasoning payload")
+        .map_err(AnthropicAdapterError::InvalidContext)?;
+    if object
+        .get(field)
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return Err(AnthropicAdapterError::InvalidContext(format!(
+            "Anthropic reasoning payload {field} must be a non-empty string"
+        )));
     }
+    Ok(())
+}
+
+fn ensure_only_fields(
+    object: &Map<String, Value>,
+    allowed: &[&str],
+    label: &str,
+) -> Result<(), String> {
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err(format!("{label} contains unsupported property {field}"));
+    }
+    Ok(())
 }
 
 fn validate_compaction_block(value: &Value) -> Result<(), AnthropicAdapterError> {
@@ -941,26 +1109,41 @@ impl AnthropicReceiveState {
                 )
             }
             "thinking" => {
+                ensure_only_fields(block, &["type", "thinking", "signature"], "thinking block")
+                    .map_err(AnthropicAdapterError::InvalidEvent)?;
                 if !string_field(block, "thinking")?.is_empty() {
                     return Err(AnthropicAdapterError::InvalidEvent(
                         "thinking block must start empty".into(),
                     ));
                 }
+                let signature = match block.get("signature") {
+                    None => None,
+                    Some(Value::String(signature)) if signature.is_empty() => None,
+                    Some(Value::String(signature)) => Some(signature.to_owned()),
+                    Some(_) => {
+                        return Err(AnthropicAdapterError::InvalidEvent(
+                            "thinking block signature must be a string when present".into(),
+                        ));
+                    }
+                };
+                let content_charge = signature.as_ref().map_or(0, String::len);
                 (
                     OpenBlock::Thinking {
                         index,
                         content: String::new(),
-                        signature: None,
+                        signature,
                     },
                     vec![ProviderEvent::ThinkingStart {
                         content_index: index as usize,
                         signature_field: "signature".into(),
                     }],
                     false,
-                    0,
+                    content_charge,
                 )
             }
             "redacted_thinking" => {
+                ensure_only_fields(block, &["type", "data"], "redacted_thinking block")
+                    .map_err(AnthropicAdapterError::InvalidEvent)?;
                 let data = required_str(block, "data")?.to_owned();
                 let content_charge = data.len();
                 (
@@ -1027,10 +1210,29 @@ impl AnthropicReceiveState {
                         "compaction block arrived without request coverage".into(),
                     ));
                 }
-                if !string_field(block, "content")?.is_empty() {
+                if self.next_index != 0 {
                     return Err(AnthropicAdapterError::InvalidEvent(
-                        "streamed compaction block must start with empty content".into(),
+                        "streamed compaction block must be index 0 and before all other blocks"
+                            .into(),
                     ));
+                }
+                match block.get("content") {
+                    Some(Value::Null) => {
+                        return Err(AnthropicAdapterError::NativeCompactionFailed {
+                            code: "compaction_content_null".into(),
+                        });
+                    }
+                    Some(value) if value.as_str().is_some_and(|text| text.is_empty()) => {}
+                    Some(_) => {
+                        return Err(AnthropicAdapterError::InvalidEvent(
+                            "streamed compaction block must start with empty content".into(),
+                        ));
+                    }
+                    None => {
+                        return Err(AnthropicAdapterError::InvalidEvent(
+                            "streamed compaction block is missing content".into(),
+                        ));
+                    }
                 }
                 (
                     OpenBlock::Compaction {
@@ -1073,6 +1275,30 @@ impl AnthropicReceiveState {
             .and_then(Value::as_object)
             .ok_or_else(|| AnthropicAdapterError::InvalidEvent("delta must be an object".into()))?;
         let kind = required_str(delta, "type")?;
+        match kind {
+            "thinking_delta" => {
+                ensure_only_fields(
+                    delta,
+                    &["type", "thinking", "estimated_tokens"],
+                    "thinking_delta",
+                )
+                .map_err(AnthropicAdapterError::InvalidEvent)?;
+                if let Some(estimated) = delta.get("estimated_tokens")
+                    && !estimated.is_null()
+                    && estimated.as_u64().is_none()
+                {
+                    return Err(AnthropicAdapterError::InvalidEvent(
+                        "thinking_delta estimated_tokens must be null or a non-negative integer"
+                            .into(),
+                    ));
+                }
+            }
+            "signature_delta" => {
+                ensure_only_fields(delta, &["type", "signature"], "signature_delta")
+                    .map_err(AnthropicAdapterError::InvalidEvent)?;
+            }
+            _ => {}
+        }
         let (value, preview_charge, event_count) = match (&self.open, kind) {
             (Some(OpenBlock::Text { index: open, .. }), "text_delta") if *open == index => {
                 (string_field(delta, "text")?.to_owned(), 0, 1)
@@ -1085,14 +1311,27 @@ impl AnthropicReceiveState {
                 }),
                 "thinking_delta",
             ) if *open == index => (string_field(delta, "thinking")?.to_owned(), 0, 1),
-            (
-                Some(OpenBlock::Thinking {
-                    index: open,
-                    signature: None,
+            (Some(OpenBlock::Thinking { index: open, .. }), "signature_delta")
+                if *open == index =>
+            {
+                let signature = required_str(delta, "signature")?;
+                if signature.is_empty() {
+                    return Err(AnthropicAdapterError::InvalidEvent(
+                        "signature_delta signature must be non-empty".into(),
+                    ));
+                }
+                if let Some(OpenBlock::Thinking {
+                    signature: Some(existing),
                     ..
-                }),
-                "signature_delta",
-            ) if *open == index => (required_str(delta, "signature")?.to_owned(), 0, 0),
+                }) = &self.open
+                    && existing != signature
+                {
+                    return Err(AnthropicAdapterError::InvalidEvent(
+                        "thinking signature changed during content block".into(),
+                    ));
+                }
+                (signature.to_owned(), 0, 0)
+            }
             (Some(OpenBlock::Compaction { index: open, block }), "compaction_delta")
                 if *open == index =>
             {
@@ -1143,7 +1382,9 @@ impl AnthropicReceiveState {
                 }]
             }
             (Some(OpenBlock::Thinking { signature, .. }), "signature_delta") => {
-                *signature = Some(value);
+                if signature.is_none() {
+                    *signature = Some(value);
+                }
                 Vec::new()
             }
             (Some(OpenBlock::Compaction { block, .. }), "compaction_delta") => {
@@ -1189,7 +1430,7 @@ impl AnthropicReceiveState {
                 signature,
                 ..
             }) if *open == index => {
-                if signature.is_none() {
+                if signature.as_deref().is_none_or(str::is_empty) {
                     return Err(AnthropicAdapterError::InvalidEvent(
                         "thinking block ended without a signature".into(),
                     ));
@@ -1285,7 +1526,7 @@ impl AnthropicReceiveState {
             OpenBlock::Compaction { index: open, block } if open == index => {
                 let coverage = self.coverage.clone().expect("validated at block start");
                 self.provider_context.push(ProviderContextFragment {
-                    wire_item_index: Some(index),
+                    wire_item_index: None,
                     payload: ProviderContextPayload::AnthropicCompaction { block, coverage },
                 });
             }
@@ -1305,57 +1546,74 @@ impl AnthropicReceiveState {
         if !matches!(self.phase, Phase::Blocks | Phase::MessageDeltas) || self.open.is_some() {
             return Err(order_error("message_delta"));
         }
-        let delta = object
-            .get("delta")
-            .and_then(Value::as_object)
-            .ok_or_else(|| AnthropicAdapterError::InvalidEvent("delta must be an object".into()))?;
-        let (reason_wire, reason) = match delta.get("stop_reason") {
-            None | Some(Value::Null) => (None, None),
-            Some(Value::String(reason)) if !reason.is_empty() => (
-                Some(reason.as_str()),
-                Some(match reason.as_str() {
-                    "end_turn" | "stop_sequence" | "pause_turn" | "compaction" => StopReason::Stop,
-                    "max_tokens" => StopReason::Length,
-                    "tool_use" if self.saw_tool => StopReason::ToolUse,
-                    "tool_use" => {
-                        return Err(AnthropicAdapterError::InvalidEvent(
-                            "tool_use stop reason without tool block".into(),
-                        ));
-                    }
-                    "refusal" | "sensitive" => StopReason::Error,
-                    other => {
-                        return Err(AnthropicAdapterError::InvalidEvent(format!(
-                            "unsupported stop reason {other}"
-                        )));
-                    }
-                }),
-            ),
-            _ => {
-                return Err(AnthropicAdapterError::InvalidEvent(
-                    "stop_reason must be a non-empty string or null".into(),
-                ));
-            }
-        };
-        if let (Some(previous), Some(next)) = (self.reason_wire.as_deref(), reason_wire)
-            && previous != next
-        {
-            return Err(AnthropicAdapterError::InvalidEvent(
-                "stop reason changed across message_delta events".into(),
-            ));
-        }
+        // Usage is accounting sideband rather than executable response state.
+        // Parse it before stop validation and keep it if later validation or
+        // budget charging fails.
         let usage = object
             .get("usage")
             .map(|usage| merge_usage(&self.usage, usage))
             .transpose()?
             .unwrap_or_else(|| self.usage.clone());
-        self.charge(0, 1, 0)?;
-        self.reason = self.reason.or(reason);
-        if self.reason_wire.is_none() {
-            self.reason_wire = reason_wire.map(str::to_owned);
+        let result = (|| -> Result<AnthropicPush, AnthropicAdapterError> {
+            let delta = object
+                .get("delta")
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    AnthropicAdapterError::InvalidEvent("delta must be an object".into())
+                })?;
+            let (reason_wire, reason) = match delta.get("stop_reason") {
+                None | Some(Value::Null) => (None, None),
+                Some(Value::String(reason)) if !reason.is_empty() => (
+                    Some(reason.as_str()),
+                    Some(match reason.as_str() {
+                        "end_turn" | "stop_sequence" | "compaction" => StopReason::Stop,
+                        "pause_turn" => {
+                            return Err(AnthropicAdapterError::InvalidEvent(
+                                "unsupported stop reason pause_turn: server-tool continuation is outside Sumi scope".into(),
+                            ));
+                        }
+                        "max_tokens" => StopReason::Length,
+                        "model_context_window_exceeded" => StopReason::Error,
+                        "tool_use" if self.saw_tool => StopReason::ToolUse,
+                        "tool_use" => {
+                            return Err(AnthropicAdapterError::InvalidEvent(
+                                "tool_use stop reason without tool block".into(),
+                            ));
+                        }
+                        "refusal" | "sensitive" => StopReason::Error,
+                        other => {
+                            return Err(AnthropicAdapterError::InvalidEvent(format!(
+                                "unsupported stop reason {other}"
+                            )));
+                        }
+                    }),
+                ),
+                _ => {
+                    return Err(AnthropicAdapterError::InvalidEvent(
+                        "stop_reason must be a non-empty string or null".into(),
+                    ));
+                }
+            };
+            if let (Some(previous), Some(next)) = (self.reason_wire.as_deref(), reason_wire)
+                && previous != next
+            {
+                return Err(AnthropicAdapterError::InvalidEvent(
+                    "stop reason changed across message_delta events".into(),
+                ));
+            }
+            self.charge(0, 1, 0)?;
+            self.reason = self.reason.or(reason);
+            if self.reason_wire.is_none() {
+                self.reason_wire = reason_wire.map(str::to_owned);
+            }
+            self.usage = usage.clone();
+            self.phase = Phase::MessageDeltas;
+            Ok(AnthropicPush::default())
+        })();
+        if result.is_err() {
+            self.usage = usage;
         }
-        self.usage = usage;
-        self.phase = Phase::MessageDeltas;
-        Ok(AnthropicPush::default())
+        result
     }
 
     fn message_stop(&mut self) -> Result<AnthropicPush, AnthropicAdapterError> {
@@ -1365,6 +1623,41 @@ impl AnthropicReceiveState {
         let reason = self
             .reason
             .ok_or_else(|| AnthropicAdapterError::InvalidEvent("missing stop reason".into()))?;
+        if self.reason_wire.as_deref() == Some("compaction") {
+            let fragments = self
+                .provider_context
+                .iter()
+                .filter(|fragment| {
+                    matches!(
+                        fragment.payload,
+                        ProviderContextPayload::AnthropicCompaction { .. }
+                    )
+                })
+                .collect::<Vec<_>>();
+            let coverage = self.coverage.as_ref().ok_or_else(|| {
+                AnthropicAdapterError::InvalidEvent(
+                    "compaction stop reason arrived without request coverage".into(),
+                )
+            })?;
+            let [fragment] = fragments.as_slice() else {
+                return Err(AnthropicAdapterError::InvalidEvent(
+                    "compaction stop reason requires exactly one native compaction fragment".into(),
+                ));
+            };
+            let ProviderContextPayload::AnthropicCompaction {
+                block,
+                coverage: fragment_coverage,
+            } = &fragment.payload
+            else {
+                unreachable!("filtered native compaction fragment")
+            };
+            validate_compaction_block(block)?;
+            if fragment.wire_item_index.is_some() || fragment_coverage != coverage {
+                return Err(AnthropicAdapterError::InvalidEvent(
+                    "native compaction fragment does not preserve request coverage".into(),
+                ));
+            }
+        }
         self.charge(0, self.closed_tools.len(), 0)?;
         self.phase = Phase::Terminal;
         let mut events = Vec::with_capacity(self.closed_tools.len());
@@ -1392,15 +1685,23 @@ impl AnthropicReceiveState {
             });
         }
         let provider_context = std::mem::take(&mut self.provider_context);
+        let provider_code = self
+            .reason_wire
+            .as_ref()
+            .and_then(|code| (reason == StopReason::Error).then(|| code.clone()));
+        let error_message = match provider_code.as_deref() {
+            Some("refusal") => Some("Anthropic refused the response".into()),
+            Some("sensitive") => Some("Anthropic marked the response as sensitive".into()),
+            _ => None,
+        };
         Ok(AnthropicPush {
             events: Vec::new(),
             terminal: Some(AnthropicTerminal {
                 events,
                 reason,
                 usage: self.usage.clone(),
-                error_message: (reason == StopReason::Error)
-                    .then(|| "Anthropic refused the response".into()),
-                provider_code: (reason == StopReason::Error).then(|| "refusal".into()),
+                error_message,
+                provider_code,
                 provider_context,
             }),
         })
@@ -1420,13 +1721,14 @@ impl AnthropicReceiveState {
             .and_then(Value::as_str)
             .unwrap_or("provider_error")
             .to_owned();
+        let reason = StopReason::Error;
+        let events = self.fail();
         self.phase = Phase::Terminal;
-        self.open = None;
         Ok(AnthropicPush {
             events: Vec::new(),
             terminal: Some(AnthropicTerminal {
-                events: Vec::new(),
-                reason: StopReason::Error,
+                events,
+                reason,
                 usage: self.usage.clone(),
                 error_message: Some(message),
                 provider_code: Some(code),
@@ -1497,12 +1799,17 @@ fn merge_usage(current: &Usage, value: &Value) -> Result<Usage, AnthropicAdapter
     let cache_read = optional_u64(object, "cache_read_input_tokens")?.unwrap_or(current.cache_read);
     let cache_write =
         optional_u64(object, "cache_creation_input_tokens")?.unwrap_or(current.cache_write);
-    let reasoning = object
-        .get("output_tokens_details")
-        .and_then(Value::as_object)
-        .and_then(|details| details.get("thinking_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(current.reasoning);
+    let reasoning = match object.get("output_tokens_details") {
+        None => current.reasoning,
+        Some(value) => {
+            let details = value.as_object().ok_or_else(|| {
+                AnthropicAdapterError::InvalidEvent(
+                    "output_tokens_details must be an object".into(),
+                )
+            })?;
+            optional_u64(details, "thinking_tokens")?.unwrap_or(current.reasoning)
+        }
+    };
     for (field, previous, next) in [
         ("input_tokens", current.input, input),
         ("output_tokens", current.output, output),
@@ -1520,16 +1827,25 @@ fn merge_usage(current: &Usage, value: &Value) -> Result<Usage, AnthropicAdapter
             )));
         }
     }
+    if reasoning > output {
+        return Err(AnthropicAdapterError::InvalidEvent(
+            "thinking_tokens exceeds output_tokens".into(),
+        ));
+    }
+    let total_tokens = input
+        .checked_add(cache_read)
+        .and_then(|total| total.checked_add(cache_write))
+        .and_then(|total| total.checked_add(output))
+        .ok_or_else(|| {
+            AnthropicAdapterError::InvalidEvent("usage token total exceeds u64".into())
+        })?;
     Ok(Usage {
         input,
         output,
         cache_read,
         cache_write,
         reasoning,
-        total_tokens: input
-            .saturating_add(cache_read)
-            .saturating_add(cache_write)
-            .saturating_add(output),
+        total_tokens,
     })
 }
 
@@ -1583,8 +1899,9 @@ fn order_error(event: &str) -> AnthropicAdapterError {
 pub fn request_coverage(
     spec: &ModelSpec,
     context: &PromptContext,
+    native_compaction: bool,
 ) -> Result<Option<NativeCompactionCoverage>, AnthropicAdapterError> {
-    if !ensure_anthropic_spec(spec)?.supports_native_compact {
+    if !ensure_anthropic_spec(spec)?.supports_native_compact || !native_compaction {
         return Ok(None);
     }
     let mut previous: Option<u64> = None;
@@ -1733,6 +2050,162 @@ mod tests {
     }
 
     #[test]
+    fn native_compaction_is_opt_in_and_default_requests_omit_native_context() {
+        let spec = spec();
+        let mut context = context(vec![persisted(1)]);
+        let coverage = NativeCompactionCoverage {
+            through_message_seq: 1,
+            context_fingerprint: context_fingerprint(&spec, &context).expect("fingerprint"),
+        };
+        context.provider_context.push(ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 0,
+            payload: ProviderContextPayload::AnthropicCompaction {
+                block: json!({"type":"compaction","content":"NATIVE_MARKER"}),
+                coverage,
+            },
+        });
+
+        let default_request = build_request(&spec, &context, &RequestOptions::default())
+            .expect("canonical three-layer request");
+        assert!(default_request.get("context_management").is_none());
+        assert!(!default_request.to_string().contains("NATIVE_MARKER"));
+
+        let native_request = build_request(
+            &spec,
+            &context,
+            &RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
+        )
+        .expect("opt-in native request");
+        assert_eq!(
+            native_request["context_management"],
+            json!({"edits":[{"type":"compact_20260112"}]})
+        );
+        assert!(native_request.to_string().contains("NATIVE_MARKER"));
+
+        let mut unsupported = spec.clone();
+        if let ProtocolCompat::Anthropic(compat) = &mut unsupported.compat {
+            compat.supports_native_compact = false;
+        }
+        let unsupported_request = build_request(
+            &unsupported,
+            &context,
+            &RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
+        )
+        .expect("capability loss falls back");
+        assert!(unsupported_request.get("context_management").is_none());
+        assert!(!unsupported_request.to_string().contains("NATIVE_MARKER"));
+    }
+
+    #[test]
+    fn native_compaction_request_requires_persisted_coverage() {
+        let request = build_request(
+            &spec(),
+            &context(vec![synthetic(Message::User(UserMessage {
+                content: vec![UserContent::Text {
+                    text: "first turn".into(),
+                }],
+                timestamp: timestamp(),
+            }))]),
+            &RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
+        )
+        .expect("synthetic-only request remains valid");
+        assert!(request.get("context_management").is_none());
+
+        let request = build_request(
+            &spec(),
+            &context(vec![persisted(1)]),
+            &RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
+        )
+        .expect("persisted request has anchored coverage");
+        assert_eq!(
+            request["context_management"],
+            json!({"edits":[{"type":"compact_20260112"}]})
+        );
+    }
+
+    #[test]
+    fn foreign_native_context_forces_three_layer_fallback() {
+        let spec = spec();
+        let mut context = context(vec![persisted(1)]);
+        context.provider_context.push(ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 0,
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({
+                    "id":"cmp",
+                    "type":"compaction",
+                    "encrypted_content":"FOREIGN_NATIVE"
+                })],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 1,
+                    context_fingerprint: "foreign".into(),
+                },
+            },
+        });
+        let request = build_request(
+            &spec,
+            &context,
+            &RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
+        )
+        .expect("foreign native state falls back");
+        assert!(!request.to_string().contains("FOREIGN_NATIVE"));
+        assert!(request.to_string().contains("message 1"));
+    }
+
+    #[test]
+    fn non_finite_temperature_is_rejected_before_anthropic_json_construction() {
+        let context = context(vec![synthetic(Message::User(UserMessage {
+            content: vec![UserContent::Text {
+                text: "hello".into(),
+            }],
+            timestamp: timestamp(),
+        }))]);
+        for temperature in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let error = build_request(
+                &spec(),
+                &context,
+                &RequestOptions {
+                    temperature: Some(temperature),
+                    ..RequestOptions::default()
+                },
+            )
+            .expect_err("non-finite temperature");
+            assert!(
+                matches!(error, AnthropicAdapterError::InvalidTemperature(value)
+                if value.to_bits() == temperature.to_bits())
+            );
+        }
+        let finite = build_request(
+            &spec(),
+            &context,
+            &RequestOptions {
+                temperature: Some(0.7),
+                ..RequestOptions::default()
+            },
+        )
+        .expect("finite Anthropic temperature");
+        assert!(finite.get("temperature").is_none());
+    }
+
+    #[test]
     fn tool_result_images_follow_model_image_capability() {
         for supports_images in [false, true] {
             let mut model = spec();
@@ -1823,6 +2296,32 @@ mod tests {
             )
             .expect_err("forced choice rejected");
             assert!(error.to_string().contains("only allow"));
+        }
+    }
+
+    #[test]
+    fn tool_choice_requires_the_official_local_shape() {
+        assert_eq!(
+            normalize_tool_choice(
+                &json!({"type":"tool","name":"read_file","disable_parallel_tool_use":true}),
+                false,
+            )
+            .unwrap(),
+            json!({"type":"tool","name":"read_file","disable_parallel_tool_use":true})
+        );
+        for malformed in [
+            json!("tool"),
+            json!({"type":"tool"}),
+            json!({"type":"tool","name":""}),
+            json!({"type":"tool","name":7}),
+            json!({"type":"tool","name":"read_file","disable_parallel_tool_use":"yes"}),
+            json!({"type":"none","name":"read_file"}),
+            json!({"type":"auto","future":true}),
+        ] {
+            assert!(
+                normalize_tool_choice(&malformed, false).is_err(),
+                "{malformed}"
+            );
         }
     }
 
@@ -2258,8 +2757,15 @@ mod tests {
                 coverage: coverage.clone(),
             },
         });
-        let request =
-            build_request(&spec, &context, &RequestOptions::default()).expect("native request");
+        let request = build_request(
+            &spec,
+            &context,
+            &RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
+        )
+        .expect("native request");
         let serialized = serde_json::to_string(&request).unwrap();
         assert!(!serialized.contains("old-prefix-marker"));
         assert!(serialized.contains("suffix-marker"));
@@ -2321,7 +2827,7 @@ mod tests {
         receive
             .push_named(
                 Some("message_delta"),
-                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}"#,
+                r#"{"type":"message_delta","delta":{"stop_reason":"compaction"},"usage":{"output_tokens":1}}"#,
             )
             .unwrap();
         let terminal = receive
@@ -2336,10 +2842,79 @@ mod tests {
                 coverage,
             }
         );
+        assert_eq!(terminal.provider_context[0].wire_item_index, None);
     }
 
     #[test]
-    fn native_compaction_replay_validates_string_content_and_preserves_extra_fields() {
+    fn compaction_stop_reason_requires_one_valid_fragment_with_exact_coverage() {
+        let coverage = NativeCompactionCoverage {
+            through_message_seq: 1,
+            context_fingerprint: "fingerprint".into(),
+        };
+        let fragment =
+            |block: Value, fragment_coverage: NativeCompactionCoverage| ProviderContextFragment {
+                wire_item_index: None,
+                payload: ProviderContextPayload::AnthropicCompaction {
+                    block,
+                    coverage: fragment_coverage,
+                },
+            };
+        for provider_context in [
+            Vec::new(),
+            vec![
+                fragment(
+                    json!({"type":"compaction","content":"one"}),
+                    coverage.clone(),
+                ),
+                fragment(
+                    json!({"type":"compaction","content":"two"}),
+                    coverage.clone(),
+                ),
+            ],
+            vec![fragment(
+                json!({"type":"compaction","content":null}),
+                coverage.clone(),
+            )],
+            vec![fragment(
+                json!({"type":"compaction","content":"opaque"}),
+                NativeCompactionCoverage {
+                    through_message_seq: 2,
+                    context_fingerprint: "other".into(),
+                },
+            )],
+        ] {
+            let mut state = AnthropicReceiveState::with_budget(
+                FrozenToolSchemaRegistry::compile(&[]).unwrap(),
+                ResponseBudget::default(),
+                Some(coverage.clone()),
+                "claude",
+            );
+            state.phase = Phase::MessageDeltas;
+            state.reason = Some(StopReason::Stop);
+            state.reason_wire = Some("compaction".into());
+            state.provider_context = provider_context;
+            assert!(state.message_stop().is_err());
+            assert_eq!(state.phase, Phase::MessageDeltas);
+        }
+
+        let mut valid = AnthropicReceiveState::with_budget(
+            FrozenToolSchemaRegistry::compile(&[]).unwrap(),
+            ResponseBudget::default(),
+            Some(coverage.clone()),
+            "claude",
+        );
+        valid.phase = Phase::MessageDeltas;
+        valid.reason = Some(StopReason::Stop);
+        valid.reason_wire = Some("compaction".into());
+        valid.provider_context = vec![fragment(
+            json!({"type":"compaction","content":"opaque"}),
+            coverage,
+        )];
+        assert!(valid.message_stop().unwrap().terminal.is_some());
+    }
+
+    #[test]
+    fn malformed_native_compaction_falls_back_and_valid_opaque_fields_are_preserved() {
         let spec = spec();
         let mut context = context(vec![persisted(1)]);
         let coverage = NativeCompactionCoverage {
@@ -2363,11 +2938,17 @@ mod tests {
             json!({"type":"compaction","content":{}}),
         ] {
             context.provider_context = vec![native(malformed)];
-            assert!(matches!(
-                build_request(&spec, &context, &RequestOptions::default()),
-                Err(AnthropicAdapterError::InvalidContext(message))
-                    if message.contains("content must be a string")
-            ));
+            let request = build_request(
+                &spec,
+                &context,
+                &RequestOptions {
+                    native_compaction: true,
+                    ..RequestOptions::default()
+                },
+            )
+            .expect("malformed persisted native state falls back");
+            assert!(request.get("context_management").is_some());
+            assert!(!request.to_string().contains("opaque"));
         }
 
         let opaque = json!({
@@ -2376,13 +2957,20 @@ mod tests {
             "future_provider_field":{"nested":[1,2,3]}
         });
         context.provider_context = vec![native(opaque.clone())];
-        let request = build_request(&spec, &context, &RequestOptions::default())
-            .expect("unknown compaction fields remain opaque");
+        let request = build_request(
+            &spec,
+            &context,
+            &RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
+        )
+        .expect("unknown compaction fields remain opaque");
         assert_eq!(request["messages"][0]["content"][0], opaque);
     }
 
     #[test]
-    fn native_compaction_replay_rejects_synthetic_inside_persisted_suffix() {
+    fn invalid_native_suffix_placement_falls_back_to_durable_messages() {
         let spec = spec();
         let mut context = context(vec![
             persisted(1),
@@ -2406,7 +2994,70 @@ mod tests {
                 coverage,
             },
         });
-        assert!(build_request(&spec, &context, &RequestOptions::default()).is_err());
+        let request = build_request(
+            &spec,
+            &context,
+            &RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
+        )
+        .expect("invalid native placement falls back");
+        let serialized = request.to_string();
+        assert!(!serialized.contains("opaque"));
+        assert!(serialized.contains("late"));
+    }
+
+    #[test]
+    fn native_fingerprint_and_suffix_gap_fall_back_without_sending_stale_block() {
+        let spec = spec();
+        let mut durable = context(vec![persisted(1), persisted(2)]);
+        durable.provider_context.push(ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 0,
+            payload: ProviderContextPayload::AnthropicCompaction {
+                block: json!({"type":"compaction","content":"STALE"}),
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 1,
+                    context_fingerprint: "wrong".into(),
+                },
+            },
+        });
+        let request = build_request(
+            &spec,
+            &durable,
+            &RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
+        )
+        .expect("fingerprint fallback");
+        assert!(!request.to_string().contains("STALE"));
+
+        let mut gap = context(vec![persisted(3)]);
+        gap.provider_context.push(ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 0,
+            payload: ProviderContextPayload::AnthropicCompaction {
+                block: json!({"type":"compaction","content":"GAP"}),
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 1,
+                    context_fingerprint: context_fingerprint(&spec, &gap).unwrap(),
+                },
+            },
+        });
+        let request = build_request(
+            &spec,
+            &gap,
+            &RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
+        )
+        .expect("suffix gap fallback");
+        assert!(!request.to_string().contains("GAP"));
     }
 
     #[test]
@@ -2426,11 +3077,166 @@ mod tests {
         assert_eq!(terminal.reason, StopReason::Error);
         assert_eq!(terminal.provider_code.as_deref(), Some("overloaded_error"));
 
+        let mut overflow = AnthropicReceiveState::with_budget(
+            FrozenToolSchemaRegistry::compile(&[]).unwrap(),
+            budget,
+            None,
+            "claude",
+        );
+        let terminal = overflow
+            .push_named(
+                Some("error"),
+                r#"{"type":"error","error":{"type":"model_context_window_exceeded","message":"prompt is too long"}}"#,
+            )
+            .unwrap()
+            .terminal
+            .unwrap();
+        assert_eq!(terminal.reason, StopReason::Error);
+        assert_eq!(
+            terminal.provider_code.as_deref(),
+            Some("model_context_window_exceeded")
+        );
+        assert_eq!(
+            terminal.error_message.as_deref(),
+            Some("prompt is too long")
+        );
+
         let incomplete = AnthropicReceiveState::with_budget(schemas, budget, None, "claude");
         assert!(matches!(
             incomplete.finish_eof(),
             Err(AnthropicAdapterError::MissingTerminal)
         ));
+    }
+
+    #[test]
+    fn provider_error_closes_trusted_text_and_preserves_only_verified_context() {
+        let mut state = AnthropicReceiveState::with_budget(
+            FrozenToolSchemaRegistry::compile(&[]).unwrap(),
+            ResponseBudget::default(),
+            None,
+            "claude",
+        );
+        for (name, payload) in [
+            (
+                "message_start",
+                r#"{"type":"message_start","message":{"id":"m","model":"claude","role":"assistant","content":[],"usage":{}}}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"verified"}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"trusted prefix"}}"#,
+            ),
+        ] {
+            state.push_named(Some(name), payload).expect("setup event");
+        }
+        let terminal = state
+            .push_named(
+                Some("error"),
+                r#"{"type":"error","error":{"type":"overloaded_error","message":"busy"}}"#,
+            )
+            .unwrap()
+            .terminal
+            .unwrap();
+        assert!(matches!(
+            terminal.events.as_slice(),
+            [ProviderEvent::TextEnd { content_index: 1, content }] if content == "trusted prefix"
+        ));
+        assert_eq!(terminal.provider_context.len(), 1);
+        assert!(matches!(
+            terminal.provider_context[0].payload,
+            ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::AnthropicMessages,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn provider_error_drops_each_unverified_open_block_kind() {
+        let blocks = [
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"opaque"}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"read","input":{}}}"#,
+        ];
+        for block in blocks {
+            let mut state = AnthropicReceiveState::with_budget(
+                FrozenToolSchemaRegistry::compile(&[]).unwrap(),
+                ResponseBudget::default(),
+                None,
+                "claude",
+            );
+            state
+                .push_named(
+                    Some("message_start"),
+                    r#"{"type":"message_start","message":{"id":"m","model":"claude","role":"assistant","content":[],"usage":{}}}"#,
+                )
+                .unwrap();
+            state
+                .push_named(Some("content_block_start"), block)
+                .unwrap();
+            let terminal = state
+                .push_named(
+                    Some("error"),
+                    r#"{"type":"error","error":{"type":"server_error","message":"failed"}}"#,
+                )
+                .unwrap()
+                .terminal
+                .unwrap();
+            assert!(terminal.events.is_empty(), "{block}");
+            assert!(terminal.provider_context.is_empty(), "{block}");
+        }
+
+        let coverage = NativeCompactionCoverage {
+            through_message_seq: 1,
+            context_fingerprint: "fingerprint".into(),
+        };
+        let mut state = AnthropicReceiveState::with_budget(
+            FrozenToolSchemaRegistry::compile(&[]).unwrap(),
+            ResponseBudget::default(),
+            Some(coverage),
+            "claude",
+        );
+        state
+            .push_named(
+                Some("message_start"),
+                r#"{"type":"message_start","message":{"id":"m","model":"claude","role":"assistant","content":[],"usage":{}}}"#,
+            )
+            .unwrap();
+        state
+            .push_named(
+                Some("content_block_start"),
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"compaction","content":""}}"#,
+            )
+            .unwrap();
+        let terminal = state
+            .push_named(
+                Some("error"),
+                r#"{"type":"error","error":{"type":"server_error","message":"failed"}}"#,
+            )
+            .unwrap()
+            .terminal
+            .unwrap();
+        assert!(terminal.events.is_empty());
+        assert!(terminal.provider_context.is_empty());
     }
 
     #[test]
@@ -2602,7 +3408,7 @@ mod tests {
             persisted(8),
         ]);
         assert_eq!(
-            request_coverage(&spec, &valid)
+            request_coverage(&spec, &valid, true)
                 .unwrap()
                 .expect("coverage")
                 .through_message_seq,
@@ -2623,7 +3429,7 @@ mod tests {
             ],
         ] {
             assert!(matches!(
-                request_coverage(&spec, &context(messages)),
+                request_coverage(&spec, &context(messages), true),
                 Err(AnthropicAdapterError::InvalidContext(_))
             ));
         }
@@ -2982,8 +3788,142 @@ mod tests {
                 )
                 .is_err()
         );
-        assert_eq!(inconsistent.usage.output, 2);
+        assert_eq!(inconsistent.usage.output, 3);
         assert_eq!(inconsistent.reason, Some(StopReason::Stop));
+    }
+
+    #[test]
+    fn message_delta_retains_valid_usage_when_charge_fails_without_semantic_commit() {
+        let mut state = AnthropicReceiveState::with_budget(
+            FrozenToolSchemaRegistry::compile(&[]).unwrap(),
+            ResponseBudget::default(),
+            None,
+            "claude",
+        );
+        state
+            .push_named(
+                Some("message_start"),
+                r#"{"type":"message_start","message":{"id":"m","model":"claude","role":"assistant","content":[],"usage":{"input_tokens":3,"output_tokens":0}}}"#,
+            )
+            .unwrap();
+        state.budget.max_events = state.event_count;
+        assert!(matches!(
+            state.push_named(
+                Some("message_delta"),
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}"#,
+            ),
+            Err(AnthropicAdapterError::ResponseLimitExceeded {
+                resource: "event_count",
+                ..
+            })
+        ));
+        assert_eq!(state.usage.input, 3);
+        assert_eq!(state.usage.output, 4);
+        assert_eq!(state.usage.total_tokens, 7);
+        assert_eq!(state.reason, None);
+        assert_eq!(state.reason_wire, None);
+        assert_eq!(state.phase, Phase::Blocks);
+    }
+
+    #[test]
+    fn usage_optional_details_are_typed_bounded_and_checked() {
+        let valid = merge_usage(
+            &Usage::default(),
+            &json!({
+                "input_tokens":10,
+                "cache_read_input_tokens":3,
+                "cache_creation_input_tokens":4,
+                "output_tokens":8,
+                "output_tokens_details":{"thinking_tokens":5}
+            }),
+        )
+        .unwrap();
+        assert_eq!(valid.reasoning, 5);
+        assert_eq!(valid.total_tokens, 25);
+        assert!(
+            merge_usage(
+                &Usage::default(),
+                &json!({"input_tokens":1,"output_tokens":1})
+            )
+            .is_ok()
+        );
+        for malformed in [
+            json!({"output_tokens":1,"output_tokens_details":null}),
+            json!({"output_tokens":1,"output_tokens_details":[]}),
+            json!({"output_tokens":1,"output_tokens_details":{"thinking_tokens":"1"}}),
+            json!({"output_tokens":1,"output_tokens_details":{"thinking_tokens":2}}),
+            json!({"input_tokens":u64::MAX,"output_tokens":1}),
+        ] {
+            assert!(
+                merge_usage(&Usage::default(), &malformed).is_err(),
+                "{malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn sensitive_stop_reason_remains_distinct_from_refusal() {
+        let mut state = AnthropicReceiveState::with_budget(
+            FrozenToolSchemaRegistry::compile(&[]).unwrap(),
+            ResponseBudget::default(),
+            None,
+            "claude",
+        );
+        state
+            .push_named(
+                Some("message_start"),
+                r#"{"type":"message_start","message":{"id":"m","model":"claude","role":"assistant","content":[],"usage":{}}}"#,
+            )
+            .unwrap();
+        state
+            .push_named(
+                Some("message_delta"),
+                r#"{"type":"message_delta","delta":{"stop_reason":"sensitive"},"usage":{"output_tokens":0}}"#,
+            )
+            .unwrap();
+        let terminal = state
+            .push_named(Some("message_stop"), r#"{"type":"message_stop"}"#)
+            .unwrap()
+            .terminal
+            .unwrap();
+        assert_eq!(terminal.provider_code.as_deref(), Some("sensitive"));
+        assert_eq!(
+            terminal.error_message.as_deref(),
+            Some("Anthropic marked the response as sensitive")
+        );
+    }
+
+    #[test]
+    fn context_window_stop_reason_is_error_with_exact_provider_code() {
+        let mut state = AnthropicReceiveState::with_budget(
+            FrozenToolSchemaRegistry::compile(&[]).unwrap(),
+            ResponseBudget::default(),
+            None,
+            "claude",
+        );
+        state
+            .push_named(
+                Some("message_start"),
+                r#"{"type":"message_start","message":{"id":"m","model":"claude","role":"assistant","content":[],"usage":{}}}"#,
+            )
+            .unwrap();
+        state
+            .push_named(
+                Some("message_delta"),
+                r#"{"type":"message_delta","delta":{"stop_reason":"model_context_window_exceeded"},"usage":{"output_tokens":0}}"#,
+            )
+            .unwrap();
+        let terminal = state
+            .push_named(Some("message_stop"), r#"{"type":"message_stop"}"#)
+            .unwrap()
+            .terminal
+            .unwrap();
+        assert_eq!(terminal.reason, StopReason::Error);
+        assert_eq!(
+            terminal.provider_code.as_deref(),
+            Some("model_context_window_exceeded")
+        );
+        assert_eq!(terminal.error_message, None);
     }
 
     #[test]
@@ -3020,6 +3960,182 @@ mod tests {
             state
                 .push_named(Some("message_stop"), r#"{"type":"message_stop"}"#)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn reasoning_payload_variants_reject_unknown_and_cross_variant_fields() {
+        for valid in [
+            json!({"type":"thinking_signature","signature":"opaque"}),
+            json!({"type":"redacted_thinking","data":"opaque"}),
+        ] {
+            validate_reasoning_item(&valid).expect("documented reasoning payload");
+        }
+        for invalid in [
+            json!({"type":"thinking_signature","signature":"opaque","data":"cross"}),
+            json!({"type":"redacted_thinking","data":"opaque","signature":"cross"}),
+            json!({"type":"thinking_signature","signature":"opaque","future":true}),
+            json!({"type":"redacted_thinking","data":"opaque","future":true}),
+        ] {
+            assert!(validate_reasoning_item(&invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn streamed_reasoning_variants_reject_unknown_fields_without_advancing_state() {
+        let mut state = AnthropicReceiveState::with_budget(
+            FrozenToolSchemaRegistry::compile(&[]).unwrap(),
+            ResponseBudget::default(),
+            None,
+            "claude",
+        );
+        state
+            .push_named(
+                Some("message_start"),
+                r#"{"type":"message_start","message":{"id":"m","model":"claude","role":"assistant","content":[],"usage":{}}}"#,
+            )
+            .unwrap();
+        assert!(
+            state
+                .push_named(
+                    Some("content_block_start"),
+                    r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","future":true}}"#,
+                )
+                .is_err()
+        );
+        state
+            .push_named(
+                Some("content_block_start"),
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            )
+            .expect("valid retry at unchanged block index");
+        assert!(
+            state
+                .push_named(
+                    Some("content_block_delta"),
+                    r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"x","future":true}}"#,
+                )
+                .is_err()
+        );
+        state
+            .push_named(
+                Some("content_block_delta"),
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"x","estimated_tokens":null}}"#,
+            )
+            .expect("documented nullable beta estimate is accepted");
+    }
+
+    #[test]
+    fn thinking_start_signature_reconciles_without_losing_opaque_value() {
+        for (start_signature, delta_signature) in [
+            (r#""signature":"""#, Some("opaque")),
+            (r#""signature":"opaque""#, None),
+            (r#""signature":"opaque""#, Some("opaque")),
+        ] {
+            let mut state = AnthropicReceiveState::with_budget(
+                FrozenToolSchemaRegistry::compile(&[]).unwrap(),
+                ResponseBudget::default(),
+                None,
+                "claude",
+            );
+            state
+                .push_named(
+                    Some("message_start"),
+                    r#"{"type":"message_start","message":{"id":"m","model":"claude","role":"assistant","content":[],"usage":{}}}"#,
+                )
+                .unwrap();
+            let start = format!(
+                r#"{{"type":"content_block_start","index":0,"content_block":{{"type":"thinking","thinking":"",{start_signature}}}}}"#
+            );
+            state
+                .push_named(Some("content_block_start"), &start)
+                .expect("documented start signature shape");
+            if let Some(signature) = delta_signature {
+                let delta = format!(
+                    r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"signature_delta","signature":"{signature}"}}}}"#
+                );
+                state
+                    .push_named(Some("content_block_delta"), &delta)
+                    .expect("matching signature delta");
+            }
+            state
+                .push_named(
+                    Some("content_block_stop"),
+                    r#"{"type":"content_block_stop","index":0}"#,
+                )
+                .unwrap();
+            assert_eq!(
+                state.verified_reasoning_context()[0].payload,
+                ProviderContextPayload::EncryptedReasoning {
+                    protocol: ApiProtocol::AnthropicMessages,
+                    item: json!({"type":"thinking_signature","signature":"opaque"}),
+                }
+            );
+        }
+
+        let mut conflict = delta_test_state(
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":"opaque"}}"#,
+            None,
+        );
+        let before = format!("{:?}", conflict.open);
+        assert!(conflict
+            .push_named(
+                Some("content_block_delta"),
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"replacement"}}"#,
+            )
+            .is_err());
+        assert_eq!(format!("{:?}", conflict.open), before);
+    }
+
+    #[test]
+    fn pause_turn_and_server_fallback_are_explicitly_unsupported() {
+        let mut paused = AnthropicReceiveState::with_budget(
+            FrozenToolSchemaRegistry::compile(&[]).unwrap(),
+            ResponseBudget::default(),
+            None,
+            "claude",
+        );
+        paused
+            .push_named(
+                Some("message_start"),
+                r#"{"type":"message_start","message":{"id":"m","model":"claude","role":"assistant","content":[],"usage":{}}}"#,
+            )
+            .unwrap();
+        let error = paused
+            .push_named(
+                Some("message_delta"),
+                r#"{"type":"message_delta","delta":{"stop_reason":"pause_turn"},"usage":{"output_tokens":1}}"#,
+            )
+            .expect_err("pause_turn is outside Sumi's server-tool scope");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported stop reason pause_turn")
+        );
+        assert_eq!(paused.usage.output, 1);
+
+        let mut fallback = AnthropicReceiveState::with_budget(
+            FrozenToolSchemaRegistry::compile(&[]).unwrap(),
+            ResponseBudget::default(),
+            None,
+            "claude",
+        );
+        fallback
+            .push_named(
+                Some("message_start"),
+                r#"{"type":"message_start","message":{"id":"m","model":"claude","role":"assistant","content":[],"usage":{}}}"#,
+            )
+            .unwrap();
+        let error = fallback
+            .push_named(
+                Some("content_block_start"),
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"fallback","from":{"model":"requested"},"to":{"model":"fallback"}}}"#,
+            )
+            .expect_err("server fallback remains unsupported");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported content block type fallback")
         );
     }
 

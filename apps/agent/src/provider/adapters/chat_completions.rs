@@ -449,7 +449,7 @@ struct MfjsValidationState {
 /// to MoonshotAI/walle v0.1.13 (196bb0ca9c2f2271cfa9623108308f0780e411ee).
 /// `false` means "not proven safe", so the request explicitly disables the
 /// provider's default strict mode while local frozen-schema validation remains.
-fn is_mfjs_strict_safe(schema: &Value) -> bool {
+pub(crate) fn is_mfjs_strict_safe(schema: &Value) -> bool {
     let Ok(encoded) = serde_json::to_vec(schema) else {
         return false;
     };

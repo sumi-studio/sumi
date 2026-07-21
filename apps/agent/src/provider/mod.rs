@@ -224,7 +224,10 @@ async fn compact_native_with_api_key(
     } else {
         MAX_PROVIDER_ERROR_BODY_BYTES
     };
-    let bytes = collect_bounded_body(response, body_limit, !success, &cancel).await?;
+    let bytes = retain_compact_http_status(
+        status,
+        collect_bounded_body(response, body_limit, !success, &cancel).await,
+    )?;
     if !status.is_success() {
         let body = String::from_utf8_lossy(&bytes)
             .chars()
@@ -239,6 +242,20 @@ async fn compact_native_with_api_key(
         .map_err(|error| NativeCompactionError::InvalidResponse(error.to_string()))?;
     parse_compact_response(value, coverage)
         .map_err(|error| NativeCompactionError::InvalidResponse(error.to_string()))
+}
+
+fn retain_compact_http_status(
+    status: reqwest::StatusCode,
+    body: Result<Vec<u8>, NativeCompactionError>,
+) -> Result<Vec<u8>, NativeCompactionError> {
+    match body {
+        Err(NativeCompactionError::Cancelled) => Err(NativeCompactionError::Cancelled),
+        Err(error) if !status.is_success() => Err(NativeCompactionError::Http {
+            status: status.as_u16(),
+            body: format!("failed to read response body: {error}"),
+        }),
+        result => result,
+    }
 }
 
 async fn collect_bounded_body(
@@ -518,7 +535,7 @@ async fn run_anthropic_stream(
             return;
         }
     };
-    let coverage = match anthropic_request_coverage(&spec, &context) {
+    let coverage = match anthropic_request_coverage(&spec, &context, options.native_compaction) {
         Ok(coverage) => coverage,
         Err(error) => {
             finish_anthropic_error(
@@ -2266,6 +2283,7 @@ fn responses_adapter_error(error: &ResponsesAdapterError) -> (String, String) {
         ),
         ResponsesAdapterError::UnsupportedProtocol
         | ResponsesAdapterError::InvalidMaxTokens { .. }
+        | ResponsesAdapterError::InvalidTemperature(_)
         | ResponsesAdapterError::InvalidContext(_) => {
             (error.to_string(), "invalid_provider_request".to_owned())
         }
@@ -2291,8 +2309,10 @@ fn anthropic_adapter_error(error: &AnthropicAdapterError) -> (String, String) {
             error.to_string(),
             "stream_ended_without_terminal_event".into(),
         ),
+        AnthropicAdapterError::NativeCompactionFailed { code } => (error.to_string(), code.clone()),
         AnthropicAdapterError::UnsupportedProtocol
         | AnthropicAdapterError::InvalidMaxTokens { .. }
+        | AnthropicAdapterError::InvalidTemperature(_)
         | AnthropicAdapterError::InvalidContext(_) => {
             (error.to_string(), "invalid_provider_request".into())
         }
@@ -3899,6 +3919,37 @@ fi
         }
     }
 
+    #[test]
+    fn compact_non_success_status_survives_every_bounded_body_failure() {
+        for error in [
+            NativeCompactionError::BodyIdleTimeout,
+            NativeCompactionError::Transport("connection reset".into()),
+            NativeCompactionError::ResponseLimitExceeded { limit: 16_000 },
+        ] {
+            let retained = retain_compact_http_status(StatusCode::BAD_GATEWAY, Err(error))
+                .expect_err("non-success body failure must retain HTTP status");
+            assert!(matches!(
+                retained,
+                NativeCompactionError::Http {
+                    status: 502,
+                    body
+                } if body.starts_with("failed to read response body:")
+            ));
+        }
+
+        assert!(matches!(
+            retain_compact_http_status(
+                StatusCode::BAD_GATEWAY,
+                Err(NativeCompactionError::Cancelled),
+            ),
+            Err(NativeCompactionError::Cancelled)
+        ));
+        assert!(matches!(
+            retain_compact_http_status(StatusCode::OK, Err(NativeCompactionError::BodyIdleTimeout),),
+            Err(NativeCompactionError::BodyIdleTimeout)
+        ));
+    }
+
     #[tokio::test]
     async fn explicit_cancellation_preempts_non_success_error_body_read() {
         let (base_url, server) = serve_stalled_error_body(StatusCode::PAYLOAD_TOO_LARGE).await;
@@ -5239,7 +5290,13 @@ fi
                 {"id":"m1","type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},
                 {"id":"cmp1","type":"compaction","encrypted_content":"opaque"}
             ],
-            "usage":{"input_tokens":8,"output_tokens":2,"total_tokens":10}
+            "usage":{
+                "input_tokens":8,
+                "input_tokens_details":{"cached_tokens":0},
+                "output_tokens":2,
+                "output_tokens_details":{"reasoning_tokens":0},
+                "total_tokens":10
+            }
         })
         .to_string();
         let app = Router::new().route(
