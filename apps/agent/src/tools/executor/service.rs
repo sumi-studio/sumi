@@ -954,13 +954,67 @@ fn forward_bash_update(
     request_id: &str,
     value: Value,
 ) -> Result<(), ToolError> {
-    lifecycle.accept_update(request_id)?;
-    let frame = RpcFrame::<ExecutorResponse>::Update {
+    let output = match &value {
+        Value::Object(fields) if fields.len() == 1 => fields.get("output").and_then(Value::as_str),
+        _ => None,
+    };
+    let Some(output) = output else {
+        return forward_single_bash_update(writer, identity, lifecycle, request_id, value);
+    };
+
+    // Bash emits at most one bounded reader chunk per callback, but JSON
+    // escaping and frame metadata can still push that update beyond PIPE_BUF.
+    // Split only the output value, measuring the actual encoded frame at UTF-8
+    // boundaries so every attempted progress write remains atomic.
+    let mut pending = vec![output];
+    while let Some(chunk) = pending.pop() {
+        let value = serde_json::json!({"output": chunk});
+        let frame = bash_update_frame(identity, request_id, value.clone());
+        if encode_rpc_frame(&frame).is_ok_and(|bytes| bytes.len() <= MAX_ATOMIC_UPDATE_FRAME_BYTES)
+        {
+            forward_single_bash_update(writer, identity, lifecycle, request_id, value)?;
+            continue;
+        }
+
+        let midpoint = chunk.len() / 2;
+        let split = (1..=midpoint)
+            .rev()
+            .find(|index| chunk.is_char_boundary(*index));
+        let Some(split) = split else {
+            // Metadata alone can make even one scalar unwriteable. Preserve
+            // volatile-update semantics and let try_update drop it explicitly.
+            forward_single_bash_update(writer, identity, lifecycle, request_id, value)?;
+            continue;
+        };
+        let (left, right) = chunk.split_at(split);
+        pending.push(right);
+        pending.push(left);
+    }
+    Ok(())
+}
+
+fn bash_update_frame(
+    identity: &RpcIdentity,
+    request_id: &str,
+    value: Value,
+) -> RpcFrame<ExecutorResponse> {
+    RpcFrame::Update {
         generation: identity.generation,
         nonce: identity.nonce.clone(),
         request_id: request_id.to_owned(),
         value,
-    };
+    }
+}
+
+fn forward_single_bash_update(
+    writer: &ExecutorWriter,
+    identity: &RpcIdentity,
+    lifecycle: &RpcLifecycleTracker,
+    request_id: &str,
+    value: Value,
+) -> Result<(), ToolError> {
+    lifecycle.accept_update(request_id)?;
+    let frame = bash_update_frame(identity, request_id, value);
     writer.try_update(&frame)
 }
 
@@ -1554,6 +1608,70 @@ mod tests {
             delivered == Vec::<Value>::new()
                 || delivered == vec![serde_json::json!("first")]
                 || delivered == vec![serde_json::json!("first"), serde_json::json!("second")]
+        );
+        writer_task.abort();
+    }
+
+    #[tokio::test]
+    async fn oversized_bash_progress_is_split_into_atomic_utf8_frames() {
+        let identity = RpcIdentity {
+            generation: 7,
+            nonce: "boot-nonce".to_owned(),
+        };
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let transport = AtomicBlockedThenWrite {
+            bytes: bytes.clone(),
+            allow_write: Arc::new(Mutex::new(true)),
+        };
+        let (writer, writer_task) = ExecutorWriter::start_atomic_progress(transport);
+        let mut lifecycle = RpcLifecycleTracker::default();
+        lifecycle
+            .begin_execution("request-1", "execution-1")
+            .expect("begin execution");
+        let output = "界\"\\\n".repeat(2_000);
+
+        forward_bash_update(
+            &writer,
+            &identity,
+            &lifecycle,
+            "request-1",
+            serde_json::json!({"output": output}),
+        )
+        .expect("forward oversized progress");
+
+        let delivered = timeout(Duration::from_secs(1), async {
+            loop {
+                let delivered = bytes.lock().unwrap().clone();
+                let reconstructed = delivered
+                    .split(|byte| *byte == b'\n')
+                    .filter(|line| !line.is_empty())
+                    .map(|line| {
+                        let RpcFrame::Update { value, .. } =
+                            decode_rpc_frame::<ExecutorResponse>(line, &identity)
+                                .expect("decode update")
+                        else {
+                            panic!("unexpected terminal")
+                        };
+                        value["output"].as_str().expect("output string").to_owned()
+                    })
+                    .collect::<String>();
+                if reconstructed == output {
+                    break delivered;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("split progress delivery");
+
+        let frames = delivered
+            .split_inclusive(|byte| *byte == b'\n')
+            .collect::<Vec<_>>();
+        assert!(frames.len() > 1);
+        assert!(
+            frames
+                .iter()
+                .all(|frame| frame.len() <= MAX_ATOMIC_UPDATE_FRAME_BYTES)
         );
         writer_task.abort();
     }

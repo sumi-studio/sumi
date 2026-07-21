@@ -25,8 +25,8 @@ use tokio_util::sync::CancellationToken;
 use super::{
     ResourceLimit, ToolError,
     shell_capture::{
-        ArtifactAppender, OUTPUT_QUEUE_CAPACITY, ShellCapture, ShellCaptureResult,
-        copy_bounded_chunks, output_limit_if_reached,
+        ArtifactAppender, COMMAND_OUTPUT_LIMIT_BYTES, OUTPUT_QUEUE_CAPACITY, ShellCapture,
+        ShellCaptureResult, copy_bounded_chunks, output_limit_if_reached,
     },
     truncate::{TruncationOptions, TruncationResult, truncate_tail},
     unix_pipe::merged_output_pipe,
@@ -49,8 +49,18 @@ pub struct BashExecutionResult {
 
 impl BashExecutionResult {
     pub(crate) fn is_consistent(&self) -> bool {
+        // Sanitization may remove raw control bytes or expand each invalid byte
+        // to one three-byte U+FFFD, but it cannot escape that raw-byte envelope.
+        let sanitized_bytes_bound = usize::try_from(self.observed_bytes)
+            .ok()
+            .and_then(|observed| observed.checked_mul('\u{fffd}'.len_utf8()));
+        let sanitized_lines_are_bounded = usize::try_from(self.observed_bytes)
+            .is_ok_and(|observed| self.truncation.total_lines <= observed);
         if self.output != self.truncation.content
             || self.output.len() > super::truncate::DEFAULT_MAX_BYTES
+            || self.observed_bytes > COMMAND_OUTPUT_LIMIT_BYTES
+            || sanitized_bytes_bound.is_none_or(|bound| self.truncation.total_bytes > bound)
+            || !sanitized_lines_are_bounded
             || self.truncation.max_lines != super::truncate::DEFAULT_MAX_LINES
             || self.truncation.max_bytes != super::truncate::DEFAULT_MAX_BYTES
             || !self
@@ -58,6 +68,9 @@ impl BashExecutionResult {
                 .is_consistent(super::truncate::RetainedOutput::Tail)
             || (self.cancelled && self.resource_limit.is_some())
             || (self.resource_limit.is_some() && self.exit_code.is_some())
+            || (self.observed_bytes == COMMAND_OUTPUT_LIMIT_BYTES
+                && !(self.cancelled && self.resource_limit.is_none())
+                && !matches!(self.resource_limit, Some(ResourceLimit::OutputBytes { .. })))
             || self
                 .artifact_handle
                 .as_deref()
@@ -68,7 +81,9 @@ impl BashExecutionResult {
 
         match &self.resource_limit {
             Some(ResourceLimit::OutputBytes { observed, limit }) => {
-                *observed == self.observed_bytes && observed >= limit
+                *observed == COMMAND_OUTPUT_LIMIT_BYTES
+                    && *limit == COMMAND_OUTPUT_LIMIT_BYTES
+                    && self.observed_bytes == COMMAND_OUTPUT_LIMIT_BYTES
             }
             _ => true,
         }
@@ -792,6 +807,43 @@ mod tests {
         assert!(updates.load(Ordering::Relaxed) > 0);
     }
 
+    #[tokio::test]
+    async fn consistency_accepts_real_sanitized_output_accounting() {
+        let workspace = TempWorkspace::new();
+        let artifacts = MemoryArtifacts::default();
+
+        for (command, execution_id, ordering) in [
+            (
+                "printf '\\001ok\\002'",
+                "bash-sanitized-contract-shrinks",
+                std::cmp::Ordering::Less,
+            ),
+            (
+                "printf '\\377'",
+                "bash-sanitized-contract-expands",
+                std::cmp::Ordering::Greater,
+            ),
+        ] {
+            let result = LowTrustLocalBash::new(workspace.0.clone(), &artifacts)
+                .execute(
+                    command,
+                    execution_id,
+                    CancellationToken::new(),
+                    Arc::new(|_| {}),
+                )
+                .await
+                .expect("real bash result");
+            assert_eq!(
+                result
+                    .truncation
+                    .total_bytes
+                    .cmp(&usize::try_from(result.observed_bytes).expect("bounded observed bytes")),
+                ordering
+            );
+            assert!(result.is_consistent());
+        }
+    }
+
     async fn assert_inherited_fd_is_closed(force_fallback: bool) {
         let workspace = TempWorkspace::new();
         let artifacts = MemoryArtifacts::default();
@@ -1310,6 +1362,7 @@ mod tests {
             }) if observed == result.observed_bytes
                 && observed >= super::super::shell_capture::COMMAND_OUTPUT_LIMIT_BYTES
         ));
+        assert!(result.is_consistent());
         let handle = result.artifact_handle.expect("quota artifact");
         assert_eq!(
             artifacts

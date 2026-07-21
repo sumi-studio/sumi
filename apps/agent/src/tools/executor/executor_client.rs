@@ -843,6 +843,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn real_service_streams_oversized_normal_output_before_complete_terminal() {
+        let root = temp_root("oversized-progress");
+        let (socket, service) = spawn_real_service(&root, 1);
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let updates_callback = updates.clone();
+        let response = ExecutorClient::new(&socket, identity(), "conversation-1")
+            .with_deadlines(test_deadlines())
+            .execute(
+                ExecutorOperation::Bash {
+                    command: "head -c 8192 /dev/zero | tr '\\0' x; sleep 0.05".to_owned(),
+                    execution_id: "bash-oversized-progress".to_owned(),
+                },
+                CancellationToken::new(),
+                Arc::new(move |value| updates_callback.lock().unwrap().push(value)),
+            )
+            .await
+            .expect("real service result");
+        let ExecutorResponse::Bash { result } = response else {
+            panic!("wrong response")
+        };
+        assert_eq!(result.output, "x".repeat(8_192));
+        assert!(result.is_consistent());
+        assert!(
+            updates.lock().unwrap().iter().any(|value| value["output"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())),
+            "oversized normal output must deliver progress before the terminal"
+        );
+        service.await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn real_service_cancellation_waits_for_ack_and_terminal() {
         let root = temp_root("cancel");
         let (socket, service) = spawn_real_service(&root, 1);
@@ -1371,6 +1404,112 @@ mod tests {
                 &operation,
                 &ExecutorResponse::Bash {
                     result: too_visible,
+                },
+            )
+            .is_err()
+        );
+
+        let mut unbounded_observed = result.clone();
+        unbounded_observed.observed_bytes = u64::MAX;
+        assert!(
+            validate_response(
+                &operation,
+                &ExecutorResponse::Bash {
+                    result: unbounded_observed,
+                },
+            )
+            .is_err()
+        );
+
+        let observed = usize::try_from(result.observed_bytes).expect("fixture observed bytes");
+        let mut unbounded_sanitized_bytes = result.clone();
+        unbounded_sanitized_bytes.truncation.truncated = true;
+        unbounded_sanitized_bytes.truncation.truncated_by =
+            Some(crate::tools::truncate::TruncatedBy::Bytes);
+        unbounded_sanitized_bytes.truncation.total_bytes = observed * 3 + 1;
+        assert!(
+            validate_response(
+                &operation,
+                &ExecutorResponse::Bash {
+                    result: unbounded_sanitized_bytes,
+                },
+            )
+            .is_err()
+        );
+
+        let mut unbounded_sanitized_lines = result.clone();
+        unbounded_sanitized_lines.truncation.truncated = true;
+        unbounded_sanitized_lines.truncation.truncated_by =
+            Some(crate::tools::truncate::TruncatedBy::Lines);
+        unbounded_sanitized_lines.truncation.total_lines = observed + 1;
+        assert!(
+            validate_response(
+                &operation,
+                &ExecutorResponse::Bash {
+                    result: unbounded_sanitized_lines,
+                },
+            )
+            .is_err()
+        );
+
+        let output_limit = crate::tools::shell_capture::COMMAND_OUTPUT_LIMIT_BYTES;
+        let mut noncanonical_output_limit = result.clone();
+        noncanonical_output_limit.observed_bytes = output_limit;
+        noncanonical_output_limit.exit_code = None;
+        noncanonical_output_limit.resource_limit = Some(crate::tools::ResourceLimit::OutputBytes {
+            observed: output_limit,
+            limit: 0,
+        });
+        assert!(
+            validate_response(
+                &operation,
+                &ExecutorResponse::Bash {
+                    result: noncanonical_output_limit,
+                },
+            )
+            .is_err()
+        );
+
+        let mut noncanonical_output_observed = result.clone();
+        noncanonical_output_observed.observed_bytes = output_limit - 1;
+        noncanonical_output_observed.exit_code = None;
+        noncanonical_output_observed.resource_limit =
+            Some(crate::tools::ResourceLimit::OutputBytes {
+                observed: output_limit - 1,
+                limit: output_limit,
+            });
+        assert!(
+            validate_response(
+                &operation,
+                &ExecutorResponse::Bash {
+                    result: noncanonical_output_observed,
+                },
+            )
+            .is_err()
+        );
+
+        let mut noncanonical_wall_time = result.clone();
+        noncanonical_wall_time.observed_bytes = output_limit;
+        noncanonical_wall_time.exit_code = None;
+        noncanonical_wall_time.resource_limit =
+            Some(crate::tools::ResourceLimit::WallTime { limit_seconds: 1 });
+        assert!(
+            validate_response(
+                &operation,
+                &ExecutorResponse::Bash {
+                    result: noncanonical_wall_time,
+                },
+            )
+            .is_err()
+        );
+
+        let mut noncanonical_completion = result.clone();
+        noncanonical_completion.observed_bytes = output_limit;
+        assert!(
+            validate_response(
+                &operation,
+                &ExecutorResponse::Bash {
+                    result: noncanonical_completion,
                 },
             )
             .is_err()
