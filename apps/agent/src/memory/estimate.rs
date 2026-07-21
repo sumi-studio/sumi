@@ -11,6 +11,9 @@ use thiserror::Error;
 /// The estimator version is coupled to the provider-owned probe contract.
 pub const EVICTION_ESTIMATOR_VERSION_V1: u32 = crate::provider::replay_probe::REPLAY_PROBE_VERSION;
 
+const NO_TOOL_OUTPUT_PLACEHOLDER: &str = "(no tool output)";
+const TOOL_RESULT_IMAGE_PLACEHOLDER: &str = "(see attached image)";
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TokenCalibration {
     ratio: f64,
@@ -201,17 +204,10 @@ pub fn estimate_public_message(message: &PublicMessage) -> Result<u64, EstimateE
                     .ok_or(EstimateError::ArithmeticOverflow)
             })
         }
-        PublicMessage::ToolResult(message) => {
-            let content = message.content.iter().try_fold(0, add_user_content)?;
-            let details = serde_json::to_string(&message.details)
-                .map_err(|error| EstimateError::SerializerFailure(error.to_string()))?;
-            checked_sum([
-                content,
-                estimate_text_tokens(&message.tool_call_id)?,
-                estimate_text_tokens(&message.tool_name)?,
-                estimate_text_tokens(&details)?,
-            ])
-        }
+        PublicMessage::ToolResult(message) => checked_sum([
+            estimate_tool_result_content(&message.content)?,
+            estimate_text_tokens(&message.tool_call_id)?,
+        ]),
     }
 }
 
@@ -239,6 +235,32 @@ fn add_user_content(total: u64, content: &UserContent) -> Result<u64, EstimateEr
     total
         .checked_add(current)
         .ok_or(EstimateError::ArithmeticOverflow)
+}
+
+fn estimate_tool_result_content(content: &[UserContent]) -> Result<u64, EstimateError> {
+    let text = content
+        .iter()
+        .filter_map(|item| match item {
+            UserContent::Text { text } => Some(text.as_str()),
+            UserContent::Image { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let images = content.iter().try_fold(0_u64, |total, item| match item {
+        UserContent::Text { .. } => Ok(total),
+        UserContent::Image { .. } => add_user_content(total, item),
+    })?;
+    let has_images = content
+        .iter()
+        .any(|item| matches!(item, UserContent::Image { .. }));
+    let placeholder = if !text.is_empty() {
+        0
+    } else if has_images {
+        estimate_text_tokens(TOOL_RESULT_IMAGE_PLACEHOLDER)?
+    } else {
+        estimate_text_tokens(NO_TOOL_OUTPUT_PLACEHOLDER)?
+    };
+    checked_sum([estimate_text_tokens(&text)?, images, placeholder])
 }
 
 fn checked_sum(values: impl IntoIterator<Item = u64>) -> Result<u64, EstimateError> {
@@ -308,8 +330,24 @@ mod tests {
     use crate::provider::{
         ModelSpec,
         replay_probe::ReplayProbeV1,
-        types::{ApiProtocol, ProviderContextPayload},
+        types::{ApiProtocol, ProviderContextPayload, ToolResultMessage},
     };
+
+    fn public_tool_result(
+        tool_call_id: &str,
+        tool_name: &str,
+        content: Vec<UserContent>,
+        details: Value,
+    ) -> PublicMessage {
+        PublicMessage::ToolResult(ToolResultMessage {
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: tool_name.to_owned(),
+            content,
+            details,
+            is_error: false,
+            timestamp: chrono::Utc::now(),
+        })
+    }
 
     #[test]
     fn multilingual_estimates_have_explicit_rounding() {
@@ -591,5 +629,88 @@ mod tests {
         });
         assert_eq!(estimate_public_message(&public), Ok(3));
         assert_eq!(estimate_public_messages([&public]), Ok(3));
+    }
+
+    #[test]
+    fn tool_result_estimate_ignores_ui_only_name_and_details() {
+        let content = vec![UserContent::Text {
+            text: "visible output".into(),
+        }];
+        let baseline = public_tool_result("call-1", "read", content.clone(), json!({}));
+        let huge_ui_only = public_tool_result(
+            "call-1",
+            &"n".repeat(100_000),
+            content,
+            json!({"ui_only": "d".repeat(100_000)}),
+        );
+        assert_eq!(
+            estimate_public_message(&baseline),
+            estimate_public_message(&huge_ui_only)
+        );
+    }
+
+    #[test]
+    fn tool_result_estimate_tracks_visible_content_and_call_id() {
+        let baseline = public_tool_result(
+            "id",
+            "ignored",
+            vec![UserContent::Text {
+                text: "abcd".into(),
+            }],
+            json!({}),
+        );
+        let longer_content = public_tool_result(
+            "id",
+            "ignored",
+            vec![UserContent::Text {
+                text: "abcdefghijkl".into(),
+            }],
+            json!({}),
+        );
+        let longer_id = public_tool_result(
+            "identifier-longer-than-id",
+            "ignored",
+            vec![UserContent::Text {
+                text: "abcd".into(),
+            }],
+            json!({}),
+        );
+        assert!(
+            estimate_public_message(&longer_content).expect("content estimate")
+                > estimate_public_message(&baseline).expect("baseline estimate")
+        );
+        assert!(
+            estimate_public_message(&longer_id).expect("ID estimate")
+                > estimate_public_message(&baseline).expect("baseline estimate")
+        );
+    }
+
+    #[test]
+    fn tool_result_estimate_counts_protocol_placeholders() {
+        let id_tokens = estimate_text_tokens("id").expect("ID estimate");
+        let empty = public_tool_result("id", "ignored", vec![], json!({}));
+        assert_eq!(
+            estimate_public_message(&empty),
+            checked_sum([
+                id_tokens,
+                estimate_text_tokens(NO_TOOL_OUTPUT_PLACEHOLDER).expect("placeholder estimate")
+            ])
+        );
+
+        let image = UserContent::Image {
+            data: "base64".into(),
+            mime_type: "image/png".into(),
+        };
+        let image_content = add_user_content(0, &image).expect("image estimate");
+        let image_only = public_tool_result("id", "ignored", vec![image], json!({}));
+        assert_eq!(
+            estimate_public_message(&image_only),
+            checked_sum([
+                id_tokens,
+                image_content,
+                estimate_text_tokens(TOOL_RESULT_IMAGE_PLACEHOLDER)
+                    .expect("image placeholder estimate")
+            ])
+        );
     }
 }

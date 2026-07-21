@@ -5,7 +5,24 @@ use std::collections::HashSet;
 use crate::provider::types::{AssistantContent, ContextMessage, Message};
 
 use super::estimate::TokenCalibration;
-use super::{BatchState, L0_BATCH_MIN, L0_FORCED_SEAL_LIMIT, L0Batch};
+use super::{BatchState, L0_BATCH_MIN, L0_FORCED_SEAL_LIMIT, L0_LIMIT, L0Batch};
+
+// Every non-empty ID costs at least one public-estimator token. The byte cap
+// also covers the estimator's worst case: 1.5 non-ASCII chars/token at four
+// UTF-8 bytes each. Both limits therefore derive from the existing L0 ceiling.
+const MAX_PENDING_TOOL_IDS: usize = L0_LIMIT as usize;
+const MAX_PENDING_TOOL_ID_BYTES: usize = MAX_PENDING_TOOL_IDS * 6;
+
+#[derive(Clone, Copy)]
+struct PendingIdLimits {
+    count: usize,
+    bytes: usize,
+}
+
+const PENDING_ID_LIMITS: PendingIdLimits = PendingIdLimits {
+    count: MAX_PENDING_TOOL_IDS,
+    bytes: MAX_PENDING_TOOL_ID_BYTES,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MessageRole {
@@ -34,7 +51,9 @@ pub struct BoundaryContext {
     next_user_is_steering: bool,
     pending_tool_call_ids: HashSet<String>,
     pending_rejected_tool_call_ids: HashSet<String>,
-    malformed_tool_loop: bool,
+    pending_tool_id_bytes: usize,
+    pending_tool_tracking_overflowed: bool,
+    unsafe_suffix: bool,
 }
 
 impl BoundaryContext {
@@ -44,8 +63,13 @@ impl BoundaryContext {
         next_user_is_steering: bool,
     ) -> Self {
         let previous = history.last().map(context_message);
-        let (pending_tool_call_ids, pending_rejected_tool_call_ids, malformed_tool_loop) =
-            pending_tool_calls(history);
+        let (
+            pending_tool_call_ids,
+            pending_rejected_tool_call_ids,
+            pending_tool_id_bytes,
+            pending_tool_tracking_overflowed,
+            unsafe_suffix,
+        ) = pending_tool_calls(history);
         Self {
             previous_role: history.last().map(MessageRole::of_context),
             previous_assistant_interrupted: matches!(
@@ -56,7 +80,9 @@ impl BoundaryContext {
             next_user_is_steering,
             pending_tool_call_ids,
             pending_rejected_tool_call_ids,
-            malformed_tool_loop,
+            pending_tool_id_bytes,
+            pending_tool_tracking_overflowed,
+            unsafe_suffix,
         }
     }
 
@@ -65,19 +91,26 @@ impl BoundaryContext {
     }
 
     pub fn unresolved_tool_loop(&self) -> bool {
-        self.malformed_tool_loop
+        self.unsafe_suffix
+            || self.pending_tool_tracking_overflowed
             || !self.pending_tool_call_ids.is_empty()
             || !self.pending_rejected_tool_call_ids.is_empty()
     }
 
-    pub fn pending_tool_call_ids(&self) -> impl Iterator<Item = &str> {
-        self.pending_tool_call_ids.iter().map(String::as_str)
+    pub fn pending_tool_call_count(&self) -> usize {
+        self.pending_tool_call_ids.len()
     }
 
-    pub fn pending_rejected_tool_call_ids(&self) -> impl Iterator<Item = &str> {
-        self.pending_rejected_tool_call_ids
-            .iter()
-            .map(String::as_str)
+    pub fn pending_rejected_tool_call_count(&self) -> usize {
+        self.pending_rejected_tool_call_ids.len()
+    }
+
+    pub fn pending_tool_id_bytes(&self) -> usize {
+        self.pending_tool_id_bytes
+    }
+
+    pub fn pending_tool_tracking_overflowed(&self) -> bool {
+        self.pending_tool_tracking_overflowed
     }
 }
 
@@ -130,84 +163,134 @@ fn is_safe_boundary(boundary: &BoundaryContext) -> bool {
         && boundary.previous_assistant_interrupted)
 }
 
-/// Track executable and rejected calls as separate expectations. Results remove
-/// only their matching ID and expected kind; malformed, orphan, duplicate, and
-/// missing cases remain fail-closed even if another result arrives.
-fn pending_tool_calls(history: &[ContextMessage]) -> (HashSet<String>, HashSet<String>, bool) {
+/// Track the unresolved tool suffix needed for cut safety. Call and rejection
+/// IDs coalesce into one structural expectation per ID; transcript validity is
+/// owned by the canonical transform/assembler, not this boundary projection.
+fn pending_tool_calls(
+    history: &[ContextMessage],
+) -> (HashSet<String>, HashSet<String>, usize, bool, bool) {
+    pending_tool_calls_with_limits(history, PENDING_ID_LIMITS)
+}
+
+fn pending_tool_calls_with_limits(
+    history: &[ContextMessage],
+    limits: PendingIdLimits,
+) -> (HashSet<String>, HashSet<String>, usize, bool, bool) {
     let mut pending = HashSet::new();
     let mut pending_rejected = HashSet::new();
-    let mut completed = HashSet::new();
-    let mut completed_rejected = HashSet::new();
-    let mut malformed = false;
+    let mut pending_id_bytes = 0_usize;
+    let mut tracking_overflowed = false;
+    let mut unsafe_suffix = false;
     for context in history {
         match context_message(context) {
             Message::Assistant(message) => {
-                // A new assistant can only begin a new flow after every
-                // prior call has a matching result.  This permits a reused
-                // provider ID across assistant flows while rejecting an
-                // overlapping continuation, even when it uses another ID.
-                if !pending.is_empty() || !pending_rejected.is_empty() {
-                    malformed = true;
-                } else {
-                    completed.clear();
-                    completed_rejected.clear();
+                // An assistant with no open IDs starts a new structural flow;
+                // a user or this new flow resets anomalies from an older one.
+                if pending.is_empty() && pending_rejected.is_empty() {
+                    pending_id_bytes = 0;
+                    tracking_overflowed = false;
+                    unsafe_suffix = false;
                 }
                 for content in &message.content {
                     match content {
-                        AssistantContent::ToolCall { tool_call, .. } => {
-                            if pending.contains(&tool_call.id)
-                                || pending_rejected.contains(&tool_call.id)
-                                || completed.contains(&tool_call.id)
-                                || completed_rejected.contains(&tool_call.id)
-                            {
-                                malformed = true;
-                            } else {
-                                pending.insert(tool_call.id.clone());
-                            }
-                        }
-                        AssistantContent::RejectedToolCall { rejected, .. } => {
-                            if pending.contains(&rejected.id)
-                                || pending_rejected.contains(&rejected.id)
-                                || completed.contains(&rejected.id)
-                                || completed_rejected.contains(&rejected.id)
-                            {
-                                malformed = true;
-                            } else {
-                                pending_rejected.insert(rejected.id.clone());
-                            }
-                        }
+                        AssistantContent::ToolCall { tool_call, .. } => retain_pending_id(
+                            &tool_call.id,
+                            false,
+                            &mut pending,
+                            &mut pending_rejected,
+                            &mut pending_id_bytes,
+                            &mut tracking_overflowed,
+                            limits,
+                        ),
+                        AssistantContent::RejectedToolCall { rejected, .. } => retain_pending_id(
+                            &rejected.id,
+                            true,
+                            &mut pending,
+                            &mut pending_rejected,
+                            &mut pending_id_bytes,
+                            &mut tracking_overflowed,
+                            limits,
+                        ),
                         _ => {}
                     }
                 }
             }
             Message::ToolResult(message) => {
-                if pending.remove(&message.tool_call_id) {
-                    completed.insert(message.tool_call_id.clone());
-                } else if pending_rejected.contains(&message.tool_call_id) {
-                    if message.is_error {
-                        pending_rejected.remove(&message.tool_call_id);
-                        completed_rejected.insert(message.tool_call_id.clone());
+                if pending.remove(&message.tool_call_id)
+                    || pending_rejected.remove(&message.tool_call_id)
+                {
+                    // Rejected/non-error mismatches are still structurally
+                    // closed here; this function only decides cut safety.
+                    if let Some(remaining) =
+                        pending_id_bytes.checked_sub(message.tool_call_id.len())
+                    {
+                        pending_id_bytes = remaining;
                     } else {
-                        malformed = true;
+                        // Unreachable for correctly-maintained state; fail
+                        // closed if accounting ever becomes inconsistent.
+                        pending_id_bytes = 0;
+                        tracking_overflowed = true;
+                        unsafe_suffix = true;
                     }
                 } else {
-                    malformed = true;
+                    // An orphan or late result blocks only this immediate
+                    // suffix. A later user/new flow clears unsafe_suffix.
+                    unsafe_suffix = true;
                 }
             }
-            // IDs may be reused in a later user turn after a complete loop.
-            // A user arriving while a call is pending proves the loop was
-            // interrupted; retain the malformed marker even if a late result
-            // later happens to remove the pending ID.
             Message::User(_) => {
-                if !pending.is_empty() || !pending_rejected.is_empty() {
-                    malformed = true;
-                }
-                completed.clear();
-                completed_rejected.clear();
+                // A user turn closes the current suffix, including an
+                // interrupted call sequence, so future boundaries can seal.
+                pending.clear();
+                pending_rejected.clear();
+                pending_id_bytes = 0;
+                tracking_overflowed = false;
+                unsafe_suffix = false;
             }
         }
     }
-    (pending, pending_rejected, malformed)
+    (
+        pending,
+        pending_rejected,
+        pending_id_bytes,
+        tracking_overflowed,
+        unsafe_suffix,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn retain_pending_id(
+    id: &str,
+    rejected: bool,
+    pending: &mut HashSet<String>,
+    pending_rejected: &mut HashSet<String>,
+    pending_id_bytes: &mut usize,
+    tracking_overflowed: &mut bool,
+    limits: PendingIdLimits,
+) {
+    if *tracking_overflowed || pending.contains(id) || pending_rejected.contains(id) {
+        return;
+    }
+
+    let within_limit = pending
+        .len()
+        .checked_add(pending_rejected.len())
+        .and_then(|count| count.checked_add(1))
+        .filter(|count| *count <= limits.count)
+        .and_then(|_| pending_id_bytes.checked_add(id.len()))
+        .filter(|bytes| *bytes <= limits.bytes);
+    let Some(next_bytes) = within_limit else {
+        *tracking_overflowed = true;
+        return;
+    };
+
+    let inserted = if rejected {
+        pending_rejected.insert(id.to_owned())
+    } else {
+        pending.insert(id.to_owned())
+    };
+    debug_assert!(inserted, "duplicate IDs returned before allocation");
+    *pending_id_bytes = next_bytes;
 }
 
 fn context_message(context: &ContextMessage) -> &Message {
@@ -243,7 +326,7 @@ mod tests {
         next_role: MessageRole,
         steering: bool,
         pending: &[&str],
-        malformed: bool,
+        unsafe_suffix: bool,
     ) -> BoundaryContext {
         BoundaryContext {
             previous_role: Some(MessageRole::Assistant),
@@ -252,7 +335,9 @@ mod tests {
             next_user_is_steering: steering,
             pending_tool_call_ids: pending.iter().map(|id| (*id).to_owned()).collect(),
             pending_rejected_tool_call_ids: HashSet::new(),
-            malformed_tool_loop: malformed,
+            pending_tool_id_bytes: pending.iter().map(|id| id.len()).sum(),
+            pending_tool_tracking_overflowed: false,
+            unsafe_suffix,
         }
     }
 
@@ -387,6 +472,41 @@ mod tests {
         context
     }
 
+    fn assistant_calls(ids: &[&str]) -> ContextMessage {
+        let mut context = assistant_call(ids.first().copied().expect("at least one call"));
+        let ContextMessage::Persisted {
+            message: Message::Assistant(message),
+            ..
+        } = &mut context
+        else {
+            unreachable!("assistant call fixture is persisted assistant")
+        };
+        for (wire_item_index, id) in ids.iter().enumerate().skip(1) {
+            message.content.push(
+                serde_json::from_value(serde_json::json!({
+                    "type":"tool_call",
+                    "tool_call":{"id":id,"name":"read_file","arguments":{"path":"x"}},
+                    "wire_item_index":wire_item_index
+                }))
+                .expect("additional assistant call"),
+            );
+        }
+        context
+    }
+
+    fn interrupted_assistant_call(id: &str) -> ContextMessage {
+        let mut context = assistant_call(id);
+        let ContextMessage::Persisted {
+            message: Message::Assistant(message),
+            ..
+        } = &mut context
+        else {
+            unreachable!("assistant call fixture is persisted assistant")
+        };
+        message.interrupted = true;
+        context
+    }
+
     fn rejected_call(id: &str) -> ContextMessage {
         serde_json::from_value(serde_json::json!({
             "source":"persisted","id":format!("rejected-{id}"),"seq":1,
@@ -418,6 +538,91 @@ mod tests {
     }
 
     #[test]
+    fn pending_id_limits_derive_from_the_l0_estimator_ceiling() {
+        assert_eq!(MAX_PENDING_TOOL_IDS, 40_000);
+        assert_eq!(MAX_PENDING_TOOL_ID_BYTES, 240_000);
+        assert_eq!(MAX_PENDING_TOOL_ID_BYTES, MAX_PENDING_TOOL_IDS * 6);
+    }
+
+    #[test]
+    fn pending_id_count_limit_accepts_boundary_then_stops_retaining() {
+        let limits = PendingIdLimits {
+            count: 2,
+            bytes: 100,
+        };
+        let exact = pending_tool_calls_with_limits(&[assistant_calls(&["a", "bb"])], limits);
+        assert_eq!(exact.0.len(), 2);
+        assert_eq!(exact.2, 3);
+        assert!(!exact.3);
+
+        let exceeded =
+            pending_tool_calls_with_limits(&[assistant_calls(&["a", "bb", "ccc", "dddd"])], limits);
+        assert_eq!(exceeded.0.len(), 2);
+        assert_eq!(exceeded.2, 3);
+        assert!(exceeded.3);
+    }
+
+    #[test]
+    fn pending_id_byte_limit_accepts_exact_boundary_and_rejects_overflow() {
+        let limits = PendingIdLimits {
+            count: 10,
+            bytes: 5,
+        };
+        let exact = pending_tool_calls_with_limits(&[assistant_calls(&["aa", "bbb"])], limits);
+        assert_eq!(exact.0.len(), 2);
+        assert_eq!(exact.2, 5);
+        assert!(!exact.3);
+
+        let exceeded =
+            pending_tool_calls_with_limits(&[assistant_calls(&["aa", "bbb", "c"])], limits);
+        assert_eq!(exceeded.0.len(), 2);
+        assert_eq!(exceeded.2, 5);
+        assert!(exceeded.3);
+    }
+
+    #[test]
+    fn pending_id_overflow_blocks_immediate_cut_and_later_flows_recover() {
+        let oversized = "x".repeat(MAX_PENDING_TOOL_ID_BYTES + 1);
+        let overflow_history = vec![assistant_calls(&[oversized.as_str(), "not-retained"])];
+        let next = user_message();
+        let overflow = BoundaryContext::from_history(&overflow_history, &next, false);
+        assert_eq!(overflow.pending_tool_call_count(), 0);
+        assert_eq!(overflow.pending_tool_id_bytes(), 0);
+        assert!(overflow.pending_tool_tracking_overflowed());
+        assert_eq!(
+            seal_before_next(
+                &batch(L0_FORCED_SEAL_LIMIT + 1, 0),
+                &overflow,
+                calibration()
+            ),
+            None
+        );
+
+        let mut after_user = overflow_history.clone();
+        after_user.push(user_message());
+        let recovered = BoundaryContext::from_history(&after_user, &next, false);
+        assert!(!recovered.unresolved_tool_loop());
+        assert_eq!(
+            seal_before_next(&batch(L0_BATCH_MIN, 0), &recovered, calibration()),
+            Some(SealReason::Normal)
+        );
+        assert_eq!(
+            seal_before_next(
+                &batch(L0_FORCED_SEAL_LIMIT + 1, 0),
+                &recovered,
+                calibration()
+            ),
+            Some(SealReason::ForcedFootprint)
+        );
+
+        let mut after_new_flow = overflow_history;
+        after_new_flow.push(assistant_call("new"));
+        after_new_flow.push(tool_result("new"));
+        let recovered = BoundaryContext::from_history(&after_new_flow, &next, false);
+        assert!(!recovered.unresolved_tool_loop());
+    }
+
+    #[test]
     fn completed_single_and_multiple_loops_clear_matching_ids() {
         let next = user_message();
         for history in [
@@ -443,8 +648,8 @@ mod tests {
             ],
         ] {
             let boundary = BoundaryContext::from_history(&history, &next, false);
-            assert!(boundary.pending_tool_call_ids().next().is_none());
-            assert!(boundary.pending_rejected_tool_call_ids().next().is_none());
+            assert_eq!(boundary.pending_tool_call_count(), 0);
+            assert_eq!(boundary.pending_rejected_tool_call_count(), 0);
             assert!(!boundary.unresolved_tool_loop());
             assert_eq!(
                 seal_before_next(&batch(L0_BATCH_MIN, 0), &boundary, calibration()),
@@ -454,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_missing_orphan_and_duplicate_loops_fail_closed() {
+    fn immediate_unresolved_suffixes_remain_uncuttable() {
         let next = user_message();
         let partial = vec![
             assistant_call("one"),
@@ -462,79 +667,161 @@ mod tests {
             tool_result("one"),
         ];
         let boundary = BoundaryContext::from_history(&partial, &next, false);
-        assert_eq!(
-            boundary.pending_tool_call_ids().collect::<Vec<_>>(),
-            vec!["two"]
-        );
+        assert_eq!(boundary.pending_tool_call_count(), 1);
+        assert_eq!(boundary.pending_tool_id_bytes(), "two".len());
         assert!(boundary.unresolved_tool_loop());
+        assert_eq!(
+            seal_before_next(
+                &batch(L0_FORCED_SEAL_LIMIT + 1, 0),
+                &boundary,
+                calibration()
+            ),
+            None
+        );
 
         let orphan = vec![tool_result("orphan")];
-        assert!(BoundaryContext::from_history(&orphan, &next, false).unresolved_tool_loop());
+        let orphan_boundary = BoundaryContext::from_history(&orphan, &next, false);
+        assert!(orphan_boundary.unresolved_tool_loop());
+        assert_eq!(
+            seal_before_next(
+                &batch(L0_FORCED_SEAL_LIMIT + 1, 0),
+                &orphan_boundary,
+                calibration()
+            ),
+            None
+        );
 
         let duplicate_result = vec![
             assistant_call("one"),
             tool_result("one"),
             tool_result("one"),
         ];
-        assert!(
-            BoundaryContext::from_history(&duplicate_result, &next, false).unresolved_tool_loop()
+        let duplicate_result_boundary =
+            BoundaryContext::from_history(&duplicate_result, &next, false);
+        assert!(duplicate_result_boundary.unresolved_tool_loop());
+        assert_eq!(
+            seal_before_next(
+                &batch(L0_FORCED_SEAL_LIMIT + 1, 0),
+                &duplicate_result_boundary,
+                calibration()
+            ),
+            None
         );
 
-        let duplicate_call = vec![
-            assistant_call("one"),
-            assistant_call("one"),
-            tool_result("one"),
-        ];
-        assert!(
-            BoundaryContext::from_history(&duplicate_call, &next, false).unresolved_tool_loop()
-        );
-
-        let overlapping_distinct_calls = vec![
-            assistant_call("one"),
-            assistant_call("two"),
-            tool_result("one"),
-            tool_result("two"),
-        ];
-        assert!(
-            BoundaryContext::from_history(&overlapping_distinct_calls, &next, false)
-                .unresolved_tool_loop()
-        );
-
-        let rejected_non_error = vec![rejected_call("rejected"), tool_result("rejected")];
-        assert!(
-            BoundaryContext::from_history(&rejected_non_error, &next, false).unresolved_tool_loop()
-        );
-
-        let rejected_duplicate = vec![
+        let rejected_duplicate_result = vec![
             rejected_call("rejected"),
             tool_result_with_error("rejected", true),
             tool_result_with_error("rejected", true),
         ];
-        assert!(
-            BoundaryContext::from_history(&rejected_duplicate, &next, false).unresolved_tool_loop()
-        );
-
-        let rejected_late_result = vec![
-            rejected_call("rejected"),
-            user_message(),
-            tool_result_with_error("rejected", true),
-        ];
-        assert!(
-            BoundaryContext::from_history(&rejected_late_result, &next, false)
-                .unresolved_tool_loop()
-        );
-
-        let cross_kind_duplicate = vec![
-            assistant_with_rejected_duplicate("same"),
-            tool_result_with_error("same", true),
-        ];
-        assert!(
-            BoundaryContext::from_history(&cross_kind_duplicate, &next, false)
-                .unresolved_tool_loop()
+        let rejected_duplicate_boundary =
+            BoundaryContext::from_history(&rejected_duplicate_result, &next, false);
+        assert!(rejected_duplicate_boundary.unresolved_tool_loop());
+        assert_eq!(
+            seal_before_next(
+                &batch(L0_FORCED_SEAL_LIMIT + 1, 0),
+                &rejected_duplicate_boundary,
+                calibration()
+            ),
+            None
         );
 
         let late_result = vec![assistant_call("one"), user_message(), tool_result("one")];
-        assert!(BoundaryContext::from_history(&late_result, &next, false).unresolved_tool_loop());
+        let late_boundary = BoundaryContext::from_history(&late_result, &next, false);
+        assert!(late_boundary.unresolved_tool_loop());
+        assert_eq!(
+            seal_before_next(
+                &batch(L0_FORCED_SEAL_LIMIT + 1, 0),
+                &late_boundary,
+                calibration()
+            ),
+            None
+        );
+
+        let rejected_next_result = rejected_call("rejected");
+        let rejected_next_result_boundary =
+            BoundaryContext::from_history(&[rejected_next_result], &tool_result("rejected"), false);
+        assert_eq!(
+            seal_before_next(
+                &batch(L0_FORCED_SEAL_LIMIT + 1, 0),
+                &rejected_next_result_boundary,
+                calibration()
+            ),
+            None
+        );
+
+        let completed_result = vec![assistant_call("one"), tool_result("one")];
+        let continuation_boundary =
+            BoundaryContext::from_history(&completed_result, &assistant_call("next"), false);
+        assert_eq!(
+            seal_before_next(
+                &batch(L0_FORCED_SEAL_LIMIT + 1, 0),
+                &continuation_boundary,
+                calibration()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn historical_anomalies_recover_after_user_or_new_flow() {
+        let next = user_message();
+        let histories = [
+            vec![assistant_call("one"), user_message()],
+            vec![interrupted_assistant_call("interrupted"), user_message()],
+            vec![tool_result("orphan"), user_message()],
+            vec![
+                assistant_call("one"),
+                assistant_call("one"),
+                tool_result("one"),
+                user_message(),
+            ],
+            vec![
+                assistant_call("one"),
+                tool_result("one"),
+                tool_result("one"),
+                user_message(),
+            ],
+            vec![
+                assistant_call("one"),
+                user_message(),
+                tool_result("one"),
+                user_message(),
+            ],
+            vec![
+                assistant_with_rejected_duplicate("same"),
+                tool_result_with_error("same", false),
+                user_message(),
+            ],
+            vec![
+                rejected_call("rejected"),
+                tool_result("rejected"),
+                user_message(),
+            ],
+            vec![
+                tool_result("orphan"),
+                assistant_call("new-flow"),
+                tool_result("new-flow"),
+            ],
+        ];
+
+        for history in histories {
+            let boundary = BoundaryContext::from_history(&history, &next, false);
+            assert_eq!(boundary.pending_tool_call_count(), 0);
+            assert_eq!(boundary.pending_rejected_tool_call_count(), 0);
+            assert!(!boundary.unresolved_tool_loop());
+            assert_eq!(
+                seal_before_next(&batch(L0_BATCH_MIN, 0), &boundary, calibration()),
+                Some(SealReason::Normal)
+            );
+            assert_eq!(
+                seal_before_next(
+                    &batch(L0_FORCED_SEAL_LIMIT + 1, 0),
+                    &boundary,
+                    calibration()
+                ),
+                Some(SealReason::ForcedFootprint)
+            );
+        }
     }
 
     #[test]
@@ -546,8 +833,8 @@ mod tests {
         let next = user_message();
         let boundary = BoundaryContext::from_history(&history, &next, false);
 
-        assert!(boundary.pending_tool_call_ids().next().is_none());
-        assert!(boundary.pending_rejected_tool_call_ids().next().is_none());
+        assert_eq!(boundary.pending_tool_call_count(), 0);
+        assert_eq!(boundary.pending_rejected_tool_call_count(), 0);
         assert!(!boundary.unresolved_tool_loop());
         assert_eq!(
             seal_before_next(&batch(L0_BATCH_MIN, 0), &boundary, calibration()),
