@@ -29,7 +29,7 @@ use crate::{
 };
 
 use super::{
-    AdmittedCommand, AgentEvent, ProjectedProviderEvent, ProviderEventProjector,
+    AdmittedCommand, AgentEvent, DurableRunBinding, ProjectedProviderEvent, ProviderEventProjector,
     ProviderTerminalKind, RunCompletion, RunControl, RunCore, RunOutput, RunWorker, SteerMode,
     WorkerFailure, WorkerFuture,
 };
@@ -42,6 +42,9 @@ const LENGTH_OVERFLOW_CODE: &str = "context_overflow_length_usage";
 const MAX_OVERFLOW_RECOVERIES: u8 = 2;
 const TOOL_RESULT_MESSAGE_ID_NAMESPACE: Uuid = Uuid::from_bytes([
     0x73, 0x75, 0x6d, 0x69, 0xa4, 0xc1, 0x48, 0x22, 0x91, 0x5d, 0xb5, 0xd2, 0x5a, 0x69, 0x9f, 0x31,
+]);
+const SYNTHETIC_ATTEMPT_MESSAGE_ID_NAMESPACE: Uuid = Uuid::from_bytes([
+    0x94, 0x76, 0x9e, 0x72, 0xc9, 0x5b, 0x4d, 0xa8, 0x9c, 0x59, 0x8e, 0x36, 0xa2, 0x53, 0xa1, 0x70,
 ]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +62,8 @@ pub(crate) enum OverflowRecoveryOutcome {
 /// origin metadata for `MessageStart`; the stream remains the authority for
 /// the terminal message.
 pub(crate) struct ProviderAttempt {
+    /// Stable, conversation-global durable message identity. Reusing an ID in
+    /// another run would collide with the Store's globally keyed message row.
     pub(crate) message_id: String,
     pub(crate) initial_message: PublicMessage,
     pub(crate) events: ProviderEventStream,
@@ -390,11 +395,22 @@ impl Runner {
             .await
         {
             Ok(attempt) => attempt,
-            Err(error) => return self.synthetic_attempt_error(error.to_string()).await,
+            Err(error) => {
+                return self
+                    .synthetic_attempt_error(error.to_string(), SyntheticAttemptFailure::Start)
+                    .await;
+            }
         };
         let mut projector = match ProviderEventProjector::new(attempt.message_id.clone()) {
             Ok(projector) => projector,
-            Err(error) => return self.synthetic_attempt_error(error.to_string()).await,
+            Err(error) => {
+                return self
+                    .synthetic_attempt_error(
+                        error.to_string(),
+                        SyntheticAttemptFailure::InvalidMessageId,
+                    )
+                    .await;
+            }
         };
         let mut message_started = false;
         let mut rejected_results = Vec::new();
@@ -569,9 +585,13 @@ impl Runner {
     async fn synthetic_attempt_error(
         &mut self,
         error: String,
+        failure: SyntheticAttemptFailure,
     ) -> Result<AttemptOutcome, WorkerFailure> {
         let message = self.driver.synthetic_error(&error);
-        let message_id = format!("synthetic-error-{}", self.attempt_sequence);
+        let binding = self.core.durable_binding.as_ref().ok_or_else(|| {
+            WorkerFailure::Error("RunCore has no durable worker binding".to_owned())
+        })?;
+        let message_id = synthetic_attempt_message_id(binding, self.attempt_sequence, failure)?;
         self.emit(AgentEvent::MessageStart {
             message_id: message_id.clone(),
             message: Box::new(message.clone()),
@@ -955,6 +975,12 @@ enum AttemptOutcome {
     },
 }
 
+#[derive(Clone, Copy)]
+enum SyntheticAttemptFailure {
+    Start,
+    InvalidMessageId,
+}
+
 fn tool_calls(message: &PublicMessage) -> Vec<ToolCall> {
     let PublicMessage::Assistant(message) = message else {
         return Vec::new();
@@ -1049,6 +1075,29 @@ fn tool_result_message_id(assistant_message_id: &str, tool_call_id: &str) -> Str
     pair_digest[..32].copy_from_slice(&assistant_digest);
     pair_digest[32..].copy_from_slice(&tool_call_digest);
     Uuid::new_v5(&TOOL_RESULT_MESSAGE_ID_NAMESPACE, &pair_digest).to_string()
+}
+
+fn synthetic_attempt_message_id(
+    binding: &DurableRunBinding,
+    attempt: usize,
+    failure: SyntheticAttemptFailure,
+) -> Result<String, WorkerFailure> {
+    let attempt = u64::try_from(attempt).map_err(|_| {
+        WorkerFailure::Error(
+            "provider attempt ordinal exceeds its durable identity range".to_owned(),
+        )
+    })?;
+    let run_digest = Sha256::digest(binding.run_id.as_bytes());
+    let turn_digest = Sha256::digest(binding.turn_id.as_bytes());
+    let mut name = [0_u8; 73];
+    name[..32].copy_from_slice(&run_digest);
+    name[32..64].copy_from_slice(&turn_digest);
+    name[64..72].copy_from_slice(&attempt.to_be_bytes());
+    name[72] = match failure {
+        SyntheticAttemptFailure::Start => 0,
+        SyntheticAttemptFailure::InvalidMessageId => 1,
+    };
+    Ok(Uuid::new_v5(&SYNTHETIC_ATTEMPT_MESSAGE_ID_NAMESPACE, &name).to_string())
 }
 
 #[cfg(test)]

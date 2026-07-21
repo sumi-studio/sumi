@@ -901,6 +901,35 @@ async fn reused_tool_call_id_gets_turn_scoped_stable_result_message_ids() {
     );
 }
 
+#[test]
+fn synthetic_attempt_message_ids_are_stable_and_scoped_by_durable_identity_and_failure_role() {
+    let binding = DurableRunBinding {
+        command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+        command_seq: 1,
+        run_id: "01900000-0000-7000-8000-000000000001".to_owned(),
+        turn_id: "01900000-0000-7000-8000-000000000002".to_owned(),
+    };
+    let start = synthetic_attempt_message_id(&binding, 0, SyntheticAttemptFailure::Start)
+        .expect("synthetic start identity");
+    assert_eq!(
+        start,
+        synthetic_attempt_message_id(&binding, 0, SyntheticAttemptFailure::Start)
+            .expect("stable synthetic start identity")
+    );
+    assert_ne!(
+        start,
+        synthetic_attempt_message_id(&binding, 0, SyntheticAttemptFailure::InvalidMessageId)
+            .expect("failure role identity")
+    );
+    let mut next_turn = binding.clone();
+    next_turn.turn_id = "01900000-0000-7000-8000-000000000003".to_owned();
+    assert_ne!(
+        start,
+        synthetic_attempt_message_id(&next_turn, 0, SyntheticAttemptFailure::Start)
+            .expect("next turn identity")
+    );
+}
+
 #[tokio::test]
 async fn tool_failure_is_synthetic_result_and_preserves_normal_form() {
     let driver = Arc::new(

@@ -102,6 +102,30 @@ fn controlled_gateway() -> ControlledGateway {
     }
 }
 
+struct FailFirstEventGateway {
+    commands: mpsc::Receiver<InboundCommand>,
+    event_attempts: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Gateway for FailFirstEventGateway {
+    async fn next_command(&mut self) -> Result<InboundCommand> {
+        self.commands
+            .recv()
+            .await
+            .ok_or_else(|| GatewayClosed.into())
+    }
+
+    async fn send(&mut self, frame: OutboundFrame) -> Result<()> {
+        if matches!(frame, OutboundFrame::Event { .. })
+            && self.event_attempts.fetch_add(1, Ordering::SeqCst) == 0
+        {
+            return Err(anyhow!("fixture first event delivery failure"));
+        }
+        Ok(())
+    }
+}
+
 fn completed(result: SessionResult) -> RunCore {
     match result {
         SessionResult::Completed(core) => core,
@@ -574,6 +598,73 @@ async fn active_session_uses_durable_backpressure_before_its_bounded_fifo_can_ov
 }
 
 #[tokio::test]
+async fn active_session_keeps_early_reserved_abort_and_remaining_ordinary_window_fifo_bounded() {
+    let store = Store::session_test_store("active-early-abort-bounded-fifo-session")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (gateway, _commands, _frames) = gateway();
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |_core: RunCore,
+         _initial: AdmittedCommand,
+         _controls: mpsc::Receiver<RunControl>,
+         _events: mpsc::Sender<AgentEvent>| async move { pending::<RunCompletion>().await },
+    );
+    let mut session = Session::start(store, gateway, RunCore::new(), worker)
+        .await
+        .expect("session");
+
+    session
+        .admit_and_route(user(1))
+        .await
+        .expect("active owner");
+    session
+        .admit_and_route(abort(2))
+        .await
+        .expect("early reserved Abort");
+    for seq in 3..=33 {
+        session
+            .admit_and_route(user(seq))
+            .await
+            .expect("remaining 31 ordinary commands fit beside owner and Abort");
+    }
+    assert_eq!(session.deferred_commands.len(), 32);
+    assert_eq!(
+        session
+            .deferred_commands
+            .iter()
+            .map(|command| command.envelope().seq)
+            .collect::<Vec<_>>(),
+        (2..=33).collect::<Vec<_>>()
+    );
+    assert!(matches!(
+        session
+            .deferred_commands
+            .front()
+            .expect("reserved Abort remains at FIFO head")
+            .envelope()
+            .command,
+        Command::Abort {}
+    ));
+
+    let overflow = session
+        .admit_and_route(user(34))
+        .await
+        .expect_err("next ordinary command must backpressure before persistence");
+    assert!(overflow.to_string().contains("admission window is full"));
+    let persisted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbound_commands")
+        .fetch_one(&pool)
+        .await
+        .expect("durable admission count");
+    assert_eq!(
+        persisted, 33,
+        "overflow command was not assigned durable state"
+    );
+    assert_eq!(session.deferred_commands.len(), 32);
+    session.shutdown_active().await;
+}
+
+#[tokio::test]
 async fn ready_completion_event_and_next_command_all_progress_with_one_core() {
     let (gateway, commands, frames) = gateway();
     let starts = Arc::new(AtomicUsize::new(0));
@@ -884,6 +975,101 @@ async fn event_drain_send_failure_preserves_ready_completion_core() {
         panic!("ready completion core was discarded during event drain");
     };
     assert_eq!(core.ownership_id(), ownership_id);
+}
+
+#[tokio::test]
+async fn completion_drain_persists_all_outputs_before_recovering_mutated_core_after_delivery_loss()
+{
+    let store = Store::session_test_store("completion-drain-delivery-loss-session")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (commands_tx, commands) = mpsc::channel(1);
+    let event_attempts = Arc::new(AtomicUsize::new(0));
+    let gateway = FailFirstEventGateway {
+        commands,
+        event_attempts: event_attempts.clone(),
+    };
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |mut core: RunCore,
+         initial: AdmittedCommand,
+         mut controls: mpsc::Receiver<RunControl>,
+         events: mpsc::Sender<AgentEvent>| async move {
+            let Command::UserMessage { text, .. } = &initial.envelope().command else {
+                panic!("idle fixture requires user command")
+            };
+            let user_context = PublicMessage::User(UserMessage {
+                content: vec![UserContent::Text { text: text.clone() }],
+                timestamp: initial.received_at(),
+            });
+            emit_idle_injection(&events, &initial).await;
+            let assistant = bridge_assistant(StopReason::Stop);
+            for event in [
+                AgentEvent::MessageStart {
+                    message_id: "completion-drain-assistant".to_owned(),
+                    message: Box::new(assistant.clone()),
+                },
+                AgentEvent::MessageEnd {
+                    message_id: "completion-drain-assistant".to_owned(),
+                    message: Box::new(assistant.clone()),
+                },
+                AgentEvent::TurnEnd {
+                    message: Some(Box::new(assistant.clone())),
+                    tool_results: Vec::new(),
+                },
+                AgentEvent::AgentEnd,
+            ] {
+                events.send(event).await.expect("session event receiver");
+            }
+            core.runtime_context = vec![user_context, assistant];
+            core.mark_mutated();
+            controls.close();
+            RunCompletion::Completed(core)
+        },
+    );
+    let mut session = Session::start(store, gateway, RunCore::new(), worker)
+        .await
+        .expect("session");
+
+    session
+        .admit_and_route(user(1))
+        .await
+        .expect("start active run");
+    drop(commands_tx);
+    let completion = {
+        let active = session.active.as_mut().expect("active run");
+        (&mut active.completion_rx).await
+    };
+    let failure = session
+        .finish_run(completion)
+        .await
+        .expect_err("first completion-drained frame must fail delivery");
+    assert!(matches!(
+        failure,
+        SessionFailure::Gateway {
+            operation: "send",
+            ..
+        }
+    ));
+    assert_eq!(event_attempts.load(Ordering::SeqCst), 1);
+
+    let recovered = session
+        .core
+        .take()
+        .expect("fully drained completed core remains recoverable");
+    assert_eq!(recovered.mutation_epoch(), 1);
+    assert_eq!(recovered.runtime_context.len(), 2);
+    let durable_messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+        .fetch_one(&pool)
+        .await
+        .expect("durable message count");
+    assert_eq!(durable_messages, 2);
+    let durable_tail: Vec<String> =
+        sqlx::query_scalar("SELECT event_type FROM agent_events ORDER BY seq DESC LIMIT 2")
+            .fetch_all(&pool)
+            .await
+            .expect("durable completion tail");
+    assert_eq!(durable_tail, vec!["agent_end", "turn_end"]);
 }
 
 #[tokio::test]
@@ -1355,6 +1541,46 @@ async fn active_abort_then_user_applies_abort_before_starting_later_user() {
 }
 
 struct OpaqueContextDriver;
+
+struct StartFailureDriver;
+
+#[async_trait]
+impl RunDriver for StartFailureDriver {
+    async fn start_provider(
+        &self,
+        _attempt: usize,
+        _context: &[PublicMessage],
+        _cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        Err(anyhow!("fixture provider start failure"))
+    }
+
+    async fn execute_tool(
+        &self,
+        _call: &ToolCall,
+        _cancel: CancellationToken,
+    ) -> Result<ToolResultMessage> {
+        Err(anyhow!("start-failure fixture has no tools"))
+    }
+
+    fn synthetic_error(&self, message: &str) -> PublicMessage {
+        let mut assistant = match bridge_assistant(StopReason::Error) {
+            PublicMessage::Assistant(message) => message,
+            _ => unreachable!(),
+        };
+        assistant.error_message = Some(message.to_owned());
+        PublicMessage::Assistant(assistant)
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        _active_context: &[PublicMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        Err(anyhow!("start-failure fixture has no overflow recovery"))
+    }
+}
 
 #[async_trait]
 impl RunDriver for OpaqueContextDriver {
@@ -2210,6 +2436,59 @@ async fn retry_error_is_excluded_and_retry_schedule_precedes_next_attempt() {
     .await
     .expect("retry error projection");
     assert_eq!(error_stop, "error");
+}
+
+#[tokio::test]
+async fn provider_start_failures_in_two_runs_use_distinct_stable_durable_message_ids() {
+    let store = Store::session_test_store("two-run-provider-start-failure-session")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (gateway, commands, frames) = gateway();
+    let worker: Arc<dyn RunWorker> =
+        Arc::new(SequentialRunWorker::new(Arc::new(StartFailureDriver)));
+    let session = Session::start(store, gateway, RunCore::new(), worker)
+        .await
+        .expect("session");
+    let task = tokio::spawn(session.run());
+
+    commands.send(user(1)).await.expect("first command");
+    commands.send(user(2)).await.expect("second command");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let applied = frames
+                .lock()
+                .expect("frame mutex")
+                .iter()
+                .filter(|frame| {
+                    matches!(frame, OutboundFrame::CommandAck { ack }
+                        if ack.status == CommandAckStatus::Applied)
+                })
+                .count();
+            if applied == 2 || task.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both failed provider starts close durably");
+    drop(commands);
+    completed(task.await.expect("session join"));
+
+    let synthetic_ids: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM messages WHERE role='assistant' ORDER BY seq")
+            .fetch_all(&pool)
+            .await
+            .expect("synthetic durable message IDs");
+    assert_eq!(synthetic_ids.len(), 2);
+    assert_ne!(synthetic_ids[0], synthetic_ids[1]);
+    assert!(
+        synthetic_ids
+            .iter()
+            .all(|message_id| Uuid::parse_str(message_id).is_ok()),
+        "synthetic identities use the bounded UUIDv5 form"
+    );
 }
 
 #[tokio::test]

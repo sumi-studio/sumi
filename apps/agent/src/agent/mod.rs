@@ -656,16 +656,11 @@ impl<G: Gateway + 'static> Session<G> {
         if let Err(error) = active.join.await {
             return Err(worker_join_failure(error));
         }
-        let worker_failure = match completion {
-            RunCompletion::Completed(core) => {
-                self.core = Some(core);
-                None
-            }
-            RunCompletion::Failed { core, failure } => {
-                self.core = Some(core);
-                Some(failure)
-            }
+        let (core, worker_failure) = match completion {
+            RunCompletion::Completed(core) => (core, None),
+            RunCompletion::Failed { core, failure } => (core, Some(failure)),
         };
+        let mut delivery_failure = None;
         while let Ok(output) = active.events_rx.try_recv() {
             let committed = match active.bridge.commit(&self.writer, output).await {
                 Ok(committed) => committed,
@@ -674,8 +669,19 @@ impl<G: Gateway + 'static> Session<G> {
                     return Err(error.into());
                 }
             };
-            self.send_committed(committed, Some(active.bridge.command_id().to_owned()))
-                .await?;
+            if delivery_failure.is_none() {
+                delivery_failure = self
+                    .send_committed(committed, Some(active.bridge.command_id().to_owned()))
+                    .await
+                    .err();
+            }
+        }
+        // A completed RunCore includes every output already produced by the
+        // worker. Do not expose it until the disconnected bounded event lane
+        // has been drained into SQLite, even when Gateway delivery was lost.
+        self.core = Some(core);
+        if let Some(failure) = delivery_failure {
+            return Err(failure);
         }
         match worker_failure {
             Some(failure) => Err(SessionFailure::Worker(failure)),
