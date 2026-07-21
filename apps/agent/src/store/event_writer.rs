@@ -7083,11 +7083,13 @@ mod tests {
 
     use super::*;
     use crate::{
+        agent::{ProjectedProviderEvent, ProviderEventProjector, ProviderTerminalKind},
         gateway::{Command, SensitiveCommandPayload},
         provider::types::{
-            ApiProtocol, ProviderOrigin, PublicAssistantContent, PublicAssistantMessage,
-            PublicMessage, RejectedToolCall, StopReason, ToolArgumentError, ToolCall,
-            ToolResultMessage, Usage, UserContent, UserMessage,
+            ApiProtocol, AssistantContent, AssistantMessage, ProviderEvent, ProviderOrigin,
+            ProviderOutput, PublicAssistantContent, PublicAssistantMessage, PublicMessage,
+            RejectedToolCall, StopReason, ToolArgumentError, ToolCall, ToolResultMessage, Usage,
+            UserContent, UserMessage,
         },
         store::{
             AgentScope, KeyProvider, RecoveryStep, SuffixRecovery,
@@ -16401,6 +16403,200 @@ mod tests {
                     .expect("remove hard-kill fixture");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn projected_provider_terminal_round_trips_through_event_writer_with_full_metadata() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000072";
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let injected =
+            classified_injection(&writer, 1, command_id, "ignored", "metadata fixture").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "metadata fixture"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("persist user injection");
+
+        let timestamp = DateTime::parse_from_rfc3339("2026-07-21T01:02:03.456789Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let initial = PublicMessage::Assistant(PublicAssistantMessage {
+            content: Vec::new(),
+            model: "model-nondefault".to_owned(),
+            provider: "provider-nondefault".to_owned(),
+            origin: ProviderOrigin {
+                provider_instance_id: "provider-instance-nondefault".to_owned(),
+                protocol: ApiProtocol::AnthropicMessages,
+                model: "model-nondefault".to_owned(),
+            },
+            usage: Usage::default(),
+            stop_reason: StopReason::Error,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp,
+        });
+        let assistant_id = "assistant-provider-terminal";
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            assistant_id,
+                            &initial,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("open assistant attempt");
+
+        let message = AssistantMessage {
+            content: vec![
+                AssistantContent::Thinking {
+                    thinking: "non-default plan".to_owned(),
+                    signature_field: "thinking".to_owned(),
+                    wire_item_index: 4,
+                },
+                AssistantContent::Text {
+                    text: "partial answer".to_owned(),
+                    wire_item_index: 5,
+                },
+            ],
+            model: "model-nondefault".to_owned(),
+            provider: "provider-nondefault".to_owned(),
+            origin: ProviderOrigin {
+                provider_instance_id: "provider-instance-nondefault".to_owned(),
+                protocol: ApiProtocol::AnthropicMessages,
+                model: "model-nondefault".to_owned(),
+            },
+            usage: Usage {
+                input: 11,
+                output: 22,
+                cache_read: 33,
+                cache_write: 44,
+                reasoning: 55,
+                total_tokens: 110,
+            },
+            stop_reason: StopReason::Error,
+            error_message: Some("provider unavailable".to_owned()),
+            provider_code: Some("http_503".to_owned()),
+            interrupted: true,
+            timestamp,
+        };
+        let mut projector = ProviderEventProjector::new(assistant_id).expect("projector");
+        assert!(matches!(
+            projector.project(ProviderEvent::Start).expect("Start"),
+            ProjectedProviderEvent::Started
+        ));
+        let ProjectedProviderEvent::Terminal(terminal) = projector
+            .project(ProviderEvent::Error {
+                reason: StopReason::Error,
+                output: ProviderOutput {
+                    message,
+                    provider_context: Vec::new(),
+                },
+            })
+            .expect("terminal projection")
+        else {
+            panic!("expected terminal");
+        };
+        assert_eq!(terminal.kind(), ProviderTerminalKind::Error);
+        let PublicMessage::Assistant(projected) = terminal.message() else {
+            panic!("expected assistant projection");
+        };
+        assert_eq!(projected.usage.input, 11);
+        assert_eq!(projected.usage.reasoning, 55);
+        assert_eq!(projected.origin.protocol, ApiProtocol::AnthropicMessages);
+        assert_eq!(
+            projected.origin.provider_instance_id,
+            "provider-instance-nondefault"
+        );
+        assert_eq!(
+            projected.error_message.as_deref(),
+            Some("provider unavailable")
+        );
+        assert_eq!(projected.provider_code.as_deref(), Some("http_503"));
+        assert_eq!(projected.timestamp, timestamp);
+        let terminal_message = terminal.message().clone();
+        let terminal_write = terminal
+            .into_t12_write(run_id.clone(), turn_id.clone(), false)
+            .expect("context-free T12 terminal write");
+        let terminal_sequences = writer
+            .apply(EventBatch {
+                writes: vec![
+                    terminal_write,
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::turn_end(
+                                run_id.clone(),
+                                turn_id.clone(),
+                                terminal_message.clone(),
+                                Vec::new(),
+                            )
+                            .expect("TurnEnd"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(DurableEvent::agent_end(run_id.clone()).expect("AgentEnd")),
+                        projections: vec![Projection::CommandApplied {
+                            command_id: command_id.to_owned(),
+                            command_seq: 1,
+                            run_id: Some(run_id),
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist projected provider terminal");
+        let [terminal_message_end_seq, _, _] = terminal_sequences.as_slice() else {
+            panic!("terminal batch must persist MessageEnd, TurnEnd, and AgentEnd");
+        };
+        let terminal_message_end_seq = i64::try_from(*terminal_message_end_seq)
+            .expect("terminal MessageEnd sequence fits SQLite INTEGER");
+
+        let payload: String =
+            sqlx::query_scalar("SELECT payload FROM messages WHERE id=? AND role='assistant'")
+                .bind(assistant_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("durable message projection");
+        assert_eq!(
+            serde_json::from_str::<PublicMessage>(&payload).expect("message payload"),
+            terminal_message
+        );
+        let mut transaction = store.pool().begin().await.expect("event read transaction");
+        let durable = load_authenticated_event(&store, &mut transaction, terminal_message_end_seq)
+            .await
+            .expect("authenticated MessageEnd");
+        transaction.rollback().await.expect("rollback event read");
+        assert_eq!(durable.kind, "message_end");
+        assert_eq!(
+            durable.envelope,
+            serde_json::to_value(&terminal_message)
+                .map(|message| {
+                    json!({"type":"message_end","message_id":assistant_id,"message":message})
+                })
+                .expect("terminal envelope")
+        );
     }
 
     #[cfg(not(unix))]
