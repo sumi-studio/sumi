@@ -6,7 +6,6 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::provider::{
-    adapters::chat_completions::is_mfjs_strict_safe,
     assembler::{
         FrozenToolSchemaRegistry, ResponseBudget, ToolArgumentAccumulator, ToolArgumentOutcome,
     },
@@ -313,17 +312,469 @@ fn ensure_responses_spec(spec: &ModelSpec) -> Result<&ResponsesCompat, Responses
 }
 
 fn convert_tool(tool: &ToolDefinition) -> Value {
-    // OpenAI Responses defaults to strict generation, but only the same
-    // conservative MFJS subset proven by Chat can safely rely on that
-    // default. Explicitly disable it for arbitrary schemas while preserving
-    // the strict request for schemas that pass the predicate.
-    let strict = is_mfjs_strict_safe(&tool.parameters);
+    // OpenAI Responses attempts strict generation by default. Explicitly
+    // disable it when the tool schema does not satisfy OpenAI's strict subset;
+    // this keeps the provider's fallback behavior explicit in the request.
+    let strict = is_openai_strict_safe(&tool.parameters);
     json!({
         "type": "function",
         "name": tool.name,
         "description": tool.description,
         "parameters": tool.parameters,
         "strict": strict,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenAiSchemaType {
+    Object,
+    Array,
+    String,
+    Integer,
+    Number,
+    Boolean,
+    Null,
+}
+
+#[derive(Default)]
+struct OpenAiSchemaValidationState<'a> {
+    definitions: Option<&'a Map<String, Value>>,
+    active_refs: HashSet<String>,
+    validated_refs: HashSet<String>,
+    property_count: usize,
+    enum_values: usize,
+    aggregate_string_length: usize,
+}
+
+/// Proves that a tool schema can be sent with `strict: true` to OpenAI
+/// Responses. OpenAI's strict function schemas require every object to opt
+/// out of additional properties and every declared property to be required.
+/// It also enforces the documented 10-level object, 1000-enum, 120,000-string,
+/// and 15,000-long-string-enum limits. The remaining checks intentionally
+/// retain the conservative schema subset used by the Chat adapter; a false
+/// result only opts into best-effort calls.
+fn is_openai_strict_safe(schema: &Value) -> bool {
+    let Some(root) = schema.as_object() else {
+        return false;
+    };
+    let definitions = match root.get("$defs") {
+        Some(value) => {
+            let Some(definitions) = value.as_object() else {
+                return false;
+            };
+            Some(definitions)
+        }
+        None => None,
+    };
+    if definitions.is_some_and(|definitions| {
+        definitions
+            .keys()
+            .any(|name| name.is_empty() || name.contains('/') || name.contains('~'))
+    }) {
+        return false;
+    }
+    let mut state = OpenAiSchemaValidationState {
+        definitions,
+        ..Default::default()
+    };
+    if definitions.is_some_and(|definitions| {
+        definitions
+            .keys()
+            .any(|name| !add_openai_string_budget(&mut state, name))
+    }) {
+        return false;
+    }
+    if !validate_openai_schema(schema, true, 1, 0, true, &mut state) {
+        return false;
+    }
+    state.property_count <= 2_048
+        && definitions.is_none_or(|definitions| {
+            definitions.iter().all(|(name, definition)| {
+                if state.validated_refs.contains(name) {
+                    true
+                } else {
+                    let valid = validate_openai_schema(definition, false, 2, 0, true, &mut state);
+                    if valid {
+                        state.validated_refs.insert(name.clone());
+                    }
+                    valid
+                }
+            })
+        })
+}
+
+fn validate_openai_schema(
+    schema: &Value,
+    root: bool,
+    depth: usize,
+    object_nesting: usize,
+    count_limits: bool,
+    state: &mut OpenAiSchemaValidationState<'_>,
+) -> bool {
+    if depth > 30 {
+        return false;
+    }
+    let Some(object) = schema.as_object() else {
+        return false;
+    };
+    if object.contains_key("default") {
+        return false;
+    }
+    if object
+        .get("description")
+        .is_some_and(|value| !value.is_string())
+        || object.get("title").is_some_and(|value| !value.is_string())
+        || object.get("$id").is_some_and(|value| !value.is_string())
+        || (!root && (object.contains_key("$defs") || object.contains_key("$id")))
+    {
+        return false;
+    }
+
+    if let Some(reference) = object.get("$ref") {
+        if root
+            || object
+                .keys()
+                .any(|key| !matches!(key.as_str(), "$ref" | "description" | "title"))
+        {
+            return false;
+        }
+        let Some(name) = reference
+            .as_str()
+            .and_then(|reference| reference.strip_prefix("#/$defs/"))
+            .filter(|name| !name.is_empty() && !name.contains('/') && !name.contains('~'))
+        else {
+            return false;
+        };
+        let Some(definitions) = state.definitions else {
+            return false;
+        };
+        if !definitions.contains_key(name) {
+            return false;
+        }
+        if state.validated_refs.contains(name) {
+            return validate_openai_schema(
+                definitions.get(name).expect("checked definition presence"),
+                false,
+                depth + 1,
+                object_nesting,
+                false,
+                state,
+            );
+        }
+        if !state.active_refs.insert(name.to_owned()) {
+            return true;
+        }
+        let valid = validate_openai_schema(
+            definitions.get(name).expect("checked definition presence"),
+            false,
+            depth + 1,
+            object_nesting,
+            count_limits,
+            state,
+        );
+        state.active_refs.remove(name);
+        if valid {
+            state.validated_refs.insert(name.to_owned());
+        }
+        return valid;
+    }
+
+    if let Some(any_of) = object.get("anyOf") {
+        if root
+            || object
+                .keys()
+                .any(|key| !matches!(key.as_str(), "anyOf" | "description" | "title"))
+        {
+            return false;
+        }
+        let Some(branches) = any_of.as_array() else {
+            return false;
+        };
+        return !branches.is_empty()
+            && branches.iter().all(|branch| {
+                validate_openai_schema(
+                    branch,
+                    false,
+                    depth + 1,
+                    object_nesting,
+                    count_limits,
+                    state,
+                )
+            });
+    }
+
+    let Some((types, primary_type)) = openai_schema_types(object.get("type")) else {
+        return false;
+    };
+    if root && (primary_type != OpenAiSchemaType::Object || types.len() != 1) {
+        return false;
+    }
+    if object
+        .keys()
+        .any(|key| !openai_keyword_allowed(key, primary_type, root))
+    {
+        return false;
+    }
+
+    match primary_type {
+        OpenAiSchemaType::Object => {
+            let object_nesting = object_nesting.saturating_add(1);
+            if object_nesting > 10 {
+                return false;
+            }
+            if object.get("additionalProperties") != Some(&Value::Bool(false)) {
+                return false;
+            }
+            let properties = match object.get("properties") {
+                Some(value) => {
+                    let Some(properties) = value.as_object() else {
+                        return false;
+                    };
+                    Some(properties)
+                }
+                None => None,
+            };
+            if properties.is_some_and(|properties| {
+                properties.keys().any(|name| {
+                    name.contains('/')
+                        || matches!(
+                            name.as_str(),
+                            "$defs" | "$ref" | "anyOf" | "required" | "additionalProperties"
+                        )
+                })
+            }) {
+                return false;
+            }
+            if count_limits
+                && properties.is_some_and(|properties| {
+                    properties
+                        .keys()
+                        .any(|name| !add_openai_string_budget(state, name))
+                })
+            {
+                return false;
+            }
+            let property_count = properties.map_or(0, Map::len);
+            if count_limits {
+                state.property_count = state.property_count.saturating_add(property_count);
+                if state.property_count > 2_048 {
+                    return false;
+                }
+            }
+            if properties.is_some_and(|properties| {
+                properties.values().any(|property| {
+                    !validate_openai_schema(
+                        property,
+                        false,
+                        depth + 1,
+                        object_nesting,
+                        count_limits,
+                        state,
+                    )
+                })
+            }) {
+                return false;
+            }
+
+            let Some(required) = object.get("required").and_then(Value::as_array) else {
+                return false;
+            };
+            let mut seen = HashSet::new();
+            if required.len() != property_count
+                || required.iter().any(|value| {
+                    !value.as_str().is_some_and(|name| {
+                        properties.is_some_and(|properties| properties.contains_key(name))
+                            && seen.insert(name.to_owned())
+                    })
+                })
+            {
+                return false;
+            }
+        }
+        OpenAiSchemaType::Array => {
+            if let Some(items) = object.get("items")
+                && !validate_openai_schema(
+                    items,
+                    false,
+                    depth + 1,
+                    object_nesting,
+                    count_limits,
+                    state,
+                )
+            {
+                return false;
+            }
+            if !valid_openai_u64_bounds(object, "minItems", "maxItems") {
+                return false;
+            }
+        }
+        OpenAiSchemaType::String => {
+            if !valid_openai_u64_bounds(object, "minLength", "maxLength") {
+                return false;
+            }
+        }
+        OpenAiSchemaType::Integer | OpenAiSchemaType::Number => {
+            if !valid_openai_number_bounds(object, "minimum", "maximum") {
+                return false;
+            }
+        }
+        OpenAiSchemaType::Boolean | OpenAiSchemaType::Null => {}
+    }
+
+    if count_limits
+        && object
+            .get("enum")
+            .is_some_and(|values| !record_openai_enum(values, &types, primary_type, state))
+    {
+        return false;
+    }
+    if count_limits
+        && object.get("const").is_some_and(|value| {
+            !openai_value_matches(value, &types)
+                || value
+                    .as_str()
+                    .is_some_and(|value| !add_openai_string_budget(state, value))
+        })
+    {
+        return false;
+    }
+    true
+}
+
+fn openai_schema_types(value: Option<&Value>) -> Option<(Vec<OpenAiSchemaType>, OpenAiSchemaType)> {
+    let raw = value?;
+    let names = match raw {
+        Value::String(name) => vec![name.as_str()],
+        Value::Array(names) if !names.is_empty() => names
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()?,
+        _ => return None,
+    };
+    let mut types = Vec::with_capacity(names.len());
+    for name in names {
+        let kind = match name {
+            "object" => OpenAiSchemaType::Object,
+            "array" => OpenAiSchemaType::Array,
+            "string" => OpenAiSchemaType::String,
+            "integer" => OpenAiSchemaType::Integer,
+            "number" => OpenAiSchemaType::Number,
+            "boolean" => OpenAiSchemaType::Boolean,
+            "null" => OpenAiSchemaType::Null,
+            _ => return None,
+        };
+        if types.contains(&kind) {
+            return None;
+        }
+        types.push(kind);
+    }
+    let non_null = types
+        .iter()
+        .copied()
+        .filter(|kind| *kind != OpenAiSchemaType::Null)
+        .collect::<Vec<_>>();
+    let primary = match non_null.as_slice() {
+        [primary] if types.len() <= 2 => *primary,
+        [] if types.as_slice() == [OpenAiSchemaType::Null] => OpenAiSchemaType::Null,
+        _ => return None,
+    };
+    Some((types, primary))
+}
+
+fn openai_keyword_allowed(key: &str, kind: OpenAiSchemaType, root: bool) -> bool {
+    if matches!(key, "type" | "description" | "title" | "enum" | "const")
+        || (root && matches!(key, "$defs" | "$id"))
+    {
+        return true;
+    }
+    match kind {
+        OpenAiSchemaType::Object => {
+            matches!(key, "properties" | "required" | "additionalProperties")
+        }
+        OpenAiSchemaType::Array => matches!(key, "items" | "minItems" | "maxItems"),
+        OpenAiSchemaType::String => matches!(key, "minLength" | "maxLength"),
+        OpenAiSchemaType::Integer | OpenAiSchemaType::Number => {
+            matches!(key, "minimum" | "maximum")
+        }
+        OpenAiSchemaType::Boolean | OpenAiSchemaType::Null => false,
+    }
+}
+
+fn valid_openai_u64_bounds(object: &Map<String, Value>, minimum: &str, maximum: &str) -> bool {
+    let min = object.get(minimum).map(Value::as_u64);
+    let max = object.get(maximum).map(Value::as_u64);
+    min.flatten()
+        .zip(max.flatten())
+        .is_none_or(|(min, max)| min <= max)
+        && min.is_none_or(|value| value.is_some())
+        && max.is_none_or(|value| value.is_some())
+}
+
+fn valid_openai_number_bounds(object: &Map<String, Value>, minimum: &str, maximum: &str) -> bool {
+    let min = object
+        .get(minimum)
+        .map(|value| value.as_f64().filter(|value| value.is_finite()));
+    let max = object
+        .get(maximum)
+        .map(|value| value.as_f64().filter(|value| value.is_finite()));
+    min.flatten()
+        .zip(max.flatten())
+        .is_none_or(|(min, max)| min <= max)
+        && min.is_none_or(|value| value.is_some())
+        && max.is_none_or(|value| value.is_some())
+}
+
+fn add_openai_string_budget(state: &mut OpenAiSchemaValidationState<'_>, value: &str) -> bool {
+    state.aggregate_string_length = state
+        .aggregate_string_length
+        .saturating_add(value.chars().count());
+    state.aggregate_string_length <= 120_000
+}
+
+fn record_openai_enum(
+    values: &Value,
+    types: &[OpenAiSchemaType],
+    primary_type: OpenAiSchemaType,
+    state: &mut OpenAiSchemaValidationState<'_>,
+) -> bool {
+    let Some(values) = values.as_array() else {
+        return false;
+    };
+    if values.is_empty() {
+        return false;
+    }
+    state.enum_values = state.enum_values.saturating_add(values.len());
+    if state.enum_values > 1_000
+        || (primary_type == OpenAiSchemaType::String
+            && values.len() > 250
+            && values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|value| value.chars().count())
+                .sum::<usize>()
+                > 15_000)
+    {
+        return false;
+    }
+    values.iter().all(|value| {
+        openai_value_matches(value, types)
+            && value
+                .as_str()
+                .is_none_or(|value| add_openai_string_budget(state, value))
+    })
+}
+
+fn openai_value_matches(value: &Value, types: &[OpenAiSchemaType]) -> bool {
+    types.iter().any(|kind| match kind {
+        OpenAiSchemaType::Object => value.is_object(),
+        OpenAiSchemaType::Array => value.is_array(),
+        OpenAiSchemaType::String => value.is_string(),
+        OpenAiSchemaType::Integer => value
+            .as_number()
+            .is_some_and(|number| number.is_i64() || number.is_u64()),
+        OpenAiSchemaType::Number => value.is_number(),
+        OpenAiSchemaType::Boolean => value.is_boolean(),
+        OpenAiSchemaType::Null => value.is_null(),
     })
 }
 
@@ -3110,7 +3561,7 @@ mod tests {
     }
 
     #[test]
-    fn request_tool_strict_mode_follows_mfjs_safe_subset() {
+    fn request_tool_strict_mode_requires_openai_strict_schema() {
         let mut context = PromptContext {
             system_prompt: "constitution".into(),
             memory_blocks: vec![],
@@ -3146,10 +3597,186 @@ mod tests {
                     "additionalProperties":false
                 }),
             },
+            ToolDefinition {
+                name: "missing_required".into(),
+                description: "not strict because a property is optional".into(),
+                parameters: json!({
+                    "type":"object",
+                    "properties":{"city":{"type":"string"}},
+                    "additionalProperties":false
+                }),
+            },
+            ToolDefinition {
+                name: "missing_additional_properties".into(),
+                description: "not strict because extra keys are allowed".into(),
+                parameters: json!({
+                    "type":"object",
+                    "properties":{"city":{"type":"string"}},
+                    "required":["city"]
+                }),
+            },
+            ToolDefinition {
+                name: "nested".into(),
+                description: "nested strict objects".into(),
+                parameters: json!({
+                    "type":"object",
+                    "properties":{
+                        "address":{
+                            "type":"object",
+                            "properties":{"city":{"type":"string"}},
+                            "required":["city"],
+                            "additionalProperties":false
+                        }
+                    },
+                    "required":["address"],
+                    "additionalProperties":false
+                }),
+            },
+            ToolDefinition {
+                name: "nested_missing_additional_properties".into(),
+                description: "nested object must also disallow extra keys".into(),
+                parameters: json!({
+                    "type":"object",
+                    "properties":{
+                        "address":{
+                            "type":"object",
+                            "properties":{"city":{"type":"string"}},
+                            "required":["city"]
+                        }
+                    },
+                    "required":["address"],
+                    "additionalProperties":false
+                }),
+            },
         ];
         let body = build_request(&spec(), &context, &RequestOptions::default()).expect("request");
         assert_eq!(body["tools"][0]["strict"], true);
         assert_eq!(body["tools"][1]["strict"], false);
+        assert_eq!(body["tools"][2]["strict"], false);
+        assert_eq!(body["tools"][3]["strict"], false);
+        assert_eq!(body["tools"][4]["strict"], true);
+        assert_eq!(body["tools"][5]["strict"], false);
+    }
+
+    #[test]
+    fn openai_strict_schema_enforces_official_limits_and_recursive_requirements() {
+        fn nested_objects(levels: usize) -> Value {
+            let mut schema = json!({"type":"string"});
+            for _ in 0..levels {
+                schema = json!({
+                    "type":"object",
+                    "properties":{"next":schema},
+                    "required":["next"],
+                    "additionalProperties":false
+                });
+            }
+            schema
+        }
+
+        fn property_schema(name: String, value: Value) -> Value {
+            let mut properties = Map::new();
+            properties.insert(name.clone(), value);
+            json!({
+                "type":"object",
+                "properties":properties,
+                "required":[name],
+                "additionalProperties":false
+            })
+        }
+
+        fn enum_schema(count: usize, value_length: usize) -> Value {
+            property_schema(
+                "value".into(),
+                json!({
+                    "type":"string",
+                    "enum":(0..count)
+                        .map(|index| json!(format!("{}{}", "x".repeat(value_length), index)))
+                        .collect::<Vec<_>>()
+                }),
+            )
+        }
+
+        assert!(is_openai_strict_safe(&nested_objects(10)));
+        assert!(!is_openai_strict_safe(&nested_objects(11)));
+
+        assert!(is_openai_strict_safe(&enum_schema(1_000, 1)));
+        assert!(!is_openai_strict_safe(&enum_schema(1_001, 1)));
+        assert!(is_openai_strict_safe(&enum_schema(250, 60)));
+        assert!(!is_openai_strict_safe(&enum_schema(251, 60)));
+
+        let property_name = "p".repeat(120_000);
+        assert!(is_openai_strict_safe(&property_schema(
+            property_name.clone(),
+            json!({"type":"string"}),
+        )));
+        assert!(!is_openai_strict_safe(&property_schema(
+            format!("{property_name}x"),
+            json!({"type":"string"}),
+        )));
+
+        let enum_value = "e".repeat(119_995);
+        assert!(is_openai_strict_safe(&property_schema(
+            "value".into(),
+            json!({"type":"string","enum":[enum_value.clone()]}),
+        )));
+        assert!(!is_openai_strict_safe(&property_schema(
+            "value".into(),
+            json!({"type":"string","enum":[format!("{enum_value}x")]}),
+        )));
+
+        let const_value = "c".repeat(119_995);
+        assert!(is_openai_strict_safe(&property_schema(
+            "value".into(),
+            json!({"type":"string","const":const_value.clone()}),
+        )));
+        assert!(!is_openai_strict_safe(&property_schema(
+            "value".into(),
+            json!({"type":"string","const":format!("{const_value}x")}),
+        )));
+
+        let definition_name = "d".repeat(119_996);
+        let mut definitions = Map::new();
+        definitions.insert(definition_name.clone(), json!({"type":"string"}));
+        let mut definition_schema = property_schema(
+            "node".into(),
+            json!({"$ref":format!("#/$defs/{definition_name}")}),
+        );
+        definition_schema["$defs"] = Value::Object(definitions);
+        assert!(is_openai_strict_safe(&definition_schema));
+        let mut oversized_definitions = Map::new();
+        let oversized_definition_name = format!("{definition_name}x");
+        oversized_definitions.insert(oversized_definition_name.clone(), json!({"type":"string"}));
+        definition_schema["$defs"] = Value::Object(oversized_definitions);
+        definition_schema["properties"]["node"]["$ref"] =
+            json!(format!("#/$defs/{oversized_definition_name}"));
+        assert!(!is_openai_strict_safe(&definition_schema));
+
+        assert!(!is_openai_strict_safe(&property_schema(
+            "nested".into(),
+            json!({
+                "type":"object",
+                "properties":{"value":{"type":"string","default":"x"}},
+                "required":["value"],
+                "additionalProperties":false
+            }),
+        )));
+
+        let valid_any_of = property_schema(
+            "value".into(),
+            json!({"anyOf":[{"type":"string"},{"type":"null"}]}),
+        );
+        assert!(is_openai_strict_safe(&valid_any_of));
+        let invalid_any_of = property_schema(
+            "value".into(),
+            json!({
+                "anyOf":[{
+                    "type":"object",
+                    "properties":{"city":{"type":"string"}},
+                    "additionalProperties":false
+                }]
+            }),
+        );
+        assert!(!is_openai_strict_safe(&invalid_any_of));
     }
 
     #[test]
