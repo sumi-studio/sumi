@@ -1,4 +1,9 @@
 //! Workspace filesystem operations rooted at a directory file descriptor.
+//!
+//! This implementation requires Linux `openat2(2)`, which was introduced in
+//! Linux 5.6, and a runtime policy that permits the syscall. A seccomp policy
+//! that denies `openat2` is unsupported; [`WorkspaceFs::open`] probes the
+//! syscall with the same beneath/no-symlink policy used by every operation.
 
 #![cfg(target_os = "linux")]
 
@@ -33,6 +38,7 @@ const MAX_SCAN_ENTRIES: usize = 4_096;
 const MAX_SCAN_DEPTH: usize = 128;
 const MAX_GREP_MATCHES: usize = 4_096;
 const MAX_GREP_SERIALIZED_BYTES: usize = 50 * 1024;
+const OPENAT2_UNAVAILABLE: &str = "workspace filesystem requires Linux openat2(2) (available since Linux 5.6) with the required beneath/no-symlink resolve policy; the syscall is missing or blocked by seccomp";
 /// `edit_file` is a whole-file unique-replacement operation. Keep its snapshot
 /// inside the same explicit 10 MiB local-input envelope used by bounded scans.
 pub const MAX_EDIT_FILE_BYTES: u64 = MAX_SCAN_BYTES;
@@ -71,6 +77,7 @@ pub struct GrepMatch {
     pub line_truncated: bool,
 }
 
+/// Workspace operations rooted at an opened directory file descriptor.
 pub struct WorkspaceFs {
     root: File,
     display_root: PathBuf,
@@ -88,6 +95,7 @@ impl WorkspaceFs {
                 "workspace root is not a directory".to_owned(),
             ));
         }
+        probe_openat2(&file).map_err(map_openat2_probe_error)?;
         Ok(Self {
             root: file,
             display_root: root.to_owned(),
@@ -899,6 +907,39 @@ pub(super) fn openat2(
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
+fn probe_openat2(root: &File) -> Result<(), ToolError> {
+    let probe = openat2(
+        root.as_raw_fd(),
+        Path::new("."),
+        libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        0,
+        RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
+    )?;
+    drop(probe);
+    Ok(())
+}
+
+fn map_openat2_probe_error(error: ToolError) -> ToolError {
+    match error {
+        ToolError::Io(error) if openat2_unavailable_errno(error.raw_os_error()) => {
+            ToolError::Protocol(OPENAT2_UNAVAILABLE.to_owned())
+        }
+        error => error,
+    }
+}
+
+fn openat2_unavailable_errno(errno: Option<i32>) -> bool {
+    matches!(
+        errno,
+        Some(errno)
+            if errno == libc::ENOSYS
+                || errno == libc::EOPNOTSUPP
+                || errno == libc::EINVAL
+                || errno == libc::EPERM
+                || errno == libc::EACCES
+    )
+}
+
 pub(super) fn read_dir_names(fd: OwnedFd) -> Result<Vec<String>, ToolError> {
     let duplicate = unsafe { libc::dup(fd.as_raw_fd()) };
     if duplicate < 0 {
@@ -1149,6 +1190,49 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn open_probes_openat2_without_mutating_the_workspace() {
+        let root = TempWorkspace::new();
+        std::fs::write(root.path.join("existing.txt"), b"content").expect("write fixture");
+        let before = std::fs::read_dir(&root.path)
+            .expect("read workspace")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .collect::<Vec<_>>();
+
+        WorkspaceFs::open(&root.path).expect("workspace fs");
+
+        let after = std::fs::read_dir(&root.path)
+            .expect("read workspace")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn openat2_probe_maps_unavailable_errors_but_preserves_other_io_errors() {
+        for errno in [
+            libc::ENOSYS,
+            libc::EOPNOTSUPP,
+            libc::EINVAL,
+            libc::EPERM,
+            libc::EACCES,
+        ] {
+            let error =
+                map_openat2_probe_error(ToolError::Io(std::io::Error::from_raw_os_error(errno)));
+            assert!(
+                matches!(error, ToolError::Protocol(message) if message == OPENAT2_UNAVAILABLE)
+            );
+        }
+
+        let error = map_openat2_probe_error(ToolError::Io(std::io::Error::from_raw_os_error(
+            libc::ENOENT,
+        )));
+        assert!(matches!(
+            error,
+            ToolError::Io(error) if error.raw_os_error() == Some(libc::ENOENT)
+        ));
     }
 
     #[test]
