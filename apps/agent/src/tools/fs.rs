@@ -12,7 +12,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+        fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
         unix::{
             ffi::OsStrExt,
             fs::{MetadataExt, OpenOptionsExt},
@@ -28,8 +28,8 @@ use uuid::Uuid;
 use super::{
     ResourceLimit, ToolError,
     truncate::{
-        GREP_MAX_LINE_LENGTH, TruncationOptions, TruncationResult, truncate_head,
-        truncate_line_total,
+        DEFAULT_MAX_BYTES, GREP_MAX_LINE_LENGTH, TruncationOptions, TruncationResult,
+        truncate_head, truncate_line_total,
     },
 };
 
@@ -85,17 +85,41 @@ pub struct WorkspaceFs {
 
 impl WorkspaceFs {
     pub fn open(root: &Path) -> Result<Self, ToolError> {
-        let file = OpenOptions::new()
+        let (base_path, relative_root) = if root.is_absolute() {
+            (
+                Path::new("/"),
+                root.strip_prefix(Path::new("/")).map_err(|_| {
+                    ToolError::InvalidPath(
+                        "workspace root was not a valid absolute path".to_owned(),
+                    )
+                })?,
+            )
+        } else {
+            (Path::new("."), root)
+        };
+        let base = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NONBLOCK)
-            .open(root)?;
+            .open(base_path)?;
+        probe_openat2(&base).map_err(map_openat2_probe_error)?;
+        let relative_root = if relative_root.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            relative_root
+        };
+        let file = File::from(openat2(
+            base.as_raw_fd(),
+            relative_root,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            0,
+            RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
+        )?);
         let metadata = file.metadata()?;
         if !metadata.is_dir() {
             return Err(ToolError::InvalidPath(
                 "workspace root is not a directory".to_owned(),
             ));
         }
-        probe_openat2(&file).map_err(map_openat2_probe_error)?;
         Ok(Self {
             root: file,
             display_root: root.to_owned(),
@@ -108,6 +132,11 @@ impl WorkspaceFs {
         offset: u64,
         max_bytes: usize,
     ) -> Result<TruncationResult, ToolError> {
+        if max_bytes > DEFAULT_MAX_BYTES {
+            return Err(ToolError::Protocol(format!(
+                "read_file max_bytes exceeds the model-visible limit of {DEFAULT_MAX_BYTES} bytes"
+            )));
+        }
         let relative = self.relative(path)?;
         let fd = self.open_beneath(
             &relative,
@@ -941,16 +970,14 @@ fn openat2_unavailable_errno(errno: Option<i32>) -> bool {
 }
 
 pub(super) fn read_dir_names(fd: OwnedFd) -> Result<Vec<String>, ToolError> {
-    let duplicate = unsafe { libc::dup(fd.as_raw_fd()) };
-    if duplicate < 0 {
-        return Err(ToolError::Io(std::io::Error::last_os_error()));
-    }
+    let duplicate = duplicate_cloexec(fd.as_raw_fd())?.into_raw_fd();
     let directory = unsafe { libc::fdopendir(duplicate) };
     if directory.is_null() {
+        let error = std::io::Error::last_os_error();
         unsafe {
             libc::close(duplicate);
         }
-        return Err(ToolError::Io(std::io::Error::last_os_error()));
+        return Err(ToolError::Io(error));
     }
     let mut names = Vec::new();
     loop {
@@ -993,6 +1020,14 @@ pub(super) fn read_dir_names(fd: OwnedFd) -> Result<Vec<String>, ToolError> {
     }
     names.sort();
     Ok(names)
+}
+
+fn duplicate_cloexec(fd: RawFd) -> Result<OwnedFd, ToolError> {
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate < 0 {
+        return Err(ToolError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
 }
 
 fn walk_files(
@@ -1211,6 +1246,27 @@ mod tests {
     }
 
     #[test]
+    fn open_accepts_ordinary_absolute_and_relative_workspace_roots() {
+        let absolute = TempWorkspace::new();
+        WorkspaceFs::open(&absolute.path).expect("absolute workspace root");
+        WorkspaceFs::open(Path::new(".")).expect("relative workspace root");
+    }
+
+    #[test]
+    fn open_rejects_a_symlinked_workspace_root() {
+        let container = TempWorkspace::new();
+        let real_root = container.path.join("real-root");
+        let linked_root = container.path.join("linked-root");
+        std::fs::create_dir(&real_root).expect("create real workspace root");
+        symlink(&real_root, &linked_root).expect("create workspace-root symlink");
+
+        assert!(matches!(
+            WorkspaceFs::open(&linked_root),
+            Err(ToolError::Io(error)) if error.raw_os_error() == Some(libc::ELOOP)
+        ));
+    }
+
+    #[test]
     fn openat2_probe_maps_unavailable_errors_but_preserves_other_io_errors() {
         for errno in [
             libc::ENOSYS,
@@ -1233,6 +1289,17 @@ mod tests {
             error,
             ToolError::Io(error) if error.raw_os_error() == Some(libc::ENOENT)
         ));
+    }
+
+    #[test]
+    fn directory_fd_duplicates_are_close_on_exec() {
+        let root = TempWorkspace::new();
+        let fs = WorkspaceFs::open(&root.path).expect("workspace fs");
+        let duplicate = duplicate_cloexec(fs.root.as_raw_fd()).expect("duplicate directory fd");
+
+        let flags = unsafe { libc::fcntl(duplicate.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0, "read duplicate descriptor flags");
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
     }
 
     #[test]
@@ -1817,6 +1884,33 @@ mod tests {
         assert_eq!(result.total_lines, 1);
         assert_eq!(result.output_lines, 1);
         assert_eq!(result.content, "a\n");
+    }
+
+    #[test]
+    fn read_file_enforces_the_model_visible_byte_limit_at_its_public_boundary() {
+        let root = TempWorkspace::new();
+        std::fs::write(
+            root.path.join("boundary.txt"),
+            vec![b'x'; DEFAULT_MAX_BYTES],
+        )
+        .expect("write boundary file");
+        let fs = WorkspaceFs::open(&root.path).expect("workspace fs");
+
+        let boundary = fs
+            .read_file(Path::new("boundary.txt"), 0, DEFAULT_MAX_BYTES)
+            .expect("exact byte limit is accepted");
+        assert_eq!(boundary.output_bytes, DEFAULT_MAX_BYTES);
+        assert_eq!(boundary.content.len(), DEFAULT_MAX_BYTES);
+
+        for requested in [DEFAULT_MAX_BYTES + 1, usize::MAX] {
+            assert!(matches!(
+                fs.read_file(Path::new("missing.txt"), 0, requested),
+                Err(ToolError::Protocol(message))
+                    if message == format!(
+                        "read_file max_bytes exceeds the model-visible limit of {DEFAULT_MAX_BYTES} bytes"
+                    )
+            ));
+        }
     }
 
     #[test]
