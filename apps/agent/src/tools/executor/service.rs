@@ -129,11 +129,16 @@ impl AsyncRead for NonblockingStdin {
                     buffer.advance(read);
                     return Poll::Ready(Ok(()));
                 }
+                Ok(Err(error)) if is_interrupted_read_error(&error) => continue,
                 Ok(Err(error)) => return Poll::Ready(Err(error)),
                 Err(_) => continue,
             }
         }
     }
+}
+
+fn is_interrupted_read_error(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::Interrupted
 }
 
 impl AsyncWrite for NonblockingStdout {
@@ -1134,6 +1139,22 @@ mod tests {
 
         assert_eq!(control.unwrap(), "cancel");
         assert!(!reader_done);
+    }
+
+    #[test]
+    fn nonblocking_stdin_retries_only_interrupted_reads() {
+        assert!(is_interrupted_read_error(
+            &std::io::Error::from_raw_os_error(libc::EINTR)
+        ));
+        assert!(is_interrupted_read_error(&std::io::Error::from(
+            std::io::ErrorKind::Interrupted,
+        )));
+        assert!(!is_interrupted_read_error(&std::io::Error::from(
+            std::io::ErrorKind::WouldBlock,
+        )));
+        assert!(!is_interrupted_read_error(&std::io::Error::from(
+            std::io::ErrorKind::BrokenPipe,
+        )));
     }
 
     #[tokio::test]
