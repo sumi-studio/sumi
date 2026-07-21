@@ -23,8 +23,6 @@ use store::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = config::Config::load().await?;
-
     tracing_subscriber::fmt()
         .json()
         .with_writer(io::stderr)
@@ -33,6 +31,26 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("sumi_agent=info")),
         )
         .init();
+    match env::args().nth(1).as_deref() {
+        Some("--tool-executor") => {
+            tracing::warn!(
+                service = "tool-executor",
+                trust = "low-trust-local",
+                "starting service mode"
+            );
+            return tools::executor::run_tool_executor_mode().await;
+        }
+        Some("--artifact-broker") => {
+            tracing::warn!(
+                service = "artifact-broker",
+                trust = "low-trust-local",
+                "starting service mode"
+            );
+            return tools::executor::run_artifact_broker_mode().await;
+        }
+        _ => {}
+    }
+    let config = config::Config::load().await?;
 
     let model_spec = config.model_spec()?;
     let conversation_id = config.conversation_id.clone();

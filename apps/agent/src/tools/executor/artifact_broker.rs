@@ -88,11 +88,27 @@ struct AppendReceipt {
 
 impl ArtifactBroker {
     pub fn open(root: &Path) -> Result<Self, ToolError> {
-        let root = OpenOptions::new()
+        if !root.is_absolute() {
+            return Err(ToolError::InvalidPath(
+                "artifact broker root must be absolute".to_owned(),
+            ));
+        }
+        let filesystem_root = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(root)?;
-        if !root.metadata()?.is_dir() {
+            .open("/")?;
+        let relative = root.strip_prefix("/").map_err(|_| {
+            ToolError::InvalidPath("artifact broker root must be absolute".to_owned())
+        })?;
+        let relative = CString::new(relative.as_os_str().as_bytes())
+            .map_err(|_| ToolError::InvalidPath("artifact root contains NUL".to_owned()))?;
+        let root = openat2_cstr(
+            filesystem_root.as_raw_fd(),
+            &relative,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            0,
+        )?;
+        if !File::from(root.try_clone()?).metadata()?.is_dir() {
             return Err(ToolError::InvalidPath(
                 "artifact broker root is not a directory".to_owned(),
             ));
@@ -100,7 +116,7 @@ impl ArtifactBroker {
         fchmod(root.as_raw_fd(), 0o700)?;
         probe_openat2(root.as_raw_fd())?;
         Ok(Self {
-            root: root.into(),
+            root,
             state: Mutex::new(BrokerState::default()),
         })
     }
@@ -723,6 +739,23 @@ mod tests {
                     if message == "artifact is not a regular file"
             ));
         }
+    }
+
+    #[test]
+    fn root_with_a_symlinked_parent_component_is_rejected_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let container = TestRoot::new();
+        let outside = container.0.join("outside");
+        fs::create_dir(&outside).unwrap();
+        let marker = outside.join("marker");
+        fs::write(&marker, b"untouched").unwrap();
+        let link = container.0.join("link");
+        symlink(&outside, &link).unwrap();
+
+        assert!(ArtifactBroker::open(&link).is_err());
+        assert_eq!(fs::read(marker).unwrap(), b"untouched");
+        assert!(fs::read_dir(outside).unwrap().count() == 1);
     }
 
     #[test]

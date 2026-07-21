@@ -76,6 +76,8 @@ pub enum ToolError {
     Io(#[from] std::io::Error),
     #[error("tool RPC failed: {0}")]
     Rpc(String),
+    #[error("tool RPC outcome is indeterminate: {0}")]
+    RpcIndeterminate(String),
     #[error("tool protocol violation: {0}")]
     Protocol(String),
 }
