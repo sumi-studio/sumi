@@ -49,6 +49,35 @@ const MAX_ATOMIC_UPDATE_FRAME_BYTES: usize = 4_096;
 const EXECUTOR_REAP_DEADLINE: Duration = Duration::from_secs(2);
 type BashUpdateCallback = Arc<dyn Fn(Value) + Send + Sync>;
 
+#[cfg(test)]
+pub(super) struct ExecutorTestControls {
+    cancel_stop_delay: Duration,
+    cancel_ingested: Option<oneshot::Sender<()>>,
+}
+
+#[cfg(test)]
+impl ExecutorTestControls {
+    pub(super) fn observe_cancel(
+        cancel_stop_delay: Duration,
+        cancel_ingested: oneshot::Sender<()>,
+    ) -> Self {
+        Self {
+            cancel_stop_delay,
+            cancel_ingested: Some(cancel_ingested),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Default for ExecutorTestControls {
+    fn default() -> Self {
+        Self {
+            cancel_stop_delay: Duration::ZERO,
+            cancel_ingested: None,
+        }
+    }
+}
+
 enum ActiveControl {
     Cancel(String),
     Fatal {
@@ -234,15 +263,42 @@ impl ExecutorWriter {
                 } else {
                     EXECUTOR_UPDATE_WRITE_DEADLINE
                 };
-                let result = match timeout(deadline, async {
-                    write.write_all(&message.bytes).await?;
-                    write.flush().await
-                })
-                .await
+                let result = if !terminal
+                    && progress_write_guarantee == ProgressWriteGuarantee::MayWritePartial
                 {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(error)) => Err(error.to_string()),
-                    Err(_) => Err("executor output write deadline elapsed".to_owned()),
+                    // Poll exactly one write future. If it remains Pending until
+                    // the deadline, AsyncWrite has accepted no bytes and this
+                    // volatile frame can be dropped without poisoning JSONL.
+                    // Once Ready reports a prefix or error, the transport epoch
+                    // is no longer safe for a later authoritative terminal.
+                    match timeout(deadline, write.write(&message.bytes)).await {
+                        Ok(Ok(written)) if written == message.bytes.len() => {
+                            match timeout(deadline, write.flush()).await {
+                                Ok(Ok(())) => Ok(()),
+                                Ok(Err(error)) => Err(error.to_string()),
+                                Err(_) => Err("executor output flush deadline elapsed".to_owned()),
+                            }
+                        }
+                        Ok(Ok(_)) => Err("executor output write was partial".to_owned()),
+                        Ok(Err(error)) => Err(error.to_string()),
+                        Err(_) => {
+                            tracing::warn!(
+                                "dropping volatile executor progress update: write deadline elapsed before accepting bytes"
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    match timeout(deadline, async {
+                        write.write_all(&message.bytes).await?;
+                        write.flush().await
+                    })
+                    .await
+                    {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(error)) => Err(error.to_string()),
+                        Err(_) => Err("executor output write deadline elapsed".to_owned()),
+                    }
                 };
                 if let Some(acknowledgement) = message.acknowledgement {
                     let _ = acknowledgement.send(result.clone());
@@ -391,7 +447,7 @@ pub async fn run_tool_executor_mode() -> Result<()> {
         fs,
         broker,
         #[cfg(test)]
-        Duration::ZERO,
+        ExecutorTestControls::default(),
     )
     .await
 }
@@ -533,7 +589,7 @@ where
         fs,
         broker,
         #[cfg(test)]
-        Duration::ZERO,
+        ExecutorTestControls::default(),
     )
     .await
 }
@@ -546,7 +602,7 @@ pub(super) async fn run_executor_service_with_cancel_delay<R, W>(
     workspace: PathBuf,
     fs: WorkspaceFs,
     broker: ArtifactBrokerClient,
-    cancel_stop_delay: Duration,
+    test_controls: ExecutorTestControls,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
@@ -559,7 +615,7 @@ where
         workspace,
         fs,
         broker,
-        cancel_stop_delay,
+        test_controls,
     )
     .await
 }
@@ -571,7 +627,7 @@ async fn run_executor_service_with_writer<R>(
     workspace: PathBuf,
     fs: WorkspaceFs,
     broker: ArtifactBrokerClient,
-    #[cfg(test)] cancel_stop_delay: Duration,
+    #[cfg(test)] test_controls: ExecutorTestControls,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
@@ -584,7 +640,7 @@ where
         fs,
         broker,
         #[cfg(test)]
-        cancel_stop_delay,
+        test_controls,
     )
     .await;
     writer_task.abort();
@@ -599,7 +655,7 @@ async fn run_executor_loop<R>(
     workspace: PathBuf,
     fs: WorkspaceFs,
     broker: ArtifactBrokerClient,
-    #[cfg(test)] cancel_stop_delay: Duration,
+    #[cfg(test)] mut test_controls: ExecutorTestControls,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
@@ -636,7 +692,10 @@ where
                     execution_id,
                     command,
                     #[cfg(test)]
-                    cancel_stop_delay,
+                    ExecutorTestControls {
+                        cancel_stop_delay: test_controls.cancel_stop_delay,
+                        cancel_ingested: test_controls.cancel_ingested.take(),
+                    },
                 )
                 .await?;
             }
@@ -679,7 +738,7 @@ async fn run_bash_request<R>(
     request_id: String,
     execution_id: String,
     command: String,
-    #[cfg(test)] cancel_stop_delay: Duration,
+    #[cfg(test)] mut test_controls: ExecutorTestControls,
 ) -> Result<()>
 where
     R: AsyncBufRead + Unpin,
@@ -688,7 +747,7 @@ where
     let (on_update, mut updates_rx) = bounded_bash_updates();
     let bash = LowTrustLocalBash::new(workspace.to_path_buf(), broker);
     #[cfg(test)]
-    let bash = bash.with_cancel_stop_delay(cancel_stop_delay);
+    let bash = bash.with_cancel_stop_delay(test_controls.cancel_stop_delay);
     let execution = bash.execute(&command, &execution_id, cancel.clone(), on_update);
     tokio::pin!(execution);
     // Keep one persistent read future alive across select iterations. Recreating
@@ -711,9 +770,11 @@ where
             biased;
             next = control_rx.recv(), if !control_reader_done || !control_rx.is_empty() => {
                 match classify_active_control(next, identity, &execution_id, lifecycle) {
-                    ActiveControl::Cancel(cancel_request_id) => break BashExit::Cancelled {
-                        cancel_request_id,
-                        completed: None,
+                    ActiveControl::Cancel(cancel_request_id) => {
+                        break BashExit::Cancelled {
+                            cancel_request_id,
+                            completed: None,
+                        }
                     },
                     ActiveControl::Fatal { error, response } => break BashExit::Fatal {
                         error,
@@ -735,9 +796,11 @@ where
                         &execution_id,
                         lifecycle,
                     ) {
-                        ActiveControl::Cancel(cancel_request_id) => break BashExit::Cancelled {
-                            cancel_request_id,
-                            completed: Some(result),
+                        ActiveControl::Cancel(cancel_request_id) => {
+                            break BashExit::Cancelled {
+                                cancel_request_id,
+                                completed: Some(result),
+                            }
                         },
                         ActiveControl::Fatal { error, response } => break BashExit::Fatal {
                             error,
@@ -853,6 +916,8 @@ where
             completed,
         } => {
             cancel.cancel();
+            #[cfg(test)]
+            signal_cancel_ingested(&mut test_controls.cancel_ingested);
             let result = match completed {
                 Some(result) => result,
                 None => match timeout(EXECUTOR_REAP_DEADLINE, &mut execution).await {
@@ -945,6 +1010,13 @@ fn bounded_bash_updates() -> (BashUpdateCallback, mpsc::Receiver<Value>) {
         }
     });
     (on_update, updates_rx)
+}
+
+#[cfg(test)]
+fn signal_cancel_ingested(cancel_ingested: &mut Option<oneshot::Sender<()>>) {
+    if let Some(sender) = cancel_ingested.take() {
+        let _ = sender.send(());
+    }
 }
 
 fn forward_bash_update(
@@ -1432,6 +1504,43 @@ mod tests {
         allow_write: Arc<Mutex<bool>>,
     }
 
+    struct UpdatePendingTerminalWrite {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        pending_polled: Option<oneshot::Sender<()>>,
+    }
+
+    impl AsyncWrite for UpdatePendingTerminalWrite {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _context: &mut TaskContext<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let frame: Value = serde_json::from_slice(buffer).expect("encoded RPC frame");
+            if frame["type"] == "update" {
+                if let Some(sender) = self.pending_polled.take() {
+                    let _ = sender.send(());
+                }
+                return Poll::Pending;
+            }
+            self.bytes.lock().unwrap().extend_from_slice(buffer);
+            Poll::Ready(Ok(buffer.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _context: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     impl AsyncWrite for AtomicBlockedThenWrite {
         fn poll_write(
             self: Pin<&mut Self>,
@@ -1673,6 +1782,61 @@ mod tests {
                 .iter()
                 .all(|frame| frame.len() <= MAX_ATOMIC_UPDATE_FRAME_BYTES)
         );
+        writer_task.abort();
+    }
+
+    #[tokio::test]
+    async fn pending_zero_byte_progress_timeout_preserves_terminal() {
+        let identity = RpcIdentity {
+            generation: 7,
+            nonce: "boot-nonce".to_owned(),
+        };
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (pending_polled, pending_polled_rx) = oneshot::channel();
+        let transport = UpdatePendingTerminalWrite {
+            bytes: bytes.clone(),
+            pending_polled: Some(pending_polled),
+        };
+        let (writer, writer_task) = ExecutorWriter::start(transport);
+        writer
+            .try_update(&RpcFrame::<ExecutorResponse>::Update {
+                generation: identity.generation,
+                nonce: identity.nonce.clone(),
+                request_id: "request-1".to_owned(),
+                value: serde_json::json!({"output": "dropped progress"}),
+            })
+            .expect("enqueue progress");
+        timeout(Duration::from_secs(1), pending_polled_rx)
+            .await
+            .expect("progress write was not polled")
+            .expect("progress writer stopped before polling transport");
+        assert!(bytes.lock().unwrap().is_empty());
+
+        // The transport keeps every update write Pending while accepting a
+        // terminal immediately. Terminal acknowledgement therefore proves the
+        // zero-byte update future timed out and was dropped without poisoning
+        // the writer epoch.
+        writer
+            .terminal(
+                &identity,
+                "request-1".to_owned(),
+                Ok(ExecutorResponse::Written {}),
+            )
+            .await
+            .expect("zero-byte progress timeout must not poison terminal delivery");
+        let delivered = bytes.lock().unwrap().clone();
+        let frame = decode_rpc_frame::<ExecutorResponse>(
+            delivered.strip_suffix(b"\n").expect("terminal newline"),
+            &identity,
+        )
+        .expect("decode terminal");
+        assert!(matches!(
+            frame,
+            RpcFrame::Terminal {
+                result: Ok(ExecutorResponse::Written {}),
+                ..
+            }
+        ));
         writer_task.abort();
     }
 

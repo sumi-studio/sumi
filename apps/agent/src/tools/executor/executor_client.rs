@@ -633,7 +633,9 @@ mod tests {
     use crate::tools::{
         executor::{
             ArtifactBrokerClient,
-            service::{run_executor_service, run_executor_service_with_cancel_delay},
+            service::{
+                ExecutorTestControls, run_executor_service, run_executor_service_with_cancel_delay,
+            },
         },
         fs::WorkspaceFs,
     };
@@ -642,6 +644,7 @@ mod tests {
     use tokio::{
         io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
         net::UnixListener,
+        sync::{Semaphore, oneshot},
         task::JoinHandle,
     };
 
@@ -702,12 +705,13 @@ mod tests {
     fn spawn_real_service_with_cancel_delay(
         root: &Path,
         cancel_stop_delay: Duration,
-    ) -> (PathBuf, JoinHandle<()>) {
+    ) -> (PathBuf, oneshot::Receiver<()>, JoinHandle<()>) {
         let socket = root.join("executor.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let workspace = root.join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
         let broker_socket = root.join("unused-broker.sock");
+        let (cancel_ingested, cancel_ingested_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let fs = WorkspaceFs::open(&workspace).unwrap();
@@ -720,12 +724,12 @@ mod tests {
                 workspace,
                 fs,
                 broker,
-                cancel_stop_delay,
+                ExecutorTestControls::observe_cancel(cancel_stop_delay, cancel_ingested),
             )
             .await
             .unwrap();
         });
-        (socket, task)
+        (socket, cancel_ingested_rx, task)
     }
 
     fn spawn_real_service_cancel_race(
@@ -883,8 +887,14 @@ mod tests {
             .with_deadlines(test_deadlines());
         let cancel = CancellationToken::new();
         let trigger = cancel.clone();
+        let started = Arc::new(Semaphore::new(0));
+        let started_update = started.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            timeout(Duration::from_secs(3), started.acquire())
+                .await
+                .expect("started output timeout")
+                .expect("started output semaphore closed")
+                .forget();
             trigger.cancel();
         });
         let response = client
@@ -894,7 +904,14 @@ mod tests {
                     execution_id: "bash-cancel".to_owned(),
                 },
                 cancel,
-                Arc::new(|_| {}),
+                Arc::new(move |value| {
+                    if value["output"]
+                        .as_str()
+                        .is_some_and(|output| output.contains("started"))
+                    {
+                        started_update.add_permits(1);
+                    }
+                }),
             )
             .await
             .unwrap();
@@ -911,11 +928,12 @@ mod tests {
     async fn real_service_cancellation_remains_authoritative_at_output_quota() {
         let root = temp_root("cancel-at-output-quota");
         let output_limit = crate::tools::shell_capture::COMMAND_OUTPUT_LIMIT_BYTES;
-        let (socket, service) =
+        let (socket, cancel_ingested, service) =
             spawn_real_service_with_cancel_delay(&root, Duration::from_millis(50));
         let cancel = CancellationToken::new();
         let cancel_at_marker = cancel.clone();
         let marker = root.join("workspace/quota-ready");
+        let release = root.join("workspace/quota-release");
         let trigger = tokio::spawn(async move {
             timeout(Duration::from_secs(5), async {
                 while !marker.exists() {
@@ -925,6 +943,11 @@ mod tests {
             .await
             .expect("quota marker timeout");
             cancel_at_marker.cancel();
+            timeout(Duration::from_secs(3), cancel_ingested)
+                .await
+                .expect("executor cancel-ingestion timeout")
+                .expect("executor stopped before ingesting cancel");
+            std::fs::write(release, b"release").expect("release final quota bytes");
         });
         let mut deadlines = test_deadlines();
         deadlines.frame = Duration::from_secs(15);
@@ -933,7 +956,7 @@ mod tests {
             .with_deadlines(deadlines)
             .execute(
                 ExecutorOperation::Bash {
-                    command: "head -c 10477568 /dev/zero | tr '\\0' x; : > quota-ready; sleep 0.02; head -c 8192 /dev/zero | tr '\\0' x; while :; do :; done".to_owned(),
+                    command: "head -c 10477568 /dev/zero | tr '\\0' x; : > quota-ready; while [ ! -e quota-release ]; do sleep 0.001; done; head -c 8192 /dev/zero | tr '\\0' x; while :; do :; done".to_owned(),
                     execution_id: "bash-cancel-at-quota".to_owned(),
                 },
                 cancel,
