@@ -58,6 +58,9 @@ use self::crypto::{
     unwrap_data_key, wrap_data_key,
 };
 
+#[cfg(test)]
+use self::crypto::WrappingKey;
+
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -145,6 +148,39 @@ impl Store {
             .connect_with(options)
             .await?;
         Self::finish_open(pool, scope, key_provider).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn session_test_store(conversation_id: &str) -> Result<Self> {
+        #[derive(Clone)]
+        struct SessionTestKeyProvider(WrappingKey);
+
+        #[async_trait::async_trait]
+        impl KeyProvider for SessionTestKeyProvider {
+            async fn current_key(&self) -> Result<WrappingKey> {
+                Ok(self.0.clone())
+            }
+
+            async fn key_by_id(&self, key_id: &str) -> Result<WrappingKey> {
+                if key_id != self.0.key_id() {
+                    bail!("unknown session test wrapping key {key_id}");
+                }
+                Ok(self.0.clone())
+            }
+        }
+
+        Self::in_memory(
+            AgentScope {
+                tenant_id: "session-test-tenant".to_owned(),
+                agent_id: "session-test-agent".to_owned(),
+                conversation_id: conversation_id.to_owned(),
+            },
+            Arc::new(SessionTestKeyProvider(WrappingKey::new(
+                "session-test-key/v1",
+                [0x5a; 32],
+            ))),
+        )
+        .await
     }
 
     async fn finish_open(
