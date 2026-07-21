@@ -871,6 +871,7 @@ Sumi では 3層メモリが常時 70k 以内に抑えるため溢れは本来�
 移植必須の細部:
 
 - **Length 停止時のツール一括失敗 [事実]** (`pi:agent-loop.ts:207-215, 383-408`): 出力トークン上限で切れたメッセージは、個々のtool引数がstrict JSON/schema検証に通っても、後続callや説明を含む応答全体の意図が未完了であり得る。strict終端guardとは独立に1つも実行せず、全部に `"Tool call was not executed: the response hit the output token limit..."` のエラー結果を返してモデルに再発行させる。**Sumi 追加ガード**: この一括失敗が同一 run 内で連続2回発生したら、3回目の再発行 API コールへは進まずリトライ不可 Error として Turn を閉じる(§4.5 の溢れ再送上限と同型の暴走ガード。K3 は thinking 常時ON + 既定 max_tokens 16k — §7.8 — のため、長い reasoning の連発で再発行ループが無限に回り得る)
+  - strict検証済みToolCall自体はassistant公開transcriptへ残すが、承認・executor・公開`ToolExecutionStart/End`は発火しない。EventWriterはprivate `Skip` mutationで`tool_executions(state='not_started', started_at=NULL, finished_at!=NULL, error_code='length_guard')`と対応する`is_error` ToolResult `MessageStart/End`を1 transactionで確定する。`failed`/`cancelled`、`RejectedToolCall`、架空の実行eventへ意味を曲げない。
 - **ツール実行は sequential 固定**。pi の parallel モード(:491-556)は準備だけ順次・実行は並行だが、Sumi は承認・steer・crash復旧の順序を一意に保つため並列実行を製品契約に含めない。導入する場合は`Tool::risk`だけで暗黙に有効化せず、状態機械と承認UXを更新する別ADRを必須とする **[推測]**
 - **steering ポーリング位置 [事実]** (:167, :259): ループ開始時(送信待ち中に打った分)と各 TurnEnd 後。Sumi のソフトステア(第6章)はこの機構をそのまま使う
 - **キュー既定 one-at-a-time [事実]** (`pi:agent.ts:222-223`): 複数の割込みを1個ずつ消化し、各々に応答機会を与える
@@ -1894,14 +1895,14 @@ CREATE TABLE tool_executions (
   command_id TEXT NOT NULL,
   run_id TEXT NOT NULL,
   executor_generation INTEGER NOT NULL,
-  state TEXT NOT NULL,          -- prepared|running|succeeded|failed|cancelled|indeterminate
+  state TEXT NOT NULL,          -- prepared|running|succeeded|failed|cancelled|indeterminate|not_started
   idempotency_key TEXT NOT NULL UNIQUE,
   started_at TEXT,
   finished_at TEXT,
   error_code TEXT CHECK (error_code IS NULL OR error_code IN (
-    'executor_failed', 'cancelled', 'indeterminate', 'invalid_result', 'internal'
+    'executor_failed', 'cancelled', 'indeterminate', 'invalid_result', 'internal', 'length_guard'
   )),                           -- 自由文・executor stderrは禁止。表示文は暗号化raw event + redacted projectionに置く
-  CHECK (state IN ('prepared', 'running', 'succeeded', 'failed', 'cancelled', 'indeterminate')),
+  CHECK (state IN ('prepared', 'running', 'succeeded', 'failed', 'cancelled', 'indeterminate', 'not_started')),
   CHECK (
     (state = 'prepared' AND started_at IS NULL AND finished_at IS NULL)
     OR
@@ -1911,11 +1912,15 @@ CREATE TABLE tool_executions (
       AND started_at IS NOT NULL AND finished_at IS NOT NULL)
     OR
     (state = 'cancelled' AND finished_at IS NOT NULL) -- prepared取消はstarted_at=NULL、running取消は非NULL
+    OR
+    (state = 'not_started' AND started_at IS NULL AND finished_at IS NOT NULL)
   ),
   CHECK (
     (state IN ('prepared', 'running', 'succeeded') AND error_code IS NULL)
     OR
     (state IN ('failed', 'cancelled', 'indeterminate') AND error_code IS NOT NULL)
+    OR (state = 'not_started' AND started_at IS NULL AND finished_at IS NOT NULL
+        AND error_code = 'length_guard')
   )
 );
 ```

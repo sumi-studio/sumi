@@ -33,11 +33,13 @@ use crate::{
     },
 };
 
+mod durable_bridge;
 mod events;
 mod provider_projection;
 mod queue;
 mod run;
 
+use durable_bridge::{CommittedOutput, DurableBridge, DurableRunBinding, RunOutput};
 use queue::MessageQueue;
 
 pub(crate) use events::{
@@ -59,7 +61,8 @@ pub(crate) use run::{
 const CONTROL_CHANNEL_CAPACITY: usize = 32;
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 /// API admission permits 32 ordinary commands plus one reserved Abort.
-const PENDING_CONTROL_CAPACITY: usize = 33;
+const PENDING_ORDINARY_CONTROL_CAPACITY: usize = 32;
+const PENDING_CONTROL_CAPACITY: usize = PENDING_ORDINARY_CONTROL_CAPACITY + 1;
 
 type WorkerFuture = Pin<Box<dyn Future<Output = RunCompletion> + Send + 'static>>;
 
@@ -75,6 +78,7 @@ pub(crate) struct RunCore {
     /// flat representation with `ThreeLayerMemory`; keeping it in `RunCore`
     /// prevents a second Session run from silently losing the first run.
     runtime_context: Vec<PublicMessage>,
+    durable_binding: Option<DurableRunBinding>,
 }
 
 impl RunCore {
@@ -85,6 +89,7 @@ impl RunCore {
             pending_controls: MessageQueue::bounded(PENDING_CONTROL_CAPACITY),
             pending_overflow_apply: None,
             runtime_context: Vec::new(),
+            durable_binding: None,
         }
     }
 
@@ -180,10 +185,11 @@ pub(crate) trait RunWorker: Send + Sync + 'static {
         core: RunCore,
         initial: AdmittedCommand,
         controls: mpsc::Receiver<RunControl>,
-        events: mpsc::Sender<AgentEvent>,
+        events: mpsc::Sender<RunOutput>,
     ) -> WorkerFuture;
 }
 
+#[cfg(test)]
 impl<F, Fut> RunWorker for F
 where
     F: Fn(RunCore, AdmittedCommand, mpsc::Receiver<RunControl>, mpsc::Sender<AgentEvent>) -> Fut
@@ -197,17 +203,92 @@ where
         core: RunCore,
         initial: AdmittedCommand,
         controls: mpsc::Receiver<RunControl>,
-        events: mpsc::Sender<AgentEvent>,
+        events: mpsc::Sender<RunOutput>,
     ) -> WorkerFuture {
-        Box::pin((self)(core, initial, controls, events))
+        let mut binding = core
+            .durable_binding
+            .clone()
+            .expect("Session must bind RunCore before starting a worker");
+        let mut emitted_turn = false;
+        let (fixture_tx, mut fixture_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let future = (self)(core, initial, controls, fixture_tx);
+        Box::pin(async move {
+            tokio::pin!(future);
+            loop {
+                tokio::select! {
+                    biased;
+                    completion = &mut future => {
+                        while let Ok(event) = fixture_rx.try_recv() {
+                            if matches!(event, AgentEvent::TurnStart) {
+                                if emitted_turn {
+                                    binding.turn_id = Uuid::now_v7().to_string();
+                                }
+                                emitted_turn = true;
+                            }
+                            if events.send(RunOutput { binding: binding.clone(), event }).await.is_err() {
+                                return event_channel_lost(completion);
+                            }
+                        }
+                        return completion;
+                    }
+                    event = fixture_rx.recv() => {
+                        let Some(event) = event else {
+                            drop(events);
+                            return future.await;
+                        };
+                        if matches!(event, AgentEvent::TurnStart) {
+                            if emitted_turn {
+                                binding.turn_id = Uuid::now_v7().to_string();
+                            }
+                            emitted_turn = true;
+                        }
+                        if events.send(RunOutput { binding: binding.clone(), event }).await.is_err() {
+                            // The fixture future owns the real RunCore. Keep
+                            // draining its bounded event lane while it settles;
+                            // simply awaiting it here can deadlock once that
+                            // lane fills, while fabricating a replacement core
+                            // lies about ownership.
+                            loop {
+                                tokio::select! {
+                                    completion = &mut future => {
+                                        return event_channel_lost(completion);
+                                    }
+                                    event = fixture_rx.recv() => {
+                                        if event.is_none() {
+                                            return event_channel_lost(future.await);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+fn event_channel_lost(completion: RunCompletion) -> RunCompletion {
+    let core = match completion {
+        RunCompletion::Completed(core) | RunCompletion::Failed { core, .. } => core,
+    };
+    RunCompletion::Failed {
+        core,
+        failure: WorkerFailure::EventChannelClosed,
     }
 }
 
 pub(crate) struct ActiveRun {
+    #[allow(
+        dead_code,
+        reason = "T15 retains the sender so an active worker never observes a false control-lane close"
+    )]
     control_tx: mpsc::Sender<RunControl>,
-    events_rx: mpsc::Receiver<AgentEvent>,
+    events_rx: mpsc::Receiver<RunOutput>,
     completion_rx: oneshot::Receiver<RunCompletion>,
     join: JoinHandle<()>,
+    bridge: DurableBridge,
 }
 
 #[derive(Debug)]
@@ -237,8 +318,6 @@ pub(crate) enum SessionFailure {
     CompletionChannelClosed,
     #[error("run worker event channel closed")]
     EventChannelClosed,
-    #[error("run worker control channel closed before completion")]
-    ControlChannelClosed,
     #[error("gateway closed while a run owned RunCore")]
     GatewayClosedDuringRun,
     #[error("gateway {operation} failed: {source}")]
@@ -264,6 +343,15 @@ pub(crate) struct Session<G: Gateway> {
     core: Option<RunCore>,
     active: Option<ActiveRun>,
     worker: Arc<dyn RunWorker>,
+    /// T16 owns active-run classification and control semantics. Until then
+    /// every command received during a run remains durably `received` in one
+    /// sequence-ordered queue. After AgentEnd, T15 may start a fresh user run
+    /// or apply an idle Abort cutoff, but it must not let a user overtake an
+    /// earlier/later control that only T16 can apply safely.
+    deferred_commands: MessageQueue<AdmittedCommand>,
+    /// A bridge/Store refusal means the worker's returned core may be ahead of
+    /// the durable transcript and must never be exposed as recovered.
+    durable_core_invalidated: bool,
 }
 
 impl<G: Gateway + 'static> Session<G> {
@@ -295,6 +383,8 @@ impl<G: Gateway + 'static> Session<G> {
             core: Some(core),
             active: None,
             worker,
+            deferred_commands: MessageQueue::bounded(PENDING_CONTROL_CAPACITY),
+            durable_core_invalidated: false,
         })
     }
 
@@ -309,10 +399,14 @@ impl<G: Gateway + 'static> Session<G> {
                 if self.active.is_some() {
                     self.shutdown_active().await;
                 }
-                let ownership = self
-                    .core
-                    .take()
-                    .map_or(RunOwnership::Lost, RunOwnership::Recovered);
+                let ownership = if self.durable_core_invalidated {
+                    self.core.take();
+                    RunOwnership::Lost
+                } else {
+                    self.core
+                        .take()
+                        .map_or(RunOwnership::Lost, RunOwnership::Recovered)
+                };
                 SessionResult::Failed { failure, ownership }
             }
         }
@@ -335,7 +429,7 @@ impl<G: Gateway + 'static> Session<G> {
             enum Selected {
                 Completion(std::result::Result<RunCompletion, oneshot::error::RecvError>),
                 Command(Result<InboundCommand>),
-                Event(Option<AgentEvent>),
+                Event(Option<RunOutput>),
             }
 
             let selected = {
@@ -359,7 +453,7 @@ impl<G: Gateway + 'static> Session<G> {
                 Selected::Command(Err(error)) => {
                     return Err(gateway_failure("receive", error));
                 }
-                Selected::Event(Some(event)) => self.send_event(event).await?,
+                Selected::Event(Some(event)) => self.persist_active_event(event).await?,
                 Selected::Event(None) => self.resolve_closed_event_channel().await?,
             }
         }
@@ -403,15 +497,41 @@ impl<G: Gateway + 'static> Session<G> {
             unreachable!("invalid commands return above");
         };
         let command = AdmittedCommand::new(command, received_at);
-        if let Some(active) = self.active.as_mut() {
-            if let Err(error) = active.control_tx.send(RunControl::Command(command)).await {
-                let RunControl::Command(command) = error.0;
-                self.harvest_after_closed_control().await?;
-                return self.route_idle(command).await;
-            }
+        if self.active.is_some() {
+            self.defer_active_command(command)?;
             return Ok(());
         }
         self.route_idle(command).await
+    }
+
+    fn defer_active_command(&mut self, command: AdmittedCommand) -> Result<(), SessionFailure> {
+        let is_abort = matches!(command.envelope().command, Command::Abort {});
+        let ordinary_count = self
+            .deferred_commands
+            .iter()
+            .filter(|pending| !matches!(pending.envelope().command, Command::Abort {}))
+            .count();
+        if !is_abort && ordinary_count >= PENDING_ORDINARY_CONTROL_CAPACITY {
+            return Err(anyhow::anyhow!(
+                "Session deferred non-Abort window exceeds its 32-command invariant; command remains durably received"
+            )
+            .into());
+        }
+        if is_abort
+            && self
+                .deferred_commands
+                .iter()
+                .any(|pending| matches!(pending.envelope().command, Command::Abort {}))
+        {
+            return Err(anyhow::anyhow!(
+                "Session deferred Abort reservation is already occupied; command remains durably received"
+            )
+            .into());
+        }
+        self.deferred_commands
+            .push(command)
+            .map_err(anyhow::Error::from)?;
+        Ok(())
     }
 
     async fn route_idle(&mut self, command: AdmittedCommand) -> Result<(), SessionFailure> {
@@ -434,35 +554,7 @@ impl<G: Gateway + 'static> Session<G> {
         if !matches!(command.envelope().command, Command::UserMessage { .. }) {
             return Err(SessionFailure::IdleControl);
         }
-        self.spawn_worker(command)
-    }
-
-    async fn harvest_after_closed_control(&mut self) -> Result<(), SessionFailure> {
-        tokio::task::yield_now().await;
-        let completion = {
-            let active = self
-                .active
-                .as_mut()
-                .expect("closed control requires active run");
-            active.completion_rx.try_recv()
-        };
-        match completion {
-            Ok(completion) => self.finish_run(Ok(completion)).await,
-            Err(oneshot::error::TryRecvError::Closed) => {
-                let active = self
-                    .active
-                    .take()
-                    .expect("closed control requires active run");
-                match active.join.await {
-                    Err(error) => Err(worker_join_failure(error)),
-                    Ok(()) => Err(SessionFailure::CompletionChannelClosed),
-                }
-            }
-            Err(oneshot::error::TryRecvError::Empty) => {
-                self.shutdown_active().await;
-                Err(SessionFailure::ControlChannelClosed)
-            }
-        }
+        self.spawn_worker(command).await
     }
 
     async fn resolve_closed_event_channel(&mut self) -> Result<(), SessionFailure> {
@@ -503,11 +595,27 @@ impl<G: Gateway + 'static> Session<G> {
         }
     }
 
-    fn spawn_worker(&mut self, initial: AdmittedCommand) -> Result<(), SessionFailure> {
-        let core = self
+    async fn spawn_worker(&mut self, initial: AdmittedCommand) -> Result<(), SessionFailure> {
+        let binding = DurableRunBinding::idle(&initial);
+        self.writer
+            .apply(crate::store::EventBatch {
+                writes: vec![crate::store::EventWrite {
+                    event: None,
+                    projections: vec![crate::store::Projection::CommandClassified {
+                        command_id: binding.command_id.clone(),
+                        application_kind: crate::store::ApplicationKind::IdleRun,
+                        run_id: binding.run_id.clone(),
+                        turn_id: binding.turn_id.clone(),
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await?;
+        let mut core = self
             .core
             .take()
             .ok_or(SessionFailure::CompletionChannelClosed)?;
+        core.durable_binding = Some(binding.clone());
         let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
         let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let (completion_tx, completion_rx) = oneshot::channel();
@@ -526,6 +634,7 @@ impl<G: Gateway + 'static> Session<G> {
             events_rx,
             completion_rx,
             join,
+            bridge: DurableBridge::new(binding),
         });
         Ok(())
     }
@@ -544,26 +653,77 @@ impl<G: Gateway + 'static> Session<G> {
                 };
             }
         };
-        if let Err(error) = active.join.await {
+        if let Err(error) = (&mut active.join).await {
             return Err(worker_join_failure(error));
         }
-        let worker_failure = match completion {
-            RunCompletion::Completed(core) => {
-                self.core = Some(core);
-                None
-            }
-            RunCompletion::Failed { core, failure } => {
-                self.core = Some(core);
-                Some(failure)
-            }
+        let (core, worker_failure) = match completion {
+            RunCompletion::Completed(core) => (core, None),
+            RunCompletion::Failed { core, failure } => (core, Some(failure)),
         };
-        while let Ok(event) = active.events_rx.try_recv() {
-            self.send_event(event).await?;
+        let delivery_failure = self.drain_disconnected_outputs(&mut active, true).await?;
+        // A completed RunCore includes every output already produced by the
+        // worker. Do not expose it until the disconnected bounded event lane
+        // has been drained into SQLite, even when Gateway delivery was lost.
+        self.core = Some(core);
+        if let Some(failure) = delivery_failure {
+            return Err(failure);
         }
         match worker_failure {
             Some(failure) => Err(SessionFailure::Worker(failure)),
-            None => Ok(()),
+            None => self.route_deferred_after_run().await,
         }
+    }
+
+    async fn route_deferred_after_run(&mut self) -> Result<(), SessionFailure> {
+        loop {
+            let abort = self
+                .deferred_commands
+                .iter()
+                .find(|command| matches!(command.envelope().command, Command::Abort {}))
+                .cloned();
+            let Some(abort) = abort else {
+                break;
+            };
+            let abort_seq = abort.envelope().seq;
+            let mut terminal = self
+                .writer
+                .apply_idle_abort_cutoff(abort.envelope().command_id.as_str(), abort_seq)
+                .await?;
+            for ack in terminal.drain(..) {
+                self.gateway
+                    .send(OutboundFrame::CommandAck { ack })
+                    .await
+                    .map_err(|error| gateway_failure("send", error))?;
+            }
+            while self
+                .deferred_commands
+                .front()
+                .is_some_and(|command| command.envelope().seq <= abort_seq)
+            {
+                self.deferred_commands.pop_one();
+            }
+        }
+
+        let Some(next) = self.deferred_commands.pop_one() else {
+            return Ok(());
+        };
+        if !matches!(next.envelope().command, Command::UserMessage { .. }) {
+            self.deferred_commands
+                .push_front(next)
+                .map_err(anyhow::Error::from)?;
+            return Err(SessionFailure::IdleControl);
+        }
+        if self
+            .deferred_commands
+            .iter()
+            .any(|command| !matches!(command.envelope().command, Command::UserMessage { .. }))
+        {
+            self.deferred_commands
+                .push_front(next)
+                .map_err(anyhow::Error::from)?;
+            return Err(SessionFailure::IdleControl);
+        }
+        self.spawn_worker(next).await
     }
 
     async fn shutdown_active(&mut self) {
@@ -573,8 +733,15 @@ impl<G: Gateway + 'static> Session<G> {
         tokio::task::yield_now().await;
         match active.completion_rx.try_recv() {
             Ok(RunCompletion::Completed(core) | RunCompletion::Failed { core, .. }) => {
-                self.core = Some(core);
-                let _ = active.join.await;
+                if (&mut active.join).await.is_err() {
+                    return;
+                }
+                // The caller already holds the primary Session failure. Commit
+                // the suffix, but do not re-enter a failed Gateway during shutdown.
+                match self.drain_disconnected_outputs(&mut active, false).await {
+                    Ok(_) => self.core = Some(core),
+                    Err(_) => self.durable_core_invalidated = true,
+                }
             }
             Err(oneshot::error::TryRecvError::Closed) => {
                 let _ = active.join.await;
@@ -586,17 +753,80 @@ impl<G: Gateway + 'static> Session<G> {
         }
     }
 
-    async fn send_event(&mut self, event: AgentEvent) -> Result<(), SessionFailure> {
-        self.gateway
-            .send(OutboundFrame::Event {
-                envelope: crate::gateway::Envelope {
-                    seq: None,
-                    conversation_id: self.conversation_id.clone(),
-                    event: serde_json::to_value(event).map_err(anyhow::Error::from)?,
-                },
-            })
-            .await
-            .map_err(|error| gateway_failure("send", error))?;
+    async fn drain_disconnected_outputs(
+        &mut self,
+        active: &mut ActiveRun,
+        deliver: bool,
+    ) -> Result<Option<SessionFailure>, SessionFailure> {
+        let mut delivery_failure = None;
+        while let Ok(output) = active.events_rx.try_recv() {
+            let committed = match active.bridge.commit(&self.writer, output).await {
+                Ok(committed) => committed,
+                Err(error) => {
+                    self.durable_core_invalidated = true;
+                    return Err(error.into());
+                }
+            };
+            if deliver && delivery_failure.is_none() {
+                delivery_failure = self
+                    .send_committed(committed, Some(active.bridge.command_id().to_owned()))
+                    .await
+                    .err();
+            }
+        }
+        Ok(delivery_failure)
+    }
+
+    async fn persist_active_event(&mut self, output: RunOutput) -> Result<(), SessionFailure> {
+        let committed = {
+            let active = self.active.as_mut().expect("event requires active run");
+            match active.bridge.commit(&self.writer, output).await {
+                Ok(committed) => committed,
+                Err(error) => {
+                    self.durable_core_invalidated = true;
+                    return Err(error.into());
+                }
+            }
+        };
+        let command_id = self
+            .active
+            .as_ref()
+            .map(|active| active.bridge.command_id().to_owned());
+        self.send_committed(committed, command_id).await
+    }
+
+    async fn send_committed(
+        &mut self,
+        committed: Vec<CommittedOutput>,
+        command_id: Option<String>,
+    ) -> Result<(), SessionFailure> {
+        let applied_command = committed
+            .iter()
+            .any(|output| matches!(output.event, AgentEvent::AgentEnd));
+        for output in committed {
+            self.gateway
+                .send(OutboundFrame::Event {
+                    envelope: crate::gateway::Envelope {
+                        seq: output.seq,
+                        conversation_id: self.conversation_id.clone(),
+                        event: serde_json::to_value(output.event).map_err(anyhow::Error::from)?,
+                    },
+                })
+                .await
+                .map_err(|error| gateway_failure("send", error))?;
+        }
+        if applied_command {
+            let command_id = command_id.ok_or(SessionFailure::CompletionChannelClosed)?;
+            let ack = self
+                .writer
+                .ack_for_command(&command_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("applied command disappeared after AgentEnd"))?;
+            self.gateway
+                .send(OutboundFrame::CommandAck { ack })
+                .await
+                .map_err(|error| gateway_failure("send", error))?;
+        }
         Ok(())
     }
 }

@@ -13,10 +13,12 @@ use tokio::sync::{Notify, mpsc};
 
 use super::*;
 use crate::{
+    agent::DurableRunBinding,
     gateway::{CommandEnvelope, CommandId},
     provider::types::{
-        ApiProtocol, AssistantContent, AssistantMessage, ProviderOrigin, ProviderOutput,
-        PublicAssistantMessage, RejectedToolCall, ToolArgumentError, Usage, ValidatedToolArguments,
+        ApiProtocol, AssistantContent, AssistantMessage, ProviderContextFragment,
+        ProviderContextPayload, ProviderOrigin, ProviderOutput, PublicAssistantMessage,
+        RejectedToolCall, ToolArgumentError, Usage, ValidatedToolArguments,
     },
 };
 
@@ -494,16 +496,23 @@ fn pending_sequences(core: &mut RunCore) -> Vec<u64> {
     sequences
 }
 
+fn bound_core(seq: u64) -> RunCore {
+    let command = admitted_user(seq);
+    let mut core = RunCore::new();
+    core.durable_binding = Some(DurableRunBinding::idle(&command));
+    core
+}
+
 async fn run_fixture(driver: Arc<FixtureDriver>) -> (RunCompletion, Vec<AgentEvent>) {
     let worker = SequentialRunWorker::new(driver);
     let (_control_tx, control_rx) = mpsc::channel(8);
     let (events_tx, mut events_rx) = mpsc::channel(256);
     let completion = worker
-        .run(RunCore::new(), admitted_user(1), control_rx, events_tx)
+        .run(bound_core(1), admitted_user(1), control_rx, events_tx)
         .await;
     let mut events = Vec::new();
     while let Some(event) = events_rx.recv().await {
-        events.push(event);
+        events.push(event.event);
     }
     (completion, events)
 }
@@ -569,6 +578,54 @@ async fn retry_closes_error_before_schedule_and_does_not_append_error_context() 
 }
 
 #[tokio::test]
+async fn nonempty_provider_context_fails_closed_instead_of_being_dropped() {
+    let message = assistant(StopReason::Stop, Vec::new(), None, None);
+    let events = vec![
+        ProviderEvent::Start,
+        ProviderEvent::Done {
+            reason: StopReason::Stop,
+            output: ProviderOutput {
+                message,
+                provider_context: vec![ProviderContextFragment {
+                    wire_item_index: Some(0),
+                    payload: ProviderContextPayload::EncryptedReasoning {
+                        protocol: ApiProtocol::OpenAiResponses,
+                        item: json!({"encrypted_content":"opaque"}),
+                    },
+                }],
+            },
+        },
+    ];
+    let driver = Arc::new(FixtureDriver::new(vec![Script::Events(events)]));
+    let (completion, emitted) = run_fixture(driver).await;
+    assert_completed(completion);
+    let end = emitted
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::MessageEnd {
+                message_id,
+                message,
+            } if message_id == "assistant-0" => Some(message.as_ref()),
+            _ => None,
+        })
+        .expect("synthetic assistant close");
+    assert!(matches!(
+        end,
+        PublicMessage::Assistant(assistant)
+            if assistant.stop_reason == StopReason::Error
+                && assistant.error_message.as_deref().is_some_and(|message| {
+                    message.contains("T17 durable hand-off")
+                        && message.contains("refusing to persist opaque context")
+                })
+    ));
+    assert!(matches!(
+        emitted[emitted.len() - 2],
+        AgentEvent::TurnEnd { .. }
+    ));
+    assert!(matches!(emitted.last(), Some(AgentEvent::AgentEnd)));
+}
+
+#[tokio::test]
 async fn retry_wait_control_is_injected_mid_turn_before_next_attempt() {
     let driver = Arc::new(
         FixtureDriver::new(vec![
@@ -587,7 +644,7 @@ async fn retry_wait_control_is_injected_mid_turn_before_next_attempt() {
     let (events_tx, mut events_rx) = mpsc::channel(256);
     let completion = tokio::spawn(async move {
         worker
-            .run(RunCore::new(), admitted_user(1), control_rx, events_tx)
+            .run(bound_core(1), admitted_user(1), control_rx, events_tx)
             .await
     });
     driver.retry_waiting.notified().await;
@@ -599,7 +656,7 @@ async fn retry_wait_control_is_injected_mid_turn_before_next_attempt() {
     assert_completed(completion);
     let mut events = Vec::new();
     while let Some(event) = events_rx.recv().await {
-        events.push(event);
+        events.push(event.event);
     }
     let retry = events
         .iter()
@@ -844,6 +901,35 @@ async fn reused_tool_call_id_gets_turn_scoped_stable_result_message_ids() {
     );
 }
 
+#[test]
+fn synthetic_attempt_message_ids_are_stable_and_scoped_by_durable_identity_and_failure_role() {
+    let binding = DurableRunBinding {
+        command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+        command_seq: 1,
+        run_id: "01900000-0000-7000-8000-000000000001".to_owned(),
+        turn_id: "01900000-0000-7000-8000-000000000002".to_owned(),
+    };
+    let start = synthetic_attempt_message_id(&binding, 0, SyntheticAttemptFailure::Start)
+        .expect("synthetic start identity");
+    assert_eq!(
+        start,
+        synthetic_attempt_message_id(&binding, 0, SyntheticAttemptFailure::Start)
+            .expect("stable synthetic start identity")
+    );
+    assert_ne!(
+        start,
+        synthetic_attempt_message_id(&binding, 0, SyntheticAttemptFailure::InvalidMessageId)
+            .expect("failure role identity")
+    );
+    let mut next_turn = binding.clone();
+    next_turn.turn_id = "01900000-0000-7000-8000-000000000003".to_owned();
+    assert_ne!(
+        start,
+        synthetic_attempt_message_id(&next_turn, 0, SyntheticAttemptFailure::Start)
+            .expect("next turn identity")
+    );
+}
+
 #[tokio::test]
 async fn tool_failure_is_synthetic_result_and_preserves_normal_form() {
     let driver = Arc::new(
@@ -872,15 +958,27 @@ async fn tool_failure_is_synthetic_result_and_preserves_normal_form() {
 }
 
 #[tokio::test]
-async fn done_rejection_pair_enters_context_but_not_turn_tool_results() {
-    let rejected = rejected("invalid");
+async fn mixed_rejections_precede_valid_lifecycle_and_only_valid_results_enter_turn_results() {
+    let rejected_first = rejected("invalid");
+    let rejected_second = rejected("invalid-2");
+    let valid = call("valid");
     let driver = Arc::new(FixtureDriver::new(vec![
         output(assistant(
             StopReason::ToolUse,
-            vec![AssistantContent::RejectedToolCall {
-                rejected: rejected.clone(),
-                wire_item_index: 0,
-            }],
+            vec![
+                AssistantContent::ToolCall {
+                    tool_call: valid.clone(),
+                    wire_item_index: 0,
+                },
+                AssistantContent::RejectedToolCall {
+                    rejected: rejected_first.clone(),
+                    wire_item_index: 1,
+                },
+                AssistantContent::RejectedToolCall {
+                    rejected: rejected_second.clone(),
+                    wire_item_index: 2,
+                },
+            ],
             None,
             None,
         )),
@@ -888,10 +986,24 @@ async fn done_rejection_pair_enters_context_but_not_turn_tool_results() {
     ]));
     let (completion, events) = run_fixture(driver.clone()).await;
     assert_completed(completion);
-    assert!(!events.iter().any(|event| matches!(
-        event,
-        AgentEvent::ToolExecutionStart { .. } | AgentEvent::ToolExecutionEnd { .. }
-    )));
+    let valid_start = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::ToolExecutionStart { tool_call_id, .. } if tool_call_id == &valid.id))
+        .expect("valid execution start");
+    for rejected in [&rejected_first, &rejected_second] {
+        let rejected_end = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    AgentEvent::MessageEnd { message, .. }
+                        if matches!(message.as_ref(), PublicMessage::ToolResult(result)
+                            if result.tool_call_id == rejected.id)
+                )
+            })
+            .expect("rejected result end");
+        assert!(rejected_end < valid_start);
+    }
     let first_turn = events
         .iter()
         .find(|event| matches!(event, AgentEvent::TurnEnd { .. }))
@@ -900,31 +1012,36 @@ async fn done_rejection_pair_enters_context_but_not_turn_tool_results() {
         matches!(
             first_turn,
             AgentEvent::TurnEnd { message: Some(message), tool_results }
-                if tool_results.is_empty()
+                if tool_results.len() == 1 && tool_results[0].tool_call_id == valid.id
                     && matches!(message.as_ref(), PublicMessage::Assistant(assistant)
                         if assistant.content.iter().any(|content| matches!(
                             content,
                             PublicAssistantContent::RejectedToolCall { rejected: value, .. }
-                                if value == &rejected
+                                if value == &rejected_first
                         )))
         ),
         "unexpected first turn: {first_turn:#?}"
     );
     let contexts = driver.started_contexts.lock().expect("contexts");
-    assert_eq!(contexts[1].len(), 3);
+    assert_eq!(contexts[1].len(), 5);
     assert!(matches!(
         &contexts[1][1],
         PublicMessage::Assistant(assistant)
             if assistant.content.iter().any(|content| matches!(
                 content,
                 PublicAssistantContent::RejectedToolCall { rejected: value, .. }
-                    if value == &rejected
+                    if value == &rejected_first
             ))
     ));
     assert!(matches!(
-        &contexts[1][2],
+        &contexts[1][3],
         PublicMessage::ToolResult(result)
-            if result.tool_call_id == rejected.id && result.is_error
+            if result.tool_call_id == rejected_first.id && result.is_error
+    ));
+    assert!(matches!(
+        &contexts[1][4],
+        PublicMessage::ToolResult(result)
+            if result.tool_call_id == rejected_second.id && result.is_error
     ));
 }
 
@@ -1058,7 +1175,7 @@ async fn provider_start_failure_recovers_received_controls_and_next_run_consumes
         .expect("second received control");
     let (events_tx, mut events_rx) = mpsc::channel(256);
     let first = first_worker
-        .run(RunCore::new(), admitted_user(1), control_rx, events_tx)
+        .run(bound_core(1), admitted_user(1), control_rx, events_tx)
         .await;
     while events_rx.recv().await.is_some() {}
     let core = recovered_core(first);
@@ -1123,7 +1240,7 @@ async fn closed_error_recovers_cross_kind_controls_without_reordering_or_preempt
         .expect("later user");
     let (events_tx, mut events_rx) = mpsc::channel(256);
     let completion = worker
-        .run(RunCore::new(), admitted_user(1), control_rx, events_tx)
+        .run(bound_core(1), admitted_user(1), control_rx, events_tx)
         .await;
     while events_rx.recv().await.is_some() {}
     let core = recovered_core(completion);
@@ -1175,7 +1292,7 @@ async fn deferred_t16_control_blocks_later_user_at_every_safe_point() {
         .expect("later user");
     let (events_tx, mut events_rx) = mpsc::channel(256);
     let completion = worker
-        .run(RunCore::new(), admitted_user(1), control_rx, events_tx)
+        .run(bound_core(1), admitted_user(1), control_rx, events_tx)
         .await;
     while events_rx.recv().await.is_some() {}
     let mut core = recovered_core(completion);
@@ -1208,7 +1325,7 @@ async fn event_failure_race_recovers_every_control_accepted_before_receiver_clos
     let (events_tx, events_rx) = mpsc::channel(1);
     drop(events_rx);
     let completion = worker
-        .run(RunCore::new(), admitted_user(1), control_rx, events_tx)
+        .run(bound_core(1), admitted_user(1), control_rx, events_tx)
         .await;
     assert!(matches!(
         &completion,
@@ -1231,7 +1348,7 @@ async fn initial_command_is_recovered_before_each_fallible_injection_boundary() 
         let driver = Arc::new(FixtureDriver::new(vec![Script::StartFailure("unused")]));
         let (_control_tx, control_rx) = mpsc::channel(1);
         let (events_tx, mut events_rx) = mpsc::channel(8);
-        let mut runner = Runner::new(RunCore::new(), driver, control_rx, events_tx);
+        let mut runner = Runner::new(bound_core(1), driver, control_rx, events_tx);
         runner
             .claim_ordered_initial(admitted_user(1))
             .expect("claim initial");
@@ -1314,7 +1431,7 @@ async fn claimed_followups_survive_turn_steer_and_injection_event_failures() {
     let cases = ["turn_start", "steered", "message_start"];
     for case in cases {
         let driver = Arc::new(FixtureDriver::new(Vec::new()));
-        let mut core = RunCore::new();
+        let mut core = bound_core(1);
         core.queue_followup(admitted_user(2)).expect("followup");
         let (_control_tx, control_rx) = mpsc::channel(1);
         let (events_tx, events_rx) = mpsc::channel(1);
@@ -1374,7 +1491,7 @@ async fn retry_wait_channel_close_and_cancelled_hook_never_start_another_attempt
         };
         let (events_tx, mut events_rx) = mpsc::channel(64);
         let completion = worker
-            .run(RunCore::new(), admitted_user(1), control_rx, events_tx)
+            .run(bound_core(1), admitted_user(1), control_rx, events_tx)
             .await;
         while events_rx.recv().await.is_some() {}
         assert!(matches!(

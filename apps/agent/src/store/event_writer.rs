@@ -833,6 +833,17 @@ pub(crate) enum ToolExecutionMutation {
         state: &'static str,
         error_code: Option<&'static str>,
     },
+    /// Records a validated call that was deliberately never prepared or run.
+    /// This mutation is eventless and must be paired with its error ToolResult
+    /// MessageStart/End in the same EventBatch.
+    Skip {
+        tool_call_id: String,
+        command_id: String,
+        run_id: String,
+        turn_id: String,
+        idempotency_key: String,
+        error_code: &'static str,
+    },
 }
 
 #[allow(
@@ -2516,7 +2527,9 @@ fn prepared_consumes_lifecycle_history(prepared: &[PreparedWrite]) -> bool {
                 matches!(
                     projection,
                     PreparedProjection::Plain(Projection::ToolExecution(
-                        ToolExecutionMutation::Prepare { .. } | ToolExecutionMutation::Start { .. }
+                        ToolExecutionMutation::Prepare { .. }
+                            | ToolExecutionMutation::Start { .. }
+                            | ToolExecutionMutation::Skip { .. }
                     )) | PreparedProjection::Plain(Projection::CommandClassified { .. })
                         | PreparedProjection::Plain(Projection::RunPhase { .. })
                         | PreparedProjection::Plain(Projection::CommandApplied {
@@ -2819,6 +2832,7 @@ fn validate_batch_shape(
     let mut tool_mutation_ids = HashSet::new();
     let mut tool_start_mutation_ids: HashSet<String> = HashSet::new();
     let mut tool_finish_mutation_ids: HashSet<String> = HashSet::new();
+    let mut tool_skip_mutation_ids: HashSet<String> = HashSet::new();
     let mut approval_mutation_ids = HashSet::new();
     let mut approval_pending_mutation_ids: HashSet<String> = HashSet::new();
     let mut approval_resolve_mutation_ids: HashSet<String> = HashSet::new();
@@ -3216,7 +3230,8 @@ fn validate_batch_shape(
                 let tool_call_id = match mutation {
                     ToolExecutionMutation::Prepare { tool_call_id, .. }
                     | ToolExecutionMutation::Start { tool_call_id, .. }
-                    | ToolExecutionMutation::Finish { tool_call_id, .. } => tool_call_id,
+                    | ToolExecutionMutation::Finish { tool_call_id, .. }
+                    | ToolExecutionMutation::Skip { tool_call_id, .. } => tool_call_id,
                 };
                 if !tool_mutation_ids.insert(tool_call_id.as_str()) {
                     bail!("duplicate tool mutation for tool {tool_call_id}");
@@ -3252,6 +3267,12 @@ fn validate_batch_shape(
                         );
                     }
                     ToolExecutionMutation::Prepare { .. } => {}
+                    ToolExecutionMutation::Skip { error_code, .. } => {
+                        if *error_code != "length_guard" {
+                            bail!("ToolExecution Skip only supports length_guard");
+                        }
+                        tool_skip_mutation_ids.insert(tool_call_id.clone());
+                    }
                 }
             }
             if let Projection::Approval(mutation) = projection {
@@ -3545,6 +3566,18 @@ fn validate_batch_shape(
             );
         }
     }
+    for tool_call_id in &tool_skip_mutation_ids {
+        let Some(message_id) = tool_result_message_ids.get(tool_call_id.as_str()) else {
+            bail!(
+                "ToolExecution Skip for {tool_call_id} requires its tool-result MessageEnd in the same EventBatch"
+            );
+        };
+        if !message_start_event_ids.contains(message_id) {
+            bail!(
+                "ToolExecution Skip for {tool_call_id} requires tool-result MessageStart and MessageEnd in the same EventBatch"
+            );
+        }
+    }
     for (tool_call_id, (message_id, result_position, is_error)) in &tool_result_positions {
         let Some(start_position) = message_start_positions.get(message_id) else {
             bail!("tool-result MessageEnd for {tool_call_id} requires its same-batch MessageStart");
@@ -3560,6 +3593,10 @@ fn validate_batch_shape(
                 bail!(
                     "ToolExecutionEnd for {tool_call_id} must precede its result MessageStart/MessageEnd"
                 );
+            }
+        } else if tool_skip_mutation_ids.contains(*tool_call_id) {
+            if !*is_error {
+                bail!("not-started tool result for {tool_call_id} must be an error");
             }
         } else {
             let rejected_position = rejected_tool_calls.get(*tool_call_id);
@@ -3598,10 +3635,21 @@ fn validate_batch_shape(
         let result = projected_message_digests
             .get(message_id)
             .ok_or_else(|| anyhow!("missing tool-result message for {tool_call_id}"))?;
+        let mut canonical_message = result.clone();
+        canonical_message
+            .as_object_mut()
+            .expect("typed PublicMessage projection is an object")
+            .remove("role");
         let result_message: crate::provider::types::ToolResultMessage =
-            serde_json::from_value(result.clone())
+            serde_json::from_value(canonical_message.clone())
                 .context("tool-result MessageEnd projection is invalid")?;
-        if event.result != *result || event.is_error != result_message.is_error {
+        let mut canonical_event_result = event.result.clone();
+        canonical_event_result
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("tool terminal event result must be an object"))?
+            .remove("role");
+        if canonical_event_result != canonical_message || event.is_error != result_message.is_error
+        {
             bail!("tool terminal event result does not match result message for {tool_call_id}");
         }
     }
@@ -3930,6 +3978,19 @@ fn projection_size_upper_bound(projection: &Projection) -> Result<usize> {
                 run_id,
             } => tool_call_id.len().saturating_add(run_id.len()),
             ToolExecutionMutation::Finish { tool_call_id, .. } => tool_call_id.len(),
+            ToolExecutionMutation::Skip {
+                tool_call_id,
+                command_id,
+                run_id,
+                turn_id,
+                idempotency_key,
+                ..
+            } => tool_call_id
+                .len()
+                .saturating_add(command_id.len())
+                .saturating_add(run_id.len())
+                .saturating_add(turn_id.len())
+                .saturating_add(idempotency_key.len()),
         },
         Projection::Approval(mutation) => match mutation {
             ApprovalMutation::Pending {
@@ -4771,6 +4832,9 @@ async fn validate_required_projection_sets(
                     tool_finishes
                         .insert(tool_call_id.as_str(), ToolFinishBinding { expected, state });
                 }
+                PreparedProjection::Plain(Projection::ToolExecution(
+                    ToolExecutionMutation::Skip { .. },
+                )) => {}
                 PreparedProjection::Plain(Projection::CommandApplied {
                     command_id,
                     command_seq,
@@ -6126,6 +6190,41 @@ async fn validate_durable_lifecycle_suffix(
                 )) if tool_call_id.is_empty() => {
                     bail!("ToolExecutionFinish identity must not be empty")
                 }
+                PreparedProjection::Plain(Projection::ToolExecution(
+                    ToolExecutionMutation::Skip {
+                        tool_call_id,
+                        command_id,
+                        run_id,
+                        turn_id,
+                        idempotency_key,
+                        error_code,
+                    },
+                )) if tool_call_id.is_empty()
+                    || command_id.is_empty()
+                    || run_id.is_empty()
+                    || turn_id.is_empty()
+                    || idempotency_key.is_empty()
+                    || *error_code != "length_guard" =>
+                {
+                    bail!("ToolExecutionSkip identity must be non-empty and use length_guard")
+                }
+                PreparedProjection::Plain(Projection::ToolExecution(
+                    ToolExecutionMutation::Skip {
+                        tool_call_id,
+                        run_id,
+                        turn_id,
+                        ..
+                    },
+                )) => {
+                    let origin = state.tool_call_origins.get(tool_call_id).ok_or_else(|| {
+                        anyhow!(
+                            "ToolExecutionSkip has no canonical assistant ToolCall {tool_call_id}"
+                        )
+                    })?;
+                    if origin.run_id != *run_id || origin.turn_id != *turn_id {
+                        bail!("ToolExecutionSkip does not match the canonical run/turn origin");
+                    }
+                }
                 PreparedProjection::Plain(Projection::RunPhase {
                     run_id,
                     expected: RunPhase::UserCommitted,
@@ -6437,7 +6536,22 @@ fn apply_lifecycle_event(
                     if !supplied.insert(tool_call_id) {
                         bail!("TurnEnd contains duplicate tool result {tool_call_id}");
                     }
-                    if state.tool_results.get(tool_call_id) != Some(result) {
+                    let mut canonical_result = result.clone();
+                    canonical_result
+                        .as_object_mut()
+                        .expect("typed TurnEnd tool result is an object")
+                        .remove("role");
+                    let Some(mut canonical_message) = state.tool_results.get(tool_call_id).cloned()
+                    else {
+                        bail!(
+                            "TurnEnd tool result {tool_call_id} does not match durable tool-result MessageEnd"
+                        );
+                    };
+                    canonical_message
+                        .as_object_mut()
+                        .expect("typed tool-result MessageEnd is an object")
+                        .remove("role");
+                    if canonical_message != canonical_result {
                         bail!(
                             "TurnEnd tool result {tool_call_id} does not match durable tool-result MessageEnd"
                         );
@@ -7032,6 +7146,37 @@ async fn apply_tool_mutation(
             .execute(&mut **transaction)
             .await?;
             require_single_cas(result.rows_affected(), "ToolExecutionEnd")?;
+        }
+        ToolExecutionMutation::Skip {
+            tool_call_id,
+            command_id,
+            run_id,
+            turn_id: _,
+            idempotency_key,
+            error_code,
+        } => {
+            if error_code != "length_guard" {
+                bail!("ToolExecutionSkip only supports length_guard");
+            }
+            let result = sqlx::query(
+                "INSERT INTO tool_executions(
+                    tool_call_id, command_id, run_id, executor_generation, state,
+                    idempotency_key, started_at, finished_at, error_code
+                 )
+                 SELECT ?, command_id, run_id, 0, 'not_started', ?, NULL, ?, ?
+                 FROM inbound_commands
+                 WHERE command_id = ? AND run_id = ? AND command_kind = 'user_message'
+                   AND status = 'applying' AND run_phase = 'assistant_started'",
+            )
+            .bind(tool_call_id)
+            .bind(idempotency_key)
+            .bind(Utc::now().to_rfc3339())
+            .bind(error_code)
+            .bind(command_id)
+            .bind(run_id)
+            .execute(&mut **transaction)
+            .await?;
+            require_single_cas(result.rows_affected(), "ToolExecutionSkip")?;
         }
     }
     Ok(())
