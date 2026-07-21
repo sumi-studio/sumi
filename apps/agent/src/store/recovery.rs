@@ -14,7 +14,7 @@ use super::{
     crypto::decrypt_content,
     event_log::{EVENT_DIGEST_BYTES, EventChainEntry, extend_event_chain, verify_event_head},
     event_writer::DurableEventMetadata,
-    verify_keyed_digest,
+    verify_command_payload_digest,
 };
 
 const EVENT_EVIDENCE_PAGE_ROWS: i64 = 64;
@@ -94,11 +94,8 @@ impl SuffixRecovery {
         store: &Store,
         writer: &EventWriter,
     ) -> Result<Vec<RecoveryStep>> {
-        // Authenticate the entire append-only history once before any recovery
-        // mutation. Subsequent iterations only choose the next bounded action.
-        durable_event_evidence(store, EventEvidence::default()).await?;
         loop {
-            let steps = Self::plan_next_without_history_scan(store).await?;
+            let steps = Self::plan_next_without_history_scan(store, Some(writer)).await?;
             let Some(step) = steps.first() else {
                 return Ok(steps);
             };
@@ -169,20 +166,40 @@ impl SuffixRecovery {
         reason = "T15 consumes the bounded next-action recovery planner"
     )]
     pub(crate) async fn plan(store: &Store) -> Result<Vec<RecoveryStep>> {
-        Self::plan_next_without_history_scan(store).await
+        Self::plan_next_without_history_scan(store, None).await
     }
 
-    async fn plan_next_without_history_scan(store: &Store) -> Result<Vec<RecoveryStep>> {
+    async fn plan_next_without_history_scan(
+        store: &Store,
+        writer: Option<&EventWriter>,
+    ) -> Result<Vec<RecoveryStep>> {
         validate_pending_window(store).await?;
         let Some(command) = next_pending_command(store).await? else {
-            durable_event_evidence(store, EventEvidence::default()).await?;
+            if let Some(writer) = writer {
+                writer.initialize_recovery_checkpoint().await?;
+            } else {
+                durable_event_evidence(store, EventEvidence::default()).await?;
+            }
             return Ok(Vec::new());
         };
-        let events = durable_event_evidence(
-            store,
-            EventEvidence::required_for(std::slice::from_ref(&command))?,
-        )
-        .await?;
+        let mut events = EventEvidence::required_for(std::slice::from_ref(&command))?;
+        if let Some(writer) = writer {
+            writer.initialize_recovery_checkpoint().await?;
+            for predicate in events.required.clone() {
+                if writer
+                    .has_recovery_lifecycle_evidence(
+                        predicate.event_type,
+                        &predicate.run_id,
+                        predicate.turn_id.as_deref(),
+                    )
+                    .await?
+                {
+                    events.found.insert(predicate);
+                }
+            }
+        } else {
+            events = durable_event_evidence(store, events).await?;
+        }
         let step = match command.phase {
             RunPhase::Received => {
                 if command.command_kind == "user_message" {
@@ -470,7 +487,7 @@ async fn authenticated_pending_payload(
         decrypt_content(&key, &ciphertext, &aad)
             .with_context(|| format!("pending command {seq} failed authenticated recovery"))?,
     );
-    verify_keyed_digest(
+    verify_command_payload_digest(
         &key,
         &plaintext,
         row.try_get::<Vec<u8>, _>("payload_hmac")?.as_slice(),
@@ -588,7 +605,7 @@ async fn recoverable_noop_approval_sequence(
             .context("stored ApprovalDecision failed authenticated recovery")?,
     );
     let payload_hmac: Vec<u8> = row.try_get("payload_hmac")?;
-    verify_keyed_digest(&key, &plaintext, &payload_hmac)
+    verify_command_payload_digest(&key, &plaintext, &payload_hmac)
         .context("stored ApprovalDecision HMAC is invalid")?;
     let command: Command =
         serde_json::from_slice(&plaintext).context("stored ApprovalDecision payload is invalid")?;
@@ -929,7 +946,14 @@ mod tests {
     }
 
     async fn persist_run_started(store: &Store, writer: &EventWriter) {
-        persist_user(writer, 1, "00000000-0000-4000-8000-000000000001").await;
+        let seq = u64::try_from(
+            sqlx::query_scalar::<_, i64>("SELECT COALESCE(MAX(seq),0) + 1 FROM inbound_commands")
+                .fetch_one(store.pool())
+                .await
+                .expect("next recovery fixture sequence"),
+        )
+        .expect("next recovery fixture sequence");
+        persist_user(writer, seq, "00000000-0000-4000-8000-000000000001").await;
         writer
             .apply(EventBatch {
                 writes: vec![EventWrite {
@@ -976,35 +1000,86 @@ mod tests {
         );
     }
 
-    async fn persist_retry_events(writer: &EventWriter, count: usize) {
-        let writes = (0..count)
-            .map(|attempt| EventWrite {
-                event: Some(
-                    DurableEvent::new(&serde_json::json!({
-                        "type":"retry_scheduled",
-                        "attempt":u32::try_from(attempt + 1).expect("bounded fixture"),
-                        "delay_ms":1,
-                        "retry_at":"2026-07-20T00:00:00Z",
-                        "error_message":"fixture"
-                    }))
-                    .expect("retry event"),
-                ),
-                projections: Vec::new(),
-            })
-            .collect();
-        writer
-            .apply(EventBatch {
-                writes,
-                injected_commands: Vec::new(),
-            })
-            .await
-            .expect("persist retry event history");
+    async fn persist_valid_history(
+        store: &Store,
+        writer: &EventWriter,
+        minimum_event_count: usize,
+    ) -> usize {
+        let cycle_count = minimum_event_count.div_ceil(2);
+        let mut next_seq = u64::try_from(
+            sqlx::query_scalar::<_, i64>("SELECT COALESCE(MAX(seq),0) FROM inbound_commands")
+                .fetch_one(store.pool())
+                .await
+                .expect("load next command sequence"),
+        )
+        .expect("stored command sequence")
+        .saturating_add(1);
+        for _ in 0..cycle_count {
+            let user_id = Uuid::now_v7().to_string();
+            let abort_id = Uuid::now_v7().to_string();
+            let run_id = Uuid::now_v7().to_string();
+            let turn_id = Uuid::now_v7().to_string();
+            persist_user(writer, next_seq, &user_id).await;
+            writer
+                .apply(EventBatch {
+                    writes: vec![EventWrite {
+                        event: None,
+                        projections: vec![Projection::CommandClassified {
+                            command_id: user_id.clone(),
+                            application_kind: ApplicationKind::IdleRun,
+                            run_id: run_id.clone(),
+                            turn_id,
+                        }],
+                    }],
+                    injected_commands: Vec::new(),
+                })
+                .await
+                .expect("classify valid history command");
+            writer
+                .apply(EventBatch {
+                    writes: vec![EventWrite {
+                        event: Some(
+                            DurableEvent::new(&serde_json::json!({
+                                "type":"agent_start",
+                                "run_id":run_id
+                            }))
+                            .expect("valid history AgentStart"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: user_id,
+                            run_id,
+                            expected: RunPhase::Classified,
+                            next: RunPhase::RunStarted,
+                        }],
+                    }],
+                    injected_commands: Vec::new(),
+                })
+                .await
+                .expect("persist valid history AgentStart");
+            next_seq = next_seq.saturating_add(1);
+            writer
+                .persist_inbound(&InboundCommand::Valid(CommandEnvelope {
+                    seq: next_seq,
+                    command_id: crate::gateway::CommandId::parse(&abort_id)
+                        .expect("valid history Abort command ID"),
+                    command: Command::Abort {},
+                }))
+                .await
+                .expect("persist valid history Abort");
+            writer
+                .apply_idle_abort_cutoff(&abort_id, next_seq)
+                .await
+                .expect("close valid history run");
+            next_seq = next_seq.saturating_add(1);
+        }
+        cycle_count * 2
     }
 
     #[tokio::test]
     async fn authenticated_event_head_accepts_valid_history_across_page_boundary() {
         let (store, writer) = setup().await;
-        persist_retry_events(&writer, EVENT_EVIDENCE_PAGE_ROWS as usize + 1).await;
+        let persisted =
+            persist_valid_history(&store, &writer, EVENT_EVIDENCE_PAGE_ROWS as usize + 1).await;
 
         assert!(
             SuffixRecovery::plan(&store)
@@ -1018,14 +1093,17 @@ mod tests {
             .expect("event-log head");
         assert_eq!(
             head,
-            (EVENT_EVIDENCE_PAGE_ROWS + 1, EVENT_EVIDENCE_PAGE_ROWS + 1)
+            (
+                i64::try_from(persisted).expect("persisted event count"),
+                i64::try_from(persisted).expect("persisted event count"),
+            )
         );
     }
 
     #[tokio::test]
     async fn authenticated_event_head_rejects_middle_and_tail_deletion() {
         let (middle_store, middle_writer) = setup().await;
-        persist_retry_events(&middle_writer, 4).await;
+        persist_valid_history(&middle_store, &middle_writer, 4).await;
         sqlx::query("DELETE FROM agent_events WHERE seq=2")
             .execute(middle_store.pool())
             .await
@@ -1039,7 +1117,7 @@ mod tests {
         );
 
         let (tail_store, tail_writer) = setup().await;
-        persist_retry_events(&tail_writer, 4).await;
+        persist_valid_history(&tail_store, &tail_writer, 4).await;
         sqlx::query("DELETE FROM agent_events WHERE seq=4")
             .execute(tail_store.pool())
             .await
@@ -1058,7 +1136,7 @@ mod tests {
     #[tokio::test]
     async fn authenticated_event_head_rejects_head_metadata_mismatch() {
         let (store, writer) = setup().await;
-        persist_retry_events(&writer, 4).await;
+        persist_valid_history(&store, &writer, 4).await;
         sqlx::query("UPDATE event_log_heads SET chain_digest=zeroblob(32)")
             .execute(store.pool())
             .await
@@ -1185,6 +1263,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_abort_contextualizes_earlier_unclassified_users_without_binding_them() {
+        let (store, writer) = setup().await;
+        persist_user(&writer, 1, "00000000-0000-4000-8000-000000000011").await;
+        persist_user(&writer, 2, "00000000-0000-4000-8000-000000000012").await;
+        sqlx::query(
+            "UPDATE inbound_commands
+             SET status='applying', application_kind='soft_steer', run_id='run-startup',
+                 turn_id='turn-startup', run_phase='classified'
+             WHERE seq=2",
+        )
+        .execute(store.pool())
+        .await
+        .expect("seed invalid startup classification");
+        writer
+            .persist_inbound(&InboundCommand::Valid(CommandEnvelope {
+                seq: 3,
+                command_id: crate::gateway::CommandId::parse(
+                    "00000000-0000-4000-8000-000000000013",
+                )
+                .expect("Abort ID"),
+                command: Command::Abort {},
+            }))
+            .await
+            .expect("persist startup Abort");
+
+        SuffixRecovery::recover_t12_prefix(&store, &writer)
+            .await
+            .expect_err("non-idle startup classification must fail without partial terminals");
+        assert_eq!(
+            sqlx::query_as::<_, (String, String, String)>(
+                "SELECT
+                    (SELECT status FROM inbound_commands WHERE seq=1),
+                    (SELECT status FROM inbound_commands WHERE seq=2),
+                    (SELECT status FROM inbound_commands WHERE seq=3)",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("failed recovery states"),
+            (
+                "received".to_owned(),
+                "applying".to_owned(),
+                "received".to_owned()
+            )
+        );
+
+        sqlx::query("UPDATE inbound_commands SET application_kind='idle_run' WHERE seq=2")
+            .execute(store.pool())
+            .await
+            .expect("repair startup fixture");
+        assert!(
+            SuffixRecovery::recover_t12_prefix(&store, &writer)
+                .await
+                .expect("recover contextual startup Abort")
+                .is_empty()
+        );
+        let rows = sqlx::query(
+            "SELECT status, run_id, application_kind, run_phase
+             FROM inbound_commands ORDER BY seq",
+        )
+        .fetch_all(store.pool())
+        .await
+        .expect("recovered command rows");
+        assert_eq!(rows[0].get::<String, _>("status"), "superseded");
+        assert!(
+            rows[0].get::<Option<String>, _>("run_id").is_none(),
+            "contextual supersede must not become a durable classification binding"
+        );
+        assert!(
+            rows[0]
+                .get::<Option<String>, _>("application_kind")
+                .is_none()
+        );
+        assert_eq!(rows[0].get::<String, _>("run_phase"), "received");
+        assert_eq!(rows[1].get::<String, _>("status"), "superseded");
+        assert_eq!(rows[2].get::<String, _>("status"), "applied");
+    }
+
+    #[tokio::test]
     async fn t12_startup_recovery_terminals_unknown_approval_as_durable_noop() {
         let (store, writer) = setup().await;
         writer
@@ -1222,25 +1378,7 @@ mod tests {
     #[tokio::test]
     async fn no_pending_commands_still_require_authenticated_event_history() {
         let (store, writer) = setup().await;
-        writer
-            .apply(EventBatch {
-                writes: vec![EventWrite {
-                    event: Some(
-                        DurableEvent::new(&serde_json::json!({
-                            "type":"retry_scheduled",
-                            "attempt":1,
-                            "delay_ms":1,
-                            "retry_at":"2026-07-20T00:00:00Z",
-                            "error_message":"fixture"
-                        }))
-                        .expect("event"),
-                    ),
-                    projections: Vec::new(),
-                }],
-                injected_commands: Vec::new(),
-            })
-            .await
-            .expect("persist history without a pending command");
+        persist_valid_history(&store, &writer, 2).await;
         sqlx::query("UPDATE agent_events SET raw_ciphertext=zeroblob(1)")
             .execute(store.pool())
             .await
@@ -1258,29 +1396,8 @@ mod tests {
     #[tokio::test]
     async fn pending_recovery_authenticates_every_keyset_page_without_retaining_history() {
         let (store, writer) = setup().await;
+        persist_valid_history(&store, &writer, EVENT_EVIDENCE_PAGE_ROWS as usize * 2 + 1).await;
         persist_run_started(&store, &writer).await;
-        let writes = (0..(EVENT_EVIDENCE_PAGE_ROWS as usize * 2 + 1))
-            .map(|attempt| EventWrite {
-                event: Some(
-                    DurableEvent::new(&serde_json::json!({
-                        "type":"retry_scheduled",
-                        "attempt": u32::try_from(attempt + 1).expect("bounded fixture"),
-                        "delay_ms":1,
-                        "retry_at":"2026-07-20T00:00:00Z",
-                        "error_message":"fixture"
-                    }))
-                    .expect("event"),
-                ),
-                projections: Vec::new(),
-            })
-            .collect();
-        writer
-            .apply(EventBatch {
-                writes,
-                injected_commands: Vec::new(),
-            })
-            .await
-            .expect("persist multi-page history");
         sqlx::query(
             "UPDATE agent_events SET raw_ciphertext=zeroblob(1)
              WHERE seq=(SELECT MAX(seq) FROM agent_events)",
@@ -1418,16 +1535,15 @@ mod tests {
             .apply(EventBatch {
                 writes: vec![EventWrite {
                     event: Some(
-                        DurableEvent::new(&serde_json::json!({
-                            "type":"retry_scheduled",
-                            "attempt":1,
-                            "delay_ms":1,
-                            "retry_at":"2026-07-20T00:00:00Z",
-                            "error_message":"fixture"
-                        }))
-                        .expect("second event"),
+                        DurableEvent::turn_start("run-1", "turn-1")
+                            .expect("second valid lifecycle event"),
                     ),
-                    projections: Vec::new(),
+                    projections: vec![Projection::RunPhase {
+                        command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+                        run_id: "run-1".to_owned(),
+                        expected: RunPhase::RunStarted,
+                        next: RunPhase::TurnStarted,
+                    }],
                 }],
                 injected_commands: Vec::new(),
             })

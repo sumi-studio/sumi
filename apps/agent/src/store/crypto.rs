@@ -235,26 +235,38 @@ impl Drop for ConversationCommandDigestFactory {
 
 impl CommandDigestFactory for ConversationCommandDigestFactory {
     fn start(&self) -> Box<dyn IncrementalCommandDigest> {
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.key)
+            .expect("HMAC accepts keys of every length");
+        mac.update(COMMAND_PAYLOAD_DIGEST_DOMAIN);
         Box::new(CommandDigestAccumulator {
             key_ref: self.key_ref.clone(),
-            mac: <Hmac<Sha256> as Mac>::new_from_slice(&self.key)
-                .expect("HMAC accepts keys of every length"),
+            mac,
+            payload_bytes: 0,
         })
     }
 }
 
+const COMMAND_PAYLOAD_DIGEST_DOMAIN: &[u8] = b"sumi-command-payload/v1";
+
 struct CommandDigestAccumulator {
     key_ref: String,
     mac: Hmac<Sha256>,
+    payload_bytes: u64,
 }
 
 impl IncrementalCommandDigest for CommandDigestAccumulator {
     fn update(&mut self, bytes: &[u8]) {
         self.mac.update(bytes);
+        self.payload_bytes = self.payload_bytes.saturating_add(bytes.len() as u64);
     }
 
     fn finish(self: Box<Self>) -> KeyedCommandDigest {
-        let Self { key_ref, mac } = *self;
+        let Self {
+            key_ref,
+            mut mac,
+            payload_bytes,
+        } = *self;
+        mac.update(&payload_bytes.to_be_bytes());
         KeyedCommandDigest::new(key_ref, mac.finalize().into_bytes().into())
     }
 }
@@ -406,27 +418,54 @@ pub(crate) fn decrypt_content(
     )
 }
 
-pub(crate) fn keyed_digest(data_key: &DataKeyMaterial, canonical_payload: &[u8]) -> Vec<u8> {
+pub(crate) fn command_payload_digest(
+    data_key: &DataKeyMaterial,
+    canonical_payload: &[u8],
+) -> Vec<u8> {
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(data_key.bytes())
         .expect("HMAC accepts keys of every length");
-    mac.update(b"sumi-command-payload/v1");
-    mac.update(&(canonical_payload.len() as u64).to_be_bytes());
+    mac.update(COMMAND_PAYLOAD_DIGEST_DOMAIN);
     mac.update(canonical_payload);
+    mac.update(&(canonical_payload.len() as u64).to_be_bytes());
     mac.finalize().into_bytes().to_vec()
 }
 
-pub(crate) fn verify_keyed_digest(
+pub(crate) fn verify_command_payload_digest(
     data_key: &DataKeyMaterial,
     canonical_payload: &[u8],
     expected: &[u8],
 ) -> Result<()> {
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(data_key.bytes())
         .expect("HMAC accepts keys of every length");
-    mac.update(b"sumi-command-payload/v1");
-    mac.update(&(canonical_payload.len() as u64).to_be_bytes());
+    mac.update(COMMAND_PAYLOAD_DIGEST_DOMAIN);
     mac.update(canonical_payload);
+    mac.update(&(canonical_payload.len() as u64).to_be_bytes());
     mac.verify_slice(expected)
         .map_err(|_| anyhow!("command payload digest mismatch"))
+}
+
+pub(super) fn keyed_proof(data_key: &DataKeyMaterial, domain: &[u8], payload: &[u8]) -> Vec<u8> {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(data_key.bytes())
+        .expect("HMAC accepts keys of every length");
+    mac.update(domain);
+    mac.update(&(payload.len() as u64).to_be_bytes());
+    mac.update(payload);
+    mac.finalize().into_bytes().to_vec()
+}
+
+pub(super) fn verify_keyed_proof(
+    data_key: &DataKeyMaterial,
+    domain: &[u8],
+    payload: &[u8],
+    expected: &[u8],
+) -> Result<()> {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(data_key.bytes())
+        .expect("HMAC accepts keys of every length");
+    mac.update(domain);
+    mac.update(&(payload.len() as u64).to_be_bytes());
+    mac.update(payload);
+    mac.verify_slice(expected)
+        .map_err(|_| anyhow!("keyed proof mismatch"))
 }
 
 fn aead_encrypt(
@@ -495,12 +534,21 @@ fn decode_hex_key(encoded: &str) -> Result<[u8; DATA_KEY_BYTES]> {
         bail!("invalid key length");
     }
     let mut bytes = [0_u8; DATA_KEY_BYTES];
-    for (index, slot) in bytes.iter_mut().enumerate() {
-        let offset = index * 2;
-        *slot = u8::from_str_radix(&encoded[offset..offset + 2], 16)
-            .map_err(|_| anyhow!("invalid hexadecimal key"))?;
+    for (slot, pair) in bytes.iter_mut().zip(encoded.as_bytes().chunks_exact(2)) {
+        let high = decode_hex_nibble(pair[0]).ok_or_else(|| anyhow!("invalid hexadecimal key"))?;
+        let low = decode_hex_nibble(pair[1]).ok_or_else(|| anyhow!("invalid hexadecimal key"))?;
+        *slot = (high << 4) | low;
     }
     Ok(bytes)
+}
+
+fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -590,9 +638,30 @@ mod tests {
     fn command_digest_rejects_payload_replacement() {
         let data_key =
             DataKeyMaterial::from_bytes("key-1", DataKeyPurpose::Command, [9; DATA_KEY_BYTES]);
-        let digest = keyed_digest(&data_key, br#"{"type":"abort"}"#);
-        verify_keyed_digest(&data_key, br#"{"type":"abort"}"#, &digest).expect("same payload");
-        assert!(verify_keyed_digest(&data_key, br#"{"type":"user_message"}"#, &digest).is_err());
+        let digest = command_payload_digest(&data_key, br#"{"type":"abort"}"#);
+        verify_command_payload_digest(&data_key, br#"{"type":"abort"}"#, &digest)
+            .expect("same payload");
+        assert!(
+            verify_command_payload_digest(&data_key, br#"{"type":"user_message"}"#, &digest)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn command_digest_framing_is_domain_separated_and_length_unambiguous() {
+        let data_key =
+            DataKeyMaterial::from_bytes("key-1", DataKeyPurpose::Command, [9; DATA_KEY_BYTES]);
+        let payload = b"same bytes";
+        let command_digest = command_payload_digest(&data_key, payload);
+        let internal_proof = keyed_proof(&data_key, b"sumi-internal-proof/v1", payload);
+        assert_ne!(command_digest, internal_proof);
+
+        let mut payload_with_suffix_like_bytes = payload.to_vec();
+        payload_with_suffix_like_bytes.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        assert_ne!(
+            command_digest,
+            command_payload_digest(&data_key, &payload_with_suffix_like_bytes)
+        );
     }
 
     #[test]
@@ -627,21 +696,31 @@ mod tests {
         let data_key = DataKeyMaterial::from_bytes("command-key", DataKeyPurpose::Command, key);
         let factory = ConversationCommandDigestFactory::new(&data_key).expect("digest factory");
         let payload: Vec<u8> = (0_u16..=511).map(|value| value as u8).collect();
-        let mut one_shot =
-            <Hmac<Sha256> as Mac>::new_from_slice(&key).expect("valid command HMAC key");
-        one_shot.update(&payload);
-        let expected: [u8; 32] = one_shot.finalize().into_bytes().into();
+        let expected = command_payload_digest(&data_key, &payload);
         for chunk_size in [1, 31, 63, 64, 65, 127, 128, 129, 511, 512] {
             let mut incremental = factory.start();
             for chunk in payload.chunks(chunk_size) {
                 incremental.update(chunk);
             }
-            assert_eq!(incremental.finish().hmac(), &expected);
+            assert_eq!(incremental.finish().hmac(), expected.as_slice());
         }
 
         let payload = br#"{"type":"abort"}"#;
-        let actual = keyed_digest(&data_key, payload);
-        verify_keyed_digest(&data_key, payload, &actual).expect("one-shot digest verifies");
-        assert!(verify_keyed_digest(&data_key, b"replacement", &actual).is_err());
+        let actual = command_payload_digest(&data_key, payload);
+        verify_command_payload_digest(&data_key, payload, &actual)
+            .expect("one-shot digest verifies");
+        assert!(verify_command_payload_digest(&data_key, b"replacement", &actual).is_err());
+    }
+
+    #[test]
+    fn non_ascii_hex_key_with_valid_byte_length_returns_an_error_without_panicking() {
+        let encoded = "é".repeat(DATA_KEY_BYTES);
+        assert_eq!(encoded.len(), DATA_KEY_BYTES * 2);
+        assert_eq!(
+            decode_hex_key(&encoded)
+                .expect_err("non-ASCII bytes are not hexadecimal")
+                .to_string(),
+            "invalid hexadecimal key"
+        );
     }
 }

@@ -7,7 +7,10 @@ mod recovery;
 mod redactor;
 mod sizer;
 
-use std::{path::Path, str::FromStr, sync::Arc};
+use std::{path::Path, sync::Arc};
+
+#[cfg(test)]
+use std::str::FromStr;
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -19,10 +22,12 @@ use sqlx::{
     Row, Sqlite, SqlitePool, Transaction,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
 };
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 pub(crate) use crypto::{
-    DataKeyPurpose, EnvironmentKeyProvider, KeyProvider, RowAad, keyed_digest, verify_keyed_digest,
+    DataKeyPurpose, EnvironmentKeyProvider, KeyProvider, RowAad, command_payload_digest,
+    verify_command_payload_digest,
 };
 #[allow(
     unused_imports,
@@ -104,6 +109,7 @@ pub(crate) struct Store {
     scope: AgentScope,
     key_provider: Arc<dyn KeyProvider>,
     redactor: Redactor,
+    event_writer_state: Arc<Mutex<event_writer::WriterState>>,
 }
 
 impl Store {
@@ -114,8 +120,8 @@ impl Store {
     ) -> Result<Self> {
         scope.validate()?;
         prepare_state_path(path).await?;
-        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
-            .context("invalid SQLite database path")?
+        let options = SqliteConnectOptions::new()
+            .filename(path)
             .create_if_missing(true)
             .foreign_keys(true)
             .journal_mode(SqliteJournalMode::Wal);
@@ -170,6 +176,7 @@ impl Store {
             scope,
             key_provider,
             redactor: Redactor::v1(),
+            event_writer_state: Arc::new(Mutex::new(event_writer::WriterState::default())),
         };
         store.validate_startup().await?;
         Ok(store)
@@ -185,6 +192,10 @@ impl Store {
 
     pub(crate) fn redactor(&self) -> &Redactor {
         &self.redactor
+    }
+
+    fn event_writer_state(&self) -> Arc<Mutex<event_writer::WriterState>> {
+        self.event_writer_state.clone()
     }
 
     async fn validate_startup(&self) -> Result<()> {
@@ -225,6 +236,28 @@ impl Store {
                 self.scope,
                 stored
             );
+        }
+
+        // Public projections are readable without decrypting their raw source,
+        // so an unsupported rule version must stop startup before any command
+        // admission. These bounded existence probes avoid replaying projections
+        // whose exact event parity is authenticated separately by EventWriter.
+        for (table, label) in [
+            ("messages", "message"),
+            ("approval_log", "approval"),
+            ("agent_events", "event"),
+        ] {
+            let sql = format!(
+                "SELECT EXISTS(SELECT 1 FROM {table} WHERE redaction_version <> ? LIMIT 1)"
+            );
+            let unsupported: i64 = sqlx::query_scalar(&sql)
+                .bind(i64::from(self.redactor.version()))
+                .fetch_one(&self.pool)
+                .await
+                .with_context(|| format!("failed to validate {label} redaction versions"))?;
+            if unsupported != 0 {
+                bail!("persisted {label} projection uses an unsupported redaction version");
+            }
         }
 
         let active_keys = sqlx::query(
@@ -1049,6 +1082,27 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn file_store_treats_uri_reserved_characters_as_literal_filename_bytes() {
+        let root = std::env::temp_dir().join(format!("sumi-store-uri-{}", Uuid::now_v7()));
+        let path = root.join("agent ?# %.db");
+        std::fs::create_dir_all(&root).expect("create URI filename fixture");
+
+        let store = Store::open(&path, scope(), provider())
+            .await
+            .expect("open literal SQLite filename");
+        assert!(path.is_file());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_scope")
+                .fetch_one(store.pool())
+                .await
+                .expect("read literal-path store"),
+            1
+        );
+        store.pool().close().await;
+        std::fs::remove_dir_all(root).expect("remove URI filename fixture");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn file_store_enforces_private_permissions_on_create_and_reopen() {
@@ -1258,5 +1312,63 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("unsupported algorithm"));
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_unsupported_message_redaction_version() {
+        let store = store().await;
+        let key = store
+            .conversation_key(DataKeyPurpose::Transcript)
+            .await
+            .expect("mint transcript key");
+        sqlx::query(
+            "INSERT INTO messages(
+                id, seq, role, raw_key_ref, raw_ciphertext, payload, search_text,
+                redaction_version, interrupted, created_at
+             ) VALUES('message-version-2', 1, 'user', ?, X'00', '{}', '', 2, 0, 'now')",
+        )
+        .bind(&key.key_ref)
+        .execute(store.pool())
+        .await
+        .expect("seed isolated message projection version tamper");
+        let pool = store.pool.clone();
+        drop(store);
+
+        let error = match Store::finish_open(pool, scope(), provider()).await {
+            Ok(_) => panic!("message projection version 2 must fail startup"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("message projection uses an unsupported redaction version")
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_unsupported_approval_redaction_version() {
+        let store = store().await;
+        sqlx::query(
+            "INSERT INTO approval_log(
+                id, tool_call_id, run_id, turn_id, state, request_projection,
+                redaction_version, created_at, decided_at
+             ) VALUES('approval-version-2', 'tool-version-2', 'run-version-2',
+                      'turn-version-2', 'pending', '{}', 2, 'now', NULL)",
+        )
+        .execute(store.pool())
+        .await
+        .expect("seed isolated approval projection version tamper");
+        let pool = store.pool.clone();
+        drop(store);
+
+        let error = match Store::finish_open(pool, scope(), provider()).await {
+            Ok(_) => panic!("approval projection version 2 must fail startup"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("approval projection uses an unsupported redaction version")
+        );
     }
 }

@@ -54,6 +54,7 @@ async fn main() -> Result<()> {
         store.conversation_key(purpose).await?;
     }
     let event_writer = EventWriter::new(store.clone());
+    event_writer.initialize_recovery_checkpoint().await?;
     let pending_recovery = SuffixRecovery::recover_t12_prefix(&store, &event_writer).await?;
     if !pending_recovery.is_empty() {
         tracing::warn!(

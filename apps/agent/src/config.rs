@@ -1,9 +1,11 @@
 use std::{
     env,
+    ffi::OsString,
+    io::ErrorKind,
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 const DEFAULT_CONVERSATION_ID: &str = "default";
@@ -68,18 +70,30 @@ impl Config {
         Self::resolve(file.unwrap_or_default(), EnvOverrides::from_env())
     }
 
-    fn resolve(mut file: FileConfig, overrides: EnvOverrides) -> Result<Self> {
+    fn resolve(file: FileConfig, overrides: EnvOverrides) -> Result<Self> {
+        let current_dir = env::current_dir().context("failed to resolve current directory")?;
+        Self::resolve_from(file, overrides, &current_dir)
+    }
+
+    fn resolve_from(
+        mut file: FileConfig,
+        overrides: EnvOverrides,
+        current_dir: &Path,
+    ) -> Result<Self> {
         let workspace = overrides
             .workspace
             .or(file.workspace)
-            .map(Ok)
-            .unwrap_or_else(env::current_dir)
-            .context("failed to resolve workspace path")?;
-        let database_path = overrides
+            .unwrap_or_else(|| current_dir.to_owned());
+        let state_dir = overrides
             .state_dir
             .or(file.state_dir)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR))
-            .join("agent.db");
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR));
+        let workspace = resolve_for_boundary(&workspace, current_dir)
+            .context("failed to resolve workspace path")?;
+        let state_dir = resolve_for_boundary(&state_dir, current_dir)
+            .context("failed to resolve agent state directory")?;
+        ensure_isolated_state_dir(&workspace, &state_dir)?;
+        let database_path = state_dir.join("agent.db");
 
         if let Some(value) = overrides.model_preset {
             file.model.preset = Some(value);
@@ -110,6 +124,78 @@ impl Config {
     }
 }
 
+fn ensure_isolated_state_dir(workspace: &Path, state_dir: &Path) -> Result<()> {
+    if workspace == state_dir
+        || workspace.starts_with(state_dir)
+        || state_dir.starts_with(workspace)
+    {
+        bail!(
+            "agent state directory {} must not overlap workspace {}",
+            state_dir.display(),
+            workspace.display()
+        );
+    }
+    Ok(())
+}
+
+/// Resolve every existing path component through the filesystem, while still
+/// supporting a state leaf that has not been created yet. This must remain
+/// read-only: Store owns creation and permission changes after this boundary.
+fn resolve_for_boundary(path: &Path, current_dir: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        current_dir.join(path)
+    };
+    let mut existing_prefix = absolute.clone();
+    let mut missing_suffix = Vec::<OsString>::new();
+    let canonical_prefix = loop {
+        match std::fs::canonicalize(&existing_prefix) {
+            Ok(canonical) => break canonical,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                let component = existing_prefix
+                    .components()
+                    .next_back()
+                    .ok_or_else(|| anyhow::anyhow!("path has no resolvable filesystem prefix"))?
+                    .as_os_str()
+                    .to_os_string();
+                if !existing_prefix.pop() {
+                    return Err(error).context("path has no existing filesystem prefix");
+                }
+                missing_suffix.push(component);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to resolve filesystem path {}",
+                        existing_prefix.display()
+                    )
+                });
+            }
+        }
+    };
+
+    let mut resolved = canonical_prefix;
+    for component in missing_suffix.iter().rev() {
+        resolved.push(component);
+    }
+    Ok(normalize_absolute(&resolved))
+}
+
+fn normalize_absolute(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
 impl EnvOverrides {
     fn from_env() -> Self {
         Self {
@@ -136,6 +222,31 @@ async fn load_file(path: &Path) -> Result<FileConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FixtureRoot(PathBuf);
+
+    impl FixtureRoot {
+        fn new(label: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("sumi-config-{label}-{}", uuid::Uuid::now_v7()));
+            std::fs::create_dir_all(&path).expect("create config fixture root");
+            Self(path)
+        }
+    }
+
+    impl Drop for FixtureRoot {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).expect("remove config fixture root");
+        }
+    }
+
+    fn paths_config(workspace: impl Into<PathBuf>, state_dir: impl Into<PathBuf>) -> FileConfig {
+        FileConfig {
+            workspace: Some(workspace.into()),
+            state_dir: Some(state_dir.into()),
+            ..FileConfig::default()
+        }
+    }
 
     #[test]
     fn parses_toml_and_derives_database_path_from_state_dir() {
@@ -217,6 +328,114 @@ workspace = "/workspace/customer-data"
             PathBuf::from("/var/lib/sumi/agent.db")
         );
         assert!(!config.database_path.starts_with(&config.workspace));
+    }
+
+    #[test]
+    fn resolves_relative_workspace_and_nonexistent_state_leaf_before_comparison() {
+        let root = FixtureRoot::new("relative");
+        std::fs::create_dir(root.0.join("workspace")).expect("create workspace");
+
+        let config = Config::resolve_from(
+            paths_config("workspace", "private/state"),
+            EnvOverrides::default(),
+            &root.0,
+        )
+        .expect("non-overlapping relative paths");
+
+        assert_eq!(config.workspace, root.0.join("workspace"));
+        assert_eq!(config.database_path, root.0.join("private/state/agent.db"));
+        assert!(
+            !root.0.join("private").exists(),
+            "boundary validation must not create the intended state leaf"
+        );
+    }
+
+    #[test]
+    fn rejects_equal_and_bidirectional_workspace_state_overlap() {
+        let root = FixtureRoot::new("overlap");
+        let workspace = root.0.join("workspace");
+        std::fs::create_dir(&workspace).expect("create workspace");
+
+        for (workspace_path, state_path) in [
+            (workspace.clone(), workspace.clone()),
+            (workspace.join("customer"), workspace.clone()),
+            (workspace.clone(), workspace.join("private/state")),
+        ] {
+            let error = Config::resolve_from(
+                paths_config(workspace_path, state_path),
+                EnvOverrides::default(),
+                &root.0,
+            )
+            .expect_err("workspace/state overlap must fail closed");
+            assert!(error.to_string().contains("must not overlap workspace"));
+        }
+    }
+
+    #[test]
+    fn rejects_relative_workspace_descendant_state() {
+        let root = FixtureRoot::new("relative-overlap");
+        std::fs::create_dir(root.0.join("workspace")).expect("create workspace");
+
+        let error = Config::resolve_from(
+            paths_config("./workspace", "workspace/private/state"),
+            EnvOverrides::default(),
+            &root.0,
+        )
+        .expect_err("relative overlap must fail closed");
+
+        assert!(error.to_string().contains("must not overlap workspace"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_existing_symlink_alias_without_mutating_workspace_parent() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = FixtureRoot::new("symlink");
+        let workspace = root.0.join("workspace");
+        std::fs::create_dir(&workspace).expect("create workspace");
+        std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o755))
+            .expect("set workspace fixture mode");
+        let alias = root.0.join("workspace-alias");
+        symlink(&workspace, &alias).expect("create workspace alias");
+
+        let error = Config::resolve_from(
+            paths_config(&workspace, alias.join("agent-state")),
+            EnvOverrides::default(),
+            &root.0,
+        )
+        .expect_err("symlinked overlap must fail closed");
+
+        assert!(error.to_string().contains("must not overlap workspace"));
+        assert_eq!(
+            std::fs::metadata(&workspace)
+                .expect("workspace metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "config validation must not chmod any workspace path"
+        );
+        assert!(!workspace.join("agent-state").exists());
+    }
+
+    #[test]
+    fn accepts_existing_non_overlapping_sibling_trees() {
+        let root = FixtureRoot::new("siblings");
+        let workspace = root.0.join("workspace");
+        let state = root.0.join("agent-state");
+        std::fs::create_dir(&workspace).expect("create workspace");
+        std::fs::create_dir(&state).expect("create state");
+
+        let config = Config::resolve_from(
+            paths_config(&workspace, &state),
+            EnvOverrides::default(),
+            &root.0,
+        )
+        .expect("sibling workspace and state trees are isolated");
+
+        assert_eq!(config.workspace, workspace);
+        assert_eq!(config.database_path, state.join("agent.db"));
     }
 
     #[test]

@@ -77,6 +77,23 @@ CREATE TABLE agent_events (
   created_at TEXT NOT NULL
 );
 
+-- Lifecycle identities remain globally unique without replaying/scanning the
+-- append-only event history on every EventWriter transaction.
+CREATE UNIQUE INDEX one_agent_start_per_run
+ON agent_events(json_extract(internal_metadata, '$.run_id'))
+WHERE event_type = 'agent_start';
+
+CREATE UNIQUE INDEX one_turn_start_per_run_turn
+ON agent_events(
+  json_extract(internal_metadata, '$.run_id'),
+  json_extract(internal_metadata, '$.turn_id')
+)
+WHERE event_type = 'turn_start';
+
+CREATE UNIQUE INDEX one_message_start_per_message
+ON agent_events(json_extract(envelope, '$.message_id'))
+WHERE event_type = 'message_start';
+
 CREATE TABLE event_log_heads (
   conversation_id TEXT PRIMARY KEY REFERENCES agent_scope(conversation_id),
   last_seq INTEGER NOT NULL CHECK (last_seq >= 1),

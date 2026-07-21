@@ -28,16 +28,17 @@ use crate::{
 use super::{
     BatchBounds, DURABLE_ROW_OVERHEAD_BYTES, DataKeyPurpose, EventBatchSizer, InjectionApplication,
     InjectionBatchSizeInput, InjectionCommandSizeInput, PublicProjectionBuilder, Redactor, Store,
+    command_payload_digest,
     event_log::{
         EVENT_DIGEST_BYTES, EventChainEntry, authenticate_event_head, extend_event_chain,
         verify_event_head,
     },
-    keyed_digest,
     redactor::search_text_from_projection,
-    verify_keyed_digest,
+    verify_command_payload_digest,
 };
 
-const PREPARED_KEY_MATERIAL_PROOF: &[u8] = b"\0sumi/event-batch/prepared-key-material/v1";
+const PREPARED_KEY_MATERIAL_PROOF_DOMAIN: &[u8] = b"sumi-event-batch-prepared-key-material/v1";
+const PREPARED_KEY_MATERIAL_PROOF: &[u8] = b"active-key-material";
 
 #[derive(Clone)]
 pub(crate) struct DurableEvent {
@@ -113,11 +114,46 @@ impl DurableEvent {
         )
     }
 
-    fn agent_end(run_id: impl Into<String>) -> Result<Self> {
+    #[allow(dead_code, reason = "T15 consumes the T12-frozen lifecycle builders")]
+    pub(crate) fn agent_end(run_id: impl Into<String>) -> Result<Self> {
+        let run_id = run_id.into();
+        if run_id.is_empty() {
+            bail!("durable AgentEnd run_id must not be empty");
+        }
         Self::from_parts(
             AgentEvent::AgentEnd,
             DurableEventMetadata {
-                run_id: Some(run_id.into()),
+                run_id: Some(run_id),
+                ..DurableEventMetadata::default()
+            },
+        )
+    }
+
+    #[allow(dead_code, reason = "T15 consumes the T12-frozen retry builder")]
+    pub(crate) fn retry_scheduled(
+        run_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        attempt: u32,
+        delay_ms: u64,
+        retry_at: DateTime<Utc>,
+        error_message: impl Into<String>,
+    ) -> Result<Self> {
+        let run_id = run_id.into();
+        let turn_id = turn_id.into();
+        let error_message = error_message.into();
+        if run_id.is_empty() || turn_id.is_empty() || attempt == 0 || error_message.is_empty() {
+            bail!("durable RetryScheduled identity and fields must be non-empty");
+        }
+        Self::from_parts(
+            AgentEvent::RetryScheduled {
+                attempt,
+                delay_ms,
+                retry_at,
+                error_message,
+            },
+            DurableEventMetadata {
+                run_id: Some(run_id),
+                turn_id: Some(turn_id),
                 ..DurableEventMetadata::default()
             },
         )
@@ -182,6 +218,20 @@ impl DurableEvent {
         message_id: &str,
         message: &PublicMessage,
     ) -> Result<Self> {
+        Self::message_in_turn(event_type, message_id, message, None, None)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "T15 binds assistant/tool lifecycle events to their open turn"
+    )]
+    pub(crate) fn message_in_turn(
+        event_type: &'static str,
+        message_id: &str,
+        message: &PublicMessage,
+        run_id: impl Into<Option<String>>,
+        turn_id: impl Into<Option<String>>,
+    ) -> Result<Self> {
         let value = match event_type {
             "message_start" => AgentEvent::MessageStart {
                 message_id: message_id.to_owned(),
@@ -193,7 +243,14 @@ impl DurableEvent {
             },
             _ => bail!("unsupported durable message event type {event_type}"),
         };
-        Self::from_parts(value, DurableEventMetadata::default())
+        Self::from_parts(
+            value,
+            DurableEventMetadata {
+                run_id: run_id.into(),
+                turn_id: turn_id.into(),
+                ..DurableEventMetadata::default()
+            },
+        )
     }
 
     #[allow(dead_code, reason = "T15 consumes the T12-frozen tool builder")]
@@ -333,10 +390,18 @@ fn normalize_test_event(mut raw: Value) -> Result<(AgentEvent, DurableEventMetad
                 metadata.empty_turn = true;
             }
         }
+        "message_start" | "message_end" => {
+            metadata.run_id = take_string(object, "run_id")?;
+            metadata.turn_id = take_string(object, "turn_id")?;
+        }
         "tool_execution_start" => {
+            metadata.run_id = take_string(object, "run_id")?;
+            metadata.turn_id = take_string(object, "turn_id")?;
             metadata.tool_state = take_string(object, "state")?;
         }
         "tool_execution_end" => {
+            metadata.run_id = take_string(object, "run_id")?;
+            metadata.turn_id = take_string(object, "turn_id")?;
             metadata.tool_state = take_string(object, "state")?;
             metadata.tool_error_code = take_string(object, "error_code")?;
         }
@@ -382,6 +447,10 @@ fn normalize_test_event(mut raw: Value) -> Result<(AgentEvent, DurableEventMetad
             object
                 .entry("mode")
                 .or_insert_with(|| Value::String("soft".to_owned()));
+        }
+        "retry_scheduled" => {
+            metadata.run_id = take_string(object, "run_id")?;
+            metadata.turn_id = take_string(object, "turn_id")?;
         }
         _ => {}
     }
@@ -457,7 +526,11 @@ impl DurableEvent {
                 turn_id: self.metadata.turn_id.as_deref(),
                 ..empty("steered")
             },
-            AgentEvent::RetryScheduled { .. } => empty("retry_scheduled"),
+            AgentEvent::RetryScheduled { .. } => DurableEventIdentity {
+                run_id: self.metadata.run_id.as_deref(),
+                turn_id: self.metadata.turn_id.as_deref(),
+                ..empty("retry_scheduled")
+            },
             AgentEvent::MemoryMaintenance { .. }
             | AgentEvent::MessageUpdate { .. }
             | AgentEvent::ToolExecutionUpdate { .. }
@@ -751,6 +824,7 @@ pub(crate) enum ToolExecutionMutation {
     },
     Start {
         tool_call_id: String,
+        run_id: String,
     },
     Finish {
         tool_call_id: String,
@@ -771,8 +845,6 @@ pub(crate) enum ApprovalMutation {
         tool_call_id: String,
         run_id: String,
         turn_id: String,
-        request_projection: String,
-        redaction_version: u32,
     },
     Resolve {
         request_id: String,
@@ -790,6 +862,7 @@ struct PreparedEvent {
     turn_id: Option<String>,
     message_id: Option<String>,
     message_role: Option<String>,
+    steer_mode: Option<&'static str>,
     raw_key_ref: String,
     raw_key_proof: Vec<u8>,
     raw_ciphertext: Vec<u8>,
@@ -893,7 +966,6 @@ struct ApprovalResolvedEvent {
 #[derive(Clone)]
 struct ApprovalPendingEvidence {
     tool_call_id: String,
-    request_projection: String,
 }
 
 #[derive(Clone)]
@@ -911,7 +983,19 @@ struct ToolFinishEvidence {
 
 pub(crate) struct EventWriter {
     store: Arc<Store>,
-    gate: Mutex<()>,
+    gate: Arc<Mutex<WriterState>>,
+}
+
+#[derive(Default)]
+pub(super) struct WriterState {
+    checkpoint: Option<LifecycleCheckpoint>,
+}
+
+#[derive(Clone)]
+struct LifecycleCheckpoint {
+    event_head: Option<EventLogHead>,
+    lifecycle: DurableLifecycleState,
+    historical_rows_visited: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -925,9 +1009,16 @@ struct EventLogHead {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InboundAdmissionMode {
-    Open,
+    LiveBounded,
     ReplayOnly,
+    #[cfg(test)]
+    UnboundedTestFixture,
 }
+
+const LIVE_PENDING_NON_ABORT_MAX_COMMANDS: usize = 32;
+const LIVE_PENDING_NON_ABORT_MAX_BYTES: usize = 4 * 1024 * 1024;
+const CONTENT_ENVELOPE_OVERHEAD_BYTES: usize = 1 + super::crypto::CONTENT_NONCE_BYTES + 16;
+const EVENT_CHAIN_VERIFICATION_PAGE_ROWS: i64 = 64;
 
 /// Startup command-receiver boundary. While a durable suffix remains, exact
 /// at-least-once replays may recover their stored ACK, but a new identity can
@@ -942,7 +1033,7 @@ impl InboundAdmission {
             mode: if has_pending_suffix {
                 InboundAdmissionMode::ReplayOnly
             } else {
-                InboundAdmissionMode::Open
+                InboundAdmissionMode::LiveBounded
             },
         }
     }
@@ -950,7 +1041,7 @@ impl InboundAdmission {
     /// The T12 receiver uses this after a terminal control leaves no suffix;
     /// T15 uses the same transition only after its fresh recovery plan is empty.
     pub(crate) fn resume_after_suffix_recovery(&mut self) {
-        self.mode = InboundAdmissionMode::Open;
+        self.mode = InboundAdmissionMode::LiveBounded;
     }
 
     pub(crate) fn is_replay_only(&self) -> bool {
@@ -962,13 +1053,9 @@ impl InboundAdmission {
         writer: &EventWriter,
         inbound: &InboundCommand,
     ) -> Result<CommandAck> {
-        let ack = writer
+        writer
             .persist_inbound_with_admission(inbound, self.mode)
-            .await?;
-        if self.mode == InboundAdmissionMode::Open && ack.status == CommandAckStatus::Received {
-            self.mode = InboundAdmissionMode::ReplayOnly;
-        }
-        Ok(ack)
+            .await
     }
 }
 
@@ -976,17 +1063,85 @@ impl InboundAdmission {
 #[error("durable suffix recovery is required before accepting a new command")]
 pub(crate) struct RecoveryRequired;
 
+#[derive(Debug, Error)]
+#[error("live command admission window is full; retry after a terminal ACK")]
+pub(crate) struct InboundBackpressure;
+
 impl EventWriter {
     pub(crate) fn new(store: Arc<Store>) -> Self {
-        Self {
-            store,
-            gate: Mutex::new(()),
+        let gate = store.event_writer_state();
+        Self { store, gate }
+    }
+
+    /// Authenticates and reconstructs the durable lifecycle prefix exactly once
+    /// for all EventWriter handles sharing this Store. Startup/recovery must call
+    /// this before command admission; write entry points also call it defensively
+    /// for tests and non-main embedders.
+    pub(crate) async fn initialize_recovery_checkpoint(&self) -> Result<()> {
+        let mut state = self.gate.lock().await;
+        self.ensure_checkpoint(&mut state).await
+    }
+
+    #[cfg(test)]
+    async fn historical_rows_visited(&self) -> u64 {
+        self.gate
+            .lock()
+            .await
+            .checkpoint
+            .as_ref()
+            .map_or(0, |checkpoint| checkpoint.historical_rows_visited)
+    }
+
+    #[cfg(test)]
+    async fn retained_turn_start_identities(&self) -> usize {
+        self.gate
+            .lock()
+            .await
+            .checkpoint
+            .as_ref()
+            .map_or(0, |checkpoint| checkpoint.lifecycle.seen_turn_starts.len())
+    }
+
+    #[cfg(test)]
+    async fn reset_checkpoint_after_direct_fixture_mutation(&self) {
+        self.gate.lock().await.checkpoint = None;
+    }
+
+    pub(crate) async fn has_recovery_lifecycle_evidence(
+        &self,
+        event_type: &str,
+        run_id: &str,
+        turn_id: Option<&str>,
+    ) -> Result<bool> {
+        let mut state = self.gate.lock().await;
+        self.ensure_checkpoint(&mut state).await?;
+        let lifecycle = &state
+            .checkpoint
+            .as_ref()
+            .expect("checkpoint initialized for recovery evidence")
+            .lifecycle;
+        Ok(match event_type {
+            "agent_start" => lifecycle.seen_agent_starts.contains(run_id),
+            "turn_start" => turn_id.is_some_and(|turn_id| {
+                lifecycle
+                    .seen_turn_starts
+                    .contains(&(run_id.to_owned(), turn_id.to_owned()))
+            }),
+            _ => false,
+        })
+    }
+
+    async fn ensure_checkpoint(&self, state: &mut WriterState) -> Result<()> {
+        if state.checkpoint.is_none() {
+            state.checkpoint =
+                Some(reconstruct_authenticated_checkpoint(self.store.as_ref()).await?);
         }
+        Ok(())
     }
 
     #[cfg(test)]
     pub(crate) async fn persist_inbound(&self, inbound: &InboundCommand) -> Result<CommandAck> {
-        self.persist_inbound_with_admission(inbound, InboundAdmissionMode::Open)
+        self.persist_inbound_with_admission(inbound, InboundAdmissionMode::UnboundedTestFixture)
             .await
     }
 
@@ -995,7 +1150,7 @@ impl EventWriter {
         inbound: &InboundCommand,
         admission: InboundAdmissionMode,
     ) -> Result<CommandAck> {
-        let _guard = self.gate.lock().await;
+        let mut guard = self.gate.lock().await;
         if let InboundCommand::Invalid {
             reason,
             raw_command,
@@ -1074,6 +1229,10 @@ impl EventWriter {
             return Err(RecoveryRequired.into());
         }
         self.validate_next_command_seq(seq).await?;
+        if admission == InboundAdmissionMode::LiveBounded {
+            self.validate_live_admission(inbound, canonical_payload.len())
+                .await?;
+        }
 
         let projection = match inbound {
             InboundCommand::Valid(envelope) => Projection::CommandReceived {
@@ -1093,17 +1252,81 @@ impl EventWriter {
                 payload_digest: payload_digest.clone(),
             },
         };
-        self.apply_locked(EventBatch {
-            writes: vec![EventWrite {
-                event: None,
-                projections: vec![projection],
-            }],
-            injected_commands: Vec::new(),
-        })
+        self.apply_locked(
+            EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![projection],
+                }],
+                injected_commands: Vec::new(),
+            },
+            &mut guard,
+        )
         .await?;
         self.ack_for_command(command_id)
             .await?
             .ok_or_else(|| anyhow!("committed command row is missing"))
+    }
+
+    async fn validate_live_admission(
+        &self,
+        inbound: &InboundCommand,
+        canonical_payload_bytes: usize,
+    ) -> Result<()> {
+        let InboundCommand::Valid(envelope) = inbound else {
+            // Invalid commands become terminal Rejected rows in the receipt
+            // transaction and therefore do not occupy the live pending window.
+            return Ok(());
+        };
+
+        let encrypted_lengths: Vec<i64> = sqlx::query_scalar(
+            "SELECT length(payload_ciphertext)
+             FROM inbound_commands
+             WHERE status IN ('received', 'applying') AND command_kind <> 'abort'",
+        )
+        .fetch_all(self.store.pool())
+        .await?;
+        if encrypted_lengths.len() > LIVE_PENDING_NON_ABORT_MAX_COMMANDS {
+            bail!("durable non-Abort command window exceeds its 32-command invariant");
+        }
+        let mut pending_plaintext_bytes = 0usize;
+        for encrypted_bytes in encrypted_lengths.iter().copied() {
+            let encrypted_bytes = usize::try_from(encrypted_bytes)
+                .context("durable command ciphertext length is negative or too large")?;
+            let plaintext_bytes = encrypted_bytes
+                .checked_sub(CONTENT_ENVELOPE_OVERHEAD_BYTES)
+                .ok_or_else(|| {
+                    anyhow!("durable command ciphertext is shorter than its envelope")
+                })?;
+            pending_plaintext_bytes = pending_plaintext_bytes
+                .checked_add(plaintext_bytes)
+                .ok_or_else(|| anyhow!("durable command window byte count overflowed"))?;
+        }
+        if pending_plaintext_bytes > LIVE_PENDING_NON_ABORT_MAX_BYTES {
+            bail!("durable non-Abort command window exceeds its 4 MiB invariant");
+        }
+
+        if matches!(&envelope.command, Command::Abort {}) {
+            let pending_abort_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM inbound_commands
+                 WHERE status IN ('received', 'applying') AND command_kind = 'abort'",
+            )
+            .fetch_one(self.store.pool())
+            .await?;
+            if pending_abort_count != 0 {
+                return Err(InboundBackpressure.into());
+            }
+            return Ok(());
+        }
+
+        if encrypted_lengths.len() == LIVE_PENDING_NON_ABORT_MAX_COMMANDS
+            || pending_plaintext_bytes
+                .checked_add(canonical_payload_bytes)
+                .is_none_or(|total| total > LIVE_PENDING_NON_ABORT_MAX_BYTES)
+        {
+            return Err(InboundBackpressure.into());
+        }
+        Ok(())
     }
 
     #[allow(
@@ -1111,8 +1334,8 @@ impl EventWriter {
         reason = "T12 freezes the EventBatch entry point consumed by the T15 run loop"
     )]
     pub(crate) async fn apply(&self, batch: EventBatch) -> Result<Vec<u64>> {
-        let _guard = self.gate.lock().await;
-        self.apply_locked(batch).await
+        let mut guard = self.gate.lock().await;
+        self.apply_locked(batch, &mut guard).await
     }
 
     #[cfg(test)]
@@ -1121,8 +1344,8 @@ impl EventWriter {
         batch: EventBatch,
         fail_after_writes: usize,
     ) -> Result<Vec<u64>> {
-        let _guard = self.gate.lock().await;
-        self.apply_locked_with_failpoint(batch, Some(fail_after_writes), None, None)
+        let mut guard = self.gate.lock().await;
+        self.apply_locked_with_failpoint(batch, Some(fail_after_writes), None, None, &mut guard)
             .await
     }
 
@@ -1134,12 +1357,13 @@ impl EventWriter {
         after_commit: bool,
         readiness_path: &std::path::Path,
     ) -> Result<Vec<u64>> {
-        let _guard = self.gate.lock().await;
+        let mut guard = self.gate.lock().await;
         self.apply_locked_with_failpoint(
             batch,
             None,
             Some((name, after_commit, readiness_path)),
             None,
+            &mut guard,
         )
         .await
     }
@@ -1150,8 +1374,8 @@ impl EventWriter {
         batch: EventBatch,
         key_ref: &str,
     ) -> Result<Vec<u64>> {
-        let _guard = self.gate.lock().await;
-        self.apply_locked_with_failpoint(batch, None, None, Some(key_ref))
+        let mut guard = self.gate.lock().await;
+        self.apply_locked_with_failpoint(batch, None, None, Some(key_ref), &mut guard)
             .await
     }
 
@@ -1160,7 +1384,21 @@ impl EventWriter {
         abort_command_id: &str,
         abort_seq: u64,
     ) -> Result<Vec<CommandAck>> {
-        let _guard = self.gate.lock().await;
+        let mut guard = self.gate.lock().await;
+        let mut authentication = self.store.pool().begin().await?;
+        let command = load_authenticated_command(
+            self.store.as_ref(),
+            &mut authentication,
+            abort_command_id,
+            abort_seq,
+            "abort",
+        )
+        .await
+        .context("idle Abort failed authenticated command validation")?;
+        if !matches!(command, Command::Abort {}) {
+            bail!("durable abort row contains a different command variant");
+        }
+        authentication.rollback().await?;
         let abort_seq = sqlite_i64(abort_seq, "Abort command sequence")?;
         let owner_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM inbound_commands
@@ -1190,7 +1428,7 @@ impl EventWriter {
         if pending.len() > 32 {
             bail!("idle Abort cutoff exceeds the bounded 32-command window");
         }
-        let mut projections = Vec::with_capacity(pending.len() + 1);
+        let mut pending_terminals = Vec::with_capacity(pending.len());
         let mut terminal_ids = Vec::with_capacity(pending.len() + 1);
         let mut startup: Option<(String, String, RunPhase)> = None;
         for row in pending {
@@ -1200,18 +1438,10 @@ impl EventWriter {
             let status: String = row.try_get("status")?;
             match (kind.as_str(), status.as_str()) {
                 ("user_message", "received") => {
-                    projections.push(Projection::CommandSuperseded {
-                        command_id: command_id.clone(),
-                        command_seq: seq,
-                        run_id: None,
-                    });
+                    pending_terminals.push((command_id.clone(), seq, true, None));
                 }
                 ("approval_decision", "received") => {
-                    projections.push(Projection::CommandApplied {
-                        command_id: command_id.clone(),
-                        command_seq: seq,
-                        run_id: None,
-                    });
+                    pending_terminals.push((command_id.clone(), seq, false, None));
                 }
                 ("user_message", "applying") => {
                     let application_kind: String = row.try_get("application_kind")?;
@@ -1230,11 +1460,7 @@ impl EventWriter {
                             phase.as_str()
                         );
                     }
-                    projections.push(Projection::CommandSuperseded {
-                        command_id: command_id.clone(),
-                        command_seq: seq,
-                        run_id: Some(run_id.clone()),
-                    });
+                    pending_terminals.push((command_id.clone(), seq, true, Some(run_id.clone())));
                     startup = Some((run_id, turn_id, phase));
                 }
                 _ => {
@@ -1246,6 +1472,24 @@ impl EventWriter {
             terminal_ids.push(command_id);
         }
         let abort_run_id = startup.as_ref().map(|(run_id, _, _)| run_id.clone());
+        let mut projections = Vec::with_capacity(pending_terminals.len() + 1);
+        for (command_id, command_seq, is_user_message, stored_context) in pending_terminals {
+            if is_user_message {
+                projections.push(Projection::CommandSuperseded {
+                    command_id,
+                    command_seq,
+                    // An unclassified command remains unbound in the database, but its
+                    // terminal projection identifies the startup/live run cut off by Abort.
+                    run_id: stored_context.or_else(|| abort_run_id.clone()),
+                });
+            } else {
+                projections.push(Projection::CommandApplied {
+                    command_id,
+                    command_seq,
+                    run_id: None,
+                });
+            }
+        }
         projections.push(Projection::CommandApplied {
             command_id: abort_command_id.to_owned(),
             command_seq: sqlite_u64(abort_seq, "Abort command sequence")?,
@@ -1271,10 +1515,13 @@ impl EventWriter {
             event: None,
             projections,
         });
-        self.apply_locked(EventBatch {
-            writes,
-            injected_commands: Vec::new(),
-        })
+        self.apply_locked(
+            EventBatch {
+                writes,
+                injected_commands: Vec::new(),
+            },
+            &mut guard,
+        )
         .await?;
 
         let mut acks = Vec::with_capacity(terminal_ids.len());
@@ -1288,8 +1535,8 @@ impl EventWriter {
         Ok(acks)
     }
 
-    async fn apply_locked(&self, batch: EventBatch) -> Result<Vec<u64>> {
-        self.apply_locked_with_failpoint(batch, None, None, None)
+    async fn apply_locked(&self, batch: EventBatch, state: &mut WriterState) -> Result<Vec<u64>> {
+        self.apply_locked_with_failpoint(batch, None, None, None, state)
             .await
     }
 
@@ -1299,11 +1546,18 @@ impl EventWriter {
         fail_after_writes: Option<usize>,
         abrupt_failpoint: Option<(&str, bool, &std::path::Path)>,
         destroy_after_prepare: Option<&str>,
+        state: &mut WriterState,
     ) -> Result<Vec<u64>> {
+        self.ensure_checkpoint(state).await?;
         preflight_materialization_bounds(self.store.redactor(), &batch)?;
         let expected_injections = validate_batch_shape(self.store.redactor(), &batch)?;
         let injected_commands = batch.injected_commands.clone();
-        let previous_event_head = load_verified_event_head(self.store.as_ref()).await?;
+        let checkpoint = state
+            .checkpoint
+            .as_ref()
+            .expect("checkpoint initialized before EventBatch")
+            .clone();
+        let previous_event_head = checkpoint.event_head.clone();
         let next_seq = previous_event_head
             .as_ref()
             .map_or(0, |head| head.last_seq)
@@ -1321,6 +1575,7 @@ impl EventWriter {
         if transaction_event_head != previous_event_head {
             bail!("event-log head changed while EventBatch was prepared");
         }
+        let consumes_lifecycle_history = prepared_consumes_lifecycle_history(&prepared);
         let mut command_bounds = BatchBounds::default();
         if !injected_commands.is_empty() {
             let command_size = self
@@ -1358,7 +1613,26 @@ impl EventWriter {
             require_owner_count(&mut transaction, run_id, *expected).await?;
         }
         validate_owner_open_preconditions(&mut transaction, &prepared).await?;
-        validate_required_projection_sets(self.store.as_ref(), &mut transaction, &prepared).await?;
+        validate_non_empty_turn_end_bindings(&mut transaction, &prepared).await?;
+        validate_required_projection_sets(
+            self.store.as_ref(),
+            &mut transaction,
+            &prepared,
+            &checkpoint.lifecycle,
+        )
+        .await?;
+        let next_lifecycle = if consumes_lifecycle_history {
+            Some(
+                validate_durable_lifecycle_suffix(
+                    &mut transaction,
+                    &prepared,
+                    &checkpoint.lifecycle,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         for run_id in &owner_preconditions {
             require_owner_count(&mut transaction, run_id, 1).await?;
         }
@@ -1470,6 +1744,11 @@ impl EventWriter {
             .commit()
             .await
             .context("failed to commit EventBatch")?;
+        state.checkpoint = Some(LifecycleCheckpoint {
+            event_head: updated_event_head,
+            lifecycle: next_lifecycle.unwrap_or(checkpoint.lifecycle),
+            historical_rows_visited: checkpoint.historical_rows_visited,
+        });
         if let Some((name, true, readiness_path)) = abrupt_failpoint {
             abrupt_transaction_exit(name, "after_commit", readiness_path);
         }
@@ -1553,6 +1832,15 @@ impl EventWriter {
                     let turn_id = identity.turn_id.map(str::to_owned);
                     let message_id = identity.message_id.map(str::to_owned);
                     let message_role = identity.message_role.map(str::to_owned);
+                    let steer_mode = match &event.value {
+                        AgentEvent::Steered {
+                            mode: SteerMode::Hard,
+                        } => Some("hard"),
+                        AgentEvent::Steered {
+                            mode: SteerMode::Soft,
+                        } => Some("soft"),
+                        _ => None,
+                    };
                     let internal_metadata = serde_json::to_string(&event.metadata)
                         .context("failed to serialize durable event internal metadata")?;
                     let message_end = message_end_identity(&event.value)?;
@@ -1576,8 +1864,13 @@ impl EventWriter {
                         turn_id,
                         message_id,
                         message_role,
+                        steer_mode,
                         raw_key_ref: key.key_ref.clone(),
-                        raw_key_proof: keyed_digest(key, PREPARED_KEY_MATERIAL_PROOF),
+                        raw_key_proof: super::crypto::keyed_proof(
+                            key,
+                            PREPARED_KEY_MATERIAL_PROOF_DOMAIN,
+                            PREPARED_KEY_MATERIAL_PROOF,
+                        ),
                         raw_ciphertext: protected.ciphertext,
                         envelope: protected.projection,
                         redaction_version: protected.redaction_version,
@@ -1640,7 +1933,11 @@ impl EventWriter {
                             message_id,
                             role,
                             raw_key_ref: key.key_ref.clone(),
-                            raw_key_proof: keyed_digest(key, PREPARED_KEY_MATERIAL_PROOF),
+                            raw_key_proof: super::crypto::keyed_proof(
+                                key,
+                                PREPARED_KEY_MATERIAL_PROOF_DOMAIN,
+                                PREPARED_KEY_MATERIAL_PROOF,
+                            ),
                             raw_ciphertext: protected.ciphertext,
                             payload: protected.projection,
                             search_text,
@@ -1688,18 +1985,6 @@ impl EventWriter {
                         )?;
                         projections.push(prepared);
                     }
-                    Projection::Approval(ApprovalMutation::Pending {
-                        request_projection,
-                        redaction_version,
-                        ..
-                    }) if redaction_version != self.store.redactor().version()
-                        || self.store.redactor().redact_text(&request_projection)
-                            != request_projection =>
-                    {
-                        bail!(
-                            "approval projection must already be redacted with the current version"
-                        );
-                    }
                     projection => {
                         charge_transaction_bytes(
                             &mut transaction_bytes,
@@ -1740,7 +2025,7 @@ impl EventWriter {
             ),
             (true, None) => bail!("oversized command requires an incremental payload digest"),
             (false, Some(_)) => bail!("only oversized commands may carry a precomputed digest"),
-            (false, None) => keyed_digest(key, canonical_payload),
+            (false, None) => command_payload_digest(key, canonical_payload),
         };
         let payload_ciphertext = if oversized {
             None
@@ -1767,7 +2052,11 @@ impl EventWriter {
             command_id,
             command_kind,
             payload_key_ref: key.key_ref.clone(),
-            payload_key_proof: keyed_digest(key, PREPARED_KEY_MATERIAL_PROOF),
+            payload_key_proof: super::crypto::keyed_proof(
+                key,
+                PREPARED_KEY_MATERIAL_PROOF_DOMAIN,
+                PREPARED_KEY_MATERIAL_PROOF,
+            ),
             payload_ciphertext,
             payload_hmac,
             status,
@@ -1842,6 +2131,9 @@ impl EventWriter {
                 .store
                 .data_key_by_ref_in_transaction(transaction, &key_ref)
                 .await?;
+            if key.purpose != DataKeyPurpose::Command {
+                bail!("injected command references a non-command data key");
+            }
             let ciphertext: Vec<u8> = row.try_get("payload_ciphertext")?;
             let aad = self.store.scope().row_aad(
                 "inbound_commands",
@@ -1851,7 +2143,7 @@ impl EventWriter {
             let plaintext =
                 Zeroizing::new(super::crypto::decrypt_content(&key, &ciphertext, &aad)?);
             let digest: Vec<u8> = row.try_get("payload_hmac")?;
-            verify_keyed_digest(&key, &plaintext, &digest)?;
+            verify_command_payload_digest(&key, &plaintext, &digest)?;
 
             let mut parsed: Command = serde_json::from_slice(&plaintext)
                 .context("durable injected command payload is invalid")?;
@@ -2030,6 +2322,9 @@ impl EventWriter {
         }
         let key_ref: String = row.try_get("payload_key_ref")?;
         let key = self.store.data_key_by_ref(&key_ref).await?;
+        if key.purpose != DataKeyPurpose::Command {
+            bail!("command replay references a non-command data key");
+        }
         let digest: Vec<u8> = row.try_get("payload_hmac")?;
         let ciphertext = row.try_get::<Option<Vec<u8>>, _>("payload_ciphertext")?;
         if let Some(incoming_digest) = incoming_digest {
@@ -2041,7 +2336,7 @@ impl EventWriter {
                 bail!("oversized command replay unexpectedly has durable ciphertext");
             }
         } else {
-            verify_keyed_digest(&key, canonical_payload, &digest)?;
+            verify_command_payload_digest(&key, canonical_payload, &digest)?;
         }
         if let Some(ciphertext) = ciphertext {
             let aad = self.store.scope().row_aad(
@@ -2094,29 +2389,47 @@ fn decrypt_replay_payload(
     )?))
 }
 
-async fn load_verified_event_head(store: &Store) -> Result<Option<EventLogHead>> {
+async fn load_authenticated_command(
+    store: &Store,
+    transaction: &mut Transaction<'_, Sqlite>,
+    command_id: &str,
+    command_seq: u64,
+    expected_kind: &str,
+) -> Result<Command> {
     let row = sqlx::query(
-        "SELECT last_seq, event_count, chain_digest, key_ref, head_hmac
-         FROM event_log_heads WHERE conversation_id = ?",
+        "SELECT command_kind, payload_key_ref, payload_ciphertext, payload_hmac
+         FROM inbound_commands WHERE command_id=? AND seq=?",
     )
-    .bind(&store.scope().conversation_id)
-    .fetch_optional(store.pool())
-    .await
-    .context("failed to load event-log head")?;
-    let Some(row) = row else {
-        let event_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
-            .fetch_one(store.pool())
-            .await?;
-        if event_count != 0 {
-            bail!("durable events exist without an authenticated event-log head");
-        }
-        return Ok(None);
-    };
-    let key_ref: String = row.try_get("key_ref")?;
-    let key = store.data_key_by_ref(&key_ref).await?;
-    decode_verified_event_head(store, &row, &key_ref, &key)
-        .map(Some)
-        .context("event-log head failed authenticated validation")
+    .bind(command_id)
+    .bind(sqlite_i64(command_seq, "command sequence")?)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or_else(|| anyhow!("authenticated command target does not exist"))?;
+    let stored_kind: String = row.try_get("command_kind")?;
+    if stored_kind != expected_kind {
+        bail!("expected {expected_kind} command, found durable kind {stored_kind}");
+    }
+    let key_ref: String = row.try_get("payload_key_ref")?;
+    let key = store
+        .data_key_by_ref_in_transaction(transaction, &key_ref)
+        .await?;
+    if key.purpose != DataKeyPurpose::Command {
+        bail!("durable {expected_kind} references a non-command data key");
+    }
+    let ciphertext: Vec<u8> = row
+        .try_get::<Option<Vec<u8>>, _>("payload_ciphertext")?
+        .ok_or_else(|| anyhow!("durable {expected_kind} has no authenticated ciphertext"))?;
+    let aad = store.scope().row_aad(
+        "inbound_commands",
+        command_seq.to_string(),
+        DataKeyPurpose::Command,
+    );
+    let plaintext = Zeroizing::new(super::crypto::decrypt_content(&key, &ciphertext, &aad)?);
+    let payload_hmac: Vec<u8> = row.try_get("payload_hmac")?;
+    verify_command_payload_digest(&key, &plaintext, &payload_hmac)
+        .with_context(|| format!("durable {expected_kind} HMAC is invalid"))?;
+    serde_json::from_slice(&plaintext)
+        .with_context(|| format!("durable {expected_kind} payload is invalid"))
 }
 
 async fn load_verified_event_head_in_transaction(
@@ -2147,6 +2460,25 @@ async fn load_verified_event_head_in_transaction(
     decode_verified_event_head(store, &row, &key_ref, &key)
         .map(Some)
         .context("event-log head failed authenticated EventBatch validation")
+}
+
+fn prepared_consumes_lifecycle_history(prepared: &[PreparedWrite]) -> bool {
+    prepared.iter().any(|write| {
+        write.event.is_some()
+            || write.projections.iter().any(|projection| {
+                matches!(
+                    projection,
+                    PreparedProjection::Plain(Projection::ToolExecution(
+                        ToolExecutionMutation::Prepare { .. } | ToolExecutionMutation::Start { .. }
+                    )) | PreparedProjection::Plain(Projection::CommandClassified { .. })
+                        | PreparedProjection::Plain(Projection::RunPhase { .. })
+                        | PreparedProjection::Plain(Projection::CommandApplied {
+                            run_id: Some(_),
+                            ..
+                        })
+                )
+            })
+    })
 }
 
 fn decode_verified_event_head(
@@ -2316,14 +2648,18 @@ async fn revalidate_prepared_key_refs(
                 purpose.as_str()
             );
         }
-        verify_keyed_digest(&key, PREPARED_KEY_MATERIAL_PROOF, expected_proof).with_context(
-            || {
-                format!(
-                    "prepared {} key {key_ref} changed material before EventBatch transaction",
-                    purpose.as_str()
-                )
-            },
-        )?;
+        super::crypto::verify_keyed_proof(
+            &key,
+            PREPARED_KEY_MATERIAL_PROOF_DOMAIN,
+            PREPARED_KEY_MATERIAL_PROOF,
+            expected_proof,
+        )
+        .with_context(|| {
+            format!(
+                "prepared {} key {key_ref} changed material before EventBatch transaction",
+                purpose.as_str()
+            )
+        })?;
     }
     Ok(())
 }
@@ -2376,7 +2712,10 @@ fn verify_digest_bytes(incoming: &[u8], stored: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn validate_batch_shape(redactor: &Redactor, batch: &EventBatch) -> Result<Vec<ExpectedInjection>> {
+fn validate_batch_shape(
+    _redactor: &Redactor,
+    batch: &EventBatch,
+) -> Result<Vec<ExpectedInjection>> {
     if batch.writes.is_empty() {
         bail!("EventBatch must contain at least one write");
     }
@@ -2444,9 +2783,27 @@ fn validate_batch_shape(redactor: &Redactor, batch: &EventBatch) -> Result<Vec<E
     let mut approval_resolve_mutations = HashMap::new();
     let mut tool_finish_mutations = HashMap::new();
     let mut empty_turn_runs = HashSet::new();
+    let mut agent_start_runs = HashSet::new();
     let mut agent_end_runs = HashSet::new();
+    let mut turn_start_ids = HashSet::new();
+    let mut turn_end_ids = HashSet::new();
+    let mut steered_ids = HashSet::new();
     let mut superseded_runs = HashSet::new();
-    for write in &batch.writes {
+    let mut message_start_positions = HashMap::new();
+    let mut message_start_roles = HashMap::new();
+    let mut message_end_positions = HashMap::new();
+    let mut approval_requested_positions = HashMap::new();
+    let mut approval_resolved_positions = HashMap::new();
+    let mut tool_end_positions = HashMap::new();
+    let mut tool_result_positions = HashMap::new();
+    let mut rejected_tool_calls = HashMap::new();
+    let mut steered_positions = HashMap::new();
+    let mut turn_start_positions = HashMap::new();
+    let mut turn_end_positions = HashMap::new();
+    let mut agent_end_positions = HashMap::new();
+    let mut assistant_start_positions = Vec::new();
+    let mut injected_user_end_positions = Vec::new();
+    for (write_position, write) in batch.writes.iter().enumerate() {
         if let Some(event) = &write.event {
             match &event.value {
                 AgentEvent::MessageStart {
@@ -2458,11 +2815,22 @@ fn validate_batch_shape(redactor: &Redactor, batch: &EventBatch) -> Result<Vec<E
                     }
                     message_start_event_digests
                         .insert(message_id.as_str(), Some(serde_json::to_value(message)?));
+                    message_start_positions.insert(message_id.as_str(), write_position);
+                    let role = match message.as_ref() {
+                        PublicMessage::User(_) => "user",
+                        PublicMessage::Assistant(_) => "assistant",
+                        PublicMessage::ToolResult(_) => "tool_result",
+                    };
+                    message_start_roles.insert(message_id.as_str(), role);
+                    if role == "assistant" {
+                        assistant_start_positions.push(write_position);
+                    }
                 }
                 AgentEvent::MessageEnd { message_id, .. } => {
                     if !message_end_event_ids.insert(message_id.as_str()) {
                         bail!("duplicate message_end event for message {message_id}");
                     }
+                    message_end_positions.insert(message_id.as_str(), write_position);
                 }
                 AgentEvent::ApprovalRequested { request } => {
                     if request.id.is_empty()
@@ -2481,6 +2849,7 @@ fn validate_batch_shape(redactor: &Redactor, batch: &EventBatch) -> Result<Vec<E
                             request: request.clone(),
                         },
                     );
+                    approval_requested_positions.insert(request.id.as_str(), write_position);
                 }
                 AgentEvent::ApprovalResolved {
                     request_id,
@@ -2503,6 +2872,7 @@ fn validate_batch_shape(redactor: &Redactor, batch: &EventBatch) -> Result<Vec<E
                             actor: actor.to_owned(),
                         },
                     );
+                    approval_resolved_positions.insert(request_id.as_str(), write_position);
                 }
                 AgentEvent::ToolExecutionStart {
                     tool_call_id,
@@ -2551,37 +2921,64 @@ fn validate_batch_shape(redactor: &Redactor, batch: &EventBatch) -> Result<Vec<E
                             error_code: error_code.map(str::to_owned),
                         },
                     );
+                    tool_end_positions.insert(tool_call_id.as_str(), write_position);
                 }
-                AgentEvent::AgentStart | AgentEvent::AgentEnd => {
+                AgentEvent::AgentStart => {
                     let run_id = event.metadata.run_id.as_deref().unwrap_or_default();
                     if run_id.is_empty() {
                         bail!("durable agent event run_id must not be empty");
                     }
-                    if matches!(event.value, AgentEvent::AgentEnd) {
-                        agent_end_runs.insert(run_id.to_owned());
+                    if !agent_start_runs.insert(run_id.to_owned()) {
+                        bail!("duplicate AgentStart lifecycle event for run {run_id}");
                     }
                 }
-                AgentEvent::TurnStart | AgentEvent::TurnEnd { .. } => {
+                AgentEvent::AgentEnd => {
+                    let run_id = event.metadata.run_id.as_deref().unwrap_or_default();
+                    if run_id.is_empty() {
+                        bail!("durable agent event run_id must not be empty");
+                    }
+                    if !agent_end_runs.insert(run_id.to_owned()) {
+                        bail!("duplicate AgentEnd lifecycle event for run {run_id}");
+                    }
+                    agent_end_positions.insert(run_id, write_position);
+                }
+                AgentEvent::TurnStart => {
                     let run_id = event.metadata.run_id.as_deref().unwrap_or_default();
                     let turn_id = event.metadata.turn_id.as_deref().unwrap_or_default();
                     if run_id.is_empty() || turn_id.is_empty() {
                         bail!("durable turn event identity must not be empty");
                     }
-                    if let AgentEvent::TurnEnd {
-                        message,
-                        tool_results,
-                    } = &event.value
-                    {
-                        if message.is_none() {
-                            if !event.metadata.empty_turn || !tool_results.is_empty() {
-                                bail!(
-                                    "TurnEnd message=None is reserved for a true empty idle-startup turn"
-                                );
-                            }
-                            empty_turn_runs.insert(run_id.to_owned());
-                        } else if event.metadata.empty_turn {
-                            bail!("non-empty TurnEnd must not carry empty-turn metadata");
+                    if !turn_start_ids.insert((run_id.to_owned(), turn_id.to_owned())) {
+                        bail!(
+                            "duplicate TurnStart lifecycle event for run {run_id} turn {turn_id}"
+                        );
+                    }
+                    turn_start_positions
+                        .insert((run_id.to_owned(), turn_id.to_owned()), write_position);
+                }
+                AgentEvent::TurnEnd {
+                    message,
+                    tool_results,
+                } => {
+                    let run_id = event.metadata.run_id.as_deref().unwrap_or_default();
+                    let turn_id = event.metadata.turn_id.as_deref().unwrap_or_default();
+                    if run_id.is_empty() || turn_id.is_empty() {
+                        bail!("durable turn event identity must not be empty");
+                    }
+                    if !turn_end_ids.insert((run_id.to_owned(), turn_id.to_owned())) {
+                        bail!("duplicate TurnEnd lifecycle event for run {run_id} turn {turn_id}");
+                    }
+                    turn_end_positions
+                        .insert((run_id.to_owned(), turn_id.to_owned()), write_position);
+                    if message.is_none() {
+                        if !event.metadata.empty_turn || !tool_results.is_empty() {
+                            bail!(
+                                "TurnEnd message=None is reserved for a true empty idle-startup turn"
+                            );
                         }
+                        empty_turn_runs.insert(run_id.to_owned());
+                    } else if event.metadata.empty_turn {
+                        bail!("non-empty TurnEnd must not carry empty-turn metadata");
                     }
                 }
                 AgentEvent::Steered { .. } => {
@@ -2591,15 +2988,30 @@ fn validate_batch_shape(redactor: &Redactor, batch: &EventBatch) -> Result<Vec<E
                     if command_id.is_empty() || run_id.is_empty() || turn_id.is_empty() {
                         bail!("durable Steered identity must not be empty");
                     }
+                    if !steered_ids.insert((
+                        command_id.to_owned(),
+                        run_id.to_owned(),
+                        turn_id.to_owned(),
+                    )) {
+                        bail!(
+                            "duplicate Steered lifecycle event for command {command_id} run {run_id} turn {turn_id}"
+                        );
+                    }
+                    steered_positions.insert(command_id.to_owned(), write_position);
                 }
                 AgentEvent::RetryScheduled {
                     attempt,
-                    delay_ms,
                     error_message,
                     ..
                 } => {
-                    if *attempt == 0 || *delay_ms == 0 || error_message.is_empty() {
-                        bail!("durable RetryScheduled fields must be non-zero/non-empty");
+                    let run_id = event.metadata.run_id.as_deref().unwrap_or_default();
+                    let turn_id = event.metadata.turn_id.as_deref().unwrap_or_default();
+                    if run_id.is_empty()
+                        || turn_id.is_empty()
+                        || *attempt == 0
+                        || error_message.is_empty()
+                    {
+                        bail!("durable RetryScheduled identity and fields must be non-empty");
                     }
                 }
                 AgentEvent::MemoryMaintenance { .. }
@@ -2704,9 +3116,24 @@ fn validate_batch_shape(redactor: &Redactor, batch: &EventBatch) -> Result<Vec<E
                         }
                         tool_result_message_ids
                             .insert(message.tool_call_id.as_str(), message_id.as_str());
+                        tool_result_positions.insert(
+                            message.tool_call_id.as_str(),
+                            (message_id.as_str(), write_position, message.is_error),
+                        );
                         "tool_result"
                     }
                 };
+                if let PublicMessage::Assistant(message) = message {
+                    for content in &message.content {
+                        if let crate::provider::types::PublicAssistantContent::RejectedToolCall {
+                            rejected,
+                            ..
+                        } = content
+                        {
+                            rejected_tool_calls.insert(rejected.id.as_str(), write_position);
+                        }
+                    }
+                }
                 if *role != actual_role {
                     bail!("MessageEnd role {role} does not match its {actual_role} message");
                 }
@@ -2739,12 +3166,13 @@ fn validate_batch_shape(redactor: &Redactor, batch: &EventBatch) -> Result<Vec<E
                         text: Zeroizing::new(text.clone()),
                         timestamp: message.timestamp,
                     });
+                    injected_user_end_positions.push(write_position);
                 }
             }
             if let Projection::ToolExecution(mutation) = projection {
                 let tool_call_id = match mutation {
                     ToolExecutionMutation::Prepare { tool_call_id, .. }
-                    | ToolExecutionMutation::Start { tool_call_id }
+                    | ToolExecutionMutation::Start { tool_call_id, .. }
                     | ToolExecutionMutation::Finish { tool_call_id, .. } => tool_call_id,
                 };
                 if !tool_mutation_ids.insert(tool_call_id.as_str()) {
@@ -2787,19 +3215,13 @@ fn validate_batch_shape(redactor: &Redactor, batch: &EventBatch) -> Result<Vec<E
                 match mutation {
                     ApprovalMutation::Pending { request_id, .. } => {
                         approval_pending_mutation_ids.insert(request_id.clone());
-                        let ApprovalMutation::Pending {
-                            tool_call_id,
-                            request_projection,
-                            ..
-                        } = mutation
-                        else {
+                        let ApprovalMutation::Pending { tool_call_id, .. } = mutation else {
                             unreachable!()
                         };
                         approval_pending_mutations.insert(
                             request_id.clone(),
                             ApprovalPendingEvidence {
                                 tool_call_id: tool_call_id.clone(),
-                                request_projection: request_projection.clone(),
                             },
                         );
                     }
@@ -2844,6 +3266,93 @@ fn validate_batch_shape(redactor: &Redactor, batch: &EventBatch) -> Result<Vec<E
                         next.as_str()
                     );
                 }
+            }
+        }
+    }
+    for (message_id, start_position) in &message_start_positions {
+        if let Some(end_position) = message_end_positions.get(message_id)
+            && start_position >= end_position
+        {
+            bail!("MessageStart for {message_id} must precede its same-batch MessageEnd");
+        }
+        if message_start_roles.get(message_id) != Some(&"assistant") {
+            let end_position = message_end_positions.get(message_id).ok_or_else(|| {
+                anyhow!(
+                    "non-assistant MessageStart for {message_id} requires its canonical MessageEnd in the same EventBatch"
+                )
+            })?;
+            if start_position >= end_position {
+                bail!("MessageStart for {message_id} must precede its same-batch MessageEnd");
+            }
+            let started = message_start_event_digests
+                .get(message_id)
+                .and_then(Option::as_ref)
+                .expect("MessageStart digest was collected with its identity");
+            let projected = projected_message_digests.get(message_id).ok_or_else(|| {
+                anyhow!(
+                    "non-assistant MessageStart for {message_id} requires its canonical MessageEnd projection"
+                )
+            })?;
+            if started != projected {
+                bail!(
+                    "non-assistant MessageStart for {message_id} does not match its canonical MessageEnd"
+                );
+            }
+        }
+    }
+    for (request_id, requested_position) in &approval_requested_positions {
+        if let Some(resolved_position) = approval_resolved_positions.get(request_id)
+            && requested_position >= resolved_position
+        {
+            bail!("ApprovalRequested for {request_id} must precede ApprovalResolved");
+        }
+    }
+    for ((run_id, turn_id), turn_start_position) in &turn_start_positions {
+        if let Some(turn_end_position) = turn_end_positions.get(&(run_id.clone(), turn_id.clone()))
+            && turn_start_position >= turn_end_position
+        {
+            bail!("TurnStart for {run_id}/{turn_id} must precede TurnEnd");
+        }
+    }
+    for ((run_id, _), turn_end_position) in &turn_end_positions {
+        if let Some(agent_end_position) = agent_end_positions.get(run_id.as_str())
+            && turn_end_position >= agent_end_position
+        {
+            bail!("TurnEnd for run {run_id} must precede same-batch AgentEnd");
+        }
+    }
+    if injected_user_end_positions
+        .windows(2)
+        .any(|positions| positions[0] >= positions[1])
+    {
+        bail!("injected user MessageEnd events must follow durable command sequence order");
+    }
+    if let Some(last_user_end) = injected_user_end_positions.last()
+        && assistant_start_positions
+            .iter()
+            .any(|assistant_start| assistant_start <= last_user_end)
+    {
+        bail!("injected user MessageEnd events must precede same-batch assistant MessageStart");
+    }
+    let mut previous_steered_position = None;
+    for command in &batch.injected_commands {
+        let Some(position) = steered_positions.get(command.command_id.as_str()) else {
+            continue;
+        };
+        if previous_steered_position.is_some_and(|previous| previous >= *position) {
+            bail!("Steered events must follow injected command durable sequence order");
+        }
+        previous_steered_position = Some(*position);
+    }
+    for (command_id, run_id, turn_id) in &steered_ids {
+        if let Some(turn_start_position) =
+            turn_start_positions.get(&(run_id.clone(), turn_id.clone()))
+        {
+            let steered_position = steered_positions
+                .get(command_id)
+                .expect("Steered position was collected with its identity");
+            if steered_position >= turn_start_position {
+                bail!("Steered for {command_id} must precede same-batch TurnStart");
             }
         }
     }
@@ -2993,6 +3502,35 @@ fn validate_batch_shape(redactor: &Redactor, batch: &EventBatch) -> Result<Vec<E
             );
         }
     }
+    for (tool_call_id, (message_id, result_position, is_error)) in &tool_result_positions {
+        let Some(start_position) = message_start_positions.get(message_id) else {
+            bail!("tool-result MessageEnd for {tool_call_id} requires its same-batch MessageStart");
+        };
+        if start_position >= result_position {
+            bail!("tool-result MessageStart for {tool_call_id} must precede MessageEnd");
+        }
+        if tool_finish_mutation_ids.contains(*tool_call_id) {
+            let terminal_position = tool_end_positions
+                .get(*tool_call_id)
+                .expect("terminal event/mutation target equality was checked");
+            if terminal_position >= start_position || terminal_position >= result_position {
+                bail!(
+                    "ToolExecutionEnd for {tool_call_id} must precede its result MessageStart/MessageEnd"
+                );
+            }
+        } else {
+            let rejected_position = rejected_tool_calls.get(*tool_call_id);
+            if !*is_error
+                || rejected_position.is_none_or(|rejected_position| {
+                    rejected_position >= start_position || rejected_position >= result_position
+                })
+            {
+                bail!(
+                    "tool-result MessageEnd for {tool_call_id} requires same-batch ToolExecutionEnd and Finish or a preceding RejectedToolCall"
+                );
+            }
+        }
+    }
     for (tool_call_id, event) in &tool_start_events {
         if !tool_start_mutation_ids.contains(tool_call_id.as_str()) {
             continue;
@@ -3030,13 +3568,6 @@ fn validate_batch_shape(redactor: &Redactor, batch: &EventBatch) -> Result<Vec<E
             .ok_or_else(|| anyhow!("missing typed approval_requested event for {request_id}"))?;
         if event.request.tool_call_id != mutation.tool_call_id {
             bail!("approval request identity does not match mutation for {request_id}");
-        }
-        let raw_request = serde_json::to_value(&event.request)?;
-        let redacted_request = redactor.redact_value(&raw_request)?;
-        let supplied_projection: Value = serde_json::from_str(&mutation.request_projection)
-            .context("approval request projection is invalid JSON")?;
-        if redacted_request != supplied_projection {
-            bail!("approval request projection does not match its event for {request_id}");
         }
     }
     for (request_id, mutation) in &approval_resolve_mutations {
@@ -3351,8 +3882,11 @@ fn projection_size_upper_bound(projection: &Projection) -> Result<usize> {
                 .saturating_add(command_id.len())
                 .saturating_add(run_id.len())
                 .saturating_add(idempotency_key.len()),
-            ToolExecutionMutation::Start { tool_call_id }
-            | ToolExecutionMutation::Finish { tool_call_id, .. } => tool_call_id.len(),
+            ToolExecutionMutation::Start {
+                tool_call_id,
+                run_id,
+            } => tool_call_id.len().saturating_add(run_id.len()),
+            ToolExecutionMutation::Finish { tool_call_id, .. } => tool_call_id.len(),
         },
         Projection::Approval(mutation) => match mutation {
             ApprovalMutation::Pending {
@@ -3360,14 +3894,12 @@ fn projection_size_upper_bound(projection: &Projection) -> Result<usize> {
                 tool_call_id,
                 run_id,
                 turn_id,
-                request_projection,
                 ..
             } => request_id
                 .len()
                 .saturating_add(tool_call_id.len())
                 .saturating_add(run_id.len())
-                .saturating_add(turn_id.len())
-                .saturating_add(request_projection.len()),
+                .saturating_add(turn_id.len()),
             ApprovalMutation::Resolve { request_id, .. } => request_id.len(),
         },
         Projection::MessageEnd { .. } => 0,
@@ -3518,28 +4050,34 @@ fn collect_owner_conditions(
     post: &mut HashSet<String>,
 ) {
     let mut chains: HashMap<&str, (&str, RunPhase, RunPhase)> = HashMap::new();
+    let mut terminal_commands = HashSet::new();
     for write in prepared {
         for projection in &write.projections {
-            if let PreparedProjection::Plain(Projection::RunPhase {
-                command_id,
-                run_id,
-                expected,
-                next,
-                ..
-            }) = projection
-            {
-                chains
-                    .entry(command_id)
-                    .and_modify(|(_, _, final_phase)| *final_phase = *next)
-                    .or_insert((run_id, *expected, *next));
+            match projection {
+                PreparedProjection::Plain(Projection::RunPhase {
+                    command_id,
+                    run_id,
+                    expected,
+                    next,
+                    ..
+                }) => {
+                    chains
+                        .entry(command_id)
+                        .and_modify(|(_, _, final_phase)| *final_phase = *next)
+                        .or_insert((run_id, *expected, *next));
+                }
+                PreparedProjection::Plain(Projection::CommandApplied { command_id, .. }) => {
+                    terminal_commands.insert(command_id.as_str());
+                }
+                _ => {}
             }
         }
     }
-    for (_, (run_id, initial_phase, final_phase)) in chains {
+    for (command_id, (run_id, initial_phase, final_phase)) in chains {
         if initial_phase.is_owner() {
             pre.insert(run_id.to_owned());
         }
-        if final_phase.is_owner() {
+        if final_phase.is_owner() && !terminal_commands.contains(command_id) {
             post.insert(run_id.to_owned());
         }
     }
@@ -3577,6 +4115,28 @@ fn durable_event_position(
                 && turn_id.is_none_or(|value| event.turn_id.as_deref() == Some(value))
         })
     })
+}
+
+fn durable_event_envelope_identity_position(
+    prepared: &[PreparedWrite],
+    kind: &str,
+    identity_field: &str,
+    identity: &str,
+) -> Result<Option<usize>> {
+    for (position, write) in prepared.iter().enumerate() {
+        let Some(event) = &write.event else {
+            continue;
+        };
+        if event.kind != kind {
+            continue;
+        }
+        let envelope: Value = serde_json::from_str(&event.envelope)
+            .context("prepared durable event envelope is invalid")?;
+        if envelope.get(identity_field).and_then(Value::as_str) == Some(identity) {
+            return Ok(Some(position));
+        }
+    }
+    Ok(None)
 }
 
 fn require_durable_event(
@@ -3686,18 +4246,425 @@ async fn validate_zero_owner_startup_abort(
     Ok(())
 }
 
+async fn validate_abort_cutoff_completeness(
+    transaction: &mut Transaction<'_, Sqlite>,
+    applied_controls: &[(&str, u64, Option<&str>, usize)],
+    supersedes: &[(&str, u64, Option<&str>, usize)],
+    abort_command_id: &str,
+    abort_seq: u64,
+    abort_position: usize,
+) -> Result<()> {
+    let pending = sqlx::query(
+        "SELECT seq, command_id, command_kind, status, run_phase
+         FROM inbound_commands
+         WHERE seq < ?
+           AND (
+             status = 'received'
+             OR (
+               command_kind = 'user_message'
+               AND status = 'applying'
+               AND run_phase IN ('classified', 'run_started', 'turn_started')
+             )
+           )
+         ORDER BY seq",
+    )
+    .bind(sqlite_i64(abort_seq, "Abort command sequence")?)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    let mut previous_position = None;
+    for row in pending {
+        let command_seq = sqlite_u64(row.try_get("seq")?, "stored command sequence")?;
+        let command_id: String = row.try_get("command_id")?;
+        let command_kind: String = row.try_get("command_kind")?;
+        let status: String = row.try_get("status")?;
+        let run_phase: String = row.try_get("run_phase")?;
+        let terminal_position = match command_kind.as_str() {
+            "user_message" => supersedes.iter().find_map(
+                |(projected_id, projected_seq, _, projected_position)| {
+                    (*projected_id == command_id
+                        && *projected_seq == command_seq
+                        && *projected_position < abort_position)
+                        .then_some(*projected_position)
+                },
+            ),
+            "approval_decision" if status == "received" => applied_controls.iter().find_map(
+                |(projected_id, projected_seq, projected_run, projected_position)| {
+                    (*projected_id == command_id
+                        && *projected_seq == command_seq
+                        && projected_run.is_none()
+                        && *projected_position < abort_position)
+                        .then_some(*projected_position)
+                },
+            ),
+            _ => {
+                bail!(
+                    "Abort cutoff {abort_command_id} found unsupported earlier nonterminal command \
+                     {command_id}: {command_kind}/{status}/{run_phase}"
+                )
+            }
+        };
+        let terminal_position = terminal_position.ok_or_else(|| {
+            anyhow!(
+                "Abort cutoff {abort_command_id} is incomplete: earlier nonterminal command \
+                 {command_id} at seq {command_seq} has no terminal projection before Abort"
+            )
+        })?;
+        if previous_position.is_some_and(|previous| previous >= terminal_position) {
+            bail!(
+                "Abort cutoff {abort_command_id} terminal projections must follow exact command \
+                 sequence order"
+            );
+        }
+        previous_position = Some(terminal_position);
+    }
+    Ok(())
+}
+
+async fn has_later_abort_cutoff(
+    transaction: &mut Transaction<'_, Sqlite>,
+    applied_controls: &[(&str, u64, Option<&str>, usize)],
+    command_seq: u64,
+    projection_position: usize,
+) -> Result<bool> {
+    for (candidate_id, candidate_seq, _, candidate_position) in applied_controls {
+        if *candidate_seq <= command_seq || *candidate_position <= projection_position {
+            continue;
+        }
+        let is_abort: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+               SELECT 1 FROM inbound_commands
+               WHERE command_id = ? AND seq = ? AND command_kind = 'abort'
+                 AND status = 'received' AND run_phase = 'received'
+             )",
+        )
+        .bind(candidate_id)
+        .bind(sqlite_i64(*candidate_seq, "Abort command sequence")?)
+        .fetch_one(&mut **transaction)
+        .await?;
+        if is_abort {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+struct PreparedToolBinding {
+    command_id: String,
+    run_id: String,
+}
+
+#[derive(Clone, Copy)]
+struct ToolFinishBinding<'a> {
+    expected: &'a str,
+    state: &'a str,
+}
+
+struct OwnerBatchState<'a> {
+    phase_transitions: &'a [(&'a str, &'a str, RunPhase, RunPhase)],
+    applied_controls: &'a [(&'a str, u64, Option<&'a str>, usize)],
+}
+
+async fn load_prepared_tool_binding(
+    transaction: &mut Transaction<'_, Sqlite>,
+    tool_call_id: &str,
+) -> Result<Option<PreparedToolBinding>> {
+    let row = sqlx::query(
+        "SELECT command_id, run_id
+         FROM tool_executions
+         WHERE tool_call_id = ? AND state = 'prepared'",
+    )
+    .bind(tool_call_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    row.map(|row| {
+        Ok(PreparedToolBinding {
+            command_id: row.try_get("command_id")?,
+            run_id: row.try_get("run_id")?,
+        })
+    })
+    .transpose()
+}
+
+async fn require_tool_owner_binding(
+    transaction: &mut Transaction<'_, Sqlite>,
+    tool_call_id: &str,
+    command_id: &str,
+    run_id: &str,
+    batch_state: &OwnerBatchState<'_>,
+    operation: &str,
+    cancellation_cleanup: bool,
+) -> Result<()> {
+    let stored_phase: Option<String> = sqlx::query_scalar(
+        "SELECT run_phase
+         FROM inbound_commands
+         WHERE command_id = ? AND run_id = ? AND command_kind = 'user_message'
+           AND status = 'applying'",
+    )
+    .bind(command_id)
+    .bind(run_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some(stored_phase) = stored_phase else {
+        bail!(
+            "prepared tool {tool_call_id} has no matching durable owner command {command_id} in run {run_id}"
+        );
+    };
+    let mut final_phase = RunPhase::parse(&stored_phase)?;
+    for (transition_command, transition_run, expected, next) in batch_state.phase_transitions {
+        if *transition_command != command_id || *transition_run != run_id {
+            continue;
+        }
+        if final_phase != *expected {
+            bail!(
+                "{operation} owner {command_id} phase chain expected {}, found {}",
+                expected.as_str(),
+                final_phase.as_str()
+            );
+        }
+        final_phase = *next;
+    }
+    let closes_owner =
+        batch_state
+            .applied_controls
+            .iter()
+            .any(|(applied_command, _, applied_run, _)| {
+                *applied_command == command_id && *applied_run == Some(run_id)
+            });
+    if cancellation_cleanup {
+        if !matches!(
+            final_phase,
+            RunPhase::AssistantStarted | RunPhase::HardSteerRequested | RunPhase::CancelRequested
+        ) {
+            bail!(
+                "{operation} for {tool_call_id} requires a live cancellation-cleanup owner, found {}",
+                final_phase.as_str()
+            );
+        }
+    } else if final_phase != RunPhase::AssistantStarted || closes_owner {
+        bail!(
+            "{operation} for {tool_call_id} requires a live assistant/tool execution owner that remains open in the EventBatch, found {}{}",
+            final_phase.as_str(),
+            if closes_owner {
+                " with same-batch owner close"
+            } else {
+                ""
+            }
+        );
+    }
+    Ok(())
+}
+
+async fn validate_tool_finish_owner(
+    transaction: &mut Transaction<'_, Sqlite>,
+    tool_call_id: &str,
+    finish: ToolFinishBinding<'_>,
+    batch_state: &OwnerBatchState<'_>,
+    approval_resolutions: &HashMap<&str, (&str, &str)>,
+) -> Result<()> {
+    let row = sqlx::query(
+        "SELECT command_id, run_id, state
+         FROM tool_executions WHERE tool_call_id = ?",
+    )
+    .bind(tool_call_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or_else(|| anyhow!("ToolExecutionEnd has no durable tool {tool_call_id}"))?;
+    let command_id: String = row.try_get("command_id")?;
+    let run_id: String = row.try_get("run_id")?;
+    let stored_state: String = row.try_get("state")?;
+    if stored_state != finish.expected {
+        bail!(
+            "ToolExecutionEnd for {tool_call_id} expected {}, found durable state {stored_state}",
+            finish.expected
+        );
+    }
+
+    let stored_phase: String = sqlx::query_scalar(
+        "SELECT run_phase FROM inbound_commands
+         WHERE command_id = ? AND run_id = ? AND command_kind = 'user_message'
+           AND status = 'applying'",
+    )
+    .bind(&command_id)
+    .bind(&run_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or_else(|| {
+        anyhow!(
+            "ToolExecutionEnd for {tool_call_id} has no live durable owner {command_id} in run {run_id}"
+        )
+    })?;
+    let mut final_phase = RunPhase::parse(&stored_phase)?;
+    for (transition_command, transition_run, expected, next) in batch_state.phase_transitions {
+        if *transition_command != command_id || *transition_run != run_id {
+            continue;
+        }
+        if final_phase != *expected {
+            bail!(
+                "ToolExecutionEnd owner {command_id} phase chain expected {}, found {}",
+                expected.as_str(),
+                final_phase.as_str()
+            );
+        }
+        final_phase = *next;
+    }
+    let closes_owner =
+        batch_state
+            .applied_controls
+            .iter()
+            .any(|(applied_command, _, applied_run, _)| {
+                *applied_command == command_id && *applied_run == Some(run_id.as_str())
+            });
+
+    match finish.expected {
+        "running"
+            if final_phase == RunPhase::AssistantStarted
+                || (closes_owner
+                    && matches!(
+                        final_phase,
+                        RunPhase::HardSteerRequested | RunPhase::CancelRequested
+                    )) => {}
+        "running" => bail!(
+            "running ToolExecutionEnd for {tool_call_id} requires its live assistant owner or exact same-batch owner close, found {}",
+            final_phase.as_str()
+        ),
+        "prepared" => {
+            let approval_cleanup = sqlx::query_scalar::<_, String>(
+                "SELECT id FROM approval_log
+                 WHERE tool_call_id = ? AND state = 'pending'",
+            )
+            .bind(tool_call_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+            .is_some_and(|request_id| {
+                approval_resolutions
+                    .get(request_id.as_str())
+                    .is_some_and(|(resolution, _)| matches!(*resolution, "denied" | "cancelled"))
+            });
+            if finish.state != "cancelled"
+                || !(closes_owner
+                    || approval_cleanup
+                    || matches!(
+                        final_phase,
+                        RunPhase::HardSteerRequested | RunPhase::CancelRequested
+                    ))
+            {
+                bail!(
+                    "prepared ToolExecutionEnd for {tool_call_id} is permitted only for cancellation or denial cleanup"
+                );
+            }
+        }
+        state => bail!("ToolExecutionEnd has invalid expected state {state}"),
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn validate_owner_active_work_terminalized(
+    transaction: &mut Transaction<'_, Sqlite>,
+    command_id: &str,
+    run_id: &str,
+    tool_prepares: &HashMap<&str, (&str, &str)>,
+    tool_starts: &HashMap<&str, &str>,
+    tool_finishes: &HashMap<&str, ToolFinishBinding<'_>>,
+    approval_pendings: &[(&str, &str, &str)],
+    approval_resolutions: &HashMap<&str, (&str, &str)>,
+) -> Result<()> {
+    let rows = sqlx::query(
+        "SELECT tool_call_id, state FROM tool_executions
+         WHERE command_id = ? AND run_id = ? AND state IN ('prepared', 'running')",
+    )
+    .bind(command_id)
+    .bind(run_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let mut active_tools = HashMap::new();
+    for row in rows {
+        active_tools.insert(
+            row.try_get::<String, _>("tool_call_id")?,
+            row.try_get::<String, _>("state")?,
+        );
+    }
+    for (tool_call_id, (prepared_command, prepared_run)) in tool_prepares {
+        if *prepared_command == command_id && *prepared_run == run_id {
+            active_tools.insert((*tool_call_id).to_owned(), "prepared".to_owned());
+        }
+    }
+    for (tool_call_id, start_run) in tool_starts {
+        if *start_run == run_id && active_tools.contains_key(*tool_call_id) {
+            active_tools.insert((*tool_call_id).to_owned(), "running".to_owned());
+        }
+    }
+    for (tool_call_id, state) in &active_tools {
+        let finish = tool_finishes.get(tool_call_id.as_str()).ok_or_else(|| {
+            anyhow!(
+                "owner {command_id} cannot close run {run_id} with active {state} tool {tool_call_id}"
+            )
+        })?;
+        if finish.expected != state {
+            bail!(
+                "owner {command_id} cleanup for {tool_call_id} expected {}, but its post-batch active state is {state}",
+                finish.expected
+            );
+        }
+    }
+
+    let pending_rows = sqlx::query(
+        "SELECT a.id, a.tool_call_id FROM approval_log a
+         JOIN tool_executions t ON t.tool_call_id = a.tool_call_id
+         WHERE t.command_id = ? AND t.run_id = ? AND a.state = 'pending'",
+    )
+    .bind(command_id)
+    .bind(run_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let mut pending_approvals = HashMap::new();
+    for row in pending_rows {
+        pending_approvals.insert(
+            row.try_get::<String, _>("id")?,
+            row.try_get::<String, _>("tool_call_id")?,
+        );
+    }
+    for (request_id, tool_call_id, pending_run) in approval_pendings {
+        if *pending_run == run_id && active_tools.contains_key(*tool_call_id) {
+            pending_approvals.insert((*request_id).to_owned(), (*tool_call_id).to_owned());
+        }
+    }
+    for (request_id, tool_call_id) in pending_approvals {
+        let resolution = approval_resolutions.get(request_id.as_str()).ok_or_else(|| {
+            anyhow!(
+                "owner {command_id} cannot close run {run_id} with pending approval {request_id} for {tool_call_id}"
+            )
+        })?;
+        if !matches!(resolution.0, "denied" | "cancelled") {
+            bail!(
+                "owner {command_id} close requires denial/cancellation cleanup for pending approval {request_id}"
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn validate_required_projection_sets(
     store: &Store,
     transaction: &mut Transaction<'_, Sqlite>,
     prepared: &[PreparedWrite],
+    lifecycle: &DurableLifecycleState,
 ) -> Result<()> {
     let mut phase_transitions = Vec::new();
     let mut approval_resolutions = HashMap::new();
-    let mut tool_starts = HashSet::new();
+    let mut approval_resolution_positions = HashMap::new();
+    let mut approval_pendings = Vec::new();
+    let mut tool_prepares = HashMap::new();
+    let mut tool_starts = HashMap::new();
+    let mut tool_start_positions = HashMap::new();
+    let mut tool_finishes = HashMap::new();
     let mut applied_controls = Vec::new();
-    let mut contextual_supersedes = Vec::new();
+    let mut supersedes = Vec::new();
+    let mut projection_position = 0usize;
     for write in prepared {
         for projection in &write.projections {
+            projection_position = projection_position.saturating_add(1);
             match projection {
                 PreparedProjection::Plain(Projection::RunPhase {
                     command_id,
@@ -3714,28 +4681,300 @@ async fn validate_required_projection_sets(
                     ..
                 })) => {
                     approval_resolutions.insert(request_id.as_str(), (*state, actor.as_str()));
+                    approval_resolution_positions.insert(request_id.as_str(), projection_position);
+                }
+                PreparedProjection::Plain(Projection::Approval(ApprovalMutation::Pending {
+                    request_id,
+                    tool_call_id,
+                    run_id,
+                    ..
+                })) => {
+                    approval_pendings.push((
+                        request_id.as_str(),
+                        tool_call_id.as_str(),
+                        run_id.as_str(),
+                    ));
                 }
                 PreparedProjection::Plain(Projection::ToolExecution(
-                    ToolExecutionMutation::Start { tool_call_id },
+                    ToolExecutionMutation::Prepare {
+                        tool_call_id,
+                        command_id,
+                        run_id,
+                        ..
+                    },
                 )) => {
-                    tool_starts.insert(tool_call_id.as_str());
+                    tool_prepares.insert(
+                        tool_call_id.as_str(),
+                        (command_id.as_str(), run_id.as_str()),
+                    );
+                }
+                PreparedProjection::Plain(Projection::ToolExecution(
+                    ToolExecutionMutation::Start {
+                        tool_call_id,
+                        run_id,
+                    },
+                )) => {
+                    tool_starts.insert(tool_call_id.as_str(), run_id.as_str());
+                    tool_start_positions.insert(tool_call_id.as_str(), projection_position);
+                }
+                PreparedProjection::Plain(Projection::ToolExecution(
+                    ToolExecutionMutation::Finish {
+                        tool_call_id,
+                        expected,
+                        state,
+                        ..
+                    },
+                )) => {
+                    tool_finishes
+                        .insert(tool_call_id.as_str(), ToolFinishBinding { expected, state });
                 }
                 PreparedProjection::Plain(Projection::CommandApplied {
                     command_id,
                     command_seq,
                     run_id,
                 }) => {
-                    applied_controls.push((command_id.as_str(), *command_seq, run_id.as_deref()));
+                    applied_controls.push((
+                        command_id.as_str(),
+                        *command_seq,
+                        run_id.as_deref(),
+                        projection_position,
+                    ));
                 }
                 PreparedProjection::Plain(Projection::CommandSuperseded {
                     command_id,
                     command_seq,
-                    run_id: Some(run_id),
-                }) => {
-                    contextual_supersedes.push((command_id.as_str(), *command_seq, run_id.as_str()))
-                }
+                    run_id,
+                }) => supersedes.push((
+                    command_id.as_str(),
+                    *command_seq,
+                    run_id.as_deref(),
+                    projection_position,
+                )),
                 _ => {}
             }
+        }
+    }
+    let contextual_supersedes: Vec<(&str, u64, &str)> = supersedes
+        .iter()
+        .filter_map(|(command_id, command_seq, run_id, _)| {
+            run_id.map(|run_id| (*command_id, *command_seq, run_id))
+        })
+        .collect();
+    let owner_batch_state = OwnerBatchState {
+        phase_transitions: &phase_transitions,
+        applied_controls: &applied_controls,
+    };
+
+    for (tool_call_id, (command_id, run_id)) in &tool_prepares {
+        require_tool_owner_binding(
+            transaction,
+            tool_call_id,
+            command_id,
+            run_id,
+            &owner_batch_state,
+            "ToolExecutionPrepare",
+            false,
+        )
+        .await?;
+    }
+
+    for (request_id, tool_call_id, approval_run_id) in &approval_pendings {
+        let binding = if let Some((command_id, tool_run_id)) = tool_prepares.get(tool_call_id) {
+            PreparedToolBinding {
+                command_id: (*command_id).to_owned(),
+                run_id: (*tool_run_id).to_owned(),
+            }
+        } else {
+            load_prepared_tool_binding(transaction, tool_call_id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow!("Approval Pending {request_id} requires prepared tool {tool_call_id}")
+                })?
+        };
+        if binding.run_id != *approval_run_id {
+            bail!(
+                "Approval Pending {request_id} run {approval_run_id} does not match prepared tool {tool_call_id} run {}",
+                binding.run_id
+            );
+        }
+        let approval_turn_id = prepared
+            .iter()
+            .flat_map(|write| &write.projections)
+            .find_map(|projection| match projection {
+                PreparedProjection::Plain(Projection::Approval(ApprovalMutation::Pending {
+                    request_id: candidate,
+                    turn_id,
+                    ..
+                })) if candidate == request_id => Some(turn_id.as_str()),
+                _ => None,
+            })
+            .expect("approval pending projection was collected");
+        let owner_turn_id: String = sqlx::query_scalar(
+            "SELECT turn_id FROM inbound_commands
+             WHERE command_id = ? AND run_id = ? AND command_kind = 'user_message'
+               AND status = 'applying'",
+        )
+        .bind(&binding.command_id)
+        .bind(approval_run_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or_else(|| {
+            anyhow!(
+                "Approval Pending {request_id} has no durable owner turn for {}",
+                binding.command_id
+            )
+        })?;
+        if owner_turn_id != approval_turn_id {
+            bail!(
+                "Approval Pending {request_id} turn {approval_turn_id} does not match durable owner turn {owner_turn_id}"
+            );
+        }
+        require_tool_owner_binding(
+            transaction,
+            tool_call_id,
+            &binding.command_id,
+            approval_run_id,
+            &owner_batch_state,
+            "Approval Pending",
+            false,
+        )
+        .await?;
+    }
+
+    for (tool_call_id, contextual_run_id) in &tool_starts {
+        let binding = load_prepared_tool_binding(transaction, tool_call_id)
+            .await?
+            .ok_or_else(|| anyhow!("ToolExecutionStart requires prepared tool {tool_call_id}"))?;
+        if binding.run_id != *contextual_run_id {
+            bail!(
+                "ToolExecutionStart for {tool_call_id} run {contextual_run_id} does not match prepared run {}",
+                binding.run_id
+            );
+        }
+        require_tool_owner_binding(
+            transaction,
+            tool_call_id,
+            &binding.command_id,
+            contextual_run_id,
+            &owner_batch_state,
+            "ToolExecutionStart",
+            false,
+        )
+        .await?;
+    }
+
+    let mut approval_resolution_bindings = HashMap::new();
+    for (request_id, (resolution, _)) in &approval_resolutions {
+        let approval = sqlx::query(
+            "SELECT run_id, tool_call_id
+             FROM approval_log
+             WHERE id = ? AND state = 'pending'",
+        )
+        .bind(request_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or_else(|| anyhow!("ApprovalResolved {request_id} has no pending approval"))?;
+        let approval_run_id: String = approval.try_get("run_id")?;
+        let tool_call_id: String = approval.try_get("tool_call_id")?;
+        let binding = load_prepared_tool_binding(transaction, &tool_call_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "ApprovalResolved {request_id} is not bound to prepared tool {tool_call_id}"
+                )
+            })?;
+        if binding.run_id != approval_run_id {
+            bail!(
+                "ApprovalResolved {request_id} run {approval_run_id} does not match prepared tool {tool_call_id} run {}",
+                binding.run_id
+            );
+        }
+        require_tool_owner_binding(
+            transaction,
+            &tool_call_id,
+            &binding.command_id,
+            &approval_run_id,
+            &owner_batch_state,
+            "ApprovalResolved",
+            *resolution == "cancelled",
+        )
+        .await?;
+        approval_resolution_bindings
+            .insert((*request_id).to_owned(), (approval_run_id, tool_call_id));
+    }
+
+    for (tool_call_id, finish) in &tool_finishes {
+        validate_tool_finish_owner(
+            transaction,
+            tool_call_id,
+            *finish,
+            &owner_batch_state,
+            &approval_resolutions,
+        )
+        .await?;
+    }
+
+    for (tool_call_id, contextual_run_id) in &tool_starts {
+        let approval =
+            sqlx::query("SELECT id, state, run_id FROM approval_log WHERE tool_call_id = ?")
+                .bind(tool_call_id)
+                .fetch_optional(&mut **transaction)
+                .await?;
+        let Some(approval) = approval else {
+            if approval_pendings
+                .iter()
+                .any(|(_, pending_tool, _)| *pending_tool == *tool_call_id)
+            {
+                bail!(
+                    "ToolExecutionStart for {tool_call_id} cannot treat a same-batch Approval Pending as policy Allow"
+                );
+            }
+            continue;
+        };
+        let request_id: String = approval.try_get("id")?;
+        let state: String = approval.try_get("state")?;
+        let approval_run_id: String = approval.try_get("run_id")?;
+        let approved_in_batch = approval_resolutions
+            .get(request_id.as_str())
+            .is_some_and(|(resolution, _)| *resolution == "approved_once")
+            && approval_resolution_bindings.get(&request_id).is_some_and(
+                |(run_id, approved_tool)| {
+                    run_id == *contextual_run_id && approved_tool == *tool_call_id
+                },
+            );
+        let approved_event_before_start = durable_event_envelope_identity_position(
+            prepared,
+            "approval_resolved",
+            "request_id",
+            &request_id,
+        )?
+        .zip(durable_event_envelope_identity_position(
+            prepared,
+            "tool_execution_start",
+            "tool_call_id",
+            tool_call_id,
+        )?)
+        .is_some_and(|(approval_position, start_position)| approval_position < start_position);
+        let approved_before_start = approved_in_batch
+            && approval_resolution_positions
+                .get(request_id.as_str())
+                .zip(tool_start_positions.get(tool_call_id))
+                .is_some_and(|(approval_position, start_position)| {
+                    approval_position < start_position
+                })
+            && approved_event_before_start;
+        let already_approved = state == "approved_once"
+            && approval_run_id == *contextual_run_id
+            && lifecycle
+                .approved_once
+                .get(&request_id)
+                .is_some_and(|approved_tool| approved_tool == *tool_call_id);
+        if !(already_approved
+            || state == "pending" && approval_run_id == *contextual_run_id && approved_before_start)
+        {
+            bail!(
+                "ToolExecutionStart for {tool_call_id} cannot bypass approval {request_id} in state {state}; approval must already be approved_once or its exact same-batch approved resolution must precede execution"
+            );
         }
     }
 
@@ -3823,15 +5062,18 @@ async fn validate_required_projection_sets(
                     .run_id
                     .as_deref()
                     .ok_or_else(|| anyhow!("agent_start event has no run_id"))?;
-                if !phase_transitions
+                let pair_count = phase_transitions
                     .iter()
-                    .any(|(_, transition_run, expected, next)| {
+                    .filter(|(_, transition_run, expected, next)| {
                         *transition_run == run_id
                             && *expected == RunPhase::Classified
                             && *next == RunPhase::RunStarted
                     })
-                {
-                    bail!("AgentStart for run {run_id} has no classified -> run_started pair");
+                    .count();
+                if pair_count != 1 {
+                    bail!(
+                        "AgentStart for run {run_id} requires exactly one classified -> run_started pair, found {pair_count}"
+                    );
                 }
             }
             "turn_start" => {
@@ -3843,7 +5085,8 @@ async fn validate_required_projection_sets(
                     .turn_id
                     .as_deref()
                     .ok_or_else(|| anyhow!("turn_start event has no turn_id"))?;
-                let mut paired = false;
+                let mut run_start_pairs = 0usize;
+                let mut steer_group_pairs = 0usize;
                 for (command_id, transition_run, expected, next) in &phase_transitions {
                     if *transition_run != run_id
                         || !matches!(
@@ -3861,12 +5104,38 @@ async fn validate_required_projection_sets(
                     .fetch_optional(&mut **transaction)
                     .await?;
                     if stored_turn.as_deref() == Some(turn_id) {
-                        paired = true;
-                        break;
+                        match (*expected, *next) {
+                            (RunPhase::RunStarted, RunPhase::TurnStarted) => {
+                                run_start_pairs = run_start_pairs.saturating_add(1);
+                            }
+                            (RunPhase::Classified, RunPhase::TurnStarted) => {
+                                steer_group_pairs = steer_group_pairs.saturating_add(1);
+                            }
+                            _ => unreachable!("candidate phase pair was filtered"),
+                        }
                     }
                 }
-                if !paired {
-                    bail!("TurnStart for {run_id}/{turn_id} has no exact phase transition pair");
+                let continuation_owner_count = if run_start_pairs == 0 && steer_group_pairs == 0 {
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM inbound_commands
+                         WHERE run_id = ? AND command_kind = 'user_message' AND status = 'applying'
+                           AND run_phase IN (
+                             'user_started', 'user_committed', 'assistant_started',
+                             'hard_steer_requested', 'cancel_requested'
+                           )",
+                    )
+                    .bind(run_id)
+                    .fetch_one(&mut **transaction)
+                    .await?
+                } else {
+                    0
+                };
+                if !matches!((run_start_pairs, steer_group_pairs), (1, 0) | (0, 1..))
+                    && continuation_owner_count != 1
+                {
+                    bail!(
+                        "TurnStart for {run_id}/{turn_id} requires one exact run-start pair, one non-empty steer-group transition set, or one live continuation owner; found {run_start_pairs}/{steer_group_pairs}/{continuation_owner_count}"
+                    );
                 }
             }
             "steered" => {
@@ -3878,15 +5147,68 @@ async fn validate_required_projection_sets(
                     .run_id
                     .as_deref()
                     .ok_or_else(|| anyhow!("steered event has no run_id"))?;
-                if !phase_transitions.iter().any(
-                    |(transition_command, transition_run, expected, next)| {
+                let pair_count = phase_transitions
+                    .iter()
+                    .filter(|(transition_command, transition_run, expected, next)| {
                         *transition_command == command_id
                             && *transition_run == run_id
                             && *expected == RunPhase::Classified
                             && *next == RunPhase::TurnStarted
-                    },
-                ) {
-                    bail!("Steered for {command_id} has no classified -> turn_started pair");
+                    })
+                    .count();
+                if pair_count != 1 {
+                    bail!(
+                        "Steered for {command_id} requires exactly one classified -> turn_started pair, found {pair_count}"
+                    );
+                }
+                let row = sqlx::query(
+                    "SELECT application_kind, turn_id FROM inbound_commands
+                     WHERE command_id = ? AND run_id = ? AND command_kind = 'user_message'
+                       AND status = 'applying'",
+                )
+                .bind(command_id)
+                .bind(run_id)
+                .fetch_optional(&mut **transaction)
+                .await?
+                .ok_or_else(|| anyhow!("Steered event has no durable command binding"))?;
+                let application_kind: String = row.try_get("application_kind")?;
+                let durable_turn_id: String = row.try_get("turn_id")?;
+                if event.turn_id.as_deref() != Some(durable_turn_id.as_str()) {
+                    bail!("Steered turn does not match durable command turn {durable_turn_id}");
+                }
+                let steered_mode = event
+                    .steer_mode
+                    .ok_or_else(|| anyhow!("Steered event has no typed mode"))?;
+                let expected_mode = match application_kind.as_str() {
+                    "hard_steer" => "hard",
+                    "soft_steer" | "retry_steer" => "soft",
+                    _ => bail!("Steered is invalid for application kind {application_kind}"),
+                };
+                if steered_mode != expected_mode {
+                    bail!(
+                        "Steered mode {steered_mode} does not match application kind {application_kind}"
+                    );
+                }
+                let steered_position = prepared
+                    .iter()
+                    .position(|write| {
+                        write.event.as_ref().is_some_and(|candidate| {
+                            candidate.kind == "steered"
+                                && candidate.command_id.as_deref() == Some(command_id)
+                        })
+                    })
+                    .expect("current Steered event is prepared");
+                if matches!(application_kind.as_str(), "hard_steer" | "soft_steer") {
+                    let turn_start_position = durable_event_position(
+                        prepared,
+                        "turn_start",
+                        run_id,
+                        Some(&durable_turn_id),
+                    )
+                    .expect("hard/soft steer TurnStart presence was checked");
+                    if steered_position >= turn_start_position {
+                        bail!("{application_kind} Steered for {command_id} must precede TurnStart");
+                    }
                 }
             }
             _ => {}
@@ -3896,20 +5218,45 @@ async fn validate_required_projection_sets(
     let mut consumed_approval_resolutions = HashSet::new();
     let mut active_abort_runs = HashSet::new();
     let mut user_owner_close_runs = HashSet::new();
-    for (command_id, command_seq, contextual_run_id) in applied_controls {
+    let mut user_owner_closes = Vec::new();
+    let mut abort_applications = Vec::new();
+    for (command_id, command_seq, contextual_run_id, position) in &applied_controls {
         let row = sqlx::query(
-            "SELECT command_kind, payload_key_ref, payload_ciphertext, payload_hmac
+            "SELECT command_kind, status, run_id, run_phase,
+                    payload_key_ref, payload_ciphertext, payload_hmac
              FROM inbound_commands WHERE command_id = ? AND seq = ?",
         )
         .bind(command_id)
-        .bind(sqlite_i64(command_seq, "command sequence")?)
+        .bind(sqlite_i64(*command_seq, "command sequence")?)
         .fetch_optional(&mut **transaction)
         .await?
         .ok_or_else(|| anyhow!("CommandApplied target does not exist"))?;
         let command_kind: String = row.try_get("command_kind")?;
         match command_kind.as_str() {
             "abort" => {
-                if let Some(run_id) = contextual_run_id {
+                let command = load_authenticated_command(
+                    store,
+                    transaction,
+                    command_id,
+                    *command_seq,
+                    "abort",
+                )
+                .await
+                .context("live Abort failed authenticated command validation")?;
+                if !matches!(command, Command::Abort {}) {
+                    bail!("durable abort row contains a different command variant");
+                }
+                validate_abort_cutoff_completeness(
+                    transaction,
+                    &applied_controls,
+                    &supersedes,
+                    command_id,
+                    *command_seq,
+                    *position,
+                )
+                .await?;
+                abort_applications.push((*command_seq, *contextual_run_id, *position));
+                if let Some(run_id) = *contextual_run_id {
                     active_abort_runs.insert(run_id.to_owned());
                     let owner_count: i64 = sqlx::query_scalar(
                         "SELECT COUNT(*) FROM inbound_commands
@@ -3962,23 +5309,14 @@ async fn validate_required_projection_sets(
                 }
             }
             "approval_decision" => {
-                let key_ref: String = row.try_get("payload_key_ref")?;
-                let ciphertext: Vec<u8> = row.try_get("payload_ciphertext")?;
-                let payload_hmac: Vec<u8> = row.try_get("payload_hmac")?;
-                let key = store
-                    .data_key_by_ref_in_transaction(transaction, &key_ref)
-                    .await?;
-                let aad = store.scope().row_aad(
-                    "inbound_commands",
-                    command_seq.to_string(),
-                    DataKeyPurpose::Command,
-                );
-                let plaintext =
-                    Zeroizing::new(super::crypto::decrypt_content(&key, &ciphertext, &aad)?);
-                verify_keyed_digest(&key, &plaintext, &payload_hmac)
-                    .context("durable ApprovalDecision HMAC is invalid")?;
-                let command: Command = serde_json::from_slice(&plaintext)
-                    .context("durable ApprovalDecision payload is invalid")?;
+                let command = load_authenticated_command(
+                    store,
+                    transaction,
+                    command_id,
+                    *command_seq,
+                    "approval_decision",
+                )
+                .await?;
                 let Command::ApprovalDecision {
                     request_id,
                     decision,
@@ -3986,7 +5324,7 @@ async fn validate_required_projection_sets(
                 else {
                     bail!("durable approval_decision row contains a different command variant");
                 };
-                match contextual_run_id {
+                match *contextual_run_id {
                     Some(run_id) => {
                         let expected_resolution = match decision {
                             ApprovalDecision::ApproveOnce => "approved_once",
@@ -4012,41 +5350,23 @@ async fn validate_required_projection_sets(
                         if *actor == "runtime" {
                             bail!("user ApprovalDecision cannot use the runtime resolution actor");
                         }
-                        let approval = sqlx::query(
-                            "SELECT run_id, tool_call_id FROM approval_log
-                             WHERE id = ? AND state = 'pending'",
-                        )
-                        .bind(&request_id)
-                        .fetch_optional(&mut **transaction)
-                        .await?;
-                        let Some(approval) = approval else {
-                            bail!(
-                                "ApprovalDecision {request_id} does not resolve a pending approval"
-                            );
-                        };
-                        let approval_run: String = approval.try_get("run_id")?;
-                        let tool_call_id: String = approval.try_get("tool_call_id")?;
+                        let (approval_run, tool_call_id) = approval_resolution_bindings
+                            .get(&request_id)
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "ApprovalDecision {request_id} does not resolve a pending approval"
+                                )
+                            })?;
                         if approval_run != run_id {
                             bail!(
                                 "ApprovalDecision {request_id} does not resolve a pending approval in run {run_id}"
-                            );
-                        }
-                        let tool_state: Option<String> = sqlx::query_scalar(
-                            "SELECT state FROM tool_executions WHERE tool_call_id = ?",
-                        )
-                        .bind(&tool_call_id)
-                        .fetch_optional(&mut **transaction)
-                        .await?;
-                        if tool_state.as_deref() != Some("prepared") {
-                            bail!(
-                                "ApprovalDecision {request_id} is not bound to a prepared tool execution"
                             );
                         }
                         if expected_resolution == "denied" && !tool_starts.is_empty() {
                             bail!("denied ApprovalDecision cannot co-commit ToolExecutionStart");
                         }
                         if !tool_starts.is_empty()
-                            && (!tool_starts.contains(tool_call_id.as_str())
+                            && (!tool_starts.contains_key(tool_call_id.as_str())
                                 || tool_starts.len() != 1)
                         {
                             bail!(
@@ -4060,32 +5380,106 @@ async fn validate_required_projection_sets(
                             "no-op ApprovalDecision cannot carry ApprovalResolved for {request_id}"
                         );
                     }
-                    None => {}
+                    None => {
+                        let approval_state: Option<String> =
+                            sqlx::query_scalar("SELECT state FROM approval_log WHERE id = ?")
+                                .bind(&request_id)
+                                .fetch_optional(&mut **transaction)
+                                .await?;
+                        if approval_state.as_deref() == Some("pending")
+                            && !has_later_abort_cutoff(
+                                transaction,
+                                &applied_controls,
+                                *command_seq,
+                                *position,
+                            )
+                            .await?
+                        {
+                            bail!(
+                                "no-op ApprovalDecision cannot target pending approval {request_id}"
+                            );
+                        }
+                        tracing::warn!(
+                            audit_event = "approval_decision_noop",
+                            %command_id,
+                            %request_id,
+                            approval_state = approval_state.as_deref().unwrap_or("unknown"),
+                            "terminal or unknown ApprovalDecision committed as a durable no-op"
+                        );
+                    }
                 }
             }
             "user_message" => {
                 let run_id = contextual_run_id
                     .ok_or_else(|| anyhow!("UserMessage CommandApplied requires run_id"))?;
+                if row.try_get::<String, _>("status")? != "applying"
+                    || row.try_get::<Option<String>, _>("run_id")?.as_deref() != Some(run_id)
+                {
+                    bail!("UserMessage owner {command_id} has no matching live run binding");
+                }
+                let mut final_phase = RunPhase::parse(row.try_get("run_phase")?)?;
+                for (transition_command, transition_run, expected, next) in &phase_transitions {
+                    if *transition_command != *command_id || *transition_run != run_id {
+                        continue;
+                    }
+                    if final_phase != *expected {
+                        bail!(
+                            "UserMessage owner {command_id} phase chain expected {}, found {}",
+                            expected.as_str(),
+                            final_phase.as_str()
+                        );
+                    }
+                    final_phase = *next;
+                }
                 user_owner_close_runs.insert(run_id.to_owned());
+                user_owner_closes.push((command_id.to_owned(), run_id.to_owned()));
                 let normal_close =
                     has_durable_event(prepared, "agent_end", None, Some(run_id), None, None);
                 let handoff =
                     phase_transitions
                         .iter()
                         .any(|(next_owner, transition_run, expected, next)| {
-                            *next_owner != command_id
+                            *next_owner != *command_id
                                 && *transition_run == run_id
                                 && *expected == RunPhase::TurnStarted
                                 && *next == RunPhase::UserStarted
                         });
-                if !normal_close && !handoff {
-                    bail!(
-                        "UserMessage owner {command_id} may finish only with AgentEnd or same-run atomic owner handoff"
-                    );
+                match (normal_close, handoff, final_phase) {
+                    (true, false, RunPhase::AssistantStarted | RunPhase::CancelRequested) => {}
+                    (false, true, RunPhase::AssistantStarted | RunPhase::HardSteerRequested) => {}
+                    (true, true, _) => {
+                        bail!("AgentEnd cannot co-commit a same-run owner handoff")
+                    }
+                    (true, false, phase) => bail!(
+                        "AgentEnd owner {command_id} must close from assistant_started or cancel_requested, found {}",
+                        phase.as_str()
+                    ),
+                    (false, true, phase) => bail!(
+                        "owner handoff for {command_id} must close from assistant_started or hard_steer_requested, found {}",
+                        phase.as_str()
+                    ),
+                    (false, false, _) => {
+                        bail!(
+                            "UserMessage owner {command_id} may finish only with AgentEnd or same-run atomic owner handoff"
+                        )
+                    }
                 }
             }
             value => bail!("CommandApplied cannot target command kind {value}"),
         }
+    }
+    for (command_id, run_id) in &user_owner_closes {
+        validate_owner_active_work_terminalized(
+            transaction,
+            command_id,
+            run_id,
+            &tool_prepares,
+            &tool_starts,
+            &tool_finishes,
+            &approval_pendings,
+            &approval_resolutions,
+        )
+        .await?;
     }
     for (request_id, (resolution, actor)) in &approval_resolutions {
         if *resolution == "cancelled" {
@@ -4099,6 +5493,17 @@ async fn validate_required_projection_sets(
             bail!(
                 "ApprovalResolved for {request_id} requires its active ApprovalDecision CommandApplied"
             );
+        } else if *resolution == "approved_once" {
+            let (_, tool_call_id) = approval_resolution_bindings
+                .get(*request_id)
+                .expect("validated approval resolution binding");
+            if !tool_starts.is_empty()
+                && (tool_starts.len() != 1 || !tool_starts.contains_key(tool_call_id.as_str()))
+            {
+                bail!(
+                    "approved ApprovalResolved for {request_id} may co-commit only its exact ToolExecutionStart"
+                );
+            }
         }
     }
     for (_, run_id, _, next) in &phase_transitions {
@@ -4108,6 +5513,65 @@ async fn validate_required_projection_sets(
             );
         }
     }
+    let mut previous_supersede_seq = None;
+    for (command_id, command_seq, contextual_run_id, position) in &supersedes {
+        if previous_supersede_seq.is_some_and(|previous| previous >= *command_seq) {
+            bail!("CommandSuperseded projections must follow strict command sequence order");
+        }
+        previous_supersede_seq = Some(*command_seq);
+        let row = sqlx::query(
+            "SELECT status, application_kind, run_id, turn_id, run_phase
+             FROM inbound_commands
+             WHERE command_id = ? AND seq = ? AND command_kind = 'user_message'",
+        )
+        .bind(command_id)
+        .bind(sqlite_i64(*command_seq, "command sequence")?)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or_else(|| anyhow!("CommandSuperseded target does not exist"))?;
+        let status: String = row.try_get("status")?;
+        let phase = RunPhase::parse(row.try_get("run_phase")?)?;
+        let stored_run_id: Option<String> = row.try_get("run_id")?;
+        match status.as_str() {
+            "received"
+                if phase == RunPhase::Received
+                    && row
+                        .try_get::<Option<String>, _>("application_kind")?
+                        .is_none()
+                    && stored_run_id.is_none()
+                    && row.try_get::<Option<String>, _>("turn_id")?.is_none() => {}
+            "applying"
+                if matches!(
+                    phase,
+                    RunPhase::Classified | RunPhase::RunStarted | RunPhase::TurnStarted
+                ) =>
+            {
+                let run_id = contextual_run_id.ok_or_else(|| {
+                    anyhow!("classified CommandSuperseded requires its stored run binding")
+                })?;
+                if stored_run_id.as_deref() != Some(run_id) {
+                    bail!("classified CommandSuperseded run context does not match stored binding");
+                }
+            }
+            _ => bail!(
+                "CommandSuperseded target has invalid durable state {status}/{}",
+                phase.as_str()
+            ),
+        }
+        if !abort_applications
+            .iter()
+            .any(|(abort_seq, abort_run_id, abort_position)| {
+                *abort_position > *position
+                    && *abort_seq > *command_seq
+                    && *abort_run_id == *contextual_run_id
+            })
+        {
+            bail!(
+                "CommandSuperseded for {command_id} requires a same-context later Abort CommandApplied cutoff"
+            );
+        }
+    }
+
     for write in prepared {
         let Some(event) = &write.event else {
             continue;
@@ -4126,21 +5590,27 @@ async fn validate_required_projection_sets(
         if !closes_owner && !closes_startup {
             bail!("AgentEnd for run {run_id} has no owner close or startup supersede");
         }
-    }
-    for (command_id, command_seq, contextual_run_id) in contextual_supersedes {
-        let status: String = sqlx::query_scalar(
-            "SELECT status FROM inbound_commands
-             WHERE command_id = ? AND seq = ? AND command_kind = 'user_message'",
+        let pending_steers = sqlx::query(
+            "SELECT command_id FROM inbound_commands
+             WHERE run_id = ? AND command_kind = 'user_message' AND status = 'applying'
+               AND application_kind IN ('hard_steer', 'soft_steer', 'retry_steer')
+               AND run_phase IN ('classified', 'turn_started')",
         )
-        .bind(command_id)
-        .bind(sqlite_i64(command_seq, "command sequence")?)
-        .fetch_optional(&mut **transaction)
-        .await?
-        .ok_or_else(|| anyhow!("CommandSuperseded target does not exist"))?;
-        if status == "received" && !active_abort_runs.contains(contextual_run_id) {
-            bail!(
-                "unclassified UserMessage contextual supersede requires active Abort for run {contextual_run_id}"
-            );
+        .bind(run_id)
+        .fetch_all(&mut **transaction)
+        .await?;
+        for pending in pending_steers {
+            let pending_id: String = pending.try_get("command_id")?;
+            if !supersedes.iter().any(|(command_id, _, superseded_run, _)| {
+                *command_id == pending_id && *superseded_run == Some(run_id)
+            }) {
+                bail!(
+                    "AgentEnd for run {run_id} cannot leave pending steer {pending_id} un-injected"
+                );
+            }
+        }
+        if closes_startup && !active_abort_runs.contains(run_id) {
+            bail!("startup AgentEnd for run {run_id} requires its active Abort CommandApplied");
         }
     }
     Ok(())
@@ -4205,6 +5675,952 @@ fn collect_classification_owner_conditions(
         }
     }
     Ok(conditions)
+}
+
+async fn validate_non_empty_turn_end_bindings(
+    transaction: &mut Transaction<'_, Sqlite>,
+    prepared: &[PreparedWrite],
+) -> Result<()> {
+    for (turn_end_position, write) in prepared.iter().enumerate() {
+        let Some(event) = &write.event else {
+            continue;
+        };
+        if event.kind != "turn_end" {
+            continue;
+        }
+        let metadata: DurableEventMetadata = serde_json::from_str(&event.internal_metadata)
+            .context("prepared TurnEnd metadata is invalid")?;
+        if metadata.empty_turn {
+            continue;
+        }
+        let run_id = event
+            .run_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("non-empty TurnEnd has no run_id"))?;
+        let turn_id = event
+            .turn_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("non-empty TurnEnd has no turn_id"))?;
+
+        let lifecycle_metadata = serde_json::to_string(&DurableEventMetadata {
+            run_id: Some(run_id.to_owned()),
+            turn_id: Some(turn_id.to_owned()),
+            ..DurableEventMetadata::default()
+        })?;
+        let stored_open = sqlx::query_scalar::<_, String>(
+            "SELECT event_type FROM agent_events
+             WHERE event_type IN ('turn_start', 'turn_end') AND internal_metadata = ?
+             ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(lifecycle_metadata)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .is_some_and(|event_type| event_type == "turn_start");
+
+        let same_batch_start = prepared.iter().position(|candidate| {
+            candidate.event.as_ref().is_some_and(|candidate_event| {
+                candidate_event.kind == "turn_start"
+                    && candidate_event.run_id.as_deref() == Some(run_id)
+                    && candidate_event.turn_id.as_deref() == Some(turn_id)
+            })
+        });
+        match same_batch_start {
+            Some(_) if stored_open => {
+                bail!("TurnStart for {run_id}/{turn_id} is already durably open")
+            }
+            Some(start_position) if start_position >= turn_end_position => {
+                bail!("TurnStart for {run_id}/{turn_id} must precede non-empty TurnEnd")
+            }
+            Some(_) => {}
+            None if stored_open => {}
+            None => {
+                bail!("non-empty TurnEnd for {run_id}/{turn_id} requires an exact open TurnStart")
+            }
+        }
+
+        let owner_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM inbound_commands
+             WHERE run_id = ? AND command_kind = 'user_message' AND status = 'applying'
+               AND run_phase IN (
+                 'user_started', 'user_committed', 'assistant_started',
+                 'hard_steer_requested', 'cancel_requested'
+               )",
+        )
+        .bind(run_id)
+        .fetch_one(&mut **transaction)
+        .await?;
+        if owner_count > 1 {
+            bail!("non-empty TurnEnd run {run_id} has multiple durable owners");
+        }
+        let same_batch_owner_open = prepared
+            .iter()
+            .take(turn_end_position + 1)
+            .flat_map(|candidate| candidate.projections.iter())
+            .any(|projection| {
+                matches!(
+                    projection,
+                    PreparedProjection::Plain(Projection::RunPhase {
+                        run_id: transition_run,
+                        next,
+                        ..
+                    }) if transition_run == run_id && next.is_owner()
+                )
+            });
+        if owner_count == 0 && !same_batch_owner_open {
+            bail!("non-empty TurnEnd for {run_id}/{turn_id} requires a live durable run owner");
+        }
+    }
+    Ok(())
+}
+
+struct AuthenticatedDurableEvent {
+    kind: String,
+    internal_metadata: String,
+    metadata: DurableEventMetadata,
+    key_ref: String,
+    ciphertext: Vec<u8>,
+    stored_envelope: String,
+    redaction_version: u32,
+    envelope: Value,
+}
+
+async fn load_authenticated_event(
+    store: &Store,
+    transaction: &mut Transaction<'_, Sqlite>,
+    seq: i64,
+) -> Result<AuthenticatedDurableEvent> {
+    let row = sqlx::query(
+        "SELECT rowid AS physical_row_id, event_type, internal_metadata, raw_key_ref,
+                raw_ciphertext, envelope, redaction_version
+         FROM agent_events WHERE seq=? LIMIT 1",
+    )
+    .bind(seq)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or_else(|| anyhow!("durable lifecycle event {seq} disappeared"))?;
+    if row.try_get::<i64, _>("physical_row_id")? != seq {
+        bail!("durable lifecycle event physical identity does not match sequence {seq}");
+    }
+    let redaction_version = u32::try_from(row.try_get::<i64, _>("redaction_version")?)
+        .context("durable lifecycle redaction version is outside u32")?;
+    if redaction_version != store.redactor().version() {
+        bail!("durable lifecycle event uses an unsupported redaction version");
+    }
+    let key_ref: String = row.try_get("raw_key_ref")?;
+    let key = store
+        .data_key_by_ref_in_transaction(transaction, &key_ref)
+        .await?;
+    if key.purpose != DataKeyPurpose::Event {
+        bail!("durable lifecycle event {seq} references a non-event data key");
+    }
+    let aad = store
+        .scope()
+        .row_aad("agent_events", seq.to_string(), DataKeyPurpose::Event);
+    let ciphertext: Vec<u8> = row.try_get("raw_ciphertext")?;
+    let raw = Zeroizing::new(
+        super::crypto::decrypt_content(&key, &ciphertext, &aad)
+            .with_context(|| format!("durable lifecycle event {seq} failed authentication"))?,
+    );
+    let stored_envelope: String = row.try_get("envelope")?;
+    if store.redactor().redact_serialized(&raw)? != stored_envelope {
+        bail!("durable lifecycle event {seq} projection does not match authenticated raw event");
+    }
+    let event: AgentEvent = serde_json::from_slice(&raw)
+        .with_context(|| format!("durable lifecycle event {seq} has invalid raw payload"))?;
+    let kind: String = row.try_get("event_type")?;
+    if event.durable_kind() != Some(kind.as_str()) {
+        bail!("durable lifecycle event {seq} type disagrees with authenticated raw event");
+    }
+    let internal_metadata: String = row.try_get("internal_metadata")?;
+    Ok(AuthenticatedDurableEvent {
+        kind,
+        internal_metadata: internal_metadata.clone(),
+        metadata: serde_json::from_str(&internal_metadata)
+            .context("stored lifecycle metadata is invalid")?,
+        key_ref,
+        ciphertext,
+        stored_envelope: stored_envelope.clone(),
+        redaction_version,
+        envelope: serde_json::from_str(&stored_envelope)
+            .context("stored lifecycle envelope is invalid")?,
+    })
+}
+
+async fn reconstruct_authenticated_checkpoint(store: &Store) -> Result<LifecycleCheckpoint> {
+    let mut transaction = store.pool().begin().await?;
+    let event_head = load_verified_event_head_in_transaction(store, &mut transaction).await?;
+    let mut lifecycle = DurableLifecycleState::default();
+    lifecycle.live_runs.extend(
+        sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT run_id FROM inbound_commands
+             WHERE run_id IS NOT NULL AND status = 'applying' AND run_phase <> 'finished'",
+        )
+        .fetch_all(&mut *transaction)
+        .await?,
+    );
+    for row in sqlx::query(
+        "SELECT run_id, turn_id FROM inbound_commands
+         WHERE run_id IS NOT NULL AND turn_id IS NOT NULL AND status = 'applying'
+           AND run_phase IN ('user_started','user_committed','assistant_started',
+                             'hard_steer_requested','cancel_requested')",
+    )
+    .fetch_all(&mut *transaction)
+    .await?
+    {
+        let run_id: String = row.try_get("run_id")?;
+        lifecycle
+            .open_turns
+            .insert(run_id.clone(), row.try_get("turn_id")?);
+        lifecycle.inferred_owner_turns.insert(run_id);
+    }
+
+    let mut after_seq = 0_i64;
+    let mut expected_seq = 1_u64;
+    let mut observed_count = 0_u64;
+    let mut chain_digest = [0_u8; EVENT_DIGEST_BYTES];
+    loop {
+        let page: Vec<i64> =
+            sqlx::query_scalar("SELECT seq FROM agent_events WHERE seq > ? ORDER BY seq LIMIT ?")
+                .bind(after_seq)
+                .bind(EVENT_CHAIN_VERIFICATION_PAGE_ROWS)
+                .fetch_all(&mut *transaction)
+                .await
+                .context("failed to page durable event history during startup recovery")?;
+        if page.is_empty() {
+            break;
+        }
+        for physical_seq in page {
+            let seq =
+                u64::try_from(physical_seq).context("durable event sequence is outside u64")?;
+            if seq != expected_seq {
+                bail!(
+                    "durable event chain is not contiguous: expected {expected_seq}, found {seq}"
+                );
+            }
+            let event = load_authenticated_event(store, &mut transaction, physical_seq).await?;
+            chain_digest = extend_event_chain(
+                &chain_digest,
+                EventChainEntry {
+                    seq,
+                    event_type: &event.kind,
+                    internal_metadata: &event.internal_metadata,
+                    key_ref: &event.key_ref,
+                    ciphertext: &event.ciphertext,
+                    envelope: &event.stored_envelope,
+                    redaction_version: event.redaction_version,
+                },
+            );
+            apply_lifecycle_event(
+                &mut lifecycle,
+                &event.kind,
+                &event.metadata,
+                &event.envelope,
+                false,
+            )?;
+            observed_count = observed_count
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("durable event count overflow"))?;
+            expected_seq = expected_seq
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("durable event sequence overflow"))?;
+            after_seq = physical_seq;
+        }
+    }
+    match &event_head {
+        None if observed_count == 0 => {}
+        None => bail!("durable events exist without an authenticated event-log head"),
+        Some(head)
+            if head.last_seq == expected_seq - 1
+                && head.event_count == observed_count
+                && head.chain_digest == chain_digest => {}
+        Some(_) => bail!("durable event history does not match authenticated head"),
+    }
+    transaction.commit().await?;
+    Ok(LifecycleCheckpoint {
+        event_head,
+        lifecycle,
+        historical_rows_visited: observed_count,
+    })
+}
+
+#[derive(Clone, Default)]
+struct DurableLifecycleState {
+    live_runs: HashSet<String>,
+    open_turns: HashMap<String, String>,
+    open_messages: HashMap<String, (String, String, String)>,
+    seen_agent_starts: HashSet<String>,
+    seen_turn_starts: HashSet<(String, String)>,
+    seen_message_starts: HashSet<String>,
+    last_assistant_end: HashMap<(String, String), (String, Value)>,
+    last_retry_attempt: HashMap<(String, String), u32>,
+    assistant_attempt_starts: HashMap<(String, String), u32>,
+    tool_results: HashMap<String, Value>,
+    tool_call_origins: HashMap<String, ToolCallOrigin>,
+    inferred_owner_turns: HashSet<String>,
+    pending_approvals: HashMap<String, String>,
+    approved_once: HashMap<String, String>,
+}
+
+#[derive(Clone)]
+struct ToolCallOrigin {
+    run_id: String,
+    turn_id: String,
+    assistant_message_id: String,
+}
+
+/// Applies only the proposed suffix to the lifecycle state authenticated at
+/// startup/recovery. Shape validation alone cannot distinguish a legal suffix
+/// from a second start or an event bound to a different live turn.
+async fn validate_durable_lifecycle_suffix(
+    transaction: &mut Transaction<'_, Sqlite>,
+    prepared: &[PreparedWrite],
+    checkpoint: &DurableLifecycleState,
+) -> Result<DurableLifecycleState> {
+    let mut state = checkpoint.clone();
+
+    let mut retry_steers = HashSet::new();
+    let mut assistant_starts = Vec::new();
+    let mut assistant_phase_starts = Vec::new();
+    for write in prepared {
+        if let Some(event) = &write.event {
+            let metadata: DurableEventMetadata = serde_json::from_str(&event.internal_metadata)
+                .context("prepared lifecycle metadata is invalid")?;
+            let envelope: Value = serde_json::from_str(&event.envelope)
+                .context("prepared lifecycle envelope is invalid")?;
+            apply_lifecycle_event(&mut state, &event.kind, &metadata, &envelope, true)?;
+            let role = envelope
+                .get("message")
+                .and_then(|message| message.get("role"))
+                .and_then(Value::as_str);
+            if event.kind == "retry_scheduled"
+                || matches!(event.kind.as_str(), "message_start" | "message_end")
+                    && role == Some("assistant")
+            {
+                let (run_id, turn_id) = lifecycle_binding(&metadata, &event.kind)?;
+                require_exact_live_owner_turn(
+                    transaction,
+                    prepared,
+                    &run_id,
+                    &turn_id,
+                    &event.kind,
+                )
+                .await?;
+            }
+            if event.kind == "message_start" && role == Some("assistant") {
+                assistant_starts.push(lifecycle_binding(&metadata, "assistant MessageStart")?);
+            }
+        }
+        for projection in &write.projections {
+            match projection {
+                PreparedProjection::Plain(Projection::CommandClassified {
+                    application_kind: ApplicationKind::RetrySteer,
+                    run_id,
+                    turn_id,
+                    ..
+                }) => {
+                    retry_steers.insert((run_id.clone(), turn_id.clone()));
+                }
+                PreparedProjection::Plain(Projection::CommandClassified {
+                    run_id,
+                    turn_id,
+                    ..
+                }) if run_id.is_empty() || turn_id.is_empty() => {
+                    bail!("CommandClassified run_id and turn_id must not be empty")
+                }
+                PreparedProjection::Plain(Projection::CommandClassified { run_id, .. }) => {
+                    // The durable command binding establishes the recoverable
+                    // run before AgentStart is emitted in the next suffix.
+                    state.live_runs.insert(run_id.clone());
+                }
+                PreparedProjection::Plain(Projection::ToolExecution(
+                    ToolExecutionMutation::Prepare {
+                        tool_call_id,
+                        command_id,
+                        run_id,
+                        idempotency_key,
+                        ..
+                    },
+                )) if tool_call_id.is_empty()
+                    || command_id.is_empty()
+                    || run_id.is_empty()
+                    || idempotency_key.is_empty() =>
+                {
+                    bail!("ToolExecutionPrepare identity and idempotency key must not be empty")
+                }
+                PreparedProjection::Plain(Projection::ToolExecution(
+                    ToolExecutionMutation::Prepare {
+                        tool_call_id,
+                        run_id,
+                        ..
+                    },
+                )) => require_canonical_tool_call_origin(
+                    &state,
+                    tool_call_id,
+                    run_id,
+                    "ToolExecutionPrepare",
+                )?,
+                PreparedProjection::Plain(Projection::ToolExecution(
+                    ToolExecutionMutation::Start {
+                        tool_call_id,
+                        run_id,
+                    },
+                )) if tool_call_id.is_empty() || run_id.is_empty() => {
+                    bail!("ToolExecutionStart identity must not be empty")
+                }
+                PreparedProjection::Plain(Projection::ToolExecution(
+                    ToolExecutionMutation::Start {
+                        tool_call_id,
+                        run_id,
+                    },
+                )) => require_canonical_tool_call_origin(
+                    &state,
+                    tool_call_id,
+                    run_id,
+                    "ToolExecutionStart",
+                )?,
+                PreparedProjection::Plain(Projection::ToolExecution(
+                    ToolExecutionMutation::Finish { tool_call_id, .. },
+                )) if tool_call_id.is_empty() => {
+                    bail!("ToolExecutionFinish identity must not be empty")
+                }
+                PreparedProjection::Plain(Projection::RunPhase {
+                    run_id,
+                    expected: RunPhase::UserCommitted,
+                    next: RunPhase::AssistantStarted,
+                    ..
+                }) => assistant_phase_starts.push(run_id.as_str()),
+                _ => {}
+            }
+        }
+    }
+    for write in prepared {
+        for projection in &write.projections {
+            let PreparedProjection::Plain(Projection::RunPhase {
+                command_id,
+                run_id,
+                expected,
+                next,
+            }) = projection
+            else {
+                continue;
+            };
+            if !matches!(
+                (*expected, *next),
+                (RunPhase::Classified, RunPhase::TurnStarted)
+                    | (RunPhase::TurnStarted, RunPhase::UserStarted)
+            ) {
+                continue;
+            }
+            let row = sqlx::query(
+                "SELECT application_kind, turn_id FROM inbound_commands
+                 WHERE command_id=? AND run_id=? AND command_kind='user_message'
+                   AND status='applying'",
+            )
+            .bind(command_id)
+            .bind(run_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+            .ok_or_else(|| {
+                anyhow!("retry-steer injection member {command_id} has no durable binding")
+            })?;
+            if row.try_get::<String, _>("application_kind")? == "retry_steer" {
+                retry_steers.insert((run_id.clone(), row.try_get("turn_id")?));
+            }
+        }
+    }
+    for run_id in assistant_phase_starts {
+        let count = assistant_starts
+            .iter()
+            .filter(|(assistant_run, _)| assistant_run == run_id)
+            .count();
+        if count != 1 {
+            bail!(
+                "user_committed -> assistant_started for {run_id} requires exactly one matching assistant MessageStart; found {count}"
+            );
+        }
+    }
+    for (run_id, turn_id) in retry_steers {
+        require_exact_live_owner_turn(transaction, prepared, &run_id, &turn_id, "retry_steer")
+            .await?;
+        let binding = (run_id.clone(), turn_id.clone());
+        if state.open_turns.get(&run_id) != Some(&turn_id) {
+            bail!("retry_steer for {run_id}/{turn_id} requires that exact current open turn");
+        }
+        let scheduled = state.last_retry_attempt.get(&binding).copied();
+        let started = state.assistant_attempt_starts.get(&binding).copied();
+        if scheduled.is_none() || scheduled != started {
+            bail!(
+                "retry_steer for {run_id}/{turn_id} requires the latest RetryScheduled awaiting the next assistant MessageStart"
+            );
+        }
+    }
+    Ok(state)
+}
+
+fn require_canonical_tool_call_origin(
+    state: &DurableLifecycleState,
+    tool_call_id: &str,
+    run_id: &str,
+    operation: &str,
+) -> Result<()> {
+    #[cfg(test)]
+    if state.inferred_owner_turns.contains(run_id) {
+        return Ok(());
+    }
+    let origin = state.tool_call_origins.get(tool_call_id).ok_or_else(|| {
+        anyhow!(
+            "{operation} for {tool_call_id} requires its canonical preceding assistant MessageEnd"
+        )
+    })?;
+    if origin.run_id != run_id {
+        bail!(
+            "{operation} for {tool_call_id} run {run_id} does not match assistant MessageEnd run {}",
+            origin.run_id
+        );
+    }
+    if state.open_turns.get(run_id) != Some(&origin.turn_id) {
+        bail!(
+            "{operation} for {tool_call_id} does not bind the exact open turn {} from assistant MessageEnd {}",
+            origin.turn_id,
+            origin.assistant_message_id
+        );
+    }
+    Ok(())
+}
+
+async fn require_exact_live_owner_turn(
+    transaction: &mut Transaction<'_, Sqlite>,
+    prepared: &[PreparedWrite],
+    run_id: &str,
+    turn_id: &str,
+    kind: &str,
+) -> Result<()> {
+    let rows = sqlx::query(
+        "SELECT command_id, run_phase FROM inbound_commands
+         WHERE run_id = ? AND command_kind = 'user_message'
+           AND status = 'applying'",
+    )
+    .bind(run_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let matches =
+        rows.iter()
+            .filter(|row| {
+                let Ok(command_id) = row.try_get::<String, _>("command_id") else {
+                    return false;
+                };
+                let Ok(phase) = row.try_get::<String, _>("run_phase") else {
+                    return false;
+                };
+                RunPhase::parse(&phase).is_ok_and(RunPhase::is_owner)
+                    || prepared.iter().flat_map(|write| &write.projections).any(|projection| {
+                        matches!(
+                            projection,
+                            PreparedProjection::Plain(Projection::RunPhase {
+                                command_id: target,
+                                run_id: target_run,
+                                next,
+                                ..
+                            }) if target == &command_id && target_run == run_id && next.is_owner()
+                        )
+                    })
+            })
+            .count();
+    if matches != 1 {
+        bail!("{kind} for {run_id}/{turn_id} requires exactly one live owner; found {matches}");
+    }
+    Ok(())
+}
+
+fn lifecycle_string<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("durable lifecycle field {field} must not be empty"))
+}
+
+fn lifecycle_binding(metadata: &DurableEventMetadata, kind: &str) -> Result<(String, String)> {
+    let run_id = metadata
+        .run_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("{kind} requires non-empty internal run_id metadata"))?;
+    let turn_id = metadata
+        .turn_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("{kind} requires non-empty internal turn_id metadata"))?;
+    Ok((run_id.to_owned(), turn_id.to_owned()))
+}
+
+fn apply_lifecycle_event(
+    state: &mut DurableLifecycleState,
+    kind: &str,
+    metadata: &DurableEventMetadata,
+    envelope: &Value,
+    proposed: bool,
+) -> Result<()> {
+    match kind {
+        "agent_start" => {
+            let run_id = metadata
+                .run_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| anyhow!("AgentStart requires non-empty internal run_id metadata"))?;
+            if !state.seen_agent_starts.insert(run_id.to_owned()) {
+                bail!("duplicate AgentStart lifecycle event for run {run_id}");
+            }
+            state.live_runs.insert(run_id.to_owned());
+        }
+        "agent_end" => {
+            let run_id = metadata
+                .run_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| anyhow!("AgentEnd requires non-empty internal run_id metadata"))?;
+            if !state.live_runs.remove(run_id) {
+                bail!("AgentEnd requires live run {run_id}");
+            }
+            if (state.open_turns.contains_key(run_id)
+                && !state.inferred_owner_turns.contains(run_id))
+                || state
+                    .open_messages
+                    .values()
+                    .any(|(message_run, _, _)| message_run == run_id)
+            {
+                bail!("AgentEnd for {run_id} requires normal-form lifecycle closure");
+            }
+            state.seen_agent_starts.remove(run_id);
+            state
+                .seen_turn_starts
+                .retain(|(seen_run, _)| seen_run != run_id);
+            state
+                .last_assistant_end
+                .retain(|(seen_run, _), _| seen_run != run_id);
+            state
+                .last_retry_attempt
+                .retain(|(seen_run, _), _| seen_run != run_id);
+            state
+                .assistant_attempt_starts
+                .retain(|(seen_run, _), _| seen_run != run_id);
+            state
+                .tool_call_origins
+                .retain(|_, origin| origin.run_id != run_id);
+        }
+        "turn_start" => {
+            let (run_id, turn_id) = lifecycle_binding(metadata, "TurnStart")?;
+            if !state.live_runs.contains(&run_id) {
+                bail!("TurnStart for {run_id}/{turn_id} requires live AgentStart");
+            }
+            if proposed
+                && !state.inferred_owner_turns.contains(&run_id)
+                && let Some(open_turn) = state.open_turns.get(&run_id)
+            {
+                bail!("TurnStart for {run_id}/{turn_id} cannot open while {open_turn} is open");
+            }
+            if !state
+                .seen_turn_starts
+                .insert((run_id.clone(), turn_id.clone()))
+            {
+                bail!("duplicate TurnStart lifecycle event for run {run_id} turn {turn_id}");
+            }
+            state.open_turns.insert(run_id.clone(), turn_id);
+            state.inferred_owner_turns.remove(&run_id);
+        }
+        "turn_end" => {
+            let (run_id, turn_id) = lifecycle_binding(metadata, "TurnEnd")?;
+            if state.open_turns.get(&run_id) != Some(&turn_id) {
+                bail!("TurnEnd for {run_id}/{turn_id} requires that exact open turn");
+            }
+            if state
+                .open_messages
+                .values()
+                .any(|(message_run, message_turn, _)| {
+                    message_run == &run_id && message_turn == &turn_id
+                })
+            {
+                bail!("TurnEnd for {run_id}/{turn_id} cannot close an open message");
+            }
+            if envelope
+                .get("message")
+                .is_some_and(|message| !message.is_null())
+            {
+                let message = envelope
+                    .get("message")
+                    .expect("message presence was checked");
+                if message.get("role").and_then(Value::as_str) != Some("assistant") {
+                    bail!("non-empty TurnEnd must carry an assistant message");
+                }
+                let (_, last_message) = state
+                    .last_assistant_end
+                    .get(&(run_id.clone(), turn_id.clone()))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "non-empty TurnEnd for {run_id}/{turn_id} requires assistant MessageEnd"
+                        )
+                    })?;
+                if last_message != message {
+                    bail!("TurnEnd assistant message does not match durable MessageEnd");
+                }
+                let results = envelope
+                    .get("tool_results")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| anyhow!("TurnEnd tool_results must be an array"))?;
+                let mut expected = HashSet::new();
+                if let Some(content) = last_message.get("content").and_then(Value::as_array) {
+                    for item in content {
+                        if item.get("type").and_then(Value::as_str) != Some("tool_call") {
+                            continue;
+                        }
+                        let tool_call_id = item
+                            .get("tool_call")
+                            .and_then(|call| call.get("id"))
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty())
+                            .ok_or_else(|| {
+                                anyhow!("assistant ToolCall identity must not be empty")
+                            })?;
+                        if !expected.insert(tool_call_id) {
+                            bail!(
+                                "assistant MessageEnd contains duplicate ToolCall {tool_call_id}"
+                            );
+                        }
+                    }
+                }
+                let mut supplied = HashSet::new();
+                for result in results {
+                    let tool_call_id = lifecycle_string(result, "tool_call_id")?;
+                    if !supplied.insert(tool_call_id) {
+                        bail!("TurnEnd contains duplicate tool result {tool_call_id}");
+                    }
+                    if state.tool_results.get(tool_call_id) != Some(result) {
+                        bail!(
+                            "TurnEnd tool result {tool_call_id} does not match durable tool-result MessageEnd"
+                        );
+                    }
+                }
+                if supplied != expected {
+                    bail!(
+                        "TurnEnd tool result IDs must exactly match the current assistant MessageEnd ToolCall IDs"
+                    );
+                }
+            }
+            state.open_turns.remove(&run_id);
+            state
+                .seen_turn_starts
+                .remove(&(run_id.clone(), turn_id.clone()));
+            state.inferred_owner_turns.remove(&run_id);
+            state
+                .last_assistant_end
+                .remove(&(run_id.clone(), turn_id.clone()));
+            state
+                .last_retry_attempt
+                .remove(&(run_id.clone(), turn_id.clone()));
+            state
+                .assistant_attempt_starts
+                .remove(&(run_id.clone(), turn_id.clone()));
+            state
+                .tool_call_origins
+                .retain(|_, origin| origin.run_id != run_id || origin.turn_id != turn_id);
+            state.tool_results.clear();
+        }
+        "message_start" => {
+            let message_id = lifecycle_string(envelope, "message_id")?;
+            if !state.seen_message_starts.insert(message_id.to_owned()) {
+                bail!("duplicate MessageStart lifecycle event for message {message_id}");
+            }
+            let role = lifecycle_string(envelope.get("message").unwrap_or(&Value::Null), "role")?;
+            if role == "assistant" {
+                let (run_id, turn_id) = lifecycle_binding(metadata, "assistant MessageStart")?;
+                if state.open_turns.get(&run_id) != Some(&turn_id) {
+                    bail!(
+                        "assistant MessageStart for {run_id}/{turn_id} requires that exact open turn"
+                    );
+                }
+                if state
+                    .open_messages
+                    .values()
+                    .any(|(message_run, message_turn, message_role)| {
+                        message_run == &run_id
+                            && message_turn == &turn_id
+                            && message_role == "assistant"
+                    })
+                {
+                    bail!(
+                        "assistant MessageStart for {run_id}/{turn_id} is ambiguous with an open attempt"
+                    );
+                }
+                let binding = (run_id.clone(), turn_id.clone());
+                let prior_starts = state
+                    .assistant_attempt_starts
+                    .get(&binding)
+                    .copied()
+                    .unwrap_or(0);
+                if prior_starts > 0
+                    && state.last_retry_attempt.get(&binding).copied() != Some(prior_starts)
+                {
+                    bail!(
+                        "assistant MessageStart for {run_id}/{turn_id} requires the exact RetryScheduled attempt after its prior MessageEnd"
+                    );
+                }
+                state
+                    .assistant_attempt_starts
+                    .insert(binding, prior_starts.saturating_add(1));
+                state
+                    .open_messages
+                    .insert(message_id.to_owned(), (run_id, turn_id, role.to_owned()));
+            }
+        }
+        "message_end" => {
+            let message_id = lifecycle_string(envelope, "message_id")?;
+            let message = envelope
+                .get("message")
+                .ok_or_else(|| anyhow!("MessageEnd has no message"))?;
+            let role = lifecycle_string(message, "role")?;
+            if role == "assistant" {
+                let (run_id, turn_id) = lifecycle_binding(metadata, "assistant MessageEnd")?;
+                match state.open_messages.remove(message_id) {
+                    Some((open_run, open_turn, open_role))
+                        if open_run == run_id && open_turn == turn_id && open_role == role => {}
+                    _ => bail!(
+                        "assistant MessageEnd {message_id} does not close its exact open message"
+                    ),
+                }
+                state.last_assistant_end.insert(
+                    (run_id.clone(), turn_id.clone()),
+                    (message_id.to_owned(), message.clone()),
+                );
+                if let Some(content) = message.get("content").and_then(Value::as_array) {
+                    for item in content {
+                        if item.get("type").and_then(Value::as_str) != Some("tool_call") {
+                            continue;
+                        }
+                        let tool_call_id = item
+                            .get("tool_call")
+                            .and_then(|tool_call| tool_call.get("id"))
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty())
+                            .ok_or_else(|| {
+                                anyhow!("assistant ToolCall identity must not be empty")
+                            })?;
+                        let origin = ToolCallOrigin {
+                            run_id: run_id.clone(),
+                            turn_id: turn_id.clone(),
+                            assistant_message_id: message_id.to_owned(),
+                        };
+                        if let Some(previous) = state
+                            .tool_call_origins
+                            .insert(tool_call_id.to_owned(), origin)
+                        {
+                            bail!(
+                                "assistant ToolCall {tool_call_id} is ambiguous between MessageEnd {} and {message_id}",
+                                previous.assistant_message_id
+                            );
+                        }
+                    }
+                }
+            } else if role == "tool_result" {
+                let tool_call_id = lifecycle_string(message, "tool_call_id")?;
+                if state
+                    .tool_results
+                    .insert(tool_call_id.to_owned(), message.clone())
+                    .is_some()
+                {
+                    bail!("duplicate tool-result MessageEnd for {tool_call_id}");
+                }
+            }
+            state.seen_message_starts.remove(message_id);
+        }
+        "approval_requested" => {
+            let request = envelope
+                .get("request")
+                .ok_or_else(|| anyhow!("ApprovalRequested has no request"))?;
+            let request_id = lifecycle_string(request, "id")?;
+            let tool_call_id = lifecycle_string(request, "tool_call_id")?;
+            if state
+                .pending_approvals
+                .insert(request_id.to_owned(), tool_call_id.to_owned())
+                .is_some()
+                || state.approved_once.contains_key(request_id)
+            {
+                bail!("duplicate ApprovalRequested lifecycle event for {request_id}");
+            }
+        }
+        "approval_resolved" => {
+            let request_id = lifecycle_string(envelope, "request_id")?;
+            let tool_call_id = state.pending_approvals.remove(request_id).ok_or_else(|| {
+                anyhow!("ApprovalResolved for {request_id} requires pending ApprovalRequested")
+            })?;
+            let decision = envelope
+                .get("resolution")
+                .and_then(|resolution| resolution.get("decision"))
+                .and_then(|decision| decision.get("type"))
+                .and_then(Value::as_str);
+            if decision == Some("approve_once") {
+                state
+                    .approved_once
+                    .insert(request_id.to_owned(), tool_call_id);
+            } else {
+                state.approved_once.remove(request_id);
+            }
+        }
+        "tool_execution_start" => {
+            let tool_call_id = lifecycle_string(envelope, "tool_call_id")?;
+            state
+                .pending_approvals
+                .retain(|_, pending_tool| pending_tool != tool_call_id);
+            state
+                .approved_once
+                .retain(|_, approved_tool| approved_tool != tool_call_id);
+        }
+        "retry_scheduled" => {
+            let (run_id, turn_id) = lifecycle_binding(metadata, "RetryScheduled")?;
+            if state.open_turns.get(&run_id) != Some(&turn_id) {
+                bail!("RetryScheduled for {run_id}/{turn_id} requires that exact open turn");
+            }
+            let (_, message) = state
+                .last_assistant_end
+                .get(&(run_id.clone(), turn_id.clone()))
+                .ok_or_else(|| {
+                    anyhow!("RetryScheduled requires a preceding assistant MessageEnd")
+                })?;
+            if message.get("stop_reason").and_then(Value::as_str) != Some("error") {
+                bail!("RetryScheduled requires a preceding error assistant MessageEnd");
+            }
+            let attempt = envelope
+                .get("attempt")
+                .and_then(Value::as_u64)
+                .and_then(|attempt| u32::try_from(attempt).ok())
+                .filter(|attempt| *attempt > 0)
+                .ok_or_else(|| anyhow!("RetryScheduled attempt must be non-zero"))?;
+            let previous = state
+                .last_retry_attempt
+                .get(&(run_id.clone(), turn_id.clone()))
+                .copied()
+                .unwrap_or(0);
+            let assistant_attempt = state
+                .assistant_attempt_starts
+                .get(&(run_id.clone(), turn_id.clone()))
+                .copied()
+                .ok_or_else(|| anyhow!("RetryScheduled requires an assistant attempt start"))?;
+            if previous >= assistant_attempt {
+                bail!(
+                    "RetryScheduled attempt is not monotonic: assistant error attempt {assistant_attempt} was already consumed"
+                );
+            }
+            if attempt != assistant_attempt {
+                bail!(
+                    "RetryScheduled attempt {attempt} does not match latest assistant attempt {assistant_attempt}"
+                );
+            }
+            state.last_retry_attempt.insert((run_id, turn_id), attempt);
+        }
+        _ => {
+            let _ = proposed;
+        }
+    }
+    Ok(())
 }
 
 async fn require_owner_count(
@@ -4533,13 +6949,17 @@ async fn apply_tool_mutation(
             .execute(&mut **transaction)
             .await?;
         }
-        ToolExecutionMutation::Start { tool_call_id } => {
+        ToolExecutionMutation::Start {
+            tool_call_id,
+            run_id,
+        } => {
             let result = sqlx::query(
                 "UPDATE tool_executions SET state = 'running', started_at = ?
-                 WHERE tool_call_id = ? AND state = 'prepared'",
+                 WHERE tool_call_id = ? AND run_id = ? AND state = 'prepared'",
             )
             .bind(Utc::now().to_rfc3339())
             .bind(tool_call_id)
+            .bind(run_id)
             .execute(&mut **transaction)
             .await?;
             require_single_cas(result.rows_affected(), "ToolExecutionStart")?;
@@ -4584,9 +7004,20 @@ async fn apply_approval_mutation(
             tool_call_id,
             run_id,
             turn_id,
-            request_projection,
-            redaction_version,
         } => {
+            let (request_projection, redaction_version): (String, i64) = sqlx::query_as(
+                "SELECT json_extract(envelope, '$.request'), redaction_version
+                 FROM agent_events
+                 WHERE event_type='approval_requested'
+                   AND json_extract(envelope, '$.request.id')=?
+                 ORDER BY seq DESC LIMIT 1",
+            )
+            .bind(&request_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+            .ok_or_else(|| {
+                anyhow!("Approval Pending requires its same-batch writer-generated request")
+            })?;
             sqlx::query(
                 "INSERT INTO approval_log(
                     id, tool_call_id, run_id, turn_id, state, request_projection,
@@ -4598,7 +7029,7 @@ async fn apply_approval_mutation(
             .bind(run_id)
             .bind(turn_id)
             .bind(request_projection)
-            .bind(redaction_version as i64)
+            .bind(redaction_version)
             .bind(Utc::now().to_rfc3339())
             .execute(&mut **transaction)
             .await?;
@@ -4657,8 +7088,9 @@ mod tests {
     use crate::{
         gateway::{Command, SensitiveCommandPayload},
         provider::types::{
-            PublicAssistantMessage, PublicMessage, StopReason, ToolResultMessage, Usage,
-            UserContent, UserMessage,
+            PublicAssistantContent, PublicAssistantMessage, PublicMessage, RejectedToolCall,
+            StopReason, ToolArgumentError, ToolCall, ToolResultMessage, Usage, UserContent,
+            UserMessage,
         },
         store::{
             AgentScope, KeyProvider, RecoveryStep, SuffixRecovery,
@@ -4769,8 +7201,27 @@ mod tests {
         })
     }
 
-    fn approval_request_projection(id: &str, tool_call_id: &str, risk: &str) -> String {
-        approval_request(id, tool_call_id, risk).to_string()
+    const TOOL_OWNER_COMMAND_ID: &str = "00000000-0000-4000-8000-000000000001";
+
+    async fn seed_tool_owner(store: &Arc<Store>, writer: &EventWriter, run_id: &str) {
+        writer
+            .persist_inbound(&user_command(1, TOOL_OWNER_COMMAND_ID, "tool owner"))
+            .await
+            .expect("persist tool owner");
+        sqlx::query(
+            "UPDATE inbound_commands
+             SET status='applying', application_kind='idle_run', run_id=?,
+                 turn_id='turn-1', run_phase='assistant_started'
+             WHERE command_id=?",
+        )
+        .bind(run_id)
+        .bind(TOOL_OWNER_COMMAND_ID)
+        .execute(store.pool())
+        .await
+        .expect("open tool owner");
+        writer
+            .reset_checkpoint_after_direct_fixture_mutation()
+            .await;
     }
 
     async fn seed_pending_approval(
@@ -4780,6 +7231,7 @@ mod tests {
         tool_call_id: &str,
         run_id: &str,
     ) {
+        seed_tool_owner(store, writer, run_id).await;
         let request = approval_request(request_id, tool_call_id, "mutating");
         writer
             .apply(EventBatch {
@@ -4794,7 +7246,7 @@ mod tests {
                     projections: vec![
                         Projection::ToolExecution(ToolExecutionMutation::Prepare {
                             tool_call_id: tool_call_id.to_owned(),
-                            command_id: format!("tool-command-{tool_call_id}"),
+                            command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
                             run_id: run_id.to_owned(),
                             executor_generation: 1,
                             idempotency_key: format!("idem-{tool_call_id}"),
@@ -4804,8 +7256,6 @@ mod tests {
                             tool_call_id: tool_call_id.to_owned(),
                             run_id: run_id.to_owned(),
                             turn_id: "turn-1".to_owned(),
-                            request_projection: request.to_string(),
-                            redaction_version: store.redactor().version(),
                         }),
                     ],
                 }],
@@ -4847,7 +7297,7 @@ mod tests {
         }
     }
 
-    fn tool_start_write(tool_call_id: &str) -> EventWrite {
+    fn tool_start_write(tool_call_id: &str, run_id: &str) -> EventWrite {
         EventWrite {
             event: Some(
                 DurableEvent::new(&json!({
@@ -4861,6 +7311,25 @@ mod tests {
             ),
             projections: vec![Projection::ToolExecution(ToolExecutionMutation::Start {
                 tool_call_id: tool_call_id.to_owned(),
+                run_id: run_id.to_owned(),
+            })],
+        }
+    }
+
+    fn pending_approval_write(request_id: &str, tool_call_id: &str, run_id: &str) -> EventWrite {
+        EventWrite {
+            event: Some(
+                DurableEvent::new(&json!({
+                    "type":"approval_requested",
+                    "request":approval_request(request_id, tool_call_id, "mutating"),
+                }))
+                .expect("typed pending approval event"),
+            ),
+            projections: vec![Projection::Approval(ApprovalMutation::Pending {
+                request_id: request_id.to_owned(),
+                tool_call_id: tool_call_id.to_owned(),
+                run_id: run_id.to_owned(),
+                turn_id: "turn-1".to_owned(),
             })],
         }
     }
@@ -4878,6 +7347,57 @@ mod tests {
         })
     }
 
+    fn tool_finish_writes(
+        tool_call_id: &str,
+        expected: &'static str,
+        state: &'static str,
+        error_code: Option<&'static str>,
+        text: &str,
+        is_error: bool,
+    ) -> Vec<EventWrite> {
+        let result = tool_result(tool_call_id, text, is_error);
+        let message_id = format!("{tool_call_id}-result");
+        vec![
+            EventWrite {
+                event: Some(
+                    DurableEvent::tool_execution_end(
+                        tool_call_id.to_owned(),
+                        serde_json::to_value(&result).expect("serialize tool result"),
+                        is_error,
+                        state.to_owned(),
+                        error_code.map(str::to_owned),
+                    )
+                    .expect("typed ToolExecutionEnd"),
+                ),
+                projections: vec![Projection::ToolExecution(ToolExecutionMutation::Finish {
+                    tool_call_id: tool_call_id.to_owned(),
+                    expected,
+                    state,
+                    error_code,
+                })],
+            },
+            EventWrite {
+                event: Some(
+                    DurableEvent::message("message_start", &message_id, &result)
+                        .expect("tool result MessageStart"),
+                ),
+                projections: Vec::new(),
+            },
+            EventWrite {
+                event: Some(
+                    DurableEvent::message("message_end", &message_id, &result)
+                        .expect("tool result MessageEnd"),
+                ),
+                projections: vec![Projection::MessageEnd {
+                    message_id,
+                    role: "tool_result",
+                    message: result,
+                    append_to_l0: true,
+                }],
+            },
+        ]
+    }
+
     fn assistant_message(stop_reason: StopReason) -> PublicMessage {
         PublicMessage::Assistant(PublicAssistantMessage {
             content: Vec::new(),
@@ -4887,6 +7407,32 @@ mod tests {
             stop_reason,
             error_message: (stop_reason == StopReason::Error)
                 .then(|| "retryable fixture".to_owned()),
+            provider_code: None,
+            interrupted: false,
+            timestamp: durable_test_timestamp(),
+        })
+    }
+
+    fn assistant_tool_message(tool_call_ids: &[&str]) -> PublicMessage {
+        PublicMessage::Assistant(PublicAssistantMessage {
+            content: tool_call_ids
+                .iter()
+                .enumerate()
+                .map(|(index, tool_call_id)| PublicAssistantContent::ToolCall {
+                    tool_call: ToolCall {
+                        id: (*tool_call_id).to_owned(),
+                        name: "test".to_owned(),
+                        arguments: serde_json::from_value(json!({}))
+                            .expect("object tool arguments"),
+                    },
+                    wire_item_index: u32::try_from(index).expect("bounded fixture"),
+                })
+                .collect(),
+            model: "test-model".to_owned(),
+            provider: "test-provider".to_owned(),
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
             provider_code: None,
             interrupted: false,
             timestamp: durable_test_timestamp(),
@@ -5316,7 +7862,7 @@ mod tests {
         let (_, exact, _) = writer
             .prepare_batch(
                 make_batch(exact_event_run_id.clone(), projection_run_id.clone()),
-                1,
+                2,
             )
             .await
             .expect("exact 32MiB real write-set is admitted");
@@ -5748,6 +8294,407 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_authenticates_existing_chain_and_never_advances_a_tampered_head() {
+        fn assistant_start_batch(command_id: &str, label: &str) -> EventBatch {
+            let run_id = format!("run-{command_id}");
+            let turn_id = format!("turn-{command_id}");
+            let message_id = format!("assistant-{label}");
+            EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            &message_id,
+                            &assistant_message(StopReason::Stop),
+                            Some(run_id.clone()),
+                            Some(turn_id),
+                        )
+                        .expect("assistant append fixture"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id,
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            }
+        }
+
+        let valid_store = test_store().await;
+        let valid_writer = EventWriter::new(valid_store.clone());
+        let valid_id = "00000000-0000-4000-8000-000000000094";
+        let valid_injection =
+            classified_injection(&valid_writer, 1, valid_id, "valid", "chain-valid").await;
+        valid_writer
+            .apply(EventBatch {
+                writes: injection_writes(valid_id, "valid", "chain-valid"),
+                injected_commands: vec![valid_injection],
+            })
+            .await
+            .expect("seed valid event chain");
+        valid_writer
+            .apply(assistant_start_batch(valid_id, "valid"))
+            .await
+            .expect("valid authenticated history accepts append");
+        assert_eq!(
+            sqlx::query_as::<_, (i64, i64)>("SELECT last_seq,event_count FROM event_log_heads")
+                .fetch_one(valid_store.pool())
+                .await
+                .expect("valid advanced head"),
+            (5, 5)
+        );
+
+        for tamper in [
+            "envelope",
+            "internal_metadata",
+            "ciphertext",
+            "deletion",
+            "reorder",
+        ] {
+            let store = test_store().await;
+            let writer = EventWriter::new(store.clone());
+            let command_id = "00000000-0000-4000-8000-000000000095";
+            let injected =
+                classified_injection(&writer, 1, command_id, "tamper", "chain-tamper").await;
+            writer
+                .apply(EventBatch {
+                    writes: injection_writes(command_id, "tamper", "chain-tamper"),
+                    injected_commands: vec![injected],
+                })
+                .await
+                .expect("seed chain to tamper");
+            let head_before: (i64, i64, Vec<u8>, String, Vec<u8>) = sqlx::query_as(
+                "SELECT last_seq,event_count,chain_digest,key_ref,head_hmac FROM event_log_heads",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("head before tamper");
+            match tamper {
+                "envelope" => {
+                    sqlx::query("UPDATE agent_events SET envelope='{}' WHERE seq=1")
+                        .execute(store.pool())
+                        .await
+                        .expect("tamper envelope");
+                }
+                "internal_metadata" => {
+                    sqlx::query("UPDATE agent_events SET internal_metadata='{}' WHERE seq=1")
+                        .execute(store.pool())
+                        .await
+                        .expect("tamper internal metadata");
+                }
+                "ciphertext" => {
+                    sqlx::query("UPDATE agent_events SET raw_ciphertext=zeroblob(1) WHERE seq=1")
+                        .execute(store.pool())
+                        .await
+                        .expect("tamper ciphertext");
+                }
+                "deletion" => {
+                    sqlx::query("DELETE FROM agent_events WHERE seq=2")
+                        .execute(store.pool())
+                        .await
+                        .expect("delete event");
+                }
+                "reorder" => {
+                    let mut transaction = store.pool().begin().await.expect("reorder transaction");
+                    sqlx::query("UPDATE agent_events SET seq=1000 WHERE seq=1")
+                        .execute(&mut *transaction)
+                        .await
+                        .expect("move first event aside");
+                    sqlx::query("UPDATE agent_events SET seq=1 WHERE seq=2")
+                        .execute(&mut *transaction)
+                        .await
+                        .expect("move second event first");
+                    sqlx::query("UPDATE agent_events SET seq=2 WHERE seq=1000")
+                        .execute(&mut *transaction)
+                        .await
+                        .expect("move first event second");
+                    transaction.commit().await.expect("commit reorder");
+                }
+                _ => unreachable!(),
+            }
+            let rows_after_tamper: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+                .fetch_one(store.pool())
+                .await
+                .expect("tampered row count");
+            writer
+                .reset_checkpoint_after_direct_fixture_mutation()
+                .await;
+            drop(writer);
+            let restarted_writer = EventWriter::new(store.clone());
+            let error = restarted_writer
+                .initialize_recovery_checkpoint()
+                .await
+                .expect_err("tampered history must reject startup recovery");
+            assert!(
+                !format!("{error:#}").is_empty(),
+                "{tamper} must explain startup failure"
+            );
+            assert_eq!(
+                sqlx::query_as::<_, (i64, i64, Vec<u8>, String, Vec<u8>)>(
+                    "SELECT last_seq,event_count,chain_digest,key_ref,head_hmac FROM event_log_heads"
+                )
+                .fetch_one(store.pool())
+                .await
+                .expect("head after rejected append"),
+                head_before,
+                "{tamper} startup failure must not advance or rewrite the stored head"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
+                    .fetch_one(store.pool())
+                    .await
+                    .expect("row count after rejected append"),
+                rows_after_tamper,
+                "{tamper} startup failure must not append an event"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn long_history_next_write_validates_only_checkpoint_and_new_suffix() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        seed_tool_owner(&store, &writer, "run-paged-history").await;
+        let mut writes = Vec::new();
+        for attempt in 1..=22 {
+            let message_id = format!("paged-assistant-{attempt}");
+            let message = assistant_message(StopReason::Error);
+            writes.push(EventWrite {
+                event: Some(
+                    DurableEvent::message_in_turn(
+                        "message_start",
+                        &message_id,
+                        &message,
+                        Some("run-paged-history".to_owned()),
+                        Some("turn-1".to_owned()),
+                    )
+                    .expect("paged MessageStart"),
+                ),
+                projections: Vec::new(),
+            });
+            writes.push(EventWrite {
+                event: Some(
+                    DurableEvent::message_in_turn(
+                        "message_end",
+                        &message_id,
+                        &message,
+                        Some("run-paged-history".to_owned()),
+                        Some("turn-1".to_owned()),
+                    )
+                    .expect("paged MessageEnd"),
+                ),
+                projections: vec![Projection::MessageEnd {
+                    message_id,
+                    role: "assistant",
+                    message,
+                    append_to_l0: false,
+                }],
+            });
+            writes.push(EventWrite {
+                event: Some(
+                    DurableEvent::retry_scheduled(
+                        "run-paged-history".to_owned(),
+                        "turn-1".to_owned(),
+                        attempt,
+                        0,
+                        durable_test_timestamp(),
+                        format!("paged retry {attempt}"),
+                    )
+                    .expect("paged RetryScheduled"),
+                ),
+                projections: Vec::new(),
+            });
+        }
+        writer
+            .apply(EventBatch {
+                writes,
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("seed more than one lifecycle validation page");
+        assert!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
+                .fetch_one(store.pool())
+                .await
+                .expect("count paged history")
+                > EVENT_CHAIN_VERIFICATION_PAGE_ROWS
+        );
+        let visited_before = writer.historical_rows_visited().await;
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            "paged-assistant-next",
+                            &assistant_message(StopReason::Error),
+                            Some("run-paged-history".to_owned()),
+                            Some("turn-1".to_owned()),
+                        )
+                        .expect("next suffix MessageStart"),
+                    ),
+                    projections: Vec::new(),
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("next lifecycle event validates only the checkpoint-bound suffix");
+        assert_eq!(
+            writer.historical_rows_visited().await,
+            visited_before,
+            "ordinary writes after a long history must not reload historical event rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_turn_checkpoint_state_stays_bounded_and_unique_index_survives_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "sumi-bounded-turn-checkpoint-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let path = root.join("agent.db");
+        let store: Arc<Store> = Store::open(&path, scope(), test_provider())
+            .await
+            .expect("open bounded checkpoint store")
+            .into();
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000090";
+        let injected = classified_injection(&writer, 1, command_id, "ignored", "start").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "start"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("open long-lived run");
+
+        let run_id = format!("run-{command_id}");
+        let mut current_turn = format!("turn-{command_id}");
+        for turn_index in 0..128 {
+            let assistant = assistant_message(StopReason::Stop);
+            let message_id = format!("bounded-assistant-{turn_index}");
+            let mut start_projections = Vec::new();
+            if turn_index == 0 {
+                start_projections.push(Projection::RunPhase {
+                    command_id: command_id.to_owned(),
+                    run_id: run_id.clone(),
+                    expected: RunPhase::UserCommitted,
+                    next: RunPhase::AssistantStarted,
+                });
+            }
+            let mut writes = vec![
+                EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            &message_id,
+                            &assistant,
+                            Some(run_id.clone()),
+                            Some(current_turn.clone()),
+                        )
+                        .expect("bounded assistant MessageStart"),
+                    ),
+                    projections: start_projections,
+                },
+                EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_end",
+                            &message_id,
+                            &assistant,
+                            Some(run_id.clone()),
+                            Some(current_turn.clone()),
+                        )
+                        .expect("bounded assistant MessageEnd"),
+                    ),
+                    projections: vec![Projection::MessageEnd {
+                        message_id,
+                        role: "assistant",
+                        message: assistant.clone(),
+                        append_to_l0: true,
+                    }],
+                },
+                EventWrite {
+                    event: Some(
+                        DurableEvent::turn_end(&run_id, &current_turn, assistant, Vec::new())
+                            .expect("bounded TurnEnd"),
+                    ),
+                    projections: Vec::new(),
+                },
+            ];
+            if turn_index < 127 {
+                let next_turn = format!("bounded-turn-{}", turn_index + 1);
+                writes.push(EventWrite {
+                    event: Some(
+                        DurableEvent::turn_start(&run_id, &next_turn)
+                            .expect("bounded continuation TurnStart"),
+                    ),
+                    projections: Vec::new(),
+                });
+                current_turn = next_turn;
+            }
+            writer
+                .apply(EventBatch {
+                    writes,
+                    injected_commands: Vec::new(),
+                })
+                .await
+                .expect("advance bounded long-lived run");
+            assert!(
+                writer.retained_turn_start_identities().await <= 1,
+                "checkpoint must retain at most the currently open turn identity"
+            );
+        }
+        assert_eq!(writer.retained_turn_start_identities().await, 0);
+
+        store.pool().close().await;
+        drop(writer);
+        drop(store);
+
+        let reopened: Arc<Store> = Store::open(&path, scope(), test_provider())
+            .await
+            .expect("reopen bounded checkpoint store")
+            .into();
+        let restarted_writer = EventWriter::new(reopened.clone());
+        restarted_writer
+            .initialize_recovery_checkpoint()
+            .await
+            .expect("reconstruct bounded checkpoint");
+        assert_eq!(restarted_writer.retained_turn_start_identities().await, 0);
+        let events_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+            .fetch_one(reopened.pool())
+            .await
+            .expect("count events before duplicate");
+        let duplicate = restarted_writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::turn_start(&run_id, "bounded-turn-64")
+                            .expect("duplicate historical TurnStart"),
+                    ),
+                    projections: Vec::new(),
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("durable lifecycle identity index must reject historical duplicate");
+        assert!(
+            format!("{duplicate:#}").contains("UNIQUE constraint failed"),
+            "{duplicate:#}"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
+                .fetch_one(reopened.pool())
+                .await
+                .expect("count events after duplicate"),
+            events_before,
+            "failed duplicate append must leave history unchanged"
+        );
+    }
+
+    #[tokio::test]
     async fn malformed_event_fails_before_transaction_and_persists_nothing() {
         let store = test_store().await;
         let error = DurableEvent::from_raw(br#"{"type":"message_end""#.to_vec())
@@ -5845,6 +8792,8 @@ mod tests {
             json!({"type":"steered","mode":"soft"}),
             json!({
                 "type":"retry_scheduled",
+                "run_id":"run-1",
+                "turn_id":"turn-1",
                 "attempt":1,
                 "delay_ms":100,
                 "retry_at":"2026-07-20T00:00:00Z",
@@ -5854,14 +8803,1168 @@ mod tests {
         for value in canonical {
             let event = DurableEvent::new(&value)
                 .unwrap_or_else(|error| panic!("canonical event {value} failed: {error:#}"));
+            let mut expected_public_event = value.clone();
+            if expected_public_event.get("type") == Some(&Value::String("retry_scheduled".into())) {
+                expected_public_event
+                    .as_object_mut()
+                    .expect("event object")
+                    .remove("run_id");
+                expected_public_event
+                    .as_object_mut()
+                    .expect("event object")
+                    .remove("turn_id");
+            }
             assert_eq!(
                 serde_json::from_slice::<Value>(&event.raw_json).expect("canonical raw JSON"),
-                value,
+                expected_public_event,
                 "durable raw event must contain only canonical public AgentEvent fields"
             );
             let recovered = DurableEvent::from_raw(event.raw_json.clone())
                 .expect("canonical event survives encrypted recovery decode");
             assert_eq!(recovered.raw_json, event.raw_json);
+        }
+    }
+
+    #[test]
+    fn duplicate_lifecycle_identities_cannot_reuse_one_transition_or_terminal_partner() {
+        let cases = [
+            (
+                "AgentStart",
+                DurableEvent::agent_start("run-duplicate").expect("AgentStart"),
+            ),
+            (
+                "TurnStart",
+                DurableEvent::turn_start("run-duplicate", "turn-duplicate").expect("TurnStart"),
+            ),
+            (
+                "Steered",
+                DurableEvent::steered(
+                    SteerMode::Soft,
+                    "00000000-0000-4000-8000-000000000071".to_owned(),
+                    "run-duplicate".to_owned(),
+                    "turn-duplicate".to_owned(),
+                )
+                .expect("Steered"),
+            ),
+            (
+                "TurnEnd",
+                DurableEvent::turn_end(
+                    "run-duplicate",
+                    "turn-duplicate",
+                    user_message("done"),
+                    Vec::new(),
+                )
+                .expect("TurnEnd"),
+            ),
+            (
+                "AgentEnd",
+                DurableEvent::agent_end("run-duplicate").expect("AgentEnd"),
+            ),
+        ];
+
+        for (kind, event) in cases {
+            let error = validate_batch_shape(
+                &Redactor::v1(),
+                &EventBatch {
+                    writes: vec![
+                        EventWrite {
+                            event: Some(event.clone()),
+                            projections: Vec::new(),
+                        },
+                        EventWrite {
+                            event: Some(event),
+                            projections: Vec::new(),
+                        },
+                    ],
+                    injected_commands: Vec::new(),
+                },
+            )
+            .err()
+            .expect("duplicate lifecycle identity must fail before persistence");
+            assert!(
+                error.to_string().contains(&format!("duplicate {kind}")),
+                "{kind}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn distinct_lifecycle_identities_and_multi_command_steer_group_are_not_duplicates() {
+        let command_a = "00000000-0000-4000-8000-000000000072";
+        let command_b = "00000000-0000-4000-8000-000000000073";
+        let batch = EventBatch {
+            writes: vec![
+                EventWrite {
+                    event: Some(
+                        DurableEvent::steered(
+                            SteerMode::Soft,
+                            command_a.to_owned(),
+                            "run-group".to_owned(),
+                            "turn-group".to_owned(),
+                        )
+                        .expect("first Steered"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_a.to_owned(),
+                        run_id: "run-group".to_owned(),
+                        expected: RunPhase::Classified,
+                        next: RunPhase::TurnStarted,
+                    }],
+                },
+                EventWrite {
+                    event: Some(
+                        DurableEvent::steered(
+                            SteerMode::Soft,
+                            command_b.to_owned(),
+                            "run-group".to_owned(),
+                            "turn-group".to_owned(),
+                        )
+                        .expect("second Steered"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_b.to_owned(),
+                        run_id: "run-group".to_owned(),
+                        expected: RunPhase::Classified,
+                        next: RunPhase::TurnStarted,
+                    }],
+                },
+                EventWrite {
+                    event: Some(
+                        DurableEvent::turn_start("run-group", "turn-group").expect("TurnStart"),
+                    ),
+                    projections: Vec::new(),
+                },
+            ],
+            injected_commands: Vec::new(),
+        };
+
+        validate_batch_shape(&Redactor::v1(), &batch)
+            .expect("distinct group lifecycle identities remain valid");
+    }
+
+    #[test]
+    fn same_batch_causal_orders_reject_reversed_events() {
+        let assistant = assistant_message(StopReason::Stop);
+        let reversed_message = validate_batch_shape(
+            &Redactor::v1(),
+            &EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_end", "assistant-1", &assistant)
+                                .expect("MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: "assistant-1".to_owned(),
+                            role: "assistant",
+                            message: assistant.clone(),
+                            append_to_l0: true,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_start", "assistant-1", &assistant)
+                                .expect("MessageStart"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                ],
+                injected_commands: Vec::new(),
+            },
+        )
+        .err()
+        .expect("MessageEnd cannot precede same-batch MessageStart");
+        assert!(reversed_message.to_string().contains("must precede"));
+
+        let request = approval_request("request-order", "tool-order", "mutating");
+        let reversed_approval = validate_batch_shape(
+            &Redactor::v1(),
+            &EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::new(&json!({
+                                "type":"approval_resolved",
+                                "request_id":"request-order",
+                                "resolution":"cancelled",
+                                "actor":"system"
+                            }))
+                            .expect("ApprovalResolved"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::new(&json!({
+                                "type":"approval_requested",
+                                "request":request
+                            }))
+                            .expect("ApprovalRequested"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                ],
+                injected_commands: Vec::new(),
+            },
+        )
+        .err()
+        .expect("ApprovalResolved cannot precede same-batch ApprovalRequested");
+        assert!(reversed_approval.to_string().contains("must precede"));
+
+        let reversed_steer = validate_batch_shape(
+            &Redactor::v1(),
+            &EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::turn_start("run-order", "turn-order").expect("TurnStart"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::steered(
+                                SteerMode::Soft,
+                                "00000000-0000-4000-8000-000000000080".to_owned(),
+                                "run-order".to_owned(),
+                                "turn-order".to_owned(),
+                            )
+                            .expect("Steered"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: "00000000-0000-4000-8000-000000000080".to_owned(),
+                            run_id: "run-order".to_owned(),
+                            expected: RunPhase::Classified,
+                            next: RunPhase::TurnStarted,
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            },
+        )
+        .err()
+        .expect("Steered cannot follow its same-batch TurnStart");
+        assert!(reversed_steer.to_string().contains("must precede"));
+
+        let reversed_run_close = validate_batch_shape(
+            &Redactor::v1(),
+            &EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(DurableEvent::agent_end("run-close").expect("AgentEnd")),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::turn_end(
+                                "run-close",
+                                "turn-close",
+                                assistant,
+                                Vec::new(),
+                            )
+                            .expect("TurnEnd"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                ],
+                injected_commands: Vec::new(),
+            },
+        )
+        .err()
+        .expect("AgentEnd cannot precede same-batch TurnEnd");
+        assert!(reversed_run_close.to_string().contains("must precede"));
+    }
+
+    #[test]
+    fn terminal_tool_results_require_bidirectional_pairing_and_order() {
+        let mut reversed =
+            tool_finish_writes("tool-order", "running", "succeeded", None, "done", false);
+        let terminal = reversed.remove(0);
+        reversed.push(terminal);
+        let order_error = validate_batch_shape(
+            &Redactor::v1(),
+            &EventBatch {
+                writes: reversed,
+                injected_commands: Vec::new(),
+            },
+        )
+        .err()
+        .expect("ToolExecutionEnd must precede result messages");
+        assert!(order_error.to_string().contains("ToolExecutionEnd"));
+
+        let result = tool_result("tool-orphan", "fabricated", true);
+        let orphan = validate_batch_shape(
+            &Redactor::v1(),
+            &EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_start", "orphan-result", &result)
+                                .expect("MessageStart"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_end", "orphan-result", &result)
+                                .expect("MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: "orphan-result".to_owned(),
+                            role: "tool_result",
+                            message: result,
+                            append_to_l0: true,
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            },
+        )
+        .err()
+        .expect("fabricated tool result must not persist without executor terminal");
+        assert!(
+            orphan
+                .to_string()
+                .contains("requires same-batch ToolExecutionEnd")
+        );
+    }
+
+    #[test]
+    fn turn_end_tool_results_exactly_match_the_current_assistant_tool_calls() {
+        fn lifecycle_state(
+            assistant: &PublicMessage,
+            results: &[PublicMessage],
+        ) -> DurableLifecycleState {
+            let mut state = DurableLifecycleState::default();
+            let run = DurableEventMetadata {
+                run_id: Some("run-exact-tools".to_owned()),
+                ..DurableEventMetadata::default()
+            };
+            let turn = DurableEventMetadata {
+                run_id: Some("run-exact-tools".to_owned()),
+                turn_id: Some("turn-exact-tools".to_owned()),
+                ..DurableEventMetadata::default()
+            };
+            apply_lifecycle_event(
+                &mut state,
+                "agent_start",
+                &run,
+                &json!({"type":"agent_start"}),
+                false,
+            )
+            .expect("AgentStart");
+            apply_lifecycle_event(
+                &mut state,
+                "turn_start",
+                &turn,
+                &json!({"type":"turn_start"}),
+                false,
+            )
+            .expect("TurnStart");
+            for (kind, message_id) in [
+                ("message_start", "assistant-exact-tools"),
+                ("message_end", "assistant-exact-tools"),
+            ] {
+                apply_lifecycle_event(
+                    &mut state,
+                    kind,
+                    &turn,
+                    &json!({"message_id":message_id,"message":assistant}),
+                    false,
+                )
+                .expect("assistant lifecycle");
+            }
+            for (index, result) in results.iter().enumerate() {
+                apply_lifecycle_event(
+                    &mut state,
+                    "message_end",
+                    &DurableEventMetadata::default(),
+                    &json!({"message_id":format!("tool-result-{index}"),"message":result}),
+                    false,
+                )
+                .expect("tool-result MessageEnd");
+            }
+            state
+        }
+
+        let assistant = assistant_tool_message(&["tool-current-a", "tool-current-b"]);
+        let current_a = tool_result("tool-current-a", "a", false);
+        let current_b = tool_result("tool-current-b", "b", false);
+        let prior = tool_result("tool-prior", "prior", false);
+        let metadata = DurableEventMetadata {
+            run_id: Some("run-exact-tools".to_owned()),
+            turn_id: Some("turn-exact-tools".to_owned()),
+            ..DurableEventMetadata::default()
+        };
+
+        let mut valid = lifecycle_state(
+            &assistant,
+            &[prior.clone(), current_a.clone(), current_b.clone()],
+        );
+        apply_lifecycle_event(
+            &mut valid,
+            "turn_end",
+            &metadata,
+            &json!({"message":assistant,"tool_results":[current_a.clone(),current_b.clone()]}),
+            true,
+        )
+        .expect("multi-tool current turn closes with its exact result set");
+
+        for (label, supplied) in [
+            (
+                "prior extra",
+                vec![current_a.clone(), current_b.clone(), prior],
+            ),
+            ("omission", vec![current_a.clone()]),
+            ("duplicate", vec![current_a.clone(), current_a.clone()]),
+            (
+                "wrong identity",
+                vec![current_a.clone(), tool_result("tool-wrong", "b", false)],
+            ),
+            (
+                "wrong value",
+                vec![
+                    tool_result("tool-current-a", "wrong", false),
+                    current_b.clone(),
+                ],
+            ),
+        ] {
+            let mut state = lifecycle_state(
+                &assistant,
+                &[
+                    tool_result("tool-prior", "prior", false),
+                    current_a.clone(),
+                    current_b.clone(),
+                ],
+            );
+            let error = apply_lifecycle_event(
+                &mut state,
+                "turn_end",
+                &metadata,
+                &json!({"message":assistant,"tool_results":supplied}),
+                true,
+            )
+            .expect_err(label);
+            assert!(
+                error.to_string().contains("exactly match")
+                    || error.to_string().contains("duplicate tool result")
+                    || error.to_string().contains("does not match"),
+                "{label}: {error:#}"
+            );
+        }
+
+        let no_tools = assistant_message(StopReason::Stop);
+        let mut no_tool_state = lifecycle_state(&no_tools, &[]);
+        apply_lifecycle_event(
+            &mut no_tool_state,
+            "turn_end",
+            &metadata,
+            &json!({"message":no_tools,"tool_results":[]}),
+            true,
+        )
+        .expect("no-tool turn requires and accepts an empty result set");
+
+        let rejected_only = PublicMessage::Assistant(PublicAssistantMessage {
+            content: vec![PublicAssistantContent::RejectedToolCall {
+                rejected: RejectedToolCall {
+                    id: "rejected-not-executable".to_owned(),
+                    name: "test".to_owned(),
+                    error: ToolArgumentError::InvalidJson,
+                },
+                wire_item_index: 0,
+            }],
+            model: "test-model".to_owned(),
+            provider: "test-provider".to_owned(),
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: durable_test_timestamp(),
+        });
+        let mut rejected_state = lifecycle_state(&rejected_only, &[]);
+        apply_lifecycle_event(
+            &mut rejected_state,
+            "turn_end",
+            &metadata,
+            &json!({"message":rejected_only,"tool_results":[]}),
+            true,
+        )
+        .expect("rejected ToolCall is not an executable ToolCall result obligation");
+    }
+
+    #[test]
+    fn non_assistant_message_starts_require_their_exact_same_batch_terminal_message() {
+        let user = user_message("orphan");
+        let orphan_user = validate_batch_shape(
+            &Redactor::v1(),
+            &EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message("message_start", "orphan-user", &user)
+                            .expect("user MessageStart"),
+                    ),
+                    projections: Vec::new(),
+                }],
+                injected_commands: Vec::new(),
+            },
+        )
+        .err()
+        .expect("standalone user MessageStart must fail");
+        assert!(orphan_user.to_string().contains("canonical MessageEnd"));
+
+        let start = tool_result("tool-exact", "start", false);
+        let end = tool_result("tool-exact", "different terminal result", false);
+        let mismatched_tool = validate_batch_shape(
+            &Redactor::v1(),
+            &EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_start", "tool-exact-result", &start)
+                                .expect("tool-result MessageStart"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_end", "tool-exact-result", &end)
+                                .expect("tool-result MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: "tool-exact-result".to_owned(),
+                            role: "tool_result",
+                            message: end,
+                            append_to_l0: true,
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            },
+        )
+        .err()
+        .expect("tool-result start and terminal payload must be identical");
+        assert!(mismatched_tool.to_string().contains("canonical MessageEnd"));
+
+        validate_batch_shape(
+            &Redactor::v1(),
+            &EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message(
+                            "message_start",
+                            "assistant-streaming",
+                            &assistant_message(StopReason::Stop),
+                        )
+                        .expect("assistant MessageStart"),
+                    ),
+                    projections: Vec::new(),
+                }],
+                injected_commands: Vec::new(),
+            },
+        )
+        .expect("assistant streaming MessageStart may remain open across batches");
+    }
+
+    #[test]
+    fn retry_scheduled_requires_identity_but_allows_immediate_recovery() {
+        DurableEvent::retry_scheduled(
+            "run-retry",
+            "turn-retry",
+            1,
+            0,
+            durable_test_timestamp(),
+            "context overflow",
+        )
+        .expect("delay_ms=0 is canonical for immediate overflow recovery");
+        for (run_id, turn_id, attempt, error_message) in [
+            ("", "turn-retry", 1, "retry"),
+            ("run-retry", "", 1, "retry"),
+            ("run-retry", "turn-retry", 0, "retry"),
+            ("run-retry", "turn-retry", 1, ""),
+        ] {
+            assert!(
+                DurableEvent::retry_scheduled(
+                    run_id,
+                    turn_id,
+                    attempt,
+                    0,
+                    durable_test_timestamp(),
+                    error_message,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_history_rejects_duplicate_starts_and_accepts_recovery_retry_suffix() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000084";
+        let injected = classified_injection(&writer, 1, command_id, "ignored", "retry").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "retry"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("open retry turn");
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let error_message = assistant_message(StopReason::Error);
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            "assistant-retry-1",
+                            &error_message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("retry MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist assistant attempt start");
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_end",
+                            "assistant-retry-1",
+                            &error_message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("retry MessageEnd"),
+                    ),
+                    projections: vec![Projection::MessageEnd {
+                        message_id: "assistant-retry-1".to_owned(),
+                        role: "assistant",
+                        message: error_message,
+                        append_to_l0: false,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist retryable error before crash");
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::retry_scheduled(
+                            run_id.clone(),
+                            turn_id.clone(),
+                            1,
+                            0,
+                            durable_test_timestamp(),
+                            "context overflow",
+                        )
+                        .expect("recovery RetryScheduled"),
+                    ),
+                    projections: Vec::new(),
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("recovery may append the missing delay-zero schedule later");
+
+        let duplicate_retry = writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::retry_scheduled(
+                            run_id.clone(),
+                            turn_id.clone(),
+                            1,
+                            0,
+                            durable_test_timestamp(),
+                            "duplicate",
+                        )
+                        .expect("duplicate schedule fixture"),
+                    ),
+                    projections: Vec::new(),
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("retry attempt cannot be reused across transactions");
+        assert!(duplicate_retry.to_string().contains("not monotonic"));
+
+        let second_error = assistant_message(StopReason::Error);
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_start",
+                                "assistant-retry-2",
+                                &second_error,
+                                Some(run_id.clone()),
+                                Some(turn_id.clone()),
+                            )
+                            .expect("second retry MessageStart"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_end",
+                                "assistant-retry-2",
+                                &second_error,
+                                Some(run_id.clone()),
+                                Some(turn_id.clone()),
+                            )
+                            .expect("second retry MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: "assistant-retry-2".to_owned(),
+                            role: "assistant",
+                            message: second_error,
+                            append_to_l0: false,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::retry_scheduled(
+                                run_id.clone(),
+                                turn_id.clone(),
+                                2,
+                                0,
+                                durable_test_timestamp(),
+                                "second context overflow",
+                            )
+                            .expect("second RetryScheduled"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("a new errored assistant attempt permits exactly one next schedule");
+
+        for event in [
+            DurableEvent::agent_start(run_id.clone()).expect("duplicate AgentStart fixture"),
+            DurableEvent::turn_start(run_id.clone(), turn_id.clone())
+                .expect("duplicate TurnStart fixture"),
+            DurableEvent::message_in_turn(
+                "message_start",
+                "assistant-retry-1",
+                &assistant_message(StopReason::Stop),
+                Some(run_id.clone()),
+                Some(turn_id.clone()),
+            )
+            .expect("duplicate MessageStart fixture"),
+        ] {
+            writer
+                .apply(EventBatch {
+                    writes: vec![EventWrite {
+                        event: Some(event),
+                        projections: Vec::new(),
+                    }],
+                    injected_commands: Vec::new(),
+                })
+                .await
+                .expect_err("cross-transaction lifecycle start must be unique");
+        }
+    }
+
+    #[tokio::test]
+    async fn assistant_lifecycle_rejects_missing_or_wrong_turn_binding() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store);
+        let assistant = assistant_message(StopReason::Stop);
+        let missing = writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message("message_start", "assistant-unbound", &assistant)
+                            .expect("unbound assistant fixture"),
+                    ),
+                    projections: Vec::new(),
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("assistant lifecycle metadata is mandatory");
+        assert!(missing.to_string().contains("internal run_id"));
+    }
+
+    #[test]
+    fn injected_commands_enforce_steered_and_user_before_assistant_order() {
+        let command_a =
+            CommandId::parse("00000000-0000-4000-8000-000000000081").expect("command A");
+        let command_b =
+            CommandId::parse("00000000-0000-4000-8000-000000000082").expect("command B");
+        let reversed_steers = validate_batch_shape(
+            &Redactor::v1(),
+            &EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::steered(
+                                SteerMode::Soft,
+                                command_b.to_string(),
+                                "run-order".to_owned(),
+                                "turn-order".to_owned(),
+                            )
+                            .expect("Steered B"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: command_b.to_string(),
+                            run_id: "run-order".to_owned(),
+                            expected: RunPhase::Classified,
+                            next: RunPhase::TurnStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::steered(
+                                SteerMode::Soft,
+                                command_a.to_string(),
+                                "run-order".to_owned(),
+                                "turn-order".to_owned(),
+                            )
+                            .expect("Steered A"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: command_a.to_string(),
+                            run_id: "run-order".to_owned(),
+                            expected: RunPhase::Classified,
+                            next: RunPhase::TurnStarted,
+                        }],
+                    },
+                ],
+                injected_commands: vec![
+                    InjectedCommand::new(1, command_a.clone()),
+                    InjectedCommand::new(2, command_b),
+                ],
+            },
+        )
+        .err()
+        .expect("Steered entries cannot reverse command sequence order");
+        assert!(
+            reversed_steers
+                .to_string()
+                .contains("durable sequence order")
+        );
+
+        let command_id = command_a.to_string();
+        let message_id = user_message_id(command_id.as_str());
+        let user = user_message("injected");
+        let assistant = assistant_message(StopReason::Stop);
+        let early_assistant = validate_batch_shape(
+            &Redactor::v1(),
+            &EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_start", &message_id, &user)
+                                .expect("user MessageStart"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_start", "assistant-early", &assistant)
+                                .expect("assistant MessageStart"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_end", &message_id, &user)
+                                .expect("user MessageEnd"),
+                        ),
+                        projections: vec![
+                            Projection::MessageEnd {
+                                message_id,
+                                role: "user",
+                                message: user,
+                                append_to_l0: true,
+                            },
+                            Projection::RunPhase {
+                                command_id: command_id.clone(),
+                                run_id: "run-order".to_owned(),
+                                expected: RunPhase::UserStarted,
+                                next: RunPhase::UserCommitted,
+                            },
+                        ],
+                    },
+                ],
+                injected_commands: vec![InjectedCommand::new(1, command_a)],
+            },
+        )
+        .err()
+        .expect("assistant MessageStart cannot precede injected user MessageEnd");
+        assert!(
+            early_assistant
+                .to_string()
+                .contains("assistant MessageStart")
+        );
+    }
+
+    #[tokio::test]
+    async fn non_empty_turn_end_requires_exact_open_turn_and_live_run_owner() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000083";
+        let injected = classified_injection(&writer, 1, command_id, "ignored", "hello").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "hello"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("open initial durable turn and owner");
+        let run_id = format!("run-{command_id}");
+        let original_turn_id = format!("turn-{command_id}");
+        let initial_assistant = assistant_message(StopReason::Stop);
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_start",
+                                "assistant-initial",
+                                &initial_assistant,
+                                Some(run_id.clone()),
+                                Some(original_turn_id.clone()),
+                            )
+                            .expect("initial assistant MessageStart"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: command_id.to_owned(),
+                            run_id: run_id.clone(),
+                            expected: RunPhase::UserCommitted,
+                            next: RunPhase::AssistantStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_end",
+                                "assistant-initial",
+                                &initial_assistant,
+                                Some(run_id.clone()),
+                                Some(original_turn_id.clone()),
+                            )
+                            .expect("initial assistant MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: "assistant-initial".to_owned(),
+                            role: "assistant",
+                            message: initial_assistant.clone(),
+                            append_to_l0: true,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::turn_end(
+                                &run_id,
+                                &original_turn_id,
+                                initial_assistant,
+                                Vec::new(),
+                            )
+                            .expect("initial TurnEnd"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("close the exact initial open turn");
+
+        let continuation_turn = "tool-continuation-turn";
+        let continuation_assistant = assistant_message(StopReason::Stop);
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::turn_start(&run_id, continuation_turn)
+                                .expect("continuation TurnStart"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_start",
+                                "assistant-continuation",
+                                &continuation_assistant,
+                                Some(run_id.clone()),
+                                Some(continuation_turn.to_owned()),
+                            )
+                            .expect("continuation MessageStart"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_end",
+                                "assistant-continuation",
+                                &continuation_assistant,
+                                Some(run_id.clone()),
+                                Some(continuation_turn.to_owned()),
+                            )
+                            .expect("continuation MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: "assistant-continuation".to_owned(),
+                            role: "assistant",
+                            message: continuation_assistant.clone(),
+                            append_to_l0: true,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::turn_end(
+                                &run_id,
+                                continuation_turn,
+                                continuation_assistant,
+                                Vec::new(),
+                            )
+                            .expect("continuation TurnEnd"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("owner command turn_id does not constrain later continuation turns");
+
+        let already_ended = writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::turn_end(
+                            &run_id,
+                            continuation_turn,
+                            assistant_message(StopReason::Stop),
+                            Vec::new(),
+                        )
+                        .expect("duplicate TurnEnd"),
+                    ),
+                    projections: Vec::new(),
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("an already-ended turn cannot be ended again");
+        assert!(already_ended.to_string().contains("exact open TurnStart"));
+
+        let nonexistent = writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::turn_end(
+                            &run_id,
+                            "never-started",
+                            assistant_message(StopReason::Stop),
+                            Vec::new(),
+                        )
+                        .expect("orphan TurnEnd"),
+                    ),
+                    projections: Vec::new(),
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("a nonexistent turn cannot be ended");
+        assert!(nonexistent.to_string().contains("exact open TurnStart"));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_events_consume_exact_transition_sets_instead_of_any_matching_transition() {
+        for (stored_phase, event, expected, next, expected_error) in [
+            (
+                RunPhase::Classified,
+                DurableEvent::agent_start("run-shared").expect("AgentStart"),
+                RunPhase::Classified,
+                RunPhase::RunStarted,
+                "exactly one classified -> run_started pair",
+            ),
+            (
+                RunPhase::RunStarted,
+                DurableEvent::turn_start("run-shared", "turn-shared").expect("TurnStart"),
+                RunPhase::RunStarted,
+                RunPhase::TurnStarted,
+                "found 2/0",
+            ),
+        ] {
+            let store = test_store().await;
+            let writer = EventWriter::new(store.clone());
+            for seq in 1_u64..=2 {
+                writer
+                    .persist_inbound(&user_command(
+                        seq,
+                        &Uuid::from_u128(200 + seq as u128).to_string(),
+                        "pending",
+                    ))
+                    .await
+                    .expect("persist transition target");
+            }
+            sqlx::query(
+                "UPDATE inbound_commands
+                 SET status='applying', application_kind='idle_run', run_id='run-shared',
+                     turn_id='turn-shared', run_phase=?",
+            )
+            .bind(stored_phase.as_str())
+            .execute(store.pool())
+            .await
+            .expect("seed matching phase identities");
+            let command_ids: Vec<String> =
+                sqlx::query_scalar("SELECT command_id FROM inbound_commands ORDER BY seq")
+                    .fetch_all(store.pool())
+                    .await
+                    .expect("read command identities");
+            let error = writer
+                .apply(EventBatch {
+                    writes: vec![EventWrite {
+                        event: Some(event),
+                        projections: command_ids
+                            .into_iter()
+                            .map(|command_id| Projection::RunPhase {
+                                command_id,
+                                run_id: "run-shared".to_owned(),
+                                expected,
+                                next,
+                            })
+                            .collect(),
+                    }],
+                    injected_commands: Vec::new(),
+                })
+                .await
+                .expect_err("one lifecycle event cannot be shared by two transition identities");
+            assert!(error.to_string().contains(expected_error), "{error:#}");
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
+                    .fetch_one(store.pool())
+                    .await
+                    .expect("count rolled-back events"),
+                0
+            );
         }
     }
 
@@ -5935,11 +10038,17 @@ mod tests {
     async fn secret_bearing_json_keys_are_absent_from_db_projections_and_dump() {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
+        seed_tool_owner(&store, &writer, "run-key-redaction").await;
         let secrets = [
             "sk-abcdefghijklmnop",
             "supersecretvalue",
             "abcdefghijklmnop",
             "abcdef1234567890",
+            "structured-api-value",
+            "structured-access-value",
+            "structured-secret-value",
+            "structured-authorization-value",
+            "structured-signature-value",
         ];
         let message = PublicMessage::ToolResult(ToolResultMessage {
             tool_call_id: "tool-key-redaction".to_owned(),
@@ -5954,29 +10063,92 @@ mod tests {
                             "event X-Amz-Signature=abcdef1234567890":"safe"
                         }
                     }
-                }
+                },
+                "api_key":"structured-api-value",
+                "Access-Token":"structured-access-value",
+                "secret":"structured-secret-value",
+                "Authorization":"structured-authorization-value",
+                "X-Amz-Signature":"structured-signature-value"
             }),
-            is_error: false,
+            is_error: true,
+            timestamp: durable_test_timestamp(),
+        });
+        let rejected = PublicMessage::Assistant(PublicAssistantMessage {
+            content: vec![PublicAssistantContent::RejectedToolCall {
+                rejected: RejectedToolCall {
+                    id: "tool-key-redaction".to_owned(),
+                    name: "test".to_owned(),
+                    error: ToolArgumentError::InvalidJson,
+                },
+                wire_item_index: 0,
+            }],
+            model: "test-model".to_owned(),
+            provider: "test-provider".to_owned(),
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
             timestamp: durable_test_timestamp(),
         });
         writer
             .apply(EventBatch {
-                writes: vec![EventWrite {
-                    event: Some(
-                        DurableEvent::new(&json!({
-                            "type":"message_end",
-                            "message_id":"message-key-redaction",
-                            "message":message.clone()
-                        }))
-                        .expect("MessageEnd"),
-                    ),
-                    projections: vec![Projection::MessageEnd {
-                        message_id: "message-key-redaction".to_owned(),
-                        role: "tool_result",
-                        message,
-                        append_to_l0: true,
-                    }],
-                }],
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_start",
+                                "rejected-assistant",
+                                &rejected,
+                                Some("run-key-redaction".to_owned()),
+                                Some("turn-1".to_owned()),
+                            )
+                            .expect("rejected assistant MessageStart"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_end",
+                                "rejected-assistant",
+                                &rejected,
+                                Some("run-key-redaction".to_owned()),
+                                Some("turn-1".to_owned()),
+                            )
+                            .expect("rejected assistant MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: "rejected-assistant".to_owned(),
+                            role: "assistant",
+                            message: rejected,
+                            append_to_l0: true,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message(
+                                "message_start",
+                                "message-key-redaction",
+                                &message,
+                            )
+                            .expect("tool result MessageStart"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_end", "message-key-redaction", &message)
+                                .expect("tool result MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: "message-key-redaction".to_owned(),
+                            role: "tool_result",
+                            message,
+                            append_to_l0: true,
+                        }],
+                    },
+                ],
                 injected_commands: Vec::new(),
             })
             .await
@@ -5993,6 +10165,78 @@ mod tests {
         for secret in secrets {
             assert!(!dump.contains(secret), "projection dump leaked {secret}");
         }
+    }
+
+    #[tokio::test]
+    async fn structured_approval_secrets_are_absent_from_event_and_approval_projections() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        seed_tool_owner(&store, &writer, "run-structured-secret").await;
+        let secrets = [
+            "approval-api-value",
+            "approval-access-value",
+            "approval-secret-value",
+            "approval-authorization-value",
+        ];
+        let request = json!({
+            "id":"request-structured-secret",
+            "tool_call_id":"tool-structured-secret",
+            "tool_name":"bash",
+            "action":{"reviewable":{
+                "api_key":"approval-api-value",
+                "accessToken":"approval-access-value",
+                "secret":"approval-secret-value"
+            }},
+            "args_summary":{"Authorization":"approval-authorization-value"},
+            "reason":null,
+            "audit":null
+        });
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::new(&json!({
+                            "type":"approval_requested",
+                            "request":request,
+                        }))
+                        .expect("ApprovalRequested"),
+                    ),
+                    projections: vec![
+                        Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                            tool_call_id: "tool-structured-secret".to_owned(),
+                            command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                            run_id: "run-structured-secret".to_owned(),
+                            executor_generation: 1,
+                            idempotency_key: "idem-structured-secret".to_owned(),
+                        }),
+                        Projection::Approval(ApprovalMutation::Pending {
+                            request_id: "request-structured-secret".to_owned(),
+                            tool_call_id: "tool-structured-secret".to_owned(),
+                            run_id: "run-structured-secret".to_owned(),
+                            turn_id: "turn-1".to_owned(),
+                        }),
+                    ],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist redacted approval");
+
+        let dump: String = sqlx::query_scalar(
+            "SELECT e.envelope || char(10) || a.request_projection
+             FROM agent_events e JOIN approval_log a ON a.id='request-structured-secret'
+             WHERE e.event_type='approval_requested'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("read approval projection dump");
+        for secret in secrets {
+            assert!(
+                !dump.contains(secret),
+                "approval projection leaked {secret}"
+            );
+        }
+        assert!(dump.contains("[REDACTED:secret]"));
     }
 
     #[tokio::test]
@@ -6106,6 +10350,299 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_admission_accepts_user_then_reserved_abort_without_reentering_replay_mode() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store);
+        let mut admission = InboundAdmission::after_t12_recovery(false);
+        let user = user_command(1, "00000000-0000-4000-8000-000000000001", "start live work");
+        let abort = abort_command(2, "00000000-0000-4000-8000-000000000002");
+
+        assert_eq!(
+            admission
+                .receive(&writer, &user)
+                .await
+                .expect("receive live UserMessage")
+                .status,
+            CommandAckStatus::Received
+        );
+        assert_eq!(
+            admission
+                .receive(&writer, &abort)
+                .await
+                .expect("receive reserved live Abort")
+                .status,
+            CommandAckStatus::Received
+        );
+        let terminal = writer
+            .apply_idle_abort_cutoff("00000000-0000-4000-8000-000000000002", 2)
+            .await
+            .expect("terminalize live cutoff");
+        assert_eq!(
+            terminal.iter().map(|ack| ack.status).collect::<Vec<_>>(),
+            vec![CommandAckStatus::Superseded, CommandAckStatus::Applied]
+        );
+    }
+
+    #[tokio::test]
+    async fn event_writer_handles_share_checkpoint_across_event_and_projection_only_calls() {
+        let store = test_store().await;
+        let first = EventWriter::new(store.clone());
+        let second = EventWriter::new(store.clone());
+        first
+            .initialize_recovery_checkpoint()
+            .await
+            .expect("initialize first handle");
+        second
+            .initialize_recovery_checkpoint()
+            .await
+            .expect("initialize second handle");
+
+        let user_id = "00000000-0000-4000-8000-000000000091";
+        let abort_id = "00000000-0000-4000-8000-000000000092";
+        first
+            .persist_inbound(&user_command(1, user_id, "pending startup"))
+            .await
+            .expect("first handle persists projection-only receipt");
+        second
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![Projection::CommandClassified {
+                        command_id: user_id.to_owned(),
+                        application_kind: ApplicationKind::IdleRun,
+                        run_id: "shared-run".to_owned(),
+                        turn_id: "shared-turn".to_owned(),
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("second handle classifies projection-only startup");
+        first
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::agent_start("shared-run").expect("shared handle AgentStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: user_id.to_owned(),
+                        run_id: "shared-run".to_owned(),
+                        expected: RunPhase::Classified,
+                        next: RunPhase::RunStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("first handle appends lifecycle event after second handle projection");
+        second
+            .persist_inbound(&abort_command(2, abort_id))
+            .await
+            .expect("second handle preserves reserved Abort receipt after lifecycle append");
+
+        let terminal = first
+            .apply_idle_abort_cutoff(abort_id, 2)
+            .await
+            .expect("first handle closes shared pending startup and Abort window");
+        assert_eq!(
+            terminal.iter().map(|ack| ack.status).collect::<Vec<_>>(),
+            vec![CommandAckStatus::Superseded, CommandAckStatus::Applied]
+        );
+        assert_eq!(
+            second
+                .ack_for_command(user_id)
+                .await
+                .expect("read shared user ACK")
+                .expect("shared user ACK exists")
+                .status,
+            CommandAckStatus::Superseded
+        );
+        assert_eq!(
+            second
+                .ack_for_command(abort_id)
+                .await
+                .expect("read shared Abort ACK")
+                .expect("shared Abort ACK exists")
+                .status,
+            CommandAckStatus::Applied
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_abort_authenticates_key_purpose_hmac_and_exact_variant_before_mutation() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let abort_id = "00000000-0000-4000-8000-000000000082";
+        writer
+            .persist_inbound(&abort_command(1, abort_id))
+            .await
+            .expect("persist Abort fixture");
+        let key_ref: String =
+            sqlx::query_scalar("SELECT payload_key_ref FROM inbound_commands WHERE command_id=?")
+                .bind(abort_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("load Abort key ref");
+        let key = store
+            .data_key_by_ref(&key_ref)
+            .await
+            .expect("load Abort key");
+        let replacement = serde_json::to_vec(&Command::UserMessage {
+            text: "not an abort".to_owned(),
+            attachments: Vec::new(),
+        })
+        .expect("serialize authenticated wrong variant");
+        let aad = store
+            .scope()
+            .row_aad("inbound_commands", "1", DataKeyPurpose::Command);
+        sqlx::query(
+            "UPDATE inbound_commands SET payload_ciphertext=?, payload_hmac=? WHERE command_id=?",
+        )
+        .bind(encrypt_content(&key, &replacement, &aad).expect("encrypt wrong variant"))
+        .bind(command_payload_digest(&key, &replacement))
+        .bind(abort_id)
+        .execute(store.pool())
+        .await
+        .expect("install authenticated wrong variant");
+        let wrong_variant = writer
+            .apply_idle_abort_cutoff(abort_id, 1)
+            .await
+            .expect_err("Abort cutoff must reject another authenticated command variant");
+        assert!(
+            wrong_variant
+                .to_string()
+                .contains("different command variant")
+        );
+        assert_eq!(
+            writer
+                .ack_for_command(abort_id)
+                .await
+                .expect("read unchanged Abort ACK")
+                .expect("Abort row remains")
+                .status,
+            CommandAckStatus::Received
+        );
+
+        let purpose_store = test_store().await;
+        let purpose_writer = EventWriter::new(purpose_store.clone());
+        let purpose_abort_id = "00000000-0000-4000-8000-000000000083";
+        purpose_writer
+            .persist_inbound(&abort_command(1, purpose_abort_id))
+            .await
+            .expect("persist key-purpose Abort fixture");
+        sqlx::query(
+            "UPDATE data_keys SET purpose='event'
+             WHERE key_ref=(SELECT payload_key_ref FROM inbound_commands WHERE command_id=?)",
+        )
+        .bind(purpose_abort_id)
+        .execute(purpose_store.pool())
+        .await
+        .expect("tamper Abort key purpose");
+        let wrong_purpose = purpose_writer
+            .apply_idle_abort_cutoff(purpose_abort_id, 1)
+            .await
+            .expect_err("Abort cutoff must reject a non-command key");
+        let wrong_purpose = format!("{wrong_purpose:#}");
+        assert!(
+            wrong_purpose.contains("non-command data key")
+                || wrong_purpose.contains("failed to unwrap data key")
+                || wrong_purpose.contains("AEAD authentication failed"),
+            "unexpected key-purpose error: {wrong_purpose}"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_admission_bounds_non_abort_window_but_keeps_one_abort_slot() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store);
+        let mut admission = InboundAdmission::after_t12_recovery(false);
+        let commands = (1_u64..=32)
+            .map(|seq| {
+                let command_id = Uuid::from_u128(seq as u128).to_string();
+                user_command(seq, &command_id, "pending")
+            })
+            .collect::<Vec<_>>();
+        for command in &commands {
+            admission
+                .receive(&writer, command)
+                .await
+                .expect("bounded live command");
+        }
+        assert_eq!(
+            admission
+                .receive(&writer, &commands[0])
+                .await
+                .expect("exact replay remains admissible at capacity")
+                .status,
+            CommandAckStatus::Received
+        );
+
+        let overflow = user_command(33, &Uuid::from_u128(33).to_string(), "overflow");
+        let error = admission
+            .receive(&writer, &overflow)
+            .await
+            .expect_err("33rd non-Abort command must backpressure");
+        assert!(error.downcast_ref::<InboundBackpressure>().is_some());
+
+        let abort_id = Uuid::from_u128(34).to_string();
+        assert_eq!(
+            admission
+                .receive(&writer, &abort_command(33, &abort_id))
+                .await
+                .expect("reserved Abort remains admissible")
+                .status,
+            CommandAckStatus::Received
+        );
+        let terminal = writer
+            .apply_idle_abort_cutoff(&abort_id, 33)
+            .await
+            .expect("bounded Abort cutoff");
+        assert_eq!(terminal.len(), 33);
+
+        assert_eq!(
+            admission
+                .receive(
+                    &writer,
+                    &user_command(34, &Uuid::from_u128(35).to_string(), "after cutoff"),
+                )
+                .await
+                .expect("terminal ACKs release the durable window")
+                .status,
+            CommandAckStatus::Received
+        );
+    }
+
+    #[tokio::test]
+    async fn live_admission_enforces_four_mib_canonical_payload_window() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store);
+        let mut admission = InboundAdmission::after_t12_recovery(false);
+        let near_wire_limit = "x".repeat(1_048_000);
+        for seq in 1_u64..=4 {
+            admission
+                .receive(
+                    &writer,
+                    &user_command(
+                        seq,
+                        &Uuid::from_u128(100 + seq as u128).to_string(),
+                        &near_wire_limit,
+                    ),
+                )
+                .await
+                .expect("four canonical payloads remain below 4 MiB");
+        }
+
+        let error = admission
+            .receive(
+                &writer,
+                &user_command(5, &Uuid::from_u128(105).to_string(), &"y".repeat(3_000)),
+            )
+            .await
+            .expect_err("canonical payload aggregate above 4 MiB must backpressure");
+        assert!(error.downcast_ref::<InboundBackpressure>().is_some());
+    }
+
+    #[tokio::test]
     async fn command_sequence_outside_sqlite_integer_range_is_rejected_without_a_row() {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
@@ -6172,7 +10709,7 @@ mod tests {
             raw_command: RejectedCommandPayload::DiscardedOversized,
             payload_digest: Some(KeyedCommandDigest::new(
                 key.key_ref.clone(),
-                keyed_digest(&key, &bytes)
+                command_payload_digest(&key, &bytes)
                     .try_into()
                     .expect("HMAC-SHA256 digest length"),
             )),
@@ -6217,7 +10754,7 @@ mod tests {
             raw_command: RejectedCommandPayload::DiscardedOversized,
             payload_digest: Some(KeyedCommandDigest::new(
                 key.key_ref.clone(),
-                keyed_digest(&key, &changed_bytes)
+                command_payload_digest(&key, &changed_bytes)
                     .try_into()
                     .expect("HMAC-SHA256 digest length"),
             )),
@@ -6309,23 +10846,30 @@ mod tests {
         let store = test_store().await;
         let writer = EventWriter::new(store);
         let user = user_command(1, "00000000-0000-4000-8000-000000000001", "pending");
-        let abort = abort_command(2, "00000000-0000-4000-8000-000000000013");
+        let approval =
+            approval_command(2, "00000000-0000-4000-8000-000000000020", "unknown-request");
+        let abort = abort_command(3, "00000000-0000-4000-8000-000000000013");
         writer
             .persist_inbound(&user)
             .await
             .expect("persist pending user");
+        writer
+            .persist_inbound(&approval)
+            .await
+            .expect("persist pending approval decision");
         writer.persist_inbound(&abort).await.expect("persist abort");
 
         let acks = writer
-            .apply_idle_abort_cutoff("00000000-0000-4000-8000-000000000013", 2)
+            .apply_idle_abort_cutoff("00000000-0000-4000-8000-000000000013", 3)
             .await
             .expect("apply ordered cutoff");
         assert_eq!(
             acks.iter().map(|ack| ack.seq).collect::<Vec<_>>(),
-            vec![1, 2]
+            vec![1, 2, 3]
         );
         assert_eq!(acks[0].status, CommandAckStatus::Superseded);
         assert_eq!(acks[1].status, CommandAckStatus::Applied);
+        assert_eq!(acks[2].status, CommandAckStatus::Applied);
         assert_eq!(
             writer
                 .persist_inbound(&user)
@@ -6335,10 +10879,62 @@ mod tests {
         );
         assert_eq!(
             writer
+                .persist_inbound(&approval)
+                .await
+                .expect("replay no-op approval"),
+            acks[1]
+        );
+        assert_eq!(
+            writer
                 .persist_inbound(&abort)
                 .await
                 .expect("replay applied abort"),
-            acks[1]
+            acks[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_idle_abort_rejects_an_incomplete_cutoff_and_rolls_back() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        writer
+            .persist_inbound(&user_command(
+                1,
+                "00000000-0000-4000-8000-000000000001",
+                "must be terminalized",
+            ))
+            .await
+            .expect("persist earlier command");
+        writer
+            .persist_inbound(&abort_command(2, "00000000-0000-4000-8000-000000000013"))
+            .await
+            .expect("persist Abort");
+
+        let error = writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![Projection::CommandApplied {
+                        command_id: "00000000-0000-4000-8000-000000000013".to_owned(),
+                        command_seq: 2,
+                        run_id: None,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("Abort cannot skip an earlier received command");
+        assert!(error.to_string().contains("cutoff"));
+        assert_eq!(
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT
+                    (SELECT status FROM inbound_commands WHERE seq=1),
+                    (SELECT status FROM inbound_commands WHERE seq=2)",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("rollback states"),
+            ("received".to_owned(), "received".to_owned())
         );
     }
 
@@ -6565,7 +11161,7 @@ mod tests {
             })
             .await
             .expect_err("startup Abort requires atomic supersede");
-        assert!(incomplete.to_string().contains("CommandSuperseded"));
+        assert!(incomplete.to_string().contains("terminal projection"));
         let states: (String, String) = sqlx::query_as(
             "SELECT
                 (SELECT status FROM inbound_commands WHERE command_id='00000000-0000-4000-8000-000000000011'),
@@ -6575,6 +11171,81 @@ mod tests {
         .await
         .expect("rollback states");
         assert_eq!(states, ("applying".to_owned(), "received".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn direct_active_abort_rejects_an_incomplete_cutoff_and_rolls_back() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        writer
+            .persist_inbound(&user_command(
+                1,
+                "00000000-0000-4000-8000-000000000001",
+                "running",
+            ))
+            .await
+            .expect("persist owner");
+        sqlx::query(
+            "UPDATE inbound_commands
+             SET status='applying', application_kind='idle_run', run_id='run-1',
+                 turn_id='turn-1', run_phase='assistant_started'
+             WHERE command_id='00000000-0000-4000-8000-000000000001'",
+        )
+        .execute(store.pool())
+        .await
+        .expect("open owner fixture");
+        writer
+            .persist_inbound(&user_command(
+                2,
+                "00000000-0000-4000-8000-000000000016",
+                "must be superseded",
+            ))
+            .await
+            .expect("persist earlier pending command");
+        writer
+            .persist_inbound(&abort_command(3, "00000000-0000-4000-8000-000000000014"))
+            .await
+            .expect("persist Abort");
+
+        let error = writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![
+                        Projection::RunPhase {
+                            command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+                            run_id: "run-1".to_owned(),
+                            expected: RunPhase::AssistantStarted,
+                            next: RunPhase::CancelRequested,
+                        },
+                        Projection::CommandApplied {
+                            command_id: "00000000-0000-4000-8000-000000000014".to_owned(),
+                            command_seq: 3,
+                            run_id: Some("run-1".to_owned()),
+                        },
+                    ],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("active Abort cannot skip an earlier received command");
+        assert!(error.to_string().contains("cutoff"));
+        assert_eq!(
+            sqlx::query_as::<_, (String, String, String)>(
+                "SELECT
+                    (SELECT run_phase FROM inbound_commands WHERE seq=1),
+                    (SELECT status FROM inbound_commands WHERE seq=2),
+                    (SELECT status FROM inbound_commands WHERE seq=3)",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("rollback states"),
+            (
+                "assistant_started".to_owned(),
+                "received".to_owned(),
+                "received".to_owned()
+            )
+        );
     }
 
     #[tokio::test]
@@ -6888,6 +11559,284 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn steered_mode_matches_every_durable_application_kind() {
+        for (application_kind, expected_mode, wrong_mode, needs_turn_start) in [
+            ("hard_steer", SteerMode::Hard, SteerMode::Soft, true),
+            ("soft_steer", SteerMode::Soft, SteerMode::Hard, true),
+        ] {
+            let store = test_store().await;
+            let writer = EventWriter::new(store.clone());
+            seed_tool_owner(&store, &writer, "run-steer-mode").await;
+            let command_id = "00000000-0000-4000-8000-000000000002";
+            writer
+                .persist_inbound(&user_command(2, command_id, "steer"))
+                .await
+                .expect("persist steer mode fixture");
+            sqlx::query(
+                "UPDATE inbound_commands
+                 SET status='applying', application_kind=?, run_id='run-steer-mode',
+                     turn_id='turn-steer-mode', run_phase='classified'
+                 WHERE command_id=?",
+            )
+            .bind(application_kind)
+            .bind(command_id)
+            .execute(store.pool())
+            .await
+            .expect("classify steer mode fixture");
+
+            let batch = |mode| {
+                let mut writes = vec![EventWrite {
+                    event: Some(
+                        DurableEvent::steered(
+                            mode,
+                            command_id.to_owned(),
+                            "run-steer-mode".to_owned(),
+                            "turn-steer-mode".to_owned(),
+                        )
+                        .expect("typed Steered"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: "run-steer-mode".to_owned(),
+                        expected: RunPhase::Classified,
+                        next: RunPhase::TurnStarted,
+                    }],
+                }];
+                if needs_turn_start {
+                    writes.push(EventWrite {
+                        event: Some(
+                            DurableEvent::turn_start("run-steer-mode", "turn-steer-mode")
+                                .expect("typed TurnStart"),
+                        ),
+                        projections: Vec::new(),
+                    });
+                }
+                EventBatch {
+                    writes,
+                    injected_commands: Vec::new(),
+                }
+            };
+
+            let error = writer
+                .apply(batch(wrong_mode))
+                .await
+                .expect_err("mismatched serialized steer mode must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("does not match application kind"),
+                "{application_kind}: {error:#}"
+            );
+            writer
+                .apply(batch(expected_mode))
+                .await
+                .unwrap_or_else(|error| panic!("{application_kind} positive failed: {error:#}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_steer_requires_the_current_turns_latest_unconsumed_schedule_for_every_member() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let owner_id = "00000000-0000-4000-8000-000000000091";
+        let injected = classified_injection(&writer, 1, owner_id, "owner", "retry-old").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(owner_id, "owner", "retry-old"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("open historical retry turn");
+        let run_id = format!("run-{owner_id}");
+        let old_turn_id = format!("turn-{owner_id}");
+        let old_error = assistant_message(StopReason::Error);
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            "assistant-retry-old",
+                            &old_error,
+                            Some(run_id.clone()),
+                            Some(old_turn_id.clone()),
+                        )
+                        .expect("old assistant start"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: owner_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("start old attempt");
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_end",
+                                "assistant-retry-old",
+                                &old_error,
+                                Some(run_id.clone()),
+                                Some(old_turn_id.clone()),
+                            )
+                            .expect("old assistant end"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: "assistant-retry-old".to_owned(),
+                            role: "assistant",
+                            message: old_error.clone(),
+                            append_to_l0: false,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::retry_scheduled(
+                                run_id.clone(),
+                                old_turn_id.clone(),
+                                1,
+                                0,
+                                durable_test_timestamp(),
+                                "old retry",
+                            )
+                            .expect("old retry schedule"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::turn_end(&run_id, &old_turn_id, old_error, Vec::new())
+                                .expect("close old retry turn"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("retain the historical schedule while closing its turn");
+
+        let current_turn_id = "retry-current";
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::turn_start(&run_id, current_turn_id)
+                            .expect("current TurnStart"),
+                    ),
+                    projections: Vec::new(),
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("open current continuation turn");
+        let current_error = assistant_message(StopReason::Error);
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_start",
+                                "assistant-retry-current",
+                                &current_error,
+                                Some(run_id.clone()),
+                                Some(current_turn_id.to_owned()),
+                            )
+                            .expect("current assistant start"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_end",
+                                "assistant-retry-current",
+                                &current_error,
+                                Some(run_id.clone()),
+                                Some(current_turn_id.to_owned()),
+                            )
+                            .expect("current assistant end"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: "assistant-retry-current".to_owned(),
+                            role: "assistant",
+                            message: current_error,
+                            append_to_l0: false,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::retry_scheduled(
+                                run_id.clone(),
+                                current_turn_id.to_owned(),
+                                1,
+                                0,
+                                durable_test_timestamp(),
+                                "current retry",
+                            )
+                            .expect("current retry schedule"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist current retry wait");
+
+        let first = "00000000-0000-4000-8000-000000000092";
+        let second = "00000000-0000-4000-8000-000000000093";
+        writer
+            .persist_inbound(&user_command(2, first, "first"))
+            .await
+            .expect("persist first retry steer");
+        writer
+            .persist_inbound(&user_command(3, second, "second"))
+            .await
+            .expect("persist second retry steer");
+        let classify = |command_id: &str, turn_id: &str| Projection::CommandClassified {
+            command_id: command_id.to_owned(),
+            application_kind: ApplicationKind::RetrySteer,
+            run_id: run_id.clone(),
+            turn_id: turn_id.to_owned(),
+        };
+        let stale = writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![
+                        classify(first, current_turn_id),
+                        classify(second, &old_turn_id),
+                    ],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("one stale historical member must reject the whole group");
+        assert!(stale.to_string().contains("exact current open turn"));
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![
+                        classify(first, current_turn_id),
+                        classify(second, current_turn_id),
+                    ],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("all members bound to the current retry wait");
+    }
+
+    #[tokio::test]
     async fn phase_transitions_are_cas_valid_and_owner_required_transition_fails_without_owner() {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
@@ -7102,6 +12051,359 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_supersede_requires_a_later_same_context_abort_cutoff() {
+        let received_store = test_store().await;
+        let received_writer = EventWriter::new(received_store);
+        received_writer
+            .persist_inbound(&user_command(
+                1,
+                "00000000-0000-4000-8000-000000000041",
+                "received",
+            ))
+            .await
+            .expect("persist received user");
+        let received_error = received_writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![Projection::CommandSuperseded {
+                        command_id: "00000000-0000-4000-8000-000000000041".to_owned(),
+                        command_seq: 1,
+                        run_id: None,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("Idle supersede without Abort must fail");
+        assert!(received_error.to_string().contains("later Abort"));
+
+        let classified_store = test_store().await;
+        let classified_writer = EventWriter::new(classified_store);
+        classified_writer
+            .persist_inbound(&user_command(
+                1,
+                "00000000-0000-4000-8000-000000000042",
+                "classified",
+            ))
+            .await
+            .expect("persist classified user");
+        classified_writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![Projection::CommandClassified {
+                        command_id: "00000000-0000-4000-8000-000000000042".to_owned(),
+                        application_kind: ApplicationKind::IdleRun,
+                        run_id: "run-supersede".to_owned(),
+                        turn_id: "turn-supersede".to_owned(),
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("classify user");
+        let classified_error = classified_writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![Projection::CommandSuperseded {
+                        command_id: "00000000-0000-4000-8000-000000000042".to_owned(),
+                        command_seq: 1,
+                        run_id: Some("run-supersede".to_owned()),
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("classified supersede without Abort must fail");
+        assert!(classified_error.to_string().contains("later Abort"));
+    }
+
+    #[tokio::test]
+    async fn owner_close_rejects_pre_assistant_agent_end_and_handoff() {
+        for (index, phase) in [RunPhase::UserStarted, RunPhase::UserCommitted]
+            .into_iter()
+            .enumerate()
+        {
+            let store = test_store().await;
+            let writer = EventWriter::new(store.clone());
+            let owner_id = format!("00000000-0000-4000-8000-00000000005{}", index * 2);
+            let next_id = format!("00000000-0000-4000-8000-00000000005{}", index * 2 + 1);
+            writer
+                .persist_inbound(&user_command(1, &owner_id, "owner"))
+                .await
+                .expect("persist owner");
+            sqlx::query(
+                "UPDATE inbound_commands
+                 SET status='applying', application_kind='idle_run', run_id='run-phase',
+                     turn_id='turn-owner', run_phase=?
+                 WHERE command_id=?",
+            )
+            .bind(phase.as_str())
+            .bind(&owner_id)
+            .execute(store.pool())
+            .await
+            .expect("seed pre-assistant owner");
+
+            let agent_end_error = writer
+                .apply(EventBatch {
+                    writes: vec![EventWrite {
+                        event: Some(DurableEvent::agent_end("run-phase").expect("typed AgentEnd")),
+                        projections: vec![Projection::CommandApplied {
+                            command_id: owner_id.clone(),
+                            command_seq: 1,
+                            run_id: Some("run-phase".to_owned()),
+                        }],
+                    }],
+                    injected_commands: Vec::new(),
+                })
+                .await
+                .expect_err("pre-assistant AgentEnd must fail");
+            assert!(agent_end_error.to_string().contains("must close from"));
+
+            writer
+                .persist_inbound(&user_command(2, &next_id, "next"))
+                .await
+                .expect("persist next owner");
+            sqlx::query(
+                "UPDATE inbound_commands
+                 SET status='applying', application_kind='soft_steer', run_id='run-phase',
+                     turn_id='turn-next', run_phase='classified', received_at=?
+                 WHERE command_id=?",
+            )
+            .bind(durable_test_timestamp().to_rfc3339())
+            .bind(&next_id)
+            .execute(store.pool())
+            .await
+            .expect("seed next owner");
+            let message = user_message("next");
+            let message_id = user_message_id(next_id.as_str());
+            let handoff_error = writer
+                .apply(EventBatch {
+                    writes: vec![
+                        EventWrite {
+                            event: Some(
+                                DurableEvent::steered(
+                                    SteerMode::Soft,
+                                    next_id.clone(),
+                                    "run-phase".to_owned(),
+                                    "turn-next".to_owned(),
+                                )
+                                .expect("Steered"),
+                            ),
+                            projections: vec![Projection::RunPhase {
+                                command_id: next_id.clone(),
+                                run_id: "run-phase".to_owned(),
+                                expected: RunPhase::Classified,
+                                next: RunPhase::TurnStarted,
+                            }],
+                        },
+                        EventWrite {
+                            event: Some(
+                                DurableEvent::turn_start("run-phase", "turn-next")
+                                    .expect("TurnStart"),
+                            ),
+                            projections: Vec::new(),
+                        },
+                        EventWrite {
+                            event: Some(
+                                DurableEvent::message("message_start", &message_id, &message)
+                                    .expect("MessageStart"),
+                            ),
+                            projections: vec![
+                                Projection::CommandApplied {
+                                    command_id: owner_id.clone(),
+                                    command_seq: 1,
+                                    run_id: Some("run-phase".to_owned()),
+                                },
+                                Projection::RunPhase {
+                                    command_id: next_id.clone(),
+                                    run_id: "run-phase".to_owned(),
+                                    expected: RunPhase::TurnStarted,
+                                    next: RunPhase::UserStarted,
+                                },
+                            ],
+                        },
+                        EventWrite {
+                            event: Some(
+                                DurableEvent::message("message_end", &message_id, &message)
+                                    .expect("MessageEnd"),
+                            ),
+                            projections: vec![
+                                Projection::MessageEnd {
+                                    message_id,
+                                    role: "user",
+                                    message,
+                                    append_to_l0: true,
+                                },
+                                Projection::RunPhase {
+                                    command_id: next_id.clone(),
+                                    run_id: "run-phase".to_owned(),
+                                    expected: RunPhase::UserStarted,
+                                    next: RunPhase::UserCommitted,
+                                },
+                            ],
+                        },
+                    ],
+                    injected_commands: vec![InjectedCommand::new(2, next_id)],
+                })
+                .await
+                .expect_err("pre-assistant owner handoff must fail");
+            assert!(
+                handoff_error.to_string().contains("handoff"),
+                "{handoff_error:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_end_rejects_pending_steer_but_abort_close_supersedes_it_atomically() {
+        let normal_store = test_store().await;
+        let normal_writer = EventWriter::new(normal_store.clone());
+        normal_writer
+            .persist_inbound(&user_command(
+                1,
+                "00000000-0000-4000-8000-000000000061",
+                "owner",
+            ))
+            .await
+            .expect("persist owner");
+        normal_writer
+            .persist_inbound(&user_command(
+                2,
+                "00000000-0000-4000-8000-000000000062",
+                "pending",
+            ))
+            .await
+            .expect("persist pending steer");
+        sqlx::query(
+            "UPDATE inbound_commands
+             SET status='applying', application_kind='idle_run', run_id='run-pending',
+                 turn_id='turn-owner', run_phase='assistant_started'
+             WHERE seq=1",
+        )
+        .execute(normal_store.pool())
+        .await
+        .expect("seed owner");
+        sqlx::query(
+            "UPDATE inbound_commands
+             SET status='applying', application_kind='soft_steer', run_id='run-pending',
+                 turn_id='turn-next', run_phase='classified'
+             WHERE seq=2",
+        )
+        .execute(normal_store.pool())
+        .await
+        .expect("seed pending steer");
+        let normal_error = normal_writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(DurableEvent::agent_end("run-pending").expect("AgentEnd")),
+                    projections: vec![Projection::CommandApplied {
+                        command_id: "00000000-0000-4000-8000-000000000061".to_owned(),
+                        command_seq: 1,
+                        run_id: Some("run-pending".to_owned()),
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("normal AgentEnd must not strand a pending steer");
+        assert!(normal_error.to_string().contains("pending steer"));
+
+        let abort_store = test_store().await;
+        let abort_writer = EventWriter::new(abort_store.clone());
+        for command in [
+            user_command(1, "00000000-0000-4000-8000-000000000063", "owner"),
+            user_command(2, "00000000-0000-4000-8000-000000000064", "pending"),
+            abort_command(3, "00000000-0000-4000-8000-000000000065"),
+        ] {
+            abort_writer
+                .persist_inbound(&command)
+                .await
+                .expect("persist Abort-close command");
+        }
+        sqlx::query(
+            "UPDATE inbound_commands
+             SET status='applying', application_kind='idle_run', run_id='run-abort-close',
+                 turn_id='turn-owner', run_phase='assistant_started'
+             WHERE seq=1",
+        )
+        .execute(abort_store.pool())
+        .await
+        .expect("seed Abort-close owner");
+        sqlx::query(
+            "UPDATE inbound_commands
+             SET status='applying', application_kind='soft_steer', run_id='run-abort-close',
+                 turn_id='turn-next', run_phase='classified'
+             WHERE seq=2",
+        )
+        .execute(abort_store.pool())
+        .await
+        .expect("seed Abort-close pending steer");
+        abort_writer
+            .reset_checkpoint_after_direct_fixture_mutation()
+            .await;
+        abort_writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: None,
+                        projections: vec![Projection::CommandSuperseded {
+                            command_id: "00000000-0000-4000-8000-000000000064".to_owned(),
+                            command_seq: 2,
+                            run_id: Some("run-abort-close".to_owned()),
+                        }],
+                    },
+                    EventWrite {
+                        event: None,
+                        projections: vec![
+                            Projection::RunPhase {
+                                command_id: "00000000-0000-4000-8000-000000000063".to_owned(),
+                                run_id: "run-abort-close".to_owned(),
+                                expected: RunPhase::AssistantStarted,
+                                next: RunPhase::CancelRequested,
+                            },
+                            Projection::CommandApplied {
+                                command_id: "00000000-0000-4000-8000-000000000065".to_owned(),
+                                command_seq: 3,
+                                run_id: Some("run-abort-close".to_owned()),
+                            },
+                        ],
+                    },
+                    EventWrite {
+                        event: Some(DurableEvent::agent_end("run-abort-close").expect("AgentEnd")),
+                        projections: vec![Projection::CommandApplied {
+                            command_id: "00000000-0000-4000-8000-000000000063".to_owned(),
+                            command_seq: 1,
+                            run_id: Some("run-abort-close".to_owned()),
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("Abort closes owner after superseding every pending steer");
+        let statuses: (String, String, String) = sqlx::query_as(
+            "SELECT
+                (SELECT status FROM inbound_commands WHERE seq=1),
+                (SELECT status FROM inbound_commands WHERE seq=2),
+                (SELECT status FROM inbound_commands WHERE seq=3)",
+        )
+        .fetch_one(abort_store.pool())
+        .await
+        .expect("read Abort-close states");
+        assert_eq!(
+            statuses,
+            (
+                "applied".to_owned(),
+                "superseded".to_owned(),
+                "applied".to_owned()
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn user_owner_closes_only_with_agent_end_or_atomic_handoff() {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
@@ -7122,6 +12424,9 @@ mod tests {
         .execute(store.pool())
         .await
         .expect("open owner");
+        writer
+            .reset_checkpoint_after_direct_fixture_mutation()
+            .await;
 
         let unpaired = writer
             .apply(EventBatch {
@@ -7192,6 +12497,9 @@ mod tests {
         .await
         .expect("open old owner");
         handoff_writer
+            .reset_checkpoint_after_direct_fixture_mutation()
+            .await;
+        handoff_writer
             .persist_inbound(&user_command(
                 2,
                 "00000000-0000-4000-8000-000000000018",
@@ -7219,94 +12527,133 @@ mod tests {
             })
             .await
             .expect("classify steer");
-        let message = user_message("new");
         handoff_writer
             .apply(EventBatch {
-                writes: vec![
-                    EventWrite {
-                        event: Some(
-                            DurableEvent::new(&json!({
-                                "type":"steered",
-                                "command_id":"00000000-0000-4000-8000-000000000018",
-                                "run_id":"run-handoff",
-                                "turn_id":"turn-new",
-                                "mode":"soft",
-                            }))
-                            .expect("Steered"),
-                        ),
-                        projections: vec![Projection::RunPhase {
-                            command_id: "00000000-0000-4000-8000-000000000018".to_owned(),
-                            run_id: "run-handoff".to_owned(),
-                            expected: RunPhase::Classified,
-                            next: RunPhase::TurnStarted,
-                        }],
-                    },
-                    EventWrite {
-                        event: Some(
-                            DurableEvent::new(&json!({
-                                "type":"turn_start",
-                                "run_id":"run-handoff",
-                                "turn_id":"turn-new",
-                            }))
-                            .expect("TurnStart"),
-                        ),
-                        projections: Vec::new(),
-                    },
-                    EventWrite {
-                        event: Some(
-                            DurableEvent::message(
-                                "message_start",
-                                &user_message_id("00000000-0000-4000-8000-000000000018"),
-                                &message,
-                            )
-                            .expect("MessageStart"),
-                        ),
-                        projections: vec![
-                            Projection::CommandApplied {
-                                command_id: "00000000-0000-4000-8000-000000000019".to_owned(),
-                                command_seq: 1,
-                                run_id: Some("run-handoff".to_owned()),
-                            },
-                            Projection::RunPhase {
-                                command_id: "00000000-0000-4000-8000-000000000018".to_owned(),
-                                run_id: "run-handoff".to_owned(),
-                                expected: RunPhase::TurnStarted,
-                                next: RunPhase::UserStarted,
-                            },
-                        ],
-                    },
-                    EventWrite {
-                        event: Some(
-                            DurableEvent::message(
-                                "message_end",
-                                &user_message_id("00000000-0000-4000-8000-000000000018"),
-                                &message,
-                            )
-                            .expect("MessageEnd"),
-                        ),
-                        projections: vec![
-                            Projection::MessageEnd {
-                                message_id: user_message_id("00000000-0000-4000-8000-000000000018"),
-                                role: "user",
-                                message,
-                                append_to_l0: true,
-                            },
-                            Projection::RunPhase {
-                                command_id: "00000000-0000-4000-8000-000000000018".to_owned(),
-                                run_id: "run-handoff".to_owned(),
-                                expected: RunPhase::UserStarted,
-                                next: RunPhase::UserCommitted,
-                            },
-                        ],
-                    },
-                ],
-                injected_commands: vec![InjectedCommand::new(
-                    2,
-                    "00000000-0000-4000-8000-000000000018",
-                )],
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                        tool_call_id: "tool-handoff".to_owned(),
+                        command_id: "00000000-0000-4000-8000-000000000019".to_owned(),
+                        run_id: "run-handoff".to_owned(),
+                        executor_generation: 1,
+                        idempotency_key: "idem-handoff".to_owned(),
+                    })],
+                }],
+                injected_commands: Vec::new(),
             })
             .await
-            .expect("canonical atomic owner handoff");
+            .expect("prepare handoff tool");
+        handoff_writer
+            .apply(EventBatch {
+                writes: vec![tool_start_write("tool-handoff", "run-handoff")],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("start handoff tool");
+        let message = user_message("new");
+        let mut handoff_batch = EventBatch {
+            writes: vec![
+                EventWrite {
+                    event: Some(
+                        DurableEvent::new(&json!({
+                            "type":"steered",
+                            "command_id":"00000000-0000-4000-8000-000000000018",
+                            "run_id":"run-handoff",
+                            "turn_id":"turn-new",
+                            "mode":"soft",
+                        }))
+                        .expect("Steered"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: "00000000-0000-4000-8000-000000000018".to_owned(),
+                        run_id: "run-handoff".to_owned(),
+                        expected: RunPhase::Classified,
+                        next: RunPhase::TurnStarted,
+                    }],
+                },
+                EventWrite {
+                    event: Some(
+                        DurableEvent::new(&json!({
+                            "type":"turn_start",
+                            "run_id":"run-handoff",
+                            "turn_id":"turn-new",
+                        }))
+                        .expect("TurnStart"),
+                    ),
+                    projections: Vec::new(),
+                },
+                EventWrite {
+                    event: Some(
+                        DurableEvent::message(
+                            "message_start",
+                            &user_message_id("00000000-0000-4000-8000-000000000018"),
+                            &message,
+                        )
+                        .expect("MessageStart"),
+                    ),
+                    projections: vec![
+                        Projection::CommandApplied {
+                            command_id: "00000000-0000-4000-8000-000000000019".to_owned(),
+                            command_seq: 1,
+                            run_id: Some("run-handoff".to_owned()),
+                        },
+                        Projection::RunPhase {
+                            command_id: "00000000-0000-4000-8000-000000000018".to_owned(),
+                            run_id: "run-handoff".to_owned(),
+                            expected: RunPhase::TurnStarted,
+                            next: RunPhase::UserStarted,
+                        },
+                    ],
+                },
+                EventWrite {
+                    event: Some(
+                        DurableEvent::message(
+                            "message_end",
+                            &user_message_id("00000000-0000-4000-8000-000000000018"),
+                            &message,
+                        )
+                        .expect("MessageEnd"),
+                    ),
+                    projections: vec![
+                        Projection::MessageEnd {
+                            message_id: user_message_id("00000000-0000-4000-8000-000000000018"),
+                            role: "user",
+                            message,
+                            append_to_l0: true,
+                        },
+                        Projection::RunPhase {
+                            command_id: "00000000-0000-4000-8000-000000000018".to_owned(),
+                            run_id: "run-handoff".to_owned(),
+                            expected: RunPhase::UserStarted,
+                            next: RunPhase::UserCommitted,
+                        },
+                    ],
+                },
+            ],
+            injected_commands: vec![InjectedCommand::new(
+                2,
+                "00000000-0000-4000-8000-000000000018",
+            )],
+        };
+        let active_error = handoff_writer
+            .apply(handoff_batch.clone())
+            .await
+            .expect_err("owner handoff cannot leave a running tool behind");
+        assert!(active_error.to_string().contains("active running tool"));
+        let mut cleanup = tool_finish_writes(
+            "tool-handoff",
+            "running",
+            "succeeded",
+            None,
+            "handoff complete",
+            false,
+        );
+        cleanup.append(&mut handoff_batch.writes);
+        handoff_batch.writes = cleanup;
+        handoff_writer
+            .apply(handoff_batch)
+            .await
+            .expect("canonical atomic owner handoff with tool cleanup");
         let states: (String, String) = sqlx::query_as(
             "SELECT
                 (SELECT status FROM inbound_commands WHERE command_id='00000000-0000-4000-8000-000000000019'),
@@ -7316,6 +12663,32 @@ mod tests {
         .await
         .expect("handoff states");
         assert_eq!(states, ("applied".to_owned(), "user_committed".to_owned()));
+        let event_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+            .fetch_one(handoff_store.pool())
+            .await
+            .expect("count events before late finish");
+        let late_finish = handoff_writer
+            .apply(EventBatch {
+                writes: tool_finish_writes(
+                    "tool-handoff",
+                    "running",
+                    "succeeded",
+                    None,
+                    "late duplicate",
+                    false,
+                ),
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("late ToolExecutionEnd after owner close must not leak result events");
+        assert!(late_finish.to_string().contains("durable state succeeded"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
+                .fetch_one(handoff_store.pool())
+                .await
+                .expect("late finish rollback event count"),
+            event_count
+        );
     }
 
     #[tokio::test]
@@ -7859,8 +13232,6 @@ mod tests {
                             tool_call_id: "tool-1".to_owned(),
                             run_id: "run-1".to_owned(),
                             turn_id: "turn-1".to_owned(),
-                            request_projection: "safe request".to_owned(),
-                            redaction_version: 1,
                         }),
                         Projection::Approval(ApprovalMutation::Resolve {
                             request_id: "request-1".to_owned(),
@@ -7926,12 +13297,6 @@ mod tests {
                             tool_call_id: "tool-1".to_owned(),
                             run_id: "run-1".to_owned(),
                             turn_id: "turn-1".to_owned(),
-                            request_projection: approval_request_projection(
-                                "request-1",
-                                "tool-1",
-                                "mutating",
-                            ),
-                            redaction_version: 1,
                         })],
                     }],
                     injected_commands: Vec::new(),
@@ -7964,6 +13329,7 @@ mod tests {
                         projections: vec![Projection::ToolExecution(
                             ToolExecutionMutation::Start {
                                 tool_call_id: "tool-1".to_owned(),
+                                run_id: "run-1".to_owned(),
                             },
                         )],
                     }],
@@ -7982,9 +13348,903 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_approval_requires_a_same_run_prepared_tool_and_owner() {
+        let orphan_store = test_store().await;
+        let orphan_writer = EventWriter::new(orphan_store.clone());
+        seed_tool_owner(&orphan_store, &orphan_writer, "run-orphan").await;
+        let orphan = orphan_writer
+            .apply(EventBatch {
+                writes: vec![pending_approval_write(
+                    "request-orphan",
+                    "tool-orphan",
+                    "run-orphan",
+                )],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("pending approval without a prepared tool must fail");
+        assert!(orphan.to_string().contains("requires prepared tool"));
+        assert_eq!(
+            sqlx::query_as::<_, (i64, i64)>(
+                "SELECT
+                    (SELECT COUNT(*) FROM approval_log),
+                    (SELECT COUNT(*) FROM agent_events)",
+            )
+            .fetch_one(orphan_store.pool())
+            .await
+            .expect("orphan rollback counts"),
+            (0, 0)
+        );
+
+        let wrong_turn_store = test_store().await;
+        let wrong_turn_writer = EventWriter::new(wrong_turn_store.clone());
+        seed_tool_owner(&wrong_turn_store, &wrong_turn_writer, "run-wrong-turn").await;
+        wrong_turn_writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                        tool_call_id: "tool-wrong-turn".to_owned(),
+                        command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                        run_id: "run-wrong-turn".to_owned(),
+                        executor_generation: 1,
+                        idempotency_key: "idem-wrong-turn".to_owned(),
+                    })],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("prepare wrong-turn fixture");
+        let mut wrong_turn =
+            pending_approval_write("request-wrong-turn", "tool-wrong-turn", "run-wrong-turn");
+        let Projection::Approval(ApprovalMutation::Pending { turn_id, .. }) =
+            &mut wrong_turn.projections[0]
+        else {
+            panic!("pending approval helper shape changed")
+        };
+        *turn_id = "turn-other".to_owned();
+        let error = wrong_turn_writer
+            .apply(EventBatch {
+                writes: vec![wrong_turn],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("approval turn cannot differ from its durable owner turn");
+        assert!(error.to_string().contains("durable owner turn turn-1"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM approval_log")
+                .fetch_one(wrong_turn_store.pool())
+                .await
+                .expect("wrong-turn rollback"),
+            0
+        );
+
+        let cross_run_store = test_store().await;
+        let cross_run_writer = EventWriter::new(cross_run_store.clone());
+        seed_tool_owner(&cross_run_store, &cross_run_writer, "run-a").await;
+        let mut pending = pending_approval_write("request-cross-run", "tool-cross-run", "run-b");
+        pending.projections.insert(
+            0,
+            Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                tool_call_id: "tool-cross-run".to_owned(),
+                command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                run_id: "run-a".to_owned(),
+                executor_generation: 1,
+                idempotency_key: "idem-cross-run".to_owned(),
+            }),
+        );
+        let cross_run = cross_run_writer
+            .apply(EventBatch {
+                writes: vec![pending],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("pending approval cannot change the prepared tool run");
+        assert!(
+            cross_run
+                .to_string()
+                .contains("does not match prepared tool")
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (i64, i64, i64)>(
+                "SELECT
+                    (SELECT COUNT(*) FROM approval_log),
+                    (SELECT COUNT(*) FROM tool_executions),
+                    (SELECT COUNT(*) FROM agent_events)",
+            )
+            .fetch_one(cross_run_store.pool())
+            .await
+            .expect("cross-run rollback counts"),
+            (0, 0, 0)
+        );
+
+        let wrong_owner_store = test_store().await;
+        let wrong_owner_writer = EventWriter::new(wrong_owner_store.clone());
+        seed_tool_owner(&wrong_owner_store, &wrong_owner_writer, "run-owner").await;
+        let mut pending =
+            pending_approval_write("request-wrong-owner", "tool-wrong-owner", "run-owner");
+        pending.projections.insert(
+            0,
+            Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                tool_call_id: "tool-wrong-owner".to_owned(),
+                command_id: "00000000-0000-4000-8000-000000000099".to_owned(),
+                run_id: "run-owner".to_owned(),
+                executor_generation: 1,
+                idempotency_key: "idem-wrong-owner".to_owned(),
+            }),
+        );
+        let wrong_owner = wrong_owner_writer
+            .apply(EventBatch {
+                writes: vec![pending],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("prepared tool must name the durable run owner command");
+        assert!(
+            wrong_owner
+                .to_string()
+                .contains("no matching durable owner command")
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_tool_start_is_run_bound_and_valid_existing_prepare_flow_survives() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        seed_tool_owner(&store, &writer, "run-a").await;
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                        tool_call_id: "tool-existing".to_owned(),
+                        command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                        run_id: "run-a".to_owned(),
+                        executor_generation: 1,
+                        idempotency_key: "idem-existing".to_owned(),
+                    })],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("prepare same-run tool before policy result");
+
+        let cross_run_start = writer
+            .apply(EventBatch {
+                writes: vec![tool_start_write("tool-existing", "run-b")],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("ToolExecutionStart cannot substitute a different run");
+        assert!(
+            cross_run_start
+                .to_string()
+                .contains("does not match prepared run")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM tool_executions WHERE tool_call_id='tool-existing'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("cross-run start rollback"),
+            "prepared"
+        );
+
+        writer
+            .apply(EventBatch {
+                writes: vec![pending_approval_write(
+                    "request-existing",
+                    "tool-existing",
+                    "run-a",
+                )],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("existing prepared tool accepts a same-run pending approval");
+        assert_eq!(
+            sqlx::query_as::<_, (String, String, String)>(
+                "SELECT a.state, a.run_id, t.run_id
+                 FROM approval_log a
+                 JOIN tool_executions t ON t.tool_call_id = a.tool_call_id
+                 WHERE a.id='request-existing'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("same-run durable binding"),
+            ("pending".to_owned(), "run-a".to_owned(), "run-a".to_owned())
+        );
+
+        let pending_start = writer
+            .apply(EventBatch {
+                writes: vec![tool_start_write("tool-existing", "run-a")],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("a pending approval cannot be treated as policy Allow");
+        assert!(pending_start.to_string().contains("same-batch approved"));
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM tool_executions WHERE tool_call_id='tool-existing'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("pending start rollback"),
+            "prepared"
+        );
+
+        sqlx::query("UPDATE approval_log SET run_id='run-b' WHERE id='request-existing'")
+            .execute(store.pool())
+            .await
+            .expect("simulate a legacy cross-run approval binding");
+        let cross_run_resolution = writer
+            .apply(EventBatch {
+                writes: vec![approval_resolution_write(
+                    "request-existing",
+                    "cancelled",
+                    "runtime",
+                    None,
+                )],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("approval resolution must recheck the prepared tool run");
+        assert!(
+            cross_run_resolution
+                .to_string()
+                .contains("does not match prepared tool")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM approval_log WHERE id='request-existing'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("cross-run resolution rollback"),
+            "pending"
+        );
+
+        let allow_store = test_store().await;
+        let allow_writer = EventWriter::new(allow_store.clone());
+        seed_tool_owner(&allow_store, &allow_writer, "run-allow").await;
+        allow_writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                        tool_call_id: "tool-allow".to_owned(),
+                        command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                        run_id: "run-allow".to_owned(),
+                        executor_generation: 1,
+                        idempotency_key: "idem-allow".to_owned(),
+                    })],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("policy Allow prepares without an approval row");
+        allow_writer
+            .apply(EventBatch {
+                writes: vec![tool_start_write("tool-allow", "run-allow")],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("policy Allow starts only when no approval row exists");
+        assert_eq!(
+            sqlx::query_as::<_, (String, i64)>(
+                "SELECT
+                    (SELECT state FROM tool_executions WHERE tool_call_id='tool-allow'),
+                    (SELECT COUNT(*) FROM approval_log WHERE tool_call_id='tool-allow')",
+            )
+            .fetch_one(allow_store.pool())
+            .await
+            .expect("policy Allow durable state"),
+            ("running".to_owned(), 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_prepare_and_start_require_ordered_canonical_assistant_message_end() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000090";
+        let injected = classified_injection(&writer, 1, command_id, "ignored", "tools").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "tools"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("open tool turn");
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let assistant = assistant_tool_message(&["tool-origin-a", "tool-origin-b"]);
+        let assistant_start = EventWrite {
+            event: Some(
+                DurableEvent::message_in_turn(
+                    "message_start",
+                    "assistant-tools",
+                    &assistant,
+                    Some(run_id.clone()),
+                    Some(turn_id.clone()),
+                )
+                .expect("assistant MessageStart"),
+            ),
+            projections: vec![Projection::RunPhase {
+                command_id: command_id.to_owned(),
+                run_id: run_id.clone(),
+                expected: RunPhase::UserCommitted,
+                next: RunPhase::AssistantStarted,
+            }],
+        };
+        let prepare = |tool_call_id: &str| {
+            Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                tool_call_id: tool_call_id.to_owned(),
+                command_id: command_id.to_owned(),
+                run_id: run_id.clone(),
+                executor_generation: 1,
+                idempotency_key: format!("idem-{tool_call_id}"),
+            })
+        };
+        let early = writer
+            .apply(EventBatch {
+                writes: vec![
+                    assistant_start.clone(),
+                    EventWrite {
+                        event: None,
+                        projections: vec![prepare("tool-origin-a")],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_end",
+                                "assistant-tools",
+                                &assistant,
+                                Some(run_id.clone()),
+                                Some(turn_id.clone()),
+                            )
+                            .expect("assistant MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: "assistant-tools".to_owned(),
+                            role: "assistant",
+                            message: assistant.clone(),
+                            append_to_l0: true,
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("Prepare cannot precede the assistant MessageEnd in one batch");
+        assert!(early.to_string().contains("preceding assistant MessageEnd"));
+
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    assistant_start,
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_end",
+                                "assistant-tools",
+                                &assistant,
+                                Some(run_id.clone()),
+                                Some(turn_id.clone()),
+                            )
+                            .expect("assistant MessageEnd"),
+                        ),
+                        projections: vec![
+                            Projection::MessageEnd {
+                                message_id: "assistant-tools".to_owned(),
+                                role: "assistant",
+                                message: assistant,
+                                append_to_l0: true,
+                            },
+                            prepare("tool-origin-a"),
+                            prepare("tool-origin-b"),
+                        ],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("same-batch MessageEnd may prepare every tool in the response");
+        writer
+            .apply(EventBatch {
+                writes: vec![tool_start_write("tool-origin-a", &run_id)],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("recovery transaction may start first prepared tool");
+        writer
+            .apply(EventBatch {
+                writes: vec![tool_start_write("tool-origin-b", &run_id)],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("multiple tools from one assistant turn retain distinct origins");
+
+        let unknown = writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![prepare("tool-not-in-response")],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("a different tool_call_id cannot borrow the durable response");
+        assert!(
+            unknown
+                .to_string()
+                .contains("canonical preceding assistant MessageEnd")
+        );
+
+        let rejected_store = test_store().await;
+        let rejected_writer = EventWriter::new(rejected_store);
+        let rejected_command = "00000000-0000-4000-8000-000000000091";
+        let rejected_injected =
+            classified_injection(&rejected_writer, 1, rejected_command, "ignored", "reject").await;
+        rejected_writer
+            .apply(EventBatch {
+                writes: injection_writes(rejected_command, "ignored", "reject"),
+                injected_commands: vec![rejected_injected],
+            })
+            .await
+            .expect("open rejected-tool turn");
+        let rejected_run = format!("run-{rejected_command}");
+        let rejected_turn = format!("turn-{rejected_command}");
+        let rejected = PublicMessage::Assistant(PublicAssistantMessage {
+            content: vec![PublicAssistantContent::RejectedToolCall {
+                rejected: RejectedToolCall {
+                    id: "rejected-no-execution".to_owned(),
+                    name: "test".to_owned(),
+                    error: ToolArgumentError::InvalidJson,
+                },
+                wire_item_index: 0,
+            }],
+            model: "test-model".to_owned(),
+            provider: "test-provider".to_owned(),
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: durable_test_timestamp(),
+        });
+        rejected_writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_start",
+                                "assistant-rejected-only",
+                                &rejected,
+                                Some(rejected_run.clone()),
+                                Some(rejected_turn.clone()),
+                            )
+                            .expect("rejected MessageStart"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: rejected_command.to_owned(),
+                            run_id: rejected_run.clone(),
+                            expected: RunPhase::UserCommitted,
+                            next: RunPhase::AssistantStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_end",
+                                "assistant-rejected-only",
+                                &rejected,
+                                Some(rejected_run.clone()),
+                                Some(rejected_turn),
+                            )
+                            .expect("rejected MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: "assistant-rejected-only".to_owned(),
+                            role: "assistant",
+                            message: rejected,
+                            append_to_l0: true,
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("rejected ToolCall remains a durable non-execution response");
+        let rejected_prepare = rejected_writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                        tool_call_id: "rejected-no-execution".to_owned(),
+                        command_id: rejected_command.to_owned(),
+                        run_id: rejected_run,
+                        executor_generation: 1,
+                        idempotency_key: "idem-rejected-no-execution".to_owned(),
+                    })],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("rejected tool calls must never become execution origins");
+        assert!(
+            rejected_prepare
+                .to_string()
+                .contains("canonical preceding assistant MessageEnd")
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_and_approval_opening_mutations_require_post_batch_assistant_owner() {
+        for (phase, label) in [
+            ("user_started", "before user commit"),
+            ("user_committed", "before assistant"),
+            ("hard_steer_requested", "after hard steer"),
+            ("cancel_requested", "after abort"),
+        ] {
+            let store = test_store().await;
+            let writer = EventWriter::new(store.clone());
+            seed_tool_owner(&store, &writer, "run-phase").await;
+            sqlx::query("UPDATE inbound_commands SET run_phase=? WHERE command_id=?")
+                .bind(phase)
+                .bind(TOOL_OWNER_COMMAND_ID)
+                .execute(store.pool())
+                .await
+                .expect("set owner phase fixture");
+
+            let error = writer
+                .apply(EventBatch {
+                    writes: vec![EventWrite {
+                        event: None,
+                        projections: vec![Projection::ToolExecution(
+                            ToolExecutionMutation::Prepare {
+                                tool_call_id: format!("tool-{phase}"),
+                                command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                                run_id: "run-phase".to_owned(),
+                                executor_generation: 1,
+                                idempotency_key: format!("idem-{phase}"),
+                            },
+                        )],
+                    }],
+                    injected_commands: Vec::new(),
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("live assistant/tool execution owner"),
+                "{label}: {error}"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM tool_executions")
+                    .fetch_one(store.pool())
+                    .await
+                    .expect("phase rejection rollback"),
+                0,
+                "{label}"
+            );
+        }
+
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        seed_tool_owner(&store, &writer, "run-close").await;
+        let same_batch_close = writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(DurableEvent::agent_end("run-close").expect("AgentEnd")),
+                    projections: vec![
+                        Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                            tool_call_id: "tool-close-race".to_owned(),
+                            command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                            run_id: "run-close".to_owned(),
+                            executor_generation: 1,
+                            idempotency_key: "idem-close-race".to_owned(),
+                        }),
+                        Projection::CommandApplied {
+                            command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                            command_seq: 1,
+                            run_id: Some("run-close".to_owned()),
+                        },
+                    ],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("an owner close cannot race a new prepared execution");
+        assert!(
+            same_batch_close
+                .to_string()
+                .contains("same-batch owner close")
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (String, i64, i64)>(
+                "SELECT
+                    (SELECT run_phase FROM inbound_commands WHERE command_id=?),
+                    (SELECT COUNT(*) FROM tool_executions),
+                    (SELECT COUNT(*) FROM agent_events)",
+            )
+            .bind(TOOL_OWNER_COMMAND_ID)
+            .fetch_one(store.pool())
+            .await
+            .expect("same-batch close rollback"),
+            ("assistant_started".to_owned(), 0, 0)
+        );
+
+        let start_close_store = test_store().await;
+        let start_close_writer = EventWriter::new(start_close_store.clone());
+        seed_tool_owner(&start_close_store, &start_close_writer, "run-start-close").await;
+        start_close_writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                        tool_call_id: "tool-start-close".to_owned(),
+                        command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                        run_id: "run-start-close".to_owned(),
+                        executor_generation: 1,
+                        idempotency_key: "idem-start-close".to_owned(),
+                    })],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("prepare policy-Allow close-race fixture");
+        let prepared_close = start_close_writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::agent_end("run-start-close").expect("prepared AgentEnd"),
+                    ),
+                    projections: vec![Projection::CommandApplied {
+                        command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                        command_seq: 1,
+                        run_id: Some("run-start-close".to_owned()),
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("policy-Allow prepared tool must be cleaned before owner close");
+        assert!(prepared_close.to_string().contains("active prepared tool"));
+        let start_close = start_close_writer
+            .apply(EventBatch {
+                writes: vec![
+                    tool_start_write("tool-start-close", "run-start-close"),
+                    EventWrite {
+                        event: Some(DurableEvent::agent_end("run-start-close").expect("AgentEnd")),
+                        projections: vec![Projection::CommandApplied {
+                            command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                            command_seq: 1,
+                            run_id: Some("run-start-close".to_owned()),
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("an owner close cannot race ToolExecutionStart");
+        assert!(start_close.to_string().contains("same-batch owner close"));
+
+        let pending_close_store = test_store().await;
+        let pending_close_writer = EventWriter::new(pending_close_store.clone());
+        seed_tool_owner(
+            &pending_close_store,
+            &pending_close_writer,
+            "run-pending-close",
+        )
+        .await;
+        pending_close_writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                        tool_call_id: "tool-pending-close".to_owned(),
+                        command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                        run_id: "run-pending-close".to_owned(),
+                        executor_generation: 1,
+                        idempotency_key: "idem-pending-close".to_owned(),
+                    })],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("prepare approval close-race fixture");
+        let pending_close = pending_close_writer
+            .apply(EventBatch {
+                writes: vec![
+                    pending_approval_write(
+                        "request-pending-close",
+                        "tool-pending-close",
+                        "run-pending-close",
+                    ),
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::agent_end("run-pending-close").expect("AgentEnd"),
+                        ),
+                        projections: vec![Projection::CommandApplied {
+                            command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                            command_seq: 1,
+                            run_id: Some("run-pending-close".to_owned()),
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("an owner close cannot race Approval Pending");
+        assert!(pending_close.to_string().contains("same-batch owner close"));
+
+        let cleanup_store = test_store().await;
+        let cleanup_writer = EventWriter::new(cleanup_store.clone());
+        seed_pending_approval(
+            &cleanup_store,
+            &cleanup_writer,
+            "request-cleanup",
+            "tool-cleanup",
+            "run-cleanup",
+        )
+        .await;
+        let incomplete_cleanup = cleanup_writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::agent_end("run-cleanup").expect("incomplete AgentEnd"),
+                    ),
+                    projections: vec![Projection::CommandApplied {
+                        command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                        command_seq: 1,
+                        run_id: Some("run-cleanup".to_owned()),
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("pending prepared work must be terminalized before owner close");
+        assert!(
+            incomplete_cleanup
+                .to_string()
+                .contains("active prepared tool")
+        );
+        let result = tool_result("tool-cleanup", "approval cancelled", true);
+        cleanup_writer
+            .apply(EventBatch {
+                writes: vec![
+                    approval_resolution_write("request-cleanup", "cancelled", "runtime", None),
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::new(&json!({
+                                "type":"tool_execution_end",
+                                "tool_call_id":"tool-cleanup",
+                                "state":"cancelled",
+                                "result":result.clone(),
+                                "is_error":true,
+                                "error_code":"cancelled"
+                            }))
+                            .expect("cancelled tool event"),
+                        ),
+                        projections: vec![Projection::ToolExecution(
+                            ToolExecutionMutation::Finish {
+                                tool_call_id: "tool-cleanup".to_owned(),
+                                expected: "prepared",
+                                state: "cancelled",
+                                error_code: Some("cancelled"),
+                            },
+                        )],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_start", "tool-cleanup-result", &result)
+                                .expect("cleanup result MessageStart"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_end", "tool-cleanup-result", &result)
+                                .expect("cleanup result MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: "tool-cleanup-result".to_owned(),
+                            role: "tool_result",
+                            message: result,
+                            append_to_l0: true,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::agent_end("run-cleanup").expect("cleanup AgentEnd"),
+                        ),
+                        projections: vec![Projection::CommandApplied {
+                            command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                            command_seq: 1,
+                            run_id: Some("run-cleanup".to_owned()),
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("explicit cancellation cleanup may close its owner atomically");
+        assert_eq!(
+            sqlx::query_as::<_, (String, String, String)>(
+                "SELECT
+                    (SELECT state FROM approval_log WHERE id='request-cleanup'),
+                    (SELECT state FROM tool_executions WHERE tool_call_id='tool-cleanup'),
+                    (SELECT status FROM inbound_commands WHERE command_id=?)",
+            )
+            .bind(TOOL_OWNER_COMMAND_ID)
+            .fetch_one(cleanup_store.pool())
+            .await
+            .expect("cancellation cleanup state"),
+            (
+                "cancelled".to_owned(),
+                "cancelled".to_owned(),
+                "applied".to_owned()
+            )
+        );
+
+        let deny_store = test_store().await;
+        let deny_writer = EventWriter::new(deny_store.clone());
+        seed_pending_approval(
+            &deny_store,
+            &deny_writer,
+            "request-deny-open",
+            "tool-deny-open",
+            "run-deny-open",
+        )
+        .await;
+        deny_writer
+            .persist_inbound(&approval_command_with_decision(
+                2,
+                "00000000-0000-4000-8000-000000000020",
+                "request-deny-open",
+                ApprovalDecision::Deny,
+            ))
+            .await
+            .expect("persist standalone denial command");
+        deny_writer
+            .apply(EventBatch {
+                writes: vec![approval_resolution_write(
+                    "request-deny-open",
+                    "denied",
+                    "user-1",
+                    Some(("00000000-0000-4000-8000-000000000020", 2, "run-deny-open")),
+                )],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("standalone denial may leave the owner open for later cleanup");
+        assert_eq!(
+            sqlx::query_as::<_, (String, String, String)>(
+                "SELECT
+                    (SELECT state FROM approval_log WHERE id='request-deny-open'),
+                    (SELECT state FROM tool_executions WHERE tool_call_id='tool-deny-open'),
+                    (SELECT run_phase FROM inbound_commands WHERE command_id=?)",
+            )
+            .bind(TOOL_OWNER_COMMAND_ID)
+            .fetch_one(deny_store.pool())
+            .await
+            .expect("standalone denial state"),
+            (
+                "denied".to_owned(),
+                "prepared".to_owned(),
+                "assistant_started".to_owned()
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn approval_and_tool_transitions_share_event_writer_transactions() {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
+        seed_tool_owner(&store, &writer, "run-1").await;
         writer
             .apply(EventBatch {
                 writes: vec![EventWrite {
@@ -8009,12 +14269,6 @@ mod tests {
                             tool_call_id: "tool-1".to_owned(),
                             run_id: "run-1".to_owned(),
                             turn_id: "turn-1".to_owned(),
-                            request_projection: approval_request_projection(
-                                "request-1",
-                                "tool-1",
-                                "mutating",
-                            ),
-                            redaction_version: store.redactor().version(),
                         }),
                     ],
                 }],
@@ -8031,7 +14285,7 @@ mod tests {
         );
         writer
             .persist_inbound(&approval_command(
-                1,
+                2,
                 "00000000-0000-4000-8000-000000000020",
                 "request-1",
             ))
@@ -8043,7 +14297,7 @@ mod tests {
                     event: None,
                     projections: vec![Projection::CommandApplied {
                         command_id: "00000000-0000-4000-8000-000000000020".to_owned(),
-                        command_seq: 1,
+                        command_seq: 2,
                         run_id: Some("run-1".to_owned()),
                     }],
                 }],
@@ -8090,7 +14344,7 @@ mod tests {
                             }),
                             Projection::CommandApplied {
                                 command_id: "00000000-0000-4000-8000-000000000020".to_owned(),
-                                command_seq: 1,
+                                command_seq: 2,
                                 run_id: Some("run-1".to_owned()),
                             },
                         ],
@@ -8109,6 +14363,7 @@ mod tests {
                         projections: vec![Projection::ToolExecution(
                             ToolExecutionMutation::Start {
                                 tool_call_id: "tool-1".to_owned(),
+                                run_id: "run-1".to_owned(),
                             },
                         )],
                     },
@@ -8203,13 +14458,245 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_op_approval_decision_requires_unknown_or_terminal_request() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        seed_pending_approval(&store, &writer, "request-1", "tool-1", "run-1").await;
+        let pending_decision =
+            approval_command(2, "00000000-0000-4000-8000-000000000020", "request-1");
+        writer
+            .persist_inbound(&pending_decision)
+            .await
+            .expect("persist pending approval decision");
+
+        let pending_error = writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![Projection::CommandApplied {
+                        command_id: "00000000-0000-4000-8000-000000000020".to_owned(),
+                        command_seq: 2,
+                        run_id: None,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("pending approval cannot be applied as a no-op");
+        assert!(pending_error.to_string().contains("pending approval"));
+        assert_eq!(
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT
+                    (SELECT status FROM inbound_commands WHERE seq=2),
+                    (SELECT state FROM approval_log WHERE id='request-1')",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("pending no-op rollback state"),
+            ("received".to_owned(), "pending".to_owned())
+        );
+
+        writer
+            .apply(EventBatch {
+                writes: vec![approval_resolution_write(
+                    "request-1",
+                    "cancelled",
+                    "runtime",
+                    None,
+                )],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("terminalize approval");
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![Projection::CommandApplied {
+                        command_id: "00000000-0000-4000-8000-000000000020".to_owned(),
+                        command_seq: 2,
+                        run_id: None,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("terminal approval permits a no-op");
+        assert_eq!(
+            writer
+                .persist_inbound(&pending_decision)
+                .await
+                .expect("terminal request decision replay")
+                .status,
+            CommandAckStatus::Applied
+        );
+
+        let unknown_decision =
+            approval_command(3, "00000000-0000-4000-8000-000000000021", "request-unknown");
+        writer
+            .persist_inbound(&unknown_decision)
+            .await
+            .expect("persist unknown approval decision");
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![Projection::CommandApplied {
+                        command_id: "00000000-0000-4000-8000-000000000021".to_owned(),
+                        command_seq: 3,
+                        run_id: None,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("unknown approval permits a no-op");
+        assert_eq!(
+            writer
+                .persist_inbound(&unknown_decision)
+                .await
+                .expect("unknown request decision replay")
+                .status,
+            CommandAckStatus::Applied
+        );
+
+        let cutoff_store = test_store().await;
+        let cutoff_writer = EventWriter::new(cutoff_store.clone());
+        seed_pending_approval(
+            &cutoff_store,
+            &cutoff_writer,
+            "request-cutoff",
+            "tool-cutoff",
+            "run-cutoff",
+        )
+        .await;
+        cutoff_writer
+            .persist_inbound(&approval_command(
+                2,
+                "00000000-0000-4000-8000-000000000022",
+                "request-cutoff",
+            ))
+            .await
+            .expect("persist abort-preempted approval decision");
+        cutoff_writer
+            .persist_inbound(&abort_command(3, "00000000-0000-4000-8000-000000000023"))
+            .await
+            .expect("persist cutoff Abort");
+        cutoff_writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![
+                        Projection::CommandApplied {
+                            command_id: "00000000-0000-4000-8000-000000000022".to_owned(),
+                            command_seq: 2,
+                            run_id: None,
+                        },
+                        Projection::RunPhase {
+                            command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                            run_id: "run-cutoff".to_owned(),
+                            expected: RunPhase::AssistantStarted,
+                            next: RunPhase::CancelRequested,
+                        },
+                        Projection::CommandApplied {
+                            command_id: "00000000-0000-4000-8000-000000000023".to_owned(),
+                            command_seq: 3,
+                            run_id: Some("run-cutoff".to_owned()),
+                        },
+                    ],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("same-batch later Abort permits the canonical pending no-op");
+        assert_eq!(
+            sqlx::query_as::<_, (String, String, String)>(
+                "SELECT
+                    (SELECT status FROM inbound_commands WHERE seq=2),
+                    (SELECT status FROM inbound_commands WHERE seq=3),
+                    (SELECT state FROM approval_log WHERE id='request-cutoff')",
+            )
+            .fetch_one(cutoff_store.pool())
+            .await
+            .expect("canonical Abort cutoff states"),
+            (
+                "applied".to_owned(),
+                "applied".to_owned(),
+                "pending".to_owned()
+            )
+        );
+
+        let forged_store = test_store().await;
+        let forged_writer = EventWriter::new(forged_store.clone());
+        seed_pending_approval(
+            &forged_store,
+            &forged_writer,
+            "request-forged",
+            "tool-forged",
+            "run-forged",
+        )
+        .await;
+        forged_writer
+            .persist_inbound(&approval_command(
+                2,
+                "00000000-0000-4000-8000-000000000024",
+                "request-forged",
+            ))
+            .await
+            .expect("persist pending approval decision");
+        forged_writer
+            .persist_inbound(&abort_command(3, "00000000-0000-4000-8000-000000000025"))
+            .await
+            .expect("persist later Abort");
+        let forged = forged_writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![
+                        Projection::RunPhase {
+                            command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                            run_id: "run-forged".to_owned(),
+                            expected: RunPhase::AssistantStarted,
+                            next: RunPhase::CancelRequested,
+                        },
+                        Projection::CommandApplied {
+                            command_id: "00000000-0000-4000-8000-000000000025".to_owned(),
+                            command_seq: 3,
+                            run_id: Some("run-forged".to_owned()),
+                        },
+                        Projection::CommandApplied {
+                            command_id: "00000000-0000-4000-8000-000000000024".to_owned(),
+                            command_seq: 2,
+                            run_id: None,
+                        },
+                    ],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("an unrelated or earlier Abort projection cannot forge the exception");
+        assert!(forged.to_string().contains("terminal projection"));
+        assert_eq!(
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT
+                    (SELECT status FROM inbound_commands WHERE seq=2),
+                    (SELECT status FROM inbound_commands WHERE seq=3)",
+            )
+            .fetch_one(forged_store.pool())
+            .await
+            .expect("forged exception rollback states"),
+            ("received".to_owned(), "received".to_owned())
+        );
+    }
+
+    #[tokio::test]
     async fn approval_decision_is_cryptographically_and_semantically_bound() {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
         seed_pending_approval(&store, &writer, "request-1", "tool-1", "run-1").await;
         writer
             .persist_inbound(&approval_command_with_decision(
-                1,
+                2,
                 "00000000-0000-4000-8000-000000000022",
                 "request-1",
                 ApprovalDecision::Deny,
@@ -8223,7 +14710,7 @@ mod tests {
                     "request-1",
                     "approved_once",
                     "user-1",
-                    Some(("00000000-0000-4000-8000-000000000022", 1, "run-1")),
+                    Some(("00000000-0000-4000-8000-000000000022", 2, "run-1")),
                 )],
                 injected_commands: Vec::new(),
             })
@@ -8238,19 +14725,15 @@ mod tests {
                         "request-1",
                         "denied",
                         "user-1",
-                        Some(("00000000-0000-4000-8000-000000000022", 1, "run-1")),
+                        Some(("00000000-0000-4000-8000-000000000022", 2, "run-1")),
                     ),
-                    tool_start_write("tool-1"),
+                    tool_start_write("tool-1", "run-1"),
                 ],
                 injected_commands: Vec::new(),
             })
             .await
             .expect_err("deny and tool start must roll back together");
-        assert!(
-            denied_start
-                .to_string()
-                .contains("cannot co-commit ToolExecutionStart")
-        );
+        assert!(denied_start.to_string().contains("same-batch approved"));
         assert_eq!(
             sqlx::query_as::<_, (String, String, String)>(
                 "SELECT
@@ -8274,7 +14757,7 @@ mod tests {
                     "request-1",
                     "denied",
                     "user-1",
-                    Some(("00000000-0000-4000-8000-000000000022", 1, "run-1")),
+                    Some(("00000000-0000-4000-8000-000000000022", 2, "run-1")),
                 )],
                 injected_commands: Vec::new(),
             })
@@ -8282,7 +14765,7 @@ mod tests {
             .expect("canonical denial");
         let replay = writer
             .persist_inbound(&approval_command_with_decision(
-                1,
+                2,
                 "00000000-0000-4000-8000-000000000022",
                 "request-1",
                 ApprovalDecision::Deny,
@@ -8290,13 +14773,21 @@ mod tests {
             .await
             .expect("canonical deny replay");
         assert_eq!(replay.status, CommandAckStatus::Applied);
+        let denied_after_commit = writer
+            .apply(EventBatch {
+                writes: vec![tool_start_write("tool-1", "run-1")],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("a terminal denial cannot later be treated as policy Allow");
+        assert!(denied_after_commit.to_string().contains("state denied"));
 
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
         seed_pending_approval(&store, &writer, "request-2", "tool-2", "run-2").await;
         writer
             .persist_inbound(&approval_command(
-                1,
+                2,
                 "00000000-0000-4000-8000-000000000033",
                 "request-wrong",
             ))
@@ -8308,7 +14799,7 @@ mod tests {
                     "request-2",
                     "approved_once",
                     "user-2",
-                    Some(("00000000-0000-4000-8000-000000000033", 1, "run-2")),
+                    Some(("00000000-0000-4000-8000-000000000033", 2, "run-2")),
                 )],
                 injected_commands: Vec::new(),
             })
@@ -8321,7 +14812,7 @@ mod tests {
         seed_pending_approval(&store, &writer, "request-2b", "tool-2b", "run-2b").await;
         writer
             .persist_inbound(&approval_command(
-                1,
+                2,
                 "00000000-0000-4000-8000-000000000034",
                 "request-2b",
             ))
@@ -8333,7 +14824,7 @@ mod tests {
                     "request-2b",
                     "denied",
                     "user-2b",
-                    Some(("00000000-0000-4000-8000-000000000034", 1, "run-2b")),
+                    Some(("00000000-0000-4000-8000-000000000034", 2, "run-2b")),
                 )],
                 injected_commands: Vec::new(),
             })
@@ -8351,7 +14842,7 @@ mod tests {
                     event: None,
                     projections: vec![Projection::ToolExecution(ToolExecutionMutation::Prepare {
                         tool_call_id: "wrong-tool".to_owned(),
-                        command_id: "00000000-0000-4000-8000-000000000024".to_owned(),
+                        command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
                         run_id: "run-2b".to_owned(),
                         executor_generation: 1,
                         idempotency_key: "wrong-tool-idem".to_owned(),
@@ -8368,9 +14859,9 @@ mod tests {
                         "request-2b",
                         "approved_once",
                         "user-2b",
-                        Some(("00000000-0000-4000-8000-000000000034", 1, "run-2b")),
+                        Some(("00000000-0000-4000-8000-000000000034", 2, "run-2b")),
                     ),
-                    tool_start_write("wrong-tool"),
+                    tool_start_write("wrong-tool", "run-2b"),
                 ],
                 injected_commands: Vec::new(),
             })
@@ -8388,7 +14879,7 @@ mod tests {
         seed_pending_approval(&store, &writer, "request-3", "tool-3", "run-3").await;
         writer
             .persist_inbound(&approval_command_with_decision(
-                1,
+                2,
                 "00000000-0000-4000-8000-000000000035",
                 "request-3",
                 approve_always,
@@ -8401,7 +14892,7 @@ mod tests {
                     "request-3",
                     "approved_always",
                     "user-3",
-                    Some(("00000000-0000-4000-8000-000000000035", 1, "run-3")),
+                    Some(("00000000-0000-4000-8000-000000000035", 2, "run-3")),
                 )],
                 injected_commands: Vec::new(),
             })
@@ -8416,16 +14907,36 @@ mod tests {
             .apply(EventBatch {
                 writes: vec![
                     approval_resolution_write("request-4", "cancelled", "runtime", None),
-                    tool_start_write("tool-4"),
+                    tool_start_write("tool-4", "run-4"),
                 ],
                 injected_commands: Vec::new(),
             })
             .await
             .expect_err("runtime cancellation cannot start a tool");
+        assert!(cancelled_start.to_string().contains("same-batch approved"));
+        writer
+            .apply(EventBatch {
+                writes: vec![approval_resolution_write(
+                    "request-4",
+                    "cancelled",
+                    "runtime",
+                    None,
+                )],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("commit canonical runtime cancellation");
+        let cancelled_after_commit = writer
+            .apply(EventBatch {
+                writes: vec![tool_start_write("tool-4", "run-4")],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("a terminal cancellation cannot later be treated as policy Allow");
         assert!(
-            cancelled_start
+            cancelled_after_commit
                 .to_string()
-                .contains("cannot co-commit ToolExecutionStart")
+                .contains("state cancelled")
         );
 
         let store = test_store().await;
@@ -8433,7 +14944,7 @@ mod tests {
         seed_pending_approval(&store, &writer, "request-5", "tool-5", "run-5").await;
         writer
             .persist_inbound(&approval_command(
-                1,
+                2,
                 "00000000-0000-4000-8000-000000000023",
                 "request-5",
             ))
@@ -8452,13 +14963,129 @@ mod tests {
                     "request-5",
                     "approved_once",
                     "user-5",
-                    Some(("00000000-0000-4000-8000-000000000023", 1, "run-5")),
+                    Some(("00000000-0000-4000-8000-000000000023", 2, "run-5")),
                 )],
                 injected_commands: Vec::new(),
             })
             .await
             .expect_err("tampered durable command must not resolve approval");
         assert!(format!("{tampered:#}").contains("HMAC"));
+    }
+
+    #[tokio::test]
+    async fn approved_once_must_durably_precede_tool_execution_start() {
+        let tampered_store = test_store().await;
+        let tampered_writer = EventWriter::new(tampered_store.clone());
+        seed_pending_approval(
+            &tampered_store,
+            &tampered_writer,
+            "request-tampered",
+            "tool-tampered",
+            "run-tampered",
+        )
+        .await;
+        sqlx::query(
+            "UPDATE approval_log SET state='approved_once', decided_at='tampered'
+             WHERE id='request-tampered'",
+        )
+        .execute(tampered_store.pool())
+        .await
+        .expect("tamper mutable approval projection");
+        let missing_evidence = tampered_writer
+            .apply(EventBatch {
+                writes: vec![tool_start_write("tool-tampered", "run-tampered")],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("mutable approval projection cannot authorize execution");
+        assert!(
+            missing_evidence
+                .to_string()
+                .contains("cannot bypass approval")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM tool_executions WHERE tool_call_id='tool-tampered'",
+            )
+            .fetch_one(tampered_store.pool())
+            .await
+            .expect("tampered projection start rolled back"),
+            "prepared"
+        );
+
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        seed_pending_approval(&store, &writer, "request-order", "tool-order", "run-order").await;
+        let decision_id = "00000000-0000-4000-8000-000000000099";
+        writer
+            .persist_inbound(&approval_command(2, decision_id, "request-order"))
+            .await
+            .expect("persist approval decision");
+
+        let reversed = writer
+            .apply(EventBatch {
+                writes: vec![
+                    tool_start_write("tool-order", "run-order"),
+                    approval_resolution_write(
+                        "request-order",
+                        "approved_once",
+                        "user-order",
+                        Some((decision_id, 2, "run-order")),
+                    ),
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("execution-before-authorization must roll back");
+        assert!(reversed.to_string().contains("must precede execution"));
+        assert_eq!(
+            sqlx::query_as::<_, (String, String, String)>(
+                "SELECT
+                    (SELECT state FROM approval_log WHERE id='request-order'),
+                    (SELECT state FROM tool_executions WHERE tool_call_id='tool-order'),
+                    (SELECT status FROM inbound_commands WHERE command_id=?)",
+            )
+            .bind(decision_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("reversed batch rollback"),
+            (
+                "pending".to_owned(),
+                "prepared".to_owned(),
+                "received".to_owned()
+            )
+        );
+
+        writer
+            .apply(EventBatch {
+                writes: vec![approval_resolution_write(
+                    "request-order",
+                    "approved_once",
+                    "user-order",
+                    Some((decision_id, 2, "run-order")),
+                )],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("authorization may commit before execution in an earlier transaction");
+        writer
+            .apply(EventBatch {
+                writes: vec![tool_start_write("tool-order", "run-order")],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("already-approved prior-transaction flow remains valid");
+        assert_eq!(
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT
+                    (SELECT state FROM approval_log WHERE id='request-order'),
+                    (SELECT state FROM tool_executions WHERE tool_call_id='tool-order')",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("authorized execution state"),
+            ("approved_once".to_owned(), "running".to_owned())
+        );
     }
 
     #[tokio::test]
@@ -8500,6 +15127,7 @@ mod tests {
                     ),
                     projections: vec![Projection::ToolExecution(ToolExecutionMutation::Start {
                         tool_call_id: "tool-0".to_owned(),
+                        run_id: "run-1".to_owned(),
                     })],
                 }],
                 injected_commands: Vec::new(),
@@ -8641,18 +15269,16 @@ mod tests {
                 approval_request("request-1", "tool-event", "mutating"),
                 "request-1",
                 "tool-mutation",
-                approval_request_projection("request-1", "tool-event", "mutating"),
                 "request identity",
             ),
             (
                 approval_request("request-3", "tool-3", "exec"),
-                "request-3",
+                "unrelated",
                 "tool-3",
-                approval_request_projection("unrelated", "tool-3", "exec"),
-                "projection does not match",
+                "no matching",
             ),
         ];
-        for (request, request_id, tool_call_id, request_projection, expected) in pending_cases {
+        for (request, request_id, tool_call_id, expected) in pending_cases {
             let error = writer
                 .apply(EventBatch {
                     writes: vec![EventWrite {
@@ -8668,8 +15294,6 @@ mod tests {
                             tool_call_id: tool_call_id.to_owned(),
                             run_id: "run-1".to_owned(),
                             turn_id: "turn-1".to_owned(),
-                            request_projection,
-                            redaction_version: store.redactor().version(),
                         })],
                     }],
                     injected_commands: Vec::new(),
@@ -8866,60 +15490,24 @@ mod tests {
             l0_disposition(&user_message("user"), true).expect("normal user is appended"),
             L0Disposition::Append
         );
-        let canonical = [
-            (
-                "error-valid",
-                "assistant",
-                assistant_message(StopReason::Error),
-                false,
-            ),
-            (
-                "normal-valid",
-                "assistant",
-                assistant_message(StopReason::Stop),
-                true,
-            ),
-            (
-                "tool-valid",
-                "tool_result",
-                tool_result("tool-valid", "done", false),
-                true,
-            ),
-        ];
-        for (message_id, role, message, append_to_l0) in canonical {
-            writer
-                .apply(EventBatch {
-                    writes: vec![EventWrite {
-                        event: Some(
-                            DurableEvent::message("message_end", message_id, &message)
-                                .expect("MessageEnd"),
-                        ),
-                        projections: vec![Projection::MessageEnd {
-                            message_id: message_id.to_owned(),
-                            role,
-                            message,
-                            append_to_l0,
-                        }],
-                    }],
-                    injected_commands: Vec::new(),
-                })
-                .await
-                .expect("canonical append_to_l0 value");
-        }
         assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages")
-                .fetch_one(store.pool())
-                .await
-                .expect("message count"),
-            3
+            l0_disposition(&assistant_message(StopReason::Error), false)
+                .expect("retry error is excluded"),
+            L0Disposition::ExcludeRetryError
+        );
+        assert_eq!(
+            l0_disposition(&assistant_message(StopReason::Stop), true)
+                .expect("normal assistant is appended"),
+            L0Disposition::Append
         );
     }
 
     #[tokio::test]
-    async fn unredacted_approval_projection_rolls_back_its_event() {
+    async fn approval_projection_and_version_are_writer_generated() {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
-        let error = writer
+        seed_tool_owner(&store, &writer, "run-1").await;
+        writer
             .apply(EventBatch {
                 writes: vec![EventWrite {
                     event: Some(
@@ -8937,38 +15525,36 @@ mod tests {
                         }))
                         .expect("event"),
                     ),
-                    projections: vec![Projection::Approval(ApprovalMutation::Pending {
-                        request_id: "request-secret".to_owned(),
-                        tool_call_id: "tool-secret".to_owned(),
-                        run_id: "run-1".to_owned(),
-                        turn_id: "turn-1".to_owned(),
-                        request_projection: json!({
-                            "id":"request-secret",
-                            "tool_call_id":"tool-secret",
-                            "tool_name":"bash",
-                            "action":{"reviewable":{"risk":"exec"}},
-                            "args_summary":"Bearer abcdefghijklmnop",
-                            "reason":null,
-                            "audit":null
-                        })
-                        .to_string(),
-                        redaction_version: store.redactor().version(),
-                    })],
+                    projections: vec![
+                        Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                            tool_call_id: "tool-secret".to_owned(),
+                            command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                            run_id: "run-1".to_owned(),
+                            executor_generation: 1,
+                            idempotency_key: "idem-tool-secret".to_owned(),
+                        }),
+                        Projection::Approval(ApprovalMutation::Pending {
+                            request_id: "request-secret".to_owned(),
+                            tool_call_id: "tool-secret".to_owned(),
+                            run_id: "run-1".to_owned(),
+                            turn_id: "turn-1".to_owned(),
+                        }),
+                    ],
                 }],
                 injected_commands: Vec::new(),
             })
             .await
-            .expect_err("unredacted projection must fail before transaction");
-        assert!(error.to_string().contains("does not match its event"));
-        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
-            .fetch_one(store.pool())
-            .await
-            .expect("events");
-        let approvals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM approval_log")
-            .fetch_one(store.pool())
-            .await
-            .expect("approvals");
-        assert_eq!((events, approvals), (0, 0));
+            .expect("writer derives the approval projection and version atomically");
+        let (projection, version): (String, i64) = sqlx::query_as(
+            "SELECT request_projection, redaction_version FROM approval_log
+             WHERE id='request-secret'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("read writer-generated approval projection");
+        assert!(!projection.contains("abcdefghijklmnop"));
+        assert!(projection.contains("[REDACTED:"));
+        assert_eq!(version, i64::from(store.redactor().version()));
     }
 
     #[tokio::test]
@@ -9215,7 +15801,10 @@ mod tests {
     #[cfg(unix)]
     async fn setup_hard_kill_scenario(writer: &EventWriter, store: &Arc<Store>, scenario: &str) {
         match scenario {
-            "command_received" | "command_rejected" | "tool_prepared" => {}
+            "command_received" | "command_rejected" => {}
+            "tool_prepared" => {
+                seed_tool_owner(store, writer, "run-1").await;
+            }
             "command_classified" => {
                 writer
                     .persist_inbound(&user_command(
@@ -9271,15 +15860,18 @@ mod tests {
                     .await
                     .expect("persist startup Abort");
             }
-            "approval_pending" => {}
+            "approval_pending" => {
+                seed_tool_owner(store, writer, "run-1").await;
+            }
             "approval_resolved" => {
+                seed_tool_owner(store, writer, "run-1").await;
                 writer
                     .apply(hard_kill_target_batch("approval_pending"))
                     .await
                     .expect("prepare pending approval");
                 writer
                     .persist_inbound(&approval_command(
-                        1,
+                        2,
                         "00000000-0000-4000-8000-000000000020",
                         "request-1",
                     ))
@@ -9287,6 +15879,7 @@ mod tests {
                     .expect("persist approval decision");
             }
             "tool_running" | "tool_terminal" => {
+                seed_tool_owner(store, writer, "run-1").await;
                 writer
                     .apply(hard_kill_target_batch("tool_prepared"))
                     .await
@@ -9416,41 +16009,38 @@ mod tests {
                             tool_call_id: "tool-1".to_owned(),
                             run_id: "run-1".to_owned(),
                             turn_id: "turn-1".to_owned(),
-                            request_projection: approval_request_projection(
-                                "request-1",
-                                "tool-1",
-                                "mutating",
-                            ),
-                            redaction_version: 1,
                         }),
                     ],
                 }],
                 injected_commands: Vec::new(),
             },
             "approval_resolved" => EventBatch {
-                writes: vec![EventWrite {
-                    event: Some(
-                        DurableEvent::new(&json!({
-                            "type":"approval_resolved",
-                            "request_id":"request-1",
-                            "resolution":"approved_once",
-                            "actor":"user-1"
-                        }))
-                        .expect("ApprovalResolved"),
-                    ),
-                    projections: vec![
-                        Projection::Approval(ApprovalMutation::Resolve {
-                            request_id: "request-1".to_owned(),
-                            state: "approved_once",
-                            actor: "user-1".to_owned(),
-                        }),
-                        Projection::CommandApplied {
-                            command_id: "00000000-0000-4000-8000-000000000020".to_owned(),
-                            command_seq: 1,
-                            run_id: Some("run-1".to_owned()),
-                        },
-                    ],
-                }],
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::new(&json!({
+                                "type":"approval_resolved",
+                                "request_id":"request-1",
+                                "resolution":"approved_once",
+                                "actor":"user-1"
+                            }))
+                            .expect("ApprovalResolved"),
+                        ),
+                        projections: vec![
+                            Projection::Approval(ApprovalMutation::Resolve {
+                                request_id: "request-1".to_owned(),
+                                state: "approved_once",
+                                actor: "user-1".to_owned(),
+                            }),
+                            Projection::CommandApplied {
+                                command_id: "00000000-0000-4000-8000-000000000020".to_owned(),
+                                command_seq: 2,
+                                run_id: Some("run-1".to_owned()),
+                            },
+                        ],
+                    },
+                    tool_start_write("tool-1", "run-1"),
+                ],
                 injected_commands: Vec::new(),
             },
             "tool_prepared" => EventBatch {
@@ -9480,6 +16070,7 @@ mod tests {
                     ),
                     projections: vec![Projection::ToolExecution(ToolExecutionMutation::Start {
                         tool_call_id: "tool-1".to_owned(),
+                        run_id: "run-1".to_owned(),
                     })],
                 }],
                 injected_commands: Vec::new(),
@@ -9633,18 +16224,20 @@ mod tests {
                 state == (1, 1, 1)
             }
             "approval_resolved" => {
-                let state: (i64, i64, i64) = sqlx::query_as(
+                let state: (i64, i64, i64, i64) = sqlx::query_as(
                     "SELECT
                         (SELECT COUNT(*) FROM approval_log
                          WHERE id='request-1' AND state='approved_once'),
                         (SELECT COUNT(*) FROM inbound_commands
                          WHERE command_id='00000000-0000-4000-8000-000000000020' AND status='applied'),
+                        (SELECT COUNT(*) FROM tool_executions
+                         WHERE tool_call_id='tool-1' AND state='running'),
                         (SELECT COUNT(*) FROM agent_events)",
                 )
                 .fetch_one(store.pool())
                 .await
                 .expect("approval resolved state");
-                state == (1, 1, 2)
+                state == (1, 1, 1, 3)
             }
             "tool_prepared" => {
                 sqlx::query_scalar::<_, i64>(

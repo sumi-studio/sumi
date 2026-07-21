@@ -4,6 +4,8 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use zeroize::Zeroize;
 
+use crate::provider::types::{PublicAssistantContent, PublicMessage, UserContent};
+
 use super::crypto::{DataKeyMaterial, RowAad, encrypt_content};
 
 pub const REDACTION_VERSION: u32 = 1;
@@ -76,8 +78,22 @@ impl Redactor {
             Value::Object(object) => {
                 let mut redacted = Map::with_capacity(object.len());
                 for (key, value) in object {
+                    let structured_secret = structured_secret_placeholder(key);
                     let key = self.redact_text(key);
-                    let value = self.redact_value(value)?;
+                    let value = structured_secret.map_or_else(
+                        || self.redact_value(value),
+                        |placeholder| match value {
+                            Value::String(text) => {
+                                let redacted = self.redact_text(text);
+                                Ok(Value::String(if redacted == *text {
+                                    placeholder.to_owned()
+                                } else {
+                                    redacted
+                                }))
+                            }
+                            _ => Ok(Value::String(placeholder.to_owned())),
+                        },
+                    )?;
                     if redacted.insert(key, value).is_some() {
                         bail!("JSON object keys collide after secret redaction");
                     }
@@ -93,6 +109,21 @@ impl Redactor {
             serde_json::from_slice(input).context("raw public value is not valid JSON")?;
         serde_json::to_string(&self.redact_value(&value)?)
             .context("failed to serialize redacted public projection")
+    }
+}
+
+fn structured_secret_placeholder(key: &str) -> Option<&'static str> {
+    let normalized = key
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|character| character.to_ascii_lowercase())
+        .collect::<String>();
+    match normalized.as_str() {
+        "apikey" | "accesstoken" | "secret" | "authorization" | "proxyauthorization" => {
+            Some("[REDACTED:secret]")
+        }
+        "signature" | "xamzsignature" | "xgoogsignature" => Some("[REDACTED:signature]"),
+        _ => None,
     }
 }
 
@@ -135,30 +166,30 @@ impl<'a> PublicProjectionBuilder<'a> {
 }
 
 pub(crate) fn search_text_from_projection(projection: &str) -> Result<String> {
-    let value: Value =
-        serde_json::from_str(projection).context("redacted projection is not valid JSON")?;
+    let message: PublicMessage = serde_json::from_str(projection)
+        .context("redacted projection is not a valid PublicMessage")?;
     let mut parts = Vec::new();
-    collect_search_text(&value, None, &mut parts);
+    match message {
+        PublicMessage::User(message) => collect_visible_content(&message.content, &mut parts),
+        PublicMessage::Assistant(message) => {
+            for content in message.content {
+                if let PublicAssistantContent::Text { text, .. } = content {
+                    parts.push(text);
+                }
+            }
+        }
+        PublicMessage::ToolResult(message) => {
+            collect_visible_content(&message.content, &mut parts);
+        }
+    }
     Ok(parts.join("\n"))
 }
 
-fn collect_search_text(value: &Value, field: Option<&str>, output: &mut Vec<String>) {
-    if matches!(field, Some("thinking" | "signature_field")) {
-        return;
-    }
-    match value {
-        Value::String(text) => output.push(text.clone()),
-        Value::Array(values) => {
-            for value in values {
-                collect_search_text(value, field, output);
-            }
+fn collect_visible_content(content: &[UserContent], output: &mut Vec<String>) {
+    for content in content {
+        if let UserContent::Text { text } = content {
+            output.push(text.clone());
         }
-        Value::Object(object) => {
-            for (key, value) in object {
-                collect_search_text(value, Some(key), output);
-            }
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
 }
 
@@ -167,7 +198,27 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::store::crypto::{DATA_KEY_BYTES, DataKeyPurpose};
+    use crate::{
+        provider::types::{
+            PublicAssistantMessage, RejectedToolCall, StopReason, ToolArgumentError, ToolCall,
+            ToolResultMessage, Usage, UserMessage, ValidatedToolArguments,
+        },
+        store::crypto::{DATA_KEY_BYTES, DataKeyPurpose},
+    };
+
+    fn timestamp() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-07-20T01:02:03Z")
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn projected_search(message: &PublicMessage) -> String {
+        let raw = serde_json::to_vec(message).expect("serialize PublicMessage");
+        let projection = Redactor::v1()
+            .redact_serialized(&raw)
+            .expect("redact PublicMessage");
+        search_text_from_projection(&projection).expect("extract typed search text")
+    }
 
     #[test]
     fn redacts_secrets_in_nested_message_event_and_error_fields() {
@@ -191,6 +242,47 @@ mod tests {
         assert!(encoded.contains("[REDACTED:bearer_token]"));
         assert!(encoded.contains("[REDACTED:secret]"));
         assert!(encoded.contains("[REDACTED:signature]"));
+    }
+
+    #[test]
+    fn structured_named_secret_fields_redact_values_across_case_and_separator_variants() {
+        let redactor = Redactor::v1();
+        let value = json!({
+            "api_key": "plain-api-value",
+            "API-Key": "plain-api-dash-value",
+            "apiKey": "plain-api-camel-value",
+            "access_token": "plain-access-value",
+            "Access-Token": "plain-access-dash-value",
+            "secret": {"nested": "plain-nested-value"},
+            "Authorization": "Basic plain-authorization-value",
+            "proxy_authorization": "plain-proxy-value",
+            "X-Amz-Signature": "plain-signature-value",
+            "ordinary": "plain-visible-value"
+        });
+
+        let projection = redactor.redact_value(&value).expect("redact value");
+        let encoded = serde_json::to_string(&projection).expect("serialize projection");
+
+        for secret in [
+            "plain-api-value",
+            "plain-api-dash-value",
+            "plain-api-camel-value",
+            "plain-access-value",
+            "plain-access-dash-value",
+            "plain-nested-value",
+            "plain-authorization-value",
+            "plain-proxy-value",
+            "plain-signature-value",
+        ] {
+            assert!(
+                !encoded.contains(secret),
+                "structured field leaked {secret}"
+            );
+        }
+        assert_eq!(projection["ordinary"], "plain-visible-value");
+        assert_eq!(projection["api_key"], "[REDACTED:secret]");
+        assert_eq!(projection["Authorization"], "[REDACTED:secret]");
+        assert_eq!(projection["X-Amz-Signature"], "[REDACTED:signature]");
     }
 
     #[test]
@@ -224,13 +316,126 @@ mod tests {
     }
 
     #[test]
-    fn thinking_is_excluded_from_search_projection() {
-        let search_text = search_text_from_projection(
-            r#"{"content":[{"type":"thinking","thinking":"private chain"},{"type":"text","text":"visible answer"}]}"#,
-        )
-        .expect("extract search text");
-        assert!(!search_text.contains("private chain"));
-        assert!(search_text.contains("visible answer"));
+    fn user_search_indexes_only_visible_text_content() {
+        let message = PublicMessage::User(UserMessage {
+            content: vec![
+                UserContent::Text {
+                    text: "ordinary user text".to_owned(),
+                },
+                UserContent::Image {
+                    data: "private-base64-image-data".to_owned(),
+                    mime_type: "image/private-fixture".to_owned(),
+                },
+            ],
+            timestamp: timestamp(),
+        });
+
+        assert_eq!(projected_search(&message), "ordinary user text");
+    }
+
+    #[test]
+    fn assistant_search_excludes_thinking_signature_and_message_metadata() {
+        let message = PublicMessage::Assistant(PublicAssistantMessage {
+            content: vec![
+                PublicAssistantContent::Thinking {
+                    thinking: "private chain".to_owned(),
+                    signature_field: "private signature field".to_owned(),
+                    wire_item_index: 0,
+                },
+                PublicAssistantContent::ToolCall {
+                    tool_call: ToolCall {
+                        id: "private-tool-call-id".to_owned(),
+                        name: "private-tool-name".to_owned(),
+                        arguments: serde_json::from_value::<ValidatedToolArguments>(json!({
+                            "path": "/workspace/private-tool-argument.txt"
+                        }))
+                        .expect("validated tool argument fixture"),
+                    },
+                    wire_item_index: 1,
+                },
+                PublicAssistantContent::RejectedToolCall {
+                    rejected: RejectedToolCall {
+                        id: "private-rejected-tool-call-id".to_owned(),
+                        name: "private-rejected-tool-name".to_owned(),
+                        error: ToolArgumentError::SchemaViolation,
+                    },
+                    wire_item_index: 2,
+                },
+                PublicAssistantContent::Text {
+                    text: "visible answer".to_owned(),
+                    wire_item_index: 3,
+                },
+            ],
+            model: "private-model-metadata".to_owned(),
+            provider: "private-provider-metadata".to_owned(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: Some("private error metadata".to_owned()),
+            provider_code: Some("private provider code".to_owned()),
+            interrupted: false,
+            timestamp: timestamp(),
+        });
+
+        assert_eq!(projected_search(&message), "visible answer");
+    }
+
+    #[test]
+    fn image_only_message_has_no_search_text() {
+        let message = PublicMessage::User(UserMessage {
+            content: vec![UserContent::Image {
+                data: "private-base64-image-data".to_owned(),
+                mime_type: "image/private-fixture".to_owned(),
+            }],
+            timestamp: timestamp(),
+        });
+
+        assert!(projected_search(&message).is_empty());
+    }
+
+    #[test]
+    fn tool_result_search_indexes_only_visible_text_content() {
+        let message = PublicMessage::ToolResult(ToolResultMessage {
+            tool_call_id: "private-tool-call-id".to_owned(),
+            tool_name: "private-tool-name".to_owned(),
+            content: vec![
+                UserContent::Text {
+                    text: "visible tool output".to_owned(),
+                },
+                UserContent::Image {
+                    data: "private-tool-image-base64".to_owned(),
+                    mime_type: "image/private-tool-fixture".to_owned(),
+                },
+            ],
+            details: json!({
+                "internal_metadata": "private tool metadata",
+                "path": "/workspace/private.txt"
+            }),
+            is_error: false,
+            timestamp: timestamp(),
+        });
+
+        assert_eq!(projected_search(&message), "visible tool output");
+    }
+
+    #[test]
+    fn search_text_is_derived_from_the_redacted_typed_projection() {
+        let secret = "sk-abcdefghijklmnop";
+        let message = PublicMessage::User(UserMessage {
+            content: vec![UserContent::Text {
+                text: format!("visible {secret}"),
+            }],
+            timestamp: timestamp(),
+        });
+        let raw = serde_json::to_vec(&message).expect("serialize secret fixture");
+        let projection = Redactor::v1()
+            .redact_serialized(&raw)
+            .expect("redact secret fixture");
+        let search_text =
+            search_text_from_projection(&projection).expect("extract redacted search text");
+
+        assert!(!projection.contains(secret));
+        assert!(!search_text.contains(secret));
+        assert_eq!(search_text, "visible [REDACTED:api_key]");
     }
 
     #[test]

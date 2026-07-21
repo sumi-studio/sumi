@@ -144,6 +144,29 @@ fn invalid_control_payloads_are_rejected_without_closing_the_epoch() {
 }
 
 #[test]
+fn live_user_message_then_abort_is_received_and_terminalized_in_one_epoch() {
+    let (success, frames, stderr) = run_agent(
+        br#"{"seq":1,"command_id":"00000000-0000-4000-8000-000000000051","command":{"type":"user_message","text":"start work","attachments":[]}}
+{"seq":2,"command_id":"00000000-0000-4000-8000-000000000052","command":{"type":"abort"}}
+"#,
+    );
+
+    assert!(
+        success,
+        "live admission must preserve the reserved Abort window; stderr: {stderr}"
+    );
+    assert_eq!(frames.len(), 4, "stderr: {stderr}");
+    assert_eq!(frames[0]["ack"]["seq"], 1);
+    assert_eq!(frames[0]["ack"]["status"], "received");
+    assert_eq!(frames[1]["ack"]["seq"], 1);
+    assert_eq!(frames[1]["ack"]["status"], "superseded");
+    assert_eq!(frames[2]["ack"]["seq"], 2);
+    assert_eq!(frames[2]["ack"]["status"], "received");
+    assert_eq!(frames[3]["ack"]["seq"], 2);
+    assert_eq!(frames[3]["ack"]["status"], "applied");
+}
+
+#[test]
 fn malformed_command_value_is_durably_rejected_and_replays_the_same_ack() {
     let database_path = fresh_database_path();
     let input = b"{\"seq\":1,\"command_id\":\"00000000-0000-4000-8000-000000000036\",\"command\":{\"type\":\"abort\",}}\n";
