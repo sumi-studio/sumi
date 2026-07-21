@@ -104,7 +104,13 @@ pub fn seal_before_next(
 }
 
 fn is_safe_boundary(boundary: &BoundaryContext) -> bool {
-    if boundary.unresolved_tool_loop() || boundary.next_role == MessageRole::ToolResult {
+    // A continuation assistant immediately following a completed tool result
+    // remains in the same tool flow, even though no call ID is pending.
+    if boundary.unresolved_tool_loop()
+        || boundary.next_role == MessageRole::ToolResult
+        || (boundary.next_role == MessageRole::Assistant
+            && boundary.previous_role == Some(MessageRole::ToolResult))
+    {
         return false;
     }
     !(boundary.next_role == MessageRole::User
@@ -123,6 +129,15 @@ fn pending_tool_calls(history: &[ContextMessage]) -> (HashSet<String>, bool) {
     for context in history {
         match context_message(context) {
             Message::Assistant(message) => {
+                // A new assistant can only begin a new flow after every
+                // prior call has a matching result.  This permits a reused
+                // provider ID across assistant flows while rejecting an
+                // overlapping continuation, even when it uses another ID.
+                if !pending.is_empty() {
+                    malformed = true;
+                } else {
+                    completed.clear();
+                }
                 for content in &message.content {
                     let AssistantContent::ToolCall { tool_call, .. } = content else {
                         continue;
@@ -343,6 +358,12 @@ mod tests {
                 assistant_call("one"),
                 tool_result("one"),
             ],
+            vec![
+                assistant_call("one"),
+                tool_result("one"),
+                assistant_call("one"),
+                tool_result("one"),
+            ],
         ] {
             let boundary = BoundaryContext::from_history(&history, &next, false);
             assert!(boundary.pending_tool_call_ids().next().is_none());
@@ -390,7 +411,34 @@ mod tests {
             BoundaryContext::from_history(&duplicate_call, &next, false).unresolved_tool_loop()
         );
 
+        let overlapping_distinct_calls = vec![
+            assistant_call("one"),
+            assistant_call("two"),
+            tool_result("one"),
+            tool_result("two"),
+        ];
+        assert!(
+            BoundaryContext::from_history(&overlapping_distinct_calls, &next, false)
+                .unresolved_tool_loop()
+        );
+
         let late_result = vec![assistant_call("one"), user_message(), tool_result("one")];
         assert!(BoundaryContext::from_history(&late_result, &next, false).unresolved_tool_loop());
+    }
+
+    #[test]
+    fn tool_result_to_assistant_boundary_never_forces_a_cut() {
+        let history = vec![assistant_call("one"), tool_result("one")];
+        let next = assistant_call("continuation");
+        let boundary = BoundaryContext::from_history(&history, &next, false);
+
+        assert_eq!(
+            seal_before_next(
+                &batch(L0_FORCED_SEAL_LIMIT + 1, 0),
+                &boundary,
+                calibration()
+            ),
+            None
+        );
     }
 }
