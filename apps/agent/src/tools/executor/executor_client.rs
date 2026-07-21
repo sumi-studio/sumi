@@ -20,8 +20,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    ExecutorOperation, ExecutorResponse, MAX_RPC_LINE_BYTES, RpcError, RpcFrame, RpcIdentity,
-    RpcOperationValidation, RpcRequest, decode_rpc_frame,
+    ArtifactResponse, ExecutorOperation, ExecutorResponse, MAX_RPC_LINE_BYTES, RpcError, RpcFrame,
+    RpcIdentity, RpcOperationValidation, RpcRequest, decode_rpc_frame,
 };
 use crate::tools::ToolError;
 
@@ -236,7 +236,7 @@ impl ExecutorClient {
                                 return Err(indeterminate("executor emitted duplicate cancel terminal"));
                             }
                             match result {
-                                Ok(ExecutorResponse::CancelAccepted) => cancel_terminal_seen = true,
+                                Ok(ExecutorResponse::CancelAccepted {}) => cancel_terminal_seen = true,
                                 _ => return Err(indeterminate("executor rejected or malformed cancellation")),
                             }
                         }
@@ -379,67 +379,50 @@ fn validate_response(
     operation: &ExecutorOperation,
     response: &ExecutorResponse,
 ) -> Result<(), ToolError> {
-    let routed_response_matches = match operation {
-        ExecutorOperation::ReadFile { path, .. } => {
-            matches!(response, ExecutorResponse::Artifact { .. }) == path.starts_with("artifact://")
-                && matches!(
-                    response,
-                    ExecutorResponse::Artifact { .. } | ExecutorResponse::ReadFile { .. }
-                )
-        }
-        ExecutorOperation::Grep { path, .. } => {
-            matches!(response, ExecutorResponse::Artifact { .. }) == path.starts_with("artifact://")
-                && matches!(
-                    response,
-                    ExecutorResponse::Artifact { .. } | ExecutorResponse::Grepped { .. }
-                )
-        }
-        _ => true,
-    };
-    let matches = matches!(
-        (operation, response),
+    let valid = match (operation, response) {
         (
-            ExecutorOperation::ReadFile { .. },
-            ExecutorResponse::ReadFile { .. }
-        ) | (
-            ExecutorOperation::ReadFile { .. },
-            ExecutorResponse::Artifact { .. }
-        ) | (
-            ExecutorOperation::WriteFile { .. },
-            ExecutorResponse::Written
-        ) | (ExecutorOperation::EditFile { .. }, ExecutorResponse::Edited)
-            | (
-                ExecutorOperation::RemoveFile { .. },
-                ExecutorResponse::Removed
-            )
-            | (
-                ExecutorOperation::ListDir { .. },
-                ExecutorResponse::Listed { .. }
-            )
-            | (
-                ExecutorOperation::Glob { .. },
-                ExecutorResponse::Globbed { .. }
-            )
-            | (
-                ExecutorOperation::Grep { .. },
-                ExecutorResponse::Grepped { .. }
-            )
-            | (
-                ExecutorOperation::Grep { .. },
-                ExecutorResponse::Artifact { .. }
-            )
-            | (
-                ExecutorOperation::Bash { .. },
-                ExecutorResponse::Bash { .. }
-            )
-    );
-    if matches && routed_response_matches {
+            ExecutorOperation::ReadFile { path, limit, .. },
+            ExecutorResponse::ReadFile { result },
+        ) => !path.starts_with("artifact://") && read_file_result_within_limit(result, *limit),
+        (
+            ExecutorOperation::ReadFile { path, limit, .. },
+            ExecutorResponse::Artifact {
+                response: ArtifactResponse::Read { content, .. },
+            },
+        ) => path.starts_with("artifact://") && content.len() <= *limit,
+        (ExecutorOperation::Grep { path, .. }, ExecutorResponse::Grepped { .. }) => {
+            !path.starts_with("artifact://")
+        }
+        (
+            ExecutorOperation::Grep { path, .. },
+            ExecutorResponse::Artifact {
+                response: ArtifactResponse::Grep { .. },
+            },
+        ) => path.starts_with("artifact://"),
+        (ExecutorOperation::WriteFile { .. }, ExecutorResponse::Written {})
+        | (ExecutorOperation::EditFile { .. }, ExecutorResponse::Edited {})
+        | (ExecutorOperation::RemoveFile { .. }, ExecutorResponse::Removed {})
+        | (ExecutorOperation::ListDir { .. }, ExecutorResponse::Listed { .. })
+        | (ExecutorOperation::Glob { .. }, ExecutorResponse::Globbed { .. })
+        | (ExecutorOperation::Bash { .. }, ExecutorResponse::Bash { .. }) => true,
+        _ => false,
+    };
+    if valid {
         Ok(())
     } else {
         Err(ToolError::Protocol(
             "executor returned a response for a different operation".to_owned(),
         ))
     }
+}
+
+fn read_file_result_within_limit(
+    result: &crate::tools::truncate::TruncationResult,
+    limit: usize,
+) -> bool {
+    result.output_bytes <= limit
+        && result.content.len() <= limit
+        && result.output_bytes == result.content.len()
 }
 
 fn map_rpc_error(error: RpcError) -> ToolError {
@@ -570,7 +553,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response, ExecutorResponse::Written);
+        assert_eq!(response, ExecutorResponse::Written {});
         assert_eq!(
             std::fs::read_to_string(root.join("workspace/written.txt")).unwrap(),
             "content"
@@ -653,8 +636,8 @@ mod tests {
                 Arc::new(|_| {}),
             ),
         );
-        assert_eq!(first.unwrap(), ExecutorResponse::Written);
-        assert_eq!(second.unwrap(), ExecutorResponse::Written);
+        assert_eq!(first.unwrap(), ExecutorResponse::Written {});
+        assert_eq!(second.unwrap(), ExecutorResponse::Written {});
         assert_eq!(
             std::fs::read_to_string(root.join("workspace/a.txt")).unwrap(),
             "alpha"
@@ -712,6 +695,125 @@ mod tests {
             server.await.unwrap();
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    fn response_validation_enforces_route_inner_variant_and_read_bounds() {
+        let workspace_read = ExecutorOperation::ReadFile {
+            path: "notes.txt".to_owned(),
+            offset: 0,
+            limit: 4,
+            execution_id: "read-workspace".to_owned(),
+        };
+        let workspace_result = crate::tools::truncate::truncate_head(
+            "abcd",
+            crate::tools::truncate::TruncationOptions {
+                max_lines: 2_000,
+                max_bytes: 4,
+            },
+        );
+        assert!(
+            validate_response(
+                &workspace_read,
+                &ExecutorResponse::ReadFile {
+                    result: workspace_result.clone(),
+                },
+            )
+            .is_ok()
+        );
+
+        let mut oversized_workspace_result = workspace_result;
+        oversized_workspace_result.content.push('e');
+        oversized_workspace_result.output_bytes += 1;
+        assert!(
+            validate_response(
+                &workspace_read,
+                &ExecutorResponse::ReadFile {
+                    result: oversized_workspace_result,
+                },
+            )
+            .is_err()
+        );
+
+        let artifact_read = ExecutorOperation::ReadFile {
+            path: "artifact://conversation-1/tool-output/read".to_owned(),
+            offset: 0,
+            limit: 4,
+            execution_id: "read-artifact".to_owned(),
+        };
+        assert!(
+            validate_response(
+                &artifact_read,
+                &ExecutorResponse::Artifact {
+                    response: ArtifactResponse::Read {
+                        content: b"abcd".to_vec(),
+                        eof: true,
+                    },
+                },
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_response(
+                &artifact_read,
+                &ExecutorResponse::Artifact {
+                    response: ArtifactResponse::Read {
+                        content: b"abcde".to_vec(),
+                        eof: false,
+                    },
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            validate_response(
+                &artifact_read,
+                &ExecutorResponse::Artifact {
+                    response: ArtifactResponse::Begun {
+                        handle: "artifact://conversation-1/tool-output/read".to_owned(),
+                        offset: 0,
+                    },
+                },
+            )
+            .is_err()
+        );
+
+        let artifact_grep = ExecutorOperation::Grep {
+            path: "artifact://conversation-1/tool-output/read".to_owned(),
+            pattern: "needle".to_owned(),
+            execution_id: "grep-artifact".to_owned(),
+        };
+        assert!(
+            validate_response(
+                &artifact_grep,
+                &ExecutorResponse::Artifact {
+                    response: ArtifactResponse::Grep {
+                        matches: Vec::new()
+                    },
+                },
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_response(
+                &artifact_grep,
+                &ExecutorResponse::Artifact {
+                    response: ArtifactResponse::Read {
+                        content: Vec::new(),
+                        eof: true,
+                    },
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn executor_response_unit_variants_reject_unknown_fields() {
+        let parsed = serde_json::from_value::<ExecutorResponse>(
+            serde_json::json!({"type": "written", "extra": 1}),
+        );
+        assert!(parsed.is_err(), "unit response accepted an unknown field");
     }
 
     #[tokio::test]

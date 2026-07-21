@@ -598,28 +598,21 @@ where
                 }
             }
             update = updates_rx.recv() => {
-                if let Some(value) = update {
-                    if let Err(error) = lifecycle.accept_update(&request_id) {
-                        break BashExit::Fatal {
-                            error,
-                            response: None,
-                            completed: None,
-                        };
-                    }
-                    let frame = RpcFrame::<ExecutorResponse>::Update {
-                        generation: identity.generation,
-                        nonce: identity.nonce.clone(),
-                        request_id: request_id.clone(),
+                if let Some(value) = update
+                    && let Err(error) = forward_bash_update(
+                        writer,
+                        identity,
+                        lifecycle,
+                        &request_id,
                         value,
+                    )
+                {
+                    tracing::warn!("executor output queue unavailable; closing service epoch");
+                    break BashExit::Fatal {
+                        error,
+                        response: None,
+                        completed: None,
                     };
-                    if let Err(error) = writer.try_update(&frame) {
-                        tracing::warn!("executor output queue unavailable; closing service epoch");
-                        break BashExit::Fatal {
-                            error,
-                            response: None,
-                            completed: None,
-                        };
-                    }
                 }
             }
         }
@@ -658,6 +651,13 @@ where
                     }
                 },
             };
+            drain_completed_bash_updates(
+                writer,
+                identity,
+                lifecycle,
+                &request_id,
+                &mut updates_rx,
+            )?;
             lifecycle.accept_terminal(&request_id)?;
             writer
                 .terminal(
@@ -676,6 +676,13 @@ where
             Err(error.into())
         }
         BashExit::Completed(result) => {
+            drain_completed_bash_updates(
+                writer,
+                identity,
+                lifecycle,
+                &request_id,
+                &mut updates_rx,
+            )?;
             lifecycle.accept_terminal(&request_id)?;
             writer
                 .terminal(
@@ -703,7 +710,7 @@ where
                             .terminal(
                                 identity,
                                 cancel_request_id,
-                                Ok(ExecutorResponse::CancelAccepted),
+                                Ok(ExecutorResponse::CancelAccepted {}),
                             )
                             .await?;
                         writer
@@ -720,7 +727,7 @@ where
                             .terminal(
                                 identity,
                                 cancel_request_id,
-                                Ok(ExecutorResponse::CancelAccepted),
+                                Ok(ExecutorResponse::CancelAccepted {}),
                             )
                             .await?;
                         writer
@@ -739,12 +746,19 @@ where
                     }
                 },
             };
+            drain_completed_bash_updates(
+                writer,
+                identity,
+                lifecycle,
+                &request_id,
+                &mut updates_rx,
+            )?;
             lifecycle.accept_terminal(&request_id)?;
             writer
                 .terminal(
                     identity,
                     cancel_request_id,
-                    Ok(ExecutorResponse::CancelAccepted),
+                    Ok(ExecutorResponse::CancelAccepted {}),
                 )
                 .await?;
             writer
@@ -759,6 +773,40 @@ where
             Ok(())
         }
     }
+}
+
+fn forward_bash_update(
+    writer: &ExecutorWriter,
+    identity: &RpcIdentity,
+    lifecycle: &RpcLifecycleTracker,
+    request_id: &str,
+    value: Value,
+) -> Result<(), ToolError> {
+    lifecycle.accept_update(request_id)?;
+    let frame = RpcFrame::<ExecutorResponse>::Update {
+        generation: identity.generation,
+        nonce: identity.nonce.clone(),
+        request_id: request_id.to_owned(),
+        value,
+    };
+    writer.try_update(&frame)
+}
+
+fn drain_completed_bash_updates(
+    writer: &ExecutorWriter,
+    identity: &RpcIdentity,
+    lifecycle: &RpcLifecycleTracker,
+    request_id: &str,
+    updates_rx: &mut mpsc::Receiver<Value>,
+) -> Result<(), ToolError> {
+    // LowTrustLocalBash resolves only after its pipe reader and every callback
+    // invocation complete. No producer can enqueue another value beyond this
+    // point, so a nonblocking drain is a stable synchronization boundary, not
+    // a racy snapshot.
+    while let Ok(value) = updates_rx.try_recv() {
+        forward_bash_update(writer, identity, lifecycle, request_id, value)?;
+    }
+    Ok(())
 }
 
 async fn take_queued_control_after_completion<F, T>(
@@ -901,7 +949,7 @@ async fn execute_non_bash(
         ExecutorOperation::WriteFile { path, content, .. } => {
             resolve_input("write_file", &path)?;
             fs.write_file(path.as_ref(), content.as_bytes())?;
-            Ok(ExecutorResponse::Written)
+            Ok(ExecutorResponse::Written {})
         }
         ExecutorOperation::EditFile {
             path,
@@ -911,12 +959,12 @@ async fn execute_non_bash(
         } => {
             resolve_input("edit_file", &path)?;
             fs.edit_file(path.as_ref(), &old_string, &new_string)?;
-            Ok(ExecutorResponse::Edited)
+            Ok(ExecutorResponse::Edited {})
         }
         ExecutorOperation::RemoveFile { path, .. } => {
             resolve_input("remove_file", &path)?;
             fs.remove_file(path.as_ref())?;
-            Ok(ExecutorResponse::Removed)
+            Ok(ExecutorResponse::Removed {})
         }
         ExecutorOperation::ListDir { path, .. } => {
             resolve_input("list_dir", &path)?;
@@ -1145,6 +1193,7 @@ fn required_path(name: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::executor::decode_rpc_frame;
 
     struct QueueControlOnSecondPoll {
         polls: usize,
@@ -1178,6 +1227,81 @@ mod tests {
 
         assert_eq!(control.unwrap(), "cancel");
         assert!(!reader_done);
+    }
+
+    #[tokio::test]
+    async fn completed_bash_updates_are_emitted_before_terminal() {
+        let identity = RpcIdentity {
+            generation: 7,
+            nonce: "boot-nonce".to_owned(),
+        };
+        let (read_side, write_side) = tokio::io::duplex(4096);
+        let (writer, writer_task) = ExecutorWriter::start(write_side);
+        let mut lifecycle = RpcLifecycleTracker::default();
+        lifecycle
+            .begin_execution("request-1", "execution-1")
+            .expect("begin execution");
+        let (updates_tx, mut updates_rx) = mpsc::channel(UPDATE_CHANNEL_CAPACITY);
+        updates_tx
+            .send(serde_json::json!({"output": "first"}))
+            .await
+            .expect("queue first update");
+        updates_tx
+            .send(serde_json::json!({"output": "second"}))
+            .await
+            .expect("queue second update");
+        drop(updates_tx);
+
+        drain_completed_bash_updates(&writer, &identity, &lifecycle, "request-1", &mut updates_rx)
+            .expect("drain completed updates");
+        lifecycle
+            .accept_terminal("request-1")
+            .expect("accept terminal");
+        writer
+            .terminal(
+                &identity,
+                "request-1".to_owned(),
+                Ok(ExecutorResponse::Written {}),
+            )
+            .await
+            .expect("write terminal");
+
+        let mut read = BufReader::new(read_side);
+        let first = decode_rpc_frame::<ExecutorResponse>(
+            &read_frame(&mut read)
+                .await
+                .expect("read first frame")
+                .expect("first frame"),
+            &identity,
+        )
+        .expect("decode first frame");
+        let second = decode_rpc_frame::<ExecutorResponse>(
+            &read_frame(&mut read)
+                .await
+                .expect("read second frame")
+                .expect("second frame"),
+            &identity,
+        )
+        .expect("decode second frame");
+        let terminal = decode_rpc_frame::<ExecutorResponse>(
+            &read_frame(&mut read)
+                .await
+                .expect("read terminal frame")
+                .expect("terminal frame"),
+            &identity,
+        )
+        .expect("decode terminal frame");
+
+        let RpcFrame::Update { value: first, .. } = first else {
+            panic!("first frame was not an update");
+        };
+        let RpcFrame::Update { value: second, .. } = second else {
+            panic!("second frame was not an update");
+        };
+        assert_eq!(first["output"], "first");
+        assert_eq!(second["output"], "second");
+        assert!(matches!(terminal, RpcFrame::Terminal { .. }));
+        writer_task.abort();
     }
 
     #[test]

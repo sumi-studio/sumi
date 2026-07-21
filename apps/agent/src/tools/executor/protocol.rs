@@ -156,15 +156,15 @@ pub enum ExecutorOperation {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExecutorResponse {
     ReadFile { result: TruncationResult },
-    Written,
-    Edited,
-    Removed,
+    Written {},
+    Edited {},
+    Removed {},
     Listed { entries: Vec<String> },
     Globbed { paths: Vec<String> },
     Grepped { matches: Vec<GrepMatch> },
     Artifact { response: ArtifactResponse },
     Bash { result: BashExecutionResult },
-    CancelAccepted,
+    CancelAccepted {},
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
