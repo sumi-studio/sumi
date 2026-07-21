@@ -650,12 +650,29 @@ where
             cancel.cancel();
             let result = match completed {
                 Some(result) => result,
-                None => timeout(EXECUTOR_REAP_DEADLINE, &mut execution)
-                    .await
-                    .map_err(|_| {
+                None => match timeout(EXECUTOR_REAP_DEADLINE, &mut execution).await {
+                    Ok(result) => result,
+                    Err(_) => {
                         tracing::warn!("executor cancellation exceeded its service deadline");
-                        anyhow::anyhow!("executor cancellation exceeded its service deadline")
-                    })?,
+                        lifecycle.accept_terminal(&request_id)?;
+                        writer
+                            .terminal(
+                                identity,
+                                request_id,
+                                Err(rpc_error(ToolError::RpcIndeterminate(
+                                    "executor cancellation exceeded its service deadline"
+                                        .to_owned(),
+                                ))),
+                            )
+                            .await?;
+                        if let Some((response_id, response_error)) = response {
+                            writer
+                                .terminal(identity, response_id, Err(response_error))
+                                .await?;
+                        }
+                        return Err(error.into());
+                    }
+                },
             };
             lifecycle.accept_terminal(&request_id)?;
             writer
@@ -694,11 +711,49 @@ where
             cancel.cancel();
             let result = match completed {
                 Some(result) => result,
-                None => timeout(EXECUTOR_REAP_DEADLINE, &mut execution)
-                    .await
-                    .map_err(|_| {
-                        anyhow::anyhow!("executor cancellation exceeded its service deadline")
-                    })?,
+                None => match timeout(EXECUTOR_REAP_DEADLINE, &mut execution).await {
+                    Ok(Ok(result)) => Ok(result),
+                    Ok(Err(reap_error)) => {
+                        lifecycle.accept_terminal(&request_id)?;
+                        writer
+                            .terminal(
+                                identity,
+                                cancel_request_id,
+                                Ok(ExecutorResponse::CancelAccepted),
+                            )
+                            .await?;
+                        writer
+                            .terminal(identity, request_id, Err(rpc_error(reap_error)))
+                            .await?;
+                        return Err(anyhow::anyhow!(
+                            "executor cancellation failed before cleanup was proven"
+                        ));
+                    }
+                    Err(_) => {
+                        tracing::warn!("executor cancellation exceeded its service deadline");
+                        lifecycle.accept_terminal(&request_id)?;
+                        writer
+                            .terminal(
+                                identity,
+                                cancel_request_id,
+                                Ok(ExecutorResponse::CancelAccepted),
+                            )
+                            .await?;
+                        writer
+                            .terminal(
+                                identity,
+                                request_id,
+                                Err(rpc_error(ToolError::RpcIndeterminate(
+                                    "executor cancellation exceeded its service deadline"
+                                        .to_owned(),
+                                ))),
+                            )
+                            .await?;
+                        return Err(anyhow::anyhow!(
+                            "executor cancellation exceeded its service deadline"
+                        ));
+                    }
+                },
             };
             lifecycle.accept_terminal(&request_id)?;
             writer
