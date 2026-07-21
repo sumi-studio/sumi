@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    gateway::{Command, CommandEnvelope},
+    gateway::Command,
     provider::{
         overflow::classify_context_overflow,
         retry::{is_retryable, retry_delay, sleep_or_cancel},
@@ -27,8 +27,9 @@ use crate::{
 };
 
 use super::{
-    AgentEvent, ProjectedProviderEvent, ProviderEventProjector, ProviderTerminalKind,
-    RunCompletion, RunControl, RunCore, RunWorker, SteerMode, WorkerFailure, WorkerFuture,
+    AdmittedCommand, AgentEvent, ProjectedProviderEvent, ProviderEventProjector,
+    ProviderTerminalKind, RunCompletion, RunControl, RunCore, RunWorker, SteerMode, WorkerFailure,
+    WorkerFuture,
 };
 
 const LENGTH_TOOL_FAILURE: &str = "Tool call was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.";
@@ -89,7 +90,7 @@ impl RunWorker for SequentialRunWorker {
     fn run(
         &self,
         core: RunCore,
-        initial: CommandEnvelope,
+        initial: AdmittedCommand,
         controls: mpsc::Receiver<RunControl>,
         events: mpsc::Sender<AgentEvent>,
     ) -> WorkerFuture {
@@ -110,6 +111,7 @@ struct Runner {
     context: Vec<PublicMessage>,
     attempt: usize,
     consecutive_length_batches: usize,
+    in_flight_control: Option<AdmittedCommand>,
 }
 
 impl Runner {
@@ -128,11 +130,18 @@ impl Runner {
             context,
             attempt: 0,
             consecutive_length_batches: 0,
+            in_flight_control: None,
         }
     }
 
-    async fn run(mut self, initial: CommandEnvelope) -> RunCompletion {
-        let result = self.run_inner(initial).await;
+    async fn run(mut self, initial: AdmittedCommand) -> RunCompletion {
+        let mut result = match self.ordered_initial(initial) {
+            Ok(initial) => self.run_inner(initial).await,
+            Err(failure) => Err(failure),
+        };
+        if let Err(failure) = self.recover_received_controls() {
+            result = Err(failure);
+        }
         self.core.runtime_context = self.context;
         self.core.mark_mutated();
         match result {
@@ -144,19 +153,36 @@ impl Runner {
         }
     }
 
-    async fn run_inner(&mut self, initial: CommandEnvelope) -> Result<(), WorkerFailure> {
+    fn ordered_initial(
+        &mut self,
+        initial: AdmittedCommand,
+    ) -> Result<AdmittedCommand, WorkerFailure> {
+        self.core
+            .queue_followup(initial)
+            .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+        let oldest = self
+            .core
+            .next_followup()
+            .expect("newly queued initial makes pending controls non-empty");
+        if matches!(oldest.envelope().command, Command::UserMessage { .. }) {
+            Ok(oldest)
+        } else {
+            self.core
+                .requeue_followup_front(oldest)
+                .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+            Err(WorkerFailure::Error(
+                "pending T16 control must be applied before a later run can start".to_owned(),
+            ))
+        }
+    }
+
+    async fn run_inner(&mut self, initial: AdmittedCommand) -> Result<(), WorkerFailure> {
         self.emit(AgentEvent::AgentStart).await?;
         self.emit(AgentEvent::TurnStart).await?;
-        self.inject_user(initial).await?;
+        self.inject_user(&initial).await?;
 
         loop {
-            if let Some(command) = self.poll_control_safe_point()? {
-                self.emit(AgentEvent::Steered {
-                    mode: SteerMode::Soft,
-                })
-                .await?;
-                self.inject_user(command).await?;
-            }
+            self.receive_control_safe_point()?;
             let outcome = self.provider_attempt().await?;
             match outcome {
                 AttemptOutcome::Retry { message } => {
@@ -178,7 +204,7 @@ impl Runner {
                             mode: SteerMode::Soft,
                         })
                         .await?;
-                        self.inject_user(command).await?;
+                        self.inject_control(command).await?;
                     }
                 }
                 AttemptOutcome::Terminal {
@@ -218,11 +244,7 @@ impl Runner {
                         tool_results: results,
                     })
                     .await?;
-                    if let Some(command) = self.poll_control_safe_point()? {
-                        self.core
-                            .queue_followup(command)
-                            .map_err(|error| WorkerFailure::Error(error.to_string()))?;
-                    }
+                    self.receive_control_safe_point()?;
 
                     if is_length && self.consecutive_length_batches >= 2 {
                         break;
@@ -231,8 +253,8 @@ impl Runner {
                     // A provider terminal carrying executable calls always
                     // continues with a fresh turn after every result settles.
                     self.emit(AgentEvent::TurnStart).await?;
-                    if let Some(command) = self.core.next_followup() {
-                        self.inject_user(command).await?;
+                    if let Some(command) = self.take_pending_user()? {
+                        self.inject_control(command).await?;
                     }
                 }
                 AttemptOutcome::ClosedError { message } => {
@@ -377,7 +399,6 @@ impl Runner {
     ) -> Result<Vec<ToolResultMessage>, WorkerFailure> {
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {
-            self.emit_tool_start(call).await?;
             let message = if terminal_guard {
                 format!("{LENGTH_TOOL_FAILURE} {LENGTH_LOOP_FAILURE}")
             } else {
@@ -456,18 +477,18 @@ impl Runner {
         .await
     }
 
-    async fn inject_user(&mut self, command: CommandEnvelope) -> Result<(), WorkerFailure> {
-        let Command::UserMessage { text, attachments } = command.command else {
+    async fn inject_user(&mut self, command: &AdmittedCommand) -> Result<(), WorkerFailure> {
+        let Command::UserMessage { text, attachments } = &command.envelope().command else {
             return Err(WorkerFailure::Error(
                 "non-user command reached a user injection boundary".to_owned(),
             ));
         };
         debug_assert!(attachments.is_empty());
         let message = PublicMessage::User(UserMessage {
-            content: vec![UserContent::Text { text }],
-            timestamp: Utc::now(),
+            content: vec![UserContent::Text { text: text.clone() }],
+            timestamp: command.received_at(),
         });
-        let message_id = user_message_id(&command.command_id);
+        let message_id = user_message_id(&command.envelope().command_id);
         self.emit(AgentEvent::MessageStart {
             message_id: message_id.clone(),
             message: Box::new(message.clone()),
@@ -480,6 +501,20 @@ impl Runner {
         .await?;
         self.context.push(message);
         Ok(())
+    }
+
+    async fn inject_control(&mut self, command: AdmittedCommand) -> Result<(), WorkerFailure> {
+        self.in_flight_control = Some(command);
+        let injectable = self
+            .in_flight_control
+            .as_ref()
+            .expect("in-flight control was just installed")
+            .clone();
+        let result = self.inject_user(&injectable).await;
+        if result.is_ok() {
+            self.in_flight_control = None;
+        }
+        result
     }
 
     async fn close_turn(
@@ -500,52 +535,59 @@ impl Runner {
     }
 
     async fn advance_followup(&mut self) -> Result<bool, WorkerFailure> {
-        if let Some(command) = self.poll_control_safe_point()? {
+        self.receive_control_safe_point()?;
+        let Some(command) = self.take_pending_user()? else {
+            return Ok(false);
+        };
+        self.emit(AgentEvent::TurnStart).await?;
+        self.inject_control(command).await?;
+        Ok(true)
+    }
+
+    fn take_pending_user(&mut self) -> Result<Option<AdmittedCommand>, WorkerFailure> {
+        let Some(command) = self.core.next_followup() else {
+            return Ok(None);
+        };
+        if matches!(command.envelope().command, Command::UserMessage { .. }) {
+            Ok(Some(command))
+        } else {
+            self.core
+                .requeue_followup_front(command)
+                .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+            Ok(None)
+        }
+    }
+
+    fn receive_control_safe_point(&mut self) -> Result<(), WorkerFailure> {
+        // Deliberately consume at most one ordinary message: one-at-a-time is
+        // the product contract and keeps each queued instruction an answer turn.
+        if let Ok(RunControl::Command(command)) = self.controls.try_recv() {
             self.core
                 .queue_followup(command)
                 .map_err(|error| WorkerFailure::Error(error.to_string()))?;
         }
-        let Some(command) = self.core.next_followup() else {
-            return Ok(false);
-        };
-        self.emit(AgentEvent::TurnStart).await?;
-        self.inject_user(command).await?;
-        Ok(true)
-    }
-
-    fn poll_control_safe_point(&mut self) -> Result<Option<CommandEnvelope>, WorkerFailure> {
-        // Deliberately consume at most one ordinary message: one-at-a-time is
-        // the product contract and keeps each queued instruction an answer turn.
-        if let Ok(RunControl::Command(command)) = self.controls.try_recv() {
-            if matches!(command.command, Command::UserMessage { .. }) {
-                return Ok(Some(command));
-            } else {
-                // T16 owns application of Abort/ApprovalDecision. Retaining the
-                // already-admitted command in the returned unique core avoids
-                // silently consuming it in this earlier lifecycle slice.
-                self.core
-                    .defer_control(command)
-                    .map_err(|error| WorkerFailure::Error(error.to_string()))?;
-            }
-        }
-        Ok(None)
+        Ok(())
     }
 
     async fn wait_retry_or_control(
         &mut self,
         delay: Duration,
-    ) -> Result<Option<CommandEnvelope>, WorkerFailure> {
+    ) -> Result<Option<AdmittedCommand>, WorkerFailure> {
+        if let Some(command) = self.take_pending_user()? {
+            return Ok(Some(command));
+        }
         let cancel = CancellationToken::new();
         let injected = tokio::select! {
             biased;
             control = self.controls.recv() => {
                 if let Some(RunControl::Command(command)) = control
                 {
-                    if matches!(command.command, Command::UserMessage { .. }) {
+                    self.core.queue_followup(command)
+                        .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+                    if let Some(command) = self.take_pending_user()? {
                         Some(command)
                     } else {
-                        self.core.defer_control(command)
-                            .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+                        let _ = self.driver.wait_retry(delay, &cancel).await;
                         None
                     }
                 } else {
@@ -555,6 +597,21 @@ impl Runner {
             _ = self.driver.wait_retry(delay, &cancel) => None
         };
         Ok(injected)
+    }
+
+    fn recover_received_controls(&mut self) -> Result<(), WorkerFailure> {
+        self.controls.close();
+        if let Some(command) = self.in_flight_control.take() {
+            self.core
+                .requeue_followup_front(command)
+                .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+        }
+        while let Ok(RunControl::Command(command)) = self.controls.try_recv() {
+            self.core
+                .queue_followup(command)
+                .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+        }
+        Ok(())
     }
 
     async fn emit(&mut self, event: AgentEvent) -> Result<(), WorkerFailure> {

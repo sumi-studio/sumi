@@ -179,7 +179,7 @@ async fn active_received_replay_acks_without_duplicate_control_delivery() {
     let worker: Arc<dyn RunWorker> = Arc::new({
         let starts = starts.clone();
         move |core: RunCore,
-              _initial: CommandEnvelope,
+              _initial: AdmittedCommand,
               mut controls: mpsc::Receiver<RunControl>,
               events: mpsc::Sender<AgentEvent>| {
             starts.fetch_add(1, Ordering::SeqCst);
@@ -239,7 +239,7 @@ async fn idle_received_replay_acks_without_spawning_a_second_worker() {
     let worker: Arc<dyn RunWorker> = Arc::new({
         let starts = starts.clone();
         move |core: RunCore,
-              _initial: CommandEnvelope,
+              _initial: AdmittedCommand,
               mut controls: mpsc::Receiver<RunControl>,
               events: mpsc::Sender<AgentEvent>| {
             starts.fetch_add(1, Ordering::SeqCst);
@@ -278,7 +278,7 @@ async fn pending_worker_does_not_block_next_durable_received_ack() {
     let worker: Arc<dyn RunWorker> = Arc::new({
         let release = release.clone();
         move |mut core: RunCore,
-              initial: CommandEnvelope,
+              initial: AdmittedCommand,
               mut controls: mpsc::Receiver<RunControl>,
               events: mpsc::Sender<AgentEvent>| {
             let started_tx = started_tx.clone();
@@ -291,7 +291,7 @@ async fn pending_worker_does_not_block_next_durable_received_ack() {
             async move {
                 let _events = events;
                 started_tx
-                    .send(initial.seq)
+                    .send(initial.envelope().seq)
                     .await
                     .expect("started observer");
                 let mut release = Box::pin(release);
@@ -312,7 +312,10 @@ async fn pending_worker_does_not_block_next_durable_received_ack() {
                             };
                             core.queue_followup(command).expect("bounded follow-up");
                             let observed = core.next_followup().expect("one-at-a-time follow-up");
-                            control_tx.send(observed.seq).await.expect("control observer");
+                            control_tx
+                                .send(observed.envelope().seq)
+                                .await
+                                .expect("control observer");
                         }
                     }
                 }
@@ -352,7 +355,7 @@ async fn ready_completion_event_and_next_command_all_progress_with_one_core() {
         let ownership = ownership.clone();
         let first_release = first_release.clone();
         move |mut core: RunCore,
-              initial: CommandEnvelope,
+              initial: AdmittedCommand,
               mut controls: mpsc::Receiver<RunControl>,
               events: mpsc::Sender<AgentEvent>| {
             let invocation = starts.fetch_add(1, Ordering::SeqCst);
@@ -364,7 +367,10 @@ async fn ready_completion_event_and_next_command_all_progress_with_one_core() {
                     .lock()
                     .expect("ownership mutex")
                     .push(core.ownership_id());
-                started_tx.send(initial.seq).await.expect("start observer");
+                started_tx
+                    .send(initial.envelope().seq)
+                    .await
+                    .expect("start observer");
                 if invocation == 0 {
                     first_release.notified().await;
                     events
@@ -424,7 +430,7 @@ async fn typed_worker_failures_report_recovered_ownership() {
         let expected = failure.clone();
         let worker: Arc<dyn RunWorker> = Arc::new(
             move |core: RunCore,
-                  _initial: CommandEnvelope,
+                  _initial: AdmittedCommand,
                   mut controls: mpsc::Receiver<RunControl>,
                   events: mpsc::Sender<AgentEvent>| {
                 let failure = failure.clone();
@@ -470,7 +476,7 @@ async fn active_gateway_receive_failure_aborts_and_awaits_worker() {
     let worker: Arc<dyn RunWorker> = Arc::new({
         let running = running.clone();
         move |_core: RunCore,
-              _initial: CommandEnvelope,
+              _initial: AdmittedCommand,
               _controls: mpsc::Receiver<RunControl>,
               events: mpsc::Sender<AgentEvent>| {
             let running = running.clone();
@@ -522,7 +528,7 @@ async fn active_gateway_send_failure_aborts_and_awaits_worker() {
         let running = running.clone();
         let emit = emit.clone();
         move |_core: RunCore,
-              _initial: CommandEnvelope,
+              _initial: AdmittedCommand,
               _controls: mpsc::Receiver<RunControl>,
               events: mpsc::Sender<AgentEvent>| {
             let running = running.clone();
@@ -577,7 +583,7 @@ async fn event_drain_send_failure_preserves_ready_completion_core() {
     let worker: Arc<dyn RunWorker> = Arc::new({
         let release = release.clone();
         move |core: RunCore,
-              _initial: CommandEnvelope,
+              _initial: AdmittedCommand,
               mut controls: mpsc::Receiver<RunControl>,
               events: mpsc::Sender<AgentEvent>| {
             let release = release.clone();
@@ -621,7 +627,7 @@ async fn closed_control_with_pending_worker_is_bounded_and_joined() {
     let worker: Arc<dyn RunWorker> = Arc::new({
         let running = running.clone();
         move |_core: RunCore,
-              _initial: CommandEnvelope,
+              _initial: AdmittedCommand,
               controls: mpsc::Receiver<RunControl>,
               events: mpsc::Sender<AgentEvent>| {
             let running = running.clone();
@@ -659,7 +665,7 @@ async fn synchronous_worker_factory_panic_is_typed_and_lost() {
     let (gateway, commands, _frames) = gateway();
     let worker: Arc<dyn RunWorker> = Arc::new(
         |_core: RunCore,
-         _initial: CommandEnvelope,
+         _initial: AdmittedCommand,
          _controls: mpsc::Receiver<RunControl>,
          _events: mpsc::Sender<AgentEvent>|
          -> std::future::Pending<RunCompletion> {
@@ -683,7 +689,7 @@ async fn panic_and_unpaired_event_channel_close_report_lost_ownership() {
     let (panic_gateway, commands, _frames) = gateway();
     let panic_worker: Arc<dyn RunWorker> = Arc::new(
         |_core: RunCore,
-         _initial: CommandEnvelope,
+         _initial: AdmittedCommand,
          _controls: mpsc::Receiver<RunControl>,
          events: mpsc::Sender<AgentEvent>| async move {
             let _events = events;
@@ -702,7 +708,7 @@ async fn panic_and_unpaired_event_channel_close_report_lost_ownership() {
     let (gateway, commands, _frames) = gateway();
     let close_worker: Arc<dyn RunWorker> = Arc::new(
         |_core: RunCore,
-         _initial: CommandEnvelope,
+         _initial: AdmittedCommand,
          _controls: mpsc::Receiver<RunControl>,
          events: mpsc::Sender<AgentEvent>| async move {
             drop(events);
@@ -747,7 +753,7 @@ async fn pending_t15_suffix_allows_only_t12_exact_retransmission() {
     let (gateway, commands, frames) = gateway();
     let worker: Arc<dyn RunWorker> = Arc::new(
         |core: RunCore,
-         _initial: CommandEnvelope,
+         _initial: AdmittedCommand,
          mut controls: mpsc::Receiver<RunControl>,
          events: mpsc::Sender<AgentEvent>| async move {
             let _events = events;
