@@ -35,7 +35,7 @@ use super::unix_pipe::merged_output_pipe;
 use super::{
     ResourceLimit, ToolError,
     shell_capture::{ArtifactAppender, ShellCaptureResult},
-    truncate::TruncationResult,
+    truncate::{TruncationOptions, TruncationResult, truncate_tail},
 };
 
 pub const DEFAULT_WALL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -75,6 +75,9 @@ impl<'a> LowTrustLocalBash<'a> {
         cancel: CancellationToken,
         on_update: Arc<dyn Fn(Value) + Send + Sync>,
     ) -> Result<BashExecutionResult, ToolError> {
+        if cancel.is_cancelled() {
+            return Ok(cancelled_before_spawn_result());
+        }
         #[cfg(unix)]
         {
             self.execute_unix(command, execution_id, cancel, on_update)
@@ -102,6 +105,7 @@ impl<'a> LowTrustLocalBash<'a> {
             target: "sumi_agent::tools",
             "starting non-Linux low-trust bash; child.kill() cannot stop escaped descendants"
         );
+        let inherited_fd_limit = inherited_fd_limit()?;
         let (output_read, output_write) = merged_output_pipe()?;
         let output_stderr = output_write.try_clone()?;
         let mut process = Command::new("bash");
@@ -116,6 +120,7 @@ impl<'a> LowTrustLocalBash<'a> {
             .stdin(Stdio::null())
             .stdout(Stdio::from(output_write))
             .stderr(Stdio::from(output_stderr));
+        configure_child_fd_sanitizer(&mut process, inherited_fd_limit);
 
         let mut child = process.spawn()?;
         drop(process);
@@ -309,6 +314,162 @@ impl<'a> LowTrustLocalBash<'a> {
     }
 }
 
+fn cancelled_before_spawn_result() -> BashExecutionResult {
+    to_execution_result(
+        ShellCaptureResult {
+            output: String::new(),
+            truncation: truncate_tail("", TruncationOptions::default()),
+            artifact_handle: None,
+            observed_bytes: 0,
+        },
+        None,
+        true,
+        None,
+    )
+}
+
+#[cfg(unix)]
+fn inherited_fd_limit() -> Result<libc::rlim_t, ToolError> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+    if result != 0 {
+        return Err(ToolError::Io(std::io::Error::last_os_error()));
+    }
+
+    // A descriptor opened before the soft limit was lowered may remain above
+    // rlim_cur, so the sanitizer must use the hard allocation ceiling.
+    #[cfg(target_vendor = "apple")]
+    let inherited_fd_limit = if limit.rlim_max == libc::RLIM_INFINITY {
+        apple_max_files_per_process()?
+    } else {
+        limit.rlim_max
+    };
+    #[cfg(not(target_vendor = "apple"))]
+    let inherited_fd_limit = limit.rlim_max;
+    let largest_representable_bound = (libc::c_int::MAX as libc::rlim_t) + 1;
+    if inherited_fd_limit == libc::RLIM_INFINITY
+        || inherited_fd_limit < 3
+        || inherited_fd_limit > largest_representable_bound
+    {
+        return Err(ToolError::Protocol(format!(
+            "RLIMIT_NOFILE hard limit is not a finite supported descriptor bound: {inherited_fd_limit}"
+        )));
+    }
+    Ok(inherited_fd_limit)
+}
+
+#[cfg(all(unix, target_vendor = "apple"))]
+fn apple_max_files_per_process() -> Result<libc::rlim_t, ToolError> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_MAXFILESPERPROC];
+    let mut maximum: libc::c_int = 0;
+    let mut maximum_size = std::mem::size_of::<libc::c_int>();
+    let result = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            (&raw mut maximum).cast(),
+            &mut maximum_size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 {
+        return Err(ToolError::Io(std::io::Error::last_os_error()));
+    }
+    if maximum_size != std::mem::size_of::<libc::c_int>() || maximum < 3 {
+        return Err(ToolError::Protocol(
+            "kern.maxfilesperproc did not return a valid descriptor bound".to_owned(),
+        ));
+    }
+    Ok(maximum as libc::rlim_t)
+}
+
+#[cfg(unix)]
+fn configure_child_fd_sanitizer(process: &mut Command, inherited_fd_limit: libc::rlim_t) {
+    #[allow(unsafe_code)]
+    unsafe {
+        process.pre_exec(move || mark_inherited_fds_close_on_exec(inherited_fd_limit));
+    }
+}
+
+#[cfg(unix)]
+fn mark_inherited_fds_close_on_exec(inherited_fd_limit: libc::rlim_t) -> std::io::Result<()> {
+    let mut fd = 3;
+    while (fd as libc::rlim_t) < inherited_fd_limit {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 {
+            let error = errno();
+            if error != libc::EBADF {
+                return Err(std::io::Error::from_raw_os_error(error));
+            }
+        } else if flags & libc::FD_CLOEXEC == 0 {
+            let result = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+            if result < 0 {
+                let error = errno();
+                if error != libc::EBADF {
+                    return Err(std::io::Error::from_raw_os_error(error));
+                }
+            }
+        }
+        if fd == libc::c_int::MAX {
+            break;
+        }
+        fd += 1;
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, any(target_vendor = "apple", target_os = "freebsd")))]
+fn errno() -> libc::c_int {
+    unsafe { *libc::__error() }
+}
+
+#[cfg(all(
+    unix,
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "emscripten",
+        target_os = "hurd",
+        target_os = "redox"
+    )
+))]
+fn errno() -> libc::c_int {
+    unsafe { *libc::__errno_location() }
+}
+
+#[cfg(all(
+    unix,
+    any(target_os = "netbsd", target_os = "openbsd", target_os = "cygwin")
+))]
+fn errno() -> libc::c_int {
+    unsafe { *libc::__errno() }
+}
+
+#[cfg(all(unix, any(target_os = "solaris", target_os = "illumos")))]
+fn errno() -> libc::c_int {
+    unsafe { *libc::___errno() }
+}
+
+#[cfg(all(unix, target_os = "haiku"))]
+fn errno() -> libc::c_int {
+    unsafe { *libc::_errnop() }
+}
+
+#[cfg(all(unix, target_os = "nto"))]
+fn errno() -> libc::c_int {
+    unsafe { *libc::__get_errno_ptr() }
+}
+
+#[cfg(all(unix, target_os = "aix"))]
+fn errno() -> libc::c_int {
+    unsafe { *libc::_Errno() }
+}
+
 #[cfg(unix)]
 fn add_stopped_bytes(total: &mut u64, chunk: &[u8]) -> Result<(), ToolError> {
     *total =
@@ -353,5 +514,119 @@ fn to_execution_result(
         },
         cancelled,
         resource_limit,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::{
+        io::Read,
+        os::fd::{AsRawFd, FromRawFd, OwnedFd},
+        process::Stdio,
+    };
+
+    use super::*;
+
+    struct UnusedArtifacts;
+
+    #[async_trait::async_trait]
+    impl ArtifactAppender for UnusedArtifacts {
+        async fn begin_tool_output(
+            &self,
+            _execution_id: &str,
+            _initial_content: &[u8],
+        ) -> Result<String, ToolError> {
+            panic!("pre-cancelled execution must not begin an artifact")
+        }
+
+        async fn append_tool_output(
+            &self,
+            _handle: &str,
+            _offset: u64,
+            _content: &[u8],
+        ) -> Result<(), ToolError> {
+            panic!("pre-cancelled execution must not append an artifact")
+        }
+
+        async fn finish_tool_output(&self, _handle: &str) -> Result<(), ToolError> {
+            panic!("pre-cancelled execution must not finish an artifact")
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_execution_returns_empty_without_spawning() {
+        let workspace = std::env::temp_dir().join(format!(
+            "sumi-missing-non-linux-bash-workspace-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = LowTrustLocalBash::new(workspace, &UnusedArtifacts)
+            .execute(
+                ": > must-not-exist",
+                "non-linux-bash-pre-cancelled",
+                cancel,
+                Arc::new(|_| panic!("pre-cancelled execution must not emit updates")),
+            )
+            .await
+            .expect("pre-cancel must win before workspace/spawn failure");
+        assert_eq!(
+            result,
+            BashExecutionResult {
+                output: String::new(),
+                truncation: truncate_tail("", TruncationOptions::default()),
+                artifact_handle: None,
+                observed_bytes: 0,
+                exit_code: None,
+                cancelled: true,
+                resource_limit: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn inherited_non_cloexec_fd_is_closed_only_at_exec() {
+        let inherited_fd_limit = inherited_fd_limit().expect("finite inherited FD bound");
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        let read_fd = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+        let write_fd = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+        assert_eq!(
+            unsafe { libc::fcntl(write_fd.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0,
+            "fixture must deliberately be inherited across exec"
+        );
+
+        let mut process = Command::new("bash");
+        process
+            .arg("-c")
+            .arg(format!("printf inherited >&{}", write_fd.as_raw_fd()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_child_fd_sanitizer(&mut process, inherited_fd_limit);
+        let mut child = process.spawn().expect("spawn bash fixture");
+        drop(write_fd);
+        let _status = child.wait().await.expect("wait for bash fixture");
+
+        let mut inherited_bytes = Vec::new();
+        std::fs::File::from(read_fd)
+            .read_to_end(&mut inherited_bytes)
+            .expect("read inheritance probe");
+        assert!(
+            inherited_bytes.is_empty(),
+            "bash child observed a non-CLOEXEC inherited descriptor"
+        );
+    }
+
+    #[test]
+    fn exec_failure_remains_visible_after_fd_sanitizer() {
+        let inherited_fd_limit = inherited_fd_limit().expect("finite inherited FD bound");
+        let mut process = Command::new("/sumi-test/no-such-non-linux-executable");
+        configure_child_fd_sanitizer(&mut process, inherited_fd_limit);
+        let error = process
+            .spawn()
+            .expect_err("exec error must reach the parent through Command's errpipe");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     }
 }

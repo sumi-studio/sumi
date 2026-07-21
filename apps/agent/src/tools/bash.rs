@@ -28,7 +28,7 @@ use super::{
         ArtifactAppender, OUTPUT_QUEUE_CAPACITY, ShellCapture, ShellCaptureResult,
         copy_bounded_chunks, output_limit_if_reached,
     },
-    truncate::TruncationResult,
+    truncate::{TruncationOptions, TruncationResult, truncate_tail},
     unix_pipe::merged_output_pipe,
 };
 
@@ -50,6 +50,8 @@ pub struct LowTrustLocalBash<'a> {
     workspace: PathBuf,
     artifact: &'a dyn ArtifactAppender,
     wall_timeout: Duration,
+    #[cfg(test)]
+    force_close_range_fallback: bool,
 }
 
 impl<'a> LowTrustLocalBash<'a> {
@@ -58,12 +60,20 @@ impl<'a> LowTrustLocalBash<'a> {
             workspace,
             artifact,
             wall_timeout: DEFAULT_WALL_TIMEOUT,
+            #[cfg(test)]
+            force_close_range_fallback: false,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn with_timeout(mut self, wall_timeout: Duration) -> Self {
         self.wall_timeout = wall_timeout;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_forced_close_range_fallback(mut self) -> Self {
+        self.force_close_range_fallback = true;
         self
     }
 
@@ -74,10 +84,14 @@ impl<'a> LowTrustLocalBash<'a> {
         cancel: CancellationToken,
         on_update: Arc<dyn Fn(Value) + Send + Sync>,
     ) -> Result<BashExecutionResult, ToolError> {
+        if cancel.is_cancelled() {
+            return Ok(cancelled_before_spawn_result());
+        }
         tracing::warn!(
             target: "sumi_agent::tools",
             "starting Linux low-trust local bash; process-group kill cannot stop setsid-escaped descendants"
         );
+        let inherited_fd_limit = inherited_fd_limit()?;
         let (output_read, output_write) = merged_output_pipe()?;
         let output_stderr = output_write.try_clone()?;
         let mut process = Command::new("bash");
@@ -92,20 +106,11 @@ impl<'a> LowTrustLocalBash<'a> {
             .stdin(Stdio::null())
             .stdout(Stdio::from(output_write))
             .stderr(Stdio::from(output_stderr));
-        #[allow(unsafe_code)]
-        unsafe {
-            process.process_group(0);
-            process.pre_exec(|| {
-                let result = libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
-                if result < 0 {
-                    let error = std::io::Error::last_os_error();
-                    if error.raw_os_error() != Some(libc::ENOSYS) {
-                        return Err(error);
-                    }
-                }
-                Ok(())
-            });
-        }
+        #[cfg(test)]
+        let force_close_range_fallback = self.force_close_range_fallback;
+        #[cfg(not(test))]
+        let force_close_range_fallback = false;
+        configure_child_process(&mut process, inherited_fd_limit, force_close_range_fallback);
 
         let mut child = process.spawn()?;
         drop(process);
@@ -355,6 +360,112 @@ impl<'a> LowTrustLocalBash<'a> {
     }
 }
 
+fn cancelled_before_spawn_result() -> BashExecutionResult {
+    to_execution_result(
+        ShellCaptureResult {
+            output: String::new(),
+            truncation: truncate_tail("", TruncationOptions::default()),
+            artifact_handle: None,
+            observed_bytes: 0,
+        },
+        None,
+        true,
+        None,
+    )
+}
+
+fn inherited_fd_limit() -> Result<libc::rlim_t, ToolError> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+    if result != 0 {
+        return Err(ToolError::Io(std::io::Error::last_os_error()));
+    }
+    // An FD opened before the soft limit was lowered may remain above rlim_cur.
+    // The finite hard allocation ceiling covers those descriptors as well as
+    // the Command errpipe and stdio plumbing created immediately before fork.
+    let inherited_fd_limit = limit.rlim_max;
+    let largest_representable_bound = (libc::c_int::MAX as libc::rlim_t) + 1;
+    if inherited_fd_limit == libc::RLIM_INFINITY
+        || inherited_fd_limit < 3
+        || inherited_fd_limit > largest_representable_bound
+    {
+        return Err(ToolError::Protocol(format!(
+            "RLIMIT_NOFILE hard limit is not a finite supported descriptor bound: {inherited_fd_limit}"
+        )));
+    }
+    Ok(inherited_fd_limit)
+}
+
+fn configure_child_process(
+    process: &mut Command,
+    inherited_fd_limit: libc::rlim_t,
+    force_close_range_fallback: bool,
+) {
+    #[allow(unsafe_code)]
+    unsafe {
+        process.process_group(0);
+        process.pre_exec(move || {
+            sanitize_inherited_fds(inherited_fd_limit, force_close_range_fallback)
+        });
+    }
+}
+
+fn sanitize_inherited_fds(
+    inherited_fd_limit: libc::rlim_t,
+    force_close_range_fallback: bool,
+) -> std::io::Result<()> {
+    const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+
+    let result = if force_close_range_fallback {
+        -1
+    } else {
+        unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, CLOSE_RANGE_CLOEXEC) }
+    };
+    if result == 0 {
+        return Ok(());
+    }
+
+    let close_range_errno = if force_close_range_fallback {
+        libc::ENOSYS
+    } else {
+        errno()
+    };
+    if close_range_errno != libc::ENOSYS && close_range_errno != libc::EINVAL {
+        return Err(std::io::Error::from_raw_os_error(close_range_errno));
+    }
+
+    let mut fd = 3;
+    while (fd as libc::rlim_t) < inherited_fd_limit {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 {
+            let error = errno();
+            if error != libc::EBADF {
+                return Err(std::io::Error::from_raw_os_error(error));
+            }
+        } else if flags & libc::FD_CLOEXEC == 0 {
+            let result = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+            if result < 0 {
+                let error = errno();
+                if error != libc::EBADF {
+                    return Err(std::io::Error::from_raw_os_error(error));
+                }
+            }
+        }
+        if fd == libc::c_int::MAX {
+            break;
+        }
+        fd += 1;
+    }
+    Ok(())
+}
+
+fn errno() -> libc::c_int {
+    unsafe { *libc::__errno_location() }
+}
+
 fn to_execution_result(
     capture: ShellCaptureResult,
     exit_code: Option<i32>,
@@ -400,6 +511,7 @@ fn kill_process_group(pid: u32) -> Result<(), ToolError> {
 mod tests {
     use std::{
         collections::HashMap,
+        os::fd::{AsRawFd, FromRawFd, OwnedFd},
         sync::{
             Mutex,
             atomic::{AtomicUsize, Ordering},
@@ -623,6 +735,120 @@ mod tests {
         assert_eq!(result.exit_code, Some(0));
         assert_eq!(result.output, format!("{}:unset", workspace.0.display()));
         assert!(updates.load(Ordering::Relaxed) > 0);
+    }
+
+    async fn assert_inherited_fd_is_closed(force_fallback: bool) {
+        let workspace = TempWorkspace::new();
+        let artifacts = MemoryArtifacts::default();
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        let read_fd = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+        let write_fd = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+        assert_eq!(
+            unsafe { libc::fcntl(write_fd.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0,
+            "fixture must deliberately be inherited across exec"
+        );
+        let command = format!(
+            "if [ -e /proc/self/fd/{} ]; then printf inherited; else printf closed; fi",
+            write_fd.as_raw_fd()
+        );
+        let mut bash = LowTrustLocalBash::new(workspace.0.clone(), &artifacts);
+        if force_fallback {
+            bash = bash.with_forced_close_range_fallback();
+        }
+        let result = bash
+            .execute(
+                &command,
+                if force_fallback {
+                    "bash-fd-fallback"
+                } else {
+                    "bash-fd-close-range"
+                },
+                CancellationToken::new(),
+                Arc::new(|_| {}),
+            )
+            .await
+            .expect("bash result");
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.output, "closed");
+        drop((read_fd, write_fd));
+    }
+
+    #[tokio::test]
+    async fn close_range_closes_inherited_non_cloexec_fd() {
+        assert_inherited_fd_is_closed(false).await;
+    }
+
+    #[tokio::test]
+    async fn enosys_fallback_closes_inherited_non_cloexec_fd() {
+        assert_inherited_fd_is_closed(true).await;
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_execution_returns_empty_without_spawning() {
+        let workspace = TempWorkspace::new();
+        let marker = workspace.0.join("must-not-exist");
+        let artifacts = MemoryArtifacts::default();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = LowTrustLocalBash::new(workspace.0.clone(), &artifacts)
+            .execute(
+                ": > must-not-exist",
+                "bash-pre-cancelled",
+                cancel,
+                Arc::new(|_| panic!("pre-cancelled execution must not emit updates")),
+            )
+            .await
+            .expect("pre-cancelled result");
+        assert_eq!(
+            result,
+            BashExecutionResult {
+                output: String::new(),
+                truncation: truncate_tail("", TruncationOptions::default()),
+                artifact_handle: None,
+                observed_bytes: 0,
+                exit_code: None,
+                cancelled: true,
+                resource_limit: None,
+            }
+        );
+        assert!(!marker.exists(), "pre-cancelled bash command was spawned");
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_execution_precedes_invalid_workspace_error() {
+        let workspace = std::env::temp_dir().join(format!(
+            "sumi-missing-bash-workspace-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let artifacts = MemoryArtifacts::default();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = LowTrustLocalBash::new(workspace, &artifacts)
+            .execute(
+                "exit 0",
+                "bash-pre-cancelled-invalid-workspace",
+                cancel,
+                Arc::new(|_| {}),
+            )
+            .await
+            .expect("pre-cancel must win before workspace validation");
+        assert!(result.cancelled);
+        assert_eq!(result.observed_bytes, 0);
+    }
+
+    #[test]
+    fn exec_failure_is_reported_after_fd_sanitizer() {
+        let inherited_fd_limit = inherited_fd_limit().expect("finite inherited FD bound");
+        for force_fallback in [false, true] {
+            let mut process = Command::new("/sumi-test/no-such-executable");
+            configure_child_process(&mut process, inherited_fd_limit, force_fallback);
+            let error = process
+                .spawn()
+                .expect_err("exec failure must reach the parent through Command's errpipe");
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        }
     }
 
     #[tokio::test]
