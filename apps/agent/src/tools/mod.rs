@@ -15,6 +15,8 @@ pub mod bash;
 #[path = "bash_non_linux.rs"]
 mod bash_non_linux_compile_check;
 #[cfg(target_os = "linux")]
+pub mod executor;
+#[cfg(target_os = "linux")]
 pub mod fs;
 pub mod shell_capture;
 pub mod truncate;
