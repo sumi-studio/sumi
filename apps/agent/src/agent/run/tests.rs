@@ -16,13 +16,14 @@ use crate::{
     gateway::{CommandEnvelope, CommandId},
     provider::types::{
         ApiProtocol, AssistantContent, AssistantMessage, ProviderOrigin, ProviderOutput,
-        PublicAssistantMessage, Usage, ValidatedToolArguments,
+        PublicAssistantMessage, RejectedToolCall, ToolArgumentError, Usage, ValidatedToolArguments,
     },
 };
 
 #[derive(Clone)]
 enum Script {
     Output(Box<AssistantMessage>),
+    Events(Vec<ProviderEvent>),
     StartFailure(&'static str),
 }
 
@@ -44,6 +45,7 @@ struct FixtureDriver {
     retry_result: bool,
     context_window: Option<u64>,
     overflow_recoveries: Mutex<Vec<OverflowRecoveryRequest>>,
+    overflow_core_epochs: Mutex<Vec<u64>>,
     overflow_contexts: Mutex<VecDeque<Vec<PublicMessage>>>,
 }
 
@@ -63,6 +65,7 @@ impl FixtureDriver {
             retry_result: true,
             context_window: None,
             overflow_recoveries: Mutex::new(Vec::new()),
+            overflow_core_epochs: Mutex::new(Vec::new()),
             overflow_contexts: Mutex::new(VecDeque::new()),
         }
     }
@@ -111,13 +114,11 @@ impl RunDriver for FixtureDriver {
             .expect("scripts")
             .pop_front()
             .expect("provider script");
-        let Script::Output(message) = script else {
-            let Script::StartFailure(error) = script else {
-                unreachable!()
-            };
-            return Err(anyhow!(error));
-        };
-        Ok(provider_attempt(attempt, *message))
+        match script {
+            Script::Output(message) => Ok(provider_attempt(attempt, *message)),
+            Script::Events(events) => Ok(provider_attempt_from_events(attempt, events)),
+            Script::StartFailure(error) => Err(anyhow!(error)),
+        }
     }
 
     async fn execute_tool(
@@ -164,9 +165,9 @@ impl RunDriver for FixtureDriver {
         self.context_window
     }
 
-    async fn recover_overflow(
+    async fn plan_overflow_recovery(
         &self,
-        _core: &mut RunCore,
+        core: &RunCore,
         request: OverflowRecoveryRequest,
         _active_context: &[PublicMessage],
     ) -> Result<OverflowRecoveryOutcome> {
@@ -174,6 +175,10 @@ impl RunDriver for FixtureDriver {
             .lock()
             .expect("overflow recoveries")
             .push(request);
+        self.overflow_core_epochs
+            .lock()
+            .expect("overflow core epochs")
+            .push(core.mutation_epoch());
         let replacement = self
             .overflow_contexts
             .lock()
@@ -303,6 +308,31 @@ fn call(id: &str) -> ToolCall {
     }
 }
 
+fn rejected(id: &str) -> RejectedToolCall {
+    RejectedToolCall {
+        id: id.to_owned(),
+        name: format!("tool-{id}"),
+        error: ToolArgumentError::InvalidJson,
+    }
+}
+
+fn rejected_result(rejected: &RejectedToolCall) -> ToolResultMessage {
+    ToolResultMessage {
+        tool_call_id: rejected.id.clone(),
+        tool_name: rejected.name.clone(),
+        content: vec![UserContent::Text {
+            text: "Tool arguments were rejected. Regenerate the tool call with complete, schema-valid arguments.".to_owned(),
+        }],
+        details: json!({
+            "category": "invalid_json",
+            "instance_path": "",
+            "constraint": "json_syntax",
+        }),
+        is_error: true,
+        timestamp: timestamp(),
+    }
+}
+
 fn provider_attempt(attempt: usize, message: AssistantMessage) -> ProviderAttempt {
     let (tx, rx) = mpsc::channel(16);
     tx.try_send(ProviderEvent::Start).expect("start");
@@ -338,9 +368,22 @@ fn provider_attempt(attempt: usize, message: AssistantMessage) -> ProviderAttemp
                 })
                 .expect("tool end");
             }
-            AssistantContent::Thinking { .. } | AssistantContent::RejectedToolCall { .. } => {
-                panic!("fixture helper does not need this content")
+            AssistantContent::RejectedToolCall {
+                rejected,
+                wire_item_index,
+            } => {
+                tx.try_send(ProviderEvent::ToolCallStart {
+                    content_index: *wire_item_index as usize,
+                })
+                .expect("rejected tool start");
+                tx.try_send(ProviderEvent::ToolCallRejected {
+                    content_index: *wire_item_index as usize,
+                    rejected: rejected.clone(),
+                    synthetic_result: rejected_result(rejected),
+                })
+                .expect("tool rejected");
             }
+            AssistantContent::Thinking { .. } => panic!("fixture helper does not need thinking"),
         }
     }
     let output = ProviderOutput {
@@ -359,6 +402,19 @@ fn provider_attempt(attempt: usize, message: AssistantMessage) -> ProviderAttemp
         }
     };
     tx.try_send(terminal).expect("terminal");
+    drop(tx);
+    ProviderAttempt {
+        message_id: format!("assistant-{attempt}"),
+        initial_message: public_message(&assistant(StopReason::Stop, Vec::new(), None, None)),
+        events: ProviderEventStream::new(rx, CancellationToken::new(), "fixture", origin()),
+    }
+}
+
+fn provider_attempt_from_events(attempt: usize, events: Vec<ProviderEvent>) -> ProviderAttempt {
+    let (tx, rx) = mpsc::channel(16);
+    for event in events {
+        tx.try_send(event).expect("fixture event");
+    }
     drop(tx);
     ProviderAttempt {
         message_id: format!("assistant-{attempt}"),
@@ -577,7 +633,10 @@ async fn two_consecutive_length_tool_batches_prevent_third_provider_call() {
     };
     let driver = Arc::new(FixtureDriver::new(vec![length(), length()]));
     let (completion, events) = run_fixture(driver.clone()).await;
-    assert_completed(completion);
+    let core = match completion {
+        RunCompletion::Completed(core) => core,
+        RunCompletion::Failed { failure, .. } => panic!("unexpected failure: {failure}"),
+    };
     assert_eq!(driver.started_contexts.lock().expect("contexts").len(), 2);
     assert!(driver.tool_order.lock().expect("tool order").is_empty());
     assert!(
@@ -613,6 +672,43 @@ async fn two_consecutive_length_tool_batches_prevent_third_provider_call() {
                 if result.content.iter().any(|content| matches!(content,
                     UserContent::Text { text } if text.contains(LENGTH_LOOP_FAILURE)))))
     }));
+    let guarded_end = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                AgentEvent::MessageEnd { message, .. }
+                    if matches!(message.as_ref(), PublicMessage::Assistant(assistant)
+                        if assistant.stop_reason == StopReason::Error
+                            && assistant.provider_code.as_deref() == Some(LENGTH_LOOP_CODE)
+                            && assistant.error_message.as_deref() == Some(LENGTH_LOOP_FAILURE))
+            )
+        })
+        .expect("guarded assistant MessageEnd");
+    let guarded_turn = events
+        .iter()
+        .skip(guarded_end + 1)
+        .find(|event| matches!(event, AgentEvent::TurnEnd { .. }))
+        .expect("guarded TurnEnd");
+    assert!(matches!(
+        guarded_turn,
+        AgentEvent::TurnEnd { message: Some(message), tool_results }
+            if matches!(message.as_ref(), PublicMessage::Assistant(assistant)
+                if assistant.stop_reason == StopReason::Error
+                    && assistant.provider_code.as_deref() == Some(LENGTH_LOOP_CODE))
+                && tool_results.len() == 1
+                && tool_results[0].is_error
+    ));
+    assert_eq!(
+        core.runtime_context.len(),
+        3,
+        "only user plus the first Length assistant/result pair enter context"
+    );
+    assert!(!core.runtime_context.iter().any(|message| matches!(
+        message,
+        PublicMessage::Assistant(assistant)
+            if assistant.provider_code.as_deref() == Some(LENGTH_LOOP_CODE)
+    )));
     assert!(matches!(events.last(), Some(AgentEvent::AgentEnd)));
 }
 
@@ -671,6 +767,167 @@ async fn tool_failure_is_synthetic_result_and_preserves_normal_form() {
             .any(|event| matches!(event, AgentEvent::ToolExecutionEnd { is_error: true, .. }))
     );
     assert!(matches!(events.last(), Some(AgentEvent::AgentEnd)));
+}
+
+#[tokio::test]
+async fn done_rejection_pair_enters_context_but_not_turn_tool_results() {
+    let rejected = rejected("invalid");
+    let driver = Arc::new(FixtureDriver::new(vec![
+        output(assistant(
+            StopReason::ToolUse,
+            vec![AssistantContent::RejectedToolCall {
+                rejected: rejected.clone(),
+                wire_item_index: 0,
+            }],
+            None,
+            None,
+        )),
+        output(assistant(StopReason::Stop, Vec::new(), None, None)),
+    ]));
+    let (completion, events) = run_fixture(driver.clone()).await;
+    assert_completed(completion);
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolExecutionStart { .. } | AgentEvent::ToolExecutionEnd { .. }
+    )));
+    let first_turn = events
+        .iter()
+        .find(|event| matches!(event, AgentEvent::TurnEnd { .. }))
+        .expect("first TurnEnd");
+    assert!(
+        matches!(
+            first_turn,
+            AgentEvent::TurnEnd { message: Some(message), tool_results }
+                if tool_results.is_empty()
+                    && matches!(message.as_ref(), PublicMessage::Assistant(assistant)
+                        if assistant.content.iter().any(|content| matches!(
+                            content,
+                            PublicAssistantContent::RejectedToolCall { rejected: value, .. }
+                                if value == &rejected
+                        )))
+        ),
+        "unexpected first turn: {first_turn:#?}"
+    );
+    let contexts = driver.started_contexts.lock().expect("contexts");
+    assert_eq!(contexts[1].len(), 3);
+    assert!(matches!(
+        &contexts[1][1],
+        PublicMessage::Assistant(assistant)
+            if assistant.content.iter().any(|content| matches!(
+                content,
+                PublicAssistantContent::RejectedToolCall { rejected: value, .. }
+                    if value == &rejected
+            ))
+    ));
+    assert!(matches!(
+        &contexts[1][2],
+        PublicMessage::ToolResult(result)
+            if result.tool_call_id == rejected.id && result.is_error
+    ));
+}
+
+#[tokio::test]
+async fn error_and_immediate_overflow_emit_rejection_pair_without_context_or_turn_results() {
+    for overflow in [false, true] {
+        let rejected = rejected(if overflow { "overflow" } else { "error" });
+        let (error, code) = if overflow {
+            ("maximum context length exceeded", "context_length_exceeded")
+        } else {
+            ("invalid request", "http_400")
+        };
+        let driver = Arc::new(FixtureDriver::new(vec![output(assistant(
+            StopReason::Error,
+            vec![AssistantContent::RejectedToolCall {
+                rejected: rejected.clone(),
+                wire_item_index: 0,
+            }],
+            Some(error),
+            Some(code),
+        ))]));
+        let (completion, events) = run_fixture(driver).await;
+        let core = match completion {
+            RunCompletion::Completed(core) => core,
+            RunCompletion::Failed { failure, .. } => panic!("unexpected failure: {failure}"),
+        };
+        assert_eq!(core.runtime_context, vec![runtime_user(1)]);
+        let result_end = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    AgentEvent::MessageEnd { message, .. }
+                        if matches!(message.as_ref(), PublicMessage::ToolResult(result)
+                            if result.tool_call_id == rejected.id && result.is_error)
+                )
+            })
+            .unwrap_or_else(|| panic!("rejected result MessageEnd missing: {events:#?}"));
+        let turn = events
+            .iter()
+            .skip(result_end + 1)
+            .find(|event| matches!(event, AgentEvent::TurnEnd { .. }))
+            .expect("error TurnEnd");
+        assert!(matches!(
+            turn,
+            AgentEvent::TurnEnd { message: Some(message), tool_results }
+                if tool_results.is_empty()
+                    && matches!(message.as_ref(), PublicMessage::Assistant(assistant)
+                        if assistant.stop_reason == StopReason::Error)
+        ));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::RetryScheduled { .. }))
+        );
+    }
+}
+
+#[tokio::test]
+async fn non_authoritative_projection_failure_and_eof_discard_rejected_results() {
+    for suffix in [vec![ProviderEvent::Start], Vec::new()] {
+        let rejected = rejected("volatile");
+        let mut events = vec![
+            ProviderEvent::Start,
+            ProviderEvent::ToolCallStart { content_index: 0 },
+            ProviderEvent::ToolCallRejected {
+                content_index: 0,
+                rejected: rejected.clone(),
+                synthetic_result: rejected_result(&rejected),
+            },
+        ];
+        events.extend(suffix);
+        let driver = Arc::new(FixtureDriver::new(vec![
+            Script::Events(events),
+            output(assistant(StopReason::Stop, Vec::new(), None, None)),
+        ]));
+        let (completion, events) = run_fixture(driver).await;
+        let core = match completion {
+            RunCompletion::Completed(core) => core,
+            RunCompletion::Failed { failure, .. } => panic!("unexpected failure: {failure}"),
+        };
+        assert!(
+            !core
+                .runtime_context
+                .iter()
+                .any(|message| matches!(message, PublicMessage::ToolResult(_)))
+        );
+        assert!(!core.runtime_context.iter().any(|message| matches!(
+            message,
+            PublicMessage::Assistant(assistant)
+                if assistant.content.iter().any(|item| matches!(
+                    item,
+                    PublicAssistantContent::RejectedToolCall { .. }
+                ))
+        )));
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                AgentEvent::MessageStart { message, .. }
+                    | AgentEvent::MessageEnd { message, .. }
+                    if matches!(message.as_ref(), PublicMessage::ToolResult(_))
+            )),
+            "without an authoritative terminal rejection snapshot, its result would be orphaned: {events:#?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1106,6 +1363,14 @@ async fn immediate_overflow_recovers_twice_then_closes_without_appending_attempt
         ]
     );
     assert_eq!(
+        *driver
+            .overflow_core_epochs
+            .lock()
+            .expect("overflow core epochs"),
+        vec![0, 0],
+        "planning receives immutable core state and cannot advance it"
+    );
+    assert_eq!(
         events
             .iter()
             .filter(|event| matches!(event, AgentEvent::RetryScheduled { delay_ms: 0, .. }))
@@ -1117,6 +1382,14 @@ async fn immediate_overflow_recovers_twice_then_closes_without_appending_attempt
     let contexts = driver.started_contexts.lock().expect("contexts");
     assert_eq!(contexts[1], recovered_one);
     assert_eq!(contexts[2], recovered_two);
+    for retry in events.iter().enumerate().filter_map(|(index, event)| {
+        matches!(event, AgentEvent::RetryScheduled { delay_ms: 0, .. }).then_some(index)
+    }) {
+        assert!(matches!(
+            events.get(retry + 1),
+            Some(AgentEvent::MessageStart { .. })
+        ));
+    }
     assert!(matches!(events.last(), Some(AgentEvent::AgentEnd)));
 }
 
