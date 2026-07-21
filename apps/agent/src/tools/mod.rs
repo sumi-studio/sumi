@@ -6,9 +6,20 @@
 #![allow(dead_code)]
 
 #[cfg(target_os = "linux")]
+pub mod bash;
+#[cfg(not(target_os = "linux"))]
+#[path = "bash_non_linux.rs"]
+pub mod bash;
+#[cfg(all(test, target_os = "linux"))]
+#[allow(dead_code)]
+#[path = "bash_non_linux.rs"]
+mod bash_non_linux_compile_check;
+#[cfg(target_os = "linux")]
 pub mod fs;
 pub mod shell_capture;
 pub mod truncate;
+#[cfg(unix)]
+mod unix_pipe;
 
 use std::{
     collections::BTreeMap,

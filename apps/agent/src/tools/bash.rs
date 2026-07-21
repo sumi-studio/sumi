@@ -1,0 +1,1271 @@
+//! Development-only low-trust bash execution harness.
+
+#![cfg(target_os = "linux")]
+
+use std::{
+    collections::VecDeque,
+    path::PathBuf,
+    process::Stdio,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+
+use serde::Serialize;
+use serde_json::{Value, json};
+use tokio::{
+    process::Command,
+    sync::mpsc,
+    time::{Instant, timeout_at},
+};
+use tokio_util::sync::CancellationToken;
+
+use super::{
+    ResourceLimit, ToolError,
+    shell_capture::{
+        ArtifactAppender, OUTPUT_QUEUE_CAPACITY, ShellCapture, ShellCaptureResult,
+        copy_bounded_chunks, output_limit_if_reached,
+    },
+    truncate::{TruncationOptions, TruncationResult, truncate_tail},
+    unix_pipe::merged_output_pipe,
+};
+
+pub const DEFAULT_WALL_TIMEOUT: Duration = Duration::from_secs(120);
+const STOPPED_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BashExecutionResult {
+    pub output: String,
+    pub truncation: TruncationResult,
+    pub artifact_handle: Option<String>,
+    pub observed_bytes: u64,
+    pub exit_code: Option<i32>,
+    pub cancelled: bool,
+    pub resource_limit: Option<ResourceLimit>,
+}
+
+pub struct LowTrustLocalBash<'a> {
+    workspace: PathBuf,
+    artifact: &'a dyn ArtifactAppender,
+    wall_timeout: Duration,
+    #[cfg(test)]
+    force_close_range_fallback: bool,
+}
+
+impl<'a> LowTrustLocalBash<'a> {
+    pub fn new(workspace: PathBuf, artifact: &'a dyn ArtifactAppender) -> Self {
+        Self {
+            workspace,
+            artifact,
+            wall_timeout: DEFAULT_WALL_TIMEOUT,
+            #[cfg(test)]
+            force_close_range_fallback: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_timeout(mut self, wall_timeout: Duration) -> Self {
+        self.wall_timeout = wall_timeout;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_forced_close_range_fallback(mut self) -> Self {
+        self.force_close_range_fallback = true;
+        self
+    }
+
+    pub async fn execute(
+        &self,
+        command: &str,
+        execution_id: &str,
+        cancel: CancellationToken,
+        on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<BashExecutionResult, ToolError> {
+        if cancel.is_cancelled() {
+            return Ok(cancelled_before_spawn_result());
+        }
+        tracing::warn!(
+            target: "sumi_agent::tools",
+            "starting Linux low-trust local bash; process-group kill cannot stop setsid-escaped descendants"
+        );
+        let inherited_fd_limit = inherited_fd_limit()?;
+        let (output_read, output_write) = merged_output_pipe()?;
+        let output_stderr = output_write.try_clone()?;
+        let mut process = Command::new("bash");
+        process
+            .arg("-c")
+            .arg(command)
+            .current_dir(&self.workspace)
+            .env_clear()
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("HOME", &self.workspace)
+            .env("LANG", "C.UTF-8")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(output_write))
+            .stderr(Stdio::from(output_stderr));
+        #[cfg(test)]
+        let force_close_range_fallback = self.force_close_range_fallback;
+        #[cfg(not(test))]
+        let force_close_range_fallback = false;
+        configure_child_process(&mut process, inherited_fd_limit, force_close_range_fallback);
+
+        let mut child = process.spawn()?;
+        drop(process);
+        let pid = child.id().ok_or_else(|| {
+            ToolError::Protocol("spawned bash did not expose a process id".to_owned())
+        })?;
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(OUTPUT_QUEUE_CAPACITY);
+        let pipe_observed_bytes = Arc::new(AtomicU64::new(0));
+        let output_quota = CancellationToken::new();
+        let mut output_task = Some(tokio::spawn(copy_bounded_chunks(
+            output_read,
+            tx,
+            pipe_observed_bytes.clone(),
+            output_quota.clone(),
+        )));
+        let mut capture = ShellCapture::new(execution_id, self.artifact);
+        let deadline = Instant::now() + self.wall_timeout;
+        let mut wait = Box::pin(child.wait());
+        let mut exit_status = None;
+        let mut cancelled = false;
+        let mut resource_limit = None;
+        let mut streams_open = true;
+
+        loop {
+            if exit_status.is_some() && !streams_open {
+                break;
+            }
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    cancelled = true;
+                    kill_process_group(pid)?;
+                    break;
+                }
+                _ = output_quota.cancelled() => {
+                    resource_limit =
+                        output_limit_if_reached(pipe_observed_bytes.load(Ordering::Acquire));
+                    kill_process_group(pid)?;
+                    break;
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    resource_limit = Some(ResourceLimit::WallTime {
+                        limit_seconds: self.wall_timeout.as_secs(),
+                    });
+                    kill_process_group(pid)?;
+                    break;
+                }
+                status = &mut wait, if exit_status.is_none() => {
+                    exit_status = Some(status?);
+                }
+                chunk = rx.recv(), if streams_open => {
+                    let Some(chunk) = chunk else {
+                        streams_open = false;
+                        continue;
+                    };
+                    // This is deliberately synchronous. Once recv() transfers
+                    // ownership, the bytes are accounted and decoded before a
+                    // newly-ready higher-priority stop branch can win.
+                    let recorded = capture.record_chunk(&chunk)?;
+                    let push = capture.archive_recorded(recorded);
+                    tokio::pin!(push);
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            cancelled = true;
+                            kill_process_group(pid)?;
+                            break;
+                        }
+                        _ = output_quota.cancelled() => {
+                            resource_limit =
+                                output_limit_if_reached(pipe_observed_bytes.load(Ordering::Acquire));
+                            kill_process_group(pid)?;
+                            break;
+                        }
+                        _ = tokio::time::sleep_until(deadline) => {
+                            resource_limit = Some(ResourceLimit::WallTime {
+                                limit_seconds: self.wall_timeout.as_secs(),
+                            });
+                            kill_process_group(pid)?;
+                            break;
+                        }
+                        result = &mut push => match result {
+                            Ok(text) => on_update(json!({"output": text})),
+                            Err(ToolError::ResourceLimit(limit)) => {
+                                resource_limit = Some(limit);
+                                kill_process_group(pid)?;
+                                break;
+                            }
+                            Err(error) => {
+                                kill_process_group(pid)?;
+                                if exit_status.is_none() {
+                                    let _status = timeout_at(
+                                        Instant::now() + Duration::from_secs(1),
+                                        &mut wait,
+                                    )
+                                    .await
+                                    .map_err(|_| {
+                                        ToolError::Protocol(
+                                            "low-trust process group was killed but bash was not reaped"
+                                                .to_owned(),
+                                        )
+                                    })??;
+                                }
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if exit_status.is_none() {
+            exit_status = Some(
+                timeout_at(Instant::now() + Duration::from_secs(1), &mut wait)
+                    .await
+                    .map_err(|_| {
+                        ToolError::Protocol(
+                            "low-trust process group did not terminate after SIGKILL".to_owned(),
+                        )
+                    })??,
+            );
+        }
+
+        drop(wait);
+        let mut output_task_result = None;
+        if resource_limit.is_some() || cancelled {
+            let drain_deadline = Instant::now() + STOPPED_PIPE_DRAIN_TIMEOUT;
+            let mut stopped_chunks = VecDeque::new();
+            let mut stopped_bytes = 0u64;
+            loop {
+                let chunk = match timeout_at(drain_deadline, rx.recv()).await {
+                    Ok(chunk) => chunk,
+                    Err(_) => {
+                        let task = output_task.take().ok_or_else(|| {
+                            ToolError::Protocol("merged output task was already joined".to_owned())
+                        })?;
+                        task.abort();
+                        output_task_result = Some(task.await);
+                        while let Ok(chunk) = rx.try_recv() {
+                            stopped_bytes = stopped_bytes
+                                .checked_add(u64::try_from(chunk.len()).map_err(|_| {
+                                    ToolError::Protocol(
+                                        "stopped bash output length overflow".to_owned(),
+                                    )
+                                })?)
+                                .ok_or_else(|| {
+                                    ToolError::Protocol(
+                                        "stopped bash output length overflow".to_owned(),
+                                    )
+                                })?;
+                            stopped_chunks.push_back(capture.record_chunk(&chunk)?);
+                        }
+                        break;
+                    }
+                };
+                let Some(chunk) = chunk else {
+                    break;
+                };
+                stopped_bytes = stopped_bytes
+                    .checked_add(u64::try_from(chunk.len()).map_err(|_| {
+                        ToolError::Protocol("stopped bash output length overflow".to_owned())
+                    })?)
+                    .ok_or_else(|| {
+                        ToolError::Protocol("stopped bash output length overflow".to_owned())
+                    })?;
+                if stopped_bytes > super::shell_capture::COMMAND_OUTPUT_LIMIT_BYTES {
+                    return Err(ToolError::Protocol(
+                        "stopped bash output exceeded the pipe-reader hard bound".to_owned(),
+                    ));
+                }
+                stopped_chunks.push_back(capture.record_chunk(&chunk)?);
+            }
+            if stopped_bytes > super::shell_capture::COMMAND_OUTPUT_LIMIT_BYTES {
+                return Err(ToolError::Protocol(
+                    "stopped bash output exceeded the pipe-reader hard bound".to_owned(),
+                ));
+            }
+
+            // First detach every reader-observed byte from the bounded channel.
+            // Best-effort artifact publication then gets one bounded deadline
+            // without consuming the one-second pipe-reader drain goal.
+            for recorded in stopped_chunks {
+                match capture.archive_recorded(recorded).await {
+                    Ok(text) => on_update(json!({"output": text})),
+                    Err(ToolError::ResourceLimit(limit)) => {
+                        resource_limit = Some(limit);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "failed to archive a queued bash output chunk after process stop"
+                        );
+                    }
+                }
+            }
+            let observed = pipe_observed_bytes.load(Ordering::Acquire);
+            if let Some(limit) = output_limit_if_reached(observed) {
+                resource_limit = Some(limit);
+            }
+        } else {
+            debug_assert!(!streams_open);
+        }
+        let output_task_result = match output_task_result {
+            Some(result) => result,
+            None => {
+                output_task
+                    .take()
+                    .ok_or_else(|| {
+                        ToolError::Protocol("merged output task was already joined".to_owned())
+                    })?
+                    .await
+            }
+        };
+        match output_task_result {
+            Ok(result) => {
+                let _observed_bytes = result?;
+            }
+            Err(error) if error.is_cancelled() && (resource_limit.is_some() || cancelled) => {}
+            Err(error) => {
+                return Err(ToolError::Protocol(format!(
+                    "merged output capture task failed: {error}"
+                )));
+            }
+        }
+
+        let capture = if cancelled {
+            capture.finish_after_abort().await
+        } else if resource_limit.is_some() {
+            capture.finish_after_limit().await?
+        } else {
+            capture.finish().await?
+        };
+        let result = to_execution_result(
+            capture,
+            exit_status.and_then(|status| status.code()),
+            cancelled,
+            resource_limit,
+        );
+        let pipe_observed = pipe_observed_bytes.load(Ordering::Acquire);
+        if result.observed_bytes != pipe_observed {
+            return Err(ToolError::Protocol(format!(
+                "terminal bash byte accounting omitted reader-observed bytes: captured={} reader={pipe_observed}",
+                result.observed_bytes
+            )));
+        }
+        Ok(result)
+    }
+}
+
+fn cancelled_before_spawn_result() -> BashExecutionResult {
+    to_execution_result(
+        ShellCaptureResult {
+            output: String::new(),
+            truncation: truncate_tail("", TruncationOptions::default()),
+            artifact_handle: None,
+            observed_bytes: 0,
+        },
+        None,
+        true,
+        None,
+    )
+}
+
+fn inherited_fd_limit() -> Result<libc::rlim_t, ToolError> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+    if result != 0 {
+        return Err(ToolError::Io(std::io::Error::last_os_error()));
+    }
+    // An FD opened before the soft limit was lowered may remain above rlim_cur.
+    // The finite hard allocation ceiling covers those descriptors as well as
+    // the Command errpipe and stdio plumbing created immediately before fork.
+    let inherited_fd_limit = limit.rlim_max;
+    let largest_representable_bound = (libc::c_int::MAX as libc::rlim_t) + 1;
+    if inherited_fd_limit == libc::RLIM_INFINITY
+        || inherited_fd_limit < 3
+        || inherited_fd_limit > largest_representable_bound
+    {
+        return Err(ToolError::Protocol(format!(
+            "RLIMIT_NOFILE hard limit is not a finite supported descriptor bound: {inherited_fd_limit}"
+        )));
+    }
+    Ok(inherited_fd_limit)
+}
+
+fn configure_child_process(
+    process: &mut Command,
+    inherited_fd_limit: libc::rlim_t,
+    force_close_range_fallback: bool,
+) {
+    #[allow(unsafe_code)]
+    unsafe {
+        process.process_group(0);
+        process.pre_exec(move || {
+            sanitize_inherited_fds(inherited_fd_limit, force_close_range_fallback)
+        });
+    }
+}
+
+fn sanitize_inherited_fds(
+    inherited_fd_limit: libc::rlim_t,
+    force_close_range_fallback: bool,
+) -> std::io::Result<()> {
+    const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+
+    let result = if force_close_range_fallback {
+        -1
+    } else {
+        unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, CLOSE_RANGE_CLOEXEC) }
+    };
+    if result == 0 {
+        return Ok(());
+    }
+
+    let close_range_errno = if force_close_range_fallback {
+        libc::ENOSYS
+    } else {
+        errno()
+    };
+    if close_range_errno != libc::ENOSYS && close_range_errno != libc::EINVAL {
+        return Err(std::io::Error::from_raw_os_error(close_range_errno));
+    }
+
+    let mut fd = 3;
+    while (fd as libc::rlim_t) < inherited_fd_limit {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 {
+            let error = errno();
+            if error != libc::EBADF {
+                return Err(std::io::Error::from_raw_os_error(error));
+            }
+        } else if flags & libc::FD_CLOEXEC == 0 {
+            let result = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+            if result < 0 {
+                let error = errno();
+                if error != libc::EBADF {
+                    return Err(std::io::Error::from_raw_os_error(error));
+                }
+            }
+        }
+        if fd == libc::c_int::MAX {
+            break;
+        }
+        fd += 1;
+    }
+    Ok(())
+}
+
+fn errno() -> libc::c_int {
+    unsafe { *libc::__errno_location() }
+}
+
+fn to_execution_result(
+    capture: ShellCaptureResult,
+    exit_code: Option<i32>,
+    cancelled: bool,
+    resource_limit: Option<ResourceLimit>,
+) -> BashExecutionResult {
+    let ShellCaptureResult {
+        output,
+        truncation,
+        artifact_handle,
+        observed_bytes,
+    } = capture;
+    BashExecutionResult {
+        output,
+        truncation,
+        artifact_handle,
+        observed_bytes,
+        exit_code: if cancelled || resource_limit.is_some() {
+            None
+        } else {
+            exit_code
+        },
+        cancelled,
+        resource_limit,
+    }
+}
+
+fn kill_process_group(pid: u32) -> Result<(), ToolError> {
+    let pid = i32::try_from(pid)
+        .map_err(|_| ToolError::Protocol("bash process id exceeded i32".to_owned()))?;
+    let result = unsafe { libc::kill(-pid, libc::SIGKILL) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(ToolError::Io(error))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashMap,
+        os::fd::{AsRawFd, FromRawFd, OwnedFd},
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use async_trait::async_trait;
+    use std::future::pending;
+    use tokio::sync::Notify;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct MemoryArtifacts {
+        content: Mutex<HashMap<String, Vec<u8>>>,
+    }
+
+    #[async_trait]
+    impl ArtifactAppender for MemoryArtifacts {
+        async fn begin_tool_output(
+            &self,
+            execution_id: &str,
+            initial_content: &[u8],
+        ) -> Result<String, ToolError> {
+            let handle = format!("artifact://conversation/tool-output/{execution_id}");
+            self.content
+                .lock()
+                .expect("artifact lock")
+                .insert(handle.clone(), initial_content.to_vec());
+            Ok(handle)
+        }
+
+        async fn append_tool_output(
+            &self,
+            handle: &str,
+            offset: u64,
+            content: &[u8],
+        ) -> Result<(), ToolError> {
+            let mut artifacts = self.content.lock().expect("artifact lock");
+            let artifact = artifacts.get_mut(handle).expect("known handle");
+            assert_eq!(
+                u64::try_from(artifact.len()).expect("artifact length"),
+                offset
+            );
+            artifact.extend_from_slice(content);
+            Ok(())
+        }
+
+        async fn finish_tool_output(&self, _handle: &str) -> Result<(), ToolError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct HangingArtifacts {
+        begin_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ArtifactAppender for HangingArtifacts {
+        async fn begin_tool_output(
+            &self,
+            _execution_id: &str,
+            _initial_content: &[u8],
+        ) -> Result<String, ToolError> {
+            if self.begin_calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                pending().await
+            } else {
+                Err(ToolError::Rpc(
+                    "injected reconnect failure after cancellation".to_owned(),
+                ))
+            }
+        }
+
+        async fn append_tool_output(
+            &self,
+            _handle: &str,
+            _offset: u64,
+            _content: &[u8],
+        ) -> Result<(), ToolError> {
+            pending().await
+        }
+
+        async fn finish_tool_output(&self, _handle: &str) -> Result<(), ToolError> {
+            pending().await
+        }
+    }
+
+    #[derive(Default)]
+    struct BlockingBeginArtifacts {
+        entered: Notify,
+        begin_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ArtifactAppender for BlockingBeginArtifacts {
+        async fn begin_tool_output(
+            &self,
+            execution_id: &str,
+            _initial_content: &[u8],
+        ) -> Result<String, ToolError> {
+            if self.begin_calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                self.entered.notify_one();
+                pending().await
+            } else {
+                Ok(format!(
+                    "artifact://conversation/tool-output/{execution_id}"
+                ))
+            }
+        }
+
+        async fn append_tool_output(
+            &self,
+            _handle: &str,
+            _offset: u64,
+            _content: &[u8],
+        ) -> Result<(), ToolError> {
+            Ok(())
+        }
+
+        async fn finish_tool_output(&self, _handle: &str) -> Result<(), ToolError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct DelayedReplayArtifacts {
+        entered: Notify,
+        begin_calls: AtomicUsize,
+        content: Mutex<HashMap<String, Vec<u8>>>,
+    }
+
+    #[async_trait]
+    impl ArtifactAppender for DelayedReplayArtifacts {
+        async fn begin_tool_output(
+            &self,
+            execution_id: &str,
+            initial_content: &[u8],
+        ) -> Result<String, ToolError> {
+            if self.begin_calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                self.entered.notify_one();
+                pending().await
+            } else {
+                tokio::time::sleep(STOPPED_PIPE_DRAIN_TIMEOUT + Duration::from_millis(200)).await;
+                let handle = format!("artifact://conversation/tool-output/{execution_id}");
+                self.content
+                    .lock()
+                    .expect("artifact lock")
+                    .insert(handle.clone(), initial_content.to_vec());
+                Ok(handle)
+            }
+        }
+
+        async fn append_tool_output(
+            &self,
+            handle: &str,
+            offset: u64,
+            content: &[u8],
+        ) -> Result<(), ToolError> {
+            let mut artifacts = self.content.lock().expect("artifact lock");
+            let artifact = artifacts.get_mut(handle).expect("known handle");
+            assert_eq!(
+                u64::try_from(artifact.len()).expect("artifact length"),
+                offset
+            );
+            artifact.extend_from_slice(content);
+            Ok(())
+        }
+
+        async fn finish_tool_output(&self, _handle: &str) -> Result<(), ToolError> {
+            Ok(())
+        }
+    }
+
+    struct TempWorkspace(PathBuf);
+
+    impl TempWorkspace {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("sumi-bash-{}", uuid::Uuid::now_v7()));
+            std::fs::create_dir_all(&path).expect("create temp workspace");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempWorkspace {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    async fn wait_for_workspace_marker(marker: &std::path::Path) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if marker.exists() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bash command did not create its completion marker");
+    }
+
+    #[tokio::test]
+    async fn executes_in_workspace_with_cleared_environment_and_streams_updates() {
+        let workspace = TempWorkspace::new();
+        let artifacts = MemoryArtifacts::default();
+        let updates = Arc::new(AtomicUsize::new(0));
+        let observed = updates.clone();
+        let result = LowTrustLocalBash::new(workspace.0.clone(), &artifacts)
+            .execute(
+                "printf '%s:%s' \"$PWD\" \"${SUMI_SECRET-unset}\"",
+                "bash-1",
+                CancellationToken::new(),
+                Arc::new(move |_| {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                }),
+            )
+            .await
+            .expect("bash result");
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.output, format!("{}:unset", workspace.0.display()));
+        assert!(updates.load(Ordering::Relaxed) > 0);
+    }
+
+    async fn assert_inherited_fd_is_closed(force_fallback: bool) {
+        let workspace = TempWorkspace::new();
+        let artifacts = MemoryArtifacts::default();
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        let read_fd = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+        let write_fd = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+        assert_eq!(
+            unsafe { libc::fcntl(write_fd.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0,
+            "fixture must deliberately be inherited across exec"
+        );
+        let command = format!(
+            "if [ -e /proc/self/fd/{} ]; then printf inherited; else printf closed; fi",
+            write_fd.as_raw_fd()
+        );
+        let mut bash = LowTrustLocalBash::new(workspace.0.clone(), &artifacts);
+        if force_fallback {
+            bash = bash.with_forced_close_range_fallback();
+        }
+        let result = bash
+            .execute(
+                &command,
+                if force_fallback {
+                    "bash-fd-fallback"
+                } else {
+                    "bash-fd-close-range"
+                },
+                CancellationToken::new(),
+                Arc::new(|_| {}),
+            )
+            .await
+            .expect("bash result");
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.output, "closed");
+        drop((read_fd, write_fd));
+    }
+
+    #[tokio::test]
+    async fn close_range_closes_inherited_non_cloexec_fd() {
+        assert_inherited_fd_is_closed(false).await;
+    }
+
+    #[tokio::test]
+    async fn enosys_fallback_closes_inherited_non_cloexec_fd() {
+        assert_inherited_fd_is_closed(true).await;
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_execution_returns_empty_without_spawning() {
+        let workspace = TempWorkspace::new();
+        let marker = workspace.0.join("must-not-exist");
+        let artifacts = MemoryArtifacts::default();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = LowTrustLocalBash::new(workspace.0.clone(), &artifacts)
+            .execute(
+                ": > must-not-exist",
+                "bash-pre-cancelled",
+                cancel,
+                Arc::new(|_| panic!("pre-cancelled execution must not emit updates")),
+            )
+            .await
+            .expect("pre-cancelled result");
+        assert_eq!(
+            result,
+            BashExecutionResult {
+                output: String::new(),
+                truncation: truncate_tail("", TruncationOptions::default()),
+                artifact_handle: None,
+                observed_bytes: 0,
+                exit_code: None,
+                cancelled: true,
+                resource_limit: None,
+            }
+        );
+        assert!(!marker.exists(), "pre-cancelled bash command was spawned");
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_execution_precedes_invalid_workspace_error() {
+        let workspace = std::env::temp_dir().join(format!(
+            "sumi-missing-bash-workspace-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let artifacts = MemoryArtifacts::default();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = LowTrustLocalBash::new(workspace, &artifacts)
+            .execute(
+                "exit 0",
+                "bash-pre-cancelled-invalid-workspace",
+                cancel,
+                Arc::new(|_| {}),
+            )
+            .await
+            .expect("pre-cancel must win before workspace validation");
+        assert!(result.cancelled);
+        assert_eq!(result.observed_bytes, 0);
+    }
+
+    #[test]
+    fn exec_failure_is_reported_after_fd_sanitizer() {
+        let inherited_fd_limit = inherited_fd_limit().expect("finite inherited FD bound");
+        for force_fallback in [false, true] {
+            let mut process = Command::new("/sumi-test/no-such-executable");
+            configure_child_process(&mut process, inherited_fd_limit, force_fallback);
+            let error = process
+                .spawn()
+                .expect_err("exec failure must reach the parent through Command's errpipe");
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        }
+    }
+
+    #[tokio::test]
+    async fn large_output_is_truncated_and_fully_archived() {
+        let workspace = TempWorkspace::new();
+        let artifacts = MemoryArtifacts::default();
+        let result = LowTrustLocalBash::new(workspace.0.clone(), &artifacts)
+            .execute(
+                "head -c 70000 /dev/zero | tr '\\0' x",
+                "bash-2",
+                CancellationToken::new(),
+                Arc::new(|_| {}),
+            )
+            .await
+            .expect("bash result");
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.output.len() <= super::super::truncate::DEFAULT_MAX_BYTES);
+        assert_eq!(result.truncation.total_bytes, 70_000);
+        let handle = result.artifact_handle.expect("artifact handle");
+        assert_eq!(
+            artifacts
+                .content
+                .lock()
+                .expect("artifact lock")
+                .get(&handle)
+                .expect("artifact")
+                .len(),
+            70_000
+        );
+    }
+
+    #[tokio::test]
+    async fn stdout_and_stderr_share_one_ordered_pipe() {
+        let workspace = TempWorkspace::new();
+        let artifacts = MemoryArtifacts::default();
+        let result = LowTrustLocalBash::new(workspace.0.clone(), &artifacts)
+            .execute(
+                "printf A; printf B >&2; printf C; printf D >&2",
+                "bash-ordered",
+                CancellationToken::new(),
+                Arc::new(|_| {}),
+            )
+            .await
+            .expect("bash result");
+        assert_eq!(result.output, "ABCD");
+    }
+
+    #[tokio::test]
+    async fn nonzero_exit_code_is_preserved_for_terminal_rendering() {
+        let workspace = TempWorkspace::new();
+        let artifacts = MemoryArtifacts::default();
+        let result = LowTrustLocalBash::new(workspace.0.clone(), &artifacts)
+            .execute(
+                "printf failed; exit 17",
+                "bash-nonzero",
+                CancellationToken::new(),
+                Arc::new(|_| {}),
+            )
+            .await
+            .expect("nonzero bash result");
+        assert_eq!(result.output, "failed");
+        assert_eq!(result.exit_code, Some(17));
+    }
+
+    #[tokio::test]
+    async fn deadline_still_applies_after_parent_exits_with_descendant_pipe_open() {
+        let workspace = TempWorkspace::new();
+        let artifacts = MemoryArtifacts::default();
+        let started = Instant::now();
+        let result = LowTrustLocalBash::new(workspace.0.clone(), &artifacts)
+            .with_timeout(Duration::from_millis(80))
+            .execute(
+                "(sleep 30) &",
+                "bash-descendant-pipe",
+                CancellationToken::new(),
+                Arc::new(|_| {}),
+            )
+            .await
+            .expect("timed result");
+        assert!(matches!(
+            result.resource_limit,
+            Some(ResourceLimit::WallTime { .. })
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn stopped_reader_closes_fd_held_by_setsid_escaped_descendant() {
+        let workspace = TempWorkspace::new();
+        let artifacts = MemoryArtifacts::default();
+        let marker = workspace.0.join("escaped-marker");
+        let started = Instant::now();
+        let result = LowTrustLocalBash::new(workspace.0.clone(), &artifacts)
+            .with_timeout(Duration::from_millis(40))
+            .execute(
+                "setsid bash -c 'set -e; sleep 2; printf ESCAPED; : > escaped-marker' &",
+                "bash-setsid-reader-abort",
+                CancellationToken::new(),
+                Arc::new(|_| {}),
+            )
+            .await
+            .expect("timed result");
+        assert!(matches!(
+            result.resource_limit,
+            Some(ResourceLimit::WallTime { .. })
+        ));
+        assert!(started.elapsed() < Duration::from_millis(1_500));
+
+        // The escaped descendant retains the pipe writer beyond the bounded
+        // drain. Aborting the AsyncFd reader must close the actual read FD, so
+        // its later write fails and `set -e` prevents the marker operation.
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert!(!result.output.contains("ESCAPED"));
+        assert!(
+            !marker.exists(),
+            "an escaped descendant wrote after the stopped reader returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_kills_process_group_and_returns_partial_result() {
+        let workspace = TempWorkspace::new();
+        let artifacts = MemoryArtifacts::default();
+        let cancel = CancellationToken::new();
+        let cancel_task = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel_task.cancel();
+        });
+        let result = LowTrustLocalBash::new(workspace.0.clone(), &artifacts)
+            .execute(
+                "printf started; sleep 30; printf finished",
+                "bash-3",
+                cancel,
+                Arc::new(|_| {}),
+            )
+            .await
+            .expect("cancelled result");
+        assert!(result.cancelled);
+        assert_eq!(result.exit_code, None);
+        assert!(
+            !result.output.is_empty(),
+            "output read before the stalled artifact await must remain as bounded partial output"
+        );
+        assert!(result.output.contains("started"));
+        assert!(!result.output.contains("finished"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_drains_every_chunk_already_read_from_the_bounded_pipe() {
+        let workspace = TempWorkspace::new();
+        let artifacts = BlockingBeginArtifacts::default();
+        let marker = workspace.0.join("queued-cancel-complete");
+        let cancel = CancellationToken::new();
+        let cancel_after_begin = cancel.clone();
+        let bash = LowTrustLocalBash::new(workspace.0.clone(), &artifacts);
+        let execution = bash.execute(
+            "head -c 98304 /dev/zero | tr '\\0' x; printf END; : > queued-cancel-complete",
+            "bash-queued-cancel",
+            cancel,
+            Arc::new(|_| {}),
+        );
+        let trigger = async {
+            artifacts.entered.notified().await;
+            wait_for_workspace_marker(&marker).await;
+            cancel_after_begin.cancel();
+        };
+        let (result, ()) = tokio::join!(execution, trigger);
+        let result = result.expect("cancelled result");
+        assert!(result.cancelled);
+        assert_eq!(result.observed_bytes, 98_307);
+        assert!(
+            result.output.ends_with("END"),
+            "the terminal result must include bytes queued behind the stalled artifact exchange"
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_stop_between_dequeue_and_archive_poll_cannot_omit_the_chunk() {
+        let artifacts = MemoryArtifacts::default();
+        let (tx, mut rx) = mpsc::channel(1);
+        let reader_observed = vec![b'x'; 60_000];
+        tx.send(reader_observed.clone())
+            .await
+            .expect("queue fixture chunk");
+        drop(tx);
+
+        let chunk = rx.recv().await.expect("dequeue fixture chunk");
+        let mut capture = ShellCapture::new("bash-ready-stop", &artifacts);
+        let recorded = capture
+            .record_chunk(&chunk)
+            .expect("synchronously account dequeued chunk");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        {
+            let archive = capture.archive_recorded(recorded);
+            tokio::pin!(archive);
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {}
+                _ = &mut archive => panic!("ready stop must win before the first archive poll"),
+            }
+        }
+
+        let result = capture.finish_after_abort().await;
+        assert_eq!(result.observed_bytes, chunk.len() as u64);
+        assert_eq!(result.truncation.total_bytes, chunk.len());
+        let handle = result
+            .artifact_handle
+            .expect("recorded chunk must be replayed to the partial artifact");
+        assert_eq!(
+            artifacts
+                .content
+                .lock()
+                .expect("artifact lock")
+                .get(&handle)
+                .expect("artifact"),
+            &reader_observed
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_artifact_replay_cannot_consume_the_bounded_reader_drain() {
+        let workspace = TempWorkspace::new();
+        let artifacts = DelayedReplayArtifacts::default();
+        let marker = workspace.0.join("delayed-replay-complete");
+        let cancel = CancellationToken::new();
+        let cancel_after_begin = cancel.clone();
+        let bash = LowTrustLocalBash::new(workspace.0.clone(), &artifacts);
+        let execution = bash.execute(
+            "head -c 98304 /dev/zero | tr '\\0' x; printf END; : > delayed-replay-complete",
+            "bash-delayed-replay",
+            cancel,
+            Arc::new(|_| {}),
+        );
+        let trigger = async {
+            artifacts.entered.notified().await;
+            wait_for_workspace_marker(&marker).await;
+            cancel_after_begin.cancel();
+        };
+        let (result, ()) = tokio::join!(execution, trigger);
+        let result = result.expect("cancelled result");
+        assert!(result.cancelled);
+        assert_eq!(result.observed_bytes, 98_307);
+        assert_eq!(result.truncation.total_bytes, 98_307);
+        assert!(result.output.ends_with("END"));
+        let handle = result.artifact_handle.expect("complete replayed artifact");
+        assert_eq!(
+            artifacts
+                .content
+                .lock()
+                .expect("artifact lock")
+                .get(&handle)
+                .expect("artifact")
+                .len(),
+            usize::try_from(result.observed_bytes).expect("observed length"),
+            "artifact and terminal byte accounting must include all queued chunks"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_a_stalled_artifact_rpc_and_reaps_bash() {
+        let workspace = TempWorkspace::new();
+        let artifacts = HangingArtifacts::default();
+        let cancel = CancellationToken::new();
+        let cancel_task = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel_task.cancel();
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            LowTrustLocalBash::new(workspace.0.clone(), &artifacts).execute(
+                "head -c 60000 /dev/zero | tr '\\0' x; sleep 10",
+                "bash-stalled-artifact",
+                cancel,
+                Arc::new(|_| {}),
+            ),
+        )
+        .await
+        .expect("bash cancellation deadline")
+        .expect("cancelled bash result");
+        assert!(result.cancelled);
+        assert_eq!(result.exit_code, None);
+        assert_eq!(
+            result.artifact_handle, None,
+            "an artifact whose replay/close was not acknowledged must not be exposed"
+        );
+        assert_eq!(
+            artifacts.begin_calls.load(Ordering::Relaxed),
+            2,
+            "one failed post-stop replay must disable the artifact instead of retrying it for every queued chunk"
+        );
+    }
+
+    #[tokio::test]
+    async fn wall_timeout_is_typed_and_returns_partial_result() {
+        let workspace = TempWorkspace::new();
+        let artifacts = MemoryArtifacts::default();
+        let result = LowTrustLocalBash::new(workspace.0.clone(), &artifacts)
+            .with_timeout(Duration::from_millis(50))
+            .execute(
+                "printf started; sleep 30",
+                "bash-4",
+                CancellationToken::new(),
+                Arc::new(|_| {}),
+            )
+            .await
+            .expect("timed out result");
+        assert!(matches!(
+            result.resource_limit,
+            Some(ResourceLimit::WallTime { .. })
+        ));
+        assert_eq!(result.exit_code, None);
+        assert!(result.output.contains("started"));
+    }
+
+    #[tokio::test]
+    async fn pipe_reader_quota_is_inclusive_at_exact_byte_boundary() {
+        async fn copy_fixture(size: u64) -> (u64, bool, usize) {
+            let raw = vec![b'x'; usize::try_from(size).expect("fixture size")];
+            let (tx, mut rx) = mpsc::channel(32);
+            let observed = Arc::new(AtomicU64::new(0));
+            let quota = CancellationToken::new();
+            let copy = copy_bounded_chunks(raw.as_slice(), tx, observed, quota.clone());
+            let drain = async move {
+                let mut drained = 0usize;
+                while let Some(chunk) = rx.recv().await {
+                    drained = drained.saturating_add(chunk.len());
+                }
+                drained
+            };
+            let (copied, drained) = tokio::join!(copy, drain);
+            (copied.expect("copy fixture"), quota.is_cancelled(), drained)
+        }
+
+        for (size, limited) in [
+            (
+                super::super::shell_capture::COMMAND_OUTPUT_LIMIT_BYTES - 1,
+                false,
+            ),
+            (
+                super::super::shell_capture::COMMAND_OUTPUT_LIMIT_BYTES,
+                true,
+            ),
+            (
+                super::super::shell_capture::COMMAND_OUTPUT_LIMIT_BYTES + 1,
+                true,
+            ),
+        ] {
+            let (observed, cancelled, drained) = copy_fixture(size).await;
+            let expected_observed =
+                size.min(super::super::shell_capture::COMMAND_OUTPUT_LIMIT_BYTES);
+            assert_eq!(observed, expected_observed);
+            assert_eq!(cancelled, limited, "size={size}");
+            assert_eq!(
+                u64::try_from(drained).expect("drained size"),
+                expected_observed
+            );
+        }
+    }
+
+    #[test]
+    fn post_drain_quota_classification_is_inclusive() {
+        let limit = super::super::shell_capture::COMMAND_OUTPUT_LIMIT_BYTES;
+        assert_eq!(output_limit_if_reached(limit - 1), None);
+        assert_eq!(
+            output_limit_if_reached(limit),
+            Some(ResourceLimit::OutputBytes {
+                observed: limit,
+                limit,
+            })
+        );
+        assert_eq!(
+            output_limit_if_reached(limit + 1),
+            Some(ResourceLimit::OutputBytes {
+                observed: limit + 1,
+                limit,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn output_quota_drains_all_pipe_bytes_observed_before_kill() {
+        let workspace = TempWorkspace::new();
+        let artifacts = MemoryArtifacts::default();
+        let result = tokio::time::timeout(
+            Duration::from_secs(15),
+            LowTrustLocalBash::new(workspace.0.clone(), &artifacts).execute(
+                "head -c 11000000 /dev/zero | tr '\\0' x",
+                "bash-pipe-quota",
+                CancellationToken::new(),
+                Arc::new(|_| {}),
+            ),
+        )
+        .await
+        .expect("quota execution deadline")
+        .expect("quota result");
+        assert!(matches!(
+            result.resource_limit,
+            Some(ResourceLimit::OutputBytes {
+                observed,
+                limit: super::super::shell_capture::COMMAND_OUTPUT_LIMIT_BYTES,
+            }) if observed == result.observed_bytes
+                && observed >= super::super::shell_capture::COMMAND_OUTPUT_LIMIT_BYTES
+        ));
+        let handle = result.artifact_handle.expect("quota artifact");
+        assert_eq!(
+            artifacts
+                .content
+                .lock()
+                .expect("artifact lock")
+                .get(&handle)
+                .expect("artifact")
+                .len(),
+            usize::try_from(result.observed_bytes).expect("observed length"),
+            "every byte measured at the pipe-reader boundary must reach the artifact"
+        );
+    }
+}
