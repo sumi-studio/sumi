@@ -557,6 +557,34 @@ supports_required_tool_choice = true
     }
 
     #[test]
+    fn rejects_chat_compat_overrides_for_non_chat_presets() {
+        for preset in ["anthropic", "openai-responses"] {
+            let file = FileConfig {
+                model: ModelConfig {
+                    preset: Some(preset.to_owned()),
+                    compat: CompatConfig {
+                        supports_store: Some(true),
+                        ..CompatConfig::default()
+                    },
+                    ..ModelConfig::default()
+                },
+                ..FileConfig::default()
+            };
+            let config = Config::resolve(file, EnvOverrides::default()).expect("resolved config");
+
+            let error = config
+                .model_spec()
+                .expect_err("Chat compat overrides must fail for non-Chat presets");
+
+            assert_eq!(
+                error.to_string(),
+                "Chat compatibility overrides require a Chat protocol preset",
+                "preset={preset}"
+            );
+        }
+    }
+
+    #[test]
     fn model_preset_values_can_be_overridden_without_recompiling() {
         let file: FileConfig = toml::from_str(
             r#"
