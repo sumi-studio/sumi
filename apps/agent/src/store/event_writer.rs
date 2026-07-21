@@ -16538,7 +16538,7 @@ mod tests {
         let terminal_write = terminal
             .into_t12_write(run_id.clone(), turn_id.clone(), false)
             .expect("context-free T12 terminal write");
-        writer
+        let terminal_sequences = writer
             .apply(EventBatch {
                 writes: vec![
                     terminal_write,
@@ -16567,6 +16567,11 @@ mod tests {
             })
             .await
             .expect("persist projected provider terminal");
+        let [terminal_message_end_seq, _, _] = terminal_sequences.as_slice() else {
+            panic!("terminal batch must persist MessageEnd, TurnEnd, and AgentEnd");
+        };
+        let terminal_message_end_seq = i64::try_from(*terminal_message_end_seq)
+            .expect("terminal MessageEnd sequence fits SQLite INTEGER");
 
         let payload: String =
             sqlx::query_scalar("SELECT payload FROM messages WHERE id=? AND role='assistant'")
@@ -16579,7 +16584,7 @@ mod tests {
             terminal_message
         );
         let mut transaction = store.pool().begin().await.expect("event read transaction");
-        let durable = load_authenticated_event(&store, &mut transaction, 6)
+        let durable = load_authenticated_event(&store, &mut transaction, terminal_message_end_seq)
             .await
             .expect("authenticated MessageEnd");
         transaction.rollback().await.expect("rollback event read");
