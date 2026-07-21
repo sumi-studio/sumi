@@ -106,9 +106,7 @@ pub fn transform(messages: &[ContextMessage], destination: &ProviderOrigin) -> V
                 let exact_origin =
                     same_origin(&context, destination) && assistant.model == destination.model;
                 let tool_id_constraint = match destination.protocol {
-                    ApiProtocol::OpenAiChatCompletions | ApiProtocol::OpenAiResponses
-                        if !exact_origin =>
-                    {
+                    ApiProtocol::OpenAiChatCompletions if !exact_origin => {
                         Some(ToolIdConstraint::OpenAiCompatible)
                     }
                     ApiProtocol::AnthropicMessages => Some(ToolIdConstraint::Anthropic),
@@ -1481,41 +1479,67 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_bounded_ids_for_chat_and_responses_destinations() {
+    fn normalizes_bounded_ids_for_cross_origin_chat_destination() {
         let original = format!("call+bad|{}", "x".repeat(100));
-        for protocol in [
-            ApiProtocol::OpenAiChatCompletions,
-            ApiProtocol::OpenAiResponses,
-        ] {
-            let mut destination = cross_origin_target();
-            destination.protocol = protocol;
-            let output = transform(
-                &[
-                    persisted(
-                        "a",
-                        1,
-                        assistant(
-                            vec![tool_call(&original, "tool")],
-                            StopReason::ToolUse,
-                            false,
-                        ),
+        let output = transform(
+            &[
+                persisted(
+                    "a",
+                    1,
+                    assistant(
+                        vec![tool_call(&original, "tool")],
+                        StopReason::ToolUse,
+                        false,
                     ),
-                    persisted("r", 2, result(&original, false)),
-                ],
-                &destination,
-            );
-            let Message::Assistant(assistant) = message(&output[0]) else {
-                panic!("assistant");
-            };
-            let AssistantContent::ToolCall { tool_call, .. } = &assistant.content[0] else {
-                panic!("tool call");
-            };
-            let Message::ToolResult(result) = message(&output[1]) else {
-                panic!("tool result");
-            };
-            assert!(tool_call.id.len() <= 40);
-            assert_eq!(result.tool_call_id, tool_call.id);
-        }
+                ),
+                persisted("r", 2, result(&original, false)),
+            ],
+            &cross_origin_target(),
+        );
+        let Message::Assistant(assistant) = message(&output[0]) else {
+            panic!("assistant");
+        };
+        let AssistantContent::ToolCall { tool_call, .. } = &assistant.content[0] else {
+            panic!("tool call");
+        };
+        let Message::ToolResult(result) = message(&output[1]) else {
+            panic!("tool result");
+        };
+        assert!(tool_call.id.len() <= 40);
+        assert_eq!(result.tool_call_id, tool_call.id);
+    }
+
+    #[test]
+    fn preserves_cross_origin_responses_tool_ids_without_a_wire_constraint() {
+        let original = format!("call+bad|{}界", "x".repeat(100));
+        let mut destination = cross_origin_target();
+        destination.protocol = ApiProtocol::OpenAiResponses;
+        let output = transform(
+            &[
+                persisted(
+                    "a",
+                    1,
+                    assistant(
+                        vec![tool_call(&original, "tool")],
+                        StopReason::ToolUse,
+                        false,
+                    ),
+                ),
+                persisted("r", 2, result(&original, false)),
+            ],
+            &destination,
+        );
+        let Message::Assistant(assistant) = message(&output[0]) else {
+            panic!("assistant");
+        };
+        let AssistantContent::ToolCall { tool_call, .. } = &assistant.content[0] else {
+            panic!("tool call");
+        };
+        let Message::ToolResult(result) = message(&output[1]) else {
+            panic!("tool result");
+        };
+        assert_eq!(tool_call.id.as_bytes(), original.as_bytes());
+        assert_eq!(result.tool_call_id.as_bytes(), original.as_bytes());
     }
 
     #[test]
