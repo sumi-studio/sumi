@@ -2,6 +2,7 @@
 
 use std::{
     env,
+    future::{Future, poll_fn},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     path::{Path, PathBuf},
     pin::Pin,
@@ -16,7 +17,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::{
     io::unix::AsyncFd,
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf},
     net::{UnixListener, UnixStream},
     sync::{Semaphore, mpsc, oneshot},
     task::JoinHandle,
@@ -91,6 +92,53 @@ struct ExecutorWriter {
 
 struct NonblockingStdout {
     fd: AsyncFd<OwnedFd>,
+}
+
+struct NonblockingStdin {
+    fd: AsyncFd<OwnedFd>,
+}
+
+impl AsyncRead for NonblockingStdin {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        loop {
+            let mut ready = match self.fd.poll_read_ready(context) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(ready)) => ready,
+            };
+            match ready.try_io(|fd| {
+                let destination = buffer.initialize_unfilled();
+                let read = unsafe {
+                    libc::read(
+                        fd.get_ref().as_raw_fd(),
+                        destination.as_mut_ptr().cast(),
+                        destination.len(),
+                    )
+                };
+                if read == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(read as usize)
+                }
+            }) {
+                Ok(Ok(read)) => {
+                    buffer.advance(read);
+                    return Poll::Ready(Ok(()));
+                }
+                Ok(Err(error)) if is_interrupted_read_error(&error) => continue,
+                Ok(Err(error)) => return Poll::Ready(Err(error)),
+                Err(_) => continue,
+            }
+        }
+    }
+}
+
+fn is_interrupted_read_error(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::Interrupted
 }
 
 impl AsyncWrite for NonblockingStdout {
@@ -263,8 +311,9 @@ pub async fn run_tool_executor_mode() -> Result<()> {
     let broker_socket = required_path("SUMI_ARTIFACT_BROKER_SOCKET")?;
     let fs = WorkspaceFs::open(&workspace).context("failed to open executor workspace")?;
     let broker = ArtifactBrokerClient::new(broker_socket, identity.clone(), conversation_id);
+    let stdin = nonblocking_stdin().context("failed to take ownership of executor stdin")?;
     let stdout = nonblocking_stdout().context("failed to take ownership of executor stdout")?;
-    run_executor_service(tokio::io::stdin(), stdout, identity, workspace, fs, broker).await
+    run_executor_service(stdin, stdout, identity, workspace, fs, broker).await
 }
 
 pub async fn run_artifact_broker_mode() -> Result<()> {
@@ -538,7 +587,11 @@ where
             }
             _ = &mut control_reader, if !control_reader_done => control_reader_done = true,
             result = &mut execution => {
-                match control_rx.try_recv() {
+                match take_queued_control_after_completion(
+                    &mut control_rx,
+                    control_reader.as_mut(),
+                    &mut control_reader_done,
+                ).await {
                     Ok(next) => match classify_active_control(
                         Some(next),
                         identity,
@@ -597,12 +650,29 @@ where
             cancel.cancel();
             let result = match completed {
                 Some(result) => result,
-                None => timeout(EXECUTOR_REAP_DEADLINE, &mut execution)
-                    .await
-                    .map_err(|_| {
+                None => match timeout(EXECUTOR_REAP_DEADLINE, &mut execution).await {
+                    Ok(result) => result,
+                    Err(_) => {
                         tracing::warn!("executor cancellation exceeded its service deadline");
-                        anyhow::anyhow!("executor cancellation exceeded its service deadline")
-                    })?,
+                        lifecycle.accept_terminal(&request_id)?;
+                        writer
+                            .terminal(
+                                identity,
+                                request_id,
+                                Err(rpc_error(ToolError::RpcIndeterminate(
+                                    "executor cancellation exceeded its service deadline"
+                                        .to_owned(),
+                                ))),
+                            )
+                            .await?;
+                        if let Some((response_id, response_error)) = response {
+                            writer
+                                .terminal(identity, response_id, Err(response_error))
+                                .await?;
+                        }
+                        return Err(error.into());
+                    }
+                },
             };
             lifecycle.accept_terminal(&request_id)?;
             writer
@@ -641,11 +711,49 @@ where
             cancel.cancel();
             let result = match completed {
                 Some(result) => result,
-                None => timeout(EXECUTOR_REAP_DEADLINE, &mut execution)
-                    .await
-                    .map_err(|_| {
-                        anyhow::anyhow!("executor cancellation exceeded its service deadline")
-                    })?,
+                None => match timeout(EXECUTOR_REAP_DEADLINE, &mut execution).await {
+                    Ok(Ok(result)) => Ok(result),
+                    Ok(Err(reap_error)) => {
+                        lifecycle.accept_terminal(&request_id)?;
+                        writer
+                            .terminal(
+                                identity,
+                                cancel_request_id,
+                                Ok(ExecutorResponse::CancelAccepted),
+                            )
+                            .await?;
+                        writer
+                            .terminal(identity, request_id, Err(rpc_error(reap_error)))
+                            .await?;
+                        return Err(anyhow::anyhow!(
+                            "executor cancellation failed before cleanup was proven"
+                        ));
+                    }
+                    Err(_) => {
+                        tracing::warn!("executor cancellation exceeded its service deadline");
+                        lifecycle.accept_terminal(&request_id)?;
+                        writer
+                            .terminal(
+                                identity,
+                                cancel_request_id,
+                                Ok(ExecutorResponse::CancelAccepted),
+                            )
+                            .await?;
+                        writer
+                            .terminal(
+                                identity,
+                                request_id,
+                                Err(rpc_error(ToolError::RpcIndeterminate(
+                                    "executor cancellation exceeded its service deadline"
+                                        .to_owned(),
+                                ))),
+                            )
+                            .await?;
+                        return Err(anyhow::anyhow!(
+                            "executor cancellation exceeded its service deadline"
+                        ));
+                    }
+                },
             };
             lifecycle.accept_terminal(&request_id)?;
             writer
@@ -667,6 +775,32 @@ where
             Ok(())
         }
     }
+}
+
+async fn take_queued_control_after_completion<F, T>(
+    control_rx: &mut mpsc::Receiver<T>,
+    mut control_reader: Pin<&mut F>,
+    control_reader_done: &mut bool,
+) -> Result<T, mpsc::error::TryRecvError>
+where
+    F: Future<Output = ()>,
+{
+    match control_rx.try_recv() {
+        Ok(next) => return Ok(next),
+        Err(mpsc::error::TryRecvError::Disconnected) => {
+            return Err(mpsc::error::TryRecvError::Disconnected);
+        }
+        Err(mpsc::error::TryRecvError::Empty) => {}
+    }
+
+    if !*control_reader_done {
+        // The nonblocking stdin reader observes the pipe directly here. This
+        // final priority poll closes the gap where completion became ready
+        // after the select had already polled control once.
+        let poll = poll_fn(|context| Poll::Ready(control_reader.as_mut().poll(context))).await;
+        *control_reader_done = poll.is_ready();
+    }
+    control_rx.try_recv()
 }
 
 fn classify_active_control(
@@ -967,7 +1101,19 @@ fn io_error(message: &str) -> ToolError {
 }
 
 fn nonblocking_stdout() -> std::io::Result<NonblockingStdout> {
-    let duplicated = unsafe { libc::dup(libc::STDOUT_FILENO) };
+    Ok(NonblockingStdout {
+        fd: nonblocking_stdio_fd(libc::STDOUT_FILENO)?,
+    })
+}
+
+fn nonblocking_stdin() -> std::io::Result<NonblockingStdin> {
+    Ok(NonblockingStdin {
+        fd: nonblocking_stdio_fd(libc::STDIN_FILENO)?,
+    })
+}
+
+fn nonblocking_stdio_fd(raw_fd: libc::c_int) -> std::io::Result<AsyncFd<OwnedFd>> {
+    let duplicated = unsafe { libc::dup(raw_fd) };
     if duplicated == -1 {
         return Err(std::io::Error::last_os_error());
     }
@@ -979,12 +1125,10 @@ fn nonblocking_stdout() -> std::io::Result<NonblockingStdout> {
     if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
         return Err(std::io::Error::last_os_error());
     }
-    if unsafe { libc::close(libc::STDOUT_FILENO) } == -1 {
+    if unsafe { libc::close(raw_fd) } == -1 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(NonblockingStdout {
-        fd: AsyncFd::new(fd)?,
-    })
+    AsyncFd::new(fd)
 }
 
 fn identity_from_env() -> Result<RpcIdentity> {
@@ -1017,6 +1161,56 @@ fn required_path(name: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct QueueControlOnSecondPoll {
+        polls: usize,
+        sender: mpsc::Sender<&'static str>,
+    }
+
+    impl Future for QueueControlOnSecondPoll {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, _context: &mut TaskContext<'_>) -> Poll<Self::Output> {
+            self.polls += 1;
+            if self.polls == 2 {
+                self.sender.try_send("cancel").unwrap();
+            }
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_repolls_control_reader_before_settling() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let reader = QueueControlOnSecondPoll { polls: 0, sender };
+        tokio::pin!(reader);
+        let first_poll = poll_fn(|context| Poll::Ready(reader.as_mut().poll(context))).await;
+        assert!(first_poll.is_pending());
+
+        let mut reader_done = false;
+        let control =
+            take_queued_control_after_completion(&mut receiver, reader.as_mut(), &mut reader_done)
+                .await;
+
+        assert_eq!(control.unwrap(), "cancel");
+        assert!(!reader_done);
+    }
+
+    #[test]
+    fn nonblocking_stdin_retries_only_interrupted_reads() {
+        assert!(is_interrupted_read_error(
+            &std::io::Error::from_raw_os_error(libc::EINTR)
+        ));
+        assert!(is_interrupted_read_error(&std::io::Error::from(
+            std::io::ErrorKind::Interrupted,
+        )));
+        assert!(!is_interrupted_read_error(&std::io::Error::from(
+            std::io::ErrorKind::WouldBlock,
+        )));
+        assert!(!is_interrupted_read_error(&std::io::Error::from(
+            std::io::ErrorKind::BrokenPipe,
+        )));
+    }
 
     #[tokio::test]
     async fn blocking_work_registry_has_no_unbounded_waiting_queue() {

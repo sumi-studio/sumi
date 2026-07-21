@@ -11,8 +11,9 @@ use std::{
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::UnixStream,
+    net::{UnixListener, UnixStream},
     process::{Child, Command},
+    sync::mpsc,
     time::timeout,
 };
 use uuid::Uuid;
@@ -472,6 +473,102 @@ async fn bash_cancel_emits_one_terminal_per_request_and_no_late_update() {
         .expect("executor must exit after stdout EOF")
         .unwrap();
     assert!(status.success());
+}
+
+async fn run_bash_reap_timeout_case(matching_cancel: bool) -> [Value; 2] {
+    let mut fixture = Fixture::new().await;
+    fixture.broker.start_kill().unwrap();
+    fixture.broker.wait().await.unwrap();
+    std::fs::remove_file(&fixture.socket).unwrap();
+
+    let listener = UnixListener::bind(&fixture.socket).unwrap();
+    let (accepted_tx, mut accepted_rx) = mpsc::channel(4);
+    let hanging_broker = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let accepted_tx = accepted_tx.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                stream.read_to_end(&mut request).await.unwrap();
+                accepted_tx.send(()).await.unwrap();
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+
+    let mut child = fixture.executor();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    send_request(
+        &mut stdin,
+        &request(
+            "bash-reap-timeout",
+            json!({
+                "type":"bash",
+                "command":"head -c 60000 /dev/zero | tr '\\0' x; sleep 30",
+                "execution_id":"bash-reap-timeout",
+            }),
+        ),
+    )
+    .await;
+    timeout(Duration::from_secs(5), accepted_rx.recv())
+        .await
+        .expect("bash must reach the hanging broker")
+        .expect("hanging broker notification");
+    send_request(
+        &mut stdin,
+        &request(
+            "control-reap-timeout",
+            json!({
+                "type":"cancel",
+                "execution_id": if matching_cancel {
+                    "bash-reap-timeout"
+                } else {
+                    "wrong-execution"
+                },
+            }),
+        ),
+    )
+    .await;
+    drop(stdin);
+
+    let first_terminal = loop {
+        let frame = read_frame(&mut stdout).await;
+        if frame["type"] == "terminal" {
+            break frame;
+        }
+    };
+    let second_terminal = read_frame(&mut stdout).await;
+    assert_eq!(second_terminal["type"], "terminal");
+
+    let mut trailing = Vec::new();
+    timeout(Duration::from_secs(5), stdout.read_to_end(&mut trailing))
+        .await
+        .expect("executor stdout must close after uncertain reap")
+        .unwrap();
+    assert!(trailing.iter().all(|byte| byte.is_ascii_whitespace()));
+    let status = timeout(Duration::from_secs(5), child.wait())
+        .await
+        .expect("executor must close the service epoch after uncertain reap")
+        .unwrap();
+    assert!(!status.success());
+    hanging_broker.abort();
+    [first_terminal, second_terminal]
+}
+
+#[tokio::test]
+async fn bash_reap_timeout_emits_bounded_terminals_then_closes_epoch() {
+    let cancelled = run_bash_reap_timeout_case(true).await;
+    assert_eq!(cancelled[0]["request_id"], "control-reap-timeout");
+    assert_eq!(cancelled[0]["result"]["Ok"]["type"], "cancel_accepted");
+    assert_eq!(cancelled[1]["request_id"], "bash-reap-timeout");
+    assert_eq!(cancelled[1]["result"]["Err"]["code"], "rpc_indeterminate");
+
+    let fatal = run_bash_reap_timeout_case(false).await;
+    assert_eq!(fatal[0]["request_id"], "bash-reap-timeout");
+    assert_eq!(fatal[0]["result"]["Err"]["code"], "rpc_indeterminate");
+    assert_eq!(fatal[1]["request_id"], "control-reap-timeout");
+    assert_eq!(fatal[1]["result"]["Err"]["code"], "protocol");
 }
 
 #[tokio::test]
