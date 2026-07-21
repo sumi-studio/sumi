@@ -53,6 +53,7 @@ use types::{
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
+const TIMING_OBSERVATION_CAPACITY: usize = 2;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
 const RESPONSE_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -91,6 +92,46 @@ struct ProducerChannels {
     normal: mpsc::Sender<ProviderEvent>,
     priority_terminal: mpsc::Sender<ProviderEvent>,
     success_terminal_committed: Arc<SuccessTerminalCommit>,
+    timing: Option<ProviderTimingObserver>,
+}
+
+/// Monotonic provider timing observations consumed by the agent run driver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProviderTimingObservation {
+    RequestSent(Instant),
+    FirstPublicDelta(Instant),
+}
+
+pub(crate) struct ProviderTimingObserver {
+    sender: mpsc::Sender<ProviderTimingObservation>,
+}
+
+#[allow(dead_code)] // T15 consumes this receiver from ProductionRunDriver.
+pub(crate) struct ProviderTimingObservations {
+    receiver: mpsc::Receiver<ProviderTimingObservation>,
+}
+
+#[allow(dead_code)] // T15 consumes this receiver from ProductionRunDriver.
+impl ProviderTimingObservations {
+    pub(crate) async fn recv(&mut self) -> Option<ProviderTimingObservation> {
+        self.receiver.recv().await
+    }
+}
+
+/// Creates the fixed-size observation lane. The producer never awaits this lane.
+#[allow(dead_code)] // T15 connects this seam to ProductionRunDriver.
+pub(crate) fn timing_observation_channel() -> (ProviderTimingObserver, ProviderTimingObservations) {
+    let (sender, receiver) = mpsc::channel(TIMING_OBSERVATION_CAPACITY);
+    (
+        ProviderTimingObserver { sender },
+        ProviderTimingObservations { receiver },
+    )
+}
+
+impl ProviderTimingObserver {
+    fn observe(&self, observation: ProviderTimingObservation) {
+        let _ = self.sender.try_send(observation);
+    }
 }
 
 async fn await_request<F, T, E, O>(
@@ -121,22 +162,35 @@ where
 struct TtftObservation {
     request_sent_at: Instant,
     first_public_delta_sent: bool,
+    observer: Option<ProviderTimingObserver>,
 }
 
 impl TtftObservation {
-    fn new(request_sent_at: Instant) -> Self {
+    fn new(request_sent_at: Instant, observer: Option<ProviderTimingObserver>) -> Self {
         Self {
             request_sent_at,
             first_public_delta_sent: false,
+            observer,
+        }
+    }
+
+    fn observe_request_sent(observer: &Option<ProviderTimingObserver>, at: Instant) {
+        tracing::info!(phase = "request_sent", "provider request sent");
+        if let Some(observer) = observer {
+            observer.observe(ProviderTimingObservation::RequestSent(at));
         }
     }
 
     fn observe_emit(&mut self, is_public_delta: bool, result: &EmitResult) {
         if is_public_delta && !self.first_public_delta_sent && matches!(result, EmitResult::Sent) {
             self.first_public_delta_sent = true;
+            let observed_at = Instant::now();
+            if let Some(observer) = &self.observer {
+                observer.observe(ProviderTimingObservation::FirstPublicDelta(observed_at));
+            }
             tracing::info!(
                 phase = "request_sent_to_first_public_delta",
-                elapsed_ms = self.request_sent_at.elapsed().as_millis() as u64,
+                elapsed_ms = observed_at.duration_since(self.request_sent_at).as_millis() as u64,
                 "provider first public delta"
             );
         }
@@ -164,6 +218,19 @@ pub fn stream(
 ) -> ProviderEventStream {
     let api_key = env::var(&spec.api_key_env).ok();
     stream_with_api_key(spec, context, options, cancel, api_key)
+}
+
+/// Starts a provider stream with a non-blocking, bounded timing observer.
+#[allow(dead_code)] // T15 connects this seam to ProductionRunDriver.
+pub(crate) fn stream_observed(
+    spec: ModelSpec,
+    context: PromptContext,
+    options: RequestOptions,
+    cancel: CancellationToken,
+    observer: ProviderTimingObserver,
+) -> ProviderEventStream {
+    let api_key = env::var(&spec.api_key_env).ok();
+    stream_with_api_key_observed(spec, context, options, cancel, api_key, Some(observer))
 }
 
 pub async fn compact_native(
@@ -306,15 +373,26 @@ fn stream_with_api_key(
     cancel: CancellationToken,
     api_key: Option<String>,
 ) -> ProviderEventStream {
+    stream_with_api_key_observed(spec, context, options, cancel, api_key, None)
+}
+
+fn stream_with_api_key_observed(
+    spec: ModelSpec,
+    context: PromptContext,
+    options: RequestOptions,
+    cancel: CancellationToken,
+    api_key: Option<String>,
+    observer: Option<ProviderTimingObserver>,
+) -> ProviderEventStream {
     match spec.protocol {
         ApiProtocol::OpenAiChatCompletions => {
-            stream_chat_with_api_key(spec, context, options, cancel, api_key)
+            stream_chat_with_api_key(spec, context, options, cancel, api_key, observer)
         }
         ApiProtocol::OpenAiResponses => {
-            stream_responses_with_api_key(spec, context, options, cancel, api_key)
+            stream_responses_with_api_key(spec, context, options, cancel, api_key, observer)
         }
         ApiProtocol::AnthropicMessages => {
-            stream_anthropic_with_api_key(spec, context, options, cancel, api_key)
+            stream_anthropic_with_api_key(spec, context, options, cancel, api_key, observer)
         }
     }
 }
@@ -325,6 +403,7 @@ fn stream_chat_with_api_key(
     options: RequestOptions,
     cancel: CancellationToken,
     api_key: Option<String>,
+    observer: Option<ProviderTimingObserver>,
 ) -> ProviderEventStream {
     let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let (priority_terminal_tx, priority_terminal_rx) = mpsc::channel(1);
@@ -355,6 +434,7 @@ fn stream_chat_with_api_key(
                     normal: tx,
                     priority_terminal: priority_terminal_tx,
                     success_terminal_committed: producer_terminal_committed,
+                    timing: observer,
                 },
             )
             .await;
@@ -378,6 +458,7 @@ fn stream_responses_with_api_key(
     options: RequestOptions,
     cancel: CancellationToken,
     api_key: Option<String>,
+    observer: Option<ProviderTimingObserver>,
 ) -> ProviderEventStream {
     let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let (priority_terminal_tx, priority_terminal_rx) = mpsc::channel(1);
@@ -408,6 +489,7 @@ fn stream_responses_with_api_key(
                     normal: tx,
                     priority_terminal: priority_terminal_tx,
                     success_terminal_committed: producer_terminal_committed,
+                    timing: observer,
                 },
             )
             .await;
@@ -431,6 +513,7 @@ fn stream_anthropic_with_api_key(
     options: RequestOptions,
     cancel: CancellationToken,
     api_key: Option<String>,
+    observer: Option<ProviderTimingObserver>,
 ) -> ProviderEventStream {
     let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let (priority_terminal_tx, priority_terminal_rx) = mpsc::channel(1);
@@ -461,6 +544,7 @@ fn stream_anthropic_with_api_key(
                     normal: tx,
                     priority_terminal: priority_terminal_tx,
                     success_terminal_committed: producer_terminal_committed,
+                    timing: observer,
                 },
             )
             .await;
@@ -490,6 +574,7 @@ async fn run_anthropic_stream(
         normal: tx,
         priority_terminal: priority_terminal_tx,
         success_terminal_committed,
+        timing,
     } = channels;
     let mut assembler = MessageAssembler::new();
     let _ = assembler.apply(&ProviderEvent::Start);
@@ -632,7 +717,7 @@ async fn run_anthropic_stream(
         body.apply(request).send(),
         &cancel,
         RESPONSE_HEADER_TIMEOUT,
-        |_| tracing::info!(phase = "request_sent", "provider request sent"),
+        |at| TtftObservation::observe_request_sent(&timing, at),
     )
     .await
     {
@@ -735,7 +820,7 @@ async fn run_anthropic_stream(
             }
         };
 
-    let mut ttft = TtftObservation::new(request_sent_at);
+    let mut ttft = TtftObservation::new(request_sent_at, timing);
     loop {
         match transport.next_event().await {
             Ok(Some(event)) => {
@@ -888,6 +973,7 @@ async fn run_responses_stream(
         normal: tx,
         priority_terminal: priority_terminal_tx,
         success_terminal_committed,
+        timing,
     } = channels;
     let mut assembler = MessageAssembler::new();
     let _ = assembler.apply(&ProviderEvent::Start);
@@ -1004,8 +1090,8 @@ async fn run_responses_stream(
         .apply(client.post(spec.endpoint()).bearer_auth(api_key))
         .send();
     let (response, request_sent_at) =
-        match await_request(request, &cancel, RESPONSE_HEADER_TIMEOUT, |_| {
-            tracing::info!(phase = "request_sent", "provider request sent")
+        match await_request(request, &cancel, RESPONSE_HEADER_TIMEOUT, |at| {
+            TtftObservation::observe_request_sent(&timing, at)
         })
         .await
         {
@@ -1081,7 +1167,7 @@ async fn run_responses_stream(
             }
         };
 
-    let mut ttft = TtftObservation::new(request_sent_at);
+    let mut ttft = TtftObservation::new(request_sent_at, timing);
     loop {
         match transport.next_event().await {
             Ok(Some(event)) => {
@@ -1219,6 +1305,7 @@ async fn run_chat_stream(
         normal: tx,
         priority_terminal: priority_terminal_tx,
         success_terminal_committed,
+        timing,
     } = channels;
     let output_tokens = match chat_requested_output_tokens(&spec, &options) {
         Ok(output_tokens) => output_tokens,
@@ -1343,8 +1430,8 @@ async fn run_chat_stream(
         .apply(client.post(spec.endpoint()).bearer_auth(api_key))
         .send();
     let (response, request_sent_at) =
-        match await_request(request, &cancel, RESPONSE_HEADER_TIMEOUT, |_| {
-            tracing::info!(phase = "request_sent", "provider request sent")
+        match await_request(request, &cancel, RESPONSE_HEADER_TIMEOUT, |at| {
+            TtftObservation::observe_request_sent(&timing, at)
         })
         .await
         {
@@ -1419,7 +1506,7 @@ async fn run_chat_stream(
             }
         };
 
-    let mut ttft = TtftObservation::new(request_sent_at);
+    let mut ttft = TtftObservation::new(request_sent_at, timing);
     loop {
         match transport.next_event().await {
             Ok(Some(event)) if event.data == "[DONE]" => {
@@ -2872,6 +2959,228 @@ fi
         received
     }
 
+    async fn replay_observed(
+        preset: &str,
+        route: &'static str,
+        body: &'static str,
+        context: PromptContext,
+    ) -> (Vec<ProviderEvent>, Vec<ProviderTimingObservation>) {
+        let app = Router::new().route(
+            route,
+            post(move || async move {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(body))
+                    .expect("response")
+            }),
+        );
+        let (base_url, server) = serve_router(app).await;
+        let mut spec = ModelSpec::preset(preset).expect("preset");
+        spec.base_url = base_url;
+        let (observer, mut observations) = timing_observation_channel();
+        let mut stream = stream_with_api_key_observed(
+            spec,
+            context,
+            RequestOptions::default(),
+            CancellationToken::new(),
+            Some("test-key".to_owned()),
+            Some(observer),
+        );
+        let mut events = Vec::new();
+        while let Some(event) = stream.recv().await {
+            events.push(event);
+        }
+        let mut timing = Vec::new();
+        while let Some(observation) = observations.recv().await {
+            timing.push(observation);
+        }
+        server.abort();
+        (events, timing)
+    }
+
+    #[tokio::test]
+    async fn timing_observations_are_ordered_once_for_all_protocols() {
+        for (preset, route, fixture, expected_delta) in [
+            (
+                "kimi-k3",
+                "/chat/completions",
+                include_str!("../../tests/fixtures/kimi_text.sse"),
+                "text",
+            ),
+            (
+                "openai-responses",
+                "/responses",
+                include_str!("../../tests/fixtures/openai_responses_official.sse"),
+                "text",
+            ),
+            (
+                "anthropic",
+                "/messages",
+                include_str!("../../tests/fixtures/anthropic_messages_official.sse"),
+                "thinking",
+            ),
+        ] {
+            let context = if preset == "anthropic" {
+                persisted_context(1)
+            } else {
+                empty_context()
+            };
+            let (events, observations) = replay_observed(preset, route, fixture, context).await;
+            assert!(
+                events.iter().any(|event| matches!(
+                    (expected_delta, event),
+                    ("text", ProviderEvent::TextDelta { .. })
+                        | ("thinking", ProviderEvent::ThinkingDelta { .. })
+                )),
+                "{preset} fixture must exercise {expected_delta}"
+            );
+            assert_eq!(observations.len(), 2, "{preset}");
+            let ProviderTimingObservation::RequestSent(request_sent) = observations[0] else {
+                panic!("{preset}: first observation was not request_sent")
+            };
+            let ProviderTimingObservation::FirstPublicDelta(first_delta) = observations[1] else {
+                panic!("{preset}: second observation was not first_public_delta")
+            };
+            assert!(first_delta >= request_sent, "{preset}");
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_only_stream_has_no_first_public_delta_observation() {
+        let context = PromptContext {
+            tools: vec![ToolDefinition {
+                name: "read_file".to_owned(),
+                description: String::new(),
+                parameters: serde_json::json!({
+                    "type":"object",
+                    "properties":{"path":{"type":"string"}},
+                    "required":["path"]
+                }),
+            }],
+            ..empty_context()
+        };
+        let (_, observations) = replay_observed(
+            "kimi-k3",
+            "/chat/completions",
+            include_str!("../../tests/fixtures/kimi_toolcall.sse"),
+            context,
+        )
+        .await;
+        assert!(matches!(
+            observations.as_slice(),
+            [ProviderTimingObservation::RequestSent(_)]
+        ));
+    }
+
+    #[tokio::test]
+    async fn preflight_failure_and_precancel_emit_no_timing_observations() {
+        let (observer, mut observations) = timing_observation_channel();
+        let mut invalid = stream_with_api_key_observed(
+            ModelSpec::preset("anthropic").expect("preset"),
+            empty_context(),
+            RequestOptions::default(),
+            CancellationToken::new(),
+            Some("test-key".to_owned()),
+            Some(observer),
+        );
+        while invalid.recv().await.is_some() {}
+        assert!(observations.recv().await.is_none());
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let (observer, mut observations) = timing_observation_channel();
+        let mut cancelled = stream_with_api_key_observed(
+            ModelSpec::preset("kimi-k3").expect("preset"),
+            empty_context(),
+            RequestOptions::default(),
+            cancel,
+            Some("test-key".to_owned()),
+            Some(observer),
+        );
+        while cancelled.recv().await.is_some() {}
+        assert!(observations.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn observed_and_unobserved_streams_emit_the_same_events() {
+        let fixture = include_str!("../../tests/fixtures/kimi_text.sse");
+        let expected = replay("kimi-k3", fixture).await;
+        let (actual, _) =
+            replay_observed("kimi-k3", "/chat/completions", fixture, empty_context()).await;
+        assert_eq!(
+            normalized_event_snapshot(&actual),
+            normalized_event_snapshot(&expected)
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_or_full_timing_observer_does_not_affect_provider_stream() {
+        for (observer, _keep_full_receiver_alive) in {
+            let (closed_sender, closed_receiver) = mpsc::channel(1);
+            drop(closed_receiver);
+
+            let (full_sender, full_receiver) = mpsc::channel(1);
+            full_sender
+                .try_send(ProviderTimingObservation::RequestSent(Instant::now()))
+                .expect("fill observer lane");
+            [
+                (
+                    ProviderTimingObserver {
+                        sender: closed_sender,
+                    },
+                    None,
+                ),
+                (
+                    ProviderTimingObserver {
+                        sender: full_sender,
+                    },
+                    Some(full_receiver),
+                ),
+            ]
+        } {
+            let fixture = include_str!("../../tests/fixtures/kimi_text.sse");
+            let app = Router::new().route(
+                "/chat/completions",
+                post(move || async move {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(fixture))
+                        .expect("response")
+                }),
+            );
+            let (base_url, server) = serve_router(app).await;
+            let mut spec = ModelSpec::preset("kimi-k3").expect("preset");
+            spec.base_url = base_url;
+            let mut stream = stream_with_api_key_observed(
+                spec,
+                empty_context(),
+                RequestOptions::default(),
+                CancellationToken::new(),
+                Some("test-key".to_owned()),
+                Some(observer),
+            );
+            let terminal = tokio::time::timeout(Duration::from_secs(1), async {
+                let mut terminal = None;
+                while let Some(event) = stream.recv().await {
+                    if matches!(
+                        event,
+                        ProviderEvent::Done { .. } | ProviderEvent::Error { .. }
+                    ) {
+                        terminal = Some(event);
+                    }
+                }
+                terminal
+            })
+            .await
+            .expect("timing observer must not block provider")
+            .expect("terminal event");
+            assert!(matches!(terminal, ProviderEvent::Done { .. }));
+            server.abort();
+        }
+    }
+
     fn normalized_event_snapshot(events: &[ProviderEvent]) -> serde_json::Value {
         fn normalize(value: &mut serde_json::Value) {
             match value {
@@ -3242,7 +3551,7 @@ fi
         let result = emit(&tx, &mut assembler, delta, &cancel).await;
         assert!(matches!(result, EmitResult::Cancelled));
 
-        let mut ttft = TtftObservation::new(Instant::now());
+        let mut ttft = TtftObservation::new(Instant::now(), None);
         ttft.observe_emit(true, &result);
         assert!(!ttft.first_public_delta_sent);
 
