@@ -41,6 +41,16 @@ impl<T> MessageQueue<T> {
         Ok(())
     }
 
+    pub(crate) fn push_front(&mut self, value: T) -> Result<(), QueueFull> {
+        if self.entries.len() == self.capacity {
+            return Err(QueueFull {
+                capacity: self.capacity,
+            });
+        }
+        self.entries.push_front(value);
+        Ok(())
+    }
+
     pub(crate) fn pop_one(&mut self) -> Option<T> {
         self.entries.pop_front()
     }

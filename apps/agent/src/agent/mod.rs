@@ -13,6 +13,7 @@ use std::{
 };
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot},
@@ -25,6 +26,7 @@ use crate::{
         Command, CommandAckStatus, CommandEnvelope, Gateway, GatewayClosed, InboundCommand,
         OutboundFrame,
     },
+    provider::{overflow::OverflowSource, types::PublicMessage},
     store::{
         DataKeyPurpose, EventWriter, InboundAdmission, InboundReceiptOrigin,
         RecoveryRequired as AdmissionRecoveryRequired, RecoveryStep, Store, SuffixRecovery,
@@ -34,6 +36,7 @@ use crate::{
 mod events;
 mod provider_projection;
 mod queue;
+mod run;
 
 use queue::MessageQueue;
 
@@ -44,10 +47,19 @@ pub(crate) use events::{
 pub(crate) use provider_projection::{
     ProjectedProviderEvent, ProviderEventProjector, ProviderTerminal, ProviderTerminalKind,
 };
+#[allow(
+    unused_imports,
+    reason = "production provider/executor wiring lands in the final T15 integration slice"
+)]
+pub(crate) use run::{
+    OverflowRecoveryOutcome, OverflowRecoveryRequest, ProviderAttempt, RunDriver,
+    SequentialRunWorker,
+};
 
 const CONTROL_CHANNEL_CAPACITY: usize = 32;
 const EVENT_CHANNEL_CAPACITY: usize = 64;
-const FOLLOWUP_QUEUE_CAPACITY: usize = 32;
+/// API admission permits 32 ordinary commands plus one reserved Abort.
+const PENDING_CONTROL_CAPACITY: usize = 33;
 
 type WorkerFuture = Pin<Box<dyn Future<Output = RunCompletion> + Send + 'static>>;
 
@@ -57,7 +69,12 @@ type WorkerFuture = Pin<Box<dyn Future<Output = RunCompletion> + Send + 'static>
 pub(crate) struct RunCore {
     ownership_id: Uuid,
     mutation_epoch: u64,
-    ordinary_followups: MessageQueue<CommandEnvelope>,
+    pending_controls: MessageQueue<AdmittedCommand>,
+    pending_overflow_apply: Option<OverflowSource>,
+    /// In-memory send context returned with the unique core. T17 replaces this
+    /// flat representation with `ThreeLayerMemory`; keeping it in `RunCore`
+    /// prevents a second Session run from silently losing the first run.
+    runtime_context: Vec<PublicMessage>,
 }
 
 impl RunCore {
@@ -65,7 +82,9 @@ impl RunCore {
         Self {
             ownership_id: Uuid::now_v7(),
             mutation_epoch: 0,
-            ordinary_followups: MessageQueue::bounded(FOLLOWUP_QUEUE_CAPACITY),
+            pending_controls: MessageQueue::bounded(PENDING_CONTROL_CAPACITY),
+            pending_overflow_apply: None,
+            runtime_context: Vec::new(),
         }
     }
 
@@ -81,13 +100,26 @@ impl RunCore {
         self.mutation_epoch = self.mutation_epoch.saturating_add(1);
     }
 
-    pub(crate) fn queue_followup(&mut self, command: CommandEnvelope) -> Result<()> {
-        self.ordinary_followups.push(command)?;
+    pub(crate) fn queue_followup(&mut self, command: AdmittedCommand) -> Result<()> {
+        self.pending_controls.push(command)?;
         Ok(())
     }
 
-    pub(crate) fn next_followup(&mut self) -> Option<CommandEnvelope> {
-        self.ordinary_followups.pop_one()
+    pub(crate) fn next_followup(&mut self) -> Option<AdmittedCommand> {
+        self.pending_controls.pop_one()
+    }
+
+    pub(crate) fn requeue_followup_front(&mut self, command: AdmittedCommand) -> Result<()> {
+        self.pending_controls.push_front(command)?;
+        Ok(())
+    }
+
+    pub(crate) fn defer_overflow_apply(&mut self, source: OverflowSource) {
+        self.pending_overflow_apply.get_or_insert(source);
+    }
+
+    pub(crate) fn pending_overflow_apply(&self) -> Option<OverflowSource> {
+        self.pending_overflow_apply
     }
 }
 
@@ -97,8 +129,31 @@ impl Default for RunCore {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct AdmittedCommand {
+    envelope: CommandEnvelope,
+    received_at: DateTime<Utc>,
+}
+
+impl AdmittedCommand {
+    pub(crate) fn new(envelope: CommandEnvelope, received_at: DateTime<Utc>) -> Self {
+        Self {
+            envelope,
+            received_at,
+        }
+    }
+
+    pub(crate) fn envelope(&self) -> &CommandEnvelope {
+        &self.envelope
+    }
+
+    pub(crate) fn received_at(&self) -> DateTime<Utc> {
+        self.received_at
+    }
+}
+
 pub(crate) enum RunControl {
-    Command(CommandEnvelope),
+    Command(AdmittedCommand),
 }
 
 pub(crate) enum RunCompletion {
@@ -123,7 +178,7 @@ pub(crate) trait RunWorker: Send + Sync + 'static {
     fn run(
         &self,
         core: RunCore,
-        initial: CommandEnvelope,
+        initial: AdmittedCommand,
         controls: mpsc::Receiver<RunControl>,
         events: mpsc::Sender<AgentEvent>,
     ) -> WorkerFuture;
@@ -131,7 +186,7 @@ pub(crate) trait RunWorker: Send + Sync + 'static {
 
 impl<F, Fut> RunWorker for F
 where
-    F: Fn(RunCore, CommandEnvelope, mpsc::Receiver<RunControl>, mpsc::Sender<AgentEvent>) -> Fut
+    F: Fn(RunCore, AdmittedCommand, mpsc::Receiver<RunControl>, mpsc::Sender<AgentEvent>) -> Fut
         + Send
         + Sync
         + 'static,
@@ -140,7 +195,7 @@ where
     fn run(
         &self,
         core: RunCore,
-        initial: CommandEnvelope,
+        initial: AdmittedCommand,
         controls: mpsc::Receiver<RunControl>,
         events: mpsc::Sender<AgentEvent>,
     ) -> WorkerFuture {
@@ -325,11 +380,13 @@ impl<G: Gateway + 'static> Session<G> {
             Err(error) => return Err(error.into()),
         };
         let ack = receipt.ack;
+        let receipt_origin = receipt.origin;
+        let received_at = receipt.received_at;
         self.gateway
             .send(OutboundFrame::CommandAck { ack: ack.clone() })
             .await
             .map_err(|error| gateway_failure("send", error))?;
-        if receipt.origin == InboundReceiptOrigin::Replay {
+        if receipt_origin == InboundReceiptOrigin::Replay {
             return Ok(());
         }
         if ack.status != CommandAckStatus::Received
@@ -345,6 +402,7 @@ impl<G: Gateway + 'static> Session<G> {
         let InboundCommand::Valid(command) = inbound else {
             unreachable!("invalid commands return above");
         };
+        let command = AdmittedCommand::new(command, received_at);
         if let Some(active) = self.active.as_mut() {
             if let Err(error) = active.control_tx.send(RunControl::Command(command)).await {
                 let RunControl::Command(command) = error.0;
@@ -356,11 +414,14 @@ impl<G: Gateway + 'static> Session<G> {
         self.route_idle(command).await
     }
 
-    async fn route_idle(&mut self, command: CommandEnvelope) -> Result<(), SessionFailure> {
-        if matches!(command.command, Command::Abort {}) {
+    async fn route_idle(&mut self, command: AdmittedCommand) -> Result<(), SessionFailure> {
+        if matches!(command.envelope().command, Command::Abort {}) {
             let mut terminal = self
                 .writer
-                .apply_idle_abort_cutoff(command.command_id.as_str(), command.seq)
+                .apply_idle_abort_cutoff(
+                    command.envelope().command_id.as_str(),
+                    command.envelope().seq,
+                )
                 .await?;
             for ack in terminal.drain(..) {
                 self.gateway
@@ -370,7 +431,7 @@ impl<G: Gateway + 'static> Session<G> {
             }
             return Ok(());
         }
-        if !matches!(command.command, Command::UserMessage { .. }) {
+        if !matches!(command.envelope().command, Command::UserMessage { .. }) {
             return Err(SessionFailure::IdleControl);
         }
         self.spawn_worker(command)
@@ -442,7 +503,7 @@ impl<G: Gateway + 'static> Session<G> {
         }
     }
 
-    fn spawn_worker(&mut self, initial: CommandEnvelope) -> Result<(), SessionFailure> {
+    fn spawn_worker(&mut self, initial: AdmittedCommand) -> Result<(), SessionFailure> {
         let core = self
             .core
             .take()

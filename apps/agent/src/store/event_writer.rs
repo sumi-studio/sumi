@@ -1037,6 +1037,7 @@ pub(crate) enum InboundReceiptOrigin {
 pub(crate) struct InboundReceipt {
     pub(crate) ack: CommandAck,
     pub(crate) origin: InboundReceiptOrigin,
+    pub(crate) received_at: DateTime<Utc>,
 }
 
 impl InboundAdmission {
@@ -1245,9 +1246,11 @@ impl EventWriter {
             )
             .await?
         {
+            let received_at = self.received_at_for_command(command_id).await?;
             return Ok(InboundReceipt {
                 ack,
                 origin: InboundReceiptOrigin::Replay,
+                received_at,
             });
         }
         if admission == InboundAdmissionMode::ReplayOnly {
@@ -1292,9 +1295,11 @@ impl EventWriter {
             .ack_for_command(command_id)
             .await?
             .ok_or_else(|| anyhow!("committed command row is missing"))?;
+        let received_at = self.received_at_for_command(command_id).await?;
         Ok(InboundReceipt {
             ack,
             origin: InboundReceiptOrigin::NewlyPersisted,
+            received_at,
         })
     }
 
@@ -2406,6 +2411,18 @@ impl EventWriter {
             status,
             reject_reason: row.try_get("reject_reason")?,
         }))
+    }
+
+    async fn received_at_for_command(&self, command_id: &str) -> Result<DateTime<Utc>> {
+        let value: String =
+            sqlx::query_scalar("SELECT received_at FROM inbound_commands WHERE command_id = ?")
+                .bind(command_id)
+                .fetch_optional(self.store.pool())
+                .await?
+                .ok_or_else(|| anyhow!("committed command row is missing"))?;
+        DateTime::parse_from_rfc3339(&value)
+            .map(|timestamp| timestamp.with_timezone(&Utc))
+            .map_err(|error| anyhow!("persisted command received_at is invalid: {error}"))
     }
 }
 
@@ -8167,6 +8184,38 @@ mod tests {
         tokio::fs::remove_dir_all(root)
             .await
             .expect("remove timestamp fixture");
+    }
+
+    #[tokio::test]
+    async fn inbound_receipt_replays_the_exact_persisted_received_at() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        writer
+            .initialize_recovery_checkpoint()
+            .await
+            .expect("checkpoint");
+        let command = user_command(1, "00000000-0000-4000-8000-000000000001", "timestamped");
+        let mut admission = InboundAdmission::after_t12_recovery(false);
+        let first = admission
+            .receive_with_origin(&writer, &command)
+            .await
+            .expect("fresh receipt");
+        let replay = admission
+            .receive_with_origin(&writer, &command)
+            .await
+            .expect("replayed receipt");
+        let durable: String =
+            sqlx::query_scalar("SELECT received_at FROM inbound_commands WHERE command_id = ?")
+                .bind("00000000-0000-4000-8000-000000000001")
+                .fetch_one(store.pool())
+                .await
+                .expect("durable timestamp");
+        let durable = DateTime::parse_from_rfc3339(&durable)
+            .expect("valid durable timestamp")
+            .with_timezone(&Utc);
+        assert_eq!(first.received_at, durable);
+        assert_eq!(replay.received_at, durable);
+        assert_eq!(first.received_at, replay.received_at);
     }
 
     #[tokio::test]
