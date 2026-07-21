@@ -1028,6 +1028,17 @@ pub(crate) struct InboundAdmission {
     mode: InboundAdmissionMode,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InboundReceiptOrigin {
+    NewlyPersisted,
+    Replay,
+}
+
+pub(crate) struct InboundReceipt {
+    pub(crate) ack: CommandAck,
+    pub(crate) origin: InboundReceiptOrigin,
+}
+
 impl InboundAdmission {
     pub(crate) fn after_t12_recovery(has_pending_suffix: bool) -> Self {
         Self {
@@ -1054,6 +1065,14 @@ impl InboundAdmission {
         writer: &EventWriter,
         inbound: &InboundCommand,
     ) -> Result<CommandAck> {
+        Ok(self.receive_with_origin(writer, inbound).await?.ack)
+    }
+
+    pub(crate) async fn receive_with_origin(
+        &mut self,
+        writer: &EventWriter,
+        inbound: &InboundCommand,
+    ) -> Result<InboundReceipt> {
         writer
             .persist_inbound_with_admission(inbound, self.mode)
             .await
@@ -1142,15 +1161,17 @@ impl EventWriter {
 
     #[cfg(test)]
     pub(crate) async fn persist_inbound(&self, inbound: &InboundCommand) -> Result<CommandAck> {
-        self.persist_inbound_with_admission(inbound, InboundAdmissionMode::UnboundedTestFixture)
-            .await
+        Ok(self
+            .persist_inbound_with_admission(inbound, InboundAdmissionMode::UnboundedTestFixture)
+            .await?
+            .ack)
     }
 
     async fn persist_inbound_with_admission(
         &self,
         inbound: &InboundCommand,
         admission: InboundAdmissionMode,
-    ) -> Result<CommandAck> {
+    ) -> Result<InboundReceipt> {
         let mut guard = self.gate.lock().await;
         if let InboundCommand::Invalid {
             reason,
@@ -1224,7 +1245,10 @@ impl EventWriter {
             )
             .await?
         {
-            return Ok(ack);
+            return Ok(InboundReceipt {
+                ack,
+                origin: InboundReceiptOrigin::Replay,
+            });
         }
         if admission == InboundAdmissionMode::ReplayOnly {
             return Err(RecoveryRequired.into());
@@ -1264,9 +1288,14 @@ impl EventWriter {
             &mut guard,
         )
         .await?;
-        self.ack_for_command(command_id)
+        let ack = self
+            .ack_for_command(command_id)
             .await?
-            .ok_or_else(|| anyhow!("committed command row is missing"))
+            .ok_or_else(|| anyhow!("committed command row is missing"))?;
+        Ok(InboundReceipt {
+            ack,
+            origin: InboundReceiptOrigin::NewlyPersisted,
+        })
     }
 
     async fn validate_live_admission(

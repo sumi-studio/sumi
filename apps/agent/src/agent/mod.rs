@@ -26,7 +26,7 @@ use crate::{
         OutboundFrame,
     },
     store::{
-        DataKeyPurpose, EventWriter, InboundAdmission,
+        DataKeyPurpose, EventWriter, InboundAdmission, InboundReceiptOrigin,
         RecoveryRequired as AdmissionRecoveryRequired, RecoveryStep, Store, SuffixRecovery,
     },
 };
@@ -311,8 +311,12 @@ impl<G: Gateway + 'static> Session<G> {
     }
 
     async fn admit_and_route(&mut self, inbound: InboundCommand) -> Result<(), SessionFailure> {
-        let ack = match self.admission.receive(&self.writer, &inbound).await {
-            Ok(ack) => ack,
+        let receipt = match self
+            .admission
+            .receive_with_origin(&self.writer, &inbound)
+            .await
+        {
+            Ok(receipt) => receipt,
             Err(error) if error.downcast_ref::<AdmissionRecoveryRequired>().is_some() => {
                 return Err(SessionFailure::RecoveryRequired {
                     steps: self.recovery_steps.clone(),
@@ -320,10 +324,14 @@ impl<G: Gateway + 'static> Session<G> {
             }
             Err(error) => return Err(error.into()),
         };
+        let ack = receipt.ack;
         self.gateway
             .send(OutboundFrame::CommandAck { ack: ack.clone() })
             .await
             .map_err(|error| gateway_failure("send", error))?;
+        if receipt.origin == InboundReceiptOrigin::Replay {
+            return Ok(());
+        }
         if ack.status != CommandAckStatus::Received
             || matches!(inbound, InboundCommand::Invalid { .. })
         {

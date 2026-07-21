@@ -159,6 +159,115 @@ async fn session_with_core(
     .expect("session startup")
 }
 
+async fn finish_active(session: &mut Session<MockGateway>) {
+    let completion = {
+        let active = session.active.as_mut().expect("active worker");
+        (&mut active.completion_rx).await
+    };
+    session
+        .finish_run(completion)
+        .await
+        .expect("worker completion");
+}
+
+#[tokio::test]
+async fn active_received_replay_acks_without_duplicate_control_delivery() {
+    let (gateway, _commands, frames) = gateway();
+    let starts = Arc::new(AtomicUsize::new(0));
+    let (release_tx, release_rx) = oneshot::channel();
+    let release = Arc::new(Mutex::new(Some(release_rx)));
+    let worker: Arc<dyn RunWorker> = Arc::new({
+        let starts = starts.clone();
+        move |core: RunCore,
+              _initial: CommandEnvelope,
+              mut controls: mpsc::Receiver<RunControl>,
+              events: mpsc::Sender<AgentEvent>| {
+            starts.fetch_add(1, Ordering::SeqCst);
+            let release = release
+                .lock()
+                .expect("release mutex")
+                .take()
+                .expect("single worker");
+            async move {
+                let _events = events;
+                release.await.expect("release worker");
+                controls.close();
+                RunCompletion::Completed(core)
+            }
+        }
+    });
+    let mut session = session(gateway, worker).await;
+
+    session
+        .admit_and_route(user(1))
+        .await
+        .expect("fresh receipt");
+    assert_eq!(
+        session
+            .active
+            .as_ref()
+            .expect("active worker")
+            .control_tx
+            .capacity(),
+        CONTROL_CHANNEL_CAPACITY
+    );
+    session
+        .admit_and_route(user(1))
+        .await
+        .expect("exact replay");
+
+    assert_eq!(received_acks(&frames).len(), 2, "fresh and stored ACK");
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        session
+            .active
+            .as_ref()
+            .expect("same active worker")
+            .control_tx
+            .capacity(),
+        CONTROL_CHANNEL_CAPACITY,
+        "replay must not occupy a control channel slot"
+    );
+    release_tx.send(()).expect("release worker");
+    finish_active(&mut session).await;
+}
+
+#[tokio::test]
+async fn idle_received_replay_acks_without_spawning_a_second_worker() {
+    let (gateway, _commands, frames) = gateway();
+    let starts = Arc::new(AtomicUsize::new(0));
+    let worker: Arc<dyn RunWorker> = Arc::new({
+        let starts = starts.clone();
+        move |core: RunCore,
+              _initial: CommandEnvelope,
+              mut controls: mpsc::Receiver<RunControl>,
+              events: mpsc::Sender<AgentEvent>| {
+            starts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                let _events = events;
+                controls.close();
+                RunCompletion::Completed(core)
+            }
+        }
+    });
+    let mut session = session(gateway, worker).await;
+
+    session
+        .admit_and_route(user(1))
+        .await
+        .expect("fresh receipt");
+    finish_active(&mut session).await;
+    assert!(session.active.is_none());
+    session
+        .admit_and_route(user(1))
+        .await
+        .expect("idle exact replay");
+
+    assert_eq!(received_acks(&frames).len(), 2, "fresh and stored ACK");
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    assert!(session.active.is_none(), "replay must not spawn a worker");
+}
+
 #[tokio::test]
 async fn pending_worker_does_not_block_next_durable_received_ack() {
     let (gateway, commands, frames) = gateway();
