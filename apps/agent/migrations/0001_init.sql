@@ -247,11 +247,12 @@ CREATE TABLE tool_executions (
   error_code TEXT CHECK (
     error_code IS NULL
     OR error_code IN (
-      'executor_failed', 'cancelled', 'indeterminate', 'invalid_result', 'internal'
+      'executor_failed', 'cancelled', 'indeterminate', 'invalid_result', 'internal',
+      'length_guard'
     )
   ),
   CHECK (
-    state IN ('prepared', 'running', 'succeeded', 'failed', 'cancelled', 'indeterminate')
+    state IN ('prepared', 'running', 'succeeded', 'failed', 'cancelled', 'indeterminate', 'not_started')
   ),
   CHECK (
     (state = 'prepared' AND started_at IS NULL AND finished_at IS NULL)
@@ -263,11 +264,15 @@ CREATE TABLE tool_executions (
       AND finished_at IS NOT NULL)
     OR
     (state = 'cancelled' AND finished_at IS NOT NULL)
+    OR
+    (state = 'not_started' AND started_at IS NULL AND finished_at IS NOT NULL)
   ),
   CHECK (
     (state IN ('prepared', 'running', 'succeeded') AND error_code IS NULL)
     OR
     (state IN ('failed', 'cancelled', 'indeterminate') AND error_code IS NOT NULL)
+    OR
+    (state = 'not_started' AND error_code = 'length_guard')
   )
 );
 

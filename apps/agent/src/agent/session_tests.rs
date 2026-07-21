@@ -13,7 +13,12 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use super::*;
 use crate::{
     gateway::{CommandAck, CommandId},
-    store::Store,
+    provider::types::{
+        ApiProtocol, ProviderOrigin, PublicAssistantContent, PublicAssistantMessage, PublicMessage,
+        StopReason, ToolCall, ToolResultMessage, Usage, UserContent, UserMessage,
+        ValidatedToolArguments,
+    },
+    store::{Store, user_message_id},
 };
 
 struct MockGateway {
@@ -122,6 +127,31 @@ fn user(seq: u64) -> InboundCommand {
             attachments: Vec::new(),
         },
     })
+}
+
+async fn emit_idle_injection(events: &mpsc::Sender<AgentEvent>, initial: &AdmittedCommand) {
+    let Command::UserMessage { text, .. } = &initial.envelope().command else {
+        panic!("idle fixture requires user command")
+    };
+    let message = PublicMessage::User(UserMessage {
+        content: vec![UserContent::Text { text: text.clone() }],
+        timestamp: initial.received_at(),
+    });
+    let message_id = user_message_id(&initial.envelope().command_id);
+    for event in [
+        AgentEvent::AgentStart,
+        AgentEvent::TurnStart,
+        AgentEvent::MessageStart {
+            message_id: message_id.clone(),
+            message: Box::new(message.clone()),
+        },
+        AgentEvent::MessageEnd {
+            message_id,
+            message: Box::new(message),
+        },
+    ] {
+        events.send(event).await.expect("event receiver");
+    }
 }
 
 fn received_acks(frames: &Arc<Mutex<Vec<OutboundFrame>>>) -> Vec<CommandAck> {
@@ -408,14 +438,12 @@ async fn ready_completion_event_and_next_command_all_progress_with_one_core() {
     assert_eq!(ids[0], ids[1], "the same non-cloned RunCore moved twice");
     assert_eq!(received_acks(&frames).len(), 2);
     assert!(
-        frames
+        !frames
             .lock()
             .expect("frame mutex")
             .iter()
-            .any(|frame| matches!(
-                frame,
-                OutboundFrame::Event { envelope } if envelope.event["type"] == "agent_start"
-            ))
+            .any(|frame| { matches!(frame, OutboundFrame::Event { .. }) }),
+        "an incomplete startup must not publish a partial AgentStart"
     );
 }
 
@@ -528,7 +556,7 @@ async fn active_gateway_send_failure_aborts_and_awaits_worker() {
         let running = running.clone();
         let emit = emit.clone();
         move |_core: RunCore,
-              _initial: AdmittedCommand,
+              initial: AdmittedCommand,
               _controls: mpsc::Receiver<RunControl>,
               events: mpsc::Sender<AgentEvent>| {
             let running = running.clone();
@@ -539,10 +567,7 @@ async fn active_gateway_send_failure_aborts_and_awaits_worker() {
                 let _guard = RunningGuard(running);
                 started_tx.send(()).await.expect("start observer");
                 emit.notified().await;
-                events
-                    .send(AgentEvent::AgentStart)
-                    .await
-                    .expect("event receiver");
+                emit_idle_injection(&events, &initial).await;
                 pending::<RunCompletion>().await
             }
         }
@@ -583,7 +608,7 @@ async fn event_drain_send_failure_preserves_ready_completion_core() {
     let worker: Arc<dyn RunWorker> = Arc::new({
         let release = release.clone();
         move |core: RunCore,
-              _initial: AdmittedCommand,
+              initial: AdmittedCommand,
               mut controls: mpsc::Receiver<RunControl>,
               events: mpsc::Sender<AgentEvent>| {
             let release = release.clone();
@@ -591,9 +616,7 @@ async fn event_drain_send_failure_preserves_ready_completion_core() {
             async move {
                 started_tx.send(()).await.expect("start observer");
                 release.notified().await;
-                events
-                    .try_send(AgentEvent::AgentStart)
-                    .expect("event capacity");
+                emit_idle_injection(&events, &initial).await;
                 controls.close();
                 RunCompletion::Completed(core)
             }
@@ -787,4 +810,598 @@ async fn pending_t15_suffix_allows_only_t12_exact_retransmission() {
     // A fresh identity is rejected by InboundAdmission before CommandReceived;
     // this is separately frozen by the T12 admission tests. This actor test
     // proves the Session never resumes the gate for its T15-owned suffix.
+}
+
+struct CommitCheckingGateway {
+    commands: mpsc::Receiver<InboundCommand>,
+    pool: sqlx::SqlitePool,
+    observed: Arc<Mutex<Vec<(u64, String)>>>,
+}
+
+#[async_trait]
+impl Gateway for CommitCheckingGateway {
+    async fn next_command(&mut self) -> Result<InboundCommand> {
+        self.commands
+            .recv()
+            .await
+            .ok_or_else(|| GatewayClosed.into())
+    }
+
+    async fn send(&mut self, frame: OutboundFrame) -> Result<()> {
+        if let OutboundFrame::Event { envelope } = frame {
+            let seq = envelope
+                .seq
+                .ok_or_else(|| anyhow!("durable fixture event lost seq"))?;
+            let kind: String =
+                sqlx::query_scalar("SELECT event_type FROM agent_events WHERE seq = ?")
+                    .bind(i64::try_from(seq)?)
+                    .fetch_one(&self.pool)
+                    .await?;
+            self.observed
+                .lock()
+                .expect("observed mutex")
+                .push((seq, kind));
+        }
+        Ok(())
+    }
+}
+
+fn bridge_assistant(reason: StopReason) -> PublicMessage {
+    PublicMessage::Assistant(PublicAssistantMessage {
+        content: Vec::new(),
+        model: "bridge-model".to_owned(),
+        provider: "fixture".to_owned(),
+        origin: ProviderOrigin {
+            provider_instance_id: "bridge-fixture".to_owned(),
+            protocol: ApiProtocol::OpenAiChatCompletions,
+            model: "bridge-model".to_owned(),
+        },
+        usage: Usage::default(),
+        stop_reason: reason,
+        error_message: None,
+        provider_code: None,
+        interrupted: false,
+        timestamp: Utc::now(),
+    })
+}
+
+#[tokio::test]
+async fn durable_bridge_commits_each_event_before_gateway_delivery_with_exact_seq() {
+    let store = Store::session_test_store("durable-bridge-session")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (commands_tx, commands) = mpsc::channel(2);
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let gateway = CommitCheckingGateway {
+        commands,
+        pool: pool.clone(),
+        observed: observed.clone(),
+    };
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |core: RunCore,
+         initial: AdmittedCommand,
+         _controls: mpsc::Receiver<RunControl>,
+         events: mpsc::Sender<AgentEvent>| async move {
+            let user = PublicMessage::User(UserMessage {
+                content: vec![UserContent::Text {
+                    text: "message 1".to_owned(),
+                }],
+                timestamp: initial.received_at(),
+            });
+            let assistant = bridge_assistant(StopReason::Stop);
+            for event in [
+                AgentEvent::AgentStart,
+                AgentEvent::TurnStart,
+                AgentEvent::MessageStart {
+                    message_id: user_message_id(&initial.envelope().command_id),
+                    message: Box::new(user.clone()),
+                },
+                AgentEvent::MessageEnd {
+                    message_id: user_message_id(&initial.envelope().command_id),
+                    message: Box::new(user),
+                },
+                AgentEvent::MessageStart {
+                    message_id: "assistant-bridge".to_owned(),
+                    message: Box::new(bridge_assistant(StopReason::Stop)),
+                },
+                AgentEvent::MessageEnd {
+                    message_id: "assistant-bridge".to_owned(),
+                    message: Box::new(assistant.clone()),
+                },
+                AgentEvent::TurnEnd {
+                    message: Some(Box::new(assistant)),
+                    tool_results: Vec::new(),
+                },
+                AgentEvent::AgentEnd,
+            ] {
+                events.send(event).await.expect("session event receiver");
+            }
+            RunCompletion::Completed(core)
+        },
+    );
+    let session = Session::start(store, gateway, RunCore::new(), worker)
+        .await
+        .expect("session");
+    let task = tokio::spawn(session.run());
+    commands_tx.send(user(1)).await.expect("command");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if observed.lock().expect("observed mutex").len() == 8 {
+                break;
+            }
+            if task.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all durable frames");
+    drop(commands_tx);
+    completed(task.await.expect("session join"));
+
+    let observed = observed.lock().expect("observed mutex").clone();
+    assert_eq!(observed.len(), 8);
+    assert!(observed.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+        .fetch_one(&pool)
+        .await
+        .expect("stored events");
+    assert_eq!(stored, 8);
+    let projected: String = sqlx::query_scalar(
+        "SELECT json_extract(payload, '$.stop_reason') FROM messages WHERE id='assistant-bridge'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("assistant projection");
+    assert_eq!(projected, "stop");
+}
+
+#[tokio::test]
+async fn first_length_tool_call_is_durably_not_started_without_public_execution_lifecycle() {
+    let store = Store::session_test_store("durable-length-session")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (gateway, commands, frames) = gateway();
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |core: RunCore,
+         initial: AdmittedCommand,
+         _controls: mpsc::Receiver<RunControl>,
+         events: mpsc::Sender<AgentEvent>| async move {
+            let user = PublicMessage::User(UserMessage {
+                content: vec![UserContent::Text {
+                    text: "message 1".to_owned(),
+                }],
+                timestamp: initial.received_at(),
+            });
+            let call = ToolCall {
+                id: "length-call".to_owned(),
+                name: "fixture-tool".to_owned(),
+                arguments: serde_json::from_value::<ValidatedToolArguments>(
+                    serde_json::json!({"safe":true}),
+                )
+                .expect("validated arguments"),
+            };
+            let mut length = match bridge_assistant(StopReason::Length) {
+                PublicMessage::Assistant(message) => message,
+                _ => unreachable!(),
+            };
+            length.content.push(PublicAssistantContent::ToolCall {
+                tool_call: call.clone(),
+                wire_item_index: 0,
+            });
+            let length = PublicMessage::Assistant(length);
+            let result = ToolResultMessage {
+                tool_call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                content: vec![UserContent::Text {
+                    text: "Tool call was not executed: output token limit".to_owned(),
+                }],
+                details: serde_json::json!({"error":"output token limit"}),
+                is_error: true,
+                timestamp: Utc::now(),
+            };
+            let result_message = PublicMessage::ToolResult(result.clone());
+            let result_id = "length-result".to_owned();
+            for event in [
+                AgentEvent::AgentStart,
+                AgentEvent::TurnStart,
+                AgentEvent::MessageStart {
+                    message_id: user_message_id(&initial.envelope().command_id),
+                    message: Box::new(user.clone()),
+                },
+                AgentEvent::MessageEnd {
+                    message_id: user_message_id(&initial.envelope().command_id),
+                    message: Box::new(user),
+                },
+                AgentEvent::MessageStart {
+                    message_id: "length-assistant".to_owned(),
+                    message: Box::new(bridge_assistant(StopReason::Stop)),
+                },
+                AgentEvent::MessageEnd {
+                    message_id: "length-assistant".to_owned(),
+                    message: Box::new(length.clone()),
+                },
+                AgentEvent::MessageStart {
+                    message_id: result_id.clone(),
+                    message: Box::new(result_message.clone()),
+                },
+                AgentEvent::MessageEnd {
+                    message_id: result_id,
+                    message: Box::new(result_message),
+                },
+                AgentEvent::TurnEnd {
+                    message: Some(Box::new(length)),
+                    tool_results: vec![result],
+                },
+                AgentEvent::AgentEnd,
+            ] {
+                events.send(event).await.expect("session event receiver");
+            }
+            RunCompletion::Completed(core)
+        },
+    );
+    let session = Session::start(store, gateway, RunCore::new(), worker)
+        .await
+        .expect("session");
+    let task = tokio::spawn(session.run());
+    commands.send(user(1)).await.expect("command");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if frames.lock().expect("frame mutex").iter().any(|frame| {
+                matches!(frame, OutboundFrame::Event { envelope }
+                    if envelope.event["type"] == "agent_end")
+            }) {
+                break;
+            }
+            if task.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal frame");
+    drop(commands);
+    completed(task.await.expect("session join"));
+
+    let rows: Vec<(String, String, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT tool_call_id, state, started_at, error_code FROM tool_executions")
+            .fetch_all(&pool)
+            .await
+            .expect("not-started audit row");
+    assert_eq!(
+        rows,
+        vec![(
+            "length-call".to_owned(),
+            "not_started".to_owned(),
+            None,
+            Some("length_guard".to_owned()),
+        )]
+    );
+    assert!(!frames.lock().expect("frame mutex").iter().any(|frame| {
+        matches!(frame, OutboundFrame::Event { envelope }
+            if matches!(envelope.event["type"].as_str(),
+                Some("tool_execution_start" | "tool_execution_end")))
+    }));
+}
+
+#[tokio::test]
+async fn failed_idle_injection_batch_publishes_no_partial_event_frame() {
+    let store = Store::session_test_store("durable-rollback-session")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (gateway, commands, frames) = gateway();
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |core: RunCore,
+         initial: AdmittedCommand,
+         _controls: mpsc::Receiver<RunControl>,
+         events: mpsc::Sender<AgentEvent>| async move {
+            let invalid = PublicMessage::User(UserMessage {
+                content: vec![UserContent::Text {
+                    text: "message 1".to_owned(),
+                }],
+                // Exact start/end, but deliberately not the durable receipt timestamp.
+                timestamp: initial.received_at() + chrono::Duration::seconds(1),
+            });
+            for event in [
+                AgentEvent::AgentStart,
+                AgentEvent::TurnStart,
+                AgentEvent::MessageStart {
+                    message_id: user_message_id(&initial.envelope().command_id),
+                    message: Box::new(invalid.clone()),
+                },
+                AgentEvent::MessageEnd {
+                    message_id: user_message_id(&initial.envelope().command_id),
+                    message: Box::new(invalid),
+                },
+            ] {
+                events.send(event).await.expect("session event receiver");
+            }
+            RunCompletion::Completed(core)
+        },
+    );
+    let session = Session::start(store, gateway, RunCore::new(), worker)
+        .await
+        .expect("session");
+    let task = tokio::spawn(session.run());
+    commands.send(user(1)).await.expect("command");
+    let (failure, ownership) = failed(task.await.expect("session join"));
+    assert!(matches!(failure, SessionFailure::Other(_)));
+    assert!(matches!(ownership, RunOwnership::Recovered(_)));
+    assert!(
+        !frames
+            .lock()
+            .expect("frame mutex")
+            .iter()
+            .any(|frame| { matches!(frame, OutboundFrame::Event { .. }) })
+    );
+    let durable_events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+        .fetch_one(&pool)
+        .await
+        .expect("event count");
+    assert_eq!(
+        durable_events, 0,
+        "the four-event injection batch rolled back"
+    );
+}
+
+#[tokio::test]
+async fn retry_error_is_excluded_and_retry_schedule_precedes_next_attempt() {
+    let store = Store::session_test_store("durable-retry-session")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (gateway, commands, frames) = gateway();
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |core: RunCore,
+         initial: AdmittedCommand,
+         _controls: mpsc::Receiver<RunControl>,
+         events: mpsc::Sender<AgentEvent>| async move {
+            let user = PublicMessage::User(UserMessage {
+                content: vec![UserContent::Text {
+                    text: "message 1".to_owned(),
+                }],
+                timestamp: initial.received_at(),
+            });
+            let mut error = match bridge_assistant(StopReason::Error) {
+                PublicMessage::Assistant(message) => message,
+                _ => unreachable!(),
+            };
+            error.error_message = Some("network error".to_owned());
+            error.provider_code = Some("network_error".to_owned());
+            let error = PublicMessage::Assistant(error);
+            let success = bridge_assistant(StopReason::Stop);
+            for event in [
+                AgentEvent::AgentStart,
+                AgentEvent::TurnStart,
+                AgentEvent::MessageStart {
+                    message_id: user_message_id(&initial.envelope().command_id),
+                    message: Box::new(user.clone()),
+                },
+                AgentEvent::MessageEnd {
+                    message_id: user_message_id(&initial.envelope().command_id),
+                    message: Box::new(user),
+                },
+                AgentEvent::MessageStart {
+                    message_id: "retry-error".to_owned(),
+                    message: Box::new(bridge_assistant(StopReason::Stop)),
+                },
+                AgentEvent::MessageEnd {
+                    message_id: "retry-error".to_owned(),
+                    message: Box::new(error),
+                },
+                AgentEvent::RetryScheduled {
+                    attempt: 1,
+                    delay_ms: 2_000,
+                    retry_at: Utc::now(),
+                    error_message: "network error".to_owned(),
+                },
+                AgentEvent::MessageStart {
+                    message_id: "retry-success".to_owned(),
+                    message: Box::new(bridge_assistant(StopReason::Stop)),
+                },
+                AgentEvent::MessageEnd {
+                    message_id: "retry-success".to_owned(),
+                    message: Box::new(success.clone()),
+                },
+                AgentEvent::TurnEnd {
+                    message: Some(Box::new(success)),
+                    tool_results: Vec::new(),
+                },
+                AgentEvent::AgentEnd,
+            ] {
+                events.send(event).await.expect("session event receiver");
+            }
+            RunCompletion::Completed(core)
+        },
+    );
+    let session = Session::start(store, gateway, RunCore::new(), worker)
+        .await
+        .expect("session");
+    let task = tokio::spawn(session.run());
+    commands.send(user(1)).await.expect("command");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if frames.lock().expect("frame mutex").iter().any(|frame| {
+                matches!(frame, OutboundFrame::Event { envelope }
+                    if envelope.event["type"] == "agent_end")
+            }) || task.is_finished()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal frame");
+    drop(commands);
+    completed(task.await.expect("session join"));
+
+    let kinds: Vec<String> = sqlx::query_scalar(
+        "SELECT event_type FROM agent_events WHERE event_type IN ('message_end','retry_scheduled') ORDER BY seq",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("retry durable sequence");
+    assert_eq!(
+        kinds,
+        vec![
+            "message_end",
+            "message_end",
+            "retry_scheduled",
+            "message_end"
+        ]
+    );
+    let error_stop: String = sqlx::query_scalar(
+        "SELECT json_extract(payload, '$.stop_reason') FROM messages WHERE id='retry-error'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("retry error projection");
+    assert_eq!(error_stop, "error");
+}
+
+#[tokio::test]
+async fn normal_tool_lifecycle_is_prepared_started_finished_and_paired() {
+    let store = Store::session_test_store("durable-normal-tool-session")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (gateway, commands, frames) = gateway();
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |core: RunCore,
+         initial: AdmittedCommand,
+         _controls: mpsc::Receiver<RunControl>,
+         events: mpsc::Sender<AgentEvent>| async move {
+            emit_idle_injection(&events, &initial).await;
+            let call = ToolCall {
+                id: "normal-call".to_owned(),
+                name: "fixture-tool".to_owned(),
+                arguments: serde_json::from_value::<ValidatedToolArguments>(
+                    serde_json::json!({"safe":true}),
+                )
+                .expect("validated arguments"),
+            };
+            let mut tool_use = match bridge_assistant(StopReason::ToolUse) {
+                PublicMessage::Assistant(message) => message,
+                _ => unreachable!(),
+            };
+            tool_use.content.push(PublicAssistantContent::ToolCall {
+                tool_call: call.clone(),
+                wire_item_index: 0,
+            });
+            let tool_use = PublicMessage::Assistant(tool_use);
+            let result = ToolResultMessage {
+                tool_call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                content: Vec::new(),
+                details: serde_json::json!({"ok":true}),
+                is_error: false,
+                timestamp: Utc::now(),
+            };
+            let result_message = PublicMessage::ToolResult(result.clone());
+            let final_message = bridge_assistant(StopReason::Stop);
+            for event in [
+                AgentEvent::MessageStart {
+                    message_id: "normal-assistant".to_owned(),
+                    message: Box::new(bridge_assistant(StopReason::Stop)),
+                },
+                AgentEvent::MessageEnd {
+                    message_id: "normal-assistant".to_owned(),
+                    message: Box::new(tool_use.clone()),
+                },
+                AgentEvent::ToolExecutionStart {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    args: serde_json::json!({"safe":true}),
+                },
+                AgentEvent::ToolExecutionEnd {
+                    tool_call_id: call.id.clone(),
+                    result: serde_json::to_value(&result).expect("tool result"),
+                    is_error: false,
+                },
+                AgentEvent::MessageStart {
+                    message_id: "normal-result".to_owned(),
+                    message: Box::new(result_message.clone()),
+                },
+                AgentEvent::MessageEnd {
+                    message_id: "normal-result".to_owned(),
+                    message: Box::new(result_message),
+                },
+                AgentEvent::TurnEnd {
+                    message: Some(Box::new(tool_use)),
+                    tool_results: vec![result],
+                },
+                AgentEvent::TurnStart,
+                AgentEvent::MessageStart {
+                    message_id: "normal-final".to_owned(),
+                    message: Box::new(final_message.clone()),
+                },
+                AgentEvent::MessageEnd {
+                    message_id: "normal-final".to_owned(),
+                    message: Box::new(final_message.clone()),
+                },
+                AgentEvent::TurnEnd {
+                    message: Some(Box::new(final_message)),
+                    tool_results: Vec::new(),
+                },
+                AgentEvent::AgentEnd,
+            ] {
+                events.send(event).await.expect("session event receiver");
+            }
+            RunCompletion::Completed(core)
+        },
+    );
+    let session = Session::start(store, gateway, RunCore::new(), worker)
+        .await
+        .expect("session");
+    let task = tokio::spawn(session.run());
+    commands.send(user(1)).await.expect("command");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if frames.lock().expect("frame mutex").iter().any(|frame| {
+                matches!(frame, OutboundFrame::Event { envelope }
+                    if envelope.event["type"] == "agent_end")
+            }) || task.is_finished()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal frame");
+    drop(commands);
+    completed(task.await.expect("session join"));
+
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM tool_executions WHERE tool_call_id='normal-call'")
+            .fetch_one(&pool)
+            .await
+            .expect("tool audit row");
+    assert_eq!(state, "succeeded");
+    let lifecycle: Vec<String> = frames
+        .lock()
+        .expect("frame mutex")
+        .iter()
+        .filter_map(|frame| match frame {
+            OutboundFrame::Event { envelope }
+                if matches!(
+                    envelope.event["type"].as_str(),
+                    Some("tool_execution_start" | "tool_execution_end")
+                ) =>
+            {
+                envelope.event["type"].as_str().map(str::to_owned)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        lifecycle,
+        vec!["tool_execution_start", "tool_execution_end"]
+    );
 }

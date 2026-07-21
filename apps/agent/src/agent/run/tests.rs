@@ -15,8 +15,9 @@ use super::*;
 use crate::{
     gateway::{CommandEnvelope, CommandId},
     provider::types::{
-        ApiProtocol, AssistantContent, AssistantMessage, ProviderOrigin, ProviderOutput,
-        PublicAssistantMessage, RejectedToolCall, ToolArgumentError, Usage, ValidatedToolArguments,
+        ApiProtocol, AssistantContent, AssistantMessage, ProviderContextFragment,
+        ProviderContextPayload, ProviderOrigin, ProviderOutput, PublicAssistantMessage,
+        RejectedToolCall, ToolArgumentError, Usage, ValidatedToolArguments,
     },
 };
 
@@ -566,6 +567,39 @@ async fn retry_closes_error_before_schedule_and_does_not_append_error_context() 
     assert_eq!(contexts[1].len(), 1, "only the user is replayable");
     assert!(matches!(contexts[1][0], PublicMessage::User(_)));
     assert_eq!(driver.retry_waits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn nonempty_provider_context_fails_closed_instead_of_being_dropped() {
+    let message = assistant(StopReason::Stop, Vec::new(), None, None);
+    let events = vec![
+        ProviderEvent::Start,
+        ProviderEvent::Done {
+            reason: StopReason::Stop,
+            output: ProviderOutput {
+                message,
+                provider_context: vec![ProviderContextFragment {
+                    wire_item_index: Some(0),
+                    payload: ProviderContextPayload::EncryptedReasoning {
+                        protocol: ApiProtocol::OpenAiResponses,
+                        item: json!({"encrypted_content":"opaque"}),
+                    },
+                }],
+            },
+        },
+    ];
+    let driver = Arc::new(FixtureDriver::new(vec![Script::Events(events)]));
+    let (completion, emitted) = run_fixture(driver).await;
+    assert!(matches!(
+        completion,
+        RunCompletion::Failed {
+            failure: WorkerFailure::Error(ref message),
+            ..
+        } if message.contains("T17 durable hand-off")
+    ));
+    assert!(!emitted.iter().any(|event| {
+        matches!(event, AgentEvent::MessageEnd { message_id, .. } if message_id == "assistant-0")
+    }));
 }
 
 #[tokio::test]

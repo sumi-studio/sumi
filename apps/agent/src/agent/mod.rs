@@ -33,11 +33,13 @@ use crate::{
     },
 };
 
+mod durable_bridge;
 mod events;
 mod provider_projection;
 mod queue;
 mod run;
 
+use durable_bridge::{CommittedOutput, DurableBridge, DurableRunBinding};
 use queue::MessageQueue;
 
 pub(crate) use events::{
@@ -75,6 +77,7 @@ pub(crate) struct RunCore {
     /// flat representation with `ThreeLayerMemory`; keeping it in `RunCore`
     /// prevents a second Session run from silently losing the first run.
     runtime_context: Vec<PublicMessage>,
+    durable_binding: Option<DurableRunBinding>,
 }
 
 impl RunCore {
@@ -85,6 +88,7 @@ impl RunCore {
             pending_controls: MessageQueue::bounded(PENDING_CONTROL_CAPACITY),
             pending_overflow_apply: None,
             runtime_context: Vec::new(),
+            durable_binding: None,
         }
     }
 
@@ -208,6 +212,7 @@ pub(crate) struct ActiveRun {
     events_rx: mpsc::Receiver<AgentEvent>,
     completion_rx: oneshot::Receiver<RunCompletion>,
     join: JoinHandle<()>,
+    bridge: DurableBridge,
 }
 
 #[derive(Debug)]
@@ -359,7 +364,7 @@ impl<G: Gateway + 'static> Session<G> {
                 Selected::Command(Err(error)) => {
                     return Err(gateway_failure("receive", error));
                 }
-                Selected::Event(Some(event)) => self.send_event(event).await?,
+                Selected::Event(Some(event)) => self.persist_active_event(event).await?,
                 Selected::Event(None) => self.resolve_closed_event_channel().await?,
             }
         }
@@ -434,7 +439,7 @@ impl<G: Gateway + 'static> Session<G> {
         if !matches!(command.envelope().command, Command::UserMessage { .. }) {
             return Err(SessionFailure::IdleControl);
         }
-        self.spawn_worker(command)
+        self.spawn_worker(command).await
     }
 
     async fn harvest_after_closed_control(&mut self) -> Result<(), SessionFailure> {
@@ -503,11 +508,27 @@ impl<G: Gateway + 'static> Session<G> {
         }
     }
 
-    fn spawn_worker(&mut self, initial: AdmittedCommand) -> Result<(), SessionFailure> {
-        let core = self
+    async fn spawn_worker(&mut self, initial: AdmittedCommand) -> Result<(), SessionFailure> {
+        let binding = DurableRunBinding::idle(&initial);
+        self.writer
+            .apply(crate::store::EventBatch {
+                writes: vec![crate::store::EventWrite {
+                    event: None,
+                    projections: vec![crate::store::Projection::CommandClassified {
+                        command_id: binding.command_id.clone(),
+                        application_kind: crate::store::ApplicationKind::IdleRun,
+                        run_id: binding.run_id.clone(),
+                        turn_id: binding.turn_id.clone(),
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await?;
+        let mut core = self
             .core
             .take()
             .ok_or(SessionFailure::CompletionChannelClosed)?;
+        core.durable_binding = Some(binding.clone());
         let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
         let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let (completion_tx, completion_rx) = oneshot::channel();
@@ -526,6 +547,7 @@ impl<G: Gateway + 'static> Session<G> {
             events_rx,
             completion_rx,
             join,
+            bridge: DurableBridge::new(binding),
         });
         Ok(())
     }
@@ -558,7 +580,10 @@ impl<G: Gateway + 'static> Session<G> {
             }
         };
         while let Ok(event) = active.events_rx.try_recv() {
-            self.send_event(event).await?;
+            let output = active.bridge.output(event);
+            let committed = active.bridge.commit(&self.writer, output).await?;
+            self.send_committed(committed, Some(active.bridge.command_id().to_owned()))
+                .await?;
         }
         match worker_failure {
             Some(failure) => Err(SessionFailure::Worker(failure)),
@@ -586,17 +611,51 @@ impl<G: Gateway + 'static> Session<G> {
         }
     }
 
-    async fn send_event(&mut self, event: AgentEvent) -> Result<(), SessionFailure> {
-        self.gateway
-            .send(OutboundFrame::Event {
-                envelope: crate::gateway::Envelope {
-                    seq: None,
-                    conversation_id: self.conversation_id.clone(),
-                    event: serde_json::to_value(event).map_err(anyhow::Error::from)?,
-                },
-            })
-            .await
-            .map_err(|error| gateway_failure("send", error))?;
+    async fn persist_active_event(&mut self, event: AgentEvent) -> Result<(), SessionFailure> {
+        let committed = {
+            let active = self.active.as_mut().expect("event requires active run");
+            let output = active.bridge.output(event);
+            active.bridge.commit(&self.writer, output).await?
+        };
+        let command_id = self
+            .active
+            .as_ref()
+            .map(|active| active.bridge.command_id().to_owned());
+        self.send_committed(committed, command_id).await
+    }
+
+    async fn send_committed(
+        &mut self,
+        committed: Vec<CommittedOutput>,
+        command_id: Option<String>,
+    ) -> Result<(), SessionFailure> {
+        let applied_command = committed
+            .iter()
+            .any(|output| matches!(output.event, AgentEvent::AgentEnd));
+        for output in committed {
+            self.gateway
+                .send(OutboundFrame::Event {
+                    envelope: crate::gateway::Envelope {
+                        seq: output.seq,
+                        conversation_id: self.conversation_id.clone(),
+                        event: serde_json::to_value(output.event).map_err(anyhow::Error::from)?,
+                    },
+                })
+                .await
+                .map_err(|error| gateway_failure("send", error))?;
+        }
+        if applied_command {
+            let command_id = command_id.ok_or(SessionFailure::CompletionChannelClosed)?;
+            let ack = self
+                .writer
+                .ack_for_command(&command_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("applied command disappeared after AgentEnd"))?;
+            self.gateway
+                .send(OutboundFrame::CommandAck { ack })
+                .await
+                .map_err(|error| gateway_failure("send", error))?;
+        }
         Ok(())
     }
 }

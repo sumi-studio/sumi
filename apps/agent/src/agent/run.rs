@@ -438,6 +438,12 @@ impl Runner {
                     rejected_results.push(synthetic_result);
                 }
                 ProjectedProviderEvent::Terminal(terminal) => {
+                    if !terminal.provider_context().is_empty() {
+                        return Err(WorkerFailure::Error(
+                            "provider terminal context requires the T17 durable hand-off; refusing to drop it"
+                                .to_owned(),
+                        ));
+                    }
                     let kind = terminal.kind();
                     let internal =
                         terminal_message.expect("terminal projection has provider output");
