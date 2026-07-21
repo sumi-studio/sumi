@@ -52,7 +52,6 @@ pub(super) struct DurableBridge {
     assistant_open: Option<String>,
     pending_start: Option<(String, PublicMessage)>,
     pending_tool_end: HashMap<String, (Value, bool)>,
-    last_assistant: Option<PublicMessage>,
     length_not_started: HashSet<String>,
     pending_rejected_end: Option<(String, PublicMessage, HashSet<String>)>,
     pending_rejected_results: Vec<(String, PublicMessage)>,
@@ -69,7 +68,6 @@ impl DurableBridge {
             assistant_open: None,
             pending_start: None,
             pending_tool_end: HashMap::new(),
-            last_assistant: None,
             length_not_started: HashSet::new(),
             pending_rejected_end: None,
             pending_rejected_results: Vec::new(),
@@ -382,7 +380,6 @@ impl DurableBridge {
             &message,
             PublicMessage::Assistant(assistant) if assistant.stop_reason == StopReason::Error
         );
-        self.last_assistant = Some(message.clone());
         if !rejected.is_empty() {
             if self.pending_rejected_end.is_some() || !self.pending_rejected_results.is_empty() {
                 bail!("a rejected assistant pair is already pending");

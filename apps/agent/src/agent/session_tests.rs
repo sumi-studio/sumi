@@ -15,10 +15,11 @@ use super::*;
 use crate::{
     gateway::{CommandAck, CommandId},
     provider::types::{
-        ApiProtocol, AssistantMessage, ProviderContextFragment, ProviderContextPayload,
-        ProviderEvent, ProviderEventStream, ProviderOrigin, ProviderOutput, PublicAssistantContent,
-        PublicAssistantMessage, PublicMessage, RejectedToolCall, StopReason, ToolArgumentError,
-        ToolCall, ToolResultMessage, Usage, UserContent, UserMessage, ValidatedToolArguments,
+        ApiProtocol, AssistantContent, AssistantMessage, ProviderContextFragment,
+        ProviderContextPayload, ProviderEvent, ProviderEventStream, ProviderOrigin, ProviderOutput,
+        PublicAssistantContent, PublicAssistantMessage, PublicMessage, RejectedToolCall,
+        StopReason, ToolArgumentError, ToolCall, ToolResultMessage, Usage, UserContent,
+        UserMessage, ValidatedToolArguments,
     },
     store::{Store, user_message_id},
 };
@@ -446,65 +447,24 @@ async fn idle_received_replay_acks_without_spawning_a_second_worker() {
 }
 
 #[tokio::test]
-async fn pending_worker_does_not_block_next_durable_control_received_ack() {
-    let (gateway, commands, frames) = gateway();
-    let (started_tx, mut started_rx) = mpsc::channel(1);
-    let (control_tx, mut control_rx) = mpsc::channel(1);
-    let (release_tx, release_rx) = oneshot::channel();
-    let release = Arc::new(Mutex::new(Some(release_rx)));
-    let worker: Arc<dyn RunWorker> = Arc::new({
-        let release = release.clone();
-        move |mut core: RunCore,
-              initial: AdmittedCommand,
-              mut controls: mpsc::Receiver<RunControl>,
-              events: mpsc::Sender<AgentEvent>| {
-            let started_tx = started_tx.clone();
-            let control_tx = control_tx.clone();
-            let release = release
-                .lock()
-                .expect("release mutex")
-                .take()
-                .expect("one worker");
-            async move {
-                let _events = events;
-                started_tx
-                    .send(initial.envelope().seq)
-                    .await
-                    .expect("started observer");
-                let mut release = Box::pin(release);
-                loop {
-                    tokio::select! {
-                        released = &mut release => {
-                            released.expect("release signal");
-                            controls.close();
-                            while let Ok(RunControl::Command(command)) = controls.try_recv() {
-                                core.queue_followup(command).expect("bounded follow-up");
-                            }
-                            core.mark_mutated();
-                            return RunCompletion::Completed(core);
-                        }
-                        control = controls.recv() => {
-                            let Some(RunControl::Command(command)) = control else {
-                                return RunCompletion::Failed { core, failure: WorkerFailure::Cancelled };
-                            };
-                            core.queue_followup(command).expect("bounded follow-up");
-                            let observed = core.next_followup().expect("one-at-a-time follow-up");
-                            control_tx
-                                .send(observed.envelope().seq)
-                                .await
-                                .expect("control observer");
-                        }
-                    }
-                }
-            }
-        }
-    });
-    let task = tokio::spawn(session(gateway, worker).await.run());
+async fn pending_worker_does_not_block_deferred_control_received_ack() {
+    let (gateway, _commands, frames) = gateway();
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |_core: RunCore,
+         _initial: AdmittedCommand,
+         _controls: mpsc::Receiver<RunControl>,
+         _events: mpsc::Sender<AgentEvent>| async move { pending::<RunCompletion>().await },
+    );
+    let mut session = session(gateway, worker).await;
 
-    commands.send(user(1)).await.expect("first command");
-    assert_eq!(started_rx.recv().await, Some(1));
-    commands.send(abort(2)).await.expect("second command");
-    assert_eq!(control_rx.recv().await, Some(2));
+    session
+        .admit_and_route(user(1))
+        .await
+        .expect("first command");
+    session
+        .admit_and_route(abort(2))
+        .await
+        .expect("second command");
     assert_eq!(
         received_acks(&frames)
             .into_iter()
@@ -512,12 +472,105 @@ async fn pending_worker_does_not_block_next_durable_control_received_ack() {
             .collect::<Vec<_>>(),
         vec![1, 2]
     );
+    assert_eq!(session.deferred_commands.len(), 1);
+    assert_eq!(
+        session
+            .deferred_commands
+            .front()
+            .expect("deferred Abort")
+            .envelope()
+            .seq,
+        2
+    );
+    assert_eq!(
+        session
+            .active
+            .as_ref()
+            .expect("active worker")
+            .control_tx
+            .capacity(),
+        CONTROL_CHANNEL_CAPACITY,
+        "T15 must not send an unimplemented active Abort to the worker"
+    );
+    session.shutdown_active().await;
+}
 
-    release_tx.send(()).expect("release worker");
-    tokio::task::yield_now().await;
-    drop(commands);
-    let core = completed(task.await.expect("session join"));
-    assert_eq!(core.mutation_epoch(), 1);
+#[tokio::test]
+async fn active_session_uses_durable_backpressure_before_its_bounded_fifo_can_overflow() {
+    let store = Store::session_test_store("active-bounded-fifo-session")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (gateway, _commands, frames) = gateway();
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |_core: RunCore,
+         _initial: AdmittedCommand,
+         _controls: mpsc::Receiver<RunControl>,
+         _events: mpsc::Sender<AgentEvent>| async move { pending::<RunCompletion>().await },
+    );
+    let mut session = Session::start(store, gateway, RunCore::new(), worker)
+        .await
+        .expect("session");
+
+    session
+        .admit_and_route(user(1))
+        .await
+        .expect("active owner");
+    for seq in 2..=32 {
+        session
+            .admit_and_route(user(seq))
+            .await
+            .expect("31 deferred ordinary commands fit beside the active owner");
+    }
+    assert_eq!(session.deferred_commands.len(), 31);
+
+    let overflow = session
+        .admit_and_route(user(33))
+        .await
+        .expect_err("33rd live ordinary command must backpressure before persistence");
+    assert!(overflow.to_string().contains("admission window is full"));
+    assert_eq!(session.deferred_commands.len(), 31);
+
+    session
+        .admit_and_route(abort(33))
+        .await
+        .expect("reserved Abort remains admissible at the ordinary limit");
+    assert_eq!(session.deferred_commands.len(), 32);
+    assert_eq!(
+        session
+            .deferred_commands
+            .iter()
+            .map(|command| command.envelope().seq)
+            .collect::<Vec<_>>(),
+        (2..=33).collect::<Vec<_>>()
+    );
+    assert!(matches!(
+        session
+            .deferred_commands
+            .front()
+            .expect("oldest deferred command")
+            .envelope()
+            .command,
+        Command::UserMessage { .. }
+    ));
+
+    let rows: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT seq, command_id, status FROM inbound_commands ORDER BY seq, command_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("bounded durable window");
+    assert_eq!(rows.len(), 33);
+    assert!(
+        !rows
+            .iter()
+            .any(|(_, command_id, _)| { command_id == "00000000-0000-4000-8000-000000000033" })
+    );
+    assert!(rows.iter().any(|(seq, command_id, status)| {
+        *seq == 33 && command_id == "10000000-0000-4000-8000-000000000033" && status == "received"
+    }));
+    assert_eq!(received_acks(&frames).len(), 33);
+    session.shutdown_active().await;
 }
 
 #[tokio::test]
@@ -834,47 +887,6 @@ async fn event_drain_send_failure_preserves_ready_completion_core() {
 }
 
 #[tokio::test]
-async fn closed_control_with_pending_worker_is_bounded_and_joined() {
-    let (gateway, commands, _frames) = gateway();
-    let running = Arc::new(AtomicBool::new(false));
-    let (started_tx, mut started_rx) = mpsc::channel(1);
-    let worker: Arc<dyn RunWorker> = Arc::new({
-        let running = running.clone();
-        move |_core: RunCore,
-              _initial: AdmittedCommand,
-              controls: mpsc::Receiver<RunControl>,
-              events: mpsc::Sender<AgentEvent>| {
-            let running = running.clone();
-            let started_tx = started_tx.clone();
-            drop(controls);
-            async move {
-                running.store(true, Ordering::SeqCst);
-                let _guard = RunningGuard(running);
-                let _events = events;
-                started_tx.send(()).await.expect("start observer");
-                pending::<RunCompletion>().await
-            }
-        }
-    });
-    let task = tokio::spawn(session(gateway, worker).await.run());
-    commands.send(user(1)).await.expect("initial command");
-    started_rx.recv().await.expect("worker started");
-    commands.send(abort(2)).await.expect("control command");
-
-    let (failure, ownership) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        failed(task.await.expect("session join"))
-    })
-    .await
-    .expect("closed control resolution is bounded");
-    assert!(matches!(failure, SessionFailure::ControlChannelClosed));
-    assert!(matches!(ownership, RunOwnership::Lost));
-    assert!(
-        !running.load(Ordering::SeqCst),
-        "worker must be joined before return"
-    );
-}
-
-#[tokio::test]
 async fn synchronous_worker_factory_panic_is_typed_and_lost() {
     let (gateway, commands, _frames) = gateway();
     let worker: Arc<dyn RunWorker> = Arc::new(
@@ -1178,6 +1190,170 @@ async fn active_second_user_stays_received_then_runs_after_the_current_agent_end
     assert_eq!(run_count.load(Ordering::SeqCst), 2);
 }
 
+fn deferred_boundary_worker(
+    run_count: Arc<AtomicUsize>,
+    first_started: Arc<Notify>,
+    release_first: Arc<Notify>,
+) -> Arc<dyn RunWorker> {
+    Arc::new(
+        move |core: RunCore,
+              initial: AdmittedCommand,
+              _controls: mpsc::Receiver<RunControl>,
+              events: mpsc::Sender<AgentEvent>| {
+            let run_count = run_count.clone();
+            let first_started = first_started.clone();
+            let release_first = release_first.clone();
+            async move {
+                let ordinal = run_count.fetch_add(1, Ordering::SeqCst);
+                emit_idle_injection(&events, &initial).await;
+                if ordinal == 0 {
+                    first_started.notify_one();
+                    release_first.notified().await;
+                }
+                let assistant = bridge_assistant(StopReason::Stop);
+                let assistant_id = format!("fifo-boundary-assistant-{ordinal}");
+                for event in [
+                    AgentEvent::MessageStart {
+                        message_id: assistant_id.clone(),
+                        message: Box::new(bridge_assistant(StopReason::Stop)),
+                    },
+                    AgentEvent::MessageEnd {
+                        message_id: assistant_id,
+                        message: Box::new(assistant.clone()),
+                    },
+                    AgentEvent::TurnEnd {
+                        message: Some(Box::new(assistant)),
+                        tool_results: Vec::new(),
+                    },
+                    AgentEvent::AgentEnd,
+                ] {
+                    events.send(event).await.expect("session event receiver");
+                }
+                RunCompletion::Completed(core)
+            }
+        },
+    )
+}
+
+#[tokio::test]
+async fn active_user_then_abort_is_cut_off_after_agent_end_without_starting_user() {
+    let store = Store::session_test_store("active-user-abort-fifo-session")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (gateway, commands, frames) = gateway();
+    let run_count = Arc::new(AtomicUsize::new(0));
+    let first_started = Arc::new(Notify::new());
+    let release_first = Arc::new(Notify::new());
+    let worker = deferred_boundary_worker(
+        run_count.clone(),
+        first_started.clone(),
+        release_first.clone(),
+    );
+    let session = Session::start(store, gateway, RunCore::new(), worker)
+        .await
+        .expect("session");
+    let task = tokio::spawn(session.run());
+    commands.send(user(1)).await.expect("active command");
+    tokio::time::timeout(std::time::Duration::from_secs(2), first_started.notified())
+        .await
+        .expect("first run started");
+    commands.send(user(2)).await.expect("deferred user");
+    commands.send(abort(3)).await.expect("deferred Abort");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while received_acks(&frames).len() < 3 && !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both active-run commands admitted");
+    release_first.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let terminal = frames
+                .lock()
+                .expect("frame mutex")
+                .iter()
+                .filter(|frame| {
+                    matches!(frame, OutboundFrame::CommandAck { ack }
+                        if matches!(ack.status, CommandAckStatus::Applied | CommandAckStatus::Superseded))
+                })
+                .count();
+            if terminal == 3 || task.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Abort cutoff terminal ACKs");
+    drop(commands);
+    completed(task.await.expect("session join"));
+
+    let states: Vec<(i64, String, Option<String>)> =
+        sqlx::query_as("SELECT seq, status, run_id FROM inbound_commands ORDER BY seq")
+            .fetch_all(&pool)
+            .await
+            .expect("FIFO command states");
+    assert_eq!(states[1], (2, "superseded".to_owned(), None));
+    assert_eq!(states[2], (3, "applied".to_owned(), None));
+    assert_eq!(run_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn active_abort_then_user_applies_abort_before_starting_later_user() {
+    let store = Store::session_test_store("active-abort-user-fifo-session")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (gateway, commands, frames) = gateway();
+    let run_count = Arc::new(AtomicUsize::new(0));
+    let first_started = Arc::new(Notify::new());
+    let release_first = Arc::new(Notify::new());
+    let worker = deferred_boundary_worker(
+        run_count.clone(),
+        first_started.clone(),
+        release_first.clone(),
+    );
+    let session = Session::start(store, gateway, RunCore::new(), worker)
+        .await
+        .expect("session");
+    let task = tokio::spawn(session.run());
+    commands.send(user(1)).await.expect("active command");
+    tokio::time::timeout(std::time::Duration::from_secs(2), first_started.notified())
+        .await
+        .expect("first run started");
+    commands.send(abort(2)).await.expect("deferred Abort");
+    commands.send(user(3)).await.expect("later user");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while received_acks(&frames).len() < 3 && !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both active-run commands admitted");
+    release_first.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while run_count.load(Ordering::SeqCst) < 2 && !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("later user run");
+    drop(commands);
+    completed(task.await.expect("session join"));
+
+    let states: Vec<(i64, String, Option<String>)> =
+        sqlx::query_as("SELECT seq, status, run_id FROM inbound_commands ORDER BY seq")
+            .fetch_all(&pool)
+            .await
+            .expect("FIFO command states");
+    assert_eq!(states[1], (2, "applied".to_owned(), None));
+    assert_eq!(states[2].1, "applied");
+    assert!(states[2].2.is_some());
+    assert_eq!(run_count.load(Ordering::SeqCst), 2);
+}
+
 struct OpaqueContextDriver;
 
 #[async_trait]
@@ -1193,8 +1369,16 @@ impl RunDriver for OpaqueContextDriver {
             protocol: ApiProtocol::OpenAiResponses,
             model: "bridge-model".to_owned(),
         };
+        let rejected = RejectedToolCall {
+            id: "opaque-rejected-call".to_owned(),
+            name: "opaque-tool".to_owned(),
+            error: ToolArgumentError::InvalidJson,
+        };
         let message = AssistantMessage {
-            content: Vec::new(),
+            content: vec![AssistantContent::RejectedToolCall {
+                rejected: rejected.clone(),
+                wire_item_index: 0,
+            }],
             model: origin.model.clone(),
             provider: "fixture".to_owned(),
             origin: origin.clone(),
@@ -1205,8 +1389,26 @@ impl RunDriver for OpaqueContextDriver {
             interrupted: false,
             timestamp: Utc::now(),
         };
-        let (tx, rx) = mpsc::channel(2);
+        let synthetic_result = ToolResultMessage {
+            tool_call_id: rejected.id.clone(),
+            tool_name: rejected.name.clone(),
+            content: vec![UserContent::Text {
+                text: "Tool arguments were rejected.".to_owned(),
+            }],
+            details: serde_json::json!({"category":"invalid_json"}),
+            is_error: true,
+            timestamp: Utc::now(),
+        };
+        let (tx, rx) = mpsc::channel(4);
         tx.try_send(ProviderEvent::Start).expect("provider start");
+        tx.try_send(ProviderEvent::ToolCallStart { content_index: 0 })
+            .expect("rejected tool start");
+        tx.try_send(ProviderEvent::ToolCallRejected {
+            content_index: 0,
+            rejected,
+            synthetic_result,
+        })
+        .expect("rejected tool terminal");
         tx.try_send(ProviderEvent::Done {
             reason: StopReason::Stop,
             output: ProviderOutput {
@@ -2073,6 +2275,17 @@ async fn opaque_context_refusal_closes_durably_before_applied_ack() {
     .await
     .expect("opaque leak check");
     assert_eq!(opaque_leaks, 0);
+    let rejected_leaks: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM messages WHERE id='opaque-rejected-call') + (SELECT COUNT(*) FROM messages WHERE json_extract(payload, '$.tool_call_id')='opaque-rejected-call') + (SELECT COUNT(*) FROM agent_events WHERE envelope LIKE '%opaque-rejected-call%')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("rejected pair leak check");
+    assert_eq!(rejected_leaks, 0);
+    assert!(!frames.lock().expect("frame mutex").iter().any(|frame| {
+        matches!(frame, OutboundFrame::Event { envelope }
+            if envelope.event.to_string().contains("\"tool_call_id\":\"opaque-rejected-call\""))
+    }));
     let frames = frames.lock().expect("frame mutex");
     let agent_end = frames
         .iter()

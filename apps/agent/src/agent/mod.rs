@@ -6,7 +6,6 @@
 
 use std::{
     any::Any,
-    collections::VecDeque,
     future::Future,
     panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
@@ -62,7 +61,8 @@ pub(crate) use run::{
 const CONTROL_CHANNEL_CAPACITY: usize = 32;
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 /// API admission permits 32 ordinary commands plus one reserved Abort.
-const PENDING_CONTROL_CAPACITY: usize = 33;
+const PENDING_ORDINARY_CONTROL_CAPACITY: usize = 32;
+const PENDING_CONTROL_CAPACITY: usize = PENDING_ORDINARY_CONTROL_CAPACITY + 1;
 
 type WorkerFuture = Pin<Box<dyn Future<Output = RunCompletion> + Send + 'static>>;
 
@@ -280,6 +280,10 @@ fn event_channel_lost(completion: RunCompletion) -> RunCompletion {
 }
 
 pub(crate) struct ActiveRun {
+    #[allow(
+        dead_code,
+        reason = "T15 retains the sender so an active worker never observes a false control-lane close"
+    )]
     control_tx: mpsc::Sender<RunControl>,
     events_rx: mpsc::Receiver<RunOutput>,
     completion_rx: oneshot::Receiver<RunCompletion>,
@@ -314,8 +318,6 @@ pub(crate) enum SessionFailure {
     CompletionChannelClosed,
     #[error("run worker event channel closed")]
     EventChannelClosed,
-    #[error("run worker control channel closed before completion")]
-    ControlChannelClosed,
     #[error("gateway closed while a run owned RunCore")]
     GatewayClosedDuringRun,
     #[error("gateway {operation} failed: {source}")]
@@ -341,10 +343,12 @@ pub(crate) struct Session<G: Gateway> {
     core: Option<RunCore>,
     active: Option<ActiveRun>,
     worker: Arc<dyn RunWorker>,
-    /// T16 owns active-run classification and owner handoff. Until then an
-    /// additional user command remains durably `received` here and is only
-    /// admitted as a fresh idle run after the current AgentEnd commits.
-    deferred_user_commands: VecDeque<AdmittedCommand>,
+    /// T16 owns active-run classification and control semantics. Until then
+    /// every command received during a run remains durably `received` in one
+    /// sequence-ordered queue. After AgentEnd, T15 may start a fresh user run
+    /// or apply an idle Abort cutoff, but it must not let a user overtake an
+    /// earlier/later control that only T16 can apply safely.
+    deferred_commands: MessageQueue<AdmittedCommand>,
     /// A bridge/Store refusal means the worker's returned core may be ahead of
     /// the durable transcript and must never be exposed as recovered.
     durable_core_invalidated: bool,
@@ -379,7 +383,7 @@ impl<G: Gateway + 'static> Session<G> {
             core: Some(core),
             active: None,
             worker,
-            deferred_user_commands: VecDeque::new(),
+            deferred_commands: MessageQueue::bounded(PENDING_CONTROL_CAPACITY),
             durable_core_invalidated: false,
         })
     }
@@ -493,19 +497,41 @@ impl<G: Gateway + 'static> Session<G> {
             unreachable!("invalid commands return above");
         };
         let command = AdmittedCommand::new(command, received_at);
-        if let Some(active) = self.active.as_mut() {
-            if matches!(command.envelope().command, Command::UserMessage { .. }) {
-                self.deferred_user_commands.push_back(command);
-                return Ok(());
-            }
-            if let Err(error) = active.control_tx.send(RunControl::Command(command)).await {
-                let RunControl::Command(command) = error.0;
-                self.harvest_after_closed_control().await?;
-                return self.route_idle(command).await;
-            }
+        if self.active.is_some() {
+            self.defer_active_command(command)?;
             return Ok(());
         }
         self.route_idle(command).await
+    }
+
+    fn defer_active_command(&mut self, command: AdmittedCommand) -> Result<(), SessionFailure> {
+        let is_abort = matches!(command.envelope().command, Command::Abort {});
+        let ordinary_count = self
+            .deferred_commands
+            .iter()
+            .filter(|pending| !matches!(pending.envelope().command, Command::Abort {}))
+            .count();
+        if !is_abort && ordinary_count >= PENDING_ORDINARY_CONTROL_CAPACITY {
+            return Err(anyhow::anyhow!(
+                "Session deferred non-Abort window exceeds its 32-command invariant; command remains durably received"
+            )
+            .into());
+        }
+        if is_abort
+            && self
+                .deferred_commands
+                .iter()
+                .any(|pending| matches!(pending.envelope().command, Command::Abort {}))
+        {
+            return Err(anyhow::anyhow!(
+                "Session deferred Abort reservation is already occupied; command remains durably received"
+            )
+            .into());
+        }
+        self.deferred_commands
+            .push(command)
+            .map_err(anyhow::Error::from)?;
+        Ok(())
     }
 
     async fn route_idle(&mut self, command: AdmittedCommand) -> Result<(), SessionFailure> {
@@ -529,34 +555,6 @@ impl<G: Gateway + 'static> Session<G> {
             return Err(SessionFailure::IdleControl);
         }
         self.spawn_worker(command).await
-    }
-
-    async fn harvest_after_closed_control(&mut self) -> Result<(), SessionFailure> {
-        tokio::task::yield_now().await;
-        let completion = {
-            let active = self
-                .active
-                .as_mut()
-                .expect("closed control requires active run");
-            active.completion_rx.try_recv()
-        };
-        match completion {
-            Ok(completion) => self.finish_run(Ok(completion)).await,
-            Err(oneshot::error::TryRecvError::Closed) => {
-                let active = self
-                    .active
-                    .take()
-                    .expect("closed control requires active run");
-                match active.join.await {
-                    Err(error) => Err(worker_join_failure(error)),
-                    Ok(()) => Err(SessionFailure::CompletionChannelClosed),
-                }
-            }
-            Err(oneshot::error::TryRecvError::Empty) => {
-                self.shutdown_active().await;
-                Err(SessionFailure::ControlChannelClosed)
-            }
-        }
     }
 
     async fn resolve_closed_event_channel(&mut self) -> Result<(), SessionFailure> {
@@ -681,13 +679,60 @@ impl<G: Gateway + 'static> Session<G> {
         }
         match worker_failure {
             Some(failure) => Err(SessionFailure::Worker(failure)),
-            None => {
-                if let Some(next) = self.deferred_user_commands.pop_front() {
-                    self.spawn_worker(next).await?;
-                }
-                Ok(())
+            None => self.route_deferred_after_run().await,
+        }
+    }
+
+    async fn route_deferred_after_run(&mut self) -> Result<(), SessionFailure> {
+        loop {
+            let abort = self
+                .deferred_commands
+                .iter()
+                .find(|command| matches!(command.envelope().command, Command::Abort {}))
+                .cloned();
+            let Some(abort) = abort else {
+                break;
+            };
+            let abort_seq = abort.envelope().seq;
+            let mut terminal = self
+                .writer
+                .apply_idle_abort_cutoff(abort.envelope().command_id.as_str(), abort_seq)
+                .await?;
+            for ack in terminal.drain(..) {
+                self.gateway
+                    .send(OutboundFrame::CommandAck { ack })
+                    .await
+                    .map_err(|error| gateway_failure("send", error))?;
+            }
+            while self
+                .deferred_commands
+                .front()
+                .is_some_and(|command| command.envelope().seq <= abort_seq)
+            {
+                self.deferred_commands.pop_one();
             }
         }
+
+        let Some(next) = self.deferred_commands.pop_one() else {
+            return Ok(());
+        };
+        if !matches!(next.envelope().command, Command::UserMessage { .. }) {
+            self.deferred_commands
+                .push_front(next)
+                .map_err(anyhow::Error::from)?;
+            return Err(SessionFailure::IdleControl);
+        }
+        if self
+            .deferred_commands
+            .iter()
+            .any(|command| !matches!(command.envelope().command, Command::UserMessage { .. }))
+        {
+            self.deferred_commands
+                .push_front(next)
+                .map_err(anyhow::Error::from)?;
+            return Err(SessionFailure::IdleControl);
+        }
+        self.spawn_worker(next).await
     }
 
     async fn shutdown_active(&mut self) {

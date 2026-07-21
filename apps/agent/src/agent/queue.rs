@@ -55,6 +55,14 @@ impl<T> MessageQueue<T> {
         self.entries.pop_front()
     }
 
+    pub(crate) fn front(&self) -> Option<&T> {
+        self.entries.front()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
+        self.entries.iter()
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
