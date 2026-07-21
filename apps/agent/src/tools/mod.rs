@@ -5,6 +5,8 @@
 // those production call sites land.
 #![allow(dead_code)]
 
+#[cfg(target_os = "linux")]
+pub mod fs;
 pub mod shell_capture;
 pub mod truncate;
 
