@@ -6,6 +6,7 @@ mod artifact_broker;
 mod client;
 mod executor_client;
 mod protocol;
+mod remote;
 mod service;
 
 // The service and broker slices consume these stable contracts later in T13.
@@ -21,4 +22,6 @@ pub use protocol::{
     RpcOperationValidation, RpcRequest, decode_rpc_frame, decode_rpc_line, encode_rpc_frame,
     resolve_input,
 };
+#[allow(unused_imports)]
+pub use remote::remote_executor_registry;
 pub use service::{run_artifact_broker_mode, run_tool_executor_mode};

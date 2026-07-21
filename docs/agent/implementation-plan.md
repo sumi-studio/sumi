@@ -1255,7 +1255,7 @@ transform は**送信用のビューを作る純関数**であり、L0 の保存
 
 | ツール | risk | 説明 |
 |---|---|---|
-| `read_file` | ReadOnly | workspace pathまたは`artifact://` handle + offset/limit。head 切詰め |
+| `read_file` | ReadOnly | workspace pathまたは`artifact://` handle + offset/limit。workspaceはhead切詰め、artifact textはexact byte cursorのpage fragment |
 | `write_file` | Mutating | 全置換書込み |
 | `edit_file` | Mutating | old_string/new_string 置換(一意性検査) |
 | `list_dir` / `glob` | ReadOnly | |
@@ -1267,6 +1267,10 @@ transform は**送信用のビューを作る純関数**であり、L0 の保存
 Docker sidecar は container spec で環境を `PATH` / `HOME` / `LANG` / executor generation の許可リストに限定し、host/runtime の FD を継承させない。microVM/ローカル process は guest supervisor が `env_clear` 後に同じ許可リストだけを設定し、stdio と専用 Unix socket 以外の FD を `close_range`/close-on-exec で閉じて exec する。`/var/lib/sumi`、API key、gateway credential、runtime の `/proc` は mount/継承しない。RPC は generation と per-boot nonce を含む JSON Lines とし、専用 socket 以外に runtime へ到達する経路を作らない。任意bashが`0600`/`0700`を作成できる前提で、後続のread/edit/deleteも同じexecutor UIDのRPCで行う。runtime/executor間の共有groupやumaskで直接相互アクセスを保証しない
 
 既存ツール定義を増やさず、`read_file`/`grep` の入力resolverだけが`artifact://` handleを認識して認証済みbroker RPCへrouteする。`write_file`/`edit_file`/`list_dir`/`glob`/`bash`はartifact handleを拒否し、artifactの作成・追記・GC・削除はruntime/executor内部の専用RPCからだけ行う。したがってモデルはhandleから全文を読めるが、artifact namespaceを任意作成・rename・symlink化できない。
+
+`read_file`の公開schemaはworkspace/artifactで共通のまま、artifact pathだけruntime adapterがRPC前にrequest limitを`min(user_limit, 50KiB - worst_case_continuation - separator)`へ縮める。brokerは要求値を超えるraw byteを返してはならない。artifact text pageは返却rawの先頭からUTF-8 scalar境界上のexact fragmentを直接表示し、logical line途中で開始・終了してよい。非final pageの表示sourceは常にartifactの半開区間`[request_offset, next_offset)`とbyte一致し、`next_offset > request_offset`とする。generic head切詰めの完全行規則を適用すると、50KiB超の単一行では0-byte pageから進めず、注記を後置すると表示していないbyteをcursorが飛び越すため、両契約は数学的に同時達成できない。この例外はartifact text pagerだけに限定し、workspace fileのstrict head viewは変更しない（ADR 0006）。
+
+broker page末尾がUTF-8 scalar途中で`artifact_eof=false`なら、`valid_up_to > 0`の末尾だけを保留し、cursorはvalid prefixまで進めて次回scalar先頭から再読する。EOF時の不完全文字、interior invalid byte、先頭がcontinuation byteとなるmid-scalar offsetはfail-closedとし、lossy decodeしない。limitが次の1 scalarにも満たなければ同一offset成功を返さず、より大きいlimitでのretryを要求する。`page_eof`は`artifact_eof && returned rawの全byteを表示済み`の場合だけtrueとする。結果detailsは`request_offset`、`returned_bytes`、`shown_bytes`、`next_offset`（`page_eof`時だけnull）、`artifact_eof`、`page_eof`、`ends_in_line_fragment`を持ち、50KiB/2000行はsource fragment、separator、continuationを合わせたmodel-visible全体へ適用する。binary artifactはtext pagerへlossy投影せず、将来の明示的なbinary projection/tool契約で扱う。
 
 `read_file` / `write_file` / `edit_file` / `list_dir` / `glob` / `grep` は workspace dirfd を起点に、すべての path component を `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)` 相当で open する。canonicalize は診断表示にだけ使い、canonicalize 後に path を再 open する TOCTOU 実装は禁止する。新規作成、rename、temporary file、glob/grep の走査にも同じ dirfd policy を適用する。Sumi product の workspace/Cloud は Linux を対象とする。OSS ローカル fallback は macOS 等の非 Linux Unix host でも提供するが、同等境界を実装できない bash は明示的な低信頼モードとして扱う。native 非 Unix host は明示的に非対応として fail-closed にし、WSL/Linux を利用する。**[推測→セキュリティ契約として確定、ADR 0004]**
 
@@ -1281,6 +1285,8 @@ Docker sidecar は container spec で環境を `PATH` / `HOME` / `LANG` / execut
 - `truncate_tail`(bash): 末尾から(エラーと最終結果が見えることを優先)。全部超過時のみ末尾部分行
 - 結果メタ(総行数・総バイト・切詰め理由)をツール結果の注記に含める: `"[出力 12,345行/2.1MB のうち末尾2000行を表示。全文: artifact://<conversation_id>/tool-output/bash-xxx]"`
 - Rust 実装注意: バイト長は `str::len` で UTF-8 バイト数そのまま。行分割後の境界は必ず char boundary で(`floor_char_boundary` 相当の手書き)
+
+上記の完全行head/tail規則はworkspace readと通常tool outputのgeneric viewに適用する。artifact text readだけは§8.1のlossless page fragment例外を使い、`truncate_head`へ通さない。
 
 ### 8.3 bash 実行(`bash.rs` + `shell_capture.rs`)— pi 忠実移植
 
