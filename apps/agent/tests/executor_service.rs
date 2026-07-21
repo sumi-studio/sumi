@@ -49,7 +49,7 @@ impl Fixture {
             .spawn()
             .unwrap();
         timeout(Duration::from_secs(5), async {
-            while !socket.exists() {
+            while UnixStream::connect(&socket).await.is_err() {
                 tokio::task::yield_now().await;
             }
         })
@@ -457,7 +457,21 @@ async fn bash_cancel_emits_one_terminal_per_request_and_no_late_update() {
     assert_eq!(frames[1]["request_id"], "cancel");
     assert_eq!(frames[1]["type"], "terminal");
     drop(stdin);
-    assert!(child.wait().await.unwrap().success());
+    let mut trailing = Vec::new();
+    timeout(Duration::from_secs(5), stdout.read_to_end(&mut trailing))
+        .await
+        .expect("executor stdout must reach EOF after cancellation")
+        .unwrap();
+    assert!(
+        trailing.iter().all(|byte| byte.is_ascii_whitespace()),
+        "unexpected trailing executor frames: {}",
+        String::from_utf8_lossy(&trailing)
+    );
+    let status = timeout(Duration::from_secs(5), child.wait())
+        .await
+        .expect("executor must exit after stdout EOF")
+        .unwrap();
+    assert!(status.success());
 }
 
 #[tokio::test]
@@ -504,9 +518,9 @@ async fn unconsumed_executor_stdout_cannot_block_cancel_and_reap() {
 
 #[tokio::test]
 async fn active_bash_control_failures_cancel_and_reap_the_process_group() {
-    for (case, payload) in [
-        ("decode", b"not-json\n".to_vec()),
-        ("partial-eof", b"{".to_vec()),
+    for (case, payload, response_id) in [
+        ("decode", b"not-json\n".to_vec(), None),
+        ("partial-eof", b"{".to_vec(), None),
         (
             "lifecycle",
             serde_json::to_vec(&request(
@@ -517,6 +531,31 @@ async fn active_bash_control_failures_cancel_and_reap_the_process_group() {
             .into_iter()
             .chain(std::iter::once(b'\n'))
             .collect(),
+            None,
+        ),
+        (
+            "invalid-operation",
+            serde_json::to_vec(&request(
+                "invalid-operation",
+                json!({"type":"read_file","path":"missing","offset":0,"limit":1,"execution_id":"other"}),
+            ))
+            .unwrap()
+            .into_iter()
+            .chain(std::iter::once(b'\n'))
+            .collect(),
+            Some("invalid-operation"),
+        ),
+        (
+            "wrong-target-cancel",
+            serde_json::to_vec(&request(
+                "wrong-target-cancel",
+                json!({"type":"cancel","execution_id":"not-active"}),
+            ))
+            .unwrap()
+            .into_iter()
+            .chain(std::iter::once(b'\n'))
+            .collect(),
+            Some("wrong-target-cancel"),
         ),
     ] {
         let fixture = Fixture::new().await;
@@ -528,7 +567,7 @@ async fn active_bash_control_failures_cancel_and_reap_the_process_group() {
         };
         let mut child = fixture.executor();
         let mut stdin = child.stdin.take().unwrap();
-        let _stdout = child.stdout.take().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
         send_request(
             &mut stdin,
             &request(
@@ -549,6 +588,27 @@ async fn active_bash_control_failures_cancel_and_reap_the_process_group() {
             .unwrap_or_else(|_| panic!("{case} failure must cancel and reap"))
             .unwrap();
         assert!(!status.success(), "{case}");
+        let mut output = String::new();
+        stdout.read_to_string(&mut output).await.unwrap();
+        let frames: Vec<Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            frames.iter().all(|frame| frame["type"] == "terminal"),
+            "{case}: {frames:?}"
+        );
+        assert!(
+            frames.iter().any(|frame| frame["request_id"] == request_id),
+            "{case}: missing active terminal: {frames:?}"
+        );
+        if let Some(response_id) = response_id {
+            let response = frames
+                .iter()
+                .find(|frame| frame["request_id"] == response_id)
+                .unwrap_or_else(|| panic!("{case}: missing control terminal: {frames:?}"));
+            assert_eq!(response["result"]["Err"]["code"], "protocol", "{case}");
+        }
         timeout(Duration::from_secs(2), async {
             while process_group_exists(process_group) {
                 tokio::task::yield_now().await;
@@ -557,6 +617,110 @@ async fn active_bash_control_failures_cancel_and_reap_the_process_group() {
         .await
         .unwrap_or_else(|_| panic!("{case} bash process group must disappear"));
     }
+}
+
+#[tokio::test]
+async fn queued_cancel_is_settled_before_simultaneous_bash_completion() {
+    for iteration in 0..20 {
+        let fixture = Fixture::new().await;
+        let release = fixture.workspace.join(format!("release-{iteration}"));
+        let ready = fixture.workspace.join(format!("ready-{iteration}"));
+        let mut child = fixture.executor();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let execution_id = format!("completion-race-{iteration}");
+        send_request(
+            &mut stdin,
+            &request(
+                &format!("bash-{iteration}"),
+                json!({
+                    "type":"bash",
+                    "command":format!("touch ready-{iteration}; while [ ! -e release-{iteration} ]; do :; done"),
+                    "execution_id":execution_id,
+                }),
+            ),
+        )
+        .await;
+        wait_for_nonempty_or_existing_file(&ready).await;
+        send_request(
+            &mut stdin,
+            &request(
+                &format!("cancel-{iteration}"),
+                json!({"type":"cancel","execution_id":execution_id}),
+            ),
+        )
+        .await;
+        std::fs::write(&release, b"release").unwrap();
+
+        let first = read_frame(&mut stdout).await;
+        let second = read_frame(&mut stdout).await;
+        let frames = [first, second];
+        assert!(
+            frames.iter().any(|frame| {
+                frame["request_id"] == format!("cancel-{iteration}")
+                    && frame["result"]["Ok"]["type"] == "cancel_accepted"
+            }),
+            "iteration {iteration}: {frames:?}"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame["request_id"] == format!("bash-{iteration}")),
+            "iteration {iteration}: {frames:?}"
+        );
+        drop(stdin);
+        assert!(child.wait().await.unwrap().success());
+    }
+}
+
+async fn wait_for_nonempty_or_existing_file(path: &Path) {
+    timeout(Duration::from_secs(5), async {
+        while !path.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("file creation timeout");
+}
+
+#[tokio::test]
+async fn broker_failure_telemetry_omits_caller_execution_id() {
+    let mut fixture = Fixture::new().await;
+    fixture.broker.start_kill().unwrap();
+    fixture.broker.wait().await.unwrap();
+    let secret_execution_id = "execution-secret-must-not-enter-stderr";
+    let mut child = fixture.executor_with_stderr(Stdio::piped());
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    send_request(
+        &mut stdin,
+        &request(
+            "broker-failure",
+            json!({
+                "type":"bash",
+                "command":"head -c 60000 /dev/zero | tr '\\0' x",
+                "execution_id":secret_execution_id,
+            }),
+        ),
+    )
+    .await;
+    loop {
+        if read_frame(&mut stdout).await["type"] == "terminal" {
+            break;
+        }
+    }
+    drop(stdin);
+    assert!(child.wait().await.unwrap().success());
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .await
+        .unwrap();
+    assert!(stderr.contains("artifact publication failed"), "{stderr}");
+    assert!(!stderr.contains(secret_execution_id), "{stderr}");
 }
 
 #[tokio::test]

@@ -58,6 +58,27 @@ enum ExecutorResponse {
     CancelAccepted,
 }
 
+enum ActiveControl {
+    Cancel(String),
+    Fatal {
+        error: ToolError,
+        response: Option<(String, RpcError)>,
+    },
+}
+
+enum BashExit {
+    Completed(Result<BashExecutionResult, ToolError>),
+    Cancelled {
+        cancel_request_id: String,
+        completed: Option<Result<BashExecutionResult, ToolError>>,
+    },
+    Fatal {
+        error: ToolError,
+        response: Option<(String, RpcError)>,
+        completed: Option<Result<BashExecutionResult, ToolError>>,
+    },
+}
+
 struct WriterMessage {
     bytes: Vec<u8>,
     acknowledgement: Option<oneshot::Sender<Result<(), String>>>,
@@ -492,22 +513,61 @@ where
     };
     tokio::pin!(control_reader);
     let mut control_reader_done = false;
-    enum BashExit {
-        Completed(Result<BashExecutionResult, ToolError>),
-        Cancelled { cancel_request_id: String },
-        Fatal(ToolError),
-    }
     let exit = loop {
         tokio::select! {
-            _ = &mut control_reader, if !control_reader_done => control_reader_done = true,
-            result = &mut execution => break BashExit::Completed(result),
+            biased;
             _ = writer.failed.cancelled() => {
-                break BashExit::Fatal(io_error("executor output writer failed"));
+                break BashExit::Fatal {
+                    error: io_error("executor output writer failed"),
+                    response: None,
+                    completed: None,
+                };
+            }
+            next = control_rx.recv(), if !control_reader_done || !control_rx.is_empty() => {
+                match classify_active_control(next, identity, &execution_id, lifecycle) {
+                    ActiveControl::Cancel(cancel_request_id) => break BashExit::Cancelled {
+                        cancel_request_id,
+                        completed: None,
+                    },
+                    ActiveControl::Fatal { error, response } => break BashExit::Fatal {
+                        error,
+                        response,
+                        completed: None,
+                    },
+                }
+            }
+            _ = &mut control_reader, if !control_reader_done => control_reader_done = true,
+            result = &mut execution => {
+                match control_rx.try_recv() {
+                    Ok(next) => match classify_active_control(
+                        Some(next),
+                        identity,
+                        &execution_id,
+                        lifecycle,
+                    ) {
+                        ActiveControl::Cancel(cancel_request_id) => break BashExit::Cancelled {
+                            cancel_request_id,
+                            completed: Some(result),
+                        },
+                        ActiveControl::Fatal { error, response } => break BashExit::Fatal {
+                            error,
+                            response,
+                            completed: Some(result),
+                        },
+                    },
+                    Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                        break BashExit::Completed(result);
+                    }
+                }
             }
             update = updates_rx.recv() => {
                 if let Some(value) = update {
                     if let Err(error) = lifecycle.accept_update(&request_id) {
-                        break BashExit::Fatal(error);
+                        break BashExit::Fatal {
+                            error,
+                            response: None,
+                            completed: None,
+                        };
                     }
                     let frame = RpcFrame::<ExecutorResponse>::Update {
                         generation: identity.generation,
@@ -517,77 +577,11 @@ where
                     };
                     if let Err(error) = writer.try_update(&frame) {
                         tracing::warn!("executor output queue unavailable; closing service epoch");
-                        break BashExit::Fatal(error);
-                    }
-                }
-            }
-            next = control_rx.recv(), if !control_reader_done || !control_rx.is_empty() => {
-                let Some(next) = next else {
-                    break BashExit::Fatal(ToolError::Protocol(
-                        "executor control reader stopped without a terminal input state".to_owned()
-                    ));
-                };
-                let line = match next {
-                    Ok(Some(line)) => line,
-                    Ok(None) => {
-                        break BashExit::Fatal(ToolError::Protocol(
-                            "executor input closed during active bash execution".to_owned()
-                        ));
-                    }
-                    Err(error) => {
-                        break BashExit::Fatal(error);
-                    }
-                };
-                let incoming = match decode_executor_request(&line, identity) {
-                    Err(error) => break BashExit::Fatal(error),
-                    Ok(request) => request,
-                };
-                let incoming = match incoming {
-                    Ok(request) => request,
-                    Err((invalid_id, error)) => {
-                        if let Err(error) = lifecycle.begin_request(&invalid_id) {
-                            break BashExit::Fatal(error);
-                        }
-                        if let Err(error) = lifecycle.accept_terminal(&invalid_id) {
-                            break BashExit::Fatal(error);
-                        }
-                        if let Err(error) = writer.terminal(identity, invalid_id, Err(error)).await {
-                            break BashExit::Fatal(error);
-                        }
-                        continue;
-                    }
-                };
-                match incoming.operation {
-                    ExecutorOperation::Cancel { execution_id: target }
-                        if target == execution_id =>
-                    {
-                        if let Err(error) = lifecycle.accept_cancel(&incoming.request_id, &target) {
-                            break BashExit::Fatal(error);
-                        }
-                        if let Err(error) = lifecycle.accept_terminal(&incoming.request_id) {
-                            break BashExit::Fatal(error);
-                        }
-                        break BashExit::Cancelled {
-                            cancel_request_id: incoming.request_id,
+                        break BashExit::Fatal {
+                            error,
+                            response: None,
+                            completed: None,
                         };
-                    }
-                    _ => {
-                        if let Err(error) = lifecycle.begin_request(&incoming.request_id) {
-                            break BashExit::Fatal(error);
-                        }
-                        if let Err(error) = lifecycle.accept_terminal(&incoming.request_id) {
-                            break BashExit::Fatal(error);
-                        }
-                        if let Err(error) = writer.terminal(
-                            identity,
-                            incoming.request_id,
-                            Err(RpcError {
-                                code: "busy".to_owned(),
-                                resource_limit: None,
-                            }),
-                        ).await {
-                            break BashExit::Fatal(error);
-                        }
                     }
                 }
             }
@@ -595,14 +589,35 @@ where
     };
 
     match exit {
-        BashExit::Fatal(error) => {
+        BashExit::Fatal {
+            error,
+            response,
+            completed,
+        } => {
             cancel.cancel();
-            if timeout(EXECUTOR_REAP_DEADLINE, &mut execution)
-                .await
-                .is_err()
-            {
-                tracing::warn!("executor cancellation exceeded its service deadline");
-                bail!("executor cancellation exceeded its service deadline");
+            let result = match completed {
+                Some(result) => result,
+                None => timeout(EXECUTOR_REAP_DEADLINE, &mut execution)
+                    .await
+                    .map_err(|_| {
+                        tracing::warn!("executor cancellation exceeded its service deadline");
+                        anyhow::anyhow!("executor cancellation exceeded its service deadline")
+                    })?,
+            };
+            lifecycle.accept_terminal(&request_id)?;
+            writer
+                .terminal(
+                    identity,
+                    request_id,
+                    result
+                        .map(|result| ExecutorResponse::Bash { result })
+                        .map_err(rpc_error),
+                )
+                .await?;
+            if let Some((response_id, response_error)) = response {
+                writer
+                    .terminal(identity, response_id, Err(response_error))
+                    .await?;
             }
             Err(error.into())
         }
@@ -619,13 +634,19 @@ where
                 .await?;
             Ok(())
         }
-        BashExit::Cancelled { cancel_request_id } => {
+        BashExit::Cancelled {
+            cancel_request_id,
+            completed,
+        } => {
             cancel.cancel();
-            let result = timeout(EXECUTOR_REAP_DEADLINE, &mut execution)
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!("executor cancellation exceeded its service deadline")
-                })?;
+            let result = match completed {
+                Some(result) => result,
+                None => timeout(EXECUTOR_REAP_DEADLINE, &mut execution)
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("executor cancellation exceeded its service deadline")
+                    })?,
+            };
             lifecycle.accept_terminal(&request_id)?;
             writer
                 .terminal(
@@ -645,6 +666,98 @@ where
                 .await?;
             Ok(())
         }
+    }
+}
+
+fn classify_active_control(
+    next: Option<Result<Option<Vec<u8>>, ToolError>>,
+    identity: &RpcIdentity,
+    execution_id: &str,
+    lifecycle: &mut RpcLifecycleTracker,
+) -> ActiveControl {
+    let Some(next) = next else {
+        return ActiveControl::Fatal {
+            error: ToolError::Protocol(
+                "executor control reader stopped without a terminal input state".to_owned(),
+            ),
+            response: None,
+        };
+    };
+    let line = match next {
+        Ok(Some(line)) => line,
+        Ok(None) => {
+            return ActiveControl::Fatal {
+                error: ToolError::Protocol(
+                    "executor input closed during active bash execution".to_owned(),
+                ),
+                response: None,
+            };
+        }
+        Err(error) => {
+            return ActiveControl::Fatal {
+                error,
+                response: None,
+            };
+        }
+    };
+    let incoming = match decode_executor_request(&line, identity) {
+        Err(error) => {
+            return ActiveControl::Fatal {
+                error,
+                response: None,
+            };
+        }
+        Ok(Ok(request)) => request,
+        Ok(Err((request_id, response_error))) => {
+            let lifecycle_result = lifecycle
+                .begin_request(&request_id)
+                .and_then(|()| lifecycle.accept_terminal(&request_id));
+            return match lifecycle_result {
+                Ok(()) => ActiveControl::Fatal {
+                    error: ToolError::Protocol(
+                        "invalid control request during active bash execution".to_owned(),
+                    ),
+                    response: Some((request_id, response_error)),
+                },
+                Err(error) => ActiveControl::Fatal {
+                    error,
+                    response: None,
+                },
+            };
+        }
+    };
+    if let ExecutorOperation::Cancel {
+        execution_id: target,
+    } = &incoming.operation
+        && target == execution_id
+    {
+        return match lifecycle
+            .accept_cancel(&incoming.request_id, target)
+            .and_then(|()| lifecycle.accept_terminal(&incoming.request_id))
+        {
+            Ok(()) => ActiveControl::Cancel(incoming.request_id),
+            Err(error) => ActiveControl::Fatal {
+                error,
+                response: None,
+            },
+        };
+    }
+
+    let request_id = incoming.request_id;
+    match lifecycle
+        .begin_request(&request_id)
+        .and_then(|()| lifecycle.accept_terminal(&request_id))
+    {
+        Ok(()) => ActiveControl::Fatal {
+            error: ToolError::Protocol(
+                "only a matching cancel is valid during active bash execution".to_owned(),
+            ),
+            response: Some((request_id, bounded_error("protocol"))),
+        },
+        Err(error) => ActiveControl::Fatal {
+            error,
+            response: None,
+        },
     }
 }
 

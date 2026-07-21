@@ -527,7 +527,6 @@ impl<'a> ShellCapture<'a> {
         }
         tracing::warn!(
             %error,
-            execution_id = self.execution_id,
             "shell output artifact publication failed; preserving terminal capture without a handle"
         );
         self.artifact_disabled = true;
