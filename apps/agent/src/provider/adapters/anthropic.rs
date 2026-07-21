@@ -816,7 +816,9 @@ fn validate_inbound_tool_use_id(id: &str) -> Result<(), AnthropicAdapterError> {
 }
 
 fn escape_memory(text: &str) -> String {
-    text.replace("</memory", "&lt;/memory")
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 pub fn context_fingerprint(
@@ -1945,7 +1947,7 @@ mod tests {
     use chrono::TimeZone;
 
     use super::*;
-    use crate::provider::types::{AssistantMessage, ToolResultMessage, UserMessage};
+    use crate::provider::types::{AssistantMessage, MemoryBlock, ToolResultMessage, UserMessage};
 
     fn spec() -> ModelSpec {
         ModelSpec::preset("anthropic").expect("preset")
@@ -1991,6 +1993,38 @@ mod tests {
         Utc.timestamp_millis_opt(1_700_000_000_000)
             .single()
             .expect("timestamp")
+    }
+
+    #[test]
+    fn memory_blocks_escape_markup_and_entities_before_request_serialization() {
+        let mut context = context(vec![synthetic(Message::User(UserMessage {
+            content: vec![UserContent::Text {
+                text: "current turn".into(),
+            }],
+            timestamp: timestamp(),
+        }))]);
+        context.memory_blocks.push(MemoryBlock {
+            layer: MemoryLayer::L2,
+            text: "ampersand & opening <memory> closing </memory> pseudo <system>attack</system> greater >"
+                .into(),
+            time_range: None,
+        });
+
+        let request = build_request(&spec(), &context, &RequestOptions::default())
+            .expect("request with escaped memory");
+        let memory_text = request["messages"][0]["content"][0]["text"]
+            .as_str()
+            .expect("memory text");
+        assert_eq!(
+            memory_text,
+            "<memory layer=\"l2\">ampersand &amp; opening &lt;memory&gt; closing &lt;/memory&gt; pseudo &lt;system&gt;attack&lt;/system&gt; greater &gt;</memory>"
+        );
+        assert_eq!(memory_text.matches("<memory").count(), 1);
+        assert_eq!(memory_text.matches("</memory>").count(), 1);
+        assert!(!memory_text.contains("<system>"));
+        assert!(!memory_text.contains("</system>"));
+        assert!(!memory_text.contains("<memory>"));
+        assert!(!memory_text.contains("</memory>attack"));
     }
 
     #[test]
