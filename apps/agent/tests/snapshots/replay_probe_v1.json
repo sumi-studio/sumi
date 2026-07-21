@@ -1,0 +1,65 @@
+{
+  "contract": "ReplayProbeV1",
+  "eviction_estimator_version": 1,
+  "cases": [
+    {
+      "protocol": "open_ai_responses",
+      "model_family": "responses_encrypted_reasoning",
+      "kind": "encrypted_reasoning",
+      "sentinel_position": "immediately_before_fragment",
+      "fragment_slot": "input[1]",
+      "without_body_sha256": "e49bacd0942e11515ca397ac8385426db35702537ccbd540b012460dc2999a37",
+      "with_body_sha256": "6c53f7fb8aa3d9a116dfc67f16e05c2c05ba629e8e67bb0d8a13769f5664bc72",
+      "without_body_bytes": 402,
+      "with_body_bytes": 545,
+      "replay_wire_bytes": 143,
+      "expected_t19_token_ceiling": 36
+    },
+    {
+      "protocol": "anthropic_messages",
+      "model_family": "anthropic_thinking",
+      "kind": "thinking_signature",
+      "sentinel_position": "immediately_before_fragment",
+      "fragment_slot": "messages[1].content[1]",
+      "without_body_sha256": "a57c0ac72bada26c9d471f03fdc4a55ad6b084be98719a4c08d3d9741f24e147",
+      "with_body_sha256": "bfee2d02fee3fb3411bacd3af548e31f7110ad7dbe23391592141f40aafee822",
+      "without_body_bytes": 537,
+      "with_body_bytes": 661,
+      "replay_wire_bytes": 124,
+      "expected_t19_token_ceiling": 31
+    },
+    {
+      "protocol": "anthropic_messages",
+      "model_family": "anthropic_thinking",
+      "kind": "redacted_thinking",
+      "sentinel_position": "immediately_before_fragment",
+      "fragment_slot": "messages[1].content[1]",
+      "without_body_sha256": "a57c0ac72bada26c9d471f03fdc4a55ad6b084be98719a4c08d3d9741f24e147",
+      "with_body_sha256": "66ae678f3af5451dac9d65d763dde747846d1bdac9189a712679b34a7f1fec99",
+      "without_body_bytes": 537,
+      "with_body_bytes": 627,
+      "replay_wire_bytes": 90,
+      "expected_t19_token_ceiling": 23
+    },
+    {
+      "protocol": "open_ai_responses",
+      "model_family": "responses_native_compaction",
+      "kind": "open_ai_compacted_window",
+      "sentinel_position": null,
+      "fragment_slot": "native_canonical_window",
+      "replay_wire_bytes": null,
+      "expected_t19_token_ceiling": 0,
+      "result": "native_canonical_window"
+    },
+    {
+      "protocol": "anthropic_messages",
+      "model_family": "anthropic_native_compaction",
+      "kind": "anthropic_compaction",
+      "sentinel_position": null,
+      "fragment_slot": "native_canonical_window",
+      "replay_wire_bytes": null,
+      "expected_t19_token_ceiling": 0,
+      "result": "native_canonical_window"
+    }
+  ]
+}

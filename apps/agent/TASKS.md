@@ -198,8 +198,8 @@ Cloud release (T25〜T29): M1P・M0〜M5 と依存が満たされた範囲で並
 
 - 読む: §7.2〜§7.3、§7.5、#27〜#28、pi: `agent/src/harness/compaction/compaction.ts:118-303`
 - 作る: `src/memory/batch.rs`、`estimate.rs`、`mod.rs` の状態モデル(§7.2 の構造体群と定数。`DecryptedMemorySummary` は zeroize)
-- やること: seal 境界規則(**通常 seal は user メッセージ直前に限定**、toolResult 直前禁止、interrupted+steering 間禁止、tool loop 跨ぎ禁止。assistant 直前は**強制 seal(public est+footprint がバッチ強制上限超過)時のフォールバックのみ**)。est(ascii/4 + non_ascii/1.5)+EMA 校正の器。**eviction footprint の versioned 純関数**(`ReplayProbeV1` の2回 serialize 差分、`eviction_tokens_v1 = ceil(bytes/4)`、ratio は overflow 比較時に1回だけ)
-- 受け入れ: 境界規則のテーブルテスト、見積の既知例テスト、M4 ゲート11 の golden fixture(estimator が全 adapter で同値)
+- やること: seal 境界規則(**通常 seal は user メッセージ直前に限定**、toolResult 直前禁止、interrupted+steering 間禁止、tool loop 跨ぎ禁止。assistant 直前は**強制 seal(public est+footprint がバッチ強制上限超過)時のフォールバックのみ**)。est(ascii/4 + non_ascii/1.5)+EMA 校正の器。**eviction footprint の versioned 純関数**(`ReplayProbeV1` の2回 serialize 差分、`eviction_tokens_v1 = ceil(bytes/4)`、ratio は overflow 比較時に1回だけ)。V1のserialized対象はResponses encrypted reasoning、Anthropic thinking signature/redacted thinking。OpenAI compacted window/Anthropic compactionは3層L0と排他的なtyped native zero、Chat平文Thinkingはpublic estのみでfootprintへ入れない
+- 受け入れ: 境界規則のテーブルテスト、見積の既知例テスト、M4 ゲート11 の versioned contracts golden(各adapter実装が共有goldenのprotocol固有値に一致すること。protocol間の数値差分一致は要求しない)。goldenとprovider serializer境界はT19の前提、`MessageEnd`と同一transactionのprovider_context/footprint永続化はT17結合範囲
 - コミット: `agent: 3層メモリの状態モデル/バッチ分割/見積 (M4 1/3)`
 
 ### T20: memory/compactor.rs + memory_jobs 【要T17,T19】

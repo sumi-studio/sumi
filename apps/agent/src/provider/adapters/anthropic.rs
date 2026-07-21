@@ -11,10 +11,10 @@ use crate::provider::{
     },
     model::{AnthropicCompat, ModelSpec, ProtocolCompat, RequestOptions},
     types::{
-        ApiProtocol, AssistantContent, ContextMessage, MemoryLayer, Message,
+        ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, MemoryLayer, Message,
         NativeCompactionCoverage, PromptContext, ProviderContextAnchor, ProviderContextFragment,
         ProviderContextItem, ProviderContextPayload, ProviderEvent, StopReason, ToolDefinition,
-        Usage, UserContent,
+        Usage, UserContent, UserMessage,
     },
 };
 
@@ -162,6 +162,121 @@ pub fn build_request(
         );
     }
     Ok(Value::Object(request))
+}
+
+pub(in crate::provider) fn build_replay_probe_request(
+    fragment: Option<&Value>,
+) -> Result<Value, AnthropicAdapterError> {
+    build_replay_probe_request_with_usage(fragment, Usage::default())
+}
+
+fn build_replay_probe_request_with_usage(
+    fragment: Option<&Value>,
+    usage: Usage,
+) -> Result<Value, AnthropicAdapterError> {
+    let spec =
+        ModelSpec::preset("anthropic").expect("the V1 Anthropic replay probe preset is built in");
+    let anchor = ProviderContextAnchor {
+        message_id: "replay-probe-v1-assistant".into(),
+        message_seq: 2,
+    };
+    let mut content = vec![AssistantContent::Thinking {
+        thinking: "replay-probe-v1-sentinel".into(),
+        signature_field: "thinking.signature".into(),
+        wire_item_index: 0,
+    }];
+    let mut provider_context = vec![ProviderContextItem {
+        origin_message: Some(anchor.clone()),
+        wire_item_index: Some(0),
+        ordinal: 0,
+        payload: ProviderContextPayload::EncryptedReasoning {
+            protocol: ApiProtocol::AnthropicMessages,
+            item: json!({
+                "type":"thinking_signature",
+                "signature":"replay-probe-v1-sentinel",
+            }),
+        },
+    }];
+    if let Some(fragment) = fragment {
+        let thinking = match fragment.get("type").and_then(Value::as_str) {
+            Some("thinking_signature") => "replay-probe-v1-fragment",
+            Some("redacted_thinking") => REDACTED_PLACEHOLDER,
+            _ => "replay-probe-v1-invalid",
+        };
+        content.push(AssistantContent::Thinking {
+            thinking: thinking.into(),
+            signature_field: "replay-probe-v1".into(),
+            wire_item_index: 1,
+        });
+        provider_context.push(ProviderContextItem {
+            origin_message: Some(anchor),
+            wire_item_index: Some(1),
+            ordinal: 0,
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::AnthropicMessages,
+                item: fragment.clone(),
+            },
+        });
+    }
+    let context = PromptContext {
+        system_prompt: "replay-probe-v1".into(),
+        memory_blocks: Vec::new(),
+        messages: vec![
+            ContextMessage::Persisted {
+                id: "replay-probe-v1-user-prefix".into(),
+                seq: 1,
+                message: Message::User(UserMessage {
+                    content: vec![UserContent::Text {
+                        text: "replay-probe-v1-user-prefix".into(),
+                    }],
+                    timestamp: Utc::now(),
+                }),
+            },
+            ContextMessage::Persisted {
+                id: "replay-probe-v1-assistant".into(),
+                seq: 2,
+                message: Message::Assistant(AssistantMessage {
+                    content,
+                    model: spec.id.clone(),
+                    provider: spec.provider.clone(),
+                    origin: spec.origin(),
+                    usage,
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                    provider_code: None,
+                    interrupted: false,
+                    timestamp: Utc::now(),
+                }),
+            },
+            ContextMessage::Persisted {
+                id: "replay-probe-v1-user".into(),
+                seq: 3,
+                message: Message::User(UserMessage {
+                    content: vec![UserContent::Text {
+                        text: "replay-probe-v1-user".into(),
+                    }],
+                    timestamp: Utc::now(),
+                }),
+            },
+        ],
+        provider_context,
+        tools: Vec::new(),
+    };
+    build_request(&spec, &context, &RequestOptions::default())
+}
+
+#[cfg(test)]
+pub(in crate::provider) fn build_replay_probe_request_for_usage_test(
+    fragment: Option<&Value>,
+    usage: Usage,
+) -> Result<Value, AnthropicAdapterError> {
+    build_replay_probe_request_with_usage(fragment, usage)
+}
+
+pub(in crate::provider) fn validate_replay_native_block(
+    block: &Value,
+) -> Result<(), AnthropicAdapterError> {
+    validate_compaction_block(block)
 }
 
 fn ensure_anthropic_spec(spec: &ModelSpec) -> Result<&AnthropicCompat, AnthropicAdapterError> {

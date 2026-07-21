@@ -11,10 +11,10 @@ use crate::provider::{
     },
     model::{ModelSpec, ProtocolCompat, RequestOptions, ResponsesCompat},
     types::{
-        ApiProtocol, AssistantContent, ContextMessage, MemoryLayer, Message,
+        ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, MemoryLayer, Message,
         NativeCompactionCoverage, PromptContext, ProviderContextAnchor, ProviderContextFragment,
         ProviderContextItem, ProviderContextPayload, ProviderEvent, StopReason, ToolDefinition,
-        Usage, UserContent,
+        Usage, UserContent, UserMessage,
     },
 };
 
@@ -172,6 +172,105 @@ pub fn build_request(
         }
     }
     Ok(Value::Object(request))
+}
+
+pub(in crate::provider) fn build_replay_probe_request(
+    fragment: Option<&Value>,
+) -> Result<Value, ResponsesAdapterError> {
+    build_replay_probe_request_with_usage(fragment, Usage::default())
+}
+
+fn build_replay_probe_request_with_usage(
+    fragment: Option<&Value>,
+    usage: Usage,
+) -> Result<Value, ResponsesAdapterError> {
+    let spec = ModelSpec::preset("openai-responses")
+        .expect("the V1 Responses replay probe preset is built in");
+    let anchor = ProviderContextAnchor {
+        message_id: "replay-probe-v1-assistant".into(),
+        message_seq: 1,
+    };
+    let mut provider_context = vec![ProviderContextItem {
+        origin_message: Some(anchor.clone()),
+        wire_item_index: Some(0),
+        ordinal: 0,
+        payload: ProviderContextPayload::EncryptedReasoning {
+            protocol: ApiProtocol::OpenAiResponses,
+            item: json!({
+                "type":"reasoning",
+                "id":"rs_replay_probe_v1_sentinel",
+                "encrypted_content":"replay-probe-v1-sentinel",
+                "summary":[],
+            }),
+        },
+    }];
+    if let Some(fragment) = fragment {
+        provider_context.push(ProviderContextItem {
+            origin_message: Some(anchor),
+            wire_item_index: Some(1),
+            ordinal: 0,
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiResponses,
+                item: fragment.clone(),
+            },
+        });
+    }
+    let context = PromptContext {
+        system_prompt: "replay-probe-v1".into(),
+        memory_blocks: Vec::new(),
+        messages: vec![
+            ContextMessage::Persisted {
+                id: "replay-probe-v1-assistant".into(),
+                seq: 1,
+                message: Message::Assistant(AssistantMessage {
+                    content: Vec::new(),
+                    model: spec.id.clone(),
+                    provider: spec.provider.clone(),
+                    origin: spec.origin(),
+                    usage,
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                    provider_code: None,
+                    interrupted: false,
+                    timestamp: Utc::now(),
+                }),
+            },
+            ContextMessage::Persisted {
+                id: "replay-probe-v1-user".into(),
+                seq: 2,
+                message: Message::User(UserMessage {
+                    content: vec![UserContent::Text {
+                        text: "replay-probe-v1-user".into(),
+                    }],
+                    timestamp: Utc::now(),
+                }),
+            },
+        ],
+        provider_context,
+        tools: Vec::new(),
+    };
+    build_request(&spec, &context, &RequestOptions::default())
+}
+
+#[cfg(test)]
+pub(in crate::provider) fn build_replay_probe_request_for_usage_test(
+    fragment: Option<&Value>,
+    usage: Usage,
+) -> Result<Value, ResponsesAdapterError> {
+    build_replay_probe_request_with_usage(fragment, usage)
+}
+
+pub(in crate::provider) fn validate_replay_native_items(
+    items: &[Value],
+) -> Result<(), ResponsesAdapterError> {
+    if items.is_empty() {
+        return Err(ResponsesAdapterError::InvalidContext(
+            "native compacted window must not be empty".into(),
+        ));
+    }
+    items.iter().try_for_each(|item| {
+        validate_canonical_item(item).map_err(ResponsesAdapterError::InvalidContext)
+    })
 }
 
 pub fn build_compact_request(
