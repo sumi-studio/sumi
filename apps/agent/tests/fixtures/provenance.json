@@ -1,0 +1,172 @@
+{
+  "schema_version": 1,
+  "fixtures": {
+    "kimi_text.sse": {
+      "source_kind": "synthetic_contract_fixture",
+      "provider": "moonshot",
+      "model": "kimi-k3",
+      "case": "text",
+      "live_capture_status": "blocked_missing_MOONSHOT_API_KEY",
+      "captured_at": null,
+      "raw_capture_sha256": null
+    },
+    "kimi_toolcall.sse": {
+      "source_kind": "synthetic_contract_fixture",
+      "provider": "moonshot",
+      "model": "kimi-k3",
+      "case": "tool_call",
+      "live_capture_status": "blocked_missing_MOONSHOT_API_KEY",
+      "captured_at": null,
+      "raw_capture_sha256": null
+    },
+    "kimi_reasoning.sse": {
+      "source_kind": "synthetic_contract_fixture",
+      "provider": "moonshot",
+      "model": "kimi-k3",
+      "case": "reasoning",
+      "live_capture_status": "blocked_missing_MOONSHOT_API_KEY",
+      "captured_at": null,
+      "raw_capture_sha256": null
+    },
+    "glm_tool_stream.sse": {
+      "source_kind": "synthetic_contract_fixture",
+      "provider": "zai",
+      "model": "glm-5.2",
+      "case": "thinking_and_tool_stream",
+      "live_capture_status": "blocked_missing_ZAI_API_KEY",
+      "captured_at": null,
+      "raw_capture_sha256": null
+    },
+    "glm_sensitive.sse": {
+      "source_kind": "synthetic_contract_fixture",
+      "provider": "zai",
+      "model": "glm-5.2",
+      "case": "provider_finish_reason_sensitive",
+      "live_capture_status": "blocked_missing_ZAI_API_KEY",
+      "captured_at": null,
+      "raw_capture_sha256": null
+    },
+    "glm_network_error.sse": {
+      "source_kind": "synthetic_contract_fixture",
+      "provider": "zai",
+      "model": "glm-5.2",
+      "case": "provider_finish_reason_network_error",
+      "live_capture_status": "blocked_missing_ZAI_API_KEY",
+      "captured_at": null,
+      "raw_capture_sha256": null
+    },
+    "glm_context_window.sse": {
+      "source_kind": "synthetic_contract_fixture",
+      "provider": "zai",
+      "model": "glm-5.2",
+      "case": "provider_finish_reason_model_context_window_exceeded",
+      "live_capture_status": "blocked_missing_ZAI_API_KEY",
+      "captured_at": null,
+      "raw_capture_sha256": null
+    },
+    "http_429.json": {
+      "source_kind": "synthetic_contract_fixture",
+      "provider": "protocol_neutral",
+      "model": null,
+      "case": "http_429",
+      "live_capture_status": "not_attempted_without_provider_credentials",
+      "captured_at": null,
+      "raw_capture_sha256": null
+    },
+    "transport_error.sse": {
+      "source_kind": "synthetic_transport_fixture",
+      "provider": "protocol_neutral",
+      "model": null,
+      "case": "unterminated_sse_eof",
+      "live_capture_status": "not_applicable",
+      "captured_at": null,
+      "raw_capture_sha256": null
+    },
+    "opencode_kimi_k2_7_code_text.sse": {
+      "source_kind": "sanitized_live_curl_capture",
+      "provider": "opencode-go",
+      "model": "kimi-k2.7-code",
+      "case": "reasoning_and_text_with_post_done_cost_trailer",
+      "live_capture_status": "captured_and_sanitized",
+      "endpoint_origin": "https://opencode.ai/zen/go/v1",
+      "captured_at": "2026-07-20T13:09:49.806Z",
+      "raw_capture_bytes": 4486,
+      "raw_capture_sha256": "6eb84863feb46a3091e48e25e3ab43f6a9fb309598875ae763fd1d4066467e9c",
+      "credential_source": "OpenCode auth store opencode-go entry (credential not stored)",
+      "request_body_source": "production build_request output fixed by chat_send_matrix.json opencode_live_capture_request and its provenance consistency test",
+      "capture_command": "curl -sS -N --fail-with-body --max-time 120 -H 'Authorization: Bearer $OPENCODE_GO_API_KEY' -H 'Content-Type: application/json' https://opencode.ai/zen/go/v1/chat/completions --data-binary @/tmp/sumi-opencode-production-request.json --output /tmp/sumi-opencode-production-capture.raw.sse",
+      "request_body": {
+        "max_tokens": 64,
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "text": "Reply with exactly fixture-ok",
+                "type": "text"
+              }
+            ]
+          }
+        ],
+        "model": "kimi-k2.7-code",
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "sanitization": [
+        "response id replaced with chatcmpl-<response-id>",
+        "created Unix timestamp replaced with numeric 0"
+      ],
+      "preserved": [
+        "SSE event order and blank-line framing",
+        "JSON field placement",
+        "reasoning_content and content delta splitting",
+        "usage and cost trailer placement",
+        "post-DONE cost trailer"
+      ]
+    }
+  },
+  "evidence_gaps": {
+    "moonshot_direct_text_tool_reasoning": {
+      "provider": "moonshot",
+      "model": "kimi-k3",
+      "required_cases": [
+        "text",
+        "tool_call",
+        "reasoning",
+        "two_turn_reasoning_content_replay"
+      ],
+      "status": "blocked_missing_MOONSHOT_API_KEY",
+      "deferred_gate": "T25_provider_release",
+      "release_blocking": true
+    },
+    "zai_direct_tool_and_finish_reasons": {
+      "provider": "zai",
+      "model": "glm-5.2",
+      "required_cases": [
+        "thinking_and_tool_stream",
+        "provider_finish_reason_sensitive",
+        "provider_finish_reason_network_error",
+        "provider_finish_reason_model_context_window_exceeded",
+        "two_turn_tool_reasoning"
+      ],
+      "status": "blocked_missing_ZAI_API_KEY",
+      "deferred_gate": "T25_provider_release",
+      "release_blocking": true
+    },
+    "umans_direct_text_tool_reasoning": {
+      "provider": "umans",
+      "model": "umans-kimi-k2.7",
+      "required_cases": [
+        "text",
+        "tool_call",
+        "reasoning",
+        "two_turn_tool_reasoning"
+      ],
+      "status": "blocked_missing_UMANS_API_KEY",
+      "deferred_gate": "T25_provider_release",
+      "release_blocking": true
+    }
+  }
+}

@@ -294,10 +294,18 @@ pub struct UserMessage {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProviderOrigin {
+    pub provider_instance_id: String,
+    pub protocol: ApiProtocol,
+    pub model: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AssistantMessage {
     pub content: Vec<AssistantContent>,     // Text | Thinking | ToolCall | RejectedToolCall
     pub model: String,                      // 生成時のモデルID (クロスモデル再送判定に使う)
     pub provider: String,
+    pub origin: ProviderOrigin,             // 平文thinking再送の完全一致判定
     pub usage: Usage,
     pub stop_reason: StopReason,
     pub error_message: Option<String>,
@@ -312,6 +320,7 @@ pub struct PublicAssistantMessage {
     pub content: Vec<PublicAssistantContent>, // Text | Thinking(平文) | ToolCall | RejectedToolCall。opaque は除外
     pub model: String,
     pub provider: String,
+    pub origin: ProviderOrigin,
     pub usage: Usage,
     pub stop_reason: StopReason,
     pub error_message: Option<String>,
@@ -380,7 +389,13 @@ pub struct RejectedToolCall {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ToolArgumentError { InvalidJson, NonObject, SchemaViolation }
+pub enum ToolArgumentError {
+    InvalidJson,
+    NonObject,
+    SchemaViolation,
+    IncompleteResponse,
+    TooLarge,
+}
 
 // ValidatedToolArgumentsは公開constructorを持たない。live streamではassembler内の
 // try_from_raw(raw, frozen_tool_schema)だけが生成する。custom Deserializeは暗号化済み
@@ -409,7 +424,7 @@ pub struct Usage {
 **pi との差分と理由**:
 - `ThinkingContent.thinkingSignature` → `signature_field` に改名。OpenAI互換系ではこのフィールドは「reasoning がどの JSON フィールドで届いたか」を記録して再送時に同じフィールドへ書き戻すために使われている **[事実]** (`pi:ai/src/api/openai-completions.ts:408-424, 996-1003`)。Responses の encrypted reasoning と Anthropic の署名/compaction block はこの文字列へ押し込まず、protocol-scoped な `ProviderContextItem` として扱う。
 - `AssistantMessage.interrupted` は Sumi 拡張。pi は aborted メッセージを再送時に丸ごと捨てる **[事実]** (`pi:ai/src/api/transform-messages.ts` の aborted スキップ処理) が、Sumi のハードステアは部分応答を保持する必要があるため、「打ち切られたが再送対象」であることを示すフラグを持つ(第6章)。
-- pi の `api`/`diagnostics` フィールドは省略し、protocol は `ModelSpec`、provider/model は Message に保持する。response ID は通常ログ、継続に必要な opaque ID/item は `ProviderContextItem` にだけ保存する。
+- pi の `api`/`diagnostics` フィールドは省略するが、平文thinkingの再送先を再起動後にも証明するため、非secretな`ProviderOrigin(provider_instance_id/protocol/model)`はMessageに保持する。provider表示名やmodel名だけでは同名の別endpoint/account/protocolを区別できず、trust domainも平文thinkingの可搬性を意味しない。response ID は通常ログ、継続に必要な opaque ID/item は `ProviderContextItem` にだけ保存する。
 
 ### 3.2 プロバイダイベント
 
@@ -422,14 +437,18 @@ pub enum ProviderEvent {
     TextStart     { content_index: usize },
     TextDelta     { content_index: usize, delta: String },
     TextEnd       { content_index: usize, content: String },
-    ThinkingStart { content_index: usize },
+    ThinkingStart { content_index: usize, signature_field: String },
     ThinkingDelta { content_index: usize, delta: String },
     ThinkingEnd   { content_index: usize, content: String },
     ToolCallStart { content_index: usize },
     ToolCallDelta { content_index: usize, delta: String },   // 引数JSONの生delta
     ToolCallPreview { content_index: usize, preview: ToolArgsPreview },
     ToolCallEnd   { content_index: usize, tool_call: ToolCall }, // strict検証済みだけ
-    ToolCallRejected { content_index: usize, rejected: RejectedToolCall },
+    ToolCallRejected {
+        content_index: usize,
+        rejected: RejectedToolCall,
+        synthetic_result: ToolResultMessage,
+    },
     /// provider が display-safe と明示した reasoning summary のみ (例: Responses の
     /// reasoning summary event)。raw Thinking* とは別 variant で、adapter が明示変換する。
     /// content_index は公開 content 配列とは独立した summary slot の連番
@@ -459,6 +478,8 @@ pub struct ProviderContextFragment {
 
 opaque reasoning/compaction item は delta ごとに公開イベントへ流さず、adapter 内で検証・収集して terminal `ProviderOutput` に載せる。adapter は公開 Text/ToolCall と reasoning に同じ flatten 済み `wire_item_index` を付ける。Chat adapter の `AssistantContent::Thinking`(平文 reasoning_content)は `PublicAssistantContent::Thinking` として公開形に残し、provider context へは移さない。Anthropic も thinking 本文を同様に公開形へ残し、`signature` と `redacted_thinking` だけを `EncryptedReasoning` fragment として収集する(再送時は `wire_item_index` で本文と合流 — §4.2.2)。Session は runtime `AssistantMessage` から `PublicMessage` を導出し、確定する assistant の `message_id/message_seq` と同じ wire slot 内の `ordinal` を各 payload に付けて暗号化し、同じ `MessageEnd` transaction の `Projection::MessageEnd.provider_context` へ渡す。EventWriter は anchor が MessageEnd と一致し `(wire_item_index, ordinal)` が重複しないことを検証する。通常応答の idempotency key は `message_id:wire_item_index:ordinal:kind`、dedicated compaction は request id + coverage + fingerprint から作る。復元時は公開 content と provider context を `wire_item_index, ordinal` で stable merge し、opaque item(signature 等)を元の assistant に戻す。これで Kimi の全ターン reasoning 再送や Responses item の相対配置を含め、公開 transcript へ opaque content を混ぜずに応答と継続 item の対応・順序を保った原子的な保存経路を確保する。
 
+永続contentを作る`ProviderEvent.content_index`はadapterがflatten済みwire slotとして発行し、assemblerが同値を`wire_item_index`へ変換する。`u32`へ表現不能ならtruncateせずErrorとする。`ReasoningSummary*`のindexだけはdisplay専用の別namespaceで、永続content位置へ変換しない。
+
 通常応答と別 HTTP call になる Responses `/responses/compact` は `compact_native() -> NativeCompactionResult { items, coverage }` で ordered `output[]` 全体を返す。保持された message/tool item を compaction item だけへ縮退してはならず、この配列を canonical next context window として暗号化保存・順序どおり再送する。MemoryMaintainer は `event=None + Projection::ProviderContextMutation` を EventWriter へ渡し、同じ fingerprint の旧 native window の置換無効化と新 window の暗号化 INSERT を1 transaction で行う。Anthropic の応答内 compaction block は通常どおり terminal `ProviderOutput` 経路を使う。
 
 ストリームの型は `pi:ai/src/utils/event-stream.ts` の `EventStream`(push/AsyncIterator/最終結果Promise)に対応して:
@@ -466,6 +487,8 @@ opaque reasoning/compaction item は delta ごとに公開イベントへ流さ�
 ```rust
 pub struct ProviderEventStream {
     rx: Option<tokio::sync::mpsc::Receiver<ProviderEvent>>,
+    priority_terminal_rx: Option<tokio::sync::mpsc::Receiver<ProviderEvent>>,
+    start_emitted: bool, // Start はlaneの競合・cancel状態に関係なく必ず最初に返す
     terminal_emitted: bool, // Done/Error を一度でも返したら true。以後 next() は fuse (下記)
 }
 // 最終結果は Done/Error イベント自体が運ぶ (pi の result() Promise は不要:
@@ -473,6 +496,22 @@ pub struct ProviderEventStream {
 ```
 
 契約(pi と同一 **[事実]** `pi:ai/src/types.ts:301-313`): **stream 関数は決して panic/Err を返さない**。リクエスト失敗・モデルエラー・実行時失敗はすべてストリーム内の `Error` イベント(stopReason Error/Aborted + error_message 付き AssistantMessage)として届く。この一点が呼び出し側の異常系を劇的に単純化する。
+
+通常event laneはcapacity 64のbounded channelとし、capacity 1のpriority terminal laneを
+別に持つ。priorityへ送ってよいのは`Error`/`Aborted`だけで、成功`Done`は通常lane上で
+先行delta/Endとの順序を守る。producerは正規化eventを`MessageAssembler`へ適用してから
+通常laneへawait送信し、cancel時はopen blockをproducer側でローカルに閉じたうえで、
+それまでのpartial contentと既受信usageを持つ`Aborted`をpriority laneへ`try_send`する。
+`ProviderEventStream`自身が非skippableな`Start`を必ず最初に返すため、初期request検証失敗や
+即時cancelでもpriority terminalが`Start`を追い越さない。priority terminalのmessageは
+producerが受理済みのdurable content全体を運ぶauthoritative snapshotとし、通常backlogは
+破棄され得る。consumer側の共有`MessageAssembler`は、reason/model/originとbudgetに加え、
+すでに受信したcompleted blockの完全一致、open text/thinkingのprefix非矛盾を検査してから
+snapshotへ収束する。成功`Done`はauthoritative上書きを許さず、通常laneで受け取った全event列
+からの再構成とterminal payloadの完全一致を引き続き要求する。
+consumerがcancelを観測した後は通常laneをpollせずpriority terminalを待ち、terminal受信時に
+両receiverとqueued backlogをfuseする。これによりconsumerがdeltaをdrainしていない
+飽和状態でも、cancelから1秒以内にpartialを失わずちょうど一つの異常終端へ閉じる。
 
 **EOF の終端イベント化**: `next()` は `Done`/`Error` を返すたびに `terminal_emitted` を立てる。`rx.recv()` が `None`(adapter タスクの正常終了・cancel・panic 等で送信側 `Sender` が drop)を返した時点でまだ `terminal_emitted` が立っていなければ、**その1回に限り**終端 `Error` を合成して返し、`terminal_emitted` を立てる。合成時の分類は EOF を一律 `Aborted` にしない: この stream に紐づく `CancellationToken` の発火(または Session 起点の abort/hard steer)が確認できる場合だけ `stopReason=Aborted` とし、それ以外(adapter タスクの panic・実装ミス等)は `stopReason=Error, error_message="provider stream ended without a terminal event"` の**リトライ可能エラー**として合成する — `Aborted` は §4.4/§5 のリトライに乗らないため、意図しない sender drop を Aborted に分類するとユーザーの turn が無応答で閉じる。エラーメッセージは §4.4 のリトライパターン(`ended without`)に一致させる。既に `Done`/`Error` を返し終えた後の EOF はそのままストリーム終了として扱い、二重に終端イベントを作らない。**terminal 後の fuse**: `terminal_emitted` は EOF 合成の抑止だけでは足りない — adapter の実装ミスで `Done` の後に delta や二回目の終端が channel に積まれると、そのまま呼び出し側へ素通りする。`Done`/`Error` を返す直前に `rx.take()` で Receiver を切り離す。検出時点ですでに queued な違反イベントを監査する場合だけ、固定上限件数の `try_recv()` で非同期に待たず warn を記録してから Receiver を drop し、上限を超えた分は件数不明として集約warnする。`terminal_emitted` が立った後の `next()` は Receiver を参照せず即座に `None` を返し、`recv().await` や channel close 待ちを行わない。これにより「stream は必ず正常形の終端イベントでちょうど一度閉じる」契約が adapter の実装ミスに関係なく保たれる。単体テストで (a) 正規の `Done`/`Error` 後に Sender が開いたままでも次の `next()` が即座に `None` を返すこと、(b) 終端イベントなしに channel が閉じると合成終端が1件だけ届き、cancel 発火済みなら `Aborted`・未発火なら retryable `Error` に分類されること、(c) 正規の終端時点で queued な delta や二回目の終端が呼び出し側へ届かず、検査が固定上限で終わること、の3点を確認する。
 
@@ -647,7 +686,7 @@ pub struct TypedTool<P: JsonSchema + DeserializeOwned> { /* name, desc, f */ }
 | OpenAI互換 Chat Completions / Moonshot (Kimi) | `https://api.moonshot.ai/v1` | `kimi-k3` (1M ctx / out 既定131k・物理上限1,048,576), `kimi-k2.7-code` (256k) | 自動プレフィックスキャッシュ(明示API不要)。reasoning は Preserved Thinking 常時ON |
 | OpenAI互換 Chat Completions / Z.ai (GLM) | `https://api.z.ai/api/paas/v4` | `glm-5.2` (1M ctx / 128k out) | `tool_stream: true` でツールコールもストリーミング。定額プランはバックエンド利用禁止→従量API必須 |
 | OpenAI互換 Chat Completions / Umans | `https://api.code.umans.ai/v1` | `umans-kimi-k2.7`, `umans-glm-5.2`, `umans-flash` | 開発時の保険。同時4セッション制限 |
-| OpenAI互換 Chat Completions / OpenCode Zen (Go) | `https://opencode.ai/zen/go/v1` | `kimi-k2.7-code` (256k ctx / out 既定32k) ほか | **検証用の当面の既定**(Founder 決定 2026-07-17: 契約済み枠の活用)。実体は各モデルへのゲートウェイであり、方言・Compat フラグは直結先の値を流用せず M1 のライブ fixture で個別に固定する **[推測]** |
+| OpenAI互換 Chat Completions / OpenCode Zen (Go) | `https://opencode.ai/zen/go/v1` | `kimi-k2.7-code` (256k ctx / out 既定32k) ほか | **検証用の当面の既定**(Founder 決定 2026-07-17: 契約済み枠の活用)。実体は各モデルへのゲートウェイであり、方言・Compat フラグは直結先の値を流用せず M1 のprovenance付きlive curl fixtureで個別に固定する **[推測]** |
 | OpenAI Responses | `https://api.openai.com/v1` | 設定で指定(GPT-5.6 系を主対象) | item/event ストリーム、function call、encrypted reasoning、`/responses/compact` の `compaction` item を扱う |
 | Anthropic Messages 互換 | provider ごとに設定 | 設定で指定 | `system` は messages 外、user/assistant turn、content block、tool_use/tool_result、named SSE event、compaction block を扱う |
 
@@ -665,15 +704,21 @@ pub enum ApiProtocol {
 pub struct ModelSpec {
     pub id: String,               // "kimi-k3"
     pub base_url: String,
-    /// provider + 正規化 endpoint + tenant の organization/account scope から作る非secretな安定ID。
-    /// API key 自体は含めない。
-    pub provider_instance_id: String,
+    pub provider: String,
+    pub account_scope: String,
     pub api_key_env: String,      // "MOONSHOT_API_KEY" 等
     pub context_window: u64,
-    pub max_tokens: u64,
+    pub max_output_tokens: u64,   // provider/modelの物理上限
+    pub default_output_tokens: u64, // Sumiの通常予算(既定16k、設定可)
     pub reasoning: bool,
     pub protocol: ApiProtocol,
     pub compat: ProtocolCompat,
+}
+
+impl ModelSpec {
+    /// provider + 正規化endpoint + account_scope + protocolから都度導出する非secretな安定ID。
+    /// API key自体は含めず、identity入力の変更後に古い値を保持しない。
+    pub fn provider_instance_id(&self) -> String;
 }
 
 pub enum ProtocolCompat {
@@ -693,7 +738,7 @@ pub struct ChatCompat {
     pub requires_reasoning_content_on_assistant: bool,
     /// GLM: tool_stream:true を送る
     pub zai_tool_stream: bool,
-    /// tools[].function.strict を利用するか (Kimi K3 は対応・省略時 true。MFJS 非互換 schema にだけ明示 false を送る — §4.1 プリセット)
+    /// tools[].function.strict を利用するか (Kimi K3 は対応・省略時 true。pinned walleに照らしてMFJS意味論の保持を証明できないschemaにだけ明示falseを送る — §4.1 プリセット)
     pub supports_strict_mode: bool,
     /// store:false を送るか (OpenAI 本家のみ true)
     pub supports_store: bool,
@@ -702,14 +747,14 @@ pub struct ChatCompat {
 }
 ```
 
-`ResponsesCompat` は `store`、encrypted reasoning、native compact、stream event の capability を持つ。`AnthropicCompat` は beta header、prompt cache、fine-grained tool streaming、native compact の capability を持つ。capability が false の機能を暗黙に送らず、unsupported response を自動で別 protocol へ落とさない。fallback は明示設定された別 `ModelSpec` への再試行だけとする。`provider_instance_id` は provider 名だけでなく正規化した `base_url` と認証先 organization/account scope を含む。API key のローテーションでは変えず、別 proxy/account/provider への切替では必ず変える。
+`ResponsesCompat` は `store`、encrypted reasoning、native compact、stream event の capability を持つ。`AnthropicCompat` は beta header、prompt cache、fine-grained tool streaming、native compact の capability を持つ。capability が false の機能を暗黙に送らず、unsupported response を自動で別 protocol へ落とさない。fallback は明示設定された別 `ModelSpec` への再試行だけとする。`provider_instance_id` は provider 名だけでなく正規化した `base_url` と認証先 organization/account scope を含む。API key のローテーションでは変えず、別 proxy/account/provider への切替では必ず変える。生成値はversion付き・各要素のUTF-8 byte長付きencodingとし、区切り文字だけの連結による境界衝突を許さない。`base_url`のuserinfo/query/fragmentはsecretを含み得るので識別子へ埋め込まず、account差は明示的な非secret `account_scope` で表す。派生IDを公開fieldへcacheするとidentity入力変更後の更新忘れで古いoriginを使えるため、`origin()`生成時に都度導出する。
 
 Chat Completions の初期プリセット(pi の生成メタデータを出発点に、各プロバイダ公式ドキュメントで 2026-07 に個別検証):
 
-- `kimi-k3`: **K3 は K2.x と API 方言が異なる**(2026-07-16 リリース。公式 K3 quickstart / Thinking Effort ガイドで確認 **[事実]**): `thinking_format=OpenAIEffort`(top-level `reasoning_effort`。launch 時点は `"max"` のみで thinking は常時有効。**K2.x の `thinking:{"type":"enabled"}` は送らない**)、`max_tokens_field=max_completion_tokens`(既定 131072、物理上限 1,048,576 **[事実]** 公式 K3 quickstart 2026-07 確認)、`requires_reasoning_content_on_assistant=true`(公式仕様は「完全な assistant メッセージを変更せず再送する」ことを要求し、reasoning フィールド込みの全ターン再送は K3 でも継続 **[事実]**)、`temperature`/`top_p`/`seed` は**送らない**(sampling 固定)、`supports_strict_mode=true`(現行 Kimi Tool Use 仕様は `function.strict` をサポートし**省略時 true** **[事実]** 公式 Tool Use ドキュメント 2026-07 確認。ただし schema は MFJS 仕様の JSON Schema subset に限られるため、起動時に schemars 生成 schema の **MFJS 互換判定**を行い、非互換ツールにだけ明示的に `strict:false` を付ける — 省略は true と同義なので「送らない」は回避策にならない。互換判定と strict 挙動は M1 でライブ fixture へ固定する)、`supports_store=false`、`supports_developer_role=false`。pi の `moonshotai.models.ts` メタデータ(`thinking` 方言、`useMaxTokens` 判定による `max_tokens`)は **K2.x 世代の値**であり K3 へ流用しない。K2.x 系モデルを併用する場合だけ別プリセット(`thinking_format=Deepseek` + `max_tokens`)を立てる
+- `kimi-k3`: **K3 は旧世代と API 方言が異なる**(2026-07-16 リリース。公式 K3 quickstart / Thinking Effort ガイドで確認 **[事実]**): `thinking_format=OpenAIEffort`(top-level `reasoning_effort`。launch 時点は `"max"` のみで thinking は常時有効。K2.x用の`thinking` objectは送らない)、`max_tokens_field=max_completion_tokens`(API既定 131072、物理上限 1,048,576 **[事実]**。Sumiは通常`default_output_tokens=16384`を明示送信)、`requires_reasoning_content_on_assistant=true`(公式仕様は「完全な assistant メッセージを変更せず再送する」ことを要求し、reasoning フィールド込みの全ターン再送は K3 でも継続 **[事実]**)、`temperature`/`top_p`/`seed` は**送らない**(sampling 固定)、`supports_strict_mode=true`(現行 Kimi Tool Use 仕様は `function.strict` をサポートし**省略時 true** **[事実]** 公式 Tool Use ドキュメント 2026-07 確認。ただし schema は MFJS 仕様の JSON Schema subset に限られる。MoonshotAI/walle v0.1.13 (`196bb0ca9c2f2271cfa9623108308f0780e411ee`) のserver-required strict規則と構造上限を基準に、意味論を保った互換性を**保守的に証明**できるschemaだけ省略時strictへ載せる。walleはschemaをGoの`encoding/json`で`any`へdecodeしnumberを`float64`として検査するため、enum/`minimum`/`maximum`の全numberはbinary64へ値を変えず表現できることも必要とする。`2^53`は受理できるが`2^53+1`や`0.1`は証明不能である。証明できないツールには明示的に`strict:false`を付ける — 省略はtrueと同義なので「送らない」は回避策にならない。false-negativeはprovider strictを無効化するだけで、§4.3のローカル凍結schema検証は常に維持する。互換判定とstrict挙動はdirect MoonshotのT25ライブfixtureへ固定する)、`supports_store=false`、`supports_developer_role=false`。pi の `moonshotai.models.ts` メタデータはK3へ流用しない。K2.6、K2.7 Code、各gatewayはthinking方言が同一ではないため世代名で一括せず別presetにする。特にK2.7 Codeはthinkingを省略するか`{"type":"enabled","keep":"all"}`だけを使い、OpenCode Zen Goはdirect Kimiの値を継承せずlive fixtureで固定する
 - `glm-5.2` (`pi:ai/src/providers/zai.models.ts:79-98`): `thinking_format=Zai`(`thinking: {"type":"enabled","clear_thinking":false}` + `reasoning_effort` 対応)、`zai_tool_stream=true`、`supports_store=false`、`supports_developer_role=false`、**`max_tokens_field=max_tokens`**(Z.ai 直APIの公式リファレンス(docs.z.ai の Chat Completion、2026-07 確認)は `max_tokens` のみ定義し `max_completion_tokens` の記載がない **[事実]**。pi では z.ai が `useMaxTokens` 判定に含まれず既定の `max_completion_tokens` に落ちる **[事実]** 同 :1272-1273 が、それは**コーディングプラン用エンドポイントに対する値**であり直APIへは流用しない)
-- **GLM の base_url 注意**: pi の値 `/api/coding/paas/v4` は**コーディングプラン用エンドポイント**であり、Sumi は規約上使えない(プロバイダ調査参照)。Sumi は直APIの `https://api.z.ai/api/paas/v4` を使う — これは pi 由来ではなくプロバイダ調査由来の値。同じ理由で compat 値も pi のメタデータを盲目的に流用せず、直API仕様(上記 `max_tokens`)を既定として **M1 ライブで確認**する。差異が出たら Compat フラグで切替(ランタイム設定、再コンパイル不要)
-- Umans: OpenAI互換を名乗るが実体は上記モデルのプロキシ。**M1 の実測で決める**(まず Kimi/GLM 相当のプリセットを試す)。**[推測]**
+- **GLM の base_url 注意**: pi の値 `/api/coding/paas/v4` は**コーディングプラン用エンドポイント**であり、Sumi は規約上使えない(プロバイダ調査参照)。Sumi は直APIの `https://api.z.ai/api/paas/v4` を使う — これは pi 由来ではなくプロバイダ調査由来の値。同じ理由で compat 値も pi のメタデータを盲目的に流用せず、直API仕様(上記 `max_tokens`)を既定とする。直APIのcredentialがない現時点ではsynthetic contract fixtureで形状を固定し、差異はT25のdirect Z.ai raw/live gateでCompatフラグへ反映する(ランタイム設定、再コンパイル不要)
+- Umans: OpenAI互換を名乗るが実体は上記モデルのプロキシ。現時点では未実測であり、**T25 のraw/live実測で決める**(まず Kimi/GLM 相当のプリセットを試す)。**[推測]**
 
 Chat adapter へは移植しないが別 adapter で扱うもの: Anthropic の `cache_control` / compaction block、Responses の prompt cache key / reasoning / compaction item。全 adapter で移植しないもの: session affinity ヘッダ、deferredToolsMode "kimi"(ツール凍結原則により遅延ロード不使用)、OpenRouter/Vercel ルーティング、対象外25方言の thinkingFormat。
 
@@ -720,17 +765,17 @@ Chat adapter へは移植しないが別 adapter で扱うもの: Anthropic の 
 Chat Completions JSON への変換は、**[事実]** 以下すべて `pi:ai/src/api/openai-completions.ts` の `buildParams`/`convertMessages`(:575-1150)からの移植項目:
 
 1. **system prompt**: `{"role":"system","content":...}` を先頭にする。L2/L1 は続く user 相当の memory message にし、system/developer role へ昇格させない(第7章)
-2. **assistant content は常にプレーン文字列で送る**(content-block 配列にしない)。配列で送ると一部モデルが構造を鸚鵡返しする事故がある(:987-994 コメント)
+2. **assistant content は常にプレーン文字列で送る**(content-block 配列にしない)。配列で送ると一部モデルが構造を鸚鵡返しする事故がある(:987-994 コメント)。永続messageに複数の`Text` blockがある場合は、wire順を保ってblock間に`"\n\n"`を1つだけ挿入して単一文字列へ射影する。区切りの有無は連結済み文字列の内容ではなく`Text` block数で決めるため、leading/middle/trailingの空block間にも各1個入る。この規則は空`Text` blockを型として禁止しない。区切りなしの連結は隣接blockの語彙を結合して内容を変え得る一方、この区切りはChat送信viewだけのlossy projectionであり、永続block列は変更しない
 3. **thinking の再送**: 同一の `provider_instance_id/protocol/model` なら、transcript の `PublicAssistantContent::Thinking` から `signature_field` が示すフィールド(`reasoning_content` 等)へ全ターン分を書き戻す(平文 reasoning の再送正本は transcript — 専用の provider context row は持たない)。**Kimi は過去全ターンの reasoning 保持が必須仕様**(調査レポート)。クロスモデル、別provider instance、別protocolへの切替時は thinking を**送信 view から常に除外**し、プレーンテキストやmemory blockへ降格して送らない(transcript の `Thinking` content は表示・記録用にそのまま残る — 除外は再送 view に対する操作であって削除ではない)。例外は送受信双方の一次仕様がモデル間可搬性と非公開性を明示保証する protocol-scoped な opaque block だけで、通常の `Thinking` とは別型・別 capability・別 trust-domain 契約にする。pi のクロスモデル平文化分岐は移植しない
 4. **`requires_reasoning_content_on_assistant`**: 再送する assistant メッセージに reasoning_content が無ければ `""` を補う(:1038-1044)
 5. **tool_calls**: `{id, type:"function", function:{name, arguments: JSON文字列}}`。引数は必ず `serde_json::to_string` で直列化
 6. **tool ロール**: `{"role":"tool","content":text,"tool_call_id":...}`。テキストが空で画像のみなら `"(see attached image)"`、両方空なら `"(no tool output)"` のプレースホルダ(:1073-1075)
-7. **ツール結果内の画像**: tool メッセージには載らないため、直後に user メッセージ `"Attached image(s) from tool result:"` + image_url ブロックとして追送(:1109-1127)。※ Kimi K3 は image/video 入力可 **[事実]**(公式 K3 quickstart 2026-07 確認。挙動詳細は M1 ライブ fixture で固定)、GLM-5.2 text のみ **[事実]**(モデルメタ)。非対応モデルにはプレースホルダテキストに差替(`transform-messages.ts` の画像差替処理)
+7. **ツール結果内の画像**: tool メッセージには載らないため、直後に user メッセージ `"Attached image(s) from tool result:"` + image_url ブロックとして追送(:1109-1127)。※ Kimi K3 は image/video 入力可 **[事実]**(公式 K3 quickstart 2026-07 確認。直API挙動詳細はT25ライブfixtureで固定)、GLM-5.2 text のみ **[事実]**(モデルメタ)。非対応モデルにはプレースホルダテキストに差替(`transform-messages.ts` の画像差替処理)
 8. **空 assistant のスキップ**: content も tool_calls も無い assistant メッセージは送らない(aborted 応答の残骸対策、:1045-1056)
 9. **tools が空でも履歴にツールコールがあるなら `"tools": []` を送る**(プロキシ互換、:625-628)。※ Sumi はツール凍結原則なので通常発生しないが移植しておく
 10. **サニタイズ**: 送信テキスト全部に不対サロゲート除去を適用。Rust の `String` は常に正しい UTF-8 なので pi の `sanitizeSurrogates` 相当は**受信側**(ツール出力のバイト列→String 変換時の `from_utf8_lossy`)で保証する。加えて `serde_json` は文字列中の生制御文字を正しくエスケープするため pi の repairJson 送信側問題は起きない **[推測、M1で確認]**
 11. **stream_options**: `{"include_usage": true}`(compat で無効化可能)
-12. **max_tokens / temperature / tool_choice**: オプション透過
+12. **max_tokens / temperature / tool_choice**: オプション透過。ただしmax_tokensは`1..=max_output_tokens`を検証し、未指定時は`default_output_tokens`を使う。範囲外を物理上限へ黙ってclampしない
 
 #### 4.2.1 OpenAI Responses adapter
 
@@ -757,22 +802,28 @@ Chat Completions JSON への変換は、**[事実]** 以下すべて `pi:ai/src/
 **[事実]** 組立ロジックの原典: `pi:ai/src/api/openai-completions.ts:229-511`。移植必須の細部:
 
 - **ブロック管理**: `tool_calls[].index` による Map と `id` による Map の**二重引き**(:239-241, 307-344)。プロバイダによって index だけ・id だけ・両方が来るため。text/thinking ブロックは「現在開いているブロック」1個ずつを保持し、種類が切り替わったら閉じずに保持(同種 delta の続きが来たら継続)
-- **ツール引数の逐次パースと確定境界**: delta 到着ごとに生の `raw_args` byte/string bufferへ追記し、その**コピー**を `partial_json::parse_streaming` へ渡してUIの進行表示用previewを得る。repair/partial/`{}` fallbackの戻り値は `PublicStreamEvent::ToolCallPreview` 以外へ流せず、`ToolCall`、承認、`CanonicalAction`、executor入力を構築できない型にする。`ToolCallEnd` では蓄積した生JSON全体を `serde_json::from_str::<serde_json::Value>` で strict parseし、top-level object・ツールschemaも検証する。strict parseまたはschema検証に失敗した場合はraw引数を捨て、`ToolCallRejected { RejectedToolCall }` でstream blockを明示的に閉じ、`PublicAssistantContent::RejectedToolCall`と引数を含まない`is_error=true`の合成tool resultを`MessageStart/End`で確定する。再送transformはこの対を通常の実行可能tool callへ直さず、protocol-neutralな「引数検証に失敗したのでtool callを再生成せよ」というuser相当診断へ変換する。これによりorphan tool resultもrepair済み引数の再送も作らない。**承認要求、`ToolExecutionStart`、executor RPCは発火させない**。Chatの `finish_reason=tool_calls|function_call`、Responsesのarguments done、Anthropicの`content_block_stop`の全終端で同じ検証関数を通す。`finish_reason=length` 時に当該assistant応答内の全ToolCallを一括失敗させる既存guardも独立して維持し、strict parse成功をLength実行許可の代替にしない
-- **reasoning フィールド検出**: delta 内の `reasoning_content` → `reasoning` → `reasoning_text` の順で**最初に見つかった非空フィールドだけ**採用(重複返却プロバイダ対策、:394-424)。採用フィールド名を `signature_field` に記録
+- **ツール引数の逐次パースと確定境界**: delta 到着ごとに生の `raw_args` byte/string bufferへ追記し、その**コピー**を `partial_json::parse_streaming` へ渡してUIの進行表示用previewを得る。repair/partial/`{}` fallbackの戻り値は `PublicStreamEvent::ToolCallPreview` 以外へ流せず、`ToolCall`、承認、`CanonicalAction`、executor入力を構築できない型にする。`ToolCallEnd` では蓄積した生JSON全体を `serde_json::from_str::<serde_json::Value>` で strict parseし、top-level object・ツールschemaも検証する。strict parseまたはschema検証に失敗した場合はraw引数を捨て、`ToolCallRejected { RejectedToolCall }` でstream blockを明示的に閉じ、`PublicAssistantContent::RejectedToolCall`と引数を含まない`is_error=true`の合成tool resultを`MessageStart/End`で確定する。再送transformはこの対を通常の実行可能tool callへ直さず、protocol-neutralな「引数検証に失敗したのでtool callを再生成せよ」というuser相当診断へ変換する。これによりorphan tool resultもrepair済み引数の再送も作らない。**承認要求、`ToolExecutionStart`、executor RPCは発火させない**。Chatはmodern `tool_calls`だけを受理し、pre-launchで不要なlegacy `delta.function_call`変換や架空ID合成は行わない。Chatの `finish_reason=tool_calls|function_call`、Responsesのarguments done、Anthropicの`content_block_stop`の全終端で同じ検証関数を通す。`finish_reason=length` 時に当該assistant応答内の全ToolCallを一括失敗させる既存guardも独立して維持し、strict parse成功をLength実行許可の代替にしない
+- **raw引数buffer上限**: 1回のSSE event上限を小さなdelta列で迂回できないよう、tool callごとの累積`raw_args`を4MiBで制限する。超過した時点でrawを即時破棄し、その後のdeltaも保存せず、終端では`TooLarge`の`ToolCallRejected`/合成result対で閉じる
+- **request単位の累積response budget**: 実際にrequestへ送るoutput token予算を`T`として、v1の`ResponseBudget`を`content_bytes=64T+1MiB`、`wire_bytes=6*content_bytes+1MiB`、`events=8T+256`、`preview_work_bytes=8*content_bytes`、`tool_calls=floor(T/8)+16`で導出する。これはprovider tokenizerの完全上界ではなく、Kimi K3の1,048,576-token物理上限もchecked arithmetic/`usize`で表現できる一方、通常16k requestへ物理最大相当の増幅余地を与えない製品安全ポリシーである。config load時とrequest組立時に全演算をcheckedにし、zero・overflow・表現不能を起動/request前に拒否する
+- **budget責務の分離**: transportはSSE framingと未知fieldを含むraw response byteをexactに数える。adapterはresponse ID/model、text/thinking/tool identity/argumentsを含むprotocol stateの累積content byte、発行event数、tool slot総数、deltaごとにpartial JSON parserへ渡した累積raw長の和(preview work)を数える。assemblerは正規化eventから永続contentへ入るbyteを独立counterで再検証する。各counterを足し合わせて同じbyteを二重課金せず、いずれかの超過・checked演算失敗を`response_limit_exceeded`でfail-closedにする。tool call単体4MiB上限は別の局所上限として維持する
+- **adapter budgetのtransaction境界**: Chat chunkは新規delta分だけのbounded overlayでtool identity、content/tool/event/preview、response ID/modelの次counterをpreflightし、全検証成功後に失敗しないcommitを行う。累積text/tool buffer全体のcloneは行わない。finishも必要event数をreserveしてからopen block/tool stateをdrainする。どのbudget失敗でもsemantic stateとcounterは不変とし、usageだけはprovider errorと同じchunkに載る場合も保持すべきsidebandとしてsemantic transactionから分離する
+- **拒否resultの輸送**: strict/schema拒否時の内部eventは`ToolCallRejected { rejected, synthetic_result }`を運ぶ。公開stream変換は`synthetic_result`を落とし、AgentLoopは安全化済みresultをassistant確定後までbufferして`MessageStart/End`で対にして確定する。後段でraw引数や可変schemaを再参照してresultを作り直さない。`finish_reason=length`による一括拒否は`IncompleteResponse`としてstrict成功と区別する
+- **reasoning フィールド検出**: delta 内の `reasoning_content` → `reasoning` → `reasoning_text` の順で**stream全体の最初に見つかった非空フィールドだけ**採用(重複返却プロバイダ対策、:394-424)。採用フィールド名を `signature_field` に記録し、`ThinkingStart`でassemblerへ渡す。K3の`reasoning_effort`はlaunch時に確認済みの`max`だけを受理し、reasoning無効化または未知overrideはrequest前に拒否する
 - **usage**: `chunk.usage` を都度上書き。**Moonshot は `choices[0].usage` に入れてくる**フォールバックを移植(:362-366)。`prompt_tokens_details.cached_tokens` → cache_read、`completion_tokens_details.reasoning_tokens` → reasoning。`input = prompt_tokens - cached - cache_write`(:1168-1204)
+- **失敗時のusage保持**: 最後に受信したusageはsuccessだけでなくprovider error、finish検証失敗、transport error、cancel/abortのterminal messageにも載せる。未受信ならzero defaultだが、error経路で受信済み値をdefaultへ戻したり、未知値を推測で補完したりしない
 - **finish_reason マップ**(:1206-1230 + provider 固有値): `stop|end→Stop`, `length→Length`, `tool_calls|function_call→ToolUse`, `content_filter|sensitive→Error(非リトライ)`, `network_error→Error(リトライ可)`, `model_context_window_exceeded→Error(コンテキスト溢れ)`、その他→Error(メッセージに finish_reason 原文を残す)。分類用の machine-readable `provider_code` を `error_message` とは別に保持し、後段が表示文言の正規表現だけに依存しないようにする
 - **異常終了の検出**: ストリームが finish_reason 無しで終わったら `"Stream ended without finish_reason"` エラー(:482-484)。abort シグナル済みなら Aborted
 - **エラー時のブロック掃除**: エラー確定時、組立途中の scratch(partial_args 等)は最終メッセージに残さない(:489-494)
 - **`responseId`/`responseModel`**: chunk.id / chunk.model をログ用に記録(:350-354)
 
-SSE transport の仕様: reqwest の `bytes_stream()` を UTF-8 lossless byte buffer で frame 化し、`event` と連結済み `data` を adapter へ渡す。Chat の `data: [DONE]`、Responses/Anthropic の typed/named event、comment/ping を protocol ごとに終端判定する。**HTTP レベルの失敗(非2xx)はボディを最大4000字で切り詰めてエラーメッセージ化**(**[事実]** `pi:ai/src/utils/error-body.ts` の `MAX_PROVIDER_ERROR_BODY_CHARS=4000` を踏襲(定数値は実読済み、行番号は未検証のため記さない)。ステータス+ボディを `"{status}: {body}"` 形式で)。アイドルタイムアウト(チャンク間 120s、`tokio::time::timeout`)を仕込む **[推測]**(pi は SDK 任せ。長命プロセスでは必須)。
+SSE transport の仕様: reqwest の `bytes_stream()` を UTF-8 lossless byte buffer で frame 化し、`event` と連結済み `data` を adapter へ渡す。受信chunkのbyte数はparserへ渡す前にchecked加算し、SSE field名・改行・comment・未知JSON fieldを含むraw wire全体がrequestの`max_wire_bytes`を超えた時点で`response_limit_exceeded`へ閉じる。Chat の `data: [DONE]`、Responses/Anthropic の typed/named event、comment/ping を protocol ごとに終端判定する。**HTTP レベルの失敗(非2xx)はボディを最大4000字で切り詰めてエラーメッセージ化**(**[事実]** `pi:ai/src/utils/error-body.ts` の `MAX_PROVIDER_ERROR_BODY_CHARS=4000` を踏襲(定数値は実読済み、行番号は未検証のため記さない)。ステータス+ボディを `"{status}: {body}"` 形式で)。connect 30秒、response header待ち120秒、headers後のチャンク間idle 120秒を別々に制限し、各待機の`tokio::select!`はcancelをbiased先頭に置く **[推測]**(pi は SDK 任せ。長命プロセスでは必須)。
 
 ### 4.4 リトライ(`retry.rs`)
 
 **[事実]** pi の実装: 判定は `pi:ai/src/utils/retry.ts`、ポリシーは `pi:coding-agent/src/core/agent-session.ts:2606-2673`。
 
-- **判定**: error_message に対する正規表現2段構え。(a) 非リトライパターン(quota/billing/insufficient_quota 等)に該当→リトライしない。(b) リトライパターン(overloaded, rate limit, 429/500/502/503/504/524, timeout, connection系, "ended without", "try your request again" 等)に該当→リトライ。**コンテキスト溢れはリトライではなく溢れ処理へ回す**(先に `overflow::is_context_overflow` を判定)
-- **ポリシー**: **リトライは最大3回(初回を含め計4 attempt)**、指数バックオフ 2s/4s/8s(pi 既定値。retry N 回目の前に N 番目の delay を使うので3つを使い切る)。本書の「最大attempt」(§5.2・§10.2 の復旧規則含む)はこの**計4 attempt**を指す — attempt と retry の混用で 8s が到達不能になる解釈を排除する。バックオフ待機は CancellationToken で中断可能(ステア/abort が来たら即やめる)
+- **判定**: machine-readable `provider_code`を本文より先に評価し、numeric/`http_*`の429/500/502/503/504/524、network/transport/header timeoutを本文なしでもリトライ対象にする。残りはerror_messageに対する正規表現2段構え。(a) 非リトライパターン(quota/billing/insufficient_quota 等)に該当→リトライしない。(b) リトライパターン(overloaded, rate limit, 429/500/502/503/504/524, timeout, connection系, "ended without", "try your request again" 等)に該当→リトライ。**コンテキスト溢れはリトライではなく溢れ処理へ回す**(先に `overflow::is_context_overflow` を判定)
+- **ポリシー**: **リトライは最大3回(初回を含め計4 attempt)**、指数バックオフ 2s/4s/8s(pi 既定値。retry N 回目の前に N 番目の delay を使うので3つを使い切る)。本書の「最大attempt」(§5.2・§10.2 の復旧規則含む)はこの**計4 attempt**を指す — attempt と retry の混用で 8s が到達不能になる解釈を排除する。バックオフ待機はCancellationTokenをbiased先頭に置き、delayとcancelが同時readyでも追加retryせず中断する
 - **実施位置**: プロバイダ層ではなく**エージェントループ側**(pi と同じ)。各 provider attempt は必ず `MessageStart(assistant) → MessageUpdate* → MessageEnd(assistant)` で閉じる。リトライ可能な Error でも error assistant の `MessageEnd` を発行し、続けて durable な `RetryScheduled { attempt, delay_ms, retry_at, error_message }` を発行してから待機し、次 attempt を新しい `MessageStart` で始める。同一 Turn 内なので retry 間に `TurnEnd` は出さない。error assistant はチャット全文ログには残すが L0 には追加せず、次の API コンテキストから除外する(`pi:agent-session.ts:2646-2650` の「state からは除去、session 履歴には保持」を Store 設計に反映)。これにより retry 成功時も開いた `MessageStart` を残さず、再起動 replay が attempt 境界を一意に復元できる
 
 ### 4.5 コンテキスト溢れ検出(`overflow.rs`)
@@ -783,9 +834,10 @@ SSE transport の仕様: reqwest の `bytes_stream()` を UTF-8 lossless byte bu
 - エラーメッセージのフォールバックパターン: `exceeded model token limit`(Kimi)、`exceeds the context window` / `maximum context length`(OpenAI系プロキシ・Umans想定)、`context_length_exceeded` / `model_context_window_exceeded` / `too many tokens` / `token limit exceeded`(汎用)
 - **z.ai は溢れをエラーにせず黙って受けることがある** → 成功応答でも `usage.input + cache_read + cache_write > context_window` なら溢れ扱い(usage ベース判定)
 - 非溢れ除外パターン(rate limit / too many requests)を先に判定
-- 検出時の動作は検出経路で分ける:
+- 判定APIはboolではなく回復時期を含む分類を返す。検出時の動作は検出経路で分ける:
   - **エラーとして検出した溢れ**: 通常のリトライ判定には乗せず、3層メモリの緊急溢れ処理(第7.6節)を即時適用して**同一 Turn 内で再送**する。イベント列は §4.4 のリトライと同型を流用する — `MessageEnd(error, append_to_l0=false)` → durable `RetryScheduled`(delay 0、error_message に overflow 種別を明記)→ 溢れ処理適用 → 次 attempt の `MessageStart`。§10.2 の replay 分岐も retryable Error と同じ規則で復旧できる(§6.3.1 の遷移表参照)。溢れ再送は 1 Turn につき最大2回とし、超えたらメモリバグとしてリトライ不可 Error で閉じる
-  - **成功応答に対する usage ベースのサイレント溢れ**: 応答は通常どおり確定・保存し(再送しない — 二重応答になる)、`pending_apply` を立てて次の適用タイミングで溢れ処理を行う
+  - **Length + output=0 + usageがcontext windowの99%以上**: piの`stopReason != stop`分岐と同じく、未完了応答を成功確定せず即時回復して同一Turn内で再送する
+  - **Stop成功 + usageがcontext window超過**: 応答は通常どおり確定・保存し(再送しない — 二重応答になる)、`pending_apply` を立てて次の適用タイミングで溢れ処理を行う
 
 Sumi では 3層メモリが常時 70k 以内に抑えるため溢れは本来起きない(1M ctx モデル)。この検出は**保険+メモリバグの検知器**として入れ、発火したら `tracing::error!` で警報する。
 
@@ -889,12 +941,13 @@ pi から移す挙動:
 
 ### 5.3 履歴再送時の正規化(transform)
 
-**[事実]** 原典: `pi:ai/src/api/transform-messages.ts`。API コール直前に L0 へ適用する純関数として移植:
+**[事実]** 原典: `pi:ai/src/api/transform-messages.ts`。API コール直前に L0 へ適用する純関数として移植する。transformは履歴だけから送信先を推測せず、選択済み`ModelSpec::origin()`から呼出し直前に導出したdestination `ProviderOrigin(provider_instance_id/protocol/model)`を明示入力に取る。保存済みmessageのoriginやcache済み派生値をdestinationとして代用しない:
 
 1. **孤児ツールコールへの合成結果**: assistant のツールコールに対応する toolResult が無い場合(abort・クラッシュ・ステア切断)、`"No result provided"` の is_error 結果を合成して挿入。**user メッセージがツールフローを分断した位置にも挿入**。会話末尾の未解決分も同様
 2. **Error/Aborted assistant のスキップ**: 再送しない。**ただし Sumi 拡張: `interrupted=true` のものは除く**(第6章のステア部分応答。テキスト/thinking は保持する。未実行ツールコールは §6.3 手順2が保存時に全て破棄済みのため、ここには現れない)
-3. **クロスモデル thinking再送除外(Sumi独自差分)**: provider instance/protocol/modelのいずれかが変わったら thinking を送信 view から常に除外し、テキストやmemoryへ降格して送らない(transcript の `Thinking` content は表示用に残る)。一次仕様が可搬性を明示保証するopaque blockだけを別型/capabilityで扱う(§4.2)
+3. **destination-originによるthinking再送(Sumi独自差分)**: 生成元とdestinationの`provider_instance_id/protocol/model`が完全一致するときだけthinkingをbyte-preserveする。3要素のいずれか1つでも変わったら送信viewから常に除外し、テキストやmemoryへ降格して送らない(transcript の `Thinking` content は表示用に残る)。一次仕様が可搬性を明示保証するopaque blockだけを別型/capabilityで扱う(§4.2)
 4. **拒否済みtool callの正規化**: `RejectedToolCall + is_error ToolResultMessage` は実行可能なtool callへ復元せず、raw/repair済みargumentsも再送しない。provider-neutralなuser相当診断1件へ変換し、モデルへtool callの再生成を促す
+5. **destination制約下のtool call ID対正規化**: origin完全一致のassistant tool flowではtool call IDと対応result IDをbyte-preserveする。origin不一致でもdestination protocolにID wire制約がなければ変更しない。**origin不一致かつdestination protocolの制約に適合させる必要がある場合だけ**(OpenAI互換の40字上限等)、同じassistant tool flow内の各call IDと対応result IDを同一のbounded mappingで上限内IDへ写す。mappingの保持数はそのflowのtool call数を超えず、user/次assistantのflow境界で破棄してturn間で再利用しない。call/resultを別々にtruncateして対応を壊したり、transcript全体の無制限mapを持ったりしない
 
 (いずれも `transform-messages.ts` 全223行を実読して該当処理を特定すること — 本書の旧行番号は誤りだった)
 
@@ -1185,7 +1238,7 @@ transform は**送信用のビューを作る純関数**であり、L0 の保存
 40k/80k は層の**総量**の制御であり、厳密な不変条件ではない。ただし1メッセージはバッチ分割できない最小単位のため、単一の巨大メッセージには別のガードが要る(無制限だと L0 のバッチ・溢れ設計自体が壊れる):
 
 - **ユーザー入力(二段構え)**: (a) **wire 上限 1MB**: API がユーザー入力を command 化する前(§11.1.1 の `seq`/`command_id` 採番より前)にサイズを検証し、超過分は agent へ送らずクライアントへ直接エラーを返す。agent は通常経路では 1MB 超の `user_message` を受け取らない。agent の Gateway 層でも同じ上限を保険として検証する。超過 envelope でも外形(`seq`/`command_id`)が読めるなら、接続切断ではなく §11.1.1 手順2の terminal 拒否に載せる — seq を消費して `Rejected` ACK を返し、`inbound_commands` へ本文ciphertextは保存しないが、size-limit readerが全raw byteを流して計算したconversation-keyed HMAC/key_ref、外形・実測サイズ・reject理由を記録する。同じIDで本文だけを差し替えた再送はHMAC不一致で拒否する。切断で応じると、API 側の一次検証が一度でも漏れた envelope が永久再送される poison pill になり、そのseqで後続 command 全体が止まる。read framing には transport 上限(既定 4MiB **[推測、実測調整]**)を別に置き、それすら超えて外形を安全に読めないフレームだけをプロトコル違反として切断する。oversized の `Rejected` 発生は API 一次検証のバグを意味するため運用アラートで検知する。(b) **L0 投入上限 50KB**(ツール結果と同じ値): 超過入力は `messages.raw_ciphertext` に**原文全文**を保存した上で、runtimeが専用artifact brokerの`put_attachment` RPCへ全文を渡し、返された `artifact://<conversation_id>/attachments/user-<message_id>` handleをL0の先頭50KB+「[全文 xxxKB: <handle>]」注記へ載せる。runtime/executor/bashはartifact volumeをmountせず、続きの参照は認証済み`read_artifact`/`grep_artifact` RPCだけを使う。SQLite の `MessageEnd` commit と broker 側 artifact write は永続化境界が別なので、順序と冪等性を契約にする: artifact ID は `message_id` から決定論的に導出し、`put_attachment` は全置換 write + fsync の冪等 RPC とする。書込みは **`MessageEnd` commit の後**でよい — 原文の正典は `messages.raw_ciphertext` であり、broker 障害が user メッセージの永続化を塞いではならない。ただし **assistant 再開前**に完了を検証し、欠落していれば crash 復旧と ContextAssembler が `messages.raw_ciphertext` の原文から同じ RPC で再生成する — L0 が存在しないhandleを参照したまま走らせない。先行して書かれた孤児artifactは無害で、再送時に同じIDへ上書きされる。conversation reset時はtombstoneを検証したbrokerが旧conversation subtreeだけをsymlink no-followのfd-relative walkで冪等削除する。切詰めは投入時の純関数とし、再起動時の raw transcript→L0 復元でも同じ関数を通す(保存形は常に原文 — §7.7 の「ログと記憶の分離」と同型)。この切詰めビューは `messages.raw_ciphertext`(全文正本。復旧・export・redaction 前の唯一の原文)にも `messages.payload`(同じ `PublicMessage` の redacted projection。secret 置換のみで切詰めはしない、§10.1)にも対応する列を持たない**別モデル**であり、ContextAssembler(§7.7)が `raw_ciphertext` を復号するたびに算出する runtime-only の値として扱う。DB に切詰め済みテキストを永続化しない**[推測、上限値は実測調整]**
-- **assistant 出力**: リクエストの max_tokens に**モデル上限ではなく既定 16k トークン**(設定可)を指定する。`ModelSpec.max_tokens`(128k 等)は物理上限であり通常リクエストには使わない。超過は StopReason::Length として顕在化し、既存の経路で処理される(ツールコールは一括失敗 #19、テキストは打ち切りのまま保持)
+- **assistant 出力**: リクエストの max_tokens に**モデル上限ではなく既定 16k トークン**(設定可)を指定する。`ModelSpec.max_output_tokens`(128k 等)は物理上限、`default_output_tokens`は通常予算として分離し、request overrideを含め`1..=max_output_tokens`を検証する。範囲外を黙ってclampしない。超過は StopReason::Length として顕在化し、既存の経路で処理される(ツールコールは一括失敗 #19、テキストは打ち切りのまま保持)
 - **ツール結果**: 既存の 2000行/50KB 切詰め+全文退避(§8.2)と grep 行長 500 字(§8.1)がこのガードを兼ねており、単一ツール結果が L0 に 50KB を超えて入る経路はない。追加の仕組みは不要
 - 50KB は日本語で ~10k トークン強に相当し得るため、L0 投入時の実サイズは est(§7.5)で計上し、溢れ処理が通常どおり吸収する
 
@@ -2337,13 +2390,13 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 | 3 | Moonshot の usage が `choices[0].usage` に入るフォールバック | 同 :362-366 | Kimi 直APIで usage を取り損ねると 3層メモリの校正が死ぬ | `assembler.rs` |
 | 4 | reasoning フィールド3種の検出と「最初の非空だけ採用」 | 同 :394-424 | reasoning_content/reasoning/reasoning_text の方言+二重返却プロバイダ対策。採用フィールド名を再送に使う | `assembler.rs` + `adapters/chat_completions.rs` |
 | 5 | usage 解釈(cached_tokens=読み、cache_write 別枠、input=prompt−cached−write) | 同 :1168-1204(OpenRouter PR#409 への言及コメント含む) | キャッシュヒット率の観測(M4 検証ゲート)の正確性の根拠 | `provider/types.rs::Usage::from_raw` |
-| 6 | finish_reason マッピング表 | 同 :1206-1230 + provider公式値 | content_filter/sensitive→非リトライError、network_error→リトライ可Error、model_context_window_exceeded→Overflow。原文はprovider_codeへ保存 | `assembler.rs` |
+| 6 | finish_reason マッピング表 | 同 :1206-1230 + provider公式値 | content_filter/sensitive→非リトライError、network_error→リトライ可Error、model_context_window_exceeded→Overflow。原文はprovider_codeへ保存 | `adapters/chat_completions.rs` |
 | 7 | 「finish_reason 無しでストリーム終端 = エラー」 | 同 :482-484 | 静かな切断を成功と誤認しない | `assembler.rs` |
 | 8 | assistant content を必ずプレーン文字列で再送 | 同 :957-1012(コメント含む) | content-block 配列だと DeepSeek 系が構造を鸚鵡返しする実バグ | `adapters/chat_completions.rs` |
 | 9 | thinking 再送: signature フィールドへの書き戻し、`reasoning_content:""` 補完 | 同 :976-1044 | **Kimi の Preserved Thinking 必須仕様**への対応。litellm はここを落としてバグっている(調査レポート Issue #26156) | `adapters/chat_completions.rs` |
 | 10 | ツール結果の空/画像プレースホルダ、画像の user メッセージ追送 | 同 :1058-1130 | 「either content or tool_calls」制約を踏まない | `adapters/chat_completions.rs` |
 | 11 | 空 assistant(content 無し tool_calls 無し)のスキップ | 同 :1045-1056 | aborted 残骸で 400 を食らわない | `adapters/chat_completions.rs`/transform |
-| 12 | ツールコール ID の 40 字正規化 | 同 :893-906 | OpenAI 系は 40 字制限。他モデル由来 ID の再送対策 | transform(第5.3節) |
+| 12 | destination-origin付きツールコール ID 対正規化 | 同 :893-906 | same-originのcall/result IDはbyte-preserve。cross-originかつdestination protocolにwire制約がある場合だけ、同一flow-local bounded mappingで対を同じ上限内IDへ写し、mappingはturn間で再利用しない(OpenAI互換は40字上限) | transform(第5.3節) |
 | 13 | 逐次 JSON preview戦略(厳密→repair→partial→repair+partial→{}) | `ai/src/utils/json-parse.ts` 全文 | **ストリーミング中のUI表示だけ**へ移植する。repair結果はToolCall確定・承認・実行へ流さない。終端は生bufferのstrict parse+schema検証をSumi独自に必須化する | `provider/partial_json.rs`(previewテスト) + `assembler.rs`(strict終端テスト) |
 | 14 | リトライ可否の正規表現パターン集(retryable + non-retryable) | `ai/src/utils/retry.ts` 全文 | 各パターンにコメントで実 issue 番号が付いた運用知識の結晶。quota/billing 系を先に除外する順序も含めて移す | `provider/retry.rs` |
 | 15 | リトライポリシー(3回、2s/4s/8s、中断可能 sleep、エラー assistant を state から除去しログには保持) | `coding-agent/src/core/agent-session.ts:2606-2673` | ポリシーと判定の分離。「溢れはリトライしない」ガードが先頭にある(:2610-2614) | `agent/run.rs` |
@@ -2380,12 +2433,12 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 ### M1: 共通 provider core + Chat Completions
 
 - `provider/` の共通 core と `adapters/chat_completions.rs`: 第4章+移植リスト #1〜17。types → transport → assembler → adapter → retry/overflow の順
-- テスト: (a) **SSE フィクスチャ再生**: 実 API のストリームを `curl` で採取したファイル(Kimi text / Kimi tool call / Kimi reasoning / GLM tool_stream / エラー各種)を axum モックサーバで再生し、イベント列と最終メッセージをスナップショットアサート。(b) partial_json の pi テスト移植。(c) `SUMI_LIVE_TEST=1` でのライブ疎通(Umans/Kimi/GLM 三択)
+- テスト: (a) **SSE フィクスチャ再生**: fixtureごとに`sanitized_live_curl_capture`か`synthetic_contract_fixture`かをprovenanceで明示し、axumモックサーバで再生して**全正規化イベント列と最終メッセージ**をスナップショットアサートする。syntheticを実API採取済みと表現しない。OpenCode Zen Goはcurl raw captureのsanitization前SHA-256、capture時刻・endpoint・command・sanitization操作を記録し、`reasoning_content`、usage/cost配置、`[DONE]`後cost trailerを保存する。既存Kimi text/tool/reasoning、GLM tool/provider固有finish reasonは公式形状に基づくsynthetic fixtureとして残す。(b) partial_json の pi テスト移植。(c) `SUMI_LIVE_TEST=1` でのライブ疎通。credential不在のMoonshot直API/Z.ai直API/Umansのraw captureとlive証拠は削除・skipで完了扱いにせず、T25 provider releaseのrelease-blocking gateへ引き継ぐ
 - **ゲート**:
   1. `cargo test --manifest-path apps/agent/Cargo.toml` 全緑(フィクスチャ再生で: ツールコール引数の逐次previewと生bufferのstrict終端を分離し、repairならpreview可能だがstrictでは失敗するJSONを確定ToolCallにしない、reasoning 分離、usage 取得、標準finish_reasonに加えて Z.ai の `sensitive` / `network_error` / `model_context_window_exceeded` を含む provider 固有パターン)
-  2. ライブ: 3プロバイダに対しツールコール1往復+reasoning 付き2ターン会話が完走。**2ターン目で Kimi に reasoning_content を再送しても 400 が返らない**こと
-  3. TTFT 計測基盤: `user_message command 受信 → HTTP リクエスト送出` と `送出 → 最初の公開 delta(Thinking または Text)` を tracing span で分離計測し、stdio REPL に表示。**agent 内部オーバーヘッド p95 < 30ms**(モデル側 TTFB は記録のみ)
-  4. abort: 生成中に CancellationToken 発火 → 1s 以内に Aborted イベントで正常形クローズ
+  2. ライブ: OpenCode Zen Goの実curl captureでgateway固有dialectを固定する。加えてMoonshot直API/Z.ai直API/Umansの3経路でツールコール1往復+reasoning付き2ターン会話を完走し、**2ターン目でKimiにreasoning_contentを再送しても400が返らない**こと。このdirect 3-provider証拠はcredential不在のためM1実装時点では未完了で、T25 provider releaseまでのrelease-blocking gateとして追跡する
+  3. TTFT 計測基盤: T8で`HTTP リクエスト送出 → 最初の公開 delta(Thinking または Text)`と上位span接続口を実装する。`user_message command 受信 → HTTP リクエスト送出`の接続、stdio REPL表示、**agent 内部オーバーヘッド p95 < 30ms**判定は実AgentLoopを持つT15で完成する(モデル側 TTFB は記録のみ)。T8だけの暫定loopは作らない
+  4. abort: 生成中に CancellationToken 発火 → 1s 以内に Aborted イベントで正常形クローズ。通常event channelが飽和したfixtureでもpriority terminalがbacklogを追い越し、それまでのpartial contentと既受信usageを保持し、終端後のdelta/二重terminalをfuseする
 
 ### M1P: Responses + Anthropic Messages adapters (M1後に並行、release必須)
 
@@ -2475,7 +2528,7 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 
 ### Cloud release acceptance track(M1P・M0〜M5と並行可能、すべて必須)
 
-1. **provider release**: M1P の Responses/Anthropic 全ゲートを完了する
+1. **provider release**: M1P の Responses/Anthropic 全ゲートを完了する。あわせてM1から未完了で引き継いだMoonshot直API(Kimi text/tool/reasoningとreasoning_content再送)、Z.ai直API(GLM tool stream/provider固有finish reason)、Umans(text/tool/reasoning)のraw curl captureをsanitization前SHA-256・capture metadata付きで固定し、`SUMI_LIVE_TEST=1`の各2ターン経路を完走する。credential不足によるskip、OpenCode gateway capture、synthetic contract fixtureのいずれもこのdirect 3-provider証拠の代替にしない
 2. **executor/artifact deployment**: container orchestrator/deployment supervisor を実装し、executor sidecarから `/var/lib/sumi`、artifact volume、runtime `/proc`、API key、workspace 外 pathを読めず、artifact brokerからworkspace/DB/API keyを読めず、runtime側からは両volumeのmount自体が見えないことを確認する。bashが`0600`/`0700`を作っても後続file toolは同じexecutor UIDのRPCで操作できる一方、bash子はbroker socket/FDへ到達できない。artifact RPCはumaskに関係なくfile `0600`/dir `0700`を確定し、全componentの通常symlinkを拒否し、supervisor resetは旧conversation subtreeだけをno-followで削除する。`network_mode=none` で両sidecarのTCP/DNSだけが失敗し、runtime のLLM通信は維持する
 3. **resource semantics**: disk/inode/PID の拒否、CPU throttle/CPU-time budget、memory max/OOM、wall runtime、command/workspace output の各経路を個別に発火させ、§8.3/ workspace.md の種別どおり `ResourceLimit`、kill/reap、bounded output へ収束する
 4. **generation recovery**: runtime/provider/tool 実行中に runtime を killし、deployment supervisor が旧 executor generation と登録済み execution cgroup/sandbox を回収する。`setsid` で別sessionへ離脱しstdout/stderrを閉じた descendant も abort/wall/CPU/output quota 後に `/workspace` を変更できないことを fault-injection で確認する。`running` execution は `indeterminate` で一度だけ閉じ、自動再実行しない
@@ -2500,7 +2553,7 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 | D4 | **承認待ちのタイムアウト** | 無限待ち+通知タブに滞留。§9.8 のとおり待機中のuserメッセージはPendingをCancelledにして閉じ、モデルが必要ならtool callを再発行する。**Founder確認済み(2026-07-18)** |
 | D5 | **ツール実行中のハードステア** | ツールは完走させて次の注入境界でsoft steerする。「今すぐ止めて」はabortとして分離する |
 | D6 | **永続許可ruleの置き場所** | api/control planeを認可と管理の正典にする。agentは署名済みversionのmaterialized cacheだけを保持し、欠落・期限切れ・version不一致時はfail closedでAskへ戻す |
-| D7 | **モデル構成** | Cloudは3 protocolをすべて提供する。既定deployment profileはKimi K3直API、GLMは同じChat adapterの代替profile、Responses/Anthropicは各native adapterを使う。credentialと課金設定はM1/M1Pのlive gate前に準備する |
+| D7 | **モデル構成** | Cloudは3 protocolをすべて提供する。既定deployment profileはKimi K3直API、GLMは同じChat adapterの代替profile、Responses/Anthropicは各native adapterを使う。direct providerのcredentialと課金設定はT25 provider releaseのlive gate前に準備する |
 | D8 | **OpenAPI→Rust クライアント生成** | 現状1 endpointなので手書きで開始し、domain APIが3本を超えたらprogenitor導入を別ADRで判断する |
 | D9 | **承認reviewer mode / model** | User、AutoReview、StrictAutoReviewをすべて実装する。既定User、tenant opt-inでAutoReview、検証・監査にStrictAutoReviewを使う。reviewerはtenantが許可したaudit trust domain内だけ別モデルを指定でき、未設定時は会話モデルへfallbackする。raw CanonicalActionは送らずsecret-aware ReviewableActionだけを送り、判定不能ならinteractiveはmanual、headlessはblockとする |
 | D10 | **`provider_native` mode の運用** | conversation設定で`sumi_three_layer`(既定)または`provider_native`を選択できる。native対応とfingerprint一致を組立時に必須とし、非対応・不一致・native call失敗時はイベントを残して`sumi_three_layer`へ安全にfallbackする。native発火点は `min(native_compaction_trigger_tokens, context_window×0.8)`、通常は完了turnあたり最大1回、provider overflow時だけ即時1回を許す。mode切替はprovider contextを同一transactionでinvalidateし、公開transcriptと3層メモリの保守は常に継続する |
@@ -2513,7 +2566,7 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 | **3 protocol の event/item 差異を共通型が隠す** | tool/reasoning/終了理由の欠落、silent corruption | adapter fixture を protocol ごとに保持し、未知 event policy と opaque provider context を明示する。wire JSON を共通 Message へ直接 serde しない |
 | **repair済みtool JSONを確定値として実行** | truncated path/content/commandで意図しない承認・副作用 | repair/partial parserはUI preview型に隔離し、ToolCallEndは生bufferのstrict parse+schema検証だけを許可。失敗はis_error resultで閉じ、Length一括失敗も独立維持 |
 | **interrupted 部分応答の再送を Kimi が拒む**(thinking のみ等のエッジ) | ハードステアの体験が濁る | M2 ゲート3 で確認。プレースホルダテキスト補完で回避可能(6.3節) |
-| **Umans が pi の想定と違う方言を話す**(プロキシ実装の癖) | 開発効率低下 | M1 ライブゲートで3プロバイダ全部を通す。Compat は設定ファイルなので再コンパイル不要で調整できる |
+| **Umans が pi の想定と違う方言を話す**(プロキシ実装の癖) | 開発効率低下 | T25のdirect providerライブゲートでMoonshot/Z.ai/Umansを全て通す。Compat は設定ファイルなので再コンパイル不要で調整できる |
 | **トークン見積の日本語係数が外れる** | 層境界の誤判定(溢れの検知漏れ/過剰発火) | usage 校正(7.5節)が自動吸着。加えて溢れ検出(4.5節)が最終防衛線 |
 | **Compact の品質不足**(圧縮されすぎ・人格の断絶) | 「育つ秘書」体験の毀損 | 目標圧縮率のプロンプト明示+L1 文脈の読み取り専用添付(7.4節)。M4 で実会話サンプルの要約を人間レビュー |
 | **Compact経路からhidden content/要約secretが漏れる** | 別providerへのreasoning流出、DB/backup平文残留 | 内部に`Vec<PublicMessage>`だけを持つ`CompactionInput`専用境界でprovider contextを表現不能にし、別providerもtrust-domain制約。summary/resultはmemory-summary鍵の暗号化正本+redacted projectionだけを保存しconversation resetでcrypto-erase |

@@ -1,0 +1,7 @@
+data: {"id":"text-1","model":"kimi-k3","choices":[{"delta":{"content":"hello"},"finish_reason":null}]}
+
+data: {"id":"text-1","model":"kimi-k3","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2}}
+
+data: [DONE]
+
+: fixture eof

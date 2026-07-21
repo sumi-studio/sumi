@@ -1,0 +1,235 @@
+{
+  "cross_origin": {
+    "max_completion_tokens": 16384,
+    "messages": [
+      { "content": "Stay grounded.", "role": "system" },
+      { "content": [{ "text": "read it", "type": "text" }], "role": "user" },
+      {
+        "reasoning_content": "",
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "{\"path\":\"a.txt\"}",
+              "name": "read_file"
+            },
+            "id": "call|with+noise",
+            "type": "function"
+          }
+        ]
+      },
+      {
+        "content": "hello",
+        "role": "tool",
+        "tool_call_id": "call|with+noise"
+      }
+    ],
+    "model": "kimi-k3",
+    "reasoning_effort": "max",
+    "stream": true,
+    "stream_options": { "include_usage": true },
+    "tools": [
+      {
+        "function": {
+          "description": "Read a file",
+          "name": "read_file",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": { "path": { "type": "string" } },
+            "required": ["path"],
+            "type": "object"
+          }
+        },
+        "type": "function"
+      }
+    ]
+  },
+  "image": {
+    "max_completion_tokens": 16384,
+    "messages": [
+      { "content": "System.", "role": "system" },
+      {
+        "content": [
+          { "text": "inspect", "type": "text" },
+          {
+            "image_url": { "url": "data:image/png;base64,aGVsbG8=" },
+            "type": "image_url"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "model": "kimi-k3",
+    "reasoning_effort": "max",
+    "stream": true,
+    "stream_options": { "include_usage": true }
+  },
+  "interrupted": {
+    "max_completion_tokens": 16384,
+    "messages": [
+      { "content": "System.", "role": "system" },
+      { "content": [{ "text": "hello", "type": "text" }], "role": "user" },
+      {
+        "content": "partial",
+        "reasoning_content": "",
+        "role": "assistant"
+      }
+    ],
+    "model": "kimi-k3",
+    "reasoning_effort": "max",
+    "stream": true,
+    "stream_options": { "include_usage": true }
+  },
+  "normal": {
+    "max_completion_tokens": 16384,
+    "messages": [
+      { "content": "System.", "role": "system" },
+      { "content": [{ "text": "hello", "type": "text" }], "role": "user" }
+    ],
+    "model": "kimi-k3",
+    "reasoning_effort": "max",
+    "stream": true,
+    "stream_options": { "include_usage": true }
+  },
+  "opencode_live_capture_request": {
+    "max_tokens": 64,
+    "messages": [
+      {
+        "content": [
+          { "text": "Reply with exactly fixture-ok", "type": "text" }
+        ],
+        "role": "user"
+      }
+    ],
+    "model": "kimi-k2.7-code",
+    "stream": true,
+    "stream_options": { "include_usage": true }
+  },
+  "opencode_tool_live_gate_first_turn": {
+    "max_tokens": 4096,
+    "messages": [
+      {
+        "content": "Use the requested tool exactly once.",
+        "role": "system"
+      },
+      {
+        "content": [
+          {
+            "text": "Call echo_value once with value live-smoke-ok.",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "model": "kimi-k2.7-code",
+    "stream": true,
+    "stream_options": { "include_usage": true },
+    "tools": [
+      {
+        "function": {
+          "description": "Return the supplied value unchanged.",
+          "name": "echo_value",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": { "value": { "type": "string" } },
+            "required": ["value"],
+            "type": "object"
+          }
+        },
+        "type": "function"
+      }
+    ]
+  },
+  "thinking_replay": {
+    "max_completion_tokens": 16384,
+    "messages": [
+      { "content": "Stay grounded.", "role": "system" },
+      { "content": [{ "text": "read it", "type": "text" }], "role": "user" },
+      {
+        "content": "",
+        "reasoning_content": "I should read.",
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "{\"path\":\"a.txt\"}",
+              "name": "read_file"
+            },
+            "id": "call|with+noise",
+            "type": "function"
+          }
+        ]
+      },
+      {
+        "content": "hello",
+        "role": "tool",
+        "tool_call_id": "call|with+noise"
+      }
+    ],
+    "model": "kimi-k3",
+    "reasoning_effort": "max",
+    "stream": true,
+    "stream_options": { "include_usage": true },
+    "tools": [
+      {
+        "function": {
+          "description": "Read a file",
+          "name": "read_file",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": { "path": { "type": "string" } },
+            "required": ["path"],
+            "type": "object"
+          }
+        },
+        "type": "function"
+      }
+    ]
+  },
+  "tool_roundtrip": {
+    "max_completion_tokens": 16384,
+    "messages": [
+      { "content": "Stay grounded.", "role": "system" },
+      { "content": [{ "text": "read it", "type": "text" }], "role": "user" },
+      {
+        "reasoning_content": "",
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "{\"path\":\"a.txt\"}",
+              "name": "read_file"
+            },
+            "id": "call|with+noise",
+            "type": "function"
+          }
+        ]
+      },
+      {
+        "content": "hello",
+        "role": "tool",
+        "tool_call_id": "call|with+noise"
+      }
+    ],
+    "model": "kimi-k3",
+    "reasoning_effort": "max",
+    "stream": true,
+    "stream_options": { "include_usage": true },
+    "tools": [
+      {
+        "function": {
+          "description": "Read a file",
+          "name": "read_file",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": { "path": { "type": "string" } },
+            "required": ["path"],
+            "type": "object"
+          }
+        },
+        "type": "function"
+      }
+    ]
+  }
+}

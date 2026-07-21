@@ -200,8 +200,9 @@ mod tests {
     use super::*;
     use crate::{
         provider::types::{
-            PublicAssistantMessage, RejectedToolCall, StopReason, ToolArgumentError, ToolCall,
-            ToolResultMessage, Usage, UserMessage, ValidatedToolArguments,
+            ApiProtocol, ProviderOrigin, PublicAssistantMessage, RejectedToolCall, StopReason,
+            ToolArgumentError, ToolCall, ToolResultMessage, Usage, UserMessage,
+            ValidatedToolArguments,
         },
         store::crypto::{DATA_KEY_BYTES, DataKeyPurpose},
     };
@@ -210,6 +211,14 @@ mod tests {
         chrono::DateTime::parse_from_rfc3339("2026-07-20T01:02:03Z")
             .expect("valid fixture timestamp")
             .with_timezone(&chrono::Utc)
+    }
+
+    fn provider_origin() -> ProviderOrigin {
+        ProviderOrigin {
+            provider_instance_id: "private-provider-instance".to_owned(),
+            protocol: ApiProtocol::OpenAiChatCompletions,
+            model: "private-model-metadata".to_owned(),
+        }
     }
 
     fn projected_search(message: &PublicMessage) -> String {
@@ -368,6 +377,7 @@ mod tests {
             ],
             model: "private-model-metadata".to_owned(),
             provider: "private-provider-metadata".to_owned(),
+            origin: provider_origin(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
             error_message: Some("private error metadata".to_owned()),

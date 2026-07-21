@@ -7088,9 +7088,9 @@ mod tests {
     use crate::{
         gateway::{Command, SensitiveCommandPayload},
         provider::types::{
-            PublicAssistantContent, PublicAssistantMessage, PublicMessage, RejectedToolCall,
-            StopReason, ToolArgumentError, ToolCall, ToolResultMessage, Usage, UserContent,
-            UserMessage,
+            ApiProtocol, ProviderOrigin, PublicAssistantContent, PublicAssistantMessage,
+            PublicMessage, RejectedToolCall, StopReason, ToolArgumentError, ToolCall,
+            ToolResultMessage, Usage, UserContent, UserMessage,
         },
         store::{
             AgentScope, KeyProvider, RecoveryStep, SuffixRecovery,
@@ -7187,6 +7187,14 @@ mod tests {
         DateTime::parse_from_rfc3339("2026-07-20T01:02:03.456789Z")
             .expect("valid test timestamp")
             .with_timezone(&Utc)
+    }
+
+    fn test_provider_origin() -> ProviderOrigin {
+        ProviderOrigin {
+            provider_instance_id: "test-provider-instance".to_owned(),
+            protocol: ApiProtocol::OpenAiChatCompletions,
+            model: "test-model".to_owned(),
+        }
     }
 
     fn approval_request(id: &str, tool_call_id: &str, risk: &str) -> Value {
@@ -7403,6 +7411,7 @@ mod tests {
             content: Vec::new(),
             model: "test-model".to_owned(),
             provider: "test-provider".to_owned(),
+            origin: test_provider_origin(),
             usage: Usage::default(),
             stop_reason,
             error_message: (stop_reason == StopReason::Error)
@@ -7430,6 +7439,7 @@ mod tests {
                 .collect(),
             model: "test-model".to_owned(),
             provider: "test-provider".to_owned(),
+            origin: test_provider_origin(),
             usage: Usage::default(),
             stop_reason: StopReason::ToolUse,
             error_message: None,
@@ -9275,6 +9285,7 @@ mod tests {
             }],
             model: "test-model".to_owned(),
             provider: "test-provider".to_owned(),
+            origin: test_provider_origin(),
             usage: Usage::default(),
             stop_reason: StopReason::ToolUse,
             error_message: None,
@@ -10084,6 +10095,7 @@ mod tests {
             }],
             model: "test-model".to_owned(),
             provider: "test-provider".to_owned(),
+            origin: test_provider_origin(),
             usage: Usage::default(),
             stop_reason: StopReason::ToolUse,
             error_message: None,
@@ -13806,6 +13818,7 @@ mod tests {
             }],
             model: "test-model".to_owned(),
             provider: "test-provider".to_owned(),
+            origin: test_provider_origin(),
             usage: Usage::default(),
             stop_reason: StopReason::ToolUse,
             error_message: None,

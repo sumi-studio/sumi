@@ -1,0 +1,69 @@
+[
+  { "type": "start" },
+  {
+    "content_index": 0,
+    "signature_field": "reasoning_content",
+    "type": "thinking_start"
+  },
+  { "content_index": 0, "delta": "We", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " need", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " answer", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " exactly", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " '", "type": "thinking_delta" },
+  { "content_index": 0, "delta": "fixture", "type": "thinking_delta" },
+  { "content_index": 0, "delta": "-", "type": "thinking_delta" },
+  { "content_index": 0, "delta": "ok", "type": "thinking_delta" },
+  { "content_index": 0, "delta": "'.", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " No", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " extra", "type": "thinking_delta" },
+  { "content_index": 0, "delta": " content", "type": "thinking_delta" },
+  { "content_index": 0, "delta": ".", "type": "thinking_delta" },
+  { "content_index": 1, "type": "text_start" },
+  { "content_index": 1, "delta": "fixture", "type": "text_delta" },
+  { "content_index": 1, "delta": "-", "type": "text_delta" },
+  { "content_index": 1, "delta": "ok", "type": "text_delta" },
+  { "content": "fixture-ok", "content_index": 1, "type": "text_end" },
+  {
+    "content": "We need answer exactly 'fixture-ok'. No extra content.",
+    "content_index": 0,
+    "type": "thinking_end"
+  },
+  {
+    "output": {
+      "message": {
+        "content": [
+          {
+            "signature_field": "reasoning_content",
+            "thinking": "We need answer exactly 'fixture-ok'. No extra content.",
+            "type": "thinking",
+            "wire_item_index": 0
+          },
+          { "text": "fixture-ok", "type": "text", "wire_item_index": 1 }
+        ],
+        "error_message": null,
+        "interrupted": false,
+        "model": "kimi-k2.7-code",
+        "origin": {
+          "model": "kimi-k2.7-code",
+          "protocol": "open_ai_chat_completions",
+          "provider_instance_id": "<provider_instance_id>"
+        },
+        "provider": "opencode-go",
+        "provider_code": "stop",
+        "stop_reason": "stop",
+        "timestamp": "<timestamp>",
+        "usage": {
+          "cache_read": 0,
+          "cache_write": 0,
+          "input": 13,
+          "output": 19,
+          "reasoning": 14,
+          "total_tokens": 32
+        }
+      },
+      "provider_context": []
+    },
+    "reason": "stop",
+    "type": "done"
+  }
+]

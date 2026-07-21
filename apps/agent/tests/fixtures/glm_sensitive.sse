@@ -1,0 +1,5 @@
+data: {"id":"sensitive-1","model":"glm-5.2","choices":[{"delta":{},"finish_reason":"sensitive"}],"usage":{"prompt_tokens":4,"completion_tokens":1}}
+
+data: [DONE]
+
+: fixture terminator
