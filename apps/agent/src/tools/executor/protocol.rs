@@ -195,7 +195,7 @@ impl RpcOperationValidation for ExecutorOperation {
                 ..
             } => {
                 validate_rpc_read_limit(*limit)?;
-                validate_workspace_input(path, "path")?;
+                validate_routable_input(path)?;
                 validate_executor_execution_id(execution_id)
             }
             Self::WriteFile {
@@ -205,11 +205,14 @@ impl RpcOperationValidation for ExecutorOperation {
                 path, execution_id, ..
             }
             | Self::RemoveFile { path, execution_id }
-            | Self::ListDir { path, execution_id }
-            | Self::Grep {
+            | Self::ListDir { path, execution_id } => {
+                validate_workspace_input(path, "path")?;
+                validate_executor_execution_id(execution_id)
+            }
+            Self::Grep {
                 path, execution_id, ..
             } => {
-                validate_workspace_input(path, "path")?;
+                validate_routable_input(path)?;
                 validate_executor_execution_id(execution_id)
             }
             Self::Glob {
@@ -555,6 +558,13 @@ fn validate_rpc_read_limit(limit: usize) -> Result<(), ToolError> {
         return Err(ToolError::Protocol(format!(
             "RPC read limit must be <= {MAX_RPC_READ_BYTES} bytes"
         )));
+    }
+    Ok(())
+}
+
+fn validate_routable_input(value: &str) -> Result<(), ToolError> {
+    if value.starts_with("artifact://") {
+        parse_artifact_handle(value)?;
     }
     Ok(())
 }
@@ -1411,15 +1421,9 @@ mod tests {
     }
 
     #[test]
-    fn executor_operations_reject_direct_artifact_workspace_inputs() {
+    fn executor_operations_only_decode_artifact_inputs_for_routable_tools() {
         let handle = "artifact://conversation-1/tool-output/execution-1";
         let invalid = [
-            ExecutorOperation::ReadFile {
-                path: handle.to_owned(),
-                offset: 0,
-                limit: MAX_RPC_READ_BYTES,
-                execution_id: "execution-1".to_owned(),
-            },
             ExecutorOperation::WriteFile {
                 path: handle.to_owned(),
                 content: String::new(),
@@ -1443,11 +1447,6 @@ mod tests {
                 pattern: handle.to_owned(),
                 execution_id: "execution-1".to_owned(),
             },
-            ExecutorOperation::Grep {
-                path: handle.to_owned(),
-                pattern: "needle".to_owned(),
-                execution_id: "execution-1".to_owned(),
-            },
         ];
         for operation in invalid {
             let encoded = serde_json::to_vec(&RpcRequest {
@@ -1462,6 +1461,29 @@ mod tests {
                 Err(ToolError::InvalidPath(message))
                     if message.starts_with("executor workspace ")
             ));
+        }
+
+        for operation in [
+            ExecutorOperation::ReadFile {
+                path: handle.to_owned(),
+                offset: 0,
+                limit: MAX_RPC_READ_BYTES,
+                execution_id: "execution-read".to_owned(),
+            },
+            ExecutorOperation::Grep {
+                path: handle.to_owned(),
+                pattern: "needle".to_owned(),
+                execution_id: "execution-grep".to_owned(),
+            },
+        ] {
+            let encoded = serde_json::to_vec(&RpcRequest {
+                generation: 7,
+                nonce: "boot-nonce".to_owned(),
+                request_id: "request-1".to_owned(),
+                operation,
+            })
+            .unwrap();
+            assert!(decode_rpc_line::<ExecutorOperation>(&encoded, &identity()).is_ok());
         }
 
         let embedded = "workspace/artifact://literal";

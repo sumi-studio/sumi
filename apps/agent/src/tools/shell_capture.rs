@@ -25,6 +25,7 @@ pub const ROLLING_BUFFER_BYTES: usize = DEFAULT_MAX_BYTES * 2;
 pub const COMMAND_OUTPUT_LIMIT_BYTES: u64 = 10 * 1024 * 1024;
 pub const OUTPUT_QUEUE_CAPACITY: usize = 32;
 const ARTIFACT_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
+const ARTIFACT_AMBIGUOUS_RETRY_LIMIT: usize = 3;
 
 #[async_trait]
 pub trait ArtifactAppender: Send + Sync {
@@ -182,7 +183,7 @@ impl<'a> ShellCapture<'a> {
     pub async fn finish(mut self) -> Result<ShellCaptureResult, ToolError> {
         self.finished = true;
         self.flush_pending_utf8().await?;
-        let _ = self.flush_pending_artifact_writes().await;
+        self.flush_pending_artifact_writes().await?;
         self.finish_artifact().await;
         let tail = self.rolling_text();
         let truncation = self.complete_truncation(truncate_tail(&tail, Default::default()));
@@ -385,26 +386,37 @@ impl<'a> ShellCapture<'a> {
         if self.artifact_disabled || self.pending_artifact_writes.is_empty() {
             return Ok(());
         }
-        let timeout = self.artifact_timeout;
-        let result =
-            tokio::time::timeout(timeout, self.flush_pending_artifact_writes_inner()).await;
-        match result {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error @ ToolError::ResourceLimit(ResourceLimit::OutputBytes { .. }))) => {
-                self.disable_artifact(&error);
-                Err(error)
-            }
-            Ok(Err(error)) => {
-                self.disable_artifact(&error);
-                Ok(())
-            }
-            Err(_) => {
-                self.disable_artifact(&ToolError::Rpc(
-                    "artifact RPC exceeded its deadline".to_owned(),
-                ));
-                Ok(())
+        for attempt in 0..ARTIFACT_AMBIGUOUS_RETRY_LIMIT {
+            let result = tokio::time::timeout(
+                self.artifact_timeout,
+                self.flush_pending_artifact_writes_inner(),
+            )
+            .await;
+            match result {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(error @ ToolError::ResourceLimit(ResourceLimit::OutputBytes { .. }))) => {
+                    self.disable_artifact(&error);
+                    return Err(error);
+                }
+                Ok(Err(_error @ ToolError::RpcIndeterminate(_)))
+                    if attempt + 1 < ARTIFACT_AMBIGUOUS_RETRY_LIMIT =>
+                {
+                    continue;
+                }
+                Ok(Err(error @ ToolError::RpcIndeterminate(_))) => return Err(error),
+                Ok(Err(error)) => {
+                    self.disable_artifact(&error);
+                    return Ok(());
+                }
+                Err(_) if attempt + 1 < ARTIFACT_AMBIGUOUS_RETRY_LIMIT => continue,
+                Err(_) => {
+                    return Err(ToolError::RpcIndeterminate(
+                        "artifact RPC exceeded its retry deadline".to_owned(),
+                    ));
+                }
             }
         }
+        unreachable!("bounded artifact retry loop always returns")
     }
 
     async fn flush_pending_artifact_writes_inner(&mut self) -> Result<(), ToolError> {
@@ -515,7 +527,6 @@ impl<'a> ShellCapture<'a> {
         }
         tracing::warn!(
             %error,
-            execution_id = self.execution_id,
             "shell output artifact publication failed; preserving terminal capture without a handle"
         );
         self.artifact_disabled = true;
@@ -695,6 +706,69 @@ mod tests {
     #[derive(Default)]
     struct FailingArtifacts {
         begin_count: AtomicU64,
+    }
+
+    #[derive(Default)]
+    struct CommitThenLoseResponseArtifacts {
+        state: Mutex<CommitThenLoseState>,
+    }
+
+    #[derive(Default)]
+    struct CommitThenLoseState {
+        content: Vec<u8>,
+        begin_calls: usize,
+        append_calls: usize,
+    }
+
+    #[async_trait]
+    impl ArtifactAppender for CommitThenLoseResponseArtifacts {
+        async fn begin_tool_output(
+            &self,
+            execution_id: &str,
+            initial_content: &[u8],
+        ) -> Result<String, ToolError> {
+            let mut state = self.state.lock().unwrap();
+            state.begin_calls += 1;
+            if state.content.is_empty() {
+                state.content.extend_from_slice(initial_content);
+            } else {
+                assert!(state.content.starts_with(initial_content));
+            }
+            if state.begin_calls == 1 {
+                return Err(ToolError::RpcIndeterminate(
+                    "begin response lost".to_owned(),
+                ));
+            }
+            Ok(format!(
+                "artifact://conversation-1/tool-output/{execution_id}"
+            ))
+        }
+
+        async fn append_tool_output(
+            &self,
+            _handle: &str,
+            offset: u64,
+            content: &[u8],
+        ) -> Result<(), ToolError> {
+            let mut state = self.state.lock().unwrap();
+            state.append_calls += 1;
+            let offset = usize::try_from(offset).unwrap();
+            if state.content.len() == offset {
+                state.content.extend_from_slice(content);
+            } else {
+                assert_eq!(&state.content[offset..], content);
+            }
+            if state.append_calls == 1 {
+                return Err(ToolError::RpcIndeterminate(
+                    "append response lost".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+
+        async fn finish_tool_output(&self, _handle: &str) -> Result<(), ToolError> {
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -1268,26 +1342,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stalled_artifact_is_timed_out_once_and_disabled_for_later_chunks() {
+    async fn commit_then_close_begin_and_append_replay_to_one_exact_artifact() {
+        let artifacts = CommitThenLoseResponseArtifacts::default();
+        let prefix = vec![b'x'; DEFAULT_MAX_BYTES + 1];
+        let suffix = b"tail";
+        let mut capture = ShellCapture::new("commit-loss", &artifacts);
+        capture.push(&prefix).await.expect("begin replay converges");
+        capture.push(suffix).await.expect("append replay converges");
+        let result = capture.finish().await.expect("finish artifact");
+        assert!(result.artifact_handle.is_some());
+        let state = artifacts.state.lock().unwrap();
+        assert_eq!(state.begin_calls, 3);
+        assert_eq!(state.append_calls, 2);
+        assert_eq!(state.content, [prefix, suffix.to_vec()].concat());
+    }
+
+    #[tokio::test]
+    async fn stalled_artifact_surfaces_bounded_indeterminate_failure() {
         let artifacts = StalledArtifacts::default();
         let mut capture = ShellCapture::new("bash-artifact-timeout", &artifacts)
             .with_artifact_timeout(Duration::from_millis(10));
         let prefix = vec![b'x'; DEFAULT_MAX_BYTES + 1];
-        let first = capture
-            .push(&prefix)
+        let error = tokio::time::timeout(Duration::from_millis(100), capture.push(&prefix))
             .await
-            .expect("terminal capture survives artifact deadline");
-        let second = tokio::time::timeout(Duration::from_millis(50), capture.push(b"tail"))
-            .await
-            .expect("disabled artifact must not stall another chunk")
-            .expect("capture tail");
-
-        assert_eq!(first.len(), prefix.len());
-        assert_eq!(second, "tail");
-        assert_eq!(artifacts.begin_count.load(Ordering::Relaxed), 1);
-        let result = capture.finish().await.expect("finish capture");
-        assert_eq!(result.artifact_handle, None);
-        assert!(result.output.ends_with("tail"));
+            .expect("ambiguous retries must be bounded")
+            .expect_err("indeterminate artifact cannot be discarded");
+        assert!(matches!(error, ToolError::RpcIndeterminate(_)));
+        assert_eq!(artifacts.begin_count.load(Ordering::Relaxed), 3);
     }
 
     #[tokio::test]
