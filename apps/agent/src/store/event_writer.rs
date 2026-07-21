@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, Transaction};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -2702,11 +2703,7 @@ fn abrupt_transaction_exit(name: &str, boundary: &str, readiness_path: &std::pat
 }
 
 fn verify_digest_bytes(incoming: &[u8], stored: &[u8]) -> Result<()> {
-    let mut difference = incoming.len() ^ stored.len();
-    for (incoming, stored) in incoming.iter().zip(stored) {
-        difference |= usize::from(incoming ^ stored);
-    }
-    if difference != 0 {
+    if incoming.len() != stored.len() || incoming.ct_eq(stored).unwrap_u8() == 0 {
         bail!("command payload digest mismatch");
     }
     Ok(())
@@ -7129,6 +7126,13 @@ mod tests {
             agent_id: "agent-1".to_owned(),
             conversation_id: "conversation-1".to_owned(),
         }
+    }
+
+    #[test]
+    fn verify_digest_bytes_rejects_length_and_content_mismatches() {
+        verify_digest_bytes(b"digest", b"digest").expect("equal digests verify");
+        assert!(verify_digest_bytes(b"digest", b"digest-extra").is_err());
+        assert!(verify_digest_bytes(b"digest", b"digist").is_err());
     }
 
     fn test_provider() -> Arc<dyn KeyProvider> {

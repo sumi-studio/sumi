@@ -321,6 +321,12 @@ fn resolve_for_boundary(path: &Path, current_dir: &Path) -> Result<PathBuf> {
                     .ok_or_else(|| anyhow::anyhow!("path has no resolvable filesystem prefix"))?
                     .as_os_str()
                     .to_os_string();
+                if component == ".." {
+                    bail!(
+                        "path contains parent traversal in unresolved filesystem suffix: {}",
+                        absolute.display()
+                    );
+                }
                 if !existing_prefix.pop() {
                     return Err(error).context("path has no existing filesystem prefix");
                 }
@@ -615,6 +621,41 @@ workspace = "/workspace/customer-data"
             !root.0.join("private").exists(),
             "boundary validation must not create the intended state leaf"
         );
+    }
+
+    #[test]
+    fn rejects_parent_traversal_in_unresolved_suffix() {
+        let root = FixtureRoot::new("unresolved-parent-traversal");
+        let workspace = root.0.join("workspace");
+        std::fs::create_dir(&workspace).expect("create workspace");
+
+        let error = Config::resolve_from(
+            paths_config(&workspace, workspace.join("nope/../../alias")),
+            EnvOverrides::default(),
+            &root.0,
+        )
+        .expect_err("unresolved parent traversal must fail closed");
+
+        assert!(format!("{error:#}").contains("parent traversal"));
+        assert!(!root.0.join("alias").exists());
+    }
+
+    #[test]
+    fn existing_parent_traversal_is_resolved_by_filesystem_canonicalization() {
+        let root = FixtureRoot::new("existing-parent-traversal");
+        let workspace = root.0.join("workspace");
+        let state = root.0.join("state");
+        std::fs::create_dir(&workspace).expect("create workspace");
+        std::fs::create_dir(&state).expect("create state");
+
+        let config = Config::resolve_from(
+            paths_config(&workspace, state.join("..").join("state")),
+            EnvOverrides::default(),
+            &root.0,
+        )
+        .expect("existing parent traversal should canonicalize");
+
+        assert_eq!(config.database_path, state.join("agent.db"));
     }
 
     #[test]
