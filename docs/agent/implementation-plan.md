@@ -528,7 +528,9 @@ pub enum AgentEvent {
     AgentStart,
     AgentEnd,
     TurnStart,
-    TurnEnd { message: Box<PublicMessage>, tool_results: Vec<ToolResultMessage> },
+    /// 通常は最終messageをSomeで運ぶ。durableなidle turnがuser_started前に
+    /// Abort/supersedeされた真の空turnだけNoneを許す。合成messageを捏造しない。
+    TurnEnd { message: Option<Box<PublicMessage>>, tool_results: Vec<ToolResultMessage> },
     MessageStart { message_id: String, message: Box<PublicMessage> },
     /// assistantストリーミング中のみ。公開可能な Text/ToolCall、平文 Thinking と、
     /// provider が display-safe と明示した reasoning summary だけを包む。
@@ -1046,7 +1048,7 @@ pi の `steer()` は**キュー投入のみ**で、注入は「現在のツー�
 
 abort 受理時、`seq < abort.seq`で **`user_started` へ達していない** UserMessage(`received`、分類済みidle startup、hard/soft/retry steerの全種)が残っている場合、それを注入も黙殺もしない。「MessageEnd まで到達した内容だけが実体」(§10.2)の規則どおり、この command はまだ会話の実体ではないため、**会話へ入れずにフロントへ差し戻す**:
 
-1. abort の終端処理と同じ EventWriter transaction 群で、対象を `status=superseded` の終端状態へ閉じる(`Projection::CommandSuperseded`)。分類前commandは`application_kind/run_id/turn_id=NULL, run_phase=received`のまま閉じる。分類済みidle startupは`classified|run_started|turn_started`の保存値を維持し、`TurnStart`済みなら`TurnEnd`、`AgentStart`済みなら`AgentEnd`を同じ正常形クローズへ載せる。steerは従来どおり保存済みrun/turnを維持する。複数あればcommand seq順に全件。Abortより後のseqには触れない
+1. abort の終端処理と同じ EventWriter transaction 群で、対象を `status=superseded` の終端状態へ閉じる(`Projection::CommandSuperseded`)。分類前commandは`application_kind/run_id/turn_id=NULL, run_phase=received`のまま閉じる。分類済みidle startupは`classified|run_started|turn_started`の保存値を維持し、`TurnStart`済みなら`TurnEnd(message=None, tool_results=[])`、`AgentStart`済みなら`AgentEnd`を同じ正常形クローズへ載せる。この`None`は`user_started`前に閉じた真の空turnだけを表し、存在しないassistant messageを合成しない。通常/provider/tool経路の`TurnEnd.message`は必ず`Some`である。steerは従来どおり保存済みrun/turnを維持する。複数あればcommand seq順に全件。Abortより後のseqには触れない
 2. API へ `Superseded` ACK を返す。API は durable command log を superseded と記録し、**保存済みの原文テキストを web へ返す**。web は入力欄上の保持 UI に復元し、ユーザーが送信し直せば**新しい `command_id` の通常 command** になる。agent は payload を echo しない(原文の正典は API 側 command log)
 3. 判定境界は `user_started`: それより前(`received`/`classified`/`turn_started`)なら supersede。`user_started` 以降は user メッセージが会話に存在するため差し戻さず、`MessageEnd` まで確定して未応答のまま `finished` で閉じる(§10.2 の cancel_requested 復旧と同じ扱い)
 4. supersede が abort の `AgentEnd` に先行するため、「未注入(§10.2)の steer group が残る限り `AgentEnd` を発行しない」不変条件と矛盾しない — `AgentEnd` 時点で未注入の steer は存在しない。run owner(§10.2)が存在する場合はownerを`cancel_requested → finished`へ閉じる。owner未成立のidle startupではstartup commandのrun bindingをAbortのcommit先とし、上記正常形クローズ後にsupersedeする
@@ -1544,7 +1546,7 @@ conversation 削除は transcript/memory/provider context と conversation 鍵�
 
 保存境界には versioned な純関数 `Redactor` を1つだけ置く。`PublicProjectionBuilder` は hidden provider content を型検査で除外した `PublicMessage` / durable `AgentEvent` から、(a) conversation 鍵配下で即時暗号化する原文正本と、(b) API key、署名 token、既知 secret 形式を `[REDACTED:<kind>]` へ置換した平文 projection の両方を同時に作る。`MemoryProjectionBuilder` も同じ`Redactor`を使い、Compact resultを受け取った直後、平文をDB transactionへ渡す前にmemory-summary data keyで暗号化した正本とredacted projectionを同時生成する。`messages.raw_ciphertext` / `agent_events.raw_ciphertext` は認可済み UI replay と L0 復旧だけに使い、`messages.payload` と `agent_events.envelope` は同じ redacted object から serializeし、`search_text`もredaction後に導出する。要約はContextAssembler/次段Compactが必要な短時間だけ`summary_ciphertext`/`result_ciphertext`を認可済みruntime内で復号し、管理画面・通常exportにはprojectionだけを使う。ToolExecution/Approval の args・result・details も durable event の raw ciphertext 以外の投影テーブルでは redacted 値だけを持つ。tracing は raw payload を field に載せず、揮発 `MessageUpdate` もログへ保存しない。暗号化 `provider_context` とユーザーの workspace file 自体はこの不可逆変換をせず、別の鍵・認可・保持期間で保護する。
 
-EventWriter は `redaction_version` のない公開 projection、または原文正本と redacted projection の片方だけを持つ transcript/event/memory-result write を拒否する。fixture は user text、tool args/output/details、assistant text、event envelopeに加えてCompactが生成したL1/L2要約の各位置に既知secretを置き、ciphertextを除くDB平文/FTS/log/exportのいずれにも**平文**が残らず、認可済み復号だけが原文を再構築できることを確認する。将来の検出規則更新は既存行を黙って書換えず、再 redaction migration と audit record で行う。
+EventWriter は自身が同時生成した `redaction_version` のない公開 projection、または原文正本と redacted projection の片方だけを持つ transcript/event/memory-result write を拒否する。caller が version や完成済み projection を申告する経路は設けない。fixture は user text、tool args/output/details、assistant text、event envelopeに加えてCompactが生成したL1/L2要約の各位置に既知secretを置き、ciphertextを除くDB平文/FTS/log/exportのいずれにも**平文**が残らず、認可済み復号だけが原文を再構築できることを確認する。将来の検出規則更新は既存行を黙って書換えず、migrate-before-deploy の再 redaction migration と audit record で行う。
 
 例外は crash 復旧に正確な原commandが必要な `inbound_commands` で、redact すると意味が変わるため公開 projectionには使わない。受信 transaction で conversation 鍵配下のcommand用データ鍵により application-level暗号化し、平文はSessionの処理中だけ保持する。重複payload照合用に鍵付きHMACを保存し、通常export/FTS/logから除外する。conversation resetは鍵破棄とrow削除の両方でcrypto-eraseする。
 
@@ -1963,8 +1965,6 @@ pub struct EventWrite {
     pub event: Option<AgentEvent>,  // 内部投影だけのwriteはNone。公開eventがある場合だけseqを採番
     /// 1 event と同じ transaction で適用する projection 群。順序は EventWriter が固定する。
     pub projections: Vec<Projection>,
-    /// 公開 event/message を含む write では必須。内部投影だけなら None。
-    pub redaction_version: Option<u32>,
 }
 
 pub enum Projection {
@@ -2052,6 +2052,10 @@ pub enum ProviderContextMutation {
     },
 }
 ```
+
+`redaction_version` は `EventWrite` の caller 入力にしない。EventWriter が受け取った型付き原文に、自身が保持する正確な `Redactor` を1回適用し、暗号化原文・redacted projection・その実行版を同時生成して同一 transaction に固定する。Approval Pending も caller が projection/version を申告せず、同じ `ApprovalRequested` から EventWriter が生成した redacted request と version を `approval_log` へ複製する。caller-attested version/projection は、実際に走った規則とのずれを型でも transaction でも防げず、未redact 内容や偽の版を正本化できるため棄却する。Redactor の版更新は **migrate-before-deploy** とし、既存 projection を新規則で再生成・監査してから新 binary を配備する。boot/recovery は未対応の保存済み版を fail-closed で拒否し、rotation 自体を暗黙の読み替えや live write で代替しない。
+
+boot/recovery は command 受付前に event chain 全体を一度だけ認証・復号し、lifecycle を再構成して、認証済み event head に束縛した process-local checkpoint を単一 EventWriter が所有する。以後の各 transaction はDBの認証済みheadがcheckpointと一致することを事前条件にし、新しいsuffixだけをchain/lifecycleへ適用してcommit成功後にcheckpointを前進させる。rollback時はcheckpointも前進させない。通常writeごとに全履歴を再scanしてはならない(小さいtransactionのhot pathを履歴長依存にし、累積O(N²)にするため)。脅威境界はcurrent process generationによる単一writer ownershipであり、別process等によるSQLite event rowの直接改変は次回boot/recoveryの全認証でfail-closedに検出する。同一process稼働中の外部SQLite改変を毎writeのO(N)再scanで防御する契約は持たず、headの不一致と正規のserialized write競合だけをhot pathで拒否する。
 
 `EventWriter` は `EventBatch` 単位で全 write の event と projection を検証し、重複 variant、競合する expected phase/version、anchor/ordinal 不整合を拒否してから全件を1 transaction で適用する。たとえば user `MessageEnd` は `Projection::MessageEnd + Projection::RunPhase`、assistant `MessageEnd` は `Projection::MessageEnd + 必要なら RunPhase/CommandApplied` を同居させる。`MessageEnd.eviction_footprint_tokens` は各 `EncryptedProviderContext.eviction_tokens` の検査済み合計と一致しなければ拒否し、provider context INSERT・`memory_batches` counter加算・message確定を同じtransactionに置く。`append_to_l0=false`ではprovider contextを再送対象にしないため、provider_context空かつfootprint=0だけを許す。
 
@@ -2454,7 +2458,7 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 ### M2: ループ+ツール+ステア
 
 - **先にdurability foundationを完成**する: `store/`の最小migration(`agent_scope`、`data_keys`、`messages`、`agent_events`、`inbound_commands`、`tool_executions`、`approval_log`) + 単一EventWriter + `CommandReceived/Classified/RunPhase/MessageEnd/ToolExecutionMutation/ApprovalMutation/CommandApplied`投影 + 起動時suffix復旧を実装する。hard steer手順0、abort、承認待ち、tool実行開始はこのfoundationのcommitを通るまで有効化しない。M2では本物のpolicy/reviewer/UIはまだ作らず、fixture専用のPending action driverで`ApprovalRequested + approval_log.pending`と解決/復旧transactionだけを先に検証する。M5のApprovalBrokerはこの正本へ接続し、M3も別実装へ置換せず機能を追加する
-  - **M2で`data_keys`を含める理由**: §10.1 のスキーマは `messages.raw_ciphertext`/`raw_key_ref` を NOT NULL とし、EventWriter は `redaction_version` のない公開 projection の write を拒否する契約(§10.1)。この2点は M2 で有効化される `MessageEnd`/`inbound_commands` 経路(§11.1.1 手順3)がそもそも要求するため、「暗号化/redaction は M3」とスコープを分けても M2 は `data_keys` 表・§10 の鍵供給(`KeyProvider`境界。CloudはKMS、ローカルテストだけ環境変数) + conversation データ鍵の AEAD wrap/unwrap・**Redactor基盤**(原文正本+redacted projection+`redaction_version` を同時生成する関数)なしには1行も書けない。M2 はこの暗号化経路と固定fixtureを担い、M3 は全secret pattern、FTS、`provider_context`、DeliveryPumpを結合してrelease契約を完成する — 「M2 は平文、M3 で暗号化」という分割ではなく、両マイルストーンとも同じ EventWriter 契約の上で機能を積み増す
+  - **M2で`data_keys`を含める理由**: §10.1 のスキーマは `messages.raw_ciphertext`/`raw_key_ref` を NOT NULL とし、EventWriter は自ら実行した Redactor から原文正本+redacted projection+`redaction_version`を同時生成し、不完全な公開 projection write を拒否する契約(§10.1)。この2点は M2 で有効化される `MessageEnd`/`inbound_commands` 経路(§11.1.1 手順3)がそもそも要求するため、「暗号化/redaction は M3」とスコープを分けても M2 は `data_keys` 表・§10 の鍵供給(`KeyProvider`境界。CloudはKMS、ローカルテストだけ環境変数) + conversation データ鍵の AEAD wrap/unwrap・**Redactor基盤**なしには1行も書けない。M2 はこの暗号化経路と固定fixtureを担い、M3 は全secret pattern、FTS、`provider_context`、DeliveryPumpを結合してrelease契約を完成する — 「M2 は平文、M3 で暗号化」という分割ではなく、両マイルストーンとも同じ EventWriter 契約の上で機能を積み増す
 - その上で`agent/`(run.rs, Session, queue)+ `tools/`(fs, bash, executor, truncate, shell_capture)+ ハードステア(steer.rs)。移植リスト #18-23, 25-26 + 第6章
 - low-trust local executor mode は開発用テストハーネスとしてだけ許す。Cloud release acceptance は後述の supervisor/microVM/quota 経路で行い、ローカル経路の成功で代替しない
 - **ゲート**:
@@ -2639,7 +2643,7 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 | 20 | (`run_phase` 遷移なし) status: `received → applied` | — | owner 不在時の `Abort` command 受理(Idle。C.3) | no-op の `CommandApplied(run_id=None)` のみ。cancel は発火しない | §11.1.1-4 |
 | 21 | (`run_phase` 遷移なし) status: `received → applied` | — | terminal/unknown request、または後続Abort cutoff内の未適用`ApprovalDecision` | `ApprovalResolved`を発行せずno-opの`CommandApplied(run_id=None)`。unknownは監査warn、abort-preemptedは監査reasonを残す | §5.2・§9.8・§11.1.1-4 |
 | 22 | status: `received → superseded`(`run_phase=received`維持) | 未分類UserMessage | 後続Abortのcutoff(`command.seq < abort.seq`) | `CommandSuperseded(run_id=Some(aborted_run)\|None for Idle)`。分類・注入せず入力欄へ差し戻す | §5.2・§6.5 |
-| 23 | status: `applying → superseded`(`run_phase=classified\|run_started\|turn_started`維持) | idle startup | user注入前の後続Abort cutoff | 開始済みなら`TurnEnd`→`AgentEnd`で正常形クローズし、`CommandSuperseded(run_id=Some(startup.run_id))`とAbortの`CommandApplied(run_id=Some)`を同じEventBatchへ載せる。provider cancelは不要 | §5.2・§6.5・§11.1.1-4 |
+| 23 | status: `applying → superseded`(`run_phase=classified\|run_started\|turn_started`維持) | idle startup | user注入前の後続Abort cutoff | 開始済みなら`TurnEnd(message=None, tool_results=[])`→`AgentEnd`で真の空turnを正常形クローズし、合成messageは作らない。`CommandSuperseded(run_id=Some(startup.run_id))`とAbortの`CommandApplied(run_id=Some)`を同じEventBatchへ載せる。`TurnEnd.message=None`はこの`user_started`前境界だけで、通常/provider/tool経路は`Some`必須。provider cancelは不要 | §5.2・§6.5・§11.1.1-4 |
 
 補足:
 

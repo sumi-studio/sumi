@@ -22,6 +22,12 @@ fn startup_loads_an_explicitly_selected_env_file() {
         .current_dir(&directory)
         .env("SUMI_ENV_FILE", directory.join(".env.local"))
         .env_remove("SUMI_CONFIG")
+        .env("SUMI_WORKSPACE", directory.join("workspace"))
+        .env("SUMI_STATE_DIR", directory.join("state"))
+        .env(
+            "SUMI_AGENT_WRAPPING_KEY",
+            "4242424242424242424242424242424242424242424242424242424242424242",
+        )
         .stdin(Stdio::null())
         .output()
         .expect("run sumi-agent");
@@ -49,6 +55,12 @@ fn startup_does_not_implicitly_trust_dot_env_local_in_the_working_directory() {
         .current_dir(&directory)
         .env_remove("SUMI_CONFIG")
         .env_remove("SUMI_ENV_FILE")
+        .env("SUMI_WORKSPACE", directory.join("workspace"))
+        .env("SUMI_STATE_DIR", directory.join("state"))
+        .env(
+            "SUMI_AGENT_WRAPPING_KEY",
+            "4242424242424242424242424242424242424242424242424242424242424242",
+        )
         .stdin(Stdio::null())
         .output()
         .expect("run sumi-agent");
