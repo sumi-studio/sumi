@@ -841,6 +841,7 @@ pub(crate) enum ToolExecutionMutation {
         command_id: String,
         run_id: String,
         turn_id: String,
+        executor_generation: u64,
         idempotency_key: String,
         error_code: &'static str,
     },
@@ -6198,6 +6199,7 @@ async fn validate_durable_lifecycle_suffix(
                         turn_id,
                         idempotency_key,
                         error_code,
+                        ..
                     },
                 )) if tool_call_id.is_empty()
                     || command_id.is_empty()
@@ -7152,6 +7154,7 @@ async fn apply_tool_mutation(
             command_id,
             run_id,
             turn_id: _,
+            executor_generation,
             idempotency_key,
             error_code,
         } => {
@@ -7163,12 +7166,13 @@ async fn apply_tool_mutation(
                     tool_call_id, command_id, run_id, executor_generation, state,
                     idempotency_key, started_at, finished_at, error_code
                  )
-                 SELECT ?, command_id, run_id, 0, 'not_started', ?, NULL, ?, ?
+                 SELECT ?, command_id, run_id, ?, 'not_started', ?, NULL, ?, ?
                  FROM inbound_commands
                  WHERE command_id = ? AND run_id = ? AND command_kind = 'user_message'
                    AND status = 'applying' AND run_phase = 'assistant_started'",
             )
             .bind(tool_call_id)
+            .bind(sqlite_i64(executor_generation, "executor generation")?)
             .bind(idempotency_key)
             .bind(Utc::now().to_rfc3339())
             .bind(error_code)
