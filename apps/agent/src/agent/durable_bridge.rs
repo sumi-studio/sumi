@@ -12,7 +12,7 @@ use crate::{
     },
 };
 
-use super::{AdmittedCommand, AgentEvent};
+use super::{AdmittedCommand, AgentEvent, run::LENGTH_LOOP_CODE};
 
 #[derive(Clone, Debug)]
 pub(crate) struct DurableRunBinding {
@@ -359,7 +359,10 @@ impl DurableBridge {
         self.length_not_started.clear();
         let mut rejected = HashSet::new();
         if let PublicMessage::Assistant(assistant) = &message {
-            if assistant.stop_reason == StopReason::Length {
+            if assistant.stop_reason == StopReason::Length
+                || (assistant.stop_reason == StopReason::Error
+                    && assistant.provider_code.as_deref() == Some(LENGTH_LOOP_CODE))
+            {
                 self.length_not_started
                     .extend(assistant.content.iter().filter_map(|item| match item {
                         PublicAssistantContent::ToolCall { tool_call, .. } => {

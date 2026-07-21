@@ -6,6 +6,7 @@
 
 use std::{
     any::Any,
+    collections::VecDeque,
     future::Future,
     panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
@@ -225,7 +226,7 @@ where
                                 emitted_turn = true;
                             }
                             if events.send(RunOutput { binding: binding.clone(), event }).await.is_err() {
-                                break;
+                                return event_channel_lost(completion);
                             }
                         }
                         return completion;
@@ -242,15 +243,39 @@ where
                             emitted_turn = true;
                         }
                         if events.send(RunOutput { binding: binding.clone(), event }).await.is_err() {
-                            return RunCompletion::Failed {
-                                core: RunCore::new(),
-                                failure: WorkerFailure::EventChannelClosed,
-                            };
+                            // The fixture future owns the real RunCore. Keep
+                            // draining its bounded event lane while it settles;
+                            // simply awaiting it here can deadlock once that
+                            // lane fills, while fabricating a replacement core
+                            // lies about ownership.
+                            loop {
+                                tokio::select! {
+                                    completion = &mut future => {
+                                        return event_channel_lost(completion);
+                                    }
+                                    event = fixture_rx.recv() => {
+                                        if event.is_none() {
+                                            return event_channel_lost(future.await);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+fn event_channel_lost(completion: RunCompletion) -> RunCompletion {
+    let core = match completion {
+        RunCompletion::Completed(core) | RunCompletion::Failed { core, .. } => core,
+    };
+    RunCompletion::Failed {
+        core,
+        failure: WorkerFailure::EventChannelClosed,
     }
 }
 
@@ -316,6 +341,13 @@ pub(crate) struct Session<G: Gateway> {
     core: Option<RunCore>,
     active: Option<ActiveRun>,
     worker: Arc<dyn RunWorker>,
+    /// T16 owns active-run classification and owner handoff. Until then an
+    /// additional user command remains durably `received` here and is only
+    /// admitted as a fresh idle run after the current AgentEnd commits.
+    deferred_user_commands: VecDeque<AdmittedCommand>,
+    /// A bridge/Store refusal means the worker's returned core may be ahead of
+    /// the durable transcript and must never be exposed as recovered.
+    durable_core_invalidated: bool,
 }
 
 impl<G: Gateway + 'static> Session<G> {
@@ -347,6 +379,8 @@ impl<G: Gateway + 'static> Session<G> {
             core: Some(core),
             active: None,
             worker,
+            deferred_user_commands: VecDeque::new(),
+            durable_core_invalidated: false,
         })
     }
 
@@ -361,10 +395,14 @@ impl<G: Gateway + 'static> Session<G> {
                 if self.active.is_some() {
                     self.shutdown_active().await;
                 }
-                let ownership = self
-                    .core
-                    .take()
-                    .map_or(RunOwnership::Lost, RunOwnership::Recovered);
+                let ownership = if self.durable_core_invalidated {
+                    self.core.take();
+                    RunOwnership::Lost
+                } else {
+                    self.core
+                        .take()
+                        .map_or(RunOwnership::Lost, RunOwnership::Recovered)
+                };
                 SessionResult::Failed { failure, ownership }
             }
         }
@@ -456,6 +494,10 @@ impl<G: Gateway + 'static> Session<G> {
         };
         let command = AdmittedCommand::new(command, received_at);
         if let Some(active) = self.active.as_mut() {
+            if matches!(command.envelope().command, Command::UserMessage { .. }) {
+                self.deferred_user_commands.push_back(command);
+                return Ok(());
+            }
             if let Err(error) = active.control_tx.send(RunControl::Command(command)).await {
                 let RunControl::Command(command) = error.0;
                 self.harvest_after_closed_control().await?;
@@ -627,13 +669,24 @@ impl<G: Gateway + 'static> Session<G> {
             }
         };
         while let Ok(output) = active.events_rx.try_recv() {
-            let committed = active.bridge.commit(&self.writer, output).await?;
+            let committed = match active.bridge.commit(&self.writer, output).await {
+                Ok(committed) => committed,
+                Err(error) => {
+                    self.durable_core_invalidated = true;
+                    return Err(error.into());
+                }
+            };
             self.send_committed(committed, Some(active.bridge.command_id().to_owned()))
                 .await?;
         }
         match worker_failure {
             Some(failure) => Err(SessionFailure::Worker(failure)),
-            None => Ok(()),
+            None => {
+                if let Some(next) = self.deferred_user_commands.pop_front() {
+                    self.spawn_worker(next).await?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -660,7 +713,13 @@ impl<G: Gateway + 'static> Session<G> {
     async fn persist_active_event(&mut self, output: RunOutput) -> Result<(), SessionFailure> {
         let committed = {
             let active = self.active.as_mut().expect("event requires active run");
-            active.bridge.commit(&self.writer, output).await?
+            match active.bridge.commit(&self.writer, output).await {
+                Ok(committed) => committed,
+                Err(error) => {
+                    self.durable_core_invalidated = true;
+                    return Err(error.into());
+                }
+            }
         };
         let command_id = self
             .active

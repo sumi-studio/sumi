@@ -36,7 +36,7 @@ use super::{
 
 const LENGTH_TOOL_FAILURE: &str = "Tool call was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.";
 const LENGTH_LOOP_FAILURE: &str = "provider produced tool calls at the output token limit twice consecutively; refusing a third provider call";
-const LENGTH_LOOP_CODE: &str = "consecutive_length_tool_guard";
+pub(super) const LENGTH_LOOP_CODE: &str = "consecutive_length_tool_guard";
 const LENGTH_OVERFLOW_ERROR: &str = "provider response reached the context window before producing output; immediate recovery required";
 const LENGTH_OVERFLOW_CODE: &str = "context_overflow_length_usage";
 const MAX_OVERFLOW_RECOVERIES: u8 = 2;
@@ -324,6 +324,13 @@ impl Runner {
 
                     let is_length = length_guarded
                         || (!calls.is_empty() && stop_reason(&message) == Some(StopReason::Length));
+                    // The assistant canonical snapshot and every rejected-call
+                    // result must become durable before a valid call can enter
+                    // Prepare/Start (or the private Length Skip path). The
+                    // bridge commits the rejected pair atomically once the
+                    // final result arrives.
+                    self.emit_rejected_results(&assistant_message_id, &rejected_results)
+                        .await?;
                     let executable_results = if is_length {
                         self.consecutive_length_batches += 1;
                         self.fail_length_calls(&assistant_message_id, &calls, length_guarded)
@@ -332,8 +339,6 @@ impl Runner {
                         self.consecutive_length_batches = 0;
                         self.execute_calls(&assistant_message_id, &calls).await?
                     };
-                    self.emit_rejected_results(&assistant_message_id, &rejected_results)
-                        .await?;
                     if !length_guarded {
                         self.context.push(message.clone());
                         self.context.extend(

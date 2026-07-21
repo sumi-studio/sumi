@@ -929,15 +929,27 @@ async fn tool_failure_is_synthetic_result_and_preserves_normal_form() {
 }
 
 #[tokio::test]
-async fn done_rejection_pair_enters_context_but_not_turn_tool_results() {
-    let rejected = rejected("invalid");
+async fn mixed_rejections_precede_valid_lifecycle_and_only_valid_results_enter_turn_results() {
+    let rejected_first = rejected("invalid");
+    let rejected_second = rejected("invalid-2");
+    let valid = call("valid");
     let driver = Arc::new(FixtureDriver::new(vec![
         output(assistant(
             StopReason::ToolUse,
-            vec![AssistantContent::RejectedToolCall {
-                rejected: rejected.clone(),
-                wire_item_index: 0,
-            }],
+            vec![
+                AssistantContent::ToolCall {
+                    tool_call: valid.clone(),
+                    wire_item_index: 0,
+                },
+                AssistantContent::RejectedToolCall {
+                    rejected: rejected_first.clone(),
+                    wire_item_index: 1,
+                },
+                AssistantContent::RejectedToolCall {
+                    rejected: rejected_second.clone(),
+                    wire_item_index: 2,
+                },
+            ],
             None,
             None,
         )),
@@ -945,10 +957,24 @@ async fn done_rejection_pair_enters_context_but_not_turn_tool_results() {
     ]));
     let (completion, events) = run_fixture(driver.clone()).await;
     assert_completed(completion);
-    assert!(!events.iter().any(|event| matches!(
-        event,
-        AgentEvent::ToolExecutionStart { .. } | AgentEvent::ToolExecutionEnd { .. }
-    )));
+    let valid_start = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::ToolExecutionStart { tool_call_id, .. } if tool_call_id == &valid.id))
+        .expect("valid execution start");
+    for rejected in [&rejected_first, &rejected_second] {
+        let rejected_end = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    AgentEvent::MessageEnd { message, .. }
+                        if matches!(message.as_ref(), PublicMessage::ToolResult(result)
+                            if result.tool_call_id == rejected.id)
+                )
+            })
+            .expect("rejected result end");
+        assert!(rejected_end < valid_start);
+    }
     let first_turn = events
         .iter()
         .find(|event| matches!(event, AgentEvent::TurnEnd { .. }))
@@ -957,31 +983,36 @@ async fn done_rejection_pair_enters_context_but_not_turn_tool_results() {
         matches!(
             first_turn,
             AgentEvent::TurnEnd { message: Some(message), tool_results }
-                if tool_results.is_empty()
+                if tool_results.len() == 1 && tool_results[0].tool_call_id == valid.id
                     && matches!(message.as_ref(), PublicMessage::Assistant(assistant)
                         if assistant.content.iter().any(|content| matches!(
                             content,
                             PublicAssistantContent::RejectedToolCall { rejected: value, .. }
-                                if value == &rejected
+                                if value == &rejected_first
                         )))
         ),
         "unexpected first turn: {first_turn:#?}"
     );
     let contexts = driver.started_contexts.lock().expect("contexts");
-    assert_eq!(contexts[1].len(), 3);
+    assert_eq!(contexts[1].len(), 5);
     assert!(matches!(
         &contexts[1][1],
         PublicMessage::Assistant(assistant)
             if assistant.content.iter().any(|content| matches!(
                 content,
                 PublicAssistantContent::RejectedToolCall { rejected: value, .. }
-                    if value == &rejected
+                    if value == &rejected_first
             ))
     ));
     assert!(matches!(
-        &contexts[1][2],
+        &contexts[1][3],
         PublicMessage::ToolResult(result)
-            if result.tool_call_id == rejected.id && result.is_error
+            if result.tool_call_id == rejected_first.id && result.is_error
+    ));
+    assert!(matches!(
+        &contexts[1][4],
+        PublicMessage::ToolResult(result)
+            if result.tool_call_id == rejected_second.id && result.is_error
     ));
 }
 

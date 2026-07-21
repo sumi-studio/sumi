@@ -131,6 +131,15 @@ fn user(seq: u64) -> InboundCommand {
     })
 }
 
+fn abort(seq: u64) -> InboundCommand {
+    let command_id = format!("10000000-0000-4000-8000-{seq:012}");
+    InboundCommand::Valid(CommandEnvelope {
+        seq,
+        command_id: CommandId::parse(&command_id).expect("canonical command id"),
+        command: Command::Abort {},
+    })
+}
+
 async fn emit_idle_injection(events: &mpsc::Sender<AgentEvent>, initial: &AdmittedCommand) {
     let Command::UserMessage { text, .. } = &initial.envelope().command else {
         panic!("idle fixture requires user command")
@@ -322,7 +331,7 @@ async fn session_rejects_worker_output_bound_to_a_stale_run_or_turn() {
         commands.send(user(1)).await.expect("command");
         let (failure, ownership) = failed(task.await.expect("session join"));
         assert!(matches!(failure, SessionFailure::Other(_)));
-        assert!(matches!(ownership, RunOwnership::Recovered(_)));
+        assert!(matches!(ownership, RunOwnership::Lost));
         let durable_events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
             .fetch_one(&pool)
             .await
@@ -437,7 +446,7 @@ async fn idle_received_replay_acks_without_spawning_a_second_worker() {
 }
 
 #[tokio::test]
-async fn pending_worker_does_not_block_next_durable_received_ack() {
+async fn pending_worker_does_not_block_next_durable_control_received_ack() {
     let (gateway, commands, frames) = gateway();
     let (started_tx, mut started_rx) = mpsc::channel(1);
     let (control_tx, mut control_rx) = mpsc::channel(1);
@@ -494,7 +503,7 @@ async fn pending_worker_does_not_block_next_durable_received_ack() {
 
     commands.send(user(1)).await.expect("first command");
     assert_eq!(started_rx.recv().await, Some(1));
-    commands.send(user(2)).await.expect("second command");
+    commands.send(abort(2)).await.expect("second command");
     assert_eq!(control_rx.recv().await, Some(2));
     assert_eq!(
         received_acks(&frames)
@@ -627,6 +636,50 @@ impl Drop for RunningGuard {
     fn drop(&mut self) {
         self.0.store(false, Ordering::SeqCst);
     }
+}
+
+#[tokio::test]
+async fn fixture_adapter_event_loss_drains_bounded_lane_and_returns_the_actual_core() {
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |mut core: RunCore,
+         _initial: AdmittedCommand,
+         _controls: mpsc::Receiver<RunControl>,
+         events: mpsc::Sender<AgentEvent>| async move {
+            core.mark_mutated();
+            for ordinal in 0..(EVENT_CHANNEL_CAPACITY + 8) {
+                events
+                    .send(AgentEvent::Error {
+                        message: format!("fixture event {ordinal}"),
+                    })
+                    .await
+                    .expect("adapter must drain after outer delivery loss");
+            }
+            RunCompletion::Completed(core)
+        },
+    );
+    let InboundCommand::Valid(envelope) = user(1) else {
+        unreachable!()
+    };
+    let initial = AdmittedCommand::new(envelope, Utc::now());
+    let mut core = RunCore::new();
+    let ownership_id = core.ownership_id();
+    core.durable_binding = Some(DurableRunBinding::idle(&initial));
+    let (_control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, events_rx) = mpsc::channel(1);
+    drop(events_rx);
+
+    let completion = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        worker.run(core, initial, control_rx, events_tx),
+    )
+    .await
+    .expect("event-loss adapter completion is bounded");
+    let RunCompletion::Failed { core, failure } = completion else {
+        panic!("outer event loss must fail with the actual core")
+    };
+    assert_eq!(failure, WorkerFailure::EventChannelClosed);
+    assert_eq!(core.ownership_id(), ownership_id);
+    assert_eq!(core.mutation_epoch(), 1);
 }
 
 #[tokio::test]
@@ -806,7 +859,7 @@ async fn closed_control_with_pending_worker_is_bounded_and_joined() {
     let task = tokio::spawn(session(gateway, worker).await.run());
     commands.send(user(1)).await.expect("initial command");
     started_rx.recv().await.expect("worker started");
-    commands.send(user(2)).await.expect("control command");
+    commands.send(abort(2)).await.expect("control command");
 
     let (failure, ownership) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
         failed(task.await.expect("session join"))
@@ -1001,6 +1054,128 @@ fn bridge_assistant(reason: StopReason) -> PublicMessage {
         interrupted: false,
         timestamp: Utc::now(),
     })
+}
+
+#[tokio::test]
+async fn active_second_user_stays_received_then_runs_after_the_current_agent_end() {
+    let store = Store::session_test_store("durable-deferred-second-user-session")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (gateway, commands, frames) = gateway();
+    let run_count = Arc::new(AtomicUsize::new(0));
+    let first_started = Arc::new(Notify::new());
+    let release_first = Arc::new(Notify::new());
+    let worker: Arc<dyn RunWorker> = Arc::new({
+        let run_count = run_count.clone();
+        let first_started = first_started.clone();
+        let release_first = release_first.clone();
+        move |core: RunCore,
+              initial: AdmittedCommand,
+              _controls: mpsc::Receiver<RunControl>,
+              events: mpsc::Sender<AgentEvent>| {
+            let run_count = run_count.clone();
+            let first_started = first_started.clone();
+            let release_first = release_first.clone();
+            async move {
+                let ordinal = run_count.fetch_add(1, Ordering::SeqCst);
+                emit_idle_injection(&events, &initial).await;
+                if ordinal == 0 {
+                    first_started.notify_one();
+                    release_first.notified().await;
+                }
+                let assistant = bridge_assistant(StopReason::Stop);
+                let assistant_id = format!("deferred-assistant-{}", ordinal + 1);
+                for event in [
+                    AgentEvent::MessageStart {
+                        message_id: assistant_id.clone(),
+                        message: Box::new(bridge_assistant(StopReason::Stop)),
+                    },
+                    AgentEvent::MessageEnd {
+                        message_id: assistant_id,
+                        message: Box::new(assistant.clone()),
+                    },
+                    AgentEvent::TurnEnd {
+                        message: Some(Box::new(assistant)),
+                        tool_results: Vec::new(),
+                    },
+                    AgentEvent::AgentEnd,
+                ] {
+                    events.send(event).await.expect("session event receiver");
+                }
+                RunCompletion::Completed(core)
+            }
+        }
+    });
+    let session = Session::start(store, gateway, RunCore::new(), worker)
+        .await
+        .expect("session");
+    let task = tokio::spawn(session.run());
+    commands.send(user(1)).await.expect("first command");
+    tokio::time::timeout(std::time::Duration::from_secs(2), first_started.notified())
+        .await
+        .expect("first run started");
+    commands.send(user(2)).await.expect("second command");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while received_acks(&frames).len() < 2 && !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("second Received ACK");
+
+    let before_release: (String, String, Option<String>) =
+        sqlx::query_as("SELECT status, run_phase, run_id FROM inbound_commands WHERE seq=2")
+            .fetch_one(&pool)
+            .await
+            .expect("deferred command row");
+    assert_eq!(
+        before_release,
+        ("received".to_owned(), "received".to_owned(), None)
+    );
+    assert_eq!(run_count.load(Ordering::SeqCst), 1);
+    assert!(!frames.lock().expect("frame mutex").iter().any(|frame| {
+        matches!(frame, OutboundFrame::CommandAck { ack }
+            if ack.command_id.as_str() == "00000000-0000-4000-8000-000000000002"
+                && ack.status == CommandAckStatus::Applied)
+    }));
+
+    release_first.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let applied = frames
+                .lock()
+                .expect("frame mutex")
+                .iter()
+                .filter(|frame| {
+                    matches!(frame, OutboundFrame::CommandAck { ack }
+                        if ack.status == CommandAckStatus::Applied)
+                })
+                .count();
+            if applied == 2 || task.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both commands applied");
+    drop(commands);
+    completed(task.await.expect("session join"));
+
+    let statuses: Vec<(i64, String, String)> =
+        sqlx::query_as("SELECT seq, status, application_kind FROM inbound_commands ORDER BY seq")
+            .fetch_all(&pool)
+            .await
+            .expect("both durable command outcomes");
+    assert_eq!(
+        statuses,
+        vec![
+            (1, "applied".to_owned(), "idle_run".to_owned()),
+            (2, "applied".to_owned(), "idle_run".to_owned()),
+        ]
+    );
+    assert_eq!(run_count.load(Ordering::SeqCst), 2);
 }
 
 struct OpaqueContextDriver;
@@ -1310,7 +1485,146 @@ async fn first_length_tool_call_is_durably_not_started_without_public_execution_
 }
 
 #[tokio::test]
-async fn rejected_tool_call_and_synthetic_result_commit_before_the_next_attempt() {
+async fn consecutive_length_guard_error_is_durably_not_started_and_closes_normally() {
+    let store = Store::session_test_store("durable-consecutive-length-session")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (gateway, commands, frames) = gateway();
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |core: RunCore,
+         initial: AdmittedCommand,
+         _controls: mpsc::Receiver<RunControl>,
+         events: mpsc::Sender<AgentEvent>| async move {
+            emit_idle_injection(&events, &initial).await;
+            for (ordinal, stop_reason, provider_code) in [
+                (1, StopReason::Length, None),
+                (2, StopReason::Error, Some(run::LENGTH_LOOP_CODE)),
+            ] {
+                if ordinal == 2 {
+                    events.send(AgentEvent::TurnStart).await.expect("next turn");
+                }
+                let call = ToolCall {
+                    id: format!("length-call-{ordinal}"),
+                    name: "fixture-tool".to_owned(),
+                    arguments: serde_json::from_value::<ValidatedToolArguments>(
+                        serde_json::json!({"safe":true}),
+                    )
+                    .expect("validated arguments"),
+                };
+                let mut assistant = match bridge_assistant(stop_reason) {
+                    PublicMessage::Assistant(message) => message,
+                    _ => unreachable!(),
+                };
+                assistant.provider_code = provider_code.map(str::to_owned);
+                assistant.content.push(PublicAssistantContent::ToolCall {
+                    tool_call: call.clone(),
+                    wire_item_index: 0,
+                });
+                let assistant = PublicMessage::Assistant(assistant);
+                let result = ToolResultMessage {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name,
+                    content: vec![UserContent::Text {
+                        text: "Tool call was not executed by the Length guard".to_owned(),
+                    }],
+                    details: serde_json::json!({"error":"length_guard"}),
+                    is_error: true,
+                    timestamp: Utc::now(),
+                };
+                let result_message = PublicMessage::ToolResult(result.clone());
+                let assistant_id = format!("length-assistant-{ordinal}");
+                let result_id = format!("length-result-{ordinal}");
+                for event in [
+                    AgentEvent::MessageStart {
+                        message_id: assistant_id.clone(),
+                        message: Box::new(bridge_assistant(StopReason::Stop)),
+                    },
+                    AgentEvent::MessageEnd {
+                        message_id: assistant_id,
+                        message: Box::new(assistant.clone()),
+                    },
+                    AgentEvent::MessageStart {
+                        message_id: result_id.clone(),
+                        message: Box::new(result_message.clone()),
+                    },
+                    AgentEvent::MessageEnd {
+                        message_id: result_id,
+                        message: Box::new(result_message),
+                    },
+                    AgentEvent::TurnEnd {
+                        message: Some(Box::new(assistant)),
+                        tool_results: vec![result],
+                    },
+                ] {
+                    events.send(event).await.expect("session event receiver");
+                }
+            }
+            events
+                .send(AgentEvent::AgentEnd)
+                .await
+                .expect("session event receiver");
+            RunCompletion::Completed(core)
+        },
+    );
+    let session = Session::start(store, gateway, RunCore::new(), worker)
+        .await
+        .expect("session");
+    let task = tokio::spawn(session.run());
+    commands.send(user(1)).await.expect("command");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !frames.lock().expect("frame mutex").iter().any(|frame| {
+            matches!(frame, OutboundFrame::Event { envelope }
+                if envelope.event["type"] == "agent_end")
+        }) && !task.is_finished()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal frame");
+    drop(commands);
+    completed(task.await.expect("session join"));
+
+    let rows: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT tool_call_id, state, started_at, error_code FROM tool_executions ORDER BY tool_call_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("two not-started audit rows");
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "length-call-1".to_owned(),
+                "not_started".to_owned(),
+                None,
+                Some("length_guard".to_owned()),
+            ),
+            (
+                "length-call-2".to_owned(),
+                "not_started".to_owned(),
+                None,
+                Some("length_guard".to_owned()),
+            ),
+        ]
+    );
+    assert!(!frames.lock().expect("frame mutex").iter().any(|frame| {
+        matches!(frame, OutboundFrame::Event { envelope }
+            if matches!(envelope.event["type"].as_str(),
+                Some("tool_execution_start" | "tool_execution_end")))
+    }));
+    let second_stop: String = sqlx::query_scalar(
+        "SELECT json_extract(payload, '$.stop_reason') FROM messages WHERE id='length-assistant-2'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("Error assistant persisted outside L0");
+    assert_eq!(second_stop, "error");
+}
+
+#[tokio::test]
+async fn mixed_valid_and_rejected_calls_commit_the_rejected_pair_before_valid_lifecycle() {
     let store = Store::session_test_store("durable-rejected-tool-session")
         .await
         .expect("test store");
@@ -1327,15 +1641,38 @@ async fn rejected_tool_call_and_synthetic_result_commit_before_the_next_attempt(
                 name: "fixture-tool".to_owned(),
                 error: ToolArgumentError::SchemaViolation,
             };
+            let rejected_second = RejectedToolCall {
+                id: "rejected-call-2".to_owned(),
+                name: "fixture-tool".to_owned(),
+                error: ToolArgumentError::InvalidJson,
+            };
             let mut first = match bridge_assistant(StopReason::ToolUse) {
                 PublicMessage::Assistant(message) => message,
                 _ => unreachable!(),
             };
+            let valid = ToolCall {
+                id: "valid-call".to_owned(),
+                name: "fixture-tool".to_owned(),
+                arguments: serde_json::from_value::<ValidatedToolArguments>(
+                    serde_json::json!({"safe":true}),
+                )
+                .expect("validated arguments"),
+            };
+            first.content.push(PublicAssistantContent::ToolCall {
+                tool_call: valid.clone(),
+                wire_item_index: 0,
+            });
             first
                 .content
                 .push(PublicAssistantContent::RejectedToolCall {
                     rejected: rejected.clone(),
-                    wire_item_index: 0,
+                    wire_item_index: 1,
+                });
+            first
+                .content
+                .push(PublicAssistantContent::RejectedToolCall {
+                    rejected: rejected_second.clone(),
+                    wire_item_index: 2,
                 });
             let first = PublicMessage::Assistant(first);
             let result = ToolResultMessage {
@@ -1349,6 +1686,28 @@ async fn rejected_tool_call_and_synthetic_result_commit_before_the_next_attempt(
                 timestamp: Utc::now(),
             };
             let result_message = PublicMessage::ToolResult(result.clone());
+            let result_second = ToolResultMessage {
+                tool_call_id: rejected_second.id.clone(),
+                tool_name: rejected_second.name.clone(),
+                content: vec![UserContent::Text {
+                    text: "Tool arguments were rejected; regenerate the call".to_owned(),
+                }],
+                details: serde_json::json!({"error":"invalid_json"}),
+                is_error: true,
+                timestamp: Utc::now(),
+            };
+            let result_second_message = PublicMessage::ToolResult(result_second);
+            let valid_result = ToolResultMessage {
+                tool_call_id: valid.id.clone(),
+                tool_name: valid.name.clone(),
+                content: vec![UserContent::Text {
+                    text: "done".to_owned(),
+                }],
+                details: serde_json::json!({"ok":true}),
+                is_error: false,
+                timestamp: Utc::now(),
+            };
+            let valid_result_message = PublicMessage::ToolResult(valid_result.clone());
             let final_message = bridge_assistant(StopReason::Stop);
             for event in [
                 AgentEvent::MessageStart {
@@ -1367,9 +1726,35 @@ async fn rejected_tool_call_and_synthetic_result_commit_before_the_next_attempt(
                     message_id: "rejected-result".to_owned(),
                     message: Box::new(result_message),
                 },
+                AgentEvent::MessageStart {
+                    message_id: "rejected-result-2".to_owned(),
+                    message: Box::new(result_second_message.clone()),
+                },
+                AgentEvent::MessageEnd {
+                    message_id: "rejected-result-2".to_owned(),
+                    message: Box::new(result_second_message),
+                },
+                AgentEvent::ToolExecutionStart {
+                    tool_call_id: valid.id.clone(),
+                    tool_name: valid.name.clone(),
+                    args: serde_json::json!({"safe":true}),
+                },
+                AgentEvent::ToolExecutionEnd {
+                    tool_call_id: valid.id.clone(),
+                    result: serde_json::to_value(&valid_result).expect("valid result"),
+                    is_error: false,
+                },
+                AgentEvent::MessageStart {
+                    message_id: "valid-result".to_owned(),
+                    message: Box::new(valid_result_message.clone()),
+                },
+                AgentEvent::MessageEnd {
+                    message_id: "valid-result".to_owned(),
+                    message: Box::new(valid_result_message),
+                },
                 AgentEvent::TurnEnd {
                     message: Some(Box::new(first)),
-                    tool_results: Vec::new(),
+                    tool_results: vec![valid_result],
                 },
                 AgentEvent::TurnStart,
                 AgentEvent::MessageStart {
@@ -1414,7 +1799,7 @@ async fn rejected_tool_call_and_synthetic_result_commit_before_the_next_attempt(
     completed(task.await.expect("session join"));
 
     let stored: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, role FROM messages WHERE id IN ('rejected-assistant','rejected-result','post-rejection-attempt') ORDER BY seq",
+        "SELECT id, role FROM messages WHERE id IN ('rejected-assistant','rejected-result','rejected-result-2','valid-result','post-rejection-attempt') ORDER BY seq",
     )
     .fetch_all(&pool)
     .await
@@ -1424,6 +1809,8 @@ async fn rejected_tool_call_and_synthetic_result_commit_before_the_next_attempt(
         vec![
             ("rejected-assistant".to_owned(), "assistant".to_owned()),
             ("rejected-result".to_owned(), "tool_result".to_owned()),
+            ("rejected-result-2".to_owned(), "tool_result".to_owned()),
+            ("valid-result".to_owned(), "tool_result".to_owned()),
             ("post-rejection-attempt".to_owned(), "assistant".to_owned()),
         ]
     );
@@ -1434,11 +1821,15 @@ async fn rejected_tool_call_and_synthetic_result_commit_before_the_next_attempt(
     .await
     .expect("synthetic result projection");
     assert_eq!(result_error, 1);
-    let executions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tool_executions")
-        .fetch_one(&pool)
-        .await
-        .expect("no rejected execution lifecycle");
-    assert_eq!(executions, 0);
+    let executions: Vec<(String, String)> =
+        sqlx::query_as("SELECT tool_call_id, state FROM tool_executions ORDER BY tool_call_id")
+            .fetch_all(&pool)
+            .await
+            .expect("only the valid execution lifecycle");
+    assert_eq!(
+        executions,
+        vec![("valid-call".to_owned(), "succeeded".to_owned())]
+    );
 }
 
 #[tokio::test]
@@ -1449,7 +1840,7 @@ async fn failed_idle_injection_batch_publishes_no_partial_event_frame() {
     let pool = store.pool().clone();
     let (gateway, commands, frames) = gateway();
     let worker: Arc<dyn RunWorker> = Arc::new(
-        |core: RunCore,
+        |mut core: RunCore,
          initial: AdmittedCommand,
          _controls: mpsc::Receiver<RunControl>,
          events: mpsc::Sender<AgentEvent>| async move {
@@ -1474,6 +1865,7 @@ async fn failed_idle_injection_batch_publishes_no_partial_event_frame() {
             ] {
                 events.send(event).await.expect("session event receiver");
             }
+            core.mark_mutated();
             RunCompletion::Completed(core)
         },
     );
@@ -1484,7 +1876,7 @@ async fn failed_idle_injection_batch_publishes_no_partial_event_frame() {
     commands.send(user(1)).await.expect("command");
     let (failure, ownership) = failed(task.await.expect("session join"));
     assert!(matches!(failure, SessionFailure::Other(_)));
-    assert!(matches!(ownership, RunOwnership::Recovered(_)));
+    assert!(matches!(ownership, RunOwnership::Lost));
     assert!(
         !frames
             .lock()
