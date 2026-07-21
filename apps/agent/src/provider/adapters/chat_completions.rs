@@ -2103,7 +2103,15 @@ mod tests {
             "../../../tests/snapshots/chat_send_matrix.json"
         ))
         .expect("send matrix snapshot");
-        assert_eq!(send_snapshot_matrix(), expected);
+        let actual = send_snapshot_matrix();
+        assert_eq!(actual, expected);
+        let actual_bytes =
+            crate::provider::canonical_request::CanonicalRequestBody::serialize(&actual)
+                .expect("canonical actual request fixture");
+        let expected_bytes =
+            crate::provider::canonical_request::CanonicalRequestBody::serialize(&expected)
+                .expect("canonical expected request fixture");
+        assert_eq!(actual_bytes.as_bytes(), expected_bytes.as_bytes());
     }
 
     #[test]

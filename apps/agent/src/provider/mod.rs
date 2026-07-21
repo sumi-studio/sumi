@@ -2,9 +2,13 @@
 
 pub mod adapters;
 pub mod assembler;
+mod canonical_request;
 pub mod model;
 pub mod overflow;
 pub mod partial_json;
+// Provider prerequisite consumed by T19 once its memory estimator lands.
+#[allow(dead_code)]
+pub(crate) mod replay_probe;
 pub mod retry;
 pub mod transport;
 pub mod types;
@@ -33,6 +37,7 @@ use adapters::responses::{
     requested_output_tokens as responses_requested_output_tokens, validate_event_name,
 };
 use assembler::{FrozenToolSchemaRegistry, MessageAssembler, ResponseBudget, TerminalMetadata};
+use canonical_request::CanonicalRequestBody;
 use chrono::Utc;
 use futures_util::StreamExt;
 pub use model::{
@@ -191,10 +196,10 @@ async fn compact_native_with_api_key(
     let body = build_compact_request(&spec, &context)
         .map_err(|error| NativeCompactionError::InvalidRequest(error.to_string()))?;
     let client = http_client().map_err(NativeCompactionError::Transport)?;
-    let request = client
-        .post(spec.compact_endpoint())
-        .bearer_auth(api_key)
-        .json(&body)
+    let body = CanonicalRequestBody::serialize(&body)
+        .map_err(|error| NativeCompactionError::InvalidRequest(error.to_string()))?;
+    let request = body
+        .apply(client.post(spec.compact_endpoint()).bearer_auth(api_key))
         .send();
     let response = match await_request(request, &cancel, RESPONSE_HEADER_TIMEOUT, |_| {}).await {
         RequestWait::Cancelled => return Err(NativeCompactionError::Cancelled),
@@ -607,8 +612,24 @@ async fn run_anthropic_stream(
     {
         request = request.header("anthropic-beta", compat.beta_headers.join(","));
     }
+    let body = match CanonicalRequestBody::serialize(&body) {
+        Ok(body) => body,
+        Err(error) => {
+            finish_anthropic_error(
+                &priority_terminal_tx,
+                &mut assembler,
+                &spec,
+                receive.usage().clone(),
+                AnthropicAdapterError::InvalidContext(error.to_string()),
+                cancel.is_cancelled(),
+                Vec::new(),
+            )
+            .await;
+            return;
+        }
+    };
     let (response, request_sent_at) = match await_request(
-        request.json(&body).send(),
+        body.apply(request).send(),
         &cancel,
         RESPONSE_HEADER_TIMEOUT,
         |_| tracing::info!(phase = "request_sent", "provider request sent"),
@@ -963,10 +984,24 @@ async fn run_responses_stream(
             return;
         }
     };
-    let request = client
-        .post(spec.endpoint())
-        .bearer_auth(api_key)
-        .json(&body)
+    let body = match CanonicalRequestBody::serialize(&body) {
+        Ok(body) => body,
+        Err(error) => {
+            finish_responses_error(
+                &priority_terminal_tx,
+                &mut assembler,
+                &spec,
+                receive.usage().clone(),
+                ResponsesAdapterError::InvalidContext(error.to_string()),
+                cancel.is_cancelled(),
+                receive.provider_context(),
+            )
+            .await;
+            return;
+        }
+    };
+    let request = body
+        .apply(client.post(spec.endpoint()).bearer_auth(api_key))
         .send();
     let (response, request_sent_at) =
         match await_request(request, &cancel, RESPONSE_HEADER_TIMEOUT, |_| {
@@ -1288,10 +1323,24 @@ async fn run_chat_stream(
         }
     };
 
-    let request = client
-        .post(spec.endpoint())
-        .bearer_auth(api_key)
-        .json(&body)
+    let body = match CanonicalRequestBody::serialize(&body) {
+        Ok(body) => body,
+        Err(error) => {
+            finish_failure(
+                &priority_terminal_tx,
+                &mut assembler,
+                &spec,
+                receive.usage().clone(),
+                error.to_string(),
+                "request_serialization_failed",
+                cancel.is_cancelled(),
+            )
+            .await;
+            return;
+        }
+    };
+    let request = body
+        .apply(client.post(spec.endpoint()).bearer_auth(api_key))
         .send();
     let (response, request_sent_at) =
         match await_request(request, &cancel, RESPONSE_HEADER_TIMEOUT, |_| {
