@@ -33,6 +33,7 @@ pub struct BoundaryContext {
     next_role: MessageRole,
     next_user_is_steering: bool,
     pending_tool_call_ids: HashSet<String>,
+    pending_rejected_tool_call_ids: HashSet<String>,
     malformed_tool_loop: bool,
 }
 
@@ -43,7 +44,8 @@ impl BoundaryContext {
         next_user_is_steering: bool,
     ) -> Self {
         let previous = history.last().map(context_message);
-        let (pending_tool_call_ids, malformed_tool_loop) = pending_tool_calls(history);
+        let (pending_tool_call_ids, pending_rejected_tool_call_ids, malformed_tool_loop) =
+            pending_tool_calls(history);
         Self {
             previous_role: history.last().map(MessageRole::of_context),
             previous_assistant_interrupted: matches!(
@@ -53,6 +55,7 @@ impl BoundaryContext {
             next_role: MessageRole::of_context(next),
             next_user_is_steering,
             pending_tool_call_ids,
+            pending_rejected_tool_call_ids,
             malformed_tool_loop,
         }
     }
@@ -62,11 +65,19 @@ impl BoundaryContext {
     }
 
     pub fn unresolved_tool_loop(&self) -> bool {
-        self.malformed_tool_loop || !self.pending_tool_call_ids.is_empty()
+        self.malformed_tool_loop
+            || !self.pending_tool_call_ids.is_empty()
+            || !self.pending_rejected_tool_call_ids.is_empty()
     }
 
     pub fn pending_tool_call_ids(&self) -> impl Iterator<Item = &str> {
         self.pending_tool_call_ids.iter().map(String::as_str)
+    }
+
+    pub fn pending_rejected_tool_call_ids(&self) -> impl Iterator<Item = &str> {
+        self.pending_rejected_tool_call_ids
+            .iter()
+            .map(String::as_str)
     }
 }
 
@@ -119,12 +130,14 @@ fn is_safe_boundary(boundary: &BoundaryContext) -> bool {
         && boundary.previous_assistant_interrupted)
 }
 
-/// Track executable calls rather than a single loop bit. Results remove only
-/// their matching ID; malformed, orphan, duplicate, and missing cases remain
-/// fail-closed even if another result arrives.
-fn pending_tool_calls(history: &[ContextMessage]) -> (HashSet<String>, bool) {
+/// Track executable and rejected calls as separate expectations. Results remove
+/// only their matching ID and expected kind; malformed, orphan, duplicate, and
+/// missing cases remain fail-closed even if another result arrives.
+fn pending_tool_calls(history: &[ContextMessage]) -> (HashSet<String>, HashSet<String>, bool) {
     let mut pending = HashSet::new();
+    let mut pending_rejected = HashSet::new();
     let mut completed = HashSet::new();
+    let mut completed_rejected = HashSet::new();
     let mut malformed = false;
     for context in history {
         match context_message(context) {
@@ -133,23 +146,50 @@ fn pending_tool_calls(history: &[ContextMessage]) -> (HashSet<String>, bool) {
                 // prior call has a matching result.  This permits a reused
                 // provider ID across assistant flows while rejecting an
                 // overlapping continuation, even when it uses another ID.
-                if !pending.is_empty() {
+                if !pending.is_empty() || !pending_rejected.is_empty() {
                     malformed = true;
                 } else {
                     completed.clear();
+                    completed_rejected.clear();
                 }
                 for content in &message.content {
-                    let AssistantContent::ToolCall { tool_call, .. } = content else {
-                        continue;
-                    };
-                    if completed.contains(&tool_call.id) || !pending.insert(tool_call.id.clone()) {
-                        malformed = true;
+                    match content {
+                        AssistantContent::ToolCall { tool_call, .. } => {
+                            if pending.contains(&tool_call.id)
+                                || pending_rejected.contains(&tool_call.id)
+                                || completed.contains(&tool_call.id)
+                                || completed_rejected.contains(&tool_call.id)
+                            {
+                                malformed = true;
+                            } else {
+                                pending.insert(tool_call.id.clone());
+                            }
+                        }
+                        AssistantContent::RejectedToolCall { rejected, .. } => {
+                            if pending.contains(&rejected.id)
+                                || pending_rejected.contains(&rejected.id)
+                                || completed.contains(&rejected.id)
+                                || completed_rejected.contains(&rejected.id)
+                            {
+                                malformed = true;
+                            } else {
+                                pending_rejected.insert(rejected.id.clone());
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
             Message::ToolResult(message) => {
                 if pending.remove(&message.tool_call_id) {
                     completed.insert(message.tool_call_id.clone());
+                } else if pending_rejected.contains(&message.tool_call_id) {
+                    if message.is_error {
+                        pending_rejected.remove(&message.tool_call_id);
+                        completed_rejected.insert(message.tool_call_id.clone());
+                    } else {
+                        malformed = true;
+                    }
                 } else {
                     malformed = true;
                 }
@@ -159,14 +199,15 @@ fn pending_tool_calls(history: &[ContextMessage]) -> (HashSet<String>, bool) {
             // interrupted; retain the malformed marker even if a late result
             // later happens to remove the pending ID.
             Message::User(_) => {
-                if !pending.is_empty() {
+                if !pending.is_empty() || !pending_rejected.is_empty() {
                     malformed = true;
                 }
                 completed.clear();
+                completed_rejected.clear();
             }
         }
     }
-    (pending, malformed)
+    (pending, pending_rejected, malformed)
 }
 
 fn context_message(context: &ContextMessage) -> &Message {
@@ -210,6 +251,7 @@ mod tests {
             next_role,
             next_user_is_steering: steering,
             pending_tool_call_ids: pending.iter().map(|id| (*id).to_owned()).collect(),
+            pending_rejected_tool_call_ids: HashSet::new(),
             malformed_tool_loop: malformed,
         }
     }
@@ -326,9 +368,44 @@ mod tests {
         .expect("assistant call")
     }
 
-    fn tool_result(id: &str) -> ContextMessage {
+    fn assistant_with_rejected_duplicate(id: &str) -> ContextMessage {
+        let mut context = assistant_call(id);
+        let rejected: AssistantContent = serde_json::from_value(serde_json::json!({
+            "type":"rejected_tool_call",
+            "rejected":{"id":id,"name":"read_file","error":"schema_violation"},
+            "wire_item_index":1
+        }))
+        .expect("rejected tool call");
+        let ContextMessage::Persisted {
+            message: Message::Assistant(message),
+            ..
+        } = &mut context
+        else {
+            unreachable!("assistant call fixture is persisted assistant")
+        };
+        message.content.push(rejected);
+        context
+    }
+
+    fn rejected_call(id: &str) -> ContextMessage {
         serde_json::from_value(serde_json::json!({
-            "source":"synthetic","message":{"role":"tool_result","tool_call_id":id,"tool_name":"read_file","content":[{"type":"text","text":"done"}],"details":{},"is_error":false,"timestamp":"2026-07-21T00:00:01Z"}
+            "source":"persisted","id":format!("rejected-{id}"),"seq":1,
+            "message":{
+                "role":"assistant","content":[{"type":"rejected_tool_call","rejected":{"id":id,"name":"read_file","error":"schema_violation"},"wire_item_index":0}],
+                "model":"model","provider":"provider","origin":{"provider_instance_id":"provider","protocol":"open_ai_responses","model":"model"},
+                "usage":{"input":1,"output":1,"cache_read":0,"cache_write":0,"reasoning":0,"total_tokens":2},"stop_reason":"tool_use","error_message":null,"provider_code":null,"interrupted":false,"timestamp":"2026-07-21T00:00:00Z"
+            }
+        }))
+        .expect("rejected tool call")
+    }
+
+    fn tool_result(id: &str) -> ContextMessage {
+        tool_result_with_error(id, false)
+    }
+
+    fn tool_result_with_error(id: &str, is_error: bool) -> ContextMessage {
+        serde_json::from_value(serde_json::json!({
+            "source":"synthetic","message":{"role":"tool_result","tool_call_id":id,"tool_name":"read_file","content":[{"type":"text","text":"done"}],"details":{},"is_error":is_error,"timestamp":"2026-07-21T00:00:01Z"}
         }))
         .expect("tool result")
     }
@@ -367,6 +444,7 @@ mod tests {
         ] {
             let boundary = BoundaryContext::from_history(&history, &next, false);
             assert!(boundary.pending_tool_call_ids().next().is_none());
+            assert!(boundary.pending_rejected_tool_call_ids().next().is_none());
             assert!(!boundary.unresolved_tool_loop());
             assert_eq!(
                 seal_before_next(&batch(L0_BATCH_MIN, 0), &boundary, calibration()),
@@ -422,8 +500,59 @@ mod tests {
                 .unresolved_tool_loop()
         );
 
+        let rejected_non_error = vec![rejected_call("rejected"), tool_result("rejected")];
+        assert!(
+            BoundaryContext::from_history(&rejected_non_error, &next, false).unresolved_tool_loop()
+        );
+
+        let rejected_duplicate = vec![
+            rejected_call("rejected"),
+            tool_result_with_error("rejected", true),
+            tool_result_with_error("rejected", true),
+        ];
+        assert!(
+            BoundaryContext::from_history(&rejected_duplicate, &next, false).unresolved_tool_loop()
+        );
+
+        let rejected_late_result = vec![
+            rejected_call("rejected"),
+            user_message(),
+            tool_result_with_error("rejected", true),
+        ];
+        assert!(
+            BoundaryContext::from_history(&rejected_late_result, &next, false)
+                .unresolved_tool_loop()
+        );
+
+        let cross_kind_duplicate = vec![
+            assistant_with_rejected_duplicate("same"),
+            tool_result_with_error("same", true),
+        ];
+        assert!(
+            BoundaryContext::from_history(&cross_kind_duplicate, &next, false)
+                .unresolved_tool_loop()
+        );
+
         let late_result = vec![assistant_call("one"), user_message(), tool_result("one")];
         assert!(BoundaryContext::from_history(&late_result, &next, false).unresolved_tool_loop());
+    }
+
+    #[test]
+    fn completed_rejected_pair_is_a_safe_user_boundary() {
+        let history = vec![
+            rejected_call("rejected"),
+            tool_result_with_error("rejected", true),
+        ];
+        let next = user_message();
+        let boundary = BoundaryContext::from_history(&history, &next, false);
+
+        assert!(boundary.pending_tool_call_ids().next().is_none());
+        assert!(boundary.pending_rejected_tool_call_ids().next().is_none());
+        assert!(!boundary.unresolved_tool_loop());
+        assert_eq!(
+            seal_before_next(&batch(L0_BATCH_MIN, 0), &boundary, calibration()),
+            Some(SealReason::Normal)
+        );
     }
 
     #[test]
