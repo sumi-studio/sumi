@@ -80,6 +80,8 @@ pub struct LowTrustLocalBash<'a> {
     artifact: &'a dyn ArtifactAppender,
     wall_timeout: Duration,
     #[cfg(test)]
+    cancel_stop_delay: Duration,
+    #[cfg(test)]
     force_close_range_fallback: bool,
 }
 
@@ -90,6 +92,8 @@ impl<'a> LowTrustLocalBash<'a> {
             artifact,
             wall_timeout: DEFAULT_WALL_TIMEOUT,
             #[cfg(test)]
+            cancel_stop_delay: Duration::ZERO,
+            #[cfg(test)]
             force_close_range_fallback: false,
         }
     }
@@ -97,6 +101,12 @@ impl<'a> LowTrustLocalBash<'a> {
     #[cfg(test)]
     pub(crate) fn with_timeout(mut self, wall_timeout: Duration) -> Self {
         self.wall_timeout = wall_timeout;
+        self
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_cancel_stop_delay(mut self, delay: Duration) -> Self {
+        self.cancel_stop_delay = delay;
         self
     }
 
@@ -171,6 +181,10 @@ impl<'a> LowTrustLocalBash<'a> {
                 biased;
                 _ = cancel.cancelled() => {
                     cancelled = true;
+                    #[cfg(test)]
+                    if !self.cancel_stop_delay.is_zero() {
+                        tokio::time::sleep(self.cancel_stop_delay).await;
+                    }
                     kill_process_group(pid)?;
                     break;
                 }
@@ -205,6 +219,10 @@ impl<'a> LowTrustLocalBash<'a> {
                         biased;
                         _ = cancel.cancelled() => {
                             cancelled = true;
+                            #[cfg(test)]
+                            if !self.cancel_stop_delay.is_zero() {
+                                tokio::time::sleep(self.cancel_stop_delay).await;
+                            }
                             kill_process_group(pid)?;
                             break;
                         }
@@ -324,9 +342,10 @@ impl<'a> LowTrustLocalBash<'a> {
             for recorded in stopped_chunks {
                 match capture.archive_recorded(recorded).await {
                     Ok(text) => on_update(json!({"output": text})),
-                    Err(ToolError::ResourceLimit(limit)) => {
+                    Err(ToolError::ResourceLimit(limit)) if !cancelled => {
                         resource_limit = Some(limit);
                     }
+                    Err(ToolError::ResourceLimit(_)) => {}
                     Err(error) => {
                         tracing::warn!(
                             %error,
@@ -336,7 +355,7 @@ impl<'a> LowTrustLocalBash<'a> {
                 }
             }
             let observed = pipe_observed_bytes.load(Ordering::Acquire);
-            if let Some(limit) = output_limit_if_reached(observed) {
+            if !cancelled && let Some(limit) = output_limit_if_reached(observed) {
                 resource_limit = Some(limit);
             }
         } else {
@@ -365,6 +384,13 @@ impl<'a> LowTrustLocalBash<'a> {
             }
         }
 
+        if cancelled {
+            // Cancellation is the authoritative stop cause once its biased
+            // branch wins. Post-stop accounting still drains every observed
+            // byte, but a concurrently reached output quota must not replace
+            // or coexist with the cancellation terminal.
+            resource_limit = None;
+        }
         let capture = if cancelled {
             capture.finish_after_abort().await
         } else if resource_limit.is_some() {

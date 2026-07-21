@@ -390,6 +390,8 @@ pub async fn run_tool_executor_mode() -> Result<()> {
         workspace,
         fs,
         broker,
+        #[cfg(test)]
+        Duration::ZERO,
     )
     .await
 }
@@ -530,6 +532,34 @@ where
         workspace,
         fs,
         broker,
+        #[cfg(test)]
+        Duration::ZERO,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(super) async fn run_executor_service_with_cancel_delay<R, W>(
+    read: R,
+    write: W,
+    identity: RpcIdentity,
+    workspace: PathBuf,
+    fs: WorkspaceFs,
+    broker: ArtifactBrokerClient,
+    cancel_stop_delay: Duration,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    run_executor_service_with_writer(
+        read,
+        ExecutorWriter::start(write),
+        identity,
+        workspace,
+        fs,
+        broker,
+        cancel_stop_delay,
     )
     .await
 }
@@ -541,11 +571,22 @@ async fn run_executor_service_with_writer<R>(
     workspace: PathBuf,
     fs: WorkspaceFs,
     broker: ArtifactBrokerClient,
+    #[cfg(test)] cancel_stop_delay: Duration,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
 {
-    let result = run_executor_loop(read, &writer, identity, workspace, fs, broker).await;
+    let result = run_executor_loop(
+        read,
+        &writer,
+        identity,
+        workspace,
+        fs,
+        broker,
+        #[cfg(test)]
+        cancel_stop_delay,
+    )
+    .await;
     writer_task.abort();
     let _ = timeout(EXECUTOR_TERMINAL_WRITE_DEADLINE, writer_task).await;
     result
@@ -558,6 +599,7 @@ async fn run_executor_loop<R>(
     workspace: PathBuf,
     fs: WorkspaceFs,
     broker: ArtifactBrokerClient,
+    #[cfg(test)] cancel_stop_delay: Duration,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
@@ -593,6 +635,8 @@ where
                     request.request_id,
                     execution_id,
                     command,
+                    #[cfg(test)]
+                    cancel_stop_delay,
                 )
                 .await?;
             }
@@ -635,6 +679,7 @@ async fn run_bash_request<R>(
     request_id: String,
     execution_id: String,
     command: String,
+    #[cfg(test)] cancel_stop_delay: Duration,
 ) -> Result<()>
 where
     R: AsyncBufRead + Unpin,
@@ -642,6 +687,8 @@ where
     let cancel = CancellationToken::new();
     let (on_update, mut updates_rx) = bounded_bash_updates();
     let bash = LowTrustLocalBash::new(workspace.to_path_buf(), broker);
+    #[cfg(test)]
+    let bash = bash.with_cancel_stop_delay(cancel_stop_delay);
     let execution = bash.execute(&command, &execution_id, cancel.clone(), on_update);
     tokio::pin!(execution);
     // Keep one persistent read future alive across select iterations. Recreating

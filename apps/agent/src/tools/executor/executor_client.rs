@@ -631,7 +631,10 @@ fn indeterminate(message: &str) -> ToolError {
 mod tests {
     use super::*;
     use crate::tools::{
-        executor::{ArtifactBrokerClient, service::run_executor_service},
+        executor::{
+            ArtifactBrokerClient,
+            service::{run_executor_service, run_executor_service_with_cancel_delay},
+        },
         fs::WorkspaceFs,
     };
     use serde_json::{Value, json};
@@ -692,6 +695,35 @@ mod tests {
             for session in sessions {
                 session.await.unwrap();
             }
+        });
+        (socket, task)
+    }
+
+    fn spawn_real_service_with_cancel_delay(
+        root: &Path,
+        cancel_stop_delay: Duration,
+    ) -> (PathBuf, JoinHandle<()>) {
+        let socket = root.join("executor.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let broker_socket = root.join("unused-broker.sock");
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let fs = WorkspaceFs::open(&workspace).unwrap();
+            let broker = ArtifactBrokerClient::new(broker_socket, identity(), "conversation-1");
+            let (read, write) = stream.into_split();
+            run_executor_service_with_cancel_delay(
+                read,
+                write,
+                identity(),
+                workspace,
+                fs,
+                broker,
+                cancel_stop_delay,
+            )
+            .await
+            .unwrap();
         });
         (socket, task)
     }
@@ -838,6 +870,55 @@ mod tests {
         };
         assert!(result.cancelled);
         assert!(result.output.contains("started"));
+        service.await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn real_service_cancellation_remains_authoritative_at_output_quota() {
+        let root = temp_root("cancel-at-output-quota");
+        let output_limit = crate::tools::shell_capture::COMMAND_OUTPUT_LIMIT_BYTES;
+        let (socket, service) =
+            spawn_real_service_with_cancel_delay(&root, Duration::from_millis(50));
+        let cancel = CancellationToken::new();
+        let cancel_at_marker = cancel.clone();
+        let marker = root.join("workspace/quota-ready");
+        let trigger = tokio::spawn(async move {
+            timeout(Duration::from_secs(5), async {
+                while !marker.exists() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("quota marker timeout");
+            cancel_at_marker.cancel();
+        });
+        let mut deadlines = test_deadlines();
+        deadlines.frame = Duration::from_secs(15);
+        deadlines.overall = Duration::from_secs(20);
+        let response = ExecutorClient::new(&socket, identity(), "conversation-1")
+            .with_deadlines(deadlines)
+            .execute(
+                ExecutorOperation::Bash {
+                    command: "head -c 10477568 /dev/zero | tr '\\0' x; : > quota-ready; sleep 0.02; head -c 8192 /dev/zero | tr '\\0' x; while :; do :; done".to_owned(),
+                    execution_id: "bash-cancel-at-quota".to_owned(),
+                },
+                cancel,
+                Arc::new(|_| {}),
+            )
+            .await
+            .expect("cancelled quota-race result");
+        let ExecutorResponse::Bash { result } = response else {
+            panic!("wrong response")
+        };
+        assert!(result.cancelled);
+        assert_eq!(result.resource_limit, None);
+        assert!(result.is_consistent());
+        assert_eq!(
+            result.observed_bytes, output_limit,
+            "fixture must reach the output quota concurrently with cancellation"
+        );
+        trigger.await.unwrap();
         service.await.unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
