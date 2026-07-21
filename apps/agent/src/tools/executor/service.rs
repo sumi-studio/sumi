@@ -80,6 +80,12 @@ struct ExecutorWriter {
     terminals: mpsc::Sender<WriterMessage>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProgressWriteGuarantee {
+    MayWritePartial,
+    AtomicAllOrNothing,
+}
+
 struct NonblockingStdout {
     fd: AsyncFd<OwnedFd>,
 }
@@ -179,7 +185,24 @@ impl AsyncWrite for NonblockingStdout {
 }
 
 impl ExecutorWriter {
-    fn start<W>(mut write: W) -> (Self, JoinHandle<()>)
+    fn start<W>(write: W) -> (Self, JoinHandle<()>)
+    where
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::start_with_progress_guarantee(write, ProgressWriteGuarantee::MayWritePartial)
+    }
+
+    fn start_atomic_progress<W>(write: W) -> (Self, JoinHandle<()>)
+    where
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::start_with_progress_guarantee(write, ProgressWriteGuarantee::AtomicAllOrNothing)
+    }
+
+    fn start_with_progress_guarantee<W>(
+        mut write: W,
+        progress_write_guarantee: ProgressWriteGuarantee,
+    ) -> (Self, JoinHandle<()>)
     where
         W: AsyncWrite + Unpin + Send + 'static,
     {
@@ -228,7 +251,19 @@ impl ExecutorWriter {
                     if terminal {
                         return;
                     }
-                    tracing::warn!("dropping volatile executor progress update: write unavailable");
+                    if progress_write_guarantee == ProgressWriteGuarantee::AtomicAllOrNothing {
+                        tracing::warn!(
+                            "dropping volatile executor progress update: atomic write unavailable"
+                        );
+                    } else {
+                        tracing::warn!(
+                            "executor progress write failed; permanently closing writer epoch"
+                        );
+                        // A generic AsyncWrite transport may have accepted a
+                        // prefix before stalling or failing. Appending a later
+                        // frame would turn that prefix into corrupt JSONL.
+                        return;
+                    }
                 }
             }
         });
@@ -348,7 +383,15 @@ pub async fn run_tool_executor_mode() -> Result<()> {
     let broker = ArtifactBrokerClient::new(broker_socket, identity.clone(), conversation_id);
     let stdin = nonblocking_stdin().context("failed to take ownership of executor stdin")?;
     let stdout = nonblocking_stdout().context("failed to take ownership of executor stdout")?;
-    run_executor_service(stdin, stdout, identity, workspace, fs, broker).await
+    run_executor_service_with_writer(
+        stdin,
+        ExecutorWriter::start_atomic_progress(stdout),
+        identity,
+        workspace,
+        fs,
+        broker,
+    )
+    .await
 }
 
 pub async fn run_artifact_broker_mode() -> Result<()> {
@@ -480,7 +523,28 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (writer, writer_task) = ExecutorWriter::start(write);
+    run_executor_service_with_writer(
+        read,
+        ExecutorWriter::start(write),
+        identity,
+        workspace,
+        fs,
+        broker,
+    )
+    .await
+}
+
+async fn run_executor_service_with_writer<R>(
+    read: R,
+    (writer, writer_task): (ExecutorWriter, JoinHandle<()>),
+    identity: RpcIdentity,
+    workspace: PathBuf,
+    fs: WorkspaceFs,
+    broker: ArtifactBrokerClient,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
     let result = run_executor_loop(read, &writer, identity, workspace, fs, broker).await;
     writer_task.abort();
     let _ = timeout(EXECUTOR_TERMINAL_WRITE_DEADLINE, writer_task).await;
@@ -1256,6 +1320,78 @@ mod tests {
     use super::*;
     use crate::tools::executor::decode_rpc_frame;
 
+    struct PrefixThenStall {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        prefix: usize,
+        wrote_prefix: bool,
+    }
+
+    struct AtomicBlockedThenWrite {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        allow_write: Arc<Mutex<bool>>,
+    }
+
+    impl AsyncWrite for AtomicBlockedThenWrite {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut TaskContext<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if !*self.allow_write.lock().unwrap() {
+                return Poll::Pending;
+            }
+            self.bytes.lock().unwrap().extend_from_slice(buffer);
+            Poll::Ready(Ok(buffer.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _context: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for PrefixThenStall {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _context: &mut TaskContext<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.wrote_prefix {
+                return Poll::Pending;
+            }
+            let length = self.prefix.min(buffer.len());
+            self.bytes
+                .lock()
+                .unwrap()
+                .extend_from_slice(&buffer[..length]);
+            self.wrote_prefix = true;
+            Poll::Ready(Ok(length))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _context: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     struct QueueControlOnSecondPoll {
         polls: usize,
         sender: mpsc::Sender<&'static str>,
@@ -1372,6 +1508,107 @@ mod tests {
                 || delivered == vec![serde_json::json!("first")]
                 || delivered == vec![serde_json::json!("first"), serde_json::json!("second")]
         );
+        writer_task.abort();
+    }
+
+    #[tokio::test]
+    async fn partial_progress_write_permanently_closes_writer_epoch() {
+        let identity = RpcIdentity {
+            generation: 7,
+            nonce: "boot-nonce".to_owned(),
+        };
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let prefix = 7;
+        let transport = PrefixThenStall {
+            bytes: bytes.clone(),
+            prefix,
+            wrote_prefix: false,
+        };
+        let (writer, writer_task) = ExecutorWriter::start(transport);
+        writer
+            .try_update(&RpcFrame::<ExecutorResponse>::Update {
+                generation: identity.generation,
+                nonce: identity.nonce.clone(),
+                request_id: "request-1".to_owned(),
+                value: serde_json::json!({"output": "progress"}),
+            })
+            .expect("enqueue progress");
+
+        timeout(Duration::from_millis(100), writer_task)
+            .await
+            .expect("writer epoch stops within its update deadline")
+            .expect("writer task");
+        assert!(
+            writer
+                .try_update(&RpcFrame::<ExecutorResponse>::Update {
+                    generation: identity.generation,
+                    nonce: identity.nonce.clone(),
+                    request_id: "request-1".to_owned(),
+                    value: serde_json::json!({"output": "later progress"}),
+                })
+                .is_ok(),
+            "volatile backpressure must not fail the Bash side-effect path"
+        );
+        assert!(
+            writer
+                .terminal(
+                    &identity,
+                    "request-1".to_owned(),
+                    Ok(ExecutorResponse::Written {}),
+                )
+                .await
+                .is_err(),
+            "terminal must not be appended after a partial progress frame"
+        );
+        assert_eq!(bytes.lock().unwrap().len(), prefix);
+    }
+
+    #[tokio::test]
+    async fn atomic_progress_backpressure_drops_update_and_preserves_terminal() {
+        let identity = RpcIdentity {
+            generation: 7,
+            nonce: "boot-nonce".to_owned(),
+        };
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let allow_write = Arc::new(Mutex::new(false));
+        let transport = AtomicBlockedThenWrite {
+            bytes: bytes.clone(),
+            allow_write: allow_write.clone(),
+        };
+        let (writer, writer_task) = ExecutorWriter::start_atomic_progress(transport);
+        writer
+            .try_update(&RpcFrame::<ExecutorResponse>::Update {
+                generation: identity.generation,
+                nonce: identity.nonce.clone(),
+                request_id: "request-1".to_owned(),
+                value: serde_json::json!({"output": "dropped progress"}),
+            })
+            .expect("enqueue progress");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(bytes.lock().unwrap().is_empty());
+
+        *allow_write.lock().unwrap() = true;
+        writer
+            .terminal(
+                &identity,
+                "request-1".to_owned(),
+                Ok(ExecutorResponse::Written {}),
+            )
+            .await
+            .expect("authoritative terminal survives atomic progress drop");
+        let delivered = bytes.lock().unwrap().clone();
+        let frame = decode_rpc_frame::<ExecutorResponse>(
+            delivered.strip_suffix(b"\n").expect("terminal newline"),
+            &identity,
+        )
+        .expect("decode terminal");
+        assert!(matches!(
+            frame,
+            RpcFrame::Terminal {
+                result: Ok(ExecutorResponse::Written {}),
+                ..
+            }
+        ));
         writer_task.abort();
     }
 

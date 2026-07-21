@@ -62,8 +62,9 @@ impl Default for Deadlines {
 /// the callback must be prompt and nonblocking. The client bounds frame size,
 /// update count, frame waits, and the complete exchange. The frozen service can
 /// actively cancel Bash; cancellation racing a synchronous non-Bash operation
-/// is settled without detaching but remains indeterminate because side effects
-/// may already have occurred.
+/// is settled without detaching. A successful synchronous operation followed
+/// by `CancelTooLate` is authoritative; every other non-Bash cancel settlement
+/// remains indeterminate.
 pub struct ExecutorClient {
     socket: PathBuf,
     identity: RpcIdentity,
@@ -97,6 +98,7 @@ impl ExecutorClient {
     ) -> Result<ExecutorResponse, ToolError> {
         validate_conversation_id(&self.conversation_id)?;
         operation.validate()?;
+        validate_operation_for_conversation(&operation, &self.conversation_id)?;
         if matches!(operation, ExecutorOperation::Cancel { .. }) {
             return Err(ToolError::Protocol(
                 "ExecutorClient owns cancel request construction".to_owned(),
@@ -272,12 +274,12 @@ impl ExecutorClient {
 
         let result = original_terminal
             .ok_or_else(|| indeterminate("executor response lacked operation terminal"))?;
-        if cancel_request_id.is_some() && !cancellable_bash {
-            return Err(indeterminate(
-                "non-bash executor cancellation cannot prove synchronous side effects stopped",
-            ));
-        }
-        validate_cancel_settlement(cancel_terminal, &result)?;
+        validate_cancel_settlement(
+            cancel_request_id.is_some(),
+            cancellable_bash,
+            cancel_terminal,
+            &result,
+        )?;
         result
     }
 
@@ -289,25 +291,43 @@ impl ExecutorClient {
 }
 
 fn validate_cancel_settlement(
+    cancellation_requested: bool,
+    cancellable_bash: bool,
     cancel_terminal: Option<CancelTerminal>,
     result: &Result<ExecutorResponse, ToolError>,
 ) -> Result<(), ToolError> {
-    match (cancel_terminal, result) {
-        (Some(CancelTerminal::Accepted), Ok(ExecutorResponse::Bash { result }))
+    match (
+        cancellation_requested,
+        cancellable_bash,
+        cancel_terminal,
+        result,
+    ) {
+        (false, _, None, _) => {}
+        (true, true, Some(CancelTerminal::Accepted), Ok(ExecutorResponse::Bash { result }))
             if result.cancelled => {}
-        (Some(CancelTerminal::TooLate), Ok(ExecutorResponse::Bash { result }))
+        (true, true, Some(CancelTerminal::TooLate), Ok(ExecutorResponse::Bash { result }))
             if !result.cancelled => {}
-        (Some(CancelTerminal::Accepted), _) => {
+        (true, false, Some(CancelTerminal::TooLate), Ok(_)) => {}
+        (true, _, Some(CancelTerminal::Accepted), _) => {
             return Err(indeterminate(
                 "executor acknowledged cancellation without cancelled=true",
             ));
         }
-        (Some(CancelTerminal::TooLate), _) => {
+        (true, _, Some(CancelTerminal::TooLate), _) => {
             return Err(indeterminate(
-                "executor reported cancel-too-late without a completed Bash result",
+                "executor reported cancel-too-late without an authoritative completed result",
             ));
         }
-        (None, _) => {}
+        (true, _, None, _) => {
+            return Err(indeterminate(
+                "executor cancellation lacked a terminal settlement",
+            ));
+        }
+        (false, _, Some(_), _) => {
+            return Err(indeterminate(
+                "executor emitted an unsolicited cancellation settlement",
+            ));
+        }
     }
     Ok(())
 }
@@ -433,6 +453,7 @@ fn validate_response_for_conversation(
     response: &ExecutorResponse,
     conversation_id: &str,
 ) -> Result<(), ToolError> {
+    validate_operation_for_conversation(operation, conversation_id)?;
     let valid = match (operation, response) {
         (
             ExecutorOperation::ReadFile { path, limit, .. },
@@ -479,6 +500,27 @@ fn validate_response_for_conversation(
     } else {
         Err(ToolError::Protocol(
             "executor returned a response for a different operation".to_owned(),
+        ))
+    }
+}
+
+fn validate_operation_for_conversation(
+    operation: &ExecutorOperation,
+    conversation_id: &str,
+) -> Result<(), ToolError> {
+    let path = match operation {
+        ExecutorOperation::ReadFile { path, .. } | ExecutorOperation::Grep { path, .. } => path,
+        _ => return Ok(()),
+    };
+    if !path.starts_with("artifact://") {
+        return Ok(());
+    }
+    let parsed = parse_artifact_handle(path)?;
+    if parsed.conversation_id == conversation_id {
+        Ok(())
+    } else {
+        Err(ToolError::InvalidPath(
+            "artifact belongs to another conversation".to_owned(),
         ))
     }
 }
@@ -650,6 +692,49 @@ mod tests {
             for session in sessions {
                 session.await.unwrap();
             }
+        });
+        (socket, task)
+    }
+
+    fn spawn_real_service_cancel_race(
+        root: &Path,
+        cancel: CancellationToken,
+    ) -> (PathBuf, JoinHandle<()>) {
+        let socket = root.join("executor.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let broker_socket = root.join("unused-broker.sock");
+        let task = tokio::spawn(async move {
+            let (mut client_stream, _) = listener.accept().await.unwrap();
+            let (mut proxy_stream, executor_stream) = tokio::io::duplex(2 * MAX_RPC_LINE_BYTES);
+            let (read, write) = tokio::io::split(executor_stream);
+            let service = tokio::spawn(async move {
+                let fs = WorkspaceFs::open(&workspace).unwrap();
+                let broker = ArtifactBrokerClient::new(broker_socket, identity(), "conversation-1");
+                run_executor_service(read, write, identity(), workspace, fs, broker)
+                    .await
+                    .unwrap();
+            });
+
+            // Forward exactly the original request frame, then trigger cancel.
+            // The real service is now committed to its synchronous operation
+            // and cannot observe the following Cancel until it completes.
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0u8; 1];
+                client_stream.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            proxy_stream.write_all(&request).await.unwrap();
+            cancel.cancel();
+            tokio::io::copy_bidirectional(&mut client_stream, &mut proxy_stream)
+                .await
+                .unwrap();
+            service.await.unwrap();
         });
         (socket, task)
     }
@@ -838,6 +923,49 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn cross_conversation_artifact_routes_fail_before_service_contact() {
+        let root = temp_root("cross-conversation-preflight");
+        let socket = root.join("executor.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let client = ExecutorClient::new(&socket, identity(), "conversation-1")
+            .with_deadlines(test_deadlines());
+
+        for operation in [
+            ExecutorOperation::ReadFile {
+                path: "artifact://malformed".to_owned(),
+                offset: 0,
+                limit: 4,
+                execution_id: "malformed-read".to_owned(),
+            },
+            ExecutorOperation::ReadFile {
+                path: "artifact://conversation-2/tool-output/read".to_owned(),
+                offset: 0,
+                limit: 4,
+                execution_id: "cross-read".to_owned(),
+            },
+            ExecutorOperation::Grep {
+                path: "artifact://conversation-2/attachments/input".to_owned(),
+                pattern: "needle".to_owned(),
+                execution_id: "cross-grep".to_owned(),
+            },
+        ] {
+            assert!(matches!(
+                client
+                    .execute(operation, CancellationToken::new(), Arc::new(|_| {}))
+                    .await,
+                Err(ToolError::InvalidPath(_))
+            ));
+        }
+        assert!(
+            timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err(),
+            "invalid artifact route contacted the executor"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn response_validation_enforces_route_inner_variant_and_read_bounds() {
         let workspace_read = ExecutorOperation::ReadFile {
@@ -966,6 +1094,44 @@ mod tests {
             )
             .is_err()
         );
+
+        for forged_operation in [
+            ExecutorOperation::ReadFile {
+                path: "artifact://conversation-2/tool-output/read".to_owned(),
+                offset: 0,
+                limit: 4,
+                execution_id: "forged-read".to_owned(),
+            },
+            ExecutorOperation::Grep {
+                path: "artifact://conversation-2/tool-output/grep".to_owned(),
+                pattern: "needle".to_owned(),
+                execution_id: "forged-grep".to_owned(),
+            },
+        ] {
+            let forged_response = match &forged_operation {
+                ExecutorOperation::ReadFile { .. } => ExecutorResponse::Artifact {
+                    response: ArtifactResponse::Read {
+                        content: b"safe".to_vec(),
+                        eof: true,
+                    },
+                },
+                ExecutorOperation::Grep { .. } => ExecutorResponse::Artifact {
+                    response: ArtifactResponse::Grep {
+                        matches: Vec::new(),
+                    },
+                },
+                _ => unreachable!(),
+            };
+            assert!(
+                validate_response_for_conversation(
+                    &forged_operation,
+                    &forged_response,
+                    "conversation-1",
+                )
+                .is_err(),
+                "accepted a bounded cross-conversation artifact response"
+            );
+        }
     }
 
     #[test]
@@ -1191,11 +1357,17 @@ mod tests {
             },
         };
         assert!(
-            validate_cancel_settlement(Some(CancelTerminal::TooLate), &Ok(completed.clone()))
-                .is_ok()
+            validate_cancel_settlement(
+                true,
+                true,
+                Some(CancelTerminal::TooLate),
+                &Ok(completed.clone()),
+            )
+            .is_ok()
         );
         assert!(
-            validate_cancel_settlement(Some(CancelTerminal::Accepted), &Ok(completed)).is_err()
+            validate_cancel_settlement(true, true, Some(CancelTerminal::Accepted), &Ok(completed),)
+                .is_err()
         );
 
         let cancelled = ExecutorResponse::Bash {
@@ -1210,14 +1382,53 @@ mod tests {
             },
         };
         assert!(
-            validate_cancel_settlement(Some(CancelTerminal::Accepted), &Ok(cancelled.clone()))
-                .is_ok()
+            validate_cancel_settlement(
+                true,
+                true,
+                Some(CancelTerminal::Accepted),
+                &Ok(cancelled.clone()),
+            )
+            .is_ok()
         );
-        assert!(validate_cancel_settlement(Some(CancelTerminal::TooLate), &Ok(cancelled)).is_err());
+        assert!(
+            validate_cancel_settlement(true, true, Some(CancelTerminal::TooLate), &Ok(cancelled),)
+                .is_err()
+        );
         assert!(
             validate_cancel_settlement(
+                true,
+                true,
                 Some(CancelTerminal::TooLate),
                 &Err(ToolError::RpcIndeterminate("reap".to_owned())),
+            )
+            .is_err()
+        );
+
+        let completed_write = Ok(ExecutorResponse::Written {});
+        assert!(
+            validate_cancel_settlement(
+                true,
+                false,
+                Some(CancelTerminal::TooLate),
+                &completed_write,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_cancel_settlement(
+                true,
+                false,
+                Some(CancelTerminal::Accepted),
+                &completed_write,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_cancel_settlement(
+                true,
+                false,
+                Some(CancelTerminal::TooLate),
+                &Err(ToolError::Rpc("ambiguous read failure".to_owned())),
             )
             .is_err()
         );
@@ -1371,54 +1582,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_bash_cancellation_is_indeterminate_even_after_clean_settlement() {
-        let root = temp_root("non-bash-cancel");
-        let socket = root.join("executor.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (read, mut write) = stream.into_split();
-            let mut read = BufReader::new(read);
-            let operation = read_request(&mut read).await;
-            let cancel = read_request(&mut read).await;
-            write_json_line(
-                &mut write,
-                json!({
-                    "type":"terminal", "generation":7, "nonce":"boot-nonce",
-                    "request_id":operation["request_id"],
-                    "result":{"Ok":{"type":"written"}}
-                }),
-            )
-            .await;
-            write_json_line(
-                &mut write,
-                json!({
-                    "type":"terminal", "generation":7, "nonce":"boot-nonce",
-                    "request_id":cancel["request_id"],
-                    "result":{"Ok":{"type":"cancel_accepted"}}
-                }),
-            )
-            .await;
-        });
-        let cancel = CancellationToken::new();
-        let trigger = cancel.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            trigger.cancel();
-        });
-        let error = ExecutorClient::new(&socket, identity(), "conversation-1")
-            .with_deadlines(test_deadlines())
-            .execute(
-                write_operation("sync-side-effect", "x", "x"),
-                cancel,
-                Arc::new(|_| {}),
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(error, ToolError::RpcIndeterminate(message)
-                if message.contains("non-bash")));
-        server.await.unwrap();
-        std::fs::remove_dir_all(root).unwrap();
+    async fn real_service_cancel_too_late_preserves_read_and_write_results() {
+        for mode in ["read", "write"] {
+            let root = temp_root(&format!("non-bash-cancel-{mode}"));
+            let workspace = root.join("workspace");
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::write(workspace.join("source.txt"), "source").unwrap();
+            let cancel = CancellationToken::new();
+            let (socket, service) = spawn_real_service_cancel_race(&root, cancel.clone());
+            let operation = if mode == "read" {
+                ExecutorOperation::ReadFile {
+                    path: "source.txt".to_owned(),
+                    offset: 0,
+                    limit: 64,
+                    execution_id: "sync-read".to_owned(),
+                }
+            } else {
+                write_operation("sync-write", "written.txt", "written")
+            };
+            let response = ExecutorClient::new(&socket, identity(), "conversation-1")
+                .with_deadlines(test_deadlines())
+                .execute(operation, cancel, Arc::new(|_| {}))
+                .await
+                .unwrap();
+            if mode == "read" {
+                assert!(matches!(
+                    response,
+                    ExecutorResponse::ReadFile { result } if result.content == "source"
+                ));
+            } else {
+                assert_eq!(response, ExecutorResponse::Written {});
+                assert_eq!(
+                    std::fs::read_to_string(workspace.join("written.txt")).unwrap(),
+                    "written"
+                );
+            }
+            service.await.unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[tokio::test]
