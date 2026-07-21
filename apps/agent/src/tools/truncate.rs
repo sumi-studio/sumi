@@ -99,10 +99,12 @@ pub fn truncate_head(content: &str, options: TruncationOptions) -> TruncationRes
         output.push(*line);
         bytes += line_bytes;
     }
-    if output.len() >= options.max_lines && bytes <= options.max_bytes {
-        truncated_by = TruncatedBy::Lines;
+    // If all semantic lines fit but the source's terminal delimiter does not,
+    // the bounded result drops that delimiter and the byte limit is the
+    // truthful truncation reason.
+    if output.len() == total_lines && total_bytes > options.max_bytes {
+        truncated_by = TruncatedBy::Bytes;
     }
-
     let content = output.join("\n");
     TruncationResult {
         output_lines: output.len(),
@@ -145,7 +147,6 @@ pub fn truncate_tail(content: &str, options: TruncationOptions) -> TruncationRes
             truncated_by = TruncatedBy::Bytes;
             if output.is_empty() {
                 let tail = string_tail_at_char_boundary(line, options.max_bytes);
-                bytes = tail.len();
                 output.push(tail);
                 last_line_partial = true;
             }
@@ -155,8 +156,12 @@ pub fn truncate_tail(content: &str, options: TruncationOptions) -> TruncationRes
         bytes += line_bytes;
     }
     output.reverse();
-    if output.len() >= options.max_lines && bytes <= options.max_bytes {
-        truncated_by = TruncatedBy::Lines;
+    // If all semantic lines fit but the source's terminal delimiter does not,
+    // the bounded result drops that delimiter and the byte limit is the
+    // truthful truncation reason. A partial oversized line already selected
+    // the byte reason in the loop above.
+    if output.len() == total_lines && total_bytes > options.max_bytes {
+        truncated_by = TruncatedBy::Bytes;
     }
 
     let content = output.join("\n");
@@ -432,6 +437,16 @@ mod tests {
     }
 
     #[test]
+    fn head_drops_terminal_newline_at_exact_byte_limit() {
+        let input = "abcde\n";
+        let result = truncate_head(input, options(5, 10));
+        assert_eq!(result.content, "abcde");
+        assert!(result.truncated);
+        assert_eq!(result.truncated_by, Some(TruncatedBy::Bytes));
+        assert_eq!(result.output_bytes, 5);
+    }
+
+    #[test]
     fn head_uses_utf8_byte_limits_without_partial_lines() {
         let result = truncate_head("éé\nabc", options(4, 10));
         assert_eq!(result.content, "éé");
@@ -474,7 +489,19 @@ mod tests {
         let result = truncate_tail(&input, options(1024, 100));
         assert_eq!(result.content, "X".repeat(1024));
         assert_eq!(result.output_lines, 1);
+        assert!(result.truncated);
+        assert_eq!(result.truncated_by, Some(TruncatedBy::Bytes));
         assert!(result.last_line_partial);
+    }
+
+    #[test]
+    fn tail_drops_terminal_newline_at_exact_byte_limit() {
+        let input = "abcde\n";
+        let result = truncate_tail(input, options(5, 10));
+        assert_eq!(result.content, "abcde");
+        assert!(result.truncated);
+        assert_eq!(result.truncated_by, Some(TruncatedBy::Bytes));
+        assert!(!result.last_line_partial);
     }
 
     #[test]

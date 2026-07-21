@@ -99,6 +99,10 @@ pub struct ToolCtx<'a> {
     pub call_id: &'a str,
     pub args: &'a ValidatedToolArguments,
     pub cancel: CancellationToken,
+    /// Synchronous progress delivery. The callback runs while the internal
+    /// settlement gate is locked, so it must be prompt and nonblocking and
+    /// must not synchronously re-enter this invocation's update gate. Queue
+    /// any slow or asynchronous work in the callback owner.
     pub on_update: Arc<dyn Fn(Value) + Send + Sync>,
     pub workspace: &'a WorkspacePaths,
 }
@@ -212,6 +216,10 @@ pub struct ToolUpdate {
 }
 
 impl ToolUpdate {
+    /// Deliver one progress update while the settlement gate is held.
+    /// Implementations supplied as the callback must therefore be prompt and
+    /// nonblocking; waiting for settlement or re-entering this update gate
+    /// synchronously can deadlock settlement.
     pub fn emit(&self, update: Value) {
         let Ok(settled) = self.settled.lock() else {
             return;
