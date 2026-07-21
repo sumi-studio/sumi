@@ -25,6 +25,7 @@ use crate::{
         Command, CommandAckStatus, CommandEnvelope, Gateway, GatewayClosed, InboundCommand,
         OutboundFrame,
     },
+    provider::types::PublicMessage,
     store::{
         DataKeyPurpose, EventWriter, InboundAdmission, InboundReceiptOrigin,
         RecoveryRequired as AdmissionRecoveryRequired, RecoveryStep, Store, SuffixRecovery,
@@ -34,6 +35,7 @@ use crate::{
 mod events;
 mod provider_projection;
 mod queue;
+mod run;
 
 use queue::MessageQueue;
 
@@ -44,6 +46,11 @@ pub(crate) use events::{
 pub(crate) use provider_projection::{
     ProjectedProviderEvent, ProviderEventProjector, ProviderTerminal, ProviderTerminalKind,
 };
+#[allow(
+    unused_imports,
+    reason = "production provider/executor wiring lands in the final T15 integration slice"
+)]
+pub(crate) use run::{ProviderAttempt, RunDriver, SequentialRunWorker};
 
 const CONTROL_CHANNEL_CAPACITY: usize = 32;
 const EVENT_CHANNEL_CAPACITY: usize = 64;
@@ -58,6 +65,11 @@ pub(crate) struct RunCore {
     ownership_id: Uuid,
     mutation_epoch: u64,
     ordinary_followups: MessageQueue<CommandEnvelope>,
+    deferred_controls: MessageQueue<CommandEnvelope>,
+    /// In-memory send context returned with the unique core. T17 replaces this
+    /// flat representation with `ThreeLayerMemory`; keeping it in `RunCore`
+    /// prevents a second Session run from silently losing the first run.
+    runtime_context: Vec<PublicMessage>,
 }
 
 impl RunCore {
@@ -66,6 +78,8 @@ impl RunCore {
             ownership_id: Uuid::now_v7(),
             mutation_epoch: 0,
             ordinary_followups: MessageQueue::bounded(FOLLOWUP_QUEUE_CAPACITY),
+            deferred_controls: MessageQueue::bounded(CONTROL_CHANNEL_CAPACITY),
+            runtime_context: Vec::new(),
         }
     }
 
@@ -88,6 +102,11 @@ impl RunCore {
 
     pub(crate) fn next_followup(&mut self) -> Option<CommandEnvelope> {
         self.ordinary_followups.pop_one()
+    }
+
+    pub(crate) fn defer_control(&mut self, command: CommandEnvelope) -> Result<()> {
+        self.deferred_controls.push(command)?;
+        Ok(())
     }
 }
 
