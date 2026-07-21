@@ -34,10 +34,10 @@ use super::{
 };
 
 const MAX_SCAN_BYTES: u64 = 10 * 1024 * 1024;
-const MAX_SCAN_ENTRIES: usize = 4_096;
+pub(crate) const MAX_SCAN_ENTRIES: usize = 4_096;
 const MAX_SCAN_DEPTH: usize = 128;
-const MAX_GREP_MATCHES: usize = 4_096;
-const MAX_GREP_SERIALIZED_BYTES: usize = 50 * 1024;
+pub(crate) const MAX_GREP_MATCHES: usize = 4_096;
+pub(crate) const MAX_GREP_SERIALIZED_BYTES: usize = 50 * 1024;
 const OPENAT2_UNAVAILABLE: &str = "workspace filesystem requires Linux openat2(2) (available since Linux 5.6) with the required beneath/no-symlink resolve policy; the syscall is missing or blocked by seccomp";
 /// `edit_file` is a whole-file unique-replacement operation. Keep its snapshot
 /// inside the same explicit 10 MiB local-input envelope used by bounded scans.

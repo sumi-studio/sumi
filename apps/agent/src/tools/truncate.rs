@@ -51,6 +51,51 @@ pub struct TruncationResult {
     pub max_bytes: usize,
 }
 
+impl TruncationResult {
+    pub(crate) fn is_consistent(&self, retained: RetainedOutput) -> bool {
+        if self.output_bytes != self.content.len()
+            || !semantic_line_count_is_consistent(&self.content, self.output_lines)
+            || self.output_bytes > self.max_bytes
+            || self.output_lines > self.max_lines
+            || self.total_bytes < self.output_bytes
+            || self.total_lines < self.output_lines
+            || (retained == RetainedOutput::Head && self.last_line_partial)
+            || (self.first_line_exceeds_limit
+                && (retained != RetainedOutput::Head
+                    || !self.content.is_empty()
+                    || self.output_lines != 0
+                    || self.output_bytes != 0
+                    || self.truncated_by != Some(TruncatedBy::Bytes)))
+            || (self.last_line_partial
+                && (retained != RetainedOutput::Tail
+                    || self.output_lines != 1
+                    || self.truncated_by != Some(TruncatedBy::Bytes)))
+        {
+            return false;
+        }
+
+        if self.truncated {
+            self.truncated_by.is_some()
+                && (self.total_bytes > self.output_bytes || self.total_lines > self.output_lines)
+        } else {
+            self.truncated_by.is_none()
+                && self.total_bytes == self.output_bytes
+                && self.total_lines == self.output_lines
+                && (!self.content.is_empty() || self.output_lines == 0)
+                && !self.last_line_partial
+                && !self.first_line_exceeds_limit
+        }
+    }
+}
+
+fn semantic_line_count_is_consistent(content: &str, output_lines: usize) -> bool {
+    if content.is_empty() {
+        output_lines <= 1
+    } else {
+        output_lines == content.split('\n').count() - usize::from(content.ends_with('\n'))
+    }
+}
+
 pub fn truncate_head(content: &str, options: TruncationOptions) -> TruncationResult {
     if content.is_empty() {
         return unchanged(content, 0, 0, options);

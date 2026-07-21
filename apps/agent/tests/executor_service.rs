@@ -759,11 +759,13 @@ async fn queued_cancel_is_settled_before_simultaneous_bash_completion() {
             }),
             "iteration {iteration}: {frames:?}"
         );
-        assert!(
-            frames
-                .iter()
-                .any(|frame| frame["request_id"] == format!("bash-{iteration}")),
-            "iteration {iteration}: {frames:?}"
+        let bash = frames
+            .iter()
+            .find(|frame| frame["request_id"] == format!("bash-{iteration}"))
+            .unwrap_or_else(|| panic!("iteration {iteration}: {frames:?}"));
+        assert_eq!(
+            bash["result"]["Ok"]["result"]["cancelled"], true,
+            "iteration {iteration}: cancel acknowledgement requires a cancelled settlement: {frames:?}"
         );
         drop(stdin);
         assert!(child.wait().await.unwrap().success());

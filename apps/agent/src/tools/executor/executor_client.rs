@@ -2,7 +2,7 @@
 
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -19,11 +19,16 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use super::protocol::parse_artifact_handle;
 use super::{
     ArtifactResponse, ExecutorOperation, ExecutorResponse, MAX_RPC_LINE_BYTES, RpcError, RpcFrame,
     RpcIdentity, RpcOperationValidation, RpcRequest, decode_rpc_frame,
 };
-use crate::tools::ToolError;
+use crate::tools::{
+    ToolError,
+    fs::{GrepMatch, MAX_GREP_MATCHES, MAX_GREP_SERIALIZED_BYTES, MAX_SCAN_ENTRIES},
+    truncate::{DEFAULT_MAX_LINES, GREP_MAX_LINE_LENGTH, GREP_TRUNCATION_SUFFIX, RetainedOutput},
+};
 
 const MAX_EXECUTOR_UPDATES: usize = 65_536;
 
@@ -255,6 +260,16 @@ impl ExecutorClient {
                 "non-bash executor cancellation cannot prove synchronous side effects stopped",
             ));
         }
+        if cancel_terminal_seen
+            && matches!(
+                &result,
+                Ok(ExecutorResponse::Bash { result }) if !result.cancelled
+            )
+        {
+            return Err(indeterminate(
+                "executor acknowledged cancellation but returned cancelled=false",
+            ));
+        }
         result
     }
 
@@ -390,21 +405,31 @@ fn validate_response(
                 response: ArtifactResponse::Read { content, .. },
             },
         ) => path.starts_with("artifact://") && content.len() <= *limit,
-        (ExecutorOperation::Grep { path, .. }, ExecutorResponse::Grepped { .. }) => {
-            !path.starts_with("artifact://")
+        (ExecutorOperation::Grep { path, .. }, ExecutorResponse::Grepped { matches }) => {
+            !path.starts_with("artifact://") && workspace_grep_matches_are_bounded(matches)
         }
         (
             ExecutorOperation::Grep { path, .. },
             ExecutorResponse::Artifact {
-                response: ArtifactResponse::Grep { .. },
+                response: ArtifactResponse::Grep { matches },
             },
-        ) => path.starts_with("artifact://"),
+        ) => path.starts_with("artifact://") && artifact_grep_matches_are_bounded(matches),
         (ExecutorOperation::WriteFile { .. }, ExecutorResponse::Written {})
         | (ExecutorOperation::EditFile { .. }, ExecutorResponse::Edited {})
-        | (ExecutorOperation::RemoveFile { .. }, ExecutorResponse::Removed {})
-        | (ExecutorOperation::ListDir { .. }, ExecutorResponse::Listed { .. })
-        | (ExecutorOperation::Glob { .. }, ExecutorResponse::Globbed { .. })
-        | (ExecutorOperation::Bash { .. }, ExecutorResponse::Bash { .. }) => true,
+        | (ExecutorOperation::RemoveFile { .. }, ExecutorResponse::Removed {}) => true,
+        (ExecutorOperation::ListDir { .. }, ExecutorResponse::Listed { entries }) => {
+            entries.len() <= MAX_SCAN_ENTRIES && entries.iter().all(|entry| valid_entry(entry))
+        }
+        (ExecutorOperation::Glob { .. }, ExecutorResponse::Globbed { paths }) => {
+            paths.len() <= MAX_SCAN_ENTRIES && paths.iter().all(|path| valid_relative_path(path))
+        }
+        (ExecutorOperation::Bash { .. }, ExecutorResponse::Bash { result }) => {
+            result.is_consistent()
+                && result
+                    .artifact_handle
+                    .as_deref()
+                    .is_none_or(|handle| parse_artifact_handle(handle).is_ok())
+        }
         _ => false,
     };
     if valid {
@@ -420,9 +445,57 @@ fn read_file_result_within_limit(
     result: &crate::tools::truncate::TruncationResult,
     limit: usize,
 ) -> bool {
-    result.output_bytes <= limit
-        && result.content.len() <= limit
-        && result.output_bytes == result.content.len()
+    result.max_lines == DEFAULT_MAX_LINES
+        && result.max_bytes == limit
+        && result.is_consistent(RetainedOutput::Head)
+}
+
+fn valid_entry(entry: &str) -> bool {
+    !entry.is_empty()
+        && entry.len() < MAX_RPC_LINE_BYTES
+        && !entry.contains(['\0', '/'])
+        && entry != "."
+        && entry != ".."
+}
+
+fn valid_relative_path(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() < MAX_RPC_LINE_BYTES
+        && !value.contains('\0')
+        && Path::new(value)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn valid_grep_line(line: &str, line_truncated: bool) -> bool {
+    let chars = line.chars().count();
+    chars <= GREP_MAX_LINE_LENGTH
+        && (!line_truncated
+            || (chars == GREP_MAX_LINE_LENGTH && line.ends_with(GREP_TRUNCATION_SUFFIX)))
+}
+
+fn serialized_matches_are_bounded<T: serde::Serialize>(matches: &[T]) -> bool {
+    matches.len() <= MAX_GREP_MATCHES
+        && serde_json::to_vec(matches)
+            .is_ok_and(|encoded| encoded.len() <= MAX_GREP_SERIALIZED_BYTES)
+}
+
+fn workspace_grep_matches_are_bounded(matches: &[GrepMatch]) -> bool {
+    serialized_matches_are_bounded(matches)
+        && matches.iter().all(|item| {
+            item.line_number > 0
+                && valid_relative_path(&item.path)
+                && valid_grep_line(&item.line, item.line_truncated)
+        })
+}
+
+fn artifact_grep_matches_are_bounded(
+    matches: &[crate::tools::executor::ArtifactGrepMatch],
+) -> bool {
+    serialized_matches_are_bounded(matches)
+        && matches
+            .iter()
+            .all(|item| item.line_number > 0 && valid_grep_line(&item.line, item.line_truncated))
 }
 
 fn map_rpc_error(error: RpcError) -> ToolError {
@@ -735,6 +808,25 @@ mod tests {
             .is_err()
         );
 
+        let mut contradictory = crate::tools::truncate::truncate_head(
+            "abcd",
+            crate::tools::truncate::TruncationOptions {
+                max_lines: DEFAULT_MAX_LINES,
+                max_bytes: 4,
+            },
+        );
+        contradictory.truncated = true;
+        contradictory.truncated_by = None;
+        assert!(
+            validate_response(
+                &workspace_read,
+                &ExecutorResponse::ReadFile {
+                    result: contradictory,
+                },
+            )
+            .is_err()
+        );
+
         let artifact_read = ExecutorOperation::ReadFile {
             path: "artifact://conversation-1/tool-output/read".to_owned(),
             offset: 0,
@@ -802,6 +894,182 @@ mod tests {
                         content: Vec::new(),
                         eof: true,
                     },
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn response_collection_and_grep_limits_are_semantic() {
+        let list = ExecutorOperation::ListDir {
+            path: ".".to_owned(),
+            execution_id: "list-limits".to_owned(),
+        };
+        let entries = (0..MAX_SCAN_ENTRIES)
+            .map(|index| format!("entry-{index}"))
+            .collect::<Vec<_>>();
+        assert!(
+            validate_response(
+                &list,
+                &ExecutorResponse::Listed {
+                    entries: entries.clone(),
+                },
+            )
+            .is_ok()
+        );
+        let mut too_many_entries = entries;
+        too_many_entries.push("overflow".to_owned());
+        assert!(
+            validate_response(
+                &list,
+                &ExecutorResponse::Listed {
+                    entries: too_many_entries,
+                },
+            )
+            .is_err()
+        );
+
+        let grep = ExecutorOperation::Grep {
+            path: ".".to_owned(),
+            pattern: "x".to_owned(),
+            execution_id: "grep-limits".to_owned(),
+        };
+        let mut matches = Vec::new();
+        loop {
+            let mut candidate = matches.clone();
+            candidate.push(GrepMatch {
+                path: "p".to_owned(),
+                line_number: 1,
+                line: String::new(),
+                line_truncated: false,
+            });
+            if serde_json::to_vec(&candidate).unwrap().len() > MAX_GREP_SERIALIZED_BYTES {
+                break;
+            }
+            matches = candidate;
+        }
+        let current = serde_json::to_vec(&matches).unwrap().len();
+        matches
+            .last_mut()
+            .unwrap()
+            .path
+            .push_str(&"a".repeat(MAX_GREP_SERIALIZED_BYTES - current));
+        assert_eq!(
+            serde_json::to_vec(&matches).unwrap().len(),
+            MAX_GREP_SERIALIZED_BYTES
+        );
+        assert!(
+            validate_response(
+                &grep,
+                &ExecutorResponse::Grepped {
+                    matches: matches.clone(),
+                },
+            )
+            .is_ok()
+        );
+        matches.last_mut().unwrap().path.push('a');
+        assert!(validate_response(&grep, &ExecutorResponse::Grepped { matches }).is_err());
+
+        let artifact_grep = ExecutorOperation::Grep {
+            path: "artifact://conversation-1/tool-output/grep".to_owned(),
+            pattern: "x".to_owned(),
+            execution_id: "artifact-grep-lines".to_owned(),
+        };
+        let exact_line = "x".repeat(GREP_MAX_LINE_LENGTH);
+        assert!(
+            validate_response(
+                &artifact_grep,
+                &ExecutorResponse::Artifact {
+                    response: ArtifactResponse::Grep {
+                        matches: vec![crate::tools::executor::ArtifactGrepMatch {
+                            line_number: 1,
+                            line: exact_line.clone(),
+                            line_truncated: false,
+                        }],
+                    },
+                },
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_response(
+                &artifact_grep,
+                &ExecutorResponse::Artifact {
+                    response: ArtifactResponse::Grep {
+                        matches: vec![crate::tools::executor::ArtifactGrepMatch {
+                            line_number: 1,
+                            line: format!("{exact_line}x"),
+                            line_truncated: false,
+                        }],
+                    },
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bash_response_limits_and_terminal_metadata_are_semantic() {
+        let operation = ExecutorOperation::Bash {
+            command: "true".to_owned(),
+            execution_id: "bash-bounds".to_owned(),
+        };
+        let exact = "x".repeat(crate::tools::truncate::DEFAULT_MAX_BYTES);
+        let result = crate::tools::bash::BashExecutionResult {
+            output: exact.clone(),
+            truncation: crate::tools::truncate::truncate_tail(&exact, Default::default()),
+            artifact_handle: None,
+            observed_bytes: exact.len() as u64,
+            exit_code: Some(0),
+            cancelled: false,
+            resource_limit: None,
+        };
+        assert!(
+            validate_response(
+                &operation,
+                &ExecutorResponse::Bash {
+                    result: result.clone(),
+                },
+            )
+            .is_ok()
+        );
+
+        let mut too_visible = result.clone();
+        too_visible.output.push('x');
+        assert!(
+            validate_response(
+                &operation,
+                &ExecutorResponse::Bash {
+                    result: too_visible,
+                },
+            )
+            .is_err()
+        );
+
+        let mut malformed_handle = result.clone();
+        malformed_handle.artifact_handle = Some("artifact://bad".to_owned());
+        assert!(
+            validate_response(
+                &operation,
+                &ExecutorResponse::Bash {
+                    result: malformed_handle,
+                },
+            )
+            .is_err()
+        );
+
+        let mut contradictory = result;
+        contradictory.cancelled = true;
+        contradictory.resource_limit = Some(crate::tools::ResourceLimit::OutputBytes {
+            observed: contradictory.observed_bytes,
+            limit: contradictory.observed_bytes,
+        });
+        assert!(
+            validate_response(
+                &operation,
+                &ExecutorResponse::Bash {
+                    result: contradictory,
                 },
             )
             .is_err()
@@ -965,6 +1233,65 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, ToolError::RpcIndeterminate(message)
                 if message.contains("non-bash")));
+        server.await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_ack_with_uncancelled_bash_terminal_is_indeterminate() {
+        let root = temp_root("cancel-false");
+        let socket = root.join("executor.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut read = BufReader::new(read);
+            let operation = read_request(&mut read).await;
+            let cancel = read_request(&mut read).await;
+            let truncation = crate::tools::truncate::truncate_tail("done", Default::default());
+            write_json_line(
+                &mut write,
+                json!({
+                    "type":"terminal", "generation":7, "nonce":"boot-nonce",
+                    "request_id":cancel["request_id"],
+                    "result":{"Ok":{"type":"cancel_accepted"}}
+                }),
+            )
+            .await;
+            write_json_line(
+                &mut write,
+                json!({
+                    "type":"terminal", "generation":7, "nonce":"boot-nonce",
+                    "request_id":operation["request_id"],
+                    "result":{"Ok":{"type":"bash","result":{
+                        "output":"done", "truncation":truncation,
+                        "artifact_handle":null, "observed_bytes":4,
+                        "exit_code":0, "cancelled":false, "resource_limit":null
+                    }}}
+                }),
+            )
+            .await;
+        });
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            trigger.cancel();
+        });
+        let error = ExecutorClient::new(&socket, identity())
+            .with_deadlines(test_deadlines())
+            .execute(
+                ExecutorOperation::Bash {
+                    command: "sleep 30".to_owned(),
+                    execution_id: "cancel-false".to_owned(),
+                },
+                cancel,
+                Arc::new(|_| {}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::RpcIndeterminate(message)
+            if message.contains("cancelled=false")));
         server.await.unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }

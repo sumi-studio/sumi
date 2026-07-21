@@ -47,6 +47,34 @@ pub struct BashExecutionResult {
     pub resource_limit: Option<ResourceLimit>,
 }
 
+impl BashExecutionResult {
+    pub(crate) fn is_consistent(&self) -> bool {
+        if self.output != self.truncation.content
+            || self.output.len() > super::truncate::DEFAULT_MAX_BYTES
+            || self.truncation.max_lines != super::truncate::DEFAULT_MAX_LINES
+            || self.truncation.max_bytes != super::truncate::DEFAULT_MAX_BYTES
+            || !self
+                .truncation
+                .is_consistent(super::truncate::RetainedOutput::Tail)
+            || (self.cancelled && self.resource_limit.is_some())
+            || (self.resource_limit.is_some() && self.exit_code.is_some())
+            || self
+                .artifact_handle
+                .as_deref()
+                .is_some_and(|handle| !handle.starts_with("artifact://"))
+        {
+            return false;
+        }
+
+        match &self.resource_limit {
+            Some(ResourceLimit::OutputBytes { observed, limit }) => {
+                *observed == self.observed_bytes && observed >= limit
+            }
+            _ => true,
+        }
+    }
+}
+
 pub struct LowTrustLocalBash<'a> {
     workspace: PathBuf,
     artifact: &'a dyn ArtifactAppender,

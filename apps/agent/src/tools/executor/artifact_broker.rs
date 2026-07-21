@@ -22,12 +22,11 @@ use super::protocol::{
 };
 use crate::tools::{
     ResourceLimit, ToolError,
+    fs::{MAX_GREP_MATCHES, MAX_GREP_SERIALIZED_BYTES},
     truncate::{GREP_MAX_LINE_LENGTH, truncate_line_total},
 };
 
 const MAX_SCAN_BYTES: u64 = 10 * 1024 * 1024;
-const MAX_GREP_MATCHES: usize = 4_096;
-const MAX_GREP_SERIALIZED_BYTES: usize = 50 * 1024;
 const MAX_TRACKED_ARTIFACTS: usize = 4_096;
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 const RESOLVE_NO_SYMLINKS: u64 = 0x04;

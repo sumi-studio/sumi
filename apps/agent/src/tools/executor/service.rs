@@ -42,6 +42,7 @@ const BROKER_BLOCKING_WORK_CAPACITY: usize = 8;
 const BROKER_EXCHANGE_DEADLINE: Duration = Duration::from_secs(2);
 const EXECUTOR_WRITE_DEADLINE: Duration = Duration::from_millis(100);
 const EXECUTOR_REAP_DEADLINE: Duration = Duration::from_secs(2);
+type BashUpdateCallback = Arc<dyn Fn(Value) + Send + Sync>;
 
 enum ActiveControl {
     Cancel(String),
@@ -53,6 +54,7 @@ enum ActiveControl {
 
 enum BashExit {
     Completed(Result<BashExecutionResult, ToolError>),
+    UpdateOverflow,
     Cancelled {
         cancel_request_id: String,
         completed: Option<Result<BashExecutionResult, ToolError>>,
@@ -524,10 +526,7 @@ where
     R: AsyncBufRead + Unpin,
 {
     let cancel = CancellationToken::new();
-    let (updates_tx, mut updates_rx) = mpsc::channel::<Value>(UPDATE_CHANNEL_CAPACITY);
-    let on_update = Arc::new(move |value| {
-        let _ = updates_tx.try_send(value);
-    });
+    let (on_update, mut updates_rx, update_overflow) = bounded_bash_updates();
     let bash = LowTrustLocalBash::new(workspace.to_path_buf(), broker);
     let execution = bash.execute(&command, &execution_id, cancel.clone(), on_update);
     tokio::pin!(execution);
@@ -556,6 +555,7 @@ where
                     completed: None,
                 };
             }
+            _ = update_overflow.cancelled() => break BashExit::UpdateOverflow,
             next = control_rx.recv(), if !control_reader_done || !control_rx.is_empty() => {
                 match classify_active_control(next, identity, &execution_id, lifecycle) {
                     ActiveControl::Cancel(cancel_request_id) => break BashExit::Cancelled {
@@ -571,6 +571,9 @@ where
             }
             _ = &mut control_reader, if !control_reader_done => control_reader_done = true,
             result = &mut execution => {
+                if update_overflow.is_cancelled() {
+                    break BashExit::UpdateOverflow;
+                }
                 match take_queued_control_after_completion(
                     &mut control_rx,
                     control_reader.as_mut(),
@@ -619,6 +622,34 @@ where
     };
 
     match exit {
+        BashExit::UpdateOverflow => {
+            cancel.cancel();
+            let cleanup_timed_out = timeout(EXECUTOR_REAP_DEADLINE, &mut execution)
+                .await
+                .is_err();
+            if cleanup_timed_out {
+                tracing::warn!(
+                    "executor update overflow cancellation exceeded its service deadline"
+                );
+            }
+            lifecycle.accept_terminal(&request_id)?;
+            writer
+                .terminal(
+                    identity,
+                    request_id,
+                    Err(rpc_error(ToolError::RpcIndeterminate(
+                        "executor update callback queue overflowed".to_owned(),
+                    ))),
+                )
+                .await?;
+            if cleanup_timed_out {
+                Err(anyhow::anyhow!(
+                    "executor update overflow cleanup was not proven"
+                ))
+            } else {
+                Ok(())
+            }
+        }
         BashExit::Fatal {
             error,
             response,
@@ -701,7 +732,7 @@ where
         } => {
             cancel.cancel();
             let result = match completed {
-                Some(result) => result,
+                Some(result) => result.map(normalize_cancel_won_after_completion),
                 None => match timeout(EXECUTOR_REAP_DEADLINE, &mut execution).await {
                     Ok(Ok(result)) => Ok(result),
                     Ok(Err(reap_error)) => {
@@ -773,6 +804,27 @@ where
             Ok(())
         }
     }
+}
+
+fn bounded_bash_updates() -> (BashUpdateCallback, mpsc::Receiver<Value>, CancellationToken) {
+    let (updates_tx, updates_rx) = mpsc::channel::<Value>(UPDATE_CHANNEL_CAPACITY);
+    let overflow = CancellationToken::new();
+    let callback_overflow = overflow.clone();
+    let on_update = Arc::new(move |value| {
+        if updates_tx.try_send(value).is_err() {
+            callback_overflow.cancel();
+        }
+    });
+    (on_update, updates_rx, overflow)
+}
+
+fn normalize_cancel_won_after_completion(mut result: BashExecutionResult) -> BashExecutionResult {
+    // The service settlement is cancelled because the queued Cancel won the
+    // final control poll. Preserve a completed process's exit status so this
+    // does not falsely claim that the process itself was interrupted.
+    result.cancelled = true;
+    result.resource_limit = None;
+    result
 }
 
 fn forward_bash_update(
@@ -1210,6 +1262,40 @@ mod tests {
             }
             Poll::Pending
         }
+    }
+
+    #[test]
+    fn update_callback_burst_is_exact_or_marks_overflow() {
+        let (callback, mut receiver, overflow) = bounded_bash_updates();
+        for index in 0..=UPDATE_CHANNEL_CAPACITY {
+            callback(serde_json::json!({"index": index}));
+        }
+
+        let received = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(received.len(), UPDATE_CHANNEL_CAPACITY);
+        assert_eq!(received[0]["index"], 0);
+        assert_eq!(received[UPDATE_CHANNEL_CAPACITY - 1]["index"], 31);
+        assert!(
+            overflow.is_cancelled(),
+            "the 33rd callback must be observable"
+        );
+    }
+
+    #[test]
+    fn queued_cancel_marks_settlement_without_erasing_completed_exit() {
+        let completed = BashExecutionResult {
+            output: "done".to_owned(),
+            truncation: crate::tools::truncate::truncate_tail("done", Default::default()),
+            artifact_handle: None,
+            observed_bytes: 4,
+            exit_code: Some(0),
+            cancelled: false,
+            resource_limit: None,
+        };
+        let settled = normalize_cancel_won_after_completion(completed);
+        assert!(settled.cancelled);
+        assert_eq!(settled.exit_code, Some(0));
+        assert_eq!(settled.output, "done");
     }
 
     #[tokio::test]
