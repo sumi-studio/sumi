@@ -487,18 +487,25 @@ async fn slow_progress_consumer_drops_overflow_but_receives_authoritative_termin
         "shrink executor stdout pipe for deterministic backpressure"
     );
     let mut stdout = BufReader::new(stdout);
+    let marker = fixture.workspace.join("bash-slow-progress.complete");
     send_request(
         &mut stdin,
         &request(
             "bash-slow-progress",
             json!({
                 "type":"bash",
-                "command":"for i in $(seq 1 300); do printf '%03d\\n' \"$i\"; sleep 0.001; done",
+                "command":"head -c 524288 /dev/zero | tr '\\0' x; printf complete > bash-slow-progress.complete",
                 "execution_id":"bash-slow-progress",
             }),
         ),
     )
     .await;
+
+    // Keep stdout unread while the command emits substantially more than the
+    // internal capture queue and the 4 KiB executor pipe. The marker is
+    // written by the command itself, so this wait observes command progress
+    // without using timing as synchronization.
+    assert_eq!(wait_for_nonempty_file(&marker).await, "complete");
 
     let mut delivered = Vec::new();
     let terminal = timeout(Duration::from_secs(15), async {
@@ -510,7 +517,6 @@ async fn slow_progress_consumer_drops_overflow_but_receives_authoritative_termin
             if let Some(output) = frame["value"]["output"].as_str() {
                 delivered.push(output.to_owned());
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
@@ -518,14 +524,19 @@ async fn slow_progress_consumer_drops_overflow_but_receives_authoritative_termin
     let result = &terminal["result"]["Ok"]["result"];
     assert_eq!(result["cancelled"], false);
     assert_eq!(result["exit_code"], 0);
+    assert_eq!(result["observed_bytes"], 524288);
+    assert_eq!(result["truncation"]["total_bytes"], 524288);
+    assert_eq!(result["truncation"]["truncated"], true);
+    assert_eq!(result["truncation"]["truncated_by"], "bytes");
     let complete = result["output"].as_str().unwrap();
-    let mut cursor = 0usize;
-    for chunk in delivered {
-        let relative = complete[cursor..]
-            .find(&chunk)
-            .unwrap_or_else(|| panic!("delivered update was out of order: {chunk:?}"));
-        cursor += relative + chunk.len();
-    }
+    assert_eq!(complete.len(), 50 * 1024);
+    assert!(complete.bytes().all(|byte| byte == b'x'));
+    assert!(
+        delivered
+            .iter()
+            .all(|chunk| chunk.bytes().all(|byte| byte == b'x'))
+    );
+    assert!(delivered.iter().map(String::len).sum::<usize>() <= 524288);
 
     drop(stdin);
     assert!(child.wait().await.unwrap().success());
