@@ -10,8 +10,10 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::{
     gateway::Command,
@@ -38,6 +40,9 @@ const LENGTH_LOOP_CODE: &str = "consecutive_length_tool_guard";
 const LENGTH_OVERFLOW_ERROR: &str = "provider response reached the context window before producing output; immediate recovery required";
 const LENGTH_OVERFLOW_CODE: &str = "context_overflow_length_usage";
 const MAX_OVERFLOW_RECOVERIES: u8 = 2;
+const TOOL_RESULT_MESSAGE_ID_NAMESPACE: Uuid = Uuid::from_bytes([
+    0x73, 0x75, 0x6d, 0x69, 0xa4, 0xc1, 0x48, 0x22, 0x91, 0x5d, 0xb5, 0xd2, 0x5a, 0x69, 0x9f, 0x31,
+]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OverflowRecoveryRequest {
@@ -213,10 +218,12 @@ impl Runner {
             self.attempt_sequence = self.attempt_sequence.saturating_add(1);
             match outcome {
                 AttemptOutcome::Retry {
+                    assistant_message_id,
                     message,
                     rejected_results,
                 } => {
-                    self.emit_rejected_results(&rejected_results).await?;
+                    self.emit_rejected_results(&assistant_message_id, &rejected_results)
+                        .await?;
                     self.consecutive_length_batches = 0;
                     let Some(delay) = retry_delay(self.ordinary_retries) else {
                         self.close_turn(message, Vec::new()).await?;
@@ -240,11 +247,13 @@ impl Runner {
                     }
                 }
                 AttemptOutcome::ImmediateOverflow {
+                    assistant_message_id,
                     message,
                     source,
                     rejected_results,
                 } => {
-                    self.emit_rejected_results(&rejected_results).await?;
+                    self.emit_rejected_results(&assistant_message_id, &rejected_results)
+                        .await?;
                     self.consecutive_length_batches = 0;
                     if self.overflow_recoveries >= MAX_OVERFLOW_RECOVERIES {
                         self.close_turn_without_context(message).await?;
@@ -288,6 +297,7 @@ impl Runner {
                     self.context = replacement;
                 }
                 AttemptOutcome::Terminal {
+                    assistant_message_id,
                     message,
                     rejected_results,
                     deferred_overflow,
@@ -316,12 +326,14 @@ impl Runner {
                         || (!calls.is_empty() && stop_reason(&message) == Some(StopReason::Length));
                     let executable_results = if is_length {
                         self.consecutive_length_batches += 1;
-                        self.fail_length_calls(&calls, length_guarded).await?
+                        self.fail_length_calls(&assistant_message_id, &calls, length_guarded)
+                            .await?
                     } else {
                         self.consecutive_length_batches = 0;
-                        self.execute_calls(&calls).await?
+                        self.execute_calls(&assistant_message_id, &calls).await?
                     };
-                    self.emit_rejected_results(&rejected_results).await?;
+                    self.emit_rejected_results(&assistant_message_id, &rejected_results)
+                        .await?;
                     if !length_guarded {
                         self.context.push(message.clone());
                         self.context.extend(
@@ -351,10 +363,12 @@ impl Runner {
                     }
                 }
                 AttemptOutcome::ClosedError {
+                    assistant_message_id,
                     message,
                     rejected_results,
                 } => {
-                    self.emit_rejected_results(&rejected_results).await?;
+                    self.emit_rejected_results(&assistant_message_id, &rejected_results)
+                        .await?;
                     self.close_turn(message, Vec::new()).await?;
                     break;
                 }
@@ -471,9 +485,13 @@ impl Runner {
                             )
                         });
                     let public = match overflow {
-                        Some(OverflowClassification::ImmediateRecovery(
-                            OverflowSource::LengthUsage,
-                        )) => normalize_length_overflow(terminal.message()),
+                        Some(OverflowClassification::ImmediateRecovery(source)) => {
+                            normalize_immediate_overflow(
+                                terminal.message(),
+                                source,
+                                &rejected_results,
+                            )
+                        }
                         _ if length_guarded => normalize_length_loop_guard(terminal.message()),
                         _ => terminal.message().clone(),
                     };
@@ -487,6 +505,7 @@ impl Runner {
                     self.emit(terminal_event).await?;
                     if let Some(OverflowClassification::ImmediateRecovery(source)) = overflow {
                         return Ok(AttemptOutcome::ImmediateOverflow {
+                            assistant_message_id: attempt.message_id.clone(),
                             message: public,
                             source,
                             rejected_results,
@@ -496,16 +515,19 @@ impl Runner {
                         // Error assistants remain observable but never enter L0/context.
                         if internal.stop_reason == StopReason::Error && is_retryable(&internal) {
                             return Ok(AttemptOutcome::Retry {
+                                assistant_message_id: attempt.message_id.clone(),
                                 message: public,
                                 rejected_results,
                             });
                         }
                         return Ok(AttemptOutcome::ClosedError {
+                            assistant_message_id: attempt.message_id.clone(),
                             message: public,
                             rejected_results,
                         });
                     }
                     return Ok(AttemptOutcome::Terminal {
+                        assistant_message_id: attempt.message_id.clone(),
                         message: public,
                         rejected_results,
                         deferred_overflow: match overflow {
@@ -540,11 +562,12 @@ impl Runner {
         })
         .await?;
         self.emit(AgentEvent::MessageEnd {
-            message_id,
+            message_id: message_id.clone(),
             message: Box::new(message.clone()),
         })
         .await?;
         Ok(AttemptOutcome::ClosedError {
+            assistant_message_id: message_id,
             message,
             rejected_results: Vec::new(),
         })
@@ -570,6 +593,7 @@ impl Runner {
         })
         .await?;
         Ok(AttemptOutcome::ClosedError {
+            assistant_message_id: message_id.to_owned(),
             message,
             rejected_results: Vec::new(),
         })
@@ -577,9 +601,12 @@ impl Runner {
 
     async fn fail_length_calls(
         &mut self,
+        assistant_message_id: &str,
         calls: &[ToolCall],
         terminal_guard: bool,
     ) -> Result<Vec<ToolResultMessage>, WorkerFailure> {
+        // These synthetic results deliberately have no execution lifecycle.
+        // The durable bridge must map them to skipped/not-started transactions.
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {
             let message = if terminal_guard {
@@ -588,7 +615,8 @@ impl Runner {
                 LENGTH_TOOL_FAILURE.to_owned()
             };
             let result = error_tool_result(call, &message);
-            self.emit_result_message(&result).await?;
+            self.emit_result_message(assistant_message_id, &result)
+                .await?;
             results.push(result);
         }
         Ok(results)
@@ -596,6 +624,7 @@ impl Runner {
 
     async fn execute_calls(
         &mut self,
+        assistant_message_id: &str,
         calls: &[ToolCall],
     ) -> Result<Vec<ToolResultMessage>, WorkerFailure> {
         let mut results = Vec::with_capacity(calls.len());
@@ -614,7 +643,7 @@ impl Runner {
                 }
                 Err(error) => error_tool_result(call, &format!("Tool execution failed: {error}")),
             };
-            self.emit_tool_result(&result).await?;
+            self.emit_tool_result(assistant_message_id, &result).await?;
             results.push(result);
         }
         Ok(results)
@@ -629,25 +658,30 @@ impl Runner {
         .await
     }
 
-    async fn emit_tool_result(&mut self, result: &ToolResultMessage) -> Result<(), WorkerFailure> {
+    async fn emit_tool_result(
+        &mut self,
+        assistant_message_id: &str,
+        result: &ToolResultMessage,
+    ) -> Result<(), WorkerFailure> {
+        let durable_result = serde_json::to_value(result).map_err(|error| {
+            WorkerFailure::Error(format!("tool result serialization failed: {error}"))
+        })?;
         self.emit(AgentEvent::ToolExecutionEnd {
             tool_call_id: result.tool_call_id.clone(),
-            result: json!({
-                "content": result.content,
-                "details": result.details,
-            }),
+            result: durable_result,
             is_error: result.is_error,
         })
         .await?;
-        self.emit_result_message(result).await
+        self.emit_result_message(assistant_message_id, result).await
     }
 
     async fn emit_result_message(
         &mut self,
+        assistant_message_id: &str,
         result: &ToolResultMessage,
     ) -> Result<(), WorkerFailure> {
         let message = PublicMessage::ToolResult(result.clone());
-        let message_id = format!("tool-result:{}", result.tool_call_id);
+        let message_id = tool_result_message_id(assistant_message_id, &result.tool_call_id);
         self.emit(AgentEvent::MessageStart {
             message_id: message_id.clone(),
             message: Box::new(message.clone()),
@@ -662,10 +696,12 @@ impl Runner {
 
     async fn emit_rejected_results(
         &mut self,
+        assistant_message_id: &str,
         results: &[ToolResultMessage],
     ) -> Result<(), WorkerFailure> {
         for result in results {
-            self.emit_result_message(result).await?;
+            self.emit_result_message(assistant_message_id, result)
+                .await?;
         }
         Ok(())
     }
@@ -868,21 +904,25 @@ impl Runner {
 
 enum AttemptOutcome {
     Retry {
+        assistant_message_id: String,
         message: PublicMessage,
         rejected_results: Vec<ToolResultMessage>,
     },
     ImmediateOverflow {
+        assistant_message_id: String,
         message: PublicMessage,
         source: OverflowSource,
         rejected_results: Vec<ToolResultMessage>,
     },
     Terminal {
+        assistant_message_id: String,
         message: PublicMessage,
         rejected_results: Vec<ToolResultMessage>,
         deferred_overflow: Option<OverflowSource>,
         length_guarded: bool,
     },
     ClosedError {
+        assistant_message_id: String,
         message: PublicMessage,
         rejected_results: Vec<ToolResultMessage>,
     },
@@ -919,14 +959,31 @@ fn assistant_error(message: &PublicMessage) -> String {
     }
 }
 
-fn normalize_length_overflow(message: &PublicMessage) -> PublicMessage {
+fn normalize_immediate_overflow(
+    message: &PublicMessage,
+    source: OverflowSource,
+    rejected_results: &[ToolResultMessage],
+) -> PublicMessage {
     let PublicMessage::Assistant(message) = message else {
         unreachable!("provider terminal message is always assistant")
     };
     let mut normalized = message.clone();
+    normalized.content.retain(|content| match content {
+        PublicAssistantContent::ToolCall { .. } => false,
+        PublicAssistantContent::RejectedToolCall { rejected, .. } => rejected_results
+            .iter()
+            .any(|result| result.tool_call_id == rejected.id),
+        PublicAssistantContent::Text { .. } | PublicAssistantContent::Thinking { .. } => true,
+    });
     normalized.stop_reason = StopReason::Error;
-    normalized.error_message = Some(LENGTH_OVERFLOW_ERROR.to_owned());
-    normalized.provider_code = Some(LENGTH_OVERFLOW_CODE.to_owned());
+    if source == OverflowSource::LengthUsage {
+        normalized.error_message = Some(LENGTH_OVERFLOW_ERROR.to_owned());
+        normalized.provider_code = Some(LENGTH_OVERFLOW_CODE.to_owned());
+    } else if normalized.error_message.is_none() {
+        normalized.error_message = Some(format!(
+            "provider context overflow requires immediate recovery ({source:?})"
+        ));
+    }
     normalized.interrupted = false;
     PublicMessage::Assistant(normalized)
 }
@@ -954,6 +1011,17 @@ fn error_tool_result(call: &ToolCall, message: &str) -> ToolResultMessage {
         is_error: true,
         timestamp: Utc::now(),
     }
+}
+
+fn tool_result_message_id(assistant_message_id: &str, tool_call_id: &str) -> String {
+    // Hash each variable-length identity independently so pair framing is
+    // unambiguous without constructing an unbounded concatenated name.
+    let assistant_digest = Sha256::digest(assistant_message_id.as_bytes());
+    let tool_call_digest = Sha256::digest(tool_call_id.as_bytes());
+    let mut pair_digest = [0_u8; 64];
+    pair_digest[..32].copy_from_slice(&assistant_digest);
+    pair_digest[32..].copy_from_slice(&tool_call_digest);
+    Uuid::new_v5(&TOOL_RESULT_MESSAGE_ID_NAMESPACE, &pair_digest).to_string()
 }
 
 #[cfg(test)]

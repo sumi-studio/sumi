@@ -347,6 +347,11 @@ fn provider_attempt(attempt: usize, message: AssistantMessage) -> ProviderAttemp
                     content_index: index,
                 })
                 .expect("text start");
+                tx.try_send(ProviderEvent::TextDelta {
+                    content_index: index,
+                    delta: text.clone(),
+                })
+                .expect("text delta");
                 tx.try_send(ProviderEvent::TextEnd {
                     content_index: index,
                     content: text.clone(),
@@ -732,7 +737,7 @@ async fn tool_calls_execute_strictly_sequentially_and_continue_provider() {
         )),
         output(assistant(StopReason::Stop, Vec::new(), None, None)),
     ]));
-    let (completion, _) = run_fixture(driver.clone()).await;
+    let (completion, events) = run_fixture(driver.clone()).await;
     assert_completed(completion);
     assert_eq!(
         *driver.tool_order.lock().expect("tool order"),
@@ -740,6 +745,103 @@ async fn tool_calls_execute_strictly_sequentially_and_continue_provider() {
     );
     assert_eq!(driver.max_active_tools.load(Ordering::SeqCst), 1);
     assert_eq!(driver.started_contexts.lock().expect("contexts").len(), 2);
+    for event in &events {
+        let AgentEvent::ToolExecutionEnd {
+            tool_call_id,
+            result,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        let durable_message = events
+            .iter()
+            .find_map(|candidate| match candidate {
+                AgentEvent::MessageEnd { message, .. }
+                    if matches!(message.as_ref(), PublicMessage::ToolResult(tool_result)
+                        if &tool_result.tool_call_id == tool_call_id) =>
+                {
+                    let PublicMessage::ToolResult(tool_result) = message.as_ref() else {
+                        unreachable!()
+                    };
+                    Some(tool_result)
+                }
+                _ => None,
+            })
+            .expect("tool result MessageEnd");
+        assert_eq!(
+            result,
+            &serde_json::to_value(durable_message).expect("serialize durable result"),
+            "ToolExecutionEnd must carry the exact durable ToolResultMessage payload"
+        );
+    }
+}
+
+#[tokio::test]
+async fn reused_tool_call_id_gets_turn_scoped_stable_result_message_ids() {
+    let tool_turn = || {
+        output(assistant(
+            StopReason::ToolUse,
+            vec![AssistantContent::ToolCall {
+                tool_call: call("reused"),
+                wire_item_index: 0,
+            }],
+            None,
+            None,
+        ))
+    };
+    let driver = Arc::new(FixtureDriver::new(vec![
+        tool_turn(),
+        tool_turn(),
+        output(assistant(StopReason::Stop, Vec::new(), None, None)),
+    ]));
+    let (completion, events) = run_fixture(driver).await;
+    assert_completed(completion);
+
+    let starts: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::MessageStart {
+                message_id,
+                message,
+            } if matches!(message.as_ref(), PublicMessage::ToolResult(result)
+                if result.tool_call_id == "reused") =>
+            {
+                Some(message_id.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    let ends: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::MessageEnd {
+                message_id,
+                message,
+            } if matches!(message.as_ref(), PublicMessage::ToolResult(result)
+                if result.tool_call_id == "reused") =>
+            {
+                Some(message_id.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(starts, ends, "each result must close under its start ID");
+    assert_eq!(starts.len(), 2);
+    assert_ne!(starts[0], starts[1]);
+    let first_pair_id = tool_result_message_id("assistant-0", "reused");
+    assert_eq!(starts[0], first_pair_id);
+    assert_eq!(starts[1], tool_result_message_id("assistant-1", "reused"));
+    assert_eq!(
+        first_pair_id,
+        tool_result_message_id("assistant-0", "reused"),
+        "replaying the same assistant/call pair must reproduce the ID"
+    );
+    assert!(
+        starts
+            .iter()
+            .all(|message_id| Uuid::parse_str(message_id).is_ok())
+    );
 }
 
 #[tokio::test]
@@ -1328,7 +1430,16 @@ async fn immediate_overflow_recovers_twice_then_closes_without_appending_attempt
     let overflow = || {
         output(assistant(
             StopReason::Error,
-            Vec::new(),
+            vec![
+                AssistantContent::Text {
+                    text: "display-safe prefix".to_owned(),
+                    wire_item_index: 0,
+                },
+                AssistantContent::ToolCall {
+                    tool_call: call("must-not-start"),
+                    wire_item_index: 1,
+                },
+            ],
             Some("maximum context length exceeded"),
             Some("context_length_exceeded"),
         ))
@@ -1360,7 +1471,8 @@ async fn immediate_overflow_recovers_twice_then_closes_without_appending_attempt
                 source: OverflowSource::ProviderCode,
                 ordinal: 2,
             },
-        ]
+        ],
+        "unexpected events: {events:#?}"
     );
     assert_eq!(
         *driver
@@ -1378,6 +1490,31 @@ async fn immediate_overflow_recovers_twice_then_closes_without_appending_attempt
         2
     );
     assert_eq!(driver.started_contexts.lock().expect("contexts").len(), 3);
+    assert!(driver.tool_order.lock().expect("tool order").is_empty());
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolExecutionStart { .. } | AgentEvent::ToolExecutionEnd { .. }
+    )));
+    assert!(events.iter().filter_map(|event| match event {
+        AgentEvent::MessageEnd { message, .. }
+            if matches!(message.as_ref(), PublicMessage::Assistant(_)) => Some(message.as_ref()),
+        _ => None,
+    }).all(|message| matches!(message, PublicMessage::Assistant(assistant)
+        if assistant.stop_reason == StopReason::Error
+            && assistant.content.iter().any(|content| matches!(content,
+                PublicAssistantContent::Text { text, .. } if text == "display-safe prefix"))
+            && !assistant.content.iter().any(|content| matches!(content,
+                PublicAssistantContent::ToolCall { .. }))
+    )));
+    assert!(matches!(
+        events.iter().find(|event| matches!(event, AgentEvent::TurnEnd { .. })),
+        Some(AgentEvent::TurnEnd { message: Some(message), tool_results })
+            if tool_results.is_empty()
+                && matches!(message.as_ref(), PublicMessage::Assistant(assistant)
+                    if assistant.stop_reason == StopReason::Error
+                        && !assistant.content.iter().any(|content| matches!(content,
+                            PublicAssistantContent::ToolCall { .. })))
+    ));
     assert_eq!(core.runtime_context, recovered_two);
     let contexts = driver.started_contexts.lock().expect("contexts");
     assert_eq!(contexts[1], recovered_one);
@@ -1399,9 +1536,12 @@ async fn failed_or_noop_overflow_recovery_closes_normally_without_scheduling_ret
         let mut fixture = FixtureDriver::new(vec![
             output(assistant(
                 StopReason::Error,
-                Vec::new(),
+                vec![AssistantContent::ToolCall {
+                    tool_call: call("pattern-overflow-must-not-start"),
+                    wire_item_index: 0,
+                }],
                 Some("maximum context length exceeded"),
-                Some("context_length_exceeded"),
+                None,
             )),
             output(assistant(StopReason::Stop, Vec::new(), None, None)),
         ])
@@ -1413,6 +1553,11 @@ async fn failed_or_noop_overflow_recovery_closes_normally_without_scheduling_ret
         let (completion, events) = run_fixture(driver.clone()).await;
         assert_completed(completion);
         assert_eq!(driver.started_contexts.lock().expect("contexts").len(), 1);
+        assert!(driver.tool_order.lock().expect("tool order").is_empty());
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolExecutionStart { .. } | AgentEvent::ToolExecutionEnd { .. }
+        )));
         assert!(
             !events
                 .iter()
@@ -1431,7 +1576,11 @@ async fn failed_or_noop_overflow_recovery_closes_normally_without_scheduling_ret
             .expect("overflow error MessageEnd");
         assert!(matches!(
             events.get(error_end + 1),
-            Some(AgentEvent::TurnEnd { .. })
+            Some(AgentEvent::TurnEnd { message: Some(message), tool_results })
+                if tool_results.is_empty()
+                    && matches!(message.as_ref(), PublicMessage::Assistant(assistant)
+                        if !assistant.content.iter().any(|content| matches!(content,
+                            PublicAssistantContent::ToolCall { .. })))
         ));
         assert!(matches!(
             events.get(error_end + 2),
@@ -1510,10 +1659,9 @@ async fn length_usage_overflow_recovers_before_any_tool_or_context_append() {
                             && assistant.error_message.as_deref() == Some(LENGTH_OVERFLOW_ERROR)
                             && assistant.usage.input == 99
                             && assistant.usage.output == 0
-                            && assistant.content.iter().any(|content| matches!(
+                            && !assistant.content.iter().any(|content| matches!(
                                 content,
-                                PublicAssistantContent::ToolCall { tool_call, .. }
-                                    if tool_call.id == "incomplete"
+                                PublicAssistantContent::ToolCall { .. }
                             )))
             )
         })
