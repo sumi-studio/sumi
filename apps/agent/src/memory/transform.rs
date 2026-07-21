@@ -14,15 +14,45 @@ use crate::provider::types::{
 /// time and is never persisted.
 pub const INTERRUPTION_MARKER: &str = "[この応答はユーザーの割り込みにより中断された]";
 
-fn protocol_requires_bounded_tool_ids(protocol: ApiProtocol) -> bool {
-    matches!(
-        protocol,
-        ApiProtocol::OpenAiChatCompletions | ApiProtocol::OpenAiResponses
-    )
+#[derive(Clone, Copy)]
+enum ToolIdConstraint {
+    OpenAiCompatible,
+    Anthropic,
+}
+
+impl ToolIdConstraint {
+    fn max_bytes(self) -> usize {
+        match self {
+            Self::OpenAiCompatible => 40,
+            Self::Anthropic => 64,
+        }
+    }
+
+    fn accepts(self, id: &str) -> bool {
+        if id.is_empty() || id.len() > self.max_bytes() {
+            return false;
+        }
+        match self {
+            Self::OpenAiCompatible => id
+                .chars()
+                .all(|character| character.is_alphanumeric() || matches!(character, '_' | '-')),
+            Self::Anthropic => id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')),
+        }
+    }
+
+    fn accepts_readable_char(self, character: char) -> bool {
+        match self {
+            Self::OpenAiCompatible => character.is_alphanumeric() || matches!(character, '_' | '-'),
+            Self::Anthropic => character.is_ascii_alphanumeric() || matches!(character, '_' | '-'),
+        }
+    }
 }
 
 #[derive(Clone)]
 struct PendingTool {
+    raw_id: String,
     call: ToolCall,
     timestamp: chrono::DateTime<chrono::Utc>,
 }
@@ -35,47 +65,81 @@ struct PendingRejection {
 
 /// Build a provider send view without mutating persisted identities or transcript data.
 pub fn transform(messages: &[ContextMessage], destination: &ProviderOrigin) -> Vec<ContextMessage> {
-    let normalized = normalize_messages(messages, destination);
-    let mut result = Vec::with_capacity(normalized.len());
+    let mut result = Vec::with_capacity(messages.len());
     let mut pending_tools = Vec::<PendingTool>::new();
     let mut seen_tool_results = HashSet::<String>::new();
     let mut pending_rejections = Vec::<PendingRejection>::new();
-    let mut rejected_ids = HashSet::<String>::new();
+    let mut consumed_call_ids = HashSet::<String>::new();
     let mut seen_call_ids = HashSet::<String>::new();
-    let mut accepted_call_ids = HashSet::<String>::new();
+    let mut accepted_call_ids = HashMap::<String, String>::new();
+    let mut pending_orphan_result = None;
 
-    for context in normalized {
+    for context in messages.iter().cloned() {
         match context_message(&context) {
             Message::Assistant(message) => {
                 flush_pending_tools(&mut result, &mut pending_tools, &seen_tool_results);
                 seen_tool_results.clear();
                 flush_rejections(&mut result, &mut pending_rejections);
-                rejected_ids.clear();
+                flush_orphan_result(&mut result, &mut pending_orphan_result);
+                consumed_call_ids.clear();
                 seen_call_ids.clear();
                 accepted_call_ids.clear();
 
                 if should_skip_assistant(message) {
+                    for content in &message.content {
+                        match content {
+                            AssistantContent::ToolCall { tool_call, .. } => {
+                                consumed_call_ids.insert(tool_call.id.clone());
+                            }
+                            AssistantContent::RejectedToolCall { rejected, .. } => {
+                                consumed_call_ids.insert(rejected.id.clone());
+                            }
+                            AssistantContent::Text { .. } | AssistantContent::Thinking { .. } => {}
+                        }
+                    }
                     continue;
                 }
 
                 let mut assistant = message.clone();
+                let mut id_map = ToolIdMap::default();
+                let keep_thinking = may_replay_thinking(&context, &assistant, destination);
+                let exact_origin =
+                    same_origin(&context, destination) && assistant.model == destination.model;
+                let tool_id_constraint = match destination.protocol {
+                    ApiProtocol::OpenAiChatCompletions if !exact_origin => {
+                        Some(ToolIdConstraint::OpenAiCompatible)
+                    }
+                    ApiProtocol::AnthropicMessages => Some(ToolIdConstraint::Anthropic),
+                    _ => None,
+                };
                 let mut retained = Vec::with_capacity(assistant.content.len());
                 let mut has_sendable_content = false;
                 for content in assistant.content {
                     match content {
-                        AssistantContent::ToolCall { ref tool_call, .. } => {
-                            if seen_call_ids.insert(tool_call.id.clone()) {
-                                accepted_call_ids.insert(tool_call.id.clone());
+                        AssistantContent::ToolCall {
+                            mut tool_call,
+                            wire_item_index,
+                        } => {
+                            let raw_id = tool_call.id.clone();
+                            if seen_call_ids.insert(raw_id.clone()) {
+                                if let Some(constraint) = tool_id_constraint {
+                                    tool_call.id = mapped_tool_id(&raw_id, &mut id_map, constraint);
+                                }
+                                accepted_call_ids.insert(raw_id.clone(), tool_call.id.clone());
                                 has_sendable_content = true;
                                 pending_tools.push(PendingTool {
                                     call: tool_call.clone(),
+                                    raw_id,
                                     timestamp: assistant.timestamp,
                                 });
-                                retained.push(content);
+                                retained.push(AssistantContent::ToolCall {
+                                    tool_call,
+                                    wire_item_index,
+                                });
                             } else {
                                 pending_rejections.push(PendingRejection {
                                     rejected: RejectedToolCall {
-                                        id: tool_call.id.clone(),
+                                        id: raw_id,
                                         name: tool_call.name.clone(),
                                         error:
                                             crate::provider::types::ToolArgumentError::InvalidJson,
@@ -85,7 +149,9 @@ pub fn transform(messages: &[ContextMessage], destination: &ProviderOrigin) -> V
                             }
                         }
                         AssistantContent::RejectedToolCall { rejected, .. } => {
-                            rejected_ids.insert(rejected.id.clone());
+                            if !accepted_call_ids.contains_key(&rejected.id) {
+                                consumed_call_ids.insert(rejected.id.clone());
+                            }
                             pending_rejections.push(PendingRejection {
                                 rejected,
                                 timestamp: assistant.timestamp,
@@ -96,8 +162,10 @@ pub fn transform(messages: &[ContextMessage], destination: &ProviderOrigin) -> V
                             retained.push(content);
                         }
                         AssistantContent::Thinking { ref thinking, .. } => {
-                            has_sendable_content |= !thinking.is_empty();
-                            retained.push(content);
+                            if keep_thinking {
+                                has_sendable_content |= !thinking.is_empty();
+                                retained.push(content);
+                            }
                         }
                     }
                 }
@@ -110,20 +178,26 @@ pub fn transform(messages: &[ContextMessage], destination: &ProviderOrigin) -> V
                 }
             }
             Message::ToolResult(tool_result) => {
-                if rejected_ids.contains(&tool_result.tool_call_id) && tool_result.is_error {
+                let raw_id = tool_result.tool_call_id.clone();
+                if let Some(wire_id) = accepted_call_ids.get(&raw_id) {
+                    if seen_tool_results.insert(raw_id) {
+                        let mut tool_result = tool_result.clone();
+                        tool_result.tool_call_id = wire_id.clone();
+                        result.push(with_message(context, Message::ToolResult(tool_result)));
+                    }
                     continue;
                 }
-                let is_new_result = seen_tool_results.insert(tool_result.tool_call_id.clone());
-                if accepted_call_ids.contains(&tool_result.tool_call_id) && !is_new_result {
+                if consumed_call_ids.contains(&raw_id) {
                     continue;
                 }
-                result.push(context);
+                pending_orphan_result.get_or_insert(tool_result.timestamp);
             }
             Message::User(_) => {
                 flush_pending_tools(&mut result, &mut pending_tools, &seen_tool_results);
                 seen_tool_results.clear();
                 flush_rejections(&mut result, &mut pending_rejections);
-                rejected_ids.clear();
+                flush_orphan_result(&mut result, &mut pending_orphan_result);
+                consumed_call_ids.clear();
                 seen_call_ids.clear();
                 accepted_call_ids.clear();
                 result.push(context);
@@ -133,80 +207,8 @@ pub fn transform(messages: &[ContextMessage], destination: &ProviderOrigin) -> V
 
     flush_pending_tools(&mut result, &mut pending_tools, &seen_tool_results);
     flush_rejections(&mut result, &mut pending_rejections);
+    flush_orphan_result(&mut result, &mut pending_orphan_result);
     result
-}
-
-fn normalize_messages(
-    messages: &[ContextMessage],
-    destination: &ProviderOrigin,
-) -> Vec<ContextMessage> {
-    let mut id_map = ToolIdMap::default();
-    messages
-        .iter()
-        .cloned()
-        .map(|context| {
-            let message = match context_message(&context) {
-                Message::User(message) => {
-                    id_map = ToolIdMap::default();
-                    Message::User(message.clone())
-                }
-                Message::ToolResult(message) => {
-                    let mut message = message.clone();
-                    if let Some(normalized) =
-                        id_map.original_to_normalized.get(&message.tool_call_id)
-                    {
-                        message.tool_call_id = normalized.clone();
-                    }
-                    Message::ToolResult(message)
-                }
-                Message::Assistant(message) => {
-                    // A mapping belongs to this assistant flow and its
-                    // following tool results only.
-                    id_map = ToolIdMap::default();
-                    let mut message = message.clone();
-                    let keep_thinking = may_replay_thinking(&context, &message, destination);
-                    let normalize_tool_ids =
-                        protocol_requires_bounded_tool_ids(destination.protocol)
-                            && !(same_origin(&context, destination)
-                                && message.model == destination.model);
-                    message.content = message
-                        .content
-                        .into_iter()
-                        .filter_map(|content| match content {
-                            AssistantContent::Thinking { .. } if !keep_thinking => None,
-                            AssistantContent::ToolCall {
-                                mut tool_call,
-                                wire_item_index,
-                            } => {
-                                if normalize_tool_ids {
-                                    tool_call.id = mapped_tool_id(&tool_call.id, &mut id_map);
-                                }
-                                Some(AssistantContent::ToolCall {
-                                    tool_call,
-                                    wire_item_index,
-                                })
-                            }
-                            AssistantContent::RejectedToolCall {
-                                mut rejected,
-                                wire_item_index,
-                            } => {
-                                if normalize_tool_ids {
-                                    rejected.id = mapped_tool_id(&rejected.id, &mut id_map);
-                                }
-                                Some(AssistantContent::RejectedToolCall {
-                                    rejected,
-                                    wire_item_index,
-                                })
-                            }
-                            other => Some(other),
-                        })
-                        .collect();
-                    Message::Assistant(message)
-                }
-            };
-            with_message(context, message)
-        })
-        .collect()
 }
 
 fn same_origin(context: &ContextMessage, destination: &ProviderOrigin) -> bool {
@@ -233,19 +235,14 @@ struct ToolIdMap {
     normalized_to_original: HashMap<String, String>,
 }
 
-fn mapped_tool_id(id: &str, map: &mut ToolIdMap) -> String {
+fn mapped_tool_id(id: &str, map: &mut ToolIdMap, constraint: ToolIdConstraint) -> String {
     if let Some(normalized) = map.original_to_normalized.get(id) {
         return normalized.clone();
     }
-    let preferred = if id.len() <= 40
-        && !id.is_empty()
-        && id
-            .chars()
-            .all(|character| character.is_alphanumeric() || matches!(character, '_' | '-'))
-    {
+    let preferred = if constraint.accepts(id) {
         id.to_owned()
     } else {
-        normalized_tool_id(id, 0)
+        normalized_tool_id(id, 0, constraint)
     };
     let mut normalized = preferred;
     let mut attempt = 1u32;
@@ -254,7 +251,7 @@ fn mapped_tool_id(id: &str, map: &mut ToolIdMap) -> String {
         .get(&normalized)
         .is_some_and(|original| original != id)
     {
-        normalized = normalized_tool_id(id, attempt);
+        normalized = normalized_tool_id(id, attempt, constraint);
         attempt = attempt.saturating_add(1);
     }
     map.original_to_normalized
@@ -264,8 +261,7 @@ fn mapped_tool_id(id: &str, map: &mut ToolIdMap) -> String {
     normalized
 }
 
-fn normalized_tool_id(id: &str, attempt: u32) -> String {
-    const MAX_ID_BYTES: usize = 40;
+fn normalized_tool_id(id: &str, attempt: u32, constraint: ToolIdConstraint) -> String {
     const DIGEST_BYTES: usize = 5;
     const SUFFIX_BYTES: usize = 1 + DIGEST_BYTES * 2;
 
@@ -273,14 +269,14 @@ fn normalized_tool_id(id: &str, attempt: u32) -> String {
     let readable_candidate = prefix
         .chars()
         .map(|character| {
-            if character.is_alphanumeric() || matches!(character, '_' | '-') {
+            if constraint.accepts_readable_char(character) {
                 character
             } else {
                 '_'
             }
         })
         .collect::<String>();
-    let readable = utf8_prefix(&readable_candidate, MAX_ID_BYTES - SUFFIX_BYTES);
+    let readable = utf8_prefix(&readable_candidate, constraint.max_bytes() - SUFFIX_BYTES);
     let readable = if readable.is_empty() {
         "call".to_owned()
     } else {
@@ -318,7 +314,7 @@ fn flush_pending_tools(
     seen_results: &HashSet<String>,
 ) {
     for pending in pending.drain(..) {
-        if seen_results.contains(&pending.call.id) {
+        if seen_results.contains(&pending.raw_id) {
             continue;
         }
         result.push(ContextMessage::Synthetic {
@@ -334,6 +330,24 @@ fn flush_pending_tools(
             }),
         });
     }
+}
+
+fn flush_orphan_result(
+    result: &mut Vec<ContextMessage>,
+    pending_timestamp: &mut Option<chrono::DateTime<chrono::Utc>>,
+) {
+    let Some(timestamp) = pending_timestamp.take() else {
+        return;
+    };
+    result.push(ContextMessage::Synthetic {
+        message: Message::User(UserMessage {
+            content: vec![UserContent::Text {
+                text: "対応するツール呼び出しがないツール結果は再送から除外されました。必要ならツール呼び出しを再生成してください。"
+                    .to_owned(),
+            }],
+            timestamp,
+        }),
+    });
 }
 
 fn flush_rejections(result: &mut Vec<ContextMessage>, pending: &mut Vec<PendingRejection>) {
@@ -399,7 +413,11 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::provider::types::{ToolArgumentError, Usage, UserMessage, ValidatedToolArguments};
+    use crate::provider::{
+        ModelSpec, RequestOptions,
+        adapters::{anthropic, chat_completions, responses},
+        types::{PromptContext, ToolArgumentError, Usage, UserMessage, ValidatedToolArguments},
+    };
 
     fn timestamp() -> chrono::DateTime<Utc> {
         Utc.timestamp_millis_opt(1_700_000_000_000)
@@ -498,6 +516,16 @@ mod tests {
 
     fn message(context: &ContextMessage) -> &Message {
         context_message(context)
+    }
+
+    fn prompt_context(messages: Vec<ContextMessage>) -> PromptContext {
+        PromptContext {
+            system_prompt: "system".to_owned(),
+            memory_blocks: Vec::new(),
+            messages,
+            provider_context: Vec::new(),
+            tools: Vec::new(),
+        }
     }
 
     #[test]
@@ -649,6 +677,134 @@ mod tests {
             &target(),
         );
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn skipped_terminal_assistant_consumes_its_later_result_without_synthesis() {
+        for reason in [StopReason::Error, StopReason::Aborted] {
+            let output = transform(
+                &[
+                    persisted(
+                        "a",
+                        1,
+                        assistant(vec![tool_call("skipped", "tool")], reason, false),
+                    ),
+                    persisted("r", 2, result("skipped", false)),
+                ],
+                &target(),
+            );
+            assert!(output.is_empty());
+        }
+    }
+
+    #[test]
+    fn orphan_only_and_unknown_after_a_completed_flow_become_safe_user_diagnostics() {
+        let orphan_only = transform(
+            &[persisted("orphan", 1, result("unknown", false))],
+            &target(),
+        );
+        assert_eq!(orphan_only.len(), 1);
+        assert!(matches!(
+            &orphan_only[0],
+            ContextMessage::Synthetic {
+                message: Message::User(_)
+            }
+        ));
+
+        let after_flow = transform(
+            &[
+                persisted(
+                    "a",
+                    1,
+                    assistant(vec![tool_call("known", "tool")], StopReason::ToolUse, false),
+                ),
+                persisted("known-result", 2, result("known", false)),
+                persisted("orphan", 3, result("unknown", false)),
+            ],
+            &target(),
+        );
+        assert_eq!(after_flow.len(), 3);
+        assert!(matches!(message(&after_flow[0]), Message::Assistant(_)));
+        assert!(matches!(message(&after_flow[1]), Message::ToolResult(_)));
+        assert!(matches!(message(&after_flow[2]), Message::User(_)));
+    }
+
+    #[test]
+    fn raw_result_equal_to_another_calls_normalized_id_does_not_pair() {
+        let raw_call_id = format!("same-prefix|{}", "a".repeat(100));
+        let normalized = normalized_tool_id(&raw_call_id, 0, ToolIdConstraint::OpenAiCompatible);
+        let output = transform(
+            &[
+                persisted(
+                    "a",
+                    1,
+                    assistant(
+                        vec![tool_call(&raw_call_id, "tool")],
+                        StopReason::ToolUse,
+                        false,
+                    ),
+                ),
+                persisted("collision", 2, result(&normalized, false)),
+            ],
+            &cross_origin_target(),
+        );
+
+        assert_eq!(output.len(), 3);
+        assert!(matches!(
+            &output[1],
+            ContextMessage::Synthetic {
+                message: Message::ToolResult(result)
+            } if result.tool_call_id == normalized
+                && result.is_error
+                && result.details == json!({"code": "missing_tool_result"})
+        ));
+        assert!(matches!(message(&output[2]), Message::User(_)));
+        assert!(!output.iter().any(|context| matches!(
+            context,
+            ContextMessage::Persisted { id, .. } if id == "collision"
+        )));
+    }
+
+    #[test]
+    fn repaired_orphan_only_history_is_valid_for_all_provider_builders() {
+        for preset in ["glm-5.2", "openai-responses", "anthropic"] {
+            let spec = ModelSpec::preset(preset).expect("built-in provider preset");
+            let replay = transform(
+                &[persisted("orphan", 1, result("unknown", false))],
+                &spec.origin(),
+            );
+            let context = prompt_context(replay);
+            let options = RequestOptions::default();
+            match spec.protocol {
+                ApiProtocol::OpenAiChatCompletions => {
+                    let request = chat_completions::build_request(&spec, &context, &options)
+                        .expect("Chat builder accepts repaired history");
+                    assert!(
+                        request["messages"]
+                            .as_array()
+                            .expect("messages")
+                            .iter()
+                            .all(|message| message["role"] != "tool")
+                    );
+                }
+                ApiProtocol::OpenAiResponses => {
+                    let request = responses::build_request(&spec, &context, &options)
+                        .expect("Responses builder accepts repaired history");
+                    assert!(
+                        request["input"]
+                            .as_array()
+                            .expect("input")
+                            .iter()
+                            .all(|item| item["type"] != "function_call_output")
+                    );
+                }
+                ApiProtocol::AnthropicMessages => {
+                    let request = anthropic::build_request(&spec, &context, &options)
+                        .expect("Anthropic builder accepts repaired history");
+                    assert!(!request["messages"].as_array().expect("messages").is_empty());
+                }
+            }
+        }
     }
 
     #[test]
@@ -1103,7 +1259,7 @@ mod tests {
     }
 
     #[test]
-    fn rejected_id_suppresses_all_error_results_but_keeps_non_error_and_unrelated() {
+    fn rejected_only_id_consumes_error_and_non_error_results() {
         let output = transform(
             &[
                 persisted(
@@ -1118,34 +1274,109 @@ mod tests {
                 persisted("bad-error-1", 2, result("bad", true)),
                 persisted("bad-error-2", 3, result("bad", true)),
                 persisted("bad-ok", 4, result("bad", false)),
-                persisted("other-error", 5, result("other", true)),
             ],
             &target(),
         );
-        let results = output
-            .iter()
-            .filter_map(|context| match message(context) {
-                Message::ToolResult(result) => Some(result),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(results.len(), 2);
-        assert!(
-            results
-                .iter()
-                .any(|result| result.tool_call_id == "bad" && !result.is_error)
-        );
-        assert!(
-            results
-                .iter()
-                .any(|result| result.tool_call_id == "other" && result.is_error)
-        );
-        assert!(output.iter().any(|context| matches!(
-            context,
+        assert_eq!(output.len(), 1);
+        assert!(matches!(
+            &output[0],
             ContextMessage::Synthetic {
                 message: Message::User(_)
             }
-        )));
+        ));
+    }
+
+    #[test]
+    fn retained_call_owns_first_cross_kind_result_even_when_error() {
+        let output = transform(
+            &[
+                persisted(
+                    "a",
+                    1,
+                    assistant(
+                        vec![tool_call("shared", "run"), rejected("shared", "run")],
+                        StopReason::ToolUse,
+                        false,
+                    ),
+                ),
+                persisted("first-error", 2, result("shared", true)),
+                persisted("extra-ok", 3, result("shared", false)),
+                persisted("extra-error", 4, result("shared", true)),
+            ],
+            &target(),
+        );
+
+        assert_eq!(output.len(), 3);
+        assert!(matches!(message(&output[0]), Message::Assistant(_)));
+        assert!(matches!(
+            &output[1],
+            ContextMessage::Persisted {
+                id,
+                message: Message::ToolResult(result),
+                ..
+            } if id == "first-error" && result.is_error && result.tool_call_id == "shared"
+        ));
+        assert!(matches!(message(&output[2]), Message::User(_)));
+    }
+
+    #[test]
+    fn retained_call_owns_first_cross_kind_non_error_result_when_rejection_comes_first() {
+        let output = transform(
+            &[
+                persisted(
+                    "a",
+                    1,
+                    assistant(
+                        vec![rejected("shared", "run"), tool_call("shared", "run")],
+                        StopReason::ToolUse,
+                        false,
+                    ),
+                ),
+                persisted("first-ok", 2, result("shared", false)),
+                persisted("extra-error", 3, result("shared", true)),
+            ],
+            &target(),
+        );
+
+        assert_eq!(output.len(), 3);
+        assert!(matches!(message(&output[0]), Message::Assistant(_)));
+        assert!(matches!(
+            &output[1],
+            ContextMessage::Persisted {
+                id,
+                message: Message::ToolResult(result),
+                ..
+            } if id == "first-ok" && !result.is_error && result.tool_call_id == "shared"
+        ));
+        assert!(matches!(message(&output[2]), Message::User(_)));
+    }
+
+    #[test]
+    fn retained_cross_kind_call_without_result_gets_normal_missing_result() {
+        let output = transform(
+            &[persisted(
+                "a",
+                1,
+                assistant(
+                    vec![tool_call("shared", "run"), rejected("shared", "run")],
+                    StopReason::ToolUse,
+                    false,
+                ),
+            )],
+            &target(),
+        );
+
+        assert_eq!(output.len(), 3);
+        assert!(matches!(message(&output[0]), Message::Assistant(_)));
+        assert!(matches!(
+            &output[1],
+            ContextMessage::Synthetic {
+                message: Message::ToolResult(result)
+            } if result.tool_call_id == "shared"
+                && result.is_error
+                && result.details == json!({"code": "missing_tool_result"})
+        ));
+        assert!(matches!(message(&output[2]), Message::User(_)));
     }
 
     #[test]
@@ -1248,41 +1479,67 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_bounded_ids_for_chat_and_responses_destinations() {
+    fn normalizes_bounded_ids_for_cross_origin_chat_destination() {
         let original = format!("call+bad|{}", "x".repeat(100));
-        for protocol in [
-            ApiProtocol::OpenAiChatCompletions,
-            ApiProtocol::OpenAiResponses,
-        ] {
-            let mut destination = cross_origin_target();
-            destination.protocol = protocol;
-            let output = transform(
-                &[
-                    persisted(
-                        "a",
-                        1,
-                        assistant(
-                            vec![tool_call(&original, "tool")],
-                            StopReason::ToolUse,
-                            false,
-                        ),
+        let output = transform(
+            &[
+                persisted(
+                    "a",
+                    1,
+                    assistant(
+                        vec![tool_call(&original, "tool")],
+                        StopReason::ToolUse,
+                        false,
                     ),
-                    persisted("r", 2, result(&original, false)),
-                ],
-                &destination,
-            );
-            let Message::Assistant(assistant) = message(&output[0]) else {
-                panic!("assistant");
-            };
-            let AssistantContent::ToolCall { tool_call, .. } = &assistant.content[0] else {
-                panic!("tool call");
-            };
-            let Message::ToolResult(result) = message(&output[1]) else {
-                panic!("tool result");
-            };
-            assert!(tool_call.id.len() <= 40);
-            assert_eq!(result.tool_call_id, tool_call.id);
-        }
+                ),
+                persisted("r", 2, result(&original, false)),
+            ],
+            &cross_origin_target(),
+        );
+        let Message::Assistant(assistant) = message(&output[0]) else {
+            panic!("assistant");
+        };
+        let AssistantContent::ToolCall { tool_call, .. } = &assistant.content[0] else {
+            panic!("tool call");
+        };
+        let Message::ToolResult(result) = message(&output[1]) else {
+            panic!("tool result");
+        };
+        assert!(tool_call.id.len() <= 40);
+        assert_eq!(result.tool_call_id, tool_call.id);
+    }
+
+    #[test]
+    fn preserves_cross_origin_responses_tool_ids_without_a_wire_constraint() {
+        let original = format!("call+bad|{}界", "x".repeat(100));
+        let mut destination = cross_origin_target();
+        destination.protocol = ApiProtocol::OpenAiResponses;
+        let output = transform(
+            &[
+                persisted(
+                    "a",
+                    1,
+                    assistant(
+                        vec![tool_call(&original, "tool")],
+                        StopReason::ToolUse,
+                        false,
+                    ),
+                ),
+                persisted("r", 2, result(&original, false)),
+            ],
+            &destination,
+        );
+        let Message::Assistant(assistant) = message(&output[0]) else {
+            panic!("assistant");
+        };
+        let AssistantContent::ToolCall { tool_call, .. } = &assistant.content[0] else {
+            panic!("tool call");
+        };
+        let Message::ToolResult(result) = message(&output[1]) else {
+            panic!("tool result");
+        };
+        assert_eq!(tool_call.id.as_bytes(), original.as_bytes());
+        assert_eq!(result.tool_call_id.as_bytes(), original.as_bytes());
     }
 
     #[test]
@@ -1351,25 +1608,24 @@ mod tests {
     }
 
     #[test]
-    fn cross_origin_unbounded_destination_preserves_tool_id_bytes() {
+    fn cross_origin_anthropic_normalizes_invalid_id_and_pairs_result() {
         let original = format!("call+bad|{}", "x".repeat(100));
         let mut target = target();
         target.protocol = ApiProtocol::AnthropicMessages;
-        let output = transform(
-            &[
-                persisted(
-                    "a",
-                    1,
-                    assistant(
-                        vec![tool_call(&original, "tool")],
-                        StopReason::ToolUse,
-                        false,
-                    ),
+        let input = vec![
+            persisted(
+                "a",
+                1,
+                assistant(
+                    vec![tool_call(&original, "tool")],
+                    StopReason::ToolUse,
+                    false,
                 ),
-                persisted("r", 2, result(&original, false)),
-            ],
-            &target,
-        );
+            ),
+            persisted("r", 2, result(&original, false)),
+        ];
+        let output = transform(&input, &target);
+        assert_eq!(output, transform(&input, &target));
         let Message::Assistant(assistant) = message(&output[0]) else {
             panic!("assistant");
         };
@@ -1379,8 +1635,203 @@ mod tests {
         let Message::ToolResult(result) = message(&output[1]) else {
             panic!("tool result");
         };
-        assert_eq!(tool_call.id, original);
-        assert_eq!(result.tool_call_id, original);
+        assert_ne!(tool_call.id, original);
+        assert!(ToolIdConstraint::Anthropic.accepts(&tool_call.id));
+        assert_eq!(result.tool_call_id, tool_call.id);
+    }
+
+    #[test]
+    fn anthropic_preserves_64_byte_boundary_and_normalizes_65_bytes() {
+        let boundary = "a".repeat(64);
+        let overlong = "b".repeat(65);
+        let mut destination = target();
+        destination.protocol = ApiProtocol::AnthropicMessages;
+        let output = transform(
+            &[
+                persisted(
+                    "a",
+                    1,
+                    assistant(
+                        vec![
+                            tool_call(&boundary, "boundary"),
+                            tool_call(&overlong, "overlong"),
+                        ],
+                        StopReason::ToolUse,
+                        false,
+                    ),
+                ),
+                persisted("r1", 2, result(&boundary, false)),
+                persisted("r2", 3, result(&overlong, false)),
+            ],
+            &destination,
+        );
+        let Message::Assistant(assistant) = message(&output[0]) else {
+            panic!("assistant");
+        };
+        let call_ids = assistant
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                AssistantContent::ToolCall { tool_call, .. } => Some(tool_call.id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let result_ids = output[1..]
+            .iter()
+            .filter_map(|context| match message(context) {
+                Message::ToolResult(result) => Some(result.tool_call_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(call_ids[0], boundary);
+        assert_ne!(call_ids[1], overlong);
+        assert!(
+            call_ids
+                .iter()
+                .all(|id| ToolIdConstraint::Anthropic.accepts(id))
+        );
+        assert_eq!(result_ids, call_ids);
+    }
+
+    #[test]
+    fn anthropic_empty_noisy_and_unicode_ids_are_stable_safe_and_paired() {
+        let mut destination = target();
+        destination.protocol = ApiProtocol::AnthropicMessages;
+        for original in ["", "call+bad|opaque", "呼び出し識別子"] {
+            let input = vec![
+                persisted(
+                    "a",
+                    1,
+                    assistant(
+                        vec![tool_call(original, "tool")],
+                        StopReason::ToolUse,
+                        false,
+                    ),
+                ),
+                persisted("r", 2, result(original, false)),
+            ];
+            let output = transform(&input, &destination);
+            assert_eq!(output, transform(&input, &destination));
+            let Message::Assistant(assistant) = message(&output[0]) else {
+                panic!("assistant");
+            };
+            let AssistantContent::ToolCall { tool_call, .. } = &assistant.content[0] else {
+                panic!("tool call");
+            };
+            let Message::ToolResult(result) = message(&output[1]) else {
+                panic!("tool result");
+            };
+            assert!(ToolIdConstraint::Anthropic.accepts(&tool_call.id));
+            assert_eq!(result.tool_call_id, tool_call.id);
+        }
+    }
+
+    #[test]
+    fn same_origin_anthropic_preserves_valid_id_but_repairs_builder_invalid_id() {
+        let valid = "v".repeat(64);
+        let invalid = "same+origin";
+        let mut destination = target();
+        destination.protocol = ApiProtocol::AnthropicMessages;
+        let mut source = assistant(
+            vec![tool_call(&valid, "valid"), tool_call(invalid, "invalid")],
+            StopReason::ToolUse,
+            false,
+        );
+        let Message::Assistant(assistant) = &mut source else {
+            panic!("assistant");
+        };
+        assistant.origin = destination.clone();
+        let output = transform(
+            &[
+                persisted("a", 1, source),
+                persisted("r1", 2, result(&valid, false)),
+                persisted("r2", 3, result(invalid, false)),
+            ],
+            &destination,
+        );
+        let Message::Assistant(assistant) = message(&output[0]) else {
+            panic!("assistant");
+        };
+        let call_ids = assistant
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                AssistantContent::ToolCall { tool_call, .. } => Some(tool_call.id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(call_ids[0], valid);
+        assert_ne!(call_ids[1], invalid);
+        assert!(
+            call_ids
+                .iter()
+                .all(|id| ToolIdConstraint::Anthropic.accepts(id))
+        );
+        assert_eq!(
+            output[1..]
+                .iter()
+                .filter_map(|context| match message(context) {
+                    Message::ToolResult(result) => Some(result.tool_call_id.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            call_ids
+        );
+    }
+
+    #[test]
+    fn anthropic_collision_resolution_is_deterministic_and_pairs_each_result() {
+        let invalid = format!("same+prefix|{}", "x".repeat(100));
+        let colliding_valid = normalized_tool_id(&invalid, 0, ToolIdConstraint::Anthropic);
+        let mut destination = target();
+        destination.protocol = ApiProtocol::AnthropicMessages;
+        let input = vec![
+            persisted(
+                "a",
+                1,
+                assistant(
+                    vec![
+                        tool_call(&invalid, "first"),
+                        tool_call(&colliding_valid, "second"),
+                    ],
+                    StopReason::ToolUse,
+                    false,
+                ),
+            ),
+            persisted("r1", 2, result(&invalid, false)),
+            persisted("r2", 3, result(&colliding_valid, false)),
+        ];
+        let output = transform(&input, &destination);
+        assert_eq!(output, transform(&input, &destination));
+        let Message::Assistant(assistant) = message(&output[0]) else {
+            panic!("assistant");
+        };
+        let call_ids = assistant
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                AssistantContent::ToolCall { tool_call, .. } => Some(tool_call.id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(call_ids.len(), 2);
+        assert_eq!(call_ids[0], colliding_valid);
+        assert_ne!(call_ids[0], call_ids[1]);
+        assert!(
+            call_ids
+                .iter()
+                .all(|id| ToolIdConstraint::Anthropic.accepts(id))
+        );
+        assert_eq!(
+            output[1..]
+                .iter()
+                .filter_map(|context| match message(context) {
+                    Message::ToolResult(result) => Some(result.tool_call_id.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            call_ids
+        );
     }
 
     #[test]
@@ -1425,7 +1876,7 @@ mod tests {
     #[test]
     fn valid_id_cannot_collide_with_an_earlier_normalized_id() {
         let long = format!("same-prefix|{}", "a".repeat(100));
-        let colliding_valid = normalized_tool_id(&long, 0);
+        let colliding_valid = normalized_tool_id(&long, 0, ToolIdConstraint::OpenAiCompatible);
         let output = transform(
             &[
                 persisted(
@@ -1590,7 +2041,7 @@ mod tests {
     #[test]
     fn id_mapping_is_flow_local_and_later_valid_id_is_preserved() {
         let first = format!("first|{}", "a".repeat(80));
-        let second = normalized_tool_id(&first, 0);
+        let second = normalized_tool_id(&first, 0, ToolIdConstraint::OpenAiCompatible);
         let output = transform(
             &[
                 persisted(
@@ -1635,6 +2086,53 @@ mod tests {
         assert_eq!(ids[0], second);
         assert_eq!(ids[1], second);
         assert!(ids.iter().all(|id| id.len() <= 40));
+    }
+
+    #[test]
+    fn anthropic_id_mapping_is_reset_for_a_later_assistant_flow() {
+        let first = format!("first+{}", "a".repeat(80));
+        let second = normalized_tool_id(&first, 0, ToolIdConstraint::Anthropic);
+        let mut destination = target();
+        destination.protocol = ApiProtocol::AnthropicMessages;
+        let output = transform(
+            &[
+                persisted(
+                    "a1",
+                    1,
+                    assistant(vec![tool_call(&first, "one")], StopReason::ToolUse, false),
+                ),
+                persisted("r1", 2, result(&first, false)),
+                persisted(
+                    "a2",
+                    3,
+                    assistant(vec![tool_call(&second, "two")], StopReason::ToolUse, false),
+                ),
+                persisted("r2", 4, result(&second, false)),
+            ],
+            &destination,
+        );
+        let call_ids = output
+            .iter()
+            .filter_map(|context| match message(context) {
+                Message::Assistant(assistant) => assistant.content.iter().find_map(|content| {
+                    if let AssistantContent::ToolCall { tool_call, .. } = content {
+                        Some(tool_call.id.as_str())
+                    } else {
+                        None
+                    }
+                }),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let result_ids = output
+            .iter()
+            .filter_map(|context| match message(context) {
+                Message::ToolResult(result) => Some(result.tool_call_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(call_ids, vec![second.as_str(), second.as_str()]);
+        assert_eq!(result_ids, call_ids);
     }
 
     #[test]
