@@ -36,6 +36,7 @@ impl Default for TruncationOptions {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TruncationResult {
     pub content: String,
     pub truncated: bool,

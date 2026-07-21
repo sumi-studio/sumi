@@ -41,6 +41,7 @@ struct OpenHow {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactGrepMatch {
     pub line_number: u64,
     pub line: String,
@@ -48,7 +49,7 @@ pub struct ArtifactGrepMatch {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ArtifactResponse {
     Begun { handle: String, offset: u64 },
     Appended { offset: u64 },

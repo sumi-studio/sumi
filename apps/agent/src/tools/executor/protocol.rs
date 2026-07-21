@@ -5,6 +5,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::super::{ResourceLimit, ToolError};
+use super::ArtifactResponse;
+use crate::tools::{bash::BashExecutionResult, fs::GrepMatch, truncate::TruncationResult};
 
 pub const MAX_RPC_LINE_BYTES: usize = 1024 * 1024;
 pub const MAX_RPC_READ_BYTES: usize = 50 * 1024;
@@ -148,6 +150,21 @@ pub enum ExecutorOperation {
     Cancel {
         execution_id: String,
     },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExecutorResponse {
+    ReadFile { result: TruncationResult },
+    Written,
+    Edited,
+    Removed,
+    Listed { entries: Vec<String> },
+    Globbed { paths: Vec<String> },
+    Grepped { matches: Vec<GrepMatch> },
+    Artifact { response: ArtifactResponse },
+    Bash { result: BashExecutionResult },
+    CancelAccepted,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

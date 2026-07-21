@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
     process::Command,
@@ -35,7 +35,8 @@ use super::{
 pub const DEFAULT_WALL_TIMEOUT: Duration = Duration::from_secs(120);
 const STOPPED_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BashExecutionResult {
     pub output: String,
     pub truncation: TruncationResult,

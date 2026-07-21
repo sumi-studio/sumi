@@ -22,7 +22,7 @@ use std::{
 };
 
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
@@ -69,7 +69,8 @@ struct OpenHow {
     resolve: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GrepMatch {
     pub path: String,
     pub line_number: u64,

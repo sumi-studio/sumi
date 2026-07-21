@@ -27,14 +27,13 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     ArtifactBroker, ArtifactBrokerClient, ArtifactOperation, ArtifactResponse, ExecutorOperation,
-    InputRoute, MAX_RPC_LINE_BYTES, RpcError, RpcFrame, RpcIdentity, RpcLifecycleTracker,
-    RpcRequest, decode_rpc_line, encode_rpc_frame, resolve_input,
+    ExecutorResponse, InputRoute, MAX_RPC_LINE_BYTES, RpcError, RpcFrame, RpcIdentity,
+    RpcLifecycleTracker, RpcRequest, decode_rpc_line, encode_rpc_frame, resolve_input,
 };
 use crate::tools::{
     ToolError,
     bash::{BashExecutionResult, LowTrustLocalBash},
-    fs::{GrepMatch, WorkspaceFs},
-    truncate::TruncationResult,
+    fs::WorkspaceFs,
 };
 
 const UPDATE_CHANNEL_CAPACITY: usize = 32;
@@ -43,21 +42,6 @@ const BROKER_BLOCKING_WORK_CAPACITY: usize = 8;
 const BROKER_EXCHANGE_DEADLINE: Duration = Duration::from_secs(2);
 const EXECUTOR_WRITE_DEADLINE: Duration = Duration::from_millis(100);
 const EXECUTOR_REAP_DEADLINE: Duration = Duration::from_secs(2);
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ExecutorResponse {
-    ReadFile { result: TruncationResult },
-    Written,
-    Edited,
-    Removed,
-    Listed { entries: Vec<String> },
-    Globbed { paths: Vec<String> },
-    Grepped { matches: Vec<GrepMatch> },
-    Artifact { response: ArtifactResponse },
-    Bash { result: BashExecutionResult },
-    CancelAccepted,
-}
 
 enum ActiveControl {
     Cancel(String),
@@ -433,7 +417,7 @@ async fn serve_broker_connection(
     Ok(())
 }
 
-async fn run_executor_service<R, W>(
+pub(super) async fn run_executor_service<R, W>(
     read: R,
     write: W,
     identity: RpcIdentity,
