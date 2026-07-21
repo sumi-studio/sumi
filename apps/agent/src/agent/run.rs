@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     gateway::Command,
     provider::{
-        overflow::classify_context_overflow,
+        overflow::{OverflowClassification, OverflowSource, classify_context_overflow},
         retry::{is_retryable, retry_delay, sleep_or_cancel},
         types::{
             ProviderEvent, ProviderEventStream, PublicAssistantContent, PublicMessage, StopReason,
@@ -34,6 +34,20 @@ use super::{
 
 const LENGTH_TOOL_FAILURE: &str = "Tool call was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.";
 const LENGTH_LOOP_FAILURE: &str = "provider produced tool calls at the output token limit twice consecutively; refusing a third provider call";
+const LENGTH_OVERFLOW_ERROR: &str = "provider response reached the context window before producing output; immediate recovery required";
+const LENGTH_OVERFLOW_CODE: &str = "context_overflow_length_usage";
+const MAX_OVERFLOW_RECOVERIES: u8 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OverflowRecoveryRequest {
+    pub(crate) source: OverflowSource,
+    pub(crate) ordinal: u8,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum OverflowRecoveryOutcome {
+    ReplacementContext(Vec<PublicMessage>),
+}
 
 /// One provider attempt. The initial public message supplies stable model and
 /// origin metadata for `MessageStart`; the stream remains the authority for
@@ -67,6 +81,16 @@ pub(crate) trait RunDriver: Send + Sync + 'static {
     fn context_window(&self) -> Option<u64> {
         None
     }
+
+    /// Applies one bounded emergency memory recovery before the next provider
+    /// attempt. There is intentionally no default: T21 production wiring must
+    /// mutate the supplied core and return the exact replacement send context.
+    async fn recover_overflow(
+        &self,
+        core: &mut RunCore,
+        request: OverflowRecoveryRequest,
+        active_context: &[PublicMessage],
+    ) -> Result<OverflowRecoveryOutcome>;
 
     async fn wait_retry(&self, delay: Duration, cancel: &CancellationToken) -> bool {
         sleep_or_cancel(delay, cancel).await
@@ -109,7 +133,9 @@ struct Runner {
     controls: mpsc::Receiver<RunControl>,
     events: mpsc::Sender<AgentEvent>,
     context: Vec<PublicMessage>,
-    attempt: usize,
+    attempt_sequence: usize,
+    ordinary_retries: usize,
+    overflow_recoveries: u8,
     consecutive_length_batches: usize,
     in_flight_control: Option<AdmittedCommand>,
 }
@@ -128,15 +154,17 @@ impl Runner {
             controls,
             events,
             context,
-            attempt: 0,
+            attempt_sequence: 0,
+            ordinary_retries: 0,
+            overflow_recoveries: 0,
             consecutive_length_batches: 0,
             in_flight_control: None,
         }
     }
 
     async fn run(mut self, initial: AdmittedCommand) -> RunCompletion {
-        let mut result = match self.ordered_initial(initial) {
-            Ok(initial) => self.run_inner(initial).await,
+        let mut result = match self.claim_ordered_initial(initial) {
+            Ok(()) => self.run_inner().await,
             Err(failure) => Err(failure),
         };
         if let Err(failure) = self.recover_received_controls() {
@@ -153,10 +181,7 @@ impl Runner {
         }
     }
 
-    fn ordered_initial(
-        &mut self,
-        initial: AdmittedCommand,
-    ) -> Result<AdmittedCommand, WorkerFailure> {
+    fn claim_ordered_initial(&mut self, initial: AdmittedCommand) -> Result<(), WorkerFailure> {
         self.core
             .queue_followup(initial)
             .map_err(|error| WorkerFailure::Error(error.to_string()))?;
@@ -165,7 +190,7 @@ impl Runner {
             .next_followup()
             .expect("newly queued initial makes pending controls non-empty");
         if matches!(oldest.envelope().command, Command::UserMessage { .. }) {
-            Ok(oldest)
+            self.claim_control(oldest)
         } else {
             self.core
                 .requeue_followup_front(oldest)
@@ -176,42 +201,95 @@ impl Runner {
         }
     }
 
-    async fn run_inner(&mut self, initial: AdmittedCommand) -> Result<(), WorkerFailure> {
+    async fn run_inner(&mut self) -> Result<(), WorkerFailure> {
         self.emit(AgentEvent::AgentStart).await?;
         self.emit(AgentEvent::TurnStart).await?;
-        self.inject_user(&initial).await?;
+        self.inject_in_flight().await?;
 
         loop {
             self.receive_control_safe_point()?;
             let outcome = self.provider_attempt().await?;
+            self.attempt_sequence = self.attempt_sequence.saturating_add(1);
             match outcome {
                 AttemptOutcome::Retry { message } => {
-                    let Some(delay) = retry_delay(self.attempt) else {
+                    self.consecutive_length_batches = 0;
+                    let Some(delay) = retry_delay(self.ordinary_retries) else {
                         self.close_turn(message, Vec::new()).await?;
                         break;
                     };
-                    self.attempt += 1;
+                    self.ordinary_retries += 1;
                     self.emit(AgentEvent::RetryScheduled {
-                        attempt: self.attempt as u32,
+                        attempt: self.attempt_sequence as u32,
                         delay_ms: delay.as_millis() as u64,
                         retry_at: Utc::now()
                             + chrono::Duration::from_std(delay).unwrap_or_default(),
                         error_message: assistant_error(&message),
                     })
                     .await?;
-                    if let Some(command) = self.wait_retry_or_control(delay).await? {
+                    if self.wait_retry_or_control(delay).await? {
                         self.emit(AgentEvent::Steered {
                             mode: SteerMode::Soft,
                         })
                         .await?;
-                        self.inject_control(command).await?;
+                        self.inject_in_flight().await?;
                     }
+                }
+                AttemptOutcome::ImmediateOverflow { message, source } => {
+                    self.consecutive_length_batches = 0;
+                    if self.overflow_recoveries >= MAX_OVERFLOW_RECOVERIES {
+                        self.close_turn_without_context(message).await?;
+                        break;
+                    }
+                    self.overflow_recoveries += 1;
+                    tracing::error!(
+                        ?source,
+                        ordinal = self.overflow_recoveries,
+                        "provider context overflow requires immediate recovery"
+                    );
+                    let request = OverflowRecoveryRequest {
+                        source,
+                        ordinal: self.overflow_recoveries,
+                    };
+                    let outcome = match self
+                        .driver
+                        .recover_overflow(&mut self.core, request, &self.context)
+                        .await
+                    {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            tracing::error!(%error, ?source, "immediate overflow recovery failed");
+                            self.close_turn_without_context(message).await?;
+                            break;
+                        }
+                    };
+                    let OverflowRecoveryOutcome::ReplacementContext(replacement) = outcome;
+                    if let Err(error) = self.install_recovered_context(replacement) {
+                        tracing::error!(%error, ?source, "immediate overflow recovery was invalid");
+                        self.close_turn_without_context(message).await?;
+                        break;
+                    }
+                    self.emit(AgentEvent::RetryScheduled {
+                        attempt: self.attempt_sequence as u32,
+                        delay_ms: 0,
+                        retry_at: Utc::now(),
+                        error_message: format!("context overflow: {source:?}"),
+                    })
+                    .await?;
                 }
                 AttemptOutcome::Terminal {
                     message,
                     rejected_results,
+                    deferred_overflow,
                 } => {
-                    self.attempt = 0;
+                    self.ordinary_retries = 0;
+                    self.overflow_recoveries = 0;
+                    if let Some(source) = deferred_overflow {
+                        tracing::error!(
+                            ?source,
+                            "provider context overflow deferred until the next memory apply boundary"
+                        );
+                        self.core.defer_overflow_apply(source);
+                    }
                     let calls = tool_calls(&message);
                     if calls.is_empty() && rejected_results.is_empty() {
                         self.consecutive_length_batches = 0;
@@ -253,8 +331,8 @@ impl Runner {
                     // A provider terminal carrying executable calls always
                     // continues with a fresh turn after every result settles.
                     self.emit(AgentEvent::TurnStart).await?;
-                    if let Some(command) = self.take_pending_user()? {
-                        self.inject_control(command).await?;
+                    if self.claim_pending_user()? {
+                        self.inject_in_flight().await?;
                     }
                 }
                 AttemptOutcome::ClosedError { message } => {
@@ -270,7 +348,7 @@ impl Runner {
         let cancel = CancellationToken::new();
         let mut attempt = match self
             .driver
-            .start_provider(self.attempt, &self.context, cancel)
+            .start_provider(self.attempt_sequence, &self.context, cancel)
             .await
         {
             Ok(attempt) => attempt,
@@ -290,6 +368,9 @@ impl Runner {
                 }
                 _ => None,
             };
+            let terminal_overflow = terminal_message.as_ref().and_then(|message| {
+                classify_context_overflow(message, self.driver.context_window())
+            });
             let projected = match projector.project(event) {
                 Ok(projected) => projected,
                 Err(error) => {
@@ -321,17 +402,32 @@ impl Runner {
                 }
                 ProjectedProviderEvent::Terminal(terminal) => {
                     let kind = terminal.kind();
-                    let public = terminal.message().clone();
-                    self.emit(terminal.event().clone()).await?;
                     let internal =
                         terminal_message.expect("terminal projection has provider output");
+                    let overflow = terminal_overflow;
+                    let public = match overflow {
+                        Some(OverflowClassification::ImmediateRecovery(
+                            OverflowSource::LengthUsage,
+                        )) => normalize_length_overflow(terminal.message()),
+                        _ => terminal.message().clone(),
+                    };
+                    let terminal_event = match terminal.event() {
+                        AgentEvent::MessageEnd { message_id, .. } => AgentEvent::MessageEnd {
+                            message_id: message_id.clone(),
+                            message: Box::new(public.clone()),
+                        },
+                        _ => unreachable!("provider terminal is always MessageEnd"),
+                    };
+                    self.emit(terminal_event).await?;
+                    if let Some(OverflowClassification::ImmediateRecovery(source)) = overflow {
+                        return Ok(AttemptOutcome::ImmediateOverflow {
+                            message: public,
+                            source,
+                        });
+                    }
                     if kind == ProviderTerminalKind::Error {
                         // Error assistants remain observable but never enter L0/context.
-                        if internal.stop_reason == StopReason::Error
-                            && classify_context_overflow(&internal, self.driver.context_window())
-                                .is_none()
-                            && is_retryable(&internal)
-                        {
+                        if internal.stop_reason == StopReason::Error && is_retryable(&internal) {
                             return Ok(AttemptOutcome::Retry { message: public });
                         }
                         return Ok(AttemptOutcome::ClosedError { message: public });
@@ -339,6 +435,10 @@ impl Runner {
                     return Ok(AttemptOutcome::Terminal {
                         message: public,
                         rejected_results,
+                        deferred_overflow: match overflow {
+                            Some(OverflowClassification::DeferredApply(source)) => Some(source),
+                            _ => None,
+                        },
                     });
                 }
             }
@@ -356,7 +456,7 @@ impl Runner {
         error: String,
     ) -> Result<AttemptOutcome, WorkerFailure> {
         let message = self.driver.synthetic_error(&error);
-        let message_id = format!("synthetic-error-{}", self.attempt);
+        let message_id = format!("synthetic-error-{}", self.attempt_sequence);
         self.emit(AgentEvent::MessageStart {
             message_id: message_id.clone(),
             message: Box::new(message.clone()),
@@ -405,7 +505,7 @@ impl Runner {
                 LENGTH_TOOL_FAILURE.to_owned()
             };
             let result = error_tool_result(call, &message);
-            self.emit_tool_result(&result).await?;
+            self.emit_result_message(&result).await?;
             results.push(result);
         }
         Ok(results)
@@ -503,12 +603,21 @@ impl Runner {
         Ok(())
     }
 
-    async fn inject_control(&mut self, command: AdmittedCommand) -> Result<(), WorkerFailure> {
+    fn claim_control(&mut self, command: AdmittedCommand) -> Result<(), WorkerFailure> {
+        if self.in_flight_control.is_some() {
+            return Err(WorkerFailure::Error(
+                "a second control cannot be claimed while injection is in flight".to_owned(),
+            ));
+        }
         self.in_flight_control = Some(command);
+        Ok(())
+    }
+
+    async fn inject_in_flight(&mut self) -> Result<(), WorkerFailure> {
         let injectable = self
             .in_flight_control
             .as_ref()
-            .expect("in-flight control was just installed")
+            .expect("caller must claim a control before injection")
             .clone();
         let result = self.inject_user(&injectable).await;
         if result.is_ok() {
@@ -534,27 +643,68 @@ impl Runner {
         .await
     }
 
+    async fn close_turn_without_context(
+        &mut self,
+        message: PublicMessage,
+    ) -> Result<(), WorkerFailure> {
+        self.emit(AgentEvent::TurnEnd {
+            message: Some(Box::new(message)),
+            tool_results: Vec::new(),
+        })
+        .await
+    }
+
+    fn install_recovered_context(
+        &mut self,
+        replacement: Vec<PublicMessage>,
+    ) -> Result<(), WorkerFailure> {
+        if replacement.is_empty() || replacement == self.context {
+            return Err(WorkerFailure::Error(
+                "overflow recovery did not establish a changed send context".to_owned(),
+            ));
+        }
+        if let Some(active_user) = self
+            .context
+            .iter()
+            .rev()
+            .find(|message| matches!(message, PublicMessage::User(_)))
+            && !replacement.contains(active_user)
+        {
+            return Err(WorkerFailure::Error(
+                "overflow recovery dropped the active user from the send context".to_owned(),
+            ));
+        }
+        self.context = replacement;
+        Ok(())
+    }
+
     async fn advance_followup(&mut self) -> Result<bool, WorkerFailure> {
         self.receive_control_safe_point()?;
-        let Some(command) = self.take_pending_user()? else {
+        if !self.claim_pending_user()? {
             return Ok(false);
-        };
+        }
         self.emit(AgentEvent::TurnStart).await?;
-        self.inject_control(command).await?;
+        self.inject_in_flight().await?;
         Ok(true)
     }
 
-    fn take_pending_user(&mut self) -> Result<Option<AdmittedCommand>, WorkerFailure> {
+    fn claim_pending_user(&mut self) -> Result<bool, WorkerFailure> {
+        if self.in_flight_control.is_some() {
+            return Err(WorkerFailure::Error(
+                "pending control cannot be popped while injection is in flight".to_owned(),
+            ));
+        }
         let Some(command) = self.core.next_followup() else {
-            return Ok(None);
+            return Ok(false);
         };
         if matches!(command.envelope().command, Command::UserMessage { .. }) {
-            Ok(Some(command))
+            self.claim_control(command)?;
+            Ok(true)
         } else {
             self.core
                 .requeue_followup_front(command)
                 .map_err(|error| WorkerFailure::Error(error.to_string()))?;
-            Ok(None)
+            Ok(false)
         }
     }
 
@@ -569,32 +719,34 @@ impl Runner {
         Ok(())
     }
 
-    async fn wait_retry_or_control(
-        &mut self,
-        delay: Duration,
-    ) -> Result<Option<AdmittedCommand>, WorkerFailure> {
-        if let Some(command) = self.take_pending_user()? {
-            return Ok(Some(command));
+    async fn wait_retry_or_control(&mut self, delay: Duration) -> Result<bool, WorkerFailure> {
+        if self.claim_pending_user()? {
+            return Ok(true);
         }
         let cancel = CancellationToken::new();
         let injected = tokio::select! {
             biased;
             control = self.controls.recv() => {
-                if let Some(RunControl::Command(command)) = control
-                {
-                    self.core.queue_followup(command)
-                        .map_err(|error| WorkerFailure::Error(error.to_string()))?;
-                    if let Some(command) = self.take_pending_user()? {
-                        Some(command)
-                    } else {
-                        let _ = self.driver.wait_retry(delay, &cancel).await;
-                        None
-                    }
+                let Some(RunControl::Command(command)) = control else {
+                    return Err(WorkerFailure::Cancelled);
+                };
+                self.core.queue_followup(command)
+                    .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+                if self.claim_pending_user()? {
+                    true
+                } else if self.driver.wait_retry(delay, &cancel).await {
+                    false
                 } else {
-                    None
+                    return Err(WorkerFailure::Cancelled);
                 }
             }
-            _ = self.driver.wait_retry(delay, &cancel) => None
+            completed = self.driver.wait_retry(delay, &cancel) => {
+                if completed {
+                    false
+                } else {
+                    return Err(WorkerFailure::Cancelled);
+                }
+            }
         };
         Ok(injected)
     }
@@ -626,9 +778,14 @@ enum AttemptOutcome {
     Retry {
         message: PublicMessage,
     },
+    ImmediateOverflow {
+        message: PublicMessage,
+        source: OverflowSource,
+    },
     Terminal {
         message: PublicMessage,
         rejected_results: Vec<ToolResultMessage>,
+        deferred_overflow: Option<OverflowSource>,
     },
     ClosedError {
         message: PublicMessage,
@@ -664,6 +821,18 @@ fn assistant_error(message: &PublicMessage) -> String {
             .unwrap_or_else(|| "provider error".to_owned()),
         _ => "provider error".to_owned(),
     }
+}
+
+fn normalize_length_overflow(message: &PublicMessage) -> PublicMessage {
+    let PublicMessage::Assistant(message) = message else {
+        unreachable!("provider terminal message is always assistant")
+    };
+    let mut normalized = message.clone();
+    normalized.stop_reason = StopReason::Error;
+    normalized.error_message = Some(LENGTH_OVERFLOW_ERROR.to_owned());
+    normalized.provider_code = Some(LENGTH_OVERFLOW_CODE.to_owned());
+    normalized.interrupted = false;
+    PublicMessage::Assistant(normalized)
 }
 
 fn error_tool_result(call: &ToolCall, message: &str) -> ToolResultMessage {

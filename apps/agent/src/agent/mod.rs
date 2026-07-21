@@ -26,7 +26,7 @@ use crate::{
         Command, CommandAckStatus, CommandEnvelope, Gateway, GatewayClosed, InboundCommand,
         OutboundFrame,
     },
-    provider::types::PublicMessage,
+    provider::{overflow::OverflowSource, types::PublicMessage},
     store::{
         DataKeyPurpose, EventWriter, InboundAdmission, InboundReceiptOrigin,
         RecoveryRequired as AdmissionRecoveryRequired, RecoveryStep, Store, SuffixRecovery,
@@ -51,7 +51,10 @@ pub(crate) use provider_projection::{
     unused_imports,
     reason = "production provider/executor wiring lands in the final T15 integration slice"
 )]
-pub(crate) use run::{ProviderAttempt, RunDriver, SequentialRunWorker};
+pub(crate) use run::{
+    OverflowRecoveryOutcome, OverflowRecoveryRequest, ProviderAttempt, RunDriver,
+    SequentialRunWorker,
+};
 
 const CONTROL_CHANNEL_CAPACITY: usize = 32;
 const EVENT_CHANNEL_CAPACITY: usize = 64;
@@ -67,6 +70,7 @@ pub(crate) struct RunCore {
     ownership_id: Uuid,
     mutation_epoch: u64,
     pending_controls: MessageQueue<AdmittedCommand>,
+    pending_overflow_apply: Option<OverflowSource>,
     /// In-memory send context returned with the unique core. T17 replaces this
     /// flat representation with `ThreeLayerMemory`; keeping it in `RunCore`
     /// prevents a second Session run from silently losing the first run.
@@ -79,6 +83,7 @@ impl RunCore {
             ownership_id: Uuid::now_v7(),
             mutation_epoch: 0,
             pending_controls: MessageQueue::bounded(PENDING_CONTROL_CAPACITY),
+            pending_overflow_apply: None,
             runtime_context: Vec::new(),
         }
     }
@@ -107,6 +112,14 @@ impl RunCore {
     pub(crate) fn requeue_followup_front(&mut self, command: AdmittedCommand) -> Result<()> {
         self.pending_controls.push_front(command)?;
         Ok(())
+    }
+
+    pub(crate) fn defer_overflow_apply(&mut self, source: OverflowSource) {
+        self.pending_overflow_apply.get_or_insert(source);
+    }
+
+    pub(crate) fn pending_overflow_apply(&self) -> Option<OverflowSource> {
+        self.pending_overflow_apply
     }
 }
 

@@ -38,8 +38,13 @@ struct FixtureDriver {
     active_tools: AtomicUsize,
     max_active_tools: AtomicUsize,
     retry_waits: AtomicUsize,
+    retry_delays: Mutex<Vec<Duration>>,
     retry_waiting: Notify,
     block_retry: bool,
+    retry_result: bool,
+    context_window: Option<u64>,
+    overflow_recoveries: Mutex<Vec<OverflowRecoveryRequest>>,
+    overflow_contexts: Mutex<VecDeque<Vec<PublicMessage>>>,
 }
 
 impl FixtureDriver {
@@ -52,8 +57,13 @@ impl FixtureDriver {
             active_tools: AtomicUsize::new(0),
             max_active_tools: AtomicUsize::new(0),
             retry_waits: AtomicUsize::new(0),
+            retry_delays: Mutex::new(Vec::new()),
             retry_waiting: Notify::new(),
             block_retry: false,
+            retry_result: true,
+            context_window: None,
+            overflow_recoveries: Mutex::new(Vec::new()),
+            overflow_contexts: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -64,6 +74,21 @@ impl FixtureDriver {
 
     fn blocking_retry(mut self) -> Self {
         self.block_retry = true;
+        self
+    }
+
+    fn cancelled_retry(mut self) -> Self {
+        self.retry_result = false;
+        self
+    }
+
+    fn with_context_window(mut self, context_window: u64) -> Self {
+        self.context_window = Some(context_window);
+        self
+    }
+
+    fn with_overflow_contexts(self, contexts: Vec<Vec<PublicMessage>>) -> Self {
+        *self.overflow_contexts.lock().expect("overflow contexts") = contexts.into();
         self
     }
 }
@@ -135,13 +160,37 @@ impl RunDriver for FixtureDriver {
         ))
     }
 
-    async fn wait_retry(&self, _delay: Duration, _cancel: &CancellationToken) -> bool {
+    fn context_window(&self) -> Option<u64> {
+        self.context_window
+    }
+
+    async fn recover_overflow(
+        &self,
+        _core: &mut RunCore,
+        request: OverflowRecoveryRequest,
+        _active_context: &[PublicMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        self.overflow_recoveries
+            .lock()
+            .expect("overflow recoveries")
+            .push(request);
+        let replacement = self
+            .overflow_contexts
+            .lock()
+            .expect("overflow contexts")
+            .pop_front()
+            .ok_or_else(|| anyhow!("missing fixture overflow context"))?;
+        Ok(OverflowRecoveryOutcome::ReplacementContext(replacement))
+    }
+
+    async fn wait_retry(&self, delay: Duration, _cancel: &CancellationToken) -> bool {
         self.retry_waits.fetch_add(1, Ordering::SeqCst);
+        self.retry_delays.lock().expect("retry delays").push(delay);
         self.retry_waiting.notify_one();
         if self.block_retry {
             std::future::pending().await
         } else {
-            true
+            self.retry_result
         }
     }
 }
@@ -178,6 +227,21 @@ fn assistant(
         interrupted: reason == StopReason::Aborted,
         timestamp: timestamp(),
     }
+}
+
+fn assistant_with_usage(
+    reason: StopReason,
+    content: Vec<AssistantContent>,
+    error: Option<&str>,
+    code: Option<&str>,
+    input: u64,
+    output: u64,
+) -> AssistantMessage {
+    let mut message = assistant(reason, content, error, code);
+    message.usage.input = input;
+    message.usage.output = output;
+    message.usage.total_tokens = input.saturating_add(output);
+    message
 }
 
 fn public_message(message: &AssistantMessage) -> PublicMessage {
@@ -329,6 +393,30 @@ fn admitted_abort(seq: u64) -> AdmittedCommand {
         },
         timestamp(),
     )
+}
+
+fn runtime_user(seq: u64) -> PublicMessage {
+    PublicMessage::User(UserMessage {
+        content: vec![UserContent::Text {
+            text: format!("message {seq}"),
+        }],
+        timestamp: timestamp(),
+    })
+}
+
+fn recovered_context(label: &str) -> Vec<PublicMessage> {
+    vec![
+        runtime_user(1),
+        public_message(&assistant(
+            StopReason::Stop,
+            vec![AssistantContent::Text {
+                text: format!("recovered {label}"),
+                wire_item_index: 0,
+            }],
+            None,
+            None,
+        )),
+    ]
 }
 
 fn recovered_core(completion: RunCompletion) -> RunCore {
@@ -497,12 +585,11 @@ async fn two_consecutive_length_tool_batches_prevent_third_provider_call() {
             .iter()
             .any(|event| matches!(event, AgentEvent::ToolExecutionStart { .. }))
     );
-    assert_eq!(
-        events
+    assert!(
+        !events
             .iter()
-            .filter(|event| matches!(event, AgentEvent::ToolExecutionEnd { is_error: true, .. }))
-            .count(),
-        2
+            .any(|event| matches!(event, AgentEvent::ToolExecutionEnd { .. })),
+        "a skipped call has no ordinary execution lifecycle"
     );
     assert_eq!(
         events
@@ -526,15 +613,6 @@ async fn two_consecutive_length_tool_batches_prevent_third_provider_call() {
                 if result.content.iter().any(|content| matches!(content,
                     UserContent::Text { text } if text.contains(LENGTH_LOOP_FAILURE)))))
     }));
-    for (index, event) in events.iter().enumerate() {
-        if matches!(event, AgentEvent::ToolExecutionEnd { .. }) {
-            assert!(matches!(
-                events.get(index + 1),
-                Some(AgentEvent::MessageStart { message, .. })
-                    if matches!(message.as_ref(), PublicMessage::ToolResult(result) if result.is_error)
-            ));
-        }
-    }
     assert!(matches!(events.last(), Some(AgentEvent::AgentEnd)));
 }
 
@@ -783,7 +861,490 @@ async fn event_failure_race_recovers_every_control_accepted_before_receiver_clos
     let mut core = recovered_core(completion);
     assert_eq!(
         pending_sequences(&mut core),
-        (2..=33).collect::<Vec<_>>(),
-        "all 32 accepted controls fit the 33-command admission-total bound"
+        (1..=33).collect::<Vec<_>>(),
+        "the uncommitted initial command and all 32 accepted controls are recovered exactly once"
     );
+}
+
+#[tokio::test]
+async fn initial_command_is_recovered_before_each_fallible_injection_boundary() {
+    for boundary in 0..=3 {
+        let driver = Arc::new(FixtureDriver::new(vec![Script::StartFailure("unused")]));
+        let (_control_tx, control_rx) = mpsc::channel(1);
+        let (events_tx, mut events_rx) = mpsc::channel(8);
+        let mut runner = Runner::new(RunCore::new(), driver, control_rx, events_tx);
+        runner
+            .claim_ordered_initial(admitted_user(1))
+            .expect("claim initial");
+        if boundary > 0 {
+            runner
+                .emit(AgentEvent::AgentStart)
+                .await
+                .expect("agent start");
+            events_rx.recv().await.expect("agent start event");
+        }
+        if boundary > 1 {
+            runner
+                .emit(AgentEvent::TurnStart)
+                .await
+                .expect("turn start");
+            events_rx.recv().await.expect("turn start event");
+        }
+
+        let failure = match boundary {
+            0 => {
+                drop(events_rx);
+                runner
+                    .emit(AgentEvent::AgentStart)
+                    .await
+                    .expect_err("closed before AgentStart")
+            }
+            1 => {
+                drop(events_rx);
+                runner
+                    .emit(AgentEvent::TurnStart)
+                    .await
+                    .expect_err("closed before TurnStart")
+            }
+            2 => {
+                drop(events_rx);
+                runner
+                    .inject_in_flight()
+                    .await
+                    .expect_err("closed before user MessageStart")
+            }
+            3 => {
+                let message = PublicMessage::User(UserMessage {
+                    content: vec![UserContent::Text {
+                        text: "message 1".to_owned(),
+                    }],
+                    timestamp: timestamp(),
+                });
+                let message_id = user_message_id(&user(1).command_id);
+                runner
+                    .emit(AgentEvent::MessageStart {
+                        message_id: message_id.clone(),
+                        message: Box::new(message.clone()),
+                    })
+                    .await
+                    .expect("user MessageStart");
+                events_rx.recv().await.expect("user MessageStart event");
+                drop(events_rx);
+                runner
+                    .emit(AgentEvent::MessageEnd {
+                        message_id,
+                        message: Box::new(message),
+                    })
+                    .await
+                    .expect_err("closed before user MessageEnd")
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(failure, WorkerFailure::EventChannelClosed);
+        runner.recover_received_controls().expect("recover initial");
+        assert_eq!(
+            pending_sequences(&mut runner.core),
+            vec![1],
+            "initial command must be recovered at event boundary {boundary}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn claimed_followups_survive_turn_steer_and_injection_event_failures() {
+    let cases = ["turn_start", "steered", "message_start"];
+    for case in cases {
+        let driver = Arc::new(FixtureDriver::new(Vec::new()));
+        let mut core = RunCore::new();
+        core.queue_followup(admitted_user(2)).expect("followup");
+        let (_control_tx, control_rx) = mpsc::channel(1);
+        let (events_tx, events_rx) = mpsc::channel(1);
+        drop(events_rx);
+        let mut runner = Runner::new(core, driver, control_rx, events_tx);
+
+        let failure = match case {
+            "turn_start" => runner.advance_followup().await.expect_err("closed events"),
+            "steered" => {
+                assert!(runner.claim_pending_user().expect("claim"));
+                runner
+                    .emit(AgentEvent::Steered {
+                        mode: SteerMode::Soft,
+                    })
+                    .await
+                    .expect_err("closed events")
+            }
+            "message_start" => {
+                assert!(runner.claim_pending_user().expect("claim"));
+                runner.inject_in_flight().await.expect_err("closed events")
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(failure, WorkerFailure::EventChannelClosed);
+        runner.recover_received_controls().expect("recover control");
+        assert_eq!(
+            pending_sequences(&mut runner.core),
+            vec![2],
+            "claimed followup must survive {case} failure"
+        );
+    }
+}
+
+#[tokio::test]
+async fn retry_wait_channel_close_and_cancelled_hook_never_start_another_attempt() {
+    for cancelled_hook in [false, true] {
+        let mut fixture = FixtureDriver::new(vec![
+            output(assistant(
+                StopReason::Error,
+                Vec::new(),
+                Some("network error"),
+                Some("network_error"),
+            )),
+            output(assistant(StopReason::Stop, Vec::new(), None, None)),
+        ]);
+        if cancelled_hook {
+            fixture = fixture.cancelled_retry();
+        }
+        let driver = Arc::new(fixture);
+        let worker = SequentialRunWorker::new(driver.clone());
+        let (control_tx, control_rx) = mpsc::channel(1);
+        let open_control = if cancelled_hook {
+            Some(control_tx)
+        } else {
+            drop(control_tx);
+            None
+        };
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let completion = worker
+            .run(RunCore::new(), admitted_user(1), control_rx, events_tx)
+            .await;
+        while events_rx.recv().await.is_some() {}
+        assert!(matches!(
+            completion,
+            RunCompletion::Failed {
+                failure: WorkerFailure::Cancelled,
+                ..
+            }
+        ));
+        assert_eq!(
+            driver.started_contexts.lock().expect("contexts").len(),
+            1,
+            "neither closure nor a false wait outcome may bypass backoff into another attempt"
+        );
+        if cancelled_hook {
+            assert_eq!(driver.retry_waits.load(Ordering::SeqCst), 1);
+        }
+        drop(open_control);
+    }
+}
+
+#[tokio::test]
+async fn retry_wait_uses_all_three_backoff_delays_before_the_fourth_attempt() {
+    let retryable = || {
+        output(assistant(
+            StopReason::Error,
+            Vec::new(),
+            Some("network error"),
+            Some("network_error"),
+        ))
+    };
+    let driver = Arc::new(FixtureDriver::new(vec![
+        retryable(),
+        retryable(),
+        retryable(),
+        output(assistant(StopReason::Stop, Vec::new(), None, None)),
+    ]));
+    let (completion, _) = run_fixture(driver.clone()).await;
+    assert_completed(completion);
+    assert_eq!(
+        *driver.retry_delays.lock().expect("retry delays"),
+        vec![
+            Duration::from_secs(2),
+            Duration::from_secs(4),
+            Duration::from_secs(8),
+        ]
+    );
+    assert_eq!(driver.started_contexts.lock().expect("contexts").len(), 4);
+}
+
+#[tokio::test]
+async fn immediate_overflow_recovers_twice_then_closes_without_appending_attempts() {
+    let overflow = || {
+        output(assistant(
+            StopReason::Error,
+            Vec::new(),
+            Some("maximum context length exceeded"),
+            Some("context_length_exceeded"),
+        ))
+    };
+    let recovered_one = recovered_context("one");
+    let recovered_two = recovered_context("two");
+    let driver = Arc::new(
+        FixtureDriver::new(vec![overflow(), overflow(), overflow()])
+            .with_context_window(100)
+            .with_overflow_contexts(vec![recovered_one.clone(), recovered_two.clone()]),
+    );
+    let (completion, events) = run_fixture(driver.clone()).await;
+    let core = match completion {
+        RunCompletion::Completed(core) => core,
+        RunCompletion::Failed { failure, .. } => panic!("unexpected failure: {failure}"),
+    };
+    let recoveries = driver
+        .overflow_recoveries
+        .lock()
+        .expect("overflow recoveries");
+    assert_eq!(
+        *recoveries,
+        vec![
+            OverflowRecoveryRequest {
+                source: OverflowSource::ProviderCode,
+                ordinal: 1,
+            },
+            OverflowRecoveryRequest {
+                source: OverflowSource::ProviderCode,
+                ordinal: 2,
+            },
+        ]
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::RetryScheduled { delay_ms: 0, .. }))
+            .count(),
+        2
+    );
+    assert_eq!(driver.started_contexts.lock().expect("contexts").len(), 3);
+    assert_eq!(core.runtime_context, recovered_two);
+    let contexts = driver.started_contexts.lock().expect("contexts");
+    assert_eq!(contexts[1], recovered_one);
+    assert_eq!(contexts[2], recovered_two);
+    assert!(matches!(events.last(), Some(AgentEvent::AgentEnd)));
+}
+
+#[tokio::test]
+async fn failed_or_noop_overflow_recovery_closes_normally_without_scheduling_retry() {
+    for replacement in [None, Some(vec![runtime_user(1)])] {
+        let mut fixture = FixtureDriver::new(vec![
+            output(assistant(
+                StopReason::Error,
+                Vec::new(),
+                Some("maximum context length exceeded"),
+                Some("context_length_exceeded"),
+            )),
+            output(assistant(StopReason::Stop, Vec::new(), None, None)),
+        ])
+        .with_context_window(100);
+        if let Some(replacement) = replacement {
+            fixture = fixture.with_overflow_contexts(vec![replacement]);
+        }
+        let driver = Arc::new(fixture);
+        let (completion, events) = run_fixture(driver.clone()).await;
+        assert_completed(completion);
+        assert_eq!(driver.started_contexts.lock().expect("contexts").len(), 1);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::RetryScheduled { .. }))
+        );
+        let error_end = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    AgentEvent::MessageEnd { message, .. }
+                        if matches!(message.as_ref(), PublicMessage::Assistant(assistant)
+                            if assistant.stop_reason == StopReason::Error)
+                )
+            })
+            .expect("overflow error MessageEnd");
+        assert!(matches!(
+            events.get(error_end + 1),
+            Some(AgentEvent::TurnEnd { .. })
+        ));
+        assert!(matches!(
+            events.get(error_end + 2),
+            Some(AgentEvent::AgentEnd)
+        ));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::TurnEnd { .. }))
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn length_usage_overflow_recovers_before_any_tool_or_context_append() {
+    let length = assistant_with_usage(
+        StopReason::Length,
+        vec![AssistantContent::ToolCall {
+            tool_call: call("incomplete"),
+            wire_item_index: 0,
+        }],
+        None,
+        None,
+        99,
+        0,
+    );
+    let recovered = recovered_context("length");
+    let driver = Arc::new(
+        FixtureDriver::new(vec![
+            output(length),
+            output(assistant(StopReason::Stop, Vec::new(), None, None)),
+        ])
+        .with_context_window(100)
+        .with_overflow_contexts(vec![recovered.clone()]),
+    );
+    let (completion, events) = run_fixture(driver.clone()).await;
+    assert_completed(completion);
+    assert_eq!(
+        *driver
+            .overflow_recoveries
+            .lock()
+            .expect("overflow recoveries"),
+        vec![OverflowRecoveryRequest {
+            source: OverflowSource::LengthUsage,
+            ordinal: 1,
+        }]
+    );
+    assert!(driver.tool_order.lock().expect("tools").is_empty());
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolExecutionStart { .. } | AgentEvent::ToolExecutionEnd { .. }
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::MessageEnd { message, .. }
+            if matches!(message.as_ref(), PublicMessage::ToolResult(_))
+    )));
+    let contexts = driver.started_contexts.lock().expect("contexts");
+    assert_eq!(contexts.len(), 2);
+    assert_eq!(
+        contexts[1], recovered,
+        "next attempt uses recovered context"
+    );
+
+    let overflow_end = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                AgentEvent::MessageEnd { message, .. }
+                    if matches!(message.as_ref(), PublicMessage::Assistant(assistant)
+                        if assistant.stop_reason == StopReason::Error
+                            && assistant.provider_code.as_deref() == Some(LENGTH_OVERFLOW_CODE)
+                            && assistant.error_message.as_deref() == Some(LENGTH_OVERFLOW_ERROR)
+                            && assistant.usage.input == 99
+                            && assistant.usage.output == 0
+                            && assistant.content.iter().any(|content| matches!(
+                                content,
+                                PublicAssistantContent::ToolCall { tool_call, .. }
+                                    if tool_call.id == "incomplete"
+                            )))
+            )
+        })
+        .expect("normalized LengthUsage error MessageEnd");
+    assert!(matches!(
+        events.get(overflow_end + 1),
+        Some(AgentEvent::RetryScheduled { delay_ms: 0, .. })
+    ));
+}
+
+#[tokio::test]
+async fn length_usage_recovery_resets_the_consecutive_bulk_failure_guard() {
+    let ordinary_length = || {
+        output(assistant(
+            StopReason::Length,
+            vec![AssistantContent::ToolCall {
+                tool_call: call("ordinary"),
+                wire_item_index: 0,
+            }],
+            None,
+            None,
+        ))
+    };
+    let overflow_length = output(assistant_with_usage(
+        StopReason::Length,
+        vec![AssistantContent::ToolCall {
+            tool_call: call("overflow"),
+            wire_item_index: 0,
+        }],
+        None,
+        None,
+        99,
+        0,
+    ));
+    let driver = Arc::new(
+        FixtureDriver::new(vec![
+            ordinary_length(),
+            overflow_length,
+            ordinary_length(),
+            output(assistant(StopReason::Stop, Vec::new(), None, None)),
+        ])
+        .with_context_window(100)
+        .with_overflow_contexts(vec![recovered_context("guard reset")]),
+    );
+    let (completion, events) = run_fixture(driver.clone()).await;
+    assert_completed(completion);
+    assert_eq!(driver.started_contexts.lock().expect("contexts").len(), 4);
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::MessageEnd { message, .. }
+            if matches!(message.as_ref(), PublicMessage::ToolResult(result)
+                if result.content.iter().any(|content| matches!(content,
+                    UserContent::Text { text } if text.contains(LENGTH_LOOP_FAILURE))))
+    )));
+}
+
+#[tokio::test]
+async fn successful_stop_overflow_returns_a_typed_deferred_apply_marker() {
+    let stop = assistant_with_usage(StopReason::Stop, Vec::new(), None, None, 101, 1);
+    let driver = Arc::new(FixtureDriver::new(vec![output(stop)]).with_context_window(100));
+    let (completion, _) = run_fixture(driver).await;
+    let core = match completion {
+        RunCompletion::Completed(core) => core,
+        RunCompletion::Failed { failure, .. } => panic!("unexpected failure: {failure}"),
+    };
+    assert_eq!(
+        core.pending_overflow_apply(),
+        Some(OverflowSource::StopUsage)
+    );
+    assert_eq!(core.runtime_context.len(), 2, "successful Stop is retained");
+}
+
+#[tokio::test]
+async fn retryable_error_breaks_the_consecutive_length_guard() {
+    let length = || {
+        output(assistant(
+            StopReason::Length,
+            vec![AssistantContent::ToolCall {
+                tool_call: call("truncated"),
+                wire_item_index: 0,
+            }],
+            None,
+            None,
+        ))
+    };
+    let driver = Arc::new(FixtureDriver::new(vec![
+        length(),
+        output(assistant(
+            StopReason::Error,
+            Vec::new(),
+            Some("network error"),
+            Some("network_error"),
+        )),
+        length(),
+        output(assistant(StopReason::Stop, Vec::new(), None, None)),
+    ]));
+    let (completion, events) = run_fixture(driver.clone()).await;
+    assert_completed(completion);
+    assert_eq!(driver.started_contexts.lock().expect("contexts").len(), 4);
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::MessageEnd { message, .. }
+            if matches!(message.as_ref(), PublicMessage::ToolResult(result)
+                if result.content.iter().any(|content| matches!(content,
+                    UserContent::Text { text } if text.contains(LENGTH_LOOP_FAILURE))))
+    )));
 }
