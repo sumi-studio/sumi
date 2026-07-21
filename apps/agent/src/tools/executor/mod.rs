@@ -2,9 +2,12 @@
 
 #![cfg(target_os = "linux")]
 
+mod artifact_broker;
 mod protocol;
 
 // The service and broker slices consume these stable contracts later in T13.
+#[allow(unused_imports)]
+pub use artifact_broker::{ArtifactBroker, ArtifactGrepMatch, ArtifactResponse};
 #[allow(unused_imports)]
 pub use protocol::{
     ArtifactOperation, ExecutorOperation, InputRoute, MAX_RPC_LINE_BYTES, MAX_RPC_READ_BYTES,
