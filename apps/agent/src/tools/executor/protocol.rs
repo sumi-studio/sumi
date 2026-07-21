@@ -165,6 +165,7 @@ pub enum ExecutorResponse {
     Artifact { response: ArtifactResponse },
     Bash { result: BashExecutionResult },
     CancelAccepted {},
+    CancelTooLate {},
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -470,6 +471,11 @@ impl RpcLifecycleTracker {
         Ok(())
     }
 
+    pub fn execution_is_completed(&self, execution_id: &str) -> bool {
+        self.completed_executions
+            .contains(&rpc_id_digest(execution_id))
+    }
+
     pub fn accept_update(&self, request_id: &str) -> Result<(), ToolError> {
         if self.active_requests.contains(request_id) {
             if self.active_cancel_requests.contains(request_id) {
@@ -598,6 +604,11 @@ fn validate_workspace_input(value: &str, field: &str) -> Result<(), ToolError> {
 fn validate_executor_execution_id(execution_id: &str) -> Result<(), ToolError> {
     validate_artifact_handle_component(execution_id)?;
     validate_rpc_id(execution_id, "execution_id")
+}
+
+pub(super) fn validate_conversation_id(conversation_id: &str) -> Result<(), ToolError> {
+    validate_artifact_handle_component(conversation_id)?;
+    validate_rpc_id(conversation_id, "conversation_id")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

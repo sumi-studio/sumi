@@ -19,7 +19,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::protocol::parse_artifact_handle;
+use super::protocol::{parse_artifact_handle, validate_conversation_id};
 use super::{
     ArtifactResponse, ExecutorOperation, ExecutorResponse, MAX_RPC_LINE_BYTES, RpcError, RpcFrame,
     RpcIdentity, RpcOperationValidation, RpcRequest, decode_rpc_frame,
@@ -67,14 +67,20 @@ impl Default for Deadlines {
 pub struct ExecutorClient {
     socket: PathBuf,
     identity: RpcIdentity,
+    conversation_id: String,
     deadlines: Deadlines,
 }
 
 impl ExecutorClient {
-    pub fn new(socket: impl Into<PathBuf>, identity: RpcIdentity) -> Self {
+    pub fn new(
+        socket: impl Into<PathBuf>,
+        identity: RpcIdentity,
+        conversation_id: impl Into<String>,
+    ) -> Self {
         Self {
             socket: socket.into(),
             identity,
+            conversation_id: conversation_id.into(),
             deadlines: Deadlines::default(),
         }
     }
@@ -89,6 +95,7 @@ impl ExecutorClient {
         cancel: CancellationToken,
         on_update: Arc<dyn Fn(Value) + Send + Sync>,
     ) -> Result<ExecutorResponse, ToolError> {
+        validate_conversation_id(&self.conversation_id)?;
         operation.validate()?;
         if matches!(operation, ExecutorOperation::Cancel { .. }) {
             return Err(ToolError::Protocol(
@@ -145,7 +152,7 @@ impl ExecutorClient {
         write_with_deadline(&mut write, &encoded, self.deadlines.write, "request").await?;
 
         let mut cancel_request_id = None;
-        let mut cancel_terminal_seen = false;
+        let mut cancel_terminal = None;
         let mut original_terminal = None;
         let mut update_count = 0usize;
         let mut write_closed = false;
@@ -153,7 +160,7 @@ impl ExecutorClient {
 
         loop {
             if original_terminal.is_some()
-                && (cancel_request_id.is_none() || cancel_terminal_seen)
+                && (cancel_request_id.is_none() || cancel_terminal.is_some())
                 && !write_closed
             {
                 shutdown_with_deadline(&mut write, self.deadlines.write).await?;
@@ -228,20 +235,30 @@ impl ExecutorClient {
                             if original_terminal.is_some() {
                                 return Err(indeterminate("executor emitted duplicate operation terminal"));
                             }
-                            let response = result.map_err(map_rpc_error);
+                            let response = result.map_err(|error| map_rpc_error(&operation, error));
                             if let Ok(response) = &response {
-                                validate_response(&operation, response).map_err(as_indeterminate)?;
+                                validate_response_for_conversation(
+                                    &operation,
+                                    response,
+                                    &self.conversation_id,
+                                )
+                                    .map_err(as_indeterminate)?;
                             }
                             original_terminal = Some(response);
                         }
                         RpcFrame::Terminal { request_id: frame_id, result, .. }
                             if cancel_request_id.as_deref() == Some(frame_id.as_str()) =>
                         {
-                            if cancel_terminal_seen {
+                            if cancel_terminal.is_some() {
                                 return Err(indeterminate("executor emitted duplicate cancel terminal"));
                             }
                             match result {
-                                Ok(ExecutorResponse::CancelAccepted {}) => cancel_terminal_seen = true,
+                                Ok(ExecutorResponse::CancelAccepted {}) => {
+                                    cancel_terminal = Some(CancelTerminal::Accepted)
+                                }
+                                Ok(ExecutorResponse::CancelTooLate {}) => {
+                                    cancel_terminal = Some(CancelTerminal::TooLate)
+                                }
                                 _ => return Err(indeterminate("executor rejected or malformed cancellation")),
                             }
                         }
@@ -260,16 +277,7 @@ impl ExecutorClient {
                 "non-bash executor cancellation cannot prove synchronous side effects stopped",
             ));
         }
-        if cancel_terminal_seen
-            && matches!(
-                &result,
-                Ok(ExecutorResponse::Bash { result }) if !result.cancelled
-            )
-        {
-            return Err(indeterminate(
-                "executor acknowledged cancellation but returned cancelled=false",
-            ));
-        }
+        validate_cancel_settlement(cancel_terminal, &result)?;
         result
     }
 
@@ -278,6 +286,36 @@ impl ExecutorClient {
         self.deadlines = deadlines;
         self
     }
+}
+
+fn validate_cancel_settlement(
+    cancel_terminal: Option<CancelTerminal>,
+    result: &Result<ExecutorResponse, ToolError>,
+) -> Result<(), ToolError> {
+    match (cancel_terminal, result) {
+        (Some(CancelTerminal::Accepted), Ok(ExecutorResponse::Bash { result }))
+            if result.cancelled => {}
+        (Some(CancelTerminal::TooLate), Ok(ExecutorResponse::Bash { result }))
+            if !result.cancelled => {}
+        (Some(CancelTerminal::Accepted), _) => {
+            return Err(indeterminate(
+                "executor acknowledged cancellation without cancelled=true",
+            ));
+        }
+        (Some(CancelTerminal::TooLate), _) => {
+            return Err(indeterminate(
+                "executor reported cancel-too-late without a completed Bash result",
+            ));
+        }
+        (None, _) => {}
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum CancelTerminal {
+    Accepted,
+    TooLate,
 }
 
 fn encode_request(
@@ -390,9 +428,10 @@ fn operation_execution_id(operation: &ExecutorOperation) -> &str {
     }
 }
 
-fn validate_response(
+fn validate_response_for_conversation(
     operation: &ExecutorOperation,
     response: &ExecutorResponse,
+    conversation_id: &str,
 ) -> Result<(), ToolError> {
     let valid = match (operation, response) {
         (
@@ -423,12 +462,15 @@ fn validate_response(
         (ExecutorOperation::Glob { .. }, ExecutorResponse::Globbed { paths }) => {
             paths.len() <= MAX_SCAN_ENTRIES && paths.iter().all(|path| valid_relative_path(path))
         }
-        (ExecutorOperation::Bash { .. }, ExecutorResponse::Bash { result }) => {
+        (ExecutorOperation::Bash { execution_id, .. }, ExecutorResponse::Bash { result }) => {
             result.is_consistent()
-                && result
-                    .artifact_handle
-                    .as_deref()
-                    .is_none_or(|handle| parse_artifact_handle(handle).is_ok())
+                && result.artifact_handle.as_deref().is_none_or(|handle| {
+                    parse_artifact_handle(handle).is_ok_and(|parsed| {
+                        parsed.kind == super::protocol::ArtifactKind::ToolOutput
+                            && parsed.artifact_id == execution_id
+                            && parsed.conversation_id == conversation_id
+                    })
+                })
         }
         _ => false,
     };
@@ -439,6 +481,14 @@ fn validate_response(
             "executor returned a response for a different operation".to_owned(),
         ))
     }
+}
+
+#[cfg(test)]
+fn validate_response(
+    operation: &ExecutorOperation,
+    response: &ExecutorResponse,
+) -> Result<(), ToolError> {
+    validate_response_for_conversation(operation, response, "conversation-1")
 }
 
 fn read_file_result_within_limit(
@@ -474,14 +524,12 @@ fn valid_grep_line(line: &str, line_truncated: bool) -> bool {
             || (chars == GREP_MAX_LINE_LENGTH && line.ends_with(GREP_TRUNCATION_SUFFIX)))
 }
 
-fn serialized_matches_are_bounded<T: serde::Serialize>(matches: &[T]) -> bool {
-    matches.len() <= MAX_GREP_MATCHES
-        && serde_json::to_vec(matches)
-            .is_ok_and(|encoded| encoded.len() <= MAX_GREP_SERIALIZED_BYTES)
-}
-
 fn workspace_grep_matches_are_bounded(matches: &[GrepMatch]) -> bool {
-    serialized_matches_are_bounded(matches)
+    matches.len() <= MAX_GREP_MATCHES
+        && serde_json::to_vec(&ExecutorResponse::Grepped {
+            matches: matches.to_vec(),
+        })
+        .is_ok_and(|encoded| encoded.len() <= MAX_GREP_SERIALIZED_BYTES)
         && matches.iter().all(|item| {
             item.line_number > 0
                 && valid_relative_path(&item.path)
@@ -492,23 +540,36 @@ fn workspace_grep_matches_are_bounded(matches: &[GrepMatch]) -> bool {
 fn artifact_grep_matches_are_bounded(
     matches: &[crate::tools::executor::ArtifactGrepMatch],
 ) -> bool {
-    serialized_matches_are_bounded(matches)
+    matches.len() <= MAX_GREP_MATCHES
+        && serde_json::to_vec(&ArtifactResponse::Grep {
+            matches: matches.to_vec(),
+        })
+        .is_ok_and(|encoded| encoded.len() <= MAX_GREP_SERIALIZED_BYTES)
         && matches
             .iter()
             .all(|item| item.line_number > 0 && valid_grep_line(&item.line, item.line_truncated))
 }
 
-fn map_rpc_error(error: RpcError) -> ToolError {
+fn map_rpc_error(operation: &ExecutorOperation, error: RpcError) -> ToolError {
+    let mutating = matches!(
+        operation,
+        ExecutorOperation::WriteFile { .. }
+            | ExecutorOperation::EditFile { .. }
+            | ExecutorOperation::RemoveFile { .. }
+    );
     match (error.code.as_str(), error.resource_limit) {
         ("resource_limit", Some(limit)) => ToolError::ResourceLimit(limit),
-        ("cancelled", None) => ToolError::Cancelled,
+        ("cancelled", None) if !mutating => ToolError::Cancelled,
         ("invalid_arguments", None) => ToolError::InvalidArguments,
         ("invalid_path", None) => ToolError::InvalidPath("executor path rejected".to_owned()),
-        ("io", None) => ToolError::Rpc("executor I/O operation failed".to_owned()),
+        ("protocol", None) => ToolError::Protocol("executor rejected request".to_owned()),
         ("rpc_indeterminate", None) => {
             ToolError::RpcIndeterminate("executor reported an indeterminate outcome".to_owned())
         }
-        ("protocol", None) => ToolError::Protocol("executor rejected request".to_owned()),
+        ("io", None) if !mutating => ToolError::Rpc("executor I/O operation failed".to_owned()),
+        (_, _) if mutating => ToolError::RpcIndeterminate(
+            "executor mutating operation failed after request emission".to_owned(),
+        ),
         (_, _) => ToolError::Rpc("executor operation failed".to_owned()),
     }
 }
@@ -617,7 +678,8 @@ mod tests {
     async fn real_service_success_and_ordered_updates() {
         let root = temp_root("success-updates");
         let (socket, service) = spawn_real_service(&root, 2);
-        let client = ExecutorClient::new(&socket, identity()).with_deadlines(test_deadlines());
+        let client = ExecutorClient::new(&socket, identity(), "conversation-1")
+            .with_deadlines(test_deadlines());
         let response = client
             .execute(
                 write_operation("write-1", "written.txt", "content"),
@@ -655,7 +717,10 @@ mod tests {
             .iter()
             .filter_map(|value| value.get("output").and_then(Value::as_str))
             .collect::<String>();
-        assert_eq!(streamed, "firstsecond");
+        assert!(
+            "firstsecond".starts_with(&streamed),
+            "delivered updates were not an ordered prefix: {streamed:?}"
+        );
         service.await.unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -664,7 +729,8 @@ mod tests {
     async fn real_service_cancellation_waits_for_ack_and_terminal() {
         let root = temp_root("cancel");
         let (socket, service) = spawn_real_service(&root, 1);
-        let client = ExecutorClient::new(&socket, identity()).with_deadlines(test_deadlines());
+        let client = ExecutorClient::new(&socket, identity(), "conversation-1")
+            .with_deadlines(test_deadlines());
         let cancel = CancellationToken::new();
         let trigger = cancel.clone();
         tokio::spawn(async move {
@@ -695,8 +761,10 @@ mod tests {
     async fn concurrent_clients_remain_execution_isolated() {
         let root = temp_root("concurrent");
         let (socket, service) = spawn_real_service(&root, 2);
-        let first = ExecutorClient::new(&socket, identity()).with_deadlines(test_deadlines());
-        let second = ExecutorClient::new(&socket, identity()).with_deadlines(test_deadlines());
+        let first = ExecutorClient::new(&socket, identity(), "conversation-1")
+            .with_deadlines(test_deadlines());
+        let second = ExecutorClient::new(&socket, identity(), "conversation-1")
+            .with_deadlines(test_deadlines());
         let (first, second) = tokio::join!(
             first.execute(
                 write_operation("execution-a", "a.txt", "alpha"),
@@ -752,7 +820,7 @@ mod tests {
                 )
                 .await;
             });
-            let error = ExecutorClient::new(&socket, identity())
+            let error = ExecutorClient::new(&socket, identity(), "conversation-1")
                 .with_deadlines(test_deadlines())
                 .execute(
                     write_operation("wrong-frame", "x", "x"),
@@ -944,19 +1012,33 @@ mod tests {
                 line: String::new(),
                 line_truncated: false,
             });
-            if serde_json::to_vec(&candidate).unwrap().len() > MAX_GREP_SERIALIZED_BYTES {
+            if serde_json::to_vec(&ExecutorResponse::Grepped {
+                matches: candidate.clone(),
+            })
+            .unwrap()
+            .len()
+                > MAX_GREP_SERIALIZED_BYTES
+            {
                 break;
             }
             matches = candidate;
         }
-        let current = serde_json::to_vec(&matches).unwrap().len();
+        let current = serde_json::to_vec(&ExecutorResponse::Grepped {
+            matches: matches.clone(),
+        })
+        .unwrap()
+        .len();
         matches
             .last_mut()
             .unwrap()
             .path
             .push_str(&"a".repeat(MAX_GREP_SERIALIZED_BYTES - current));
         assert_eq!(
-            serde_json::to_vec(&matches).unwrap().len(),
+            serde_json::to_vec(&ExecutorResponse::Grepped {
+                matches: matches.clone(),
+            })
+            .unwrap()
+            .len(),
             MAX_GREP_SERIALIZED_BYTES
         );
         assert!(
@@ -1059,6 +1141,25 @@ mod tests {
             .is_err()
         );
 
+        for handle in [
+            "artifact://conversation-2/tool-output/bash-bounds",
+            "artifact://conversation-1/attachments/bash-bounds",
+            "artifact://conversation-1/tool-output/other-execution",
+        ] {
+            let mut wrong_claim = result.clone();
+            wrong_claim.artifact_handle = Some(handle.to_owned());
+            assert!(
+                validate_response(
+                    &operation,
+                    &ExecutorResponse::Bash {
+                        result: wrong_claim,
+                    },
+                )
+                .is_err(),
+                "accepted wrong artifact claim: {handle}"
+            );
+        }
+
         let mut contradictory = result;
         contradictory.cancelled = true;
         contradictory.resource_limit = Some(crate::tools::ResourceLimit::OutputBytes {
@@ -1074,6 +1175,89 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn cancellation_terminal_matches_physical_bash_result() {
+        let completed = ExecutorResponse::Bash {
+            result: crate::tools::bash::BashExecutionResult {
+                output: "done".to_owned(),
+                truncation: crate::tools::truncate::truncate_tail("done", Default::default()),
+                artifact_handle: None,
+                observed_bytes: 4,
+                exit_code: Some(0),
+                cancelled: false,
+                resource_limit: None,
+            },
+        };
+        assert!(
+            validate_cancel_settlement(Some(CancelTerminal::TooLate), &Ok(completed.clone()))
+                .is_ok()
+        );
+        assert!(
+            validate_cancel_settlement(Some(CancelTerminal::Accepted), &Ok(completed)).is_err()
+        );
+
+        let cancelled = ExecutorResponse::Bash {
+            result: crate::tools::bash::BashExecutionResult {
+                output: String::new(),
+                truncation: crate::tools::truncate::truncate_tail("", Default::default()),
+                artifact_handle: None,
+                observed_bytes: 0,
+                exit_code: None,
+                cancelled: true,
+                resource_limit: None,
+            },
+        };
+        assert!(
+            validate_cancel_settlement(Some(CancelTerminal::Accepted), &Ok(cancelled.clone()))
+                .is_ok()
+        );
+        assert!(validate_cancel_settlement(Some(CancelTerminal::TooLate), &Ok(cancelled)).is_err());
+        assert!(
+            validate_cancel_settlement(
+                Some(CancelTerminal::TooLate),
+                &Err(ToolError::RpcIndeterminate("reap".to_owned())),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn mutating_rpc_errors_preserve_unproven_side_effect_ambiguity() {
+        let mutation = write_operation("mapping", "note.txt", "content");
+        for code in ["io", "rpc", "cancelled", "future_error"] {
+            assert!(matches!(
+                map_rpc_error(
+                    &mutation,
+                    RpcError {
+                        code: code.to_owned(),
+                        resource_limit: None,
+                    },
+                ),
+                ToolError::RpcIndeterminate(_)
+            ));
+        }
+        assert!(matches!(
+            map_rpc_error(
+                &mutation,
+                RpcError {
+                    code: "invalid_path".to_owned(),
+                    resource_limit: None,
+                },
+            ),
+            ToolError::InvalidPath(_)
+        ));
+        assert!(matches!(
+            map_rpc_error(
+                &mutation,
+                RpcError {
+                    code: "protocol".to_owned(),
+                    resource_limit: None,
+                },
+            ),
+            ToolError::Protocol(_)
+        ));
     }
 
     #[test]
@@ -1116,7 +1300,7 @@ mod tests {
             let mut deadlines = test_deadlines();
             deadlines.frame = Duration::from_millis(80);
             deadlines.overall = Duration::from_millis(250);
-            let error = ExecutorClient::new(&socket, identity())
+            let error = ExecutorClient::new(&socket, identity(), "conversation-1")
                 .with_deadlines(deadlines)
                 .execute(
                     write_operation("bad-reply", "x", "x"),
@@ -1157,7 +1341,7 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         // A token cancelled before emission must produce no service contact.
-        let pre = ExecutorClient::new(&socket, identity())
+        let pre = ExecutorClient::new(&socket, identity(), "conversation-1")
             .with_deadlines(test_deadlines())
             .execute(write_operation("pre", "x", "x"), cancel, Arc::new(|_| {}))
             .await;
@@ -1169,7 +1353,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
             trigger.cancel();
         });
-        let error = ExecutorClient::new(&socket, identity())
+        let error = ExecutorClient::new(&socket, identity(), "conversation-1")
             .with_deadlines(test_deadlines())
             .execute(
                 ExecutorOperation::Bash {
@@ -1222,7 +1406,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
             trigger.cancel();
         });
-        let error = ExecutorClient::new(&socket, identity())
+        let error = ExecutorClient::new(&socket, identity(), "conversation-1")
             .with_deadlines(test_deadlines())
             .execute(
                 write_operation("sync-side-effect", "x", "x"),
@@ -1238,7 +1422,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_ack_with_uncancelled_bash_terminal_is_indeterminate() {
+    async fn cancel_too_late_returns_the_authoritative_completed_bash_result() {
         let root = temp_root("cancel-false");
         let socket = root.join("executor.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -1254,7 +1438,7 @@ mod tests {
                 json!({
                     "type":"terminal", "generation":7, "nonce":"boot-nonce",
                     "request_id":cancel["request_id"],
-                    "result":{"Ok":{"type":"cancel_accepted"}}
+                    "result":{"Ok":{"type":"cancel_too_late"}}
                 }),
             )
             .await;
@@ -1278,7 +1462,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
             trigger.cancel();
         });
-        let error = ExecutorClient::new(&socket, identity())
+        let response = ExecutorClient::new(&socket, identity(), "conversation-1")
             .with_deadlines(test_deadlines())
             .execute(
                 ExecutorOperation::Bash {
@@ -1289,9 +1473,12 @@ mod tests {
                 Arc::new(|_| {}),
             )
             .await
-            .unwrap_err();
-        assert!(matches!(error, ToolError::RpcIndeterminate(message)
-            if message.contains("cancelled=false")));
+            .unwrap();
+        assert!(matches!(
+            response,
+            ExecutorResponse::Bash { result }
+                if !result.cancelled && result.exit_code == Some(0) && result.output == "done"
+        ));
         server.await.unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }

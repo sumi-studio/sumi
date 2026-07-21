@@ -40,7 +40,12 @@ const UPDATE_CHANNEL_CAPACITY: usize = 32;
 const BROKER_CONNECTION_CAPACITY: usize = 32;
 const BROKER_BLOCKING_WORK_CAPACITY: usize = 8;
 const BROKER_EXCHANGE_DEADLINE: Duration = Duration::from_secs(2);
-const EXECUTOR_WRITE_DEADLINE: Duration = Duration::from_millis(100);
+const EXECUTOR_UPDATE_WRITE_DEADLINE: Duration = Duration::from_millis(5);
+const EXECUTOR_TERMINAL_WRITE_DEADLINE: Duration = Duration::from_secs(2);
+// Service stdout is a nonblocking pipe in production. Keeping each volatile
+// update within PIPE_BUF makes a timed-out write all-or-nothing, so dropping
+// progress can never leave a partial JSON frame ahead of the terminal.
+const MAX_ATOMIC_UPDATE_FRAME_BYTES: usize = 4_096;
 const EXECUTOR_REAP_DEADLINE: Duration = Duration::from_secs(2);
 type BashUpdateCallback = Arc<dyn Fn(Value) + Send + Sync>;
 
@@ -54,7 +59,6 @@ enum ActiveControl {
 
 enum BashExit {
     Completed(Result<BashExecutionResult, ToolError>),
-    UpdateOverflow,
     Cancelled {
         cancel_request_id: String,
         completed: Option<Result<BashExecutionResult, ToolError>>,
@@ -72,8 +76,8 @@ struct WriterMessage {
 }
 
 struct ExecutorWriter {
-    sender: mpsc::Sender<WriterMessage>,
-    failed: CancellationToken,
+    updates: mpsc::Sender<WriterMessage>,
+    terminals: mpsc::Sender<WriterMessage>,
 }
 
 struct NonblockingStdout {
@@ -179,12 +183,35 @@ impl ExecutorWriter {
     where
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let (sender, mut receiver) = mpsc::channel::<WriterMessage>(UPDATE_CHANNEL_CAPACITY);
-        let failed = CancellationToken::new();
-        let failed_task = failed.clone();
+        let (updates, mut update_receiver) =
+            mpsc::channel::<WriterMessage>(UPDATE_CHANNEL_CAPACITY);
+        // Progress is volatile. A dedicated terminal slot ensures queued
+        // progress can never consume the capacity needed by authoritative
+        // completion.
+        let (terminals, mut terminal_receiver) = mpsc::channel::<WriterMessage>(1);
         let task = tokio::spawn(async move {
-            while let Some(message) = receiver.recv().await {
-                let result = match timeout(EXECUTOR_WRITE_DEADLINE, async {
+            let mut terminal_started = false;
+            loop {
+                let message = if terminal_started {
+                    terminal_receiver.recv().await
+                } else {
+                    tokio::select! {
+                        biased;
+                        message = terminal_receiver.recv() => message,
+                        message = update_receiver.recv() => message,
+                    }
+                };
+                let Some(message) = message else {
+                    return;
+                };
+                let terminal = message.acknowledgement.is_some();
+                terminal_started |= terminal;
+                let deadline = if terminal {
+                    EXECUTOR_TERMINAL_WRITE_DEADLINE
+                } else {
+                    EXECUTOR_UPDATE_WRITE_DEADLINE
+                };
+                let result = match timeout(deadline, async {
                     write.write_all(&message.bytes).await?;
                     write.flush().await
                 })
@@ -198,22 +225,44 @@ impl ExecutorWriter {
                     let _ = acknowledgement.send(result.clone());
                 }
                 if result.is_err() {
-                    failed_task.cancel();
-                    return;
+                    if terminal {
+                        return;
+                    }
+                    tracing::warn!("dropping volatile executor progress update: write unavailable");
                 }
             }
         });
-        (Self { sender, failed }, task)
+        (Self { updates, terminals }, task)
     }
 
     fn try_update<T: Serialize>(&self, frame: &RpcFrame<T>) -> Result<(), ToolError> {
-        let bytes = encode_rpc_frame(frame)?;
-        self.sender
-            .try_send(WriterMessage {
-                bytes,
-                acknowledgement: None,
-            })
-            .map_err(|_| io_error("executor output queue unavailable"))
+        let bytes = match encode_rpc_frame(frame) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(error = %error, "dropping volatile executor progress update: encode failed");
+                return Ok(());
+            }
+        };
+        if bytes.len() > MAX_ATOMIC_UPDATE_FRAME_BYTES {
+            tracing::warn!(
+                "dropping volatile executor progress update: frame exceeds atomic pipe write"
+            );
+            return Ok(());
+        }
+        match self.updates.try_send(WriterMessage {
+            bytes,
+            acknowledgement: None,
+        }) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!("dropping volatile executor progress update: writer queue full");
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::warn!("dropping volatile executor progress update: writer unavailable");
+                Ok(())
+            }
+        }
     }
 
     async fn terminal(
@@ -242,8 +291,8 @@ impl ExecutorWriter {
         };
         let (acknowledgement, received) = oneshot::channel();
         timeout(
-            EXECUTOR_WRITE_DEADLINE,
-            self.sender.send(WriterMessage {
+            EXECUTOR_TERMINAL_WRITE_DEADLINE,
+            self.terminals.send(WriterMessage {
                 bytes,
                 acknowledgement: Some(acknowledgement),
             }),
@@ -251,7 +300,7 @@ impl ExecutorWriter {
         .await
         .map_err(|_| io_error("executor output queue deadline elapsed"))?
         .map_err(|_| io_error("executor output writer unavailable"))?;
-        timeout(EXECUTOR_WRITE_DEADLINE, received)
+        timeout(EXECUTOR_TERMINAL_WRITE_DEADLINE, received)
             .await
             .map_err(|_| io_error("executor terminal write deadline elapsed"))?
             .map_err(|_| io_error("executor output writer stopped"))?
@@ -434,7 +483,7 @@ where
     let (writer, writer_task) = ExecutorWriter::start(write);
     let result = run_executor_loop(read, &writer, identity, workspace, fs, broker).await;
     writer_task.abort();
-    let _ = timeout(EXECUTOR_WRITE_DEADLINE, writer_task).await;
+    let _ = timeout(EXECUTOR_TERMINAL_WRITE_DEADLINE, writer_task).await;
     result
 }
 
@@ -483,18 +532,19 @@ where
                 )
                 .await?;
             }
-            ExecutorOperation::Cancel { .. } => {
+            ExecutorOperation::Cancel { execution_id } => {
                 lifecycle.begin_request(&request.request_id)?;
                 lifecycle.accept_terminal(&request.request_id)?;
+                let result = if lifecycle.execution_is_completed(&execution_id) {
+                    Ok(ExecutorResponse::CancelTooLate {})
+                } else {
+                    Err(RpcError {
+                        code: "protocol".to_owned(),
+                        resource_limit: None,
+                    })
+                };
                 writer
-                    .terminal(
-                        &identity,
-                        request.request_id,
-                        Err(RpcError {
-                            code: "protocol".to_owned(),
-                            resource_limit: None,
-                        }),
-                    )
+                    .terminal(&identity, request.request_id, result)
                     .await?;
             }
             operation => {
@@ -526,7 +576,7 @@ where
     R: AsyncBufRead + Unpin,
 {
     let cancel = CancellationToken::new();
-    let (on_update, mut updates_rx, update_overflow) = bounded_bash_updates();
+    let (on_update, mut updates_rx) = bounded_bash_updates();
     let bash = LowTrustLocalBash::new(workspace.to_path_buf(), broker);
     let execution = bash.execute(&command, &execution_id, cancel.clone(), on_update);
     tokio::pin!(execution);
@@ -548,14 +598,6 @@ where
     let exit = loop {
         tokio::select! {
             biased;
-            _ = writer.failed.cancelled() => {
-                break BashExit::Fatal {
-                    error: io_error("executor output writer failed"),
-                    response: None,
-                    completed: None,
-                };
-            }
-            _ = update_overflow.cancelled() => break BashExit::UpdateOverflow,
             next = control_rx.recv(), if !control_reader_done || !control_rx.is_empty() => {
                 match classify_active_control(next, identity, &execution_id, lifecycle) {
                     ActiveControl::Cancel(cancel_request_id) => break BashExit::Cancelled {
@@ -571,9 +613,6 @@ where
             }
             _ = &mut control_reader, if !control_reader_done => control_reader_done = true,
             result = &mut execution => {
-                if update_overflow.is_cancelled() {
-                    break BashExit::UpdateOverflow;
-                }
                 match take_queued_control_after_completion(
                     &mut control_rx,
                     control_reader.as_mut(),
@@ -622,34 +661,6 @@ where
     };
 
     match exit {
-        BashExit::UpdateOverflow => {
-            cancel.cancel();
-            let cleanup_timed_out = timeout(EXECUTOR_REAP_DEADLINE, &mut execution)
-                .await
-                .is_err();
-            if cleanup_timed_out {
-                tracing::warn!(
-                    "executor update overflow cancellation exceeded its service deadline"
-                );
-            }
-            lifecycle.accept_terminal(&request_id)?;
-            writer
-                .terminal(
-                    identity,
-                    request_id,
-                    Err(rpc_error(ToolError::RpcIndeterminate(
-                        "executor update callback queue overflowed".to_owned(),
-                    ))),
-                )
-                .await?;
-            if cleanup_timed_out {
-                Err(anyhow::anyhow!(
-                    "executor update overflow cleanup was not proven"
-                ))
-            } else {
-                Ok(())
-            }
-        }
         BashExit::Fatal {
             error,
             response,
@@ -732,20 +743,24 @@ where
         } => {
             cancel.cancel();
             let result = match completed {
-                Some(result) => result.map(normalize_cancel_won_after_completion),
+                Some(result) => result,
                 None => match timeout(EXECUTOR_REAP_DEADLINE, &mut execution).await {
                     Ok(Ok(result)) => Ok(result),
-                    Ok(Err(reap_error)) => {
+                    Ok(Err(_reap_error)) => {
                         lifecycle.accept_terminal(&request_id)?;
                         writer
                             .terminal(
                                 identity,
                                 cancel_request_id,
-                                Ok(ExecutorResponse::CancelAccepted {}),
+                                Err(bounded_error("rpc_indeterminate")),
                             )
                             .await?;
                         writer
-                            .terminal(identity, request_id, Err(rpc_error(reap_error)))
+                            .terminal(
+                                identity,
+                                request_id,
+                                Err(bounded_error("rpc_indeterminate")),
+                            )
                             .await?;
                         return Err(anyhow::anyhow!(
                             "executor cancellation failed before cleanup was proven"
@@ -758,7 +773,7 @@ where
                             .terminal(
                                 identity,
                                 cancel_request_id,
-                                Ok(ExecutorResponse::CancelAccepted {}),
+                                Err(bounded_error("rpc_indeterminate")),
                             )
                             .await?;
                         writer
@@ -785,12 +800,13 @@ where
                 &mut updates_rx,
             )?;
             lifecycle.accept_terminal(&request_id)?;
+            let cancel_response = match &result {
+                Ok(result) if result.cancelled => Ok(ExecutorResponse::CancelAccepted {}),
+                Ok(_) => Ok(ExecutorResponse::CancelTooLate {}),
+                Err(_) => Err(bounded_error("rpc_indeterminate")),
+            };
             writer
-                .terminal(
-                    identity,
-                    cancel_request_id,
-                    Ok(ExecutorResponse::CancelAccepted {}),
-                )
+                .terminal(identity, cancel_request_id, cancel_response)
                 .await?;
             writer
                 .terminal(
@@ -806,25 +822,18 @@ where
     }
 }
 
-fn bounded_bash_updates() -> (BashUpdateCallback, mpsc::Receiver<Value>, CancellationToken) {
+fn bounded_bash_updates() -> (BashUpdateCallback, mpsc::Receiver<Value>) {
     let (updates_tx, updates_rx) = mpsc::channel::<Value>(UPDATE_CHANNEL_CAPACITY);
-    let overflow = CancellationToken::new();
-    let callback_overflow = overflow.clone();
-    let on_update = Arc::new(move |value| {
-        if updates_tx.try_send(value).is_err() {
-            callback_overflow.cancel();
+    let on_update = Arc::new(move |value| match updates_tx.try_send(value) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            tracing::warn!("dropping volatile executor progress update: callback queue full");
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            tracing::warn!("dropping volatile executor progress update: callback queue closed");
         }
     });
-    (on_update, updates_rx, overflow)
-}
-
-fn normalize_cancel_won_after_completion(mut result: BashExecutionResult) -> BashExecutionResult {
-    // The service settlement is cancelled because the queued Cancel won the
-    // final control poll. Preserve a completed process's exit status so this
-    // does not falsely claim that the process itself was interrupted.
-    result.cancelled = true;
-    result.resource_limit = None;
-    result
+    (on_update, updates_rx)
 }
 
 fn forward_bash_update(
@@ -1265,8 +1274,8 @@ mod tests {
     }
 
     #[test]
-    fn update_callback_burst_is_exact_or_marks_overflow() {
-        let (callback, mut receiver, overflow) = bounded_bash_updates();
+    fn update_callback_burst_drops_overflow_without_reordering_delivery() {
+        let (callback, mut receiver) = bounded_bash_updates();
         for index in 0..=UPDATE_CHANNEL_CAPACITY {
             callback(serde_json::json!({"index": index}));
         }
@@ -1275,27 +1284,17 @@ mod tests {
         assert_eq!(received.len(), UPDATE_CHANNEL_CAPACITY);
         assert_eq!(received[0]["index"], 0);
         assert_eq!(received[UPDATE_CHANNEL_CAPACITY - 1]["index"], 31);
-        assert!(
-            overflow.is_cancelled(),
-            "the 33rd callback must be observable"
-        );
     }
 
     #[test]
-    fn queued_cancel_marks_settlement_without_erasing_completed_exit() {
-        let completed = BashExecutionResult {
-            output: "done".to_owned(),
-            truncation: crate::tools::truncate::truncate_tail("done", Default::default()),
-            artifact_handle: None,
-            observed_bytes: 4,
-            exit_code: Some(0),
-            cancelled: false,
-            resource_limit: None,
-        };
-        let settled = normalize_cancel_won_after_completion(completed);
-        assert!(settled.cancelled);
-        assert_eq!(settled.exit_code, Some(0));
-        assert_eq!(settled.output, "done");
+    fn service_preserves_post_commit_indeterminate_error_code() {
+        assert_eq!(
+            rpc_error(ToolError::RpcIndeterminate(
+                "mutation committed before directory sync failed".to_owned(),
+            ))
+            .code,
+            "rpc_indeterminate"
+        );
     }
 
     #[tokio::test]
@@ -1353,40 +1352,26 @@ mod tests {
             .expect("write terminal");
 
         let mut read = BufReader::new(read_side);
-        let first = decode_rpc_frame::<ExecutorResponse>(
-            &read_frame(&mut read)
-                .await
-                .expect("read first frame")
-                .expect("first frame"),
-            &identity,
-        )
-        .expect("decode first frame");
-        let second = decode_rpc_frame::<ExecutorResponse>(
-            &read_frame(&mut read)
-                .await
-                .expect("read second frame")
-                .expect("second frame"),
-            &identity,
-        )
-        .expect("decode second frame");
-        let terminal = decode_rpc_frame::<ExecutorResponse>(
-            &read_frame(&mut read)
-                .await
-                .expect("read terminal frame")
-                .expect("terminal frame"),
-            &identity,
-        )
-        .expect("decode terminal frame");
-
-        let RpcFrame::Update { value: first, .. } = first else {
-            panic!("first frame was not an update");
-        };
-        let RpcFrame::Update { value: second, .. } = second else {
-            panic!("second frame was not an update");
-        };
-        assert_eq!(first["output"], "first");
-        assert_eq!(second["output"], "second");
-        assert!(matches!(terminal, RpcFrame::Terminal { .. }));
+        let mut delivered = Vec::new();
+        loop {
+            let frame = decode_rpc_frame::<ExecutorResponse>(
+                &read_frame(&mut read)
+                    .await
+                    .expect("read frame")
+                    .expect("frame"),
+                &identity,
+            )
+            .expect("decode frame");
+            match frame {
+                RpcFrame::Update { value, .. } => delivered.push(value["output"].clone()),
+                RpcFrame::Terminal { .. } => break,
+            }
+        }
+        assert!(
+            delivered == Vec::<Value>::new()
+                || delivered == vec![serde_json::json!("first")]
+                || delivered == vec![serde_json::json!("first"), serde_json::json!("second")]
+        );
         writer_task.abort();
     }
 
