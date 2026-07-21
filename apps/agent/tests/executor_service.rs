@@ -796,6 +796,7 @@ async fn queued_cancel_is_settled_before_simultaneous_bash_completion() {
     for iteration in 0..100 {
         let release = fixture.workspace.join(format!("release-{iteration}"));
         let ready = fixture.workspace.join(format!("ready-{iteration}"));
+        let pid_path = fixture.workspace.join(format!("pid-{iteration}"));
         let execution_id = format!("completion-race-{iteration}");
         send_request(
             &mut stdin,
@@ -803,7 +804,7 @@ async fn queued_cancel_is_settled_before_simultaneous_bash_completion() {
                 &format!("bash-{iteration}"),
                 json!({
                     "type":"bash",
-                    "command":format!("touch ready-{iteration}; while [ ! -e release-{iteration} ]; do :; done"),
+                    "command":format!("echo $$ > pid-{iteration}; touch ready-{iteration}; while [ ! -e release-{iteration} ]; do :; done"),
                     "execution_id":execution_id,
                 }),
             ),
@@ -819,6 +820,18 @@ async fn queued_cancel_is_settled_before_simultaneous_bash_completion() {
                 ),
             )
             .await;
+            let process_group = wait_for_nonempty_file(&pid_path)
+                .await
+                .trim()
+                .parse::<i32>()
+                .expect("bash process group id");
+            timeout(Duration::from_secs(5), async {
+                while process_group_exists(process_group) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancel must be ingested before release");
             std::fs::write(&release, b"release").unwrap();
         } else {
             std::fs::write(&release, b"release").unwrap();
@@ -844,15 +857,26 @@ async fn queued_cancel_is_settled_before_simultaneous_bash_completion() {
             .find(|frame| frame["request_id"] == format!("bash-{iteration}"))
             .unwrap_or_else(|| panic!("iteration {iteration}: {frames:?}"));
         let physically_cancelled = bash["result"]["Ok"]["result"]["cancelled"] == true;
-        assert_eq!(
-            cancel["result"]["Ok"]["type"],
-            if physically_cancelled {
-                "cancel_accepted"
-            } else {
-                "cancel_too_late"
-            },
-            "iteration {iteration}: {frames:?}"
-        );
+        if iteration % 2 == 0 {
+            // send_request fully writes and flushes Cancel before release is
+            // created, so this branch must be a physical cancellation rather
+            // than a completion race observed by the service.
+            assert!(physically_cancelled, "iteration {iteration}: {frames:?}");
+            assert_eq!(
+                cancel["result"]["Ok"]["type"], "cancel_accepted",
+                "iteration {iteration}: {frames:?}"
+            );
+        } else {
+            assert_eq!(
+                cancel["result"]["Ok"]["type"],
+                if physically_cancelled {
+                    "cancel_accepted"
+                } else {
+                    "cancel_too_late"
+                },
+                "iteration {iteration}: {frames:?}"
+            );
+        }
     }
     drop(stdin);
     assert!(child.wait().await.unwrap().success());

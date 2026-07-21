@@ -107,6 +107,10 @@ struct WriterMessage {
 struct ExecutorWriter {
     updates: mpsc::Sender<WriterMessage>,
     terminals: mpsc::Sender<WriterMessage>,
+    // A terminal ACK is the service's sequential exchange boundary. Hold this
+    // gate while admitting progress so no update can race the terminal fence
+    // after the writer has selected it.
+    terminal_started: Arc<Mutex<bool>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -241,6 +245,8 @@ impl ExecutorWriter {
         // progress can never consume the capacity needed by authoritative
         // completion.
         let (terminals, mut terminal_receiver) = mpsc::channel::<WriterMessage>(1);
+        let terminal_started = Arc::new(Mutex::new(false));
+        let writer_terminal_started = terminal_started.clone();
         let task = tokio::spawn(async move {
             let mut terminal_started = false;
             loop {
@@ -258,6 +264,13 @@ impl ExecutorWriter {
                 };
                 let terminal = message.acknowledgement.is_some();
                 terminal_started |= terminal;
+                if terminal {
+                    // Progress admitted before the terminal was selected is
+                    // volatile and must not be written after the authoritative
+                    // frame. New progress is blocked by the shared gate until
+                    // this terminal has been acknowledged.
+                    while update_receiver.try_recv().is_ok() {}
+                }
                 let deadline = if terminal {
                     EXECUTOR_TERMINAL_WRITE_DEADLINE
                 } else {
@@ -300,6 +313,15 @@ impl ExecutorWriter {
                         Err(_) => Err("executor output write deadline elapsed".to_owned()),
                     }
                 };
+                if terminal {
+                    // Re-enable progress before sending the ACK. The service
+                    // cannot begin its next request until that ACK is observed,
+                    // so no next-request update can be drained in this epoch.
+                    if let Ok(mut started) = writer_terminal_started.lock() {
+                        *started = false;
+                    }
+                    terminal_started = false;
+                }
                 if let Some(acknowledgement) = message.acknowledgement {
                     let _ = acknowledgement.send(result.clone());
                 }
@@ -323,7 +345,14 @@ impl ExecutorWriter {
                 }
             }
         });
-        (Self { updates, terminals }, task)
+        (
+            Self {
+                updates,
+                terminals,
+                terminal_started,
+            },
+            task,
+        )
     }
 
     fn try_update<T: Serialize>(&self, frame: &RpcFrame<T>) -> Result<(), ToolError> {
@@ -338,6 +367,14 @@ impl ExecutorWriter {
             tracing::warn!(
                 "dropping volatile executor progress update: frame exceeds atomic pipe write"
             );
+            return Ok(());
+        }
+        let terminal_started = self
+            .terminal_started
+            .lock()
+            .map_err(|_| ToolError::Protocol("executor writer state lock poisoned".to_owned()))?;
+        if *terminal_started {
+            tracing::warn!("dropping volatile executor progress update: terminal in flight");
             return Ok(());
         }
         match self.updates.try_send(WriterMessage {
@@ -381,7 +418,13 @@ impl ExecutorWriter {
             Err(error) => return Err(error),
         };
         let (acknowledgement, received) = oneshot::channel();
-        timeout(
+        {
+            let mut terminal_started = self.terminal_started.lock().map_err(|_| {
+                ToolError::Protocol("executor writer state lock poisoned".to_owned())
+            })?;
+            *terminal_started = true;
+        }
+        let sent = timeout(
             EXECUTOR_TERMINAL_WRITE_DEADLINE,
             self.terminals.send(WriterMessage {
                 bytes,
@@ -389,8 +432,14 @@ impl ExecutorWriter {
             }),
         )
         .await
-        .map_err(|_| io_error("executor output queue deadline elapsed"))?
-        .map_err(|_| io_error("executor output writer unavailable"))?;
+        .map_err(|_| io_error("executor output queue deadline elapsed"))
+        .and_then(|result| result.map_err(|_| io_error("executor output writer unavailable")));
+        if let Err(error) = sent {
+            if let Ok(mut terminal_started) = self.terminal_started.lock() {
+                *terminal_started = false;
+            }
+            return Err(error);
+        }
         timeout(EXECUTOR_TERMINAL_WRITE_DEADLINE, received)
             .await
             .map_err(|_| io_error("executor terminal write deadline elapsed"))?
@@ -1718,6 +1767,100 @@ mod tests {
                 || delivered == vec![serde_json::json!("first")]
                 || delivered == vec![serde_json::json!("first"), serde_json::json!("second")]
         );
+        writer_task.abort();
+    }
+
+    #[tokio::test]
+    async fn terminal_fence_drops_old_updates_and_reenables_next_exchange() {
+        let identity = RpcIdentity {
+            generation: 7,
+            nonce: "boot-nonce".to_owned(),
+        };
+        let (read_side, write_side) = tokio::io::duplex(4096);
+        let (writer, writer_task) = ExecutorWriter::start(write_side);
+
+        writer
+            .try_update(&RpcFrame::<ExecutorResponse>::Update {
+                generation: identity.generation,
+                nonce: identity.nonce.clone(),
+                request_id: "request-1".to_owned(),
+                value: serde_json::json!({"output": "stale"}),
+            })
+            .expect("queue stale progress");
+        timeout(
+            Duration::from_secs(1),
+            writer.terminal(
+                &identity,
+                "request-1".to_owned(),
+                Ok(ExecutorResponse::Written {}),
+            ),
+        )
+        .await
+        .expect("first terminal timeout")
+        .expect("write first terminal");
+
+        let mut read = BufReader::new(read_side);
+        let first = decode_rpc_frame::<ExecutorResponse>(
+            &read_frame(&mut read)
+                .await
+                .expect("read first frame")
+                .expect("first frame"),
+            &identity,
+        )
+        .expect("decode first frame");
+        assert!(matches!(
+            first,
+            RpcFrame::Terminal { request_id, .. } if request_id == "request-1"
+        ));
+
+        writer
+            .try_update(&RpcFrame::<ExecutorResponse>::Update {
+                generation: identity.generation,
+                nonce: identity.nonce.clone(),
+                request_id: "request-2".to_owned(),
+                value: serde_json::json!({"output": "fresh"}),
+            })
+            .expect("queue next-request progress");
+        let second = decode_rpc_frame::<ExecutorResponse>(
+            &read_frame(&mut read)
+                .await
+                .expect("read second frame")
+                .expect("second frame"),
+            &identity,
+        )
+        .expect("decode second frame");
+        assert!(matches!(
+            second,
+            RpcFrame::Update {
+                request_id,
+                value,
+                ..
+            } if request_id == "request-2" && value["output"] == "fresh"
+        ));
+
+        timeout(
+            Duration::from_secs(1),
+            writer.terminal(
+                &identity,
+                "request-2".to_owned(),
+                Ok(ExecutorResponse::Written {}),
+            ),
+        )
+        .await
+        .expect("second terminal timeout")
+        .expect("write second terminal");
+        let third = decode_rpc_frame::<ExecutorResponse>(
+            &read_frame(&mut read)
+                .await
+                .expect("read third frame")
+                .expect("third frame"),
+            &identity,
+        )
+        .expect("decode third frame");
+        assert!(matches!(
+            third,
+            RpcFrame::Terminal { request_id, .. } if request_id == "request-2"
+        ));
         writer_task.abort();
     }
 
