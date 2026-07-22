@@ -16,7 +16,7 @@ use super::*;
 use crate::{
     gateway::{CommandAck, CommandId},
     provider::types::{
-        ApiProtocol, AssistantContent, AssistantMessage, ProviderContextFragment,
+        ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, ProviderContextFragment,
         ProviderContextPayload, ProviderEvent, ProviderEventStream, ProviderOrigin, ProviderOutput,
         PublicAssistantContent, PublicAssistantMessage, PublicMessage, RejectedToolCall,
         StopReason, ToolArgumentError, ToolCall, ToolResultMessage, Usage, UserContent,
@@ -38,6 +38,15 @@ fn session_start_composition_boundary_requires_process_generation() {
     }
 
     assert_signature(Session::<MockGateway>::start);
+}
+
+fn synthetic_runtime_context(messages: Vec<PublicMessage>) -> Vec<ContextMessage> {
+    messages
+        .into_iter()
+        .map(|message| ContextMessage::Synthetic {
+            message: super::run::public_to_message(message),
+        })
+        .collect()
 }
 
 struct MockGateway {
@@ -539,11 +548,7 @@ impl RunWorker for StaleBindingWorker {
                 StaleBinding::PriorRun => {
                     binding.run_id = Uuid::now_v7().to_string();
                     events
-                        .send(RunOutput {
-                            binding,
-                            event: AgentEvent::AgentStart,
-                            commit_barrier: None,
-                        })
+                        .send(RunOutput::detached(binding, AgentEvent::AgentStart, None))
                         .await
                         .expect("session output receiver");
                 }
@@ -581,33 +586,25 @@ impl RunWorker for StaleBindingWorker {
                         },
                     ] {
                         events
-                            .send(RunOutput {
-                                binding: binding.clone(),
-                                event,
-                                commit_barrier: None,
-                            })
+                            .send(RunOutput::detached(binding.clone(), event, None))
                             .await
                             .expect("session output receiver");
                     }
                     let stale = binding.clone();
                     binding.turn_id = Uuid::now_v7().to_string();
                     events
-                        .send(RunOutput {
-                            binding,
-                            event: AgentEvent::TurnStart,
-                            commit_barrier: None,
-                        })
+                        .send(RunOutput::detached(binding, AgentEvent::TurnStart, None))
                         .await
                         .expect("new turn output");
                     events
-                        .send(RunOutput {
-                            binding: stale,
-                            event: AgentEvent::MessageStart {
+                        .send(RunOutput::detached(
+                            stale,
+                            AgentEvent::MessageStart {
                                 message_id: "stale-prior-turn-output".to_owned(),
                                 message: Box::new(bridge_assistant(StopReason::Stop)),
                             },
-                            commit_barrier: None,
-                        })
+                            None,
+                        ))
                         .await
                         .expect("stale turn output");
                 }
@@ -616,11 +613,7 @@ impl RunWorker for StaleBindingWorker {
                         ProcessGeneration::from_wire(binding.executor_generation.to_wire() + 1)
                             .expect("next test generation");
                     events
-                        .send(RunOutput {
-                            binding,
-                            event: AgentEvent::AgentStart,
-                            commit_barrier: None,
-                        })
+                        .send(RunOutput::detached(binding, AgentEvent::AgentStart, None))
                         .await
                         .expect("session output receiver");
                 }
@@ -1372,7 +1365,7 @@ async fn shutdown_drains_ready_completion_outputs_before_recovering_core_after_g
                 ] {
                     events.send(event).await.expect("session event receiver");
                 }
-                core.runtime_context = vec![user_context, assistant];
+                core.runtime_context = synthetic_runtime_context(vec![user_context, assistant]);
                 core.mark_mutated();
                 controls.close();
                 worker_ready.notify_one();
@@ -1515,7 +1508,7 @@ async fn completion_drain_persists_all_outputs_before_recovering_mutated_core_af
             ] {
                 events.send(event).await.expect("session event receiver");
             }
-            core.runtime_context = vec![user_context, assistant];
+            core.runtime_context = synthetic_runtime_context(vec![user_context, assistant]);
             core.mark_mutated();
             controls.close();
             RunCompletion::Completed(core)
@@ -2072,10 +2065,173 @@ async fn active_abort_then_user_applies_abort_before_starting_later_user() {
 
 struct OpaqueContextDriver;
 
+struct MultiRejectedReceiptDriver {
+    observed_contexts: Mutex<Vec<Vec<ContextMessage>>>,
+    terminal_rejections: Vec<RejectedToolCall>,
+    streamed_rejections: Vec<RejectedToolCall>,
+}
+
+impl MultiRejectedReceiptDriver {
+    fn new() -> Self {
+        let rejections = vec![
+            RejectedToolCall {
+                id: "rejected-receipt-a".to_owned(),
+                name: "fixture-tool".to_owned(),
+                error: ToolArgumentError::InvalidJson,
+            },
+            RejectedToolCall {
+                id: "rejected-receipt-b".to_owned(),
+                name: "fixture-tool".to_owned(),
+                error: ToolArgumentError::SchemaViolation,
+            },
+        ];
+        Self {
+            observed_contexts: Mutex::new(Vec::new()),
+            terminal_rejections: rejections.clone(),
+            streamed_rejections: rejections,
+        }
+    }
+
+    fn malformed(terminal_ids: &[&str], streamed_ids: &[&str]) -> Self {
+        let rejected = |id: &&str| RejectedToolCall {
+            id: (*id).to_owned(),
+            name: "fixture-tool".to_owned(),
+            error: ToolArgumentError::InvalidJson,
+        };
+        Self {
+            observed_contexts: Mutex::new(Vec::new()),
+            terminal_rejections: terminal_ids.iter().map(rejected).collect(),
+            streamed_rejections: streamed_ids.iter().map(rejected).collect(),
+        }
+    }
+
+    fn origin() -> ProviderOrigin {
+        ProviderOrigin {
+            provider_instance_id: "multi-rejected-receipts".to_owned(),
+            protocol: ApiProtocol::OpenAiChatCompletions,
+            model: "bridge-model".to_owned(),
+        }
+    }
+}
+
+#[async_trait]
+impl RunDriver for MultiRejectedReceiptDriver {
+    async fn start_provider(
+        &self,
+        attempt: usize,
+        context: &[ContextMessage],
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.observed_contexts
+            .lock()
+            .expect("observed contexts")
+            .push(context.to_vec());
+        let content = if attempt == 0 {
+            self.terminal_rejections
+                .iter()
+                .enumerate()
+                .map(|(index, rejected)| AssistantContent::RejectedToolCall {
+                    rejected: rejected.clone(),
+                    wire_item_index: index as u32,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let message = AssistantMessage {
+            content,
+            model: "bridge-model".to_owned(),
+            provider: "fixture".to_owned(),
+            origin: Self::origin(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: Utc::now(),
+        };
+        let (tx, rx) = mpsc::channel(8);
+        tx.try_send(ProviderEvent::Start)?;
+        if attempt == 0 {
+            for (index, rejected) in self.streamed_rejections.iter().enumerate() {
+                tx.try_send(ProviderEvent::ToolCallStart {
+                    content_index: index,
+                })?;
+                tx.try_send(ProviderEvent::ToolCallRejected {
+                    content_index: index,
+                    rejected: rejected.clone(),
+                    synthetic_result: ToolResultMessage {
+                        tool_call_id: rejected.id.clone(),
+                        tool_name: rejected.name.clone(),
+                        content: vec![UserContent::Text {
+                            text: "Tool arguments were rejected. Regenerate the tool call with complete, schema-valid arguments."
+                                .to_owned(),
+                        }],
+                        details: match rejected.error {
+                            ToolArgumentError::InvalidJson => serde_json::json!({
+                                "category": "invalid_json",
+                                "instance_path": "",
+                                "constraint": "json_syntax",
+                            }),
+                            ToolArgumentError::SchemaViolation => serde_json::json!({
+                                "category": "schema_violation",
+                                "instance_path": "",
+                                "constraint": "schema",
+                            }),
+                            _ => unreachable!("fixture uses two explicit rejection kinds"),
+                        },
+                        is_error: true,
+                        timestamp: Utc::now(),
+                    },
+                })?;
+            }
+        }
+        tx.try_send(ProviderEvent::Done {
+            reason: StopReason::Stop,
+            output: ProviderOutput {
+                message,
+                provider_context: Vec::new(),
+            },
+        })?;
+        drop(tx);
+        Ok(ProviderAttempt {
+            message_id: format!("multi-rejected-assistant-{attempt}"),
+            initial_message: bridge_assistant(StopReason::Stop),
+            events: ProviderEventStream::new(rx, cancel, "fixture", Self::origin()),
+        })
+    }
+
+    async fn execute_tool(
+        &self,
+        _call: &ToolCall,
+        _cancel: CancellationToken,
+    ) -> Result<ToolResultMessage> {
+        Err(anyhow!("rejected calls must never execute"))
+    }
+
+    fn synthetic_error(&self, message: &str) -> PublicMessage {
+        let PublicMessage::Assistant(mut assistant) = bridge_assistant(StopReason::Error) else {
+            unreachable!()
+        };
+        assistant.error_message = Some(message.to_owned());
+        PublicMessage::Assistant(assistant)
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        _active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        Err(anyhow!("multi-rejection fixture has no overflow recovery"))
+    }
+}
+
 struct DurableToolBarrierDriver {
     pool: sqlx::SqlitePool,
     executions: AtomicUsize,
     observed_running: AtomicBool,
+    observed_contexts: Mutex<Vec<Vec<ContextMessage>>>,
 }
 
 impl DurableToolBarrierDriver {
@@ -2084,6 +2240,7 @@ impl DurableToolBarrierDriver {
             pool,
             executions: AtomicUsize::new(0),
             observed_running: AtomicBool::new(false),
+            observed_contexts: Mutex::new(Vec::new()),
         }
     }
 
@@ -2101,9 +2258,13 @@ impl RunDriver for DurableToolBarrierDriver {
     async fn start_provider(
         &self,
         attempt: usize,
-        _context: &[PublicMessage],
+        context: &[ContextMessage],
         cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
+        self.observed_contexts
+            .lock()
+            .expect("observed contexts")
+            .push(context.to_vec());
         let (tx, rx) = mpsc::channel(8);
         tx.try_send(ProviderEvent::Start).expect("provider start");
         let mut content = Vec::new();
@@ -2190,9 +2351,159 @@ impl RunDriver for DurableToolBarrierDriver {
         &self,
         _core: &RunCore,
         _request: OverflowRecoveryRequest,
-        _active_context: &[PublicMessage],
+        _active_context: &[ContextMessage],
     ) -> Result<OverflowRecoveryOutcome> {
         Err(anyhow!("barrier fixture has no overflow recovery"))
+    }
+}
+
+#[tokio::test]
+async fn sequential_worker_makes_progress_with_multiple_rejected_result_receipts() {
+    let store = Store::session_test_store("multi-rejected-receipt-progress")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let driver = Arc::new(MultiRejectedReceiptDriver::new());
+    let (gateway, _commands, _frames) = gateway();
+    let mut session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        Arc::new(SequentialRunWorker::new(driver.clone())),
+        test_executor_generation(),
+    )
+    .await
+    .expect("session");
+    session.admit_and_route(user(1)).await.expect("command");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        drive_active_to_completion(&mut session),
+    )
+    .await
+    .expect("multi-rejection receipts must not deadlock")
+    .expect("run completion");
+    session.wait_outbound_idle().await;
+
+    let second = {
+        let contexts = driver.observed_contexts.lock().expect("observed contexts");
+        assert_eq!(contexts.len(), 2);
+        contexts[1].clone()
+    };
+    assert_eq!(
+        second.len(),
+        4,
+        "user, assistant, and both results retained"
+    );
+    let durable_message_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+        .fetch_one(&pool)
+        .await
+        .expect("exact durable message count");
+    assert_eq!(
+        durable_message_count, 5,
+        "user, rejected assistant, both results, and the next terminal assistant"
+    );
+    let observed: Vec<(String, u64)> = second
+        .iter()
+        .map(|message| match message {
+            ContextMessage::Persisted { id, seq, .. } => (id.clone(), *seq),
+            ContextMessage::Synthetic { .. } => panic!("live durable context became synthetic"),
+        })
+        .collect();
+    let observed_last_seq = observed.last().expect("context receipt prefix").1;
+    let durable: Vec<(String, u64)> =
+        sqlx::query_as("SELECT id, seq FROM messages WHERE seq <= ? ORDER BY seq")
+            .bind(observed_last_seq as i64)
+            .fetch_all(&pool)
+            .await
+            .expect("rejected message anchor prefix");
+    assert_eq!(observed, durable);
+    // This integration test proves bounded progress and exact receipt-derived
+    // anchors. Transaction rollback itself is covered by
+    // `failed_idle_injection_batch_publishes_no_partial_event_frame` at this
+    // bridge boundary and `failpoint_mid_batch_rolls_back_before_store_restart`
+    // at the EventWriter boundary; it does not infer transaction identity from
+    // adjacent message sequence numbers.
+    for (message, expected_id) in second[2..]
+        .iter()
+        .zip(["rejected-receipt-a", "rejected-receipt-b"])
+    {
+        assert!(matches!(
+            message,
+            ContextMessage::Persisted {
+                message: crate::provider::types::Message::ToolResult(result),
+                ..
+            } if result.tool_call_id == expected_id && result.is_error
+        ));
+    }
+}
+
+#[tokio::test]
+async fn malformed_rejection_terminal_correspondence_fails_closed_without_receipt_hang() {
+    let scenarios: [(&str, &[&str], &[&str]); 5] = [
+        ("missing", &["rejected-a"], &[]),
+        ("partial", &["rejected-a", "rejected-b"], &["rejected-a"]),
+        ("extra", &["rejected-a"], &["rejected-a", "rejected-b"]),
+        (
+            "duplicate-stream",
+            &["rejected-a", "rejected-b"],
+            &["rejected-a", "rejected-a"],
+        ),
+        (
+            "duplicate-terminal",
+            &["rejected-a", "rejected-a"],
+            &["rejected-a", "rejected-a"],
+        ),
+    ];
+
+    for (label, terminal_ids, streamed_ids) in scenarios {
+        let store = Store::session_test_store(&format!("malformed-rejections-{label}"))
+            .await
+            .expect("test store");
+        let pool = store.pool().clone();
+        let driver = Arc::new(MultiRejectedReceiptDriver::malformed(
+            terminal_ids,
+            streamed_ids,
+        ));
+        let (gateway, _commands, _frames) = gateway();
+        let mut session = Session::start(
+            store,
+            gateway,
+            RunCore::new(),
+            Arc::new(SequentialRunWorker::new(driver)),
+            test_executor_generation(),
+        )
+        .await
+        .expect("session");
+        session.admit_and_route(user(1)).await.expect("command");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            drive_active_to_completion(&mut session),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{label} correspondence left a receipt waiter unreachable"))
+        .unwrap_or_else(|error| panic!("{label} failed outside the closed attempt: {error}"));
+        session.wait_outbound_idle().await;
+
+        let messages: Vec<(String, String)> = sqlx::query_as(
+            "SELECT role, COALESCE(json_extract(payload, '$.stop_reason'), '') FROM messages ORDER BY seq",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("closed malformed attempt messages");
+        assert_eq!(
+            messages,
+            vec![
+                ("user".to_owned(), "".to_owned()),
+                ("assistant".to_owned(), "error".to_owned()),
+            ],
+            "{label} must persist only the user and synthetic Error assistant",
+        );
+        let tool_results: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE role='tool_result'")
+                .fetch_one(&pool)
+                .await
+                .expect("tool-result message count");
+        assert_eq!(tool_results, 0, "{label} must not persist orphan results");
     }
 }
 
@@ -2221,6 +2532,34 @@ async fn tool_driver_observes_running_only_after_start_commit() {
 
     assert_eq!(driver.executions.load(Ordering::SeqCst), 1);
     assert!(driver.observed_running.load(Ordering::SeqCst));
+    let second = {
+        let contexts = driver.observed_contexts.lock().expect("observed contexts");
+        assert_eq!(contexts.len(), 2);
+        contexts[1].clone()
+    };
+    assert_eq!(
+        second.len(),
+        3,
+        "user, assistant, and tool result are retained"
+    );
+    let durable: Vec<(String, u64)> =
+        sqlx::query_as("SELECT id, seq FROM messages ORDER BY seq LIMIT 3")
+            .fetch_all(&pool)
+            .await
+            .expect("durable message anchors");
+    let observed: Vec<(String, u64)> = second
+        .iter()
+        .map(|message| match message {
+            ContextMessage::Persisted { id, seq, .. } => (id.clone(), *seq),
+            ContextMessage::Synthetic { .. } => panic!("live durable context became synthetic"),
+        })
+        .collect();
+    assert_eq!(observed, durable);
+    assert_eq!(
+        crate::memory::transform::transform(&second, &DurableToolBarrierDriver::origin()),
+        second,
+        "send normalization preserves exact durable anchors",
+    );
     let state: String =
         sqlx::query_scalar("SELECT state FROM tool_executions WHERE tool_call_id='barrier-call'")
             .fetch_one(&pool)
@@ -2592,7 +2931,7 @@ impl RunDriver for StartFailureDriver {
     async fn start_provider(
         &self,
         _attempt: usize,
-        _context: &[PublicMessage],
+        _context: &[ContextMessage],
         _cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
         Err(anyhow!("fixture provider start failure"))
@@ -2619,7 +2958,7 @@ impl RunDriver for StartFailureDriver {
         &self,
         _core: &RunCore,
         _request: OverflowRecoveryRequest,
-        _active_context: &[PublicMessage],
+        _active_context: &[ContextMessage],
     ) -> Result<OverflowRecoveryOutcome> {
         Err(anyhow!("start-failure fixture has no overflow recovery"))
     }
@@ -2630,7 +2969,7 @@ impl RunDriver for OpaqueContextDriver {
     async fn start_provider(
         &self,
         _attempt: usize,
-        _context: &[PublicMessage],
+        _context: &[ContextMessage],
         _cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
         let origin = ProviderOrigin {
@@ -2726,7 +3065,7 @@ impl RunDriver for OpaqueContextDriver {
         &self,
         _core: &RunCore,
         _request: OverflowRecoveryRequest,
-        _active_context: &[PublicMessage],
+        _active_context: &[ContextMessage],
     ) -> Result<OverflowRecoveryOutcome> {
         Err(anyhow!("opaque fixture has no overflow recovery"))
     }
@@ -3630,7 +3969,10 @@ async fn opaque_context_refusal_closes_durably_before_applied_ack() {
     assert_eq!(core.runtime_context.len(), 1);
     assert!(matches!(
         core.runtime_context.first(),
-        Some(PublicMessage::User(_))
+        Some(ContextMessage::Persisted {
+            message: crate::provider::types::Message::User(_),
+            ..
+        })
     ));
 
     let kinds: Vec<String> = sqlx::query_scalar(

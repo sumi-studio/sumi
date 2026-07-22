@@ -16,7 +16,7 @@ use crate::{
     agent::DurableRunBinding,
     gateway::{CommandEnvelope, CommandId},
     provider::types::{
-        ApiProtocol, AssistantContent, AssistantMessage, ProviderContextFragment,
+        ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, ProviderContextFragment,
         ProviderContextPayload, ProviderOrigin, ProviderOutput, PublicAssistantMessage,
         RejectedToolCall, ToolArgumentError, Usage, ValidatedToolArguments,
     },
@@ -40,7 +40,7 @@ fn output(message: AssistantMessage) -> Script {
 
 struct FixtureDriver {
     scripts: Mutex<VecDeque<Script>>,
-    started_contexts: Mutex<Vec<Vec<PublicMessage>>>,
+    started_contexts: Mutex<Vec<Vec<ContextMessage>>>,
     tool_order: Mutex<Vec<String>>,
     tool_failures: Mutex<VecDeque<Option<&'static str>>>,
     active_tools: AtomicUsize,
@@ -103,12 +103,29 @@ impl FixtureDriver {
     }
 }
 
+fn recovered_context_from_active(
+    messages: Vec<PublicMessage>,
+    active_context: &[ContextMessage],
+) -> Vec<ContextMessage> {
+    messages
+        .into_iter()
+        .map(|message| {
+            let message = public_to_message(message);
+            active_context
+                .iter()
+                .find(|candidate| context_message(candidate) == &message)
+                .cloned()
+                .unwrap_or(ContextMessage::Synthetic { message })
+        })
+        .collect()
+}
+
 #[async_trait]
 impl RunDriver for FixtureDriver {
     async fn start_provider(
         &self,
         attempt: usize,
-        context: &[PublicMessage],
+        context: &[ContextMessage],
         _cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
         self.started_contexts
@@ -176,7 +193,7 @@ impl RunDriver for FixtureDriver {
         &self,
         core: &RunCore,
         request: OverflowRecoveryRequest,
-        _active_context: &[PublicMessage],
+        active_context: &[ContextMessage],
     ) -> Result<OverflowRecoveryOutcome> {
         self.overflow_recoveries
             .lock()
@@ -192,7 +209,9 @@ impl RunDriver for FixtureDriver {
             .expect("overflow contexts")
             .pop_front()
             .ok_or_else(|| anyhow!("missing fixture overflow context"))?;
-        Ok(OverflowRecoveryOutcome::ReplacementContext(replacement))
+        Ok(OverflowRecoveryOutcome::ReplacementContext(
+            recovered_context_from_active(replacement, active_context),
+        ))
     }
 
     async fn wait_retry(&self, delay: Duration, _cancel: &CancellationToken) -> bool {
@@ -338,6 +357,39 @@ fn rejected_result(rejected: &RejectedToolCall) -> ToolResultMessage {
         is_error: true,
         timestamp: timestamp(),
     }
+}
+
+#[test]
+fn rejected_results_follow_authoritative_terminal_order() {
+    let first = rejected("ordered-first");
+    let second = rejected("ordered-second");
+    let message = assistant(
+        StopReason::ToolUse,
+        vec![
+            AssistantContent::RejectedToolCall {
+                rejected: first.clone(),
+                wire_item_index: 0,
+            },
+            AssistantContent::RejectedToolCall {
+                rejected: second.clone(),
+                wire_item_index: 1,
+            },
+        ],
+        None,
+        None,
+    );
+    let mut results = vec![rejected_result(&second), rejected_result(&first)];
+
+    validate_and_order_rejected_results(&message, &mut results)
+        .expect("unique exact identities are unambiguous");
+
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result.tool_call_id.as_str())
+            .collect::<Vec<_>>(),
+        [first.id.as_str(), second.id.as_str()]
+    );
 }
 
 fn provider_attempt(attempt: usize, message: AssistantMessage) -> ProviderAttempt {
@@ -521,13 +573,43 @@ async fn run_fixture(driver: Arc<FixtureDriver>) -> (RunCompletion, Vec<AgentEve
             .await
     });
     let mut events = Vec::new();
+    let mut message_seq = 1;
     while let Some(mut output) = events_rx.recv().await {
+        resolve_message_output(&mut output, &mut message_seq);
         if let Some(barrier) = output.commit_barrier.take() {
             barrier.committed();
         }
         events.push(output.event);
     }
     (completion.await.expect("worker join"), events)
+}
+
+fn resolve_message_output(output: &mut RunOutput, next_seq: &mut u64) {
+    if let Some(barrier) = output.message_commit_barrier.take() {
+        let AgentEvent::MessageEnd { message_id, .. } = &output.event else {
+            panic!("message receipt barrier without MessageEnd");
+        };
+        barrier.resolve(MessageCommitReceipt {
+            message_id: message_id.clone(),
+            message_seq: *next_seq,
+        });
+        *next_seq += 1;
+    }
+}
+
+async fn complete_with_receipts(
+    future: WorkerFuture,
+    mut events_rx: mpsc::Receiver<RunOutput>,
+) -> RunCompletion {
+    let completion = tokio::spawn(future);
+    let mut message_seq = 1;
+    while let Some(mut output) = events_rx.recv().await {
+        resolve_message_output(&mut output, &mut message_seq);
+        if let Some(barrier) = output.commit_barrier.take() {
+            barrier.committed();
+        }
+    }
+    completion.await.expect("worker join")
 }
 
 fn assert_completed(completion: RunCompletion) {
@@ -586,7 +668,7 @@ async fn retry_closes_error_before_schedule_and_does_not_append_error_context() 
     let contexts = driver.started_contexts.lock().expect("contexts");
     assert_eq!(contexts.len(), 2);
     assert_eq!(contexts[1].len(), 1, "only the user is replayable");
-    assert!(matches!(contexts[1][0], PublicMessage::User(_)));
+    assert!(matches!(context_message(&contexts[1][0]), Message::User(_)));
     assert_eq!(driver.retry_waits.load(Ordering::SeqCst), 1);
 }
 
@@ -660,6 +742,18 @@ async fn retry_wait_control_is_injected_mid_turn_before_next_attempt() {
             .run(bound_core(1), admitted_user(1), control_rx, events_tx)
             .await
     });
+    let event_collector = tokio::spawn(async move {
+        let mut events = Vec::new();
+        let mut message_seq = 1;
+        while let Some(mut output) = events_rx.recv().await {
+            resolve_message_output(&mut output, &mut message_seq);
+            if let Some(barrier) = output.commit_barrier.take() {
+                barrier.committed();
+            }
+            events.push(output.event);
+        }
+        events
+    });
     driver.retry_waiting.notified().await;
     control_tx
         .send(RunControl::Command(admitted_user(2)))
@@ -667,10 +761,7 @@ async fn retry_wait_control_is_injected_mid_turn_before_next_attempt() {
         .expect("retry steer");
     let completion = completion.await.expect("worker join");
     assert_completed(completion);
-    let mut events = Vec::new();
-    while let Some(event) = events_rx.recv().await {
-        events.push(event.event);
-    }
+    let events = event_collector.await.expect("event collector");
     let retry = events
         .iter()
         .position(|event| matches!(event, AgentEvent::RetryScheduled { .. }))
@@ -689,7 +780,7 @@ async fn retry_wait_control_is_injected_mid_turn_before_next_attempt() {
     assert!(
         contexts[1]
             .iter()
-            .all(|message| matches!(message, PublicMessage::User(_)))
+            .all(|message| matches!(context_message(message), Message::User(_)))
     );
 }
 
@@ -776,12 +867,12 @@ async fn two_consecutive_length_tool_batches_prevent_third_provider_call() {
     ));
     assert_eq!(
         core.runtime_context.len(),
-        3,
-        "only user plus the first Length assistant/result pair enter context"
+        4,
+        "both durable Length result batches remain anchored while the guard Error assistant is excluded"
     );
     assert!(!core.runtime_context.iter().any(|message| matches!(
-        message,
-        PublicMessage::Assistant(assistant)
+        context_message(message),
+        Message::Assistant(assistant)
             if assistant.provider_code.as_deref() == Some(LENGTH_LOOP_CODE)
     )));
     assert!(matches!(events.last(), Some(AgentEvent::AgentEnd)));
@@ -1039,22 +1130,22 @@ async fn mixed_rejections_precede_valid_lifecycle_and_only_valid_results_enter_t
     let contexts = driver.started_contexts.lock().expect("contexts");
     assert_eq!(contexts[1].len(), 5);
     assert!(matches!(
-        &contexts[1][1],
-        PublicMessage::Assistant(assistant)
+        context_message(&contexts[1][1]),
+        Message::Assistant(assistant)
             if assistant.content.iter().any(|content| matches!(
                 content,
-                PublicAssistantContent::RejectedToolCall { rejected: value, .. }
+                AssistantContent::RejectedToolCall { rejected: value, .. }
                     if value == &rejected_first
             ))
     ));
     assert!(matches!(
-        &contexts[1][3],
-        PublicMessage::ToolResult(result)
+        context_message(&contexts[1][2]),
+        Message::ToolResult(result)
             if result.tool_call_id == rejected_first.id && result.is_error
     ));
     assert!(matches!(
-        &contexts[1][4],
-        PublicMessage::ToolResult(result)
+        context_message(&contexts[1][3]),
+        Message::ToolResult(result)
             if result.tool_call_id == rejected_second.id && result.is_error
     ));
 }
@@ -1082,7 +1173,15 @@ async fn error_and_immediate_overflow_emit_rejection_pair_without_context_or_tur
             RunCompletion::Completed(core) => core,
             RunCompletion::Failed { failure, .. } => panic!("unexpected failure: {failure}"),
         };
-        assert_eq!(core.runtime_context, vec![runtime_user(1)]);
+        assert_eq!(core.runtime_context.len(), 2);
+        assert!(matches!(
+            context_message(&core.runtime_context[0]),
+            Message::User(_)
+        ));
+        assert!(matches!(
+            context_message(&core.runtime_context[1]),
+            Message::ToolResult(_)
+        ));
         let result_end = events
             .iter()
             .position(|event| {
@@ -1115,6 +1214,47 @@ async fn error_and_immediate_overflow_emit_rejection_pair_without_context_or_tur
 }
 
 #[tokio::test]
+async fn retryable_error_commits_rejected_result_before_scheduling_next_attempt() {
+    let rejected = rejected("retry-rejected");
+    let driver = Arc::new(FixtureDriver::new(vec![
+        output(assistant(
+            StopReason::Error,
+            vec![AssistantContent::RejectedToolCall {
+                rejected: rejected.clone(),
+                wire_item_index: 0,
+            }],
+            Some("temporary network error"),
+            Some("http_500"),
+        )),
+        output(assistant(StopReason::Stop, Vec::new(), None, None)),
+    ]));
+    let (completion, events) = run_fixture(driver.clone()).await;
+    assert_completed(completion);
+
+    let result_end = events
+        .iter()
+        .position(|event| {
+            matches!(event, AgentEvent::MessageEnd { message, .. }
+                if matches!(message.as_ref(), PublicMessage::ToolResult(result)
+                    if result.tool_call_id == rejected.id && result.is_error))
+        })
+        .expect("rejected result MessageEnd");
+    let retry = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::RetryScheduled { .. }))
+        .expect("retry schedule");
+    assert!(result_end < retry);
+
+    let contexts = driver.started_contexts.lock().expect("contexts");
+    assert_eq!(contexts.len(), 2);
+    assert_eq!(contexts[1].len(), 2, "error assistant stays outside L0");
+    assert!(matches!(
+        context_message(&contexts[1][1]),
+        Message::ToolResult(result) if result.tool_call_id == rejected.id && result.is_error
+    ));
+}
+
+#[tokio::test]
 async fn non_authoritative_projection_failure_and_eof_discard_rejected_results() {
     for suffix in [vec![ProviderEvent::Start], Vec::new()] {
         let rejected = rejected("volatile");
@@ -1141,14 +1281,14 @@ async fn non_authoritative_projection_failure_and_eof_discard_rejected_results()
             !core
                 .runtime_context
                 .iter()
-                .any(|message| matches!(message, PublicMessage::ToolResult(_)))
+                .any(|message| matches!(context_message(message), Message::ToolResult(_)))
         );
         assert!(!core.runtime_context.iter().any(|message| matches!(
-            message,
-            PublicMessage::Assistant(assistant)
+            context_message(message),
+            Message::Assistant(assistant)
                 if assistant.content.iter().any(|item| matches!(
                     item,
-                    PublicAssistantContent::RejectedToolCall { .. }
+                    AssistantContent::RejectedToolCall { .. }
                 ))
         )));
         assert!(
@@ -1187,11 +1327,12 @@ async fn provider_start_failure_recovers_received_controls_and_next_run_consumes
         .send(RunControl::Command(admitted_user(3)))
         .await
         .expect("second received control");
-    let (events_tx, mut events_rx) = mpsc::channel(256);
-    let first = first_worker
-        .run(bound_core(1), admitted_user(1), control_rx, events_tx)
-        .await;
-    while events_rx.recv().await.is_some() {}
+    let (events_tx, events_rx) = mpsc::channel(256);
+    let first = complete_with_receipts(
+        first_worker.run(bound_core(1), admitted_user(1), control_rx, events_tx),
+        events_rx,
+    )
+    .await;
     let core = recovered_core(first);
     assert_eq!(
         core.runtime_context.len(),
@@ -1206,26 +1347,27 @@ async fn provider_start_failure_recovers_received_controls_and_next_run_consumes
     ]));
     let second_worker = SequentialRunWorker::new(second_driver.clone());
     let (_control_tx, control_rx) = mpsc::channel(8);
-    let (events_tx, mut events_rx) = mpsc::channel(256);
-    let second = second_worker
-        .run(core, admitted_user(4), control_rx, events_tx)
-        .await;
-    while events_rx.recv().await.is_some() {}
+    let (events_tx, events_rx) = mpsc::channel(256);
+    let second = complete_with_receipts(
+        second_worker.run(core, admitted_user(4), control_rx, events_tx),
+        events_rx,
+    )
+    .await;
     assert_completed(second);
     let contexts = second_driver.started_contexts.lock().expect("contexts");
     assert!(matches!(
-        &contexts[0][1],
-        PublicMessage::User(user)
+        context_message(&contexts[0][1]),
+        Message::User(user)
             if matches!(&user.content[0], UserContent::Text { text } if text == "message 2")
     ));
     assert!(matches!(
-        &contexts[1][3],
-        PublicMessage::User(user)
+        context_message(&contexts[1][3]),
+        Message::User(user)
             if matches!(&user.content[0], UserContent::Text { text } if text == "message 3")
     ));
     assert!(matches!(
-        &contexts[2][5],
-        PublicMessage::User(user)
+        context_message(&contexts[2][5]),
+        Message::User(user)
             if matches!(&user.content[0], UserContent::Text { text } if text == "message 4")
     ));
 }
@@ -1258,7 +1400,9 @@ async fn closed_error_recovers_cross_kind_controls_without_reordering_or_preempt
             .run(bound_core(1), admitted_user(1), control_rx, events_tx)
             .await
     });
+    let mut message_seq = 1;
     while let Some(mut output) = events_rx.recv().await {
+        resolve_message_output(&mut output, &mut message_seq);
         if let Some(barrier) = output.commit_barrier.take() {
             barrier.committed();
         }
@@ -1274,11 +1418,12 @@ async fn closed_error_recovers_cross_kind_controls_without_reordering_or_preempt
     ))]));
     let blocked_worker = SequentialRunWorker::new(blocked_driver);
     let (_control_tx, control_rx) = mpsc::channel(1);
-    let (events_tx, mut events_rx) = mpsc::channel(8);
-    let blocked = blocked_worker
-        .run(core, admitted_user(5), control_rx, events_tx)
-        .await;
-    while events_rx.recv().await.is_some() {}
+    let (events_tx, events_rx) = mpsc::channel(8);
+    let blocked = complete_with_receipts(
+        blocked_worker.run(core, admitted_user(5), control_rx, events_tx),
+        events_rx,
+    )
+    .await;
     let mut core = recovered_core(blocked);
     assert_eq!(
         pending_sequences(&mut core),
@@ -1317,7 +1462,9 @@ async fn deferred_t16_control_blocks_later_user_at_every_safe_point() {
             .run(bound_core(1), admitted_user(1), control_rx, events_tx)
             .await
     });
+    let mut message_seq = 1;
     while let Some(mut output) = events_rx.recv().await {
+        resolve_message_output(&mut output, &mut message_seq);
         if let Some(barrier) = output.commit_barrier.take() {
             barrier.committed();
         }
@@ -1328,7 +1475,7 @@ async fn deferred_t16_control_blocks_later_user_at_every_safe_point() {
     assert_eq!(
         core.runtime_context
             .iter()
-            .filter(|message| matches!(message, PublicMessage::User(_)))
+            .filter(|message| matches!(context_message(message), Message::User(_)))
             .count(),
         1,
         "seq 3 cannot overtake the unimplemented seq 2 Abort"
@@ -1517,11 +1664,12 @@ async fn retry_wait_channel_close_and_cancelled_hook_never_start_another_attempt
             drop(control_tx);
             None
         };
-        let (events_tx, mut events_rx) = mpsc::channel(64);
-        let completion = worker
-            .run(bound_core(1), admitted_user(1), control_rx, events_tx)
-            .await;
-        while events_rx.recv().await.is_some() {}
+        let (events_tx, events_rx) = mpsc::channel(64);
+        let completion = complete_with_receipts(
+            worker.run(bound_core(1), admitted_user(1), control_rx, events_tx),
+            events_rx,
+        )
+        .await;
         assert!(matches!(
             completion,
             RunCompletion::Failed {
@@ -1660,10 +1808,19 @@ async fn immediate_overflow_recovers_twice_then_closes_without_appending_attempt
                         && !assistant.content.iter().any(|content| matches!(content,
                             PublicAssistantContent::ToolCall { .. })))
     ));
-    assert_eq!(core.runtime_context, recovered_two);
     let contexts = driver.started_contexts.lock().expect("contexts");
-    assert_eq!(contexts[1], recovered_one);
-    assert_eq!(contexts[2], recovered_two);
+    assert_eq!(
+        core.runtime_context,
+        recovered_context_from_active(recovered_two.clone(), &contexts[0])
+    );
+    assert_eq!(
+        contexts[1],
+        recovered_context_from_active(recovered_one, &contexts[0])
+    );
+    assert_eq!(
+        contexts[2],
+        recovered_context_from_active(recovered_two, &contexts[1])
+    );
     for retry in events.iter().enumerate().filter_map(|(index, event)| {
         matches!(event, AgentEvent::RetryScheduled { delay_ms: 0, .. }).then_some(index)
     }) {
@@ -1788,7 +1945,8 @@ async fn length_usage_overflow_recovers_before_any_tool_or_context_append() {
     let contexts = driver.started_contexts.lock().expect("contexts");
     assert_eq!(contexts.len(), 2);
     assert_eq!(
-        contexts[1], recovered,
+        contexts[1],
+        recovered_context_from_active(recovered, &contexts[0]),
         "next attempt uses recovered context"
     );
 

@@ -4,14 +4,14 @@
 //! This module owns only the in-memory lifecycle after an admitted user command
 //! has been transferred together with the unique [`RunCore`].
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -21,17 +21,19 @@ use crate::{
         overflow::{OverflowClassification, OverflowSource, classify_context_overflow},
         retry::{is_retryable, retry_delay, sleep_or_cancel},
         types::{
-            ProviderEvent, ProviderEventStream, PublicAssistantContent, PublicMessage, StopReason,
-            ToolCall, ToolResultMessage, UserContent, UserMessage,
+            AssistantContent, ContextMessage, Message, ProviderEvent, ProviderEventStream,
+            PublicAssistantContent, PublicMessage, StopReason, ToolCall, ToolResultMessage,
+            UserContent, UserMessage,
         },
     },
     store::user_message_id,
 };
 
 use super::{
-    AdmittedCommand, AgentEvent, DurableRunBinding, ProjectedProviderEvent, ProviderEventProjector,
-    ProviderTerminalKind, RunCompletion, RunControl, RunCore, RunOutput, RunWorker, SteerMode,
-    ToolStartCommitBarrier, WorkerFailure, WorkerFuture,
+    AdmittedCommand, AgentEvent, DurableRunBinding, MessageCommitBarrier, MessageCommitReceipt,
+    ProjectedProviderEvent, ProviderEventProjector, ProviderTerminalKind, RunCompletion,
+    RunControl, RunCore, RunOutput, RunWorker, SteerMode, ToolStartCommitBarrier, WorkerFailure,
+    WorkerFuture,
 };
 
 const LENGTH_TOOL_FAILURE: &str = "Tool call was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.";
@@ -55,7 +57,7 @@ pub(crate) struct OverflowRecoveryRequest {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum OverflowRecoveryOutcome {
-    ReplacementContext(Vec<PublicMessage>),
+    ReplacementContext(Vec<ContextMessage>),
 }
 
 /// One provider attempt. The initial public message supplies stable model and
@@ -77,7 +79,7 @@ pub(crate) trait RunDriver: Send + Sync + 'static {
     async fn start_provider(
         &self,
         attempt: usize,
-        context: &[PublicMessage],
+        context: &[ContextMessage],
         cancel: CancellationToken,
     ) -> Result<ProviderAttempt>;
 
@@ -100,7 +102,7 @@ pub(crate) trait RunDriver: Send + Sync + 'static {
         &self,
         core: &RunCore,
         request: OverflowRecoveryRequest,
-        active_context: &[PublicMessage],
+        active_context: &[ContextMessage],
     ) -> Result<OverflowRecoveryOutcome>;
 
     async fn wait_retry(&self, delay: Duration, cancel: &CancellationToken) -> bool {
@@ -143,7 +145,7 @@ struct Runner {
     driver: Arc<dyn RunDriver>,
     controls: mpsc::Receiver<RunControl>,
     events: mpsc::Sender<RunOutput>,
-    context: Vec<PublicMessage>,
+    context: Vec<ContextMessage>,
     attempt_sequence: usize,
     ordinary_retries: usize,
     overflow_recoveries: u8,
@@ -225,10 +227,14 @@ impl Runner {
                 AttemptOutcome::Retry {
                     assistant_message_id,
                     message,
+                    receipt,
                     rejected_results,
                 } => {
-                    self.emit_rejected_results(&assistant_message_id, &rejected_results)
+                    let receipts = self
+                        .emit_rejected_results(&assistant_message_id, &rejected_results)
                         .await?;
+                    self.retain_tool_results(&receipts, &rejected_results)?;
+                    self.await_message_receipt(receipt).await?;
                     self.consecutive_length_batches = 0;
                     let Some(delay) = retry_delay(self.ordinary_retries) else {
                         self.close_turn(message, Vec::new()).await?;
@@ -254,11 +260,15 @@ impl Runner {
                 AttemptOutcome::ImmediateOverflow {
                     assistant_message_id,
                     message,
+                    receipt,
                     source,
                     rejected_results,
                 } => {
-                    self.emit_rejected_results(&assistant_message_id, &rejected_results)
+                    let receipts = self
+                        .emit_rejected_results(&assistant_message_id, &rejected_results)
                         .await?;
+                    self.retain_tool_results(&receipts, &rejected_results)?;
+                    self.await_message_receipt(receipt).await?;
                     self.consecutive_length_batches = 0;
                     if self.overflow_recoveries >= MAX_OVERFLOW_RECOVERIES {
                         self.close_turn_without_context(message).await?;
@@ -304,10 +314,12 @@ impl Runner {
                 AttemptOutcome::Terminal {
                     assistant_message_id,
                     message,
+                    receipt,
                     rejected_results,
                     deferred_overflow,
                     length_guarded,
                 } => {
+                    let assistant_receipt_waiter = receipt;
                     self.ordinary_retries = 0;
                     self.overflow_recoveries = 0;
                     if let Some(source) = deferred_overflow {
@@ -320,6 +332,8 @@ impl Runner {
                     let calls = tool_calls(&message);
                     if calls.is_empty() && rejected_results.is_empty() {
                         self.consecutive_length_batches = 0;
+                        let receipt = self.await_message_receipt(assistant_receipt_waiter).await?;
+                        self.retain_committed(receipt, &message)?;
                         self.close_turn(message, Vec::new()).await?;
                         if !self.advance_followup().await? {
                             break;
@@ -334,9 +348,11 @@ impl Runner {
                     // Prepare/Start (or the private Length Skip path). The
                     // bridge commits the rejected pair atomically once the
                     // final result arrives.
-                    self.emit_rejected_results(&assistant_message_id, &rejected_results)
+                    let rejected_receipts = self
+                        .emit_rejected_results(&assistant_message_id, &rejected_results)
                         .await?;
-                    let executable_results = if is_length {
+                    let receipt = self.await_message_receipt(assistant_receipt_waiter).await?;
+                    let (executable_results, executable_receipts) = if is_length {
                         self.consecutive_length_batches += 1;
                         self.fail_length_calls(&assistant_message_id, &calls, length_guarded)
                             .await?
@@ -345,14 +361,33 @@ impl Runner {
                         self.execute_calls(&assistant_message_id, &calls).await?
                     };
                     if !length_guarded {
-                        self.context.push(message.clone());
-                        self.context.extend(
-                            executable_results
-                                .iter()
-                                .chain(rejected_results.iter())
-                                .cloned()
-                                .map(PublicMessage::ToolResult),
+                        let mut committed = vec![(receipt, message.clone())];
+                        committed.extend(
+                            rejected_receipts.into_iter().zip(
+                                rejected_results
+                                    .iter()
+                                    .cloned()
+                                    .map(PublicMessage::ToolResult),
+                            ),
                         );
+                        committed.extend(
+                            executable_receipts.into_iter().zip(
+                                executable_results
+                                    .iter()
+                                    .cloned()
+                                    .map(PublicMessage::ToolResult),
+                            ),
+                        );
+                        committed.sort_by_key(|(receipt, _)| receipt.message_seq);
+                        for (receipt, committed_message) in committed {
+                            self.retain_committed(receipt, &committed_message)?;
+                        }
+                        // Normal and non-guarded length receipts are retained in
+                        // the sorted committed batch above; guarded-length
+                        // receipts are retained separately below.
+                    } else {
+                        self.retain_tool_results(&rejected_receipts, &rejected_results)?;
+                        self.retain_tool_results(&executable_receipts, &executable_results)?;
                     }
                     self.emit(AgentEvent::TurnEnd {
                         message: Some(Box::new(message)),
@@ -375,10 +410,14 @@ impl Runner {
                 AttemptOutcome::ClosedError {
                     assistant_message_id,
                     message,
+                    receipt,
                     rejected_results,
                 } => {
-                    self.emit_rejected_results(&assistant_message_id, &rejected_results)
+                    let receipts = self
+                        .emit_rejected_results(&assistant_message_id, &rejected_results)
                         .await?;
+                    self.retain_tool_results(&receipts, &rejected_results)?;
+                    self.await_message_receipt(receipt).await?;
                     self.close_turn(message, Vec::new()).await?;
                     break;
                 }
@@ -477,7 +516,7 @@ impl Runner {
                     // shadow into a synthesized terminal, but that shadow is
                     // not an authoritative provider snapshot. Its buffered
                     // rejection results must not survive as durable orphans.
-                    if matches!(
+                    let internal_projection_failure = matches!(
                         internal.provider_code.as_deref(),
                         Some(
                             "stream_ended_without_terminal_event"
@@ -485,20 +524,23 @@ impl Runner {
                                 | "invalid_provider_terminal"
                                 | "invalid_provider_stream"
                         )
-                    ) {
+                    );
+                    if internal_projection_failure {
                         rejected_results.clear();
-                    } else {
-                        rejected_results.retain(|result| {
-                            internal.content.iter().any(|content| {
-                                matches!(
-                                    content,
-                                    crate::provider::types::AssistantContent::RejectedToolCall {
-                                        rejected,
-                                        ..
-                                    } if rejected.id == result.tool_call_id
-                                )
-                            })
-                        });
+                    }
+                    if let Err(error) =
+                        validate_and_order_rejected_results(&internal, &mut rejected_results)
+                    {
+                        rejected_results.clear();
+                        return self
+                            .close_broken_attempt(
+                                &attempt.message_id,
+                                message_started,
+                                format!(
+                                    "provider terminal rejection/result correspondence failed: {error}"
+                                ),
+                            )
+                            .await;
                     }
                     let overflow = terminal_overflow;
                     let length_guarded = kind == ProviderTerminalKind::Done
@@ -527,18 +569,20 @@ impl Runner {
                         _ if length_guarded => normalize_length_loop_guard(terminal.message()),
                         _ => terminal.message().clone(),
                     };
-                    let terminal_event = match terminal.event() {
-                        AgentEvent::MessageEnd { message_id, .. } => AgentEvent::MessageEnd {
-                            message_id: message_id.clone(),
-                            message: Box::new(public.clone()),
-                        },
+                    let (terminal_message_id, terminal_message) = match terminal.event() {
+                        AgentEvent::MessageEnd { message_id, .. } => {
+                            (message_id.clone(), public.clone())
+                        }
                         _ => unreachable!("provider terminal is always MessageEnd"),
                     };
-                    self.emit(terminal_event).await?;
+                    let receipt = self
+                        .emit_message_end(terminal_message_id, terminal_message)
+                        .await?;
                     if let Some(OverflowClassification::ImmediateRecovery(source)) = overflow {
                         return Ok(AttemptOutcome::ImmediateOverflow {
                             assistant_message_id: attempt.message_id.clone(),
                             message: public,
+                            receipt,
                             source,
                             rejected_results,
                         });
@@ -549,18 +593,21 @@ impl Runner {
                             return Ok(AttemptOutcome::Retry {
                                 assistant_message_id: attempt.message_id.clone(),
                                 message: public,
+                                receipt,
                                 rejected_results,
                             });
                         }
                         return Ok(AttemptOutcome::ClosedError {
                             assistant_message_id: attempt.message_id.clone(),
                             message: public,
+                            receipt,
                             rejected_results,
                         });
                     }
                     return Ok(AttemptOutcome::Terminal {
                         assistant_message_id: attempt.message_id.clone(),
                         message: public,
+                        receipt,
                         rejected_results,
                         deferred_overflow: match overflow {
                             Some(OverflowClassification::DeferredApply(source)) => Some(source),
@@ -597,14 +644,13 @@ impl Runner {
             message: Box::new(message.clone()),
         })
         .await?;
-        self.emit(AgentEvent::MessageEnd {
-            message_id: message_id.clone(),
-            message: Box::new(message.clone()),
-        })
-        .await?;
+        let receipt = self
+            .emit_message_end(message_id.clone(), message.clone())
+            .await?;
         Ok(AttemptOutcome::ClosedError {
             assistant_message_id: message_id,
             message,
+            receipt,
             rejected_results: Vec::new(),
         })
     }
@@ -623,14 +669,13 @@ impl Runner {
             })
             .await?;
         }
-        self.emit(AgentEvent::MessageEnd {
-            message_id: message_id.to_owned(),
-            message: Box::new(message.clone()),
-        })
-        .await?;
+        let receipt = self
+            .emit_message_end(message_id.to_owned(), message.clone())
+            .await?;
         Ok(AttemptOutcome::ClosedError {
             assistant_message_id: message_id.to_owned(),
             message,
+            receipt,
             rejected_results: Vec::new(),
         })
     }
@@ -640,10 +685,11 @@ impl Runner {
         assistant_message_id: &str,
         calls: &[ToolCall],
         terminal_guard: bool,
-    ) -> Result<Vec<ToolResultMessage>, WorkerFailure> {
+    ) -> Result<(Vec<ToolResultMessage>, Vec<MessageCommitReceipt>), WorkerFailure> {
         // These synthetic results deliberately have no execution lifecycle.
         // The durable bridge must map them to skipped/not-started transactions.
         let mut results = Vec::with_capacity(calls.len());
+        let mut receipts = Vec::with_capacity(calls.len());
         for call in calls {
             let message = if terminal_guard {
                 format!("{LENGTH_TOOL_FAILURE} {LENGTH_LOOP_FAILURE}")
@@ -651,19 +697,23 @@ impl Runner {
                 LENGTH_TOOL_FAILURE.to_owned()
             };
             let result = error_tool_result(call, &message);
-            self.emit_result_message(assistant_message_id, &result)
+            let waiter = self
+                .emit_result_message(assistant_message_id, &result)
                 .await?;
+            let receipt = self.await_message_receipt(waiter).await?;
+            receipts.push(receipt);
             results.push(result);
         }
-        Ok(results)
+        Ok((results, receipts))
     }
 
     async fn execute_calls(
         &mut self,
         assistant_message_id: &str,
         calls: &[ToolCall],
-    ) -> Result<Vec<ToolResultMessage>, WorkerFailure> {
+    ) -> Result<(Vec<ToolResultMessage>, Vec<MessageCommitReceipt>), WorkerFailure> {
         let mut results = Vec::with_capacity(calls.len());
+        let mut receipts = Vec::with_capacity(calls.len());
         for call in calls {
             self.emit_tool_start_and_wait_committed(call).await?;
             let result = match self
@@ -679,10 +729,10 @@ impl Runner {
                 }
                 Err(error) => error_tool_result(call, &format!("Tool execution failed: {error}")),
             };
-            self.emit_tool_result(assistant_message_id, &result).await?;
+            receipts.push(self.emit_tool_result(assistant_message_id, &result).await?);
             results.push(result);
         }
-        Ok(results)
+        Ok((results, receipts))
     }
 
     async fn emit_tool_start_and_wait_committed(
@@ -702,6 +752,7 @@ impl Runner {
                     args: Value::Object(call.arguments.as_object().clone()),
                 },
                 commit_barrier: Some(commit_barrier),
+                message_commit_barrier: None,
             })
             .await
             .map_err(|_| WorkerFailure::EventChannelClosed)?;
@@ -714,7 +765,7 @@ impl Runner {
         &mut self,
         assistant_message_id: &str,
         result: &ToolResultMessage,
-    ) -> Result<(), WorkerFailure> {
+    ) -> Result<MessageCommitReceipt, WorkerFailure> {
         let durable_result = serde_json::to_value(result).map_err(|error| {
             WorkerFailure::Error(format!("tool result serialization failed: {error}"))
         })?;
@@ -724,14 +775,18 @@ impl Runner {
             is_error: result.is_error,
         })
         .await?;
-        self.emit_result_message(assistant_message_id, result).await
+        let receipt = self
+            .emit_result_message(assistant_message_id, result)
+            .await?;
+        let receipt = self.await_message_receipt(receipt).await?;
+        Ok(receipt)
     }
 
     async fn emit_result_message(
         &mut self,
         assistant_message_id: &str,
         result: &ToolResultMessage,
-    ) -> Result<(), WorkerFailure> {
+    ) -> Result<oneshot::Receiver<MessageCommitReceipt>, WorkerFailure> {
         let message = PublicMessage::ToolResult(result.clone());
         let message_id = tool_result_message_id(assistant_message_id, &result.tool_call_id);
         self.emit(AgentEvent::MessageStart {
@@ -739,23 +794,26 @@ impl Runner {
             message: Box::new(message.clone()),
         })
         .await?;
-        self.emit(AgentEvent::MessageEnd {
-            message_id,
-            message: Box::new(message),
-        })
-        .await
+        self.emit_message_end(message_id, message).await
     }
 
     async fn emit_rejected_results(
         &mut self,
         assistant_message_id: &str,
         results: &[ToolResultMessage],
-    ) -> Result<(), WorkerFailure> {
+    ) -> Result<Vec<MessageCommitReceipt>, WorkerFailure> {
+        let mut pending = Vec::with_capacity(results.len());
         for result in results {
-            self.emit_result_message(assistant_message_id, result)
-                .await?;
+            pending.push(
+                self.emit_result_message(assistant_message_id, result)
+                    .await?,
+            );
         }
-        Ok(())
+        let mut receipts = Vec::with_capacity(pending.len());
+        for waiter in pending {
+            receipts.push(self.await_message_receipt(waiter).await?);
+        }
+        Ok(receipts)
     }
 
     async fn inject_user(&mut self, command: &AdmittedCommand) -> Result<(), WorkerFailure> {
@@ -775,12 +833,9 @@ impl Runner {
             message: Box::new(message.clone()),
         })
         .await?;
-        self.emit(AgentEvent::MessageEnd {
-            message_id,
-            message: Box::new(message.clone()),
-        })
-        .await?;
-        self.context.push(message);
+        let receipt = self.emit_message_end(message_id, message.clone()).await?;
+        let receipt = self.await_message_receipt(receipt).await?;
+        self.retain_committed(receipt, &message)?;
         Ok(())
     }
 
@@ -812,11 +867,6 @@ impl Runner {
         message: PublicMessage,
         tool_results: Vec<ToolResultMessage>,
     ) -> Result<(), WorkerFailure> {
-        if stop_reason(&message) != Some(StopReason::Error) {
-            self.context.push(message.clone());
-        }
-        self.context
-            .extend(tool_results.iter().cloned().map(PublicMessage::ToolResult));
         self.emit(AgentEvent::TurnEnd {
             message: Some(Box::new(message)),
             tool_results,
@@ -837,7 +887,7 @@ impl Runner {
 
     fn validate_recovered_context(
         &self,
-        replacement: &[PublicMessage],
+        replacement: &[ContextMessage],
     ) -> Result<(), WorkerFailure> {
         if replacement.is_empty() || replacement == self.context {
             return Err(WorkerFailure::Error(
@@ -848,7 +898,7 @@ impl Runner {
             .context
             .iter()
             .rev()
-            .find(|message| matches!(message, PublicMessage::User(_)))
+            .find(|message| matches!(context_message(message), Message::User(_)))
             && !replacement.contains(active_user)
         {
             return Err(WorkerFailure::Error(
@@ -955,9 +1005,75 @@ impl Runner {
                 binding,
                 event,
                 commit_barrier: None,
+                message_commit_barrier: None,
             })
             .await
             .map_err(|_| WorkerFailure::EventChannelClosed)
+    }
+
+    async fn emit_message_end(
+        &mut self,
+        message_id: String,
+        message: PublicMessage,
+    ) -> Result<oneshot::Receiver<MessageCommitReceipt>, WorkerFailure> {
+        let binding = self.core.durable_binding.clone().ok_or_else(|| {
+            WorkerFailure::Error("RunCore has no durable worker binding".to_owned())
+        })?;
+        let (barrier, receipt) = MessageCommitBarrier::channel();
+        self.events
+            .send(RunOutput {
+                binding,
+                event: AgentEvent::MessageEnd {
+                    message_id,
+                    message: Box::new(message),
+                },
+                commit_barrier: None,
+                message_commit_barrier: Some(barrier),
+            })
+            .await
+            .map_err(|_| WorkerFailure::EventChannelClosed)?;
+        Ok(receipt)
+    }
+
+    async fn await_message_receipt(
+        &self,
+        receipt: oneshot::Receiver<MessageCommitReceipt>,
+    ) -> Result<MessageCommitReceipt, WorkerFailure> {
+        receipt
+            .await
+            .map_err(|_| WorkerFailure::Error("MessageEnd durability commit failed".to_owned()))
+    }
+
+    fn retain_committed(
+        &mut self,
+        receipt: MessageCommitReceipt,
+        message: &PublicMessage,
+    ) -> Result<(), WorkerFailure> {
+        if stop_reason(message) == Some(StopReason::Error) {
+            return Ok(());
+        }
+        self.context.push(ContextMessage::Persisted {
+            id: receipt.message_id,
+            seq: receipt.message_seq,
+            message: public_to_message(message.clone()),
+        });
+        Ok(())
+    }
+
+    fn retain_tool_results(
+        &mut self,
+        receipts: &[MessageCommitReceipt],
+        results: &[ToolResultMessage],
+    ) -> Result<(), WorkerFailure> {
+        if receipts.len() != results.len() {
+            return Err(WorkerFailure::Error(
+                "tool-result receipt cardinality mismatch".to_owned(),
+            ));
+        }
+        for (receipt, result) in receipts.iter().cloned().zip(results) {
+            self.retain_committed(receipt, &PublicMessage::ToolResult(result.clone()))?;
+        }
+        Ok(())
     }
 
     async fn start_next_turn(&mut self) -> Result<(), WorkerFailure> {
@@ -973,17 +1089,20 @@ enum AttemptOutcome {
     Retry {
         assistant_message_id: String,
         message: PublicMessage,
+        receipt: oneshot::Receiver<MessageCommitReceipt>,
         rejected_results: Vec<ToolResultMessage>,
     },
     ImmediateOverflow {
         assistant_message_id: String,
         message: PublicMessage,
+        receipt: oneshot::Receiver<MessageCommitReceipt>,
         source: OverflowSource,
         rejected_results: Vec<ToolResultMessage>,
     },
     Terminal {
         assistant_message_id: String,
         message: PublicMessage,
+        receipt: oneshot::Receiver<MessageCommitReceipt>,
         rejected_results: Vec<ToolResultMessage>,
         deferred_overflow: Option<OverflowSource>,
         length_guarded: bool,
@@ -991,6 +1110,7 @@ enum AttemptOutcome {
     ClosedError {
         assistant_message_id: String,
         message: PublicMessage,
+        receipt: oneshot::Receiver<MessageCommitReceipt>,
         rejected_results: Vec<ToolResultMessage>,
     },
 }
@@ -1015,10 +1135,136 @@ fn tool_calls(message: &PublicMessage) -> Vec<ToolCall> {
         .collect()
 }
 
+fn validate_and_order_rejected_results(
+    message: &crate::provider::types::AssistantMessage,
+    results: &mut [ToolResultMessage],
+) -> Result<(), &'static str> {
+    let mut terminal_rejections = Vec::new();
+    let mut executable_ids = HashSet::new();
+    for content in &message.content {
+        match content {
+            AssistantContent::ToolCall { tool_call, .. } => {
+                executable_ids.insert(tool_call.id.as_str());
+            }
+            AssistantContent::RejectedToolCall { rejected, .. } => {
+                terminal_rejections.push((rejected.id.as_str(), rejected.name.as_str()));
+            }
+            _ => {}
+        }
+    }
+
+    let unique_terminal_ids: HashSet<_> = terminal_rejections.iter().map(|(id, _)| *id).collect();
+    if unique_terminal_ids.len() != terminal_rejections.len() {
+        return Err("terminal contains duplicate rejected tool-call IDs");
+    }
+    if terminal_rejections
+        .iter()
+        .any(|(id, _)| executable_ids.contains(id))
+    {
+        return Err("a terminal tool-call ID is both executable and rejected");
+    }
+    if terminal_rejections.len() != results.len() {
+        return Err("terminal rejection/result cardinality differs");
+    }
+
+    let unique_result_ids: HashSet<_> = results
+        .iter()
+        .map(|result| result.tool_call_id.as_str())
+        .collect();
+    if unique_result_ids.len() != results.len() {
+        return Err("stream contains duplicate rejected-result tool-call IDs");
+    }
+    for result in results.iter() {
+        let Some((_, terminal_name)) = terminal_rejections
+            .iter()
+            .find(|(terminal_id, _)| *terminal_id == result.tool_call_id)
+        else {
+            return Err("terminal rejection/result identities differ");
+        };
+        if *terminal_name != result.tool_name {
+            return Err("terminal rejection/result tool names differ");
+        }
+        if !result.is_error {
+            return Err("rejected synthetic result is not an error");
+        }
+    }
+    results.sort_by_key(|result| {
+        terminal_rejections
+            .iter()
+            .position(|(terminal_id, _)| *terminal_id == result.tool_call_id)
+            .expect("validated rejected result identity")
+    });
+    Ok(())
+}
+
 fn stop_reason(message: &PublicMessage) -> Option<StopReason> {
     match message {
         PublicMessage::Assistant(message) => Some(message.stop_reason),
         _ => None,
+    }
+}
+
+fn context_message(message: &ContextMessage) -> &Message {
+    match message {
+        ContextMessage::Persisted { message, .. } | ContextMessage::Synthetic { message } => {
+            message
+        }
+    }
+}
+
+pub(super) fn public_to_message(message: PublicMessage) -> Message {
+    match message {
+        PublicMessage::User(message) => Message::User(message),
+        PublicMessage::ToolResult(message) => Message::ToolResult(message),
+        PublicMessage::Assistant(message) => {
+            Message::Assistant(crate::provider::types::AssistantMessage {
+                content: message
+                    .content
+                    .into_iter()
+                    .map(|content| match content {
+                        PublicAssistantContent::Text {
+                            text,
+                            wire_item_index,
+                        } => AssistantContent::Text {
+                            text,
+                            wire_item_index,
+                        },
+                        PublicAssistantContent::Thinking {
+                            thinking,
+                            signature_field,
+                            wire_item_index,
+                        } => AssistantContent::Thinking {
+                            thinking,
+                            signature_field,
+                            wire_item_index,
+                        },
+                        PublicAssistantContent::ToolCall {
+                            tool_call,
+                            wire_item_index,
+                        } => AssistantContent::ToolCall {
+                            tool_call,
+                            wire_item_index,
+                        },
+                        PublicAssistantContent::RejectedToolCall {
+                            rejected,
+                            wire_item_index,
+                        } => AssistantContent::RejectedToolCall {
+                            rejected,
+                            wire_item_index,
+                        },
+                    })
+                    .collect(),
+                model: message.model,
+                provider: message.provider,
+                origin: message.origin,
+                usage: message.usage,
+                stop_reason: message.stop_reason,
+                error_message: message.error_message,
+                provider_code: message.provider_code,
+                interrupted: message.interrupted,
+                timestamp: message.timestamp,
+            })
+        }
     }
 }
 
