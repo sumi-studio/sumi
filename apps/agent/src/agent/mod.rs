@@ -31,11 +31,11 @@ use crate::{
         GatewayWriter, InboundCommand, OutboundFrame,
     },
     provider::{overflow::OverflowSource, types::PublicMessage},
+    runtime::contracts::ProcessGeneration,
     store::{
         DataKeyPurpose, EventWriter, InboundAdmission, InboundReceiptOrigin,
         RecoveryRequired as AdmissionRecoveryRequired, RecoveryStep, Store, SuffixRecovery,
     },
-    tools::executor::validate_process_generation,
 };
 
 mod durable_bridge;
@@ -455,7 +455,7 @@ pub(crate) struct Session<G: Gateway> {
     core: Option<RunCore>,
     active: Option<ActiveRun>,
     worker: Arc<dyn RunWorker>,
-    executor_generation: u64,
+    executor_generation: ProcessGeneration,
     /// T15 already applies the idle/post-run Abort cutoff and supplies the
     /// injected cancellation and phase-observation seams. Commands received
     /// during an active run otherwise remain durably `received` in this
@@ -474,9 +474,8 @@ impl<G: Gateway + 'static> Session<G> {
         gateway: G,
         core: RunCore,
         worker: Arc<dyn RunWorker>,
-        executor_generation: u64,
+        executor_generation: ProcessGeneration,
     ) -> Result<Self> {
-        validate_process_generation(executor_generation)?;
         let conversation_id = store.scope().conversation_id.clone();
         let store = Arc::new(store);
         for purpose in [

@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::{
     provider::types::{PublicAssistantContent, PublicMessage, StopReason},
+    runtime::contracts::ProcessGeneration,
     store::{
         DurableEvent, EventBatch, EventWrite, EventWriter, InjectedCommand, Projection, RunPhase,
         ToolExecutionMutation,
@@ -21,11 +22,11 @@ pub(crate) struct DurableRunBinding {
     pub command_seq: u64,
     pub run_id: String,
     pub turn_id: String,
-    pub executor_generation: u64,
+    pub executor_generation: ProcessGeneration,
 }
 
 impl DurableRunBinding {
-    pub(super) fn idle(command: &AdmittedCommand, executor_generation: u64) -> Self {
+    pub(super) fn idle(command: &AdmittedCommand, executor_generation: ProcessGeneration) -> Self {
         Self {
             command_id: command.envelope().command_id.to_string(),
             command_seq: command.envelope().seq,
@@ -748,7 +749,7 @@ mod tests {
             command_seq: 1,
             run_id: "run-a".to_owned(),
             turn_id: "turn-a".to_owned(),
-            executor_generation: 73,
+            executor_generation: ProcessGeneration::from_wire(73).unwrap(),
         }
     }
 
@@ -784,7 +785,7 @@ mod tests {
             event: AgentEvent::AgentStart,
             commit_barrier: None,
         };
-        assert_eq!(output.binding.executor_generation, 73);
+        assert_eq!(output.binding.executor_generation.to_wire(), 73);
         let public = serde_json::to_value(output.event).expect("serialize public event");
         assert_eq!(public, serde_json::json!({"type":"agent_start"}));
         assert!(public.get("executor_generation").is_none());

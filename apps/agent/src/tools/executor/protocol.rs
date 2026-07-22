@@ -6,52 +6,17 @@ use sha2::{Digest, Sha256};
 
 use super::super::{ResourceLimit, ToolError};
 use super::ArtifactResponse;
+use crate::runtime::contracts::RpcIdentity;
 use crate::tools::{bash::BashExecutionResult, fs::GrepMatch, truncate::TruncationResult};
 
 pub const MAX_RPC_LINE_BYTES: usize = 1024 * 1024;
 pub const MAX_RPC_READ_BYTES: usize = 50 * 1024;
-pub const MAX_PROCESS_GENERATION: u64 = i64::MAX as u64;
 const MAX_RPC_ID_BYTES: usize = 128;
-const MAX_RPC_NONCE_BYTES: usize = 128;
 const MAX_RPC_ERROR_CODE_BYTES: usize = 128;
 const RPC_ACTIVE_REQUEST_CAPACITY: usize = 4_096;
 const RPC_ORDINARY_ACTIVE_REQUEST_CAPACITY: usize = RPC_ACTIVE_REQUEST_CAPACITY - 1;
 const RPC_TERMINAL_HISTORY_CAPACITY: usize = 4_096;
 type RpcIdDigest = [u8; 32];
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RpcIdentity {
-    pub generation: u64,
-    pub nonce: String,
-}
-
-impl RpcIdentity {
-    pub(crate) fn validate(&self) -> Result<(), ToolError> {
-        validate_process_generation(self.generation)?;
-        validate_bounded_text(&self.nonce, "nonce", MAX_RPC_NONCE_BYTES)
-    }
-
-    fn validate_wire(&self, generation: u64, nonce: &str) -> Result<(), ToolError> {
-        self.validate()?;
-        validate_process_generation(generation)?;
-        validate_bounded_text(nonce, "nonce", MAX_RPC_NONCE_BYTES)?;
-        if generation != self.generation || nonce != self.nonce {
-            return Err(ToolError::Protocol(
-                "RPC generation or boot nonce mismatch".to_owned(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-pub fn validate_process_generation(generation: u64) -> Result<(), ToolError> {
-    if generation > MAX_PROCESS_GENERATION {
-        return Err(ToolError::Protocol(format!(
-            "process generation must be in 0..={MAX_PROCESS_GENERATION}"
-        )));
-    }
-    Ok(())
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -340,11 +305,7 @@ pub fn decode_rpc_line<T: DeserializeOwned + RpcOperationValidation>(
 
 pub fn encode_rpc_frame<T: Serialize>(frame: &RpcFrame<T>) -> Result<Vec<u8>, ToolError> {
     let (generation, nonce) = frame.identity_fields();
-    RpcIdentity {
-        generation,
-        nonce: nonce.to_owned(),
-    }
-    .validate()?;
+    RpcIdentity::from_wire(generation, nonce)?;
     match frame {
         RpcFrame::Update { request_id, .. } => validate_rpc_id(request_id, "request_id")?,
         RpcFrame::Terminal {
@@ -740,26 +701,21 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+    use crate::runtime::contracts::{MAX_OPAQUE_ID_BYTES, MAX_PROCESS_GENERATION};
 
     fn identity() -> RpcIdentity {
-        RpcIdentity {
-            generation: 7,
-            nonce: "boot-nonce".to_owned(),
-        }
+        RpcIdentity::from_wire(7, "boot-nonce").unwrap()
     }
 
     #[test]
     fn process_generation_domain_is_shared_by_identity_and_wire_paths() {
         for generation in [0, MAX_PROCESS_GENERATION] {
-            let identity = RpcIdentity {
-                generation,
-                nonce: "boot-nonce".to_owned(),
-            };
-            identity.validate().expect("valid identity generation");
+            let identity = RpcIdentity::from_wire(generation, "boot-nonce")
+                .expect("valid identity generation");
 
             let request = serde_json::to_vec(&RpcRequest {
                 generation,
-                nonce: identity.nonce.clone(),
+                nonce: identity.nonce().as_str().to_owned(),
                 request_id: "request-1".to_owned(),
                 operation: ExecutorOperation::Cancel {
                     execution_id: "execution-1".to_owned(),
@@ -771,7 +727,7 @@ mod tests {
 
             encode_rpc_frame(&RpcFrame::<Value>::Update {
                 generation,
-                nonce: identity.nonce,
+                nonce: identity.nonce().as_str().to_owned(),
                 request_id: "request-1".to_owned(),
                 value: json!({}),
             })
@@ -779,11 +735,7 @@ mod tests {
         }
 
         let out_of_domain = MAX_PROCESS_GENERATION + 1;
-        let invalid_identity = RpcIdentity {
-            generation: out_of_domain,
-            nonce: "boot-nonce".to_owned(),
-        };
-        assert!(invalid_identity.validate().is_err());
+        assert!(RpcIdentity::from_wire(out_of_domain, "boot-nonce").is_err());
         assert!(
             encode_rpc_frame(&RpcFrame::<Value>::Update {
                 generation: out_of_domain,
@@ -794,10 +746,7 @@ mod tests {
             .is_err()
         );
 
-        let valid_identity = RpcIdentity {
-            generation: MAX_PROCESS_GENERATION,
-            nonce: "boot-nonce".to_owned(),
-        };
+        let valid_identity = RpcIdentity::from_wire(MAX_PROCESS_GENERATION, "boot-nonce").unwrap();
         let invalid_request = serde_json::to_vec(&RpcRequest {
             generation: out_of_domain,
             nonce: "boot-nonce".to_owned(),
@@ -859,10 +808,7 @@ mod tests {
         );
         assert!(decode_rpc_line::<ExecutorOperation>(b"{}\n", &identity()).is_err());
 
-        let wrong = RpcIdentity {
-            generation: 8,
-            nonce: "boot-nonce".to_owned(),
-        };
+        let wrong = RpcIdentity::from_wire(8, "boot-nonce").unwrap();
         assert!(decode_rpc_line::<ExecutorOperation>(&encoded, &wrong).is_err());
         assert!(decode_rpc_line::<ExecutorOperation>(
             br#"{"generation":7,"nonce":"boot-nonce","request_id":"request-1","operation":{"type":"cancel","execution_id":"execution-1"},"extra":true}"#,
@@ -933,7 +879,7 @@ mod tests {
 
     #[test]
     fn nonces_are_nonempty_bounded_and_checked_on_both_directions() {
-        for nonce in ["".to_owned(), "n".repeat(MAX_RPC_NONCE_BYTES + 1)] {
+        for nonce in ["".to_owned(), "n".repeat(MAX_OPAQUE_ID_BYTES + 1)] {
             let request = serde_json::to_vec(&RpcRequest {
                 generation: 7,
                 nonce: nonce.clone(),
@@ -945,17 +891,7 @@ mod tests {
             .expect("encode malformed request fixture");
             assert!(decode_rpc_line::<ExecutorOperation>(&request, &identity()).is_err());
 
-            let expected = RpcIdentity {
-                generation: 7,
-                nonce: nonce.clone(),
-            };
-            assert!(
-                decode_rpc_line::<ExecutorOperation>(
-                    &request_line("request-1", "execution-1"),
-                    &expected
-                )
-                .is_err()
-            );
+            assert!(RpcIdentity::from_wire(7, nonce.clone()).is_err());
 
             let mut frame = update_frame("request-1");
             let RpcFrame::Update {
@@ -1118,14 +1054,8 @@ mod tests {
         assert_eq!(decode_rpc_frame::<Value>(line, &identity()).unwrap(), frame);
 
         for stale in [
-            RpcIdentity {
-                generation: 8,
-                nonce: "boot-nonce".to_owned(),
-            },
-            RpcIdentity {
-                generation: 7,
-                nonce: "stale-nonce".to_owned(),
-            },
+            RpcIdentity::from_wire(8, "boot-nonce").unwrap(),
+            RpcIdentity::from_wire(7, "stale-nonce").unwrap(),
         ] {
             assert!(matches!(
                 decode_rpc_frame::<Value>(line, &stale),

@@ -22,52 +22,22 @@ use crate::{
         StopReason, ToolArgumentError, ToolCall, ToolResultMessage, Usage, UserContent,
         UserMessage, ValidatedToolArguments,
     },
+    runtime::contracts::{MAX_PROCESS_GENERATION, ProcessGeneration},
     store::{Store, user_message_id},
-    tools::executor::MAX_PROCESS_GENERATION,
 };
 
-const TEST_EXECUTOR_GENERATION: u64 = 73;
+fn test_executor_generation() -> ProcessGeneration {
+    ProcessGeneration::from_wire(73).expect("valid test generation")
+}
 
-#[tokio::test]
-async fn session_rejects_out_of_domain_generation_before_durable_mutation() {
-    let store = Store::session_test_store("invalid-generation-session")
-        .await
-        .expect("test store");
-    let pool = store.pool().clone();
-    let (gateway, _commands, _frames) = gateway();
-    let worker: Arc<dyn RunWorker> = Arc::new(
-        |core: RunCore,
-         _initial: AdmittedCommand,
-         _controls: mpsc::Receiver<RunControl>,
-         _events: mpsc::Sender<AgentEvent>| async move { RunCompletion::Completed(core) },
-    );
-
-    let error = match Session::start(
-        store,
-        gateway,
-        RunCore::new(),
-        worker,
-        MAX_PROCESS_GENERATION + 1,
-    )
-    .await
-    {
-        Ok(_) => panic!("out-of-domain generation must fail startup"),
-        Err(error) => error,
-    };
-    assert!(error.to_string().contains("process generation"));
-
-    for table in [
-        "data_keys",
-        "agent_events",
-        "inbound_commands",
-        "tool_executions",
-    ] {
-        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-            .fetch_one(&pool)
-            .await
-            .expect("durable row count");
-        assert_eq!(count, 0, "startup must not mutate {table}");
+#[test]
+fn session_start_composition_boundary_requires_process_generation() {
+    fn assert_signature<Future>(
+        _start: fn(Store, MockGateway, RunCore, Arc<dyn RunWorker>, ProcessGeneration) -> Future,
+    ) {
     }
+
+    assert_signature(Session::<MockGateway>::start);
 }
 
 struct MockGateway {
@@ -497,7 +467,7 @@ async fn session_with_core(
         gateway,
         core,
         worker,
-        TEST_EXECUTOR_GENERATION,
+        test_executor_generation(),
     )
     .await
     .expect("session startup")
@@ -642,7 +612,9 @@ impl RunWorker for StaleBindingWorker {
                         .expect("stale turn output");
                 }
                 StaleBinding::ExecutorGeneration => {
-                    binding.executor_generation += 1;
+                    binding.executor_generation =
+                        ProcessGeneration::from_wire(binding.executor_generation.to_wire() + 1)
+                            .expect("next test generation");
                     events
                         .send(RunOutput {
                             binding,
@@ -675,7 +647,7 @@ async fn session_rejects_worker_output_with_any_changed_durable_binding() {
             gateway,
             RunCore::new(),
             Arc::new(StaleBindingWorker(kind)),
-            TEST_EXECUTOR_GENERATION,
+            test_executor_generation(),
         )
         .await
         .expect("session");
@@ -882,7 +854,7 @@ async fn active_session_uses_durable_backpressure_before_its_bounded_fifo_can_ov
         gateway,
         RunCore::new(),
         worker,
-        TEST_EXECUTOR_GENERATION,
+        test_executor_generation(),
     )
     .await
     .expect("session");
@@ -967,7 +939,7 @@ async fn active_session_keeps_early_reserved_abort_and_remaining_ordinary_window
         gateway,
         RunCore::new(),
         worker,
-        TEST_EXECUTOR_GENERATION,
+        test_executor_generation(),
     )
     .await
     .expect("session");
@@ -1174,7 +1146,10 @@ async fn fixture_adapter_event_loss_drains_bounded_lane_and_returns_the_actual_c
     let initial = AdmittedCommand::new(envelope, Utc::now());
     let mut core = RunCore::new();
     let ownership_id = core.ownership_id();
-    core.durable_binding = Some(DurableRunBinding::idle(&initial, TEST_EXECUTOR_GENERATION));
+    core.durable_binding = Some(DurableRunBinding::idle(
+        &initial,
+        test_executor_generation(),
+    ));
     let (_control_tx, control_rx) = mpsc::channel(1);
     let (events_tx, events_rx) = mpsc::channel(1);
     drop(events_rx);
@@ -1411,7 +1386,7 @@ async fn shutdown_drains_ready_completion_outputs_before_recovering_core_after_g
             gateway,
             RunCore::new(),
             worker,
-            TEST_EXECUTOR_GENERATION,
+            test_executor_generation(),
         )
         .await
         .expect("session")
@@ -1551,7 +1526,7 @@ async fn completion_drain_persists_all_outputs_before_recovering_mutated_core_af
         gateway,
         RunCore::new(),
         worker,
-        TEST_EXECUTOR_GENERATION,
+        test_executor_generation(),
     )
     .await
     .expect("session");
@@ -1695,7 +1670,7 @@ async fn t15_recovery_gate_allows_only_t12_prefix_exact_retransmission() {
         gateway,
         RunCore::new(),
         worker,
-        TEST_EXECUTOR_GENERATION,
+        test_executor_generation(),
     )
     .await
     .expect("recovery-gated session constructs");
@@ -1847,7 +1822,7 @@ async fn active_second_user_stays_received_then_runs_after_the_current_agent_end
         gateway,
         RunCore::new(),
         worker,
-        TEST_EXECUTOR_GENERATION,
+        test_executor_generation(),
     )
     .await
     .expect("session");
@@ -1984,7 +1959,7 @@ async fn active_user_then_abort_is_cut_off_after_agent_end_without_starting_user
         gateway,
         RunCore::new(),
         worker,
-        TEST_EXECUTOR_GENERATION,
+        test_executor_generation(),
     )
     .await
     .expect("session");
@@ -2055,7 +2030,7 @@ async fn active_abort_then_user_applies_abort_before_starting_later_user() {
         gateway,
         RunCore::new(),
         worker,
-        TEST_EXECUTOR_GENERATION,
+        test_executor_generation(),
     )
     .await
     .expect("session");
@@ -2234,7 +2209,7 @@ async fn tool_driver_observes_running_only_after_start_commit() {
         gateway,
         RunCore::new(),
         Arc::new(SequentialRunWorker::new(driver.clone())),
-        TEST_EXECUTOR_GENERATION,
+        test_executor_generation(),
     )
     .await
     .expect("session");
@@ -2275,7 +2250,7 @@ async fn rejected_running_transition_never_calls_driver_or_publishes_start() {
         gateway,
         RunCore::new(),
         Arc::new(SequentialRunWorker::new(driver.clone())),
-        TEST_EXECUTOR_GENERATION,
+        test_executor_generation(),
     )
     .await
     .expect("session");
@@ -2369,7 +2344,7 @@ async fn blocked_writer_drops_only_volatile_suffix_and_preserves_terminal_reserv
         gateway,
         RunCore::new(),
         worker,
-        TEST_EXECUTOR_GENERATION,
+        test_executor_generation(),
     )
     .await
     .expect("session");
@@ -2443,7 +2418,7 @@ async fn idle_gateway_eof_aborts_a_blocked_writer_without_hanging() {
         gateway,
         RunCore::new(),
         worker,
-        TEST_EXECUTOR_GENERATION,
+        test_executor_generation(),
     )
     .await
     .expect("session");
@@ -2508,7 +2483,7 @@ async fn aborting_session_drops_blocked_writer_and_active_worker() {
         gateway,
         RunCore::new(),
         worker,
-        TEST_EXECUTOR_GENERATION,
+        test_executor_generation(),
     )
     .await
     .expect("session startup");
@@ -2817,7 +2792,7 @@ async fn durable_bridge_commits_each_event_before_gateway_delivery_with_exact_se
         gateway,
         RunCore::new(),
         worker,
-        TEST_EXECUTOR_GENERATION,
+        test_executor_generation(),
     )
     .await
     .expect("session");
@@ -2856,7 +2831,7 @@ async fn durable_bridge_commits_each_event_before_gateway_delivery_with_exact_se
     assert_eq!(projected, "stop");
 }
 
-async fn assert_first_length_tool_call_persists_generation(executor_generation: u64) {
+async fn assert_first_length_tool_call_persists_generation(executor_generation: ProcessGeneration) {
     let store = Store::session_test_store(&format!("durable-length-session-{executor_generation}"))
         .await
         .expect("test store");
@@ -2976,7 +2951,7 @@ async fn assert_first_length_tool_call_persists_generation(executor_generation: 
         rows,
         vec![(
             "length-call".to_owned(),
-            i64::try_from(executor_generation).expect("validated generation"),
+            executor_generation.as_i64(),
             "00000000-0000-4000-8000-000000000001/length-call".to_owned(),
             "not_started".to_owned(),
             None,
@@ -2993,7 +2968,10 @@ async fn assert_first_length_tool_call_persists_generation(executor_generation: 
 #[tokio::test]
 async fn first_length_tool_call_is_durably_not_started_without_public_execution_lifecycle() {
     for generation in [0, MAX_PROCESS_GENERATION] {
-        assert_first_length_tool_call_persists_generation(generation).await;
+        assert_first_length_tool_call_persists_generation(
+            ProcessGeneration::from_wire(generation).expect("valid boundary generation"),
+        )
+        .await;
     }
 }
 
@@ -3085,7 +3063,7 @@ async fn consecutive_length_guard_error_is_durably_not_started_and_closes_normal
         gateway,
         RunCore::new(),
         worker,
-        TEST_EXECUTOR_GENERATION,
+        test_executor_generation(),
     )
     .await
     .expect("session");
@@ -3118,14 +3096,14 @@ async fn consecutive_length_guard_error_is_durably_not_started_and_closes_normal
         vec![
             (
                 "length-call-1".to_owned(),
-                TEST_EXECUTOR_GENERATION as i64,
+                test_executor_generation().as_i64(),
                 "not_started".to_owned(),
                 None,
                 Some("length_guard".to_owned()),
             ),
             (
                 "length-call-2".to_owned(),
-                TEST_EXECUTOR_GENERATION as i64,
+                test_executor_generation().as_i64(),
                 "not_started".to_owned(),
                 None,
                 Some("length_guard".to_owned()),
@@ -3304,7 +3282,7 @@ async fn mixed_valid_and_rejected_calls_commit_the_rejected_pair_before_valid_li
         gateway,
         RunCore::new(),
         worker,
-        TEST_EXECUTOR_GENERATION,
+        test_executor_generation(),
     )
     .await
     .expect("session");
@@ -3403,7 +3381,7 @@ async fn failed_idle_injection_batch_publishes_no_partial_event_frame() {
         gateway,
         RunCore::new(),
         worker,
-        TEST_EXECUTOR_GENERATION,
+        test_executor_generation(),
     )
     .await
     .expect("session");
@@ -3504,7 +3482,7 @@ async fn retry_error_is_excluded_and_retry_schedule_precedes_next_attempt() {
         gateway,
         RunCore::new(),
         worker,
-        TEST_EXECUTOR_GENERATION,
+        test_executor_generation(),
     )
     .await
     .expect("session");
@@ -3565,7 +3543,7 @@ async fn provider_start_failures_in_two_runs_use_distinct_stable_durable_message
         gateway,
         RunCore::new(),
         worker,
-        TEST_EXECUTOR_GENERATION,
+        test_executor_generation(),
     )
     .await
     .expect("session");
@@ -3624,7 +3602,7 @@ async fn opaque_context_refusal_closes_durably_before_applied_ack() {
         gateway,
         RunCore::new(),
         worker,
-        TEST_EXECUTOR_GENERATION,
+        test_executor_generation(),
     )
     .await
     .expect("session");
@@ -3708,7 +3686,7 @@ async fn opaque_context_refusal_closes_durably_before_applied_ack() {
     assert!(agent_end < applied);
 }
 
-async fn assert_normal_tool_lifecycle_persists_generation(executor_generation: u64) {
+async fn assert_normal_tool_lifecycle_persists_generation(executor_generation: ProcessGeneration) {
     let store = Store::session_test_store(&format!(
         "durable-normal-tool-session-{executor_generation}"
     ))
@@ -3833,7 +3811,7 @@ async fn assert_normal_tool_lifecycle_persists_generation(executor_generation: u
         row,
         (
             "succeeded".to_owned(),
-            i64::try_from(executor_generation).expect("validated generation"),
+            executor_generation.as_i64(),
             "00000000-0000-4000-8000-000000000001/normal-call".to_owned(),
         )
     );
@@ -3862,7 +3840,10 @@ async fn assert_normal_tool_lifecycle_persists_generation(executor_generation: u
 #[tokio::test]
 async fn normal_tool_lifecycle_is_prepared_started_finished_and_paired() {
     for generation in [0, MAX_PROCESS_GENERATION] {
-        assert_normal_tool_lifecycle_persists_generation(generation).await;
+        assert_normal_tool_lifecycle_persists_generation(
+            ProcessGeneration::from_wire(generation).expect("valid boundary generation"),
+        )
+        .await;
     }
 }
 
@@ -3938,7 +3919,7 @@ async fn tool_execution_update_after_end_is_rejected_while_result_pairing_is_pen
             gateway,
             RunCore::new(),
             worker,
-            TEST_EXECUTOR_GENERATION,
+            test_executor_generation(),
         )
         .await
         .expect("session")

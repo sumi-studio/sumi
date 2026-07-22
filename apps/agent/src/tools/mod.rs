@@ -82,6 +82,12 @@ pub enum ToolError {
     Protocol(String),
 }
 
+impl From<crate::runtime::contracts::RuntimeContractError> for ToolError {
+    fn from(error: crate::runtime::contracts::RuntimeContractError) -> Self {
+        Self::Protocol(error.to_string())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolOutput {
     pub content: Vec<UserContent>,
