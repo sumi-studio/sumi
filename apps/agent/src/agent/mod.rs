@@ -7,9 +7,13 @@
 use std::{
     any::Any,
     future::Future,
+    marker::PhantomData,
     panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use anyhow::Result;
@@ -23,8 +27,8 @@ use uuid::Uuid;
 
 use crate::{
     gateway::{
-        Command, CommandAckStatus, CommandEnvelope, Gateway, GatewayClosed, InboundCommand,
-        OutboundFrame,
+        Command, CommandAckStatus, CommandEnvelope, Gateway, GatewayClosed, GatewayReader,
+        GatewayWriter, InboundCommand, OutboundFrame,
     },
     provider::{overflow::OverflowSource, types::PublicMessage},
     store::{
@@ -40,7 +44,9 @@ mod provider_projection;
 mod queue;
 mod run;
 
-use durable_bridge::{CommittedOutput, DurableBridge, DurableRunBinding, RunOutput};
+use durable_bridge::{
+    CommittedOutput, DurableBridge, DurableRunBinding, RunOutput, ToolStartCommitBarrier,
+};
 use queue::MessageQueue;
 
 pub(crate) use events::{
@@ -61,11 +67,97 @@ pub(crate) use run::{
 
 const CONTROL_CHANNEL_CAPACITY: usize = 32;
 const EVENT_CHANNEL_CAPACITY: usize = 64;
+const OUTBOUND_CHANNEL_CAPACITY: usize = 64;
+const VOLATILE_OUTBOUND_BUDGET: usize = 32;
 /// API admission permits 32 ordinary commands plus one reserved Abort.
 const PENDING_ORDINARY_CONTROL_CAPACITY: usize = 32;
 const PENDING_CONTROL_CAPACITY: usize = PENDING_ORDINARY_CONTROL_CAPACITY + 1;
 
 type WorkerFuture = Pin<Box<dyn Future<Output = RunCompletion> + Send + 'static>>;
+
+struct OutboundItem {
+    frames: Vec<OutboundFrame>,
+    volatile: bool,
+}
+
+#[derive(Clone)]
+struct OutboundHandle {
+    tx: mpsc::Sender<OutboundItem>,
+    volatile_in_flight: Arc<AtomicUsize>,
+    progress: Arc<OutboundProgress>,
+}
+
+#[derive(Default)]
+struct OutboundProgress {
+    enqueued: AtomicUsize,
+    completed: AtomicUsize,
+    completed_notify: tokio::sync::Notify,
+}
+
+impl OutboundHandle {
+    fn enqueue_reliable(&self, frames: Vec<OutboundFrame>) -> Result<(), SessionFailure> {
+        self.tx
+            .try_send(OutboundItem {
+                frames,
+                volatile: false,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => SessionFailure::OutboundFull,
+                mpsc::error::TrySendError::Closed(_) => SessionFailure::OutboundClosed,
+            })?;
+        self.progress.enqueued.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
+    fn enqueue_volatile(&self, frame: OutboundFrame) {
+        if self
+            .volatile_in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < VOLATILE_OUTBOUND_BUDGET).then_some(current + 1)
+            })
+            .is_err()
+        {
+            return;
+        }
+        if self
+            .tx
+            .try_send(OutboundItem {
+                frames: vec![frame],
+                volatile: true,
+            })
+            .is_err()
+        {
+            self.volatile_in_flight.fetch_sub(1, Ordering::AcqRel);
+        } else {
+            self.progress.enqueued.fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
+async fn own_gateway_writer<W: GatewayWriter>(
+    mut writer: W,
+    mut outbound: mpsc::Receiver<OutboundItem>,
+    volatile_in_flight: Arc<AtomicUsize>,
+    progress: Arc<OutboundProgress>,
+) -> Result<()> {
+    while let Some(item) = outbound.recv().await {
+        let volatile = item.volatile;
+        for frame in item.frames {
+            if let Err(error) = writer.send(frame).await {
+                if volatile {
+                    volatile_in_flight.fetch_sub(1, Ordering::AcqRel);
+                }
+                return Err(error);
+            }
+        }
+        if volatile {
+            volatile_in_flight.fetch_sub(1, Ordering::AcqRel);
+        }
+        progress.completed.fetch_add(1, Ordering::Release);
+        progress.completed_notify.notify_waiters();
+    }
+    Ok(())
+}
 
 /// The sole mutable conversation value transferred into and out of a worker.
 /// It is intentionally neither `Clone` nor wrapped in shared mutability.
@@ -226,7 +318,9 @@ where
                                 }
                                 emitted_turn = true;
                             }
-                            if events.send(RunOutput { binding: binding.clone(), event }).await.is_err() {
+                            let commit_barrier = matches!(event, AgentEvent::ToolExecutionStart { .. })
+                                .then(|| ToolStartCommitBarrier::channel().0);
+                            if events.send(RunOutput { binding: binding.clone(), event, commit_barrier }).await.is_err() {
                                 return event_channel_lost(completion);
                             }
                         }
@@ -243,7 +337,9 @@ where
                             }
                             emitted_turn = true;
                         }
-                        if events.send(RunOutput { binding: binding.clone(), event }).await.is_err() {
+                        let commit_barrier = matches!(event, AgentEvent::ToolExecutionStart { .. })
+                            .then(|| ToolStartCommitBarrier::channel().0);
+                        if events.send(RunOutput { binding: binding.clone(), event, commit_barrier }).await.is_err() {
                             // The fixture future owns the real RunCore. Keep
                             // draining its bounded event lane while it settles;
                             // simply awaiting it here can deadlock once that
@@ -327,6 +423,10 @@ pub(crate) enum SessionFailure {
         #[source]
         source: anyhow::Error,
     },
+    #[error("bounded outbound queue is full after durable state was committed")]
+    OutboundFull,
+    #[error("bounded outbound queue is closed after durable state was committed")]
+    OutboundClosed,
     #[error("received a control command while idle; command remains durably received")]
     IdleControl,
     #[error(transparent)]
@@ -336,7 +436,11 @@ pub(crate) enum SessionFailure {
 /// Gateway/control-plane owner. `EventWriter` and `InboundAdmission` never
 /// leave this value; workers receive only already-admitted typed commands.
 pub(crate) struct Session<G: Gateway> {
-    gateway: G,
+    gateway_reader: G::Reader,
+    outbound: Option<OutboundHandle>,
+    writer_done: oneshot::Receiver<Result<()>>,
+    writer_join: Option<JoinHandle<()>>,
+    gateway_type: PhantomData<G>,
     conversation_id: String,
     writer: EventWriter,
     admission: InboundAdmission,
@@ -378,8 +482,33 @@ impl<G: Gateway + 'static> Session<G> {
         writer.initialize_recovery_checkpoint().await?;
         let recovery_steps = SuffixRecovery::recover_t12_prefix(&store, &writer).await?;
         let admission = InboundAdmission::after_t12_recovery(!recovery_steps.is_empty());
+        let (gateway_reader, gateway_writer) = gateway.split();
+        let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_CHANNEL_CAPACITY);
+        let volatile_in_flight = Arc::new(AtomicUsize::new(0));
+        let outbound_progress = Arc::new(OutboundProgress::default());
+        let (writer_done_tx, writer_done) = oneshot::channel();
+        let writer_counters = volatile_in_flight.clone();
+        let writer_progress = outbound_progress.clone();
+        let writer_join = tokio::spawn(async move {
+            let result = own_gateway_writer(
+                gateway_writer,
+                outbound_rx,
+                writer_counters,
+                writer_progress,
+            )
+            .await;
+            let _ = writer_done_tx.send(result);
+        });
         Ok(Self {
-            gateway,
+            gateway_reader,
+            outbound: Some(OutboundHandle {
+                tx: outbound_tx,
+                volatile_in_flight,
+                progress: outbound_progress,
+            }),
+            writer_done,
+            writer_join: Some(writer_join),
+            gateway_type: PhantomData,
             conversation_id,
             writer,
             admission,
@@ -395,15 +524,21 @@ impl<G: Gateway + 'static> Session<G> {
 
     pub(crate) async fn run(mut self) -> SessionResult {
         match self.run_until_exit().await {
-            Ok(()) => SessionResult::Completed(
-                self.core
-                    .take()
-                    .expect("clean idle exit retains the unique RunCore"),
-            ),
+            Ok(()) => {
+                // Gateway EOF is terminal. Do not wait for an arbitrary
+                // transport send to finish after the reader has closed.
+                self.abort_writer().await;
+                SessionResult::Completed(
+                    self.core
+                        .take()
+                        .expect("clean idle exit retains the unique RunCore"),
+                )
+            }
             Err(failure) => {
                 if self.active.is_some() {
                     self.shutdown_active().await;
                 }
+                self.abort_writer().await;
                 let ownership = if self.durable_core_invalidated {
                     self.core.take();
                     RunOwnership::Lost
@@ -420,12 +555,27 @@ impl<G: Gateway + 'static> Session<G> {
     async fn run_until_exit(&mut self) -> Result<(), SessionFailure> {
         loop {
             if self.active.is_none() {
-                let inbound = match self.gateway.next_command().await {
-                    Ok(inbound) => inbound,
-                    Err(error) if error.downcast_ref::<GatewayClosed>().is_some() => {
-                        return Ok(());
+                enum IdleSelected {
+                    Command(Result<InboundCommand>),
+                    Writer(std::result::Result<Result<()>, oneshot::error::RecvError>),
+                }
+                let selected = tokio::select! {
+                    command = self.gateway_reader.next_command() => IdleSelected::Command(command),
+                    writer = &mut self.writer_done => IdleSelected::Writer(writer),
+                };
+                let inbound = match selected {
+                    IdleSelected::Command(Ok(inbound)) => inbound,
+                    IdleSelected::Command(Err(error))
+                        if error.downcast_ref::<GatewayClosed>().is_some() =>
+                    {
+                        // Preserve a writer failure that won the race with
+                        // EOF without waiting for a transport still in send.
+                        return self.gateway_closed_result(false);
                     }
-                    Err(error) => return Err(gateway_failure("receive", error)),
+                    IdleSelected::Command(Err(error)) => {
+                        return Err(gateway_failure("receive", error));
+                    }
+                    IdleSelected::Writer(writer) => return Err(writer_failure(writer)),
                 };
                 self.admit_and_route(inbound).await?;
                 continue;
@@ -435,6 +585,7 @@ impl<G: Gateway + 'static> Session<G> {
                 Completion(std::result::Result<RunCompletion, oneshot::error::RecvError>),
                 Command(Result<InboundCommand>),
                 Event(Option<RunOutput>),
+                Writer(std::result::Result<Result<()>, oneshot::error::RecvError>),
             }
 
             let selected = {
@@ -442,8 +593,9 @@ impl<G: Gateway + 'static> Session<G> {
                 tokio::select! {
                     biased;
                     completion = &mut active.completion_rx => Selected::Completion(completion),
-                    command = self.gateway.next_command() => Selected::Command(command),
+                    command = self.gateway_reader.next_command() => Selected::Command(command),
                     event = active.events_rx.recv() => Selected::Event(event),
+                    writer = &mut self.writer_done => Selected::Writer(writer),
                 }
             };
 
@@ -453,13 +605,49 @@ impl<G: Gateway + 'static> Session<G> {
                 Selected::Command(Err(error))
                     if error.downcast_ref::<GatewayClosed>().is_some() =>
                 {
-                    return Err(SessionFailure::GatewayClosedDuringRun);
+                    return self.gateway_closed_result(true);
                 }
                 Selected::Command(Err(error)) => {
                     return Err(gateway_failure("receive", error));
                 }
                 Selected::Event(Some(event)) => self.persist_active_event(event).await?,
                 Selected::Event(None) => self.resolve_closed_event_channel().await?,
+                Selected::Writer(writer) => return Err(writer_failure(writer)),
+            }
+        }
+    }
+
+    async fn abort_writer(&mut self) {
+        self.outbound.take();
+        if let Some(join) = self.writer_join.take() {
+            join.abort();
+            let _ = join.await;
+        }
+    }
+
+    fn gateway_closed_result(&mut self, active: bool) -> Result<(), SessionFailure> {
+        match self.writer_done.try_recv() {
+            Ok(Ok(())) => {
+                if active {
+                    Err(SessionFailure::GatewayClosedDuringRun)
+                } else {
+                    Ok(())
+                }
+            }
+            Ok(Err(error)) => Err(gateway_failure("send", error)),
+            Err(oneshot::error::TryRecvError::Closed) => {
+                if active {
+                    Err(SessionFailure::GatewayClosedDuringRun)
+                } else {
+                    Err(SessionFailure::OutboundClosed)
+                }
+            }
+            Err(oneshot::error::TryRecvError::Empty) => {
+                if active {
+                    Err(SessionFailure::GatewayClosedDuringRun)
+                } else {
+                    Ok(())
+                }
             }
         }
     }
@@ -481,10 +669,7 @@ impl<G: Gateway + 'static> Session<G> {
         let ack = receipt.ack;
         let receipt_origin = receipt.origin;
         let received_at = receipt.received_at;
-        self.gateway
-            .send(OutboundFrame::CommandAck { ack: ack.clone() })
-            .await
-            .map_err(|error| gateway_failure("send", error))?;
+        self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack: ack.clone() }])?;
         if receipt_origin == InboundReceiptOrigin::Replay {
             return Ok(());
         }
@@ -549,10 +734,7 @@ impl<G: Gateway + 'static> Session<G> {
                 )
                 .await?;
             for ack in terminal.drain(..) {
-                self.gateway
-                    .send(OutboundFrame::CommandAck { ack })
-                    .await
-                    .map_err(|error| gateway_failure("send", error))?;
+                self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack }])?;
             }
             return Ok(());
         }
@@ -695,10 +877,7 @@ impl<G: Gateway + 'static> Session<G> {
                 .apply_idle_abort_cutoff(abort.envelope().command_id.as_str(), abort_seq)
                 .await?;
             for ack in terminal.drain(..) {
-                self.gateway
-                    .send(OutboundFrame::CommandAck { ack })
-                    .await
-                    .map_err(|error| gateway_failure("send", error))?;
+                self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack }])?;
             }
             while self
                 .deferred_commands
@@ -772,9 +951,15 @@ impl<G: Gateway + 'static> Session<G> {
                     return Err(error.into());
                 }
             };
+            if let Some(barrier) = committed.tool_start_barrier {
+                barrier.committed();
+            }
             if deliver && delivery_failure.is_none() {
                 delivery_failure = self
-                    .send_committed(committed, Some(active.bridge.command_id().to_owned()))
+                    .send_committed(
+                        committed.outputs,
+                        Some(active.bridge.command_id().to_owned()),
+                    )
                     .await
                     .err();
             }
@@ -793,11 +978,14 @@ impl<G: Gateway + 'static> Session<G> {
                 }
             }
         };
+        if let Some(barrier) = committed.tool_start_barrier {
+            barrier.committed();
+        }
         let command_id = self
             .active
             .as_ref()
             .map(|active| active.bridge.command_id().to_owned());
-        self.send_committed(committed, command_id).await
+        self.send_committed(committed.outputs, command_id).await
     }
 
     async fn send_committed(
@@ -808,17 +996,22 @@ impl<G: Gateway + 'static> Session<G> {
         let applied_command = committed
             .iter()
             .any(|output| matches!(output.event, AgentEvent::AgentEnd));
+        let volatile = committed.iter().all(|output| output.seq.is_none());
+        if !committed.is_empty() && committed.iter().any(|output| output.seq.is_none()) != volatile
+        {
+            return Err(
+                anyhow::anyhow!("committed output mixed durable and volatile frames").into(),
+            );
+        }
+        let mut frames = Vec::with_capacity(committed.len() + usize::from(applied_command));
         for output in committed {
-            self.gateway
-                .send(OutboundFrame::Event {
-                    envelope: crate::gateway::Envelope {
-                        seq: output.seq,
-                        conversation_id: self.conversation_id.clone(),
-                        event: serde_json::to_value(output.event).map_err(anyhow::Error::from)?,
-                    },
-                })
-                .await
-                .map_err(|error| gateway_failure("send", error))?;
+            frames.push(OutboundFrame::Event {
+                envelope: crate::gateway::Envelope {
+                    seq: output.seq,
+                    conversation_id: self.conversation_id.clone(),
+                    event: serde_json::to_value(output.event).map_err(anyhow::Error::from)?,
+                },
+            });
         }
         if applied_command {
             let command_id = command_id.ok_or(SessionFailure::CompletionChannelClosed)?;
@@ -827,17 +1020,58 @@ impl<G: Gateway + 'static> Session<G> {
                 .ack_for_command(&command_id)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("applied command disappeared after AgentEnd"))?;
-            self.gateway
-                .send(OutboundFrame::CommandAck { ack })
-                .await
-                .map_err(|error| gateway_failure("send", error))?;
+            frames.push(OutboundFrame::CommandAck { ack });
+        }
+        if volatile {
+            for frame in frames {
+                self.outbound_handle()?.enqueue_volatile(frame);
+            }
+        } else if !frames.is_empty() {
+            self.enqueue_reliable(frames)?;
         }
         Ok(())
+    }
+
+    fn outbound_handle(&self) -> Result<&OutboundHandle, SessionFailure> {
+        self.outbound.as_ref().ok_or(SessionFailure::OutboundClosed)
+    }
+
+    fn enqueue_reliable(&mut self, frames: Vec<OutboundFrame>) -> Result<(), SessionFailure> {
+        match self.outbound_handle()?.enqueue_reliable(frames) {
+            Err(SessionFailure::OutboundClosed) => match self.writer_done.try_recv() {
+                Ok(result) => result.map_err(|error| gateway_failure("send", error)),
+                Err(oneshot::error::TryRecvError::Closed) => Err(SessionFailure::OutboundClosed),
+                Err(oneshot::error::TryRecvError::Empty) => Err(SessionFailure::OutboundClosed),
+            },
+            result => result,
+        }
+    }
+
+    #[cfg(test)]
+    async fn wait_outbound_idle(&self) {
+        let progress = &self.outbound_handle().expect("outbound handle").progress;
+        let target = progress.enqueued.load(Ordering::Acquire);
+        loop {
+            let notified = progress.completed_notify.notified();
+            if progress.completed.load(Ordering::Acquire) >= target {
+                break;
+            }
+            notified.await;
+        }
     }
 }
 
 fn gateway_failure(operation: &'static str, source: anyhow::Error) -> SessionFailure {
     SessionFailure::Gateway { operation, source }
+}
+
+fn writer_failure(
+    result: std::result::Result<Result<()>, oneshot::error::RecvError>,
+) -> SessionFailure {
+    match result {
+        Ok(Err(error)) => gateway_failure("send", error),
+        Ok(Ok(())) | Err(_) => SessionFailure::OutboundClosed,
+    }
 }
 
 fn worker_join_failure(error: tokio::task::JoinError) -> SessionFailure {

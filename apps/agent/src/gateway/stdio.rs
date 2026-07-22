@@ -14,8 +14,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use super::{
     CommandDigestFactory, CommandEnvelope, CommandId, CommandRejectReason, Gateway, GatewayClosed,
-    InboundCommand, IncrementalCommandDigest, KeyedCommandDigest, OutboundFrame,
-    RejectedCommandPayload, SensitiveCommandPayload,
+    GatewayReader, GatewayWriter, InboundCommand, IncrementalCommandDigest, KeyedCommandDigest,
+    OutboundFrame, RejectedCommandPayload, SensitiveCommandPayload,
 };
 
 const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
@@ -40,6 +40,15 @@ pub struct StdioGateway {
     command_digest_factory: Arc<dyn CommandDigestFactory>,
 }
 
+pub struct StdioGatewayReader {
+    input: BufReader<Stdin>,
+    command_digest_factory: Arc<dyn CommandDigestFactory>,
+}
+
+pub struct StdioGatewayWriter {
+    output: BufWriter<Stdout>,
+}
+
 impl StdioGateway {
     pub(crate) fn new(command_digest_factory: Arc<dyn CommandDigestFactory>) -> Self {
         Self {
@@ -50,12 +59,32 @@ impl StdioGateway {
     }
 }
 
-#[async_trait]
 impl Gateway for StdioGateway {
+    type Reader = StdioGatewayReader;
+    type Writer = StdioGatewayWriter;
+
+    fn split(self) -> (Self::Reader, Self::Writer) {
+        (
+            StdioGatewayReader {
+                input: self.input,
+                command_digest_factory: self.command_digest_factory,
+            },
+            StdioGatewayWriter {
+                output: self.output,
+            },
+        )
+    }
+}
+
+#[async_trait]
+impl GatewayReader for StdioGatewayReader {
     async fn next_command(&mut self) -> Result<InboundCommand> {
         read_command(&mut self.input, self.command_digest_factory.as_ref()).await
     }
+}
 
+#[async_trait]
+impl GatewayWriter for StdioGatewayWriter {
     async fn send(&mut self, frame: OutboundFrame) -> Result<()> {
         let mut line = serde_json::to_vec(&frame).context("failed to encode gateway frame JSON")?;
         line.push(b'\n');

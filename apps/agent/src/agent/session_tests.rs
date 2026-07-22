@@ -74,10 +74,35 @@ struct MockGateway {
     frames: Arc<Mutex<Vec<OutboundFrame>>>,
     next_failure: Option<mpsc::Receiver<()>>,
     fail_send: Arc<AtomicBool>,
+    send_failure_observed: Arc<Notify>,
+}
+
+impl Gateway for MockGateway {
+    type Reader = MockGatewayReader;
+    type Writer = MockGatewayWriter;
+
+    fn split(self) -> (Self::Reader, Self::Writer) {
+        (
+            MockGatewayReader {
+                commands: self.commands,
+                next_failure: self.next_failure,
+            },
+            MockGatewayWriter {
+                frames: self.frames,
+                fail_send: self.fail_send,
+                send_failure_observed: self.send_failure_observed,
+            },
+        )
+    }
+}
+
+struct MockGatewayReader {
+    commands: mpsc::Receiver<InboundCommand>,
+    next_failure: Option<mpsc::Receiver<()>>,
 }
 
 #[async_trait]
-impl Gateway for MockGateway {
+impl GatewayReader for MockGatewayReader {
     async fn next_command(&mut self) -> Result<InboundCommand> {
         if let Some(failures) = self.next_failure.as_mut() {
             tokio::select! {
@@ -92,9 +117,19 @@ impl Gateway for MockGateway {
                 .ok_or_else(|| GatewayClosed.into())
         }
     }
+}
 
+struct MockGatewayWriter {
+    frames: Arc<Mutex<Vec<OutboundFrame>>>,
+    fail_send: Arc<AtomicBool>,
+    send_failure_observed: Arc<Notify>,
+}
+
+#[async_trait]
+impl GatewayWriter for MockGatewayWriter {
     async fn send(&mut self, frame: OutboundFrame) -> Result<()> {
         if self.fail_send.load(Ordering::SeqCst) {
+            self.send_failure_observed.notify_one();
             return Err(anyhow!("fixture gateway send failure"));
         }
         self.frames.lock().expect("frame mutex").push(frame);
@@ -110,12 +145,14 @@ fn gateway() -> (
     let (commands_tx, commands) = mpsc::channel(40);
     let frames = Arc::new(Mutex::new(Vec::new()));
     let fail_send = Arc::new(AtomicBool::new(false));
+    let send_failure_observed = Arc::new(Notify::new());
     (
         MockGateway {
             commands,
             frames: frames.clone(),
             next_failure: None,
             fail_send,
+            send_failure_observed,
         },
         commands_tx,
         frames,
@@ -127,6 +164,7 @@ struct ControlledGateway {
     commands: mpsc::Sender<InboundCommand>,
     next_failure: mpsc::Sender<()>,
     fail_send: Arc<AtomicBool>,
+    send_failure_observed: Arc<Notify>,
 }
 
 fn controlled_gateway() -> ControlledGateway {
@@ -134,37 +172,64 @@ fn controlled_gateway() -> ControlledGateway {
     let (next_failure_tx, next_failure) = mpsc::channel(1);
     let frames = Arc::new(Mutex::new(Vec::new()));
     let fail_send = Arc::new(AtomicBool::new(false));
+    let send_failure_observed = Arc::new(Notify::new());
     ControlledGateway {
         gateway: MockGateway {
             commands,
             frames: frames.clone(),
             next_failure: Some(next_failure),
             fail_send: fail_send.clone(),
+            send_failure_observed: send_failure_observed.clone(),
         },
         commands: commands_tx,
         next_failure: next_failure_tx,
         fail_send,
+        send_failure_observed,
     }
 }
 
 struct FailFirstEventGateway {
     commands: mpsc::Receiver<InboundCommand>,
     event_attempts: Arc<AtomicUsize>,
+    attempted: Arc<Notify>,
+}
+
+impl Gateway for FailFirstEventGateway {
+    type Reader = SimpleReader;
+    type Writer = FailFirstEventWriter;
+
+    fn split(self) -> (Self::Reader, Self::Writer) {
+        (
+            SimpleReader(self.commands),
+            FailFirstEventWriter {
+                event_attempts: self.event_attempts,
+                attempted: self.attempted,
+            },
+        )
+    }
+}
+
+struct SimpleReader(mpsc::Receiver<InboundCommand>);
+
+#[async_trait]
+impl GatewayReader for SimpleReader {
+    async fn next_command(&mut self) -> Result<InboundCommand> {
+        self.0.recv().await.ok_or_else(|| GatewayClosed.into())
+    }
+}
+
+struct FailFirstEventWriter {
+    event_attempts: Arc<AtomicUsize>,
+    attempted: Arc<Notify>,
 }
 
 #[async_trait]
-impl Gateway for FailFirstEventGateway {
-    async fn next_command(&mut self) -> Result<InboundCommand> {
-        self.commands
-            .recv()
-            .await
-            .ok_or_else(|| GatewayClosed.into())
-    }
-
+impl GatewayWriter for FailFirstEventWriter {
     async fn send(&mut self, frame: OutboundFrame) -> Result<()> {
         if matches!(frame, OutboundFrame::Event { .. })
             && self.event_attempts.fetch_add(1, Ordering::SeqCst) == 0
         {
+            self.attempted.notify_one();
             return Err(anyhow!("fixture first event delivery failure"));
         }
         Ok(())
@@ -178,15 +243,145 @@ struct ShutdownDrainGateway {
     failed_event: bool,
 }
 
+struct BlockingWriterGateway {
+    commands: mpsc::Receiver<InboundCommand>,
+    frames: Arc<Mutex<Vec<OutboundFrame>>>,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl Gateway for BlockingWriterGateway {
+    type Reader = SimpleReader;
+    type Writer = BlockingWriter;
+
+    fn split(self) -> (Self::Reader, Self::Writer) {
+        (
+            SimpleReader(self.commands),
+            BlockingWriter {
+                frames: self.frames,
+                entered: self.entered,
+                release: self.release,
+                blocked_once: false,
+            },
+        )
+    }
+}
+
+struct BlockingWriter {
+    frames: Arc<Mutex<Vec<OutboundFrame>>>,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    blocked_once: bool,
+}
+
 #[async_trait]
-impl Gateway for ShutdownDrainGateway {
+impl GatewayWriter for BlockingWriter {
+    async fn send(&mut self, frame: OutboundFrame) -> Result<()> {
+        if !self.blocked_once {
+            self.blocked_once = true;
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        self.frames.lock().expect("frames").push(frame);
+        Ok(())
+    }
+}
+
+struct EofBlockingGateway {
+    commands: mpsc::Receiver<InboundCommand>,
+    idle: Arc<Notify>,
+    writer_entered: Arc<Notify>,
+    writer_dropped: Arc<Notify>,
+}
+
+impl Gateway for EofBlockingGateway {
+    type Reader = EofBlockingReader;
+    type Writer = EofBlockingWriter;
+
+    fn split(self) -> (Self::Reader, Self::Writer) {
+        (
+            EofBlockingReader {
+                commands: self.commands,
+                idle: self.idle,
+                polls: 0,
+            },
+            EofBlockingWriter {
+                entered: self.writer_entered,
+                dropped: self.writer_dropped,
+                blocked_once: false,
+            },
+        )
+    }
+}
+
+struct EofBlockingReader {
+    commands: mpsc::Receiver<InboundCommand>,
+    idle: Arc<Notify>,
+    polls: usize,
+}
+
+#[async_trait]
+impl GatewayReader for EofBlockingReader {
     async fn next_command(&mut self) -> Result<InboundCommand> {
+        self.polls += 1;
+        if self.polls == 2 {
+            self.idle.notify_one();
+        }
         self.commands
             .recv()
             .await
             .ok_or_else(|| GatewayClosed.into())
     }
+}
 
+struct EofBlockingWriter {
+    entered: Arc<Notify>,
+    dropped: Arc<Notify>,
+    blocked_once: bool,
+}
+
+impl Drop for EofBlockingWriter {
+    fn drop(&mut self) {
+        self.dropped.notify_one();
+    }
+}
+
+#[async_trait]
+impl GatewayWriter for EofBlockingWriter {
+    async fn send(&mut self, _frame: OutboundFrame) -> Result<()> {
+        if !self.blocked_once {
+            self.blocked_once = true;
+            self.entered.notify_one();
+            pending::<()>().await;
+        }
+        Ok(())
+    }
+}
+
+impl Gateway for ShutdownDrainGateway {
+    type Reader = SimpleReader;
+    type Writer = ShutdownDrainWriter;
+
+    fn split(self) -> (Self::Reader, Self::Writer) {
+        (
+            SimpleReader(self.commands),
+            ShutdownDrainWriter {
+                release_worker: self.release_worker,
+                worker_ready: self.worker_ready,
+                failed_event: self.failed_event,
+            },
+        )
+    }
+}
+
+struct ShutdownDrainWriter {
+    release_worker: Arc<Notify>,
+    worker_ready: Arc<Notify>,
+    failed_event: bool,
+}
+
+#[async_trait]
+impl GatewayWriter for ShutdownDrainWriter {
     async fn send(&mut self, frame: OutboundFrame) -> Result<()> {
         if matches!(frame, OutboundFrame::Event { .. }) && !self.failed_event {
             self.failed_event = true;
@@ -310,6 +505,37 @@ async fn finish_active(session: &mut Session<MockGateway>) {
         .expect("worker completion");
 }
 
+async fn drive_active_to_completion<G: Gateway>(
+    session: &mut Session<G>,
+) -> Result<(), SessionFailure> {
+    loop {
+        let completion = session
+            .active
+            .as_mut()
+            .expect("active worker")
+            .completion_rx
+            .try_recv();
+        match completion {
+            Ok(completion) => return session.finish_run(Ok(completion)).await,
+            Err(oneshot::error::TryRecvError::Closed) => {
+                return session.resolve_closed_event_channel().await;
+            }
+            Err(oneshot::error::TryRecvError::Empty) => {}
+        }
+        let output = session
+            .active
+            .as_mut()
+            .expect("active worker")
+            .events_rx
+            .recv()
+            .await;
+        match output {
+            Some(output) => session.persist_active_event(output).await?,
+            None => session.resolve_closed_event_channel().await?,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum StaleBinding {
     PriorRun,
@@ -337,6 +563,7 @@ impl RunWorker for StaleBindingWorker {
                         .send(RunOutput {
                             binding,
                             event: AgentEvent::AgentStart,
+                            commit_barrier: None,
                         })
                         .await
                         .expect("session output receiver");
@@ -378,6 +605,7 @@ impl RunWorker for StaleBindingWorker {
                             .send(RunOutput {
                                 binding: binding.clone(),
                                 event,
+                                commit_barrier: None,
                             })
                             .await
                             .expect("session output receiver");
@@ -388,6 +616,7 @@ impl RunWorker for StaleBindingWorker {
                         .send(RunOutput {
                             binding,
                             event: AgentEvent::TurnStart,
+                            commit_barrier: None,
                         })
                         .await
                         .expect("new turn output");
@@ -398,6 +627,7 @@ impl RunWorker for StaleBindingWorker {
                                 message_id: "stale-prior-turn-output".to_owned(),
                                 message: Box::new(bridge_assistant(StopReason::Stop)),
                             },
+                            commit_barrier: None,
                         })
                         .await
                         .expect("stale turn output");
@@ -408,6 +638,7 @@ impl RunWorker for StaleBindingWorker {
                         .send(RunOutput {
                             binding,
                             event: AgentEvent::AgentStart,
+                            commit_barrier: None,
                         })
                         .await
                         .expect("session output receiver");
@@ -462,10 +693,15 @@ async fn session_rejects_worker_output_with_any_changed_durable_binding() {
             .iter()
             .filter(|frame| matches!(frame, OutboundFrame::Event { .. }))
             .count();
-        assert_eq!(
-            public_events, expected_prefix as usize,
-            "stale {label} output itself must not be delivered"
+        assert!(
+            public_events <= expected_prefix as usize,
+            "writer shutdown may leave a committed replayable prefix undelivered"
         );
+        assert!(frames.lock().expect("frame mutex").iter().all(|frame| {
+            !matches!(frame, OutboundFrame::Event { envelope }
+                if envelope.event.get("message_id").and_then(serde_json::Value::as_str)
+                    == Some("stale-prior-turn-output"))
+        }));
     }
 }
 
@@ -514,6 +750,7 @@ async fn active_received_replay_acks_without_duplicate_control_delivery() {
         .admit_and_route(user(1))
         .await
         .expect("exact replay");
+    session.wait_outbound_idle().await;
 
     assert_eq!(received_acks(&frames).len(), 2, "fresh and stored ACK");
     assert_eq!(starts.load(Ordering::SeqCst), 1);
@@ -561,6 +798,7 @@ async fn idle_received_replay_acks_without_spawning_a_second_worker() {
         .admit_and_route(user(1))
         .await
         .expect("idle exact replay");
+    session.wait_outbound_idle().await;
 
     assert_eq!(received_acks(&frames).len(), 2, "fresh and stored ACK");
     assert_eq!(starts.load(Ordering::SeqCst), 1);
@@ -586,6 +824,7 @@ async fn pending_worker_does_not_block_deferred_control_received_ack() {
         .admit_and_route(abort(2))
         .await
         .expect("second command");
+    session.wait_outbound_idle().await;
     assert_eq!(
         received_acks(&frames)
             .into_iter()
@@ -696,6 +935,7 @@ async fn active_session_uses_durable_backpressure_before_its_bounded_fifo_can_ov
     assert!(rows.iter().any(|(seq, command_id, status)| {
         *seq == 33 && command_id == "10000000-0000-4000-8000-000000000033" && status == "received"
     }));
+    session.wait_outbound_idle().await;
     assert_eq!(received_acks(&frames).len(), 33);
     session.shutdown_active().await;
 }
@@ -823,7 +1063,16 @@ async fn ready_completion_event_and_next_command_all_progress_with_one_core() {
     first_release.notify_one();
     commands.send(user(2)).await.expect("simultaneous command");
     assert_eq!(started_rx.recv().await, Some(2));
-    tokio::task::yield_now().await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if received_acks(&frames).len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("writer observed both Received ACKs");
     drop(commands);
 
     let core = completed(task.await.expect("session join"));
@@ -1038,6 +1287,58 @@ async fn active_gateway_send_failure_aborts_and_awaits_worker() {
 }
 
 #[tokio::test]
+async fn active_gateway_eof_after_writer_failure_preserves_send_error() {
+    let ControlledGateway {
+        gateway,
+        commands,
+        fail_send,
+        send_failure_observed,
+        ..
+    } = controlled_gateway();
+    let emit = Arc::new(Notify::new());
+    let (started_tx, mut started_rx) = mpsc::channel(1);
+    let worker: Arc<dyn RunWorker> = Arc::new({
+        let emit = emit.clone();
+        move |_core: RunCore,
+              initial: AdmittedCommand,
+              _controls: mpsc::Receiver<RunControl>,
+              events: mpsc::Sender<AgentEvent>| {
+            let emit = emit.clone();
+            let started_tx = started_tx.clone();
+            async move {
+                started_tx.send(()).await.expect("start observer");
+                emit.notified().await;
+                emit_idle_injection(&events, &initial).await;
+                pending::<RunCompletion>().await
+            }
+        }
+    });
+    let task = tokio::spawn(session(gateway, worker).await.run());
+    commands.send(user(1)).await.expect("initial command");
+    started_rx.recv().await.expect("worker started");
+    fail_send.store(true, Ordering::SeqCst);
+    emit.notify_one();
+
+    // The failing send path has signalled. Let the writer task publish its
+    // completion result, then close the reader so EOF and writer completion
+    // are ready in the same active select without a scheduling sleep.
+    send_failure_observed.notified().await;
+    tokio::task::yield_now().await;
+    drop(commands);
+
+    let (failure, ownership) = failed(task.await.expect("session join"));
+    assert!(matches!(
+        failure,
+        SessionFailure::Gateway {
+            operation: "send",
+            ref source,
+        } if source.to_string() == "fixture gateway send failure"
+    ));
+    assert!(!matches!(failure, SessionFailure::GatewayClosedDuringRun));
+    assert!(matches!(ownership, RunOwnership::Lost));
+}
+
+#[tokio::test]
 async fn shutdown_drains_ready_completion_outputs_before_recovering_core_after_gateway_failure() {
     let store = Store::session_test_store("shutdown-ready-completion-drain-session")
         .await
@@ -1193,9 +1494,11 @@ async fn completion_drain_persists_all_outputs_before_recovering_mutated_core_af
     let pool = store.pool().clone();
     let (commands_tx, commands) = mpsc::channel(1);
     let event_attempts = Arc::new(AtomicUsize::new(0));
+    let attempted = Arc::new(Notify::new());
     let gateway = FailFirstEventGateway {
         commands,
         event_attempts: event_attempts.clone(),
+        attempted: attempted.clone(),
     };
     let worker: Arc<dyn RunWorker> = Arc::new(
         |mut core: RunCore,
@@ -1234,7 +1537,7 @@ async fn completion_drain_persists_all_outputs_before_recovering_mutated_core_af
             RunCompletion::Completed(core)
         },
     );
-    let mut session = Session::start(
+    let session = Session::start(
         store,
         gateway,
         RunCore::new(),
@@ -1244,19 +1547,12 @@ async fn completion_drain_persists_all_outputs_before_recovering_mutated_core_af
     .await
     .expect("session");
 
-    session
-        .admit_and_route(user(1))
-        .await
-        .expect("start active run");
+    let send_attempted = attempted.notified();
+    let task = tokio::spawn(session.run());
+    commands_tx.send(user(1)).await.expect("start active run");
+    send_attempted.await;
     drop(commands_tx);
-    let completion = {
-        let active = session.active.as_mut().expect("active run");
-        (&mut active.completion_rx).await
-    };
-    let failure = session
-        .finish_run(completion)
-        .await
-        .expect_err("first completion-drained frame must fail delivery");
+    let (failure, ownership) = failed(task.await.expect("session join"));
     assert!(matches!(
         failure,
         SessionFailure::Gateway {
@@ -1266,10 +1562,9 @@ async fn completion_drain_persists_all_outputs_before_recovering_mutated_core_af
     ));
     assert_eq!(event_attempts.load(Ordering::SeqCst), 1);
 
-    let recovered = session
-        .core
-        .take()
-        .expect("fully drained completed core remains recoverable");
+    let RunOwnership::Recovered(recovered) = ownership else {
+        panic!("fully drained completed core remains recoverable")
+    };
     assert_eq!(recovered.mutation_epoch(), 1);
     assert_eq!(recovered.runtime_context.len(), 2);
     let durable_messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
@@ -1426,15 +1721,28 @@ struct CommitCheckingGateway {
     observed: Arc<Mutex<Vec<(u64, String)>>>,
 }
 
-#[async_trait]
 impl Gateway for CommitCheckingGateway {
-    async fn next_command(&mut self) -> Result<InboundCommand> {
-        self.commands
-            .recv()
-            .await
-            .ok_or_else(|| GatewayClosed.into())
-    }
+    type Reader = SimpleReader;
+    type Writer = CommitCheckingWriter;
 
+    fn split(self) -> (Self::Reader, Self::Writer) {
+        (
+            SimpleReader(self.commands),
+            CommitCheckingWriter {
+                pool: self.pool,
+                observed: self.observed,
+            },
+        )
+    }
+}
+
+struct CommitCheckingWriter {
+    pool: sqlx::SqlitePool,
+    observed: Arc<Mutex<Vec<(u64, String)>>>,
+}
+
+#[async_trait]
+impl GatewayWriter for CommitCheckingWriter {
     async fn send(&mut self, frame: OutboundFrame) -> Result<()> {
         if let OutboundFrame::Event { envelope } = frame {
             let seq = envelope
@@ -1778,6 +2086,410 @@ async fn active_abort_then_user_applies_abort_before_starting_later_user() {
 }
 
 struct OpaqueContextDriver;
+
+struct DurableToolBarrierDriver {
+    pool: sqlx::SqlitePool,
+    executions: AtomicUsize,
+    observed_running: AtomicBool,
+}
+
+impl DurableToolBarrierDriver {
+    fn new(pool: sqlx::SqlitePool) -> Self {
+        Self {
+            pool,
+            executions: AtomicUsize::new(0),
+            observed_running: AtomicBool::new(false),
+        }
+    }
+
+    fn origin() -> ProviderOrigin {
+        ProviderOrigin {
+            provider_instance_id: "durable-tool-barrier".to_owned(),
+            protocol: ApiProtocol::OpenAiChatCompletions,
+            model: "bridge-model".to_owned(),
+        }
+    }
+}
+
+#[async_trait]
+impl RunDriver for DurableToolBarrierDriver {
+    async fn start_provider(
+        &self,
+        attempt: usize,
+        _context: &[PublicMessage],
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        let (tx, rx) = mpsc::channel(8);
+        tx.try_send(ProviderEvent::Start).expect("provider start");
+        let mut content = Vec::new();
+        let reason = if attempt == 0 {
+            let call = ToolCall {
+                id: "barrier-call".to_owned(),
+                name: "fixture-tool".to_owned(),
+                arguments: serde_json::from_value::<ValidatedToolArguments>(
+                    serde_json::json!({"safe":true}),
+                )?,
+            };
+            tx.try_send(ProviderEvent::ToolCallStart { content_index: 0 })?;
+            tx.try_send(ProviderEvent::ToolCallEnd {
+                content_index: 0,
+                tool_call: call.clone(),
+            })?;
+            content.push(AssistantContent::ToolCall {
+                tool_call: call,
+                wire_item_index: 0,
+            });
+            StopReason::ToolUse
+        } else {
+            StopReason::Stop
+        };
+        let message = AssistantMessage {
+            content,
+            model: "bridge-model".to_owned(),
+            provider: "fixture".to_owned(),
+            origin: Self::origin(),
+            usage: Usage::default(),
+            stop_reason: reason,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: Utc::now(),
+        };
+        tx.try_send(ProviderEvent::Done {
+            reason,
+            output: ProviderOutput {
+                message,
+                provider_context: Vec::new(),
+            },
+        })?;
+        drop(tx);
+        Ok(ProviderAttempt {
+            message_id: format!("barrier-assistant-{attempt}"),
+            initial_message: bridge_assistant(StopReason::Stop),
+            events: ProviderEventStream::new(rx, cancel, "fixture", Self::origin()),
+        })
+    }
+
+    async fn execute_tool(
+        &self,
+        call: &ToolCall,
+        _cancel: CancellationToken,
+    ) -> Result<ToolResultMessage> {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM tool_executions WHERE tool_call_id = ?")
+                .bind(&call.id)
+                .fetch_one(&self.pool)
+                .await?;
+        self.observed_running
+            .store(state == "running", Ordering::SeqCst);
+        Ok(ToolResultMessage {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            content: Vec::new(),
+            details: serde_json::json!({"ok":true}),
+            is_error: false,
+            timestamp: Utc::now(),
+        })
+    }
+
+    fn synthetic_error(&self, message: &str) -> PublicMessage {
+        let PublicMessage::Assistant(mut assistant) = bridge_assistant(StopReason::Error) else {
+            unreachable!()
+        };
+        assistant.error_message = Some(message.to_owned());
+        PublicMessage::Assistant(assistant)
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        _active_context: &[PublicMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        Err(anyhow!("barrier fixture has no overflow recovery"))
+    }
+}
+
+#[tokio::test]
+async fn tool_driver_observes_running_only_after_start_commit() {
+    let store = Store::session_test_store("tool-start-commit-barrier")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let driver = Arc::new(DurableToolBarrierDriver::new(pool.clone()));
+    let (gateway, _commands, _frames) = gateway();
+    let mut session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        Arc::new(SequentialRunWorker::new(driver.clone())),
+        TEST_EXECUTOR_GENERATION,
+    )
+    .await
+    .expect("session");
+    session.admit_and_route(user(1)).await.expect("command");
+    drive_active_to_completion(&mut session)
+        .await
+        .expect("run completion");
+    session.wait_outbound_idle().await;
+
+    assert_eq!(driver.executions.load(Ordering::SeqCst), 1);
+    assert!(driver.observed_running.load(Ordering::SeqCst));
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM tool_executions WHERE tool_call_id='barrier-call'")
+            .fetch_one(&pool)
+            .await
+            .expect("tool row");
+    assert_eq!(state, "succeeded");
+}
+
+#[tokio::test]
+async fn rejected_running_transition_never_calls_driver_or_publishes_start() {
+    let store = Store::session_test_store("tool-start-commit-barrier-failure")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    sqlx::query(
+        "CREATE TRIGGER reject_tool_running BEFORE UPDATE OF state ON tool_executions
+         WHEN NEW.state = 'running'
+         BEGIN SELECT RAISE(ABORT, 'fixture rejects running transition'); END",
+    )
+    .execute(&pool)
+    .await
+    .expect("failure trigger");
+    let driver = Arc::new(DurableToolBarrierDriver::new(pool.clone()));
+    let (gateway, _commands, frames) = gateway();
+    let mut session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        Arc::new(SequentialRunWorker::new(driver.clone())),
+        TEST_EXECUTOR_GENERATION,
+    )
+    .await
+    .expect("session");
+    session.admit_and_route(user(1)).await.expect("command");
+    let failure = drive_active_to_completion(&mut session)
+        .await
+        .expect_err("running transition must fail");
+    session.shutdown_active().await;
+    session.wait_outbound_idle().await;
+
+    assert!(
+        failure
+            .to_string()
+            .contains("fixture rejects running transition")
+    );
+    assert_eq!(driver.executions.load(Ordering::SeqCst), 0);
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM tool_executions WHERE tool_call_id='barrier-call'")
+            .fetch_one(&pool)
+            .await
+            .expect("prepared tool row");
+    assert_eq!(state, "prepared");
+    assert!(frames.lock().expect("frames").iter().all(|frame| {
+        !matches!(frame, OutboundFrame::Event { envelope }
+            if envelope.event["type"] == "tool_execution_start")
+    }));
+}
+
+#[tokio::test]
+async fn blocked_writer_drops_only_volatile_suffix_and_preserves_terminal_reserve() {
+    let store = Store::session_test_store("blocked-writer-volatile-reserve")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (_commands_tx, commands) = mpsc::channel(1);
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let gateway = BlockingWriterGateway {
+        commands,
+        frames: frames.clone(),
+        entered: entered.clone(),
+        release: release.clone(),
+    };
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |core: RunCore,
+         initial: AdmittedCommand,
+         mut controls: mpsc::Receiver<RunControl>,
+         events: mpsc::Sender<AgentEvent>| async move {
+            emit_idle_injection(&events, &initial).await;
+            let message_id = "volatile-reserve-assistant".to_owned();
+            let assistant = bridge_assistant(StopReason::Stop);
+            events
+                .send(AgentEvent::MessageStart {
+                    message_id: message_id.clone(),
+                    message: Box::new(assistant.clone()),
+                })
+                .await
+                .expect("message start");
+            for sequence in 0..(VOLATILE_OUTBOUND_BUDGET + 8) {
+                events
+                    .send(AgentEvent::MessageUpdate {
+                        message_id: message_id.clone(),
+                        event: PublicStreamEvent::TextDelta {
+                            content_index: 0,
+                            delta: format!("{sequence}"),
+                        },
+                    })
+                    .await
+                    .expect("volatile update");
+            }
+            for event in [
+                AgentEvent::MessageEnd {
+                    message_id,
+                    message: Box::new(assistant.clone()),
+                },
+                AgentEvent::TurnEnd {
+                    message: Some(Box::new(assistant)),
+                    tool_results: Vec::new(),
+                },
+                AgentEvent::AgentEnd,
+            ] {
+                events.send(event).await.expect("terminal lifecycle");
+            }
+            controls.close();
+            RunCompletion::Completed(core)
+        },
+    );
+    let mut session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        worker,
+        TEST_EXECUTOR_GENERATION,
+    )
+    .await
+    .expect("session");
+    session.admit_and_route(user(1)).await.expect("command");
+    entered.notified().await;
+    drive_active_to_completion(&mut session)
+        .await
+        .expect("durable terminal suffix enqueues while writer is blocked");
+
+    let volatile_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE event_type='message_update'")
+            .fetch_one(&pool)
+            .await
+            .expect("volatile row count");
+    assert_eq!(volatile_rows, 0);
+    release.notify_one();
+    session.wait_outbound_idle().await;
+    let frames = frames.lock().expect("frames");
+    let update_count = frames
+        .iter()
+        .filter(|frame| {
+            matches!(frame, OutboundFrame::Event { envelope }
+            if envelope.event["type"] == "message_update")
+        })
+        .count();
+    assert_eq!(update_count, VOLATILE_OUTBOUND_BUDGET);
+    let kinds: Vec<&str> = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            OutboundFrame::Event { envelope } => envelope.event["type"].as_str(),
+            OutboundFrame::CommandAck { .. } => None,
+        })
+        .collect();
+    assert!(
+        kinds.iter().position(|kind| *kind == "message_start")
+            < kinds.iter().position(|kind| *kind == "message_update")
+    );
+    assert!(
+        kinds.iter().rposition(|kind| *kind == "message_update")
+            < kinds.iter().rposition(|kind| *kind == "message_end")
+    );
+    assert!(
+        kinds.iter().rposition(|kind| *kind == "message_end")
+            < kinds.iter().position(|kind| *kind == "agent_end")
+    );
+}
+
+#[tokio::test]
+async fn idle_gateway_eof_aborts_a_blocked_writer_without_hanging() {
+    let store = Store::session_test_store("idle-eof-blocked-writer")
+        .await
+        .expect("test store");
+    let (commands_tx, commands) = mpsc::channel(1);
+    let idle = Arc::new(Notify::new());
+    let writer_entered = Arc::new(Notify::new());
+    let writer_dropped = Arc::new(Notify::new());
+    let gateway = EofBlockingGateway {
+        commands,
+        idle: idle.clone(),
+        writer_entered: writer_entered.clone(),
+        writer_dropped: writer_dropped.clone(),
+    };
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |core: RunCore,
+         _initial: AdmittedCommand,
+         _controls: mpsc::Receiver<RunControl>,
+         _events: mpsc::Sender<AgentEvent>| async move { RunCompletion::Completed(core) },
+    );
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        worker,
+        TEST_EXECUTOR_GENERATION,
+    )
+    .await
+    .expect("session");
+    let mut task = tokio::spawn(session.run());
+
+    commands_tx.send(user(1)).await.expect("command");
+    writer_entered.notified().await;
+    // The second reader poll is entered only after the worker completion has
+    // been handled and Session has returned to its idle control branch.
+    idle.notified().await;
+    drop(commands_tx);
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), &mut task).await;
+    if result.is_err() {
+        task.abort();
+        let _ = task.await;
+        panic!("idle EOF must abort a blocked writer instead of waiting for it");
+    }
+    let result = result
+        .expect("session timeout already checked")
+        .expect("session join");
+    completed(result);
+    tokio::time::timeout(std::time::Duration::from_secs(2), writer_dropped.notified())
+        .await
+        .expect("writer half dropped after idle EOF");
+}
+
+#[test]
+fn reliable_outbound_admission_fails_explicitly_when_full_or_closed() {
+    let (tx, rx) = mpsc::channel(1);
+    let handle = OutboundHandle {
+        tx,
+        volatile_in_flight: Arc::new(AtomicUsize::new(0)),
+        progress: Arc::new(OutboundProgress::default()),
+    };
+    let ack = || OutboundFrame::CommandAck {
+        ack: CommandAck {
+            seq: 1,
+            command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            status: CommandAckStatus::Received,
+            reject_reason: None,
+        },
+    };
+    handle
+        .enqueue_reliable(vec![ack()])
+        .expect("first reliable item");
+    assert!(matches!(
+        handle.enqueue_reliable(vec![ack()]),
+        Err(SessionFailure::OutboundFull)
+    ));
+    drop(rx);
+    assert!(matches!(
+        handle.enqueue_reliable(vec![ack()]),
+        Err(SessionFailure::OutboundClosed)
+    ));
+}
 
 struct StartFailureDriver;
 

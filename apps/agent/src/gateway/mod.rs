@@ -313,9 +313,23 @@ pub enum OutboundFrame {
 pub struct GatewayClosed;
 
 #[async_trait]
-pub trait Gateway: Send {
+pub trait GatewayReader: Send {
     async fn next_command(&mut self) -> Result<InboundCommand>;
+}
+
+#[async_trait]
+pub trait GatewayWriter: Send {
     async fn send(&mut self, frame: OutboundFrame) -> Result<()>;
+}
+
+/// An established transport that can transfer each half to its sole owner.
+/// Neither half is shared behind a mutex: the Session owns the reader and a
+/// dedicated task owns the writer.
+pub trait Gateway: Send + 'static {
+    type Reader: GatewayReader + 'static;
+    type Writer: GatewayWriter + 'static;
+
+    fn split(self) -> (Self::Reader, Self::Writer);
 }
 
 #[cfg(test)]

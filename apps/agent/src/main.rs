@@ -13,8 +13,8 @@ use std::{env, io, sync::Arc};
 
 use anyhow::{Result, anyhow};
 use gateway::{
-    CommandAckStatus, Envelope, Gateway, GatewayClosed, InboundCommand, InvalidCommand,
-    OutboundFrame, StdioGateway,
+    CommandAckStatus, Envelope, Gateway, GatewayClosed, GatewayReader, GatewayWriter,
+    InboundCommand, InvalidCommand, OutboundFrame, StdioGateway,
 };
 use store::{
     AgentScope, DataKeyPurpose, EnvironmentKeyProvider, EventWriter, InboundAdmission, Store,
@@ -87,7 +87,8 @@ async fn main() -> Result<()> {
         tracing::warn!("gateway command admission is replay-only until T15 completes recovery");
     }
     let command_digest_factory = store.command_digest_factory().await?;
-    let mut gateway = StdioGateway::new(command_digest_factory);
+    let (mut gateway_reader, mut gateway_writer) =
+        StdioGateway::new(command_digest_factory).split();
 
     tracing::info!(
         conversation_id,
@@ -102,12 +103,12 @@ async fn main() -> Result<()> {
     );
 
     loop {
-        let inbound = match gateway.next_command().await {
+        let inbound = match gateway_reader.next_command().await {
             Ok(inbound) => inbound,
             Err(error) if error.downcast_ref::<GatewayClosed>().is_some() => break,
             Err(error) if error.downcast_ref::<InvalidCommand>().is_some() => {
                 tracing::warn!(%error, "rejected invalid stdio command");
-                gateway
+                gateway_writer
                     .send(OutboundFrame::Event {
                         envelope: Envelope {
                             seq: None,
@@ -126,14 +127,14 @@ async fn main() -> Result<()> {
 
         let receipt_ack = admission.receive(&event_writer, &inbound).await?;
         if receipt_ack.status != CommandAckStatus::Received {
-            gateway
+            gateway_writer
                 .send(OutboundFrame::CommandAck { ack: receipt_ack })
                 .await?;
             continue;
         }
         match &inbound {
             InboundCommand::Invalid { .. } => {
-                gateway
+                gateway_writer
                     .send(OutboundFrame::CommandAck { ack: receipt_ack })
                     .await?;
                 continue;
@@ -150,14 +151,14 @@ async fn main() -> Result<()> {
                     .pop()
                     .ok_or_else(|| anyhow!("terminal Abort ACK disappeared"))?;
                 for prior_ack in terminal_acks {
-                    gateway
+                    gateway_writer
                         .send(OutboundFrame::CommandAck { ack: prior_ack })
                         .await?;
                 }
-                gateway
+                gateway_writer
                     .send(OutboundFrame::CommandAck { ack: receipt_ack })
                     .await?;
-                gateway
+                gateway_writer
                     .send(OutboundFrame::CommandAck { ack: terminal_ack })
                     .await?;
                 admission.resume_after_suffix_recovery();
@@ -166,7 +167,7 @@ async fn main() -> Result<()> {
             InboundCommand::Valid(_) => {}
         }
 
-        gateway
+        gateway_writer
             .send(OutboundFrame::CommandAck { ack: receipt_ack })
             .await?;
     }

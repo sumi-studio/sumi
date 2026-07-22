@@ -509,14 +509,19 @@ async fn run_fixture(driver: Arc<FixtureDriver>) -> (RunCompletion, Vec<AgentEve
     let worker = SequentialRunWorker::new(driver);
     let (_control_tx, control_rx) = mpsc::channel(8);
     let (events_tx, mut events_rx) = mpsc::channel(256);
-    let completion = worker
-        .run(bound_core(1), admitted_user(1), control_rx, events_tx)
-        .await;
+    let completion = tokio::spawn(async move {
+        worker
+            .run(bound_core(1), admitted_user(1), control_rx, events_tx)
+            .await
+    });
     let mut events = Vec::new();
-    while let Some(event) = events_rx.recv().await {
-        events.push(event.event);
+    while let Some(mut output) = events_rx.recv().await {
+        if let Some(barrier) = output.commit_barrier.take() {
+            barrier.committed();
+        }
+        events.push(output.event);
     }
-    (completion, events)
+    (completion.await.expect("worker join"), events)
 }
 
 fn assert_completed(completion: RunCompletion) {
@@ -1242,10 +1247,17 @@ async fn closed_error_recovers_cross_kind_controls_without_reordering_or_preempt
         .await
         .expect("later user");
     let (events_tx, mut events_rx) = mpsc::channel(256);
-    let completion = worker
-        .run(bound_core(1), admitted_user(1), control_rx, events_tx)
-        .await;
-    while events_rx.recv().await.is_some() {}
+    let completion = tokio::spawn(async move {
+        worker
+            .run(bound_core(1), admitted_user(1), control_rx, events_tx)
+            .await
+    });
+    while let Some(mut output) = events_rx.recv().await {
+        if let Some(barrier) = output.commit_barrier.take() {
+            barrier.committed();
+        }
+    }
+    let completion = completion.await.expect("worker join");
     let core = recovered_core(completion);
 
     let blocked_driver = Arc::new(FixtureDriver::new(vec![output(assistant(
@@ -1294,10 +1306,17 @@ async fn deferred_t16_control_blocks_later_user_at_every_safe_point() {
         .await
         .expect("later user");
     let (events_tx, mut events_rx) = mpsc::channel(256);
-    let completion = worker
-        .run(bound_core(1), admitted_user(1), control_rx, events_tx)
-        .await;
-    while events_rx.recv().await.is_some() {}
+    let completion = tokio::spawn(async move {
+        worker
+            .run(bound_core(1), admitted_user(1), control_rx, events_tx)
+            .await
+    });
+    while let Some(mut output) = events_rx.recv().await {
+        if let Some(barrier) = output.commit_barrier.take() {
+            barrier.committed();
+        }
+    }
+    let completion = completion.await.expect("worker join");
     let mut core = recovered_core(completion);
     assert_eq!(pending_sequences(&mut core), vec![2, 3]);
     assert_eq!(

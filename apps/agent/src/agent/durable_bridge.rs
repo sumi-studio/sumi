@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::{
@@ -44,6 +45,25 @@ impl DurableRunBinding {
 pub(crate) struct RunOutput {
     pub binding: DurableRunBinding,
     pub event: AgentEvent,
+    pub commit_barrier: Option<ToolStartCommitBarrier>,
+}
+
+pub(crate) struct ToolStartCommitBarrier(oneshot::Sender<()>);
+
+impl ToolStartCommitBarrier {
+    pub(crate) fn channel() -> (Self, oneshot::Receiver<()>) {
+        let (sender, receiver) = oneshot::channel();
+        (Self(sender), receiver)
+    }
+
+    pub(super) fn committed(self) {
+        let _ = self.0.send(());
+    }
+}
+
+pub(super) struct CommittedRunOutput {
+    pub outputs: Vec<CommittedOutput>,
+    pub tool_start_barrier: Option<ToolStartCommitBarrier>,
 }
 
 pub(super) struct CommittedOutput {
@@ -90,7 +110,12 @@ impl DurableBridge {
         &mut self,
         writer: &EventWriter,
         output: RunOutput,
-    ) -> Result<Vec<CommittedOutput>> {
+    ) -> Result<CommittedRunOutput> {
+        let has_barrier = output.commit_barrier.is_some();
+        let is_tool_start = matches!(output.event, AgentEvent::ToolExecutionStart { .. });
+        if has_barrier != is_tool_start {
+            bail!("commit barrier is required exactly for ToolExecutionStart");
+        }
         if output.binding.command_id != self.binding.command_id
             || output.binding.command_seq != self.binding.command_seq
             || output.binding.run_id != self.binding.run_id
@@ -109,7 +134,7 @@ impl DurableBridge {
             bail!("run output durable turn binding changed outside TurnStart");
         }
         let event = output.event;
-        match event {
+        let outputs = match event {
             AgentEvent::MessageUpdate { ref message_id, .. } => {
                 if self.assistant_open.as_deref() != Some(message_id.as_str()) {
                     bail!("volatile message update has no prerequisite durable MessageStart");
@@ -177,18 +202,18 @@ impl DurableBridge {
                     self.phase = RunPhase::TurnStarted;
                     self.startup_turn_pending = true;
                     self.turn_open = true;
-                    return Ok(Vec::new());
+                    Ok(Vec::new())
                 } else {
                     self.binding.turn_id = output.binding.turn_id;
+                    self.turn_open = true;
+                    self.commit_single(
+                        writer,
+                        DurableEvent::turn_start(&self.binding.run_id, &self.binding.turn_id)?,
+                        Vec::new(),
+                        AgentEvent::TurnStart,
+                    )
+                    .await
                 }
-                self.turn_open = true;
-                self.commit_single(
-                    writer,
-                    DurableEvent::turn_start(&self.binding.run_id, &self.binding.turn_id)?,
-                    Vec::new(),
-                    AgentEvent::TurnStart,
-                )
-                .await
             }
             AgentEvent::MessageStart {
                 message_id,
@@ -351,7 +376,11 @@ impl DurableBridge {
             | AgentEvent::MemoryMaintenance { .. } => {
                 bail!("event requires a later T15/T16/T17 durable bridge extension")
             }
-        }
+        }?;
+        Ok(CommittedRunOutput {
+            outputs,
+            tool_start_barrier: output.commit_barrier,
+        })
     }
 
     async fn commit_assistant_end(
@@ -753,6 +782,7 @@ mod tests {
         let output = RunOutput {
             binding: binding("command-a"),
             event: AgentEvent::AgentStart,
+            commit_barrier: None,
         };
         assert_eq!(output.binding.executor_generation, 73);
         let public = serde_json::to_value(output.event).expect("serialize public event");
