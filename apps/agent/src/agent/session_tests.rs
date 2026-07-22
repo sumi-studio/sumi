@@ -534,6 +534,12 @@ enum StaleBinding {
 struct StaleBindingWorker(StaleBinding);
 
 impl RunWorker for StaleBindingWorker {
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+        (generation == test_executor_generation())
+            .then_some(())
+            .ok_or_else(|| anyhow!("fixture executor generation mismatch"))
+    }
+
     fn run(
         &self,
         core: RunCore,
@@ -2116,6 +2122,12 @@ impl MultiRejectedReceiptDriver {
 
 #[async_trait]
 impl RunDriver for MultiRejectedReceiptDriver {
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+        (generation == test_executor_generation())
+            .then_some(())
+            .ok_or_else(|| anyhow!("fixture executor generation mismatch"))
+    }
+
     async fn start_provider(
         &self,
         attempt: usize,
@@ -2255,6 +2267,12 @@ impl DurableToolBarrierDriver {
 
 #[async_trait]
 impl RunDriver for DurableToolBarrierDriver {
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+        (generation == test_executor_generation())
+            .then_some(())
+            .ok_or_else(|| anyhow!("fixture executor generation mismatch"))
+    }
+
     async fn start_provider(
         &self,
         attempt: usize,
@@ -2928,6 +2946,12 @@ struct StartFailureDriver;
 
 #[async_trait]
 impl RunDriver for StartFailureDriver {
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+        (generation == test_executor_generation())
+            .then_some(())
+            .ok_or_else(|| anyhow!("fixture executor generation mismatch"))
+    }
+
     async fn start_provider(
         &self,
         _attempt: usize,
@@ -2966,6 +2990,12 @@ impl RunDriver for StartFailureDriver {
 
 #[async_trait]
 impl RunDriver for OpaqueContextDriver {
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+        (generation == test_executor_generation())
+            .then_some(())
+            .ok_or_else(|| anyhow!("fixture executor generation mismatch"))
+    }
+
     async fn start_provider(
         &self,
         _attempt: usize,

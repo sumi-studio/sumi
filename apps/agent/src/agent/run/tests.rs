@@ -41,6 +41,7 @@ fn output(message: AssistantMessage) -> Script {
 struct FixtureDriver {
     scripts: Mutex<VecDeque<Script>>,
     started_contexts: Mutex<Vec<Vec<ContextMessage>>>,
+    started_command_times: Mutex<Vec<Option<std::time::Instant>>>,
     tool_order: Mutex<Vec<String>>,
     tool_failures: Mutex<VecDeque<Option<&'static str>>>,
     active_tools: AtomicUsize,
@@ -61,6 +62,7 @@ impl FixtureDriver {
         Self {
             scripts: Mutex::new(scripts.into()),
             started_contexts: Mutex::new(Vec::new()),
+            started_command_times: Mutex::new(Vec::new()),
             tool_order: Mutex::new(Vec::new()),
             tool_failures: Mutex::new(VecDeque::new()),
             active_tools: AtomicUsize::new(0),
@@ -122,6 +124,12 @@ fn recovered_context_from_active(
 
 #[async_trait]
 impl RunDriver for FixtureDriver {
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+        (generation == test_executor_generation())
+            .then_some(())
+            .ok_or_else(|| anyhow!("fixture executor generation mismatch"))
+    }
+
     async fn start_provider(
         &self,
         attempt: usize,
@@ -143,6 +151,20 @@ impl RunDriver for FixtureDriver {
             Script::Events(events) => Ok(provider_attempt_from_events(attempt, events)),
             Script::StartFailure(error) => Err(anyhow!(error)),
         }
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        attempt: usize,
+        context: &[ContextMessage],
+        command_received_at: Option<std::time::Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.started_command_times
+            .lock()
+            .expect("command times")
+            .push(command_received_at);
+        self.start_provider(attempt, context, cancel).await
     }
 
     async fn execute_tool(
@@ -503,6 +525,10 @@ fn admitted_user(seq: u64) -> AdmittedCommand {
     AdmittedCommand::new(user(seq), timestamp())
 }
 
+fn live_admitted_user(seq: u64) -> AdmittedCommand {
+    AdmittedCommand::live(user(seq), timestamp(), std::time::Instant::now())
+}
+
 fn admitted_abort(seq: u64) -> AdmittedCommand {
     AdmittedCommand::new(
         CommandEnvelope {
@@ -564,12 +590,19 @@ fn bound_core(seq: u64) -> RunCore {
 }
 
 async fn run_fixture(driver: Arc<FixtureDriver>) -> (RunCompletion, Vec<AgentEvent>) {
+    run_fixture_with_initial(driver, admitted_user(1)).await
+}
+
+async fn run_fixture_with_initial(
+    driver: Arc<FixtureDriver>,
+    initial: AdmittedCommand,
+) -> (RunCompletion, Vec<AgentEvent>) {
     let worker = SequentialRunWorker::new(driver);
     let (_control_tx, control_rx) = mpsc::channel(8);
     let (events_tx, mut events_rx) = mpsc::channel(256);
     let completion = tokio::spawn(async move {
         worker
-            .run(bound_core(1), admitted_user(1), control_rx, events_tx)
+            .run(bound_core(1), initial, control_rx, events_tx)
             .await
     });
     let mut events = Vec::new();
@@ -657,7 +690,8 @@ async fn retry_closes_error_before_schedule_and_does_not_append_error_context() 
         )),
         output(assistant(StopReason::Stop, Vec::new(), None, None)),
     ]));
-    let (completion, events) = run_fixture(driver.clone()).await;
+    let (completion, events) =
+        run_fixture_with_initial(driver.clone(), live_admitted_user(1)).await;
     assert_completed(completion);
     let retry = events
         .iter()
@@ -670,6 +704,13 @@ async fn retry_closes_error_before_schedule_and_does_not_append_error_context() 
     assert_eq!(contexts[1].len(), 1, "only the user is replayable");
     assert!(matches!(context_message(&contexts[1][0]), Message::User(_)));
     assert_eq!(driver.retry_waits.load(Ordering::SeqCst), 1);
+    let command_times = driver.started_command_times.lock().expect("command times");
+    assert_eq!(command_times.len(), 2);
+    assert!(command_times[0].is_some());
+    assert_eq!(
+        command_times[1], None,
+        "retry backoff is not internal overhead"
+    );
 }
 
 #[tokio::test]
@@ -898,7 +939,8 @@ async fn tool_calls_execute_strictly_sequentially_and_continue_provider() {
         )),
         output(assistant(StopReason::Stop, Vec::new(), None, None)),
     ]));
-    let (completion, events) = run_fixture(driver.clone()).await;
+    let (completion, events) =
+        run_fixture_with_initial(driver.clone(), live_admitted_user(1)).await;
     assert_completed(completion);
     assert_eq!(
         *driver.tool_order.lock().expect("tool order"),
@@ -906,6 +948,13 @@ async fn tool_calls_execute_strictly_sequentially_and_continue_provider() {
     );
     assert_eq!(driver.max_active_tools.load(Ordering::SeqCst), 1);
     assert_eq!(driver.started_contexts.lock().expect("contexts").len(), 2);
+    let command_times = driver.started_command_times.lock().expect("command times");
+    assert_eq!(command_times.len(), 2);
+    assert!(command_times[0].is_some());
+    assert_eq!(
+        command_times[1], None,
+        "tool execution is not internal overhead"
+    );
     for event in &events {
         let AgentEvent::ToolExecutionEnd {
             tool_call_id,

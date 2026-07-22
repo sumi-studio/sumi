@@ -14,6 +14,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Instant,
 };
 
 use anyhow::Result;
@@ -38,6 +39,7 @@ use crate::{
     },
 };
 
+mod driver;
 mod durable_bridge;
 mod events;
 mod provider_projection;
@@ -50,6 +52,11 @@ use durable_bridge::{
 };
 use queue::MessageQueue;
 
+#[allow(
+    unused_imports,
+    reason = "T26 constructs the injected production runtime"
+)]
+pub(crate) use driver::{InjectedRunDriver, RunTimingSample, RunTimingSamples};
 pub(crate) use events::{
     AgentEvent, ApprovalRequest, ApprovalResolution, PublicStreamEvent, SteerMode,
 };
@@ -233,6 +240,7 @@ impl Default for RunCore {
 pub(crate) struct AdmittedCommand {
     envelope: CommandEnvelope,
     received_at: DateTime<Utc>,
+    received_monotonic: Option<Instant>,
 }
 
 impl AdmittedCommand {
@@ -240,6 +248,19 @@ impl AdmittedCommand {
         Self {
             envelope,
             received_at,
+            received_monotonic: None,
+        }
+    }
+
+    pub(crate) fn live(
+        envelope: CommandEnvelope,
+        received_at: DateTime<Utc>,
+        received_monotonic: Instant,
+    ) -> Self {
+        Self {
+            envelope,
+            received_at,
+            received_monotonic: Some(received_monotonic),
         }
     }
 
@@ -249,6 +270,10 @@ impl AdmittedCommand {
 
     pub(crate) fn received_at(&self) -> DateTime<Utc> {
         self.received_at
+    }
+
+    pub(crate) fn received_monotonic(&self) -> Option<Instant> {
+        self.received_monotonic
     }
 }
 
@@ -275,6 +300,8 @@ pub(crate) enum WorkerFailure {
 }
 
 pub(crate) trait RunWorker: Send + Sync + 'static {
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()>;
+
     fn run(
         &self,
         core: RunCore,
@@ -293,6 +320,12 @@ where
         + 'static,
     Fut: Future<Output = RunCompletion> + Send + 'static,
 {
+    fn validate_executor_generation(&self, _generation: ProcessGeneration) -> Result<()> {
+        // Test-only closure workers explicitly opt into the Session identity;
+        // production workers delegate to their injected driver below.
+        Ok(())
+    }
+
     fn run(
         &self,
         core: RunCore,
@@ -477,6 +510,7 @@ impl<G: Gateway + 'static> Session<G> {
         worker: Arc<dyn RunWorker>,
         executor_generation: ProcessGeneration,
     ) -> Result<Self> {
+        worker.validate_executor_generation(executor_generation)?;
         let conversation_id = store.scope().conversation_id.clone();
         let store = Arc::new(store);
         for purpose in [
@@ -661,6 +695,9 @@ impl<G: Gateway + 'static> Session<G> {
     }
 
     async fn admit_and_route(&mut self, inbound: InboundCommand) -> Result<(), SessionFailure> {
+        // Capture live ingress before durable admission. Replay returns before
+        // construction below and therefore never fabricates a monotonic span.
+        let received_monotonic = Instant::now();
         let receipt = match self
             .admission
             .receive_with_origin(&self.writer, &inbound)
@@ -694,7 +731,7 @@ impl<G: Gateway + 'static> Session<G> {
         let InboundCommand::Valid(command) = inbound else {
             unreachable!("invalid commands return above");
         };
-        let command = AdmittedCommand::new(command, received_at);
+        let command = AdmittedCommand::live(command, received_at, received_monotonic);
         if self.active.is_some() {
             self.defer_active_command(command)?;
             return Ok(());

@@ -129,7 +129,7 @@ pub(crate) fn timing_observation_channel() -> (ProviderTimingObserver, ProviderT
 }
 
 impl ProviderTimingObserver {
-    fn observe(&self, observation: ProviderTimingObservation) {
+    pub(crate) fn observe(&self, observation: ProviderTimingObservation) {
         let _ = self.sender.try_send(observation);
     }
 }
@@ -376,7 +376,7 @@ fn stream_with_api_key(
     stream_with_api_key_observed(spec, context, options, cancel, api_key, None)
 }
 
-fn stream_with_api_key_observed(
+pub(crate) fn stream_with_api_key_observed(
     spec: ModelSpec,
     context: PromptContext,
     options: RequestOptions,
@@ -422,7 +422,7 @@ fn stream_chat_with_api_key(
         model = %spec.id,
         protocol = "open_ai_chat_completions"
     );
-    tokio::spawn(
+    let producer_task = tokio::spawn(
         async move {
             run_chat_stream(
                 spec,
@@ -450,6 +450,7 @@ fn stream_chat_with_api_key(
         stream_budget,
         success_terminal_committed,
     )
+    .own_producer(producer_task)
 }
 
 fn stream_responses_with_api_key(
@@ -477,7 +478,7 @@ fn stream_responses_with_api_key(
         model = %spec.id,
         protocol = "open_ai_responses"
     );
-    tokio::spawn(
+    let producer_task = tokio::spawn(
         async move {
             run_responses_stream(
                 spec,
@@ -505,6 +506,7 @@ fn stream_responses_with_api_key(
         stream_budget,
         success_terminal_committed,
     )
+    .own_producer(producer_task)
 }
 
 fn stream_anthropic_with_api_key(
@@ -532,7 +534,7 @@ fn stream_anthropic_with_api_key(
         model = %spec.id,
         protocol = "anthropic_messages"
     );
-    tokio::spawn(
+    let producer_task = tokio::spawn(
         async move {
             run_anthropic_stream(
                 spec,
@@ -560,6 +562,7 @@ fn stream_anthropic_with_api_key(
         stream_budget,
         success_terminal_committed,
     )
+    .own_producer(producer_task)
 }
 
 async fn run_anthropic_stream(

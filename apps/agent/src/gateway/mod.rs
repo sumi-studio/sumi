@@ -11,6 +11,11 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
+#[allow(
+    unused_imports,
+    reason = "T15 injected loop harness; T26 constructs production IO"
+)]
+pub(crate) use stdio::InjectedStdioGateway;
 pub use stdio::{InvalidCommand, StdioGateway};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

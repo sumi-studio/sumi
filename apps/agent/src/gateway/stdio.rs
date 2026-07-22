@@ -8,7 +8,7 @@ use serde::{
 };
 use thiserror::Error;
 use tokio::io::{
-    AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter, Stdin, Stdout,
+    AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter, Stdin, Stdout,
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -49,6 +49,88 @@ pub struct StdioGatewayWriter {
     output: BufWriter<Stdout>,
 }
 
+/// Injected JSON-lines transport used by the T15 loop harness. Production
+/// stdin/stdout ownership remains in [`StdioGateway`].
+#[allow(
+    dead_code,
+    reason = "constructed by injected harnesses until T26 bootstrap"
+)]
+pub(crate) struct InjectedStdioGateway<R, W> {
+    input: R,
+    output: W,
+    command_digest_factory: Arc<dyn CommandDigestFactory>,
+}
+
+#[allow(dead_code, reason = "associated injected gateway half")]
+pub(crate) struct InjectedStdioGatewayReader<R> {
+    input: R,
+    command_digest_factory: Arc<dyn CommandDigestFactory>,
+}
+
+#[allow(dead_code, reason = "associated injected gateway half")]
+pub(crate) struct InjectedStdioGatewayWriter<W> {
+    output: W,
+}
+
+impl<R, W> InjectedStdioGateway<R, W> {
+    #[allow(
+        dead_code,
+        reason = "constructed by injected harnesses until T26 bootstrap"
+    )]
+    pub(crate) fn new(
+        input: R,
+        output: W,
+        command_digest_factory: Arc<dyn CommandDigestFactory>,
+    ) -> Self {
+        Self {
+            input,
+            output,
+            command_digest_factory,
+        }
+    }
+}
+
+impl<R, W> Gateway for InjectedStdioGateway<R, W>
+where
+    R: AsyncBufRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    type Reader = InjectedStdioGatewayReader<R>;
+    type Writer = InjectedStdioGatewayWriter<W>;
+
+    fn split(self) -> (Self::Reader, Self::Writer) {
+        (
+            InjectedStdioGatewayReader {
+                input: self.input,
+                command_digest_factory: self.command_digest_factory,
+            },
+            InjectedStdioGatewayWriter {
+                output: self.output,
+            },
+        )
+    }
+}
+
+#[async_trait]
+impl<R> GatewayReader for InjectedStdioGatewayReader<R>
+where
+    R: AsyncBufRead + Unpin + Send,
+{
+    async fn next_command(&mut self) -> Result<InboundCommand> {
+        read_command(&mut self.input, self.command_digest_factory.as_ref()).await
+    }
+}
+
+#[async_trait]
+impl<W> GatewayWriter for InjectedStdioGatewayWriter<W>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    async fn send(&mut self, frame: OutboundFrame) -> Result<()> {
+        write_frame(&mut self.output, frame).await
+    }
+}
+
 impl StdioGateway {
     pub(crate) fn new(command_digest_factory: Arc<dyn CommandDigestFactory>) -> Self {
         Self {
@@ -86,17 +168,21 @@ impl GatewayReader for StdioGatewayReader {
 #[async_trait]
 impl GatewayWriter for StdioGatewayWriter {
     async fn send(&mut self, frame: OutboundFrame) -> Result<()> {
-        let mut line = serde_json::to_vec(&frame).context("failed to encode gateway frame JSON")?;
-        line.push(b'\n');
-        self.output
-            .write_all(&line)
-            .await
-            .context("failed to write event to stdout")?;
-        self.output
-            .flush()
-            .await
-            .context("failed to flush event to stdout")
+        write_frame(&mut self.output, frame).await
     }
+}
+
+async fn write_frame<W: AsyncWrite + Unpin>(output: &mut W, frame: OutboundFrame) -> Result<()> {
+    let mut line = serde_json::to_vec(&frame).context("failed to encode gateway frame JSON")?;
+    line.push(b'\n');
+    output
+        .write_all(&line)
+        .await
+        .context("failed to write event to stdout")?;
+    output
+        .flush()
+        .await
+        .context("failed to flush event to stdout")
 }
 
 #[derive(serde::Deserialize)]

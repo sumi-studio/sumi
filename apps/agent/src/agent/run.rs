@@ -4,7 +4,14 @@
 //! This module owns only the in-memory lifecycle after an admitted user command
 //! has been transferred together with the unique [`RunCore`].
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -26,6 +33,7 @@ use crate::{
             UserContent, UserMessage,
         },
     },
+    runtime::contracts::ProcessGeneration,
     store::user_message_id,
 };
 
@@ -76,6 +84,9 @@ pub(crate) struct ProviderAttempt {
 /// unit fixtures can remain transport- and credential-free.
 #[async_trait]
 pub(crate) trait RunDriver: Send + Sync + 'static {
+    /// Fail closed before Session creates keys, recovery state, or a worker.
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()>;
+
     async fn start_provider(
         &self,
         attempt: usize,
@@ -83,11 +94,31 @@ pub(crate) trait RunDriver: Send + Sync + 'static {
         cancel: CancellationToken,
     ) -> Result<ProviderAttempt>;
 
+    async fn start_provider_for_command(
+        &self,
+        attempt: usize,
+        context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.start_provider(attempt, context, cancel).await
+    }
+
     async fn execute_tool(
         &self,
         call: &ToolCall,
         cancel: CancellationToken,
     ) -> Result<ToolResultMessage>;
+
+    async fn execute_tool_observed(
+        &self,
+        _flow_id: &str,
+        call: &ToolCall,
+        cancel: CancellationToken,
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage> {
+        self.execute_tool(call, cancel).await
+    }
 
     fn synthetic_error(&self, message: &str) -> PublicMessage;
 
@@ -124,6 +155,10 @@ impl SequentialRunWorker {
 }
 
 impl RunWorker for SequentialRunWorker {
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+        self.driver.validate_executor_generation(generation)
+    }
+
     fn run(
         &self,
         core: RunCore,
@@ -151,6 +186,7 @@ struct Runner {
     overflow_recoveries: u8,
     consecutive_length_batches: usize,
     in_flight_control: Option<AdmittedCommand>,
+    pending_command_received_at: Option<std::time::Instant>,
 }
 
 impl Runner {
@@ -172,6 +208,7 @@ impl Runner {
             overflow_recoveries: 0,
             consecutive_length_batches: 0,
             in_flight_control: None,
+            pending_command_received_at: None,
         }
     }
 
@@ -428,11 +465,19 @@ impl Runner {
 
     async fn provider_attempt(&mut self) -> Result<AttemptOutcome, WorkerFailure> {
         let cancel = CancellationToken::new();
-        let mut attempt = match self
-            .driver
-            .start_provider(self.attempt_sequence, &self.context, cancel)
-            .await
-        {
+        let start_cancel = cancel.clone();
+        // A command ingress timestamp has exactly one causal consumer: the
+        // first provider request started after that command is injected.
+        // Retries and tool continuations keep their own TTFT observation, but
+        // must not fold provider/backoff/tool time into agent internal p95.
+        let command_received_at = self.pending_command_received_at.take();
+        let start = self.driver.start_provider_for_command(
+            self.attempt_sequence,
+            &self.context,
+            command_received_at,
+            cancel,
+        );
+        let mut attempt = match CancelOnDrop::new(start, start_cancel).await {
             Ok(attempt) => attempt,
             Err(error) => {
                 return self
@@ -717,8 +762,7 @@ impl Runner {
         for call in calls {
             self.emit_tool_start_and_wait_committed(call).await?;
             let result = match self
-                .driver
-                .execute_tool(call, CancellationToken::new())
+                .execute_tool_with_updates(assistant_message_id, call)
                 .await
             {
                 Ok(mut result) => {
@@ -733,6 +777,47 @@ impl Runner {
             results.push(result);
         }
         Ok((results, receipts))
+    }
+
+    async fn execute_tool_with_updates(
+        &mut self,
+        flow_id: &str,
+        call: &ToolCall,
+    ) -> Result<ToolResultMessage> {
+        const TOOL_UPDATE_CAPACITY: usize = 32;
+        let (updates_tx, mut updates_rx) = mpsc::channel(TOOL_UPDATE_CAPACITY);
+        let callback_call_id = call.id.clone();
+        let on_update: Arc<dyn Fn(Value) + Send + Sync> = Arc::new(move |partial| {
+            // Progress is volatile. Never block a tool or bypass the bounded
+            // Session event lane; a saturated progress lane coalesces by drop.
+            let _ = updates_tx.try_send((callback_call_id.clone(), partial));
+        });
+        let driver = self.driver.clone();
+        let cancel = CancellationToken::new();
+        let future = CancelOnDrop::new(
+            driver.execute_tool_observed(flow_id, call, cancel.clone(), on_update),
+            cancel,
+        );
+        tokio::pin!(future);
+        let result = loop {
+            tokio::select! {
+                biased;
+                result = &mut future => break result,
+                update = updates_rx.recv() => {
+                    if let Some((tool_call_id, partial)) = update {
+                        self.emit(AgentEvent::ToolExecutionUpdate { tool_call_id, partial }).await?;
+                    }
+                }
+            }
+        };
+        while let Ok((tool_call_id, partial)) = updates_rx.try_recv() {
+            self.emit(AgentEvent::ToolExecutionUpdate {
+                tool_call_id,
+                partial,
+            })
+            .await?;
+        }
+        result
     }
 
     async fn emit_tool_start_and_wait_committed(
@@ -857,6 +942,7 @@ impl Runner {
             .clone();
         let result = self.inject_user(&injectable).await;
         if result.is_ok() {
+            self.pending_command_received_at = injectable.received_monotonic();
             self.in_flight_control = None;
         }
         result
@@ -1082,6 +1168,45 @@ impl Runner {
         })?;
         binding.turn_id = Uuid::now_v7().to_string();
         self.emit(AgentEvent::TurnStart).await
+    }
+}
+
+/// Cancels an externally-backed operation before its future is dropped. This
+/// ordering lets child producers/process reapers observe cancellation even
+/// when the owning worker task itself is aborted.
+struct CancelOnDrop<F> {
+    future: Pin<Box<F>>,
+    cancel: Option<CancellationToken>,
+}
+
+impl<F> CancelOnDrop<F> {
+    fn new(future: F, cancel: CancellationToken) -> Self {
+        Self {
+            future: Box::pin(future),
+            cancel: Some(cancel),
+        }
+    }
+}
+
+impl<F: Future> Future for CancelOnDrop<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.future.as_mut().poll(cx) {
+            Poll::Ready(output) => {
+                self.cancel = None;
+                Poll::Ready(output)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<F> Drop for CancelOnDrop<F> {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            cancel.cancel();
+        }
     }
 }
 
