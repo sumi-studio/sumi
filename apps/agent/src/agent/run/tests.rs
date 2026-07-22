@@ -53,7 +53,7 @@ struct FixtureDriver {
     context_window: Option<u64>,
     overflow_recoveries: Mutex<Vec<OverflowRecoveryRequest>>,
     overflow_core_epochs: Mutex<Vec<u64>>,
-    overflow_contexts: Mutex<VecDeque<Vec<ContextMessage>>>,
+    overflow_contexts: Mutex<VecDeque<Vec<PublicMessage>>>,
 }
 
 impl FixtureDriver {
@@ -98,24 +98,24 @@ impl FixtureDriver {
     }
 
     fn with_overflow_contexts(self, contexts: Vec<Vec<PublicMessage>>) -> Self {
-        *self.overflow_contexts.lock().expect("overflow contexts") =
-            contexts.into_iter().map(persisted_context).collect();
+        *self.overflow_contexts.lock().expect("overflow contexts") = contexts.into();
         self
     }
 }
 
-fn persisted_context(messages: Vec<PublicMessage>) -> Vec<ContextMessage> {
+fn recovered_context_from_active(
+    messages: Vec<PublicMessage>,
+    active_context: &[ContextMessage],
+) -> Vec<ContextMessage> {
     messages
         .into_iter()
-        .enumerate()
-        .map(|(index, message)| ContextMessage::Persisted {
-            id: if index == 0 && matches!(message, PublicMessage::User(_)) {
-                user_message_id(&user(1).command_id)
-            } else {
-                format!("fixture-context-{index}")
-            },
-            seq: index as u64 + 1,
-            message: public_to_message(message),
+        .map(|message| {
+            let message = public_to_message(message);
+            active_context
+                .iter()
+                .find(|candidate| context_message(candidate) == &message)
+                .cloned()
+                .unwrap_or(ContextMessage::Synthetic { message })
         })
         .collect()
 }
@@ -193,7 +193,7 @@ impl RunDriver for FixtureDriver {
         &self,
         core: &RunCore,
         request: OverflowRecoveryRequest,
-        _active_context: &[ContextMessage],
+        active_context: &[ContextMessage],
     ) -> Result<OverflowRecoveryOutcome> {
         self.overflow_recoveries
             .lock()
@@ -209,7 +209,9 @@ impl RunDriver for FixtureDriver {
             .expect("overflow contexts")
             .pop_front()
             .ok_or_else(|| anyhow!("missing fixture overflow context"))?;
-        Ok(OverflowRecoveryOutcome::ReplacementContext(replacement))
+        Ok(OverflowRecoveryOutcome::ReplacementContext(
+            recovered_context_from_active(replacement, active_context),
+        ))
     }
 
     async fn wait_retry(&self, delay: Duration, _cancel: &CancellationToken) -> bool {
@@ -355,6 +357,39 @@ fn rejected_result(rejected: &RejectedToolCall) -> ToolResultMessage {
         is_error: true,
         timestamp: timestamp(),
     }
+}
+
+#[test]
+fn rejected_results_follow_authoritative_terminal_order() {
+    let first = rejected("ordered-first");
+    let second = rejected("ordered-second");
+    let message = assistant(
+        StopReason::ToolUse,
+        vec![
+            AssistantContent::RejectedToolCall {
+                rejected: first.clone(),
+                wire_item_index: 0,
+            },
+            AssistantContent::RejectedToolCall {
+                rejected: second.clone(),
+                wire_item_index: 1,
+            },
+        ],
+        None,
+        None,
+    );
+    let mut results = vec![rejected_result(&second), rejected_result(&first)];
+
+    validate_and_order_rejected_results(&message, &mut results)
+        .expect("unique exact identities are unambiguous");
+
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result.tool_call_id.as_str())
+            .collect::<Vec<_>>(),
+        [first.id.as_str(), second.id.as_str()]
+    );
 }
 
 fn provider_attempt(attempt: usize, message: AssistantMessage) -> ProviderAttempt {
@@ -1176,6 +1211,47 @@ async fn error_and_immediate_overflow_emit_rejection_pair_without_context_or_tur
 }
 
 #[tokio::test]
+async fn retryable_error_commits_rejected_result_before_scheduling_next_attempt() {
+    let rejected = rejected("retry-rejected");
+    let driver = Arc::new(FixtureDriver::new(vec![
+        output(assistant(
+            StopReason::Error,
+            vec![AssistantContent::RejectedToolCall {
+                rejected: rejected.clone(),
+                wire_item_index: 0,
+            }],
+            Some("temporary network error"),
+            Some("http_500"),
+        )),
+        output(assistant(StopReason::Stop, Vec::new(), None, None)),
+    ]));
+    let (completion, events) = run_fixture(driver.clone()).await;
+    assert_completed(completion);
+
+    let result_end = events
+        .iter()
+        .position(|event| {
+            matches!(event, AgentEvent::MessageEnd { message, .. }
+                if matches!(message.as_ref(), PublicMessage::ToolResult(result)
+                    if result.tool_call_id == rejected.id && result.is_error))
+        })
+        .expect("rejected result MessageEnd");
+    let retry = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::RetryScheduled { .. }))
+        .expect("retry schedule");
+    assert!(result_end < retry);
+
+    let contexts = driver.started_contexts.lock().expect("contexts");
+    assert_eq!(contexts.len(), 2);
+    assert_eq!(contexts[1].len(), 2, "error assistant stays outside L0");
+    assert!(matches!(
+        context_message(&contexts[1][1]),
+        Message::ToolResult(result) if result.tool_call_id == rejected.id && result.is_error
+    ));
+}
+
+#[tokio::test]
 async fn non_authoritative_projection_failure_and_eof_discard_rejected_results() {
     for suffix in [vec![ProviderEvent::Start], Vec::new()] {
         let rejected = rejected("volatile");
@@ -1729,13 +1805,19 @@ async fn immediate_overflow_recovers_twice_then_closes_without_appending_attempt
                         && !assistant.content.iter().any(|content| matches!(content,
                             PublicAssistantContent::ToolCall { .. })))
     ));
+    let contexts = driver.started_contexts.lock().expect("contexts");
     assert_eq!(
         core.runtime_context,
-        persisted_context(recovered_two.clone())
+        recovered_context_from_active(recovered_two.clone(), &contexts[0])
     );
-    let contexts = driver.started_contexts.lock().expect("contexts");
-    assert_eq!(contexts[1], persisted_context(recovered_one));
-    assert_eq!(contexts[2], persisted_context(recovered_two));
+    assert_eq!(
+        contexts[1],
+        recovered_context_from_active(recovered_one, &contexts[0])
+    );
+    assert_eq!(
+        contexts[2],
+        recovered_context_from_active(recovered_two, &contexts[1])
+    );
     for retry in events.iter().enumerate().filter_map(|(index, event)| {
         matches!(event, AgentEvent::RetryScheduled { delay_ms: 0, .. }).then_some(index)
     }) {
@@ -1861,7 +1943,7 @@ async fn length_usage_overflow_recovers_before_any_tool_or_context_append() {
     assert_eq!(contexts.len(), 2);
     assert_eq!(
         contexts[1],
-        persisted_context(recovered),
+        recovered_context_from_active(recovered, &contexts[0]),
         "next attempt uses recovered context"
     );
 

@@ -4,7 +4,7 @@
 //! This module owns only the in-memory lifecycle after an admitted user command
 //! has been transferred together with the unique [`RunCore`].
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -515,7 +515,7 @@ impl Runner {
                     // shadow into a synthesized terminal, but that shadow is
                     // not an authoritative provider snapshot. Its buffered
                     // rejection results must not survive as durable orphans.
-                    if matches!(
+                    let internal_projection_failure = matches!(
                         internal.provider_code.as_deref(),
                         Some(
                             "stream_ended_without_terminal_event"
@@ -523,20 +523,23 @@ impl Runner {
                                 | "invalid_provider_terminal"
                                 | "invalid_provider_stream"
                         )
-                    ) {
+                    );
+                    if internal_projection_failure {
                         rejected_results.clear();
-                    } else {
-                        rejected_results.retain(|result| {
-                            internal.content.iter().any(|content| {
-                                matches!(
-                                    content,
-                                    crate::provider::types::AssistantContent::RejectedToolCall {
-                                        rejected,
-                                        ..
-                                    } if rejected.id == result.tool_call_id
-                                )
-                            })
-                        });
+                    }
+                    if let Err(error) =
+                        validate_and_order_rejected_results(&internal, &mut rejected_results)
+                    {
+                        rejected_results.clear();
+                        return self
+                            .close_broken_attempt(
+                                &attempt.message_id,
+                                message_started,
+                                format!(
+                                    "provider terminal rejection/result correspondence failed: {error}"
+                                ),
+                            )
+                            .await;
                     }
                     let overflow = terminal_overflow;
                     let length_guarded = kind == ProviderTerminalKind::Done
@@ -1129,6 +1132,68 @@ fn tool_calls(message: &PublicMessage) -> Vec<ToolCall> {
             _ => None,
         })
         .collect()
+}
+
+fn validate_and_order_rejected_results(
+    message: &crate::provider::types::AssistantMessage,
+    results: &mut [ToolResultMessage],
+) -> Result<(), &'static str> {
+    let mut terminal_rejections = Vec::new();
+    let mut executable_ids = HashSet::new();
+    for content in &message.content {
+        match content {
+            AssistantContent::ToolCall { tool_call, .. } => {
+                executable_ids.insert(tool_call.id.as_str());
+            }
+            AssistantContent::RejectedToolCall { rejected, .. } => {
+                terminal_rejections.push((rejected.id.as_str(), rejected.name.as_str()));
+            }
+            _ => {}
+        }
+    }
+
+    let unique_terminal_ids: HashSet<_> = terminal_rejections.iter().map(|(id, _)| *id).collect();
+    if unique_terminal_ids.len() != terminal_rejections.len() {
+        return Err("terminal contains duplicate rejected tool-call IDs");
+    }
+    if terminal_rejections
+        .iter()
+        .any(|(id, _)| executable_ids.contains(id))
+    {
+        return Err("a terminal tool-call ID is both executable and rejected");
+    }
+    if terminal_rejections.len() != results.len() {
+        return Err("terminal rejection/result cardinality differs");
+    }
+
+    let unique_result_ids: HashSet<_> = results
+        .iter()
+        .map(|result| result.tool_call_id.as_str())
+        .collect();
+    if unique_result_ids.len() != results.len() {
+        return Err("stream contains duplicate rejected-result tool-call IDs");
+    }
+    for result in results.iter() {
+        let Some((_, terminal_name)) = terminal_rejections
+            .iter()
+            .find(|(terminal_id, _)| *terminal_id == result.tool_call_id)
+        else {
+            return Err("terminal rejection/result identities differ");
+        };
+        if *terminal_name != result.tool_name {
+            return Err("terminal rejection/result tool names differ");
+        }
+        if !result.is_error {
+            return Err("rejected synthetic result is not an error");
+        }
+    }
+    results.sort_by_key(|result| {
+        terminal_rejections
+            .iter()
+            .position(|(terminal_id, _)| *terminal_id == result.tool_call_id)
+            .expect("validated rejected result identity")
+    });
+    Ok(())
 }
 
 fn stop_reason(message: &PublicMessage) -> Option<StopReason> {

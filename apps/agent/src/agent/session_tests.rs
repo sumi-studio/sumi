@@ -40,13 +40,10 @@ fn session_start_composition_boundary_requires_process_generation() {
     assert_signature(Session::<MockGateway>::start);
 }
 
-fn persisted_runtime_context(messages: Vec<PublicMessage>) -> Vec<ContextMessage> {
+fn synthetic_runtime_context(messages: Vec<PublicMessage>) -> Vec<ContextMessage> {
     messages
         .into_iter()
-        .enumerate()
-        .map(|(index, message)| ContextMessage::Persisted {
-            id: format!("session-fixture-{index}"),
-            seq: index as u64 + 1,
+        .map(|message| ContextMessage::Synthetic {
             message: super::run::public_to_message(message),
         })
         .collect()
@@ -1368,7 +1365,7 @@ async fn shutdown_drains_ready_completion_outputs_before_recovering_core_after_g
                 ] {
                     events.send(event).await.expect("session event receiver");
                 }
-                core.runtime_context = persisted_runtime_context(vec![user_context, assistant]);
+                core.runtime_context = synthetic_runtime_context(vec![user_context, assistant]);
                 core.mark_mutated();
                 controls.close();
                 worker_ready.notify_one();
@@ -1511,7 +1508,7 @@ async fn completion_drain_persists_all_outputs_before_recovering_mutated_core_af
             ] {
                 events.send(event).await.expect("session event receiver");
             }
-            core.runtime_context = persisted_runtime_context(vec![user_context, assistant]);
+            core.runtime_context = synthetic_runtime_context(vec![user_context, assistant]);
             core.mark_mutated();
             controls.close();
             RunCompletion::Completed(core)
@@ -2070,12 +2067,41 @@ struct OpaqueContextDriver;
 
 struct MultiRejectedReceiptDriver {
     observed_contexts: Mutex<Vec<Vec<ContextMessage>>>,
+    terminal_rejections: Vec<RejectedToolCall>,
+    streamed_rejections: Vec<RejectedToolCall>,
 }
 
 impl MultiRejectedReceiptDriver {
     fn new() -> Self {
+        let rejections = vec![
+            RejectedToolCall {
+                id: "rejected-receipt-a".to_owned(),
+                name: "fixture-tool".to_owned(),
+                error: ToolArgumentError::InvalidJson,
+            },
+            RejectedToolCall {
+                id: "rejected-receipt-b".to_owned(),
+                name: "fixture-tool".to_owned(),
+                error: ToolArgumentError::SchemaViolation,
+            },
+        ];
         Self {
             observed_contexts: Mutex::new(Vec::new()),
+            terminal_rejections: rejections.clone(),
+            streamed_rejections: rejections,
+        }
+    }
+
+    fn malformed(terminal_ids: &[&str], streamed_ids: &[&str]) -> Self {
+        let rejected = |id: &&str| RejectedToolCall {
+            id: (*id).to_owned(),
+            name: "fixture-tool".to_owned(),
+            error: ToolArgumentError::InvalidJson,
+        };
+        Self {
+            observed_contexts: Mutex::new(Vec::new()),
+            terminal_rejections: terminal_ids.iter().map(rejected).collect(),
+            streamed_rejections: streamed_ids.iter().map(rejected).collect(),
         }
     }
 
@@ -2100,20 +2126,8 @@ impl RunDriver for MultiRejectedReceiptDriver {
             .lock()
             .expect("observed contexts")
             .push(context.to_vec());
-        let rejected = [
-            RejectedToolCall {
-                id: "rejected-receipt-a".to_owned(),
-                name: "fixture-tool".to_owned(),
-                error: ToolArgumentError::InvalidJson,
-            },
-            RejectedToolCall {
-                id: "rejected-receipt-b".to_owned(),
-                name: "fixture-tool".to_owned(),
-                error: ToolArgumentError::SchemaViolation,
-            },
-        ];
         let content = if attempt == 0 {
-            rejected
+            self.terminal_rejections
                 .iter()
                 .enumerate()
                 .map(|(index, rejected)| AssistantContent::RejectedToolCall {
@@ -2139,7 +2153,7 @@ impl RunDriver for MultiRejectedReceiptDriver {
         let (tx, rx) = mpsc::channel(8);
         tx.try_send(ProviderEvent::Start)?;
         if attempt == 0 {
-            for (index, rejected) in rejected.iter().enumerate() {
+            for (index, rejected) in self.streamed_rejections.iter().enumerate() {
                 tx.try_send(ProviderEvent::ToolCallStart {
                     content_index: index,
                 })?;
@@ -2344,8 +2358,8 @@ impl RunDriver for DurableToolBarrierDriver {
 }
 
 #[tokio::test]
-async fn sequential_worker_enqueues_all_rejected_results_before_awaiting_atomic_receipts() {
-    let store = Store::session_test_store("multi-rejected-atomic-receipts")
+async fn sequential_worker_makes_progress_with_multiple_rejected_result_receipts() {
+    let store = Store::session_test_store("multi-rejected-receipt-progress")
         .await
         .expect("test store");
     let pool = store.pool().clone();
@@ -2380,11 +2394,14 @@ async fn sequential_worker_enqueues_all_rejected_results_before_awaiting_atomic_
         4,
         "user, assistant, and both results retained"
     );
-    let durable: Vec<(String, u64)> =
-        sqlx::query_as("SELECT id, seq FROM messages ORDER BY seq LIMIT 4")
-            .fetch_all(&pool)
-            .await
-            .expect("atomic rejected message anchors");
+    let durable_message_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+        .fetch_one(&pool)
+        .await
+        .expect("exact durable message count");
+    assert_eq!(
+        durable_message_count, 5,
+        "user, rejected assistant, both results, and the next terminal assistant"
+    );
     let observed: Vec<(String, u64)> = second
         .iter()
         .map(|message| match message {
@@ -2392,7 +2409,20 @@ async fn sequential_worker_enqueues_all_rejected_results_before_awaiting_atomic_
             ContextMessage::Synthetic { .. } => panic!("live durable context became synthetic"),
         })
         .collect();
+    let observed_last_seq = observed.last().expect("context receipt prefix").1;
+    let durable: Vec<(String, u64)> =
+        sqlx::query_as("SELECT id, seq FROM messages WHERE seq <= ? ORDER BY seq")
+            .bind(observed_last_seq as i64)
+            .fetch_all(&pool)
+            .await
+            .expect("rejected message anchor prefix");
     assert_eq!(observed, durable);
+    // This integration test proves bounded progress and exact receipt-derived
+    // anchors. Transaction rollback itself is covered by
+    // `failed_idle_injection_batch_publishes_no_partial_event_frame` at this
+    // bridge boundary and `failpoint_mid_batch_rolls_back_before_store_restart`
+    // at the EventWriter boundary; it does not infer transaction identity from
+    // adjacent message sequence numbers.
     for (message, expected_id) in second[2..]
         .iter()
         .zip(["rejected-receipt-a", "rejected-receipt-b"])
@@ -2404,6 +2434,76 @@ async fn sequential_worker_enqueues_all_rejected_results_before_awaiting_atomic_
                 ..
             } if result.tool_call_id == expected_id && result.is_error
         ));
+    }
+}
+
+#[tokio::test]
+async fn malformed_rejection_terminal_correspondence_fails_closed_without_receipt_hang() {
+    let scenarios: [(&str, &[&str], &[&str]); 5] = [
+        ("missing", &["rejected-a"], &[]),
+        ("partial", &["rejected-a", "rejected-b"], &["rejected-a"]),
+        ("extra", &["rejected-a"], &["rejected-a", "rejected-b"]),
+        (
+            "duplicate-stream",
+            &["rejected-a", "rejected-b"],
+            &["rejected-a", "rejected-a"],
+        ),
+        (
+            "duplicate-terminal",
+            &["rejected-a", "rejected-a"],
+            &["rejected-a", "rejected-a"],
+        ),
+    ];
+
+    for (label, terminal_ids, streamed_ids) in scenarios {
+        let store = Store::session_test_store(&format!("malformed-rejections-{label}"))
+            .await
+            .expect("test store");
+        let pool = store.pool().clone();
+        let driver = Arc::new(MultiRejectedReceiptDriver::malformed(
+            terminal_ids,
+            streamed_ids,
+        ));
+        let (gateway, _commands, _frames) = gateway();
+        let mut session = Session::start(
+            store,
+            gateway,
+            RunCore::new(),
+            Arc::new(SequentialRunWorker::new(driver)),
+            test_executor_generation(),
+        )
+        .await
+        .expect("session");
+        session.admit_and_route(user(1)).await.expect("command");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            drive_active_to_completion(&mut session),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{label} correspondence left a receipt waiter unreachable"))
+        .unwrap_or_else(|error| panic!("{label} failed outside the closed attempt: {error}"));
+        session.wait_outbound_idle().await;
+
+        let messages: Vec<(String, String)> = sqlx::query_as(
+            "SELECT role, COALESCE(json_extract(payload, '$.stop_reason'), '') FROM messages ORDER BY seq",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("closed malformed attempt messages");
+        assert_eq!(
+            messages,
+            vec![
+                ("user".to_owned(), "".to_owned()),
+                ("assistant".to_owned(), "error".to_owned()),
+            ],
+            "{label} must persist only the user and synthetic Error assistant",
+        );
+        let tool_results: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE role='tool_result'")
+                .fetch_one(&pool)
+                .await
+                .expect("tool-result message count");
+        assert_eq!(tool_results, 0, "{label} must not persist orphan results");
     }
 }
 
