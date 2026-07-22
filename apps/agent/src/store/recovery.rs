@@ -86,10 +86,12 @@ struct PendingCommand {
 pub(crate) struct SuffixRecovery;
 
 impl SuffixRecovery {
-    /// Advances only the restart suffix owned by the T12 durability foundation.
+    /// Plans and persists only the restart prefix owned by T12.
     ///
-    /// T15 owns run/turn emission and provider/tool execution. Those planned
-    /// steps remain durable and must not prevent the gateway from reopening.
+    /// T15 uses this boundary only as a startup gate: after the T12-safe prefix
+    /// work, it returns any remaining plan as `RecoveryRequired` instead of
+    /// consuming it. T17 consumes the full suffix plan during hydration; T26
+    /// composes that hydrated state into production.
     pub(crate) async fn recover_t12_prefix(
         store: &Store,
         writer: &EventWriter,
@@ -163,7 +165,7 @@ impl SuffixRecovery {
     /// events and phase-specific state at execution time.
     #[allow(
         dead_code,
-        reason = "T15 consumes the bounded next-action recovery planner"
+        reason = "T12 persists prefix work; T15 only gates and returns RecoveryRequired; T17 consumes the full suffix plan"
     )]
     pub(crate) async fn plan(store: &Store) -> Result<Vec<RecoveryStep>> {
         Self::plan_next_without_history_scan(store, None).await
@@ -1188,7 +1190,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn t12_startup_recovery_classifies_idle_then_leaves_run_start_pending() {
+    async fn t12_prefix_application_classifies_idle_then_leaves_t17_suffix_pending() {
         let (store, writer) = setup().await;
         persist_user(&writer, 1, "00000000-0000-4000-8000-000000000001").await;
 
@@ -1218,12 +1220,12 @@ mod tests {
                 .await
                 .expect("event count"),
             0,
-            "T15-owned AgentStart must remain pending"
+            "T17-owned full-suffix AgentStart must remain pending after T12 prefix application"
         );
     }
 
     #[tokio::test]
-    async fn t12_startup_recovery_applies_idle_abort_cutoff_before_reclassifying() {
+    async fn t12_prefix_application_applies_idle_abort_cutoff_before_reclassifying() {
         let (store, writer) = setup().await;
         persist_user(&writer, 1, "00000000-0000-4000-8000-000000000001").await;
         writer
@@ -1341,7 +1343,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn t12_startup_recovery_terminals_unknown_approval_as_durable_noop() {
+    async fn t12_prefix_application_terminals_unknown_approval_as_durable_noop() {
         let (store, writer) = setup().await;
         writer
             .persist_inbound(&InboundCommand::Valid(CommandEnvelope {

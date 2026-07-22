@@ -1,7 +1,7 @@
 //! Agent session orchestration and turn lifecycle.
 #![allow(
     dead_code,
-    reason = "the Session actor is intentionally left unwired until the final T15 integration slice"
+    reason = "the Session actor is intentionally left unwired until T26 production composition"
 )]
 
 use std::{
@@ -58,7 +58,7 @@ pub(crate) use provider_projection::{
 };
 #[allow(
     unused_imports,
-    reason = "production provider/executor wiring lands in the final T15 integration slice"
+    reason = "production provider/executor wiring lands in T26 composition; T15 consumes injected boundaries"
 )]
 pub(crate) use run::{
     OverflowRecoveryOutcome, OverflowRecoveryRequest, ProviderAttempt, RunDriver,
@@ -167,9 +167,10 @@ pub(crate) struct RunCore {
     mutation_epoch: u64,
     pending_controls: MessageQueue<AdmittedCommand>,
     pending_overflow_apply: Option<OverflowSource>,
-    /// In-memory send context returned with the unique core. T17 replaces this
-    /// flat representation with `ThreeLayerMemory`; keeping it in `RunCore`
-    /// prevents a second Session run from silently losing the first run.
+    /// In-memory send context returned with the unique core. T21 defines the
+    /// `ThreeLayerMemory` replacement, and T26 composes it into production;
+    /// keeping this injected representation in `RunCore` prevents a second
+    /// Session run from silently losing the first run.
     runtime_context: Vec<PublicMessage>,
     durable_binding: Option<DurableRunBinding>,
 }
@@ -411,7 +412,7 @@ pub(crate) enum SessionResult {
 
 #[derive(Debug, Error)]
 pub(crate) enum SessionFailure {
-    #[error("session startup is recovery-gated by T15-owned suffix: {steps:?}")]
+    #[error("session startup is recovery-gated by T17-owned suffix: {steps:?}")]
     RecoveryRequired { steps: Vec<RecoveryStep> },
     #[error("run worker failed: {0}")]
     Worker(WorkerFailure),
@@ -455,11 +456,12 @@ pub(crate) struct Session<G: Gateway> {
     active: Option<ActiveRun>,
     worker: Arc<dyn RunWorker>,
     executor_generation: u64,
-    /// T16 owns active-run classification and control semantics. Until then
-    /// every command received during a run remains durably `received` in one
-    /// sequence-ordered queue. After AgentEnd, T15 may start a fresh user run
-    /// or apply an idle Abort cutoff, but it must not let a user overtake an
-    /// earlier/later control that only T16 can apply safely.
+    /// T15 already applies the idle/post-run Abort cutoff and supplies the
+    /// injected cancellation and phase-observation seams. Commands received
+    /// during an active run otherwise remain durably `received` in this
+    /// sequence-ordered queue. T16 owns active/live classification, cutoff,
+    /// and the full control semantics without allowing a user to overtake an
+    /// earlier/later control.
     deferred_commands: MessageQueue<AdmittedCommand>,
     /// A bridge/Store refusal means the worker's returned core may be ahead of
     /// the durable transcript and must never be exposed as recovered.

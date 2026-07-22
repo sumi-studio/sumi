@@ -1652,7 +1652,7 @@ async fn panic_and_unpaired_event_channel_close_report_lost_ownership() {
 }
 
 #[tokio::test]
-async fn pending_t15_suffix_allows_only_t12_exact_retransmission() {
+async fn t15_recovery_gate_allows_only_t12_prefix_exact_retransmission() {
     let store = Store::session_test_store("recovery-gated-session")
         .await
         .expect("test store");
@@ -1721,7 +1721,8 @@ async fn pending_t15_suffix_allows_only_t12_exact_retransmission() {
 
     // A fresh identity is rejected by InboundAdmission before CommandReceived;
     // this is separately frozen by the T12 admission tests. This actor test
-    // proves the Session never resumes the gate for its T15-owned suffix.
+    // proves the T15 Session gate never admits unseen work while T17-owned
+    // full-suffix hydration remains required.
 }
 
 struct CommitCheckingGateway {
