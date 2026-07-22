@@ -178,11 +178,11 @@ async fn write_frame<W: AsyncWrite + Unpin>(output: &mut W, frame: OutboundFrame
     output
         .write_all(&line)
         .await
-        .context("failed to write event to stdout")?;
+        .context("failed to write gateway frame")?;
     output
         .flush()
         .await
-        .context("failed to flush event to stdout")
+        .context("failed to flush gateway frame")
 }
 
 #[derive(serde::Deserialize)]

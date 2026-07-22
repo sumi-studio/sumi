@@ -278,6 +278,7 @@ impl<'a> LowTrustLocalBash<'a> {
                                         )
                                     })??;
                                 }
+                                process_group.disarm();
                                 return Err(error);
                             }
                         }
