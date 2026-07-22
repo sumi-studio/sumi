@@ -1,0 +1,3 @@
+//! Neutral runtime identity contracts shared across process boundaries.
+
+pub mod contracts;

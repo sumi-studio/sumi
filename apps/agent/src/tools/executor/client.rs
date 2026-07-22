@@ -21,9 +21,10 @@ use tokio::{
 use uuid::Uuid;
 
 use super::{
-    ArtifactOperation, ArtifactResponse, MAX_RPC_LINE_BYTES, RpcError, RpcFrame, RpcIdentity,
-    RpcRequest, decode_rpc_frame,
+    ArtifactOperation, ArtifactResponse, MAX_RPC_LINE_BYTES, RpcError, RpcFrame, RpcRequest,
+    decode_rpc_frame,
 };
+use crate::runtime::contracts::RpcIdentity;
 use crate::tools::{ToolError, shell_capture::ArtifactAppender};
 
 /// Each exchange uses a fresh socket connection and permits exactly one
@@ -78,11 +79,10 @@ impl ArtifactBrokerClient {
         operation: ArtifactOperation,
         request_emitted: Arc<AtomicBool>,
     ) -> Result<ArtifactResponse, ToolError> {
-        self.identity.validate()?;
         let request_id = format!("broker-{}", Uuid::now_v7());
         let request = RpcRequest {
-            generation: self.identity.generation,
-            nonce: self.identity.nonce.clone(),
+            generation: self.identity.generation().to_wire(),
+            nonce: self.identity.nonce().as_str().to_owned(),
             request_id: request_id.clone(),
             operation,
         };
@@ -446,10 +446,7 @@ mod tests {
         });
         let client = ArtifactBrokerClient::new(
             &socket,
-            RpcIdentity {
-                generation: 1,
-                nonce: "nonce".to_owned(),
-            },
+            RpcIdentity::from_wire(1, "nonce").unwrap(),
             "conversation-1",
         );
         let error = client
@@ -466,22 +463,12 @@ mod tests {
 
     #[tokio::test]
     async fn outgoing_request_rejects_out_of_domain_generation_before_connecting() {
-        let client = ArtifactBrokerClient::new(
-            "/unused",
-            RpcIdentity {
-                generation: super::super::MAX_PROCESS_GENERATION + 1,
-                nonce: "boot-nonce".to_owned(),
-            },
-            "conversation-1",
-        );
-        let error = client
-            .execute(ArtifactOperation::FinishToolOutput {
-                conversation_id: "conversation-1".to_owned(),
-                handle: "artifact://conversation-1/tool-output/execution-1".to_owned(),
-            })
-            .await
-            .expect_err("invalid generation");
-        assert!(matches!(error, ToolError::Protocol(message) if message.contains("generation")));
+        let error = RpcIdentity::from_wire(
+            crate::runtime::contracts::MAX_PROCESS_GENERATION + 1,
+            "boot-nonce",
+        )
+        .expect_err("invalid generation");
+        assert!(error.to_string().contains("generation"));
     }
 
     #[tokio::test]
@@ -498,10 +485,7 @@ mod tests {
     async fn complete_request_followed_by_shutdown_failure_is_indeterminate() {
         let client = ArtifactBrokerClient::new(
             "/unused",
-            RpcIdentity {
-                generation: 1,
-                nonce: "nonce".to_owned(),
-            },
+            RpcIdentity::from_wire(1, "nonce").unwrap(),
             "conversation-1",
         );
         let written = Arc::new(Mutex::new(Vec::new()));
@@ -593,10 +577,7 @@ mod tests {
 
         let client = ArtifactBrokerClient::new(
             &socket,
-            RpcIdentity {
-                generation: 1,
-                nonce: "nonce".to_owned(),
-            },
+            RpcIdentity::from_wire(1, "nonce").unwrap(),
             "conversation-1",
         );
         let error = client
@@ -678,10 +659,7 @@ mod tests {
             });
             let client = ArtifactBrokerClient::new(
                 &socket,
-                RpcIdentity {
-                    generation: 1,
-                    nonce: "nonce".to_owned(),
-                },
+                RpcIdentity::from_wire(1, "nonce").unwrap(),
                 "conversation-1",
             );
             assert!(matches!(
@@ -722,10 +700,7 @@ mod tests {
         });
         let client = ArtifactBrokerClient::new(
             &socket,
-            RpcIdentity {
-                generation: 1,
-                nonce: "nonce".to_owned(),
-            },
+            RpcIdentity::from_wire(1, "nonce").unwrap(),
             "conversation-1",
         );
         assert!(matches!(
@@ -833,10 +808,7 @@ mod tests {
         });
         let client = ArtifactBrokerClient::new(
             &socket,
-            RpcIdentity {
-                generation: 1,
-                nonce: "nonce".to_owned(),
-            },
+            RpcIdentity::from_wire(1, "nonce").unwrap(),
             "conversation-1",
         );
         let prefix = vec![b'x'; DEFAULT_MAX_BYTES + 1];
@@ -878,10 +850,7 @@ mod tests {
         });
         let client = ArtifactBrokerClient::new(
             &socket,
-            RpcIdentity {
-                generation: 1,
-                nonce: "nonce".to_owned(),
-            },
+            RpcIdentity::from_wire(1, "nonce").unwrap(),
             "conversation-1",
         );
         let error = client

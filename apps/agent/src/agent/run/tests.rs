@@ -20,9 +20,12 @@ use crate::{
         ProviderContextPayload, ProviderOrigin, ProviderOutput, PublicAssistantMessage,
         RejectedToolCall, ToolArgumentError, Usage, ValidatedToolArguments,
     },
+    runtime::contracts::ProcessGeneration,
 };
 
-const TEST_EXECUTOR_GENERATION: u64 = 73;
+fn test_executor_generation() -> ProcessGeneration {
+    ProcessGeneration::from_wire(73).expect("valid test generation")
+}
 
 #[derive(Clone)]
 enum Script {
@@ -501,7 +504,10 @@ fn pending_sequences(core: &mut RunCore) -> Vec<u64> {
 fn bound_core(seq: u64) -> RunCore {
     let command = admitted_user(seq);
     let mut core = RunCore::new();
-    core.durable_binding = Some(DurableRunBinding::idle(&command, TEST_EXECUTOR_GENERATION));
+    core.durable_binding = Some(DurableRunBinding::idle(
+        &command,
+        test_executor_generation(),
+    ));
     core
 }
 
@@ -915,7 +921,7 @@ fn synthetic_attempt_message_ids_are_stable_and_scoped_by_durable_identity_and_f
         command_seq: 1,
         run_id: "01900000-0000-7000-8000-000000000001".to_owned(),
         turn_id: "01900000-0000-7000-8000-000000000002".to_owned(),
-        executor_generation: TEST_EXECUTOR_GENERATION,
+        executor_generation: test_executor_generation(),
     };
     let start = synthetic_attempt_message_id(&binding, 0, SyntheticAttemptFailure::Start)
         .expect("synthetic start identity");

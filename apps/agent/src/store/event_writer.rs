@@ -24,6 +24,7 @@ use crate::{
         CommandRejectReason, InboundCommand, KeyedCommandDigest, RejectedCommandPayload,
     },
     provider::types::{PublicMessage, StopReason, ToolResultMessage},
+    runtime::contracts::ProcessGeneration,
 };
 
 use super::{
@@ -820,7 +821,7 @@ pub(crate) enum ToolExecutionMutation {
         tool_call_id: String,
         command_id: String,
         run_id: String,
-        executor_generation: u64,
+        executor_generation: ProcessGeneration,
         idempotency_key: String,
     },
     Start {
@@ -841,7 +842,7 @@ pub(crate) enum ToolExecutionMutation {
         command_id: String,
         run_id: String,
         turn_id: String,
-        executor_generation: u64,
+        executor_generation: ProcessGeneration,
         idempotency_key: String,
         error_code: &'static str,
     },
@@ -7103,7 +7104,7 @@ async fn apply_tool_mutation(
             .bind(tool_call_id)
             .bind(command_id)
             .bind(run_id)
-            .bind(sqlite_i64(executor_generation, "executor generation")?)
+            .bind(executor_generation.as_i64())
             .bind(idempotency_key)
             .execute(&mut **transaction)
             .await?;
@@ -7172,7 +7173,7 @@ async fn apply_tool_mutation(
                    AND status = 'applying' AND run_phase = 'assistant_started'",
             )
             .bind(tool_call_id)
-            .bind(sqlite_i64(executor_generation, "executor generation")?)
+            .bind(executor_generation.as_i64())
             .bind(idempotency_key)
             .bind(Utc::now().to_rfc3339())
             .bind(error_code)
@@ -7298,6 +7299,40 @@ mod tests {
             },
         },
     };
+
+    fn test_process_generation(raw: u64) -> ProcessGeneration {
+        ProcessGeneration::from_wire(raw).expect("valid test process generation")
+    }
+
+    #[test]
+    fn tool_execution_mutation_boundaries_require_process_generation() {
+        fn prepare(generation: ProcessGeneration) -> ToolExecutionMutation {
+            ToolExecutionMutation::Prepare {
+                tool_call_id: "tool-call".to_owned(),
+                command_id: "command".to_owned(),
+                run_id: "run".to_owned(),
+                executor_generation: generation,
+                idempotency_key: "idempotency-key".to_owned(),
+            }
+        }
+
+        fn skip(generation: ProcessGeneration) -> ToolExecutionMutation {
+            ToolExecutionMutation::Skip {
+                tool_call_id: "tool-call".to_owned(),
+                command_id: "command".to_owned(),
+                run_id: "run".to_owned(),
+                turn_id: "turn".to_owned(),
+                executor_generation: generation,
+                idempotency_key: "idempotency-key".to_owned(),
+                error_code: "length_guard",
+            }
+        }
+
+        let _: fn(ProcessGeneration) -> ToolExecutionMutation = prepare;
+        let _: fn(ProcessGeneration) -> ToolExecutionMutation = skip;
+        let _ = prepare(ProcessGeneration::MIN);
+        let _ = skip(ProcessGeneration::MAX);
+    }
 
     struct TestKeyProvider {
         key: WrappingKey,
@@ -7457,7 +7492,7 @@ mod tests {
                             tool_call_id: tool_call_id.to_owned(),
                             command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
                             run_id: run_id.to_owned(),
-                            executor_generation: 1,
+                            executor_generation: test_process_generation(1),
                             idempotency_key: format!("idem-{tool_call_id}"),
                         }),
                         Projection::Approval(ApprovalMutation::Pending {
@@ -10451,7 +10486,7 @@ mod tests {
                             tool_call_id: "tool-structured-secret".to_owned(),
                             command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
                             run_id: "run-structured-secret".to_owned(),
-                            executor_generation: 1,
+                            executor_generation: test_process_generation(1),
                             idempotency_key: "idem-structured-secret".to_owned(),
                         }),
                         Projection::Approval(ApprovalMutation::Pending {
@@ -12780,7 +12815,7 @@ mod tests {
                         tool_call_id: "tool-handoff".to_owned(),
                         command_id: "00000000-0000-4000-8000-000000000019".to_owned(),
                         run_id: "run-handoff".to_owned(),
-                        executor_generation: 1,
+                        executor_generation: test_process_generation(1),
                         idempotency_key: "idem-handoff".to_owned(),
                     })],
                 }],
@@ -13632,7 +13667,7 @@ mod tests {
                         tool_call_id: "tool-wrong-turn".to_owned(),
                         command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
                         run_id: "run-wrong-turn".to_owned(),
-                        executor_generation: 1,
+                        executor_generation: test_process_generation(1),
                         idempotency_key: "idem-wrong-turn".to_owned(),
                     })],
                 }],
@@ -13674,7 +13709,7 @@ mod tests {
                 tool_call_id: "tool-cross-run".to_owned(),
                 command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
                 run_id: "run-a".to_owned(),
-                executor_generation: 1,
+                executor_generation: test_process_generation(1),
                 idempotency_key: "idem-cross-run".to_owned(),
             }),
         );
@@ -13714,7 +13749,7 @@ mod tests {
                 tool_call_id: "tool-wrong-owner".to_owned(),
                 command_id: "00000000-0000-4000-8000-000000000099".to_owned(),
                 run_id: "run-owner".to_owned(),
-                executor_generation: 1,
+                executor_generation: test_process_generation(1),
                 idempotency_key: "idem-wrong-owner".to_owned(),
             }),
         );
@@ -13745,7 +13780,7 @@ mod tests {
                         tool_call_id: "tool-existing".to_owned(),
                         command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
                         run_id: "run-a".to_owned(),
-                        executor_generation: 1,
+                        executor_generation: test_process_generation(1),
                         idempotency_key: "idem-existing".to_owned(),
                     })],
                 }],
@@ -13860,7 +13895,7 @@ mod tests {
                         tool_call_id: "tool-allow".to_owned(),
                         command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
                         run_id: "run-allow".to_owned(),
-                        executor_generation: 1,
+                        executor_generation: test_process_generation(1),
                         idempotency_key: "idem-allow".to_owned(),
                     })],
                 }],
@@ -13927,7 +13962,7 @@ mod tests {
                 tool_call_id: tool_call_id.to_owned(),
                 command_id: command_id.to_owned(),
                 run_id: run_id.clone(),
-                executor_generation: 1,
+                executor_generation: test_process_generation(1),
                 idempotency_key: format!("idem-{tool_call_id}"),
             })
         };
@@ -14111,7 +14146,7 @@ mod tests {
                         tool_call_id: "rejected-no-execution".to_owned(),
                         command_id: rejected_command.to_owned(),
                         run_id: rejected_run,
-                        executor_generation: 1,
+                        executor_generation: test_process_generation(1),
                         idempotency_key: "idem-rejected-no-execution".to_owned(),
                     })],
                 }],
@@ -14153,7 +14188,7 @@ mod tests {
                                 tool_call_id: format!("tool-{phase}"),
                                 command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
                                 run_id: "run-phase".to_owned(),
-                                executor_generation: 1,
+                                executor_generation: test_process_generation(1),
                                 idempotency_key: format!("idem-{phase}"),
                             },
                         )],
@@ -14190,7 +14225,7 @@ mod tests {
                             tool_call_id: "tool-close-race".to_owned(),
                             command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
                             run_id: "run-close".to_owned(),
-                            executor_generation: 1,
+                            executor_generation: test_process_generation(1),
                             idempotency_key: "idem-close-race".to_owned(),
                         }),
                         Projection::CommandApplied {
@@ -14234,7 +14269,7 @@ mod tests {
                         tool_call_id: "tool-start-close".to_owned(),
                         command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
                         run_id: "run-start-close".to_owned(),
-                        executor_generation: 1,
+                        executor_generation: test_process_generation(1),
                         idempotency_key: "idem-start-close".to_owned(),
                     })],
                 }],
@@ -14294,7 +14329,7 @@ mod tests {
                         tool_call_id: "tool-pending-close".to_owned(),
                         command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
                         run_id: "run-pending-close".to_owned(),
-                        executor_generation: 1,
+                        executor_generation: test_process_generation(1),
                         idempotency_key: "idem-pending-close".to_owned(),
                     })],
                 }],
@@ -14506,7 +14541,7 @@ mod tests {
                             tool_call_id: "tool-1".to_owned(),
                             command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
                             run_id: "run-1".to_owned(),
-                            executor_generation: 1,
+                            executor_generation: test_process_generation(1),
                             idempotency_key: "00000000-0000-4000-8000-000000000001/tool-1"
                                 .to_owned(),
                         }),
@@ -15090,7 +15125,7 @@ mod tests {
                         tool_call_id: "wrong-tool".to_owned(),
                         command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
                         run_id: "run-2b".to_owned(),
-                        executor_generation: 1,
+                        executor_generation: test_process_generation(1),
                         idempotency_key: "wrong-tool-idem".to_owned(),
                     })],
                 }],
@@ -15776,7 +15811,7 @@ mod tests {
                             tool_call_id: "tool-secret".to_owned(),
                             command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
                             run_id: "run-1".to_owned(),
-                            executor_generation: 1,
+                            executor_generation: test_process_generation(1),
                             idempotency_key: "idem-tool-secret".to_owned(),
                         }),
                         Projection::Approval(ApprovalMutation::Pending {
@@ -16246,7 +16281,7 @@ mod tests {
                             tool_call_id: "tool-1".to_owned(),
                             command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
                             run_id: "run-1".to_owned(),
-                            executor_generation: 1,
+                            executor_generation: test_process_generation(1),
                             idempotency_key: "00000000-0000-4000-8000-000000000001/tool-1"
                                 .to_owned(),
                         }),
@@ -16296,7 +16331,7 @@ mod tests {
                         tool_call_id: "tool-1".to_owned(),
                         command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
                         run_id: "run-1".to_owned(),
-                        executor_generation: 1,
+                        executor_generation: test_process_generation(1),
                         idempotency_key: "00000000-0000-4000-8000-000000000001/tool-1".to_owned(),
                     })],
                 }],

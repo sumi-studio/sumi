@@ -6,6 +6,7 @@ mod gateway;
 mod memory;
 mod prompts;
 pub mod provider;
+pub mod runtime;
 mod store;
 mod tools;
 

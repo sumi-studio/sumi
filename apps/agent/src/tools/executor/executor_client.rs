@@ -22,8 +22,9 @@ use uuid::Uuid;
 use super::protocol::{parse_artifact_handle, validate_conversation_id};
 use super::{
     ArtifactResponse, ExecutorOperation, ExecutorResponse, MAX_RPC_LINE_BYTES, RpcError, RpcFrame,
-    RpcIdentity, RpcOperationValidation, RpcRequest, decode_rpc_frame,
+    RpcOperationValidation, RpcRequest, decode_rpc_frame,
 };
+use crate::runtime::contracts::RpcIdentity;
 use crate::tools::{
     ToolError,
     fs::{GrepMatch, MAX_GREP_MATCHES, MAX_GREP_SERIALIZED_BYTES, MAX_SCAN_ENTRIES},
@@ -343,10 +344,9 @@ fn encode_request(
     request_id: &str,
     operation: ExecutorOperation,
 ) -> Result<Vec<u8>, ToolError> {
-    identity.validate()?;
     let request = RpcRequest {
-        generation: identity.generation,
-        nonce: identity.nonce.clone(),
+        generation: identity.generation().to_wire(),
+        nonce: identity.nonce().as_str().to_owned(),
         request_id: request_id.to_owned(),
         operation,
     };
@@ -650,26 +650,17 @@ mod tests {
     };
 
     fn identity() -> RpcIdentity {
-        RpcIdentity {
-            generation: 7,
-            nonce: "boot-nonce".to_owned(),
-        }
+        RpcIdentity::from_wire(7, "boot-nonce").unwrap()
     }
 
     #[test]
     fn outgoing_request_rejects_out_of_domain_generation_before_encoding() {
-        let error = encode_request(
-            &RpcIdentity {
-                generation: super::super::MAX_PROCESS_GENERATION + 1,
-                nonce: "boot-nonce".to_owned(),
-            },
-            "request-1",
-            ExecutorOperation::Cancel {
-                execution_id: "execution-1".to_owned(),
-            },
+        let error = RpcIdentity::from_wire(
+            crate::runtime::contracts::MAX_PROCESS_GENERATION + 1,
+            "boot-nonce",
         )
         .expect_err("invalid generation");
-        assert!(matches!(error, ToolError::Protocol(message) if message.contains("generation")));
+        assert!(error.to_string().contains("generation"));
     }
 
     fn test_deadlines() -> Deadlines {

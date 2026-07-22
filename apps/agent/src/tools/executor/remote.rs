@@ -631,10 +631,11 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::runtime::contracts::RpcIdentity;
     use crate::tools::{
         ResourceLimit, WorkspacePaths,
         bash::BashExecutionResult,
-        executor::{RpcFrame, RpcIdentity, RpcRequest},
+        executor::{RpcFrame, RpcRequest},
         fs::GrepMatch,
         truncate::{TruncatedBy, TruncationResult},
     };
@@ -1442,10 +1443,7 @@ mod tests {
         });
         let client = Arc::new(ExecutorClient::new(
             socket,
-            RpcIdentity {
-                generation: 7,
-                nonce: "current-nonce".to_owned(),
-            },
+            RpcIdentity::from_wire(7, "current-nonce").unwrap(),
             "conversation-1",
         ));
         let registry = remote_executor_registry(client).unwrap();
