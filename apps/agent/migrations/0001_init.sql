@@ -7,7 +7,7 @@ CREATE TABLE agent_scope (
 );
 
 CREATE TABLE data_keys (
-  key_ref TEXT PRIMARY KEY,
+  key_ref TEXT NOT NULL PRIMARY KEY,
   scope TEXT NOT NULL,
   purpose TEXT NOT NULL,
   conversation_id TEXT,
@@ -53,7 +53,7 @@ ON data_keys(scope, purpose, COALESCE(conversation_id, ''))
 WHERE state = 'active' AND purpose <> 'provider_context';
 
 CREATE TABLE messages (
-  id TEXT PRIMARY KEY,
+  id TEXT NOT NULL PRIMARY KEY,
   seq INTEGER NOT NULL UNIQUE CHECK (seq >= 0),
   role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'tool_result')),
   raw_key_ref TEXT NOT NULL REFERENCES data_keys(key_ref),
@@ -95,7 +95,7 @@ ON agent_events(json_extract(envelope, '$.message_id'))
 WHERE event_type = 'message_start';
 
 CREATE TABLE event_log_heads (
-  conversation_id TEXT PRIMARY KEY REFERENCES agent_scope(conversation_id),
+  conversation_id TEXT NOT NULL PRIMARY KEY REFERENCES agent_scope(conversation_id),
   last_seq INTEGER NOT NULL CHECK (last_seq >= 1),
   event_count INTEGER NOT NULL CHECK (event_count >= 1),
   chain_digest BLOB NOT NULL CHECK (length(chain_digest) = 32),
@@ -236,7 +236,7 @@ WHERE command_kind = 'user_message'
   );
 
 CREATE TABLE tool_executions (
-  tool_call_id TEXT PRIMARY KEY,
+  tool_call_id TEXT NOT NULL PRIMARY KEY,
   command_id TEXT NOT NULL,
   run_id TEXT NOT NULL,
   executor_generation INTEGER NOT NULL CHECK (executor_generation >= 0),
@@ -277,7 +277,7 @@ CREATE TABLE tool_executions (
 );
 
 CREATE TABLE approval_log (
-  id TEXT PRIMARY KEY,
+  id TEXT NOT NULL PRIMARY KEY,
   tool_call_id TEXT NOT NULL UNIQUE,
   run_id TEXT NOT NULL,
   turn_id TEXT NOT NULL,

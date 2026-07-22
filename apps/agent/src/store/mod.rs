@@ -866,6 +866,148 @@ mod tests {
             .expect("open in-memory store")
     }
 
+    fn assert_not_null_violation(error: &sqlx::Error) {
+        let database_error = error
+            .as_database_error()
+            .expect("constraint violation must be a database error");
+        assert_eq!(
+            database_error.kind(),
+            sqlx::error::ErrorKind::NotNullViolation
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_rejects_null_text_primary_key_identities() {
+        let store = store().await;
+        let transcript_key = store
+            .conversation_key(DataKeyPurpose::Transcript)
+            .await
+            .expect("mint transcript key");
+        let event_key = store
+            .conversation_key(DataKeyPurpose::Event)
+            .await
+            .expect("mint event key");
+
+        let data_key_error = sqlx::query(
+            "INSERT INTO data_keys(
+                key_ref, scope, purpose, conversation_id, algorithm, wrap_key_id,
+                wrap_nonce, wrapped_key, state, created_at, destroyed_at
+             ) VALUES(NULL, 'conversation', 'artifact', 'conversation-1', ?, 'wrap',
+                X'00', X'00', 'active', 'now', NULL)",
+        )
+        .bind(WRAP_ALGORITHM)
+        .execute(store.pool())
+        .await
+        .expect_err("data_keys.key_ref NULL must be rejected");
+        assert_not_null_violation(&data_key_error);
+
+        let message_error = sqlx::query(
+            "INSERT INTO messages(
+                id, seq, role, raw_key_ref, raw_ciphertext, payload, search_text,
+                redaction_version, interrupted, created_at
+             ) VALUES(NULL, 1, 'user', ?, X'00', '{}', '', 1, 0, 'now')",
+        )
+        .bind(&transcript_key.key_ref)
+        .execute(store.pool())
+        .await
+        .expect_err("messages.id NULL must be rejected");
+        assert_not_null_violation(&message_error);
+
+        let head_error = sqlx::query(
+            "INSERT INTO event_log_heads(
+                conversation_id, last_seq, event_count, chain_digest, key_ref,
+                head_hmac, updated_at
+             ) VALUES(NULL, 1, 1, zeroblob(32), ?, zeroblob(32), 'now')",
+        )
+        .bind(&event_key.key_ref)
+        .execute(store.pool())
+        .await
+        .expect_err("event_log_heads.conversation_id NULL must be rejected");
+        assert_not_null_violation(&head_error);
+
+        let tool_execution_error = sqlx::query(
+            "INSERT INTO tool_executions(
+                tool_call_id, command_id, run_id, executor_generation, state,
+                idempotency_key, started_at, finished_at, error_code
+             ) VALUES(NULL, 'command-null', 'run-null', 0, 'prepared',
+                'idempotency-null', NULL, NULL, NULL)",
+        )
+        .execute(store.pool())
+        .await
+        .expect_err("tool_executions.tool_call_id NULL must be rejected");
+        assert_not_null_violation(&tool_execution_error);
+
+        let approval_error = sqlx::query(
+            "INSERT INTO approval_log(
+                id, tool_call_id, run_id, turn_id, state, request_projection,
+                redaction_version, created_at, decided_at
+             ) VALUES(NULL, 'approval-tool-null', 'run-null', 'turn-null',
+                'pending', '{}', 1, 'now', NULL)",
+        )
+        .execute(store.pool())
+        .await
+        .expect_err("approval_log.id NULL must be rejected");
+        assert_not_null_violation(&approval_error);
+
+        store
+            .conversation_key(DataKeyPurpose::Artifact)
+            .await
+            .expect("valid data_keys identity still inserts");
+        sqlx::query(
+            "INSERT INTO messages(
+                id, seq, role, raw_key_ref, raw_ciphertext, payload, search_text,
+                redaction_version, interrupted, created_at
+             ) VALUES('message-valid', 1, 'user', ?, X'00', '{}', '', 1, 0, 'now')",
+        )
+        .bind(&transcript_key.key_ref)
+        .execute(store.pool())
+        .await
+        .expect("valid messages identity still inserts");
+        sqlx::query(
+            "INSERT INTO event_log_heads(
+                conversation_id, last_seq, event_count, chain_digest, key_ref,
+                head_hmac, updated_at
+             ) VALUES('conversation-1', 1, 1, zeroblob(32), ?, zeroblob(32), 'now')",
+        )
+        .bind(&event_key.key_ref)
+        .execute(store.pool())
+        .await
+        .expect("valid event_log_heads identity still inserts");
+        sqlx::query(
+            "INSERT INTO tool_executions(
+                tool_call_id, command_id, run_id, executor_generation, state,
+                idempotency_key, started_at, finished_at, error_code
+             ) VALUES('tool-valid', 'command-valid', 'run-valid', 0, 'prepared',
+                'idempotency-valid', NULL, NULL, NULL)",
+        )
+        .execute(store.pool())
+        .await
+        .expect("valid tool_executions identity still inserts");
+        sqlx::query(
+            "INSERT INTO approval_log(
+                id, tool_call_id, run_id, turn_id, state, request_projection,
+                redaction_version, created_at, decided_at
+             ) VALUES('approval-valid', 'approval-tool-valid', 'run-valid',
+                'turn-valid', 'pending', '{}', 1, 'now', NULL)",
+        )
+        .execute(store.pool())
+        .await
+        .expect("valid approval_log identity still inserts");
+
+        let quick_check: String = sqlx::query_scalar("PRAGMA quick_check")
+            .fetch_one(store.pool())
+            .await
+            .expect("quick_check after valid fixtures");
+        assert_eq!(quick_check, "ok");
+        assert!(
+            sqlx::query("PRAGMA foreign_key_check")
+                .fetch_optional(store.pool())
+                .await
+                .expect("foreign_key_check after valid fixtures")
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn migration_rejects_invalid_data_key_check_fixtures() {
         let store = store().await;
