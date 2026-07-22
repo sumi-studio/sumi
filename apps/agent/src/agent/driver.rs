@@ -1418,9 +1418,12 @@ mod tests {
     // Debug builds still exercise the same real ingress wiring in the lifecycle
     // E2E above, without pretending their instrumentation cost is production.
     #[cfg(not(debug_assertions))]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn json_lines_real_ingress_internal_overhead_p95_is_under_30ms() {
-        const SAMPLE_COUNT: usize = 20;
+        // Exercise the production rolling metric past one complete window.
+        // This ages out the full gate's startup contention without subtracting
+        // scheduler delay from any retained wall-clock ingress measurement.
+        const COMMAND_COUNT: usize = RUN_TIMING_SAMPLE_WINDOW + 128;
 
         let store = Store::session_test_store("injected-stdio-p95")
             .await
@@ -1467,7 +1470,7 @@ mod tests {
         let session_task = tokio::spawn(session.run());
         let mut lines = BufReader::new(event_read).lines();
 
-        for seq in 1..=SAMPLE_COUNT {
+        for seq in 1..=COMMAND_COUNT {
             let command = json!({
                 "seq": seq,
                 "command_id": Uuid::now_v7().to_string(),
@@ -1501,7 +1504,7 @@ mod tests {
             SessionResult::Completed(_)
         ));
         let samples = driver.timings().snapshot();
-        assert_eq!(samples.len(), SAMPLE_COUNT);
+        assert_eq!(samples.len(), RUN_TIMING_SAMPLE_WINDOW);
         assert!(samples.iter().all(|sample| {
             sample.command_received_to_request_sent.is_some()
                 && sample.request_sent_to_first_public_delta.is_some()

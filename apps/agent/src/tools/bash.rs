@@ -825,6 +825,22 @@ mod tests {
         .expect("bash command did not create its completion marker");
     }
 
+    async fn wait_for_workspace_pid(pid_file: &std::path::Path) -> libc::pid_t {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(pid_file)
+                    && let Ok(pid) = contents.trim().parse::<libc::pid_t>()
+                    && pid > 0
+                {
+                    return pid;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bash command did not publish a valid pid")
+    }
+
     #[tokio::test]
     async fn executes_in_workspace_with_cleared_environment_and_streams_updates() {
         let workspace = TempWorkspace::new();
@@ -1087,7 +1103,7 @@ mod tests {
         let workspace = TempWorkspace::new();
         let artifacts = MemoryArtifacts::default();
         let pid_file = workspace.0.join("active.pid");
-        {
+        let pid = {
             let bash = LowTrustLocalBash::new(workspace.0.clone(), &artifacts);
             let execution = bash.execute(
                 "echo $$ > active.pid; sleep 120",
@@ -1098,14 +1114,9 @@ mod tests {
             tokio::pin!(execution);
             tokio::select! {
                 result = &mut execution => panic!("held bash exited early: {result:?}"),
-                () = wait_for_workspace_marker(&pid_file) => {}
+                pid = wait_for_workspace_pid(&pid_file) => pid,
             }
-        }
-        let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
-            .expect("pid file")
-            .trim()
-            .parse()
-            .expect("pid");
+        };
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let result = unsafe { libc::kill(pid, 0) };
