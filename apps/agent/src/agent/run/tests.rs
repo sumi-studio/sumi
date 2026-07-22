@@ -747,6 +747,9 @@ async fn retry_wait_control_is_injected_mid_turn_before_next_attempt() {
         let mut message_seq = 1;
         while let Some(mut output) = events_rx.recv().await {
             resolve_message_output(&mut output, &mut message_seq);
+            if let Some(barrier) = output.commit_barrier.take() {
+                barrier.committed();
+            }
             events.push(output.event);
         }
         events
