@@ -2068,6 +2068,151 @@ async fn active_abort_then_user_applies_abort_before_starting_later_user() {
 
 struct OpaqueContextDriver;
 
+struct MultiRejectedReceiptDriver {
+    observed_contexts: Mutex<Vec<Vec<ContextMessage>>>,
+}
+
+impl MultiRejectedReceiptDriver {
+    fn new() -> Self {
+        Self {
+            observed_contexts: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn origin() -> ProviderOrigin {
+        ProviderOrigin {
+            provider_instance_id: "multi-rejected-receipts".to_owned(),
+            protocol: ApiProtocol::OpenAiChatCompletions,
+            model: "bridge-model".to_owned(),
+        }
+    }
+}
+
+#[async_trait]
+impl RunDriver for MultiRejectedReceiptDriver {
+    async fn start_provider(
+        &self,
+        attempt: usize,
+        context: &[ContextMessage],
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.observed_contexts
+            .lock()
+            .expect("observed contexts")
+            .push(context.to_vec());
+        let rejected = [
+            RejectedToolCall {
+                id: "rejected-receipt-a".to_owned(),
+                name: "fixture-tool".to_owned(),
+                error: ToolArgumentError::InvalidJson,
+            },
+            RejectedToolCall {
+                id: "rejected-receipt-b".to_owned(),
+                name: "fixture-tool".to_owned(),
+                error: ToolArgumentError::SchemaViolation,
+            },
+        ];
+        let content = if attempt == 0 {
+            rejected
+                .iter()
+                .enumerate()
+                .map(|(index, rejected)| AssistantContent::RejectedToolCall {
+                    rejected: rejected.clone(),
+                    wire_item_index: index as u32,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let message = AssistantMessage {
+            content,
+            model: "bridge-model".to_owned(),
+            provider: "fixture".to_owned(),
+            origin: Self::origin(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: Utc::now(),
+        };
+        let (tx, rx) = mpsc::channel(8);
+        tx.try_send(ProviderEvent::Start)?;
+        if attempt == 0 {
+            for (index, rejected) in rejected.iter().enumerate() {
+                tx.try_send(ProviderEvent::ToolCallStart {
+                    content_index: index,
+                })?;
+                tx.try_send(ProviderEvent::ToolCallRejected {
+                    content_index: index,
+                    rejected: rejected.clone(),
+                    synthetic_result: ToolResultMessage {
+                        tool_call_id: rejected.id.clone(),
+                        tool_name: rejected.name.clone(),
+                        content: vec![UserContent::Text {
+                            text: "Tool arguments were rejected. Regenerate the tool call with complete, schema-valid arguments."
+                                .to_owned(),
+                        }],
+                        details: match rejected.error {
+                            ToolArgumentError::InvalidJson => serde_json::json!({
+                                "category": "invalid_json",
+                                "instance_path": "",
+                                "constraint": "json_syntax",
+                            }),
+                            ToolArgumentError::SchemaViolation => serde_json::json!({
+                                "category": "schema_violation",
+                                "instance_path": "",
+                                "constraint": "schema",
+                            }),
+                            _ => unreachable!("fixture uses two explicit rejection kinds"),
+                        },
+                        is_error: true,
+                        timestamp: Utc::now(),
+                    },
+                })?;
+            }
+        }
+        tx.try_send(ProviderEvent::Done {
+            reason: StopReason::Stop,
+            output: ProviderOutput {
+                message,
+                provider_context: Vec::new(),
+            },
+        })?;
+        drop(tx);
+        Ok(ProviderAttempt {
+            message_id: format!("multi-rejected-assistant-{attempt}"),
+            initial_message: bridge_assistant(StopReason::Stop),
+            events: ProviderEventStream::new(rx, cancel, "fixture", Self::origin()),
+        })
+    }
+
+    async fn execute_tool(
+        &self,
+        _call: &ToolCall,
+        _cancel: CancellationToken,
+    ) -> Result<ToolResultMessage> {
+        Err(anyhow!("rejected calls must never execute"))
+    }
+
+    fn synthetic_error(&self, message: &str) -> PublicMessage {
+        let PublicMessage::Assistant(mut assistant) = bridge_assistant(StopReason::Error) else {
+            unreachable!()
+        };
+        assistant.error_message = Some(message.to_owned());
+        PublicMessage::Assistant(assistant)
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        _active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        Err(anyhow!("multi-rejection fixture has no overflow recovery"))
+    }
+}
+
 struct DurableToolBarrierDriver {
     pool: sqlx::SqlitePool,
     executions: AtomicUsize,
@@ -2195,6 +2340,70 @@ impl RunDriver for DurableToolBarrierDriver {
         _active_context: &[ContextMessage],
     ) -> Result<OverflowRecoveryOutcome> {
         Err(anyhow!("barrier fixture has no overflow recovery"))
+    }
+}
+
+#[tokio::test]
+async fn sequential_worker_enqueues_all_rejected_results_before_awaiting_atomic_receipts() {
+    let store = Store::session_test_store("multi-rejected-atomic-receipts")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let driver = Arc::new(MultiRejectedReceiptDriver::new());
+    let (gateway, _commands, _frames) = gateway();
+    let mut session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        Arc::new(SequentialRunWorker::new(driver.clone())),
+        test_executor_generation(),
+    )
+    .await
+    .expect("session");
+    session.admit_and_route(user(1)).await.expect("command");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        drive_active_to_completion(&mut session),
+    )
+    .await
+    .expect("multi-rejection receipts must not deadlock")
+    .expect("run completion");
+    session.wait_outbound_idle().await;
+
+    let second = {
+        let contexts = driver.observed_contexts.lock().expect("observed contexts");
+        assert_eq!(contexts.len(), 2);
+        contexts[1].clone()
+    };
+    assert_eq!(
+        second.len(),
+        4,
+        "user, assistant, and both results retained"
+    );
+    let durable: Vec<(String, u64)> =
+        sqlx::query_as("SELECT id, seq FROM messages ORDER BY seq LIMIT 4")
+            .fetch_all(&pool)
+            .await
+            .expect("atomic rejected message anchors");
+    let observed: Vec<(String, u64)> = second
+        .iter()
+        .map(|message| match message {
+            ContextMessage::Persisted { id, seq, .. } => (id.clone(), *seq),
+            ContextMessage::Synthetic { .. } => panic!("live durable context became synthetic"),
+        })
+        .collect();
+    assert_eq!(observed, durable);
+    for (message, expected_id) in second[2..]
+        .iter()
+        .zip(["rejected-receipt-a", "rejected-receipt-b"])
+    {
+        assert!(matches!(
+            message,
+            ContextMessage::Persisted {
+                message: crate::provider::types::Message::ToolResult(result),
+                ..
+            } if result.tool_call_id == expected_id && result.is_error
+        ));
     }
 }
 
