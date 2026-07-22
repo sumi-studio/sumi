@@ -30,7 +30,7 @@ use crate::{
         Command, CommandAckStatus, CommandEnvelope, Gateway, GatewayClosed, GatewayReader,
         GatewayWriter, InboundCommand, OutboundFrame,
     },
-    provider::{overflow::OverflowSource, types::PublicMessage},
+    provider::{overflow::OverflowSource, types::ContextMessage},
     runtime::contracts::ProcessGeneration,
     store::{
         DataKeyPurpose, EventWriter, InboundAdmission, InboundReceiptOrigin,
@@ -45,7 +45,8 @@ mod queue;
 mod run;
 
 use durable_bridge::{
-    CommittedOutput, DurableBridge, DurableRunBinding, RunOutput, ToolStartCommitBarrier,
+    CommittedOutput, DurableBridge, DurableRunBinding, MessageCommitBarrier, MessageCommitReceipt,
+    RunOutput, ToolStartCommitBarrier,
 };
 use queue::MessageQueue;
 
@@ -167,11 +168,11 @@ pub(crate) struct RunCore {
     mutation_epoch: u64,
     pending_controls: MessageQueue<AdmittedCommand>,
     pending_overflow_apply: Option<OverflowSource>,
-    /// In-memory send context returned with the unique core. T21 defines the
-    /// `ThreeLayerMemory` replacement, and T26 composes it into production;
-    /// keeping this injected representation in `RunCore` prevents a second
-    /// Session run from silently losing the first run.
-    runtime_context: Vec<PublicMessage>,
+    /// In-memory persisted send context returned with the unique core. T21
+    /// defines the `ThreeLayerMemory` replacement, and T26 composes it into
+    /// production; keeping this injected representation in `RunCore` prevents
+    /// a second Session run from silently losing the first run.
+    runtime_context: Vec<ContextMessage>,
     durable_binding: Option<DurableRunBinding>,
 }
 
@@ -321,7 +322,7 @@ where
                             }
                             let commit_barrier = matches!(event, AgentEvent::ToolExecutionStart { .. })
                                 .then(|| ToolStartCommitBarrier::channel().0);
-                            if events.send(RunOutput { binding: binding.clone(), event, commit_barrier }).await.is_err() {
+                            if events.send(RunOutput::detached(binding.clone(), event, commit_barrier)).await.is_err() {
                                 return event_channel_lost(completion);
                             }
                         }
@@ -340,7 +341,7 @@ where
                         }
                         let commit_barrier = matches!(event, AgentEvent::ToolExecutionStart { .. })
                             .then(|| ToolStartCommitBarrier::channel().0);
-                        if events.send(RunOutput { binding: binding.clone(), event, commit_barrier }).await.is_err() {
+                        if events.send(RunOutput::detached(binding.clone(), event, commit_barrier)).await.is_err() {
                             // The fixture future owns the real RunCore. Keep
                             // draining its bounded event lane while it settles;
                             // simply awaiting it here can deadlock once that
@@ -958,15 +959,13 @@ impl<G: Gateway + 'static> Session<G> {
                     return Err(error.into());
                 }
             };
-            if let Some(barrier) = committed.tool_start_barrier {
+            let (outputs, tool_start_barrier) = committed.resolve_message_receipts();
+            if let Some(barrier) = tool_start_barrier {
                 barrier.committed();
             }
             if deliver && delivery_failure.is_none() {
                 delivery_failure = self
-                    .send_committed(
-                        committed.outputs,
-                        Some(active.bridge.command_id().to_owned()),
-                    )
+                    .send_committed(outputs, Some(active.bridge.command_id().to_owned()))
                     .await
                     .err();
             }
@@ -985,14 +984,15 @@ impl<G: Gateway + 'static> Session<G> {
                 }
             }
         };
-        if let Some(barrier) = committed.tool_start_barrier {
+        let (outputs, tool_start_barrier) = committed.resolve_message_receipts();
+        if let Some(barrier) = tool_start_barrier {
             barrier.committed();
         }
         let command_id = self
             .active
             .as_ref()
             .map(|active| active.bridge.command_id().to_owned());
-        self.send_committed(committed.outputs, command_id).await
+        self.send_committed(outputs, command_id).await
     }
 
     async fn send_committed(

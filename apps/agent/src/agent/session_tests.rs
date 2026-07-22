@@ -16,7 +16,7 @@ use super::*;
 use crate::{
     gateway::{CommandAck, CommandId},
     provider::types::{
-        ApiProtocol, AssistantContent, AssistantMessage, ProviderContextFragment,
+        ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, ProviderContextFragment,
         ProviderContextPayload, ProviderEvent, ProviderEventStream, ProviderOrigin, ProviderOutput,
         PublicAssistantContent, PublicAssistantMessage, PublicMessage, RejectedToolCall,
         StopReason, ToolArgumentError, ToolCall, ToolResultMessage, Usage, UserContent,
@@ -38,6 +38,18 @@ fn session_start_composition_boundary_requires_process_generation() {
     }
 
     assert_signature(Session::<MockGateway>::start);
+}
+
+fn persisted_runtime_context(messages: Vec<PublicMessage>) -> Vec<ContextMessage> {
+    messages
+        .into_iter()
+        .enumerate()
+        .map(|(index, message)| ContextMessage::Persisted {
+            id: format!("session-fixture-{index}"),
+            seq: index as u64 + 1,
+            message: super::run::public_to_message(message),
+        })
+        .collect()
 }
 
 struct MockGateway {
@@ -539,11 +551,7 @@ impl RunWorker for StaleBindingWorker {
                 StaleBinding::PriorRun => {
                     binding.run_id = Uuid::now_v7().to_string();
                     events
-                        .send(RunOutput {
-                            binding,
-                            event: AgentEvent::AgentStart,
-                            commit_barrier: None,
-                        })
+                        .send(RunOutput::detached(binding, AgentEvent::AgentStart, None))
                         .await
                         .expect("session output receiver");
                 }
@@ -581,33 +589,25 @@ impl RunWorker for StaleBindingWorker {
                         },
                     ] {
                         events
-                            .send(RunOutput {
-                                binding: binding.clone(),
-                                event,
-                                commit_barrier: None,
-                            })
+                            .send(RunOutput::detached(binding.clone(), event, None))
                             .await
                             .expect("session output receiver");
                     }
                     let stale = binding.clone();
                     binding.turn_id = Uuid::now_v7().to_string();
                     events
-                        .send(RunOutput {
-                            binding,
-                            event: AgentEvent::TurnStart,
-                            commit_barrier: None,
-                        })
+                        .send(RunOutput::detached(binding, AgentEvent::TurnStart, None))
                         .await
                         .expect("new turn output");
                     events
-                        .send(RunOutput {
-                            binding: stale,
-                            event: AgentEvent::MessageStart {
+                        .send(RunOutput::detached(
+                            stale,
+                            AgentEvent::MessageStart {
                                 message_id: "stale-prior-turn-output".to_owned(),
                                 message: Box::new(bridge_assistant(StopReason::Stop)),
                             },
-                            commit_barrier: None,
-                        })
+                            None,
+                        ))
                         .await
                         .expect("stale turn output");
                 }
@@ -616,11 +616,7 @@ impl RunWorker for StaleBindingWorker {
                         ProcessGeneration::from_wire(binding.executor_generation.to_wire() + 1)
                             .expect("next test generation");
                     events
-                        .send(RunOutput {
-                            binding,
-                            event: AgentEvent::AgentStart,
-                            commit_barrier: None,
-                        })
+                        .send(RunOutput::detached(binding, AgentEvent::AgentStart, None))
                         .await
                         .expect("session output receiver");
                 }
@@ -1372,7 +1368,7 @@ async fn shutdown_drains_ready_completion_outputs_before_recovering_core_after_g
                 ] {
                     events.send(event).await.expect("session event receiver");
                 }
-                core.runtime_context = vec![user_context, assistant];
+                core.runtime_context = persisted_runtime_context(vec![user_context, assistant]);
                 core.mark_mutated();
                 controls.close();
                 worker_ready.notify_one();
@@ -1515,7 +1511,7 @@ async fn completion_drain_persists_all_outputs_before_recovering_mutated_core_af
             ] {
                 events.send(event).await.expect("session event receiver");
             }
-            core.runtime_context = vec![user_context, assistant];
+            core.runtime_context = persisted_runtime_context(vec![user_context, assistant]);
             core.mark_mutated();
             controls.close();
             RunCompletion::Completed(core)
@@ -2076,6 +2072,7 @@ struct DurableToolBarrierDriver {
     pool: sqlx::SqlitePool,
     executions: AtomicUsize,
     observed_running: AtomicBool,
+    observed_contexts: Mutex<Vec<Vec<ContextMessage>>>,
 }
 
 impl DurableToolBarrierDriver {
@@ -2084,6 +2081,7 @@ impl DurableToolBarrierDriver {
             pool,
             executions: AtomicUsize::new(0),
             observed_running: AtomicBool::new(false),
+            observed_contexts: Mutex::new(Vec::new()),
         }
     }
 
@@ -2101,9 +2099,13 @@ impl RunDriver for DurableToolBarrierDriver {
     async fn start_provider(
         &self,
         attempt: usize,
-        _context: &[PublicMessage],
+        context: &[ContextMessage],
         cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
+        self.observed_contexts
+            .lock()
+            .expect("observed contexts")
+            .push(context.to_vec());
         let (tx, rx) = mpsc::channel(8);
         tx.try_send(ProviderEvent::Start).expect("provider start");
         let mut content = Vec::new();
@@ -2190,7 +2192,7 @@ impl RunDriver for DurableToolBarrierDriver {
         &self,
         _core: &RunCore,
         _request: OverflowRecoveryRequest,
-        _active_context: &[PublicMessage],
+        _active_context: &[ContextMessage],
     ) -> Result<OverflowRecoveryOutcome> {
         Err(anyhow!("barrier fixture has no overflow recovery"))
     }
@@ -2221,6 +2223,34 @@ async fn tool_driver_observes_running_only_after_start_commit() {
 
     assert_eq!(driver.executions.load(Ordering::SeqCst), 1);
     assert!(driver.observed_running.load(Ordering::SeqCst));
+    let second = {
+        let contexts = driver.observed_contexts.lock().expect("observed contexts");
+        assert_eq!(contexts.len(), 2);
+        contexts[1].clone()
+    };
+    assert_eq!(
+        second.len(),
+        3,
+        "user, assistant, and tool result are retained"
+    );
+    let durable: Vec<(String, u64)> =
+        sqlx::query_as("SELECT id, seq FROM messages ORDER BY seq LIMIT 3")
+            .fetch_all(&pool)
+            .await
+            .expect("durable message anchors");
+    let observed: Vec<(String, u64)> = second
+        .iter()
+        .map(|message| match message {
+            ContextMessage::Persisted { id, seq, .. } => (id.clone(), *seq),
+            ContextMessage::Synthetic { .. } => panic!("live durable context became synthetic"),
+        })
+        .collect();
+    assert_eq!(observed, durable);
+    assert_eq!(
+        crate::memory::transform::transform(&second, &DurableToolBarrierDriver::origin()),
+        second,
+        "send normalization preserves exact durable anchors",
+    );
     let state: String =
         sqlx::query_scalar("SELECT state FROM tool_executions WHERE tool_call_id='barrier-call'")
             .fetch_one(&pool)
@@ -2592,7 +2622,7 @@ impl RunDriver for StartFailureDriver {
     async fn start_provider(
         &self,
         _attempt: usize,
-        _context: &[PublicMessage],
+        _context: &[ContextMessage],
         _cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
         Err(anyhow!("fixture provider start failure"))
@@ -2619,7 +2649,7 @@ impl RunDriver for StartFailureDriver {
         &self,
         _core: &RunCore,
         _request: OverflowRecoveryRequest,
-        _active_context: &[PublicMessage],
+        _active_context: &[ContextMessage],
     ) -> Result<OverflowRecoveryOutcome> {
         Err(anyhow!("start-failure fixture has no overflow recovery"))
     }
@@ -2630,7 +2660,7 @@ impl RunDriver for OpaqueContextDriver {
     async fn start_provider(
         &self,
         _attempt: usize,
-        _context: &[PublicMessage],
+        _context: &[ContextMessage],
         _cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
         let origin = ProviderOrigin {
@@ -2726,7 +2756,7 @@ impl RunDriver for OpaqueContextDriver {
         &self,
         _core: &RunCore,
         _request: OverflowRecoveryRequest,
-        _active_context: &[PublicMessage],
+        _active_context: &[ContextMessage],
     ) -> Result<OverflowRecoveryOutcome> {
         Err(anyhow!("opaque fixture has no overflow recovery"))
     }
@@ -3630,7 +3660,10 @@ async fn opaque_context_refusal_closes_durably_before_applied_ack() {
     assert_eq!(core.runtime_context.len(), 1);
     assert!(matches!(
         core.runtime_context.first(),
-        Some(PublicMessage::User(_))
+        Some(ContextMessage::Persisted {
+            message: crate::provider::types::Message::User(_),
+            ..
+        })
     ));
 
     let kinds: Vec<String> = sqlx::query_scalar(

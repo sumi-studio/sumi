@@ -47,6 +47,46 @@ pub(crate) struct RunOutput {
     pub binding: DurableRunBinding,
     pub event: AgentEvent,
     pub commit_barrier: Option<ToolStartCommitBarrier>,
+    pub message_commit_barrier: Option<MessageCommitBarrier>,
+}
+
+impl RunOutput {
+    pub(super) fn detached(
+        binding: DurableRunBinding,
+        event: AgentEvent,
+        commit_barrier: Option<ToolStartCommitBarrier>,
+    ) -> Self {
+        let message_commit_barrier = matches!(event, AgentEvent::MessageEnd { .. }).then(|| {
+            let (barrier, receiver) = MessageCommitBarrier::channel();
+            drop(receiver);
+            barrier
+        });
+        Self {
+            binding,
+            event,
+            commit_barrier,
+            message_commit_barrier,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MessageCommitReceipt {
+    pub message_id: String,
+    pub message_seq: u64,
+}
+
+pub(crate) struct MessageCommitBarrier(oneshot::Sender<MessageCommitReceipt>);
+
+impl MessageCommitBarrier {
+    pub(crate) fn channel() -> (Self, oneshot::Receiver<MessageCommitReceipt>) {
+        let (sender, receiver) = oneshot::channel();
+        (Self(sender), receiver)
+    }
+
+    pub(crate) fn resolve(self, receipt: MessageCommitReceipt) {
+        let _ = self.0.send(receipt);
+    }
 }
 
 pub(crate) struct ToolStartCommitBarrier(oneshot::Sender<()>);
@@ -65,6 +105,18 @@ impl ToolStartCommitBarrier {
 pub(super) struct CommittedRunOutput {
     pub outputs: Vec<CommittedOutput>,
     pub tool_start_barrier: Option<ToolStartCommitBarrier>,
+    message_receipts: Vec<(MessageCommitBarrier, MessageCommitReceipt)>,
+}
+
+impl CommittedRunOutput {
+    pub(super) fn resolve_message_receipts(
+        self,
+    ) -> (Vec<CommittedOutput>, Option<ToolStartCommitBarrier>) {
+        for (barrier, receipt) in self.message_receipts {
+            barrier.resolve(receipt);
+        }
+        (self.outputs, self.tool_start_barrier)
+    }
 }
 
 pub(super) struct CommittedOutput {
@@ -80,8 +132,8 @@ pub(super) struct DurableBridge {
     pending_start: Option<(String, PublicMessage)>,
     pending_tool_end: HashMap<String, (Value, bool)>,
     length_not_started: HashSet<String>,
-    pending_rejected_end: Option<(String, PublicMessage, HashSet<String>)>,
-    pending_rejected_results: Vec<(String, PublicMessage)>,
+    pending_rejected_end: Option<(String, PublicMessage, HashSet<String>, MessageCommitBarrier)>,
+    pending_rejected_results: Vec<(String, PublicMessage, MessageCommitBarrier)>,
     startup_agent_pending: bool,
     startup_turn_pending: bool,
 }
@@ -117,6 +169,10 @@ impl DurableBridge {
         if has_barrier != is_tool_start {
             bail!("commit barrier is required exactly for ToolExecutionStart");
         }
+        let is_message_end = matches!(output.event, AgentEvent::MessageEnd { .. });
+        if output.message_commit_barrier.is_some() != is_message_end {
+            bail!("message commit barrier is required exactly for MessageEnd");
+        }
         if output.binding.command_id != self.binding.command_id
             || output.binding.command_seq != self.binding.command_seq
             || output.binding.run_id != self.binding.run_id
@@ -135,12 +191,13 @@ impl DurableBridge {
             bail!("run output durable turn binding changed outside TurnStart");
         }
         let event = output.event;
+        let message_commit_barrier = output.message_commit_barrier;
         let outputs = match event {
             AgentEvent::MessageUpdate { ref message_id, .. } => {
                 if self.assistant_open.as_deref() != Some(message_id.as_str()) {
                     bail!("volatile message update has no prerequisite durable MessageStart");
                 }
-                Ok(vec![CommittedOutput { event, seq: None }])
+                Ok((vec![CommittedOutput { event, seq: None }], Vec::new()))
             }
             AgentEvent::ToolExecutionUpdate {
                 ref tool_call_id, ..
@@ -152,9 +209,11 @@ impl DurableBridge {
                         bail!("volatile tool update has no prerequisite durable ToolExecutionStart")
                     }
                 }
-                Ok(vec![CommittedOutput { event, seq: None }])
+                Ok((vec![CommittedOutput { event, seq: None }], Vec::new()))
             }
-            AgentEvent::Error { .. } => Ok(vec![CommittedOutput { event, seq: None }]),
+            AgentEvent::Error { .. } => {
+                Ok((vec![CommittedOutput { event, seq: None }], Vec::new()))
+            }
             AgentEvent::MessageStart {
                 message_id,
                 message,
@@ -163,14 +222,19 @@ impl DurableBridge {
                     bail!("a second non-assistant MessageStart arrived before its MessageEnd");
                 }
                 self.pending_start = Some((message_id, *message));
-                Ok(Vec::new())
+                Ok((Vec::new(), Vec::new()))
             }
             AgentEvent::MessageEnd {
                 message_id,
                 message,
             } if !matches!(message.as_ref(), PublicMessage::Assistant(_)) => {
-                self.commit_non_assistant(writer, message_id, *message)
-                    .await
+                self.commit_non_assistant(
+                    writer,
+                    message_id,
+                    *message,
+                    message_commit_barrier.expect("MessageEnd barrier checked"),
+                )
+                .await
             }
             AgentEvent::ToolExecutionEnd {
                 tool_call_id,
@@ -185,7 +249,7 @@ impl DurableBridge {
                     bail!("duplicate pending ToolExecutionEnd");
                 }
                 *pending = (result, is_error);
-                Ok(Vec::new())
+                Ok((Vec::new(), Vec::new()))
             }
             AgentEvent::AgentStart => {
                 if self.phase != RunPhase::Classified || self.startup_agent_pending {
@@ -193,7 +257,7 @@ impl DurableBridge {
                 }
                 self.phase = RunPhase::RunStarted;
                 self.startup_agent_pending = true;
-                Ok(Vec::new())
+                Ok((Vec::new(), Vec::new()))
             }
             AgentEvent::TurnStart => {
                 if self.turn_open {
@@ -203,7 +267,7 @@ impl DurableBridge {
                     self.phase = RunPhase::TurnStarted;
                     self.startup_turn_pending = true;
                     self.turn_open = true;
-                    Ok(Vec::new())
+                    Ok((Vec::new(), Vec::new()))
                 } else {
                     self.binding.turn_id = output.binding.turn_id;
                     self.turn_open = true;
@@ -254,8 +318,13 @@ impl DurableBridge {
                 message_id,
                 message,
             } => {
-                self.commit_assistant_end(writer, message_id, *message)
-                    .await
+                self.commit_assistant_end(
+                    writer,
+                    message_id,
+                    *message,
+                    message_commit_barrier.expect("MessageEnd barrier checked"),
+                )
+                .await
             }
             AgentEvent::ToolExecutionStart {
                 tool_call_id,
@@ -378,9 +447,11 @@ impl DurableBridge {
                 bail!("event requires a later T15/T16/T17 durable bridge extension")
             }
         }?;
+        let (outputs, message_receipts) = outputs;
         Ok(CommittedRunOutput {
             outputs,
             tool_start_barrier: output.commit_barrier,
+            message_receipts,
         })
     }
 
@@ -389,7 +460,11 @@ impl DurableBridge {
         writer: &EventWriter,
         message_id: String,
         message: PublicMessage,
-    ) -> Result<Vec<CommittedOutput>> {
+        barrier: MessageCommitBarrier,
+    ) -> Result<(
+        Vec<CommittedOutput>,
+        Vec<(MessageCommitBarrier, MessageCommitReceipt)>,
+    )> {
         if self.assistant_open.as_deref() != Some(message_id.as_str()) {
             bail!("assistant MessageEnd does not close its exact durable MessageStart");
         }
@@ -424,28 +499,34 @@ impl DurableBridge {
             if self.pending_rejected_end.is_some() || !self.pending_rejected_results.is_empty() {
                 bail!("a rejected assistant pair is already pending");
             }
-            self.pending_rejected_end = Some((message_id, message, rejected));
-            return Ok(Vec::new());
+            self.pending_rejected_end = Some((message_id, message, rejected, barrier));
+            return Ok((Vec::new(), Vec::new()));
         }
-        self.commit_single(
+        self.commit_message_batch(
             writer,
-            DurableEvent::message_in_turn(
-                "message_end",
-                &message_id,
-                &message,
-                Some(self.binding.run_id.clone()),
-                Some(self.binding.turn_id.clone()),
-            )?,
-            vec![Projection::MessageEnd {
-                message_id: message_id.clone(),
-                role: "assistant",
-                message: message.clone(),
-                append_to_l0,
-            }],
-            AgentEvent::MessageEnd {
-                message_id,
-                message: Box::new(message),
+            EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(DurableEvent::message_in_turn(
+                        "message_end",
+                        &message_id,
+                        &message,
+                        Some(self.binding.run_id.clone()),
+                        Some(self.binding.turn_id.clone()),
+                    )?),
+                    projections: vec![Projection::MessageEnd {
+                        message_id: message_id.clone(),
+                        role: "assistant",
+                        message: message.clone(),
+                        append_to_l0,
+                    }],
+                }],
+                injected_commands: Vec::new(),
             },
+            vec![AgentEvent::MessageEnd {
+                message_id: message_id.clone(),
+                message: Box::new(message),
+            }],
+            vec![(message_id, barrier)],
         )
         .await
     }
@@ -455,7 +536,11 @@ impl DurableBridge {
         writer: &EventWriter,
         message_id: String,
         message: PublicMessage,
-    ) -> Result<Vec<CommittedOutput>> {
+        barrier: MessageCommitBarrier,
+    ) -> Result<(
+        Vec<CommittedOutput>,
+        Vec<(MessageCommitBarrier, MessageCommitReceipt)>,
+    )> {
         let (start_id, start_message) = self
             .pending_start
             .take()
@@ -557,16 +642,16 @@ impl DurableBridge {
                     idempotency_key: self.binding.tool_execution_idempotency_key(&tool_call_id),
                     error_code: "length_guard",
                 }));
-            } else if let Some((_, _, pending_ids)) = self.pending_rejected_end.as_mut()
+            } else if let Some((_, _, pending_ids, _)) = self.pending_rejected_end.as_mut()
                 && pending_ids.remove(&tool_call_id)
             {
                 if !result.is_error {
                     bail!("RejectedToolCall synthetic ToolResult must be is_error=true");
                 }
                 self.pending_rejected_results
-                    .push((message_id.clone(), message.clone()));
+                    .push((message_id.clone(), message.clone(), barrier));
                 if !pending_ids.is_empty() {
-                    return Ok(Vec::new());
+                    return Ok((Vec::new(), Vec::new()));
                 }
                 return self.commit_rejected_pair_batch(writer).await;
             } else {
@@ -593,17 +678,18 @@ impl DurableBridge {
                 message: Box::new(message.clone()),
             },
             AgentEvent::MessageEnd {
-                message_id,
+                message_id: message_id.clone(),
                 message: Box::new(message),
             },
         ]);
-        self.commit_batch(
+        self.commit_message_batch(
             writer,
             EventBatch {
                 writes,
                 injected_commands,
             },
             public_prefix,
+            vec![(message_id, barrier)],
         )
         .await
     }
@@ -611,8 +697,11 @@ impl DurableBridge {
     async fn commit_rejected_pair_batch(
         &mut self,
         writer: &EventWriter,
-    ) -> Result<Vec<CommittedOutput>> {
-        let (assistant_id, assistant, pending_ids) = self
+    ) -> Result<(
+        Vec<CommittedOutput>,
+        Vec<(MessageCommitBarrier, MessageCommitReceipt)>,
+    )> {
+        let (assistant_id, assistant, pending_ids, assistant_barrier) = self
             .pending_rejected_end
             .take()
             .ok_or_else(|| anyhow!("rejected result has no pending assistant"))?;
@@ -638,11 +727,12 @@ impl DurableBridge {
                 append_to_l0,
             }],
         }];
+        let mut receipt_requests = vec![(assistant_id.clone(), assistant_barrier)];
         let mut public = vec![AgentEvent::MessageEnd {
             message_id: assistant_id,
             message: Box::new(assistant),
         }];
-        for (message_id, message) in self.pending_rejected_results.drain(..) {
+        for (message_id, message, barrier) in self.pending_rejected_results.drain(..) {
             writes.push(EventWrite {
                 event: Some(DurableEvent::message(
                     "message_start",
@@ -665,19 +755,65 @@ impl DurableBridge {
                 message: Box::new(message.clone()),
             });
             public.push(AgentEvent::MessageEnd {
-                message_id,
+                message_id: message_id.clone(),
                 message: Box::new(message),
             });
+            receipt_requests.push((message_id, barrier));
         }
-        self.commit_batch(
+        self.commit_message_batch(
             writer,
             EventBatch {
                 writes,
                 injected_commands: Vec::new(),
             },
             public,
+            receipt_requests,
         )
         .await
+    }
+
+    async fn commit_message_batch(
+        &self,
+        writer: &EventWriter,
+        batch: EventBatch,
+        public: Vec<AgentEvent>,
+        receipt_requests: Vec<(String, MessageCommitBarrier)>,
+    ) -> Result<(
+        Vec<CommittedOutput>,
+        Vec<(MessageCommitBarrier, MessageCommitReceipt)>,
+    )> {
+        let outputs = self.commit_batch(writer, batch, public).await?;
+        let mut committed_by_id = HashMap::new();
+        for output in &outputs {
+            if let AgentEvent::MessageEnd { message_id, .. } = &output.event {
+                let seq = output
+                    .seq
+                    .ok_or_else(|| anyhow!("MessageEnd commit has no durable seq"))?;
+                if committed_by_id.insert(message_id.clone(), seq).is_some() {
+                    bail!("atomic batch committed duplicate MessageEnd identity");
+                }
+            }
+        }
+        if committed_by_id.len() != receipt_requests.len() {
+            bail!("atomic batch MessageEnd receipt cardinality mismatch");
+        }
+        let mut receipts = Vec::with_capacity(receipt_requests.len());
+        for (message_id, barrier) in receipt_requests {
+            let message_seq = committed_by_id.remove(&message_id).ok_or_else(|| {
+                anyhow!("atomic batch omitted receipt-bound MessageEnd {message_id}")
+            })?;
+            receipts.push((
+                barrier,
+                MessageCommitReceipt {
+                    message_id,
+                    message_seq,
+                },
+            ));
+        }
+        if !committed_by_id.is_empty() {
+            bail!("atomic batch contained an unbound MessageEnd receipt");
+        }
+        Ok((outputs, receipts))
     }
 
     fn transition(&mut self, expected: RunPhase, next: RunPhase) -> Result<Projection> {
@@ -703,19 +839,24 @@ impl DurableBridge {
         durable: DurableEvent,
         projections: Vec<Projection>,
         public: AgentEvent,
-    ) -> Result<Vec<CommittedOutput>> {
-        self.commit_batch(
-            writer,
-            EventBatch {
-                writes: vec![EventWrite {
-                    event: Some(durable),
-                    projections,
-                }],
-                injected_commands: Vec::new(),
-            },
-            vec![public],
-        )
-        .await
+    ) -> Result<(
+        Vec<CommittedOutput>,
+        Vec<(MessageCommitBarrier, MessageCommitReceipt)>,
+    )> {
+        let outputs = self
+            .commit_batch(
+                writer,
+                EventBatch {
+                    writes: vec![EventWrite {
+                        event: Some(durable),
+                        projections,
+                    }],
+                    injected_commands: Vec::new(),
+                },
+                vec![public],
+            )
+            .await?;
+        Ok((outputs, Vec::new()))
     }
 
     async fn commit_batch(
@@ -784,6 +925,7 @@ mod tests {
             binding: binding("command-a"),
             event: AgentEvent::AgentStart,
             commit_barrier: None,
+            message_commit_barrier: None,
         };
         assert_eq!(output.binding.executor_generation.to_wire(), 73);
         let public = serde_json::to_value(output.event).expect("serialize public event");
