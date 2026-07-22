@@ -382,8 +382,9 @@ impl Runner {
                         for (receipt, committed_message) in committed {
                             self.retain_committed(receipt, &committed_message)?;
                         }
-                        // Normal/Length tool-result receipts are returned by the
-                        // emission methods below and retained there.
+                        // Normal and non-guarded length receipts are retained in
+                        // the sorted committed batch above; guarded-length
+                        // receipts are retained separately below.
                     } else {
                         self.retain_tool_results(&rejected_receipts, &rejected_results)?;
                         self.retain_tool_results(&executable_receipts, &executable_results)?;
