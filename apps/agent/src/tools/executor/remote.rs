@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 use super::{ArtifactResponse, ExecutorClient, ExecutorOperation, ExecutorResponse};
 use crate::{
     provider::types::{ToolDefinition, ValidatedToolArguments},
+    runtime::contracts::ProcessGeneration,
     tools::{
         Tool, ToolCtx, ToolError, ToolOutput, ToolRegistry, ToolRegistryBuilder, ToolRisk,
         text_output,
@@ -57,10 +58,25 @@ impl ExecutorInvoker for ExecutorClient {
 /// supervisor-issued executor client. Registration is explicit and duplicate
 /// checked by [`ToolRegistryBuilder`].
 pub fn remote_executor_registry(client: Arc<ExecutorClient>) -> Result<ToolRegistry, ToolError> {
-    registry_from_invoker(client)
+    let generation = client.generation();
+    registry_from_invoker_for_generation(client, generation)
 }
 
 fn registry_from_invoker(client: Arc<dyn ExecutorInvoker>) -> Result<ToolRegistry, ToolError> {
+    registry_from_invoker_inner(client, None)
+}
+
+fn registry_from_invoker_for_generation(
+    client: Arc<dyn ExecutorInvoker>,
+    generation: ProcessGeneration,
+) -> Result<ToolRegistry, ToolError> {
+    registry_from_invoker_inner(client, Some(generation))
+}
+
+fn registry_from_invoker_inner(
+    client: Arc<dyn ExecutorInvoker>,
+    generation: Option<ProcessGeneration>,
+) -> Result<ToolRegistry, ToolError> {
     let mut builder = ToolRegistryBuilder::default();
     for kind in [
         RemoteToolKind::ReadFile,
@@ -77,7 +93,10 @@ fn registry_from_invoker(client: Arc<dyn ExecutorInvoker>) -> Result<ToolRegistr
             client: client.clone(),
         }))?;
     }
-    Ok(builder.build())
+    Ok(match generation {
+        Some(generation) => builder.build_for_executor_generation(generation),
+        None => builder.build(),
+    })
 }
 
 #[derive(Clone, Copy)]

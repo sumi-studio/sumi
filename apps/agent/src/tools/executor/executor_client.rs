@@ -24,7 +24,7 @@ use super::{
     ArtifactResponse, ExecutorOperation, ExecutorResponse, MAX_RPC_LINE_BYTES, RpcError, RpcFrame,
     RpcOperationValidation, RpcRequest, decode_rpc_frame,
 };
-use crate::runtime::contracts::RpcIdentity;
+use crate::runtime::contracts::{ProcessGeneration, RpcIdentity};
 use crate::tools::{
     ToolError,
     fs::{GrepMatch, MAX_GREP_MATCHES, MAX_GREP_SERIALIZED_BYTES, MAX_SCAN_ENTRIES},
@@ -89,6 +89,10 @@ impl ExecutorClient {
 
     pub fn socket(&self) -> &Path {
         &self.socket
+    }
+
+    pub const fn generation(&self) -> ProcessGeneration {
+        self.identity.generation()
     }
 
     pub async fn execute(

@@ -56,17 +56,29 @@ const RUN_TIMING_SAMPLE_WINDOW: usize = 256;
 pub(crate) struct RunTimingSamples {
     // A Session can be long-lived. Retain only a rolling observability window
     // so p95 remains recent and memory does not grow with the conversation.
-    inner: Arc<Mutex<VecDeque<RunTimingSample>>>,
+    inner: Arc<Mutex<RunTimingWindows>>,
+}
+
+#[derive(Default)]
+struct RunTimingWindows {
+    attempts: VecDeque<RunTimingSample>,
+    command_to_request: VecDeque<Duration>,
 }
 
 impl RunTimingSamples {
     fn record(&self, sample: RunTimingSample) {
-        let mut samples = self.inner.lock().expect("timing samples lock");
-        if samples.len() == RUN_TIMING_SAMPLE_WINDOW {
-            samples.pop_front();
+        let mut windows = self.inner.lock().expect("timing samples lock");
+        if windows.attempts.len() == RUN_TIMING_SAMPLE_WINDOW {
+            windows.attempts.pop_front();
         }
-        samples.push_back(sample);
-        drop(samples);
+        windows.attempts.push_back(sample);
+        if let Some(internal) = sample.command_received_to_request_sent {
+            if windows.command_to_request.len() == RUN_TIMING_SAMPLE_WINDOW {
+                windows.command_to_request.pop_front();
+            }
+            windows.command_to_request.push_back(internal);
+        }
+        drop(windows);
 
         let internal_p95 = self.internal_p95();
         tracing::info!(
@@ -87,6 +99,7 @@ impl RunTimingSamples {
         self.inner
             .lock()
             .expect("timing samples lock")
+            .attempts
             .iter()
             .copied()
             .collect()
@@ -94,9 +107,12 @@ impl RunTimingSamples {
 
     pub(crate) fn internal_p95(&self) -> Option<Duration> {
         let mut samples: Vec<_> = self
-            .snapshot()
-            .into_iter()
-            .filter_map(|sample| sample.command_received_to_request_sent)
+            .inner
+            .lock()
+            .expect("timing samples lock")
+            .command_to_request
+            .iter()
+            .copied()
             .collect();
         if samples.is_empty() {
             return None;
@@ -159,6 +175,7 @@ impl InjectedRunDriver {
         let workspace = workspace.ok_or_else(|| anyhow!("workspace paths were not supplied"))?;
         let executor_generation = executor_generation
             .ok_or_else(|| anyhow!("executor generation identity was not supplied"))?;
+        registry.validate_executor_generation(executor_generation)?;
         Ok(Self {
             spec,
             options,
@@ -431,8 +448,12 @@ mod tests {
                 ValidatedToolArguments,
             },
         },
+        runtime::contracts::RpcIdentity,
         store::Store,
-        tools::{Tool, ToolError, ToolOutput, ToolRegistryBuilder, ToolRisk},
+        tools::{
+            Tool, ToolError, ToolOutput, ToolRegistryBuilder, ToolRisk,
+            executor::{ExecutorClient, remote_executor_registry},
+        },
     };
 
     fn generation(raw: u64) -> ProcessGeneration {
@@ -625,6 +646,52 @@ mod tests {
     }
 
     #[test]
+    fn construction_binds_remote_registry_to_executor_generation() {
+        let client = Arc::new(ExecutorClient::new(
+            "/tmp/sumi-unused-executor.sock",
+            RpcIdentity::from_wire(7, "boot-nonce").expect("identity"),
+            "conversation-1",
+        ));
+        let registry = remote_executor_registry(client).expect("remote registry");
+        let prompt = PromptContext {
+            system_prompt: "fixture".to_owned(),
+            memory_blocks: vec![],
+            messages: vec![],
+            provider_context: vec![],
+            tools: registry.definitions(),
+        };
+        let spec = ModelSpec::preset("kimi-k3").expect("preset");
+        let workspace = WorkspacePaths::new("/workspace").expect("workspace");
+
+        let error = InjectedRunDriver::with_stream_starter(
+            spec.clone(),
+            RequestOptions::default(),
+            Some(prompt.clone()),
+            Some(registry.clone()),
+            Some(workspace.clone()),
+            Some(generation(11)),
+            inert_starter(),
+        )
+        .err()
+        .expect("remote generation mismatch must fail construction");
+        assert!(error.to_string().contains(
+            "remote tool registry executor generation 7 does not match injected generation 11"
+        ));
+
+        let driver = InjectedRunDriver::with_stream_starter(
+            spec,
+            RequestOptions::default(),
+            Some(prompt),
+            Some(registry),
+            Some(workspace),
+            Some(generation(7)),
+            inert_starter(),
+        )
+        .expect("matching remote generation");
+        assert_eq!(driver.executor_generation(), generation(7));
+    }
+
+    #[test]
     fn timing_samples_use_a_bounded_rolling_window_for_p95() {
         let samples = RunTimingSamples::default();
         for millis in 0..=RUN_TIMING_SAMPLE_WINDOW {
@@ -642,6 +709,30 @@ mod tests {
             Some(Duration::from_millis(1))
         );
         assert_eq!(samples.internal_p95(), Some(Duration::from_millis(244)));
+    }
+
+    #[test]
+    fn continuation_attempts_cannot_evict_internal_overhead_window() {
+        let samples = RunTimingSamples::default();
+        samples.record(RunTimingSample {
+            command_received_to_request_sent: Some(Duration::from_millis(5)),
+            request_sent_to_first_public_delta: Some(Duration::from_millis(80)),
+        });
+        for millis in 0..RUN_TIMING_SAMPLE_WINDOW {
+            samples.record(RunTimingSample {
+                command_received_to_request_sent: None,
+                request_sent_to_first_public_delta: Some(Duration::from_millis(millis as u64)),
+            });
+        }
+
+        assert_eq!(samples.snapshot().len(), RUN_TIMING_SAMPLE_WINDOW);
+        assert!(
+            samples
+                .snapshot()
+                .iter()
+                .all(|sample| sample.command_received_to_request_sent.is_none())
+        );
+        assert_eq!(samples.internal_p95(), Some(Duration::from_millis(5)));
     }
 
     #[tokio::test]
