@@ -31,6 +31,7 @@ use crate::{
         DataKeyPurpose, EventWriter, InboundAdmission, InboundReceiptOrigin,
         RecoveryRequired as AdmissionRecoveryRequired, RecoveryStep, Store, SuffixRecovery,
     },
+    tools::executor::validate_process_generation,
 };
 
 mod durable_bridge;
@@ -363,6 +364,7 @@ impl<G: Gateway + 'static> Session<G> {
         worker: Arc<dyn RunWorker>,
         executor_generation: u64,
     ) -> Result<Self> {
+        validate_process_generation(executor_generation)?;
         let conversation_id = store.scope().conversation_id.clone();
         let store = Arc::new(store);
         for purpose in [

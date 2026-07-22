@@ -17,10 +17,10 @@ pub use client::ArtifactBrokerClient;
 pub use executor_client::ExecutorClient;
 #[allow(unused_imports)]
 pub use protocol::{
-    ArtifactOperation, ExecutorOperation, ExecutorResponse, InputRoute, MAX_RPC_LINE_BYTES,
-    MAX_RPC_READ_BYTES, RpcError, RpcFrame, RpcIdentity, RpcLifecycleTracker,
+    ArtifactOperation, ExecutorOperation, ExecutorResponse, InputRoute, MAX_PROCESS_GENERATION,
+    MAX_RPC_LINE_BYTES, MAX_RPC_READ_BYTES, RpcError, RpcFrame, RpcIdentity, RpcLifecycleTracker,
     RpcOperationValidation, RpcRequest, decode_rpc_frame, decode_rpc_line, encode_rpc_frame,
-    resolve_input,
+    resolve_input, validate_process_generation,
 };
 #[allow(unused_imports)]
 pub use remote::remote_executor_registry;

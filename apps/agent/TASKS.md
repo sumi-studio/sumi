@@ -262,7 +262,7 @@ Cloud release (T25〜T29): M1P・M0〜M5 と依存が満たされた範囲で並
 
 - 読む: §8.1〜§8.3、§13 Cloud track 2、`docs/agent/workspace.md`
 - 変更対象: deployment supervisor、`deploy/agent/`、executor/artifact broker起動設定、fault-injection harness。配置先が別repoになる場合は対応issue/commitを本項へ記録する
-- やること: runtime/executor/artifact brokerを別UID・別mount・別network namespaceで起動し、executorとbrokerのRPC generation/nonceをsupervisorが払い出す。executor/brokerは`network_mode=none`、runtimeはLLM通信を維持。artifactの0600/0700、fd-relative no-follow、conversation subtree限定resetをproduction構成で保証する
+- やること: runtime/executor/artifact brokerを別UID・別mount・別network namespaceで起動し、executorとbrokerのRPC generation/nonceをsupervisorが払い出す。generationの正規domainは0を含む`0..=i64::MAX`とし、runtime/Session/executor/brokerは共有validatorを通過した値だけを受理する。executor/brokerは`network_mode=none`、runtimeはLLM通信を維持。artifactの0600/0700、fd-relative no-follow、conversation subtree限定resetをproduction構成で保証する
 - 受け入れ: 各componentから禁止path/socket/networkが読めないこと、bash子がbrokerへ到達できないこと、file toolは同一executor UIDで継続できることを自動テスト。M2 mockだけでは代替しない
 - コミット: `infra(agent): executor/artifact isolation deployment`
 
@@ -270,8 +270,8 @@ Cloud release (T25〜T29): M1P・M0〜M5 と依存が満たされた範囲で並
 
 - 読む: §8.3、§10.2 tool_executions recovery、§13 Cloud track 3〜4、`docs/agent/workspace.md`
 - 変更対象: deployment supervisor、quota policy、execution registry、fault-injection harness、運用metrics
-- やること: disk/inode/PID/CPU throttle・CPU time/memory max/wall/outputの全制限を種別付き`ResourceLimit`へ収束させ、execution cgroup/sandboxをgeneration単位で登録・kill/reapする。runtime/provider/tool途中killでは旧generationと離脱descendantを回収し、`running`を`indeterminate`で一度だけ閉じて自動再実行しない
-- 受け入れ: quotaを1種ずつ独立発火。`setsid`+stdio close後のdescendantも回収されworkspace変更不能。kill境界を跨いでもterminal event/toolResultが重複しない
+- やること: disk/inode/PID/CPU throttle・CPU time/memory max/wall/outputの全制限を種別付き`ResourceLimit`へ収束させ、execution cgroup/sandboxをgeneration単位で登録・kill/reapする。generation allocatorは`0..=i64::MAX`を単調前進し、increment前に最大値を検査して枯渇したらwrap/reuseせず新世代起動をfail-closedに拒否する。runtime/provider/tool途中killでは旧generationと離脱descendantを回収し、`running`を`indeterminate`で一度だけ閉じて自動再実行しない
+- 受け入れ: quotaを1種ずつ独立発火。generation 0と`i64::MAX`の起動・永続化、`i64::MAX`後のallocator拒否を固定する。`setsid`+stdio close後のdescendantも回収されworkspace変更不能。kill境界を跨いでもterminal event/toolResultが重複しない
 - コミット: `infra(agent): resource quota and generation recovery`
 
 ### T28: WS production + 3言語E2E 【owner: api/web/agent、要T18,T24,T26】

@@ -22,9 +22,52 @@ use crate::{
         UserMessage, ValidatedToolArguments,
     },
     store::{Store, user_message_id},
+    tools::executor::MAX_PROCESS_GENERATION,
 };
 
 const TEST_EXECUTOR_GENERATION: u64 = 73;
+
+#[tokio::test]
+async fn session_rejects_out_of_domain_generation_before_durable_mutation() {
+    let store = Store::session_test_store("invalid-generation-session")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (gateway, _commands, _frames) = gateway();
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |core: RunCore,
+         _initial: AdmittedCommand,
+         _controls: mpsc::Receiver<RunControl>,
+         _events: mpsc::Sender<AgentEvent>| async move { RunCompletion::Completed(core) },
+    );
+
+    let error = match Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        worker,
+        MAX_PROCESS_GENERATION + 1,
+    )
+    .await
+    {
+        Ok(_) => panic!("out-of-domain generation must fail startup"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("process generation"));
+
+    for table in [
+        "data_keys",
+        "agent_events",
+        "inbound_commands",
+        "tool_executions",
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(&pool)
+            .await
+            .expect("durable row count");
+        assert_eq!(count, 0, "startup must not mutate {table}");
+    }
+}
 
 struct MockGateway {
     commands: mpsc::Receiver<InboundCommand>,
@@ -1982,9 +2025,8 @@ async fn durable_bridge_commits_each_event_before_gateway_delivery_with_exact_se
     assert_eq!(projected, "stop");
 }
 
-#[tokio::test]
-async fn first_length_tool_call_is_durably_not_started_without_public_execution_lifecycle() {
-    let store = Store::session_test_store("durable-length-session")
+async fn assert_first_length_tool_call_persists_generation(executor_generation: u64) {
+    let store = Store::session_test_store(&format!("durable-length-session-{executor_generation}"))
         .await
         .expect("test store");
     let pool = store.pool().clone();
@@ -2067,15 +2109,9 @@ async fn first_length_tool_call_is_durably_not_started_without_public_execution_
             RunCompletion::Completed(core)
         },
     );
-    let session = Session::start(
-        store,
-        gateway,
-        RunCore::new(),
-        worker,
-        TEST_EXECUTOR_GENERATION,
-    )
-    .await
-    .expect("session");
+    let session = Session::start(store, gateway, RunCore::new(), worker, executor_generation)
+        .await
+        .expect("session");
     let task = tokio::spawn(session.run());
     commands.send(user(1)).await.expect("command");
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -2109,7 +2145,7 @@ async fn first_length_tool_call_is_durably_not_started_without_public_execution_
         rows,
         vec![(
             "length-call".to_owned(),
-            TEST_EXECUTOR_GENERATION as i64,
+            i64::try_from(executor_generation).expect("validated generation"),
             "00000000-0000-4000-8000-000000000001/length-call".to_owned(),
             "not_started".to_owned(),
             None,
@@ -2121,6 +2157,13 @@ async fn first_length_tool_call_is_durably_not_started_without_public_execution_
             if matches!(envelope.event["type"].as_str(),
                 Some("tool_execution_start" | "tool_execution_end")))
     }));
+}
+
+#[tokio::test]
+async fn first_length_tool_call_is_durably_not_started_without_public_execution_lifecycle() {
+    for generation in [0, MAX_PROCESS_GENERATION] {
+        assert_first_length_tool_call_persists_generation(generation).await;
+    }
 }
 
 #[tokio::test]
@@ -2834,11 +2877,12 @@ async fn opaque_context_refusal_closes_durably_before_applied_ack() {
     assert!(agent_end < applied);
 }
 
-#[tokio::test]
-async fn normal_tool_lifecycle_is_prepared_started_finished_and_paired() {
-    let store = Store::session_test_store("durable-normal-tool-session")
-        .await
-        .expect("test store");
+async fn assert_normal_tool_lifecycle_persists_generation(executor_generation: u64) {
+    let store = Store::session_test_store(&format!(
+        "durable-normal-tool-session-{executor_generation}"
+    ))
+    .await
+    .expect("test store");
     let pool = store.pool().clone();
     let (gateway, commands, frames) = gateway();
     let worker: Arc<dyn RunWorker> = Arc::new(
@@ -2925,15 +2969,9 @@ async fn normal_tool_lifecycle_is_prepared_started_finished_and_paired() {
             RunCompletion::Completed(core)
         },
     );
-    let session = Session::start(
-        store,
-        gateway,
-        RunCore::new(),
-        worker,
-        TEST_EXECUTOR_GENERATION,
-    )
-    .await
-    .expect("session");
+    let session = Session::start(store, gateway, RunCore::new(), worker, executor_generation)
+        .await
+        .expect("session");
     let task = tokio::spawn(session.run());
     commands.send(user(1)).await.expect("command");
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -2964,7 +3002,7 @@ async fn normal_tool_lifecycle_is_prepared_started_finished_and_paired() {
         row,
         (
             "succeeded".to_owned(),
-            TEST_EXECUTOR_GENERATION as i64,
+            i64::try_from(executor_generation).expect("validated generation"),
             "00000000-0000-4000-8000-000000000001/normal-call".to_owned(),
         )
     );
@@ -2988,6 +3026,13 @@ async fn normal_tool_lifecycle_is_prepared_started_finished_and_paired() {
         lifecycle,
         vec!["tool_execution_start", "tool_execution_end"]
     );
+}
+
+#[tokio::test]
+async fn normal_tool_lifecycle_is_prepared_started_finished_and_paired() {
+    for generation in [0, MAX_PROCESS_GENERATION] {
+        assert_normal_tool_lifecycle_persists_generation(generation).await;
+    }
 }
 
 #[tokio::test]
