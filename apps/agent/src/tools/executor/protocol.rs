@@ -10,6 +10,7 @@ use crate::tools::{bash::BashExecutionResult, fs::GrepMatch, truncate::Truncatio
 
 pub const MAX_RPC_LINE_BYTES: usize = 1024 * 1024;
 pub const MAX_RPC_READ_BYTES: usize = 50 * 1024;
+pub const MAX_PROCESS_GENERATION: u64 = i64::MAX as u64;
 const MAX_RPC_ID_BYTES: usize = 128;
 const MAX_RPC_NONCE_BYTES: usize = 128;
 const MAX_RPC_ERROR_CODE_BYTES: usize = 128;
@@ -25,12 +26,14 @@ pub struct RpcIdentity {
 }
 
 impl RpcIdentity {
-    fn validate(&self) -> Result<(), ToolError> {
+    pub(crate) fn validate(&self) -> Result<(), ToolError> {
+        validate_process_generation(self.generation)?;
         validate_bounded_text(&self.nonce, "nonce", MAX_RPC_NONCE_BYTES)
     }
 
     fn validate_wire(&self, generation: u64, nonce: &str) -> Result<(), ToolError> {
         self.validate()?;
+        validate_process_generation(generation)?;
         validate_bounded_text(nonce, "nonce", MAX_RPC_NONCE_BYTES)?;
         if generation != self.generation || nonce != self.nonce {
             return Err(ToolError::Protocol(
@@ -39,6 +42,15 @@ impl RpcIdentity {
         }
         Ok(())
     }
+}
+
+pub fn validate_process_generation(generation: u64) -> Result<(), ToolError> {
+    if generation > MAX_PROCESS_GENERATION {
+        return Err(ToolError::Protocol(format!(
+            "process generation must be in 0..={MAX_PROCESS_GENERATION}"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -734,6 +746,77 @@ mod tests {
             generation: 7,
             nonce: "boot-nonce".to_owned(),
         }
+    }
+
+    #[test]
+    fn process_generation_domain_is_shared_by_identity_and_wire_paths() {
+        for generation in [0, MAX_PROCESS_GENERATION] {
+            let identity = RpcIdentity {
+                generation,
+                nonce: "boot-nonce".to_owned(),
+            };
+            identity.validate().expect("valid identity generation");
+
+            let request = serde_json::to_vec(&RpcRequest {
+                generation,
+                nonce: identity.nonce.clone(),
+                request_id: "request-1".to_owned(),
+                operation: ExecutorOperation::Cancel {
+                    execution_id: "execution-1".to_owned(),
+                },
+            })
+            .expect("encode request fixture");
+            decode_rpc_line::<ExecutorOperation>(&request, &identity)
+                .expect("valid request generation");
+
+            encode_rpc_frame(&RpcFrame::<Value>::Update {
+                generation,
+                nonce: identity.nonce,
+                request_id: "request-1".to_owned(),
+                value: json!({}),
+            })
+            .expect("valid response generation");
+        }
+
+        let out_of_domain = MAX_PROCESS_GENERATION + 1;
+        let invalid_identity = RpcIdentity {
+            generation: out_of_domain,
+            nonce: "boot-nonce".to_owned(),
+        };
+        assert!(invalid_identity.validate().is_err());
+        assert!(
+            encode_rpc_frame(&RpcFrame::<Value>::Update {
+                generation: out_of_domain,
+                nonce: "boot-nonce".to_owned(),
+                request_id: "request-1".to_owned(),
+                value: json!({}),
+            })
+            .is_err()
+        );
+
+        let valid_identity = RpcIdentity {
+            generation: MAX_PROCESS_GENERATION,
+            nonce: "boot-nonce".to_owned(),
+        };
+        let invalid_request = serde_json::to_vec(&RpcRequest {
+            generation: out_of_domain,
+            nonce: "boot-nonce".to_owned(),
+            request_id: "request-1".to_owned(),
+            operation: ExecutorOperation::Cancel {
+                execution_id: "execution-1".to_owned(),
+            },
+        })
+        .expect("encode invalid request fixture");
+        assert!(decode_rpc_line::<ExecutorOperation>(&invalid_request, &valid_identity).is_err());
+
+        let invalid_frame = serde_json::to_vec(&RpcFrame::<Value>::Update {
+            generation: out_of_domain,
+            nonce: "boot-nonce".to_owned(),
+            request_id: "request-1".to_owned(),
+            value: json!({}),
+        })
+        .expect("encode invalid response fixture");
+        assert!(decode_rpc_frame::<Value>(&invalid_frame, &valid_identity).is_err());
     }
 
     fn request_line(request_id: &str, execution_id: &str) -> Vec<u8> {

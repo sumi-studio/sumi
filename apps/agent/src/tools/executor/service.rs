@@ -1511,14 +1511,22 @@ fn nonblocking_stdio_fd(raw_fd: libc::c_int) -> std::io::Result<AsyncFd<OwnedFd>
 }
 
 fn identity_from_env() -> Result<RpcIdentity> {
-    let generation = required_text("SUMI_RPC_GENERATION")?
+    identity_from_values(
+        &required_text("SUMI_RPC_GENERATION")?,
+        required_text("SUMI_RPC_NONCE")?,
+    )
+}
+
+fn identity_from_values(generation: &str, nonce: String) -> Result<RpcIdentity> {
+    let generation = generation
         .parse::<u64>()
         .context("SUMI_RPC_GENERATION must be an unsigned integer")?;
-    let nonce = required_text("SUMI_RPC_NONCE")?;
-    if nonce.len() > 128 {
-        bail!("SUMI_RPC_NONCE must contain at most 128 bytes");
-    }
-    Ok(RpcIdentity { generation, nonce })
+    let identity = RpcIdentity { generation, nonce };
+    identity
+        .validate()
+        .map_err(anyhow::Error::from)
+        .context("invalid executor RPC identity")?;
+    Ok(identity)
 }
 
 fn required_text(name: &str) -> Result<String> {
@@ -1540,7 +1548,23 @@ fn required_path(name: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::executor::decode_rpc_frame;
+    use crate::tools::executor::{MAX_PROCESS_GENERATION, decode_rpc_frame};
+
+    #[test]
+    fn bootstrap_generation_accepts_sqlite_domain_and_rejects_the_next_value() {
+        for generation in [0, MAX_PROCESS_GENERATION] {
+            let identity = identity_from_values(&generation.to_string(), "boot-nonce".to_owned())
+                .expect("bootstrap identity");
+            assert_eq!(identity.generation, generation);
+        }
+        assert!(
+            identity_from_values(
+                &(MAX_PROCESS_GENERATION + 1).to_string(),
+                "boot-nonce".to_owned(),
+            )
+            .is_err()
+        );
+    }
 
     struct PrefixThenStall {
         bytes: Arc<Mutex<Vec<u8>>>,

@@ -31,6 +31,7 @@ use crate::{
         DataKeyPurpose, EventWriter, InboundAdmission, InboundReceiptOrigin,
         RecoveryRequired as AdmissionRecoveryRequired, RecoveryStep, Store, SuffixRecovery,
     },
+    tools::executor::validate_process_generation,
 };
 
 mod durable_bridge;
@@ -343,6 +344,7 @@ pub(crate) struct Session<G: Gateway> {
     core: Option<RunCore>,
     active: Option<ActiveRun>,
     worker: Arc<dyn RunWorker>,
+    executor_generation: u64,
     /// T16 owns active-run classification and control semantics. Until then
     /// every command received during a run remains durably `received` in one
     /// sequence-ordered queue. After AgentEnd, T15 may start a fresh user run
@@ -360,7 +362,9 @@ impl<G: Gateway + 'static> Session<G> {
         gateway: G,
         core: RunCore,
         worker: Arc<dyn RunWorker>,
+        executor_generation: u64,
     ) -> Result<Self> {
+        validate_process_generation(executor_generation)?;
         let conversation_id = store.scope().conversation_id.clone();
         let store = Arc::new(store);
         for purpose in [
@@ -383,6 +387,7 @@ impl<G: Gateway + 'static> Session<G> {
             core: Some(core),
             active: None,
             worker,
+            executor_generation,
             deferred_commands: MessageQueue::bounded(PENDING_CONTROL_CAPACITY),
             durable_core_invalidated: false,
         })
@@ -596,7 +601,7 @@ impl<G: Gateway + 'static> Session<G> {
     }
 
     async fn spawn_worker(&mut self, initial: AdmittedCommand) -> Result<(), SessionFailure> {
-        let binding = DurableRunBinding::idle(&initial);
+        let binding = DurableRunBinding::idle(&initial, self.executor_generation);
         self.writer
             .apply(crate::store::EventBatch {
                 writes: vec![crate::store::EventWrite {

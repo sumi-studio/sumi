@@ -343,6 +343,7 @@ fn encode_request(
     request_id: &str,
     operation: ExecutorOperation,
 ) -> Result<Vec<u8>, ToolError> {
+    identity.validate()?;
     let request = RpcRequest {
         generation: identity.generation,
         nonce: identity.nonce.clone(),
@@ -653,6 +654,22 @@ mod tests {
             generation: 7,
             nonce: "boot-nonce".to_owned(),
         }
+    }
+
+    #[test]
+    fn outgoing_request_rejects_out_of_domain_generation_before_encoding() {
+        let error = encode_request(
+            &RpcIdentity {
+                generation: super::super::MAX_PROCESS_GENERATION + 1,
+                nonce: "boot-nonce".to_owned(),
+            },
+            "request-1",
+            ExecutorOperation::Cancel {
+                execution_id: "execution-1".to_owned(),
+            },
+        )
+        .expect_err("invalid generation");
+        assert!(matches!(error, ToolError::Protocol(message) if message.contains("generation")));
     }
 
     fn test_deadlines() -> Deadlines {

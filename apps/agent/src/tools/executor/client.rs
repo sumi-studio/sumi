@@ -78,6 +78,7 @@ impl ArtifactBrokerClient {
         operation: ArtifactOperation,
         request_emitted: Arc<AtomicBool>,
     ) -> Result<ArtifactResponse, ToolError> {
+        self.identity.validate()?;
         let request_id = format!("broker-{}", Uuid::now_v7());
         let request = RpcRequest {
             generation: self.identity.generation,
@@ -461,6 +462,26 @@ mod tests {
         server.abort();
         let _ = std::fs::remove_dir_all(root);
         error
+    }
+
+    #[tokio::test]
+    async fn outgoing_request_rejects_out_of_domain_generation_before_connecting() {
+        let client = ArtifactBrokerClient::new(
+            "/unused",
+            RpcIdentity {
+                generation: super::super::MAX_PROCESS_GENERATION + 1,
+                nonce: "boot-nonce".to_owned(),
+            },
+            "conversation-1",
+        );
+        let error = client
+            .execute(ArtifactOperation::FinishToolOutput {
+                conversation_id: "conversation-1".to_owned(),
+                handle: "artifact://conversation-1/tool-output/execution-1".to_owned(),
+            })
+            .await
+            .expect_err("invalid generation");
+        assert!(matches!(error, ToolError::Protocol(message) if message.contains("generation")));
     }
 
     #[tokio::test]

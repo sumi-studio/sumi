@@ -20,16 +20,22 @@ pub(crate) struct DurableRunBinding {
     pub command_seq: u64,
     pub run_id: String,
     pub turn_id: String,
+    pub executor_generation: u64,
 }
 
 impl DurableRunBinding {
-    pub(super) fn idle(command: &AdmittedCommand) -> Self {
+    pub(super) fn idle(command: &AdmittedCommand, executor_generation: u64) -> Self {
         Self {
             command_id: command.envelope().command_id.to_string(),
             command_seq: command.envelope().seq,
             run_id: Uuid::now_v7().to_string(),
             turn_id: Uuid::now_v7().to_string(),
+            executor_generation,
         }
+    }
+
+    fn tool_execution_idempotency_key(&self, tool_call_id: &str) -> String {
+        format!("{}/{tool_call_id}", self.command_id)
     }
 }
 
@@ -88,6 +94,7 @@ impl DurableBridge {
         if output.binding.command_id != self.binding.command_id
             || output.binding.command_seq != self.binding.command_seq
             || output.binding.run_id != self.binding.run_id
+            || output.binding.executor_generation != self.binding.executor_generation
         {
             bail!("run output durable binding changed while the worker was active");
         }
@@ -241,11 +248,10 @@ impl DurableBridge {
                                     tool_call_id: tool_call_id.clone(),
                                     command_id: self.binding.command_id.clone(),
                                     run_id: self.binding.run_id.clone(),
-                                    executor_generation: 0,
-                                    idempotency_key: format!(
-                                        "{}:{}",
-                                        self.binding.run_id, tool_call_id
-                                    ),
+                                    executor_generation: self.binding.executor_generation,
+                                    idempotency_key: self
+                                        .binding
+                                        .tool_execution_idempotency_key(&tool_call_id),
                                 },
                             )],
                         }],
@@ -517,7 +523,8 @@ impl DurableBridge {
                     command_id: self.binding.command_id.clone(),
                     run_id: self.binding.run_id.clone(),
                     turn_id: self.binding.turn_id.clone(),
-                    idempotency_key: format!("{}:{tool_call_id}:not-started", self.binding.run_id),
+                    executor_generation: self.binding.executor_generation,
+                    idempotency_key: self.binding.tool_execution_idempotency_key(&tool_call_id),
                     error_code: "length_guard",
                 }));
             } else if let Some((_, _, pending_ids)) = self.pending_rejected_end.as_mut()
@@ -699,5 +706,57 @@ impl DurableBridge {
                 seq: Some(seq),
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn binding(command_id: &str) -> DurableRunBinding {
+        DurableRunBinding {
+            command_id: command_id.to_owned(),
+            command_seq: 1,
+            run_id: "run-a".to_owned(),
+            turn_id: "turn-a".to_owned(),
+            executor_generation: 73,
+        }
+    }
+
+    #[test]
+    fn tool_execution_identity_is_exactly_command_slash_call_and_ignores_run_turn() {
+        let first = binding("command-a");
+        assert_eq!(
+            first.tool_execution_idempotency_key("call-a"),
+            "command-a/call-a"
+        );
+
+        let mut different_run_and_turn = first.clone();
+        different_run_and_turn.run_id = "run-b".to_owned();
+        different_run_and_turn.turn_id = "turn-b".to_owned();
+        assert_eq!(
+            first.tool_execution_idempotency_key("call-a"),
+            different_run_and_turn.tool_execution_idempotency_key("call-a")
+        );
+        assert_ne!(
+            first.tool_execution_idempotency_key("call-a"),
+            binding("command-b").tool_execution_idempotency_key("call-a")
+        );
+        assert_ne!(
+            first.tool_execution_idempotency_key("call-a"),
+            first.tool_execution_idempotency_key("call-b")
+        );
+    }
+
+    #[test]
+    fn executor_generation_remains_private_run_output_metadata() {
+        let output = RunOutput {
+            binding: binding("command-a"),
+            event: AgentEvent::AgentStart,
+        };
+        assert_eq!(output.binding.executor_generation, 73);
+        let public = serde_json::to_value(output.event).expect("serialize public event");
+        assert_eq!(public, serde_json::json!({"type":"agent_start"}));
+        assert!(public.get("executor_generation").is_none());
     }
 }

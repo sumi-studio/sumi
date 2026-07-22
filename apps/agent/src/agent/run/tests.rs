@@ -22,6 +22,8 @@ use crate::{
     },
 };
 
+const TEST_EXECUTOR_GENERATION: u64 = 73;
+
 #[derive(Clone)]
 enum Script {
     Output(Box<AssistantMessage>),
@@ -499,7 +501,7 @@ fn pending_sequences(core: &mut RunCore) -> Vec<u64> {
 fn bound_core(seq: u64) -> RunCore {
     let command = admitted_user(seq);
     let mut core = RunCore::new();
-    core.durable_binding = Some(DurableRunBinding::idle(&command));
+    core.durable_binding = Some(DurableRunBinding::idle(&command, TEST_EXECUTOR_GENERATION));
     core
 }
 
@@ -908,6 +910,7 @@ fn synthetic_attempt_message_ids_are_stable_and_scoped_by_durable_identity_and_f
         command_seq: 1,
         run_id: "01900000-0000-7000-8000-000000000001".to_owned(),
         turn_id: "01900000-0000-7000-8000-000000000002".to_owned(),
+        executor_generation: TEST_EXECUTOR_GENERATION,
     };
     let start = synthetic_attempt_message_id(&binding, 0, SyntheticAttemptFailure::Start)
         .expect("synthetic start identity");

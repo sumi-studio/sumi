@@ -22,7 +22,52 @@ use crate::{
         UserMessage, ValidatedToolArguments,
     },
     store::{Store, user_message_id},
+    tools::executor::MAX_PROCESS_GENERATION,
 };
+
+const TEST_EXECUTOR_GENERATION: u64 = 73;
+
+#[tokio::test]
+async fn session_rejects_out_of_domain_generation_before_durable_mutation() {
+    let store = Store::session_test_store("invalid-generation-session")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (gateway, _commands, _frames) = gateway();
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |core: RunCore,
+         _initial: AdmittedCommand,
+         _controls: mpsc::Receiver<RunControl>,
+         _events: mpsc::Sender<AgentEvent>| async move { RunCompletion::Completed(core) },
+    );
+
+    let error = match Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        worker,
+        MAX_PROCESS_GENERATION + 1,
+    )
+    .await
+    {
+        Ok(_) => panic!("out-of-domain generation must fail startup"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("process generation"));
+
+    for table in [
+        "data_keys",
+        "agent_events",
+        "inbound_commands",
+        "tool_executions",
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(&pool)
+            .await
+            .expect("durable row count");
+        assert_eq!(count, 0, "startup must not mutate {table}");
+    }
+}
 
 struct MockGateway {
     commands: mpsc::Receiver<InboundCommand>,
@@ -248,6 +293,7 @@ async fn session_with_core(
         gateway,
         core,
         worker,
+        TEST_EXECUTOR_GENERATION,
     )
     .await
     .expect("session startup")
@@ -268,6 +314,7 @@ async fn finish_active(session: &mut Session<MockGateway>) {
 enum StaleBinding {
     PriorRun,
     PriorTurn,
+    ExecutorGeneration,
 }
 
 struct StaleBindingWorker(StaleBinding);
@@ -355,6 +402,16 @@ impl RunWorker for StaleBindingWorker {
                         .await
                         .expect("stale turn output");
                 }
+                StaleBinding::ExecutorGeneration => {
+                    binding.executor_generation += 1;
+                    events
+                        .send(RunOutput {
+                            binding,
+                            event: AgentEvent::AgentStart,
+                        })
+                        .await
+                        .expect("session output receiver");
+                }
             }
             RunCompletion::Completed(core)
         })
@@ -362,21 +419,23 @@ impl RunWorker for StaleBindingWorker {
 }
 
 #[tokio::test]
-async fn session_rejects_worker_output_bound_to_a_stale_run_or_turn() {
+async fn session_rejects_worker_output_with_any_changed_durable_binding() {
     for (label, kind) in [
         ("run", StaleBinding::PriorRun),
         ("turn", StaleBinding::PriorTurn),
+        ("executor-generation", StaleBinding::ExecutorGeneration),
     ] {
         let store = Store::session_test_store(&format!("stale-worker-{label}"))
             .await
             .expect("test store");
         let pool = store.pool().clone();
-        let (gateway, commands, _frames) = gateway();
+        let (gateway, commands, frames) = gateway();
         let session = Session::start(
             store,
             gateway,
             RunCore::new(),
             Arc::new(StaleBindingWorker(kind)),
+            TEST_EXECUTOR_GENERATION,
         )
         .await
         .expect("session");
@@ -390,12 +449,22 @@ async fn session_rejects_worker_output_bound_to_a_stale_run_or_turn() {
             .await
             .expect("event count");
         let expected_prefix = match kind {
-            StaleBinding::PriorRun => 0,
+            StaleBinding::PriorRun | StaleBinding::ExecutorGeneration => 0,
             StaleBinding::PriorTurn => 8,
         };
         assert_eq!(
             durable_events, expected_prefix,
             "stale {label} output itself must not persist"
+        );
+        let public_events = frames
+            .lock()
+            .expect("frame mutex")
+            .iter()
+            .filter(|frame| matches!(frame, OutboundFrame::Event { .. }))
+            .count();
+        assert_eq!(
+            public_events, expected_prefix as usize,
+            "stale {label} output itself must not be delivered"
         );
     }
 }
@@ -560,9 +629,15 @@ async fn active_session_uses_durable_backpressure_before_its_bounded_fifo_can_ov
          _controls: mpsc::Receiver<RunControl>,
          _events: mpsc::Sender<AgentEvent>| async move { pending::<RunCompletion>().await },
     );
-    let mut session = Session::start(store, gateway, RunCore::new(), worker)
-        .await
-        .expect("session");
+    let mut session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        worker,
+        TEST_EXECUTOR_GENERATION,
+    )
+    .await
+    .expect("session");
 
     session
         .admit_and_route(user(1))
@@ -638,9 +713,15 @@ async fn active_session_keeps_early_reserved_abort_and_remaining_ordinary_window
          _controls: mpsc::Receiver<RunControl>,
          _events: mpsc::Sender<AgentEvent>| async move { pending::<RunCompletion>().await },
     );
-    let mut session = Session::start(store, gateway, RunCore::new(), worker)
-        .await
-        .expect("session");
+    let mut session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        worker,
+        TEST_EXECUTOR_GENERATION,
+    )
+    .await
+    .expect("session");
 
     session
         .admit_and_route(user(1))
@@ -835,7 +916,7 @@ async fn fixture_adapter_event_loss_drains_bounded_lane_and_returns_the_actual_c
     let initial = AdmittedCommand::new(envelope, Utc::now());
     let mut core = RunCore::new();
     let ownership_id = core.ownership_id();
-    core.durable_binding = Some(DurableRunBinding::idle(&initial));
+    core.durable_binding = Some(DurableRunBinding::idle(&initial, TEST_EXECUTOR_GENERATION));
     let (_control_tx, control_rx) = mpsc::channel(1);
     let (events_tx, events_rx) = mpsc::channel(1);
     drop(events_rx);
@@ -1015,10 +1096,16 @@ async fn shutdown_drains_ready_completion_outputs_before_recovering_core_after_g
         },
     );
     let task = tokio::spawn(
-        Session::start(store, gateway, RunCore::new(), worker)
-            .await
-            .expect("session")
-            .run(),
+        Session::start(
+            store,
+            gateway,
+            RunCore::new(),
+            worker,
+            TEST_EXECUTOR_GENERATION,
+        )
+        .await
+        .expect("session")
+        .run(),
     );
     commands_tx.send(user(1)).await.expect("initial command");
 
@@ -1147,9 +1234,15 @@ async fn completion_drain_persists_all_outputs_before_recovering_mutated_core_af
             RunCompletion::Completed(core)
         },
     );
-    let mut session = Session::start(store, gateway, RunCore::new(), worker)
-        .await
-        .expect("session");
+    let mut session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        worker,
+        TEST_EXECUTOR_GENERATION,
+    )
+    .await
+    .expect("session");
 
     session
         .admit_and_route(user(1))
@@ -1293,9 +1386,15 @@ async fn pending_t15_suffix_allows_only_t12_exact_retransmission() {
             RunCompletion::Completed(core)
         },
     );
-    let session = Session::start(store, gateway, RunCore::new(), worker)
-        .await
-        .expect("recovery-gated session constructs");
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        worker,
+        TEST_EXECUTOR_GENERATION,
+    )
+    .await
+    .expect("recovery-gated session constructs");
     assert!(!session.recovery_steps.is_empty());
     let task = tokio::spawn(session.run());
 
@@ -1425,9 +1524,15 @@ async fn active_second_user_stays_received_then_runs_after_the_current_agent_end
             }
         }
     });
-    let session = Session::start(store, gateway, RunCore::new(), worker)
-        .await
-        .expect("session");
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        worker,
+        TEST_EXECUTOR_GENERATION,
+    )
+    .await
+    .expect("session");
     let task = tokio::spawn(session.run());
     commands.send(user(1)).await.expect("first command");
     tokio::time::timeout(std::time::Duration::from_secs(2), first_started.notified())
@@ -1556,9 +1661,15 @@ async fn active_user_then_abort_is_cut_off_after_agent_end_without_starting_user
         first_started.clone(),
         release_first.clone(),
     );
-    let session = Session::start(store, gateway, RunCore::new(), worker)
-        .await
-        .expect("session");
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        worker,
+        TEST_EXECUTOR_GENERATION,
+    )
+    .await
+    .expect("session");
     let task = tokio::spawn(session.run());
     commands.send(user(1)).await.expect("active command");
     tokio::time::timeout(std::time::Duration::from_secs(2), first_started.notified())
@@ -1621,9 +1732,15 @@ async fn active_abort_then_user_applies_abort_before_starting_later_user() {
         first_started.clone(),
         release_first.clone(),
     );
-    let session = Session::start(store, gateway, RunCore::new(), worker)
-        .await
-        .expect("session");
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        worker,
+        TEST_EXECUTOR_GENERATION,
+    )
+    .await
+    .expect("session");
     let task = tokio::spawn(session.run());
     commands.send(user(1)).await.expect("active command");
     tokio::time::timeout(std::time::Duration::from_secs(2), first_started.notified())
@@ -1864,9 +1981,15 @@ async fn durable_bridge_commits_each_event_before_gateway_delivery_with_exact_se
             RunCompletion::Completed(core)
         },
     );
-    let session = Session::start(store, gateway, RunCore::new(), worker)
-        .await
-        .expect("session");
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        worker,
+        TEST_EXECUTOR_GENERATION,
+    )
+    .await
+    .expect("session");
     let task = tokio::spawn(session.run());
     commands_tx.send(user(1)).await.expect("command");
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -1902,9 +2025,8 @@ async fn durable_bridge_commits_each_event_before_gateway_delivery_with_exact_se
     assert_eq!(projected, "stop");
 }
 
-#[tokio::test]
-async fn first_length_tool_call_is_durably_not_started_without_public_execution_lifecycle() {
-    let store = Store::session_test_store("durable-length-session")
+async fn assert_first_length_tool_call_persists_generation(executor_generation: u64) {
+    let store = Store::session_test_store(&format!("durable-length-session-{executor_generation}"))
         .await
         .expect("test store");
     let pool = store.pool().clone();
@@ -1987,7 +2109,7 @@ async fn first_length_tool_call_is_durably_not_started_without_public_execution_
             RunCompletion::Completed(core)
         },
     );
-    let session = Session::start(store, gateway, RunCore::new(), worker)
+    let session = Session::start(store, gateway, RunCore::new(), worker, executor_generation)
         .await
         .expect("session");
     let task = tokio::spawn(session.run());
@@ -2011,15 +2133,20 @@ async fn first_length_tool_call_is_durably_not_started_without_public_execution_
     drop(commands);
     completed(task.await.expect("session join"));
 
-    let rows: Vec<(String, String, Option<String>, Option<String>)> =
-        sqlx::query_as("SELECT tool_call_id, state, started_at, error_code FROM tool_executions")
-            .fetch_all(&pool)
-            .await
-            .expect("not-started audit row");
+    type LengthAuditRow = (String, i64, String, String, Option<String>, Option<String>);
+    let rows: Vec<LengthAuditRow> = sqlx::query_as(
+        "SELECT tool_call_id, executor_generation, idempotency_key, state, started_at, error_code
+         FROM tool_executions",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("not-started audit row");
     assert_eq!(
         rows,
         vec![(
             "length-call".to_owned(),
+            i64::try_from(executor_generation).expect("validated generation"),
+            "00000000-0000-4000-8000-000000000001/length-call".to_owned(),
             "not_started".to_owned(),
             None,
             Some("length_guard".to_owned()),
@@ -2030,6 +2157,13 @@ async fn first_length_tool_call_is_durably_not_started_without_public_execution_
             if matches!(envelope.event["type"].as_str(),
                 Some("tool_execution_start" | "tool_execution_end")))
     }));
+}
+
+#[tokio::test]
+async fn first_length_tool_call_is_durably_not_started_without_public_execution_lifecycle() {
+    for generation in [0, MAX_PROCESS_GENERATION] {
+        assert_first_length_tool_call_persists_generation(generation).await;
+    }
 }
 
 #[tokio::test]
@@ -2115,9 +2249,15 @@ async fn consecutive_length_guard_error_is_durably_not_started_and_closes_normal
             RunCompletion::Completed(core)
         },
     );
-    let session = Session::start(store, gateway, RunCore::new(), worker)
-        .await
-        .expect("session");
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        worker,
+        TEST_EXECUTOR_GENERATION,
+    )
+    .await
+    .expect("session");
     let task = tokio::spawn(session.run());
     commands.send(user(1)).await.expect("command");
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -2134,8 +2274,10 @@ async fn consecutive_length_guard_error_is_durably_not_started_and_closes_normal
     drop(commands);
     completed(task.await.expect("session join"));
 
-    let rows: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT tool_call_id, state, started_at, error_code FROM tool_executions ORDER BY tool_call_id",
+    type LengthAuditRow = (String, i64, String, Option<String>, Option<String>);
+    let rows: Vec<LengthAuditRow> = sqlx::query_as(
+        "SELECT tool_call_id, executor_generation, state, started_at, error_code
+         FROM tool_executions ORDER BY tool_call_id",
     )
     .fetch_all(&pool)
     .await
@@ -2145,12 +2287,14 @@ async fn consecutive_length_guard_error_is_durably_not_started_and_closes_normal
         vec![
             (
                 "length-call-1".to_owned(),
+                TEST_EXECUTOR_GENERATION as i64,
                 "not_started".to_owned(),
                 None,
                 Some("length_guard".to_owned()),
             ),
             (
                 "length-call-2".to_owned(),
+                TEST_EXECUTOR_GENERATION as i64,
                 "not_started".to_owned(),
                 None,
                 Some("length_guard".to_owned()),
@@ -2324,9 +2468,15 @@ async fn mixed_valid_and_rejected_calls_commit_the_rejected_pair_before_valid_li
             RunCompletion::Completed(core)
         },
     );
-    let session = Session::start(store, gateway, RunCore::new(), worker)
-        .await
-        .expect("session");
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        worker,
+        TEST_EXECUTOR_GENERATION,
+    )
+    .await
+    .expect("session");
     let task = tokio::spawn(session.run());
     commands.send(user(1)).await.expect("command");
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -2417,9 +2567,15 @@ async fn failed_idle_injection_batch_publishes_no_partial_event_frame() {
             RunCompletion::Completed(core)
         },
     );
-    let session = Session::start(store, gateway, RunCore::new(), worker)
-        .await
-        .expect("session");
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        worker,
+        TEST_EXECUTOR_GENERATION,
+    )
+    .await
+    .expect("session");
     let task = tokio::spawn(session.run());
     commands.send(user(1)).await.expect("command");
     let (failure, ownership) = failed(task.await.expect("session join"));
@@ -2512,9 +2668,15 @@ async fn retry_error_is_excluded_and_retry_schedule_precedes_next_attempt() {
             RunCompletion::Completed(core)
         },
     );
-    let session = Session::start(store, gateway, RunCore::new(), worker)
-        .await
-        .expect("session");
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        worker,
+        TEST_EXECUTOR_GENERATION,
+    )
+    .await
+    .expect("session");
     let task = tokio::spawn(session.run());
     commands.send(user(1)).await.expect("command");
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -2567,9 +2729,15 @@ async fn provider_start_failures_in_two_runs_use_distinct_stable_durable_message
     let (gateway, commands, frames) = gateway();
     let worker: Arc<dyn RunWorker> =
         Arc::new(SequentialRunWorker::new(Arc::new(StartFailureDriver)));
-    let session = Session::start(store, gateway, RunCore::new(), worker)
-        .await
-        .expect("session");
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        worker,
+        TEST_EXECUTOR_GENERATION,
+    )
+    .await
+    .expect("session");
     let task = tokio::spawn(session.run());
 
     commands.send(user(1)).await.expect("first command");
@@ -2620,9 +2788,15 @@ async fn opaque_context_refusal_closes_durably_before_applied_ack() {
     let (gateway, commands, frames) = gateway();
     let worker: Arc<dyn RunWorker> =
         Arc::new(SequentialRunWorker::new(Arc::new(OpaqueContextDriver)));
-    let session = Session::start(store, gateway, RunCore::new(), worker)
-        .await
-        .expect("session");
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        worker,
+        TEST_EXECUTOR_GENERATION,
+    )
+    .await
+    .expect("session");
     let task = tokio::spawn(session.run());
     commands.send(user(1)).await.expect("command");
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -2703,11 +2877,12 @@ async fn opaque_context_refusal_closes_durably_before_applied_ack() {
     assert!(agent_end < applied);
 }
 
-#[tokio::test]
-async fn normal_tool_lifecycle_is_prepared_started_finished_and_paired() {
-    let store = Store::session_test_store("durable-normal-tool-session")
-        .await
-        .expect("test store");
+async fn assert_normal_tool_lifecycle_persists_generation(executor_generation: u64) {
+    let store = Store::session_test_store(&format!(
+        "durable-normal-tool-session-{executor_generation}"
+    ))
+    .await
+    .expect("test store");
     let pool = store.pool().clone();
     let (gateway, commands, frames) = gateway();
     let worker: Arc<dyn RunWorker> = Arc::new(
@@ -2794,7 +2969,7 @@ async fn normal_tool_lifecycle_is_prepared_started_finished_and_paired() {
             RunCompletion::Completed(core)
         },
     );
-    let session = Session::start(store, gateway, RunCore::new(), worker)
+    let session = Session::start(store, gateway, RunCore::new(), worker, executor_generation)
         .await
         .expect("session");
     let task = tokio::spawn(session.run());
@@ -2816,12 +2991,21 @@ async fn normal_tool_lifecycle_is_prepared_started_finished_and_paired() {
     drop(commands);
     completed(task.await.expect("session join"));
 
-    let state: String =
-        sqlx::query_scalar("SELECT state FROM tool_executions WHERE tool_call_id='normal-call'")
-            .fetch_one(&pool)
-            .await
-            .expect("tool audit row");
-    assert_eq!(state, "succeeded");
+    let row: (String, i64, String) = sqlx::query_as(
+        "SELECT state, executor_generation, idempotency_key
+         FROM tool_executions WHERE tool_call_id='normal-call'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("tool audit row");
+    assert_eq!(
+        row,
+        (
+            "succeeded".to_owned(),
+            i64::try_from(executor_generation).expect("validated generation"),
+            "00000000-0000-4000-8000-000000000001/normal-call".to_owned(),
+        )
+    );
     let lifecycle: Vec<String> = frames
         .lock()
         .expect("frame mutex")
@@ -2842,6 +3026,13 @@ async fn normal_tool_lifecycle_is_prepared_started_finished_and_paired() {
         lifecycle,
         vec!["tool_execution_start", "tool_execution_end"]
     );
+}
+
+#[tokio::test]
+async fn normal_tool_lifecycle_is_prepared_started_finished_and_paired() {
+    for generation in [0, MAX_PROCESS_GENERATION] {
+        assert_normal_tool_lifecycle_persists_generation(generation).await;
+    }
 }
 
 #[tokio::test]
@@ -2911,10 +3102,16 @@ async fn tool_execution_update_after_end_is_rejected_while_result_pairing_is_pen
         },
     );
     let task = tokio::spawn(
-        Session::start(store, gateway, RunCore::new(), worker)
-            .await
-            .expect("session")
-            .run(),
+        Session::start(
+            store,
+            gateway,
+            RunCore::new(),
+            worker,
+            TEST_EXECUTOR_GENERATION,
+        )
+        .await
+        .expect("session")
+        .run(),
     );
     commands.send(user(1)).await.expect("command");
     let (failure, ownership) = failed(task.await.expect("session join"));
