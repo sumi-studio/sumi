@@ -329,7 +329,7 @@ fn ack_writer_failure_after_commit_replays_terminal_ack_from_fresh_process() {
 }
 
 #[tokio::test]
-async fn pending_suffix_restart_is_replay_only_and_rejects_unseen_sequence_before_insert() {
+async fn t15_recovery_gate_replays_t12_prefix_and_rejects_unseen_sequence_before_insert() {
     let database_path = fresh_database_path();
     let first = b"{\"seq\":1,\"command_id\":\"00000000-0000-4000-8000-000000000041\",\"command\":{\"type\":\"user_message\",\"text\":\"first\",\"attachments\":[]}}\n";
     let (success, frames, stderr) = run_agent_at(&database_path, first);
@@ -342,7 +342,7 @@ async fn pending_suffix_restart_is_replay_only_and_rejects_unseen_sequence_befor
     let (success, frames, stderr) = run_agent_at(&database_path, second);
     assert!(
         !success,
-        "fresh process must close an epoch that introduces unseen work during recovery; stderr: {stderr}"
+        "T15 recovery gate must close an epoch that introduces unseen work before T17 hydration; stderr: {stderr}"
     );
     assert_eq!(frames.len(), 1, "stderr: {stderr}");
     assert_eq!(frames[0]["ack"]["seq"], 1);
@@ -383,7 +383,7 @@ async fn pending_suffix_restart_is_replay_only_and_rejects_unseen_sequence_befor
         .expect("count events");
     assert_eq!(
         event_count, 0,
-        "T12 recovery must not emit T15-owned run events"
+        "T12 prefix application must not emit T17-owned full-suffix run events"
     );
     connection.close().await.expect("close durable state");
 

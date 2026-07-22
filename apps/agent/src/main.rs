@@ -79,12 +79,14 @@ async fn main() -> Result<()> {
     if !pending_recovery.is_empty() {
         tracing::warn!(
             pending_steps = ?pending_recovery,
-            "durable suffix remains pending for the T15 session loop"
+            "durable suffix remains after the T12 prefix; T17 production hydration must resolve it before T26 composition"
         );
     }
     let mut admission = InboundAdmission::after_t12_recovery(!pending_recovery.is_empty());
     if admission.is_replay_only() {
-        tracing::warn!("gateway command admission is replay-only until T15 completes recovery");
+        tracing::warn!(
+            "gateway command admission is replay-only; the T15 injected seam does not replace T17 production suffix hydration"
+        );
     }
     let command_digest_factory = store.command_digest_factory().await?;
     let (mut gateway_reader, mut gateway_writer) =
