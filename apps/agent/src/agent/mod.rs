@@ -388,6 +388,12 @@ pub(crate) struct ActiveRun {
     bridge: DurableBridge,
 }
 
+impl Drop for ActiveRun {
+    fn drop(&mut self) {
+        self.join.abort();
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum RunOwnership {
     Recovered(RunCore),
@@ -760,22 +766,22 @@ impl<G: Gateway + 'static> Session<G> {
         match completion {
             Ok(completion) => self.finish_run(Ok(completion)).await,
             Err(oneshot::error::TryRecvError::Closed) => {
-                let active = self.active.take().expect("active run checked above");
-                match active.join.await {
+                let mut active = self.active.take().expect("active run checked above");
+                match (&mut active.join).await {
                     Err(error) => Err(worker_join_failure(error)),
                     Ok(()) => Err(SessionFailure::CompletionChannelClosed),
                 }
             }
             Err(oneshot::error::TryRecvError::Empty) => {
-                let active = self.active.take().expect("active run checked above");
+                let mut active = self.active.take().expect("active run checked above");
                 if active.join.is_finished() {
-                    match active.join.await {
+                    match (&mut active.join).await {
                         Err(error) => Err(worker_join_failure(error)),
                         Ok(()) => Err(SessionFailure::CompletionChannelClosed),
                     }
                 } else {
                     active.join.abort();
-                    active.join.await.ok();
+                    (&mut active.join).await.ok();
                     Err(SessionFailure::EventChannelClosed)
                 }
             }
@@ -834,7 +840,7 @@ impl<G: Gateway + 'static> Session<G> {
         let completion = match completion {
             Ok(completion) => completion,
             Err(_) => {
-                return match active.join.await {
+                return match (&mut active.join).await {
                     Err(error) => Err(worker_join_failure(error)),
                     Ok(()) => Err(SessionFailure::CompletionChannelClosed),
                 };
@@ -928,11 +934,11 @@ impl<G: Gateway + 'static> Session<G> {
                 }
             }
             Err(oneshot::error::TryRecvError::Closed) => {
-                let _ = active.join.await;
+                let _ = (&mut active.join).await;
             }
             Err(oneshot::error::TryRecvError::Empty) => {
                 active.join.abort();
-                let _ = active.join.await;
+                let _ = (&mut active.join).await;
             }
         }
     }
@@ -1057,6 +1063,17 @@ impl<G: Gateway + 'static> Session<G> {
                 break;
             }
             notified.await;
+        }
+    }
+}
+
+impl<G: Gateway> Drop for Session<G> {
+    fn drop(&mut self) {
+        if let Some(join) = self.writer_join.as_ref() {
+            join.abort();
+        }
+        if let Some(active) = self.active.as_ref() {
+            active.join.abort();
         }
     }
 }

@@ -1,9 +1,10 @@
 use std::{
-    future::pending,
+    future::{Future, pending},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    task::{Context, Poll},
 };
 
 use anyhow::{Result, anyhow};
@@ -338,6 +339,14 @@ struct EofBlockingWriter {
     entered: Arc<Notify>,
     dropped: Arc<Notify>,
     blocked_once: bool,
+}
+
+struct DropNotifier(Arc<Notify>);
+
+impl Drop for DropNotifier {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
 }
 
 impl Drop for EofBlockingWriter {
@@ -2459,6 +2468,115 @@ async fn idle_gateway_eof_aborts_a_blocked_writer_without_hanging() {
     tokio::time::timeout(std::time::Duration::from_secs(2), writer_dropped.notified())
         .await
         .expect("writer half dropped after idle EOF");
+}
+
+#[tokio::test]
+async fn aborting_session_drops_blocked_writer_and_active_worker() {
+    let (commands_tx, commands) = mpsc::channel(1);
+    let writer_entered = Arc::new(Notify::new());
+    let writer_dropped = Arc::new(Notify::new());
+    let gateway = EofBlockingGateway {
+        commands,
+        idle: Arc::new(Notify::new()),
+        writer_entered: writer_entered.clone(),
+        writer_dropped: writer_dropped.clone(),
+    };
+    let worker_entered = Arc::new(Notify::new());
+    let worker_dropped = Arc::new(Notify::new());
+    let worker: Arc<dyn RunWorker> = Arc::new({
+        let worker_entered = worker_entered.clone();
+        let worker_dropped = worker_dropped.clone();
+        move |_core: RunCore,
+              _initial: AdmittedCommand,
+              _controls: mpsc::Receiver<RunControl>,
+              events: mpsc::Sender<AgentEvent>| {
+            let worker_entered = worker_entered.clone();
+            let worker_dropped = worker_dropped.clone();
+            async move {
+                let _events = events;
+                let _drop_notifier = DropNotifier(worker_dropped);
+                worker_entered.notify_one();
+                pending::<RunCompletion>().await
+            }
+        }
+    });
+    let session = Session::start(
+        Store::session_test_store("aborting-session-drops-children")
+            .await
+            .expect("test store"),
+        gateway,
+        RunCore::new(),
+        worker,
+        TEST_EXECUTOR_GENERATION,
+    )
+    .await
+    .expect("session startup");
+    let task = tokio::spawn(session.run());
+
+    commands_tx.send(user(1)).await.expect("command");
+    tokio::time::timeout(std::time::Duration::from_secs(2), writer_entered.notified())
+        .await
+        .expect("writer entered blocked send");
+    tokio::time::timeout(std::time::Duration::from_secs(2), worker_entered.notified())
+        .await
+        .expect("active worker entered");
+
+    task.abort();
+    assert!(
+        task.await
+            .expect_err("outer Session task must be cancelled")
+            .is_cancelled()
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), writer_dropped.notified())
+        .await
+        .expect("aborting Session drops the blocked writer");
+    tokio::time::timeout(std::time::Duration::from_secs(2), worker_dropped.notified())
+        .await
+        .expect("aborting Session drops the active worker");
+}
+
+#[tokio::test]
+async fn cancelling_shutdown_active_aborts_the_taken_worker() {
+    let (gateway, _commands, _frames) = gateway();
+    let worker_entered = Arc::new(Notify::new());
+    let worker_dropped = Arc::new(Notify::new());
+    let worker: Arc<dyn RunWorker> = Arc::new({
+        let worker_entered = worker_entered.clone();
+        let worker_dropped = worker_dropped.clone();
+        move |_core: RunCore,
+              _initial: AdmittedCommand,
+              _controls: mpsc::Receiver<RunControl>,
+              _events: mpsc::Sender<AgentEvent>| {
+            let worker_entered = worker_entered.clone();
+            let worker_dropped = worker_dropped.clone();
+            async move {
+                let _drop_notifier = DropNotifier(worker_dropped);
+                worker_entered.notify_one();
+                pending::<RunCompletion>().await
+            }
+        }
+    });
+    let mut session = session(gateway, worker).await;
+    session
+        .admit_and_route(user(1))
+        .await
+        .expect("start active worker");
+    worker_entered.notified().await;
+
+    let mut shutdown = Box::pin(session.shutdown_active());
+    let waker = futures_util::task::noop_waker();
+    let mut context = Context::from_waker(&waker);
+    assert!(matches!(
+        shutdown.as_mut().poll(&mut context),
+        Poll::Pending
+    ));
+    drop(shutdown);
+
+    assert!(session.active.is_none(), "shutdown took the active run");
+    tokio::time::timeout(std::time::Duration::from_secs(2), worker_dropped.notified())
+        .await
+        .expect("cancellation during shutdown aborts the taken worker");
 }
 
 #[test]
