@@ -432,8 +432,9 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering},
     };
 
-    use axum::{Router, body::Body, http::Response, routing::post};
+    use axum::{Json, Router, body::Body, http::Response, routing::post};
     use serde_json::json;
+    use sha2::{Digest, Sha256};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::sync::{mpsc, oneshot};
 
@@ -449,7 +450,7 @@ mod tests {
             },
         },
         runtime::contracts::RpcIdentity,
-        store::Store,
+        store::{Store, user_message_id},
         tools::{
             Tool, ToolError, ToolOutput, ToolRegistryBuilder, ToolRisk,
             executor::{ExecutorClient, remote_executor_registry},
@@ -458,6 +459,19 @@ mod tests {
 
     fn generation(raw: u64) -> ProcessGeneration {
         ProcessGeneration::from_wire(raw).expect("valid test generation")
+    }
+
+    fn expected_tool_result_message_id(assistant_message_id: &str, tool_call_id: &str) -> String {
+        let assistant_digest = Sha256::digest(assistant_message_id.as_bytes());
+        let tool_call_digest = Sha256::digest(tool_call_id.as_bytes());
+        let mut pair_digest = [0_u8; 64];
+        pair_digest[..32].copy_from_slice(&assistant_digest);
+        pair_digest[32..].copy_from_slice(&tool_call_digest);
+        let namespace = uuid::Uuid::from_bytes([
+            0x73, 0x75, 0x6d, 0x69, 0xa4, 0xc1, 0x48, 0x22, 0x91, 0x5d, 0xb5, 0xd2, 0x5a, 0x69,
+            0x9f, 0x31,
+        ]);
+        uuid::Uuid::new_v5(&namespace, &pair_digest).to_string()
     }
 
     struct FakeTool {
@@ -1115,14 +1129,18 @@ mod tests {
         server.abort();
     }
 
-    async fn serve_tool_then_text() -> (String, tokio::task::JoinHandle<()>) {
+    async fn serve_tool_then_text() -> (String, tokio::task::JoinHandle<()>, Arc<Mutex<Vec<Value>>>)
+    {
         let calls = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let app = Router::new().route(
             "/chat/completions",
             post({
                 let calls = calls.clone();
-                move || {
+                let requests = requests.clone();
+                move |Json(request): Json<Value>| {
                     let ordinal = calls.fetch_add(1, Ordering::SeqCst);
+                    requests.lock().expect("requests").push(request);
                     async move {
                         let body = if ordinal == 0 {
                             concat!(
@@ -1150,7 +1168,7 @@ mod tests {
             .expect("bind");
         let address = listener.local_addr().expect("address");
         let task = tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
-        (format!("http://{address}"), task)
+        (format!("http://{address}"), task, requests)
     }
 
     async fn serve_start_failure() -> (String, tokio::task::JoinHandle<()>) {
@@ -1356,7 +1374,7 @@ mod tests {
         let gateway =
             InjectedStdioGateway::new(BufReader::new(command_read), event_write, digest_factory);
 
-        let (base_url, server) = serve_tool_then_text().await;
+        let (base_url, server, requests) = serve_tool_then_text().await;
         let (mut spec, prompt, registry, workspace, tool_executions) = dependencies_with_counter();
         spec.base_url = base_url;
         let starter: Arc<StreamStarter> = Arc::new(|spec, context, options, cancel, observer| {
@@ -1418,42 +1436,157 @@ mod tests {
             SessionResult::Completed(_)
         ));
 
-        let event_types: Vec<_> = frames
+        let event_frames: Vec<_> = frames
             .iter()
-            .filter_map(|frame| {
+            .filter(|frame| frame.get("frame_type") == Some(&json!("event")))
+            .collect();
+        let event_types: Vec<_> = event_frames
+            .iter()
+            .map(|frame| {
                 frame
                     .pointer("/envelope/event/type")
                     .and_then(Value::as_str)
+                    .expect("public event type")
             })
             .collect();
-        for required in [
-            "agent_start",
-            "turn_start",
-            "tool_execution_start",
-            "tool_execution_update",
-            "tool_execution_end",
-            "turn_end",
-            "agent_end",
-        ] {
-            assert!(
-                event_types.contains(&required),
-                "missing {required}: {event_types:?}"
-            );
-        }
-        let positions: Vec<_> = [
-            "tool_execution_start",
-            "tool_execution_update",
-            "tool_execution_end",
-        ]
-        .into_iter()
-        .map(|kind| {
-            event_types
-                .iter()
-                .position(|event| *event == kind)
-                .expect(kind)
-        })
-        .collect();
-        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(
+            event_types,
+            vec![
+                "agent_start",
+                "turn_start",
+                "message_start",
+                "message_end",
+                "message_start",
+                "message_update",
+                "message_update",
+                "message_update",
+                "message_update",
+                "message_end",
+                "tool_execution_start",
+                "tool_execution_update",
+                "tool_execution_end",
+                "message_start",
+                "message_end",
+                "turn_end",
+                "turn_start",
+                "message_start",
+                "message_update",
+                "message_update",
+                "message_update",
+                "message_end",
+                "turn_end",
+                "agent_end",
+            ],
+            "user_message -> public event sequence changed: {event_types:?}"
+        );
+        let durable_types: Vec<_> = event_frames
+            .iter()
+            .filter(|frame| frame.pointer("/envelope/seq").is_some())
+            .map(|frame| {
+                frame
+                    .pointer("/envelope/event/type")
+                    .and_then(Value::as_str)
+                    .expect("durable event type")
+            })
+            .collect();
+        assert_eq!(
+            durable_types,
+            vec![
+                "agent_start",
+                "turn_start",
+                "message_start",
+                "message_end",
+                "message_start",
+                "message_end",
+                "tool_execution_start",
+                "tool_execution_end",
+                "message_start",
+                "message_end",
+                "turn_end",
+                "turn_start",
+                "message_start",
+                "message_end",
+                "turn_end",
+                "agent_end",
+            ],
+            "durable event sequence changed: {durable_types:?}"
+        );
+
+        let message_starts: Vec<_> = event_frames
+            .iter()
+            .filter(|frame| frame.pointer("/envelope/event/type") == Some(&json!("message_start")))
+            .collect();
+        let message_ends: Vec<_> = event_frames
+            .iter()
+            .filter(|frame| frame.pointer("/envelope/event/type") == Some(&json!("message_end")))
+            .collect();
+        assert_eq!(message_starts.len(), 4);
+        assert_eq!(message_ends.len(), 4);
+        let start_ids: Vec<_> = message_starts
+            .iter()
+            .map(|frame| {
+                frame
+                    .pointer("/envelope/event/message_id")
+                    .and_then(Value::as_str)
+                    .expect("message start ID")
+            })
+            .collect();
+        let end_ids: Vec<_> = message_ends
+            .iter()
+            .map(|frame| {
+                frame
+                    .pointer("/envelope/event/message_id")
+                    .and_then(Value::as_str)
+                    .expect("message end ID")
+            })
+            .collect();
+        assert_eq!(
+            start_ids, end_ids,
+            "each MessageStart must close exactly once"
+        );
+        assert_eq!(
+            start_ids[0],
+            user_message_id("018f6f75-43f7-7c2e-8d9a-0f6c83e75b1a")
+        );
+        assert_eq!(
+            message_ends[2].pointer("/envelope/event/message/content"),
+            Some(&json!([{ "text": "done", "type": "text" }]))
+        );
+        assert_eq!(
+            message_ends[2].pointer("/envelope/event/message/role"),
+            Some(&json!("tool_result"))
+        );
+        assert_eq!(
+            message_ends[2].pointer("/envelope/event/message/tool_call_id"),
+            Some(&json!("call-1"))
+        );
+        assert_eq!(
+            message_ends[2].pointer("/envelope/event/message/tool_name"),
+            Some(&json!("fixture_tool"))
+        );
+        assert_eq!(
+            message_ends[2].pointer("/envelope/event/message/is_error"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            start_ids[2],
+            expected_tool_result_message_id(start_ids[1], "call-1"),
+            "tool-result message ID must be bound to its assistant/tool-call pair"
+        );
+        assert_ne!(start_ids[1], start_ids[3]);
+        assert!(!start_ids[3].is_empty());
+        assert_eq!(
+            message_ends[3].pointer("/envelope/event/message/content"),
+            Some(&json!([{ "text": "complete", "type": "text", "wire_item_index": 0 }]))
+        );
+        assert_eq!(
+            message_ends[3].pointer("/envelope/event/message/stop_reason"),
+            Some(&json!("stop"))
+        );
+        assert_eq!(
+            message_ends[3].pointer("/envelope/event/message/provider_code"),
+            Some(&json!("stop"))
+        );
         assert_eq!(tool_executions.load(Ordering::SeqCst), 1);
         let progress = frames
             .iter()
@@ -1469,13 +1602,75 @@ mod tests {
             progress.pointer("/envelope/event/partial/phase"),
             Some(&json!("half"))
         );
+        let ack_indices: Vec<_> = frames
+            .iter()
+            .enumerate()
+            .filter_map(|(index, frame)| {
+                (frame.get("frame_type") == Some(&json!("command_ack"))).then_some(index)
+            })
+            .collect();
+        assert_eq!(ack_indices, vec![0, frames.len() - 1]);
         assert_eq!(
-            frames
+            ack_indices
                 .iter()
-                .filter(|frame| frame.get("frame_type") == Some(&json!("command_ack")))
-                .filter_map(|frame| frame.pointer("/ack/status").and_then(Value::as_str))
+                .filter_map(|index| frames[*index]
+                    .pointer("/ack/status")
+                    .and_then(Value::as_str))
                 .collect::<Vec<_>>(),
             vec!["received", "applied"]
+        );
+        assert!(ack_indices.iter().all(|index| {
+            frames[*index].pointer("/ack/command_id")
+                == Some(&json!("018f6f75-43f7-7c2e-8d9a-0f6c83e75b1a"))
+                && frames[*index].pointer("/ack/seq") == Some(&json!(1))
+        }));
+
+        let requests = requests.lock().expect("requests").clone();
+        assert_eq!(
+            requests.len(),
+            2,
+            "tool lifecycle must issue exactly two requests"
+        );
+        assert_eq!(requests[0].pointer("/model"), Some(&json!("kimi-k3")));
+        assert_eq!(requests[0].pointer("/stream"), Some(&json!(true)));
+        assert_eq!(
+            requests[0].pointer("/messages/0"),
+            Some(&json!({"role":"system", "content":"fixture"}))
+        );
+        assert_eq!(
+            requests[0].pointer("/messages/1"),
+            Some(&json!({
+                "role":"user",
+                "content":[{"text":"run", "type":"text"}]
+            }))
+        );
+        assert_eq!(
+            requests[0].pointer("/tools/0/function/name"),
+            Some(&json!("fixture_tool"))
+        );
+        assert_eq!(
+            requests[1].pointer("/messages/2"),
+            Some(&json!({
+                "role":"assistant",
+                "reasoning_content":"",
+                "tool_calls":[{
+                    "id":"call-1",
+                    "type":"function",
+                    "function":{"name":"fixture_tool", "arguments":"{\"value\":\"x\"}"}
+                }]
+            }))
+        );
+        assert_eq!(
+            requests[1].pointer("/messages/3/role"),
+            Some(&json!("tool"))
+        );
+        assert_eq!(
+            requests[1].pointer("/messages/3/content"),
+            Some(&json!("done"))
+        );
+        assert_eq!(
+            requests[1].pointer("/messages/3/tool_call_id"),
+            Some(&json!("call-1"))
         );
         let timings = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -1738,7 +1933,7 @@ mod tests {
             provider_context: vec![],
             tools: registry.definitions(),
         };
-        let (base_url, server) = serve_tool_then_text().await;
+        let (base_url, server, _) = serve_tool_then_text().await;
         let mut spec = ModelSpec::preset("kimi-k3").expect("preset");
         spec.base_url = base_url;
         let starter: Arc<StreamStarter> = Arc::new(|spec, context, options, cancel, observer| {
