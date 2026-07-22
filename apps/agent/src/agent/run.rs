@@ -31,7 +31,7 @@ use crate::{
 use super::{
     AdmittedCommand, AgentEvent, DurableRunBinding, ProjectedProviderEvent, ProviderEventProjector,
     ProviderTerminalKind, RunCompletion, RunControl, RunCore, RunOutput, RunWorker, SteerMode,
-    WorkerFailure, WorkerFuture,
+    ToolStartCommitBarrier, WorkerFailure, WorkerFuture,
 };
 
 const LENGTH_TOOL_FAILURE: &str = "Tool call was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.";
@@ -665,7 +665,7 @@ impl Runner {
     ) -> Result<Vec<ToolResultMessage>, WorkerFailure> {
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {
-            self.emit_tool_start(call).await?;
+            self.emit_tool_start_and_wait_committed(call).await?;
             let result = match self
                 .driver
                 .execute_tool(call, CancellationToken::new())
@@ -685,13 +685,29 @@ impl Runner {
         Ok(results)
     }
 
-    async fn emit_tool_start(&mut self, call: &ToolCall) -> Result<(), WorkerFailure> {
-        self.emit(AgentEvent::ToolExecutionStart {
-            tool_call_id: call.id.clone(),
-            tool_name: call.name.clone(),
-            args: Value::Object(call.arguments.as_object().clone()),
+    async fn emit_tool_start_and_wait_committed(
+        &mut self,
+        call: &ToolCall,
+    ) -> Result<(), WorkerFailure> {
+        let binding = self.core.durable_binding.clone().ok_or_else(|| {
+            WorkerFailure::Error("RunCore has no durable worker binding".to_owned())
+        })?;
+        let (commit_barrier, committed) = ToolStartCommitBarrier::channel();
+        self.events
+            .send(RunOutput {
+                binding,
+                event: AgentEvent::ToolExecutionStart {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    args: Value::Object(call.arguments.as_object().clone()),
+                },
+                commit_barrier: Some(commit_barrier),
+            })
+            .await
+            .map_err(|_| WorkerFailure::EventChannelClosed)?;
+        committed.await.map_err(|_| {
+            WorkerFailure::Error("ToolExecutionStart durability commit failed".to_owned())
         })
-        .await
     }
 
     async fn emit_tool_result(
@@ -935,7 +951,11 @@ impl Runner {
             WorkerFailure::Error("RunCore has no durable worker binding".to_owned())
         })?;
         self.events
-            .send(RunOutput { binding, event })
+            .send(RunOutput {
+                binding,
+                event,
+                commit_barrier: None,
+            })
             .await
             .map_err(|_| WorkerFailure::EventChannelClosed)
     }
