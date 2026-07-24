@@ -8,8 +8,9 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use chrono::{TimeZone, Utc};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc};
+use tokio_util::sync::CancellationToken;
 
 use super::*;
 use crate::{
@@ -130,12 +131,17 @@ impl RunDriver for FixtureDriver {
             .ok_or_else(|| anyhow!("fixture executor generation mismatch"))
     }
 
-    async fn start_provider(
+    async fn start_provider_for_command(
         &self,
         attempt: usize,
         context: &[ContextMessage],
+        command_received_at: Option<std::time::Instant>,
         _cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
+        self.started_command_times
+            .lock()
+            .expect("command times")
+            .push(command_received_at);
         self.started_contexts
             .lock()
             .expect("contexts")
@@ -153,24 +159,12 @@ impl RunDriver for FixtureDriver {
         }
     }
 
-    async fn start_provider_for_command(
+    async fn execute_tool_observed(
         &self,
-        attempt: usize,
-        context: &[ContextMessage],
-        command_received_at: Option<std::time::Instant>,
-        cancel: CancellationToken,
-    ) -> Result<ProviderAttempt> {
-        self.started_command_times
-            .lock()
-            .expect("command times")
-            .push(command_received_at);
-        self.start_provider(attempt, context, cancel).await
-    }
-
-    async fn execute_tool(
-        &self,
+        _flow_id: &str,
         call: &ToolCall,
         _cancel: CancellationToken,
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
     ) -> Result<ToolResultMessage> {
         let active = self.active_tools.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_active_tools.fetch_max(active, Ordering::SeqCst);
@@ -2084,6 +2078,94 @@ async fn successful_stop_overflow_returns_a_typed_deferred_apply_marker() {
         Some(OverflowSource::StopUsage)
     );
     assert_eq!(core.runtime_context.len(), 2, "successful Stop is retained");
+}
+
+struct UpdateDriver {
+    notify: Arc<Notify>,
+}
+
+#[async_trait]
+impl RunDriver for UpdateDriver {
+    fn validate_executor_generation(&self, _generation: ProcessGeneration) -> Result<()> {
+        Ok(())
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        _attempt: usize,
+        _context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        Err(anyhow!("UpdateDriver has no provider"))
+    }
+
+    async fn execute_tool_observed(
+        &self,
+        _flow_id: &str,
+        call: &ToolCall,
+        _cancel: CancellationToken,
+        on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage> {
+        self.notify.notified().await;
+        on_update(json!({"phase":"half"}));
+        Ok(ToolResultMessage {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            content: vec![UserContent::Text {
+                text: "done".to_owned(),
+            }],
+            details: json!({"ok":true}),
+            is_error: false,
+            timestamp: timestamp(),
+        })
+    }
+
+    fn synthetic_error(&self, message: &str) -> PublicMessage {
+        public_message(&assistant(
+            StopReason::Error,
+            Vec::new(),
+            Some(message),
+            None,
+        ))
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        _active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        Err(anyhow!("UpdateDriver has no overflow recovery"))
+    }
+}
+
+#[tokio::test]
+async fn progress_event_channel_close_propagates_worker_failure_without_synthetic_result() {
+    let (events_tx, events_rx) = mpsc::channel(8);
+    let (_controls_tx, controls_rx) = mpsc::channel(1);
+    let notify = Arc::new(Notify::new());
+    let core = bound_core(1);
+    let driver: Arc<dyn RunDriver> = Arc::new(UpdateDriver {
+        notify: notify.clone(),
+    });
+    let mut runner = Runner::new(core, driver, controls_rx, events_tx);
+    let call = call("call-1");
+    drop(events_rx);
+    let result =
+        tokio::spawn(async move { runner.execute_tool_with_updates("assistant-1", &call).await });
+    notify.notify_one();
+    let result = result
+        .await
+        .expect("runner task join")
+        .expect_err("progress emission must fail");
+    assert!(
+        matches!(
+            result,
+            ExecuteToolError::Worker(WorkerFailure::EventChannelClosed)
+        ),
+        "progress channel loss must remain typed as a worker failure, not a tool error: {result:?}"
+    );
 }
 
 #[tokio::test]

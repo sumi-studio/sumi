@@ -87,38 +87,21 @@ pub(crate) trait RunDriver: Send + Sync + 'static {
     /// Fail closed before Session creates keys, recovery state, or a worker.
     fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()>;
 
-    async fn start_provider(
-        &self,
-        attempt: usize,
-        context: &[ContextMessage],
-        cancel: CancellationToken,
-    ) -> Result<ProviderAttempt>;
-
     async fn start_provider_for_command(
         &self,
         attempt: usize,
         context: &[ContextMessage],
-        _command_received_at: Option<std::time::Instant>,
+        command_received_at: Option<std::time::Instant>,
         cancel: CancellationToken,
-    ) -> Result<ProviderAttempt> {
-        self.start_provider(attempt, context, cancel).await
-    }
-
-    async fn execute_tool(
-        &self,
-        call: &ToolCall,
-        cancel: CancellationToken,
-    ) -> Result<ToolResultMessage>;
+    ) -> Result<ProviderAttempt>;
 
     async fn execute_tool_observed(
         &self,
-        _flow_id: &str,
+        flow_id: &str,
         call: &ToolCall,
         cancel: CancellationToken,
-        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
-    ) -> Result<ToolResultMessage> {
-        self.execute_tool(call, cancel).await
-    }
+        on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage>;
 
     fn synthetic_error(&self, message: &str) -> PublicMessage;
 
@@ -187,6 +170,20 @@ struct Runner {
     consecutive_length_batches: usize,
     in_flight_control: Option<AdmittedCommand>,
     pending_command_received_at: Option<std::time::Instant>,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ExecuteToolError {
+    #[error("tool execution failed: {0}")]
+    Tool(anyhow::Error),
+    #[error(transparent)]
+    Worker(WorkerFailure),
+}
+
+impl From<WorkerFailure> for ExecuteToolError {
+    fn from(failure: WorkerFailure) -> Self {
+        Self::Worker(failure)
+    }
 }
 
 impl Runner {
@@ -771,7 +768,10 @@ impl Runner {
                     result.tool_name.clone_from(&call.name);
                     result
                 }
-                Err(error) => error_tool_result(call, &format!("Tool execution failed: {error}")),
+                Err(ExecuteToolError::Worker(failure)) => return Err(failure),
+                Err(ExecuteToolError::Tool(error)) => {
+                    error_tool_result(call, &format!("Tool execution failed: {error}"))
+                }
             };
             receipts.push(self.emit_tool_result(assistant_message_id, &result).await?);
             results.push(result);
@@ -783,7 +783,7 @@ impl Runner {
         &mut self,
         flow_id: &str,
         call: &ToolCall,
-    ) -> Result<ToolResultMessage> {
+    ) -> Result<ToolResultMessage, ExecuteToolError> {
         const TOOL_UPDATE_CAPACITY: usize = 32;
         let (updates_tx, mut updates_rx) = mpsc::channel(TOOL_UPDATE_CAPACITY);
         let callback_call_id = call.id.clone();
@@ -817,7 +817,7 @@ impl Runner {
             })
             .await?;
         }
-        result
+        result.map_err(ExecuteToolError::Tool)
     }
 
     async fn emit_tool_start_and_wait_committed(

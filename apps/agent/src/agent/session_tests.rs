@@ -12,6 +12,8 @@ use async_trait::async_trait;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use serde_json::Value;
+
 use super::*;
 use crate::{
     gateway::{CommandAck, CommandId},
@@ -2128,10 +2130,11 @@ impl RunDriver for MultiRejectedReceiptDriver {
             .ok_or_else(|| anyhow!("fixture executor generation mismatch"))
     }
 
-    async fn start_provider(
+    async fn start_provider_for_command(
         &self,
         attempt: usize,
         context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
         cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
         self.observed_contexts
@@ -2213,10 +2216,12 @@ impl RunDriver for MultiRejectedReceiptDriver {
         })
     }
 
-    async fn execute_tool(
+    async fn execute_tool_observed(
         &self,
+        _flow_id: &str,
         _call: &ToolCall,
         _cancel: CancellationToken,
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
     ) -> Result<ToolResultMessage> {
         Err(anyhow!("rejected calls must never execute"))
     }
@@ -2273,10 +2278,11 @@ impl RunDriver for DurableToolBarrierDriver {
             .ok_or_else(|| anyhow!("fixture executor generation mismatch"))
     }
 
-    async fn start_provider(
+    async fn start_provider_for_command(
         &self,
         attempt: usize,
         context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
         cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
         self.observed_contexts
@@ -2334,10 +2340,12 @@ impl RunDriver for DurableToolBarrierDriver {
         })
     }
 
-    async fn execute_tool(
+    async fn execute_tool_observed(
         &self,
+        _flow_id: &str,
         call: &ToolCall,
         _cancel: CancellationToken,
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
     ) -> Result<ToolResultMessage> {
         self.executions.fetch_add(1, Ordering::SeqCst);
         let state: String =
@@ -2952,19 +2960,22 @@ impl RunDriver for StartFailureDriver {
             .ok_or_else(|| anyhow!("fixture executor generation mismatch"))
     }
 
-    async fn start_provider(
+    async fn start_provider_for_command(
         &self,
         _attempt: usize,
         _context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
         _cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
         Err(anyhow!("fixture provider start failure"))
     }
 
-    async fn execute_tool(
+    async fn execute_tool_observed(
         &self,
+        _flow_id: &str,
         _call: &ToolCall,
         _cancel: CancellationToken,
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
     ) -> Result<ToolResultMessage> {
         Err(anyhow!("start-failure fixture has no tools"))
     }
@@ -2996,10 +3007,11 @@ impl RunDriver for OpaqueContextDriver {
             .ok_or_else(|| anyhow!("fixture executor generation mismatch"))
     }
 
-    async fn start_provider(
+    async fn start_provider_for_command(
         &self,
         _attempt: usize,
         _context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
         _cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
         let origin = ProviderOrigin {
@@ -3074,10 +3086,12 @@ impl RunDriver for OpaqueContextDriver {
         })
     }
 
-    async fn execute_tool(
+    async fn execute_tool_observed(
         &self,
+        _flow_id: &str,
         _call: &ToolCall,
         _cancel: CancellationToken,
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
     ) -> Result<ToolResultMessage> {
         Err(anyhow!("opaque fixture has no tools"))
     }

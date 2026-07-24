@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
+    memory::transform,
     provider::{
         ModelSpec, ProviderTimingObservation, ProviderTimingObservations, ProviderTimingObserver,
         RequestOptions, stream_observed, timing_observation_channel,
@@ -225,15 +226,6 @@ impl RunDriver for InjectedRunDriver {
         Ok(())
     }
 
-    async fn start_provider(
-        &self,
-        _attempt: usize,
-        _context: &[ContextMessage],
-        _cancel: CancellationToken,
-    ) -> Result<ProviderAttempt> {
-        bail!("command receive timestamp was not supplied to the injected provider driver")
-    }
-
     async fn start_provider_for_command(
         &self,
         _attempt: usize,
@@ -242,7 +234,9 @@ impl RunDriver for InjectedRunDriver {
         cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
         let mut prompt = self.prompt.clone();
-        prompt.messages = context.to_vec();
+        // Derive the send view immediately before the provider call.  The
+        // runner's retained runtime_context anchors must not be mutated.
+        prompt.messages = transform::transform(context, &self.spec.origin());
         // Re-check at use time: the frozen registry remains the authority.
         if prompt.tools != self.registry.definitions() {
             bail!("provider prompt tools diverged from the frozen registry");
@@ -271,14 +265,6 @@ impl RunDriver for InjectedRunDriver {
             initial_message: self.initial_message(),
             events,
         })
-    }
-
-    async fn execute_tool(
-        &self,
-        _call: &ToolCall,
-        _cancel: CancellationToken,
-    ) -> Result<ToolResultMessage> {
-        bail!("tool flow identity and progress callback were not supplied")
     }
 
     async fn execute_tool_observed(
@@ -445,7 +431,8 @@ mod tests {
         provider::{
             ProviderTimingObservation, stream_with_api_key_observed,
             types::{
-                AssistantMessage, ProviderEvent, ProviderOutput, ToolDefinition, UserContent,
+                AssistantContent, AssistantMessage, ContextMessage, Message, ProviderEvent,
+                ProviderOutput, StopReason, ToolDefinition, Usage, UserContent, UserMessage,
                 ValidatedToolArguments,
             },
         },
@@ -1991,5 +1978,119 @@ mod tests {
             "tool future was dropped before cancellation"
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn provider_send_view_is_transformed_without_mutating_active_context() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let captured = sent.clone();
+        let starter: Arc<StreamStarter> =
+            Arc::new(move |spec, prompt, _options, cancel, _observer| {
+                *captured.lock().expect("sent") = prompt.messages;
+                let (tx, rx) = mpsc::channel(1);
+                drop(tx);
+                ProviderEventStream::new(rx, cancel, spec.provider.clone(), spec.origin())
+            });
+        let (spec, prompt, registry, workspace) = dependencies();
+        let driver = InjectedRunDriver::with_stream_starter(
+            spec.clone(),
+            RequestOptions::default(),
+            Some(prompt),
+            Some(registry),
+            Some(workspace),
+            Some(generation(1)),
+            starter,
+        )
+        .expect("driver");
+
+        let user = ContextMessage::Persisted {
+            id: "u1".to_owned(),
+            seq: 1,
+            message: Message::User(UserMessage {
+                content: vec![UserContent::Text {
+                    text: "hello".to_owned(),
+                }],
+                timestamp: Utc::now(),
+            }),
+        };
+        let error = ContextMessage::Persisted {
+            id: "e1".to_owned(),
+            seq: 2,
+            message: Message::Assistant(AssistantMessage {
+                content: Vec::new(),
+                model: "fixture-model".to_owned(),
+                provider: "fixture".to_owned(),
+                origin: spec.origin(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Error,
+                error_message: Some("boom".to_owned()),
+                provider_code: None,
+                interrupted: false,
+                timestamp: Utc::now(),
+            }),
+        };
+        let cross_model = ContextMessage::Persisted {
+            id: "a1".to_owned(),
+            seq: 3,
+            message: Message::Assistant(AssistantMessage {
+                content: vec![
+                    AssistantContent::Thinking {
+                        thinking: "private".to_owned(),
+                        signature_field: "reasoning_content".to_owned(),
+                        wire_item_index: 0,
+                    },
+                    AssistantContent::Text {
+                        text: "visible".to_owned(),
+                        wire_item_index: 1,
+                    },
+                ],
+                model: "different-model".to_owned(),
+                provider: spec.provider.clone(),
+                origin: spec.origin(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                provider_code: None,
+                interrupted: false,
+                timestamp: Utc::now(),
+            }),
+        };
+        let active_context = vec![user, error, cross_model];
+        let active_context_clone = active_context.clone();
+        driver
+            .start_provider_for_command(0, &active_context, None, CancellationToken::new())
+            .await
+            .expect("start");
+
+        let captured = sent.lock().expect("captured").clone();
+        let expected = crate::memory::transform::transform(&active_context, &spec.origin());
+        assert_eq!(
+            captured, expected,
+            "provider must receive the transformed send view"
+        );
+        assert_eq!(
+            active_context, active_context_clone,
+            "retained active context must not be mutated"
+        );
+        assert_eq!(
+            captured.len(),
+            2,
+            "Error assistant must be excluded while cross-model visible text is retained"
+        );
+        let ContextMessage::Persisted {
+            message: Message::Assistant(assistant),
+            ..
+        } = &captured[1]
+        else {
+            panic!("expected transformed cross-model assistant");
+        };
+        assert_eq!(
+            assistant.content,
+            vec![AssistantContent::Text {
+                text: "visible".to_owned(),
+                wire_item_index: 1,
+            }],
+            "destination-sensitive cross-model thinking must not be replayed"
+        );
     }
 }
