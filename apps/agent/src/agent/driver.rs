@@ -28,7 +28,7 @@ use crate::{
         },
     },
     runtime::contracts::ProcessGeneration,
-    tools::{ToolCtx, ToolRegistry, WorkspacePaths},
+    tools::{ToolCtx, ToolError, ToolRegistry, WorkspacePaths},
 };
 
 use super::{
@@ -273,14 +273,16 @@ impl RunDriver for InjectedRunDriver {
         call: &ToolCall,
         cancel: CancellationToken,
         on_update: Arc<dyn Fn(Value) + Send + Sync>,
-    ) -> Result<ToolResultMessage> {
+    ) -> Result<ToolResultMessage, ToolError> {
         if flow_id.is_empty() || call.id.is_empty() {
-            bail!("tool execution identity must be non-empty");
+            return Err(ToolError::Protocol(
+                "tool execution identity must be non-empty".to_owned(),
+            ));
         }
         let tool = self
             .registry
             .get(&call.name)
-            .ok_or_else(|| anyhow!("unknown frozen tool: {}", call.name))?;
+            .ok_or_else(|| ToolError::Protocol(format!("unknown frozen tool: {}", call.name)))?;
         let output = tool
             .execute(ToolCtx {
                 flow_id,

@@ -26,6 +26,7 @@ use crate::{
     },
     runtime::contracts::{MAX_PROCESS_GENERATION, ProcessGeneration},
     store::{Store, user_message_id},
+    tools::ToolError,
 };
 
 fn test_executor_generation() -> ProcessGeneration {
@@ -2222,8 +2223,10 @@ impl RunDriver for MultiRejectedReceiptDriver {
         _call: &ToolCall,
         _cancel: CancellationToken,
         _on_update: Arc<dyn Fn(Value) + Send + Sync>,
-    ) -> Result<ToolResultMessage> {
-        Err(anyhow!("rejected calls must never execute"))
+    ) -> Result<ToolResultMessage, ToolError> {
+        Err(ToolError::Protocol(
+            "rejected calls must never execute".to_owned(),
+        ))
     }
 
     fn synthetic_error(&self, message: &str) -> PublicMessage {
@@ -2346,13 +2349,14 @@ impl RunDriver for DurableToolBarrierDriver {
         call: &ToolCall,
         _cancel: CancellationToken,
         _on_update: Arc<dyn Fn(Value) + Send + Sync>,
-    ) -> Result<ToolResultMessage> {
+    ) -> Result<ToolResultMessage, ToolError> {
         self.executions.fetch_add(1, Ordering::SeqCst);
         let state: String =
             sqlx::query_scalar("SELECT state FROM tool_executions WHERE tool_call_id = ?")
                 .bind(&call.id)
                 .fetch_one(&self.pool)
-                .await?;
+                .await
+                .map_err(|error| ToolError::Protocol(format!("fixture query failed: {error}")))?;
         self.observed_running
             .store(state == "running", Ordering::SeqCst);
         Ok(ToolResultMessage {
@@ -2380,6 +2384,155 @@ impl RunDriver for DurableToolBarrierDriver {
         _active_context: &[ContextMessage],
     ) -> Result<OverflowRecoveryOutcome> {
         Err(anyhow!("barrier fixture has no overflow recovery"))
+    }
+}
+
+struct IndeterminateToolDriver {
+    pool: sqlx::SqlitePool,
+    provider_attempts: AtomicUsize,
+    executions: AtomicUsize,
+    observed_running: AtomicBool,
+}
+
+impl IndeterminateToolDriver {
+    fn new(pool: sqlx::SqlitePool) -> Self {
+        Self {
+            pool,
+            provider_attempts: AtomicUsize::new(0),
+            executions: AtomicUsize::new(0),
+            observed_running: AtomicBool::new(false),
+        }
+    }
+
+    fn origin() -> ProviderOrigin {
+        ProviderOrigin {
+            provider_instance_id: "indeterminate-tool".to_owned(),
+            protocol: ApiProtocol::OpenAiChatCompletions,
+            model: "indeterminate-model".to_owned(),
+        }
+    }
+}
+
+#[async_trait]
+impl RunDriver for IndeterminateToolDriver {
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+        (generation == test_executor_generation())
+            .then_some(())
+            .ok_or_else(|| anyhow!("fixture executor generation mismatch"))
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        attempt: usize,
+        _context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.provider_attempts.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = mpsc::channel(8);
+        tx.try_send(ProviderEvent::Start).expect("provider start");
+        let reason = if attempt == 0 {
+            let call = ToolCall {
+                id: "indeterminate-call".to_owned(),
+                name: "fixture-tool".to_owned(),
+                arguments: serde_json::from_value::<ValidatedToolArguments>(
+                    serde_json::json!({"safe": true}),
+                )?,
+            };
+            tx.try_send(ProviderEvent::ToolCallStart { content_index: 0 })?;
+            tx.try_send(ProviderEvent::ToolCallEnd {
+                content_index: 0,
+                tool_call: call.clone(),
+            })?;
+            let message = AssistantMessage {
+                content: vec![AssistantContent::ToolCall {
+                    tool_call: call,
+                    wire_item_index: 0,
+                }],
+                model: "indeterminate-model".to_owned(),
+                provider: "fixture".to_owned(),
+                origin: Self::origin(),
+                usage: Usage::default(),
+                stop_reason: StopReason::ToolUse,
+                error_message: None,
+                provider_code: None,
+                interrupted: false,
+                timestamp: Utc::now(),
+            };
+            tx.try_send(ProviderEvent::Done {
+                reason: StopReason::ToolUse,
+                output: ProviderOutput {
+                    message,
+                    provider_context: Vec::new(),
+                },
+            })?;
+            StopReason::ToolUse
+        } else {
+            let message = AssistantMessage {
+                content: Vec::new(),
+                model: "indeterminate-model".to_owned(),
+                provider: "fixture".to_owned(),
+                origin: Self::origin(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                provider_code: None,
+                interrupted: false,
+                timestamp: Utc::now(),
+            };
+            tx.try_send(ProviderEvent::Done {
+                reason: StopReason::Stop,
+                output: ProviderOutput {
+                    message,
+                    provider_context: Vec::new(),
+                },
+            })?;
+            StopReason::Stop
+        };
+        drop(tx);
+        Ok(ProviderAttempt {
+            message_id: format!("indeterminate-assistant-{attempt}"),
+            initial_message: bridge_assistant(reason),
+            events: ProviderEventStream::new(rx, cancel, "fixture", Self::origin()),
+        })
+    }
+
+    async fn execute_tool_observed(
+        &self,
+        _flow_id: &str,
+        call: &ToolCall,
+        _cancel: CancellationToken,
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage, ToolError> {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM tool_executions WHERE tool_call_id = ?")
+                .bind(&call.id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|error| ToolError::Protocol(format!("fixture query failed: {error}")))?;
+        self.observed_running
+            .store(state == "running", Ordering::SeqCst);
+        Err(ToolError::RpcIndeterminate(
+            "mutating RPC request may have committed but terminal reply was lost".to_owned(),
+        ))
+    }
+
+    fn synthetic_error(&self, message: &str) -> PublicMessage {
+        let PublicMessage::Assistant(mut assistant) = bridge_assistant(StopReason::Error) else {
+            unreachable!()
+        };
+        assistant.error_message = Some(message.to_owned());
+        PublicMessage::Assistant(assistant)
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        _active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        Err(anyhow!("indeterminate fixture has no overflow recovery"))
     }
 }
 
@@ -2592,6 +2745,92 @@ async fn tool_driver_observes_running_only_after_start_commit() {
             .await
             .expect("tool row");
     assert_eq!(state, "succeeded");
+}
+
+#[tokio::test]
+async fn rpc_indeterminate_after_start_fails_worker_and_leaves_durable_tool_running() {
+    let store = Store::session_test_store("rpc-indeterminate-after-start")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let driver = Arc::new(IndeterminateToolDriver::new(pool.clone()));
+    let (gateway, _commands, frames) = gateway();
+    let mut session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        Arc::new(SequentialRunWorker::new(driver.clone())),
+        test_executor_generation(),
+    )
+    .await
+    .expect("session");
+    session.admit_and_route(user(1)).await.expect("command");
+    let failure = drive_active_to_completion(&mut session)
+        .await
+        .expect_err("run must fail after indeterminate tool outcome");
+    session.shutdown_active().await;
+    session.wait_outbound_idle().await;
+
+    assert!(driver.observed_running.load(Ordering::SeqCst));
+    assert_eq!(driver.provider_attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(driver.executions.load(Ordering::SeqCst), 1);
+    assert!(
+        failure
+            .to_string()
+            .contains("tool RPC outcome is indeterminate"),
+        "worker failure must expose indeterminate RPC outcome: {failure}"
+    );
+
+    let state: String = sqlx::query_scalar(
+        "SELECT state FROM tool_executions WHERE tool_call_id='indeterminate-call'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("tool row");
+    assert_eq!(state, "running");
+
+    let tool_end_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_events WHERE event_type='tool_execution_end'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("tool end event count");
+    assert_eq!(tool_end_events, 0);
+
+    let tool_result_messages: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE role='tool_result'")
+            .fetch_one(&pool)
+            .await
+            .expect("tool result message count");
+    assert_eq!(tool_result_messages, 0);
+
+    assert!(
+        !frames.lock().expect("frame mutex").iter().any(|frame| {
+            matches!(frame, OutboundFrame::Event { envelope } if {
+                let t = envelope.event["type"].as_str();
+                t == Some("tool_execution_end")
+                    || ((t == Some("message_start") || t == Some("message_end"))
+                        && envelope
+                            .event
+                            .get("message")
+                            .and_then(|m| m.get("role"))
+                            .and_then(|r| r.as_str())
+                            == Some("tool_result"))
+            })
+        }),
+        "no terminal tool event or result frame may be emitted"
+    );
+
+    let applied_acks = frames
+        .lock()
+        .expect("frame mutex")
+        .iter()
+        .filter(|frame| {
+            matches!(frame, OutboundFrame::CommandAck { ack }
+                if ack.status == CommandAckStatus::Applied)
+        })
+        .count();
+    assert_eq!(applied_acks, 0, "no applied terminal ack for failed run");
 }
 
 #[tokio::test]
@@ -2976,8 +3215,10 @@ impl RunDriver for StartFailureDriver {
         _call: &ToolCall,
         _cancel: CancellationToken,
         _on_update: Arc<dyn Fn(Value) + Send + Sync>,
-    ) -> Result<ToolResultMessage> {
-        Err(anyhow!("start-failure fixture has no tools"))
+    ) -> Result<ToolResultMessage, ToolError> {
+        Err(ToolError::Protocol(
+            "start-failure fixture has no tools".to_owned(),
+        ))
     }
 
     fn synthetic_error(&self, message: &str) -> PublicMessage {
@@ -3092,8 +3333,10 @@ impl RunDriver for OpaqueContextDriver {
         _call: &ToolCall,
         _cancel: CancellationToken,
         _on_update: Arc<dyn Fn(Value) + Send + Sync>,
-    ) -> Result<ToolResultMessage> {
-        Err(anyhow!("opaque fixture has no tools"))
+    ) -> Result<ToolResultMessage, ToolError> {
+        Err(ToolError::Protocol(
+            "opaque fixture has no tools".to_owned(),
+        ))
     }
 
     fn synthetic_error(&self, message: &str) -> PublicMessage {

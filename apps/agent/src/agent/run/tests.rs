@@ -22,6 +22,7 @@ use crate::{
         RejectedToolCall, ToolArgumentError, Usage, ValidatedToolArguments,
     },
     runtime::contracts::ProcessGeneration,
+    tools::ToolError,
 };
 
 fn test_executor_generation() -> ProcessGeneration {
@@ -165,7 +166,7 @@ impl RunDriver for FixtureDriver {
         call: &ToolCall,
         _cancel: CancellationToken,
         _on_update: Arc<dyn Fn(Value) + Send + Sync>,
-    ) -> Result<ToolResultMessage> {
+    ) -> Result<ToolResultMessage, ToolError> {
         let active = self.active_tools.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_active_tools.fetch_max(active, Ordering::SeqCst);
         self.tool_order
@@ -180,7 +181,7 @@ impl RunDriver for FixtureDriver {
             .expect("tool failures")
             .pop_front()
         {
-            return Err(anyhow!(error));
+            return Err(ToolError::Protocol(error.to_owned()));
         }
         Ok(ToolResultMessage {
             tool_call_id: call.id.clone(),
@@ -2106,7 +2107,7 @@ impl RunDriver for UpdateDriver {
         call: &ToolCall,
         _cancel: CancellationToken,
         on_update: Arc<dyn Fn(Value) + Send + Sync>,
-    ) -> Result<ToolResultMessage> {
+    ) -> Result<ToolResultMessage, ToolError> {
         self.notify.notified().await;
         on_update(json!({"phase":"half"}));
         Ok(ToolResultMessage {

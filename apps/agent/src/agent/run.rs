@@ -35,6 +35,7 @@ use crate::{
     },
     runtime::contracts::ProcessGeneration,
     store::user_message_id,
+    tools::ToolError,
 };
 
 use super::{
@@ -101,7 +102,7 @@ pub(crate) trait RunDriver: Send + Sync + 'static {
         call: &ToolCall,
         cancel: CancellationToken,
         on_update: Arc<dyn Fn(Value) + Send + Sync>,
-    ) -> Result<ToolResultMessage>;
+    ) -> Result<ToolResultMessage, ToolError>;
 
     fn synthetic_error(&self, message: &str) -> PublicMessage;
 
@@ -175,7 +176,7 @@ struct Runner {
 #[derive(Debug, thiserror::Error)]
 enum ExecuteToolError {
     #[error("tool execution failed: {0}")]
-    Tool(anyhow::Error),
+    Tool(ToolError),
     #[error(transparent)]
     Worker(WorkerFailure),
 }
@@ -769,6 +770,11 @@ impl Runner {
                     result
                 }
                 Err(ExecuteToolError::Worker(failure)) => return Err(failure),
+                Err(ExecuteToolError::Tool(ToolError::RpcIndeterminate(message))) => {
+                    return Err(WorkerFailure::Error(format!(
+                        "tool RPC outcome is indeterminate: {message}"
+                    )));
+                }
                 Err(ExecuteToolError::Tool(error)) => {
                     error_tool_result(call, &format!("Tool execution failed: {error}"))
                 }
