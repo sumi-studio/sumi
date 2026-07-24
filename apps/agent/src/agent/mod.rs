@@ -14,7 +14,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -77,6 +77,10 @@ const CONTROL_CHANNEL_CAPACITY: usize = 32;
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 const OUTBOUND_CHANNEL_CAPACITY: usize = 64;
 const VOLATILE_OUTBOUND_BUDGET: usize = 32;
+/// Bounds the in-process Session↔worker retry-steer authorization rendezvous.
+/// This is not provider retry backoff; it only prevents one stalled local task
+/// from blocking the Session event lane indefinitely.
+const RETRY_STEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(250);
 /// API admission permits 32 ordinary commands plus one reserved Abort.
 const PENDING_ORDINARY_CONTROL_CAPACITY: usize = 32;
 const PENDING_CONTROL_CAPACITY: usize = PENDING_ORDINARY_CONTROL_CAPACITY + 1;
@@ -770,6 +774,12 @@ impl<G: Gateway + 'static> Session<G> {
             return Ok(false);
         }
 
+        let mut phase_rx = self
+            .active
+            .as_ref()
+            .expect("retry eligibility requires an active run")
+            .phase_rx
+            .clone();
         let (accepted_tx, accepted_rx) = oneshot::channel();
         let (committed_tx, committed_rx) = oneshot::channel();
         let control = RunControl::RetrySteer {
@@ -786,7 +796,7 @@ impl<G: Gateway + 'static> Session<G> {
         if sent.is_err() {
             return Ok(false);
         }
-        if !accepted_rx.await.unwrap_or(false) {
+        if !await_retry_steer_acceptance(&mut phase_rx, accepted_rx).await {
             return Ok(false);
         }
         self.active
@@ -1239,6 +1249,25 @@ fn worker_join_failure(error: tokio::task::JoinError) -> SessionFailure {
         error.to_string()
     };
     SessionFailure::WorkerPanicked { message }
+}
+
+async fn await_retry_steer_acceptance(
+    phase_rx: &mut watch::Receiver<WorkerPhase>,
+    accepted_rx: oneshot::Receiver<bool>,
+) -> bool {
+    if *phase_rx.borrow_and_update() != WorkerPhase::RetryWait {
+        return false;
+    }
+    let accepted = tokio::select! {
+        biased;
+        accepted = accepted_rx => accepted.unwrap_or(false),
+        changed = phase_rx.changed() => {
+            let _ = changed;
+            false
+        }
+        () = tokio::time::sleep(RETRY_STEER_HANDSHAKE_TIMEOUT) => false,
+    };
+    accepted
 }
 
 fn committed_delivery_is_reliable(

@@ -62,6 +62,7 @@ pub fn remote_executor_registry(client: Arc<ExecutorClient>) -> Result<ToolRegis
     registry_from_invoker_for_generation(client, generation)
 }
 
+#[cfg(test)]
 fn registry_from_invoker(client: Arc<dyn ExecutorInvoker>) -> Result<ToolRegistry, ToolError> {
     registry_from_invoker_inner(client, None)
 }

@@ -824,6 +824,82 @@ async fn retry_wait_control_is_injected_mid_turn_before_next_attempt() {
 }
 
 #[tokio::test]
+async fn stale_retry_steer_acceptance_releases_exact_claim_without_loss_or_duplicate() {
+    let driver = Arc::new(
+        FixtureDriver::new(vec![
+            output(assistant(
+                StopReason::Error,
+                Vec::new(),
+                Some("network error"),
+                Some("network_error"),
+            )),
+            output(assistant(StopReason::Stop, Vec::new(), None, None)),
+        ])
+        .blocking_retry(),
+    );
+    let worker = SequentialRunWorker::new(driver.clone());
+    let (control_tx, control_rx) = mpsc::channel(8);
+    let (events_tx, mut events_rx) = mpsc::channel(256);
+    let completion = tokio::spawn(async move {
+        worker
+            .run(bound_core(1), admitted_user(1), control_rx, events_tx)
+            .await
+    });
+    let event_collector = tokio::spawn(async move {
+        let mut events = Vec::new();
+        let mut message_seq = 1;
+        while let Some(mut output) = events_rx.recv().await {
+            resolve_message_output(&mut output, &mut message_seq);
+            if let Some(barrier) = output.commit_barrier.take() {
+                barrier.committed();
+            }
+            events.push(output.event);
+        }
+        events
+    });
+    driver.retry_waiting.notified().await;
+
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    drop(accepted_rx);
+    let (_committed_tx, committed_rx) = oneshot::channel();
+    control_tx
+        .send(RunControl::RetrySteer {
+            command: admitted_user(2),
+            accepted: accepted_tx,
+            committed: committed_rx,
+        })
+        .await
+        .expect("stale retry steer");
+    control_tx
+        .send(RunControl::Command(admitted_user(2)))
+        .await
+        .expect("normal durable deferral retry");
+
+    assert_completed(completion.await.expect("worker join"));
+    let events = event_collector.await.expect("event collector");
+    let user_message_id = user_message_id(&admitted_user(2).envelope().command_id);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                matches!(event, AgentEvent::MessageEnd { message_id, .. }
+                    if message_id == &user_message_id)
+            })
+            .count(),
+        1
+    );
+    let contexts = driver.started_contexts.lock().expect("contexts");
+    assert_eq!(contexts.len(), 2);
+    assert_eq!(
+        contexts[1]
+            .iter()
+            .filter(|message| matches!(context_message(message), Message::User(_)))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
 async fn two_consecutive_length_tool_batches_prevent_third_provider_call() {
     let length = || {
         output(assistant(

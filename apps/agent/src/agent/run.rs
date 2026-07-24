@@ -1073,48 +1073,61 @@ impl Runner {
             return Ok(true);
         }
         let cancel = CancellationToken::new();
-        let injected = tokio::select! {
-            biased;
-            control = self.controls.recv() => {
-                let Some(control) = control else {
-                    return Err(WorkerFailure::Cancelled);
-                };
-                let command = match control {
-                    RunControl::Command(command) => command,
-                    RunControl::RetrySteer {
-                        command,
-                        accepted,
-                        committed,
-                    } => {
-                        self.claim_control(command)?;
-                        let _ = accepted.send(true);
-                        committed.await.map_err(|_| {
-                            WorkerFailure::Error(
-                                "retry steer durability authorization was dropped".to_owned(),
-                            )
-                        })?;
-                        return Ok(true);
+        let driver = self.driver.clone();
+        let retry = driver.wait_retry(delay, &cancel);
+        tokio::pin!(retry);
+        loop {
+            let control = tokio::select! {
+                biased;
+                control = self.controls.recv() => {
+                    let Some(control) = control else {
+                        return Err(WorkerFailure::Cancelled);
+                    };
+                    control
+                }
+                completed = &mut retry => {
+                    return if completed {
+                        Ok(false)
+                    } else {
+                        Err(WorkerFailure::Cancelled)
+                    };
+                }
+            };
+            let command = match control {
+                RunControl::Command(command) => command,
+                RunControl::RetrySteer {
+                    command,
+                    accepted,
+                    committed,
+                } => {
+                    let command_id = command.envelope().command_id.clone();
+                    self.claim_control(command)?;
+                    if accepted.send(true).is_err() {
+                        // Session timed out or observed a phase change and will
+                        // durably defer this same command. Do not claim it into
+                        // RunCore or wait on an authorization that cannot arrive.
+                        let released = self
+                            .in_flight_control
+                            .take()
+                            .expect("retry steer accepted only after exact claim");
+                        debug_assert_eq!(released.envelope().command_id, command_id);
+                        continue;
                     }
-                };
-                self.core.queue_followup(command)
-                    .map_err(|error| WorkerFailure::Error(error.to_string()))?;
-                if self.claim_pending_user()? {
-                    true
-                } else if self.driver.wait_retry(delay, &cancel).await {
-                    false
-                } else {
-                    return Err(WorkerFailure::Cancelled);
+                    committed.await.map_err(|_| {
+                        WorkerFailure::Error(
+                            "retry steer durability authorization was dropped".to_owned(),
+                        )
+                    })?;
+                    return Ok(true);
                 }
+            };
+            self.core
+                .queue_followup(command)
+                .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+            if self.claim_pending_user()? {
+                return Ok(true);
             }
-            completed = self.driver.wait_retry(delay, &cancel) => {
-                if completed {
-                    false
-                } else {
-                    return Err(WorkerFailure::Cancelled);
-                }
-            }
-        };
-        Ok(injected)
+        }
     }
 
     fn recover_received_controls(&mut self) -> Result<(), WorkerFailure> {

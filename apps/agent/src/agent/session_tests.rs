@@ -2107,6 +2107,55 @@ fn terminal_or_applied_side_effects_force_reliable_delivery_without_durable_outp
 }
 
 #[tokio::test]
+async fn retry_steer_handshake_rejects_phase_change_closed_acceptance_and_timeout() {
+    let (phase_tx, phase_rx) = watch::channel(WorkerPhase::RetryWait);
+    let (retained_tx, retained_rx) = oneshot::channel();
+    let mut changed_rx = phase_rx.clone();
+    let changed =
+        tokio::spawn(
+            async move { await_retry_steer_acceptance(&mut changed_rx, retained_rx).await },
+        );
+    tokio::task::yield_now().await;
+    phase_tx
+        .send(WorkerPhase::Active)
+        .expect("publish phase transition");
+    assert!(!changed.await.expect("phase-change handshake task"));
+    drop(retained_tx);
+
+    let (phase_tx, mut phase_rx) = watch::channel(WorkerPhase::RetryWait);
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let accepted =
+        tokio::spawn(async move { await_retry_steer_acceptance(&mut phase_rx, accepted_rx).await });
+    tokio::task::yield_now().await;
+    phase_tx
+        .send(WorkerPhase::Active)
+        .expect("publish racing phase transition");
+    accepted_tx
+        .send(true)
+        .expect("publish authoritative acceptance");
+    assert!(
+        accepted.await.expect("accepted handshake task"),
+        "accepted=true must win a simultaneous phase notification"
+    );
+
+    let (_phase_tx, mut phase_rx) = watch::channel(WorkerPhase::RetryWait);
+    let (closed_tx, closed_rx) = oneshot::channel();
+    drop(closed_tx);
+    assert!(!await_retry_steer_acceptance(&mut phase_rx, closed_rx).await);
+
+    let (_phase_tx, mut phase_rx) = watch::channel(WorkerPhase::RetryWait);
+    let (_retained_tx, retained_rx) = oneshot::channel::<bool>();
+    tokio::time::timeout(
+        RETRY_STEER_HANDSHAKE_TIMEOUT + std::time::Duration::from_millis(250),
+        async {
+            assert!(!await_retry_steer_acceptance(&mut phase_rx, retained_rx).await);
+        },
+    )
+    .await
+    .expect("bounded retry-steer handshake timeout");
+}
+
+#[tokio::test]
 async fn active_second_user_stays_received_then_runs_after_the_current_agent_end() {
     let store = Store::session_test_store("durable-deferred-second-user-session")
         .await
@@ -5199,6 +5248,211 @@ async fn retry_timer_winning_handshake_defers_command_without_loss() {
             .await
             .expect("deferred command state");
     assert_eq!(state, ("applied".to_owned(), "idle_run".to_owned()));
+}
+
+#[tokio::test]
+async fn retry_handshake_timeout_defers_once_and_unblocks_the_event_lane() {
+    let store = Store::session_test_store("retry-handshake-timeout-deferral")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (gateway, commands, frames) = gateway();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let stale_accept_failed = Arc::new(AtomicBool::new(false));
+    let worker: Arc<dyn RunWorker> = Arc::new({
+        let runs = runs.clone();
+        let stale_accept_failed = stale_accept_failed.clone();
+        move |core: RunCore,
+              initial: AdmittedCommand,
+              mut controls: mpsc::Receiver<RunControl>,
+              events: mpsc::Sender<AgentEvent>| {
+            let ordinal = runs.fetch_add(1, Ordering::SeqCst);
+            let stale_accept_failed = stale_accept_failed.clone();
+            async move {
+                emit_idle_injection(&events, &initial).await;
+                if ordinal == 0 {
+                    let mut error = match bridge_assistant(StopReason::Error) {
+                        PublicMessage::Assistant(message) => message,
+                        _ => unreachable!(),
+                    };
+                    error.error_message = Some("network error".to_owned());
+                    error.provider_code = Some("network_error".to_owned());
+                    let error = PublicMessage::Assistant(error);
+                    for event in [
+                        AgentEvent::MessageStart {
+                            message_id: "timeout-error".to_owned(),
+                            message: Box::new(bridge_assistant(StopReason::Stop)),
+                        },
+                        AgentEvent::MessageEnd {
+                            message_id: "timeout-error".to_owned(),
+                            message: Box::new(error),
+                        },
+                    ] {
+                        events.send(event).await.expect("retry error lifecycle");
+                    }
+                    let _ = core
+                        .worker_phase
+                        .as_ref()
+                        .expect("Session phase sender")
+                        .send(WorkerPhase::RetryWait);
+                    events
+                        .send(AgentEvent::RetryScheduled {
+                            attempt: 1,
+                            delay_ms: 2_000,
+                            retry_at: Utc::now(),
+                            error_message: "network error".to_owned(),
+                        })
+                        .await
+                        .expect("retry schedule");
+                    let RunControl::RetrySteer {
+                        accepted,
+                        committed,
+                        ..
+                    } = controls.recv().await.expect("candidate retry steer")
+                    else {
+                        panic!("Session must use retry handshake")
+                    };
+                    tokio::time::sleep(
+                        RETRY_STEER_HANDSHAKE_TIMEOUT + std::time::Duration::from_millis(50),
+                    )
+                    .await;
+                    stale_accept_failed.store(accepted.send(true).is_err(), Ordering::SeqCst);
+                    drop(committed);
+                    let _ = core
+                        .worker_phase
+                        .as_ref()
+                        .expect("Session phase sender")
+                        .send(WorkerPhase::Active);
+
+                    let success = bridge_assistant(StopReason::Stop);
+                    events
+                        .send(AgentEvent::MessageStart {
+                            message_id: "timeout-retry-success".to_owned(),
+                            message: Box::new(success.clone()),
+                        })
+                        .await
+                        .expect("retry success start");
+                    for sequence in 0..(EVENT_CHANNEL_CAPACITY * 3) {
+                        events
+                            .send(AgentEvent::MessageUpdate {
+                                message_id: "timeout-retry-success".to_owned(),
+                                event: PublicStreamEvent::TextDelta {
+                                    content_index: 0,
+                                    delta: sequence.to_string(),
+                                },
+                            })
+                            .await
+                            .expect("bounded event-lane progress");
+                    }
+                    for event in [
+                        AgentEvent::MessageEnd {
+                            message_id: "timeout-retry-success".to_owned(),
+                            message: Box::new(success.clone()),
+                        },
+                        AgentEvent::TurnEnd {
+                            message: Some(Box::new(success)),
+                            tool_results: Vec::new(),
+                        },
+                    ] {
+                        events.send(event).await.expect("first run terminal");
+                    }
+                } else {
+                    let success = bridge_assistant(StopReason::Stop);
+                    for event in [
+                        AgentEvent::MessageStart {
+                            message_id: "timeout-deferred-success".to_owned(),
+                            message: Box::new(success.clone()),
+                        },
+                        AgentEvent::MessageEnd {
+                            message_id: "timeout-deferred-success".to_owned(),
+                            message: Box::new(success.clone()),
+                        },
+                        AgentEvent::TurnEnd {
+                            message: Some(Box::new(success)),
+                            tool_results: Vec::new(),
+                        },
+                    ] {
+                        events.send(event).await.expect("deferred run terminal");
+                    }
+                }
+                events.send(AgentEvent::AgentEnd).await.expect("AgentEnd");
+                RunCompletion::Completed(core)
+            }
+        }
+    });
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        worker,
+        test_executor_generation(),
+    )
+    .await
+    .expect("session");
+    let task = tokio::spawn(session.run());
+
+    commands.send(user(1)).await.expect("initial command");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if frames.lock().expect("frame mutex").iter().any(|frame| {
+                matches!(frame, OutboundFrame::Event { envelope }
+                    if envelope.event["type"] == "retry_scheduled")
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("durable retry schedule");
+    commands.send(user(2)).await.expect("racing command");
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if runs.load(Ordering::SeqCst) == 2
+                && frames
+                    .lock()
+                    .expect("frame mutex")
+                    .iter()
+                    .filter(|frame| {
+                        matches!(frame, OutboundFrame::Event { envelope }
+                            if envelope.event["type"] == "agent_end")
+                    })
+                    .count()
+                    == 2
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("timeout deferral and event-lane drain");
+    drop(commands);
+    completed(task.await.expect("session join"));
+    assert!(stale_accept_failed.load(Ordering::SeqCst));
+
+    let command_id = match user(2) {
+        InboundCommand::Valid(envelope) => envelope.command_id,
+        InboundCommand::Invalid { .. } => unreachable!(),
+    };
+    assert_eq!(
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT status, application_kind FROM inbound_commands WHERE command_id=?",
+        )
+        .bind(command_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("deferred command state"),
+        ("applied".to_owned(), "idle_run".to_owned())
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE id=?")
+            .bind(user_message_id(&command_id))
+            .fetch_one(&pool)
+            .await
+            .expect("exact deferred user injection"),
+        1
+    );
 }
 
 #[tokio::test]
