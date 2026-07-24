@@ -4,14 +4,21 @@
 //! This module owns only the in-memory lifecycle after an admitted user command
 //! has been transferred together with the unique [`RunCore`].
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -26,14 +33,16 @@ use crate::{
             UserContent, UserMessage,
         },
     },
+    runtime::contracts::ProcessGeneration,
     store::user_message_id,
+    tools::ToolError,
 };
 
 use super::{
     AdmittedCommand, AgentEvent, DurableRunBinding, MessageCommitBarrier, MessageCommitReceipt,
-    ProjectedProviderEvent, ProviderEventProjector, ProviderTerminalKind, RunCompletion,
-    RunControl, RunCore, RunOutput, RunWorker, SteerMode, ToolStartCommitBarrier, WorkerFailure,
-    WorkerFuture,
+    ProjectedProviderEvent, ProviderEventProjector, ProviderTerminalKind, RetryWaitCommitBarrier,
+    RunCompletion, RunControl, RunCore, RunOutput, RunWorker, SteerMode, ToolStartCommitBarrier,
+    WorkerFailure, WorkerFuture, WorkerPhase,
 };
 
 const LENGTH_TOOL_FAILURE: &str = "Tool call was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.";
@@ -76,18 +85,24 @@ pub(crate) struct ProviderAttempt {
 /// unit fixtures can remain transport- and credential-free.
 #[async_trait]
 pub(crate) trait RunDriver: Send + Sync + 'static {
-    async fn start_provider(
+    /// Fail closed before Session creates keys, recovery state, or a worker.
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()>;
+
+    async fn start_provider_for_command(
         &self,
         attempt: usize,
         context: &[ContextMessage],
+        command_received_at: Option<std::time::Instant>,
         cancel: CancellationToken,
     ) -> Result<ProviderAttempt>;
 
-    async fn execute_tool(
+    async fn execute_tool_observed(
         &self,
+        flow_id: &str,
         call: &ToolCall,
         cancel: CancellationToken,
-    ) -> Result<ToolResultMessage>;
+        on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage, ToolError>;
 
     fn synthetic_error(&self, message: &str) -> PublicMessage;
 
@@ -124,6 +139,10 @@ impl SequentialRunWorker {
 }
 
 impl RunWorker for SequentialRunWorker {
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+        self.driver.validate_executor_generation(generation)
+    }
+
     fn run(
         &self,
         core: RunCore,
@@ -145,12 +164,28 @@ struct Runner {
     driver: Arc<dyn RunDriver>,
     controls: mpsc::Receiver<RunControl>,
     events: mpsc::Sender<RunOutput>,
+    phase: watch::Sender<WorkerPhase>,
     context: Vec<ContextMessage>,
     attempt_sequence: usize,
     ordinary_retries: usize,
     overflow_recoveries: u8,
     consecutive_length_batches: usize,
     in_flight_control: Option<AdmittedCommand>,
+    pending_command_received_at: Option<std::time::Instant>,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ExecuteToolError {
+    #[error("tool execution failed: {0}")]
+    Tool(ToolError),
+    #[error(transparent)]
+    Worker(WorkerFailure),
+}
+
+impl From<WorkerFailure> for ExecuteToolError {
+    fn from(failure: WorkerFailure) -> Self {
+        Self::Worker(failure)
+    }
 }
 
 impl Runner {
@@ -160,18 +195,24 @@ impl Runner {
         controls: mpsc::Receiver<RunControl>,
         events: mpsc::Sender<RunOutput>,
     ) -> Self {
+        let phase = core
+            .worker_phase
+            .take()
+            .unwrap_or_else(|| watch::channel(WorkerPhase::Active).0);
         let context = std::mem::take(&mut core.runtime_context);
         Self {
             core,
             driver,
             controls,
             events,
+            phase,
             context,
             attempt_sequence: 0,
             ordinary_retries: 0,
             overflow_recoveries: 0,
             consecutive_length_batches: 0,
             in_flight_control: None,
+            pending_command_received_at: None,
         }
     }
 
@@ -241,15 +282,21 @@ impl Runner {
                         break;
                     };
                     self.ordinary_retries += 1;
-                    self.emit(AgentEvent::RetryScheduled {
-                        attempt: self.attempt_sequence as u32,
-                        delay_ms: delay.as_millis() as u64,
-                        retry_at: Utc::now()
-                            + chrono::Duration::from_std(delay).unwrap_or_default(),
-                        error_message: assistant_error(&message),
-                    })
-                    .await?;
-                    if self.wait_retry_or_control(delay).await? {
+                    let _ = self.phase.send(WorkerPhase::RetryWait);
+                    if let Err(failure) = self
+                        .emit_retry_scheduled(
+                            self.attempt_sequence as u32,
+                            delay,
+                            assistant_error(&message),
+                        )
+                        .await
+                    {
+                        let _ = self.phase.send(WorkerPhase::Active);
+                        return Err(failure);
+                    }
+                    let injected = self.wait_retry_or_control(delay).await;
+                    let _ = self.phase.send(WorkerPhase::Active);
+                    if injected? {
                         self.emit(AgentEvent::Steered {
                             mode: SteerMode::Soft,
                         })
@@ -302,12 +349,11 @@ impl Runner {
                         self.close_turn_without_context(message).await?;
                         break;
                     }
-                    self.emit(AgentEvent::RetryScheduled {
-                        attempt: self.attempt_sequence as u32,
-                        delay_ms: 0,
-                        retry_at: Utc::now(),
-                        error_message: format!("context overflow: {source:?}"),
-                    })
+                    self.emit_retry_scheduled(
+                        self.attempt_sequence as u32,
+                        Duration::ZERO,
+                        format!("context overflow: {source:?}"),
+                    )
                     .await?;
                     self.context = replacement;
                 }
@@ -428,11 +474,19 @@ impl Runner {
 
     async fn provider_attempt(&mut self) -> Result<AttemptOutcome, WorkerFailure> {
         let cancel = CancellationToken::new();
-        let mut attempt = match self
-            .driver
-            .start_provider(self.attempt_sequence, &self.context, cancel)
-            .await
-        {
+        let start_cancel = cancel.clone();
+        // A command ingress timestamp has exactly one causal consumer: the
+        // first provider request started after that command is injected.
+        // Retries and tool continuations keep their own TTFT observation, but
+        // must not fold provider/backoff/tool time into agent internal p95.
+        let command_received_at = self.pending_command_received_at.take();
+        let start = self.driver.start_provider_for_command(
+            self.attempt_sequence,
+            &self.context,
+            command_received_at,
+            cancel,
+        );
+        let mut attempt = match CancelOnDrop::new(start, start_cancel).await {
             Ok(attempt) => attempt,
             Err(error) => {
                 return self
@@ -717,8 +771,7 @@ impl Runner {
         for call in calls {
             self.emit_tool_start_and_wait_committed(call).await?;
             let result = match self
-                .driver
-                .execute_tool(call, CancellationToken::new())
+                .execute_tool_with_updates(assistant_message_id, call)
                 .await
             {
                 Ok(mut result) => {
@@ -727,12 +780,70 @@ impl Runner {
                     result.tool_name.clone_from(&call.name);
                     result
                 }
-                Err(error) => error_tool_result(call, &format!("Tool execution failed: {error}")),
+                Err(ExecuteToolError::Worker(failure)) => return Err(failure),
+                Err(ExecuteToolError::Tool(ToolError::RpcIndeterminate(message))) => {
+                    return Err(WorkerFailure::Error(format!(
+                        "tool RPC outcome is indeterminate: {message}"
+                    )));
+                }
+                Err(ExecuteToolError::Tool(error)) => {
+                    error_tool_result(call, &format!("Tool execution failed: {error}"))
+                }
             };
             receipts.push(self.emit_tool_result(assistant_message_id, &result).await?);
             results.push(result);
         }
         Ok((results, receipts))
+    }
+
+    async fn execute_tool_with_updates(
+        &mut self,
+        flow_id: &str,
+        call: &ToolCall,
+    ) -> Result<ToolResultMessage, ExecuteToolError> {
+        const TOOL_UPDATE_CAPACITY: usize = 32;
+        let (updates_tx, mut updates_rx) = mpsc::channel(TOOL_UPDATE_CAPACITY);
+        let callback_call_id = call.id.clone();
+        let on_update: Arc<dyn Fn(Value) + Send + Sync> = Arc::new(move |partial| {
+            // Progress is volatile. Never block a tool or bypass the bounded
+            // Session event lane; a saturated progress lane coalesces by drop.
+            let _ = updates_tx.try_send((callback_call_id.clone(), partial));
+        });
+        let driver = self.driver.clone();
+        let cancel = CancellationToken::new();
+        let future = CancelOnDrop::new(
+            driver.execute_tool_observed(flow_id, call, cancel.clone(), on_update),
+            cancel,
+        );
+        tokio::pin!(future);
+        let result = loop {
+            let update = tokio::select! {
+                biased;
+                result = &mut future => break result,
+                update = updates_rx.recv() => update,
+            };
+            if let Some((tool_call_id, partial)) = update {
+                self.emit(AgentEvent::ToolExecutionUpdate {
+                    tool_call_id,
+                    partial,
+                })
+                .await?;
+            } else {
+                // The on_update callback (and therefore updates_tx) has been
+                // dropped while the tool future is still pending. There will
+                // never be more progress events, so stop polling this branch
+                // and wait only for the tool result.
+                break future.await;
+            }
+        };
+        while let Ok((tool_call_id, partial)) = updates_rx.try_recv() {
+            self.emit(AgentEvent::ToolExecutionUpdate {
+                tool_call_id,
+                partial,
+            })
+            .await?;
+        }
+        result.map_err(ExecuteToolError::Tool)
     }
 
     async fn emit_tool_start_and_wait_committed(
@@ -753,6 +864,7 @@ impl Runner {
                 },
                 commit_barrier: Some(commit_barrier),
                 message_commit_barrier: None,
+                retry_wait_commit_barrier: None,
             })
             .await
             .map_err(|_| WorkerFailure::EventChannelClosed)?;
@@ -857,6 +969,7 @@ impl Runner {
             .clone();
         let result = self.inject_user(&injectable).await;
         if result.is_ok() {
+            self.pending_command_received_at = injectable.received_monotonic();
             self.in_flight_control = None;
         }
         result
@@ -941,10 +1054,16 @@ impl Runner {
     fn receive_control_safe_point(&mut self) -> Result<(), WorkerFailure> {
         // Deliberately consume at most one ordinary message: one-at-a-time is
         // the product contract and keeps each queued instruction an answer turn.
-        if let Ok(RunControl::Command(command)) = self.controls.try_recv() {
-            self.core
-                .queue_followup(command)
-                .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+        if let Ok(control) = self.controls.try_recv() {
+            match control {
+                RunControl::Command(command) => self
+                    .core
+                    .queue_followup(command)
+                    .map_err(|error| WorkerFailure::Error(error.to_string()))?,
+                RunControl::RetrySteer { accepted, .. } => {
+                    let _ = accepted.send(false);
+                }
+            }
         }
         Ok(())
     }
@@ -954,31 +1073,61 @@ impl Runner {
             return Ok(true);
         }
         let cancel = CancellationToken::new();
-        let injected = tokio::select! {
-            biased;
-            control = self.controls.recv() => {
-                let Some(RunControl::Command(command)) = control else {
-                    return Err(WorkerFailure::Cancelled);
-                };
-                self.core.queue_followup(command)
-                    .map_err(|error| WorkerFailure::Error(error.to_string()))?;
-                if self.claim_pending_user()? {
-                    true
-                } else if self.driver.wait_retry(delay, &cancel).await {
-                    false
-                } else {
-                    return Err(WorkerFailure::Cancelled);
+        let driver = self.driver.clone();
+        let retry = driver.wait_retry(delay, &cancel);
+        tokio::pin!(retry);
+        loop {
+            let control = tokio::select! {
+                biased;
+                control = self.controls.recv() => {
+                    let Some(control) = control else {
+                        return Err(WorkerFailure::Cancelled);
+                    };
+                    control
                 }
-            }
-            completed = self.driver.wait_retry(delay, &cancel) => {
-                if completed {
-                    false
-                } else {
-                    return Err(WorkerFailure::Cancelled);
+                completed = &mut retry => {
+                    return if completed {
+                        Ok(false)
+                    } else {
+                        Err(WorkerFailure::Cancelled)
+                    };
                 }
+            };
+            let command = match control {
+                RunControl::Command(command) => command,
+                RunControl::RetrySteer {
+                    command,
+                    accepted,
+                    committed,
+                } => {
+                    let command_id = command.envelope().command_id.clone();
+                    self.claim_control(command)?;
+                    if accepted.send(true).is_err() {
+                        // Session timed out or observed a phase change and will
+                        // durably defer this same command. Do not claim it into
+                        // RunCore or wait on an authorization that cannot arrive.
+                        let released = self
+                            .in_flight_control
+                            .take()
+                            .expect("retry steer accepted only after exact claim");
+                        debug_assert_eq!(released.envelope().command_id, command_id);
+                        continue;
+                    }
+                    committed.await.map_err(|_| {
+                        WorkerFailure::Error(
+                            "retry steer durability authorization was dropped".to_owned(),
+                        )
+                    })?;
+                    return Ok(true);
+                }
+            };
+            self.core
+                .queue_followup(command)
+                .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+            if self.claim_pending_user()? {
+                return Ok(true);
             }
-        };
-        Ok(injected)
+        }
     }
 
     fn recover_received_controls(&mut self) -> Result<(), WorkerFailure> {
@@ -988,10 +1137,21 @@ impl Runner {
                 .requeue_followup_front(command)
                 .map_err(|error| WorkerFailure::Error(error.to_string()))?;
         }
-        while let Ok(RunControl::Command(command)) = self.controls.try_recv() {
-            self.core
-                .queue_followup(command)
-                .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+        while let Ok(control) = self.controls.try_recv() {
+            match control {
+                RunControl::Command(command) => self
+                    .core
+                    .queue_followup(command)
+                    .map_err(|error| WorkerFailure::Error(error.to_string()))?,
+                RunControl::RetrySteer {
+                    command, accepted, ..
+                } => {
+                    let _ = accepted.send(false);
+                    self.core
+                        .queue_followup(command)
+                        .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+                }
+            }
         }
         Ok(())
     }
@@ -1006,6 +1166,7 @@ impl Runner {
                 event,
                 commit_barrier: None,
                 message_commit_barrier: None,
+                retry_wait_commit_barrier: None,
             })
             .await
             .map_err(|_| WorkerFailure::EventChannelClosed)
@@ -1029,10 +1190,41 @@ impl Runner {
                 },
                 commit_barrier: None,
                 message_commit_barrier: Some(barrier),
+                retry_wait_commit_barrier: None,
             })
             .await
             .map_err(|_| WorkerFailure::EventChannelClosed)?;
         Ok(receipt)
+    }
+
+    async fn emit_retry_scheduled(
+        &mut self,
+        attempt: u32,
+        delay: Duration,
+        error_message: String,
+    ) -> Result<(), WorkerFailure> {
+        let binding = self.core.durable_binding.clone().ok_or_else(|| {
+            WorkerFailure::Error("RunCore has no durable worker binding".to_owned())
+        })?;
+        let (barrier, committed) = RetryWaitCommitBarrier::channel();
+        self.events
+            .send(RunOutput {
+                binding,
+                event: AgentEvent::RetryScheduled {
+                    attempt,
+                    delay_ms: delay.as_millis() as u64,
+                    retry_at: Utc::now() + chrono::Duration::from_std(delay).unwrap_or_default(),
+                    error_message,
+                },
+                commit_barrier: None,
+                message_commit_barrier: None,
+                retry_wait_commit_barrier: Some(barrier),
+            })
+            .await
+            .map_err(|_| WorkerFailure::EventChannelClosed)?;
+        committed
+            .await
+            .map_err(|_| WorkerFailure::Error("RetryScheduled durability commit failed".to_owned()))
     }
 
     async fn await_message_receipt(
@@ -1082,6 +1274,45 @@ impl Runner {
         })?;
         binding.turn_id = Uuid::now_v7().to_string();
         self.emit(AgentEvent::TurnStart).await
+    }
+}
+
+/// Cancels an externally-backed operation before its future is dropped. This
+/// ordering lets child producers/process reapers observe cancellation even
+/// when the owning worker task itself is aborted.
+struct CancelOnDrop<F> {
+    future: Pin<Box<F>>,
+    cancel: Option<CancellationToken>,
+}
+
+impl<F> CancelOnDrop<F> {
+    fn new(future: F, cancel: CancellationToken) -> Self {
+        Self {
+            future: Box::pin(future),
+            cancel: Some(cancel),
+        }
+    }
+}
+
+impl<F: Future> Future for CancelOnDrop<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.future.as_mut().poll(cx) {
+            Poll::Ready(output) => {
+                self.cancel = None;
+                Poll::Ready(output)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<F> Drop for CancelOnDrop<F> {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            cancel.cancel();
+        }
     }
 }
 

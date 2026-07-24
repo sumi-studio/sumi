@@ -38,6 +38,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::provider::types::{ToolDefinition, UserContent, ValidatedToolArguments};
+use crate::runtime::contracts::ProcessGeneration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolRisk {
@@ -92,6 +93,7 @@ impl From<crate::runtime::contracts::RuntimeContractError> for ToolError {
 pub struct ToolOutput {
     pub content: Vec<UserContent>,
     pub details: Value,
+    pub is_error: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -196,13 +198,29 @@ impl ToolRegistryBuilder {
     }
 
     pub fn build(self) -> ToolRegistry {
-        ToolRegistry { tools: self.tools }
+        ToolRegistry {
+            tools: self.tools,
+            executor_generation: None,
+        }
+    }
+
+    pub(crate) fn build_for_executor_generation(
+        self,
+        generation: ProcessGeneration,
+    ) -> ToolRegistry {
+        ToolRegistry {
+            tools: self.tools,
+            executor_generation: Some(generation),
+        }
     }
 }
 
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, RegisteredTool>,
+    // Local and in-memory registries do not cross an executor RPC boundary.
+    // Production remote registries bind the immutable client's generation.
+    executor_generation: Option<ProcessGeneration>,
 }
 
 #[derive(Clone)]
@@ -212,6 +230,20 @@ struct RegisteredTool {
 }
 
 impl ToolRegistry {
+    pub(crate) fn validate_executor_generation(
+        &self,
+        generation: ProcessGeneration,
+    ) -> Result<(), ToolError> {
+        if let Some(bound) = self.executor_generation
+            && bound != generation
+        {
+            return Err(ToolError::Protocol(format!(
+                "remote tool registry executor generation {bound} does not match injected generation {generation}"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.get(name).map(|entry| entry.tool.clone())
     }
@@ -361,6 +393,7 @@ pub fn text_output(text: impl Into<String>, details: Value) -> ToolOutput {
     ToolOutput {
         content: vec![UserContent::Text { text: text.into() }],
         details,
+        is_error: false,
     }
 }
 

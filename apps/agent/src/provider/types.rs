@@ -470,6 +470,7 @@ pub struct ProviderEventStream {
     origin: ProviderOrigin,
     shadow: MessageAssembler,
     success_terminal_committed: Arc<SuccessTerminalCommit>,
+    producer_task: Option<tokio::task::JoinHandle<()>>,
     start_emitted: bool,
     terminal_emitted: bool,
 }
@@ -489,6 +490,7 @@ impl ProviderEventStream {
             origin,
             shadow: MessageAssembler::new(),
             success_terminal_committed: Arc::new(SuccessTerminalCommit::new()),
+            producer_task: None,
             start_emitted: false,
             terminal_emitted: false,
         }
@@ -511,9 +513,18 @@ impl ProviderEventStream {
             origin,
             shadow: MessageAssembler::with_budget(budget),
             success_terminal_committed,
+            producer_task: None,
             start_emitted: false,
             terminal_emitted: false,
         }
+    }
+
+    /// Transfers the adapter producer into the stream ownership boundary.
+    /// Dropping or fusing the stream aborts the child even if it fails to
+    /// observe cooperative cancellation.
+    pub(crate) fn own_producer(mut self, producer_task: tokio::task::JoinHandle<()>) -> Self {
+        self.producer_task = Some(producer_task);
+        self
     }
 
     pub async fn recv(&mut self) -> Option<ProviderEvent> {
@@ -651,6 +662,9 @@ impl ProviderEventStream {
 
     fn fuse(&mut self) {
         self.terminal_emitted = true;
+        if let Some(task) = self.producer_task.take() {
+            task.abort();
+        }
         self.priority_terminal_rx.take();
         if let Some(mut rx) = self.rx.take() {
             const AUDIT_LIMIT: usize = 32;
@@ -663,6 +677,18 @@ impl ProviderEventStream {
                     "discarded provider events queued after terminal event"
                 );
             }
+        }
+    }
+}
+
+impl Drop for ProviderEventStream {
+    fn drop(&mut self) {
+        // The stream is the consumer-side ownership boundary for the producer.
+        // Dropping it must not detach an HTTP/SSE task until its transport
+        // timeout; adapters observe this same token and close their producer.
+        self.cancel.cancel();
+        if let Some(task) = self.producer_task.take() {
+            task.abort();
         }
     }
 }
@@ -818,6 +844,46 @@ mod tests {
             protocol: ApiProtocol::OpenAiChatCompletions,
             model: "kimi-k3".to_owned(),
         }
+    }
+
+    #[test]
+    fn dropping_stream_cancels_its_producer_token() {
+        let cancel = CancellationToken::new();
+        let (_tx, rx) = mpsc::channel(1);
+        let stream = ProviderEventStream::new(rx, cancel.clone(), "fixture", origin());
+        assert!(!cancel.is_cancelled());
+        drop(stream);
+        assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn dropping_stream_aborts_a_held_owned_producer() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let cancel = CancellationToken::new();
+        let (tx, rx) = mpsc::channel(1);
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _drop_signal = DropSignal(Some(dropped_tx));
+            let _tx = tx;
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.expect("producer started");
+        let stream = ProviderEventStream::new(rx, cancel, "fixture", origin()).own_producer(task);
+        drop(stream);
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("owned producer remained detached")
+            .expect("drop signal sender");
     }
 
     fn assistant_message() -> AssistantMessage {

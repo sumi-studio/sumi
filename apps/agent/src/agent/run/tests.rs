@@ -8,8 +8,9 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use chrono::{TimeZone, Utc};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc};
+use tokio_util::sync::CancellationToken;
 
 use super::*;
 use crate::{
@@ -21,6 +22,7 @@ use crate::{
         RejectedToolCall, ToolArgumentError, Usage, ValidatedToolArguments,
     },
     runtime::contracts::ProcessGeneration,
+    tools::ToolError,
 };
 
 fn test_executor_generation() -> ProcessGeneration {
@@ -41,6 +43,7 @@ fn output(message: AssistantMessage) -> Script {
 struct FixtureDriver {
     scripts: Mutex<VecDeque<Script>>,
     started_contexts: Mutex<Vec<Vec<ContextMessage>>>,
+    started_command_times: Mutex<Vec<Option<std::time::Instant>>>,
     tool_order: Mutex<Vec<String>>,
     tool_failures: Mutex<VecDeque<Option<&'static str>>>,
     active_tools: AtomicUsize,
@@ -61,6 +64,7 @@ impl FixtureDriver {
         Self {
             scripts: Mutex::new(scripts.into()),
             started_contexts: Mutex::new(Vec::new()),
+            started_command_times: Mutex::new(Vec::new()),
             tool_order: Mutex::new(Vec::new()),
             tool_failures: Mutex::new(VecDeque::new()),
             active_tools: AtomicUsize::new(0),
@@ -122,12 +126,23 @@ fn recovered_context_from_active(
 
 #[async_trait]
 impl RunDriver for FixtureDriver {
-    async fn start_provider(
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+        (generation == test_executor_generation())
+            .then_some(())
+            .ok_or_else(|| anyhow!("fixture executor generation mismatch"))
+    }
+
+    async fn start_provider_for_command(
         &self,
         attempt: usize,
         context: &[ContextMessage],
+        command_received_at: Option<std::time::Instant>,
         _cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
+        self.started_command_times
+            .lock()
+            .expect("command times")
+            .push(command_received_at);
         self.started_contexts
             .lock()
             .expect("contexts")
@@ -145,11 +160,13 @@ impl RunDriver for FixtureDriver {
         }
     }
 
-    async fn execute_tool(
+    async fn execute_tool_observed(
         &self,
+        _flow_id: &str,
         call: &ToolCall,
         _cancel: CancellationToken,
-    ) -> Result<ToolResultMessage> {
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage, ToolError> {
         let active = self.active_tools.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_active_tools.fetch_max(active, Ordering::SeqCst);
         self.tool_order
@@ -164,7 +181,7 @@ impl RunDriver for FixtureDriver {
             .expect("tool failures")
             .pop_front()
         {
-            return Err(anyhow!(error));
+            return Err(ToolError::Protocol(error.to_owned()));
         }
         Ok(ToolResultMessage {
             tool_call_id: call.id.clone(),
@@ -503,6 +520,10 @@ fn admitted_user(seq: u64) -> AdmittedCommand {
     AdmittedCommand::new(user(seq), timestamp())
 }
 
+fn live_admitted_user(seq: u64) -> AdmittedCommand {
+    AdmittedCommand::live(user(seq), timestamp(), std::time::Instant::now())
+}
+
 fn admitted_abort(seq: u64) -> AdmittedCommand {
     AdmittedCommand::new(
         CommandEnvelope {
@@ -564,12 +585,19 @@ fn bound_core(seq: u64) -> RunCore {
 }
 
 async fn run_fixture(driver: Arc<FixtureDriver>) -> (RunCompletion, Vec<AgentEvent>) {
+    run_fixture_with_initial(driver, admitted_user(1)).await
+}
+
+async fn run_fixture_with_initial(
+    driver: Arc<FixtureDriver>,
+    initial: AdmittedCommand,
+) -> (RunCompletion, Vec<AgentEvent>) {
     let worker = SequentialRunWorker::new(driver);
     let (_control_tx, control_rx) = mpsc::channel(8);
     let (events_tx, mut events_rx) = mpsc::channel(256);
     let completion = tokio::spawn(async move {
         worker
-            .run(bound_core(1), admitted_user(1), control_rx, events_tx)
+            .run(bound_core(1), initial, control_rx, events_tx)
             .await
     });
     let mut events = Vec::new();
@@ -594,6 +622,9 @@ fn resolve_message_output(output: &mut RunOutput, next_seq: &mut u64) {
             message_seq: *next_seq,
         });
         *next_seq += 1;
+    }
+    if let Some(barrier) = output.retry_wait_commit_barrier.take() {
+        barrier.committed();
     }
 }
 
@@ -657,7 +688,8 @@ async fn retry_closes_error_before_schedule_and_does_not_append_error_context() 
         )),
         output(assistant(StopReason::Stop, Vec::new(), None, None)),
     ]));
-    let (completion, events) = run_fixture(driver.clone()).await;
+    let (completion, events) =
+        run_fixture_with_initial(driver.clone(), live_admitted_user(1)).await;
     assert_completed(completion);
     let retry = events
         .iter()
@@ -670,6 +702,13 @@ async fn retry_closes_error_before_schedule_and_does_not_append_error_context() 
     assert_eq!(contexts[1].len(), 1, "only the user is replayable");
     assert!(matches!(context_message(&contexts[1][0]), Message::User(_)));
     assert_eq!(driver.retry_waits.load(Ordering::SeqCst), 1);
+    let command_times = driver.started_command_times.lock().expect("command times");
+    assert_eq!(command_times.len(), 2);
+    assert!(command_times[0].is_some());
+    assert_eq!(
+        command_times[1], None,
+        "retry backoff is not internal overhead"
+    );
 }
 
 #[tokio::test]
@@ -781,6 +820,82 @@ async fn retry_wait_control_is_injected_mid_turn_before_next_attempt() {
         contexts[1]
             .iter()
             .all(|message| matches!(context_message(message), Message::User(_)))
+    );
+}
+
+#[tokio::test]
+async fn stale_retry_steer_acceptance_releases_exact_claim_without_loss_or_duplicate() {
+    let driver = Arc::new(
+        FixtureDriver::new(vec![
+            output(assistant(
+                StopReason::Error,
+                Vec::new(),
+                Some("network error"),
+                Some("network_error"),
+            )),
+            output(assistant(StopReason::Stop, Vec::new(), None, None)),
+        ])
+        .blocking_retry(),
+    );
+    let worker = SequentialRunWorker::new(driver.clone());
+    let (control_tx, control_rx) = mpsc::channel(8);
+    let (events_tx, mut events_rx) = mpsc::channel(256);
+    let completion = tokio::spawn(async move {
+        worker
+            .run(bound_core(1), admitted_user(1), control_rx, events_tx)
+            .await
+    });
+    let event_collector = tokio::spawn(async move {
+        let mut events = Vec::new();
+        let mut message_seq = 1;
+        while let Some(mut output) = events_rx.recv().await {
+            resolve_message_output(&mut output, &mut message_seq);
+            if let Some(barrier) = output.commit_barrier.take() {
+                barrier.committed();
+            }
+            events.push(output.event);
+        }
+        events
+    });
+    driver.retry_waiting.notified().await;
+
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    drop(accepted_rx);
+    let (_committed_tx, committed_rx) = oneshot::channel();
+    control_tx
+        .send(RunControl::RetrySteer {
+            command: admitted_user(2),
+            accepted: accepted_tx,
+            committed: committed_rx,
+        })
+        .await
+        .expect("stale retry steer");
+    control_tx
+        .send(RunControl::Command(admitted_user(2)))
+        .await
+        .expect("normal durable deferral retry");
+
+    assert_completed(completion.await.expect("worker join"));
+    let events = event_collector.await.expect("event collector");
+    let user_message_id = user_message_id(&admitted_user(2).envelope().command_id);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                matches!(event, AgentEvent::MessageEnd { message_id, .. }
+                    if message_id == &user_message_id)
+            })
+            .count(),
+        1
+    );
+    let contexts = driver.started_contexts.lock().expect("contexts");
+    assert_eq!(contexts.len(), 2);
+    assert_eq!(
+        contexts[1]
+            .iter()
+            .filter(|message| matches!(context_message(message), Message::User(_)))
+            .count(),
+        2
     );
 }
 
@@ -898,7 +1013,8 @@ async fn tool_calls_execute_strictly_sequentially_and_continue_provider() {
         )),
         output(assistant(StopReason::Stop, Vec::new(), None, None)),
     ]));
-    let (completion, events) = run_fixture(driver.clone()).await;
+    let (completion, events) =
+        run_fixture_with_initial(driver.clone(), live_admitted_user(1)).await;
     assert_completed(completion);
     assert_eq!(
         *driver.tool_order.lock().expect("tool order"),
@@ -906,6 +1022,13 @@ async fn tool_calls_execute_strictly_sequentially_and_continue_provider() {
     );
     assert_eq!(driver.max_active_tools.load(Ordering::SeqCst), 1);
     assert_eq!(driver.started_contexts.lock().expect("contexts").len(), 2);
+    let command_times = driver.started_command_times.lock().expect("command times");
+    assert_eq!(command_times.len(), 2);
+    assert!(command_times[0].is_some());
+    assert_eq!(
+        command_times[1], None,
+        "tool execution is not internal overhead"
+    );
     for event in &events {
         let AgentEvent::ToolExecutionEnd {
             tool_call_id,
@@ -2035,6 +2158,191 @@ async fn successful_stop_overflow_returns_a_typed_deferred_apply_marker() {
         Some(OverflowSource::StopUsage)
     );
     assert_eq!(core.runtime_context.len(), 2, "successful Stop is retained");
+}
+
+struct UpdateDriver {
+    notify: Arc<Notify>,
+}
+
+#[async_trait]
+impl RunDriver for UpdateDriver {
+    fn validate_executor_generation(&self, _generation: ProcessGeneration) -> Result<()> {
+        Ok(())
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        _attempt: usize,
+        _context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        Err(anyhow!("UpdateDriver has no provider"))
+    }
+
+    async fn execute_tool_observed(
+        &self,
+        _flow_id: &str,
+        call: &ToolCall,
+        _cancel: CancellationToken,
+        on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage, ToolError> {
+        self.notify.notified().await;
+        on_update(json!({"phase":"half"}));
+        Ok(ToolResultMessage {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            content: vec![UserContent::Text {
+                text: "done".to_owned(),
+            }],
+            details: json!({"ok":true}),
+            is_error: false,
+            timestamp: timestamp(),
+        })
+    }
+
+    fn synthetic_error(&self, message: &str) -> PublicMessage {
+        public_message(&assistant(
+            StopReason::Error,
+            Vec::new(),
+            Some(message),
+            None,
+        ))
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        _active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        Err(anyhow!("UpdateDriver has no overflow recovery"))
+    }
+}
+
+#[tokio::test]
+async fn progress_event_channel_close_propagates_worker_failure_without_synthetic_result() {
+    let (events_tx, events_rx) = mpsc::channel(8);
+    let (_controls_tx, controls_rx) = mpsc::channel(1);
+    let notify = Arc::new(Notify::new());
+    let core = bound_core(1);
+    let driver: Arc<dyn RunDriver> = Arc::new(UpdateDriver {
+        notify: notify.clone(),
+    });
+    let mut runner = Runner::new(core, driver, controls_rx, events_tx);
+    let call = call("call-1");
+    drop(events_rx);
+    let result =
+        tokio::spawn(async move { runner.execute_tool_with_updates("assistant-1", &call).await });
+    notify.notify_one();
+    let result = result
+        .await
+        .expect("runner task join")
+        .expect_err("progress emission must fail");
+    assert!(
+        matches!(
+            result,
+            ExecuteToolError::Worker(WorkerFailure::EventChannelClosed)
+        ),
+        "progress channel loss must remain typed as a worker failure, not a tool error: {result:?}"
+    );
+}
+
+struct ReleaseDriver {
+    dropped: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl RunDriver for ReleaseDriver {
+    fn validate_executor_generation(&self, _generation: ProcessGeneration) -> Result<()> {
+        Ok(())
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        _attempt: usize,
+        _context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        Err(anyhow!("ReleaseDriver has no provider"))
+    }
+
+    async fn execute_tool_observed(
+        &self,
+        _flow_id: &str,
+        call: &ToolCall,
+        _cancel: CancellationToken,
+        on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage, ToolError> {
+        drop(on_update);
+        self.dropped.notify_one();
+        self.release.notified().await;
+        Ok(ToolResultMessage {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            content: vec![UserContent::Text {
+                text: "released".to_owned(),
+            }],
+            details: json!({"ok": true}),
+            is_error: false,
+            timestamp: timestamp(),
+        })
+    }
+
+    fn synthetic_error(&self, message: &str) -> PublicMessage {
+        public_message(&assistant(
+            StopReason::Error,
+            Vec::new(),
+            Some(message),
+            None,
+        ))
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        _active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        Err(anyhow!("ReleaseDriver has no overflow recovery"))
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn update_channel_close_yields_to_tool_future_without_spinning() {
+    let (events_tx, _events_rx) = mpsc::channel(8);
+    let (_controls_tx, controls_rx) = mpsc::channel(1);
+    let dropped = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let driver = Arc::new(ReleaseDriver {
+        dropped: dropped.clone(),
+        release: release.clone(),
+    });
+    let core = bound_core(1);
+    let mut runner = Runner::new(core, driver, controls_rx, events_tx);
+    let tool_call = call("release-call");
+    let expected_id = tool_call.id.clone();
+
+    let handle = tokio::spawn(async move {
+        runner
+            .execute_tool_with_updates("assistant-1", &tool_call)
+            .await
+    });
+
+    // Wait until the driver has dropped on_update, then release the pending
+    // tool. On the buggy implementation this notification is never received
+    // because execute_tool_with_update would spin on the closed updates_rx.
+    dropped.notified().await;
+    release.notify_one();
+
+    let result = handle
+        .await
+        .expect("runner task join")
+        .expect("tool execution should succeed");
+    assert_eq!(result.tool_call_id, expected_id);
+    assert_eq!(result.tool_name, "tool-release-call");
 }
 
 #[tokio::test]

@@ -166,15 +166,17 @@ impl<'a> LowTrustLocalBash<'a> {
         let force_close_range_fallback = false;
         configure_child_process(&mut process, inherited_fd_limit, force_close_range_fallback);
 
+        process.kill_on_drop(true);
         let mut child = process.spawn()?;
         drop(process);
         let pid = child.id().ok_or_else(|| {
             ToolError::Protocol("spawned bash did not expose a process id".to_owned())
         })?;
+        let mut process_group = ProcessGroupGuard::new(pid);
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(OUTPUT_QUEUE_CAPACITY);
         let pipe_observed_bytes = Arc::new(AtomicU64::new(0));
         let output_quota = CancellationToken::new();
-        let mut output_task = Some(tokio::spawn(copy_bounded_chunks(
+        let mut output_task = AbortOnDropTask::new(tokio::spawn(copy_bounded_chunks(
             output_read,
             tx,
             pipe_observed_bytes.clone(),
@@ -276,6 +278,7 @@ impl<'a> LowTrustLocalBash<'a> {
                                         )
                                     })??;
                                 }
+                                process_group.disarm();
                                 return Err(error);
                             }
                         }
@@ -297,6 +300,7 @@ impl<'a> LowTrustLocalBash<'a> {
         }
 
         drop(wait);
+        process_group.disarm();
         let mut output_task_result = None;
         if resource_limit.is_some() || cancelled {
             let drain_deadline = Instant::now() + STOPPED_PIPE_DRAIN_TIMEOUT;
@@ -306,9 +310,7 @@ impl<'a> LowTrustLocalBash<'a> {
                 let chunk = match timeout_at(drain_deadline, rx.recv()).await {
                     Ok(chunk) => chunk,
                     Err(_) => {
-                        let task = output_task.take().ok_or_else(|| {
-                            ToolError::Protocol("merged output task was already joined".to_owned())
-                        })?;
+                        let task = output_task.take()?;
                         task.abort();
                         output_task_result = Some(task.await);
                         while let Ok(chunk) = rx.try_recv() {
@@ -378,14 +380,7 @@ impl<'a> LowTrustLocalBash<'a> {
         }
         let output_task_result = match output_task_result {
             Some(result) => result,
-            None => {
-                output_task
-                    .take()
-                    .ok_or_else(|| {
-                        ToolError::Protocol("merged output task was already joined".to_owned())
-                    })?
-                    .await
-            }
+            None => output_task.take()?.await,
         };
         match output_task_result {
             Ok(result) => {
@@ -427,6 +422,52 @@ impl<'a> LowTrustLocalBash<'a> {
             )));
         }
         Ok(result)
+    }
+}
+
+struct ProcessGroupGuard {
+    pid: Option<u32>,
+}
+
+impl ProcessGroupGuard {
+    fn new(pid: u32) -> Self {
+        Self { pid: Some(pid) }
+    }
+
+    fn disarm(&mut self) {
+        self.pid = None;
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid {
+            let _ = kill_process_group(pid);
+        }
+    }
+}
+
+struct AbortOnDropTask<T> {
+    task: Option<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> AbortOnDropTask<T> {
+    fn new(task: tokio::task::JoinHandle<T>) -> Self {
+        Self { task: Some(task) }
+    }
+
+    fn take(&mut self) -> Result<tokio::task::JoinHandle<T>, ToolError> {
+        self.task
+            .take()
+            .ok_or_else(|| ToolError::Protocol("merged output task was already joined".to_owned()))
+    }
+}
+
+impl<T> Drop for AbortOnDropTask<T> {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -785,6 +826,22 @@ mod tests {
         .expect("bash command did not create its completion marker");
     }
 
+    async fn wait_for_workspace_pid(pid_file: &std::path::Path) -> libc::pid_t {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(pid_file)
+                    && let Ok(pid) = contents.trim().parse::<libc::pid_t>()
+                    && pid > 0
+                {
+                    return pid;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bash command did not publish a valid pid")
+    }
+
     #[tokio::test]
     async fn executes_in_workspace_with_cleared_environment_and_streams_updates() {
         let workspace = TempWorkspace::new();
@@ -1040,6 +1097,40 @@ mod tests {
             Some(ResourceLimit::WallTime { .. })
         ));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn dropping_active_execution_kills_and_reaps_process_group() {
+        let workspace = TempWorkspace::new();
+        let artifacts = MemoryArtifacts::default();
+        let pid_file = workspace.0.join("active.pid");
+        let pid = {
+            let bash = LowTrustLocalBash::new(workspace.0.clone(), &artifacts);
+            let execution = bash.execute(
+                "echo $$ > active.pid; sleep 120",
+                "bash-drop-reap",
+                CancellationToken::new(),
+                Arc::new(|_| {}),
+            );
+            tokio::pin!(execution);
+            tokio::select! {
+                result = &mut execution => panic!("held bash exited early: {result:?}"),
+                pid = wait_for_workspace_pid(&pid_file) => pid,
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let result = unsafe { libc::kill(pid, 0) };
+                if result == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped bash was not killed and reaped");
     }
 
     #[tokio::test]

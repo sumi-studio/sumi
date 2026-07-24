@@ -14,13 +14,14 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use thiserror::Error;
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     task::JoinHandle,
 };
 use uuid::Uuid;
@@ -38,6 +39,7 @@ use crate::{
     },
 };
 
+mod driver;
 mod durable_bridge;
 mod events;
 mod provider_projection;
@@ -46,10 +48,15 @@ mod run;
 
 use durable_bridge::{
     CommittedOutput, DurableBridge, DurableRunBinding, MessageCommitBarrier, MessageCommitReceipt,
-    RunOutput, ToolStartCommitBarrier,
+    RetryWaitCommitBarrier, RunOutput, ToolStartCommitBarrier,
 };
 use queue::MessageQueue;
 
+#[allow(
+    unused_imports,
+    reason = "T26 constructs the injected production runtime"
+)]
+pub(crate) use driver::{InjectedRunDriver, RunTimingSample, RunTimingSamples};
 pub(crate) use events::{
     AgentEvent, ApprovalRequest, ApprovalResolution, PublicStreamEvent, SteerMode,
 };
@@ -70,6 +77,10 @@ const CONTROL_CHANNEL_CAPACITY: usize = 32;
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 const OUTBOUND_CHANNEL_CAPACITY: usize = 64;
 const VOLATILE_OUTBOUND_BUDGET: usize = 32;
+/// Bounds the in-process Session↔worker retry-steer authorization rendezvous.
+/// This is not provider retry backoff; it only prevents one stalled local task
+/// from blocking the Session event lane indefinitely.
+const RETRY_STEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(250);
 /// API admission permits 32 ordinary commands plus one reserved Abort.
 const PENDING_ORDINARY_CONTROL_CAPACITY: usize = 32;
 const PENDING_CONTROL_CAPACITY: usize = PENDING_ORDINARY_CONTROL_CAPACITY + 1;
@@ -174,6 +185,7 @@ pub(crate) struct RunCore {
     /// a second Session run from silently losing the first run.
     runtime_context: Vec<ContextMessage>,
     durable_binding: Option<DurableRunBinding>,
+    worker_phase: Option<watch::Sender<WorkerPhase>>,
 }
 
 impl RunCore {
@@ -185,6 +197,7 @@ impl RunCore {
             pending_overflow_apply: None,
             runtime_context: Vec::new(),
             durable_binding: None,
+            worker_phase: None,
         }
     }
 
@@ -233,6 +246,7 @@ impl Default for RunCore {
 pub(crate) struct AdmittedCommand {
     envelope: CommandEnvelope,
     received_at: DateTime<Utc>,
+    received_monotonic: Option<Instant>,
 }
 
 impl AdmittedCommand {
@@ -240,6 +254,19 @@ impl AdmittedCommand {
         Self {
             envelope,
             received_at,
+            received_monotonic: None,
+        }
+    }
+
+    pub(crate) fn live(
+        envelope: CommandEnvelope,
+        received_at: DateTime<Utc>,
+        received_monotonic: Instant,
+    ) -> Self {
+        Self {
+            envelope,
+            received_at,
+            received_monotonic: Some(received_monotonic),
         }
     }
 
@@ -250,10 +277,26 @@ impl AdmittedCommand {
     pub(crate) fn received_at(&self) -> DateTime<Utc> {
         self.received_at
     }
+
+    pub(crate) fn received_monotonic(&self) -> Option<Instant> {
+        self.received_monotonic
+    }
 }
 
 pub(crate) enum RunControl {
     Command(AdmittedCommand),
+    RetrySteer {
+        command: AdmittedCommand,
+        accepted: oneshot::Sender<bool>,
+        committed: oneshot::Receiver<()>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum WorkerPhase {
+    #[default]
+    Active,
+    RetryWait,
 }
 
 pub(crate) enum RunCompletion {
@@ -275,6 +318,8 @@ pub(crate) enum WorkerFailure {
 }
 
 pub(crate) trait RunWorker: Send + Sync + 'static {
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()>;
+
     fn run(
         &self,
         core: RunCore,
@@ -293,6 +338,12 @@ where
         + 'static,
     Fut: Future<Output = RunCompletion> + Send + 'static,
 {
+    fn validate_executor_generation(&self, _generation: ProcessGeneration) -> Result<()> {
+        // Test-only closure workers explicitly opt into the Session identity;
+        // production workers delegate to their injected driver below.
+        Ok(())
+    }
+
     fn run(
         &self,
         core: RunCore,
@@ -379,11 +430,8 @@ fn event_channel_lost(completion: RunCompletion) -> RunCompletion {
 }
 
 pub(crate) struct ActiveRun {
-    #[allow(
-        dead_code,
-        reason = "T15 retains the sender so an active worker never observes a false control-lane close"
-    )]
     control_tx: mpsc::Sender<RunControl>,
+    phase_rx: watch::Receiver<WorkerPhase>,
     events_rx: mpsc::Receiver<RunOutput>,
     completion_rx: oneshot::Receiver<RunCompletion>,
     join: JoinHandle<()>,
@@ -477,6 +525,7 @@ impl<G: Gateway + 'static> Session<G> {
         worker: Arc<dyn RunWorker>,
         executor_generation: ProcessGeneration,
     ) -> Result<Self> {
+        worker.validate_executor_generation(executor_generation)?;
         let conversation_id = store.scope().conversation_id.clone();
         let store = Arc::new(store);
         for purpose in [
@@ -661,6 +710,9 @@ impl<G: Gateway + 'static> Session<G> {
     }
 
     async fn admit_and_route(&mut self, inbound: InboundCommand) -> Result<(), SessionFailure> {
+        // Capture live ingress before durable admission. Replay returns before
+        // construction below and therefore never fabricates a monotonic span.
+        let received_monotonic = Instant::now();
         let receipt = match self
             .admission
             .receive_with_origin(&self.writer, &inbound)
@@ -694,12 +746,71 @@ impl<G: Gateway + 'static> Session<G> {
         let InboundCommand::Valid(command) = inbound else {
             unreachable!("invalid commands return above");
         };
-        let command = AdmittedCommand::new(command, received_at);
+        let command = AdmittedCommand::live(command, received_at, received_monotonic);
         if self.active.is_some() {
+            if self.route_retry_wait_command(&command).await? {
+                return Ok(());
+            }
             self.defer_active_command(command)?;
             return Ok(());
         }
         self.route_idle(command).await
+    }
+
+    async fn route_retry_wait_command(
+        &mut self,
+        command: &AdmittedCommand,
+    ) -> Result<bool, SessionFailure> {
+        if !matches!(command.envelope().command, Command::UserMessage { .. })
+            || !self.deferred_commands.is_empty()
+        {
+            return Ok(false);
+        }
+        let eligible = self.active.as_ref().is_some_and(|active| {
+            *active.phase_rx.borrow() == WorkerPhase::RetryWait
+                && active.bridge.can_bind_retry_steer()
+        });
+        if !eligible {
+            return Ok(false);
+        }
+
+        let mut phase_rx = self
+            .active
+            .as_ref()
+            .expect("retry eligibility requires an active run")
+            .phase_rx
+            .clone();
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let (committed_tx, committed_rx) = oneshot::channel();
+        let control = RunControl::RetrySteer {
+            command: command.clone(),
+            accepted: accepted_tx,
+            committed: committed_rx,
+        };
+        let sent = self
+            .active
+            .as_ref()
+            .expect("retry eligibility requires an active run")
+            .control_tx
+            .try_send(control);
+        if sent.is_err() {
+            return Ok(false);
+        }
+        if !await_retry_steer_acceptance(&mut phase_rx, accepted_rx).await {
+            return Ok(false);
+        }
+        self.active
+            .as_mut()
+            .expect("accepted retry steer retains the active run")
+            .bridge
+            .bind_retry_steer(&self.writer, command.clone())
+            .await?;
+        committed_tx.send(()).map_err(|_| {
+            SessionFailure::Worker(WorkerFailure::Error(
+                "retry worker exited before durable steer authorization".to_owned(),
+            ))
+        })?;
+        Ok(true)
     }
 
     fn defer_active_command(&mut self, command: AdmittedCommand) -> Result<(), SessionFailure> {
@@ -813,6 +924,8 @@ impl<G: Gateway + 'static> Session<G> {
         core.durable_binding = Some(binding.clone());
         let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
         let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let (phase_tx, phase_rx) = watch::channel(WorkerPhase::Active);
+        core.worker_phase = Some(phase_tx);
         let (completion_tx, completion_rx) = oneshot::channel();
         let future = catch_unwind(AssertUnwindSafe(|| {
             self.worker.run(core, initial, control_rx, events_tx)
@@ -826,6 +939,7 @@ impl<G: Gateway + 'static> Session<G> {
         });
         self.active = Some(ActiveRun {
             control_tx,
+            phase_rx,
             events_rx,
             completion_rx,
             join,
@@ -959,13 +1073,21 @@ impl<G: Gateway + 'static> Session<G> {
                     return Err(error.into());
                 }
             };
-            let (outputs, tool_start_barrier) = committed.resolve_message_receipts();
+            let (outputs, tool_start_barrier, retry_wait_commit_barrier, terminal_command_ids) =
+                committed.resolve_message_receipts();
             if let Some(barrier) = tool_start_barrier {
+                barrier.committed();
+            }
+            if let Some(barrier) = retry_wait_commit_barrier {
                 barrier.committed();
             }
             if deliver && delivery_failure.is_none() {
                 delivery_failure = self
-                    .send_committed(outputs, Some(active.bridge.command_id().to_owned()))
+                    .send_committed(
+                        outputs,
+                        Some(active.bridge.command_id().to_owned()),
+                        terminal_command_ids,
+                    )
                     .await
                     .err();
             }
@@ -984,21 +1106,27 @@ impl<G: Gateway + 'static> Session<G> {
                 }
             }
         };
-        let (outputs, tool_start_barrier) = committed.resolve_message_receipts();
+        let (outputs, tool_start_barrier, retry_wait_commit_barrier, terminal_command_ids) =
+            committed.resolve_message_receipts();
         if let Some(barrier) = tool_start_barrier {
+            barrier.committed();
+        }
+        if let Some(barrier) = retry_wait_commit_barrier {
             barrier.committed();
         }
         let command_id = self
             .active
             .as_ref()
             .map(|active| active.bridge.command_id().to_owned());
-        self.send_committed(outputs, command_id).await
+        self.send_committed(outputs, command_id, terminal_command_ids)
+            .await
     }
 
     async fn send_committed(
         &mut self,
         committed: Vec<CommittedOutput>,
         command_id: Option<String>,
+        terminal_command_ids: Vec<String>,
     ) -> Result<(), SessionFailure> {
         let applied_command = committed
             .iter()
@@ -1010,7 +1138,11 @@ impl<G: Gateway + 'static> Session<G> {
                 anyhow::anyhow!("committed output mixed durable and volatile frames").into(),
             );
         }
-        let mut frames = Vec::with_capacity(committed.len() + usize::from(applied_command));
+        let reliable =
+            committed_delivery_is_reliable(&committed, applied_command, terminal_command_ids.len());
+        let mut frames = Vec::with_capacity(
+            committed.len() + usize::from(applied_command) + terminal_command_ids.len(),
+        );
         for output in committed {
             frames.push(OutboundFrame::Event {
                 envelope: crate::gateway::Envelope {
@@ -1019,6 +1151,20 @@ impl<G: Gateway + 'static> Session<G> {
                     event: serde_json::to_value(output.event).map_err(anyhow::Error::from)?,
                 },
             });
+        }
+        for command_id in terminal_command_ids {
+            let ack = self
+                .writer
+                .ack_for_command(&command_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("committed handoff command disappeared"))?;
+            if ack.status != CommandAckStatus::Applied {
+                return Err(anyhow::anyhow!(
+                    "committed handoff command did not resolve to Applied"
+                )
+                .into());
+            }
+            frames.push(OutboundFrame::CommandAck { ack });
         }
         if applied_command {
             let command_id = command_id.ok_or(SessionFailure::CompletionChannelClosed)?;
@@ -1029,12 +1175,14 @@ impl<G: Gateway + 'static> Session<G> {
                 .ok_or_else(|| anyhow::anyhow!("applied command disappeared after AgentEnd"))?;
             frames.push(OutboundFrame::CommandAck { ack });
         }
-        if volatile {
+        if reliable {
+            if !frames.is_empty() {
+                self.enqueue_reliable(frames)?;
+            }
+        } else if volatile {
             for frame in frames {
                 self.outbound_handle()?.enqueue_volatile(frame);
             }
-        } else if !frames.is_empty() {
-            self.enqueue_reliable(frames)?;
         }
         Ok(())
     }
@@ -1101,6 +1249,35 @@ fn worker_join_failure(error: tokio::task::JoinError) -> SessionFailure {
         error.to_string()
     };
     SessionFailure::WorkerPanicked { message }
+}
+
+async fn await_retry_steer_acceptance(
+    phase_rx: &mut watch::Receiver<WorkerPhase>,
+    accepted_rx: oneshot::Receiver<bool>,
+) -> bool {
+    if *phase_rx.borrow_and_update() != WorkerPhase::RetryWait {
+        return false;
+    }
+    let accepted = tokio::select! {
+        biased;
+        accepted = accepted_rx => accepted.unwrap_or(false),
+        changed = phase_rx.changed() => {
+            let _ = changed;
+            false
+        }
+        () = tokio::time::sleep(RETRY_STEER_HANDSHAKE_TIMEOUT) => false,
+    };
+    accepted
+}
+
+fn committed_delivery_is_reliable(
+    committed: &[CommittedOutput],
+    applied_command: bool,
+    terminal_command_count: usize,
+) -> bool {
+    applied_command
+        || terminal_command_count != 0
+        || committed.iter().any(|output| output.seq.is_some())
 }
 
 fn panic_message(panic: Box<dyn Any + Send>) -> String {
