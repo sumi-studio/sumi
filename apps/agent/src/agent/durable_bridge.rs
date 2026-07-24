@@ -10,12 +10,12 @@ use crate::{
     provider::types::{PublicAssistantContent, PublicMessage, StopReason},
     runtime::contracts::ProcessGeneration,
     store::{
-        ApplicationKind, DurableEvent, EventBatch, EventWrite, EventWriter, InjectedCommand,
-        Projection, RunPhase, ToolExecutionMutation,
+        ApplicationKind, ApprovalMutation, DurableEvent, EventBatch, EventWrite, EventWriter,
+        InjectedCommand, Projection, RunPhase, ToolExecutionMutation,
     },
 };
 
-use super::{AdmittedCommand, AgentEvent, run::LENGTH_LOOP_CODE};
+use super::{AdmittedCommand, AgentEvent, ApprovalResolution, run::LENGTH_LOOP_CODE};
 
 #[derive(Clone, Debug)]
 pub(crate) struct DurableRunBinding {
@@ -501,7 +501,7 @@ impl DurableBridge {
                         },
                     )
                     .await?;
-                self.retry_wait_ready = true;
+                self.retry_wait_ready = delay_ms > 0;
                 Ok(committed)
             }
             AgentEvent::TurnEnd {
@@ -550,10 +550,68 @@ impl DurableBridge {
                 self.retry_steered = true;
                 Ok((Vec::new(), Vec::new()))
             }
-            AgentEvent::Steered { .. }
-            | AgentEvent::ApprovalRequested { .. }
-            | AgentEvent::ApprovalResolved { .. }
-            | AgentEvent::MemoryMaintenance { .. } => {
+            AgentEvent::ApprovalRequested { request } => {
+                if self.phase != RunPhase::AssistantStarted
+                    || !self.turn_open
+                    || self.assistant_open.is_some()
+                {
+                    bail!(
+                        "ApprovalRequested requires a durable assistant tool call in the active turn"
+                    );
+                }
+                let request_id = request.id.clone();
+                let tool_call_id = request.tool_call_id.clone();
+                self.commit_single(
+                    writer,
+                    DurableEvent::approval_requested(request.clone())?,
+                    vec![
+                        Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                            tool_call_id: tool_call_id.clone(),
+                            command_id: self.binding.command_id.clone(),
+                            run_id: self.binding.run_id.clone(),
+                            executor_generation: self.binding.executor_generation,
+                            idempotency_key: self
+                                .binding
+                                .tool_execution_idempotency_key(&tool_call_id),
+                        }),
+                        Projection::Approval(ApprovalMutation::Pending {
+                            request_id,
+                            tool_call_id,
+                            run_id: self.binding.run_id.clone(),
+                            turn_id: self.binding.turn_id.clone(),
+                        }),
+                    ],
+                    AgentEvent::ApprovalRequested { request },
+                )
+                .await
+            }
+            AgentEvent::ApprovalResolved {
+                request_id,
+                resolution: ApprovalResolution::Cancelled,
+            } => {
+                self.commit_single(
+                    writer,
+                    DurableEvent::approval_resolved(
+                        request_id.clone(),
+                        ApprovalResolution::Cancelled,
+                        "runtime".to_owned(),
+                    )?,
+                    vec![Projection::Approval(ApprovalMutation::Resolve {
+                        request_id: request_id.clone(),
+                        state: "cancelled",
+                        actor: "runtime".to_owned(),
+                    })],
+                    AgentEvent::ApprovalResolved {
+                        request_id,
+                        resolution: ApprovalResolution::Cancelled,
+                    },
+                )
+                .await
+            }
+            AgentEvent::ApprovalResolved { .. } => {
+                bail!("user approval decisions require the later T23 ApprovalBroker")
+            }
+            AgentEvent::Steered { .. } | AgentEvent::MemoryMaintenance { .. } => {
                 bail!("event requires a later T15/T16/T17 durable bridge extension")
             }
         }?;

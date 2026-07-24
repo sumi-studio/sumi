@@ -1786,6 +1786,326 @@ fn bridge_assistant(reason: StopReason) -> PublicMessage {
     })
 }
 
+fn approval_fixture_assistant(tool_call_id: &str) -> PublicMessage {
+    let mut assistant = match bridge_assistant(StopReason::ToolUse) {
+        PublicMessage::Assistant(message) => message,
+        _ => unreachable!(),
+    };
+    assistant.content.push(PublicAssistantContent::ToolCall {
+        tool_call: ToolCall {
+            id: tool_call_id.to_owned(),
+            name: "fixture-tool".to_owned(),
+            arguments: serde_json::from_value::<ValidatedToolArguments>(
+                serde_json::json!({"path":"/workspace/report.txt"}),
+            )
+            .expect("validated approval fixture arguments"),
+        },
+        wire_item_index: 0,
+    });
+    PublicMessage::Assistant(assistant)
+}
+
+fn approval_fixture_request(request_id: &str, tool_call_id: &str) -> ApprovalRequest {
+    ApprovalRequest {
+        id: request_id.to_owned(),
+        tool_call_id: tool_call_id.to_owned(),
+        tool_name: "fixture-tool".to_owned(),
+        action: events::ReviewProjection::Reviewable(
+            serde_json::json!({"path":"/workspace/report.txt"}),
+        ),
+        args_summary: serde_json::json!({"path":"/workspace/report.txt"}),
+        reason: Some("fixture-only pending action".to_owned()),
+        audit: None,
+    }
+}
+
+async fn approval_fixture_bridge(
+    name: &str,
+) -> (
+    Arc<Store>,
+    EventWriter,
+    DurableBridge,
+    DurableRunBinding,
+    ApprovalRequest,
+) {
+    let (store, writer, bridge, binding) =
+        fixture_bridge_after_assistant(name, approval_fixture_assistant("approval-tool")).await;
+    let request = approval_fixture_request("approval-request", "approval-tool");
+    (store, writer, bridge, binding, request)
+}
+
+async fn fixture_bridge_after_assistant(
+    name: &str,
+    assistant: PublicMessage,
+) -> (Arc<Store>, EventWriter, DurableBridge, DurableRunBinding) {
+    let store = Arc::new(
+        Store::session_test_store(name)
+            .await
+            .expect("approval fixture store"),
+    );
+    let writer = EventWriter::new(store.clone());
+    let inbound = user(1);
+    writer
+        .persist_inbound(&inbound)
+        .await
+        .expect("persist approval fixture owner");
+    let InboundCommand::Valid(envelope) = &inbound else {
+        unreachable!("user fixture is valid")
+    };
+    let received_at: String =
+        sqlx::query_scalar("SELECT received_at FROM inbound_commands WHERE command_id=?")
+            .bind(envelope.command_id.as_str())
+            .fetch_one(store.pool())
+            .await
+            .expect("approval fixture received_at");
+    let received_at = chrono::DateTime::parse_from_rfc3339(&received_at)
+        .expect("valid durable received_at")
+        .with_timezone(&Utc);
+    let initial = AdmittedCommand::new(envelope.clone(), received_at);
+    let binding = DurableRunBinding::idle(&initial, test_executor_generation());
+    writer
+        .apply(crate::store::EventBatch {
+            writes: vec![crate::store::EventWrite {
+                event: None,
+                projections: vec![crate::store::Projection::CommandClassified {
+                    command_id: binding.command_id.clone(),
+                    application_kind: crate::store::ApplicationKind::IdleRun,
+                    run_id: binding.run_id.clone(),
+                    turn_id: binding.turn_id.clone(),
+                }],
+            }],
+            injected_commands: Vec::new(),
+        })
+        .await
+        .expect("classify approval fixture owner");
+    let mut bridge = DurableBridge::new(binding.clone());
+    let user_message = PublicMessage::User(UserMessage {
+        content: vec![UserContent::Text {
+            text: "message 1".to_owned(),
+        }],
+        timestamp: received_at,
+    });
+    for event in [
+        AgentEvent::AgentStart,
+        AgentEvent::TurnStart,
+        AgentEvent::MessageStart {
+            message_id: user_message_id(&envelope.command_id),
+            message: Box::new(user_message.clone()),
+        },
+        AgentEvent::MessageEnd {
+            message_id: user_message_id(&envelope.command_id),
+            message: Box::new(user_message),
+        },
+        AgentEvent::MessageStart {
+            message_id: "approval-assistant".to_owned(),
+            message: Box::new(bridge_assistant(StopReason::ToolUse)),
+        },
+        AgentEvent::MessageEnd {
+            message_id: "approval-assistant".to_owned(),
+            message: Box::new(assistant),
+        },
+    ] {
+        bridge
+            .commit(&writer, RunOutput::detached(binding.clone(), event, None))
+            .await
+            .expect("commit approval fixture prefix");
+    }
+    (store, writer, bridge, binding)
+}
+
+#[tokio::test]
+async fn fixture_pending_and_runtime_cancellation_cross_the_durable_bridge_atomically() {
+    let (store, writer, mut bridge, binding, request) =
+        approval_fixture_bridge("durable-approval-fixture").await;
+    bridge
+        .commit(
+            &writer,
+            RunOutput::detached(
+                binding.clone(),
+                AgentEvent::ApprovalRequested {
+                    request: request.clone(),
+                },
+                None,
+            ),
+        )
+        .await
+        .expect("commit fixture pending approval");
+    assert_eq!(
+        sqlx::query_as::<_, (String, String, i64)>(
+            "SELECT
+                (SELECT state FROM approval_log WHERE id='approval-request'),
+                (SELECT state FROM tool_executions WHERE tool_call_id='approval-tool'),
+                (SELECT COUNT(*) FROM agent_events
+                 WHERE event_type='approval_requested')",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("pending approval transaction"),
+        ("pending".to_owned(), "prepared".to_owned(), 1)
+    );
+
+    bridge
+        .commit(
+            &writer,
+            RunOutput::detached(
+                binding,
+                AgentEvent::ApprovalResolved {
+                    request_id: request.id,
+                    resolution: ApprovalResolution::Cancelled,
+                },
+                None,
+            ),
+        )
+        .await
+        .expect("commit fixture cancellation");
+    assert_eq!(
+        sqlx::query_as::<_, (String, i64)>(
+            "SELECT
+                (SELECT state FROM approval_log WHERE id='approval-request'),
+                (SELECT COUNT(*) FROM agent_events
+                 WHERE event_type='approval_resolved')",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("approval cancellation transaction"),
+        ("cancelled".to_owned(), 1)
+    );
+}
+
+#[tokio::test]
+async fn failed_fixture_pending_transaction_leaves_no_event_projection_or_prepared_tool() {
+    let (store, writer, mut bridge, binding, request) =
+        approval_fixture_bridge("durable-approval-rollback").await;
+    sqlx::query(
+        "CREATE TRIGGER reject_fixture_approval
+         BEFORE INSERT ON approval_log
+         BEGIN SELECT RAISE(ABORT, 'fixture rejects pending approval'); END",
+    )
+    .execute(store.pool())
+    .await
+    .expect("install approval rollback trigger");
+
+    let result = bridge
+        .commit(
+            &writer,
+            RunOutput::detached(binding, AgentEvent::ApprovalRequested { request }, None),
+        )
+        .await;
+    let error = match result {
+        Ok(_) => panic!("fixture pending transaction must fail"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("fixture rejects pending approval")
+    );
+    assert_eq!(
+        sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT
+                (SELECT COUNT(*) FROM approval_log),
+                (SELECT COUNT(*) FROM tool_executions),
+                (SELECT COUNT(*) FROM agent_events
+                 WHERE event_type='approval_requested')",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("approval rollback state"),
+        (0, 0, 0)
+    );
+}
+
+#[tokio::test]
+async fn pending_fixture_approval_is_a_fail_closed_t12_restart_suffix() {
+    let (store, writer, mut bridge, binding, request) =
+        approval_fixture_bridge("durable-approval-restart").await;
+    bridge
+        .commit(
+            &writer,
+            RunOutput::detached(
+                binding.clone(),
+                AgentEvent::ApprovalRequested { request },
+                None,
+            ),
+        )
+        .await
+        .expect("commit pending approval before restart");
+    let steps = SuffixRecovery::recover_t12_prefix(store.as_ref(), &writer)
+        .await
+        .expect("plan T12 restart boundary");
+    assert_eq!(
+        steps,
+        vec![RecoveryStep::ResumeAssistantFromDurableEvents {
+            command_id: binding.command_id,
+            run_id: binding.run_id,
+            turn_id: binding.turn_id,
+        }]
+    );
+
+    drop(bridge);
+    drop(writer);
+    let store = Arc::try_unwrap(store).unwrap_or_else(|_| panic!("sole approval fixture store"));
+    let (gateway, _commands, _frames) = gateway();
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |core: RunCore,
+         _initial: AdmittedCommand,
+         _controls: mpsc::Receiver<RunControl>,
+         _events: mpsc::Sender<AgentEvent>| async move { RunCompletion::Completed(core) },
+    );
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        worker,
+        test_executor_generation(),
+    )
+    .await
+    .expect("restart session detects pending approval suffix");
+    assert!(matches!(
+        session.recovery_steps.as_slice(),
+        [RecoveryStep::ResumeAssistantFromDurableEvents { .. }]
+    ));
+}
+
+#[tokio::test]
+async fn delay_zero_retry_schedule_never_opens_the_durable_retry_wait_gate() {
+    let mut error = match bridge_assistant(StopReason::Error) {
+        PublicMessage::Assistant(message) => message,
+        _ => unreachable!(),
+    };
+    error.error_message = Some("immediate overflow recovery".to_owned());
+    error.provider_code = Some("model_context_window_exceeded".to_owned());
+    let (_store, writer, mut bridge, binding) = fixture_bridge_after_assistant(
+        "durable-delay-zero-retry-gate",
+        PublicMessage::Assistant(error),
+    )
+    .await;
+    bridge
+        .commit(
+            &writer,
+            RunOutput::detached(
+                binding,
+                AgentEvent::RetryScheduled {
+                    attempt: 1,
+                    delay_ms: 0,
+                    retry_at: Utc::now(),
+                    error_message: "immediate overflow recovery".to_owned(),
+                },
+                None,
+            ),
+        )
+        .await
+        .expect("commit zero-delay retry schedule");
+    assert!(!bridge.can_bind_retry_steer());
+}
+
+#[test]
+fn terminal_or_applied_side_effects_force_reliable_delivery_without_durable_outputs() {
+    assert!(committed_delivery_is_reliable(&[], false, 1));
+    assert!(committed_delivery_is_reliable(&[], true, 0));
+    assert!(!committed_delivery_is_reliable(&[], false, 0));
+}
+
 #[tokio::test]
 async fn active_second_user_stays_received_then_runs_after_the_current_agent_end() {
     let store = Store::session_test_store("durable-deferred-second-user-session")
@@ -4515,6 +4835,10 @@ async fn gateway_user_during_retry_wait_is_durably_injected_before_next_attempt(
         .iter()
         .position(|kind| kind == "retry_scheduled")
         .expect("RetryScheduled");
+    assert!(
+        kinds.len() > retry + 4,
+        "retry suffix must contain injection and the next assistant start"
+    );
     assert_eq!(
         &kinds[retry + 1..retry + 4],
         ["steered", "message_start", "message_end"]
@@ -4536,6 +4860,31 @@ async fn gateway_user_during_retry_wait_is_durably_injected_before_next_attempt(
             .map(|ack| ack.command_id.as_str())
             .collect::<Vec<_>>(),
         [initial_command_id.as_str(), steer_command_id.as_str()]
+    );
+    let (injected_message_end, prior_owner_applied) = {
+        let frames = frames.lock().expect("retry steer frames");
+        let injected_message_end = frames
+            .iter()
+            .position(|frame| {
+                matches!(frame, OutboundFrame::Event { envelope }
+                    if envelope.event["type"] == "message_end"
+                        && envelope.event["message"]["role"] == "user"
+                        && envelope.event["message"]["content"][0]["text"] == "message 2")
+            })
+            .expect("injected retry-steer MessageEnd frame");
+        let prior_owner_applied = frames
+            .iter()
+            .position(|frame| {
+                matches!(frame, OutboundFrame::CommandAck { ack }
+                    if ack.command_id == initial_command_id.as_str()
+                        && ack.status == CommandAckStatus::Applied)
+            })
+            .expect("prior owner Applied ACK");
+        (injected_message_end, prior_owner_applied)
+    };
+    assert!(
+        injected_message_end < prior_owner_applied,
+        "committed handoff events must be observable before the prior owner Applied ACK"
     );
     let initial_state: (String, String) =
         sqlx::query_as("SELECT run_phase, status FROM inbound_commands WHERE command_id=?")

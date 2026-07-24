@@ -1128,9 +1128,20 @@ impl<G: Gateway + 'static> Session<G> {
                 anyhow::anyhow!("committed output mixed durable and volatile frames").into(),
             );
         }
+        let reliable =
+            committed_delivery_is_reliable(&committed, applied_command, terminal_command_ids.len());
         let mut frames = Vec::with_capacity(
             committed.len() + usize::from(applied_command) + terminal_command_ids.len(),
         );
+        for output in committed {
+            frames.push(OutboundFrame::Event {
+                envelope: crate::gateway::Envelope {
+                    seq: output.seq,
+                    conversation_id: self.conversation_id.clone(),
+                    event: serde_json::to_value(output.event).map_err(anyhow::Error::from)?,
+                },
+            });
+        }
         for command_id in terminal_command_ids {
             let ack = self
                 .writer
@@ -1145,15 +1156,6 @@ impl<G: Gateway + 'static> Session<G> {
             }
             frames.push(OutboundFrame::CommandAck { ack });
         }
-        for output in committed {
-            frames.push(OutboundFrame::Event {
-                envelope: crate::gateway::Envelope {
-                    seq: output.seq,
-                    conversation_id: self.conversation_id.clone(),
-                    event: serde_json::to_value(output.event).map_err(anyhow::Error::from)?,
-                },
-            });
-        }
         if applied_command {
             let command_id = command_id.ok_or(SessionFailure::CompletionChannelClosed)?;
             let ack = self
@@ -1163,12 +1165,14 @@ impl<G: Gateway + 'static> Session<G> {
                 .ok_or_else(|| anyhow::anyhow!("applied command disappeared after AgentEnd"))?;
             frames.push(OutboundFrame::CommandAck { ack });
         }
-        if volatile {
+        if reliable {
+            if !frames.is_empty() {
+                self.enqueue_reliable(frames)?;
+            }
+        } else if volatile {
             for frame in frames {
                 self.outbound_handle()?.enqueue_volatile(frame);
             }
-        } else if !frames.is_empty() {
-            self.enqueue_reliable(frames)?;
         }
         Ok(())
     }
@@ -1235,6 +1239,16 @@ fn worker_join_failure(error: tokio::task::JoinError) -> SessionFailure {
         error.to_string()
     };
     SessionFailure::WorkerPanicked { message }
+}
+
+fn committed_delivery_is_reliable(
+    committed: &[CommittedOutput],
+    applied_command: bool,
+    terminal_command_count: usize,
+) -> bool {
+    applied_command
+        || terminal_command_count != 0
+        || committed.iter().any(|output| output.seq.is_some())
 }
 
 fn panic_message(panic: Box<dyn Any + Send>) -> String {

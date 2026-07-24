@@ -6077,6 +6077,27 @@ struct ToolCallOrigin {
     assistant_message_id: String,
 }
 
+#[derive(Clone, Copy)]
+enum OwnerHandoffAccounting {
+    Ignore,
+    Account,
+}
+
+fn projection_closes_owner(
+    projection: &PreparedProjection,
+    command_id: &str,
+    run_id: &str,
+) -> bool {
+    matches!(
+        projection,
+        PreparedProjection::Plain(Projection::CommandApplied {
+            command_id: target,
+            run_id: Some(target_run),
+            ..
+        }) if target == command_id && target_run == run_id
+    )
+}
+
 /// Applies only the proposed suffix to the lifecycle state authenticated at
 /// startup/recovery. Shape validation alone cannot distinguish a legal suffix
 /// from a second start or an event bound to a different live turn.
@@ -6112,7 +6133,7 @@ async fn validate_durable_lifecycle_suffix(
                     &run_id,
                     &turn_id,
                     &event.kind,
-                    false,
+                    OwnerHandoffAccounting::Ignore,
                 )
                 .await?;
             }
@@ -6292,7 +6313,7 @@ async fn validate_durable_lifecycle_suffix(
             &run_id,
             &turn_id,
             "retry_steer",
-            true,
+            OwnerHandoffAccounting::Account,
         )
         .await?;
         let binding = (run_id.clone(), turn_id.clone());
@@ -6347,7 +6368,7 @@ async fn require_exact_live_owner_turn(
     run_id: &str,
     turn_id: &str,
     kind: &str,
-    account_owner_handoff: bool,
+    handoff_accounting: OwnerHandoffAccounting,
 ) -> Result<()> {
     let rows = sqlx::query(
         "SELECT command_id, run_phase FROM inbound_commands
@@ -6366,19 +6387,10 @@ async fn require_exact_live_owner_turn(
                 let Ok(phase) = row.try_get::<String, _>("run_phase") else {
                     return false;
                 };
-                let closes_owner =
-                    prepared
-                        .iter()
-                        .flat_map(|write| &write.projections)
-                        .any(|projection| {
-                            matches!(
-                                projection,
-                                PreparedProjection::Plain(Projection::CommandApplied {
-                                    command_id: target,
-                                    ..
-                                }) if target == &command_id
-                            )
-                        });
+                let closes_owner = prepared
+                    .iter()
+                    .flat_map(|write| &write.projections)
+                    .any(|projection| projection_closes_owner(projection, &command_id, run_id));
                 let opens_owner = prepared.iter().flat_map(|write| &write.projections).any(
                     |projection| {
                         matches!(
@@ -6393,7 +6405,8 @@ async fn require_exact_live_owner_turn(
                     },
                 );
                 (RunPhase::parse(&phase).is_ok_and(RunPhase::is_owner)
-                    && (!account_owner_handoff || !closes_owner))
+                    && (!matches!(handoff_accounting, OwnerHandoffAccounting::Account)
+                        || !closes_owner))
                     || opens_owner
             })
             .count();
@@ -7391,6 +7404,18 @@ mod tests {
         verify_digest_bytes(b"digest", b"digest").expect("equal digests verify");
         assert!(verify_digest_bytes(b"digest", b"digest-extra").is_err());
         assert!(verify_digest_bytes(b"digest", b"digist").is_err());
+    }
+
+    #[test]
+    fn owner_handoff_accounting_requires_the_same_command_and_run() {
+        let projection = PreparedProjection::Plain(Projection::CommandApplied {
+            command_id: "command-a".to_owned(),
+            command_seq: 1,
+            run_id: Some("run-a".to_owned()),
+        });
+        assert!(projection_closes_owner(&projection, "command-a", "run-a"));
+        assert!(!projection_closes_owner(&projection, "command-a", "run-b"));
+        assert!(!projection_closes_owner(&projection, "command-b", "run-a"));
     }
 
     fn test_provider() -> Arc<dyn KeyProvider> {
