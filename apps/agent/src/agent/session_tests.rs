@@ -33,6 +33,12 @@ fn test_executor_generation() -> ProcessGeneration {
     ProcessGeneration::from_wire(73).expect("valid test generation")
 }
 
+fn validate_test_generation(generation: ProcessGeneration) -> Result<()> {
+    (generation == test_executor_generation())
+        .then_some(())
+        .ok_or_else(|| anyhow!("fixture executor generation mismatch"))
+}
+
 #[test]
 fn session_start_composition_boundary_requires_process_generation() {
     fn assert_signature<Future>(
@@ -538,9 +544,7 @@ struct StaleBindingWorker(StaleBinding);
 
 impl RunWorker for StaleBindingWorker {
     fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
-        (generation == test_executor_generation())
-            .then_some(())
-            .ok_or_else(|| anyhow!("fixture executor generation mismatch"))
+        validate_test_generation(generation)
     }
 
     fn run(
@@ -2126,9 +2130,7 @@ impl MultiRejectedReceiptDriver {
 #[async_trait]
 impl RunDriver for MultiRejectedReceiptDriver {
     fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
-        (generation == test_executor_generation())
-            .then_some(())
-            .ok_or_else(|| anyhow!("fixture executor generation mismatch"))
+        validate_test_generation(generation)
     }
 
     async fn start_provider_for_command(
@@ -2276,9 +2278,7 @@ impl DurableToolBarrierDriver {
 #[async_trait]
 impl RunDriver for DurableToolBarrierDriver {
     fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
-        (generation == test_executor_generation())
-            .then_some(())
-            .ok_or_else(|| anyhow!("fixture executor generation mismatch"))
+        validate_test_generation(generation)
     }
 
     async fn start_provider_for_command(
@@ -2416,9 +2416,7 @@ impl IndeterminateToolDriver {
 #[async_trait]
 impl RunDriver for IndeterminateToolDriver {
     fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
-        (generation == test_executor_generation())
-            .then_some(())
-            .ok_or_else(|| anyhow!("fixture executor generation mismatch"))
+        validate_test_generation(generation)
     }
 
     async fn start_provider_for_command(
@@ -3194,9 +3192,7 @@ struct StartFailureDriver;
 #[async_trait]
 impl RunDriver for StartFailureDriver {
     fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
-        (generation == test_executor_generation())
-            .then_some(())
-            .ok_or_else(|| anyhow!("fixture executor generation mismatch"))
+        validate_test_generation(generation)
     }
 
     async fn start_provider_for_command(
@@ -3243,9 +3239,7 @@ impl RunDriver for StartFailureDriver {
 #[async_trait]
 impl RunDriver for OpaqueContextDriver {
     fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
-        (generation == test_executor_generation())
-            .then_some(())
-            .ok_or_else(|| anyhow!("fixture executor generation mismatch"))
+        validate_test_generation(generation)
     }
 
     async fn start_provider_for_command(
