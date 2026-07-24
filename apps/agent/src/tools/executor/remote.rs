@@ -320,6 +320,9 @@ impl RemoteToolKind {
                 ))
             }
             (Self::Bash, ExecutorResponse::Bash { result }) => {
+                let is_error = result.exit_code != Some(0)
+                    || result.cancelled
+                    || result.resource_limit.is_some();
                 let terminal = bash_terminal_lines(&result);
                 let content = render_bounded_output(
                     &result.truncation,
@@ -327,7 +330,9 @@ impl RemoteToolKind {
                     result.artifact_handle.as_deref(),
                     &terminal,
                 );
-                Ok(text_output(content, to_value(result)?))
+                let mut output = text_output(content, to_value(result)?);
+                output.is_error = is_error;
+                Ok(output)
             }
             _ => Err(ToolError::Protocol(
                 "executor adapter received a response for a different operation".to_owned(),
@@ -681,7 +686,7 @@ mod tests {
             if self.responses.lock().unwrap().is_empty() {
                 cancel.cancelled().await;
                 return Ok(ExecutorResponse::Bash {
-                    result: bash_result("", None, true, None),
+                    result: bash_result("", None, None, true, None),
                 });
             }
             self.responses.lock().unwrap().pop_front().unwrap()
@@ -832,6 +837,7 @@ mod tests {
     fn bash_result(
         output: &str,
         artifact_handle: Option<&str>,
+        exit_code: Option<i32>,
         cancelled: bool,
         resource_limit: Option<ResourceLimit>,
     ) -> BashExecutionResult {
@@ -840,7 +846,7 @@ mod tests {
             truncation: truncation(output),
             artifact_handle: artifact_handle.map(str::to_owned),
             observed_bytes: output.len() as u64,
-            exit_code: (!cancelled && resource_limit.is_none()).then_some(0),
+            exit_code,
             cancelled,
             resource_limit,
         }
@@ -874,6 +880,7 @@ mod tests {
                 result: bash_result(
                     "done",
                     Some("artifact://conversation-1/tool-output/exec-log"),
+                    Some(0),
                     false,
                     None,
                 ),
@@ -1528,6 +1535,7 @@ mod tests {
         let mut result = bash_result(
             "partial",
             Some("artifact://conversation-1/tool-output/exec-log"),
+            None,
             false,
             Some(ResourceLimit::WallTime { limit_seconds: 120 }),
         );
@@ -1544,5 +1552,47 @@ mod tests {
         assert!(
             matches!(output.content[0], crate::provider::types::UserContent::Text { ref text } if text.contains("artifact://conversation-1/tool-output/exec-log") && text.contains("WallTime"))
         );
+    }
+
+    #[test]
+    fn bash_output_is_error_matches_result_state() {
+        for (exit_code, cancelled, resource_limit, expected_is_error, expected_text) in [
+            (Some(0), false, None, false, "Command exited with code 0."),
+            (Some(1), false, None, true, "Command exited with code 1."),
+            (
+                None,
+                false,
+                None,
+                true,
+                "Command ended without an exit code.",
+            ),
+            (None, true, None, true, "Command cancelled."),
+            (
+                None,
+                false,
+                Some(ResourceLimit::WallTime { limit_seconds: 120 }),
+                true,
+                "WallTime",
+            ),
+        ] {
+            let result = bash_result(
+                "output",
+                Some("artifact://conversation-1/tool-output/exec-log"),
+                exit_code,
+                cancelled,
+                resource_limit.clone(),
+            );
+            let output = RemoteToolKind::Bash
+                .output(ExecutorResponse::Bash { result }, None)
+                .unwrap();
+            assert_eq!(
+                output.is_error, expected_is_error,
+                "exit_code={exit_code:?}, cancelled={cancelled}, resource_limit={resource_limit:?}"
+            );
+            assert!(
+                matches!(output.content[0], crate::provider::types::UserContent::Text { ref text } if text.contains(expected_text)),
+                "unexpected terminal text for exit_code={exit_code:?}, cancelled={cancelled}, resource_limit={resource_limit:?}"
+            );
+        }
     }
 }

@@ -298,7 +298,7 @@ impl RunDriver for InjectedRunDriver {
             tool_name: call.name.clone(),
             content: output.content,
             details: output.details,
-            is_error: false,
+            is_error: output.is_error,
             timestamp: Utc::now(),
         })
     }
@@ -494,6 +494,7 @@ mod tests {
                     text: "done".to_owned(),
                 }],
                 details: json!({"flow":ctx.flow_id,"call":ctx.call_id}),
+                is_error: false,
             })
         }
     }
@@ -907,6 +908,75 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("unknown frozen tool")
+        );
+    }
+
+    #[tokio::test]
+    async fn frozen_registry_propagates_tool_output_is_error() {
+        struct ErrorTool;
+
+        #[async_trait]
+        impl Tool for ErrorTool {
+            fn def(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "error_tool".to_owned(),
+                    description: "fixture tool that reports an error".to_owned(),
+                    parameters: json!({"type":"object"}),
+                }
+            }
+
+            fn risk(&self) -> ToolRisk {
+                ToolRisk::ReadOnly
+            }
+
+            async fn execute(&self, _ctx: ToolCtx<'_>) -> Result<ToolOutput, ToolError> {
+                Ok(ToolOutput {
+                    content: vec![UserContent::Text {
+                        text: "failed".to_owned(),
+                    }],
+                    details: json!({"failed": true}),
+                    is_error: true,
+                })
+            }
+        }
+
+        let mut builder = ToolRegistryBuilder::default();
+        builder
+            .register(Arc::new(ErrorTool))
+            .expect("register error tool");
+        let registry = builder.build();
+        let prompt = PromptContext {
+            system_prompt: "fixture".to_owned(),
+            memory_blocks: Vec::new(),
+            messages: Vec::new(),
+            provider_context: Vec::new(),
+            tools: registry.definitions(),
+        };
+        let driver = InjectedRunDriver::with_stream_starter(
+            ModelSpec::preset("kimi-k3").expect("preset"),
+            RequestOptions::default(),
+            Some(prompt),
+            Some(registry),
+            Some(WorkspacePaths::new("/workspace").expect("workspace")),
+            Some(generation(7)),
+            inert_starter(),
+        )
+        .expect("driver");
+
+        let call = ToolCall {
+            id: "call-1".to_owned(),
+            name: "error_tool".to_owned(),
+            arguments: serde_json::from_value::<ValidatedToolArguments>(json!({}))
+                .expect("empty args"),
+        };
+        let result = driver
+            .execute_tool_observed("flow-1", &call, CancellationToken::new(), Arc::new(|_| {}))
+            .await
+            .expect("tool result");
+        assert_eq!(result.tool_call_id, "call-1");
+        assert!(
+            result.is_error,
+            "execute_tool_observed must propagate ToolOutput.is_error into ToolResultMessage.is_error"
         );
     }
 

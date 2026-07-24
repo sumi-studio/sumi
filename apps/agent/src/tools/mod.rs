@@ -93,6 +93,7 @@ impl From<crate::runtime::contracts::RuntimeContractError> for ToolError {
 pub struct ToolOutput {
     pub content: Vec<UserContent>,
     pub details: Value,
+    pub is_error: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -392,6 +393,7 @@ pub fn text_output(text: impl Into<String>, details: Value) -> ToolOutput {
     ToolOutput {
         content: vec![UserContent::Text { text: text.into() }],
         details,
+        is_error: false,
     }
 }
 
