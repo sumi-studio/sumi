@@ -1000,13 +1000,17 @@ mod tests {
                 .await
                 .expect("attempt");
         }
-        for _ in 0..20 {
-            if driver.timings().snapshot().len() == 20 {
-                break;
+        let samples = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let samples = driver.timings().snapshot();
+                if samples.len() == 20 {
+                    break samples;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-        let samples = driver.timings().snapshot();
+        })
+        .await
+        .expect("timing collection hung");
         assert_eq!(samples.len(), 20);
         assert!(driver.timings().internal_p95().expect("p95") < Duration::from_millis(30));
         assert_eq!(
@@ -1106,18 +1110,16 @@ mod tests {
             7
         );
         while attempt.events.recv().await.is_some() {}
-        for _ in 0..20 {
-            if !driver.timings().snapshot().is_empty() {
-                break;
+        let sample = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(sample) = driver.timings().snapshot().into_iter().next() {
+                    break sample;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-        let sample = driver
-            .timings()
-            .snapshot()
-            .into_iter()
-            .next()
-            .expect("timing");
+        })
+        .await
+        .expect("timing collection hung");
         assert!(sample.command_received_to_request_sent.is_some());
         assert!(
             sample

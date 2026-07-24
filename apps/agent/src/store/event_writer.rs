@@ -6112,6 +6112,7 @@ async fn validate_durable_lifecycle_suffix(
                     &run_id,
                     &turn_id,
                     &event.kind,
+                    false,
                 )
                 .await?;
             }
@@ -6285,8 +6286,15 @@ async fn validate_durable_lifecycle_suffix(
         }
     }
     for (run_id, turn_id) in retry_steers {
-        require_exact_live_owner_turn(transaction, prepared, &run_id, &turn_id, "retry_steer")
-            .await?;
+        require_exact_live_owner_turn(
+            transaction,
+            prepared,
+            &run_id,
+            &turn_id,
+            "retry_steer",
+            true,
+        )
+        .await?;
         let binding = (run_id.clone(), turn_id.clone());
         if state.open_turns.get(&run_id) != Some(&turn_id) {
             bail!("retry_steer for {run_id}/{turn_id} requires that exact current open turn");
@@ -6339,6 +6347,7 @@ async fn require_exact_live_owner_turn(
     run_id: &str,
     turn_id: &str,
     kind: &str,
+    account_owner_handoff: bool,
 ) -> Result<()> {
     let rows = sqlx::query(
         "SELECT command_id, run_phase FROM inbound_commands
@@ -6357,8 +6366,21 @@ async fn require_exact_live_owner_turn(
                 let Ok(phase) = row.try_get::<String, _>("run_phase") else {
                     return false;
                 };
-                RunPhase::parse(&phase).is_ok_and(RunPhase::is_owner)
-                    || prepared.iter().flat_map(|write| &write.projections).any(|projection| {
+                let closes_owner =
+                    prepared
+                        .iter()
+                        .flat_map(|write| &write.projections)
+                        .any(|projection| {
+                            matches!(
+                                projection,
+                                PreparedProjection::Plain(Projection::CommandApplied {
+                                    command_id: target,
+                                    ..
+                                }) if target == &command_id
+                            )
+                        });
+                let opens_owner = prepared.iter().flat_map(|write| &write.projections).any(
+                    |projection| {
                         matches!(
                             projection,
                             PreparedProjection::Plain(Projection::RunPhase {
@@ -6368,7 +6390,11 @@ async fn require_exact_live_owner_turn(
                                 ..
                             }) if target == &command_id && target_run == run_id && next.is_owner()
                         )
-                    })
+                    },
+                );
+                (RunPhase::parse(&phase).is_ok_and(RunPhase::is_owner)
+                    && (!account_owner_handoff || !closes_owner))
+                    || opens_owner
             })
             .count();
     if matches != 1 {

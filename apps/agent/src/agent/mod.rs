@@ -21,7 +21,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use thiserror::Error;
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     task::JoinHandle,
 };
 use uuid::Uuid;
@@ -48,7 +48,7 @@ mod run;
 
 use durable_bridge::{
     CommittedOutput, DurableBridge, DurableRunBinding, MessageCommitBarrier, MessageCommitReceipt,
-    RunOutput, ToolStartCommitBarrier,
+    RetryWaitCommitBarrier, RunOutput, ToolStartCommitBarrier,
 };
 use queue::MessageQueue;
 
@@ -181,6 +181,7 @@ pub(crate) struct RunCore {
     /// a second Session run from silently losing the first run.
     runtime_context: Vec<ContextMessage>,
     durable_binding: Option<DurableRunBinding>,
+    worker_phase: Option<watch::Sender<WorkerPhase>>,
 }
 
 impl RunCore {
@@ -192,6 +193,7 @@ impl RunCore {
             pending_overflow_apply: None,
             runtime_context: Vec::new(),
             durable_binding: None,
+            worker_phase: None,
         }
     }
 
@@ -279,6 +281,18 @@ impl AdmittedCommand {
 
 pub(crate) enum RunControl {
     Command(AdmittedCommand),
+    RetrySteer {
+        command: AdmittedCommand,
+        accepted: oneshot::Sender<bool>,
+        committed: oneshot::Receiver<()>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum WorkerPhase {
+    #[default]
+    Active,
+    RetryWait,
 }
 
 pub(crate) enum RunCompletion {
@@ -412,11 +426,8 @@ fn event_channel_lost(completion: RunCompletion) -> RunCompletion {
 }
 
 pub(crate) struct ActiveRun {
-    #[allow(
-        dead_code,
-        reason = "T15 retains the sender so an active worker never observes a false control-lane close"
-    )]
     control_tx: mpsc::Sender<RunControl>,
+    phase_rx: watch::Receiver<WorkerPhase>,
     events_rx: mpsc::Receiver<RunOutput>,
     completion_rx: oneshot::Receiver<RunCompletion>,
     join: JoinHandle<()>,
@@ -733,10 +744,63 @@ impl<G: Gateway + 'static> Session<G> {
         };
         let command = AdmittedCommand::live(command, received_at, received_monotonic);
         if self.active.is_some() {
+            if self.route_retry_wait_command(&command).await? {
+                return Ok(());
+            }
             self.defer_active_command(command)?;
             return Ok(());
         }
         self.route_idle(command).await
+    }
+
+    async fn route_retry_wait_command(
+        &mut self,
+        command: &AdmittedCommand,
+    ) -> Result<bool, SessionFailure> {
+        if !matches!(command.envelope().command, Command::UserMessage { .. })
+            || !self.deferred_commands.is_empty()
+        {
+            return Ok(false);
+        }
+        let eligible = self.active.as_ref().is_some_and(|active| {
+            *active.phase_rx.borrow() == WorkerPhase::RetryWait
+                && active.bridge.can_bind_retry_steer()
+        });
+        if !eligible {
+            return Ok(false);
+        }
+
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let (committed_tx, committed_rx) = oneshot::channel();
+        let control = RunControl::RetrySteer {
+            command: command.clone(),
+            accepted: accepted_tx,
+            committed: committed_rx,
+        };
+        let sent = self
+            .active
+            .as_ref()
+            .expect("retry eligibility requires an active run")
+            .control_tx
+            .try_send(control);
+        if sent.is_err() {
+            return Ok(false);
+        }
+        if !accepted_rx.await.unwrap_or(false) {
+            return Ok(false);
+        }
+        self.active
+            .as_mut()
+            .expect("accepted retry steer retains the active run")
+            .bridge
+            .bind_retry_steer(&self.writer, command.clone())
+            .await?;
+        committed_tx.send(()).map_err(|_| {
+            SessionFailure::Worker(WorkerFailure::Error(
+                "retry worker exited before durable steer authorization".to_owned(),
+            ))
+        })?;
+        Ok(true)
     }
 
     fn defer_active_command(&mut self, command: AdmittedCommand) -> Result<(), SessionFailure> {
@@ -850,6 +914,8 @@ impl<G: Gateway + 'static> Session<G> {
         core.durable_binding = Some(binding.clone());
         let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
         let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let (phase_tx, phase_rx) = watch::channel(WorkerPhase::Active);
+        core.worker_phase = Some(phase_tx);
         let (completion_tx, completion_rx) = oneshot::channel();
         let future = catch_unwind(AssertUnwindSafe(|| {
             self.worker.run(core, initial, control_rx, events_tx)
@@ -863,6 +929,7 @@ impl<G: Gateway + 'static> Session<G> {
         });
         self.active = Some(ActiveRun {
             control_tx,
+            phase_rx,
             events_rx,
             completion_rx,
             join,
@@ -996,13 +1063,21 @@ impl<G: Gateway + 'static> Session<G> {
                     return Err(error.into());
                 }
             };
-            let (outputs, tool_start_barrier) = committed.resolve_message_receipts();
+            let (outputs, tool_start_barrier, retry_wait_commit_barrier, terminal_command_ids) =
+                committed.resolve_message_receipts();
             if let Some(barrier) = tool_start_barrier {
+                barrier.committed();
+            }
+            if let Some(barrier) = retry_wait_commit_barrier {
                 barrier.committed();
             }
             if deliver && delivery_failure.is_none() {
                 delivery_failure = self
-                    .send_committed(outputs, Some(active.bridge.command_id().to_owned()))
+                    .send_committed(
+                        outputs,
+                        Some(active.bridge.command_id().to_owned()),
+                        terminal_command_ids,
+                    )
                     .await
                     .err();
             }
@@ -1021,21 +1096,27 @@ impl<G: Gateway + 'static> Session<G> {
                 }
             }
         };
-        let (outputs, tool_start_barrier) = committed.resolve_message_receipts();
+        let (outputs, tool_start_barrier, retry_wait_commit_barrier, terminal_command_ids) =
+            committed.resolve_message_receipts();
         if let Some(barrier) = tool_start_barrier {
+            barrier.committed();
+        }
+        if let Some(barrier) = retry_wait_commit_barrier {
             barrier.committed();
         }
         let command_id = self
             .active
             .as_ref()
             .map(|active| active.bridge.command_id().to_owned());
-        self.send_committed(outputs, command_id).await
+        self.send_committed(outputs, command_id, terminal_command_ids)
+            .await
     }
 
     async fn send_committed(
         &mut self,
         committed: Vec<CommittedOutput>,
         command_id: Option<String>,
+        terminal_command_ids: Vec<String>,
     ) -> Result<(), SessionFailure> {
         let applied_command = committed
             .iter()
@@ -1047,7 +1128,23 @@ impl<G: Gateway + 'static> Session<G> {
                 anyhow::anyhow!("committed output mixed durable and volatile frames").into(),
             );
         }
-        let mut frames = Vec::with_capacity(committed.len() + usize::from(applied_command));
+        let mut frames = Vec::with_capacity(
+            committed.len() + usize::from(applied_command) + terminal_command_ids.len(),
+        );
+        for command_id in terminal_command_ids {
+            let ack = self
+                .writer
+                .ack_for_command(&command_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("committed handoff command disappeared"))?;
+            if ack.status != CommandAckStatus::Applied {
+                return Err(anyhow::anyhow!(
+                    "committed handoff command did not resolve to Applied"
+                )
+                .into());
+            }
+            frames.push(OutboundFrame::CommandAck { ack });
+        }
         for output in committed {
             frames.push(OutboundFrame::Event {
                 envelope: crate::gateway::Envelope {

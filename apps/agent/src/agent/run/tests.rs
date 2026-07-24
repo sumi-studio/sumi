@@ -623,6 +623,9 @@ fn resolve_message_output(output: &mut RunOutput, next_seq: &mut u64) {
         });
         *next_seq += 1;
     }
+    if let Some(barrier) = output.retry_wait_commit_barrier.take() {
+        barrier.committed();
+    }
 }
 
 async fn complete_with_receipts(
@@ -2167,6 +2170,103 @@ async fn progress_event_channel_close_propagates_worker_failure_without_syntheti
         ),
         "progress channel loss must remain typed as a worker failure, not a tool error: {result:?}"
     );
+}
+
+struct ReleaseDriver {
+    dropped: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl RunDriver for ReleaseDriver {
+    fn validate_executor_generation(&self, _generation: ProcessGeneration) -> Result<()> {
+        Ok(())
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        _attempt: usize,
+        _context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        Err(anyhow!("ReleaseDriver has no provider"))
+    }
+
+    async fn execute_tool_observed(
+        &self,
+        _flow_id: &str,
+        call: &ToolCall,
+        _cancel: CancellationToken,
+        on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage, ToolError> {
+        drop(on_update);
+        self.dropped.notify_one();
+        self.release.notified().await;
+        Ok(ToolResultMessage {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            content: vec![UserContent::Text {
+                text: "released".to_owned(),
+            }],
+            details: json!({"ok": true}),
+            is_error: false,
+            timestamp: timestamp(),
+        })
+    }
+
+    fn synthetic_error(&self, message: &str) -> PublicMessage {
+        public_message(&assistant(
+            StopReason::Error,
+            Vec::new(),
+            Some(message),
+            None,
+        ))
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        _active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        Err(anyhow!("ReleaseDriver has no overflow recovery"))
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn update_channel_close_yields_to_tool_future_without_spinning() {
+    let (events_tx, _events_rx) = mpsc::channel(8);
+    let (_controls_tx, controls_rx) = mpsc::channel(1);
+    let dropped = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let driver = Arc::new(ReleaseDriver {
+        dropped: dropped.clone(),
+        release: release.clone(),
+    });
+    let core = bound_core(1);
+    let mut runner = Runner::new(core, driver, controls_rx, events_tx);
+    let tool_call = call("release-call");
+    let expected_id = tool_call.id.clone();
+
+    let handle = tokio::spawn(async move {
+        runner
+            .execute_tool_with_updates("assistant-1", &tool_call)
+            .await
+    });
+
+    // Wait until the driver has dropped on_update, then release the pending
+    // tool. On the buggy implementation this notification is never received
+    // because execute_tool_with_update would spin on the closed updates_rx.
+    dropped.notified().await;
+    release.notify_one();
+
+    let result = handle
+        .await
+        .expect("runner task join")
+        .expect("tool execution should succeed");
+    assert_eq!(result.tool_call_id, expected_id);
+    assert_eq!(result.tool_name, "tool-release-call");
 }
 
 #[tokio::test]

@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -40,9 +40,9 @@ use crate::{
 
 use super::{
     AdmittedCommand, AgentEvent, DurableRunBinding, MessageCommitBarrier, MessageCommitReceipt,
-    ProjectedProviderEvent, ProviderEventProjector, ProviderTerminalKind, RunCompletion,
-    RunControl, RunCore, RunOutput, RunWorker, SteerMode, ToolStartCommitBarrier, WorkerFailure,
-    WorkerFuture,
+    ProjectedProviderEvent, ProviderEventProjector, ProviderTerminalKind, RetryWaitCommitBarrier,
+    RunCompletion, RunControl, RunCore, RunOutput, RunWorker, SteerMode, ToolStartCommitBarrier,
+    WorkerFailure, WorkerFuture, WorkerPhase,
 };
 
 const LENGTH_TOOL_FAILURE: &str = "Tool call was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.";
@@ -164,6 +164,7 @@ struct Runner {
     driver: Arc<dyn RunDriver>,
     controls: mpsc::Receiver<RunControl>,
     events: mpsc::Sender<RunOutput>,
+    phase: watch::Sender<WorkerPhase>,
     context: Vec<ContextMessage>,
     attempt_sequence: usize,
     ordinary_retries: usize,
@@ -194,12 +195,17 @@ impl Runner {
         controls: mpsc::Receiver<RunControl>,
         events: mpsc::Sender<RunOutput>,
     ) -> Self {
+        let phase = core
+            .worker_phase
+            .take()
+            .unwrap_or_else(|| watch::channel(WorkerPhase::Active).0);
         let context = std::mem::take(&mut core.runtime_context);
         Self {
             core,
             driver,
             controls,
             events,
+            phase,
             context,
             attempt_sequence: 0,
             ordinary_retries: 0,
@@ -276,15 +282,21 @@ impl Runner {
                         break;
                     };
                     self.ordinary_retries += 1;
-                    self.emit(AgentEvent::RetryScheduled {
-                        attempt: self.attempt_sequence as u32,
-                        delay_ms: delay.as_millis() as u64,
-                        retry_at: Utc::now()
-                            + chrono::Duration::from_std(delay).unwrap_or_default(),
-                        error_message: assistant_error(&message),
-                    })
-                    .await?;
-                    if self.wait_retry_or_control(delay).await? {
+                    let _ = self.phase.send(WorkerPhase::RetryWait);
+                    if let Err(failure) = self
+                        .emit_retry_scheduled(
+                            self.attempt_sequence as u32,
+                            delay,
+                            assistant_error(&message),
+                        )
+                        .await
+                    {
+                        let _ = self.phase.send(WorkerPhase::Active);
+                        return Err(failure);
+                    }
+                    let injected = self.wait_retry_or_control(delay).await;
+                    let _ = self.phase.send(WorkerPhase::Active);
+                    if injected? {
                         self.emit(AgentEvent::Steered {
                             mode: SteerMode::Soft,
                         })
@@ -337,12 +349,11 @@ impl Runner {
                         self.close_turn_without_context(message).await?;
                         break;
                     }
-                    self.emit(AgentEvent::RetryScheduled {
-                        attempt: self.attempt_sequence as u32,
-                        delay_ms: 0,
-                        retry_at: Utc::now(),
-                        error_message: format!("context overflow: {source:?}"),
-                    })
+                    self.emit_retry_scheduled(
+                        self.attempt_sequence as u32,
+                        Duration::ZERO,
+                        format!("context overflow: {source:?}"),
+                    )
                     .await?;
                     self.context = replacement;
                 }
@@ -806,14 +817,23 @@ impl Runner {
         );
         tokio::pin!(future);
         let result = loop {
-            tokio::select! {
+            let update = tokio::select! {
                 biased;
                 result = &mut future => break result,
-                update = updates_rx.recv() => {
-                    if let Some((tool_call_id, partial)) = update {
-                        self.emit(AgentEvent::ToolExecutionUpdate { tool_call_id, partial }).await?;
-                    }
-                }
+                update = updates_rx.recv() => update,
+            };
+            if let Some((tool_call_id, partial)) = update {
+                self.emit(AgentEvent::ToolExecutionUpdate {
+                    tool_call_id,
+                    partial,
+                })
+                .await?;
+            } else {
+                // The on_update callback (and therefore updates_tx) has been
+                // dropped while the tool future is still pending. There will
+                // never be more progress events, so stop polling this branch
+                // and wait only for the tool result.
+                break future.await;
             }
         };
         while let Ok((tool_call_id, partial)) = updates_rx.try_recv() {
@@ -844,6 +864,7 @@ impl Runner {
                 },
                 commit_barrier: Some(commit_barrier),
                 message_commit_barrier: None,
+                retry_wait_commit_barrier: None,
             })
             .await
             .map_err(|_| WorkerFailure::EventChannelClosed)?;
@@ -1033,10 +1054,16 @@ impl Runner {
     fn receive_control_safe_point(&mut self) -> Result<(), WorkerFailure> {
         // Deliberately consume at most one ordinary message: one-at-a-time is
         // the product contract and keeps each queued instruction an answer turn.
-        if let Ok(RunControl::Command(command)) = self.controls.try_recv() {
-            self.core
-                .queue_followup(command)
-                .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+        if let Ok(control) = self.controls.try_recv() {
+            match control {
+                RunControl::Command(command) => self
+                    .core
+                    .queue_followup(command)
+                    .map_err(|error| WorkerFailure::Error(error.to_string()))?,
+                RunControl::RetrySteer { accepted, .. } => {
+                    let _ = accepted.send(false);
+                }
+            }
         }
         Ok(())
     }
@@ -1049,8 +1076,25 @@ impl Runner {
         let injected = tokio::select! {
             biased;
             control = self.controls.recv() => {
-                let Some(RunControl::Command(command)) = control else {
+                let Some(control) = control else {
                     return Err(WorkerFailure::Cancelled);
+                };
+                let command = match control {
+                    RunControl::Command(command) => command,
+                    RunControl::RetrySteer {
+                        command,
+                        accepted,
+                        committed,
+                    } => {
+                        self.claim_control(command)?;
+                        let _ = accepted.send(true);
+                        committed.await.map_err(|_| {
+                            WorkerFailure::Error(
+                                "retry steer durability authorization was dropped".to_owned(),
+                            )
+                        })?;
+                        return Ok(true);
+                    }
                 };
                 self.core.queue_followup(command)
                     .map_err(|error| WorkerFailure::Error(error.to_string()))?;
@@ -1080,10 +1124,21 @@ impl Runner {
                 .requeue_followup_front(command)
                 .map_err(|error| WorkerFailure::Error(error.to_string()))?;
         }
-        while let Ok(RunControl::Command(command)) = self.controls.try_recv() {
-            self.core
-                .queue_followup(command)
-                .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+        while let Ok(control) = self.controls.try_recv() {
+            match control {
+                RunControl::Command(command) => self
+                    .core
+                    .queue_followup(command)
+                    .map_err(|error| WorkerFailure::Error(error.to_string()))?,
+                RunControl::RetrySteer {
+                    command, accepted, ..
+                } => {
+                    let _ = accepted.send(false);
+                    self.core
+                        .queue_followup(command)
+                        .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+                }
+            }
         }
         Ok(())
     }
@@ -1098,6 +1153,7 @@ impl Runner {
                 event,
                 commit_barrier: None,
                 message_commit_barrier: None,
+                retry_wait_commit_barrier: None,
             })
             .await
             .map_err(|_| WorkerFailure::EventChannelClosed)
@@ -1121,10 +1177,41 @@ impl Runner {
                 },
                 commit_barrier: None,
                 message_commit_barrier: Some(barrier),
+                retry_wait_commit_barrier: None,
             })
             .await
             .map_err(|_| WorkerFailure::EventChannelClosed)?;
         Ok(receipt)
+    }
+
+    async fn emit_retry_scheduled(
+        &mut self,
+        attempt: u32,
+        delay: Duration,
+        error_message: String,
+    ) -> Result<(), WorkerFailure> {
+        let binding = self.core.durable_binding.clone().ok_or_else(|| {
+            WorkerFailure::Error("RunCore has no durable worker binding".to_owned())
+        })?;
+        let (barrier, committed) = RetryWaitCommitBarrier::channel();
+        self.events
+            .send(RunOutput {
+                binding,
+                event: AgentEvent::RetryScheduled {
+                    attempt,
+                    delay_ms: delay.as_millis() as u64,
+                    retry_at: Utc::now() + chrono::Duration::from_std(delay).unwrap_or_default(),
+                    error_message,
+                },
+                commit_barrier: None,
+                message_commit_barrier: None,
+                retry_wait_commit_barrier: Some(barrier),
+            })
+            .await
+            .map_err(|_| WorkerFailure::EventChannelClosed)?;
+        committed
+            .await
+            .map_err(|_| WorkerFailure::Error("RetryScheduled durability commit failed".to_owned()))
     }
 
     async fn await_message_receipt(

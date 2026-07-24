@@ -1558,6 +1558,7 @@ mod tests {
     fn bash_output_is_error_matches_result_state() {
         for (exit_code, cancelled, resource_limit, expected_is_error, expected_text) in [
             (Some(0), false, None, false, "Command exited with code 0."),
+            (Some(0), true, None, true, "Command cancelled."),
             (Some(1), false, None, true, "Command exited with code 1."),
             (
                 None,

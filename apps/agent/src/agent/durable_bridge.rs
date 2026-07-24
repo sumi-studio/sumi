@@ -6,11 +6,12 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::{
+    gateway::Command,
     provider::types::{PublicAssistantContent, PublicMessage, StopReason},
     runtime::contracts::ProcessGeneration,
     store::{
-        DurableEvent, EventBatch, EventWrite, EventWriter, InjectedCommand, Projection, RunPhase,
-        ToolExecutionMutation,
+        ApplicationKind, DurableEvent, EventBatch, EventWrite, EventWriter, InjectedCommand,
+        Projection, RunPhase, ToolExecutionMutation,
     },
 };
 
@@ -48,6 +49,7 @@ pub(crate) struct RunOutput {
     pub event: AgentEvent,
     pub commit_barrier: Option<ToolStartCommitBarrier>,
     pub message_commit_barrier: Option<MessageCommitBarrier>,
+    pub retry_wait_commit_barrier: Option<RetryWaitCommitBarrier>,
 }
 
 impl RunOutput {
@@ -61,11 +63,18 @@ impl RunOutput {
             drop(receiver);
             barrier
         });
+        let retry_wait_commit_barrier =
+            matches!(event, AgentEvent::RetryScheduled { .. }).then(|| {
+                let (barrier, receiver) = RetryWaitCommitBarrier::channel();
+                drop(receiver);
+                barrier
+            });
         Self {
             binding,
             event,
             commit_barrier,
             message_commit_barrier,
+            retry_wait_commit_barrier,
         }
     }
 }
@@ -102,20 +111,45 @@ impl ToolStartCommitBarrier {
     }
 }
 
+pub(crate) struct RetryWaitCommitBarrier(oneshot::Sender<()>);
+
+impl RetryWaitCommitBarrier {
+    pub(crate) fn channel() -> (Self, oneshot::Receiver<()>) {
+        let (sender, receiver) = oneshot::channel();
+        (Self(sender), receiver)
+    }
+
+    pub(super) fn committed(self) {
+        let _ = self.0.send(());
+    }
+}
+
 pub(super) struct CommittedRunOutput {
     pub outputs: Vec<CommittedOutput>,
     pub tool_start_barrier: Option<ToolStartCommitBarrier>,
     message_receipts: Vec<(MessageCommitBarrier, MessageCommitReceipt)>,
+    retry_wait_commit_barrier: Option<RetryWaitCommitBarrier>,
+    terminal_command_ids: Vec<String>,
 }
 
 impl CommittedRunOutput {
     pub(super) fn resolve_message_receipts(
         self,
-    ) -> (Vec<CommittedOutput>, Option<ToolStartCommitBarrier>) {
+    ) -> (
+        Vec<CommittedOutput>,
+        Option<ToolStartCommitBarrier>,
+        Option<RetryWaitCommitBarrier>,
+        Vec<String>,
+    ) {
         for (barrier, receipt) in self.message_receipts {
             barrier.resolve(receipt);
         }
-        (self.outputs, self.tool_start_barrier)
+        (
+            self.outputs,
+            self.tool_start_barrier,
+            self.retry_wait_commit_barrier,
+            self.terminal_command_ids,
+        )
     }
 }
 
@@ -126,6 +160,8 @@ pub(super) struct CommittedOutput {
 
 pub(super) struct DurableBridge {
     binding: DurableRunBinding,
+    worker_command_id: String,
+    worker_command_seq: u64,
     phase: RunPhase,
     turn_open: bool,
     assistant_open: Option<String>,
@@ -136,12 +172,20 @@ pub(super) struct DurableBridge {
     pending_rejected_results: Vec<(String, PublicMessage, MessageCommitBarrier)>,
     startup_agent_pending: bool,
     startup_turn_pending: bool,
+    retry_wait_ready: bool,
+    pending_retry_steer: Option<AdmittedCommand>,
+    retry_steered: bool,
+    committed_terminal_command_ids: Vec<String>,
 }
 
 impl DurableBridge {
     pub(super) fn new(binding: DurableRunBinding) -> Self {
+        let worker_command_id = binding.command_id.clone();
+        let worker_command_seq = binding.command_seq;
         Self {
             binding,
+            worker_command_id,
+            worker_command_seq,
             phase: RunPhase::Classified,
             turn_open: false,
             assistant_open: None,
@@ -152,11 +196,53 @@ impl DurableBridge {
             pending_rejected_results: Vec::new(),
             startup_agent_pending: false,
             startup_turn_pending: false,
+            retry_wait_ready: false,
+            pending_retry_steer: None,
+            retry_steered: false,
+            committed_terminal_command_ids: Vec::new(),
         }
     }
 
     pub(super) fn command_id(&self) -> &str {
         &self.binding.command_id
+    }
+
+    pub(super) fn can_bind_retry_steer(&self) -> bool {
+        self.retry_wait_ready
+            && self.pending_retry_steer.is_none()
+            && self.phase == RunPhase::AssistantStarted
+            && self.turn_open
+            && self.assistant_open.is_none()
+    }
+
+    pub(super) async fn bind_retry_steer(
+        &mut self,
+        writer: &EventWriter,
+        command: AdmittedCommand,
+    ) -> Result<()> {
+        if !self.can_bind_retry_steer() {
+            bail!("retry steer no longer matches an observable retry wait");
+        }
+        if !matches!(command.envelope().command, Command::UserMessage { .. }) {
+            bail!("retry steer requires a UserMessage");
+        }
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![Projection::CommandClassified {
+                        command_id: command.envelope().command_id.to_string(),
+                        application_kind: ApplicationKind::RetrySteer,
+                        run_id: self.binding.run_id.clone(),
+                        turn_id: self.binding.turn_id.clone(),
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await?;
+        self.pending_retry_steer = Some(command);
+        self.retry_wait_ready = false;
+        Ok(())
     }
 
     pub(super) async fn commit(
@@ -173,8 +259,12 @@ impl DurableBridge {
         if output.message_commit_barrier.is_some() != is_message_end {
             bail!("message commit barrier is required exactly for MessageEnd");
         }
-        if output.binding.command_id != self.binding.command_id
-            || output.binding.command_seq != self.binding.command_seq
+        let is_retry_scheduled = matches!(output.event, AgentEvent::RetryScheduled { .. });
+        if output.retry_wait_commit_barrier.is_some() != is_retry_scheduled {
+            bail!("retry-wait commit barrier is required exactly for RetryScheduled");
+        }
+        if output.binding.command_id != self.worker_command_id
+            || output.binding.command_seq != self.worker_command_seq
             || output.binding.run_id != self.binding.run_id
             || output.binding.executor_generation != self.binding.executor_generation
         {
@@ -228,13 +318,23 @@ impl DurableBridge {
                 message_id,
                 message,
             } if !matches!(message.as_ref(), PublicMessage::Assistant(_)) => {
-                self.commit_non_assistant(
-                    writer,
-                    message_id,
-                    *message,
-                    message_commit_barrier.expect("MessageEnd barrier checked"),
-                )
-                .await
+                if self.retry_steered {
+                    self.commit_retry_steer(
+                        writer,
+                        message_id,
+                        *message,
+                        message_commit_barrier.expect("MessageEnd barrier checked"),
+                    )
+                    .await
+                } else {
+                    self.commit_non_assistant(
+                        writer,
+                        message_id,
+                        *message,
+                        message_commit_barrier.expect("MessageEnd barrier checked"),
+                    )
+                    .await
+                }
             }
             AgentEvent::ToolExecutionEnd {
                 tool_call_id,
@@ -297,6 +397,7 @@ impl DurableBridge {
                     bail!("assistant MessageStart requires a committed user owner");
                 };
                 self.assistant_open = Some(message_id.clone());
+                self.retry_wait_ready = false;
                 self.commit_single(
                     writer,
                     DurableEvent::message_in_turn(
@@ -380,25 +481,28 @@ impl DurableBridge {
                 retry_at,
                 error_message,
             } => {
-                self.commit_single(
-                    writer,
-                    DurableEvent::retry_scheduled(
-                        &self.binding.run_id,
-                        &self.binding.turn_id,
-                        attempt,
-                        delay_ms,
-                        retry_at,
-                        error_message.clone(),
-                    )?,
-                    Vec::new(),
-                    AgentEvent::RetryScheduled {
-                        attempt,
-                        delay_ms,
-                        retry_at,
-                        error_message,
-                    },
-                )
-                .await
+                let committed = self
+                    .commit_single(
+                        writer,
+                        DurableEvent::retry_scheduled(
+                            &self.binding.run_id,
+                            &self.binding.turn_id,
+                            attempt,
+                            delay_ms,
+                            retry_at,
+                            error_message.clone(),
+                        )?,
+                        Vec::new(),
+                        AgentEvent::RetryScheduled {
+                            attempt,
+                            delay_ms,
+                            retry_at,
+                            error_message,
+                        },
+                    )
+                    .await?;
+                self.retry_wait_ready = true;
+                Ok(committed)
             }
             AgentEvent::TurnEnd {
                 message,
@@ -440,6 +544,12 @@ impl DurableBridge {
                 )
                 .await
             }
+            AgentEvent::Steered {
+                mode: super::SteerMode::Soft,
+            } if self.pending_retry_steer.is_some() && !self.retry_steered => {
+                self.retry_steered = true;
+                Ok((Vec::new(), Vec::new()))
+            }
             AgentEvent::Steered { .. }
             | AgentEvent::ApprovalRequested { .. }
             | AgentEvent::ApprovalResolved { .. }
@@ -452,7 +562,160 @@ impl DurableBridge {
             outputs,
             tool_start_barrier: output.commit_barrier,
             message_receipts,
+            retry_wait_commit_barrier: output.retry_wait_commit_barrier,
+            terminal_command_ids: std::mem::take(&mut self.committed_terminal_command_ids),
         })
+    }
+
+    async fn commit_retry_steer(
+        &mut self,
+        writer: &EventWriter,
+        message_id: String,
+        message: PublicMessage,
+        barrier: MessageCommitBarrier,
+    ) -> Result<(
+        Vec<CommittedOutput>,
+        Vec<(MessageCommitBarrier, MessageCommitReceipt)>,
+    )> {
+        let command = self
+            .pending_retry_steer
+            .take()
+            .ok_or_else(|| anyhow!("Steered has no bound retry command"))?;
+        let (start_id, start_message) = self
+            .pending_start
+            .take()
+            .ok_or_else(|| anyhow!("retry steer MessageEnd has no MessageStart"))?;
+        if start_id != message_id || start_message != message {
+            bail!("retry steer MessageEnd does not match its exact MessageStart");
+        }
+        let expected_message_id = crate::store::user_message_id(&command.envelope().command_id);
+        if message_id != expected_message_id {
+            bail!("retry steer message identity does not derive from its command");
+        }
+        let Command::UserMessage { text, attachments } = &command.envelope().command else {
+            bail!("retry steer command changed kind before injection");
+        };
+        if !attachments.is_empty() {
+            bail!("T15 retry steer does not accept attachments");
+        }
+        let PublicMessage::User(user) = &message else {
+            bail!("retry steer must inject a user message");
+        };
+        let expected =
+            crate::provider::types::PublicMessage::User(crate::provider::types::UserMessage {
+                content: vec![crate::provider::types::UserContent::Text { text: text.clone() }],
+                timestamp: command.received_at(),
+            });
+        if message != expected || user.content.is_empty() {
+            bail!("retry steer message does not match durable command plaintext");
+        }
+
+        let command_id = command.envelope().command_id.to_string();
+        let command_seq = command.envelope().seq;
+        let run_id = self.binding.run_id.clone();
+        let turn_id = self.binding.turn_id.clone();
+        let previous_owner_command_id = self.binding.command_id.clone();
+        let previous_owner_command_seq = self.binding.command_seq;
+        let steered = AgentEvent::Steered {
+            mode: super::SteerMode::Soft,
+        };
+        let start = AgentEvent::MessageStart {
+            message_id: message_id.clone(),
+            message: Box::new(message.clone()),
+        };
+        let end = AgentEvent::MessageEnd {
+            message_id: message_id.clone(),
+            message: Box::new(message.clone()),
+        };
+        let sequences = writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(DurableEvent::steered(
+                            super::SteerMode::Soft,
+                            command_id.clone(),
+                            run_id.clone(),
+                            turn_id.clone(),
+                        )?),
+                        projections: vec![Projection::RunPhase {
+                            command_id: command_id.clone(),
+                            run_id: run_id.clone(),
+                            expected: RunPhase::Classified,
+                            next: RunPhase::TurnStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(DurableEvent::message(
+                            "message_start",
+                            &message_id,
+                            &message,
+                        )?),
+                        projections: vec![
+                            Projection::CommandApplied {
+                                command_id: previous_owner_command_id.clone(),
+                                command_seq: previous_owner_command_seq,
+                                run_id: Some(run_id.clone()),
+                            },
+                            Projection::RunPhase {
+                                command_id: command_id.clone(),
+                                run_id: run_id.clone(),
+                                expected: RunPhase::TurnStarted,
+                                next: RunPhase::UserStarted,
+                            },
+                        ],
+                    },
+                    EventWrite {
+                        event: Some(DurableEvent::message("message_end", &message_id, &message)?),
+                        projections: vec![
+                            Projection::MessageEnd {
+                                message_id: message_id.clone(),
+                                role: "user",
+                                message: message.clone(),
+                                append_to_l0: true,
+                            },
+                            Projection::RunPhase {
+                                command_id: command_id.clone(),
+                                run_id: run_id.clone(),
+                                expected: RunPhase::UserStarted,
+                                next: RunPhase::UserCommitted,
+                            },
+                        ],
+                    },
+                ],
+                injected_commands: vec![InjectedCommand::new(
+                    command_seq,
+                    command.envelope().command_id.clone(),
+                )],
+            })
+            .await?;
+        if sequences.len() != 3 {
+            bail!("retry steer injection did not commit exactly three durable events");
+        }
+        self.binding.command_id = command_id;
+        self.binding.command_seq = command_seq;
+        self.phase = RunPhase::UserCommitted;
+        self.retry_steered = false;
+        self.committed_terminal_command_ids
+            .push(previous_owner_command_id);
+        let message_seq = sequences[2];
+        let outputs = [steered, start, end]
+            .into_iter()
+            .zip(sequences)
+            .map(|(event, seq)| CommittedOutput {
+                event,
+                seq: Some(seq),
+            })
+            .collect();
+        Ok((
+            outputs,
+            vec![(
+                barrier,
+                MessageCommitReceipt {
+                    message_id,
+                    message_seq,
+                },
+            )],
+        ))
     }
 
     async fn commit_assistant_end(
@@ -926,6 +1189,7 @@ mod tests {
             event: AgentEvent::AgentStart,
             commit_barrier: None,
             message_commit_barrier: None,
+            retry_wait_commit_barrier: None,
         };
         assert_eq!(output.binding.executor_generation.to_wire(), 73);
         let public = serde_json::to_value(output.event).expect("serialize public event");

@@ -469,6 +469,20 @@ fn received_acks(frames: &Arc<Mutex<Vec<OutboundFrame>>>) -> Vec<CommandAck> {
         .collect()
 }
 
+fn applied_acks(frames: &Arc<Mutex<Vec<OutboundFrame>>>) -> Vec<CommandAck> {
+    frames
+        .lock()
+        .expect("frame mutex")
+        .iter()
+        .filter_map(|frame| match frame {
+            OutboundFrame::CommandAck { ack } if ack.status == CommandAckStatus::Applied => {
+                Some(ack.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 async fn session(gateway: MockGateway, worker: Arc<dyn RunWorker>) -> Session<MockGateway> {
     session_with_core(gateway, worker, RunCore::new()).await
 }
@@ -4147,6 +4161,695 @@ async fn retry_error_is_excluded_and_retry_schedule_precedes_next_attempt() {
     .await
     .expect("retry error projection");
     assert_eq!(error_stop, "error");
+}
+
+struct SessionRetrySteerDriver {
+    retry_wait_entered: Notify,
+    contexts: Mutex<Vec<Vec<ContextMessage>>>,
+}
+
+impl SessionRetrySteerDriver {
+    fn origin() -> ProviderOrigin {
+        ProviderOrigin {
+            provider_instance_id: "session-retry-steer".to_owned(),
+            protocol: ApiProtocol::OpenAiChatCompletions,
+            model: "bridge-model".to_owned(),
+        }
+    }
+}
+
+#[async_trait]
+impl RunDriver for SessionRetrySteerDriver {
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+        validate_test_generation(generation)
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        attempt: usize,
+        context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.contexts
+            .lock()
+            .expect("retry context mutex")
+            .push(context.to_vec());
+        let reason = if attempt == 0 {
+            StopReason::Error
+        } else {
+            StopReason::Stop
+        };
+        let message = AssistantMessage {
+            content: Vec::new(),
+            model: "bridge-model".to_owned(),
+            provider: "fixture".to_owned(),
+            origin: Self::origin(),
+            usage: Usage::default(),
+            stop_reason: reason,
+            error_message: (attempt == 0).then(|| "network error".to_owned()),
+            provider_code: (attempt == 0).then(|| "network_error".to_owned()),
+            interrupted: false,
+            timestamp: Utc::now(),
+        };
+        let (tx, rx) = mpsc::channel(4);
+        tx.try_send(ProviderEvent::Start)?;
+        let mut initial = match bridge_assistant(reason) {
+            PublicMessage::Assistant(message) => message,
+            _ => unreachable!(),
+        };
+        initial.error_message = message.error_message.clone();
+        initial.provider_code = message.provider_code.clone();
+        let initial_message = PublicMessage::Assistant(initial);
+        let output = ProviderOutput {
+            message,
+            provider_context: Vec::new(),
+        };
+        if attempt == 0 {
+            tx.try_send(ProviderEvent::Error { reason, output })?;
+        } else {
+            tx.try_send(ProviderEvent::Done { reason, output })?;
+        }
+        drop(tx);
+        Ok(ProviderAttempt {
+            message_id: format!("session-retry-steer-assistant-{attempt}"),
+            initial_message,
+            events: ProviderEventStream::new(rx, cancel, "fixture", Self::origin()),
+        })
+    }
+
+    async fn execute_tool_observed(
+        &self,
+        _flow_id: &str,
+        _call: &ToolCall,
+        _cancel: CancellationToken,
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage, ToolError> {
+        Err(ToolError::Protocol(
+            "retry-steer fixture has no tools".to_owned(),
+        ))
+    }
+
+    fn synthetic_error(&self, message: &str) -> PublicMessage {
+        let mut assistant = match bridge_assistant(StopReason::Error) {
+            PublicMessage::Assistant(message) => message,
+            _ => unreachable!(),
+        };
+        assistant.error_message = Some(message.to_owned());
+        assistant.provider_code = Some("network_error".to_owned());
+        PublicMessage::Assistant(assistant)
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        _active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        Err(anyhow!("retry-steer fixture has no overflow recovery"))
+    }
+
+    async fn wait_retry(&self, _delay: std::time::Duration, _cancel: &CancellationToken) -> bool {
+        self.retry_wait_entered.notify_one();
+        pending::<bool>().await
+    }
+}
+
+struct SessionImmediateOverflowDriver {
+    contexts: Mutex<Vec<Vec<ContextMessage>>>,
+    recoveries: AtomicUsize,
+}
+
+#[async_trait]
+impl RunDriver for SessionImmediateOverflowDriver {
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+        validate_test_generation(generation)
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        attempt: usize,
+        context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.contexts
+            .lock()
+            .expect("overflow context mutex")
+            .push(context.to_vec());
+        let reason = if attempt == 0 {
+            StopReason::Error
+        } else {
+            StopReason::Stop
+        };
+        let message = AssistantMessage {
+            content: Vec::new(),
+            model: "bridge-model".to_owned(),
+            provider: "fixture".to_owned(),
+            origin: SessionRetrySteerDriver::origin(),
+            usage: Usage::default(),
+            stop_reason: reason,
+            error_message: (attempt == 0).then(|| "maximum context length exceeded".to_owned()),
+            provider_code: (attempt == 0).then(|| "model_context_window_exceeded".to_owned()),
+            interrupted: false,
+            timestamp: Utc::now(),
+        };
+        let mut initial = match bridge_assistant(reason) {
+            PublicMessage::Assistant(message) => message,
+            _ => unreachable!(),
+        };
+        initial.error_message = message.error_message.clone();
+        initial.provider_code = message.provider_code.clone();
+        let (tx, rx) = mpsc::channel(4);
+        tx.try_send(ProviderEvent::Start)?;
+        let output = ProviderOutput {
+            message,
+            provider_context: Vec::new(),
+        };
+        if attempt == 0 {
+            tx.try_send(ProviderEvent::Error { reason, output })?;
+        } else {
+            tx.try_send(ProviderEvent::Done { reason, output })?;
+        }
+        drop(tx);
+        Ok(ProviderAttempt {
+            message_id: format!("session-immediate-overflow-{attempt}"),
+            initial_message: PublicMessage::Assistant(initial),
+            events: ProviderEventStream::new(
+                rx,
+                cancel,
+                "fixture",
+                SessionRetrySteerDriver::origin(),
+            ),
+        })
+    }
+
+    async fn execute_tool_observed(
+        &self,
+        _flow_id: &str,
+        _call: &ToolCall,
+        _cancel: CancellationToken,
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage, ToolError> {
+        Err(ToolError::Protocol(
+            "immediate-overflow fixture has no tools".to_owned(),
+        ))
+    }
+
+    fn synthetic_error(&self, message: &str) -> PublicMessage {
+        let mut assistant = match bridge_assistant(StopReason::Error) {
+            PublicMessage::Assistant(message) => message,
+            _ => unreachable!(),
+        };
+        assistant.error_message = Some(message.to_owned());
+        PublicMessage::Assistant(assistant)
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        self.recoveries.fetch_add(1, Ordering::SeqCst);
+        let mut replacement = active_context.to_vec();
+        replacement.push(ContextMessage::Synthetic {
+            message: super::run::public_to_message(PublicMessage::User(UserMessage {
+                content: vec![UserContent::Text {
+                    text: "recovered context".to_owned(),
+                }],
+                timestamp: Utc::now(),
+            })),
+        });
+        Ok(OverflowRecoveryOutcome::ReplacementContext(replacement))
+    }
+}
+
+#[tokio::test]
+async fn session_immediate_overflow_commits_zero_delay_before_installing_replacement() {
+    let store = Store::session_test_store("session-immediate-overflow")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (gateway, commands, frames) = gateway();
+    let driver = Arc::new(SessionImmediateOverflowDriver {
+        contexts: Mutex::new(Vec::new()),
+        recoveries: AtomicUsize::new(0),
+    });
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        Arc::new(SequentialRunWorker::new(driver.clone())),
+        test_executor_generation(),
+    )
+    .await
+    .expect("session");
+    let task = tokio::spawn(session.run());
+
+    commands.send(user(1)).await.expect("initial command");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if frames.lock().expect("frame mutex").iter().any(|frame| {
+                matches!(frame, OutboundFrame::Event { envelope }
+                    if envelope.event["type"] == "agent_end")
+            }) || task.is_finished()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("overflow recovery terminal");
+    drop(commands);
+    completed(task.await.expect("session join"));
+
+    assert_eq!(driver.recoveries.load(Ordering::SeqCst), 1);
+    {
+        let contexts = driver.contexts.lock().expect("overflow context mutex");
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(contexts[0].len(), 1);
+        assert_eq!(contexts[1].len(), 2);
+        assert!(matches!(
+            &contexts[1][1],
+            ContextMessage::Synthetic {
+                message: crate::provider::types::Message::User(user)
+            } if user.content == vec![UserContent::Text {
+                text: "recovered context".to_owned()
+            }]
+        ));
+    }
+    let delay: i64 = sqlx::query_scalar(
+        "SELECT json_extract(envelope, '$.delay_ms') FROM agent_events
+         WHERE event_type='retry_scheduled'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("durable immediate-overflow retry schedule");
+    assert_eq!(delay, 0);
+}
+
+#[tokio::test]
+async fn gateway_user_during_retry_wait_is_durably_injected_before_next_attempt() {
+    let store = Store::session_test_store("session-retry-wait-control")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (gateway, commands, frames) = gateway();
+    let driver = Arc::new(SessionRetrySteerDriver {
+        retry_wait_entered: Notify::new(),
+        contexts: Mutex::new(Vec::new()),
+    });
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        Arc::new(SequentialRunWorker::new(driver.clone())),
+        test_executor_generation(),
+    )
+    .await
+    .expect("session");
+    let task = tokio::spawn(session.run());
+
+    commands.send(user(1)).await.expect("initial command");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::select! {
+            () = driver.retry_wait_entered.notified() => {}
+            () = async {
+                while !task.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            } => panic!(
+                "session exited before retry wait: {:?}",
+                frames.lock().expect("frame mutex")
+            ),
+        }
+    })
+    .await
+    .expect("durable retry wait");
+    commands.send(user(2)).await.expect("retry steer command");
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if frames.lock().expect("frame mutex").iter().any(|frame| {
+                matches!(frame, OutboundFrame::Event { envelope }
+                    if envelope.event["type"] == "agent_end")
+            }) || task.is_finished()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("retry-steered run terminal");
+    drop(commands);
+    completed(task.await.expect("session join"));
+
+    let kinds: Vec<String> = sqlx::query_scalar("SELECT event_type FROM agent_events ORDER BY seq")
+        .fetch_all(&pool)
+        .await
+        .expect("durable retry-steer sequence");
+    let retry = kinds
+        .iter()
+        .position(|kind| kind == "retry_scheduled")
+        .expect("RetryScheduled");
+    assert_eq!(
+        &kinds[retry + 1..retry + 4],
+        ["steered", "message_start", "message_end"]
+    );
+    assert_eq!(kinds[retry + 4], "message_start");
+
+    let steer_command_id = match user(2) {
+        InboundCommand::Valid(envelope) => envelope.command_id,
+        InboundCommand::Invalid { .. } => unreachable!(),
+    };
+    let initial_command_id = match user(1) {
+        InboundCommand::Valid(envelope) => envelope.command_id,
+        InboundCommand::Invalid { .. } => unreachable!(),
+    };
+    let applied = applied_acks(&frames);
+    assert_eq!(
+        applied
+            .iter()
+            .map(|ack| ack.command_id.as_str())
+            .collect::<Vec<_>>(),
+        [initial_command_id.as_str(), steer_command_id.as_str()]
+    );
+    let initial_state: (String, String) =
+        sqlx::query_as("SELECT run_phase, status FROM inbound_commands WHERE command_id=?")
+            .bind(initial_command_id.as_str())
+            .fetch_one(&pool)
+            .await
+            .expect("initial owner durable state");
+    assert_eq!(initial_state, ("finished".to_owned(), "applied".to_owned()));
+    let state: (String, String, String) = sqlx::query_as(
+        "SELECT application_kind, run_phase, status FROM inbound_commands WHERE command_id=?",
+    )
+    .bind(steer_command_id.as_str())
+    .fetch_one(&pool)
+    .await
+    .expect("retry steer durable state");
+    assert_eq!(
+        state,
+        (
+            "retry_steer".to_owned(),
+            "finished".to_owned(),
+            "applied".to_owned()
+        )
+    );
+    let contexts = driver.contexts.lock().expect("retry context mutex");
+    assert_eq!(contexts.len(), 2);
+    assert!(contexts[1].iter().any(|context| {
+        matches!(
+            context,
+            ContextMessage::Persisted { id, .. }
+                if id == &user_message_id(&steer_command_id)
+        )
+    }));
+}
+
+#[tokio::test]
+async fn delay_zero_retry_schedule_without_retry_phase_never_admits_retry_steer() {
+    let store = Store::session_test_store("delay-zero-is-not-retry-wait")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (gateway, commands, frames) = gateway();
+    let inspect = Arc::new(Notify::new());
+    let inspected = Arc::new(Notify::new());
+    let received_control = Arc::new(AtomicBool::new(false));
+    let worker: Arc<dyn RunWorker> = Arc::new({
+        let inspect = inspect.clone();
+        let inspected = inspected.clone();
+        let received_control = received_control.clone();
+        move |_core: RunCore,
+              initial: AdmittedCommand,
+              mut controls: mpsc::Receiver<RunControl>,
+              events: mpsc::Sender<AgentEvent>| {
+            let inspect = inspect.clone();
+            let inspected = inspected.clone();
+            let received_control = received_control.clone();
+            async move {
+                emit_idle_injection(&events, &initial).await;
+                let start = bridge_assistant(StopReason::Stop);
+                let mut error = match bridge_assistant(StopReason::Error) {
+                    PublicMessage::Assistant(message) => message,
+                    _ => unreachable!(),
+                };
+                error.error_message = Some("overflow recovery".to_owned());
+                error.provider_code = Some("model_context_window_exceeded".to_owned());
+                let error = PublicMessage::Assistant(error);
+                events
+                    .send(AgentEvent::MessageStart {
+                        message_id: "delay-zero-assistant".to_owned(),
+                        message: Box::new(start),
+                    })
+                    .await
+                    .expect("assistant start");
+                events
+                    .send(AgentEvent::MessageEnd {
+                        message_id: "delay-zero-assistant".to_owned(),
+                        message: Box::new(error),
+                    })
+                    .await
+                    .expect("assistant end");
+                events
+                    .send(AgentEvent::RetryScheduled {
+                        attempt: 1,
+                        delay_ms: 0,
+                        retry_at: Utc::now(),
+                        error_message: "overflow recovery".to_owned(),
+                    })
+                    .await
+                    .expect("delay-zero schedule");
+                inspect.notified().await;
+                received_control.store(controls.try_recv().is_ok(), Ordering::SeqCst);
+                inspected.notify_one();
+                pending::<RunCompletion>().await
+            }
+        }
+    });
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        worker,
+        test_executor_generation(),
+    )
+    .await
+    .expect("session");
+    let task = tokio::spawn(session.run());
+
+    commands.send(user(1)).await.expect("initial command");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if frames.lock().expect("frame mutex").iter().any(|frame| {
+                matches!(frame, OutboundFrame::Event { envelope }
+                    if envelope.event["type"] == "retry_scheduled")
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("durable delay-zero schedule");
+    commands.send(user(2)).await.expect("candidate steer");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if received_acks(&frames).len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("candidate durable receipt");
+    inspect.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(2), inspected.notified())
+        .await
+        .expect("control inspection");
+
+    assert!(!received_control.load(Ordering::SeqCst));
+    let candidate_id = match user(2) {
+        InboundCommand::Valid(envelope) => envelope.command_id,
+        InboundCommand::Invalid { .. } => unreachable!(),
+    };
+    let state: (String, Option<String>) =
+        sqlx::query_as("SELECT status, application_kind FROM inbound_commands WHERE command_id=?")
+            .bind(candidate_id.as_str())
+            .fetch_one(&pool)
+            .await
+            .expect("candidate durable state");
+    assert_eq!(state, ("received".to_owned(), None));
+
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn retry_timer_winning_handshake_defers_command_without_loss() {
+    let store = Store::session_test_store("retry-timer-handshake-fallback")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (gateway, commands, frames) = gateway();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let worker: Arc<dyn RunWorker> = Arc::new({
+        let runs = runs.clone();
+        move |core: RunCore,
+              initial: AdmittedCommand,
+              mut controls: mpsc::Receiver<RunControl>,
+              events: mpsc::Sender<AgentEvent>| {
+            let ordinal = runs.fetch_add(1, Ordering::SeqCst);
+            async move {
+                emit_idle_injection(&events, &initial).await;
+                if ordinal == 0 {
+                    let start = bridge_assistant(StopReason::Stop);
+                    let mut error = match bridge_assistant(StopReason::Error) {
+                        PublicMessage::Assistant(message) => message,
+                        _ => unreachable!(),
+                    };
+                    error.error_message = Some("network error".to_owned());
+                    error.provider_code = Some("network_error".to_owned());
+                    let error = PublicMessage::Assistant(error);
+                    events
+                        .send(AgentEvent::MessageStart {
+                            message_id: "timer-race-assistant".to_owned(),
+                            message: Box::new(start),
+                        })
+                        .await
+                        .expect("assistant start");
+                    events
+                        .send(AgentEvent::MessageEnd {
+                            message_id: "timer-race-assistant".to_owned(),
+                            message: Box::new(error.clone()),
+                        })
+                        .await
+                        .expect("assistant end");
+                    let _ = core
+                        .worker_phase
+                        .as_ref()
+                        .expect("Session phase sender")
+                        .send(WorkerPhase::RetryWait);
+                    events
+                        .send(AgentEvent::RetryScheduled {
+                            attempt: 1,
+                            delay_ms: 2_000,
+                            retry_at: Utc::now(),
+                            error_message: "network error".to_owned(),
+                        })
+                        .await
+                        .expect("retry schedule");
+                    let control = controls.recv().await.expect("candidate retry steer");
+                    let RunControl::RetrySteer { accepted, .. } = control else {
+                        panic!("Session must use retry handshake")
+                    };
+                    let _ = core
+                        .worker_phase
+                        .as_ref()
+                        .expect("Session phase sender")
+                        .send(WorkerPhase::Active);
+                    accepted.send(false).expect("reject stale retry steer");
+                    events
+                        .send(AgentEvent::TurnEnd {
+                            message: Some(Box::new(error)),
+                            tool_results: Vec::new(),
+                        })
+                        .await
+                        .expect("first TurnEnd");
+                } else {
+                    let success = bridge_assistant(StopReason::Stop);
+                    events
+                        .send(AgentEvent::MessageStart {
+                            message_id: "timer-race-success".to_owned(),
+                            message: Box::new(success.clone()),
+                        })
+                        .await
+                        .expect("assistant start");
+                    events
+                        .send(AgentEvent::MessageEnd {
+                            message_id: "timer-race-success".to_owned(),
+                            message: Box::new(success.clone()),
+                        })
+                        .await
+                        .expect("assistant end");
+                    events
+                        .send(AgentEvent::TurnEnd {
+                            message: Some(Box::new(success)),
+                            tool_results: Vec::new(),
+                        })
+                        .await
+                        .expect("second TurnEnd");
+                }
+                events.send(AgentEvent::AgentEnd).await.expect("AgentEnd");
+                RunCompletion::Completed(core)
+            }
+        }
+    });
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        worker,
+        test_executor_generation(),
+    )
+    .await
+    .expect("session");
+    let task = tokio::spawn(session.run());
+
+    commands.send(user(1)).await.expect("initial command");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if frames.lock().expect("frame mutex").iter().any(|frame| {
+                matches!(frame, OutboundFrame::Event { envelope }
+                    if envelope.event["type"] == "retry_scheduled")
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("durable retry schedule");
+    commands.send(user(2)).await.expect("racing command");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if runs.load(Ordering::SeqCst) == 2
+                && frames
+                    .lock()
+                    .expect("frame mutex")
+                    .iter()
+                    .filter(|frame| {
+                        matches!(frame, OutboundFrame::Event { envelope }
+                        if envelope.event["type"] == "agent_end")
+                    })
+                    .count()
+                    == 2
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("deferred second run");
+    drop(commands);
+    completed(task.await.expect("session join"));
+
+    let command_id = match user(2) {
+        InboundCommand::Valid(envelope) => envelope.command_id,
+        InboundCommand::Invalid { .. } => unreachable!(),
+    };
+    let state: (String, String) =
+        sqlx::query_as("SELECT status, application_kind FROM inbound_commands WHERE command_id=?")
+            .bind(command_id.as_str())
+            .fetch_one(&pool)
+            .await
+            .expect("deferred command state");
+    assert_eq!(state, ("applied".to_owned(), "idle_run".to_owned()));
 }
 
 #[tokio::test]
