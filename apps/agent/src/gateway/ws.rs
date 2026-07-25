@@ -20,6 +20,7 @@ use tokio_tungstenite::tungstenite::{
     Message, client::IntoClientRequest, http::HeaderValue, protocol::WebSocketConfig,
 };
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config, tungstenite};
+use zeroize::Zeroizing;
 
 use super::supervisor::{
     AgentHello, ApiHello, ConnectorError, GatewayConnector, GatewayCredential,
@@ -133,10 +134,13 @@ impl GatewayConnector for WebSocketConnector {
             .into_client_request()
             .map_err(|e| ConnectorError::Other(anyhow!("invalid websocket url: {e}")))?;
 
-        let auth_value = format!("Bearer {}", credential.token());
-        let header = HeaderValue::from_str(&auth_value)
+        let mut auth_value = Zeroizing::new(Vec::with_capacity(7 + credential.token().len()));
+        auth_value.extend_from_slice(b"Bearer ");
+        auth_value.extend_from_slice(credential.token().as_bytes());
+        let header = HeaderValue::from_bytes(&auth_value)
             .map_err(|e| ConnectorError::Other(anyhow!("invalid authorization header: {e}")))?;
         request.headers_mut().insert("Authorization", header);
+        drop(auth_value);
 
         let ws_config = WebSocketConfig {
             max_message_size: Some(MAX_FRAME_BYTES),
@@ -257,6 +261,13 @@ impl GatewayWriter for WsGatewayWriter {
         let wire = wire::to_wire_frame(frame)
             .map_err(|e| anyhow!("frame failed wire contract validation: {e}"))?;
         let text = serde_json::to_string(&wire).context("serialize wire frame")?;
+        if text.len() > MAX_FRAME_BYTES {
+            bail!(
+                "outbound frame exceeds MAX_FRAME_BYTES: {} bytes (limit {})",
+                text.len(),
+                MAX_FRAME_BYTES
+            );
+        }
         self.write
             .send(Message::Text(text))
             .await
@@ -298,6 +309,7 @@ mod tests {
         MAX_FRAME_BYTES, OutboundFrame,
     };
     use super::{CryptoProvider, WebSocketConnector, decode_command_bytes, init_crypto_provider};
+    use crate::gateway::wire::to_wire_frame;
     use crate::runtime::contracts::ProcessGeneration;
 
     struct TestDigestFactory;
@@ -854,6 +866,195 @@ mod tests {
         assert!(err.contains("Message too long"), "unexpected error: {err}");
 
         server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn connect_sends_expected_authorization_header() {
+        let listener = TcpListener::bind(listener_addr()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let callback = AuthCallback {
+                expected: "Bearer test-token",
+            };
+            // accept_hdr_async checks the Authorization header during the
+            // handshake and returns an error if it does not match.
+            let _ = accept_hdr_async(stream, callback).await;
+        });
+
+        let mut connector =
+            WebSocketConnector::new_insecure(format!("ws://{addr}"), Arc::new(TestDigestFactory));
+        let result = connector
+            .connect(GatewayCredential::new("test-token"))
+            .await;
+        assert!(
+            result.is_ok(),
+            "connector must present the expected bearer token"
+        );
+
+        let _ = server.await;
+    }
+
+    #[test]
+    fn gateway_credential_debug_redacts_token() {
+        let cred = GatewayCredential::new("super-secret-token");
+        let debug = format!("{cred:?}");
+        assert!(
+            !debug.contains("super-secret-token"),
+            "token must not leak in Debug output"
+        );
+        assert!(
+            debug.contains("[REDACTED]"),
+            "Debug output must redact token"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_authorization_header_rejected_without_exposing_secret() {
+        // A control character in the token makes the Authorization header
+        // invalid. connect must reject it locally before any network I/O, and
+        // the error message must not contain the secret.
+        let secret_with_control = "Bearer test-token\nwith-secret";
+        let mut connector = WebSocketConnector::new_insecure(
+            "ws://localhost:0".to_owned(),
+            Arc::new(TestDigestFactory),
+        );
+        let result = connector
+            .connect(GatewayCredential::new(secret_with_control))
+            .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("invalid Authorization bytes must be rejected"),
+        }
+        .to_string();
+        assert!(
+            err.contains("invalid authorization header"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !err.contains(secret_with_control),
+            "error must not echo the secret"
+        );
+    }
+
+    fn retry_frame_with_error_len(error_message_len: usize) -> OutboundFrame {
+        OutboundFrame::Event {
+            envelope: Envelope {
+                seq: Some(1),
+                conversation_id: "c".to_owned(),
+                event: serde_json::json!({
+                    "type": "retry_scheduled",
+                    "attempt": 1,
+                    "delay_ms": 0,
+                    "retry_at": "1970-01-01T00:00:00+00:00",
+                    "error_message": "x".repeat(error_message_len),
+                }),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_accepts_exactly_max_frame_bytes() {
+        let empty = retry_frame_with_error_len(0);
+        let wire = to_wire_frame(empty).unwrap();
+        let base_text = serde_json::to_string(&wire).unwrap();
+        let base_len = base_text.len();
+        assert!(
+            base_len <= MAX_FRAME_BYTES,
+            "test fixture fits within limit"
+        );
+
+        let payload_len = MAX_FRAME_BYTES - base_len;
+        let frame = retry_frame_with_error_len(payload_len);
+        let wire = to_wire_frame(frame.clone()).unwrap();
+        let text = serde_json::to_string(&wire).unwrap();
+        assert_eq!(
+            text.len(),
+            MAX_FRAME_BYTES,
+            "fixture must serialize to exactly MAX_FRAME_BYTES"
+        );
+
+        let listener = TcpListener::bind(listener_addr()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            read_agent_hello(&mut ws).await;
+            send_api_hello(&mut ws, test_api_hello()).await;
+            let msg = ws.next().await.unwrap().unwrap();
+            assert!(matches!(
+                msg,
+                tokio_tungstenite::tungstenite::Message::Text(_)
+            ));
+        });
+
+        let mut connector =
+            WebSocketConnector::new_insecure(format!("ws://{addr}"), Arc::new(TestDigestFactory));
+        let mut gateway = connector
+            .connect(GatewayCredential::new("valid"))
+            .await
+            .unwrap();
+        let _ = gateway
+            .authenticate_hello(test_agent_hello())
+            .await
+            .unwrap();
+        let (_reader, mut writer) = gateway.split();
+        writer.send(frame).await.unwrap();
+
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn writer_rejects_oversized_frame() {
+        let empty = retry_frame_with_error_len(0);
+        let wire = to_wire_frame(empty).unwrap();
+        let base_text = serde_json::to_string(&wire).unwrap();
+        let base_len = base_text.len();
+
+        let payload_len = MAX_FRAME_BYTES - base_len + 1;
+        let oversized = retry_frame_with_error_len(payload_len);
+
+        let listener = TcpListener::bind(listener_addr()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            read_agent_hello(&mut ws).await;
+            send_api_hello(&mut ws, test_api_hello()).await;
+            // Give the client time to attempt the oversized send; no frame
+            // should actually be delivered because the local check rejects it.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = ws.close(None).await;
+        });
+
+        let mut connector =
+            WebSocketConnector::new_insecure(format!("ws://{addr}"), Arc::new(TestDigestFactory));
+        let mut gateway = connector
+            .connect(GatewayCredential::new("valid"))
+            .await
+            .unwrap();
+        let _ = gateway
+            .authenticate_hello(test_agent_hello())
+            .await
+            .unwrap();
+        let (_reader, mut writer) = gateway.split();
+        let result = writer.send(oversized).await;
+        assert!(
+            result.is_err(),
+            "oversized frame must be rejected before sending: {result:?}"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("outbound frame exceeds MAX_FRAME_BYTES"),
+            "oversized rejection must mention the size limit"
+        );
+
         let _ = server.await;
     }
 
