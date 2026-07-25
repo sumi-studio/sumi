@@ -174,7 +174,7 @@ CREATE TABLE inbound_commands (
   run_phase TEXT NOT NULL,
   received_at TEXT NOT NULL,
   applied_at TEXT,
-  CHECK (command_kind IN ('user_message', 'abort', 'approval_decision', 'invalid')),
+  CHECK (command_kind IN ('user_message', 'abort', 'approval_decision', 'lifecycle', 'invalid')),
   CHECK (status IN ('received', 'applying', 'applied', 'superseded', 'rejected')),
   CHECK (
     application_kind IS NULL
@@ -264,6 +264,13 @@ CREATE TABLE inbound_commands (
       AND run_phase = 'received')
     OR
     (command_kind IN ('abort', 'approval_decision')
+      AND status IN ('received', 'applied')
+      AND application_kind IS NULL
+      AND run_id IS NULL
+      AND turn_id IS NULL
+      AND run_phase = 'received')
+    OR
+    (command_kind = 'lifecycle'
       AND status IN ('received', 'applied')
       AND application_kind IS NULL
       AND run_id IS NULL

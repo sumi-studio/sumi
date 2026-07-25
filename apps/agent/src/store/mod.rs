@@ -1,9 +1,12 @@
 //! Durable conversation, event, and memory storage.
 
+mod compliance;
 mod crypto;
 mod delivery;
 mod event_log;
 mod event_writer;
+mod kms;
+mod lifecycle;
 mod memory_state;
 mod physical_recovery;
 mod provider_context;
@@ -12,7 +15,10 @@ mod redactor;
 mod sizer;
 mod transcript;
 
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 #[cfg(test)]
 use std::str::FromStr;
@@ -34,12 +40,18 @@ use self::crypto::{
     ConversationCommandDigestFactory, DataKeyScope, KeyWrapAad, WRAP_ALGORITHM, unwrap_data_key,
     wrap_data_key,
 };
+#[allow(unused_imports)]
+pub use compliance::{
+    AuditRecord, InMemoryTombstoneRepository, SqliteTombstoneRepository, Tombstone,
+    TombstoneRepository, TombstoneScope, TombstoneStatus,
+};
 #[cfg(test)]
-pub(crate) use crypto::{DATA_KEY_BYTES, WrappingKey};
+pub(crate) use crypto::DATA_KEY_BYTES;
 pub(crate) use crypto::{
     DataKeyMaterial, DataKeyPurpose, EnvironmentKeyProvider, KeyProvider, RowAad,
     command_payload_digest, decrypt_content, encrypt_content, verify_command_payload_digest,
 };
+pub(crate) use crypto::{WrappingKey, decode_hex_key};
 #[allow(
     unused_imports,
     reason = "T12 freezes projection types consumed by T15 without duplicating EventWriter"
@@ -49,6 +61,9 @@ pub(crate) use event_writer::{
     InboundAdmission, InboundReceipt, InboundReceiptOrigin, InjectedCommand, Projection,
     RecoveryRequired, RunPhase, ToolExecutionMutation, USER_MESSAGE_ID_NAMESPACE, user_message_id,
 };
+pub use kms::{HttpKmsClient, KmsClient, KmsKeyProvider, MockKmsClient};
+#[allow(unused_imports)]
+pub use lifecycle::{ArtifactLifecycleBroker, DirectArtifactBroker, LifecycleWorker};
 #[cfg(test)]
 pub(crate) use memory_state::{MemoryBatchMessageRecord, MemoryBatchRecord, MemoryJobRecord};
 pub(crate) use memory_state::{MemoryBatchState, MemoryJobKind, MemoryJobStatus, MemoryLayer};
@@ -117,10 +132,11 @@ impl AgentScope {
 
 pub(crate) struct Store {
     pool: SqlitePool,
-    scope: AgentScope,
+    scope: std::sync::RwLock<AgentScope>,
     key_provider: Arc<dyn KeyProvider>,
     redactor: Redactor,
     event_writer_state: Arc<Mutex<event_writer::WriterState>>,
+    db_path: Option<PathBuf>,
 }
 
 impl Store {
@@ -141,7 +157,8 @@ impl Store {
             .connect_with(options)
             .await
             .with_context(|| format!("failed to open SQLite database {}", path.display()))?;
-        let store = Self::finish_open(pool, scope, key_provider).await?;
+        let db_path = Some(path.to_path_buf());
+        let store = Self::finish_open(pool, scope, key_provider, db_path).await?;
         secure_sqlite_files(path).await?;
         Ok(store)
     }
@@ -155,7 +172,7 @@ impl Store {
             .max_connections(1)
             .connect_with(options)
             .await?;
-        Self::finish_open(pool, scope, key_provider).await
+        Self::finish_open(pool, scope, key_provider, None).await
     }
 
     #[cfg(test)]
@@ -195,6 +212,7 @@ impl Store {
         pool: SqlitePool,
         scope: AgentScope,
         key_provider: Arc<dyn KeyProvider>,
+        db_path: Option<PathBuf>,
     ) -> Result<Self> {
         MIGRATOR
             .run(&pool)
@@ -217,10 +235,11 @@ impl Store {
 
         let store = Self {
             pool,
-            scope,
+            scope: std::sync::RwLock::new(scope),
             key_provider,
             redactor: Redactor::v1(),
             event_writer_state: Arc::new(Mutex::new(event_writer::WriterState::default())),
+            db_path,
         };
         store.validate_startup().await?;
         Ok(store)
@@ -230,12 +249,26 @@ impl Store {
         &self.pool
     }
 
-    pub(crate) fn scope(&self) -> &AgentScope {
-        &self.scope
+    pub(crate) fn scope(&self) -> AgentScope {
+        self.scope
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn set_conversation_id(&self, conversation_id: String) {
+        self.scope
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .conversation_id = conversation_id;
     }
 
     pub(crate) fn redactor(&self) -> &Redactor {
         &self.redactor
+    }
+
+    pub(crate) fn db_path(&self) -> Option<&Path> {
+        self.db_path.as_deref()
     }
 
     fn event_writer_state(&self) -> Arc<Mutex<event_writer::WriterState>> {
@@ -274,10 +307,11 @@ impl Store {
             agent_id: row.try_get("agent_id")?,
             conversation_id: row.try_get("conversation_id")?,
         };
-        if stored != self.scope {
+        let runtime_scope = self.scope();
+        if stored != runtime_scope {
             bail!(
                 "database scope does not match authenticated runtime scope: expected {:?}, found {:?}",
-                self.scope,
+                runtime_scope,
                 stored
             );
         }
@@ -331,7 +365,8 @@ impl Store {
             let conversation_id: Option<String> = row.try_get("conversation_id")?;
             match key_scope {
                 DataKeyScope::Conversation
-                    if conversation_id.as_deref() != Some(self.scope.conversation_id.as_str()) =>
+                    if conversation_id.as_deref()
+                        != Some(runtime_scope.conversation_id.as_str()) =>
                 {
                     bail!("active conversation key {key_ref} is bound to the wrong conversation");
                 }
@@ -380,6 +415,7 @@ impl Store {
             return Ok(key);
         }
 
+        let scope = self.scope();
         let wrapping_key = self.key_provider.current_key().await?;
         let key_ref = format!("{}-{}", purpose.as_str(), Uuid::now_v7());
         let data_key = DataKeyMaterial::generate(&key_ref, purpose)?;
@@ -387,7 +423,7 @@ impl Store {
             key_ref: key_ref.clone(),
             scope: DataKeyScope::Conversation,
             purpose,
-            conversation_id: Some(self.scope.conversation_id.clone()),
+            conversation_id: Some(scope.conversation_id.clone()),
             wrap_key_id: wrapping_key.key_id().to_owned(),
         };
         let (wrap_nonce, wrapped_key) = wrap_data_key(&data_key, &wrapping_key, &aad)?;
@@ -399,7 +435,7 @@ impl Store {
         )
         .bind(&key_ref)
         .bind(purpose.as_str())
-        .bind(&self.scope.conversation_id)
+        .bind(&scope.conversation_id)
         .bind(WRAP_ALGORITHM)
         .bind(wrapping_key.key_id())
         .bind(wrap_nonce.as_slice())
@@ -431,13 +467,14 @@ impl Store {
         if purpose == DataKeyPurpose::ProviderContext {
             bail!("provider-context keys are not conversation-shared");
         }
+        let scope = self.scope();
         let row = sqlx::query(
             "SELECT key_ref, wrap_key_id, wrap_nonce, wrapped_key
              FROM data_keys
              WHERE scope = 'conversation' AND conversation_id = ? AND purpose = ?
                AND state = 'active'",
         )
-        .bind(&self.scope.conversation_id)
+        .bind(&scope.conversation_id)
         .bind(purpose.as_str())
         .fetch_optional(&self.pool)
         .await
@@ -452,7 +489,7 @@ impl Store {
             key_ref: key_ref.clone(),
             scope: DataKeyScope::Conversation,
             purpose,
-            conversation_id: Some(self.scope.conversation_id.clone()),
+            conversation_id: Some(scope.conversation_id.clone()),
             wrap_key_id,
         };
         unwrap_data_key(
@@ -474,14 +511,15 @@ impl Store {
         &self,
         anchor: &ProviderContextKeyAnchor,
     ) -> Result<DataKeyMaterial> {
-        if anchor.conversation_id != self.scope.conversation_id {
+        let scope = self.scope();
+        if anchor.conversation_id != scope.conversation_id {
             bail!("provider-context anchor belongs to a different authenticated conversation");
         }
         if anchor.anchor_id.is_empty() {
             bail!("provider-context anchor identity must not be empty");
         }
 
-        let key_ref = provider_context_key_ref(&self.scope, &anchor.anchor_id);
+        let key_ref = provider_context_key_ref(&scope, &anchor.anchor_id);
         let existing_state: Option<String> =
             sqlx::query_scalar("SELECT state FROM data_keys WHERE key_ref = ?")
                 .bind(&key_ref)
@@ -506,7 +544,7 @@ impl Store {
             key_ref: key_ref.clone(),
             scope: DataKeyScope::Conversation,
             purpose,
-            conversation_id: Some(self.scope.conversation_id.clone()),
+            conversation_id: Some(scope.conversation_id.clone()),
             wrap_key_id: wrapping_key.key_id().to_owned(),
         };
         let (wrap_nonce, wrapped_key) = wrap_data_key(&data_key, &wrapping_key, &aad)?;
@@ -517,7 +555,7 @@ impl Store {
              ) VALUES(?, 'conversation', 'provider_context', ?, ?, ?, ?, ?, 'active', ?, NULL)",
         )
         .bind(&key_ref)
-        .bind(&self.scope.conversation_id)
+        .bind(&scope.conversation_id)
         .bind(WRAP_ALGORITHM)
         .bind(wrapping_key.key_id())
         .bind(wrap_nonce.as_slice())
@@ -542,6 +580,7 @@ impl Store {
     }
 
     pub(crate) async fn data_key_by_ref(&self, key_ref: &str) -> Result<DataKeyMaterial> {
+        let runtime_conversation_id = self.scope().conversation_id;
         let row = sqlx::query(
             "SELECT purpose, conversation_id, wrap_key_id, wrap_nonce, wrapped_key
              FROM data_keys
@@ -554,7 +593,7 @@ impl Store {
         .ok_or_else(|| anyhow!("active data key {key_ref} is unavailable"))?;
         let purpose = DataKeyPurpose::parse(row.try_get("purpose")?)?;
         let conversation_id: Option<String> = row.try_get("conversation_id")?;
-        if conversation_id.as_deref() != Some(self.scope.conversation_id.as_str()) {
+        if conversation_id.as_deref() != Some(runtime_conversation_id.as_str()) {
             bail!("data key {key_ref} belongs to a different conversation");
         }
         let wrap_key_id: String = row.try_get("wrap_key_id")?;
@@ -581,6 +620,7 @@ impl Store {
         transaction: &mut Transaction<'_, Sqlite>,
         key_ref: &str,
     ) -> Result<DataKeyMaterial> {
+        let runtime_conversation_id = self.scope().conversation_id;
         let row = sqlx::query(
             "SELECT purpose, conversation_id, wrap_key_id, wrap_nonce, wrapped_key
              FROM data_keys
@@ -593,7 +633,7 @@ impl Store {
         .ok_or_else(|| anyhow!("active data key {key_ref} is unavailable"))?;
         let purpose = DataKeyPurpose::parse(row.try_get("purpose")?)?;
         let conversation_id: Option<String> = row.try_get("conversation_id")?;
-        if conversation_id.as_deref() != Some(self.scope.conversation_id.as_str()) {
+        if conversation_id.as_deref() != Some(runtime_conversation_id.as_str()) {
             bail!("data key {key_ref} belongs to a different conversation");
         }
         let wrap_key_id: String = row.try_get("wrap_key_id")?;
@@ -626,6 +666,7 @@ impl Store {
         if key_ref.is_empty() {
             bail!("crypto-erase key_ref must not be empty");
         }
+        let runtime_conversation_id = self.scope().conversation_id;
         let mut transaction = self.pool.begin().await?;
         let row = sqlx::query(
             "SELECT scope, purpose, conversation_id, state, wrapped_key, wrap_nonce, destroyed_at
@@ -641,7 +682,7 @@ impl Store {
         let purpose = DataKeyPurpose::parse(row.try_get("purpose")?)?;
         let conversation_id: Option<String> = row.try_get("conversation_id")?;
         if scope != DataKeyScope::Conversation.as_str()
-            || conversation_id.as_deref() != Some(self.scope.conversation_id.as_str())
+            || conversation_id.as_deref() != Some(runtime_conversation_id.as_str())
             || purpose == DataKeyPurpose::Workspace
         {
             bail!("crypto-erase key_ref {key_ref} is outside the active conversation scope");
@@ -665,7 +706,7 @@ impl Store {
                 )
                 .bind(Utc::now().to_rfc3339())
                 .bind(key_ref)
-                .bind(&self.scope.conversation_id)
+                .bind(&runtime_conversation_id)
                 .execute(&mut *transaction)
                 .await?;
                 if result.rows_affected() != 1 {
@@ -681,6 +722,100 @@ impl Store {
             }
             value => bail!("crypto-erase key_ref {key_ref} has invalid state {value}"),
         }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Re-wrap every active conversation data key with the current wrapping
+    /// key from `KeyProvider` without re-encrypting row ciphertext.  Old
+    /// wrapping keys must still be available (not yet disabled) for this to
+    /// succeed; a disabled/revoked KMS key fails closed.
+    #[allow(
+        dead_code,
+        reason = "T29 rotation boundary wired by lifecycle tests and runtime bootstrap"
+    )]
+    pub(crate) async fn rewrap_active_data_keys(&self) -> Result<()> {
+        let runtime_conversation_id = self.scope().conversation_id;
+        let new_wrapping_key = self
+            .key_provider
+            .current_key()
+            .await
+            .context("failed to obtain current wrapping key for rotation")?;
+        let new_key_id = new_wrapping_key.key_id().to_owned();
+
+        let mut transaction = self.pool.begin().await?;
+        let rows = sqlx::query(
+            "SELECT key_ref, scope, purpose, conversation_id, wrap_key_id,
+                    wrap_nonce, wrapped_key
+             FROM data_keys
+             WHERE state = 'active' AND scope = 'conversation'
+               AND conversation_id = ?",
+        )
+        .bind(&runtime_conversation_id)
+        .fetch_all(&mut *transaction)
+        .await
+        .context("failed to load active data keys for rotation")?;
+
+        for row in rows {
+            let key_ref: String = row.try_get("key_ref")?;
+            let _scope: String = row.try_get("scope")?;
+            let purpose = DataKeyPurpose::parse(row.try_get("purpose")?)?;
+            let conversation_id: Option<String> = row.try_get("conversation_id")?;
+            let old_wrap_key_id: String = row.try_get("wrap_key_id")?;
+            let old_wrapping_key = self
+                .key_provider
+                .key_by_id(&old_wrap_key_id)
+                .await
+                .with_context(|| {
+                    format!("old wrapping key {old_wrap_key_id} unavailable during rotation")
+                })?;
+
+            let old_aad = KeyWrapAad {
+                key_ref: key_ref.clone(),
+                scope: DataKeyScope::Conversation,
+                purpose,
+                conversation_id: conversation_id.clone(),
+                wrap_key_id: old_wrap_key_id,
+            };
+            let data_key = unwrap_data_key(
+                &key_ref,
+                purpose,
+                row.try_get::<Vec<u8>, _>("wrapped_key")?.as_slice(),
+                row.try_get::<Vec<u8>, _>("wrap_nonce")?.as_slice(),
+                &old_wrapping_key,
+                &old_aad,
+            )
+            .context("failed to unwrap data key during rotation")?;
+
+            let new_aad = KeyWrapAad {
+                key_ref: key_ref.clone(),
+                scope: DataKeyScope::Conversation,
+                purpose,
+                conversation_id,
+                wrap_key_id: new_key_id.clone(),
+            };
+            let (new_nonce, new_wrapped) = wrap_data_key(&data_key, &new_wrapping_key, &new_aad)
+                .context("failed to re-wrap data key during rotation")?;
+
+            let updated = sqlx::query(
+                "UPDATE data_keys
+                 SET wrap_key_id = ?, wrap_nonce = ?, wrapped_key = ?
+                 WHERE key_ref = ? AND state = 'active'
+                   AND scope = 'conversation' AND conversation_id = ?",
+            )
+            .bind(&new_key_id)
+            .bind(new_nonce.as_slice())
+            .bind(new_wrapped)
+            .bind(&key_ref)
+            .bind(&runtime_conversation_id)
+            .execute(&mut *transaction)
+            .await?;
+
+            if updated.rows_affected() != 1 {
+                bail!("data key {key_ref} disappeared during rotation");
+            }
+        }
+
         transaction.commit().await?;
         Ok(())
     }
@@ -1451,7 +1586,7 @@ mod tests {
             conversation_id: "conversation-2".to_owned(),
             ..scope()
         };
-        let error = match Store::finish_open(pool, wrong_scope, provider()).await {
+        let error = match Store::finish_open(pool, wrong_scope, provider(), None).await {
             Ok(_) => panic!("scope mismatch must fail closed"),
             Err(error) => error,
         };
@@ -1472,7 +1607,7 @@ mod tests {
         let pool = store.pool.clone();
         drop(store);
 
-        let error = match Store::finish_open(pool, scope(), provider()).await {
+        let error = match Store::finish_open(pool, scope(), provider(), None).await {
             Ok(_) => panic!("tampered key must fail startup validation"),
             Err(error) => error,
         };
@@ -1497,7 +1632,7 @@ mod tests {
         let pool = store.pool.clone();
         drop(store);
 
-        let error = match Store::finish_open(pool, scope(), provider()).await {
+        let error = match Store::finish_open(pool, scope(), provider(), None).await {
             Ok(_) => panic!("unknown active key algorithm must fail startup"),
             Err(error) => error,
         };
@@ -1524,7 +1659,7 @@ mod tests {
         let pool = store.pool.clone();
         drop(store);
 
-        let error = match Store::finish_open(pool, scope(), provider()).await {
+        let error = match Store::finish_open(pool, scope(), provider(), None).await {
             Ok(_) => panic!("message projection version 2 must fail startup"),
             Err(error) => error,
         };
@@ -1551,7 +1686,7 @@ mod tests {
         let pool = store.pool.clone();
         drop(store);
 
-        let error = match Store::finish_open(pool, scope(), provider()).await {
+        let error = match Store::finish_open(pool, scope(), provider(), None).await {
             Ok(_) => panic!("approval projection version 2 must fail startup"),
             Err(error) => error,
         };

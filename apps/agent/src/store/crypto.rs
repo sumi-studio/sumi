@@ -33,7 +33,7 @@ impl DataKeyScope {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DataKeyPurpose {
     Transcript,
     Event,
@@ -91,7 +91,7 @@ impl WrappingKey {
         &self.key_id
     }
 
-    fn bytes(&self) -> &[u8; DATA_KEY_BYTES] {
+    pub(crate) fn bytes(&self) -> &[u8; DATA_KEY_BYTES] {
         &self.bytes
     }
 }
@@ -468,7 +468,7 @@ pub(super) fn verify_keyed_proof(
         .map_err(|_| anyhow!("keyed proof mismatch"))
 }
 
-fn aead_encrypt(
+pub(crate) fn aead_encrypt(
     key: &[u8; DATA_KEY_BYTES],
     nonce: &[u8; CONTENT_NONCE_BYTES],
     plaintext: &[u8],
@@ -487,7 +487,7 @@ fn aead_encrypt(
         .map_err(|_| anyhow!("AEAD encryption failed"))
 }
 
-fn aead_decrypt(
+pub(crate) fn aead_decrypt(
     key: &[u8; DATA_KEY_BYTES],
     nonce: &[u8; CONTENT_NONCE_BYTES],
     ciphertext: &[u8],
@@ -506,7 +506,7 @@ fn aead_decrypt(
         .map_err(|_| anyhow!("AEAD authentication failed"))
 }
 
-fn random_nonce() -> Result<[u8; CONTENT_NONCE_BYTES]> {
+pub(crate) fn random_nonce() -> Result<[u8; CONTENT_NONCE_BYTES]> {
     let mut nonce = [0_u8; CONTENT_NONCE_BYTES];
     rand::rngs::OsRng
         .try_fill_bytes(&mut nonce)
@@ -514,7 +514,7 @@ fn random_nonce() -> Result<[u8; CONTENT_NONCE_BYTES]> {
     Ok(nonce)
 }
 
-fn canonical_fields<const N: usize>(domain: &[u8], fields: [&[u8]; N]) -> Vec<u8> {
+pub(crate) fn canonical_fields<const N: usize>(domain: &[u8], fields: [&[u8]; N]) -> Vec<u8> {
     let capacity = domain.len()
         + fields
             .iter()
@@ -529,7 +529,7 @@ fn canonical_fields<const N: usize>(domain: &[u8], fields: [&[u8]; N]) -> Vec<u8
     output
 }
 
-fn decode_hex_key(encoded: &str) -> Result<[u8; DATA_KEY_BYTES]> {
+pub(crate) fn decode_hex_key(encoded: &str) -> Result<[u8; DATA_KEY_BYTES]> {
     if encoded.len() != DATA_KEY_BYTES * 2 {
         bail!("invalid key length");
     }

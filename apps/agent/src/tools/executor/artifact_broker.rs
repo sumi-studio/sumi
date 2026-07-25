@@ -6,7 +6,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+        fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
         unix::{ffi::OsStrExt, fs::OpenOptionsExt},
     },
     path::Path,
@@ -56,6 +56,7 @@ pub enum ArtifactResponse {
     Read { content: Vec<u8>, eof: bool },
     Grep { matches: Vec<ArtifactGrepMatch> },
     Put { handle: String },
+    Deleted { deleted_count: u64 },
 }
 
 /// A broker instance pins its root inode for its lifetime. All descendants are
@@ -156,6 +157,10 @@ impl ArtifactBroker {
                 artifact_id,
                 content,
             } => self.put_attachment(&conversation_id, &artifact_id, &content),
+            ArtifactOperation::DeleteConversationArtifacts {
+                conversation_id,
+                tombstone_id,
+            } => self.delete_conversation_artifacts(&conversation_id, &tombstone_id),
         }
     }
 
@@ -538,6 +543,102 @@ impl ArtifactBroker {
         self.state
             .lock()
             .map_err(|_| ToolError::Protocol("artifact process state lock poisoned".to_owned()))
+    }
+
+    fn delete_conversation_artifacts(
+        &self,
+        conversation_id: &str,
+        _tombstone_id: &str,
+    ) -> Result<ArtifactResponse, ToolError> {
+        let name = cstring(conversation_id)?;
+        // Open the conversation directory relative to the pinned root FD with
+        // no-symlink / no-magic-link / no-escape resolution.
+        let conversation_fd = match openat2_cstr(
+            self.root.as_raw_fd(),
+            &name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0,
+        ) {
+            Ok(fd) => fd,
+            Err(ToolError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ArtifactResponse::Deleted { deleted_count: 0 });
+            }
+            Err(e) => return Err(e),
+        };
+        // Transfer ownership of the conversation directory fd to fdopendir.
+        let deleted = unsafe { delete_dir_contents_recursive(conversation_fd.into_raw_fd()) }?;
+        // The fd is consumed by fdopendir inside the helper, so we only need
+        // to remove the now-empty conversation directory from the root.
+        if unsafe { libc::unlinkat(self.root.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        fsync_fd(self.root.as_raw_fd())?;
+        Ok(ArtifactResponse::Deleted {
+            deleted_count: deleted,
+        })
+    }
+}
+
+unsafe fn delete_dir_contents_recursive(dir_fd: RawFd) -> Result<u64, ToolError> {
+    unsafe {
+        let dir = libc::fdopendir(dir_fd);
+        if dir.is_null() {
+            return Err(std::io::Error::last_os_error().into());
+        }
+
+        let mut entries = Vec::new();
+        loop {
+            let entry = libc::readdir(dir);
+            if entry.is_null() {
+                break;
+            }
+            let name_cstr = CStr::from_ptr((*entry).d_name.as_ptr());
+            if name_cstr == c"." || name_cstr == c".." {
+                continue;
+            }
+            entries.push(name_cstr.to_owned());
+        }
+
+        let mut deleted = 0u64;
+        for name in entries {
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if libc::fstatat(
+                dir_fd,
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let stat = stat.assume_init();
+            let is_dir = (stat.st_mode & libc::S_IFMT) == libc::S_IFDIR;
+
+            if is_dir {
+                let sub_fd = libc::openat(
+                    dir_fd,
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                );
+                if sub_fd < 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                deleted = deleted
+                    .checked_add(delete_dir_contents_recursive(sub_fd)?)
+                    .ok_or_else(|| ToolError::Protocol("delete count overflow".to_owned()))?;
+                if libc::unlinkat(dir_fd, name.as_ptr(), libc::AT_REMOVEDIR) != 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+            } else if libc::unlinkat(dir_fd, name.as_ptr(), 0) != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            deleted = deleted
+                .checked_add(1)
+                .ok_or_else(|| ToolError::Protocol("delete count overflow".to_owned()))?;
+        }
+        libc::closedir(dir);
+        Ok(deleted)
     }
 }
 
@@ -963,6 +1064,37 @@ mod tests {
             Err(ToolError::Protocol(message))
                 if message == "duplicate PutAttachment has conflicting content"
         ));
+    }
+
+    #[test]
+    fn delete_conversation_artifacts_removes_only_target_conversation() {
+        let root = TestRoot::new();
+        let broker = ArtifactBroker::open(&root.0).unwrap();
+
+        let put_target = ArtifactOperation::PutAttachment {
+            conversation_id: "conversation-1".to_owned(),
+            artifact_id: "artifact-1".to_owned(),
+            content: "target conversation data".to_owned(),
+        };
+        let put_other = ArtifactOperation::PutAttachment {
+            conversation_id: "conversation-2".to_owned(),
+            artifact_id: "artifact-2".to_owned(),
+            content: "other conversation data".to_owned(),
+        };
+        assert!(broker.execute(put_target).is_ok());
+        assert!(broker.execute(put_other).is_ok());
+
+        let delete = ArtifactOperation::DeleteConversationArtifacts {
+            conversation_id: "conversation-1".to_owned(),
+            tombstone_id: "tombstone-1".to_owned(),
+        };
+        let response = broker.execute(delete).unwrap();
+        // The conversation directory contains the `attachments` subdirectory
+        // and one file, so the recursive delete counts two entries.
+        assert_eq!(response, ArtifactResponse::Deleted { deleted_count: 2 });
+
+        assert!(!root.0.join("conversation-1").exists());
+        assert!(root.0.join("conversation-2").exists());
     }
 
     #[test]

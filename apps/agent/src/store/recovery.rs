@@ -548,6 +548,11 @@ fn validate_stored_command_variant(command_kind: &str, plaintext: &[u8]) -> Resu
         Command::UserMessage { .. } => "user_message",
         Command::Abort {} => "abort",
         Command::ApprovalDecision { .. } => "approval_decision",
+        Command::ConversationReset { .. }
+        | Command::DeleteAgent {}
+        | Command::Export { .. }
+        | Command::Search { .. }
+        | Command::RotateKeys {} => "lifecycle",
     };
     if actual_kind != command_kind {
         bail!("stored pending command kind does not match authenticated payload");
@@ -780,7 +785,7 @@ async fn durable_event_evidence(
             .await
             .context("event-log head key is unavailable")?;
         let chain_digest = verify_event_head(
-            store.scope(),
+            &store.scope(),
             &key,
             last_seq,
             event_count,

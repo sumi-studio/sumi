@@ -10,17 +10,22 @@ pub mod runtime;
 mod store;
 mod tools;
 
-use std::{env, io, sync::Arc};
+use std::{env, io, path::PathBuf, sync::Arc};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use gateway::{
-    CommandAckStatus, Envelope, Gateway, GatewayClosed, GatewayReader, GatewayWriter,
+    CommandAck, CommandAckStatus, Envelope, Gateway, GatewayClosed, GatewayReader, GatewayWriter,
     InboundCommand, InvalidCommand, OutboundFrame, StdioGateway,
 };
 use store::{
     AgentScope, DataKeyPurpose, EnvironmentKeyProvider, EventWriter, InboundAdmission, Store,
-    SuffixRecovery,
+    SuffixRecovery, WrappingKey, decode_hex_key,
 };
+use store::{
+    ArtifactLifecycleBroker, DirectArtifactBroker, HttpKmsClient, KeyProvider, KmsClient,
+    KmsKeyProvider, LifecycleWorker, MockKmsClient, SqliteTombstoneRepository, TombstoneRepository,
+};
+use tools::executor::ArtifactBroker;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -60,11 +65,7 @@ async fn main() -> Result<()> {
         agent_id: env::var("SUMI_AGENT_ID").unwrap_or_else(|_| "local-agent".to_owned()),
         conversation_id: conversation_id.clone(),
     };
-    let key_provider = Arc::new(EnvironmentKeyProvider::from_env(
-        "SUMI_AGENT_WRAPPING_KEY",
-        env::var("SUMI_AGENT_WRAPPING_KEY_ID")
-            .unwrap_or_else(|_| "local-env-wrapping-key/v1".to_owned()),
-    )?);
+    let key_provider = build_key_provider()?;
     let store = Arc::new(Store::open(&config.database_path, scope, key_provider).await?);
     // EventWriter never mints a key halfway through a command/event transaction.
     for purpose in [
@@ -76,6 +77,7 @@ async fn main() -> Result<()> {
     }
     let event_writer = EventWriter::new(store.clone());
     event_writer.initialize_recovery_checkpoint().await?;
+    let lifecycle_worker = build_lifecycle_worker(&config, store.clone()).await?;
     let pending_recovery = SuffixRecovery::recover_t12_prefix(&store, &event_writer).await?;
     if !pending_recovery.is_empty() {
         tracing::warn!(
@@ -170,6 +172,68 @@ async fn main() -> Result<()> {
             InboundCommand::Valid(_) => {}
         }
 
+        // Lifecycle commands reset/delete/export/search/rotate keys are handled
+        // at the runtime boundary before any T17 composition or tool execution.
+        if let InboundCommand::Valid(command) = &inbound
+            && is_lifecycle_command(&command.command)
+        {
+            let is_delete = matches!(command.command, gateway::Command::DeleteAgent {});
+
+            // DeleteAgent removes the SQLite file; mark applied first.
+            if is_delete {
+                lifecycle_worker
+                    .apply_command(command.command_id.as_str(), command.seq)
+                    .await?;
+            }
+
+            let result = lifecycle_worker
+                .handle_command(&command.command)
+                .await
+                .with_context(|| {
+                    format!("lifecycle command {} failed", command.command_id.as_str())
+                })?;
+
+            if !is_delete {
+                lifecycle_worker
+                    .apply_command(command.command_id.as_str(), command.seq)
+                    .await?;
+            }
+
+            gateway_writer
+                .send(OutboundFrame::CommandAck {
+                    ack: CommandAck {
+                        seq: command.seq,
+                        command_id: command.command_id.as_str().to_owned(),
+                        status: CommandAckStatus::Applied,
+                        reject_reason: None,
+                    },
+                })
+                .await?;
+
+            if let Some(payload) = result {
+                let event = serde_json::json!({
+                    "type": "lifecycle_result",
+                    "command": command.command_id.as_str(),
+                    "data": String::from_utf8_lossy(&payload),
+                });
+                gateway_writer
+                    .send(OutboundFrame::Event {
+                        envelope: Envelope {
+                            seq: Some(command.seq),
+                            conversation_id: conversation_id.clone(),
+                            event,
+                        },
+                    })
+                    .await?;
+            }
+
+            // DeleteAgent has destroyed local storage; stop reading commands.
+            if is_delete {
+                break;
+            }
+            continue;
+        }
+
         gateway_writer
             .send(OutboundFrame::CommandAck { ack: receipt_ack })
             .await?;
@@ -177,4 +241,99 @@ async fn main() -> Result<()> {
 
     tracing::info!("sumi-agent stopped");
     Ok(())
+}
+
+/// Select the `KeyProvider` implementation based on `SUMI_KEY_PROVIDER`.
+///
+/// * `env`  -> environment-variable wrapping key (local/test only).
+/// * `mock` -> fail-closed `MockKmsClient` wrapping a local KEK.
+/// * `kms`  -> production `HttpKmsClient` over TLS against `SUMI_KMS_URL`.
+fn build_key_provider() -> Result<Arc<dyn KeyProvider>> {
+    let provider = env::var("SUMI_KEY_PROVIDER").unwrap_or_else(|_| "env".to_owned());
+    match provider.as_str() {
+        "env" => {
+            let key_id = env::var("SUMI_AGENT_WRAPPING_KEY_ID")
+                .unwrap_or_else(|_| "local-env-wrapping-key/v1".to_owned());
+            Ok(Arc::new(EnvironmentKeyProvider::from_env(
+                "SUMI_AGENT_WRAPPING_KEY",
+                key_id,
+            )?))
+        }
+        "mock" => {
+            let kek_hex = env::var("SUMI_MOCK_KMS_KEK")
+                .context("SUMI_MOCK_KMS_KEK is required when SUMI_KEY_PROVIDER=mock")?;
+            let kek_bytes = decode_hex_key(&kek_hex)?;
+            let kek = WrappingKey::new("mock-tenant-kek/v1", kek_bytes);
+            let client = Arc::new(MockKmsClient::new(
+                env::var("SUMI_TENANT_ID").unwrap_or_else(|_| "local-tenant".to_owned()),
+                env::var("SUMI_AGENT_ID").unwrap_or_else(|_| "local-agent".to_owned()),
+                kek,
+            ));
+            let agent_key_id = env::var("SUMI_MOCK_KMS_AGENT_KEY_ID")
+                .unwrap_or_else(|_| "mock-agent-key/v1".to_owned());
+            let agent_key_bytes = env::var("SUMI_MOCK_KMS_AGENT_KEY")
+                .context("SUMI_MOCK_KMS_AGENT_KEY is required when SUMI_KEY_PROVIDER=mock")
+                .and_then(|hex| decode_hex_key(&hex))?;
+            let agent_key = WrappingKey::new(&agent_key_id, agent_key_bytes);
+            client
+                .register_agent_key(&agent_key_id, &agent_key)
+                .context("failed to register mock agent key")?;
+            client.set_current_key_id(&agent_key_id);
+            let kms_client: Arc<dyn KmsClient> = client;
+            Ok(Arc::new(KmsKeyProvider::new(kms_client)?))
+        }
+        "kms" => {
+            let client =
+                Arc::new(HttpKmsClient::from_env().context(
+                    "SUMI_KEY_PROVIDER=kms requires SUMI_KMS_URL and SUMI_KMS_API_TOKEN",
+                )?);
+            Ok(Arc::new(KmsKeyProvider::new(client)?))
+        }
+        other => {
+            bail!("unknown SUMI_KEY_PROVIDER={other}; expected `env`, `mock`, or `kms`");
+        }
+    }
+}
+
+/// Build a `LifecycleWorker` bound to a sidecar compliance DB and the local
+/// artifact volume.  The default artifact root is `<workspace>/artifacts`.
+async fn build_lifecycle_worker(
+    config: &config::Config,
+    store: Arc<Store>,
+) -> Result<LifecycleWorker> {
+    let compliance_path = config.database_path.with_file_name("compliance.db");
+    let tombstones: Arc<dyn TombstoneRepository> = Arc::new(
+        SqliteTombstoneRepository::open(&compliance_path)
+            .await
+            .context("failed to open lifecycle compliance database")?,
+    );
+
+    let mut artifact_root = env::var_os("SUMI_ARTIFACT_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config.workspace.join("artifacts"));
+    if artifact_root.is_relative() {
+        artifact_root = std::env::current_dir()?.join(artifact_root);
+    }
+    tokio::fs::create_dir_all(&artifact_root).await.ok();
+
+    let broker: Arc<dyn ArtifactLifecycleBroker> = Arc::new(DirectArtifactBroker::new(
+        ArtifactBroker::open(&artifact_root)?,
+    ));
+    Ok(LifecycleWorker::new(
+        store,
+        tombstones,
+        broker,
+        Some(artifact_root),
+    ))
+}
+
+fn is_lifecycle_command(command: &gateway::Command) -> bool {
+    matches!(
+        command,
+        gateway::Command::ConversationReset { .. }
+            | gateway::Command::DeleteAgent {}
+            | gateway::Command::Export { .. }
+            | gateway::Command::Search { .. }
+            | gateway::Command::RotateKeys {}
+    )
 }

@@ -2601,7 +2601,7 @@ mod tests {
                     .saturating_add(seq as u64),
                 false,
                 &key,
-                scope,
+                &scope,
                 redactor,
             )
             .expect("encrypt message");

@@ -271,9 +271,19 @@ where
             .is_some_and(|attachments| !attachments.is_empty())
     {
         Some(CommandRejectReason::AttachmentsNotEmpty)
-    } else if command_type
-        .is_some_and(|kind| !matches!(kind, "user_message" | "abort" | "approval_decision"))
-    {
+    } else if command_type.is_some_and(|kind| {
+        !matches!(
+            kind,
+            "user_message"
+                | "abort"
+                | "approval_decision"
+                | "conversation_reset"
+                | "delete_agent"
+                | "export"
+                | "search"
+                | "rotate_keys"
+        )
+    }) {
         Some(CommandRejectReason::UnknownCommand)
     } else {
         None

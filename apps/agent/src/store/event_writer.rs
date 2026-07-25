@@ -1920,7 +1920,7 @@ impl EventWriter {
                     .data_key_by_ref_in_transaction(&mut transaction, &head_key_ref)
                     .await?;
                 let head_hmac = authenticate_event_head(
-                    self.store.scope(),
+                    &self.store.scope(),
                     &key,
                     event.seq,
                     event_count,
@@ -2373,7 +2373,7 @@ impl EventWriter {
                 &id,
                 &id,
                 &key,
-                self.store.scope(),
+                &self.store.scope(),
             )
             .context("failed to encrypt provider-context record")?;
             eviction_footprint_tokens =
@@ -2471,7 +2471,13 @@ impl EventWriter {
                     text.zeroize();
                     matches
                 }
-                Command::Abort {} | Command::ApprovalDecision { .. } => false,
+                Command::Abort {}
+                | Command::ApprovalDecision { .. }
+                | Command::ConversationReset { .. }
+                | Command::DeleteAgent {}
+                | Command::Export { .. }
+                | Command::Search { .. }
+                | Command::RotateKeys {} => false,
             };
             if !matches_message {
                 bail!(
@@ -2826,7 +2832,7 @@ fn decode_verified_event_head(
     }
     let head_hmac: Vec<u8> = row.try_get("head_hmac")?;
     let chain_digest = verify_event_head(
-        store.scope(),
+        &store.scope(),
         key,
         last_seq,
         event_count,
@@ -7660,6 +7666,11 @@ fn command_kind(command: &Command) -> &'static str {
         Command::UserMessage { .. } => "user_message",
         Command::Abort {} => "abort",
         Command::ApprovalDecision { .. } => "approval_decision",
+        Command::ConversationReset { .. }
+        | Command::DeleteAgent {}
+        | Command::Export { .. }
+        | Command::Search { .. }
+        | Command::RotateKeys {} => "lifecycle",
     }
 }
 

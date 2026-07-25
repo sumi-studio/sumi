@@ -1015,7 +1015,7 @@ mod tests {
             id,
             format!("{id}:0:1:encrypted_reasoning"),
             &key,
-            store.scope(),
+            &store.scope(),
         )
         .expect("encrypt reasoning record")
     }
@@ -1134,7 +1134,7 @@ mod tests {
                 })
                 .await
                 .expect("mint different anchor key"),
-            store.scope(),
+            &store.scope(),
         )
         .expect("encrypt different reasoning");
 

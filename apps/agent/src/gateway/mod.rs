@@ -31,6 +31,18 @@ pub enum Command {
         request_id: String,
         decision: ApprovalDecision,
     },
+    ConversationReset {
+        new_conversation_id: String,
+    },
+    DeleteAgent {},
+    Export {
+        actor_id: String,
+    },
+    Search {
+        actor_id: String,
+        query: String,
+    },
+    RotateKeys {},
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

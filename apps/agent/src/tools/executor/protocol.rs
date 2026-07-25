@@ -179,6 +179,10 @@ pub enum ArtifactOperation {
         artifact_id: String,
         content: String,
     },
+    DeleteConversationArtifacts {
+        conversation_id: String,
+        tombstone_id: String,
+    },
 }
 
 pub trait RpcOperationValidation {
@@ -293,6 +297,14 @@ impl RpcOperationValidation for ArtifactOperation {
                 validate_rpc_id(conversation_id, "conversation_id")?;
                 validate_artifact_handle_component(artifact_id)?;
                 Ok(())
+            }
+            Self::DeleteConversationArtifacts {
+                conversation_id,
+                tombstone_id,
+            } => {
+                validate_artifact_handle_component(conversation_id)?;
+                validate_rpc_id(conversation_id, "conversation_id")?;
+                validate_rpc_id(tombstone_id, "tombstone_id")
             }
         }
     }
