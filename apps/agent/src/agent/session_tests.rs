@@ -16,7 +16,7 @@ use serde_json::Value;
 
 use super::*;
 use crate::{
-    gateway::{CommandAck, CommandId},
+    gateway::{AgentHello, ApiHello, CommandAck, CommandId},
     provider::types::{
         ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, ProviderContextFragment,
         ProviderContextPayload, ProviderEvent, ProviderEventStream, ProviderOrigin, ProviderOutput,
@@ -58,6 +58,14 @@ fn synthetic_runtime_context(messages: Vec<PublicMessage>) -> Vec<ContextMessage
         .collect()
 }
 
+fn test_api_hello(hello: &AgentHello) -> ApiHello {
+    ApiHello {
+        accepted_generation: hello.generation,
+        last_received_event_seq: 0,
+        next_command_seq: hello.last_applied_command_seq.saturating_add(1),
+    }
+}
+
 struct MockGateway {
     commands: mpsc::Receiver<InboundCommand>,
     frames: Arc<Mutex<Vec<OutboundFrame>>>,
@@ -66,9 +74,14 @@ struct MockGateway {
     send_failure_observed: Arc<Notify>,
 }
 
+#[async_trait]
 impl Gateway for MockGateway {
     type Reader = MockGatewayReader;
     type Writer = MockGatewayWriter;
+
+    async fn authenticate_hello(&mut self, hello: AgentHello) -> Result<ApiHello> {
+        Ok(test_api_hello(&hello))
+    }
 
     fn split(self) -> (Self::Reader, Self::Writer) {
         (
@@ -183,9 +196,14 @@ struct FailFirstEventGateway {
     attempted: Arc<Notify>,
 }
 
+#[async_trait]
 impl Gateway for FailFirstEventGateway {
     type Reader = SimpleReader;
     type Writer = FailFirstEventWriter;
+
+    async fn authenticate_hello(&mut self, hello: AgentHello) -> Result<ApiHello> {
+        Ok(test_api_hello(&hello))
+    }
 
     fn split(self) -> (Self::Reader, Self::Writer) {
         (
@@ -239,9 +257,14 @@ struct BlockingWriterGateway {
     release: Arc<Notify>,
 }
 
+#[async_trait]
 impl Gateway for BlockingWriterGateway {
     type Reader = SimpleReader;
     type Writer = BlockingWriter;
+
+    async fn authenticate_hello(&mut self, hello: AgentHello) -> Result<ApiHello> {
+        Ok(test_api_hello(&hello))
+    }
 
     fn split(self) -> (Self::Reader, Self::Writer) {
         (
@@ -283,9 +306,14 @@ struct EofBlockingGateway {
     writer_dropped: Arc<Notify>,
 }
 
+#[async_trait]
 impl Gateway for EofBlockingGateway {
     type Reader = EofBlockingReader;
     type Writer = EofBlockingWriter;
+
+    async fn authenticate_hello(&mut self, hello: AgentHello) -> Result<ApiHello> {
+        Ok(test_api_hello(&hello))
+    }
 
     fn split(self) -> (Self::Reader, Self::Writer) {
         (
@@ -355,9 +383,14 @@ impl GatewayWriter for EofBlockingWriter {
     }
 }
 
+#[async_trait]
 impl Gateway for ShutdownDrainGateway {
     type Reader = SimpleReader;
     type Writer = ShutdownDrainWriter;
+
+    async fn authenticate_hello(&mut self, hello: AgentHello) -> Result<ApiHello> {
+        Ok(test_api_hello(&hello))
+    }
 
     fn split(self) -> (Self::Reader, Self::Writer) {
         (
@@ -1726,9 +1759,14 @@ struct CommitCheckingGateway {
     observed: Arc<Mutex<Vec<(u64, String)>>>,
 }
 
+#[async_trait]
 impl Gateway for CommitCheckingGateway {
     type Reader = SimpleReader;
     type Writer = CommitCheckingWriter;
+
+    async fn authenticate_hello(&mut self, hello: AgentHello) -> Result<ApiHello> {
+        Ok(test_api_hello(&hello))
+    }
 
     fn split(self) -> (Self::Reader, Self::Writer) {
         (

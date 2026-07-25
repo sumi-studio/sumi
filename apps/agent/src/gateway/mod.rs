@@ -341,13 +341,7 @@ pub trait Gateway: Send + 'static {
     type Reader: GatewayReader + 'static;
     type Writer: GatewayWriter + 'static;
 
-    async fn authenticate_hello(&mut self, hello: AgentHello) -> Result<ApiHello> {
-        Ok(ApiHello {
-            accepted_generation: hello.generation,
-            last_received_event_seq: 0,
-            next_command_seq: 0,
-        })
-    }
+    async fn authenticate_hello(&mut self, hello: AgentHello) -> Result<ApiHello>;
     fn split(self) -> (Self::Reader, Self::Writer);
 }
 
