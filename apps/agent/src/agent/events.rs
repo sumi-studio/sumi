@@ -226,6 +226,10 @@ pub(crate) enum SteerMode {
 pub(crate) struct MemoryMaintKind(String);
 
 impl MemoryMaintKind {
+    pub(crate) fn new(kind: impl Into<String>) -> Self {
+        Self(kind.into())
+    }
+
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }

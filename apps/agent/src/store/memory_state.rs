@@ -303,7 +303,8 @@ impl MemoryApplyCursorRecord {
             "INSERT INTO memory_apply_cursors(kind, next_batch_seq)
              VALUES(?, ?)
              ON CONFLICT(kind) DO UPDATE SET
-                next_batch_seq = excluded.next_batch_seq",
+                next_batch_seq = excluded.next_batch_seq
+             WHERE excluded.next_batch_seq >= memory_apply_cursors.next_batch_seq",
         )
         .bind(&self.kind)
         .bind(self.next_batch_seq)
@@ -653,5 +654,33 @@ mod tests {
             updated_at: Utc::now().to_rfc3339(),
         };
         assert!(invalid.insert(store.pool()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn memory_apply_cursor_insert_does_not_regress() {
+        let store = store().await;
+
+        let forward = MemoryApplyCursorRecord {
+            kind: "layer-0".to_owned(),
+            next_batch_seq: 10,
+        };
+        forward.insert(store.pool()).await.expect("insert cursor");
+
+        let backward = MemoryApplyCursorRecord {
+            kind: "layer-0".to_owned(),
+            next_batch_seq: 5,
+        };
+        backward
+            .insert(store.pool())
+            .await
+            .expect("no-op regress insert");
+
+        let stored: i64 =
+            sqlx::query_scalar("SELECT next_batch_seq FROM memory_apply_cursors WHERE kind = ?")
+                .bind("layer-0")
+                .fetch_one(store.pool())
+                .await
+                .expect("fetch cursor");
+        assert_eq!(stored, 10);
     }
 }

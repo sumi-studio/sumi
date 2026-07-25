@@ -20,7 +20,7 @@ use zeroize::Zeroize;
 
 use crate::provider::types::{ApiProtocol, ProviderContextItem, ProviderContextPayload};
 
-use super::crypto::{decrypt_content, encrypt_content};
+use super::crypto::{RowAad, decrypt_content, encrypt_content};
 use super::{AgentScope, DataKeyMaterial, DataKeyPurpose, Store};
 
 const INTENT_HMAC_INFO: &[u8] = b"provider-context-mutation-intent/v1";
@@ -89,14 +89,17 @@ pub(crate) struct ProviderContextEvictionEstimate {
 impl ProviderContextEvictionEstimate {
     pub(crate) const V1: u32 = 1;
 
-    /// Returns the V1 estimate: opaque `EncryptedReasoning` payloads pay
-    /// `ceil(serialized_bytes / 4)` re-send tokens; native compaction windows
-    /// carry zero because they replace rather than append to the context.
-    pub(crate) fn v1(item: &ProviderContextItem) -> Self {
-        let tokens = match &item.payload {
+    /// Returns the V1 estimate for a payload: opaque `EncryptedReasoning`
+    /// payloads pay `ceil(serialized_bytes / 4)` re-send tokens; native
+    /// compaction windows carry zero because they replace rather than append
+    /// to the context.
+    pub(crate) fn from_payload(payload: &ProviderContextPayload) -> Self {
+        let tokens = match payload {
             ProviderContextPayload::EncryptedReasoning { item, .. } => {
-                let bytes = serde_json::to_vec(item).unwrap_or_default();
-                (bytes.len() as u64).div_ceil(4)
+                let mut bytes = serde_json::to_vec(item).unwrap_or_default();
+                let tokens = (bytes.len() as u64).div_ceil(4);
+                bytes.zeroize();
+                tokens
             }
             _ => 0,
         };
@@ -104,6 +107,11 @@ impl ProviderContextEvictionEstimate {
             tokens,
             version: Self::V1,
         }
+    }
+
+    /// Returns the V1 estimate for a full provider-context item.
+    pub(crate) fn v1(item: &ProviderContextItem) -> Self {
+        Self::from_payload(&item.payload)
     }
 }
 
@@ -359,6 +367,47 @@ fn semantic_intent_bytes(full: &FullIntent) -> Vec<u8> {
     writer.finish()
 }
 
+/// Semantic subset excluding `expected_latest_id`, used to detect a CAS retry
+/// where only the expected-latest witness changed.
+fn stable_intent_bytes(full: &FullIntent) -> Vec<u8> {
+    let mut writer = CanonicalWriter::with_domain(INTENT_HMAC_DOMAIN);
+    writer.field(full.variant.as_bytes());
+    writer.field(full.mutation_id.as_bytes());
+    writer.field(b"");
+    writer.field(&canonical_id_list(&full.invalidate_ids));
+    writer.field(full.provider_context_id.as_bytes());
+    writer.field(full.message_id.as_deref().unwrap_or("").as_bytes());
+    writer.field(&opt_u64_bytes(full.message_seq));
+    writer.field(&opt_u32_bytes(full.wire_item_index));
+    writer.field(full.item_ordinal.to_string().as_bytes());
+    writer.field(full.idempotency_key.as_bytes());
+    writer.field(full.provider_instance_id.as_bytes());
+    writer.field(full.protocol.as_bytes());
+    writer.field(full.model.as_bytes());
+    writer.field(full.kind.as_bytes());
+    writer.field(&opt_u64_bytes(full.coverage_through_seq));
+    writer.field(full.context_fingerprint.as_deref().unwrap_or("").as_bytes());
+    writer.field(full.eviction_tokens.to_string().as_bytes());
+    writer.field(full.eviction_estimator_version.to_string().as_bytes());
+    writer.field(full.config_generation.to_string().as_bytes());
+    writer.field(full.window_ordinal.to_string().as_bytes());
+    writer.field(&full.plaintext_hmac);
+    writer.finish()
+}
+
+/// Returns whether the authenticated `expected_latest_id` witness is consistent
+/// with the current replace head.  An absent witness is allowed; a present
+/// witness must match the head's latest insert id.
+fn expected_latest_matches_head(full: &FullIntent, head: Option<&(i64, i64, String)>) -> bool {
+    match head {
+        None => full.expected_latest_id.is_none(),
+        Some((_, _, head_id)) => full
+            .expected_latest_id
+            .as_ref()
+            .is_none_or(|expected| expected == head_id),
+    }
+}
+
 struct CanonicalWriter(Vec<u8>);
 
 impl CanonicalWriter {
@@ -591,24 +640,137 @@ impl<'a> ProviderContextMutationApplier<'a> {
         Self { store }
     }
 
+    fn decrypt_full_intent(
+        &self,
+        mutation_key: &DataKeyMaterial,
+        ciphertext: &[u8],
+        aad: &RowAad,
+        intent_key: &[u8],
+        expected_hmac: &[u8],
+        label: &str,
+    ) -> Result<FullIntent> {
+        let mut full_json = decrypt_content(mutation_key, ciphertext, aad)
+            .with_context(|| format!("failed to decrypt {label} mutation intent"))?;
+        let full: FullIntent = serde_json::from_slice(&full_json)
+            .with_context(|| format!("{label} mutation intent is invalid"))?;
+        full_json.zeroize();
+        let semantic = semantic_intent_bytes(&full);
+        let recomputed = hmac_sha256(intent_key, INTENT_HMAC_DOMAIN, &semantic);
+        if recomputed != expected_hmac {
+            bail!("{label} provider-context mutation intent HMAC mismatch");
+        }
+        Ok(full)
+    }
+
     pub(crate) async fn prepare(&self, prepared: &PreparedProviderContextMutation) -> Result<()> {
         if prepared.mutation_id.is_empty() {
             bail!("mutation_id must not be empty");
         }
 
-        let existing: Option<(String, Vec<u8>)> = sqlx::query_as(
-            "SELECT intent_key_ref, intent_hmac FROM provider_context_mutations WHERE mutation_id = ?",
+        let mut transaction = self.store.pool().begin().await?;
+
+        #[allow(clippy::type_complexity)]
+        let existing: Option<(String, String, Vec<u8>, String, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+            "SELECT state, intent_key_ref, intent_hmac, hmac_key_id, intent_ciphertext, prepared_at
+             FROM provider_context_mutations WHERE mutation_id = ?",
         )
         .bind(&prepared.mutation_id)
-        .fetch_optional(self.store.pool())
+        .fetch_optional(&mut *transaction)
         .await
         .context("failed to load existing mutation row")?;
 
-        if let Some((key_ref, hmac)) = existing {
-            if key_ref == prepared.intent_key_ref && hmac == prepared.intent_hmac {
+        let mutation_key = self
+            .store
+            .data_key_by_ref_in_transaction(&mut transaction, &prepared.intent_key_ref)
+            .await
+            .context("failed to load mutation key for prepare")?;
+        let aad = self.store.scope().row_aad(
+            "provider_context_mutations",
+            &prepared.mutation_id,
+            DataKeyPurpose::Mutation,
+        );
+        let intent_key = hkdf_intent_hmac_key(&mutation_key, &self.store.scope().conversation_id);
+
+        if let Some((state, key_ref, hmac, hmac_key_id, ciphertext, _prepared_at)) = existing {
+            if state != "prepared" {
+                bail!(
+                    "provider-context mutation {} is already terminal",
+                    prepared.mutation_id
+                );
+            }
+            if key_ref != prepared.intent_key_ref || hmac_key_id != prepared.hmac_key_id {
+                bail!("conflicting provider-context mutation intent already exists");
+            }
+            if hmac == prepared.intent_hmac {
+                transaction.commit().await?;
                 return Ok(());
             }
-            bail!("conflicting provider-context mutation intent already exists");
+
+            // HMAC differs: this may be a CAS retry where only the expected-latest
+            // witness changed.  Verify the existing intent, decrypt both, and compare
+            // the stable semantic subset (which excludes expected_latest_id).
+            let old_full = self.decrypt_full_intent(
+                &mutation_key,
+                &ciphertext,
+                &aad,
+                &intent_key,
+                &hmac,
+                "existing",
+            )?;
+            let new_full = self.decrypt_full_intent(
+                &mutation_key,
+                &prepared.intent_ciphertext,
+                &aad,
+                &intent_key,
+                &prepared.intent_hmac,
+                "new",
+            )?;
+
+            if stable_intent_bytes(&old_full) != stable_intent_bytes(&new_full) {
+                bail!("conflicting provider-context mutation intent already exists");
+            }
+
+            if !self
+                .is_intent_latest_candidate(&mut transaction, &new_full, &intent_key)
+                .await?
+            {
+                bail!(
+                    "CAS update rejected: provider-context intent is no longer the latest candidate"
+                );
+            }
+
+            sqlx::query(
+                "UPDATE provider_context_mutations
+                 SET intent_ciphertext = ?, intent_hmac = ?, prepared_at = ?
+                 WHERE mutation_id = ?",
+            )
+            .bind(&prepared.intent_ciphertext)
+            .bind(&prepared.intent_hmac)
+            .bind(Utc::now().to_rfc3339())
+            .bind(&prepared.mutation_id)
+            .execute(&mut *transaction)
+            .await
+            .context("failed to CAS-update provider-context mutation intent")?;
+
+            transaction.commit().await?;
+            return Ok(());
+        }
+
+        let new_full = self.decrypt_full_intent(
+            &mutation_key,
+            &prepared.intent_ciphertext,
+            &aad,
+            &intent_key,
+            &prepared.intent_hmac,
+            "new",
+        )?;
+        let head = self
+            .load_replace_head(&mut transaction, &new_full, &intent_key)
+            .await?;
+        if !expected_latest_matches_head(&new_full, head.as_ref()) {
+            bail!(
+                "provider-context mutation intent expected_latest_id does not match the current head"
+            );
         }
 
         sqlx::query(
@@ -623,9 +785,11 @@ impl<'a> ProviderContextMutationApplier<'a> {
         .bind(&prepared.hmac_key_id)
         .bind(&prepared.intent_hmac)
         .bind(Utc::now().to_rfc3339())
-        .execute(self.store.pool())
+        .execute(&mut *transaction)
         .await
         .context("failed to prepare provider-context mutation")?;
+
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -707,6 +871,20 @@ impl<'a> ProviderContextMutationApplier<'a> {
             .bind(&scope_key)
             .fetch_optional(&mut **transaction)
             .await?;
+
+            if !expected_latest_matches_head(full, head.as_ref()) {
+                return self
+                    .finish_mutation(
+                        transaction,
+                        mutation_id,
+                        "superseded",
+                        Some("newer_replace"),
+                    )
+                    .await
+                    .map(|_| ApplyOutcome::Superseded {
+                        reason: "newer_replace".to_owned(),
+                    });
+            }
 
             let candidate_gen = i64::try_from(full.config_generation).unwrap_or(i64::MAX);
             let candidate_ord = i64::try_from(full.window_ordinal).unwrap_or(i64::MAX);
@@ -822,6 +1000,83 @@ impl<'a> ProviderContextMutationApplier<'a> {
             self.finish_mutation(transaction, mutation_id, "applied", None)
                 .await?;
             Ok(ApplyOutcome::Applied)
+        }
+    }
+
+    pub(crate) async fn recover(&self) -> Result<()> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT mutation_id FROM provider_context_mutations
+             WHERE state = 'prepared'
+             ORDER BY prepared_at, mutation_id",
+        )
+        .fetch_all(self.store.pool())
+        .await
+        .context("failed to list prepared provider-context mutations")?;
+
+        for (mutation_id,) in rows {
+            self.apply(&mutation_id).await.with_context(|| {
+                format!("failed to recover provider-context mutation {mutation_id}")
+            })?;
+        }
+        Ok(())
+    }
+
+    fn replace_scope_key(&self, full: &FullIntent, intent_key: &[u8]) -> String {
+        replace_scope_key(
+            &full.provider_instance_id,
+            &full.protocol,
+            &full.model,
+            &full.kind,
+            &self.store.scope().conversation_id,
+            intent_key,
+        )
+    }
+
+    async fn load_replace_head(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        full: &FullIntent,
+        intent_key: &[u8],
+    ) -> Result<Option<(i64, i64, String)>> {
+        if !full.is_replace() {
+            return Ok(None);
+        }
+        let scope_key = self.replace_scope_key(full, intent_key);
+        let head: Option<(i64, i64, String)> = sqlx::query_as(
+            "SELECT max_config_generation, max_window_ordinal, latest_insert_id
+             FROM provider_context_replace_heads WHERE scope_key = ?",
+        )
+        .bind(&scope_key)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        Ok(head)
+    }
+
+    async fn is_intent_latest_candidate(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        full: &FullIntent,
+        intent_key: &[u8],
+    ) -> Result<bool> {
+        let head = self
+            .load_replace_head(transaction, full, intent_key)
+            .await?;
+        if !expected_latest_matches_head(full, head.as_ref()) {
+            return Ok(false);
+        }
+        if !full.is_replace() {
+            return Ok(true);
+        }
+
+        let candidate_gen = i64::try_from(full.config_generation).unwrap_or(i64::MAX);
+        let candidate_ord = i64::try_from(full.window_ordinal).unwrap_or(i64::MAX);
+
+        match head {
+            None => Ok(true),
+            Some((head_gen, head_ord, head_id)) => Ok((candidate_gen, candidate_ord)
+                > (head_gen, head_ord)
+                || ((candidate_gen, candidate_ord) == (head_gen, head_ord)
+                    && full.provider_context_id == head_id)),
         }
     }
 
@@ -1332,5 +1587,169 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(state, "applied");
+    }
+
+    #[tokio::test]
+    async fn replace_prepare_enforces_expected_latest_id_and_allows_cas_update() {
+        let store = store().await;
+        seed_message(&store, "message-1", 7).await.unwrap();
+
+        let mutation_key = store
+            .conversation_key(DataKeyPurpose::Mutation)
+            .await
+            .expect("mint mutation key");
+        let applier = ProviderContextMutationApplier::new(&store);
+        let scope = store.scope().clone();
+
+        // First Replace creates head pc-a with (gen=1, ord=1).
+        let a = reasoning_record(&store, "message-1", 7, "pc-a").await;
+        let intent_a = ProviderContextMutationBuilder::new(
+            mutation_key,
+            scope.clone(),
+            "replace-a".to_owned(),
+        )
+        .build_replace(None, vec![], &a, &reasoning_item("message-1", 7), 1, 1)
+        .expect("build replace-a");
+        applier.prepare(&intent_a).await.unwrap();
+        assert_eq!(
+            applier.apply("replace-a").await.unwrap(),
+            ApplyOutcome::Applied
+        );
+
+        // A newer Replace with a stale expected_latest_id is rejected at prepare.
+        let b = reasoning_record(&store, "message-1", 7, "pc-b").await;
+        let mutation_key_b = store
+            .conversation_key(DataKeyPurpose::Mutation)
+            .await
+            .expect("reuse mutation key");
+        let stale = ProviderContextMutationBuilder::new(
+            mutation_key_b,
+            scope.clone(),
+            "replace-b".to_owned(),
+        )
+        .build_replace(
+            Some("stale-id".to_owned()),
+            vec!["pc-a".to_owned()],
+            &b,
+            &reasoning_item("message-1", 7),
+            2,
+            2,
+        )
+        .expect("build stale replace-b");
+        applier
+            .prepare(&stale)
+            .await
+            .expect_err("stale expected_latest_id must be rejected");
+
+        // CAS update: re-prepare a pending intent after correcting only expected_latest_id.
+        let mutation_key_d = store
+            .conversation_key(DataKeyPurpose::Mutation)
+            .await
+            .expect("reuse mutation key");
+        let pending = ProviderContextMutationBuilder::new(
+            mutation_key_d,
+            scope.clone(),
+            "cas-pending".to_owned(),
+        )
+        .build_replace(None, vec![], &a, &reasoning_item("message-1", 7), 1, 1)
+        .expect("build cas pending without expected");
+        let pending_key_ref = pending.intent_key_ref.clone();
+        applier.prepare(&pending).await.unwrap();
+
+        let reused_key = store
+            .data_key_by_ref(&pending_key_ref)
+            .await
+            .expect("reload mutation key for CAS update");
+        let corrected = ProviderContextMutationBuilder::new(
+            reused_key,
+            scope.clone(),
+            "cas-pending".to_owned(),
+        )
+        .build_replace(
+            Some("pc-a".to_owned()),
+            vec![],
+            &a,
+            &reasoning_item("message-1", 7),
+            1,
+            1,
+        )
+        .expect("build cas pending with corrected expected");
+        applier.prepare(&corrected).await.unwrap();
+
+        let stored_hmac: Vec<u8> = sqlx::query_scalar(
+            "SELECT intent_hmac FROM provider_context_mutations WHERE mutation_id = ?",
+        )
+        .bind("cas-pending")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(stored_hmac, corrected.intent_hmac());
+
+        assert_eq!(
+            applier.apply("cas-pending").await.unwrap(),
+            ApplyOutcome::AlreadySatisfied
+        );
+
+        // The same newer Replace with the correct expected head succeeds.
+        let mutation_key_c = store
+            .conversation_key(DataKeyPurpose::Mutation)
+            .await
+            .expect("reuse mutation key");
+        let correct =
+            ProviderContextMutationBuilder::new(mutation_key_c, scope, "replace-b".to_owned())
+                .build_replace(
+                    Some("pc-a".to_owned()),
+                    vec!["pc-a".to_owned()],
+                    &b,
+                    &reasoning_item("message-1", 7),
+                    2,
+                    2,
+                )
+                .expect("build correct replace-b");
+        applier.prepare(&correct).await.unwrap();
+        assert_eq!(
+            applier.apply("replace-b").await.unwrap(),
+            ApplyOutcome::Applied
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_applies_prepared_provider_context_mutations() {
+        let store = store().await;
+        seed_message(&store, "message-1", 7).await.unwrap();
+
+        let record = reasoning_record(&store, "message-1", 7, "pc-1").await;
+        let mutation_key = store
+            .conversation_key(DataKeyPurpose::Mutation)
+            .await
+            .expect("mint mutation key");
+        let applier = ProviderContextMutationApplier::new(&store);
+        let intent = ProviderContextMutationBuilder::new(
+            mutation_key,
+            store.scope().clone(),
+            "recover-1".to_owned(),
+        )
+        .build_replace(None, vec![], &record, &reasoning_item("message-1", 7), 1, 1)
+        .expect("build replace intent");
+
+        applier.prepare(&intent).await.unwrap();
+        applier.recover().await.expect("recover prepared mutations");
+
+        let state: String = sqlx::query_scalar(
+            "SELECT state FROM provider_context_mutations WHERE mutation_id = ?",
+        )
+        .bind("recover-1")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(state, "applied");
+
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE id = ?")
+                .bind("pc-1")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(remaining, 1);
     }
 }

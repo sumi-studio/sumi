@@ -4,7 +4,7 @@ use crate::provider::types::{
     AssistantContent, AssistantMessage, ProviderContextFragment, ProviderEvent,
     PublicAssistantContent, PublicAssistantMessage, PublicMessage, StopReason, ToolResultMessage,
 };
-use crate::store::{DurableEvent, EventWrite, Projection};
+use crate::store::{DurableEvent, EventWrite, Projection, ProviderContextEvictionEstimate};
 
 use super::{AgentEvent, PublicStreamEvent};
 
@@ -86,6 +86,11 @@ impl ProviderTerminal {
         };
         let run_id = run_id.into();
         let turn_id = turn_id.into();
+        let eviction_footprint_tokens = self
+            .provider_context
+            .iter()
+            .map(|fragment| ProviderContextEvictionEstimate::from_payload(&fragment.payload).tokens)
+            .sum();
         Ok(EventWrite {
             event: Some(DurableEvent::message_in_turn(
                 "message_end",
@@ -100,7 +105,7 @@ impl ProviderTerminal {
                 message: self.message,
                 append_to_l0,
                 provider_context: self.provider_context,
-                eviction_footprint_tokens: 0,
+                eviction_footprint_tokens,
             }],
         })
     }

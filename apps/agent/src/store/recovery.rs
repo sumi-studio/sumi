@@ -7,10 +7,11 @@ use zeroize::Zeroizing;
 
 use crate::agent::AgentEvent;
 use crate::gateway::Command;
+use crate::runtime::contracts::{GenerationRecoveryFence, ProcessGenerationLease};
 
 use super::{
-    ApplicationKind, DataKeyPurpose, EventBatch, EventWrite, EventWriter, Projection, RunPhase,
-    Store,
+    ApplicationKind, ApplyReceiptOutcome, DataKeyPurpose, EventBatch, EventWrite, EventWriter,
+    PhysicalRecoveryReceipt, Projection, RunPhase, Store,
     crypto::decrypt_content,
     event_log::{EVENT_DIGEST_BYTES, EventChainEntry, extend_event_chain, verify_event_head},
     event_writer::DurableEventMetadata,
@@ -86,6 +87,23 @@ struct PendingCommand {
 pub(crate) struct SuffixRecovery;
 
 impl SuffixRecovery {
+    /// Complete a T17 hydration suffix after T27 has supplied an authenticated
+    /// physical recovery receipt.  EventWriter owns the transaction boundary;
+    /// this wrapper intentionally does not kill/reap processes or persist the
+    /// T27 proof store.
+    #[allow(dead_code, reason = "T26 hydration composes this T17 boundary")]
+    pub(crate) async fn apply_physical_receipt(
+        writer: &EventWriter,
+        lease: &ProcessGenerationLease,
+        fence: &GenerationRecoveryFence,
+        receipt: PhysicalRecoveryReceipt,
+        batch: EventBatch,
+    ) -> Result<(ApplyReceiptOutcome, Vec<u64>)> {
+        writer
+            .apply_physical_recovery(lease, fence, receipt, batch)
+            .await
+    }
+
     /// Plans and persists only the restart prefix owned by T12.
     ///
     /// T15 uses this boundary only as a startup gate: after the T12-safe prefix
@@ -874,8 +892,7 @@ async fn durable_event_evidence(
             if event.durable_kind() != Some(event_type.as_str())
                 || matches!(
                     event,
-                    AgentEvent::MemoryMaintenance { .. }
-                        | AgentEvent::MessageUpdate { .. }
+                    AgentEvent::MessageUpdate { .. }
                         | AgentEvent::ToolExecutionUpdate { .. }
                         | AgentEvent::Error { .. }
                 )

@@ -30,10 +30,21 @@ use sqlx::{
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::runtime::contracts::{
+    GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease,
+};
+
 use self::crypto::{
     ConversationCommandDigestFactory, DataKeyScope, KeyWrapAad, WRAP_ALGORITHM, unwrap_data_key,
     wrap_data_key,
 };
+#[allow(unused_imports)]
+pub(crate) use self::physical_recovery::{
+    ApplyReceiptOutcome, HydrationReceiptIdentity, PhysicalRecoveryApplier, PhysicalRecoveryIntent,
+    PhysicalRecoveryIntentRequest, PhysicalRecoveryReceipt,
+};
+pub(crate) use self::provider_context::ProviderContextEvictionEstimate;
+use self::provider_context::ProviderContextMutationApplier;
 #[cfg(test)]
 pub(crate) use crypto::{DATA_KEY_BYTES, WrappingKey};
 pub(crate) use crypto::{
@@ -218,11 +229,70 @@ impl Store {
             event_writer_state: Arc::new(Mutex::new(event_writer::WriterState::default())),
         };
         store.validate_startup().await?;
+        ProviderContextMutationApplier::new(&store)
+            .recover()
+            .await
+            .context("failed to recover prepared provider-context mutations")?;
         Ok(store)
     }
 
     pub(crate) fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// Hydrate only the T17 physical-recovery boundary.  T17 validates the
+    /// injected lease/fence and returns immutable running-tool attestations;
+    /// T27 owns the physical kill/reap and proof persistence.  A clean state
+    /// returns a stable receipt identity, while any running execution keeps
+    /// hydration not-ready until a matching receipt is applied through
+    /// EventWriter.
+    #[allow(dead_code, reason = "T26 injects the production hydration lease/fence")]
+    pub(crate) async fn hydrate_recovery_intents(
+        &self,
+        lease: &ProcessGenerationLease,
+        fence: &GenerationRecoveryFence,
+    ) -> Result<(
+        Vec<PhysicalRecoveryIntentRequest>,
+        Option<HydrationReceiptIdentity>,
+    )> {
+        lease
+            .validate_exact(fence.generation(), fence.lease_id())
+            .map_err(|error| anyhow!("invalid recovery lease/fence binding: {error}"))?;
+        fence
+            .validate_exact(lease, fence.fence_id())
+            .map_err(|error| anyhow!("invalid recovery fence binding: {error}"))?;
+
+        let rows = sqlx::query(
+            "SELECT tool_call_id, command_id, run_id, executor_generation
+             FROM tool_executions WHERE state = 'running' ORDER BY tool_call_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to hydrate running tool executions")?;
+        let mut intents = Vec::with_capacity(rows.len());
+        for row in rows {
+            let tool_call_id: String = row.try_get("tool_call_id")?;
+            let command_id: String = row.try_get("command_id")?;
+            let run_id: String = row.try_get("run_id")?;
+            if tool_call_id.is_empty() || command_id.is_empty() || run_id.is_empty() {
+                bail!("running tool execution identity must not be empty");
+            }
+            let generation = ProcessGeneration::from_sqlite(row.try_get("executor_generation")?)
+                .map_err(|error| anyhow!("invalid persisted executor generation: {error}"))?;
+            intents.push(PhysicalRecoveryIntentRequest {
+                tool_call_id,
+                command_id,
+                run_id,
+                executor_generation: generation,
+            });
+        }
+        let receipt = intents.is_empty().then(|| HydrationReceiptIdentity {
+            lease_id: lease.lease_id().to_owned(),
+            generation: lease.generation(),
+            fence_id: fence.fence_id().to_owned(),
+            intent_count: 0,
+        });
+        Ok((intents, receipt))
     }
 
     pub(crate) fn scope(&self) -> &AgentScope {

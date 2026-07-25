@@ -27,7 +27,7 @@ use crate::{
         ProviderContextAnchor, ProviderContextFragment, ProviderContextItem, PublicMessage,
         StopReason, ToolResultMessage,
     },
-    runtime::contracts::ProcessGeneration,
+    runtime::contracts::{GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease},
 };
 
 use super::{
@@ -38,6 +38,7 @@ use super::{
         EVENT_DIGEST_BYTES, EventChainEntry, authenticate_event_head, extend_event_chain,
         verify_event_head,
     },
+    physical_recovery::{ApplyReceiptOutcome, PhysicalRecoveryApplier, PhysicalRecoveryReceipt},
     provider_context::EncryptedProviderContextRecord,
     redactor::search_text_from_projection,
     verify_command_payload_digest,
@@ -88,13 +89,8 @@ impl DurableEvent {
     }
 
     fn from_parts(value: AgentEvent, metadata: DurableEventMetadata) -> Result<Self> {
-        let kind = value
-            .durable_kind()
-            .ok_or_else(|| anyhow!("durable event does not match the closed T12 schema"))?;
-        if kind == "memory_maintenance" {
-            bail!(
-                "durable event does not match the closed T12 schema: MemoryMaintenance is owned by T17"
-            );
+        if value.durable_kind().is_none() {
+            bail!("durable event does not match the closed T12 schema");
         }
         if matches!(&value, AgentEvent::ToolExecutionStart { args, .. } if !args.is_object()) {
             bail!(
@@ -541,8 +537,8 @@ impl DurableEvent {
                 turn_id: self.metadata.turn_id.as_deref(),
                 ..empty("retry_scheduled")
             },
-            AgentEvent::MemoryMaintenance { .. }
-            | AgentEvent::MessageUpdate { .. }
+            AgentEvent::MemoryMaintenance { .. } => empty("memory_maintenance"),
+            AgentEvent::MessageUpdate { .. }
             | AgentEvent::ToolExecutionUpdate { .. }
             | AgentEvent::Error { .. } => unreachable!("non-T12 durable event was rejected"),
         }
@@ -817,6 +813,10 @@ pub(crate) enum Projection {
     },
     ToolExecution(ToolExecutionMutation),
     Approval(ApprovalMutation),
+    /// T27 supplies the physical proof; T17 validates and applies this
+    /// projection only after the complete logical suffix is in the same
+    /// EventWriter transaction.
+    PhysicalRecovery(PhysicalRecoveryReceipt),
     #[cfg(test)]
     SizePadding(usize),
 }
@@ -1402,6 +1402,58 @@ impl EventWriter {
         self.apply_locked(batch, &mut guard).await
     }
 
+    /// Hydration entry point for a T27 physical recovery proof.  The receipt
+    /// projection must be part of the supplied batch (normally as its final
+    /// eventless write); EventWriter then commits the logical suffix, terminal
+    /// tool events/results, and T17 application ledger in one SQLite transaction.
+    #[allow(dead_code, reason = "T17 hydration caller is composed by T26")]
+    pub(crate) async fn apply_physical_recovery(
+        &self,
+        lease: &ProcessGenerationLease,
+        fence: &GenerationRecoveryFence,
+        receipt: PhysicalRecoveryReceipt,
+        mut batch: EventBatch,
+    ) -> Result<(ApplyReceiptOutcome, Vec<u64>)> {
+        receipt.validate_for(lease, fence)?;
+        let already_present: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM physical_recovery_receipt_applications WHERE receipt_id = ?",
+        )
+        .bind(&receipt.receipt_id)
+        .fetch_one(self.store.pool())
+        .await?;
+        if already_present {
+            // Exact replay is deliberately reduced to an eventless receipt
+            // projection.  A caller cannot append a second logical suffix for
+            // an already-applied receipt.
+            batch.writes = vec![EventWrite {
+                event: None,
+                projections: vec![Projection::PhysicalRecovery(receipt)],
+            }];
+            let seqs = self.apply(batch).await?;
+            return Ok((ApplyReceiptOutcome::AlreadyApplied, seqs));
+        }
+        let mut has_receipt_projection = false;
+        for projection in batch.writes.iter().flat_map(|write| &write.projections) {
+            if let Projection::PhysicalRecovery(existing) = projection {
+                if existing != &receipt {
+                    bail!("EventBatch PhysicalRecovery projection disagrees with injected receipt");
+                }
+                has_receipt_projection = true;
+            }
+        }
+        if !has_receipt_projection {
+            batch.writes.push(EventWrite {
+                event: None,
+                projections: vec![Projection::PhysicalRecovery(receipt)],
+            });
+        }
+        let seqs = self.apply(batch).await?;
+        // A fresh application is the only outcome possible for a newly
+        // appended suffix.  Replay-only batches are handled by the physical
+        // projection as an authenticated no-op and return no event sequences.
+        Ok((ApplyReceiptOutcome::Applied, seqs))
+    }
+
     #[cfg(test)]
     async fn apply_with_failpoint(
         &self,
@@ -1957,7 +2009,13 @@ impl EventWriter {
                 });
             }
             for projection in write.projections {
-                apply_projection(&mut transaction, projection).await?;
+                apply_projection(
+                    self.store.as_ref(),
+                    &mut transaction,
+                    projection,
+                    &event_seqs,
+                )
+                .await?;
             }
             applied_writes = applied_writes.saturating_add(1);
             if fail_after_writes == Some(applied_writes) {
@@ -2140,9 +2198,14 @@ impl EventWriter {
                         message,
                         append_to_l0,
                         provider_context,
-                        eviction_footprint_tokens: _,
+                        eviction_footprint_tokens: expected_eviction_footprint_tokens,
                     } => {
                         let l0_disposition = l0_disposition(&message, append_to_l0)?;
+                        if !append_to_l0 && !provider_context.is_empty() {
+                            bail!(
+                                "MessageEnd with append_to_l0=false must not carry provider_context"
+                            );
+                        }
                         let event_seq = assigned_seq
                             .ok_or_else(|| anyhow!("MessageEnd projection requires an event"))?;
                         let key = transcript_key.as_ref().expect("transcript key was loaded");
@@ -2178,6 +2241,11 @@ impl EventWriter {
                                 provider_context,
                             )
                             .await?;
+                        if eviction_footprint_tokens != expected_eviction_footprint_tokens {
+                            bail!(
+                                "MessageEnd eviction_footprint_tokens mismatch: expected {expected_eviction_footprint_tokens}, computed {eviction_footprint_tokens}"
+                            );
+                        }
                         for record in &provider_context_records {
                             charge_transaction_bytes(
                                 &mut transaction_bytes,
@@ -3347,6 +3415,7 @@ fn validate_batch_shape(
     let mut turn_start_positions = HashMap::new();
     let mut turn_end_positions = HashMap::new();
     let mut agent_end_positions = HashMap::new();
+    let mut physical_recovery_positions = Vec::new();
     let mut assistant_start_positions = Vec::new();
     let mut injected_user_end_positions = Vec::new();
     for (write_position, write) in batch.writes.iter().enumerate() {
@@ -3560,8 +3629,12 @@ fn validate_batch_shape(
                         bail!("durable RetryScheduled identity and fields must be non-empty");
                     }
                 }
-                AgentEvent::MemoryMaintenance { .. }
-                | AgentEvent::MessageUpdate { .. }
+                AgentEvent::MemoryMaintenance { kind } => {
+                    if kind.as_str().is_empty() {
+                        bail!("durable MemoryMaintenance kind must not be empty");
+                    }
+                }
+                AgentEvent::MessageUpdate { .. }
                 | AgentEvent::ToolExecutionUpdate { .. }
                 | AgentEvent::Error { .. } => {
                     bail!("volatile or future AgentEvent cannot be persisted by T12");
@@ -3569,6 +3642,13 @@ fn validate_batch_shape(
             }
         }
         for projection in &write.projections {
+            if let Projection::PhysicalRecovery(receipt) = projection {
+                receipt.validate()?;
+                if write.event.is_some() {
+                    bail!("PhysicalRecovery projection must be eventless");
+                }
+                physical_recovery_positions.push(write_position);
+            }
             if let Projection::CommandReceived { envelope } = projection
                 && (!command_insert_ids.insert(envelope.command_id.as_str())
                     || !command_insert_seqs.insert(envelope.seq))
@@ -3823,6 +3903,14 @@ fn validate_batch_shape(
                 }
             }
         }
+    }
+    if physical_recovery_positions.len() > 1 {
+        bail!("EventBatch may contain at most one PhysicalRecovery projection");
+    }
+    if let Some(position) = physical_recovery_positions.first()
+        && *position != batch.writes.len().saturating_sub(1)
+    {
+        bail!("PhysicalRecovery projection must be the final EventBatch write");
     }
     for (message_id, start_position) in &message_start_positions {
         if let Some(end_position) = message_end_positions.get(message_id)
@@ -4497,6 +4585,23 @@ fn projection_size_upper_bound(projection: &Projection) -> Result<usize> {
                 .saturating_add(turn_id.len()),
             ApprovalMutation::Resolve { request_id, .. } => request_id.len(),
         },
+        Projection::PhysicalRecovery(receipt) => receipt
+            .receipt_id
+            .len()
+            .saturating_add(receipt.digest.len())
+            .saturating_add(
+                receipt
+                    .intents
+                    .iter()
+                    .map(|intent| {
+                        intent
+                            .tool_call_id
+                            .len()
+                            .saturating_add(intent.command_id.len())
+                            .saturating_add(intent.run_id.len())
+                    })
+                    .sum::<usize>(),
+            ),
         Projection::MessageEnd { .. } => 0,
         #[cfg(test)]
         Projection::SizePadding(bytes) => return Ok(*bytes),
@@ -7381,8 +7486,10 @@ async fn require_owner_count(
 }
 
 async fn apply_projection(
+    store: &Store,
     transaction: &mut Transaction<'_, Sqlite>,
     projection: PreparedProjection,
+    batch_event_seqs: &[u64],
 ) -> Result<()> {
     match projection {
         PreparedProjection::MessageEnd {
@@ -7497,15 +7604,17 @@ async fn apply_projection(
             .context("failed to persist inbound command")?;
         }
         PreparedProjection::Plain(projection) => {
-            apply_plain_projection(transaction, projection).await?;
+            apply_plain_projection(store, transaction, projection, batch_event_seqs).await?;
         }
     }
     Ok(())
 }
 
 async fn apply_plain_projection(
+    store: &Store,
     transaction: &mut Transaction<'_, Sqlite>,
     projection: Projection,
+    batch_event_seqs: &[u64],
 ) -> Result<()> {
     match projection {
         Projection::MessageEnd { .. } => unreachable!("MessageEnd is prepared separately"),
@@ -7670,6 +7779,16 @@ async fn apply_plain_projection(
         }
         Projection::Approval(mutation) => {
             apply_approval_mutation(transaction, mutation).await?;
+        }
+        Projection::PhysicalRecovery(receipt) => {
+            let outcome = PhysicalRecoveryApplier::new(store)
+                .apply_in_transaction(transaction, &receipt, batch_event_seqs)
+                .await?;
+            if outcome == ApplyReceiptOutcome::AlreadyApplied {
+                // A replay must not be allowed to re-emit or mutate logical
+                // rows. EventWriter still validates the receipt, then this
+                // projection is an authenticated no-op.
+            }
         }
         #[cfg(test)]
         Projection::SizePadding(_) => {}
@@ -7904,7 +8023,7 @@ mod tests {
         },
         runtime::contracts::ProcessGeneration,
         store::{
-            AgentScope, KeyProvider, RecoveryStep, SuffixRecovery,
+            AgentScope, KeyProvider, ProviderContextEvictionEstimate, RecoveryStep, SuffixRecovery,
             crypto::{
                 DATA_KEY_BYTES, DataKeyMaterial, DataKeyScope, KeyWrapAad, WrappingKey,
                 decrypt_content, encrypt_content, wrap_data_key,
@@ -9934,7 +10053,6 @@ mod tests {
             json!({"type":"future_durable_variant","payload":{}}),
             json!({"type":"error","message":"must remain volatile"}),
             json!({"type":"message_update","message_id":"message-1","delta":"volatile"}),
-            json!({"type":"memory_maintenance","kind":"T17 extension"}),
         ];
         for value in malformed {
             let error = DurableEvent::new(&value)
@@ -18193,5 +18311,194 @@ mod tests {
         .await
         .expect_err("length_guard must not match cancel_requested owner");
         assert!(format!("{error:#}").contains("ToolExecutionSkip"));
+    }
+
+    #[tokio::test]
+    async fn memory_maintenance_event_is_persisted_and_recovered() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let batch = EventBatch {
+            writes: vec![EventWrite {
+                event: Some(
+                    DurableEvent::new(
+                        &json!({"type": "memory_maintenance", "kind": "compact_applied"}),
+                    )
+                    .expect("typed memory maintenance event"),
+                ),
+                projections: Vec::new(),
+            }],
+            injected_commands: Vec::new(),
+        };
+        let seqs = writer.apply(batch).await.expect("apply memory maintenance");
+        assert_eq!(seqs, vec![1]);
+        SuffixRecovery::plan(&store)
+            .await
+            .expect("recovery accepts memory maintenance");
+    }
+
+    #[tokio::test]
+    async fn error_message_end_with_append_to_l0_false_rejects_provider_context() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000050";
+        let injected = classified_injection(&writer, 1, command_id, "ignored", "error").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "error"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("open assistant owner turn");
+
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let error_message = assistant_message(StopReason::Error);
+        let message_id = "assistant-error-with-context";
+        let fragment = ProviderContextFragment {
+            wire_item_index: Some(0),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiChatCompletions,
+                item: json!({"text": "opaque reasoning"}),
+            },
+        };
+        let footprint = ProviderContextEvictionEstimate::from_payload(&fragment.payload).tokens;
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            message_id,
+                            &error_message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("error MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist assistant start");
+
+        let error = writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_end",
+                            message_id,
+                            &error_message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("error MessageEnd"),
+                    ),
+                    projections: vec![Projection::MessageEnd {
+                        message_id: message_id.to_owned(),
+                        role: "assistant",
+                        message: error_message,
+                        append_to_l0: false,
+                        provider_context: vec![fragment],
+                        eviction_footprint_tokens: footprint,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("error MessageEnd must not carry provider_context");
+        assert!(error.to_string().contains("append_to_l0=false"));
+    }
+
+    #[tokio::test]
+    async fn message_end_rejects_mismatched_eviction_footprint_tokens() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000051";
+        let injected = classified_injection(&writer, 1, command_id, "ignored", "hello").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "hello"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("open assistant owner turn");
+
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let message = assistant_message(StopReason::Stop);
+        let message_id = "assistant-stop-with-context";
+        let fragment = ProviderContextFragment {
+            wire_item_index: Some(0),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiChatCompletions,
+                item: json!({"text": "opaque reasoning"}),
+            },
+        };
+        let footprint = ProviderContextEvictionEstimate::from_payload(&fragment.payload).tokens;
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist assistant start");
+
+        let error = writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_end",
+                            message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageEnd"),
+                    ),
+                    projections: vec![Projection::MessageEnd {
+                        message_id: message_id.to_owned(),
+                        role: "assistant",
+                        message,
+                        append_to_l0: true,
+                        provider_context: vec![fragment],
+                        eviction_footprint_tokens: footprint + 1,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("MessageEnd must reject mismatched eviction footprint");
+        assert!(
+            error
+                .to_string()
+                .contains("eviction_footprint_tokens mismatch")
+        );
     }
 }
