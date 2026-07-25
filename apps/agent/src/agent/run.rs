@@ -854,11 +854,28 @@ impl Runner {
             .emit_message_end(message_id.to_owned(), partial.clone())
             .await?;
         let receipt = self.await_message_receipt(receipt).await?;
+        // Give a queued Abort its durable authorization turn before deciding
+        // whether this close can hand off to a new turn.
+        self.receive_control_safe_point().await?;
+        // An Abort can win after this MessageEnd was sent but before the
+        // hard-steer close path resumes.  The bridge has already closed the
+        // original assistant (with or without the staged new turn identity),
+        // so do not claim the superseded steer or inject it.
         if let Some(ref new_turn_id) = receipt.new_turn_id {
             let binding = self.core.durable_binding.as_mut().ok_or_else(|| {
                 WorkerFailure::Error("RunCore has no durable worker binding".to_owned())
             })?;
             binding.turn_id = new_turn_id.clone();
+        }
+        if self.abort_requested {
+            let (committed_tx, committed_rx) = oneshot::channel();
+            let _ = committed_tx.send(receipt);
+            return Ok(AttemptOutcome::ClosedError {
+                assistant_message_id: message_id.to_owned(),
+                message: partial,
+                receipt: committed_rx,
+                rejected_results: Vec::new(),
+            });
         }
         self.retain_committed(receipt, &partial)?;
         self.claim_control(command)?;
