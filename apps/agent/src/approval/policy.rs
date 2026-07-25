@@ -544,11 +544,11 @@ fn is_unmodeled_command(command: &str) -> bool {
         "export", "alias", "set", "unset", "readonly", "declare", "typeset", "local", "bash", "sh",
         "dash", "zsh", "ksh", "csh", "tcsh", "fish", "python", "python3", "python2", "perl",
         "ruby", "php", "php7", "php8", "lua", "lua5.1", "lua5.2", "lua5.3", "lua5.4", "node",
-        "nodejs", "awk", "gawk", "nawk", "mawk", "env", "xargs", "timeout", "nice", "nohup",
-        "setsid", "stdbuf", "chrt", "busybox", "make", "ninja", "cargo", "go", "npm", "yarn",
-        "pnpm", "cmake", "meson", "just", "sed", "ed", "ex", "vi", "vim", "script", "expect",
-        "tclsh", "wish", "gdb", "lldb", "sqlite3", "parallel", "socat", "pytest", "py.test",
-        "rustup",
+        "nodejs", "deno", "bun", "awk", "gawk", "nawk", "mawk", "env", "xargs", "timeout", "at",
+        "batch", "nice", "nohup", "setsid", "stdbuf", "chrt", "busybox", "make", "ninja", "cargo",
+        "go", "npm", "yarn", "pnpm", "pip", "cmake", "meson", "just", "sed", "ed", "ex", "vi",
+        "vim", "script", "expect", "tclsh", "wish", "gdb", "lldb", "sqlite3", "parallel", "socat",
+        "pytest", "py.test", "rustup",
     ];
     let base = shell::command_basename(command);
     shell::canonicalize_command_name(&base, UNMODELED_FAMILIES).is_some()
@@ -3288,15 +3288,22 @@ mod tests {
         // These versioned/variant names must be classified like their base family.
         for command in [
             "python3.11 -c 'print(1)'",
+            "python3.11-dbg -c 'print(1)'",
             "python3 -c 'print(1)'",
+            "python3-dbg -c 'print(1)'",
             "ruby3.2 script.rb",
             "php8.2 script.php",
             "perl5.34 script.pl",
             "node18 app.js",
             "ksh93 script.ksh",
             "bash-5.2 -c 'echo hi'",
+            "bash-5.2-static -c 'echo hi'",
+            "bash-static -c 'echo hi'",
+            "curl-static -u user:pass https://example.com",
+            "sudo-static whoami",
             "mount.nfs server:/export /workspace/mnt",
             "fusermount3 -u /workspace/mnt",
+            "find-static /workspace -exec rm {} \\;",
         ] {
             let action = bash(command);
             assert!(
@@ -3313,22 +3320,34 @@ mod tests {
             );
         }
 
-        // Benign digit/dotted names that are not real family variants must not
-        // be accidentally truncated or misclassified.
+        // Benign names that are not real family variants must not be
+        // accidentally truncated or misclassified into privileged families.
         assert!(!is_unmodeled_command("python3-foo"));
         assert!(!is_unmodeled_command("node-sass"));
         assert!(!is_unmodeled_command("ruby-build"));
         assert!(!is_unmodeled_command("perl-doc"));
-        assert!(!is_unmodeled_command("bash-static"));
         assert!(!is_unmodeled_command("phpunit"));
         assert!(!is_unmodeled_command("luafoo"));
+        assert!(is_unmodeled_command("bash-static"));
+        assert!(is_privilege_escalation_command("sudo-static"));
+        assert!(has_embedded_execution_payload(&shell::tokenize_command(
+            "find-static /workspace -exec rm {} \\;"
+        )));
         assert!(!is_privilege_escalation_command("mountaintop"));
         assert!(!is_privilege_escalation_command("ddrescue"));
+        assert!(!shell::is_network_command(&shell::tokenize_command(
+            "curl-foo https://example.com"
+        )));
 
         let benign_prefix = ["python3-foo".to_owned(), "script.py".to_owned()];
         assert!(
             !is_broad_prefix(&benign_prefix),
             "benign python3-foo must not be treated as python"
+        );
+        let benign_curl = ["curl-foo".to_owned(), "https://example.com".to_owned()];
+        assert!(
+            !is_broad_prefix(&benign_curl),
+            "benign curl-foo must not be treated as curl"
         );
     }
 
@@ -3387,15 +3406,22 @@ mod tests {
     #[test]
     fn openssl_s_client_is_network_and_fail_closed() {
         let p = policy();
-        let action = bash("openssl s_client -connect example.com:443");
-        assert!(
-            action.requested_permissions.contains(&Permission::Network),
-            "openssl s_client must request Network permission"
-        );
-        assert!(
-            !p.evaluate(&action).is_allow(),
-            "openssl s_client must not be allowed by default"
-        );
+        for command in [
+            "openssl s_client -connect example.com:443",
+            "openssl -provider /workspace/malicious.so s_client -connect example.com:443",
+            "openssl -provider=/workspace/malicious.so s_client -connect example.com:443",
+            "openssl -provider default -rand /dev/urandom s_client -connect example.com:443",
+        ] {
+            let action = bash(command);
+            assert!(
+                action.requested_permissions.contains(&Permission::Network),
+                "{command} must request Network permission"
+            );
+            assert!(
+                !p.evaluate(&action).is_allow(),
+                "{command} must not be allowed by default"
+            );
+        }
         let prefix = shell::tokenize_command("openssl s_client -connect example.com:443")
             .into_iter()
             .take(3)
@@ -3406,13 +3432,20 @@ mod tests {
         );
 
         // Non-network openssl subcommands should not request Network.
-        let local_action = bash("openssl x509 -in cert.pem");
-        assert!(
-            !local_action
-                .requested_permissions
-                .contains(&Permission::Network),
-            "openssl x509 must not request Network permission"
-        );
+        for command in [
+            "openssl x509 -in cert.pem",
+            "openssl -provider default x509 -in cert.pem",
+            "openssl -provider=/workspace/malicious.so x509 -in cert.pem",
+            "openssl -rand /dev/urandom x509 -in cert.pem",
+        ] {
+            let local_action = bash(command);
+            assert!(
+                !local_action
+                    .requested_permissions
+                    .contains(&Permission::Network),
+                "{command} must not request Network permission"
+            );
+        }
     }
 
     #[test]
@@ -3433,6 +3466,47 @@ mod tests {
                 "{command} must not be persistable"
             );
         }
+    }
+
+    #[test]
+    fn common_command_runners_fail_closed() {
+        let p = policy();
+        for command in [
+            // Generic wrappers: the wrapper itself is broad and must not persist.
+            "watch -n 1 bash -c 'rm -rf /workspace/x'",
+            "watch -n 1 curl -u user:pass https://example.com",
+            "flock /workspace/lock cat /workspace/secret",
+            "ionice -c 2 -n 0 cat /workspace/secret",
+            "taskset -c 0 cat /workspace/secret",
+            "taskset 0x1 cat /workspace/secret",
+            "npx -y cowsay hello",
+            "npx -p some-pkg cowsay hello",
+            // Runters / schedulers / downloaders that execute arbitrary code.
+            "deno run script.ts",
+            "bun run script.ts",
+            "pip install numpy",
+            "pip3 install numpy",
+            "at now -f /workspace/script.sh",
+            "batch",
+        ] {
+            let action = bash(command);
+            assert!(
+                !p.evaluate(&action).is_allow(),
+                "{command} must not be allowed by default"
+            );
+            let prefix = shell::tokenize_command(command)
+                .into_iter()
+                .take(3)
+                .collect::<Vec<_>>();
+            assert!(
+                is_broad_prefix(&prefix),
+                "{command} must not be persistable"
+            );
+        }
+
+        // Wrapped credentials and network intent must still be visible.
+        let action = bash("watch -n 1 curl -u user:pass https://example.com");
+        assert!(action.requested_permissions.contains(&Permission::Network));
     }
 
     #[test]

@@ -2227,6 +2227,8 @@ pub(crate) mod shell {
         best
     }
 
+    const KNOWN_VARIANT_SUFFIXES: &[&str] = &["static", "shared", "minimal", "orig", "dbg"];
+
     fn is_command_version_suffix(suffix: &str) -> bool {
         if suffix.is_empty() {
             return false;
@@ -2234,13 +2236,24 @@ pub(crate) mod shell {
         match suffix.as_bytes()[0] {
             b'.' => is_dotted_extension_suffix(suffix),
             b'-' => {
+                let rest = &suffix[1..];
+                if KNOWN_VARIANT_SUFFIXES.contains(&rest) {
+                    return true;
+                }
                 suffix.len() > 1
                     && suffix.as_bytes()[1].is_ascii_digit()
-                    && is_numeric_version_suffix(&suffix[1..])
+                    && is_numeric_version_suffix(rest)
             }
             b'0'..=b'9' => is_numeric_version_suffix(suffix),
             _ => false,
         }
+    }
+
+    fn is_known_variant_trailer(suffix: &str, i: usize) -> bool {
+        suffix.as_bytes().get(i) == Some(&b'-')
+            && suffix
+                .get(i + 1..)
+                .is_some_and(|rest| KNOWN_VARIANT_SUFFIXES.contains(&rest))
     }
 
     fn is_dotted_extension_suffix(suffix: &str) -> bool {
@@ -2258,6 +2271,9 @@ pub(crate) mod shell {
         if i == bytes.len() {
             return true;
         }
+        if is_known_variant_trailer(suffix, i) {
+            return true;
+        }
         if bytes[i].is_ascii_digit() {
             while i < bytes.len() && bytes[i].is_ascii_digit() {
                 i += 1;
@@ -2266,6 +2282,9 @@ pub(crate) mod shell {
                 return true;
             }
             if i + 1 == bytes.len() && bytes[i].is_ascii_lowercase() {
+                return true;
+            }
+            if is_known_variant_trailer(suffix, i) {
                 return true;
             }
             return false;
@@ -2279,6 +2298,9 @@ pub(crate) mod shell {
                 return true;
             }
             if i + 1 == bytes.len() && bytes[i].is_ascii_lowercase() {
+                return true;
+            }
+            if is_known_variant_trailer(suffix, i) {
                 return true;
             }
             return false;
@@ -2300,6 +2322,9 @@ pub(crate) mod shell {
                 return true;
             }
             if i + 1 == bytes.len() && bytes[i].is_ascii_lowercase() {
+                return true;
+            }
+            if is_known_variant_trailer(suffix, i) {
                 return true;
             }
             if bytes[i] != b'.' {
@@ -2401,6 +2426,20 @@ pub(crate) mod shell {
             {
                 return true;
             }
+            // Standard single-colon remote form: host:/path or host:dest.
+            // Fail closed by requiring a non-empty, slash-free prefix that does
+            // not look like a local relative path (.foo, .., ~) or an absolute
+            // path (would contain '/').
+            if colon + 1 < operand.len()
+                && !before.is_empty()
+                && !before.contains('/')
+                && before != "."
+                && before != ".."
+                && !before.starts_with('.')
+                && !before.starts_with('~')
+            {
+                return true;
+            }
         }
         false
     }
@@ -2473,13 +2512,54 @@ pub(crate) mod shell {
             "git" => git_is_network_operation(&eff.tokens[1..]),
             "rsync" => rsync_is_remote(&eff.tokens[1..]),
             "openssl" => {
+                // Global openssl options that consume a following argument. These
+                // can appear before the subcommand and would otherwise hide
+                // s_client / s_server from the scanner.
+                const OPENSSL_VALUE_OPTIONS: &[&str] = &[
+                    "provider",
+                    "provider-path",
+                    "propquery",
+                    "rand",
+                    "writerand",
+                    "config",
+                    "section",
+                    "cafile",
+                    "capath",
+                    "crlfile",
+                    "cert",
+                    "key",
+                    "passin",
+                    "passout",
+                    "cipher",
+                    "ciphersuites",
+                    "curves",
+                    "sigalgs",
+                    "client_sigalgs",
+                    "groups",
+                    "alpn",
+                    "keylogfile",
+                    "unix",
+                    "target",
+                ];
                 let mut i = 1;
                 while i < eff.tokens.len() {
-                    if eff.tokens[i].starts_with('-') {
-                        i += 1;
+                    let token = &eff.tokens[i];
+                    if let Some(stripped) = token.strip_prefix('-') {
+                        let (name, has_glued_value) = if let Some((n, _)) = stripped.split_once('=')
+                        {
+                            (n, true)
+                        } else {
+                            (stripped, false)
+                        };
+                        let lower = name.to_ascii_lowercase();
+                        if OPENSSL_VALUE_OPTIONS.contains(&lower.as_str()) && !has_glued_value {
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
                         continue;
                     }
-                    return matches!(eff.tokens[i].as_str(), "s_client" | "s_server");
+                    return matches!(token.as_str(), "s_client" | "s_server");
                 }
                 false
             }
@@ -2490,7 +2570,17 @@ pub(crate) mod shell {
     fn is_generic_wrapper(name: &str) -> bool {
         matches!(
             name,
-            "nice" | "nohup" | "setsid" | "stdbuf" | "chrt" | "busybox"
+            "nice"
+                | "nohup"
+                | "setsid"
+                | "stdbuf"
+                | "chrt"
+                | "busybox"
+                | "watch"
+                | "flock"
+                | "ionice"
+                | "taskset"
+                | "npx"
         )
     }
 
@@ -2547,6 +2637,11 @@ pub(crate) mod shell {
             "stdbuf" => parse_stdbuf_options(tokens, wrapper_index),
             "chrt" => parse_chrt_options(tokens, wrapper_index),
             "busybox" => Some(wrapper_index + 1),
+            "watch" => parse_watch_options(tokens, wrapper_index),
+            "flock" => parse_flock_options(tokens, wrapper_index),
+            "ionice" => parse_ionice_options(tokens, wrapper_index),
+            "taskset" => parse_taskset_options(tokens, wrapper_index),
+            "npx" => parse_npx_options(tokens, wrapper_index),
             _ => return None,
         }?;
         if cmd_index >= tokens.len() {
@@ -2705,6 +2800,216 @@ pub(crate) mod shell {
             }
             if t.parse::<u64>().is_ok() && i + 1 < tokens.len() {
                 i += 1;
+            }
+            return Some(i);
+        }
+        None
+    }
+
+    fn parse_watch_options(tokens: &[String], wrapper_index: usize) -> Option<usize> {
+        let mut i = wrapper_index + 1;
+        while i < tokens.len() {
+            let t = &tokens[i];
+            if t == "--" {
+                return Some(i + 1);
+            }
+            if t.starts_with('-') {
+                let lower = t.to_ascii_lowercase();
+                if matches!(lower.as_str(), "-n" | "--interval") {
+                    if i + 1 >= tokens.len() {
+                        return None;
+                    }
+                    i += 2;
+                    continue;
+                }
+                if lower.starts_with("-n=") || lower.starts_with("--interval=") {
+                    i += 1;
+                    continue;
+                }
+                // -d/--differences is a boolean unless glued with '=permanent'.
+                // All remaining - options are no-argument flags.
+                i += 1;
+                continue;
+            }
+            return Some(i);
+        }
+        None
+    }
+
+    fn parse_flock_options(tokens: &[String], wrapper_index: usize) -> Option<usize> {
+        let mut i = wrapper_index + 1;
+        while i < tokens.len() {
+            let t = &tokens[i];
+            if t == "--" {
+                if i + 2 < tokens.len() {
+                    return Some(i + 2);
+                }
+                return None;
+            }
+            if t.starts_with('-') {
+                let lower = t.to_ascii_lowercase();
+                if matches!(lower.as_str(), "-c" | "--command")
+                    || lower.starts_with("-c=")
+                    || lower.starts_with("--command=")
+                {
+                    // The command is a shell string, not a tokenized argv.
+                    return None;
+                }
+                if matches!(
+                    lower.as_str(),
+                    "-w" | "--wait" | "--timeout" | "-E" | "--conflict-exit-code"
+                ) {
+                    if i + 1 >= tokens.len() {
+                        return None;
+                    }
+                    i += 2;
+                    continue;
+                }
+                if lower.starts_with("-w=")
+                    || lower.starts_with("--wait=")
+                    || lower.starts_with("--timeout=")
+                    || lower.starts_with("-E=")
+                    || lower.starts_with("--conflict-exit-code=")
+                {
+                    i += 1;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            // First positional is the lock file; the command follows it.
+            if i + 1 < tokens.len() {
+                return Some(i + 1);
+            }
+            return None;
+        }
+        None
+    }
+
+    fn parse_ionice_options(tokens: &[String], wrapper_index: usize) -> Option<usize> {
+        let mut i = wrapper_index + 1;
+        while i < tokens.len() {
+            let t = &tokens[i];
+            if t == "--" {
+                return Some(i + 1);
+            }
+            if t.starts_with('-') {
+                let lower = t.to_ascii_lowercase();
+                if matches!(lower.as_str(), "-p" | "--pid") {
+                    // Modifies an existing process; no inner command to model.
+                    return None;
+                }
+                if matches!(lower.as_str(), "-c" | "--class" | "-n" | "--classdata") {
+                    if i + 1 >= tokens.len() {
+                        return None;
+                    }
+                    i += 2;
+                    continue;
+                }
+                if lower.starts_with("-c=")
+                    || lower.starts_with("--class=")
+                    || lower.starts_with("-n=")
+                    || lower.starts_with("--classdata=")
+                {
+                    i += 1;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            return Some(i);
+        }
+        None
+    }
+
+    fn parse_taskset_options(tokens: &[String], wrapper_index: usize) -> Option<usize> {
+        let mut i = wrapper_index + 1;
+        let mut saw_cpu_list = false;
+        while i < tokens.len() {
+            let t = &tokens[i];
+            if t == "--" {
+                if i + 2 < tokens.len() {
+                    return Some(i + 2);
+                }
+                return None;
+            }
+            if t.starts_with('-') {
+                let lower = t.to_ascii_lowercase();
+                if matches!(lower.as_str(), "-p" | "--pid") {
+                    // Modifies an existing process; no inner command to model.
+                    return None;
+                }
+                if matches!(lower.as_str(), "-c" | "--cpu-list") {
+                    if i + 1 >= tokens.len() {
+                        return None;
+                    }
+                    i += 2;
+                    saw_cpu_list = true;
+                    continue;
+                }
+                if lower.starts_with("-c=") || lower.starts_with("--cpu-list=") {
+                    i += 1;
+                    saw_cpu_list = true;
+                    continue;
+                }
+                if matches!(
+                    lower.as_str(),
+                    "-a" | "--all-tasks" | "-h" | "--help" | "-v" | "--version"
+                ) {
+                    i += 1;
+                    continue;
+                }
+                return None;
+            }
+            if saw_cpu_list {
+                return Some(i);
+            }
+            // First positional is the CPU mask; the command follows it.
+            if i + 1 < tokens.len() {
+                return Some(i + 1);
+            }
+            return None;
+        }
+        None
+    }
+
+    fn parse_npx_options(tokens: &[String], wrapper_index: usize) -> Option<usize> {
+        let mut i = wrapper_index + 1;
+        while i < tokens.len() {
+            let t = &tokens[i];
+            if t == "--" {
+                return Some(i + 1);
+            }
+            if t.starts_with('-') {
+                let lower = t.to_ascii_lowercase();
+                if matches!(lower.as_str(), "-p" | "--package" | "--node-arg") {
+                    if i + 1 >= tokens.len() {
+                        return None;
+                    }
+                    i += 2;
+                    continue;
+                }
+                if lower.starts_with("-p=")
+                    || lower.starts_with("--package=")
+                    || lower.starts_with("--node-arg=")
+                {
+                    i += 1;
+                    continue;
+                }
+                if matches!(
+                    lower.as_str(),
+                    "-y" | "--yes"
+                        | "--no-install"
+                        | "--ignore-existing"
+                        | "-h"
+                        | "--help"
+                        | "-v"
+                        | "--version"
+                ) {
+                    i += 1;
+                    continue;
+                }
+                return None;
             }
             return Some(i);
         }
@@ -2931,6 +3236,8 @@ mod tests {
             "rsync -e 'ssh -p 2222' user@host:/path /workspace/backup",
             "rsync 'rsync://host/module/path' /workspace/backup",
             "rsync /workspace/src host::module",
+            "rsync /workspace/src host:/dest",
+            "rsync /workspace/src host:dest",
             "sftp user@host",
             "lftp -u user,pass sftp://host",
         ] {
@@ -2947,12 +3254,61 @@ mod tests {
             "rsync src/ dst/",
             "rsync -avz /workspace/src/ /workspace/dst/",
             "rsync --exclude='*.so' src/ dst/",
+            "rsync /abs:path /workspace/dst",
+            "rsync ./rel:path /workspace/dst",
+            "rsync ../rel:path /workspace/dst",
+            "rsync ..:path /workspace/dst",
+            "rsync .hidden:path /workspace/dst",
+            "rsync ~:path /workspace/dst",
         ] {
             assert!(
                 !network_indicators_in_command(command),
                 "expected no network indicator: {command}"
             );
         }
+    }
+
+    #[test]
+    fn build_variant_suffixes_canonicalize_to_base_family() {
+        let candidates = &["bash", "python", "python3", "curl", "node", "sudo", "find"];
+        for (name, expected) in [
+            ("bash-static", Some("bash")),
+            ("bash-5.2-static", Some("bash")),
+            ("bash-static-5.2", None), // variant suffix is not a version
+            ("curl-static", Some("curl")),
+            ("curl-7.85.0-static", Some("curl")),
+            ("python3.11-dbg", Some("python")),
+            ("python3-static", Some("python3")),
+            ("node18.5.0-static", Some("node")),
+            ("sudo-static", Some("sudo")),
+            ("find-static", Some("find")),
+            ("python3-foo", None),
+            ("node-sass", None),
+            ("ruby-build", None),
+            ("bashful", None),
+        ] {
+            let got = shell::canonicalize_command_name(name, candidates);
+            assert_eq!(
+                got, expected,
+                "{name} should canonicalize to {:?}, got {:?}",
+                expected, got
+            );
+        }
+    }
+
+    #[test]
+    fn generic_wrappers_preserve_inner_command_classification() {
+        // watch unwraps to the inner curl, so the network/credential metadata
+        // is still visible and the wrapper itself is broad.
+        assert!(network_indicators_in_command(
+            "watch -n 1 curl -u user:pass https://example.com"
+        ));
+        // Wrapped local commands remain non-network.
+        assert!(!network_indicators_in_command(
+            "watch -n 1 cat /workspace/notes"
+        ));
+        // npx unwraps to the inner command binary.
+        assert!(!network_indicators_in_command("npx -y cowsay hello"));
     }
 
     #[test]
