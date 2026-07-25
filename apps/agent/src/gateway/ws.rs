@@ -83,10 +83,24 @@ impl GatewayConnector for WebSocketConnector {
             let _ = rustls::crypto::ring::default_provider().install_default();
         });
 
-        if self.url.starts_with("ws://") && !self.allow_insecure {
-            return Err(ConnectorError::Other(anyhow!(
-                "refusing to send bearer credential over insecure ws://"
-            )));
+        let (scheme, _rest) = self
+            .url
+            .split_once("://")
+            .ok_or_else(|| ConnectorError::Other(anyhow!("websocket url is missing a scheme")))?;
+        let scheme_lower = scheme.to_ascii_lowercase();
+        match scheme_lower.as_str() {
+            "wss" => {}
+            "ws" if self.allow_insecure => {}
+            "ws" => {
+                return Err(ConnectorError::Other(anyhow!(
+                    "refusing to send bearer credential over insecure ws://"
+                )));
+            }
+            _ => {
+                return Err(ConnectorError::Other(anyhow!(
+                    "unsupported websocket scheme: {scheme}"
+                )));
+            }
         }
 
         let mut request = self
@@ -287,6 +301,43 @@ mod tests {
             matches!(err, super::super::ConnectorError::Other(ref e) if e.to_string().contains("insecure ws://")),
             "unexpected error: {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_case_insensitive_insecure_ws_in_production() {
+        for url in [
+            "WS://localhost:1234",
+            "Ws://localhost:1234",
+            "wS://localhost:1234",
+        ] {
+            let mut connector = WebSocketConnector::new(url, Arc::new(TestDigestFactory));
+            let result = connector.connect(GatewayCredential::new("token")).await;
+            let err = result.err().expect("connect must fail");
+            assert!(
+                matches!(err, super::super::ConnectorError::Other(ref e) if e.to_string().contains("insecure ws://")),
+                "for {url}, unexpected error: {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_or_unsupported_schemes() {
+        let cases = [
+            ("localhost:1234", "missing"),
+            ("http://localhost:1234", "unsupported"),
+            ("https://localhost:1234", "unsupported"),
+            ("ftp://localhost:1234", "unsupported"),
+        ];
+        for (url, expected) in cases {
+            let mut connector = WebSocketConnector::new(url, Arc::new(TestDigestFactory));
+            let result = connector.connect(GatewayCredential::new("token")).await;
+            let err = result.err().expect("connect must fail");
+            let msg = err.to_string().to_ascii_lowercase();
+            assert!(
+                msg.contains(expected),
+                "for {url}, expected error containing '{expected}', got {err:?}"
+            );
+        }
     }
 
     #[tokio::test]
