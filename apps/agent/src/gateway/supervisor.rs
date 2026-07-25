@@ -87,6 +87,7 @@ impl Drop for GatewayCredential {
 /// credential claim. All seq values are `u64` and are validated against the
 /// durable source before the epoch proceeds.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentHello {
     pub agent_id: String,
     pub generation: ProcessGeneration,
@@ -97,6 +98,7 @@ pub struct AgentHello {
 
 /// API → Agent hello response.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApiHello {
     pub accepted_generation: ProcessGeneration,
     pub last_received_event_seq: u64,
@@ -324,7 +326,12 @@ where
         let result = self.run_loop(commands_tx).await;
 
         forwarder.abort();
-        let _ = forwarder.await;
+        if let Err(join_err) = forwarder.await
+            && let Ok(panic) = join_err.try_into_panic()
+        {
+            std::panic::resume_unwind(panic);
+        }
+        // Normal abort cancellation is intentionally not an error.
         result
     }
 
@@ -707,9 +714,15 @@ async fn event_forwarder(
         if !*online.borrow() && matches!(frame, OutboundFrame::Event { .. }) {
             continue;
         }
-        if sender.send(frame).await.is_err() {
-            // Writer closed; stale frame is dropped. The supervisor will
-            // install a new epoch and catch-up from the durable source.
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            result = sender.send(frame) => {
+                if result.is_err() {
+                    // Writer closed; stale frame is dropped. The supervisor will
+                    // install a new epoch and catch-up from the durable source.
+                }
+            }
         }
     }
 }
@@ -868,8 +881,15 @@ where
                 _ = cmd_token.cancelled() => break,
                 cmd = reader.next_command() => {
                     let is_err = cmd.is_err();
-                    if cmd_tx.send(cmd).await.is_err() {
-                        break;
+                    let send = cmd_tx.send(cmd);
+                    tokio::select! {
+                        biased;
+                        _ = cmd_token.cancelled() => break,
+                        result = send => {
+                            if result.is_err() {
+                                break;
+                            }
+                        }
                     }
                     if is_err {
                         break;
@@ -895,16 +915,18 @@ where
                     }
                     ready = Some(hydration_ready);
                     for cmd in pending.drain(..) {
-                        next_expected = send_validated(cmd, next_expected, &mut command_tx).await?;
+                        next_expected = send_validated(cmd, next_expected, &mut command_tx, &token).await?;
                     }
                 }
-                result = cmd_rx.recv(), if ready.is_some() || pending.len() < MAX_PENDING_BEFORE_READY => {
+                result = cmd_rx.recv() => {
                     match result {
                         Some(Ok(cmd)) => {
                             if ready.is_some() {
-                                next_expected = send_validated(cmd, next_expected, &mut command_tx).await?;
-                            } else {
+                                next_expected = send_validated(cmd, next_expected, &mut command_tx, &token).await?;
+                            } else if pending.len() < MAX_PENDING_BEFORE_READY {
                                 pending.push(cmd);
+                            } else {
+                                break 'task Err(anyhow!("max pending commands before hydration reached"));
                             }
                         }
                         Some(Err(e)) => break 'task Err(e),
@@ -927,13 +949,20 @@ async fn send_validated(
     cmd: InboundCommand,
     next_expected: u64,
     command_tx: &mut mpsc::Sender<InboundCommand>,
+    token: &CancellationToken,
 ) -> Result<u64> {
     let seq = inbound_command_seq(&cmd);
     if seq > next_expected {
         bail!("command seq gap: expected {next_expected}, got {seq}");
     }
-    if command_tx.send(cmd).await.is_err() {
-        bail!("command consumer closed");
+    tokio::select! {
+        biased;
+        _ = token.cancelled() => bail!("epoch cancelled"),
+        result = command_tx.send(cmd) => {
+            if result.is_err() {
+                bail!("command consumer closed");
+            }
+        }
     }
     // seq < next_expected is a legitimate retransmission; the durable consumer
     // (EventWriter) deduplicates by command_id and re-ACKs the same canonical seq.
@@ -1205,11 +1234,17 @@ mod tests {
     struct MockGatewayReader {
         commands: VecDeque<Result<InboundCommand>>,
         panic: bool,
+        on_empty: Option<Arc<tokio::sync::Notify>>,
     }
 
     impl MockGatewayReader {
         fn with_panic(mut self) -> Self {
             self.panic = true;
+            self
+        }
+
+        fn notify_on_empty(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
+            self.on_empty = Some(notify);
             self
         }
     }
@@ -1226,11 +1261,17 @@ mod tests {
             if self.panic {
                 panic!("mock reader panic");
             }
-            match self.commands.pop_front() {
+            let result = match self.commands.pop_front() {
                 Some(Ok(cmd)) => Ok(cmd),
                 Some(Err(e)) => Err(e),
                 None => std::future::pending::<Result<InboundCommand>>().await,
+            };
+            if self.commands.is_empty()
+                && let Some(notify) = self.on_empty.as_ref()
+            {
+                notify.notify_one();
             }
+            result
         }
     }
 
@@ -1266,6 +1307,7 @@ mod tests {
                 reader: MockGatewayReader {
                     commands,
                     panic: false,
+                    on_empty: None,
                 },
                 writer: MockGatewayWriter {
                     fail_after: None,
@@ -1291,6 +1333,11 @@ mod tests {
 
         fn with_hello_delay(mut self, delay: Duration) -> Self {
             self.hello_delay = Some(delay);
+            self
+        }
+
+        fn with_notify_on_empty(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
+            self.reader = self.reader.notify_on_empty(notify);
             self
         }
 
@@ -1521,6 +1568,7 @@ mod tests {
         let gateway1 = MockGateway {
             reader: MockGatewayReader {
                 panic: false,
+                on_empty: None,
                 commands: VecDeque::from([Ok(valid_command(
                     1,
                     "00000000-0000-4000-8000-000000000001",
@@ -1539,6 +1587,7 @@ mod tests {
         let gateway2 = MockGateway {
             reader: MockGatewayReader {
                 panic: false,
+                on_empty: None,
                 commands: VecDeque::new(),
             },
             writer: MockGatewayWriter {
@@ -1608,6 +1657,7 @@ mod tests {
         let gateway = MockGateway {
             reader: MockGatewayReader {
                 panic: false,
+                on_empty: None,
                 commands: VecDeque::new(),
             },
             writer: MockGatewayWriter {
@@ -1655,6 +1705,7 @@ mod tests {
         let gateway1 = MockGateway {
             reader: MockGatewayReader {
                 panic: false,
+                on_empty: None,
                 commands: VecDeque::new(),
             },
             writer: MockGatewayWriter {
@@ -1670,6 +1721,7 @@ mod tests {
         let gateway2 = MockGateway {
             reader: MockGatewayReader {
                 panic: false,
+                on_empty: None,
                 commands: VecDeque::new(),
             },
             writer: MockGatewayWriter {
@@ -1742,6 +1794,7 @@ mod tests {
         let gateway = MockGateway {
             reader: MockGatewayReader {
                 panic: false,
+                on_empty: None,
                 commands: VecDeque::from([Ok(valid_command(
                     1,
                     "00000000-0000-4000-8000-000000000001",
@@ -1799,6 +1852,7 @@ mod tests {
         let gateway = MockGateway {
             reader: MockGatewayReader {
                 panic: false,
+                on_empty: None,
                 commands: VecDeque::from([Ok(rejected_oversized_command(
                     1,
                     "00000000-0000-4000-8000-000000000001",
@@ -1878,6 +1932,7 @@ mod tests {
             valid_command(1, "00000000-0000-4000-8000-000000000001"),
             1,
             &mut tx,
+            &CancellationToken::new(),
         )
         .await;
         assert!(result.is_err());
@@ -2245,6 +2300,7 @@ mod tests {
             reader: MockGatewayReader {
                 panic: true,
                 commands: VecDeque::new(),
+                on_empty: None,
             },
             writer: MockGatewayWriter {
                 fail_after: None,
@@ -2279,6 +2335,7 @@ mod tests {
         let gateway = MockGateway {
             reader: MockGatewayReader {
                 panic: false,
+                on_empty: None,
                 commands: VecDeque::new(),
             },
             writer: MockGatewayWriter {
@@ -2763,6 +2820,7 @@ mod tests {
             reader: MockGatewayReader {
                 commands: VecDeque::new(),
                 panic: false,
+                on_empty: None,
             },
             writer: MockGatewayWriter {
                 fail_after: None,
@@ -2946,6 +3004,7 @@ mod tests {
             reader: MockGatewayReader {
                 commands: VecDeque::new(),
                 panic: false,
+                on_empty: None,
             },
             writer: MockGatewayWriter {
                 fail_after: None,
@@ -3021,5 +3080,229 @@ mod tests {
 
     fn cmd_seq(cmd: &InboundCommand) -> u64 {
         inbound_command_seq(cmd)
+    }
+
+    #[tokio::test]
+    async fn hydration_hold_limit_fails_closed() {
+        // Latch never becomes ready, so the reader must fail closed once the
+        // pre-hydration command ceiling is reached instead of stalling.
+        let latch = DynamicHydrationLatch::new().0;
+        let commands: VecDeque<_> = (1..=17)
+            .map(|seq| {
+                Ok(valid_command(
+                    seq,
+                    &format!("00000000-0000-4000-8000-{:012x}", seq),
+                ))
+            })
+            .collect();
+        let gateway = MockGateway::new(commands);
+        let connector = MockConnector::new(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            VecDeque::from([Ok(gateway)]),
+        );
+        let credentials = CountingCredentialProvider::new("token");
+        let source = MockDurableSource::new(CommandCursors::default());
+
+        let supervisor =
+            ConnectionSupervisor::new(connector, credentials, source, latch, make_config());
+        let handle = supervisor.start();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle.join()).await;
+        assert!(result.is_ok(), "exceeding the pending limit must not hang");
+        assert!(
+            result.unwrap().is_err(),
+            "exceeding the pending limit must fail closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_validated_cancels_on_full_command_channel() {
+        // command_buffer_size is 1, so the first validated command fills the
+        // channel and the second command forces send_validated to wait. The
+        // reader notifies when it has consumed the second command, proving the
+        // blocked boundary is reached, and then abort must still complete.
+        let mut config = make_config();
+        config.command_buffer_size = 1;
+
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gateway = MockGateway::new(VecDeque::from([
+            Ok(valid_command(1, "00000000-0000-4000-8000-000000000001")),
+            Ok(valid_command(2, "00000000-0000-4000-8000-000000000002")),
+        ]))
+        .with_notify_on_empty(notify.clone());
+        let connector = MockConnector::new(sent_hellos, VecDeque::from([Ok(gateway)]));
+        let credentials = CountingCredentialProvider::new("token");
+        let source = MockDurableSource::new(CommandCursors::default());
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: ProcessGeneration::from_wire(7).unwrap(),
+            receipt_identity: "r".to_owned(),
+        });
+
+        let supervisor = ConnectionSupervisor::new(connector, credentials, source, latch, config);
+        let handle = supervisor.start();
+
+        // Wait for the epoch so the reader tries to forward commands.
+        let mut epochs = handle.epochs.clone();
+        while epochs.borrow().is_none() {
+            epochs.changed().await.unwrap();
+        }
+
+        // Wait until the reader has consumed both commands. At that point the
+        // first command has filled command_tx and the second send_validated is
+        // blocked waiting for handle.commands.recv() to free capacity.
+        tokio::time::timeout(Duration::from_secs(1), notify.notified())
+            .await
+            .expect("reader must consume both commands");
+
+        // Do not call handle.commands.recv(); command_tx is still full. Abort
+        // must still stop the supervisor promptly.
+        handle.abort();
+        let result = tokio::time::timeout(Duration::from_secs(1), handle.join()).await;
+        assert!(
+            result.is_ok(),
+            "abort must complete even when command_tx send is blocked"
+        );
+    }
+
+    #[tokio::test]
+    async fn event_forwarder_cancels_blocked_writer_send() {
+        // Catch-up blocks writer_task so writer_rx fills. event_forwarder must
+        // still cancel its own sender.send when the supervisor is aborted.
+        let catch_up_notify = Arc::new(tokio::sync::Notify::new());
+        let source = DelayedCatchUpSource {
+            events: Arc::new(std::sync::Mutex::new(VecDeque::new())),
+            notify: catch_up_notify,
+            command_cursor: CommandCursors {
+                received: 0,
+                applied: 0,
+            },
+        };
+
+        let mut config = make_config();
+        config.event_buffer_size = 1;
+
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gateway = MockGateway {
+            reader: MockGatewayReader {
+                commands: VecDeque::new(),
+                panic: false,
+                on_empty: None,
+            },
+            writer: MockGatewayWriter {
+                fail_after: None,
+                sent: sent.clone(),
+                delay: None,
+            },
+            sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
+            hello_generation: None,
+            last_received_event_seq: 0,
+            hello_delay: None,
+        };
+        let connector = MockConnector::new(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            VecDeque::from([Ok(gateway)]),
+        );
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: ProcessGeneration::from_wire(7).unwrap(),
+            receipt_identity: "r".to_owned(),
+        });
+        let supervisor = ConnectionSupervisor::new(
+            connector,
+            CountingCredentialProvider::new("token"),
+            source,
+            latch,
+            config,
+        );
+        let handle = supervisor.start();
+
+        // Wait for the epoch so there is a writer installed.
+        let mut epochs = handle.epochs.clone();
+        while epochs.borrow().is_none() {
+            epochs.changed().await.unwrap();
+        }
+        let epoch = epochs.borrow().unwrap();
+
+        // CommandAcks are never dropped by the Online boundary. Send two so
+        // the first fills writer_rx and the second blocks sender.send.
+        let ack = |seq| OutboundFrame::CommandAck {
+            ack: CommandAck {
+                seq,
+                command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+                status: CommandAckStatus::Received,
+                reject_reason: None,
+            },
+        };
+        handle.events.send((epoch, ack(1))).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        handle.events.send((epoch, ack(2))).await.unwrap();
+
+        handle.abort();
+        let result = tokio::time::timeout(Duration::from_secs(1), handle.join()).await;
+        assert!(
+            result.is_ok(),
+            "abort must complete while event_forwarder is blocked on sender.send"
+        );
+    }
+
+    #[tokio::test]
+    async fn event_forwarder_panic_is_propagated() {
+        let (tx, rx) = mpsc::channel::<(DeliveryEpoch, OutboundFrame)>(1);
+        let current_writer: CurrentWriterSlot = Arc::new(std::sync::Mutex::new(None));
+
+        // Poison the writer mutex so event_forwarder panics when it locks.
+        let poison = current_writer.clone();
+        std::thread::spawn(move || {
+            let _guard = poison.lock().unwrap();
+            panic!("poison mutex");
+        })
+        .join()
+        .unwrap_err();
+
+        let (_online_tx, online_rx) = watch::channel(false);
+        let cancel = CancellationToken::new();
+        let forwarder = tokio::spawn(event_forwarder(rx, current_writer, cancel, online_rx));
+
+        // Send a frame so event_forwarder tries to lock and panics.
+        tx.send((DeliveryEpoch(1), event_frame(1))).await.unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), forwarder)
+            .await
+            .expect("forwarder must finish after panic");
+        assert!(result.is_err(), "panic must surface as a JoinError");
+        let join_err = result.unwrap_err();
+        assert!(join_err.is_panic(), "JoinError must be a panic");
+        assert!(
+            join_err.try_into_panic().is_ok(),
+            "panic payload must be recoverable"
+        );
+    }
+
+    #[test]
+    fn agent_hello_rejects_unknown_fields() {
+        let json = r#"{"agent_id":"a","generation":1,"last_sent_event_seq":0,"last_received_command_seq":0,"last_applied_command_seq":0,"extra":1}"#;
+        assert!(
+            serde_json::from_str::<AgentHello>(json).is_err(),
+            "AgentHello must reject unknown fields"
+        );
+    }
+
+    #[test]
+    fn api_hello_rejects_unknown_fields() {
+        let json = r#"{"accepted_generation":1,"last_received_event_seq":0,"next_command_seq":1,"extra":1}"#;
+        assert!(
+            serde_json::from_str::<ApiHello>(json).is_err(),
+            "ApiHello must reject unknown fields"
+        );
+    }
+
+    #[test]
+    fn hello_dto_deserialization_still_accepts_known_fields() {
+        let agent_json = r#"{"agent_id":"a","generation":1,"last_sent_event_seq":0,"last_received_command_seq":0,"last_applied_command_seq":0}"#;
+        assert!(serde_json::from_str::<AgentHello>(agent_json).is_ok());
+
+        let api_json =
+            r#"{"accepted_generation":1,"last_received_event_seq":0,"next_command_seq":1}"#;
+        assert!(serde_json::from_str::<ApiHello>(api_json).is_ok());
     }
 }
