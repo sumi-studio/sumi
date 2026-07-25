@@ -3,6 +3,7 @@
 #![allow(dead_code)] // T20/T21 consume these foundations.
 
 pub mod batch;
+pub mod compactor;
 pub mod estimate;
 #[allow(dead_code)]
 pub mod transform;
