@@ -18,7 +18,7 @@ pub(crate) enum MemoryLayer {
 }
 
 impl MemoryLayer {
-    fn as_i64(self) -> i64 {
+    pub(crate) fn as_i64(self) -> i64 {
         self as i64
     }
 
@@ -70,7 +70,7 @@ impl MemoryBatchState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MemoryJobKind {
     CompactL0,
     CompactL1,
@@ -257,6 +257,7 @@ pub(crate) struct MemoryJobRecord {
     pub source_ids: Vec<String>,
     pub source_versions: BTreeMap<String, i64>,
     pub status: MemoryJobStatus,
+    pub lease_until: Option<String>,
     pub attempts: i64,
     pub result: Option<MemoryJobResult>,
     pub created_at: String,
@@ -279,6 +280,7 @@ impl MemoryJobRecord {
             source_ids,
             source_versions,
             status: MemoryJobStatus::Pending,
+            lease_until: None,
             attempts: 0,
             result: None,
             created_at: now.clone(),
@@ -307,10 +309,10 @@ impl MemoryJobRecord {
 
         sqlx::query(
             "INSERT INTO memory_jobs(
-                id, kind, batch_seq, source_ids, source_versions, status, attempts,
+                id, kind, batch_seq, source_ids, source_versions, status, lease_until, attempts,
                 result_key_ref, result_ciphertext, result_projection,
                 result_redaction_version, created_at, updated_at
-             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&self.id)
         .bind(self.kind.as_str())
@@ -318,6 +320,7 @@ impl MemoryJobRecord {
         .bind(&source_ids_json)
         .bind(&source_versions_json)
         .bind(self.status.as_str())
+        .bind(self.lease_until.as_ref())
         .bind(self.attempts)
         .bind(key_ref)
         .bind(ciphertext)

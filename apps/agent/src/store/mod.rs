@@ -52,7 +52,7 @@ pub(crate) use self::transcript::{message_interrupted, public_message_role};
 pub(crate) use crypto::{DATA_KEY_BYTES, WrappingKey};
 pub(crate) use crypto::{
     DataKeyMaterial, DataKeyPurpose, EnvironmentKeyProvider, KeyProvider, RowAad,
-    command_payload_digest, decrypt_content, verify_command_payload_digest,
+    command_payload_digest, decrypt_content, encrypt_content, verify_command_payload_digest,
 };
 #[allow(
     unused_imports,
@@ -86,6 +86,8 @@ pub(crate) use sizer::{
     BatchBounds, CommandSizeInput, DURABLE_ROW_OVERHEAD_BYTES, EventBatchSizer,
     InjectionApplication, InjectionBatchSizeInput, InjectionCommandSizeInput,
 };
+#[cfg(test)]
+pub(crate) use transcript::TranscriptRecord;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
@@ -635,7 +637,7 @@ impl Store {
         }
 
         let job_rows = sqlx::query(
-            "SELECT id, kind, batch_seq, source_ids, source_versions, status, attempts,
+            "SELECT id, kind, batch_seq, source_ids, source_versions, status, lease_until, attempts,
                     result_key_ref, result_ciphertext, result_projection, result_redaction_version,
                     created_at, updated_at
              FROM memory_jobs ORDER BY id",
@@ -686,6 +688,7 @@ impl Store {
                 source_ids,
                 source_versions,
                 status,
+                lease_until: row.try_get("lease_until")?,
                 attempts: row.try_get("attempts")?,
                 result,
                 created_at: row.try_get("created_at")?,

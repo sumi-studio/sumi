@@ -6,17 +6,31 @@
 //! signatures, and native compaction bytes cannot be represented in it, so they
 //! cannot reach the compact HTTP body.
 
+use std::{collections::HashMap, env, sync::Arc, time::Duration};
+
+use anyhow::{Context, Result, anyhow, bail};
+use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
+use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use zeroize::Zeroizing;
+use sqlx::{Row, sqlite::SqliteRow};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::provider::{
     canonical_request::CanonicalRequestBody,
     model::{MaxTokensField, ModelSpec},
     types::{ApiProtocol, PublicAssistantContent, PublicMessage, UserContent},
 };
+use crate::store::{
+    DataKeyMaterial, DataKeyPurpose, MemoryBatchState, MemoryJobKind, MemoryJobStatus, MemoryLayer,
+    PublicProjectionBuilder, Redactor, RowAad, Store, decrypt_content, encrypt_content,
+};
 
-use super::L1Entry;
+use super::{CompactResult, DecryptedMemorySummary, L1Entry};
 
 const COMPACT_SYSTEM_PROMPT: &str = "あなたは記憶の圧縮係。会話を続けるな。要約だけ出力せよ。";
 
@@ -67,7 +81,7 @@ struct DecryptedSummary {
 /// compact request.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum CompactError {
-    #[error("compact model protocol is not OpenAI Chat Completions")]
+    #[error("compact model protocol is not supported")]
     UnsupportedProtocol,
     #[error(
         "compact model trust domain {trust_domain} is not allowed for conversation domain {conversation_domain}"
@@ -80,6 +94,37 @@ pub enum CompactError {
     InvalidOutputTokens { requested: u64, max: u64 },
     #[error("failed to serialize compact request: {0}")]
     Serialization(String),
+    #[error("compact cancelled")]
+    Cancelled,
+    #[error("compact response header timeout")]
+    HeaderTimeout,
+    #[error("compact response body idle for {0} seconds")]
+    BodyIdleTimeout(u64),
+    #[error("compact transport failed: {0}")]
+    Transport(String),
+    #[error("compact HTTP {status}: {body}")]
+    Http { status: u16, body: String },
+    #[error("compact response exceeded {limit} bytes")]
+    ResponseLimitExceeded { limit: usize },
+    #[error("compact response is invalid: {0}")]
+    InvalidResponse(String),
+    #[error("compact token estimate failed: {0}")]
+    Estimate(String),
+    #[error("compact data key unavailable: {0}")]
+    Key(String),
+}
+
+impl CompactError {
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::HeaderTimeout
+                | Self::BodyIdleTimeout(_)
+                | Self::Transport(_)
+                | Self::InvalidResponse(_)
+                | Self::ResponseLimitExceeded { .. }
+        ) || matches!(self, Self::Http { status, .. } if *status == 429 || *status >= 500)
+    }
 }
 
 /// The only input accepted by the compact request serializer.
@@ -260,11 +305,8 @@ impl CompactModelSpec {
 /// when its trust domain equals the conversation's domain or appears in the
 /// tenant allowlist.
 ///
-/// This pure input/serializer foundation only builds Chat Completions
-/// requests, so the selected model is rejected unless it uses the
-/// `OpenAiChatCompletions` protocol. The later T20 transport integration may
-/// add protocol-specific compaction paths without weakening this serializer's
-/// input boundary.
+/// Compaction supports the same conversation protocols required by canon
+/// (OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages).
 pub fn select_compact_model(
     conversation: &ModelSpec,
     explicit: Option<&ModelSpec>,
@@ -281,7 +323,12 @@ pub fn select_compact_model(
         });
     }
 
-    if selected.protocol != ApiProtocol::OpenAiChatCompletions {
+    if !matches!(
+        selected.protocol,
+        ApiProtocol::OpenAiChatCompletions
+            | ApiProtocol::OpenAiResponses
+            | ApiProtocol::AnthropicMessages
+    ) {
         return Err(CompactError::UnsupportedProtocol);
     }
 
@@ -302,14 +349,6 @@ pub(crate) fn build_compact_request(
     spec: &CompactModelSpec,
     input: &CompactionInput,
 ) -> Result<CanonicalRequestBody, CompactError> {
-    if spec.model.protocol != ApiProtocol::OpenAiChatCompletions {
-        return Err(CompactError::UnsupportedProtocol);
-    }
-    let compat = spec
-        .model
-        .chat_compat()
-        .ok_or(CompactError::UnsupportedProtocol)?;
-
     let output_tokens = MAX_COMPACT_OUTPUT_TOKENS.min(spec.model.max_output_tokens);
     if output_tokens == 0 {
         return Err(CompactError::InvalidOutputTokens {
@@ -318,25 +357,400 @@ pub(crate) fn build_compact_request(
         });
     }
 
-    let max_tokens_key = match compat.max_tokens_field {
-        MaxTokensField::MaxTokens => "max_tokens",
-        MaxTokensField::MaxCompletionTokens => "max_completion_tokens",
-    };
-
+    let user_content = build_user_content(input);
     let mut request = Map::new();
     request.insert("model".to_owned(), json!(spec.model.id));
-    request.insert(
-        "messages".to_owned(),
-        json!([
-            json!({"role": "system", "content": COMPACT_SYSTEM_PROMPT}),
-            json!({"role": "user", "content": build_user_content(input)}),
-        ]),
-    );
     request.insert("stream".to_owned(), json!(false));
-    request.insert(max_tokens_key.to_owned(), json!(output_tokens));
+
+    match spec.model.protocol {
+        ApiProtocol::OpenAiChatCompletions => {
+            let compat = spec
+                .model
+                .chat_compat()
+                .ok_or(CompactError::UnsupportedProtocol)?;
+            let max_tokens_key = match compat.max_tokens_field {
+                MaxTokensField::MaxTokens => "max_tokens",
+                MaxTokensField::MaxCompletionTokens => "max_completion_tokens",
+            };
+            request.insert(
+                "messages".to_owned(),
+                json!([
+                    json!({"role": "system", "content": COMPACT_SYSTEM_PROMPT}),
+                    json!({"role": "user", "content": user_content}),
+                ]),
+            );
+            request.insert(max_tokens_key.to_owned(), json!(output_tokens));
+        }
+        ApiProtocol::AnthropicMessages => {
+            let compat = spec
+                .model
+                .anthropic_compat()
+                .ok_or(CompactError::UnsupportedProtocol)?;
+            let system = if compat.supports_prompt_cache {
+                json!([{
+                    "type": "text",
+                    "text": COMPACT_SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }])
+            } else {
+                json!(COMPACT_SYSTEM_PROMPT)
+            };
+            request.insert("system".to_owned(), system);
+            request.insert(
+                "messages".to_owned(),
+                json!([{"role": "user", "content": user_content}]),
+            );
+            request.insert("max_tokens".to_owned(), json!(output_tokens));
+        }
+        ApiProtocol::OpenAiResponses => {
+            let compat = spec
+                .model
+                .responses_compat()
+                .ok_or(CompactError::UnsupportedProtocol)?;
+            request.insert("instructions".to_owned(), json!(COMPACT_SYSTEM_PROMPT));
+            request.insert(
+                "input".to_owned(),
+                json!([{"role": "user", "content": user_content}]),
+            );
+            request.insert("max_output_tokens".to_owned(), json!(output_tokens));
+            if compat.supports_store {
+                request.insert("store".to_owned(), json!(false));
+            }
+        }
+    }
 
     CanonicalRequestBody::serialize(&Value::Object(request))
         .map_err(|error| CompactError::Serialization(error.to_string()))
+}
+
+const LEASE_DURATION: Duration = Duration::from_secs(300);
+const LEASE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+const MAX_ATTEMPTS: i64 = 3;
+
+/// Provider-facing contract for producing a plaintext compact summary.
+#[async_trait]
+pub(crate) trait CompactProvider: Send + Sync {
+    async fn summarize(
+        &self,
+        spec: &CompactModelSpec,
+        input: &CompactionInput,
+        cancel: CancellationToken,
+    ) -> Result<String, CompactError>;
+}
+
+/// Real HTTP compact provider using the same transport client as the main
+/// conversation pipeline.
+pub(crate) struct HttpCompactProvider;
+
+#[async_trait]
+impl CompactProvider for HttpCompactProvider {
+    async fn summarize(
+        &self,
+        spec: &CompactModelSpec,
+        input: &CompactionInput,
+        cancel: CancellationToken,
+    ) -> Result<String, CompactError> {
+        let api_key = env::var(&spec.model.api_key_env)
+            .ok()
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| {
+                CompactError::Key(format!(
+                    "missing API key for provider {}",
+                    spec.model.provider
+                ))
+            })?;
+
+        let body = build_compact_request(spec, input)?;
+        let client = crate::provider::http_client().map_err(CompactError::Transport)?;
+        let request = match spec.model.protocol {
+            ApiProtocol::AnthropicMessages => {
+                let mut request = client
+                    .post(spec.model.endpoint())
+                    .header("x-api-key", api_key)
+                    .header("anthropic-version", "2023-06-01");
+                if let Some(compat) = spec.model.anthropic_compat()
+                    && !compat.beta_headers.is_empty()
+                {
+                    request = request.header("anthropic-beta", compat.beta_headers.join(","));
+                }
+                body.apply(request)
+            }
+            ApiProtocol::OpenAiChatCompletions | ApiProtocol::OpenAiResponses => {
+                body.apply(client.post(spec.model.endpoint()).bearer_auth(api_key))
+            }
+        };
+        let request_sent = request.send();
+
+        let response = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(CompactError::Cancelled),
+            result = request_sent => result,
+            _ = tokio::time::sleep(crate::provider::RESPONSE_HEADER_TIMEOUT) => {
+                return Err(CompactError::HeaderTimeout);
+            }
+        };
+
+        let response = response.map_err(|error| CompactError::Transport(error.to_string()))?;
+        let status = response.status();
+        let output_tokens = MAX_COMPACT_OUTPUT_TOKENS.min(spec.model.max_output_tokens);
+
+        let limit = if status.is_success() {
+            crate::provider::assembler::ResponseBudget::for_output_tokens(output_tokens)
+                .ok_or_else(|| {
+                    CompactError::InvalidResponse("response budget overflow".to_owned())
+                })?
+                .max_wire_bytes
+        } else {
+            crate::provider::MAX_PROVIDER_ERROR_BODY_BYTES
+        };
+
+        let bytes = collect_compact_body(response, limit, !status.is_success(), cancel).await?;
+
+        if !status.is_success() {
+            let body = String::from_utf8_lossy(&bytes)
+                .chars()
+                .take(4_000)
+                .collect();
+            return Err(CompactError::Http {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        let value: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| CompactError::InvalidResponse(error.to_string()))?;
+        parse_compact_summary(spec.model.protocol, &value)
+    }
+}
+
+/// Normalize the plain-text completion returned by each conversation
+/// protocol. Compaction deliberately uses the same model endpoint as the
+/// conversation and only asks for a public text summary; opaque provider
+/// context is never accepted here.
+fn parse_compact_summary(protocol: ApiProtocol, value: &Value) -> Result<String, CompactError> {
+    match protocol {
+        ApiProtocol::OpenAiChatCompletions => value
+            .get("choices")
+            .and_then(|choices| choices.get(0))
+            .and_then(|choice| choice.get("message"))
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| CompactError::InvalidResponse("missing assistant content".to_owned())),
+        ApiProtocol::OpenAiResponses => {
+            if let Some(text) = value.get("output_text").and_then(Value::as_str) {
+                return Ok(text.to_owned());
+            }
+            let output = value
+                .get("output")
+                .and_then(Value::as_array)
+                .ok_or_else(|| CompactError::InvalidResponse("missing response output".into()))?;
+            let mut text = String::new();
+            for item in output {
+                let Some(content) = item.get("content").and_then(Value::as_array) else {
+                    continue;
+                };
+                for part in content {
+                    if let Some(value) = part
+                        .get("text")
+                        .or_else(|| part.get("value"))
+                        .and_then(Value::as_str)
+                    {
+                        text.push_str(value);
+                    }
+                }
+            }
+            if text.is_empty() {
+                return Err(CompactError::InvalidResponse(
+                    "response output has no text".into(),
+                ));
+            }
+            Ok(text)
+        }
+        ApiProtocol::AnthropicMessages => {
+            let content = value
+                .get("content")
+                .and_then(Value::as_array)
+                .ok_or_else(|| CompactError::InvalidResponse("missing message content".into()))?;
+            let mut text = String::new();
+            for block in content {
+                if block.get("type").and_then(Value::as_str) == Some("text")
+                    && let Some(value) = block.get("text").and_then(Value::as_str)
+                {
+                    text.push_str(value);
+                }
+            }
+            if text.is_empty() {
+                return Err(CompactError::InvalidResponse(
+                    "message content has no text".into(),
+                ));
+            }
+            Ok(text)
+        }
+    }
+}
+
+async fn collect_compact_body(
+    response: reqwest::Response,
+    limit: usize,
+    is_error: bool,
+    cancel: CancellationToken,
+) -> Result<Vec<u8>, CompactError> {
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+
+    loop {
+        let chunk = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(CompactError::Cancelled),
+            chunk = stream.next() => chunk,
+            _ = tokio::time::sleep(crate::provider::RESPONSE_BODY_IDLE_TIMEOUT) => {
+                return Err(CompactError::BodyIdleTimeout(
+                    crate::provider::RESPONSE_BODY_IDLE_TIMEOUT.as_secs(),
+                ));
+            }
+        };
+
+        let Some(chunk) = chunk else {
+            break;
+        };
+        let chunk = chunk.map_err(|error| CompactError::Transport(error.to_string()))?;
+
+        if body.len() + chunk.len() > limit {
+            if is_error {
+                let take = limit.saturating_sub(body.len()).min(chunk.len());
+                body.extend_from_slice(&chunk[..take]);
+                break;
+            }
+            return Err(CompactError::ResponseLimitExceeded { limit });
+        }
+
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(body)
+}
+
+/// Run a full compact round-trip against the configured compact model.
+pub async fn compact(
+    spec: &CompactModelSpec,
+    input: &CompactionInput,
+    cancel: CancellationToken,
+) -> Result<CompactResult, CompactError> {
+    let text = HttpCompactProvider.summarize(spec, input, cancel).await?;
+    build_compact_result(text, input)
+}
+
+#[derive(Serialize, Deserialize)]
+struct MemorySummaryPayload {
+    summary: String,
+    est_tokens: u64,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MemorySummaryProjection {
+    pub key_ref: String,
+    pub ciphertext: Vec<u8>,
+    pub job_ciphertext: Vec<u8>,
+    pub projection: String,
+    pub redaction_version: u32,
+}
+
+/// Builds an encrypted unredacted memory summary source plus its redacted
+/// projection in a single atomic step, then zeroizes the plaintext JSON.
+pub(crate) struct MemoryProjectionBuilder<'a> {
+    redactor: &'a Redactor,
+    data_key: &'a DataKeyMaterial,
+}
+
+impl<'a> MemoryProjectionBuilder<'a> {
+    pub(crate) fn new(redactor: &'a Redactor, data_key: &'a DataKeyMaterial) -> Self {
+        Self { redactor, data_key }
+    }
+
+    pub(crate) fn build(
+        &self,
+        result: &CompactResult,
+        batch_aad: &RowAad,
+        job_aad: &RowAad,
+    ) -> Result<MemorySummaryProjection> {
+        let mut payload = MemorySummaryPayload {
+            summary: result.summary.expose().to_owned(),
+            est_tokens: result.est_tokens,
+            from: result.time_range.0,
+            to: result.time_range.1,
+        };
+        let mut raw = match serde_json::to_vec(&payload) {
+            Ok(raw) => raw,
+            Err(error) => {
+                payload.summary.zeroize();
+                return Err(error).context("serialize memory summary payload");
+            }
+        };
+        let protected = PublicProjectionBuilder::new(self.redactor, self.data_key)
+            .build_serialized(&raw, batch_aad)
+            .context("build memory summary projection");
+        let job_ciphertext =
+            encrypt_content(self.data_key, &raw, job_aad).context("encrypt memory job result");
+        raw.zeroize();
+        payload.summary.zeroize();
+        let protected = protected?;
+        let job_ciphertext = job_ciphertext?;
+
+        Ok(MemorySummaryProjection {
+            key_ref: self.data_key.key_ref.clone(),
+            ciphertext: protected.ciphertext,
+            job_ciphertext,
+            projection: protected.projection,
+            redaction_version: protected.redaction_version,
+        })
+    }
+}
+
+pub(crate) fn build_compact_result(
+    text: String,
+    input: &CompactionInput,
+) -> Result<CompactResult, CompactError> {
+    let summary = DecryptedMemorySummary::new(text);
+    let est_tokens = crate::memory::estimate::estimate_text_tokens(summary.expose())
+        .map_err(|error| CompactError::Estimate(error.to_string()))?;
+    let time_range = compaction_time_range(input);
+    Ok(CompactResult {
+        summary,
+        est_tokens,
+        time_range,
+    })
+}
+
+fn compaction_time_range(input: &CompactionInput) -> (DateTime<Utc>, DateTime<Utc>) {
+    let mut min: Option<DateTime<Utc>> = None;
+    let mut max: Option<DateTime<Utc>> = None;
+
+    let mut consider = |timestamp: DateTime<Utc>| {
+        min = Some(min.map_or(timestamp, |current| current.min(timestamp)));
+        max = Some(max.map_or(timestamp, |current| current.max(timestamp)));
+    };
+
+    for message in &input.conversation {
+        let timestamp = match message {
+            PublicMessage::User(message) => message.timestamp,
+            PublicMessage::Assistant(message) => message.timestamp,
+            PublicMessage::ToolResult(message) => message.timestamp,
+        };
+        consider(timestamp);
+    }
+
+    for summary in &input.summaries {
+        consider(summary.from);
+        consider(summary.to);
+    }
+
+    min.zip(max).unwrap_or_else(|| {
+        let now = Utc::now();
+        (now, now)
+    })
 }
 
 fn build_user_content(input: &CompactionInput) -> String {
@@ -445,8 +859,987 @@ fn escape_framing_text(text: &str) -> String {
         .replace(']', "&#93;")
 }
 
+#[derive(Debug, thiserror::Error)]
+enum WorkerError {
+    #[error("store operation failed: {0}")]
+    Store(#[from] anyhow::Error),
+    #[error("stale source version for batch {id}: expected {expected}, found {found}")]
+    StaleSource {
+        id: String,
+        expected: i64,
+        found: i64,
+    },
+}
+
+impl From<CompactError> for WorkerError {
+    fn from(error: CompactError) -> Self {
+        // Provider error bodies may echo request fragments. They are useful
+        // to a direct caller but must not be copied into worker logs or other
+        // durable error projections.
+        match error {
+            CompactError::Http { status, .. } => {
+                Self::Store(anyhow!("compact HTTP status {status}"))
+            }
+            error => Self::Store(error.into()),
+        }
+    }
+}
+
+impl From<sqlx::Error> for WorkerError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Store(error.into())
+    }
+}
+
+struct Job {
+    id: String,
+    kind: MemoryJobKind,
+    batch_seq: i64,
+    source_ids: Vec<String>,
+    source_versions: HashMap<String, i64>,
+    status: MemoryJobStatus,
+    attempts: i64,
+    lease_until: Option<String>,
+}
+
+struct BatchRow {
+    id: String,
+    layer: MemoryLayer,
+    batch_seq: i64,
+    version: i64,
+    state: MemoryBatchState,
+}
+
+fn parse_job_kind(value: &str) -> Result<MemoryJobKind> {
+    match value {
+        "compact_l0" => Ok(MemoryJobKind::CompactL0),
+        "compact_l1" => Ok(MemoryJobKind::CompactL1),
+        "consolidate_l2" => Ok(MemoryJobKind::ConsolidateL2),
+        _ => bail!("unknown memory job kind: {value}"),
+    }
+}
+
+fn parse_job_status(value: &str) -> Result<MemoryJobStatus> {
+    match value {
+        "pending" => Ok(MemoryJobStatus::Pending),
+        "running" => Ok(MemoryJobStatus::Running),
+        "completed" => Ok(MemoryJobStatus::Completed),
+        "applied" => Ok(MemoryJobStatus::Applied),
+        "failed" => Ok(MemoryJobStatus::Failed),
+        _ => bail!("unknown memory job status: {value}"),
+    }
+}
+
+fn parse_memory_layer(value: i64) -> Result<MemoryLayer> {
+    match value {
+        0 => Ok(MemoryLayer::L0),
+        1 => Ok(MemoryLayer::L1),
+        2 => Ok(MemoryLayer::L2),
+        _ => bail!("unknown memory layer: {value}"),
+    }
+}
+
+fn parse_batch_state(value: &str) -> Result<MemoryBatchState> {
+    match value {
+        "open" => Ok(MemoryBatchState::Open),
+        "sealed" => Ok(MemoryBatchState::Sealed),
+        "compacting" => Ok(MemoryBatchState::Compacting),
+        "compact_failed" => Ok(MemoryBatchState::CompactFailed),
+        "compacted" => Ok(MemoryBatchState::Compacted),
+        "promoted" => Ok(MemoryBatchState::Promoted),
+        "dropped" => Ok(MemoryBatchState::Dropped),
+        _ => bail!("unknown memory batch state: {value}"),
+    }
+}
+
+fn parse_job(row: &SqliteRow) -> Result<Job> {
+    let source_ids: Vec<String> =
+        serde_json::from_str(row.try_get::<String, _>("source_ids")?.as_str())
+            .context("deserialize source_ids")?;
+    let source_versions: HashMap<String, i64> =
+        serde_json::from_str(row.try_get::<String, _>("source_versions")?.as_str())
+            .context("deserialize source_versions")?;
+
+    Ok(Job {
+        id: row.try_get("id")?,
+        kind: parse_job_kind(row.try_get::<String, _>("kind")?.as_str())?,
+        batch_seq: row.try_get("batch_seq")?,
+        source_ids,
+        source_versions,
+        status: parse_job_status(row.try_get::<String, _>("status")?.as_str())?,
+        attempts: row.try_get("attempts")?,
+        lease_until: row.try_get::<Option<String>, _>("lease_until")?,
+    })
+}
+
+fn parse_batch_row(row: &SqliteRow) -> Result<BatchRow> {
+    Ok(BatchRow {
+        id: row.try_get("id")?,
+        layer: parse_memory_layer(row.try_get::<i64, _>("layer")?)?,
+        batch_seq: row.try_get("batch_seq")?,
+        version: row.try_get("version")?,
+        state: parse_batch_state(row.try_get::<String, _>("state")?.as_str())?,
+    })
+}
+
+fn target_layer_for_kind(kind: MemoryJobKind) -> MemoryLayer {
+    match kind {
+        MemoryJobKind::CompactL0 => MemoryLayer::L0,
+        MemoryJobKind::CompactL1 | MemoryJobKind::ConsolidateL2 => MemoryLayer::L2,
+    }
+}
+
+async fn load_target_batch(
+    store: &Store,
+    kind: MemoryJobKind,
+    batch_seq: i64,
+) -> Result<Option<BatchRow>> {
+    let layer = target_layer_for_kind(kind).as_i64();
+    let row = sqlx::query(
+        "SELECT id, layer, batch_seq, version, state
+         FROM memory_batches
+         WHERE layer = ? AND batch_seq = ?",
+    )
+    .bind(layer)
+    .bind(batch_seq)
+    .fetch_optional(store.pool())
+    .await?;
+    row.map(|r| parse_batch_row(&r)).transpose()
+}
+
+async fn load_batch_messages(store: &Store, batch_id: &str) -> Result<Vec<PublicMessage>> {
+    let rows = sqlx::query(
+        "SELECT m.id, m.raw_key_ref, m.raw_ciphertext
+         FROM messages m
+         JOIN memory_batch_messages mbm ON m.id = mbm.message_id
+         WHERE mbm.batch_id = ?
+         ORDER BY mbm.ord ASC",
+    )
+    .bind(batch_id)
+    .fetch_all(store.pool())
+    .await?;
+
+    let mut messages = Vec::with_capacity(rows.len());
+    let mut key_cache: HashMap<String, Arc<DataKeyMaterial>> = HashMap::new();
+
+    for row in rows {
+        let message_id: String = row.try_get("id")?;
+        let key_ref: String = row.try_get("raw_key_ref")?;
+        let ciphertext: Vec<u8> = row.try_get("raw_ciphertext")?;
+
+        let key = match key_cache.get(&key_ref) {
+            Some(key) => Arc::clone(key),
+            None => {
+                let key = store.data_key_by_ref(&key_ref).await?;
+                let key = Arc::new(key);
+                key_cache.insert(key_ref, Arc::clone(&key));
+                key
+            }
+        };
+
+        let aad = store
+            .scope()
+            .row_aad("messages", &message_id, DataKeyPurpose::Transcript);
+        let mut plaintext =
+            decrypt_content(&key, &ciphertext, &aad).context("decrypt transcript message")?;
+        let message: Result<PublicMessage> =
+            serde_json::from_slice(&plaintext).context("parse public message");
+        plaintext.zeroize();
+        let message = message?;
+        messages.push(message);
+    }
+
+    Ok(messages)
+}
+
+async fn load_batch_summaries(store: &Store, batch_ids: &[String]) -> Result<Vec<L1Entry>> {
+    let mut entries = Vec::with_capacity(batch_ids.len());
+    let mut key_cache: HashMap<String, Arc<DataKeyMaterial>> = HashMap::new();
+
+    for batch_id in batch_ids {
+        let row = sqlx::query(
+            "SELECT id, summary_key_ref, summary_ciphertext
+             FROM memory_batches
+             WHERE id = ?",
+        )
+        .bind(batch_id)
+        .fetch_one(store.pool())
+        .await?;
+
+        let id: String = row.try_get("id")?;
+        let key_ref: Option<String> = row.try_get("summary_key_ref")?;
+        let ciphertext: Option<Vec<u8>> = row.try_get("summary_ciphertext")?;
+        let key_ref = key_ref.ok_or_else(|| anyhow!("missing summary key for batch {id}"))?;
+        let ciphertext =
+            ciphertext.ok_or_else(|| anyhow!("missing summary ciphertext for batch {id}"))?;
+
+        let key = match key_cache.get(&key_ref) {
+            Some(key) => Arc::clone(key),
+            None => {
+                let key = store.data_key_by_ref(&key_ref).await?;
+                let key = Arc::new(key);
+                key_cache.insert(key_ref, Arc::clone(&key));
+                key
+            }
+        };
+
+        let aad = store
+            .scope()
+            .row_aad("memory_batches", &id, DataKeyPurpose::MemorySummary);
+        let mut plaintext =
+            decrypt_content(&key, &ciphertext, &aad).context("decrypt memory summary")?;
+        let payload: Result<MemorySummaryPayload> =
+            serde_json::from_slice(&plaintext).context("parse memory summary payload");
+        plaintext.zeroize();
+        let payload = payload?;
+
+        entries.push(L1Entry {
+            source_batch: Uuid::parse_str(&id).context("parse batch id as UUID")?,
+            summary: DecryptedMemorySummary::new(payload.summary),
+            est_tokens: payload.est_tokens,
+            time_range: (payload.from, payload.to),
+        });
+    }
+
+    Ok(entries)
+}
+
+async fn build_compaction_input(store: &Store, job: &Job) -> Result<CompactionInput> {
+    match job.kind {
+        MemoryJobKind::CompactL0 => {
+            let batch_id = job
+                .source_ids
+                .first()
+                .ok_or_else(|| anyhow!("CompactL0 job has no source batch"))?;
+            let messages = load_batch_messages(store, batch_id).await?;
+            Ok(CompactionInput::from_public_batch(&messages, None))
+        }
+        MemoryJobKind::CompactL1 | MemoryJobKind::ConsolidateL2 => {
+            let entries = load_batch_summaries(store, &job.source_ids).await?;
+            Ok(CompactionInput::from_decrypted_summaries(&entries))
+        }
+    }
+}
+
+async fn build_summary_projection(
+    store: &Store,
+    result: &CompactResult,
+    target_id: &str,
+    job_id: &str,
+) -> Result<MemorySummaryProjection> {
+    let key = store
+        .conversation_key(DataKeyPurpose::MemorySummary)
+        .await
+        .context("load memory summary key")?;
+    let batch_aad =
+        store
+            .scope()
+            .row_aad("memory_batches", target_id, DataKeyPurpose::MemorySummary);
+    let job_aad = store
+        .scope()
+        .row_aad("memory_jobs", job_id, DataKeyPurpose::MemorySummary);
+    MemoryProjectionBuilder::new(store.redactor(), &key).build(result, &batch_aad, &job_aad)
+}
+
+async fn claim_next_pending_job(store: &Store) -> Result<Option<Job>> {
+    let row = sqlx::query(
+        "SELECT id, kind, batch_seq, source_ids, source_versions, status, attempts,
+                lease_until, created_at, updated_at
+         FROM memory_jobs
+         WHERE status = 'pending'
+         ORDER BY batch_seq ASC, created_at ASC
+         LIMIT 1",
+    )
+    .fetch_optional(store.pool())
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let id: String = row.try_get("id")?;
+    let lease_until = (Utc::now() + LEASE_DURATION).to_rfc3339();
+
+    let updated = sqlx::query(
+        "UPDATE memory_jobs
+         SET status = 'running', attempts = attempts + 1, lease_until = ?, updated_at = ?
+         WHERE id = ? AND status = 'pending'",
+    )
+    .bind(&lease_until)
+    .bind(Utc::now().to_rfc3339())
+    .bind(&id)
+    .execute(store.pool())
+    .await?;
+
+    if updated.rows_affected() == 0 {
+        return Ok(None);
+    }
+
+    let row = sqlx::query(
+        "SELECT id, kind, batch_seq, source_ids, source_versions, status, attempts,
+                lease_until, created_at, updated_at
+         FROM memory_jobs
+         WHERE id = ?",
+    )
+    .bind(&id)
+    .fetch_one(store.pool())
+    .await?;
+
+    parse_job(&row).map(Some)
+}
+
+async fn reset_job_to_pending(store: &Store, job: &Job) -> Result<()> {
+    sqlx::query(
+        "UPDATE memory_jobs
+         SET status = 'pending', lease_until = NULL, updated_at = ?
+         WHERE id = ? AND status = 'running' AND attempts = ? AND lease_until = ?",
+    )
+    .bind(Utc::now().to_rfc3339())
+    .bind(&job.id)
+    .bind(job.attempts)
+    .bind(job.lease_until.as_ref())
+    .execute(store.pool())
+    .await
+    .context("reset job to pending")?;
+    Ok(())
+}
+
+async fn complete_job(
+    store: &Store,
+    job: &Job,
+    result: &CompactResult,
+    projection: &MemorySummaryProjection,
+) -> Result<(), WorkerError> {
+    let target = load_target_batch(store, job.kind, job.batch_seq)
+        .await?
+        .ok_or_else(|| anyhow!("target batch missing for job {}", job.id))?;
+
+    if target.state != MemoryBatchState::Compacting {
+        return Err(WorkerError::Store(anyhow!(
+            "target batch {} is not compacting",
+            target.id
+        )));
+    }
+
+    let mut tx = store.pool().begin().await?;
+
+    for id in &job.source_ids {
+        let expected = job
+            .source_versions
+            .get(id)
+            .copied()
+            .ok_or_else(|| anyhow!("source version missing for {id}"))?;
+        let row = sqlx::query("SELECT version FROM memory_batches WHERE id = ?")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let current: i64 = row.try_get("version")?;
+        if current != expected {
+            return Err(WorkerError::StaleSource {
+                id: id.clone(),
+                expected,
+                found: current,
+            });
+        }
+    }
+
+    let target_row = sqlx::query("SELECT version, state FROM memory_batches WHERE id = ?")
+        .bind(&target.id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let target_version: i64 = target_row.try_get("version")?;
+    let target_state: String = target_row.try_get("state")?;
+    if target_state != "compacting" || target_version != target.version {
+        return Err(WorkerError::StaleSource {
+            id: target.id.clone(),
+            expected: target.version,
+            found: target_version,
+        });
+    }
+
+    let est_tokens = i64::try_from(result.est_tokens).context("est_tokens overflow")?;
+    let updated_batch = sqlx::query(
+        "UPDATE memory_batches
+         SET state = 'compacted', version = version + 1, summary_key_ref = ?,
+             summary_ciphertext = ?, summary_projection = ?, summary_redaction_version = ?,
+             est_tokens = ?, updated_at = ?
+         WHERE id = ? AND version = ? AND state = 'compacting'",
+    )
+    .bind(&projection.key_ref)
+    .bind(&projection.ciphertext)
+    .bind(&projection.projection)
+    .bind(i64::from(projection.redaction_version))
+    .bind(est_tokens)
+    .bind(Utc::now().to_rfc3339())
+    .bind(&target.id)
+    .bind(target_version)
+    .execute(&mut *tx)
+    .await?;
+
+    if updated_batch.rows_affected() != 1 {
+        let current: Option<i64> = sqlx::query("SELECT version FROM memory_batches WHERE id = ?")
+            .bind(&target.id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(|row| row.try_get("version"))
+            .transpose()?;
+        return Err(WorkerError::StaleSource {
+            id: target.id.clone(),
+            expected: target_version,
+            found: current.unwrap_or(-1),
+        });
+    }
+
+    let mut new_source_versions = job.source_versions.clone();
+    new_source_versions.insert(target.id.clone(), target_version + 1);
+    let source_versions_json =
+        serde_json::to_string(&new_source_versions).context("serialize source_versions")?;
+
+    let updated_job = sqlx::query(
+        "UPDATE memory_jobs
+         SET status = 'completed', result_key_ref = ?, result_ciphertext = ?,
+             result_projection = ?, result_redaction_version = ?, source_versions = ?,
+             attempts = ?, lease_until = ?, updated_at = ?
+         WHERE id = ? AND status = 'running' AND attempts = ? AND lease_until = ?",
+    )
+    .bind(&projection.key_ref)
+    .bind(&projection.job_ciphertext)
+    .bind(&projection.projection)
+    .bind(i64::from(projection.redaction_version))
+    .bind(&source_versions_json)
+    .bind(job.attempts)
+    .bind(job.lease_until.as_ref())
+    .bind(Utc::now().to_rfc3339())
+    .bind(&job.id)
+    .bind(job.attempts)
+    .bind(job.lease_until.as_ref())
+    .execute(&mut *tx)
+    .await?;
+
+    if updated_job.rows_affected() != 1 {
+        return Err(WorkerError::Store(anyhow!("job CAS failed for {}", job.id)));
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn fail_job(store: &Store, job: &Job) -> Result<(), WorkerError> {
+    let target = load_target_batch(store, job.kind, job.batch_seq)
+        .await?
+        .ok_or_else(|| anyhow!("target batch missing for job {}", job.id))?;
+
+    if target.state != MemoryBatchState::Compacting {
+        return Err(WorkerError::Store(anyhow!(
+            "target batch {} is not compacting",
+            target.id
+        )));
+    }
+
+    let mut tx = store.pool().begin().await?;
+
+    for id in &job.source_ids {
+        let expected = job
+            .source_versions
+            .get(id)
+            .copied()
+            .ok_or_else(|| anyhow!("source version missing for {id}"))?;
+        let row = sqlx::query("SELECT version FROM memory_batches WHERE id = ?")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let current: i64 = row.try_get("version")?;
+        if current != expected {
+            return Err(WorkerError::StaleSource {
+                id: id.clone(),
+                expected,
+                found: current,
+            });
+        }
+    }
+
+    let target_row = sqlx::query("SELECT version, state FROM memory_batches WHERE id = ?")
+        .bind(&target.id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let target_version: i64 = target_row.try_get("version")?;
+    let target_state: String = target_row.try_get("state")?;
+    if target_state != "compacting" || target_version != target.version {
+        return Err(WorkerError::StaleSource {
+            id: target.id.clone(),
+            expected: target.version,
+            found: target_version,
+        });
+    }
+
+    let updated_batch = sqlx::query(
+        "UPDATE memory_batches
+         SET state = 'compact_failed', version = version + 1, updated_at = ?
+         WHERE id = ? AND version = ? AND state = 'compacting'",
+    )
+    .bind(Utc::now().to_rfc3339())
+    .bind(&target.id)
+    .bind(target_version)
+    .execute(&mut *tx)
+    .await?;
+
+    if updated_batch.rows_affected() != 1 {
+        let current: Option<i64> = sqlx::query("SELECT version FROM memory_batches WHERE id = ?")
+            .bind(&target.id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(|row| row.try_get("version"))
+            .transpose()?;
+        return Err(WorkerError::StaleSource {
+            id: target.id.clone(),
+            expected: target_version,
+            found: current.unwrap_or(-1),
+        });
+    }
+
+    let mut new_source_versions = job.source_versions.clone();
+    new_source_versions.insert(target.id.clone(), target_version + 1);
+    let source_versions_json =
+        serde_json::to_string(&new_source_versions).context("serialize source_versions")?;
+
+    let updated_job = sqlx::query(
+        "UPDATE memory_jobs
+         SET status = 'failed', source_versions = ?, attempts = ?, lease_until = ?,
+             updated_at = ?
+         WHERE id = ? AND status = 'running' AND attempts = ? AND lease_until = ?",
+    )
+    .bind(&source_versions_json)
+    .bind(job.attempts)
+    .bind(job.lease_until.as_ref())
+    .bind(Utc::now().to_rfc3339())
+    .bind(&job.id)
+    .bind(job.attempts)
+    .bind(job.lease_until.as_ref())
+    .execute(&mut *tx)
+    .await?;
+
+    if updated_job.rows_affected() != 1 {
+        return Err(WorkerError::Store(anyhow!("job CAS failed for {}", job.id)));
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn recover_expired_running_jobs(store: &Store) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "UPDATE memory_jobs
+         SET status = 'pending', lease_until = NULL, updated_at = ?
+         WHERE status = 'running' AND (lease_until IS NULL OR lease_until < ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(store.pool())
+    .await
+    .context("recover expired running jobs")?;
+    Ok(())
+}
+
+async fn recover_compacting_batches(store: &Store) -> Result<()> {
+    let rows = sqlx::query(
+        "SELECT id, batch_seq, version
+         FROM memory_batches
+         WHERE layer = 0 AND state = 'compacting'",
+    )
+    .fetch_all(store.pool())
+    .await?;
+
+    for row in rows {
+        let batch_id: String = row.try_get("id")?;
+        let batch_seq: i64 = row.try_get("batch_seq")?;
+        let version: i64 = row.try_get("version")?;
+
+        let kind = MemoryJobKind::CompactL0.as_str();
+        let source_ids = serde_json::to_string(std::slice::from_ref(&batch_id))
+            .context("serialize source_ids")?;
+        let source_versions =
+            serde_json::to_string(&HashMap::<String, i64>::from([(batch_id.clone(), version)]))
+                .context("serialize source_versions")?;
+        let now = Utc::now().to_rfc3339();
+
+        let inserted = sqlx::query(
+            "INSERT OR IGNORE INTO memory_jobs(
+                id, kind, batch_seq, source_ids, source_versions, status, lease_until, attempts,
+                result_key_ref, result_ciphertext, result_projection, result_redaction_version,
+                created_at, updated_at
+             ) VALUES(?, ?, ?, ?, ?, 'pending', NULL, 0, NULL, NULL, NULL, NULL, ?, ?)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(kind)
+        .bind(batch_seq)
+        .bind(&source_ids)
+        .bind(&source_versions)
+        .bind(&now)
+        .bind(&now)
+        .execute(store.pool())
+        .await
+        .context("recover compacting batch")?;
+
+        if inserted.rows_affected() > 0 {
+            tracing::debug!("reinserted compacting L0 batch {batch_id} as pending job");
+        }
+    }
+
+    Ok(())
+}
+
+async fn recover_jobs(store: &Store) -> Result<()> {
+    recover_expired_running_jobs(store).await?;
+    recover_compacting_batches(store).await?;
+    Ok(())
+}
+
+/// Apply completed shelves in durable sequence order. Completion is kept
+/// separate from this short transaction so provider latency never holds the
+/// memory tables. A later batch can finish first, but its `completed` row stays
+/// on the shelf until this cursor reaches it.
+async fn apply_next_completed_job(store: &Store, kind: MemoryJobKind) -> Result<bool> {
+    let kind_name = kind.as_str();
+    let mut tx = store.pool().begin().await?;
+
+    let cursor: Option<i64> =
+        sqlx::query_scalar("SELECT next_batch_seq FROM memory_apply_cursors WHERE kind = ?")
+            .bind(kind_name)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let mut next = match cursor {
+        Some(next) => next,
+        None => {
+            let first: Option<i64> = sqlx::query_scalar(
+                "SELECT batch_seq FROM memory_jobs WHERE kind = ? ORDER BY batch_seq ASC LIMIT 1",
+            )
+            .bind(kind_name)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(first) = first else {
+                tx.rollback().await?;
+                return Ok(false);
+            };
+            sqlx::query("INSERT INTO memory_apply_cursors(kind, next_batch_seq) VALUES(?, ?)")
+                .bind(kind_name)
+                .bind(first)
+                .execute(&mut *tx)
+                .await?;
+            first
+        }
+    };
+    let initial_cursor = next;
+
+    // Applied rows are idempotent evidence from an earlier crash. Advance
+    // over them before looking for the next completed shelf.
+    loop {
+        let row = sqlx::query(
+            "SELECT id, source_ids, status FROM memory_jobs
+             WHERE kind = ? AND batch_seq = ?",
+        )
+        .bind(kind_name)
+        .bind(next)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            if next != initial_cursor {
+                tx.commit().await?;
+                return Ok(false);
+            }
+            // A cursor may have been initialized before the first reservation;
+            // bind it to the earliest durable job without skipping a job row.
+            let Some(first) = sqlx::query_scalar::<_, i64>(
+                "SELECT batch_seq FROM memory_jobs
+                 WHERE kind = ? AND batch_seq >= ? ORDER BY batch_seq ASC LIMIT 1",
+            )
+            .bind(kind_name)
+            .bind(next)
+            .fetch_optional(&mut *tx)
+            .await?
+            else {
+                tx.rollback().await?;
+                return Ok(false);
+            };
+            if first != next {
+                sqlx::query(
+                    "UPDATE memory_apply_cursors SET next_batch_seq = ? WHERE kind = ? AND next_batch_seq = ?",
+                )
+                .bind(first)
+                .bind(kind_name)
+                .bind(next)
+                .execute(&mut *tx)
+                .await?;
+                next = first;
+                continue;
+            }
+            tx.rollback().await?;
+            return Ok(false);
+        };
+
+        let status: String = row.try_get("status")?;
+        if status == MemoryJobStatus::Applied.as_str() {
+            let expected = next;
+            next = next
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("memory apply cursor overflow"))?;
+            sqlx::query(
+                "UPDATE memory_apply_cursors SET next_batch_seq = ?
+                 WHERE kind = ? AND next_batch_seq = ?",
+            )
+            .bind(next)
+            .bind(kind_name)
+            .bind(expected)
+            .execute(&mut *tx)
+            .await?;
+            continue;
+        }
+        if status != MemoryJobStatus::Completed.as_str() {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+
+        let job_id: String = row.try_get("id")?;
+        let source_ids: Vec<String> =
+            serde_json::from_str(row.try_get::<String, _>("source_ids")?.as_str())
+                .context("deserialize apply source_ids")?;
+        let mut ids = source_ids;
+        let target_layer = target_layer_for_kind(kind).as_i64();
+        if let Some(target_id) = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM memory_batches WHERE layer = ? AND batch_seq = ?",
+        )
+        .bind(target_layer)
+        .bind(next)
+        .fetch_optional(&mut *tx)
+        .await?
+            && !ids.iter().any(|id| id == &target_id)
+        {
+            ids.push(target_id);
+        }
+
+        // Membership is the L0 public-message index. The transcript itself is
+        // retained as the encrypted source of truth; only its layer membership
+        // is removed once the summary has been promoted.
+        for id in &ids {
+            sqlx::query("DELETE FROM memory_batch_messages WHERE batch_id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "UPDATE memory_batches
+                 SET state = 'promoted', version = version + 1,
+                     eviction_footprint_tokens = 0, updated_at = ?
+                 WHERE id = ? AND state = 'compacted'",
+            )
+            .bind(Utc::now().to_rfc3339())
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let advanced = next
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("memory apply cursor overflow"))?;
+        let updated_job = sqlx::query(
+            "UPDATE memory_jobs SET status = 'applied', lease_until = NULL, updated_at = ?
+             WHERE id = ? AND status = 'completed'",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(&job_id)
+        .execute(&mut *tx)
+        .await?;
+        if updated_job.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let cursor_update = sqlx::query(
+            "UPDATE memory_apply_cursors SET next_batch_seq = ?
+             WHERE kind = ? AND next_batch_seq = ?",
+        )
+        .bind(advanced)
+        .bind(kind_name)
+        .bind(next)
+        .execute(&mut *tx)
+        .await?;
+        if cursor_update.rows_affected() != 1 {
+            bail!("memory apply cursor CAS failed for {kind_name}:{next}");
+        }
+        tx.commit().await?;
+        return Ok(true);
+    }
+}
+
+/// Single durable compaction worker. `mpsc` is wake-up only; the durable job
+/// queue in `memory_jobs` is the canonical source of work.
+pub(crate) struct CompactWorker {
+    store: Arc<Store>,
+    spec: CompactModelSpec,
+    provider: Arc<dyn CompactProvider>,
+    cancel: CancellationToken,
+}
+
+pub(crate) struct CompactWorkerHandle {
+    pub wake: mpsc::Sender<()>,
+    task: tokio::task::JoinHandle<Result<(), WorkerError>>,
+    cancel: CancellationToken,
+}
+
+impl CompactWorkerHandle {
+    pub async fn shutdown(self) {
+        self.cancel.cancel();
+        let _ = self.wake.try_send(());
+        let _ = self.task.await;
+    }
+}
+
+impl CompactWorker {
+    pub(crate) fn spawn(
+        store: Arc<Store>,
+        spec: CompactModelSpec,
+        provider: Arc<dyn CompactProvider>,
+        cancel: CancellationToken,
+    ) -> CompactWorkerHandle {
+        let (wake_tx, wake_rx) = mpsc::channel(1);
+        let worker = Self {
+            store,
+            spec,
+            provider,
+            cancel: cancel.clone(),
+        };
+        let task = tokio::spawn(async move { worker.run(wake_rx).await });
+        CompactWorkerHandle {
+            wake: wake_tx,
+            task,
+            cancel,
+        }
+    }
+
+    pub(crate) async fn recover(&self) -> Result<()> {
+        recover_jobs(&self.store).await
+    }
+
+    pub(crate) async fn process_all_pending(&self) -> Result<()> {
+        while !self.cancel.is_cancelled() {
+            if !self.process_next_job().await? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply all contiguous completed shelves for each job kind. This is
+    /// intentionally an explicit maintenance operation; compaction workers
+    /// only produce encrypted shelves and never block the conversation path.
+    pub(crate) async fn apply_ready(&self) -> Result<usize> {
+        let mut applied = 0;
+        loop {
+            let mut progress = false;
+            for kind in [
+                MemoryJobKind::CompactL0,
+                MemoryJobKind::CompactL1,
+                MemoryJobKind::ConsolidateL2,
+            ] {
+                if apply_next_completed_job(&self.store, kind).await? {
+                    applied += 1;
+                    progress = true;
+                }
+            }
+            if !progress {
+                return Ok(applied);
+            }
+        }
+    }
+
+    async fn run(self, mut wake_rx: mpsc::Receiver<()>) -> Result<(), WorkerError> {
+        self.recover().await?;
+
+        let mut interval = tokio::time::interval(LEASE_CHECK_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => break,
+                wake = wake_rx.recv() => {
+                    if wake.is_none() {
+                        break;
+                    }
+                },
+                _ = interval.tick() => {},
+            }
+
+            if let Err(error) = self.process_all_pending().await {
+                tracing::error!("compactor worker error: {error}");
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn process_next_job(&self) -> Result<bool, WorkerError> {
+        let Some(job) = claim_next_pending_job(&self.store).await? else {
+            return Ok(false);
+        };
+
+        if self.cancel.is_cancelled() {
+            return Ok(false);
+        }
+
+        let input = build_compaction_input(&self.store, &job).await?;
+
+        match self
+            .provider
+            .summarize(&self.spec, &input, self.cancel.clone())
+            .await
+        {
+            Ok(text) => {
+                let result = build_compact_result(text, &input)?;
+                let target = load_target_batch(&self.store, job.kind, job.batch_seq)
+                    .await?
+                    .ok_or_else(|| WorkerError::Store(anyhow!("target batch missing")))?;
+                let projection =
+                    build_summary_projection(&self.store, &result, &target.id, &job.id).await?;
+
+                match complete_job(&self.store, &job, &result, &projection).await {
+                    Ok(()) => {}
+                    Err(WorkerError::StaleSource { .. }) => {
+                        reset_job_to_pending(&self.store, &job).await?;
+                        return Ok(false);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(CompactError::Cancelled) => {
+                // A worker shutdown is not a compaction failure. Return the
+                // leased row to the durable queue so the next process can
+                // recover it without consuming the retry budget.
+                reset_job_to_pending(&self.store, &job).await?;
+            }
+            Err(error) if error.is_retryable() && job.attempts < MAX_ATTEMPTS => {
+                reset_job_to_pending(&self.store, &job).await?;
+            }
+            Err(_) => match fail_job(&self.store, &job).await {
+                Ok(()) => {}
+                Err(WorkerError::StaleSource { .. }) => {
+                    reset_job_to_pending(&self.store, &job).await?;
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            },
+        }
+
+        Ok(true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use async_trait::async_trait;
     use chrono::{DateTime, TimeZone, Utc};
     use serde_json::Value;
 
@@ -456,6 +1849,11 @@ mod tests {
         ProviderContextPayload, ProviderOrigin, PublicAssistantMessage, StopReason, ToolCall,
         ToolResultMessage, Usage, UserMessage, ValidatedToolArguments,
     };
+    use crate::store::{
+        DataKeyPurpose, MemoryBatchMessageRecord, MemoryBatchRecord, MemoryBatchState,
+        MemoryJobKind, MemoryJobRecord, MemoryLayer, Store, TranscriptRecord,
+    };
+    use tokio_util::sync::CancellationToken;
 
     fn timestamp() -> DateTime<Utc> {
         Utc.timestamp_millis_opt(1_700_000_000_000)
@@ -851,10 +2249,38 @@ mod tests {
     }
 
     #[test]
-    fn select_compact_model_rejects_non_chat_compact_model() {
-        let conversation = ModelSpec::preset("anthropic").expect("anthropic preset");
-        let error = select_compact_model(&conversation, None, &[]).expect_err("non-chat");
-        assert_eq!(error, CompactError::UnsupportedProtocol);
+    fn select_compact_model_supports_all_conversation_protocols() {
+        for preset in ["anthropic", "openai-responses"] {
+            let conversation = ModelSpec::preset(preset).expect("protocol preset");
+            let compact = select_compact_model(&conversation, None, &[]).expect("supported");
+            let body = build_compact_request(
+                &compact,
+                &CompactionInput::from_public_batch(&[user("hello")], None),
+            )
+            .expect("protocol request");
+            let request: Value = serde_json::from_str(&request_text(&body)).expect("json");
+            assert_eq!(request["model"], conversation.id);
+        }
+    }
+
+    #[test]
+    fn protocol_compact_responses_normalize_plain_text() {
+        assert_eq!(
+            parse_compact_summary(
+                ApiProtocol::OpenAiResponses,
+                &json!({"output_text":"response summary"}),
+            )
+            .expect("responses text"),
+            "response summary"
+        );
+        assert_eq!(
+            parse_compact_summary(
+                ApiProtocol::AnthropicMessages,
+                &json!({"content":[{"type":"text","text":"anthropic summary"}]}),
+            )
+            .expect("anthropic text"),
+            "anthropic summary"
+        );
     }
 
     fn assistant_text(text: &str) -> PublicMessage {
@@ -1103,5 +2529,431 @@ mod tests {
             3,
             "each public message must carry an RFC3339 timestamp"
         );
+    }
+
+    // --- T20 durable compactor worker tests ----------------------------------
+
+    #[derive(Default)]
+    struct FakeProvider {
+        text: Mutex<String>,
+        calls: AtomicUsize,
+        fail_next: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl CompactProvider for FakeProvider {
+        async fn summarize(
+            &self,
+            _spec: &CompactModelSpec,
+            _input: &CompactionInput,
+            _cancel: CancellationToken,
+        ) -> Result<String, CompactError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call < self.fail_next.load(Ordering::SeqCst) {
+                return Err(CompactError::Transport("injected failure".to_owned()));
+            }
+            Ok(self.text.lock().unwrap().clone())
+        }
+    }
+
+    async fn test_store() -> Arc<Store> {
+        Arc::new(
+            Store::session_test_store("compactor-test")
+                .await
+                .expect("open test store"),
+        )
+    }
+
+    async fn insert_l0_batch(store: &Store, batch_id: &str, messages: &[PublicMessage]) {
+        insert_l0_batch_with_seq(store, batch_id, 1, messages).await;
+    }
+
+    async fn insert_l0_batch_with_seq(
+        store: &Store,
+        batch_id: &str,
+        batch_seq: i64,
+        messages: &[PublicMessage],
+    ) {
+        let key = store
+            .conversation_key(DataKeyPurpose::Transcript)
+            .await
+            .expect("transcript key");
+        let redactor = store.redactor();
+        let scope = store.scope();
+
+        let batch = MemoryBatchRecord::new(
+            batch_id,
+            MemoryLayer::L0,
+            0,
+            batch_seq,
+            MemoryBatchState::Compacting,
+            100,
+            0,
+        );
+        batch.insert(store.pool()).await.expect("insert batch");
+
+        for (seq, message) in messages.iter().enumerate() {
+            let message_id = format!("{batch_id}-msg-{seq}");
+            let record = TranscriptRecord::encrypt(
+                message,
+                &message_id,
+                (batch_seq as u64)
+                    .saturating_mul(100)
+                    .saturating_add(seq as u64),
+                &key,
+                scope,
+                redactor,
+            )
+            .expect("encrypt message");
+            record.insert(store.pool()).await.expect("insert message");
+            MemoryBatchMessageRecord {
+                batch_id: batch_id.to_owned(),
+                message_id: record.id().to_owned(),
+                ord: seq as i64,
+            }
+            .insert(store.pool())
+            .await
+            .expect("insert batch message");
+        }
+    }
+
+    async fn insert_compact_l0_job(store: &Store, job_id: &str, batch_id: &str) {
+        let source_versions = BTreeMap::from([(batch_id.to_owned(), 0)]);
+        let job = MemoryJobRecord::new(
+            job_id,
+            MemoryJobKind::CompactL0,
+            1,
+            vec![batch_id.to_owned()],
+            source_versions,
+        );
+        job.insert(store.pool()).await.expect("insert job");
+    }
+
+    async fn run_worker(store: Arc<Store>, provider: Arc<dyn CompactProvider>) {
+        let cancel = CancellationToken::new();
+        let spec = select_compact_model(&chat_model(), None, &[]).expect("select compact model");
+        let worker = CompactWorker {
+            store,
+            spec,
+            provider,
+            cancel: cancel.clone(),
+        };
+        worker
+            .process_all_pending()
+            .await
+            .expect("process pending jobs");
+    }
+
+    #[tokio::test]
+    async fn worker_stores_encrypted_summary_and_redacted_projection() {
+        let store = test_store().await;
+        let batch_id = "l0-redaction";
+        let secret = "sk-123456789012";
+        insert_l0_batch(
+            &store,
+            batch_id,
+            &[
+                user(&format!("My api_key is {secret}")),
+                assistant_text("noted"),
+            ],
+        )
+        .await;
+        insert_compact_l0_job(&store, "job-redaction", batch_id).await;
+
+        let provider = Arc::new(FakeProvider {
+            text: Mutex::new(format!("User disclosed api_key {secret}")),
+            ..FakeProvider::default()
+        });
+        run_worker(store.clone(), provider).await;
+
+        let row = sqlx::query(
+            "SELECT state, summary_key_ref, summary_ciphertext, summary_projection
+             FROM memory_batches WHERE id = ?",
+        )
+        .bind(batch_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("fetch batch");
+
+        assert_eq!(row.get::<String, _>("state"), "compacted");
+        let projection: String = row.get("summary_projection");
+        assert!(
+            !projection.contains(secret),
+            "redacted projection must not contain the raw secret"
+        );
+        assert!(
+            projection.contains("[REDACTED:api_key]"),
+            "redacted projection must mark the API key"
+        );
+
+        let key_ref: String = row.get("summary_key_ref");
+        let ciphertext: Vec<u8> = row.get("summary_ciphertext");
+        let key = store
+            .data_key_by_ref(&key_ref)
+            .await
+            .expect("load summary key");
+        let aad = store
+            .scope()
+            .row_aad("memory_batches", batch_id, DataKeyPurpose::MemorySummary);
+        let plaintext =
+            crate::store::decrypt_content(&key, &ciphertext, &aad).expect("decrypt summary");
+        let payload: super::MemorySummaryPayload =
+            serde_json::from_slice(&plaintext).expect("parse summary payload");
+        assert!(
+            payload.summary.contains(secret),
+            "ciphertext must retain plaintext"
+        );
+
+        let job_row =
+            sqlx::query("SELECT result_key_ref, result_ciphertext FROM memory_jobs WHERE id = ?")
+                .bind("job-redaction")
+                .fetch_one(store.pool())
+                .await
+                .expect("fetch encrypted job result");
+        let result_key_ref: String = job_row.get("result_key_ref");
+        let result_ciphertext: Vec<u8> = job_row.get("result_ciphertext");
+        let result_key = store
+            .data_key_by_ref(&result_key_ref)
+            .await
+            .expect("load result key");
+        let result_aad = store.scope().row_aad(
+            "memory_jobs",
+            "job-redaction",
+            DataKeyPurpose::MemorySummary,
+        );
+        let result_plaintext =
+            crate::store::decrypt_content(&result_key, &result_ciphertext, &result_aad)
+                .expect("decrypt job result");
+        let result_payload: super::MemorySummaryPayload =
+            serde_json::from_slice(&result_plaintext).expect("parse job result");
+        assert_eq!(result_payload.summary, payload.summary);
+    }
+
+    #[tokio::test]
+    async fn worker_retries_retryable_errors_until_success() {
+        let store = test_store().await;
+        let batch_id = "l0-retry";
+        insert_l0_batch(&store, batch_id, &[user("hello")]).await;
+        insert_compact_l0_job(&store, "job-retry", batch_id).await;
+
+        let provider = Arc::new(FakeProvider {
+            text: Mutex::new("retry summary".into()),
+            fail_next: AtomicUsize::new(2),
+            ..FakeProvider::default()
+        });
+        run_worker(store.clone(), provider).await;
+
+        let job = sqlx::query("SELECT status, attempts FROM memory_jobs WHERE id = ?")
+            .bind("job-retry")
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch job");
+        assert_eq!(job.get::<String, _>("status"), "completed");
+        assert_eq!(job.get::<i64, _>("attempts"), 3);
+
+        let batch = sqlx::query("SELECT state FROM memory_batches WHERE id = ?")
+            .bind(batch_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch batch");
+        assert_eq!(batch.get::<String, _>("state"), "compacted");
+    }
+
+    #[tokio::test]
+    async fn worker_fails_after_max_attempts() {
+        let store = test_store().await;
+        let batch_id = "l0-fail";
+        insert_l0_batch(&store, batch_id, &[user("hello")]).await;
+        insert_compact_l0_job(&store, "job-fail", batch_id).await;
+
+        let provider = Arc::new(FakeProvider {
+            text: Mutex::new("never used".into()),
+            fail_next: AtomicUsize::new(3),
+            ..FakeProvider::default()
+        });
+        run_worker(store.clone(), provider).await;
+
+        let job = sqlx::query("SELECT status, attempts FROM memory_jobs WHERE id = ?")
+            .bind("job-fail")
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch job");
+        assert_eq!(job.get::<String, _>("status"), "failed");
+        assert_eq!(job.get::<i64, _>("attempts"), 3);
+
+        let batch = sqlx::query("SELECT state FROM memory_batches WHERE id = ?")
+            .bind(batch_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch batch");
+        assert_eq!(batch.get::<String, _>("state"), "compact_failed");
+    }
+
+    #[tokio::test]
+    async fn worker_resets_job_when_source_version_is_stale() {
+        let store = test_store().await;
+        let batch_id = "l0-stale";
+        insert_l0_batch(&store, batch_id, &[user("hello")]).await;
+        insert_compact_l0_job(&store, "job-stale", batch_id).await;
+
+        // Simulate a concurrent update that advanced the source version.
+        sqlx::query("UPDATE memory_batches SET version = 1 WHERE id = ?")
+            .bind(batch_id)
+            .execute(store.pool())
+            .await
+            .expect("bump version");
+
+        let provider = Arc::new(FakeProvider {
+            text: Mutex::new("stale summary".into()),
+            ..FakeProvider::default()
+        });
+        run_worker(store.clone(), provider).await;
+
+        let job = sqlx::query("SELECT status, attempts FROM memory_jobs WHERE id = ?")
+            .bind("job-stale")
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch job");
+        assert_eq!(job.get::<String, _>("status"), "pending");
+        assert_eq!(job.get::<i64, _>("attempts"), 1);
+
+        let batch = sqlx::query("SELECT state, version FROM memory_batches WHERE id = ?")
+            .bind(batch_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch batch");
+        assert_eq!(batch.get::<String, _>("state"), "compacting");
+        assert_eq!(batch.get::<i64, _>("version"), 1);
+    }
+
+    #[tokio::test]
+    async fn worker_recover_reinserts_lost_compacting_batches() {
+        let store = test_store().await;
+        let batch_id = "l0-recover";
+        insert_l0_batch(&store, batch_id, &[user("recover me")]).await;
+
+        // No job row: simulate a crash where the batch is compacting but the job
+        // was never written or was lost.
+        let cancel = CancellationToken::new();
+        let worker = CompactWorker {
+            store: store.clone(),
+            spec: select_compact_model(&chat_model(), None, &[]).expect("select compact model"),
+            provider: Arc::new(FakeProvider {
+                text: Mutex::new("recovered summary".into()),
+                ..FakeProvider::default()
+            }),
+            cancel: cancel.clone(),
+        };
+        worker.recover().await.expect("recover");
+
+        let pending: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM memory_jobs WHERE status = 'pending'")
+                .fetch_one(store.pool())
+                .await
+                .expect("count pending");
+        assert_eq!(pending, 1);
+
+        worker
+            .process_all_pending()
+            .await
+            .expect("process recovered job");
+
+        let batch = sqlx::query("SELECT state FROM memory_batches WHERE id = ?")
+            .bind(batch_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch batch");
+        assert_eq!(batch.get::<String, _>("state"), "compacted");
+    }
+
+    #[tokio::test]
+    async fn worker_recovery_requeues_expired_lease() {
+        let store = test_store().await;
+        let batch_id = "l0-expired-lease";
+        insert_l0_batch(&store, batch_id, &[user("recover lease")]).await;
+        insert_compact_l0_job(&store, "job-expired-lease", batch_id).await;
+        sqlx::query(
+            "UPDATE memory_jobs
+             SET status = 'running', attempts = 1, lease_until = '2000-01-01T00:00:00Z'
+             WHERE id = ?",
+        )
+        .bind("job-expired-lease")
+        .execute(store.pool())
+        .await
+        .expect("expire lease");
+
+        let worker = CompactWorker {
+            store: store.clone(),
+            spec: select_compact_model(&chat_model(), None, &[]).expect("select model"),
+            provider: Arc::new(FakeProvider::default()),
+            cancel: CancellationToken::new(),
+        };
+        worker.recover().await.expect("recover lease");
+        let row = sqlx::query("SELECT status, lease_until FROM memory_jobs WHERE id = ?")
+            .bind("job-expired-lease")
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch job");
+        assert_eq!(row.get::<String, _>("status"), "pending");
+        assert!(row.get::<Option<String>, _>("lease_until").is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_ready_advances_only_contiguous_completed_jobs() {
+        let store = test_store().await;
+        insert_l0_batch(&store, "l0-apply-1", &[user("first")]).await;
+        insert_l0_batch_with_seq(&store, "l0-apply-2", 2, &[user("second")]).await;
+        insert_compact_l0_job(&store, "job-apply-1", "l0-apply-1").await;
+        let source_versions = BTreeMap::from([("l0-apply-2".to_owned(), 0)]);
+        MemoryJobRecord::new(
+            "job-apply-2",
+            MemoryJobKind::CompactL0,
+            2,
+            vec!["l0-apply-2".to_owned()],
+            source_versions,
+        )
+        .insert(store.pool())
+        .await
+        .expect("insert second job");
+
+        let provider = Arc::new(FakeProvider {
+            text: Mutex::new("summary".into()),
+            ..FakeProvider::default()
+        });
+        let cancel = CancellationToken::new();
+        let worker = CompactWorker {
+            store: store.clone(),
+            spec: select_compact_model(&chat_model(), None, &[]).expect("select model"),
+            provider,
+            cancel,
+        };
+        worker.process_all_pending().await.expect("complete jobs");
+
+        assert_eq!(worker.apply_ready().await.expect("apply jobs"), 2);
+        let statuses: Vec<String> =
+            sqlx::query_scalar("SELECT status FROM memory_jobs ORDER BY batch_seq")
+                .fetch_all(store.pool())
+                .await
+                .expect("job statuses");
+        assert_eq!(statuses, ["applied", "applied"]);
+        let states: Vec<String> = sqlx::query_scalar(
+            "SELECT state FROM memory_batches WHERE layer = 0 ORDER BY batch_seq",
+        )
+        .fetch_all(store.pool())
+        .await
+        .expect("batch states");
+        assert_eq!(states, ["promoted", "promoted"]);
+        let membership: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_batch_messages")
+            .fetch_one(store.pool())
+            .await
+            .expect("membership count");
+        assert_eq!(membership, 0);
+        let cursor: i64 = sqlx::query_scalar(
+            "SELECT next_batch_seq FROM memory_apply_cursors WHERE kind = 'compact_l0'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("apply cursor");
+        assert_eq!(cursor, 3);
     }
 }
