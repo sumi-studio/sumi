@@ -2080,6 +2080,8 @@ mod tests {
                                 role: "user",
                                 message,
                                 append_to_l0: true,
+                                provider_context: Vec::new(),
+                                eviction_footprint_tokens: 0,
                             },
                             Projection::RunPhase {
                                 command_id: command_id.to_owned(),
