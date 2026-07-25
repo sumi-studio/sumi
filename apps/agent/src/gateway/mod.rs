@@ -7,6 +7,9 @@ pub mod stdio;
 pub mod supervisor;
 pub mod ws;
 
+/// Maximum size in bytes of a single gateway frame/message.
+pub(crate) const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+
 use std::fmt;
 
 use anyhow::Result;

@@ -16,11 +16,10 @@ use super::wire::to_wire_frame;
 use super::{
     AgentHello, ApiHello, CommandDigestFactory, CommandEnvelope, CommandId, CommandRejectReason,
     ConnectorError, Gateway, GatewayClosed, GatewayConnector, GatewayCredential, GatewayReader,
-    GatewayWriter, InboundCommand, IncrementalCommandDigest, KeyedCommandDigest, OutboundFrame,
-    RejectedCommandPayload, SensitiveCommandPayload,
+    GatewayWriter, InboundCommand, IncrementalCommandDigest, KeyedCommandDigest, MAX_FRAME_BYTES,
+    OutboundFrame, RejectedCommandPayload, SensitiveCommandPayload,
 };
 
-const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_USER_COMMAND_BYTES: usize = 1024 * 1024;
 const MAX_ENVELOPE_METADATA_BYTES: usize = 64 * 1024;
 const MAX_ENVELOPE_KEY_BYTES: usize = 256;
