@@ -403,6 +403,12 @@ impl Store {
                 DataKeyScope::Agent if conversation_id.is_some() => {
                     bail!("active agent key {key_ref} unexpectedly has a conversation");
                 }
+                DataKeyScope::Agent if purpose != DataKeyPurpose::Workspace => {
+                    bail!(
+                        "active agent key {key_ref} has purpose {purpose} but agent scope only permits workspace",
+                        purpose = purpose.as_str()
+                    );
+                }
                 _ => {}
             }
             let wrap_key_id: String = row.try_get("wrap_key_id")?;
@@ -1088,15 +1094,24 @@ mod tests {
     #[tokio::test]
     async fn migration_rejects_invalid_data_key_check_fixtures() {
         let store = store().await;
-        let invalid = [
+        let mut invalid = vec![
             ("unknown", "transcript", Some("conversation-1")),
             ("conversation", "unknown", Some("conversation-1")),
             ("conversation", "workspace", Some("conversation-1")),
             ("conversation", "transcript", None),
-            ("agent", "transcript", None),
-            ("agent", "artifact", None),
             ("agent", "workspace", Some("conversation-1")),
         ];
+        for purpose in [
+            "transcript",
+            "event",
+            "memory_summary",
+            "provider_context",
+            "command",
+            "mutation",
+            "artifact",
+        ] {
+            invalid.push(("agent", purpose, None));
+        }
         for (scope, purpose, conversation_id) in invalid {
             let result = sqlx::query(
                 "INSERT INTO data_keys(
@@ -1334,6 +1349,19 @@ mod tests {
                 .expect_err("cross-conversation anchor")
                 .to_string()
                 .contains("different authenticated conversation")
+        );
+    }
+
+    #[tokio::test]
+    async fn conversation_key_rejects_workspace_purpose() {
+        let store = store().await;
+        assert!(
+            store
+                .conversation_key(DataKeyPurpose::Workspace)
+                .await
+                .expect_err("workspace keys must be agent-scoped")
+                .to_string()
+                .contains("workspace keys are agent-scoped")
         );
     }
 

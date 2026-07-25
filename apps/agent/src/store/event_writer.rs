@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, Transaction};
 use subtle::ConstantTimeEq;
@@ -53,6 +53,14 @@ use super::{
 
 const PREPARED_KEY_MATERIAL_PROOF_DOMAIN: &[u8] = b"sumi-event-batch-prepared-key-material/v1";
 const PREPARED_KEY_MATERIAL_PROOF: &[u8] = b"active-key-material";
+
+#[derive(Serialize)]
+struct MemorySummaryPayload<'a> {
+    summary: &'a str,
+    est_tokens: u64,
+    from: &'a DateTime<Utc>,
+    to: &'a DateTime<Utc>,
+}
 
 #[derive(Clone)]
 pub(crate) struct DurableEvent {
@@ -2748,7 +2756,7 @@ impl EventWriter {
         memory_summary_key: &mut Option<super::crypto::DataKeyMaterial>,
         update: MemoryJobUpdate,
     ) -> Result<PreparedProjection> {
-        let expected_source_versions = convert_batch_versions(update.expected_source_versions);
+        let expected_source_versions = convert_batch_versions(update.expected_source_versions)?;
         let source_versions_json = serde_json::to_string(&expected_source_versions)
             .context("failed to serialize memory job source versions")?;
         let mut job_mutations = Vec::with_capacity(update.job_mutations.len());
@@ -2789,7 +2797,7 @@ impl EventWriter {
         memory_summary_key: &mut Option<super::crypto::DataKeyMaterial>,
         transition: MemoryTransition,
     ) -> Result<PreparedProjection> {
-        let pre_source_versions = convert_batch_versions(transition.expected_source_versions);
+        let pre_source_versions = convert_batch_versions(transition.expected_source_versions)?;
         let mut post_source_versions = pre_source_versions.clone();
         let mut batch_mutations = Vec::with_capacity(transition.batch_mutations.len());
         for batch in transition.batch_mutations {
@@ -2988,17 +2996,15 @@ impl EventWriter {
         row_id: &str,
         key: &super::crypto::DataKeyMaterial,
     ) -> Result<(Vec<u8>, String, u32)> {
-        let mut summary = result.summary.clone_zeroized();
         let mut raw = Zeroizing::new(
-            serde_json::to_vec(&json!({
-                "summary": summary.as_str(),
-                "est_tokens": result.est_tokens,
-                "from": result.time_range.0,
-                "to": result.time_range.1,
-            }))
+            serde_json::to_vec(&MemorySummaryPayload {
+                summary: result.summary.expose(),
+                est_tokens: result.est_tokens,
+                from: &result.time_range.0,
+                to: &result.time_range.1,
+            })
             .context("failed to serialize memory summary payload")?,
         );
-        summary.zeroize();
         let aad = self
             .store
             .scope()
@@ -5374,15 +5380,10 @@ fn prepared_projection_size(projection: &PreparedProjection) -> usize {
     }
 }
 
-fn convert_batch_versions(versions: BTreeMap<BatchId, u64>) -> BTreeMap<String, i64> {
+fn convert_batch_versions(versions: BTreeMap<BatchId, u64>) -> Result<BTreeMap<String, i64>> {
     versions
         .into_iter()
-        .map(|(id, version)| {
-            (
-                id.to_string(),
-                sqlite_i64(version, "source version").unwrap_or(i64::MAX),
-            )
-        })
+        .map(|(id, version)| Ok((id.to_string(), sqlite_i64(version, "source version")?)))
         .collect()
 }
 
@@ -8789,7 +8790,7 @@ async fn apply_memory_job_mutation(
                  result_projection = COALESCE(?, result_projection),
                  result_redaction_version = COALESCE(?, result_redaction_version),
                  updated_at = ?
-             WHERE id = ? AND status = ? AND attempts = ? AND lease_until = ?",
+             WHERE id = ? AND status = ? AND attempts = ? AND lease_until IS ?",
         )
         .bind(job.new_status)
         .bind(job.lease_until.as_ref())
@@ -9139,6 +9140,57 @@ mod tests {
             .await
             .expect("open test store")
             .into()
+    }
+
+    #[test]
+    fn batch_version_conversion_rejects_sqlite_overflow() {
+        let versions = BTreeMap::from([(Uuid::now_v7(), u64::MAX)]);
+        assert!(
+            convert_batch_versions(versions)
+                .expect_err("out-of-range CAS versions must be rejected")
+                .to_string()
+                .contains("source version exceeds SQLite INTEGER range")
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_job_null_lease_cas_can_leave_running() {
+        let store = test_store().await;
+        sqlx::query(
+            "INSERT INTO memory_jobs(
+                id, kind, batch_seq, source_ids, source_versions, status, lease_until,
+                attempts, created_at, updated_at
+             ) VALUES('null-lease-job', 'compact', 1, '[]', '{}', 'running', NULL, 0, ?, ?)",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(store.pool())
+        .await
+        .expect("insert running job without lease");
+
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
+        apply_memory_job_mutation(
+            &mut transaction,
+            PreparedMemoryJobMutation {
+                job_id: "null-lease-job".to_owned(),
+                expected_status: "running",
+                new_status: "failed",
+                attempts: 0,
+                lease_until: None,
+                source_versions: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("NULL-safe lease CAS");
+        transaction.commit().await.expect("commit transition");
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM memory_jobs WHERE id='null-lease-job'")
+                .fetch_one(store.pool())
+                .await
+                .expect("load transitioned job");
+        assert_eq!(status, "failed");
     }
 
     fn user_command(seq: u64, command_id: &str, text: &str) -> InboundCommand {
