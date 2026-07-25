@@ -655,6 +655,31 @@ fn git_config_option_key(tokens: &[String], i: usize) -> Option<(String, usize)>
     None
 }
 
+/// Detect whether a `tar` short-option token contains an embedded command
+/// executor (`-F` / `-I`). It scans the combined option group and stops as
+/// soon as it reaches a value-taking option letter, so `-cfarchive.tar` is
+/// not flagged while `-cFscript` or `-cIsh` is.
+fn tar_short_option_has_command(token: &str) -> bool {
+    if token.len() <= 1 || !token.starts_with('-') || token.starts_with("--") {
+        return false;
+    }
+    let Some(flags) = value_taking_short_options("tar") else {
+        return false;
+    };
+    let mut iter = token.char_indices();
+    iter.next(); // skip leading '-'
+    for (_idx, c) in iter {
+        if c == 'F' || c == 'I' {
+            return true;
+        }
+        if flags.contains(&c) {
+            // A value-taking non-command flag consumes the rest of the token.
+            return false;
+        }
+    }
+    false
+}
+
 /// Reject command-execution payloads embedded in another program's options.
 /// T22 intentionally does not attempt to model every tool-specific option
 /// grammar; an option whose name advertises command/exec/checkpoint/filter
@@ -749,13 +774,14 @@ fn has_embedded_execution_payload(tokens: &[String]) -> bool {
     if command == "tar"
         && tokens.iter().skip(1).any(|token| {
             let lower = token.to_ascii_lowercase();
-            token.starts_with("-I") && token.len() > 2
+            tar_short_option_has_command(token)
                 || lower == "-i"
                 || lower == "--use-compress-program"
-                || lower.starts_with("-i=")
                 || lower.starts_with("--use-compress-program=")
                 || lower == "--to-command"
                 || lower.starts_with("--to-command=")
+                || lower.starts_with("--inf")
+                || lower.starts_with("--new-v")
         })
     {
         return true;
@@ -820,13 +846,95 @@ fn bash_path_check(tokens: &[String], cwd: &Path, workspace: &Path) -> PathCheck
     worst
 }
 
+/// Commands for which we know which short option letters consume a following
+/// argument, including when that argument is glued to the option token. This
+/// allows combined short-option groups such as `tar -cvf/etc/passwd` to be
+/// parsed as `-c -v -f /etc/passwd` rather than as `-c` with value
+/// `vf/etc/passwd`.
+const COMMANDS_WITH_VALUE_SHORT_OPTIONS: &[&str] = &[
+    "cp",
+    "curl",
+    "cqlsh",
+    "git",
+    "install",
+    "ln",
+    "mariadb",
+    "mv",
+    "mysql",
+    "psql",
+    "redis-cli",
+    "rsync",
+    "scp",
+    "sftp",
+    "sqlcmd",
+    "ssh",
+    "sshpass",
+    "tar",
+    "wget",
+];
+
+fn value_taking_short_options(canonical: &str) -> Option<&'static [char]> {
+    match canonical {
+        "cp" | "mv" | "ln" | "install" => Some(&['t']),
+        "tar" => Some(&['C', 'F', 'I', 'K', 'T', 'X', 'f', 'g']),
+        "curl" => Some(&['D', 'E', 'K', 'T', 'b', 'c', 'o']),
+        "wget" => Some(&['O', 'P', 'i', 'o']),
+        "rsync" => Some(&['T', 'e']),
+        "ssh" => Some(&['E', 'F', 'S', 'i']),
+        "scp" => Some(&['F', 'S', 'i']),
+        "sftp" => Some(&['D', 'F', 'b', 'i']),
+        "git" => Some(&['C', 'F', 'c']),
+        "psql" => Some(&['L', 'f', 'o']),
+        "mysql" | "mariadb" => Some(&['S']),
+        "redis-cli" => Some(&['s']),
+        "sqlcmd" => Some(&['i', 'o']),
+        "cqlsh" => Some(&['f']),
+        "sshpass" => Some(&['f']),
+        _ => None,
+    }
+}
+
+/// Parse a short option token, accounting for combined short option groups.
+/// When the command has a known value-taking option set, the value is extracted
+/// after the last option letter that consumes an argument. For commands not in
+/// that set, the legacy single-char extraction is preserved.
+fn extract_short_option_value<'a>(token: &'a str, canonical: &str) -> Option<&'a str> {
+    if token.len() <= 1 || !token.starts_with('-') || token.starts_with("--") {
+        return None;
+    }
+    if let Some(flags) = value_taking_short_options(canonical) {
+        let mut iter = token.char_indices();
+        iter.next(); // skip leading '-'
+        for (idx, c) in iter {
+            if flags.contains(&c) {
+                return Some(&token[idx + c.len_utf8()..]);
+            }
+        }
+        None
+    } else {
+        // Legacy behaviour: value belongs to the first option character.
+        // This is correct for one-shot short options (including multi-byte
+        // option characters) but cannot disambiguate combined option groups.
+        let (idx, c) = token.char_indices().nth(1)?;
+        let value_start = idx + c.len_utf8();
+        Some(&token[value_start..])
+    }
+}
+
 /// Extract path values from option assignments before applying path policy.
 /// Treating `--file=/etc/passwd` as one relative pathname would otherwise
 /// incorrectly place it under the workspace. Long `--name=value` and short
-/// glued options whose value is visibly path-like are intentionally handled
-/// without trying to model every command's option grammar.
+/// glued options whose value is visibly path-like are intentionally handled;
+/// commands with known short-option grammar are parsed accordingly.
 fn option_path_values(tokens: &[String]) -> Vec<String> {
     let mut paths = Vec::new();
+    if tokens.is_empty() {
+        return paths;
+    }
+    let command_base = shell::command_basename(&tokens[0]);
+    let canonical =
+        shell::canonicalize_command_name(&command_base, COMMANDS_WITH_VALUE_SHORT_OPTIONS)
+            .unwrap_or(command_base.as_str());
     let mut i = 1usize;
     while i < tokens.len() {
         let token = &tokens[i];
@@ -854,14 +962,10 @@ fn option_path_values(tokens: &[String]) -> Vec<String> {
         }
 
         if token.starts_with('-') && !token.starts_with("--") {
-            if let Some((idx, c)) = token.char_indices().nth(1) {
-                let value_start = idx + c.len_utf8();
-                if value_start < token.len() {
-                    let value = &token[value_start..];
-                    if token_looks_like_path(value) {
-                        paths.push(value.to_owned());
-                    }
-                }
+            if let Some(value) = extract_short_option_value(token, canonical)
+                && token_looks_like_path(value)
+            {
+                paths.push(value.to_owned());
             }
         } else if token_looks_like_path(token) {
             paths.push(token.clone());
@@ -2680,6 +2784,95 @@ mod tests {
     }
 
     #[test]
+    fn tar_info_script_and_new_volume_script_fail_closed() {
+        let p = policy();
+        for command in [
+            "tar -F/workspace/script -cvf out.tar .",
+            "tar -F /workspace/script -cvf out.tar .",
+            "tar -cF/workspace/script -f out.tar .",
+            "tar --info-script=/workspace/script -cvf out.tar .",
+            "tar --info-script /workspace/script -cvf out.tar .",
+            "tar --info /workspace/script -cvf out.tar .",
+            "tar --inf=/workspace/script -cvf out.tar .",
+            "tar --inf /workspace/script -cvf out.tar .",
+            "tar --new-volume-script=/workspace/script -cvf out.tar .",
+            "tar --new-volume-script /workspace/script -cvf out.tar .",
+            "tar --new-volume /workspace/script -cvf out.tar .",
+            "tar --new-v=/workspace/script -cvf out.tar .",
+            "tar --new-v /workspace/script -cvf out.tar .",
+        ] {
+            let action = bash(command);
+            assert!(
+                !p.evaluate(&action).is_allow(),
+                "tar info-script must not allow: {command}"
+            );
+            let candidate = ApprovalRule {
+                id: "tar-info-script".to_owned(),
+                tool: "bash".to_owned(),
+                literal_prefix: shell::tokenize_command(command),
+                effect: RuleEffect::Allow,
+                workspace_only: true,
+                allowed_permissions: vec![Permission::Exec],
+                allowed_network_domains: vec![],
+            };
+            assert!(
+                matches!(
+                    p.clone().try_with_rule(candidate),
+                    Err(RuleValidationError::BroadPrefix)
+                ),
+                "tar info-script must not persist: {command}"
+            );
+        }
+
+        // Ordinary archive path forms (lowercase -f) remain eligible for rules.
+        let safe_action = bash("tar -c -f/workspace/out.tar .");
+        let safe_rule = ApprovalRule {
+            id: "tar-archive".to_owned(),
+            tool: "bash".to_owned(),
+            literal_prefix: shell::tokenize_command("tar -c -f/workspace/out.tar ."),
+            effect: RuleEffect::Allow,
+            workspace_only: true,
+            allowed_permissions: vec![Permission::Exec],
+            allowed_network_domains: vec![],
+        };
+        let p_safe = policy().try_with_rule(safe_rule).unwrap();
+        assert!(
+            p_safe.evaluate(&safe_action).is_allow(),
+            "plain -f archive path should remain allow-able"
+        );
+    }
+
+    #[test]
+    fn tar_benign_long_options_stay_allowed() {
+        for command in [
+            "tar --newer=2024-01-01 -cvf out.tar .",
+            "tar --newer 2024-01-01 -cvf out.tar .",
+            "tar --incremental=/workspace/snap -cvf out.tar .",
+        ] {
+            let tokens = shell::tokenize_command(command);
+            assert!(
+                !has_embedded_execution_payload(&tokens),
+                "benign tar option must not be treated as embedded execution: {command}"
+            );
+
+            let rule = ApprovalRule {
+                id: "tar-benign".to_owned(),
+                tool: "bash".to_owned(),
+                literal_prefix: tokens,
+                effect: RuleEffect::Allow,
+                workspace_only: true,
+                allowed_permissions: vec![Permission::Exec],
+                allowed_network_domains: vec![],
+            };
+            let p = policy().try_with_rule(rule).unwrap();
+            assert!(
+                p.evaluate(&bash(command)).is_allow(),
+                "benign tar option should remain allow-able: {command}"
+            );
+        }
+    }
+
+    #[test]
     fn compound_reserved_words_are_unmodeled() {
         let p = policy();
         for command in [
@@ -3529,6 +3722,152 @@ mod tests {
             option_path_values(&["cmd".to_owned(), "/workspace".to_owned()]),
             vec!["/workspace"]
         );
+    }
+
+    #[test]
+    fn combined_short_option_path_smuggling_is_forbidden() {
+        let p = policy();
+
+        // Non-network commands: a matching durable rule can be persisted, but the
+        // workspace-escape hidden in a combined short option must still be rejected.
+        for command in [
+            "tar -cvf/etc/passwd .",
+            "tar -cvf../escape.tar .",
+            "cp -rt/foo src",
+            "mv -vt/foo src",
+            "install -Dt/foo src",
+        ] {
+            let action = bash(command);
+            let rule = ApprovalRule {
+                id: command.to_owned(),
+                tool: "bash".to_owned(),
+                literal_prefix: shell::tokenize_command(command),
+                effect: RuleEffect::Allow,
+                workspace_only: true,
+                allowed_permissions: vec![Permission::Exec],
+                allowed_network_domains: vec![],
+            };
+            let p_with_rule = p
+                .clone()
+                .try_with_rule(rule.clone())
+                .expect("non-network prefix should be persistable");
+            assert!(
+                p_with_rule.evaluate(&action).is_forbidden(),
+                "{command} must be forbidden even with a matching rule"
+            );
+
+            assert!(
+                matches!(
+                    p.resolve(&action, UserDecision::ApproveOnce, &projector()),
+                    ResolvedDecision::Rejected { .. }
+                ),
+                "{command} ApproveOnce must be rejected"
+            );
+            assert!(
+                matches!(
+                    p.resolve(&action, UserDecision::ApproveAlways { rule }, &projector()),
+                    ResolvedDecision::Rejected { .. }
+                ),
+                "{command} ApproveAlways must be rejected"
+            );
+        }
+
+        // Network clients: the prefix is too broad to persist, and the hidden
+        // path also causes rejection.
+        for command in [
+            "curl -vo/etc/passwd https://example.com",
+            "wget -qO/etc/passwd https://example.com",
+            "ssh -vi/etc/ssh/key user@host",
+        ] {
+            let action = bash(command);
+            assert!(
+                action.requested_permissions.contains(&Permission::Network),
+                "{command} must request network permission"
+            );
+            let rule = ApprovalRule {
+                id: command.to_owned(),
+                tool: "bash".to_owned(),
+                literal_prefix: shell::tokenize_command(command),
+                effect: RuleEffect::Allow,
+                workspace_only: true,
+                allowed_permissions: vec![Permission::Exec, Permission::Network],
+                allowed_network_domains: vec![],
+            };
+            assert!(
+                p.clone().try_with_rule(rule.clone()).is_err(),
+                "{command} must not be persistable as a rule"
+            );
+            assert!(
+                p.evaluate(&action).is_forbidden(),
+                "{command} must be forbidden due to workspace escape"
+            );
+            assert!(
+                matches!(
+                    p.resolve(&action, UserDecision::ApproveOnce, &projector()),
+                    ResolvedDecision::Rejected { .. }
+                ),
+                "{command} ApproveOnce must be rejected"
+            );
+            assert!(
+                matches!(
+                    p.resolve(&action, UserDecision::ApproveAlways { rule }, &projector()),
+                    ResolvedDecision::Rejected { .. }
+                ),
+                "{command} ApproveAlways must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn combined_short_option_inside_paths_stay_inside() {
+        for (command, expected_paths) in [
+            ("tar -cvfworkspace/notes.tar .", vec!["workspace/notes.tar"]),
+            (
+                "tar -cvf /workspace/notes.tar .",
+                vec!["/workspace/notes.tar"],
+            ),
+            ("cp -rtworkspace/out src", vec!["workspace/out"]),
+            ("cp -rt /workspace/out src", vec!["/workspace/out"]),
+            ("mv -vtworkspace/out src", vec!["workspace/out"]),
+            ("mv -vt /workspace/out src", vec!["/workspace/out"]),
+            ("install -Dtworkspace/out src", vec!["workspace/out"]),
+            ("install -Dt /workspace/out src", vec!["/workspace/out"]),
+            (
+                "curl -o/workspace/out https://example.com",
+                vec!["/workspace/out"],
+            ),
+            (
+                "curl -o /workspace/out https://example.com",
+                vec!["/workspace/out"],
+            ),
+            (
+                "wget -O/workspace/out https://example.com",
+                vec!["/workspace/out"],
+            ),
+            (
+                "wget -O /workspace/out https://example.com",
+                vec!["/workspace/out"],
+            ),
+            ("ssh -i/workspace/key user@host", vec!["/workspace/key"]),
+            ("ssh -i /workspace/key user@host", vec!["/workspace/key"]),
+            ("git -Cworkspace/repo status", vec!["workspace/repo"]),
+            ("git -C /workspace/repo status", vec!["/workspace/repo"]),
+            ("git -ccore.pager=cat status", vec![]),
+            ("tar -cvf ./notes.tar .", vec!["./notes.tar"]),
+        ] {
+            let tokens = shell::tokenize_command(command);
+            let paths = option_path_values(&tokens);
+            let expected: Vec<String> = expected_paths.iter().map(|s| s.to_string()).collect();
+            assert_eq!(
+                paths, expected,
+                "option_path_values for {command}: got {paths:?}"
+            );
+            assert_eq!(
+                bash_path_check(&tokens, Path::new("/workspace"), Path::new("/workspace")),
+                PathCheck::InsideWorkspace,
+                "{command} must stay inside workspace"
+            );
+        }
     }
 
     #[test]
