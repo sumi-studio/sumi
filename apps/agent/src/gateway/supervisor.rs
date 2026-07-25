@@ -699,14 +699,13 @@ async fn event_forwarder(
         let Some(sender) = sender else {
             continue;
         };
-        // Drop only volatile/delta Event frames (seq: None) until the epoch has
-        // caught up and published Online. CommandAck frames are terminal command
-        // feedback and must be delivered even while catch-up is in progress.
-        if !*online.borrow() {
-            match &frame {
-                OutboundFrame::Event { envelope } if envelope.seq.is_none() => continue,
-                _ => {}
-            }
+        // Drop every Event frame until the epoch has caught up and published
+        // Online. A durable Event sent while catch-up is running could also be
+        // emitted by DurableSource::events_after, so forwarding it here would
+        // duplicate the seq. CommandAck frames are terminal command feedback and
+        // must be delivered even while catch-up is in progress.
+        if !*online.borrow() && matches!(frame, OutboundFrame::Event { .. }) {
+            continue;
         }
         if sender.send(frame).await.is_err() {
             // Writer closed; stale frame is dropped. The supervisor will
@@ -2743,12 +2742,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn online_boundary_drops_volatile_events_and_delivers_command_acks() {
+    async fn online_boundary_drops_events_and_delivers_command_acks() {
         // Use a source that delays catch-up completion until we explicitly signal,
         // so we can send frames while the epoch has a writer but is still not Online.
         let catch_up_notify = Arc::new(tokio::sync::Notify::new());
         let source = DelayedCatchUpSource {
-            events: Arc::new(std::sync::Mutex::new(VecDeque::from([event_frame(1)]))),
+            events: Arc::new(std::sync::Mutex::new(VecDeque::from([
+                event_frame(1),
+                event_frame(2),
+            ]))),
             notify: catch_up_notify.clone(),
             command_cursor: CommandCursors {
                 received: 0,
@@ -2796,7 +2798,11 @@ mod tests {
         }
         let epoch = epochs.borrow().unwrap();
 
-        // A volatile/delta Event (seq: None) sent before Online must be dropped.
+        // A durable Event sent before Online must be dropped, otherwise catch-up
+        // would emit the same seq again.
+        handle.events.send((epoch, event_frame(2))).await.unwrap();
+
+        // A volatile/delta Event (seq: None) sent before Online must also be dropped.
         let volatile = OutboundFrame::Event {
             envelope: Envelope {
                 seq: None,
@@ -2826,31 +2832,29 @@ mod tests {
         }
 
         // A durable frame sent after Online should be delivered.
-        handle.events.send((epoch, event_frame(2))).await.unwrap();
+        handle.events.send((epoch, event_frame(3))).await.unwrap();
 
         // Give writer_task time to forward the live frame.
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         {
             let sent_frames = sent.lock().unwrap();
+            let seqs: Vec<_> = sent_frames
+                .iter()
+                .filter_map(|f| outbound_frame_event_seq(f).ok())
+                .collect();
             assert_eq!(
-                sent_frames.len(),
-                3,
-                "catch-up event, pre-online CommandAck, and post-online live event should be delivered"
+                seqs,
+                vec![1, 2, 3],
+                "catch-up seqs 1 and 2 plus post-online seq 3 should be delivered exactly once"
             );
             assert_eq!(
-                outbound_frame_event_seq(&sent_frames[0]).unwrap(),
+                sent_frames
+                    .iter()
+                    .filter(|f| matches!(f, OutboundFrame::CommandAck { .. }))
+                    .count(),
                 1,
-                "catch-up event must be delivered first"
-            );
-            assert!(
-                matches!(sent_frames[1], OutboundFrame::CommandAck { .. }),
                 "pre-online CommandAck must be delivered"
-            );
-            assert_eq!(
-                outbound_frame_event_seq(&sent_frames[2]).unwrap(),
-                2,
-                "post-online live event must be delivered"
             );
             assert!(
                 !sent_frames.iter().any(
