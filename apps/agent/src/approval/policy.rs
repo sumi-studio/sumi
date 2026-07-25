@@ -801,7 +801,15 @@ fn network_client_option_payload(command: &str, token: &str) -> bool {
                 || lower.starts_with("--eval=")
         }
         "sqlcmd" => {
-            lower == "-q" || lower.starts_with("-q") || lower == "-Q" || lower.starts_with("-Q")
+            let is_input_file = token == "-i"
+                || (token.starts_with("-i") && token.len() > 2)
+                || lower == "--input-file"
+                || lower.starts_with("--input-file=");
+            is_input_file
+                || lower == "-q"
+                || lower.starts_with("-q")
+                || lower == "-Q"
+                || lower.starts_with("-Q")
         }
         _ => false,
     }
@@ -895,7 +903,14 @@ fn has_embedded_execution_payload(tokens: &[String]) -> bool {
     };
     let command = shell::command_basename(command);
     const EMBEDDED_FAMILIES: &[&str] = &["find", "git", "openssl", "rsync", "ssh", "tar"];
-    let command = shell::canonicalize_command_name(&command, EMBEDDED_FAMILIES).unwrap_or(&command);
+    let canonical =
+        shell::canonicalize_command_name(&command, EMBEDDED_FAMILIES).unwrap_or(&command);
+    // External `git-<command>` programs (and `git-foo` aliases) execute
+    // arbitrary code, so they cannot be persistently allowed.
+    if command.starts_with("git-") && command != "git" {
+        return true;
+    }
+    let command = canonical;
     if command == "find"
         && tokens.iter().skip(1).any(|token| {
             let lower = token.to_ascii_lowercase();
@@ -999,6 +1014,30 @@ fn has_embedded_execution_payload(tokens: &[String]) -> bool {
             {
                 return true;
             }
+            if sub_lower == "config" {
+                let mut j = subcommand_index + 1;
+                while j < tokens.len() {
+                    if tokens[j].starts_with('-') {
+                        if matches!(tokens[j].as_str(), "--file" | "--git-dir" | "--work-tree") {
+                            j += 2;
+                            continue;
+                        }
+                        j += 1;
+                        continue;
+                    }
+                    let key = tokens[j]
+                        .split_once('=')
+                        .map(|(k, _)| k)
+                        .unwrap_or(&tokens[j]);
+                    if git_config_key_is_command_executing(key) {
+                        return true;
+                    }
+                    break;
+                }
+            }
+            if !KNOWN_SAFE_GIT_SUBCOMMANDS.contains(&sub_lower.as_str()) {
+                return true;
+            }
         }
     }
     if command == "rsync"
@@ -1057,6 +1096,15 @@ fn has_embedded_execution_payload(tokens: &[String]) -> bool {
                 || window[0] == "--config"
                 || (window[1].starts_with("-F") && window[1].len() > 2)
                 || window[1].starts_with("--config=")
+            {
+                return true;
+            }
+            // `sftp -D <program>` executes an arbitrary local program as the
+            // SFTP server, so it is an embedded local execution payload.
+            if command == "sftp"
+                && (window[0] == "-D"
+                    || (window[0].starts_with("-D") && window[0].len() > 2)
+                    || (window[1].starts_with("-D") && window[1].len() > 2))
             {
                 return true;
             }
@@ -1158,6 +1206,51 @@ const COMMANDS_WITH_VALUE_SHORT_OPTIONS: &[&str] = &[
     "wget",
 ];
 
+/// Git subcommands that are known to be safe from arbitrary local command
+/// execution and do not trigger network/dangerous checks. Unknown subcommands,
+/// aliases, and external `git-<command>` programs must not become persistently
+/// allowed prefixes, so anything not in this list is treated as broad.
+const KNOWN_SAFE_GIT_SUBCOMMANDS: &[&str] = &[
+    "apply",
+    "archive",
+    "bisect",
+    "blame",
+    "branch",
+    "cat-file",
+    "clean",
+    "config",
+    "describe",
+    "diff",
+    "for-each-ref",
+    "grep",
+    "hash-object",
+    "init",
+    "init-db",
+    "log",
+    "ls-files",
+    "ls-remote",
+    "ls-tree",
+    "merge-base",
+    "mv",
+    "name-rev",
+    "notes",
+    "reflog",
+    "remote",
+    "reset",
+    "rev-list",
+    "rev-parse",
+    "rm",
+    "shortlog",
+    "show",
+    "show-ref",
+    "status",
+    "submodule",
+    "symbolic-ref",
+    "tag",
+    "verify-commit",
+    "verify-tag",
+];
+
 fn value_taking_short_options(canonical: &str) -> Option<&'static [char]> {
     match canonical {
         "cp" | "mv" | "ln" | "install" => Some(&['t']),
@@ -1220,6 +1313,7 @@ fn option_path_values(tokens: &[String]) -> Vec<String> {
     let canonical =
         shell::canonicalize_command_name(&command_base, COMMANDS_WITH_VALUE_SHORT_OPTIONS)
             .unwrap_or(command_base.as_str());
+    let skip_remote_operands = matches!(canonical, "scp" | "sftp" | "rsync" | "rclone");
     let mut i = 1usize;
     let mut skip_next = false;
     while i < tokens.len() {
@@ -1262,7 +1356,7 @@ fn option_path_values(tokens: &[String]) -> Vec<String> {
             if let Some(value) = extract_short_option_value(token, canonical) {
                 maybe_push_path(&mut paths, value);
             }
-        } else {
+        } else if !skip_remote_operands || !shell::is_remote_spec(token) {
             maybe_push_path(&mut paths, token);
         }
         i += 1;
@@ -4224,6 +4318,45 @@ mod tests {
     }
 
     #[test]
+    fn remote_scp_rsync_rclone_operands_are_not_local_paths() {
+        // Remote specs must not be path-checked as local workspace paths,
+        // especially when they contain relative parent traversal that only
+        // has meaning on the remote side.
+        for command in [
+            "scp user@host:/etc/passwd /workspace/out",
+            "scp /workspace/in user@host:/etc/passwd",
+            "scp user@host:../../etc/passwd /workspace/out",
+            "rsync user@host:/etc/passwd /workspace/out",
+            "rsync remote:/etc/passwd /workspace/out",
+            "rclone copy remote:path /workspace/out",
+            "scp -i /workspace/key user@host:/etc/passwd /workspace/out",
+        ] {
+            let tokens = shell::tokenize_command(command);
+            assert_eq!(
+                bash_path_check(&tokens, Path::new("/workspace"), Path::new("/workspace")),
+                PathCheck::InsideWorkspace,
+                "{command} must not be treated as a workspace escape"
+            );
+            let action = bash(command);
+            assert!(
+                !policy().evaluate(&action).is_forbidden(),
+                "{command} must remain one-shot approvable"
+            );
+        }
+
+        // Local source escaping to a remote destination is still forbidden.
+        assert_eq!(
+            bash_path_check(
+                &shell::tokenize_command("scp /etc/passwd user@host:/workspace/out"),
+                Path::new("/workspace"),
+                Path::new("/workspace")
+            ),
+            PathCheck::WorkspaceEscape,
+            "local source escape must still be forbidden"
+        );
+    }
+
+    #[test]
     fn multiple_parent_traversal_is_forbidden() {
         for path in [
             "../../etc/passwd",
@@ -4306,11 +4439,19 @@ mod tests {
             "nc -e /workspace/malicious -l -p 1234",
             "ncat -e /workspace/malicious -l -p 1234",
             "scp -S /workspace/malicious user@host:/",
+            "scp -o ProxyCommand='sh -c id' user@host:/",
+            "scp -oProxyCommand='sh -c id' user@host:/",
             "sftp -b /workspace/batch user@host",
+            "sftp -D /workspace/malicious user@host",
+            "sftp -D/workspace/malicious user@host",
             "lftp -e '!id' example.com",
             "psql -c '\\! id' db",
             "mongosh --eval 'sh.exit()' mongodb://example.com",
             "sqlcmd -Q '!! id' -S example.com",
+            "sqlcmd -i /workspace/script.sql -S example.com",
+            "sqlcmd --input-file /workspace/script.sql -S example.com",
+            "sqlcmd -i/workspace/script.sql -S example.com",
+            "sqlcmd --input-file=/workspace/script.sql -S example.com",
         ];
         for command in cases {
             let action = bash(command);
@@ -4475,6 +4616,47 @@ mod tests {
 
         // `git reset` modes that do not touch the working tree remain narrow.
         for command in ["git reset --soft HEAD~1", "git reset HEAD -- file.txt"] {
+            let tokens = shell::tokenize_command(command);
+            assert!(
+                !is_broad_prefix(&tokens),
+                "'{command}' should be a narrow prefix: {tokens:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_git_subcommands_and_aliases_are_broad_prefixes() {
+        for command in [
+            "git foo",
+            "git bar --baz",
+            "git alias.run status",
+            "git-foo status",
+        ] {
+            let tokens = shell::tokenize_command(command);
+            assert!(
+                is_broad_prefix(&tokens),
+                "'{command}' must not be a narrow prefix: {tokens:?}"
+            );
+            let rule = ApprovalRule {
+                id: command.to_owned(),
+                tool: "bash".to_owned(),
+                literal_prefix: tokens,
+                effect: RuleEffect::Allow,
+                workspace_only: true,
+                allowed_permissions: vec![Permission::Exec],
+                allowed_network_domains: vec![],
+            };
+            assert!(
+                matches!(
+                    policy().try_with_rule(rule),
+                    Err(RuleValidationError::BroadPrefix)
+                ),
+                "'{command}' must not be persistable as an Exec-only rule"
+            );
+        }
+
+        // Known safe subcommands remain narrow.
+        for command in ["git status", "git log", "git diff"] {
             let tokens = shell::tokenize_command(command);
             assert!(
                 !is_broad_prefix(&tokens),

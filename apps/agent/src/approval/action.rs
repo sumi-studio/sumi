@@ -717,6 +717,38 @@ impl SecretAwareActionProjector {
         out
     }
 
+    /// Redact `text` by running the SecretInventory over a normalized view
+    /// (e.g. shell tokens with quotes and escapes removed) and mapping each
+    /// match back to original byte positions. This preserves surrounding
+    /// punctuation such as closing quotes that a raw-text regex would otherwise
+    /// consume as part of a secret.
+    fn redact_text_with_mapping(&self, text: &str, normalized: &str, mapping: &[usize]) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut cursor = 0usize;
+        for m in self.inventory.find(normalized) {
+            if m.start >= mapping.len() || m.end >= mapping.len() {
+                return "[REDACTED:shell_unverifiable]".to_owned();
+            }
+            let secret_start = mapping[m.start];
+            let secret_end = mapping[m.end];
+            if secret_start < cursor || secret_end < secret_start {
+                return "[REDACTED:shell_unverifiable]".to_owned();
+            }
+            out.push_str(&text[cursor..secret_start]);
+            let secret = &text[secret_start..secret_end];
+            if !looks_like_redacted_placeholder(secret) {
+                out.push_str("[REDACTED:");
+                out.push_str(m.kind);
+                out.push(']');
+            } else {
+                out.push_str(secret);
+            }
+            cursor = secret_end;
+        }
+        out.push_str(&text[cursor..]);
+        out
+    }
+
     fn shell_token_normalized(span: &str) -> (String, Vec<usize>) {
         let mut out = String::with_capacity(span.len());
         let mut mapping = Vec::with_capacity(span.len() + 1);
@@ -778,10 +810,51 @@ impl SecretAwareActionProjector {
         if shell::has_nested_shell_construct(command) {
             return "[REDACTED:shell_unverifiable]".to_owned();
         }
-        let credential_spans = shell_credential_spans(command);
+        // Apply whole-command SecretInventory coverage over a normalized view
+        // (quotes and escapes removed) so that secrets that span multiple shell
+        // tokens (e.g. unquoted `Authorization: Basic <token>`) are redacted
+        // before per-token processing. Mapping matches back to original byte
+        // positions preserves surrounding punctuation such as closing quotes.
+        fn append_piece(
+            normalized: &mut String,
+            mapping: &mut Vec<usize>,
+            piece: &str,
+            piece_map: &[usize],
+        ) {
+            let base = normalized.len();
+            assert_eq!(mapping.len(), base + 1);
+            normalized.push_str(piece);
+            mapping.pop();
+            mapping.extend_from_slice(piece_map);
+        }
+
+        let mut normalized = String::with_capacity(command.len());
+        let mut mapping: Vec<usize> = vec![0];
+        let mut prev_end = 0usize;
+        let spans = shell::tokenize_command_spans(command);
+        for (start, end, _) in &spans {
+            let (start, end) = (*start, *end);
+            let span = &command[start..end];
+            let (span_norm, span_map) = Self::shell_token_normalized(span);
+            if span_norm.is_empty() {
+                prev_end = end;
+                continue;
+            }
+            if !normalized.is_empty() {
+                append_piece(&mut normalized, &mut mapping, " ", &[prev_end, start]);
+            }
+            let mut piece_map = Vec::with_capacity(span_map.len());
+            for &pos in &span_map {
+                piece_map.push(start + pos);
+            }
+            append_piece(&mut normalized, &mut mapping, &span_norm, &piece_map);
+            prev_end = end;
+        }
+        let command = self.redact_text_with_mapping(command, &normalized, &mapping);
+        let credential_spans = shell_credential_spans(&command);
         let mut out = String::new();
         let mut cursor = 0usize;
-        for (idx, (start, end, _)) in shell::tokenize_command_spans(command)
+        for (idx, (start, end, _)) in shell::tokenize_command_spans(&command)
             .into_iter()
             .enumerate()
         {
@@ -1434,18 +1507,20 @@ impl SecretInventory {
                 kind: "secret",
             },
             SecretPattern {
-                regex: Regex::new(r#"://([^/:]+):([^@]+)@"#).expect("static url-userinfo regex"),
+                regex: Regex::new(r#"://([^/:]+):([^@\s]+)@"#)
+                    .expect("static url-userinfo regex"),
                 secret_group: 2,
                 kind: "url_credential",
             },
             SecretPattern {
-                regex: Regex::new(r#"://([^@:/]+)@"#).expect("static url-userinfo-token regex"),
+                regex: Regex::new(r#"://([^@:/\s]+)@"#)
+                    .expect("static url-userinfo-token regex"),
                 secret_group: 1,
                 kind: "url_credential",
             },
             SecretPattern {
                 regex: Regex::new(
-                    r#"(?i)([?&])(?:X-Amz-Signature|X-Goog-Signature|signature)=([^&]+)"#,
+                    r#"(?i)([?&])(?:X-Amz-Signature|X-Goog-Signature|signature)=([^&\s]+)"#,
                 )
                 .expect("static signed-url-query regex"),
                 secret_group: 2,
@@ -1453,7 +1528,7 @@ impl SecretInventory {
             },
             SecretPattern {
                 regex: Regex::new(
-                    r#"(?i)([?&])(token|api[_-]?key|access[_-]?token|secret|password|passwd|pwd|pass)=([^&]+)"#,
+                    r#"(?i)([?&])(token|api[_-]?key|access[_-]?token|secret|password|passwd|pwd|pass)=([^&\s]+)"#,
                 )
                 .expect("static secret-query regex"),
                 secret_group: 3,
@@ -2419,7 +2494,7 @@ pub(crate) mod shell {
         })
     }
 
-    fn is_rsync_remote_spec(operand: &str) -> bool {
+    pub(crate) fn is_remote_spec(operand: &str) -> bool {
         if operand.starts_with("rsync://") {
             return true;
         }
@@ -2468,7 +2543,7 @@ pub(crate) mod shell {
                 i += 1;
                 continue;
             }
-            if is_rsync_remote_spec(&tokens[i]) {
+            if is_remote_spec(&tokens[i]) {
                 return true;
             }
             i += 1;
@@ -4220,6 +4295,42 @@ mod tests {
             assert!(
                 projector().text_contains_secret(command),
                 "text_contains_secret failed for {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn unquoted_authorization_headers_are_redacted_in_args_summary() {
+        for command in [
+            "echo Authorization: Basic abcdef1234567890",
+            "echo Proxy-Authorization: Basic abcdef1234567890",
+            "curl -H Authorization: Basic abcdef1234567890 https://example.com",
+            "echo Authorization: token=abcdef1234567890",
+            "echo Proxy-Authorization: OAuth abcdef1234567890",
+        ] {
+            let summary = projector().redact_bash_command_text(command);
+            assert!(
+                !summary.contains("abcdef1234567890"),
+                "args_summary leaked header credential for {command}: {summary}"
+            );
+            assert!(
+                summary.contains("[REDACTED:"),
+                "args_summary missing placeholder for {command}: {summary}"
+            );
+
+            let args = args(json!({"command": command}));
+            let redacted_args = projector().redact_arguments(&args).unwrap();
+            let args_text = serde_json::to_string(&redacted_args).unwrap();
+            assert!(
+                !args_text.contains("abcdef1234567890"),
+                "redact_arguments leaked header credential for {command}: {args_text}"
+            );
+
+            let projection = projector().project(&bash_action(command));
+            let projection_text = serde_json::to_string(&projection).unwrap();
+            assert!(
+                !projection_text.contains("abcdef1234567890"),
+                "projection leaked header credential for {command}: {projection_text}"
             );
         }
     }
