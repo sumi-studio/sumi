@@ -2,3 +2,5 @@
 
 pub mod allocator;
 pub mod contracts;
+pub mod execution_registry;
+pub mod supervisor;

@@ -19,6 +19,7 @@ use std::{
         },
     },
     path::{Component, Path, PathBuf},
+    sync::Arc,
 };
 
 use regex::Regex;
@@ -27,6 +28,7 @@ use uuid::Uuid;
 
 use super::{
     ResourceLimit, ToolError,
+    quota::DiskQuotaBackend,
     truncate::{
         DEFAULT_MAX_BYTES, GREP_MAX_LINE_LENGTH, TruncationOptions, TruncationResult,
         truncate_head, truncate_line_total,
@@ -88,10 +90,18 @@ enum WorkspaceGrepEnvelope<'a> {
 pub struct WorkspaceFs {
     root: File,
     display_root: PathBuf,
+    disk_quota: Option<Arc<dyn DiskQuotaBackend>>,
 }
 
 impl WorkspaceFs {
     pub fn open(root: &Path) -> Result<Self, ToolError> {
+        Self::open_with_disk_quota(root, None)
+    }
+
+    pub fn open_with_disk_quota(
+        root: &Path,
+        disk_quota: Option<Arc<dyn DiskQuotaBackend>>,
+    ) -> Result<Self, ToolError> {
         let (base_path, relative_root) = if root.is_absolute() {
             (
                 Path::new("/"),
@@ -130,7 +140,37 @@ impl WorkspaceFs {
         Ok(Self {
             root: file,
             display_root: root.to_owned(),
+            disk_quota,
         })
+    }
+
+    pub fn with_disk_quota(self, disk_quota: Arc<dyn DiskQuotaBackend>) -> Self {
+        Self {
+            root: self.root,
+            display_root: self.display_root,
+            disk_quota: Some(disk_quota),
+        }
+    }
+
+    fn check_disk_quota(&self, bytes: u64, inodes: u64) -> Result<(), ToolError> {
+        if let Some(quota) = &self.disk_quota {
+            quota
+                .check(bytes, inodes)
+                .map_err(ToolError::ResourceLimit)?;
+        }
+        Ok(())
+    }
+
+    fn commit_disk_quota(&self, bytes: u64, inodes: u64) {
+        if let Some(quota) = &self.disk_quota {
+            quota.commit(bytes, inodes);
+        }
+    }
+
+    fn rollback_disk_quota(&self, bytes: u64, inodes: u64) {
+        if let Some(quota) = &self.disk_quota {
+            quota.rollback(bytes, inodes);
+        }
     }
 
     pub fn read_file(
@@ -268,6 +308,8 @@ impl WorkspaceFs {
             Err(ToolError::Io(error)) if error.raw_os_error() == Some(libc::ENOENT) => {}
             Err(error) => return Err(error),
         }
+        let content_bytes = u64::try_from(content.len()).unwrap_or(u64::MAX);
+        self.check_disk_quota(content_bytes, 1)?;
         let temporary = CString::new(format!(".sumi-{}.tmp", Uuid::now_v7()))
             .map_err(|_| ToolError::InvalidPath("temporary filename was invalid".to_owned()))?;
         let name = os_str_cstring(name)?;
@@ -303,6 +345,7 @@ impl WorkspaceFs {
                 if renamed != 0 {
                     return Err(ToolError::Io(std::io::Error::last_os_error()));
                 }
+                self.commit_disk_quota(content_bytes, 1);
                 post_rename().map_err(|error| post_commit_error("write_file rename", error))?;
                 File::from(parent_fd.try_clone().map_err(|error| {
                     post_commit_error("write_file rename", ToolError::Io(error))
@@ -312,6 +355,7 @@ impl WorkspaceFs {
                 Ok(())
             })();
         if write_result.is_err() {
+            self.rollback_disk_quota(content_bytes, 1);
             unsafe {
                 libc::unlinkat(parent_fd.as_raw_fd(), temporary.as_ptr(), 0);
             }
@@ -432,6 +476,8 @@ impl WorkspaceFs {
         let temporary = CString::new(format!(".sumi-edit-{}.tmp", Uuid::now_v7()))
             .map_err(|_| ToolError::InvalidPath("temporary filename was invalid".to_owned()))?;
         let name = os_str_cstring(name)?;
+        let replacement_bytes = u64::try_from(replacement.len()).unwrap_or(u64::MAX);
+        self.check_disk_quota(replacement_bytes, 1)?;
         let raw = unsafe {
             libc::openat(
                 parent_fd.as_raw_fd(),
@@ -473,6 +519,7 @@ impl WorkspaceFs {
             {
                 return Err(ToolError::Io(std::io::Error::last_os_error()));
             }
+            self.commit_disk_quota(replacement_bytes, 1);
             temporary_ownership = EditTemporaryOwnership::OriginalQuarantine;
 
             before_post_write_check();
@@ -603,6 +650,9 @@ impl WorkspaceFs {
             temporary_ownership = EditTemporaryOwnership::Removed;
             Ok(())
         })();
+        if replacement_result.is_err() {
+            self.rollback_disk_quota(replacement_bytes, 1);
+        }
         if replacement_result.is_err() && temporary_ownership == EditTemporaryOwnership::Replacement
         {
             let replacement_metadata = replacement_file.metadata();
@@ -729,6 +779,7 @@ impl WorkspaceFs {
                 ToolError::Io(std::io::Error::last_os_error()),
             ));
         }
+        self.rollback_disk_quota(target_metadata.len(), 1);
         post_unlink().map_err(|error| post_commit_error("remove_file unlink", error))?;
         File::from(parent_fd)
             .sync_all()

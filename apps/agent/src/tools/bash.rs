@@ -4,6 +4,7 @@
 
 use std::{
     collections::VecDeque,
+    io::Write,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     process::Stdio,
@@ -25,12 +26,16 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     ResourceLimit, ToolError,
+    quota::{QuotaKind, ResourceQuotaPolicy, limit_for_breach},
     shell_capture::{
         ArtifactAppender, COMMAND_OUTPUT_LIMIT_BYTES, OUTPUT_QUEUE_CAPACITY, ShellCapture,
         ShellCaptureResult, copy_bounded_chunks, output_limit_if_reached,
     },
     truncate::{TruncationOptions, TruncationResult, truncate_tail},
     unix_pipe::merged_output_pipe,
+};
+use crate::runtime::{
+    contracts::ProcessGeneration, execution_registry::GenerationExecutionRegistry,
 };
 
 pub const DEFAULT_WALL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -96,6 +101,9 @@ pub struct LowTrustLocalBash<'a> {
     artifact: &'a dyn ArtifactAppender,
     broker_socket: Option<PathBuf>,
     wall_timeout: Duration,
+    quota_policy: ResourceQuotaPolicy,
+    process_generation: Option<ProcessGeneration>,
+    execution_registry: Option<std::sync::Arc<GenerationExecutionRegistry>>,
     #[cfg(test)]
     cancel_stop_delay: Duration,
     #[cfg(test)]
@@ -109,6 +117,9 @@ impl<'a> LowTrustLocalBash<'a> {
             artifact,
             broker_socket: None,
             wall_timeout: DEFAULT_WALL_TIMEOUT,
+            quota_policy: ResourceQuotaPolicy::default(),
+            process_generation: None,
+            execution_registry: None,
             #[cfg(test)]
             cancel_stop_delay: Duration::ZERO,
             #[cfg(test)]
@@ -118,6 +129,25 @@ impl<'a> LowTrustLocalBash<'a> {
 
     pub fn with_broker_socket(mut self, socket: PathBuf) -> Self {
         self.broker_socket = Some(socket);
+        self
+    }
+
+    pub fn with_quota_policy(mut self, policy: ResourceQuotaPolicy) -> Self {
+        self.quota_policy = policy;
+        self.wall_timeout = self.quota_policy.wall_time;
+        self
+    }
+
+    pub fn with_process_generation(mut self, generation: ProcessGeneration) -> Self {
+        self.process_generation = Some(generation);
+        self
+    }
+
+    pub fn with_execution_registry(
+        mut self,
+        registry: std::sync::Arc<GenerationExecutionRegistry>,
+    ) -> Self {
+        self.execution_registry = Some(registry);
         self
     }
 
@@ -168,6 +198,18 @@ impl<'a> LowTrustLocalBash<'a> {
             .stdin(Stdio::null())
             .stdout(Stdio::from(output_write))
             .stderr(Stdio::from(output_stderr));
+        let applied_quota = self
+            .quota_policy
+            .apply_to_command(&mut process, execution_id)?;
+        for skip in &applied_quota.skipped_features {
+            tracing::warn!(
+                target: "sumi_agent::tools",
+                feature = skip.feature,
+                reason = skip.reason,
+                "skipped resource quota because host feature is unavailable"
+            );
+        }
+
         #[cfg(test)]
         let force_close_range_fallback = self.force_close_range_fallback;
         #[cfg(not(test))]
@@ -189,7 +231,25 @@ impl<'a> LowTrustLocalBash<'a> {
         let pid = child.id().ok_or_else(|| {
             ToolError::Protocol("spawned bash did not expose a process id".to_owned())
         })?;
-        let mut process_group = ProcessGroupGuard::new(pid);
+
+        let cgroup_path = applied_quota.cgroup_path().map(PathBuf::from);
+
+        let _registry_handle = self.execution_registry.as_ref().and_then(|registry| {
+            registry
+                .register(
+                    execution_id.to_owned(),
+                    execution_id.to_owned(),
+                    self.process_generation
+                        .map(|generation| generation.to_string())
+                        .unwrap_or_default(),
+                    execution_id.to_owned(),
+                    cgroup_path.clone(),
+                    vec![pid],
+                )
+                .ok()
+        });
+
+        let mut process_group = ProcessGroupGuard::new(pid, cgroup_path.clone());
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(OUTPUT_QUEUE_CAPACITY);
         let pipe_observed_bytes = Arc::new(AtomicU64::new(0));
         let output_quota = CancellationToken::new();
@@ -219,20 +279,20 @@ impl<'a> LowTrustLocalBash<'a> {
                     if !self.cancel_stop_delay.is_zero() {
                         tokio::time::sleep(self.cancel_stop_delay).await;
                     }
-                    kill_process_group(pid)?;
+                    kill_sandbox(cgroup_path.as_deref(), pid)?;
                     break;
                 }
                 _ = output_quota.cancelled() => {
                     resource_limit =
                         output_limit_if_reached(pipe_observed_bytes.load(Ordering::Acquire));
-                    kill_process_group(pid)?;
+                    kill_sandbox(cgroup_path.as_deref(), pid)?;
                     break;
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     resource_limit = Some(ResourceLimit::WallTime {
                         limit_seconds: self.wall_timeout.as_secs(),
                     });
-                    kill_process_group(pid)?;
+                    kill_sandbox(cgroup_path.as_deref(), pid)?;
                     break;
                 }
                 status = &mut wait, if exit_status.is_none() => {
@@ -257,31 +317,31 @@ impl<'a> LowTrustLocalBash<'a> {
                             if !self.cancel_stop_delay.is_zero() {
                                 tokio::time::sleep(self.cancel_stop_delay).await;
                             }
-                            kill_process_group(pid)?;
+                            kill_sandbox(cgroup_path.as_deref(), pid)?;
                             break;
                         }
                         _ = output_quota.cancelled() => {
                             resource_limit =
                                 output_limit_if_reached(pipe_observed_bytes.load(Ordering::Acquire));
-                            kill_process_group(pid)?;
+                            kill_sandbox(cgroup_path.as_deref(), pid)?;
                             break;
                         }
                         _ = tokio::time::sleep_until(deadline) => {
                             resource_limit = Some(ResourceLimit::WallTime {
                                 limit_seconds: self.wall_timeout.as_secs(),
                             });
-                            kill_process_group(pid)?;
+                            kill_sandbox(cgroup_path.as_deref(), pid)?;
                             break;
                         }
                         result = &mut push => match result {
                             Ok(text) => on_update(json!({"output": text})),
                             Err(ToolError::ResourceLimit(limit)) => {
                                 resource_limit = Some(limit);
-                                kill_process_group(pid)?;
+                                kill_sandbox(cgroup_path.as_deref(), pid)?;
                                 break;
                             }
                             Err(error) => {
-                                kill_process_group(pid)?;
+                                kill_sandbox(cgroup_path.as_deref(), pid)?;
                                 if exit_status.is_none() {
                                     let _status = timeout_at(
                                         Instant::now() + Duration::from_secs(1),
@@ -314,6 +374,22 @@ impl<'a> LowTrustLocalBash<'a> {
                         )
                     })??,
             );
+        }
+
+        if !cancelled && let Some(status) = exit_status {
+            // When a cgroup is present, `AppliedQuota::classify` already
+            // inspected `memory.events`, `pids.events`, and `cpu.stat`. The only
+            // remaining signals that identify a limit without cgroup evidence
+            // are SIGXCPU and SIGXFSZ; SIGKILL must not be guessed as Memory
+            // when wall time or CPU throttle was the real stop cause.
+            resource_limit = applied_quota.classify(&status).or(resource_limit);
+            if resource_limit.is_none() {
+                resource_limit = classify_resource_limit(
+                    &self.quota_policy,
+                    &status,
+                    applied_quota.cgroup_path().is_none(),
+                );
+            }
         }
 
         drop(wait);
@@ -438,26 +514,35 @@ impl<'a> LowTrustLocalBash<'a> {
                 result.observed_bytes
             )));
         }
+        applied_quota.cleanup();
         Ok(result)
     }
 }
 
 struct ProcessGroupGuard {
     pid: Option<u32>,
+    cgroup_path: Option<PathBuf>,
 }
 
 impl ProcessGroupGuard {
-    fn new(pid: u32) -> Self {
-        Self { pid: Some(pid) }
+    fn new(pid: u32, cgroup_path: Option<PathBuf>) -> Self {
+        Self {
+            pid: Some(pid),
+            cgroup_path,
+        }
     }
 
     fn disarm(&mut self) {
         self.pid = None;
+        self.cgroup_path = None;
     }
 }
 
 impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
+        if let Some(ref path) = self.cgroup_path {
+            let _ = cgroup_kill(path);
+        }
         if let Some(pid) = self.pid {
             let _ = kill_process_group(pid);
         }
@@ -1105,6 +1190,36 @@ fn errno() -> libc::c_int {
     unsafe { *libc::__errno_location() }
 }
 
+fn classify_resource_limit(
+    policy: &ResourceQuotaPolicy,
+    status: &std::process::ExitStatus,
+    no_cgroup: bool,
+) -> Option<ResourceLimit> {
+    use std::os::unix::process::ExitStatusExt;
+    match status.signal() {
+        Some(libc::SIGXCPU) => policy
+            .cpu_time_seconds
+            .map(|limit| limit_for_breach(QuotaKind::CpuTime, 0, limit)),
+        Some(libc::SIGXFSZ) => policy
+            .disk_bytes
+            .map(|limit| limit_for_breach(QuotaKind::DiskBytes, limit, limit)),
+        Some(libc::SIGKILL) if no_cgroup => {
+            // Without a cgroup we cannot read controller events, so SIGKILL may
+            // have come from RLIMIT_AS or an explicit kill. Prefer the most
+            // specific configured limit that could plausibly produce SIGKILL.
+            policy
+                .memory_bytes
+                .map(|limit| limit_for_breach(QuotaKind::Memory, 0, limit))
+                .or_else(|| {
+                    policy
+                        .cpu_time_seconds
+                        .map(|limit| limit_for_breach(QuotaKind::CpuTime, 0, limit))
+                })
+        }
+        _ => None,
+    }
+}
+
 fn to_execution_result(
     capture: ShellCaptureResult,
     exit_code: Option<i32>,
@@ -1144,6 +1259,25 @@ fn kill_process_group(pid: u32) -> Result<(), ToolError> {
         return Ok(());
     }
     Err(ToolError::Io(error))
+}
+
+fn cgroup_kill(path: &Path) -> Result<(), ToolError> {
+    let kill_file = path.join("cgroup.kill");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&kill_file)
+        .map_err(ToolError::Io)?;
+    file.write_all(b"1").map_err(ToolError::Io)?;
+    Ok(())
+}
+
+fn kill_sandbox(cgroup_path: Option<&Path>, pid: u32) -> Result<(), ToolError> {
+    if let Some(path) = cgroup_path
+        && cgroup_kill(path).is_ok()
+    {
+        return Ok(());
+    }
+    kill_process_group(pid)
 }
 
 #[cfg(test)]

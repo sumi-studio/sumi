@@ -125,6 +125,24 @@ wait_for_socket() {
   error "${label} did not bind ${socket}"
 }
 
+prepare_cgroup_base() {
+  local exports
+  exports="$(
+    SUMI_TENANT_ID="${SUMI_TENANT_ID}" \
+    SUMI_AGENT_ID="${SUMI_AGENT_ID}" \
+    SUMI_CONVERSATION_ID="${SUMI_CONVERSATION_ID}" \
+    SUMI_RPC_GENERATION="${SUMI_RPC_GENERATION}" \
+    "${SUMI_BIN}" --supervisor-prepare-cgroup
+  )" || error "cgroup base preparation failed"
+  eval "${exports}"
+  : "${SUMI_EXECUTOR_CGROUP_BASE:?cgroup preparation did not set SUMI_EXECUTOR_CGROUP_BASE}"
+}
+
+recover_stale_generations() {
+  "${SUMI_BIN}" --supervisor-recovery-scan "${SUMI_EXECUTOR_CGROUP_BASE}" "${SUMI_RPC_GENERATION}" >/dev/null \
+    || error "stale generation recovery scan failed"
+}
+
 spawn_broker() {
   local generation="$1" nonce="$2"
   case "${SUMI_ISOLATION_MODE}" in
@@ -178,6 +196,7 @@ spawn_executor() {
         "SUMI_RPC_NONCE=${nonce}" \
         "SUMI_WORKSPACE=${SUMI_WORKSPACE}" \
         "SUMI_CONVERSATION_ID=${conversation}" \
+        "SUMI_EXECUTOR_CGROUP_BASE=${SUMI_EXECUTOR_CGROUP_BASE}" \
         "SUMI_ARTIFACT_BROKER_SOCKET=${SUMI_ARTIFACT_BROKER_SOCKET}" \
         "SUMI_EXECUTOR_SOCKET=${SUMI_EXECUTOR_SOCKET}" \
         "HOME=${SUMI_WORKSPACE}" \
@@ -191,6 +210,7 @@ spawn_executor() {
         "SUMI_RPC_NONCE=${nonce}" \
         "SUMI_WORKSPACE=${SUMI_WORKSPACE}" \
         "SUMI_CONVERSATION_ID=${conversation}" \
+        "SUMI_EXECUTOR_CGROUP_BASE=${SUMI_EXECUTOR_CGROUP_BASE}" \
         "SUMI_ARTIFACT_BROKER_SOCKET=${SUMI_ARTIFACT_BROKER_SOCKET}" \
         "SUMI_EXECUTOR_SOCKET=${SUMI_EXECUTOR_SOCKET}" \
         "HOME=${SUMI_WORKSPACE}" \
@@ -203,6 +223,7 @@ spawn_executor() {
         "SUMI_RPC_NONCE=${nonce}" \
         "SUMI_WORKSPACE=${SUMI_WORKSPACE}" \
         "SUMI_CONVERSATION_ID=${conversation}" \
+        "SUMI_EXECUTOR_CGROUP_BASE=${SUMI_EXECUTOR_CGROUP_BASE}" \
         "SUMI_ARTIFACT_BROKER_SOCKET=${SUMI_ARTIFACT_BROKER_SOCKET}" \
         "SUMI_EXECUTOR_SOCKET=${SUMI_EXECUTOR_SOCKET}" \
         "HOME=${SUMI_WORKSPACE}" \
@@ -229,6 +250,7 @@ spawn_runtime() {
     "SUMI_ARTIFACT_ROOT=${SUMI_ARTIFACT_ROOT}"
     "SUMI_ARTIFACT_BROKER_SOCKET=${SUMI_ARTIFACT_BROKER_SOCKET}"
     "SUMI_EXECUTOR_SOCKET=${SUMI_EXECUTOR_SOCKET}"
+    "SUMI_EXECUTOR_CGROUP_BASE=${SUMI_EXECUTOR_CGROUP_BASE}"
     "SUMI_AGENT_WRAPPING_KEY=${SUMI_AGENT_WRAPPING_KEY}"
     "SUMI_AGENT_WRAPPING_KEY_ID=${SUMI_AGENT_WRAPPING_KEY_ID:-env-wrapping-key/v1}"
     "HOME=${SUMI_STATE_DIR}"
@@ -283,8 +305,10 @@ main() {
   prepare_directories
 
   allocate_identity
+  prepare_cgroup_base
+  recover_stale_generations
 
-  log "deployment generation=${SUMI_RPC_GENERATION} mode=${SUMI_ISOLATION_MODE}"
+  log "deployment generation=${SUMI_RPC_GENERATION} mode=${SUMI_ISOLATION_MODE} cgroup=${SUMI_EXECUTOR_CGROUP_BASE}"
 
   : "${SUMI_TENANT_ID:?SUMI_TENANT_ID is required}"
   : "${SUMI_AGENT_ID:?SUMI_AGENT_ID is required}"

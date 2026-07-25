@@ -34,7 +34,7 @@ use super::{
     ExecutorResponse, InputRoute, MAX_RPC_LINE_BYTES, RpcError, RpcFrame, RpcLifecycleTracker,
     RpcRequest, decode_rpc_line, encode_rpc_frame, resolve_input,
 };
-use crate::runtime::contracts::RpcIdentity;
+use crate::runtime::{contracts::RpcIdentity, execution_registry::GenerationExecutionRegistry};
 use crate::tools::{
     ToolError,
     bash::{BashExecutionResult, LowTrustLocalBash},
@@ -866,6 +866,7 @@ async fn run_executor_service_with_writer<R>(
 where
     R: AsyncRead + Unpin,
 {
+    let registry = GenerationExecutionRegistry::new(identity.generation());
     let result = run_executor_loop(
         read,
         &writer,
@@ -873,6 +874,7 @@ where
         workspace,
         fs,
         broker,
+        registry,
         #[cfg(test)]
         test_controls,
     )
@@ -882,6 +884,7 @@ where
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_executor_loop<R>(
     read: R,
     writer: &ExecutorWriter,
@@ -889,6 +892,7 @@ async fn run_executor_loop<R>(
     workspace: PathBuf,
     fs: WorkspaceFs,
     broker: ArtifactBrokerClient,
+    registry: Arc<GenerationExecutionRegistry>,
     #[cfg(test)] mut test_controls: ExecutorTestControls,
 ) -> Result<()>
 where
@@ -922,6 +926,7 @@ where
                     &workspace,
                     &broker,
                     &mut lifecycle,
+                    registry.clone(),
                     request.request_id,
                     execution_id,
                     command,
@@ -969,6 +974,7 @@ async fn run_bash_request<R>(
     workspace: &Path,
     broker: &ArtifactBrokerClient,
     lifecycle: &mut RpcLifecycleTracker,
+    registry: Arc<GenerationExecutionRegistry>,
     request_id: String,
     execution_id: String,
     command: String,
@@ -980,7 +986,9 @@ where
     let cancel = CancellationToken::new();
     let (on_update, mut updates_rx) = bounded_bash_updates();
     let bash = LowTrustLocalBash::new(workspace.to_path_buf(), broker)
-        .with_broker_socket(broker.socket().to_path_buf());
+        .with_broker_socket(broker.socket().to_path_buf())
+        .with_process_generation(identity.generation())
+        .with_execution_registry(registry);
     #[cfg(test)]
     let bash = bash.with_cancel_stop_delay(test_controls.cancel_stop_delay);
     let execution = bash.execute(&command, &execution_id, cancel.clone(), on_update);

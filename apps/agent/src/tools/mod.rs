@@ -18,7 +18,10 @@ mod bash_non_linux_compile_check;
 pub mod executor;
 #[cfg(target_os = "linux")]
 pub mod fs;
+pub mod quota;
 pub mod shell_capture;
+#[cfg(test)]
+mod t27_quota_and_recovery;
 pub mod truncate;
 #[cfg(unix)]
 mod unix_pipe;
@@ -54,11 +57,12 @@ pub enum ResourceLimit {
     InputBytes { observed: u64, limit: u64 },
     WallTime { limit_seconds: u64 },
     Concurrency,
-    Cpu,
-    Memory,
-    Pids,
-    DiskBytes,
-    DiskInodes,
+    CpuTime { limit_seconds: u64 },
+    CpuThrottle { limit: u64 },
+    Memory { limit: u64 },
+    Pids { limit: u64 },
+    DiskBytes { observed: u64, limit: u64 },
+    DiskInodes { observed: u64, limit: u64 },
     ScanBytes,
     ScanEntries,
 }

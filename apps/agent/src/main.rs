@@ -11,7 +11,11 @@ pub mod runtime;
 mod store;
 mod tools;
 
-use std::{env, io, path::Path, sync::Arc};
+use std::{
+    env, io,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, anyhow};
 use gateway::{
@@ -98,6 +102,44 @@ async fn async_main(mode: Option<String>) -> Result<()> {
             let socket = env::var_os("SUMI_READINESS_SOCKET")
                 .ok_or_else(|| anyhow!("SUMI_READINESS_SOCKET is required for socket readiness"))?;
             return tools::executor::wait_for_unix_socket(Path::new(&socket), "readiness").await;
+        }
+        Some("--supervisor-prepare-cgroup") => {
+            let tenant_id = env::var("SUMI_TENANT_ID")
+                .context("SUMI_TENANT_ID is required for cgroup preparation")?;
+            let agent_id = env::var("SUMI_AGENT_ID")
+                .context("SUMI_AGENT_ID is required for cgroup preparation")?;
+            let conversation_id = env::var("SUMI_CONVERSATION_ID")
+                .context("SUMI_CONVERSATION_ID is required for cgroup preparation")?;
+            let generation = env::var("SUMI_RPC_GENERATION")
+                .context("SUMI_RPC_GENERATION is required for cgroup preparation")?
+                .parse::<u64>()
+                .context("SUMI_RPC_GENERATION must be an integer")?;
+            let base = runtime::supervisor::prepare_cgroup_base(
+                &tenant_id,
+                &agent_id,
+                &conversation_id,
+                generation,
+            )
+            .context("failed to prepare supervisor cgroup base")?;
+            println!("export SUMI_EXECUTOR_CGROUP_BASE={}", base.display());
+            return Ok(());
+        }
+        Some("--supervisor-recovery-scan") => {
+            let base = PathBuf::from(
+                env::args()
+                    .nth(2)
+                    .context("cgroup base path is required as the first argument")?,
+            );
+            let generation = env::args()
+                .nth(3)
+                .context("current generation is required as the second argument")?
+                .parse::<u64>()
+                .context("current generation must be an integer")?;
+            let removed = runtime::supervisor::scan_and_kill_stale(&base, generation)
+                .context("stale-generation recovery scan failed")?;
+            let serialized: Vec<String> = removed.iter().map(|p| p.display().to_string()).collect();
+            println!("{}", serde_json::to_string(&serialized)?);
+            return Ok(());
         }
         _ => {}
     }
