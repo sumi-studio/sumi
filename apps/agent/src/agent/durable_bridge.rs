@@ -276,7 +276,10 @@ impl DurableBridge {
         if self.assistant_open.is_some() {
             return SteerStage::AssistantGeneration;
         }
-        if !self.pending_tool_end.is_empty() || !self.length_not_started.is_empty() {
+        if !self.pending_tool_end.is_empty()
+            || !self.length_not_started.is_empty()
+            || !self.pending_tool_calls.is_empty()
+        {
             return SteerStage::ToolOrApproval;
         }
         SteerStage::Other
@@ -638,7 +641,15 @@ impl DurableBridge {
                         self.pending_steer_open_start = Some((message_id, *message));
                         Ok((Vec::new(), Vec::new()))
                     } else {
-                        bail!("steer group MessageStart must be a user message");
+                        // Tool results belong to the closing turn and are committed
+                        // before the buffered TurnEnd/TurnStart complete the group.
+                        if self.pending_start.is_some() {
+                            bail!(
+                                "a second non-assistant MessageStart arrived before its MessageEnd"
+                            );
+                        }
+                        self.pending_start = Some((message_id, *message));
+                        Ok((Vec::new(), Vec::new()))
                     }
                 } else {
                     if self.pending_start.is_some() {
@@ -715,7 +726,10 @@ impl DurableBridge {
                         bail!("soft-steer TurnStart arrived without a buffered TurnEnd");
                     }
                     self.pending_steer_turn_start = true;
-                    self.binding.turn_id = output.binding.turn_id;
+                    // The group turn is installed atomically by commit_steer_group
+                    // after the buffered old TurnEnd closes. Overwriting the durable
+                    // binding here would make the buffered TurnEnd reference the new
+                    // turn and fail TurnStart/TurnEnd ordering validation.
                     self.turn_open = true;
                     Ok((Vec::new(), Vec::new()))
                 } else {
@@ -1219,25 +1233,41 @@ impl DurableBridge {
                     .unwrap_or_else(|| self.binding.command_id.clone());
                 projections.push(Projection::ToolExecution(ToolExecutionMutation::Skip {
                     tool_call_id: tool_call_id.clone(),
-                    command_id: owner_id,
+                    command_id: owner_id.clone(),
                     run_id: self.binding.run_id.clone(),
                     turn_id: self.binding.turn_id.clone(),
                     executor_generation: self.binding.executor_generation,
-                    idempotency_key: self.binding.tool_execution_idempotency_key(&tool_call_id),
+                    idempotency_key: format!("{owner_id}/{tool_call_id}"),
                     error_code: "user_steer_cancelled",
                 }));
             } else if self.length_not_started.remove(&tool_call_id) {
                 if !result.is_error {
                     bail!("Length-not-started ToolResult must be is_error=true");
                 }
+                // A Length-guarded assistant that is then aborted or hard-steered
+                // leaves the original owner in cancel_requested/hard_steer_requested.
+                // The canonical skip for those not-started calls is user_steer_cancelled;
+                // length_guard is reserved to the assistant's own turn.
+                let owner_id = self
+                    .aborted_owner
+                    .as_ref()
+                    .map(|(id, _)| id.clone())
+                    .unwrap_or_else(|| self.binding.command_id.clone());
+                let steer_cancelled =
+                    self.aborted_owner.is_some() || self.pending_hard_steer.is_some();
+                let error_code = if steer_cancelled {
+                    "user_steer_cancelled"
+                } else {
+                    "length_guard"
+                };
                 projections.push(Projection::ToolExecution(ToolExecutionMutation::Skip {
                     tool_call_id: tool_call_id.clone(),
-                    command_id: self.binding.command_id.clone(),
+                    command_id: owner_id.clone(),
                     run_id: self.binding.run_id.clone(),
                     turn_id: self.binding.turn_id.clone(),
                     executor_generation: self.binding.executor_generation,
-                    idempotency_key: self.binding.tool_execution_idempotency_key(&tool_call_id),
-                    error_code: "length_guard",
+                    idempotency_key: format!("{owner_id}/{tool_call_id}"),
+                    error_code,
                 }));
             } else if let Some((_, _, pending_ids, _)) = self.pending_rejected_end.as_mut()
                 && pending_ids.remove(&tool_call_id)
@@ -1857,8 +1887,8 @@ mod tests {
     use crate::{
         gateway::{Command, CommandEnvelope, CommandId, InboundCommand},
         provider::types::{
-            PublicAssistantMessage, PublicMessage, StopReason, ToolResultMessage, UserContent,
-            UserMessage,
+            PublicAssistantContent, PublicAssistantMessage, PublicMessage, StopReason, ToolCall,
+            ToolResultMessage, UserContent, UserMessage, ValidatedToolArguments,
         },
         store::{
             ApplicationKind, DurableEvent, EventBatch, EventWriter, InjectedCommand, Projection,
@@ -2498,5 +2528,496 @@ mod tests {
             )
             .await
             .expect("tool result MessageStart accepted after hard-steer user");
+    }
+
+    #[tokio::test]
+    async fn pending_tool_calls_classify_as_tool_or_approval_for_soft_steer() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let owner_id = "00000000-0000-4000-8000-000000000201";
+        let run_id = "run-1";
+        let turn_id = "turn-1";
+        let (binding, _) = owner_in_phase(
+            &store,
+            &writer,
+            owner_id,
+            run_id,
+            turn_id,
+            RunPhase::AssistantStarted,
+        )
+        .await;
+
+        let mut bridge = DurableBridge::new(binding);
+        bridge.phase = RunPhase::AssistantStarted;
+        bridge.turn_open = true;
+        bridge.assistant_open = None;
+        bridge.pending_tool_calls.insert("pending-call".to_owned());
+
+        assert_eq!(
+            bridge.steer_stage(),
+            SteerStage::ToolOrApproval,
+            "commands between assistant MessageEnd and tool start must be ToolOrApproval"
+        );
+
+        let steer_id = "00000000-0000-4000-8000-000000000202";
+        persist_and_pin(&store, &writer, 2, steer_id, "steer now").await;
+        let command = test_admitted(2, steer_id, "steer now");
+        assert!(
+            bridge.can_bind_soft_steer(&writer, &command),
+            "soft steer must bind while tool calls are pending"
+        );
+        bridge
+            .bind_soft_steer(&writer, command.clone())
+            .await
+            .expect("bind soft steer in pending-tool-calls window");
+    }
+
+    #[tokio::test]
+    async fn soft_steer_turn_start_preserves_old_turn_until_group_commit() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let owner_id = "00000000-0000-4000-8000-000000000301";
+        let run_id = "run-1";
+        let old_turn_id = "turn-1";
+        let (owner_binding, assistant) = owner_in_phase(
+            &store,
+            &writer,
+            owner_id,
+            run_id,
+            old_turn_id,
+            RunPhase::AssistantStarted,
+        )
+        .await;
+        let (assistant_id, assistant_base) = assistant.expect("assistant MessageStart");
+
+        let tool_call = ToolCall {
+            id: "soft-call".to_owned(),
+            name: "fixture-tool".to_owned(),
+            arguments: serde_json::from_value::<ValidatedToolArguments>(
+                serde_json::json!({"safe": true}),
+            )
+            .expect("validated arguments"),
+        };
+        let mut assistant_with_tool = match assistant_base {
+            PublicMessage::Assistant(a) => a,
+            _ => unreachable!(),
+        };
+        assistant_with_tool.content = vec![PublicAssistantContent::ToolCall {
+            tool_call: tool_call.clone(),
+            wire_item_index: 0,
+        }];
+        assistant_with_tool.stop_reason = StopReason::Stop;
+        let assistant_message = PublicMessage::Assistant(assistant_with_tool);
+
+        let mut bridge = DurableBridge::new(owner_binding.clone());
+        bridge.phase = RunPhase::AssistantStarted;
+        bridge.turn_open = true;
+        bridge.assistant_open = Some(assistant_id.clone());
+
+        let (assistant_barrier, _) = MessageCommitBarrier::channel();
+        let committed = bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: owner_binding.clone(),
+                    event: AgentEvent::MessageEnd {
+                        message_id: assistant_id.clone(),
+                        message: Box::new(assistant_message.clone()),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: Some(assistant_barrier),
+                    retry_wait_commit_barrier: None,
+                },
+            )
+            .await
+            .expect("commit assistant MessageEnd with tool call");
+        committed.resolve_message_receipts();
+
+        let steer_id = "00000000-0000-4000-8000-000000000302";
+        persist_and_pin(&store, &writer, 2, steer_id, "steer now").await;
+        let steer_command = test_admitted(2, steer_id, "steer now");
+        bridge
+            .bind_soft_steer(&writer, steer_command)
+            .await
+            .expect("bind soft steer after tool call pending");
+
+        let (tool_start_barrier, _) = ToolStartCommitBarrier::channel();
+        let committed = bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: owner_binding.clone(),
+                    event: AgentEvent::ToolExecutionStart {
+                        tool_call_id: tool_call.id.clone(),
+                        tool_name: tool_call.name.clone(),
+                        args: serde_json::json!({"safe": true}),
+                    },
+                    commit_barrier: Some(tool_start_barrier),
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                },
+            )
+            .await
+            .expect("commit tool execution start");
+        let (_, tool_barrier, _, _) = committed.resolve_message_receipts();
+        if let Some(barrier) = tool_barrier {
+            barrier.committed();
+        }
+
+        let result_message = ToolResultMessage {
+            tool_call_id: tool_call.id.clone(),
+            tool_name: tool_call.name.clone(),
+            content: vec![UserContent::Text {
+                text: "ok".to_owned(),
+            }],
+            details: serde_json::json!({"ok": true}),
+            is_error: false,
+            timestamp: test_timestamp(),
+        };
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: owner_binding.clone(),
+                    event: AgentEvent::ToolExecutionEnd {
+                        tool_call_id: tool_call.id.clone(),
+                        result: serde_json::to_value(&result_message).expect("serialize result"),
+                        is_error: false,
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                },
+            )
+            .await
+            .expect("commit tool execution end");
+
+        let tool_result_id = "soft-result".to_owned();
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: owner_binding.clone(),
+                    event: AgentEvent::MessageStart {
+                        message_id: tool_result_id.clone(),
+                        message: Box::new(PublicMessage::ToolResult(result_message.clone())),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                },
+            )
+            .await
+            .expect("commit tool result MessageStart");
+
+        let (tool_result_barrier, _) = MessageCommitBarrier::channel();
+        let committed = bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: owner_binding.clone(),
+                    event: AgentEvent::MessageEnd {
+                        message_id: tool_result_id,
+                        message: Box::new(PublicMessage::ToolResult(result_message.clone())),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: Some(tool_result_barrier),
+                    retry_wait_commit_barrier: None,
+                },
+            )
+            .await
+            .expect("commit tool result MessageEnd");
+        committed.resolve_message_receipts();
+
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: owner_binding.clone(),
+                    event: AgentEvent::TurnEnd {
+                        message: Some(Box::new(assistant_message.clone())),
+                        tool_results: vec![result_message.clone()],
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                },
+            )
+            .await
+            .expect("buffer old turn end while steer group is pending");
+
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: owner_binding.clone(),
+                    event: AgentEvent::TurnStart,
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                },
+            )
+            .await
+            .expect("buffer new turn start while steer group is pending");
+
+        let user_message_id = crate::store::user_message_id(steer_id);
+        let user_message = PublicMessage::User(UserMessage {
+            content: vec![UserContent::Text {
+                text: "steer now".to_owned(),
+            }],
+            timestamp: test_timestamp(),
+        });
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: owner_binding.clone(),
+                    event: AgentEvent::MessageStart {
+                        message_id: user_message_id.clone(),
+                        message: Box::new(user_message.clone()),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                },
+            )
+            .await
+            .expect("collect steer group user MessageStart");
+
+        let (user_barrier, _) = MessageCommitBarrier::channel();
+        let committed = bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: owner_binding.clone(),
+                    event: AgentEvent::MessageEnd {
+                        message_id: user_message_id,
+                        message: Box::new(user_message),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: Some(user_barrier),
+                    retry_wait_commit_barrier: None,
+                },
+            )
+            .await
+            .expect("commit steer group and complete injection");
+        committed.resolve_message_receipts();
+
+        let turn_end_turn_id: String = sqlx::query_scalar(
+            "SELECT json_extract(internal_metadata, '$.turn_id') FROM agent_events
+             WHERE event_type='turn_end' ORDER BY seq DESC LIMIT 1",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("turn end turn id");
+        let turn_start_turn_id: String = sqlx::query_scalar(
+            "SELECT json_extract(internal_metadata, '$.turn_id') FROM agent_events
+             WHERE event_type='turn_start' ORDER BY seq DESC LIMIT 1",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("turn start turn id");
+
+        assert_eq!(
+            turn_end_turn_id, old_turn_id,
+            "old TurnEnd must use the original turn"
+        );
+        assert_ne!(
+            turn_start_turn_id, old_turn_id,
+            "new TurnStart must introduce the group turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_after_length_guard_skips_not_started_as_user_steer_cancelled() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let owner_id = "00000000-0000-4000-8000-000000000401";
+        let run_id = "run-1";
+        let turn_id = "turn-1";
+        let (owner_binding, assistant) = owner_in_phase(
+            &store,
+            &writer,
+            owner_id,
+            run_id,
+            turn_id,
+            RunPhase::AssistantStarted,
+        )
+        .await;
+        let (assistant_id, assistant_base) = assistant.expect("assistant MessageStart");
+
+        let length_call = ToolCall {
+            id: "length-call".to_owned(),
+            name: "fixture-tool".to_owned(),
+            arguments: serde_json::from_value::<ValidatedToolArguments>(
+                serde_json::json!({"safe": true}),
+            )
+            .expect("validated arguments"),
+        };
+        let mut length_assistant = match assistant_base {
+            PublicMessage::Assistant(a) => a,
+            _ => unreachable!(),
+        };
+        length_assistant.content = vec![PublicAssistantContent::ToolCall {
+            tool_call: length_call.clone(),
+            wire_item_index: 0,
+        }];
+        length_assistant.stop_reason = StopReason::Length;
+        let length_assistant_message = PublicMessage::Assistant(length_assistant);
+
+        let mut bridge = DurableBridge::new(owner_binding.clone());
+        bridge.phase = RunPhase::AssistantStarted;
+        bridge.turn_open = true;
+        bridge.assistant_open = Some(assistant_id.clone());
+
+        let (assistant_barrier, _) = MessageCommitBarrier::channel();
+        let committed = bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: owner_binding.clone(),
+                    event: AgentEvent::MessageEnd {
+                        message_id: assistant_id.clone(),
+                        message: Box::new(length_assistant_message.clone()),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: Some(assistant_barrier),
+                    retry_wait_commit_barrier: None,
+                },
+            )
+            .await
+            .expect("commit length-guarded assistant MessageEnd");
+        committed.resolve_message_receipts();
+
+        let abort_id = "00000000-0000-4000-8000-000000000402";
+        writer
+            .persist_inbound(&test_abort_command(2, abort_id))
+            .await
+            .expect("persist abort command");
+        let abort_command = test_admitted_abort(2, abort_id);
+        bridge
+            .bind_abort(&writer, abort_command)
+            .await
+            .expect("bind abort after length guard");
+
+        let result_message = ToolResultMessage {
+            tool_call_id: length_call.id.clone(),
+            tool_name: length_call.name.clone(),
+            content: vec![UserContent::Text {
+                text: "not executed".to_owned(),
+            }],
+            details: serde_json::json!({"error": "length_guard"}),
+            is_error: true,
+            timestamp: test_timestamp(),
+        };
+        let result_id = "length-result".to_owned();
+
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: owner_binding.clone(),
+                    event: AgentEvent::MessageStart {
+                        message_id: result_id.clone(),
+                        message: Box::new(PublicMessage::ToolResult(result_message.clone())),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                },
+            )
+            .await
+            .expect("commit length result MessageStart");
+
+        let (result_barrier, _) = MessageCommitBarrier::channel();
+        let committed = bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: owner_binding.clone(),
+                    event: AgentEvent::MessageEnd {
+                        message_id: result_id,
+                        message: Box::new(PublicMessage::ToolResult(result_message.clone())),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: Some(result_barrier),
+                    retry_wait_commit_barrier: None,
+                },
+            )
+            .await
+            .expect("commit length result MessageEnd with Skip");
+        committed.resolve_message_receipts();
+
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: owner_binding.clone(),
+                    event: AgentEvent::TurnEnd {
+                        message: Some(Box::new(length_assistant_message.clone())),
+                        tool_results: vec![result_message.clone()],
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                },
+            )
+            .await
+            .expect("commit TurnEnd after abort");
+
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: owner_binding.clone(),
+                    event: AgentEvent::AgentEnd,
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                },
+            )
+            .await
+            .expect("commit AgentEnd after abort");
+
+        let row: (String, String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT state, command_id, started_at, error_code
+             FROM tool_executions WHERE tool_call_id = ?",
+        )
+        .bind(&length_call.id)
+        .fetch_one(store.pool())
+        .await
+        .expect("length tool execution row");
+        assert_eq!(row.0, "not_started", "tool must remain not_started");
+        assert_eq!(row.1, owner_id, "tool must belong to the original owner");
+        assert!(row.2.is_none(), "not_started tool must have no started_at");
+        assert_eq!(
+            row.3.as_deref(),
+            Some("user_steer_cancelled"),
+            "abort must record user_steer_cancelled, not length_guard"
+        );
+
+        let execution_lifecycle: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_events
+             WHERE event_type IN ('tool_execution_start', 'tool_execution_end', 'retry_scheduled')",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("execution lifecycle count");
+        assert_eq!(
+            execution_lifecycle, 0,
+            "aborted length call must not execute or retry"
+        );
+
+        let owner_status: (String, String) =
+            sqlx::query_as("SELECT status, run_phase FROM inbound_commands WHERE command_id = ?")
+                .bind(owner_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("owner status");
+        assert_eq!(owner_status.0, "applied", "original owner must close");
+        assert_eq!(
+            owner_status.1, "finished",
+            "original owner must be finished"
+        );
     }
 }
