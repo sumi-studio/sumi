@@ -16,14 +16,19 @@ use futures_util::{SinkExt, StreamExt};
 use rustls::crypto::CryptoProvider;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest, http::HeaderValue};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite};
+use tokio_tungstenite::tungstenite::{
+    Message, client::IntoClientRequest, http::HeaderValue, protocol::WebSocketConfig,
+};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config, tungstenite};
 
 use super::supervisor::{
     AgentHello, ApiHello, ConnectorError, GatewayConnector, GatewayCredential,
 };
 use super::wire;
-use super::{Gateway, GatewayClosed, GatewayReader, GatewayWriter, InboundCommand, OutboundFrame};
+use super::{
+    Gateway, GatewayClosed, GatewayReader, GatewayWriter, InboundCommand, MAX_FRAME_BYTES,
+    OutboundFrame,
+};
 
 static RUSTLS_INIT: Once = Once::new();
 
@@ -133,7 +138,13 @@ impl GatewayConnector for WebSocketConnector {
             .map_err(|e| ConnectorError::Other(anyhow!("invalid authorization header: {e}")))?;
         request.headers_mut().insert("Authorization", header);
 
-        match connect_async(request).await {
+        let ws_config = WebSocketConfig {
+            max_message_size: Some(MAX_FRAME_BYTES),
+            max_frame_size: Some(MAX_FRAME_BYTES),
+            ..WebSocketConfig::default()
+        };
+
+        match connect_async_with_config(request, Some(ws_config), false).await {
             Ok((ws, _)) => Ok(WebSocketGateway::new(ws, self.digest_factory.clone())),
             Err(tungstenite::Error::Http(response))
                 if matches!(response.status().as_u16(), 401 | 403) =>
@@ -175,18 +186,20 @@ impl Gateway for WebSocketGateway {
             .await
             .context("send agent hello")?;
 
-        let msg = self
-            .ws
-            .next()
-            .await
-            .context("websocket closed before hello response")?
-            .context("websocket error")?;
+        let bytes = loop {
+            let msg = self
+                .ws
+                .next()
+                .await
+                .context("websocket closed before hello response")?
+                .context("websocket error")?;
 
-        let bytes = match msg {
-            Message::Text(s) => s.into_bytes(),
-            Message::Binary(b) => b,
-            Message::Close(_) => return Err(GatewayClosed.into()),
-            _ => bail!("unexpected websocket message during hello"),
+            match msg {
+                Message::Text(s) => break s.into_bytes(),
+                Message::Binary(b) => break b,
+                Message::Close(_) => return Err(GatewayClosed.into()),
+                Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
+            }
         };
 
         let api_hello: ApiHello = serde_json::from_slice(&bytes).context("parse api hello")?;
@@ -282,7 +295,7 @@ mod tests {
     use super::super::{
         AgentHello, ApiHello, CommandDigestFactory, Envelope, Gateway, GatewayConnector,
         GatewayCredential, GatewayReader, GatewayWriter, InboundCommand, IncrementalCommandDigest,
-        OutboundFrame,
+        MAX_FRAME_BYTES, OutboundFrame,
     };
     use super::{CryptoProvider, WebSocketConnector, decode_command_bytes, init_crypto_provider};
     use crate::runtime::contracts::ProcessGeneration;
@@ -717,6 +730,130 @@ mod tests {
         let cmd = reader.next_command().await.unwrap();
         assert!(matches!(cmd, InboundCommand::Valid(_)));
 
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn authenticate_hello_ignores_ping_and_pong_before_api_hello() {
+        let listener = TcpListener::bind(listener_addr()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            read_agent_hello(&mut ws).await;
+            ws.send(tokio_tungstenite::tungstenite::Message::Ping(vec![]))
+                .await
+                .unwrap();
+            ws.send(tokio_tungstenite::tungstenite::Message::Pong(vec![]))
+                .await
+                .unwrap();
+            send_api_hello(&mut ws, test_api_hello()).await;
+        });
+
+        let mut connector =
+            WebSocketConnector::new_insecure(format!("ws://{addr}"), Arc::new(TestDigestFactory));
+        let mut gateway = connector
+            .connect(GatewayCredential::new("valid"))
+            .await
+            .unwrap();
+        let api_hello = timeout(
+            Duration::from_millis(200),
+            gateway.authenticate_hello(test_agent_hello()),
+        )
+        .await
+        .expect("authenticate_hello should not hang on ping/pong")
+        .expect("authenticate_hello should succeed after ping/pong");
+        assert_eq!(
+            api_hello.accepted_generation,
+            test_api_hello().accepted_generation
+        );
+
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn authenticate_hello_returns_gateway_closed_on_close_message() {
+        let listener = TcpListener::bind(listener_addr()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            read_agent_hello(&mut ws).await;
+            ws.send(tokio_tungstenite::tungstenite::Message::Close(None))
+                .await
+                .unwrap();
+        });
+
+        let mut connector =
+            WebSocketConnector::new_insecure(format!("ws://{addr}"), Arc::new(TestDigestFactory));
+        let mut gateway = connector
+            .connect(GatewayCredential::new("valid"))
+            .await
+            .unwrap();
+        let result = gateway.authenticate_hello(test_agent_hello()).await;
+        assert!(result.is_err(), "authenticate_hello must fail on Close");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("gateway input closed")
+        );
+
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn reader_rejects_message_exceeding_max_frame_bytes() {
+        let listener = TcpListener::bind(listener_addr()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            read_agent_hello(&mut ws).await;
+            send_api_hello(&mut ws, test_api_hello()).await;
+
+            // Tell the client the oversized frame is about to be sent, then send
+            // it. The send may block once the client stops reading after the
+            // capacity error, so the test aborts the server task rather than
+            // waiting for the send to complete.
+            let _ = ready_tx.send(());
+            let oversized = vec![0u8; MAX_FRAME_BYTES + 1];
+            let _ = ws
+                .send(tokio_tungstenite::tungstenite::Message::Binary(oversized))
+                .await;
+        });
+
+        let mut connector =
+            WebSocketConnector::new_insecure(format!("ws://{addr}"), Arc::new(TestDigestFactory));
+        let mut gateway = connector
+            .connect(GatewayCredential::new("valid"))
+            .await
+            .unwrap();
+        let _ = gateway
+            .authenticate_hello(test_agent_hello())
+            .await
+            .unwrap();
+        let (mut reader, _writer) = gateway.split();
+
+        ready_rx.await.unwrap();
+        let result = timeout(Duration::from_secs(2), reader.next_command()).await;
+        assert!(
+            result.is_ok(),
+            "reader must not hang waiting for oversized message"
+        );
+        let result = result.unwrap();
+        assert!(
+            result.is_err(),
+            "reader must reject oversized websocket message: {result:?}"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Message too long"), "unexpected error: {err}");
+
+        server.abort();
         let _ = server.await;
     }
 

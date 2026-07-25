@@ -349,7 +349,7 @@ where
                         .config
                         .max_auth_attempts
                         .unwrap_or(DEFAULT_MAX_AUTH_ATTEMPTS);
-                    if auth_attempt > max {
+                    if auth_attempt >= max {
                         return Err(anyhow!("max auth attempts exceeded"));
                     }
                     tokio::select! {
@@ -361,7 +361,7 @@ where
                 Err(SupervisorError::Reconnect { reason }) => {
                     reconnect_attempt = reconnect_attempt.saturating_add(1);
                     if let Some(max) = self.config.max_reconnect_attempts
-                        && reconnect_attempt > max
+                        && reconnect_attempt >= max
                     {
                         return Err(anyhow!("max reconnect attempts exceeded: {reason}"));
                     }
@@ -372,12 +372,15 @@ where
                     }
                 }
                 Err(SupervisorError::EstablishedReconnect { reason }) => {
-                    // A healthy epoch ended; reset failure streaks and reconnect.
+                    // A successful hello resets the auth streak, but the post-hello
+                    // failure is a reconnect like any other; do not reset the streak
+                    // merely because the hello succeeded. There is currently no
+                    // observable healthy-epoch boundary in this state machine, so a
+                    // clean (Ok, Ok) epoch end is also treated as a reconnect.
                     auth_attempt = 0;
-                    reconnect_attempt = 0;
                     reconnect_attempt = reconnect_attempt.saturating_add(1);
                     if let Some(max) = self.config.max_reconnect_attempts
-                        && reconnect_attempt > max
+                        && reconnect_attempt >= max
                     {
                         return Err(anyhow!("max reconnect attempts exceeded: {reason}"));
                     }
@@ -643,9 +646,13 @@ async fn validate_hello<S: DurableSource>(
                 reason: format!("command cursor unavailable for hello validation: {e}"),
             })?;
     let expected_next_command_seq = command_cursor.applied.saturating_add(1);
-    if api.next_command_seq != expected_next_command_seq {
+    // The API may legitimately lag behind our durable applied cursor if a terminal
+    // ACK (Applied/Superseded/Rejected) was lost in flight; it will resend and the
+    // durable consumer deduplicates. Any cursor ahead of applied+1 skips commands
+    // that have not yet been durably applied and remains fatal.
+    if api.next_command_seq > expected_next_command_seq {
         return Err(SupervisorError::Fatal(anyhow!(
-            "command cursor claim mismatch: next_command_seq {} != applied {} + 1 (expected {}); received={}",
+            "command cursor claim ahead of durable boundary: next_command_seq {} > applied {} + 1 (expected {}); received={}",
             api.next_command_seq,
             command_cursor.applied,
             expected_next_command_seq,
@@ -692,11 +699,14 @@ async fn event_forwarder(
         let Some(sender) = sender else {
             continue;
         };
-        // Drop all live frames until the epoch has caught up and published Online.
-        // Durable catch-up re-fetches the cursor, so any dropped durable frame is
-        // either already in the catch-up range or will be on the next reconnect.
+        // Drop only volatile/delta Event frames (seq: None) until the epoch has
+        // caught up and published Online. CommandAck frames are terminal command
+        // feedback and must be delivered even while catch-up is in progress.
         if !*online.borrow() {
-            continue;
+            match &frame {
+                OutboundFrame::Event { envelope } if envelope.seq.is_none() => continue,
+                _ => {}
+            }
         }
         if sender.send(frame).await.is_err() {
             // Writer closed; stale frame is dropped. The supervisor will
@@ -920,13 +930,19 @@ async fn send_validated(
     command_tx: &mut mpsc::Sender<InboundCommand>,
 ) -> Result<u64> {
     let seq = inbound_command_seq(&cmd);
-    if seq != next_expected {
+    if seq > next_expected {
         bail!("command seq gap: expected {next_expected}, got {seq}");
     }
     if command_tx.send(cmd).await.is_err() {
         bail!("command consumer closed");
     }
-    Ok(next_expected + 1)
+    // seq < next_expected is a legitimate retransmission; the durable consumer
+    // (EventWriter) deduplicates by command_id and re-ACKs the same canonical seq.
+    if seq == next_expected {
+        Ok(next_expected + 1)
+    } else {
+        Ok(next_expected)
+    }
 }
 
 pub(crate) fn inbound_command_seq(cmd: &InboundCommand) -> u64 {
@@ -951,11 +967,15 @@ pub(crate) fn outbound_frame_event_seq(frame: &OutboundFrame) -> Result<u64> {
 #[derive(Clone)]
 pub struct WatchHydrationLatch {
     rx: watch::Receiver<HydrationState>,
+    observed: Arc<std::sync::Mutex<Option<HydrationReady>>>,
 }
 
 impl WatchHydrationLatch {
     pub fn new(rx: watch::Receiver<HydrationState>) -> Self {
-        Self { rx }
+        Self {
+            rx,
+            observed: Arc::new(std::sync::Mutex::new(None)),
+        }
     }
 }
 
@@ -966,7 +986,21 @@ impl HydrationLatch for WatchHydrationLatch {
         loop {
             let state = rx.borrow().clone();
             match state {
-                HydrationState::Ready(ready) if ready.generation == generation => return Ok(ready),
+                HydrationState::Ready(ready) if ready.generation == generation => {
+                    let mut observed = self.observed.lock().unwrap();
+                    if let Some(observed_ready) = observed.as_ref() {
+                        if observed_ready.receipt_identity != ready.receipt_identity {
+                            bail!(
+                                "hydration identity changed for generation {generation}: expected {}, got {}",
+                                observed_ready.receipt_identity,
+                                ready.receipt_identity
+                            );
+                        }
+                        return Ok(observed_ready.clone());
+                    }
+                    *observed = Some(ready.clone());
+                    return Ok(ready);
+                }
                 HydrationState::Ready(ready) => {
                     bail!(
                         "hydration ready for different generation: expected {generation}, got {}",
@@ -974,6 +1008,7 @@ impl HydrationLatch for WatchHydrationLatch {
                     )
                 }
                 HydrationState::NotReady => {
+                    drop(state);
                     rx.changed().await.context("hydration latch dropped")?;
                 }
             }
@@ -1851,6 +1886,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_command_retransmission_is_accepted() {
+        let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gateway = MockGateway::new(VecDeque::from([
+            Ok(valid_command(1, "00000000-0000-4000-8000-000000000001")),
+            Ok(valid_command(1, "00000000-0000-4000-8000-000000000001")),
+            Ok(valid_command(2, "00000000-0000-4000-8000-000000000002")),
+        ]));
+        let connector = MockConnector::new(sent_hellos.clone(), VecDeque::from([Ok(gateway)]));
+        let credentials = CountingCredentialProvider::new("token");
+        let source = MockDurableSource::new(CommandCursors::default());
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: ProcessGeneration::from_wire(7).unwrap(),
+            receipt_identity: "receipt-1".to_owned(),
+        });
+
+        let supervisor =
+            ConnectionSupervisor::new(connector, credentials, source, latch, make_config());
+        let mut handle = supervisor.start();
+
+        let first = tokio::time::timeout(Duration::from_millis(200), handle.commands.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cmd_seq(&first), 1);
+
+        let duplicate = tokio::time::timeout(Duration::from_millis(200), handle.commands.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cmd_seq(&duplicate), 1);
+
+        let next = tokio::time::timeout(Duration::from_millis(200), handle.commands.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cmd_seq(&next), 2);
+
+        handle.abort();
+        assert!(handle.join().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn command_seq_gap_terminates_epoch_and_respects_reconnect_limit() {
+        let mut config = make_config();
+        config.max_reconnect_attempts = Some(1);
+
+        let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gateway = MockGateway::new(VecDeque::from([
+            Ok(valid_command(1, "00000000-0000-4000-8000-000000000001")),
+            Ok(valid_command(3, "00000000-0000-4000-8000-000000000003")),
+        ]));
+        let connector = MockConnector::new(sent_hellos.clone(), VecDeque::from([Ok(gateway)]));
+        let credentials = CountingCredentialProvider::new("token");
+        let source = MockDurableSource::new(CommandCursors::default());
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: ProcessGeneration::from_wire(7).unwrap(),
+            receipt_identity: "receipt-1".to_owned(),
+        });
+
+        let supervisor = ConnectionSupervisor::new(connector, credentials, source, latch, config);
+        let mut handle = supervisor.start();
+
+        let first = tokio::time::timeout(Duration::from_millis(200), handle.commands.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cmd_seq(&first), 1);
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle.join()).await;
+        assert!(result.is_ok(), "supervisor must stop after gap");
+        assert!(result.unwrap().is_err());
+
+        assert_eq!(sent_hellos.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn auth_rejected_does_not_spin_forever_when_unlimited() {
         let mut config = make_config();
         config.max_reconnect_attempts = None;
@@ -1885,9 +1996,9 @@ mod tests {
         assert!(result.unwrap().is_err());
 
         let attempts = counter.load(Ordering::SeqCst);
-        assert!(
-            (1..=5).contains(&attempts),
-            "auth retries must be bounded, got {attempts}"
+        assert_eq!(
+            attempts, 3,
+            "auth retries must be bounded by the default max_auth_attempts"
         );
     }
 
@@ -1919,7 +2030,7 @@ mod tests {
         let mut config = make_config();
         config.hello_timeout = Duration::from_millis(1);
         config.initial_backoff = Duration::from_millis(1);
-        config.max_reconnect_attempts = Some(1);
+        config.max_reconnect_attempts = Some(2);
 
         let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
         let connector = MockConnector::new(
@@ -2005,15 +2116,15 @@ mod tests {
 
         let attempts = counter.load(Ordering::SeqCst);
         assert_eq!(
-            attempts, 3,
-            "pre-auth failures must accumulate and stop after limit"
+            attempts, 2,
+            "pre-auth failures must accumulate and stop at the configured limit"
         );
     }
 
     #[tokio::test]
-    async fn established_epoch_resets_reconnect_failure_streak() {
+    async fn established_reconnect_failures_accumulate_and_hit_limit() {
         let mut config = make_config();
-        config.max_reconnect_attempts = Some(1);
+        config.max_reconnect_attempts = Some(2);
         config.hello_timeout = Duration::from_millis(5);
         config.initial_backoff = Duration::from_millis(1);
         config.max_backoff = Duration::from_millis(5);
@@ -2022,9 +2133,6 @@ mod tests {
         let connector = MockConnector::new(
             sent_hellos.clone(),
             VecDeque::from([
-                Ok(MockGateway::new(VecDeque::from([Err(anyhow!(
-                    "reader EOF"
-                ))]))),
                 Ok(MockGateway::new(VecDeque::from([Err(anyhow!(
                     "reader EOF"
                 ))]))),
@@ -2053,8 +2161,8 @@ mod tests {
 
         assert_eq!(
             sent_hellos.lock().unwrap().len(),
-            4,
-            "healthy epoch reconnects must not exhaust a finite limit"
+            2,
+            "post-hello reconnect failures must accumulate and stop at the configured limit"
         );
     }
 
@@ -2063,7 +2171,7 @@ mod tests {
         let mut config = make_config();
         config.connect_timeout = Duration::from_millis(1);
         config.initial_backoff = Duration::from_millis(1);
-        config.max_reconnect_attempts = Some(1);
+        config.max_reconnect_attempts = Some(2);
 
         let credentials = CountingCredentialProvider::new("token");
         let counter = credentials.counter.clone();
@@ -2128,10 +2236,7 @@ mod tests {
         assert!(format!("{err:#}").contains("max auth attempts"));
 
         let attempts = counter.load(Ordering::SeqCst);
-        assert_eq!(
-            attempts, 2,
-            "auth limit should stop after max_auth_attempts + 1"
-        );
+        assert_eq!(attempts, 1, "auth limit should stop at max_auth_attempts");
     }
 
     #[tokio::test]
@@ -2391,7 +2496,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_hello_next_command_seq_must_be_applied_plus_one() {
+    async fn validate_hello_command_cursor_allows_safe_lag_and_rejects_ahead() {
         let cursor = CommandCursors {
             received: 10,
             applied: 5,
@@ -2427,7 +2532,41 @@ mod tests {
             }
         }
 
-        // Too far ahead (skips received-but-unapplied commands) is fatal.
+        // Behind the applied cursor is allowed: the API may have lost a terminal
+        // ACK and will resend already-applied commands for deduplication.
+        let api = ApiHello {
+            accepted_generation: agent.generation,
+            last_received_event_seq: 0,
+            next_command_seq: 5,
+        };
+        validate_hello(&StaticSource(cursor), &agent, &api)
+            .await
+            .expect("next_command_seq at applied should be allowed for retransmission");
+
+        // Exactly applied+1 is the normal catch-up boundary and is allowed.
+        let api = ApiHello {
+            accepted_generation: agent.generation,
+            last_received_event_seq: 0,
+            next_command_seq: 6,
+        };
+        validate_hello(&StaticSource(cursor), &agent, &api)
+            .await
+            .unwrap();
+
+        // Just ahead of applied+1 skips an unapplied command and is fatal.
+        let api = ApiHello {
+            accepted_generation: agent.generation,
+            last_received_event_seq: 0,
+            next_command_seq: 7,
+        };
+        assert!(
+            validate_hello(&StaticSource(cursor), &agent, &api)
+                .await
+                .is_err(),
+            "next_command_seq beyond applied+1 must be fatal"
+        );
+
+        // Far ahead (skips received-but-unapplied commands) is also fatal.
         let api = ApiHello {
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
@@ -2437,31 +2576,8 @@ mod tests {
             validate_hello(&StaticSource(cursor), &agent, &api)
                 .await
                 .is_err(),
-            "next_command_seq beyond applied+1 must be fatal"
+            "next_command_seq far beyond applied+1 must be fatal"
         );
-
-        // Behind the applied cursor is also fatal.
-        let api = ApiHello {
-            accepted_generation: agent.generation,
-            last_received_event_seq: 0,
-            next_command_seq: 5,
-        };
-        assert!(
-            validate_hello(&StaticSource(cursor), &agent, &api)
-                .await
-                .is_err(),
-            "next_command_seq behind applied+1 must be fatal"
-        );
-
-        // Exactly applied+1 is allowed.
-        let api = ApiHello {
-            accepted_generation: agent.generation,
-            last_received_event_seq: 0,
-            next_command_seq: 6,
-        };
-        validate_hello(&StaticSource(cursor), &agent, &api)
-            .await
-            .unwrap();
     }
 
     #[tokio::test]
@@ -2627,10 +2743,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn online_boundary_drops_frames_until_catch_up_reaches_cursor() {
+    async fn online_boundary_drops_volatile_events_and_delivers_command_acks() {
         // Use a source that delays catch-up completion until we explicitly signal,
-        // so we can send a volatile frame while the epoch has a writer but is
-        // still not Online.
+        // so we can send frames while the epoch has a writer but is still not Online.
         let catch_up_notify = Arc::new(tokio::sync::Notify::new());
         let source = DelayedCatchUpSource {
             events: Arc::new(std::sync::Mutex::new(VecDeque::from([event_frame(1)]))),
@@ -2681,8 +2796,19 @@ mod tests {
         }
         let epoch = epochs.borrow().unwrap();
 
-        // A volatile frame sent before Online must be dropped, not buffered.
-        let volatile = OutboundFrame::CommandAck {
+        // A volatile/delta Event (seq: None) sent before Online must be dropped.
+        let volatile = OutboundFrame::Event {
+            envelope: Envelope {
+                seq: None,
+                conversation_id: "conversation-1".to_owned(),
+                event: serde_json::json!({"type": "typing"}),
+            },
+        };
+        handle.events.send((epoch, volatile)).await.unwrap();
+
+        // A CommandAck sent before Online is terminal command feedback and must be
+        // delivered once the writer is installed, not held until Online.
+        let ack = OutboundFrame::CommandAck {
             ack: CommandAck {
                 seq: 1,
                 command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
@@ -2690,7 +2816,7 @@ mod tests {
                 reject_reason: None,
             },
         };
-        handle.events.send((epoch, volatile)).await.unwrap();
+        handle.events.send((epoch, ack)).await.unwrap();
 
         // Allow catch-up to finish, then wait for Online.
         catch_up_notify.notify_one();
@@ -2709,14 +2835,28 @@ mod tests {
             let sent_frames = sent.lock().unwrap();
             assert_eq!(
                 sent_frames.len(),
-                2,
-                "catch-up frame plus post-online live frame should be delivered"
+                3,
+                "catch-up event, pre-online CommandAck, and post-online live event should be delivered"
+            );
+            assert_eq!(
+                outbound_frame_event_seq(&sent_frames[0]).unwrap(),
+                1,
+                "catch-up event must be delivered first"
             );
             assert!(
-                !sent_frames
-                    .iter()
-                    .any(|f| matches!(f, OutboundFrame::CommandAck { .. })),
-                "volatile pre-online frame must be dropped"
+                matches!(sent_frames[1], OutboundFrame::CommandAck { .. }),
+                "pre-online CommandAck must be delivered"
+            );
+            assert_eq!(
+                outbound_frame_event_seq(&sent_frames[2]).unwrap(),
+                2,
+                "post-online live event must be delivered"
+            );
+            assert!(
+                !sent_frames.iter().any(
+                    |f| matches!(f, OutboundFrame::Event { envelope } if envelope.seq.is_none())
+                ),
+                "volatile pre-online Event must be dropped"
             );
         }
 
@@ -2845,6 +2985,34 @@ mod tests {
             vec![1, 2],
             "racing durable commit 2 must be included before Online"
         );
+    }
+
+    #[tokio::test]
+    async fn watch_hydration_latch_rejects_identity_change_for_same_generation() {
+        let generation = ProcessGeneration::from_wire(7).unwrap();
+        let (tx, rx) = watch::channel(HydrationState::NotReady);
+        let latch = WatchHydrationLatch::new(rx);
+
+        tx.send(HydrationState::Ready(HydrationReady {
+            generation,
+            receipt_identity: "first".to_owned(),
+        }))
+        .unwrap();
+        let first = latch.wait_for(generation).await.unwrap();
+        assert_eq!(first.receipt_identity, "first");
+
+        tx.send(HydrationState::Ready(HydrationReady {
+            generation,
+            receipt_identity: "second".to_owned(),
+        }))
+        .unwrap();
+        let result = latch.wait_for(generation).await;
+        assert!(
+            result.is_err(),
+            "re-latch with a different identity must be rejected"
+        );
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(err.contains("identity changed"), "unexpected error: {err}");
     }
 
     fn cmd_seq(cmd: &InboundCommand) -> u64 {
