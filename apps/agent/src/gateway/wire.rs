@@ -14,6 +14,7 @@
 //!   surface; the opaque values inside `provider/types.rs` are not wired to
 //!   the public contract yet.
 
+use chrono::{DateTime, Utc};
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
     de::{self, IgnoredAny, SeqAccess, Visitor},
@@ -231,6 +232,20 @@ where
     deserializer.deserialize_seq(EmptyAttachmentsVisitor)
 }
 
+/// Helper for optional fields that are forbidden to appear as explicit `null`.
+///
+/// Use with `#[serde(default, deserialize_with = "present_or_error_on_null")]`.
+/// A missing field uses serde's default (`None` for `Option`). A present `null`
+/// is rejected by delegating to `T::deserialize`, which fails on `null`. A
+/// present non-null value is deserialized and wrapped in `Some`.
+fn present_or_error_on_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Commands and ACKs
 // ═══════════════════════════════════════════════════════════════════════════
@@ -379,6 +394,10 @@ struct WireCommandAckInput {
     seq: u64,
     command_id: String,
     status: WireCommandAckStatus,
+    // `present_or_error_on_null` rejects an explicit `reject_reason: null`;
+    // the default attribute means a missing `reject_reason` yields `None`.
+    // The status-based rules below then enforce the conditional schema.
+    #[serde(default, deserialize_with = "present_or_error_on_null")]
     reject_reason: Option<WireRejectReason>,
 }
 
@@ -460,6 +479,10 @@ impl WireEnvelope {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireEnvelopeInput {
+    // `present_or_error_on_null` rejects an explicit `seq: null`; the default
+    // attribute means a missing `seq` yields `None`. `validate_seq` then
+    // enforces the durable/volatile presence rules.
+    #[serde(default, deserialize_with = "present_or_error_on_null")]
     seq: Option<u64>,
     conversation_id: String,
     event: WireAgentEvent,
@@ -542,7 +565,7 @@ pub enum WireAgentEvent {
     RetryScheduled {
         attempt: u32,
         delay_ms: u64,
-        retry_at: String,
+        retry_at: DateTime<Utc>,
         error_message: String,
     },
     Error {
@@ -664,7 +687,7 @@ pub enum WirePublicStreamEvent {
 pub enum WirePublicMessage {
     User {
         content: Vec<WireUserContent>,
-        timestamp: String,
+        timestamp: DateTime<Utc>,
     },
     Assistant {
         content: Vec<WirePublicAssistantContent>,
@@ -676,7 +699,7 @@ pub enum WirePublicMessage {
         error_message: RequiredNullable<String>,
         provider_code: RequiredNullable<String>,
         interrupted: bool,
-        timestamp: String,
+        timestamp: DateTime<Utc>,
     },
     ToolResult {
         tool_call_id: String,
@@ -684,7 +707,7 @@ pub enum WirePublicMessage {
         content: Vec<WireUserContent>,
         details: Value,
         is_error: bool,
-        timestamp: String,
+        timestamp: DateTime<Utc>,
     },
 }
 
@@ -794,7 +817,7 @@ pub struct WireToolResultMessage {
     pub content: Vec<WireUserContent>,
     pub details: Value,
     pub is_error: bool,
-    pub timestamp: String,
+    pub timestamp: DateTime<Utc>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -977,7 +1000,7 @@ impl TryFrom<AgentEvent> for WireAgentEvent {
             } => Self::RetryScheduled {
                 attempt,
                 delay_ms,
-                retry_at: retry_at.to_rfc3339(),
+                retry_at,
                 error_message,
             },
             AgentEvent::Error { message } => Self::Error { message },
@@ -1086,7 +1109,7 @@ impl TryFrom<PublicMessage> for WirePublicMessage {
                     .into_iter()
                     .map(TryInto::try_into)
                     .collect::<Result<Vec<_>, _>>()?,
-                timestamp: timestamp.to_rfc3339(),
+                timestamp,
             },
             PublicMessage::Assistant(PublicAssistantMessage {
                 content,
@@ -1112,7 +1135,7 @@ impl TryFrom<PublicMessage> for WirePublicMessage {
                 error_message: error_message.into(),
                 provider_code: provider_code.into(),
                 interrupted,
-                timestamp: timestamp.to_rfc3339(),
+                timestamp,
             },
             PublicMessage::ToolResult(ToolResultMessage {
                 tool_call_id,
@@ -1130,7 +1153,7 @@ impl TryFrom<PublicMessage> for WirePublicMessage {
                     .collect::<Result<Vec<_>, _>>()?,
                 details,
                 is_error,
-                timestamp: timestamp.to_rfc3339(),
+                timestamp,
             },
         })
     }
@@ -1281,7 +1304,7 @@ impl TryFrom<ToolResultMessage> for WireToolResultMessage {
                 .collect::<Result<Vec<_>, _>>()?,
             details: message.details,
             is_error: message.is_error,
-            timestamp: message.timestamp.to_rfc3339(),
+            timestamp: message.timestamp,
         })
     }
 }
@@ -1867,6 +1890,22 @@ mod tests {
             "reject_reason": "oversized"
         });
         assert!(serde_json::from_value::<WireCommandAck>(non_rejected_with_reason).is_err());
+
+        let non_rejected_with_null_reason = json!({
+            "seq": 1,
+            "command_id": valid_id,
+            "status": "received",
+            "reject_reason": null
+        });
+        assert!(serde_json::from_value::<WireCommandAck>(non_rejected_with_null_reason).is_err());
+
+        let rejected_with_null_reason = json!({
+            "seq": 1,
+            "command_id": valid_id,
+            "status": "rejected",
+            "reject_reason": null
+        });
+        assert!(serde_json::from_value::<WireCommandAck>(rejected_with_null_reason).is_err());
     }
 
     #[test]
@@ -1877,12 +1916,26 @@ mod tests {
         });
         assert!(serde_json::from_value::<WireEnvelope>(durable_missing_seq).is_err());
 
+        let durable_null_seq = json!({
+            "seq": null,
+            "conversation_id": "conv-1",
+            "event": {"type": "agent_start"}
+        });
+        assert!(serde_json::from_value::<WireEnvelope>(durable_null_seq).is_err());
+
         let volatile_with_seq = json!({
             "seq": 1,
             "conversation_id": "conv-1",
             "event": {"type": "error", "message": "x"}
         });
         assert!(serde_json::from_value::<WireEnvelope>(volatile_with_seq).is_err());
+
+        let volatile_null_seq = json!({
+            "seq": null,
+            "conversation_id": "conv-1",
+            "event": {"type": "error", "message": "x"}
+        });
+        assert!(serde_json::from_value::<WireEnvelope>(volatile_null_seq).is_err());
     }
 
     #[test]
@@ -2514,6 +2567,119 @@ mod tests {
                 "assistant must accept explicit null or string values"
             );
         }
+    }
+
+    #[test]
+    fn wire_date_time_fields_reject_malformed_strings() {
+        let bad_timestamp = "not-a-date";
+
+        // WirePublicMessage::User
+        let mut user = json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "hi"}],
+            "timestamp": now().to_rfc3339()
+        });
+        assert!(
+            serde_json::from_value::<WirePublicMessage>(user.clone()).is_ok(),
+            "user must accept a valid RFC3339 timestamp"
+        );
+        user["timestamp"] = json!(bad_timestamp);
+        assert!(
+            serde_json::from_value::<WirePublicMessage>(user).is_err(),
+            "user must reject a malformed timestamp"
+        );
+
+        // WirePublicMessage::ToolResult
+        let mut tool_result = json!({
+            "role": "tool_result",
+            "tool_call_id": "00000000-0000-4000-8000-000000000001",
+            "tool_name": "read",
+            "content": [{"type": "text", "text": "x"}],
+            "details": null,
+            "is_error": false,
+            "timestamp": now().to_rfc3339()
+        });
+        assert!(
+            serde_json::from_value::<WirePublicMessage>(tool_result.clone()).is_ok(),
+            "tool_result must accept a valid RFC3339 timestamp"
+        );
+        tool_result["timestamp"] = json!(bad_timestamp);
+        assert!(
+            serde_json::from_value::<WirePublicMessage>(tool_result).is_err(),
+            "tool_result must reject a malformed timestamp"
+        );
+
+        // WireToolResultMessage (payload used inside TurnEnd.tool_results)
+        let mut payload = json!({
+            "tool_call_id": "00000000-0000-4000-8000-000000000001",
+            "tool_name": "read",
+            "content": [{"type": "text", "text": "x"}],
+            "details": null,
+            "is_error": false,
+            "timestamp": now().to_rfc3339()
+        });
+        assert!(
+            serde_json::from_value::<WireToolResultMessage>(payload.clone()).is_ok(),
+            "tool_result payload must accept a valid RFC3339 timestamp"
+        );
+        payload["timestamp"] = json!(bad_timestamp);
+        assert!(
+            serde_json::from_value::<WireToolResultMessage>(payload).is_err(),
+            "tool_result payload must reject a malformed timestamp"
+        );
+
+        // WirePublicMessage::Assistant
+        let mut assistant = json!({
+            "role": "assistant",
+            "content": [],
+            "model": "kimi-k3",
+            "provider": "moonshot",
+            "origin": {
+                "provider_instance_id": "p",
+                "protocol": "open_ai_chat_completions",
+                "model": "kimi-k3"
+            },
+            "usage": {
+                "input": 0,
+                "output": 0,
+                "cache_read": 0,
+                "cache_write": 0,
+                "reasoning": 0,
+                "total_tokens": 0
+            },
+            "stop_reason": "stop",
+            "error_message": null,
+            "provider_code": null,
+            "interrupted": false,
+            "timestamp": now().to_rfc3339()
+        });
+        assert!(
+            serde_json::from_value::<WirePublicMessage>(assistant.clone()).is_ok(),
+            "assistant must accept a valid RFC3339 timestamp"
+        );
+        assistant["timestamp"] = json!(bad_timestamp);
+        assert!(
+            serde_json::from_value::<WirePublicMessage>(assistant).is_err(),
+            "assistant must reject a malformed timestamp"
+        );
+
+        // WireAgentEvent::RetryScheduled
+        let mut retry = json!({
+            "type": "retry_scheduled",
+            "attempt": 1,
+            "delay_ms": 100,
+            "retry_at": now().to_rfc3339(),
+            "error_message": "x"
+        });
+        assert!(
+            serde_json::from_value::<WireAgentEvent>(retry.clone()).is_ok(),
+            "retry_scheduled must accept a valid RFC3339 retry_at"
+        );
+        retry["retry_at"] = json!(bad_timestamp);
+        assert!(
+            serde_json::from_value::<WireAgentEvent>(retry).is_err(),
+            "retry_scheduled must reject a malformed retry_at"
+        );
     }
 
     #[test]
