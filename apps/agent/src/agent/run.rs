@@ -42,7 +42,7 @@ use super::{
     AdmittedCommand, AgentEvent, DurableRunBinding, MessageCommitBarrier, MessageCommitReceipt,
     ProjectedProviderEvent, ProviderEventProjector, ProviderTerminalKind, RetryWaitCommitBarrier,
     RunCompletion, RunControl, RunCore, RunOutput, RunWorker, SteerMode, ToolStartCommitBarrier,
-    WorkerFailure, WorkerFuture, WorkerPhase,
+    WorkerFailure, WorkerFuture, WorkerPhase, steer,
 };
 
 const LENGTH_TOOL_FAILURE: &str = "Tool call was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.";
@@ -51,7 +51,7 @@ pub(super) const LENGTH_LOOP_CODE: &str = "consecutive_length_tool_guard";
 const LENGTH_OVERFLOW_ERROR: &str = "provider response reached the context window before producing output; immediate recovery required";
 const LENGTH_OVERFLOW_CODE: &str = "context_overflow_length_usage";
 const MAX_OVERFLOW_RECOVERIES: u8 = 2;
-const TOOL_RESULT_MESSAGE_ID_NAMESPACE: Uuid = Uuid::from_bytes([
+pub(super) const TOOL_RESULT_MESSAGE_ID_NAMESPACE: Uuid = Uuid::from_bytes([
     0x73, 0x75, 0x6d, 0x69, 0xa4, 0xc1, 0x48, 0x22, 0x91, 0x5d, 0xb5, 0xd2, 0x5a, 0x69, 0x9f, 0x31,
 ]);
 const SYNTHETIC_ATTEMPT_MESSAGE_ID_NAMESPACE: Uuid = Uuid::from_bytes([
@@ -170,8 +170,11 @@ struct Runner {
     ordinary_retries: usize,
     overflow_recoveries: u8,
     consecutive_length_batches: usize,
-    in_flight_control: Option<AdmittedCommand>,
+    in_flight_controls: Vec<AdmittedCommand>,
     pending_command_received_at: Option<std::time::Instant>,
+    provider_cancel: Option<CancellationToken>,
+    hard_steer_command: Option<AdmittedCommand>,
+    abort_requested: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -180,6 +183,8 @@ enum ExecuteToolError {
     Tool(ToolError),
     #[error(transparent)]
     Worker(WorkerFailure),
+    #[error("tool execution cancelled by a control")]
+    Cancelled,
 }
 
 impl From<WorkerFailure> for ExecuteToolError {
@@ -211,8 +216,11 @@ impl Runner {
             ordinary_retries: 0,
             overflow_recoveries: 0,
             consecutive_length_batches: 0,
-            in_flight_control: None,
+            in_flight_controls: Vec::new(),
             pending_command_received_at: None,
+            provider_cancel: None,
+            hard_steer_command: None,
+            abort_requested: false,
         }
     }
 
@@ -261,7 +269,7 @@ impl Runner {
         self.inject_in_flight().await?;
 
         loop {
-            self.receive_control_safe_point()?;
+            self.receive_control_safe_point().await?;
             let outcome = self.provider_attempt().await?;
             self.attempt_sequence = self.attempt_sequence.saturating_add(1);
             match outcome {
@@ -294,9 +302,20 @@ impl Runner {
                         let _ = self.phase.send(WorkerPhase::Active);
                         return Err(failure);
                     }
-                    let injected = self.wait_retry_or_control(delay).await;
+                    let injected = match self.wait_retry_or_control(delay).await {
+                        Ok(injected) => injected,
+                        Err(WorkerFailure::Cancelled) if self.abort_requested => {
+                            self.in_flight_controls.clear();
+                            self.close_turn(message, Vec::new()).await?;
+                            break;
+                        }
+                        Err(failure) => {
+                            let _ = self.phase.send(WorkerPhase::Active);
+                            return Err(failure);
+                        }
+                    };
                     let _ = self.phase.send(WorkerPhase::Active);
-                    if injected? {
+                    if injected {
                         self.emit(AgentEvent::Steered {
                             mode: SteerMode::Soft,
                         })
@@ -440,7 +459,12 @@ impl Runner {
                         tool_results: executable_results,
                     })
                     .await?;
-                    self.receive_control_safe_point()?;
+                    self.receive_control_safe_point().await?;
+
+                    if self.abort_requested {
+                        self.in_flight_controls.clear();
+                        break;
+                    }
 
                     if length_guarded {
                         break;
@@ -467,13 +491,56 @@ impl Runner {
                     self.close_turn(message, Vec::new()).await?;
                     break;
                 }
+                AttemptOutcome::HardSteer => {
+                    self.emit(AgentEvent::Steered {
+                        mode: SteerMode::Hard,
+                    })
+                    .await?;
+                    self.inject_in_flight().await?;
+                }
             }
         }
         self.emit(AgentEvent::AgentEnd).await
     }
 
     async fn provider_attempt(&mut self) -> Result<AttemptOutcome, WorkerFailure> {
+        self.hard_steer_command = None;
+        // abort_requested is preserved when receive_control_safe_point consumes
+        // an Abort control before provider_attempt begins.
+        if self.abort_requested {
+            return self
+                .synthetic_attempt_error(
+                    "Run aborted before provider start".to_owned(),
+                    SyntheticAttemptFailure::Abort,
+                )
+                .await;
+        }
+        let attempt_cancellation = self
+            .core
+            .attempt_cancellation
+            .as_ref()
+            .ok_or_else(|| {
+                WorkerFailure::Error("RunCore has no attempt cancellation registry".to_owned())
+            })?
+            .clone();
         let cancel = CancellationToken::new();
+        let _guard = attempt_cancellation
+            .register(cancel.clone())
+            .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+        self.provider_cancel = Some(cancel.clone());
+        let outcome = self.provider_attempt_loop(cancel).await;
+        if outcome.is_ok() {
+            attempt_cancellation
+                .retire_committed()
+                .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+        }
+        outcome
+    }
+
+    async fn provider_attempt_loop(
+        &mut self,
+        cancel: CancellationToken,
+    ) -> Result<AttemptOutcome, WorkerFailure> {
         let start_cancel = cancel.clone();
         // A command ingress timestamp has exactly one causal consumer: the
         // first provider request started after that command is injected.
@@ -484,7 +551,7 @@ impl Runner {
             self.attempt_sequence,
             &self.context,
             command_received_at,
-            cancel,
+            cancel.clone(),
         );
         let mut attempt = match CancelOnDrop::new(start, start_cancel).await {
             Ok(attempt) => attempt,
@@ -507,180 +574,254 @@ impl Runner {
         };
         let mut message_started = false;
         let mut rejected_results = Vec::new();
+        let mut cancellation_observed = false;
 
-        while let Some(event) = attempt.events.recv().await {
-            let terminal_message = match &event {
-                ProviderEvent::Done { output, .. } | ProviderEvent::Error { output, .. } => {
-                    Some(output.message.clone())
+        loop {
+            tokio::select! {
+                biased;
+                control = self.controls.recv() => {
+                    let Some(control) = control else {
+                        return Err(WorkerFailure::Cancelled);
+                    };
+                    match control {
+                        RunControl::HardSteer { command, accepted } => {
+                            if accepted.send(true).is_ok() {
+                                self.hard_steer_command = Some(command);
+                                // The Session will cancel the provider attempt
+                                // only after `bind_hard_steer` commits.
+                            }
+                        }
+                        RunControl::Abort {
+                            accepted,
+                            committed,
+                            ..
+                        } => {
+                            if self.accept_abort_control(accepted, committed).await? {
+                                self.abort_requested = true;
+                                self.cancel_provider();
+                            }
+                        }
+                        RunControl::SoftSteer { accepted, committed, .. }
+                        | RunControl::RetrySteer { accepted, committed, .. } => {
+                            let _ = accepted.send(false);
+                            drop(committed);
+                        }
+                        RunControl::Command(command) => {
+                            self.core
+                                .queue_followup(command)
+                                .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+                        }
+                    }
                 }
-                _ => None,
-            };
-            let terminal_overflow = terminal_message.as_ref().and_then(|message| {
-                classify_context_overflow(message, self.driver.context_window())
-            });
-            let projected = match projector.project(event) {
-                Ok(projected) => projected,
-                Err(error) => {
-                    // No authoritative terminal retained the rejected call in
-                    // its assistant snapshot. Emitting its buffered result
-                    // here would create a durable orphan.
-                    drop(rejected_results);
-                    return self
-                        .close_broken_attempt(
+                event = attempt.events.recv(), if self.hard_steer_command.is_none() || cancellation_observed => {
+                    let Some(event) = event else {
+                        // EOF while not hard-steering.
+                        drop(rejected_results);
+                        if self.abort_requested {
+                            return self.close_aborted_attempt(
+                                &attempt.message_id,
+                                message_started,
+                                attempt.initial_message.clone(),
+                            ).await;
+                        }
+                        return self.close_broken_attempt(
                             &attempt.message_id,
                             message_started,
-                            format!("provider projection failed: {error}"),
-                        )
-                        .await;
-                }
-            };
-            match projected {
-                ProjectedProviderEvent::Started => {
-                    self.emit(AgentEvent::MessageStart {
-                        message_id: attempt.message_id.clone(),
-                        message: Box::new(attempt.initial_message.clone()),
-                    })
-                    .await?;
-                    message_started = true;
-                }
-                ProjectedProviderEvent::Update(event) => self.emit(event).await?,
-                ProjectedProviderEvent::RejectedToolCall {
-                    event,
-                    synthetic_result,
-                } => {
-                    self.emit(event).await?;
-                    rejected_results.push(synthetic_result);
-                }
-                ProjectedProviderEvent::Terminal(terminal) => {
-                    if !terminal.provider_context().is_empty() {
-                        rejected_results.clear();
-                        return self
-                            .close_broken_attempt(
-                                &attempt.message_id,
-                                message_started,
-                                "provider terminal context requires the T17 durable hand-off; refusing to persist opaque context"
-                                    .to_owned(),
-                            )
-                            .await;
-                    }
-                    let kind = terminal.kind();
-                    let internal =
-                        terminal_message.expect("terminal projection has provider output");
-                    // Internal stream/projection failures copy the volatile
-                    // shadow into a synthesized terminal, but that shadow is
-                    // not an authoritative provider snapshot. Its buffered
-                    // rejection results must not survive as durable orphans.
-                    let internal_projection_failure = matches!(
-                        internal.provider_code.as_deref(),
-                        Some(
-                            "stream_ended_without_terminal_event"
-                                | "invalid_provider_event"
-                                | "invalid_provider_terminal"
-                                | "invalid_provider_stream"
-                        )
-                    );
-                    if internal_projection_failure {
-                        rejected_results.clear();
-                    }
-                    if let Err(error) =
-                        validate_and_order_rejected_results(&internal, &mut rejected_results)
-                    {
-                        rejected_results.clear();
-                        return self
-                            .close_broken_attempt(
-                                &attempt.message_id,
-                                message_started,
-                                format!(
-                                    "provider terminal rejection/result correspondence failed: {error}"
-                                ),
-                            )
-                            .await;
-                    }
-                    let overflow = terminal_overflow;
-                    let length_guarded = kind == ProviderTerminalKind::Done
-                        && !matches!(
-                            overflow,
-                            Some(OverflowClassification::ImmediateRecovery(
-                                OverflowSource::LengthUsage
-                            ))
-                        )
-                        && self.consecutive_length_batches >= 1
-                        && internal.stop_reason == StopReason::Length
-                        && internal.content.iter().any(|content| {
-                            matches!(
-                                content,
-                                crate::provider::types::AssistantContent::ToolCall { .. }
-                            )
-                        });
-                    let public = match overflow {
-                        Some(OverflowClassification::ImmediateRecovery(source)) => {
-                            normalize_immediate_overflow(
-                                terminal.message(),
-                                source,
-                                &rejected_results,
-                            )
-                        }
-                        _ if length_guarded => normalize_length_loop_guard(terminal.message()),
-                        _ => terminal.message().clone(),
+                            "provider stream ended without a terminal event".to_owned(),
+                        ).await;
                     };
-                    let (terminal_message_id, terminal_message) = match terminal.event() {
-                        AgentEvent::MessageEnd { message_id, .. } => {
-                            (message_id.clone(), public.clone())
+                    let terminal_message = match &event {
+                        ProviderEvent::Done { output, .. } | ProviderEvent::Error { output, .. } => {
+                            Some(output.message.clone())
                         }
-                        _ => unreachable!("provider terminal is always MessageEnd"),
+                        _ => None,
                     };
-                    let receipt = self
-                        .emit_message_end(terminal_message_id, terminal_message)
-                        .await?;
-                    if let Some(OverflowClassification::ImmediateRecovery(source)) = overflow {
-                        return Ok(AttemptOutcome::ImmediateOverflow {
-                            assistant_message_id: attempt.message_id.clone(),
-                            message: public,
-                            receipt,
-                            source,
-                            rejected_results,
-                        });
-                    }
-                    if kind == ProviderTerminalKind::Error {
-                        // Error assistants remain observable but never enter L0/context.
-                        if internal.stop_reason == StopReason::Error && is_retryable(&internal) {
-                            return Ok(AttemptOutcome::Retry {
+                    let terminal_overflow = terminal_message.as_ref().and_then(|message| {
+                        classify_context_overflow(message, self.driver.context_window())
+                    });
+                    let projected = match projector.project(event) {
+                        Ok(projected) => projected,
+                        Err(error) => {
+                            // No authoritative terminal retained the rejected call in
+                            // its assistant snapshot. Emitting its buffered result
+                            // here would create a durable orphan.
+                            drop(rejected_results);
+                            return self
+                                .close_broken_attempt(
+                                    &attempt.message_id,
+                                    message_started,
+                                    format!("provider projection failed: {error}"),
+                                )
+                                .await;
+                        }
+                    };
+                    match projected {
+                        ProjectedProviderEvent::Started => {
+                            self.emit(AgentEvent::MessageStart {
+                                message_id: attempt.message_id.clone(),
+                                message: Box::new(attempt.initial_message.clone()),
+                            })
+                            .await?;
+                            message_started = true;
+                        }
+                        ProjectedProviderEvent::Update(event) => self.emit(event).await?,
+                        ProjectedProviderEvent::RejectedToolCall {
+                            event,
+                            synthetic_result,
+                        } => {
+                            self.emit(event).await?;
+                            rejected_results.push(synthetic_result);
+                        }
+                        ProjectedProviderEvent::Terminal(terminal) => {
+                            if !terminal.provider_context().is_empty() {
+                                rejected_results.clear();
+                                return self
+                                    .close_broken_attempt(
+                                        &attempt.message_id,
+                                        message_started,
+                                        "provider terminal context requires the T17 durable hand-off; refusing to persist opaque context"
+                                            .to_owned(),
+                                    )
+                                    .await;
+                            }
+                            let kind = terminal.kind();
+                            let internal =
+                                terminal_message.expect("terminal projection has provider output");
+                            // Internal stream/projection failures copy the volatile
+                            // shadow into a synthesized terminal, but that shadow is
+                            // not an authoritative provider snapshot. Its buffered
+                            // rejection results must not survive as durable orphans.
+                            let internal_projection_failure = matches!(
+                                internal.provider_code.as_deref(),
+                                Some(
+                                    "stream_ended_without_terminal_event"
+                                        | "invalid_provider_event"
+                                        | "invalid_provider_terminal"
+                                        | "invalid_provider_stream"
+                                )
+                            );
+                            if internal_projection_failure {
+                                rejected_results.clear();
+                            }
+                            if let Err(error) =
+                                validate_and_order_rejected_results(&internal, &mut rejected_results)
+                            {
+                                rejected_results.clear();
+                                return self
+                                    .close_broken_attempt(
+                                        &attempt.message_id,
+                                        message_started,
+                                        format!(
+                                            "provider terminal rejection/result correspondence failed: {error}"
+                                        ),
+                                    )
+                                    .await;
+                            }
+                            let overflow = terminal_overflow;
+                            let length_guarded = kind == ProviderTerminalKind::Done
+                                && !matches!(
+                                    overflow,
+                                    Some(OverflowClassification::ImmediateRecovery(
+                                        OverflowSource::LengthUsage
+                                    ))
+                                )
+                                && self.consecutive_length_batches >= 1
+                                && internal.stop_reason == StopReason::Length
+                                && internal.content.iter().any(|content| {
+                                    matches!(
+                                        content,
+                                        crate::provider::types::AssistantContent::ToolCall { .. }
+                                    )
+                                });
+                            let public = match overflow {
+                                Some(OverflowClassification::ImmediateRecovery(source)) => {
+                                    normalize_immediate_overflow(
+                                        terminal.message(),
+                                        source,
+                                        &rejected_results,
+                                    )
+                                }
+                                _ if length_guarded => normalize_length_loop_guard(terminal.message()),
+                                _ => terminal.message().clone(),
+                            };
+                            if self.abort_requested {
+                                self.hard_steer_command.take();
+                                return self
+                                    .close_aborted_attempt(
+                                        &attempt.message_id,
+                                        message_started,
+                                        public,
+                                    )
+                                    .await;
+                            }
+                            if let Some(command) = self.hard_steer_command.take() {
+                                return self.close_hard_steer_attempt(
+                                    &attempt.message_id,
+                                    message_started,
+                                    public,
+                                    command,
+                                )
+                                .await;
+                            }
+                            let (terminal_message_id, terminal_message) = match terminal.event() {
+                                AgentEvent::MessageEnd { message_id, .. } => {
+                                    (message_id.clone(), public.clone())
+                                }
+                                _ => unreachable!("provider terminal is always MessageEnd"),
+                            };
+                            let receipt = self
+                                .emit_message_end(terminal_message_id, terminal_message)
+                                .await?;
+                            if let Some(OverflowClassification::ImmediateRecovery(source)) = overflow {
+                                return Ok(AttemptOutcome::ImmediateOverflow {
+                                    assistant_message_id: attempt.message_id.clone(),
+                                    message: public,
+                                    receipt,
+                                    source,
+                                    rejected_results,
+                                });
+                            }
+                            if kind == ProviderTerminalKind::Error {
+                                // Error assistants remain observable but never enter L0/context.
+                                if internal.stop_reason == StopReason::Error && is_retryable(&internal) {
+                                    return Ok(AttemptOutcome::Retry {
+                                        assistant_message_id: attempt.message_id.clone(),
+                                        message: public,
+                                        receipt,
+                                        rejected_results,
+                                    });
+                                }
+                                return Ok(AttemptOutcome::ClosedError {
+                                    assistant_message_id: attempt.message_id.clone(),
+                                    message: public,
+                                    receipt,
+                                    rejected_results,
+                                });
+                            }
+                            return Ok(AttemptOutcome::Terminal {
                                 assistant_message_id: attempt.message_id.clone(),
                                 message: public,
                                 receipt,
                                 rejected_results,
+                                deferred_overflow: match overflow {
+                                    Some(OverflowClassification::DeferredApply(source)) => Some(source),
+                                    _ => None,
+                                },
+                                length_guarded,
                             });
                         }
-                        return Ok(AttemptOutcome::ClosedError {
-                            assistant_message_id: attempt.message_id.clone(),
-                            message: public,
-                            receipt,
-                            rejected_results,
-                        });
                     }
-                    return Ok(AttemptOutcome::Terminal {
-                        assistant_message_id: attempt.message_id.clone(),
-                        message: public,
-                        receipt,
-                        rejected_results,
-                        deferred_overflow: match overflow {
-                            Some(OverflowClassification::DeferredApply(source)) => Some(source),
-                            _ => None,
-                        },
-                        length_guarded,
-                    });
+                }
+                () = cancel.cancelled(), if !cancellation_observed => {
+                    // The ProviderEventStream owns the authoritative assembler
+                    // shadow. Poll it once more after cancellation so its
+                    // synthesized terminal carries every accumulated Text and
+                    // adapter-approved Thinking block; `initial_message` is
+                    // metadata only and must never replace that snapshot.
+                    cancellation_observed = true;
                 }
             }
         }
-        // EOF has no authoritative assistant snapshot containing buffered
-        // rejections, so their synthetic results must not be emitted.
-        drop(rejected_results);
-        self.close_broken_attempt(
-            &attempt.message_id,
-            message_started,
-            "provider stream ended without a terminal event".to_owned(),
-        )
-        .await
     }
 
     async fn synthetic_attempt_error(
@@ -704,6 +845,80 @@ impl Runner {
         Ok(AttemptOutcome::ClosedError {
             assistant_message_id: message_id,
             message,
+            receipt,
+            rejected_results: Vec::new(),
+        })
+    }
+
+    async fn close_hard_steer_attempt(
+        &mut self,
+        message_id: &str,
+        started: bool,
+        partial: PublicMessage,
+        command: AdmittedCommand,
+    ) -> Result<AttemptOutcome, WorkerFailure> {
+        let partial = steer::normalize_partial_assistant(partial)
+            .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+        if !started {
+            self.emit(AgentEvent::MessageStart {
+                message_id: message_id.to_owned(),
+                message: Box::new(partial.clone()),
+            })
+            .await?;
+        }
+        let receipt = self
+            .emit_message_end(message_id.to_owned(), partial.clone())
+            .await?;
+        let receipt = self.await_message_receipt(receipt).await?;
+        // Give a queued Abort its durable authorization turn before deciding
+        // whether this close can hand off to a new turn.
+        self.receive_control_safe_point().await?;
+        // An Abort can win after this MessageEnd was sent but before the
+        // hard-steer close path resumes.  The bridge has already closed the
+        // original assistant (with or without the staged new turn identity),
+        // so do not claim the superseded steer or inject it.
+        if let Some(ref new_turn_id) = receipt.new_turn_id {
+            let binding = self.core.durable_binding.as_mut().ok_or_else(|| {
+                WorkerFailure::Error("RunCore has no durable worker binding".to_owned())
+            })?;
+            binding.turn_id = new_turn_id.clone();
+        }
+        if self.abort_requested {
+            let (committed_tx, committed_rx) = oneshot::channel();
+            let _ = committed_tx.send(receipt);
+            return Ok(AttemptOutcome::ClosedError {
+                assistant_message_id: message_id.to_owned(),
+                message: partial,
+                receipt: committed_rx,
+                rejected_results: Vec::new(),
+            });
+        }
+        self.retain_committed(receipt, &partial)?;
+        self.claim_control(command)?;
+        Ok(AttemptOutcome::HardSteer)
+    }
+
+    async fn close_aborted_attempt(
+        &mut self,
+        message_id: &str,
+        started: bool,
+        partial: PublicMessage,
+    ) -> Result<AttemptOutcome, WorkerFailure> {
+        let partial = steer::normalize_partial_assistant(partial)
+            .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+        if !started {
+            self.emit(AgentEvent::MessageStart {
+                message_id: message_id.to_owned(),
+                message: Box::new(partial.clone()),
+            })
+            .await?;
+        }
+        let receipt = self
+            .emit_message_end(message_id.to_owned(), partial.clone())
+            .await?;
+        Ok(AttemptOutcome::ClosedError {
+            assistant_message_id: message_id.to_owned(),
+            message: partial,
             receipt,
             rejected_results: Vec::new(),
         })
@@ -768,7 +983,7 @@ impl Runner {
     ) -> Result<(Vec<ToolResultMessage>, Vec<MessageCommitReceipt>), WorkerFailure> {
         let mut results = Vec::with_capacity(calls.len());
         let mut receipts = Vec::with_capacity(calls.len());
-        for call in calls {
+        for (index, call) in calls.iter().enumerate() {
             self.emit_tool_start_and_wait_committed(call).await?;
             let result = match self
                 .execute_tool_with_updates(assistant_message_id, call)
@@ -786,12 +1001,52 @@ impl Runner {
                         "tool RPC outcome is indeterminate: {message}"
                     )));
                 }
+                Err(ExecuteToolError::Cancelled) => {
+                    let result =
+                        error_tool_result(call, "Tool execution was cancelled by a user control");
+                    receipts.push(self.emit_tool_result(assistant_message_id, &result).await?);
+                    results.push(result);
+                    for remaining in calls.iter().skip(index + 1) {
+                        let result = error_tool_result(
+                            remaining,
+                            "Tool execution was cancelled by a user control",
+                        );
+                        let waiter = self
+                            .emit_result_message(assistant_message_id, &result)
+                            .await?;
+                        receipts.push(self.await_message_receipt(waiter).await?);
+                        results.push(result);
+                    }
+                    break;
+                }
                 Err(ExecuteToolError::Tool(error)) => {
                     error_tool_result(call, &format!("Tool execution failed: {error}"))
                 }
             };
             receipts.push(self.emit_tool_result(assistant_message_id, &result).await?);
             results.push(result);
+            self.receive_control_safe_point().await?;
+            if self.abort_requested || !self.in_flight_controls.is_empty() {
+                // D5: a soft steer never cancels the tool that was already
+                // running when it arrived. Once that tool has completed, the
+                // classified steer is authoritative: every not-started call in
+                // this batch is closed without ToolExecutionStart, approval,
+                // or executor side effects.
+                let cancellation_message = if self.abort_requested {
+                    "Tool execution was cancelled by a user control"
+                } else {
+                    "ユーザーの新しい指示により実行前に取り消された"
+                };
+                for remaining in calls.iter().skip(index + 1) {
+                    let result = error_tool_result(remaining, cancellation_message);
+                    let waiter = self
+                        .emit_result_message(assistant_message_id, &result)
+                        .await?;
+                    receipts.push(self.await_message_receipt(waiter).await?);
+                    results.push(result);
+                }
+                break;
+            }
         }
         Ok((results, receipts))
     }
@@ -813,7 +1068,7 @@ impl Runner {
         let cancel = CancellationToken::new();
         let future = CancelOnDrop::new(
             driver.execute_tool_observed(flow_id, call, cancel.clone(), on_update),
-            cancel,
+            cancel.clone(),
         );
         tokio::pin!(future);
         let result = loop {
@@ -821,6 +1076,70 @@ impl Runner {
                 biased;
                 result = &mut future => break result,
                 update = updates_rx.recv() => update,
+                control = self.controls.recv() => {
+                    let Some(control) = control else {
+                        return Err(WorkerFailure::Cancelled.into());
+                    };
+                    match control {
+                        RunControl::SoftSteer {
+                            command,
+                            accepted,
+                            committed,
+                        }
+                        | RunControl::RetrySteer {
+                            command,
+                            accepted,
+                            committed,
+                        } => {
+                            // The active tool is allowed to finish. Durably
+                            // classify the steer now; `execute_calls` observes
+                            // the claimed group after this result and cancels
+                            // only calls that have not started.
+                            self.accept_steer_control(command, accepted, committed)
+                                .await?;
+                            continue;
+                        }
+                        RunControl::Abort {
+                            accepted,
+                            committed,
+                            ..
+                        } => {
+                            if self.accept_abort_control(accepted, committed).await? {
+                                cancel.cancel();
+                                // Wait for the driver to observe cancellation,
+                                // then record that this run has been aborted.
+                                let _ = future.await;
+                                self.abort_requested = true;
+                                return Err(ExecuteToolError::Cancelled);
+                            }
+                            continue;
+                        }
+                        RunControl::HardSteer { command, accepted } => {
+                            self.claim_control(command)?;
+                            if accepted.send(true).is_ok() {
+                                cancel.cancel();
+                                // Wait for the driver to observe cancellation,
+                                // then claim the hard-steer command for the
+                                // next turn's durable injection.
+                                let _ = future.await;
+                                return Err(ExecuteToolError::Cancelled);
+                            }
+                            self.in_flight_controls.pop();
+                            continue;
+                        }
+                        RunControl::Command(command) => {
+                            cancel.cancel();
+                            // Wait for the driver to observe cancellation, then
+                            // queue the ordinary follow-up that interrupted this
+                            // tool.
+                            let _ = future.await;
+                            self.core
+                                .queue_followup(command)
+                                .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+                            return Err(ExecuteToolError::Cancelled);
+                        }
+                    }
+                }
             };
             if let Some((tool_call_id, partial)) = update {
                 self.emit(AgentEvent::ToolExecutionUpdate {
@@ -952,27 +1271,46 @@ impl Runner {
     }
 
     fn claim_control(&mut self, command: AdmittedCommand) -> Result<(), WorkerFailure> {
-        if self.in_flight_control.is_some() {
-            return Err(WorkerFailure::Error(
-                "a second control cannot be claimed while injection is in flight".to_owned(),
-            ));
-        }
-        self.in_flight_control = Some(command);
+        self.in_flight_controls.push(command);
         Ok(())
     }
 
     async fn inject_in_flight(&mut self) -> Result<(), WorkerFailure> {
-        let injectable = self
-            .in_flight_control
-            .as_ref()
-            .expect("caller must claim a control before injection")
-            .clone();
-        let result = self.inject_user(&injectable).await;
-        if result.is_ok() {
-            self.pending_command_received_at = injectable.received_monotonic();
-            self.in_flight_control = None;
+        if self.in_flight_controls.is_empty() {
+            return Err(WorkerFailure::Error(
+                "caller must claim at least one control before injection".to_owned(),
+            ));
         }
-        result
+        // Clone so an event-channel failure leaves the controls in the runner
+        // for recovery.
+        let injectables = self.in_flight_controls.clone();
+        let mut pending_receipts = Vec::with_capacity(injectables.len());
+        let mut messages = Vec::with_capacity(injectables.len());
+        for command in &injectables {
+            let message = super::steer::build_user_message(command)
+                .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+            let message_id = crate::store::user_message_id(&command.envelope().command_id);
+            self.emit(AgentEvent::MessageStart {
+                message_id: message_id.clone(),
+                message: Box::new(message.clone()),
+            })
+            .await?;
+            let receipt = self.emit_message_end(message_id, message.clone()).await?;
+            pending_receipts.push(receipt);
+            messages.push(message);
+        }
+        let mut receipts = Vec::with_capacity(pending_receipts.len());
+        for receipt in pending_receipts {
+            receipts.push(self.await_message_receipt(receipt).await?);
+        }
+        for (receipt, message) in receipts.into_iter().zip(messages) {
+            self.retain_committed(receipt, &message)?;
+        }
+        self.pending_command_received_at = injectables
+            .first()
+            .and_then(|command| command.received_monotonic());
+        self.in_flight_controls.clear();
+        Ok(())
     }
 
     async fn close_turn(
@@ -1022,7 +1360,7 @@ impl Runner {
     }
 
     async fn advance_followup(&mut self) -> Result<bool, WorkerFailure> {
-        self.receive_control_safe_point()?;
+        self.receive_control_safe_point().await?;
         if !self.claim_pending_user()? {
             return Ok(false);
         }
@@ -1032,10 +1370,9 @@ impl Runner {
     }
 
     fn claim_pending_user(&mut self) -> Result<bool, WorkerFailure> {
-        if self.in_flight_control.is_some() {
-            return Err(WorkerFailure::Error(
-                "pending control cannot be popped while injection is in flight".to_owned(),
-            ));
+        if !self.in_flight_controls.is_empty() {
+            // A steer group is already claimed for injection.
+            return Ok(true);
         }
         let Some(command) = self.core.next_followup() else {
             return Ok(false);
@@ -1051,21 +1388,107 @@ impl Runner {
         }
     }
 
-    fn receive_control_safe_point(&mut self) -> Result<(), WorkerFailure> {
-        // Deliberately consume at most one ordinary message: one-at-a-time is
-        // the product contract and keeps each queued instruction an answer turn.
-        if let Ok(control) = self.controls.try_recv() {
+    async fn receive_control_safe_point(&mut self) -> Result<(), WorkerFailure> {
+        // Drain the control lane. Soft/retry steer commands join the in-flight
+        // group; ordinary commands and hard-steer/abort stop after one.
+        while let Ok(control) = self.controls.try_recv() {
             match control {
-                RunControl::Command(command) => self
-                    .core
-                    .queue_followup(command)
-                    .map_err(|error| WorkerFailure::Error(error.to_string()))?,
-                RunControl::RetrySteer { accepted, .. } => {
+                RunControl::Command(command) => {
+                    self.core
+                        .queue_followup(command)
+                        .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+                    return Ok(());
+                }
+                RunControl::HardSteer { command, accepted } => {
+                    if accepted.send(true).is_ok() {
+                        self.cancel_provider();
+                        self.core
+                            .queue_followup(command)
+                            .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+                        return Ok(());
+                    }
+                }
+                RunControl::SoftSteer {
+                    command,
+                    accepted,
+                    committed,
+                } => {
+                    self.accept_steer_control(command, accepted, committed)
+                        .await?;
+                }
+                RunControl::Abort {
+                    accepted,
+                    committed,
+                    ..
+                } => {
+                    if self.accept_abort_control(accepted, committed).await? {
+                        self.cancel_provider();
+                        self.abort_requested = true;
+                        return Ok(());
+                    }
+                }
+                RunControl::RetrySteer {
+                    accepted,
+                    committed,
+                    ..
+                } => {
                     let _ = accepted.send(false);
+                    drop(committed);
                 }
             }
         }
         Ok(())
+    }
+
+    fn cancel_provider(&mut self) {
+        if let Some(cancel) = self.provider_cancel.as_ref() {
+            cancel.cancel();
+        }
+    }
+
+    async fn accept_steer_control(
+        &mut self,
+        command: AdmittedCommand,
+        accepted: oneshot::Sender<bool>,
+        committed: oneshot::Receiver<()>,
+    ) -> Result<bool, WorkerFailure> {
+        let command_id = command.envelope().command_id.clone();
+        self.claim_control(command)?;
+        if accepted.send(true).is_err() {
+            // Session timed out or observed a phase change and will durably
+            // defer this same command. Do not claim it into RunCore or wait on
+            // an authorization that cannot arrive.
+            let released = self
+                .in_flight_controls
+                .pop()
+                .expect("steer control accepted only after exact claim");
+            debug_assert_eq!(released.envelope().command_id, command_id);
+            return Ok(false);
+        }
+        if committed.await.is_err() {
+            let released = self
+                .in_flight_controls
+                .pop()
+                .expect("steer control remains claimed until durable authorization");
+            debug_assert_eq!(released.envelope().command_id, command_id);
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    async fn accept_abort_control(
+        &mut self,
+        accepted: oneshot::Sender<bool>,
+        committed: oneshot::Receiver<()>,
+    ) -> Result<bool, WorkerFailure> {
+        if accepted.send(true).is_err() {
+            return Ok(false);
+        }
+        // A dropped sender is not authorization. The Session may have failed
+        // its transaction and will recover the still-durable command; the
+        // worker must not convert that control-plane failure into an external
+        // provider/tool cancellation.
+        Ok(committed.await.is_ok())
     }
 
     async fn wait_retry_or_control(&mut self, delay: Duration) -> Result<bool, WorkerFailure> {
@@ -1076,6 +1499,9 @@ impl Runner {
         let driver = self.driver.clone();
         let retry = driver.wait_retry(delay, &cancel);
         tokio::pin!(retry);
+        let mut collected = false;
+        const COLLECT_GRACE: Duration = Duration::from_millis(50);
+        let mut grace: Option<Pin<Box<tokio::time::Sleep>>> = None;
         loop {
             let control = tokio::select! {
                 biased;
@@ -1086,63 +1512,101 @@ impl Runner {
                     control
                 }
                 completed = &mut retry => {
+                    if collected {
+                        return Ok(true);
+                    }
                     return if completed {
                         Ok(false)
                     } else {
                         Err(WorkerFailure::Cancelled)
                     };
                 }
+                _ = async {
+                    if let Some(g) = grace.as_mut() {
+                        g.as_mut().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                }, if collected && grace.is_some() => {
+                    return Ok(true);
+                }
             };
-            let command = match control {
-                RunControl::Command(command) => command,
-                RunControl::RetrySteer {
+            match control {
+                RunControl::Command(command) => {
+                    self.core
+                        .queue_followup(command)
+                        .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+                    if self.claim_pending_user()? {
+                        return Ok(true);
+                    }
+                    continue;
+                }
+                RunControl::HardSteer { command, accepted } => {
+                    if accepted.send(true).is_ok() {
+                        self.cancel_provider();
+                        self.claim_control(command)?;
+                        return Ok(true);
+                    }
+                }
+                RunControl::Abort {
+                    accepted,
+                    committed,
+                    ..
+                } => {
+                    if self.accept_abort_control(accepted, committed).await? {
+                        self.cancel_provider();
+                        self.abort_requested = true;
+                        return Err(WorkerFailure::Cancelled);
+                    }
+                }
+                RunControl::SoftSteer {
+                    command,
+                    accepted,
+                    committed,
+                }
+                | RunControl::RetrySteer {
                     command,
                     accepted,
                     committed,
                 } => {
-                    let command_id = command.envelope().command_id.clone();
-                    self.claim_control(command)?;
-                    if accepted.send(true).is_err() {
-                        // Session timed out or observed a phase change and will
-                        // durably defer this same command. Do not claim it into
-                        // RunCore or wait on an authorization that cannot arrive.
-                        let released = self
-                            .in_flight_control
-                            .take()
-                            .expect("retry steer accepted only after exact claim");
-                        debug_assert_eq!(released.envelope().command_id, command_id);
-                        continue;
+                    if self
+                        .accept_steer_control(command, accepted, committed)
+                        .await?
+                    {
+                        collected = true;
+                        let deadline = tokio::time::Instant::now() + COLLECT_GRACE;
+                        grace = Some(Box::pin(tokio::time::sleep_until(deadline)));
                     }
-                    committed.await.map_err(|_| {
-                        WorkerFailure::Error(
-                            "retry steer durability authorization was dropped".to_owned(),
-                        )
-                    })?;
-                    return Ok(true);
+                    continue;
                 }
-            };
-            self.core
-                .queue_followup(command)
-                .map_err(|error| WorkerFailure::Error(error.to_string()))?;
-            if self.claim_pending_user()? {
-                return Ok(true);
             }
         }
     }
 
     fn recover_received_controls(&mut self) -> Result<(), WorkerFailure> {
         self.controls.close();
-        if let Some(command) = self.in_flight_control.take() {
+        for command in self.in_flight_controls.drain(..).rev() {
             self.core
                 .requeue_followup_front(command)
                 .map_err(|error| WorkerFailure::Error(error.to_string()))?;
         }
         while let Ok(control) = self.controls.try_recv() {
             match control {
-                RunControl::Command(command) => self
+                RunControl::Command(command) | RunControl::HardSteer { command, .. } => self
                     .core
                     .queue_followup(command)
                     .map_err(|error| WorkerFailure::Error(error.to_string()))?,
+                RunControl::SoftSteer {
+                    command, accepted, ..
+                } => {
+                    let _ = accepted.send(false);
+                    self.core
+                        .queue_followup(command)
+                        .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+                }
+                RunControl::Abort { accepted, .. } => {
+                    let _ = accepted.send(false);
+                }
                 RunControl::RetrySteer {
                     command, accepted, ..
                 } => {
@@ -1344,12 +1808,14 @@ enum AttemptOutcome {
         receipt: oneshot::Receiver<MessageCommitReceipt>,
         rejected_results: Vec<ToolResultMessage>,
     },
+    HardSteer,
 }
 
 #[derive(Clone, Copy)]
 enum SyntheticAttemptFailure {
     Start,
     InvalidMessageId,
+    Abort,
 }
 
 fn tool_calls(message: &PublicMessage) -> Vec<ToolCall> {
@@ -1593,6 +2059,7 @@ fn synthetic_attempt_message_id(
     name[72] = match failure {
         SyntheticAttemptFailure::Start => 0,
         SyntheticAttemptFailure::InvalidMessageId => 1,
+        SyntheticAttemptFailure::Abort => 2,
     };
     Ok(Uuid::new_v5(&SYNTHETIC_ATTEMPT_MESSAGE_ID_NAMESPACE, &name).to_string())
 }
