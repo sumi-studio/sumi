@@ -351,6 +351,18 @@ impl DurableBridge {
             )
             .await?;
 
+        // Abort supersedes a hard steer after step zero but before the new
+        // user message is durably injected.  Drop the staged hand-off only
+        // after the cutoff commits; keep `assistant_open` intact so the
+        // authoritative interrupted MessageEnd still closes the exact
+        // provider message under the original turn identity.
+        self.pending_hard_steer = None;
+        self.pending_hard_steer_turn_id = None;
+        self.pending_hard_steer_inject_batch = None;
+        self.pending_hard_steer_user_message_id = None;
+        self.pending_hard_steer_partial = None;
+        self.pending_hard_steer_message_barrier = None;
+
         // The abort CommandApplied ACK is delayed until the worker emits AgentEnd,
         // so the Session sends only the earlier terminal ACKs (superseded/applied)
         // now and the final Applied ACK with the run's terminal events.
@@ -1885,6 +1897,25 @@ mod tests {
         )
     }
 
+    fn test_abort_command(seq: u64, command_id: &str) -> InboundCommand {
+        InboundCommand::Valid(CommandEnvelope {
+            seq,
+            command_id: CommandId::parse(command_id).expect("canonical test UUID"),
+            command: Command::Abort {},
+        })
+    }
+
+    fn test_admitted_abort(seq: u64, command_id: &str) -> AdmittedCommand {
+        AdmittedCommand::new(
+            CommandEnvelope {
+                seq,
+                command_id: CommandId::parse(command_id).expect("canonical test UUID"),
+                command: Command::Abort {},
+            },
+            test_timestamp(),
+        )
+    }
+
     async fn test_store() -> std::sync::Arc<Store> {
         Store::session_test_store("durable-bridge-test")
             .await
@@ -2149,6 +2180,174 @@ mod tests {
         assert!(
             !bridge.can_bind_soft_steer(&writer, &command),
             "soft steer must not bind while a steer group is collecting messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_after_hard_steer_step_zero_closes_partial_without_injection_or_restart() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+
+        let owner_id = "00000000-0000-4000-8000-000000000071";
+        let run_id = "run-abort-hard-steer";
+        let turn_id = "turn-owner";
+        let (owner_binding, owner_assistant) = owner_in_phase(
+            &store,
+            &writer,
+            owner_id,
+            run_id,
+            turn_id,
+            RunPhase::AssistantStarted,
+        )
+        .await;
+        let (owner_assistant_id, _) = owner_assistant.expect("owner assistant");
+
+        let steer_id = "00000000-0000-4000-8000-000000000072";
+        persist_and_pin(&store, &writer, 2, steer_id, "superseded steer").await;
+        let abort_id = "00000000-0000-4000-8000-000000000073";
+        writer
+            .persist_inbound(&test_abort_command(3, abort_id))
+            .await
+            .expect("persist abort");
+
+        let mut bridge = DurableBridge::new(owner_binding.clone());
+        bridge.phase = RunPhase::AssistantStarted;
+        bridge.turn_open = true;
+        bridge.assistant_open = Some(owner_assistant_id.clone());
+        let steer_command = test_admitted(2, steer_id, "superseded steer");
+        bridge
+            .bind_hard_steer(&writer, steer_command)
+            .await
+            .expect("commit hard-steer step zero");
+
+        let abort_command = test_admitted_abort(3, abort_id);
+        bridge
+            .bind_abort(&writer, abort_command)
+            .await
+            .expect("commit abort cutoff");
+        assert!(bridge.pending_hard_steer.is_none());
+        assert!(bridge.pending_hard_steer_inject_batch.is_none());
+
+        let partial = PublicMessage::Assistant(PublicAssistantMessage {
+            content: Vec::new(),
+            model: "test".to_owned(),
+            provider: "test".to_owned(),
+            origin: crate::provider::types::ProviderOrigin {
+                provider_instance_id: "test".to_owned(),
+                protocol: crate::provider::types::ApiProtocol::OpenAiChatCompletions,
+                model: "test".to_owned(),
+            },
+            usage: crate::provider::types::Usage::default(),
+            stop_reason: StopReason::Aborted,
+            error_message: None,
+            provider_code: None,
+            interrupted: true,
+            timestamp: test_timestamp(),
+        });
+
+        let (partial_barrier, _) = MessageCommitBarrier::channel();
+        let partial_output = bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: owner_binding.clone(),
+                    event: AgentEvent::MessageEnd {
+                        message_id: owner_assistant_id.clone(),
+                        message: Box::new(partial.clone()),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: Some(partial_barrier),
+                    retry_wait_commit_barrier: None,
+                },
+            )
+            .await
+            .expect("commit abort partial assistant");
+        assert_eq!(
+            partial_output.outputs.len(),
+            1,
+            "Abort must emit only the original assistant MessageEnd"
+        );
+        assert!(matches!(
+            partial_output.outputs[0].event,
+            AgentEvent::MessageEnd { .. }
+        ));
+
+        let turn_output = bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: owner_binding.clone(),
+                    event: AgentEvent::TurnEnd {
+                        message: Some(Box::new(partial.clone())),
+                        tool_results: Vec::new(),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                },
+            )
+            .await
+            .expect("close aborted turn");
+        assert_eq!(turn_output.outputs.len(), 1);
+        let end_output = bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: owner_binding,
+                    event: AgentEvent::AgentEnd,
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                },
+            )
+            .await
+            .expect("close aborted run");
+        assert_eq!(end_output.outputs.len(), 1);
+        assert_eq!(bridge.phase, RunPhase::Finished);
+
+        let events: Vec<String> =
+            sqlx::query_scalar("SELECT event_type FROM agent_events ORDER BY seq")
+                .fetch_all(store.pool())
+                .await
+                .expect("read durable events");
+        assert!(
+            !events.iter().any(|kind| kind == "steered"),
+            "Abort must not restart the superseded hard steer"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM agent_events
+                 WHERE json_extract(envelope, '$.message_id')=?",
+            )
+            .bind(crate::store::user_message_id(steer_id))
+            .fetch_one(store.pool())
+            .await
+            .expect("count staged steer injection events"),
+            0,
+            "superseded hard steer must not inject its user message"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM agent_events
+                 WHERE event_type='message_end'
+                   AND json_extract(envelope, '$.message_id')=?",
+            )
+            .bind(owner_assistant_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("count original assistant close"),
+            1,
+            "Abort must close the original assistant message identity exactly once"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM inbound_commands WHERE command_id=?",
+            )
+            .bind(steer_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("read superseded steer"),
+            "superseded"
         );
     }
 

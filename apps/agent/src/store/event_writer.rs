@@ -1522,19 +1522,41 @@ impl EventWriter {
             .bind(run_id)
             .fetch_all(self.store.pool())
             .await?;
-            if owner_rows.len() > 1 {
-                bail!("multiple applying owners in run {run_id} violate the owner invariant");
-            }
-            owner_rows
+            let parsed_rows = owner_rows
                 .into_iter()
-                .next()
                 .map(|row| {
                     let command_id: String = row.try_get("command_id")?;
                     let seq = sqlite_u64(row.try_get::<i64, _>("seq")?, "run owner sequence")?;
                     let phase = RunPhase::parse(row.try_get("run_phase")?)?;
                     Ok::<_, anyhow::Error>((command_id, seq, phase))
                 })
-                .transpose()?
+                .collect::<Result<Vec<_>>>()?;
+            // A hard-steer step zero leaves the new command classified while
+            // the original owner remains in hard_steer_requested.  That
+            // classified handoff is pending work, not a second live owner;
+            // prefer the one post-user active owner for the Abort cutoff.
+            let active_rows = parsed_rows
+                .iter()
+                .filter(|(_, _, phase)| {
+                    !matches!(
+                        phase,
+                        RunPhase::Classified | RunPhase::RunStarted | RunPhase::TurnStarted
+                    )
+                })
+                .count();
+            if active_rows > 1 || (active_rows == 0 && parsed_rows.len() > 1) {
+                bail!("multiple applying owners in run {run_id} violate the owner invariant");
+            }
+            if active_rows == 1 {
+                parsed_rows.into_iter().find(|(_, _, phase)| {
+                    !matches!(
+                        phase,
+                        RunPhase::Classified | RunPhase::RunStarted | RunPhase::TurnStarted
+                    )
+                })
+            } else {
+                parsed_rows.into_iter().next()
+            }
         } else {
             None
         };
