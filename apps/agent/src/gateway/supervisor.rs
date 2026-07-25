@@ -327,6 +327,16 @@ where
                     }
                     Self::backoff_sleep(&self.config, attempt).await?;
                 }
+                Err(SupervisorError::EstablishedReconnect { reason }) => {
+                    attempt = 0;
+                    attempt = attempt.saturating_add(1);
+                    if let Some(max) = self.config.max_reconnect_attempts
+                        && attempt > max
+                    {
+                        return Err(anyhow!("max reconnect attempts exceeded: {reason}"));
+                    }
+                    Self::backoff_sleep(&self.config, attempt).await?;
+                }
             }
         }
     }
@@ -420,7 +430,7 @@ where
             "epoch ended"
         );
 
-        Err(SupervisorError::Reconnect {
+        Err(SupervisorError::EstablishedReconnect {
             reason: format!("reader/writer task ended: {result:?}"),
         })
     }
@@ -517,6 +527,7 @@ enum SupervisorError {
     AuthRejected,
     Fatal(anyhow::Error),
     Reconnect { reason: String },
+    EstablishedReconnect { reason: String },
 }
 
 async fn event_forwarder(
@@ -1524,7 +1535,7 @@ mod tests {
 
         let attempts = counter.load(Ordering::SeqCst);
         assert!(
-            attempts >= 1 && attempts <= 5,
+            (1..=5).contains(&attempts),
             "auth retries must be bounded, got {attempts}"
         );
     }
@@ -1608,6 +1619,91 @@ mod tests {
         assert!(
             elapsed >= Duration::from_millis(1),
             "nonzero delay must have nonzero jitter lower bound, elapsed {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_auth_reconnect_failures_accumulate_and_hit_limit() {
+        let mut config = make_config();
+        config.max_reconnect_attempts = Some(2);
+        config.hello_timeout = Duration::from_millis(5);
+        config.initial_backoff = Duration::from_millis(1);
+
+        let credentials = CountingCredentialProvider::new("token");
+        let counter = credentials.counter.clone();
+        let connector = MockConnector::new(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            VecDeque::from([
+                Err(ConnectorError::Other(anyhow!("connect refused"))),
+                Err(ConnectorError::Other(anyhow!("connect refused"))),
+                Err(ConnectorError::Other(anyhow!("connect refused"))),
+            ]),
+        );
+        let source = MockDurableSource::new(CommandCursors::default());
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: 7,
+            receipt_identity: "receipt-1".to_owned(),
+        });
+
+        let supervisor = ConnectionSupervisor::new(connector, credentials, source, latch, config);
+        let handle = supervisor.start();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle.join()).await;
+        assert!(result.is_ok(), "supervisor must stop within bounded time");
+        assert!(result.unwrap().is_err());
+
+        let attempts = counter.load(Ordering::SeqCst);
+        assert_eq!(
+            attempts, 3,
+            "pre-auth failures must accumulate and stop after limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn established_epoch_resets_reconnect_failure_streak() {
+        let mut config = make_config();
+        config.max_reconnect_attempts = Some(1);
+        config.hello_timeout = Duration::from_millis(5);
+        config.initial_backoff = Duration::from_millis(1);
+        config.max_backoff = Duration::from_millis(5);
+
+        let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let connector = MockConnector::new(
+            sent_hellos.clone(),
+            VecDeque::from([
+                Ok(MockGateway::new(VecDeque::from([Err(anyhow!(
+                    "reader EOF"
+                ))]))),
+                Ok(MockGateway::new(VecDeque::from([Err(anyhow!(
+                    "reader EOF"
+                ))]))),
+                Ok(MockGateway::new(VecDeque::from([Err(anyhow!(
+                    "reader EOF"
+                ))]))),
+                Ok(MockGateway::new(VecDeque::from([Err(anyhow!(
+                    "reader EOF"
+                ))]))),
+                Err(ConnectorError::Fatal(anyhow!("stop"))),
+            ]),
+        );
+        let credentials = CountingCredentialProvider::new("token");
+        let source = MockDurableSource::new(CommandCursors::default());
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: 7,
+            receipt_identity: "receipt-1".to_owned(),
+        });
+
+        let supervisor = ConnectionSupervisor::new(connector, credentials, source, latch, config);
+        let handle = supervisor.start();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle.join()).await;
+        assert!(result.is_ok(), "supervisor must stop within bounded time");
+        assert!(result.unwrap().is_err());
+
+        assert_eq!(
+            sent_hellos.lock().unwrap().len(),
+            4,
+            "healthy epoch reconnects must not exhaust a finite limit"
         );
     }
 
