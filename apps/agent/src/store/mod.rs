@@ -25,6 +25,8 @@ use sqlx::{
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+#[cfg(test)]
+pub(crate) use crypto::{DATA_KEY_BYTES, WrappingKey};
 pub(crate) use crypto::{
     DataKeyPurpose, EnvironmentKeyProvider, KeyProvider, RowAad, command_payload_digest,
     verify_command_payload_digest,
@@ -57,9 +59,6 @@ use self::crypto::{
     ConversationCommandDigestFactory, DataKeyMaterial, DataKeyScope, KeyWrapAad, WRAP_ALGORITHM,
     unwrap_data_key, wrap_data_key,
 };
-
-#[cfg(test)]
-use self::crypto::WrappingKey;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 

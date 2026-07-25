@@ -620,6 +620,7 @@ fn resolve_message_output(output: &mut RunOutput, next_seq: &mut u64) {
         barrier.resolve(MessageCommitReceipt {
             message_id: message_id.clone(),
             message_seq: *next_seq,
+            new_turn_id: None,
         });
         *next_seq += 1;
     }

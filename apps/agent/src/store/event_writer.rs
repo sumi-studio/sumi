@@ -196,7 +196,11 @@ impl DurableEvent {
         )
     }
 
-    fn empty_turn_end(run_id: impl Into<String>, turn_id: impl Into<String>) -> Result<Self> {
+    #[allow(dead_code, reason = "T15 consumes the T12-frozen lifecycle builders")]
+    pub(crate) fn empty_turn_end(
+        run_id: impl Into<String>,
+        turn_id: impl Into<String>,
+    ) -> Result<Self> {
         Self::from_parts(
             AgentEvent::TurnEnd {
                 message: None,
@@ -1107,6 +1111,10 @@ impl EventWriter {
         Self { store, gate }
     }
 
+    pub(crate) fn store(&self) -> &Arc<Store> {
+        &self.store
+    }
+
     /// Authenticates and reconstructs the durable lifecycle prefix exactly once
     /// for all EventWriter handles sharing this Store. Startup/recovery must call
     /// this before command admission; write entry points also call it defensively
@@ -1432,6 +1440,26 @@ impl EventWriter {
         abort_command_id: &str,
         abort_seq: u64,
     ) -> Result<Vec<CommandAck>> {
+        self.apply_abort_cutoff(abort_command_id, abort_seq, None)
+            .await
+    }
+
+    pub(crate) async fn apply_active_abort_cutoff(
+        &self,
+        abort_command_id: &str,
+        abort_seq: u64,
+        run_id: &str,
+    ) -> Result<Vec<CommandAck>> {
+        self.apply_abort_cutoff(abort_command_id, abort_seq, Some(run_id))
+            .await
+    }
+
+    async fn apply_abort_cutoff(
+        &self,
+        abort_command_id: &str,
+        abort_seq: u64,
+        run_id: Option<&str>,
+    ) -> Result<Vec<CommandAck>> {
         let mut guard = self.gate.lock().await;
         let mut authentication = self.store.pool().begin().await?;
         let command = load_authenticated_command(
@@ -1442,25 +1470,58 @@ impl EventWriter {
             "abort",
         )
         .await
-        .context("idle Abort failed authenticated command validation")?;
+        .context("Abort cutoff failed authenticated command validation")?;
         if !matches!(command, Command::Abort {}) {
             bail!("durable abort row contains a different command variant");
         }
         authentication.rollback().await?;
         let abort_seq = sqlite_i64(abort_seq, "Abort command sequence")?;
-        let owner_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM inbound_commands
+
+        let live_owner: Option<(String, u64, RunPhase)> = sqlx::query(
+            "SELECT command_id, seq, run_phase FROM inbound_commands
              WHERE command_kind='user_message' AND status='applying'
                AND run_phase IN (
                  'user_started','user_committed','assistant_started',
                  'hard_steer_requested','cancel_requested'
                )",
         )
-        .fetch_one(self.store.pool())
-        .await?;
-        if owner_count != 0 {
+        .fetch_optional(self.store.pool())
+        .await?
+        .map(|row| {
+            let command_id: String = row.try_get("command_id")?;
+            let seq = sqlite_u64(row.try_get::<i64, _>("seq")?, "live owner sequence")?;
+            let phase = RunPhase::parse(row.try_get("run_phase")?)?;
+            Ok::<_, anyhow::Error>((command_id, seq, phase))
+        })
+        .transpose()?;
+
+        if run_id.is_none() && live_owner.is_some() {
             bail!("idle Abort path cannot run while a live owner exists");
         }
+
+        let owner_in_run: Option<(String, u64, RunPhase)> = if let Some(run_id) = run_id {
+            sqlx::query(
+                "SELECT command_id, seq, run_phase FROM inbound_commands
+                 WHERE run_id = ? AND command_kind='user_message' AND status='applying'
+                   AND run_phase IN (
+                     'classified','run_started','turn_started',
+                     'user_started','user_committed','assistant_started',
+                     'hard_steer_requested','cancel_requested'
+                   )",
+            )
+            .bind(run_id)
+            .fetch_optional(self.store.pool())
+            .await?
+            .map(|row| {
+                let command_id: String = row.try_get("command_id")?;
+                let seq = sqlite_u64(row.try_get::<i64, _>("seq")?, "run owner sequence")?;
+                let phase = RunPhase::parse(row.try_get("run_phase")?)?;
+                Ok::<_, anyhow::Error>((command_id, seq, phase))
+            })
+            .transpose()?
+        } else {
+            None
+        };
 
         let pending = sqlx::query(
             "SELECT seq, command_id, command_kind, status, application_kind,
@@ -1474,11 +1535,12 @@ impl EventWriter {
         .fetch_all(self.store.pool())
         .await?;
         if pending.len() > 32 {
-            bail!("idle Abort cutoff exceeds the bounded 32-command window");
+            bail!("Abort cutoff exceeds the bounded 32-command window");
         }
         let mut pending_terminals = Vec::with_capacity(pending.len());
         let mut terminal_ids = Vec::with_capacity(pending.len() + 1);
         let mut startup: Option<(String, String, RunPhase)> = None;
+        let mut owner_seen = false;
         for row in pending {
             let seq = sqlite_u64(row.get::<i64, _>("seq"), "stored command sequence")?;
             let command_id: String = row.try_get("command_id")?;
@@ -1493,34 +1555,82 @@ impl EventWriter {
                 }
                 ("user_message", "applying") => {
                     let application_kind: String = row.try_get("application_kind")?;
-                    let run_id: String = row.try_get("run_id")?;
+                    let row_run_id: String = row.try_get("run_id")?;
                     let turn_id: String = row.try_get("turn_id")?;
                     let phase = RunPhase::parse(row.try_get("run_phase")?)?;
-                    if application_kind != "idle_run"
-                        || !matches!(
+                    let is_owner = owner_in_run
+                        .as_ref()
+                        .is_some_and(|(owner_id, _, _)| owner_id == &command_id);
+                    if is_owner
+                        && !matches!(
                             phase,
                             RunPhase::Classified | RunPhase::RunStarted | RunPhase::TurnStarted
                         )
-                        || startup.is_some()
                     {
+                        owner_seen = true;
+                        continue;
+                    }
+                    if application_kind == "idle_run"
+                        && matches!(
+                            phase,
+                            RunPhase::Classified | RunPhase::RunStarted | RunPhase::TurnStarted
+                        )
+                    {
+                        if startup.is_some() {
+                            bail!(
+                                "Abort cutoff requires at most one pre-user idle startup; found {command_id}"
+                            );
+                        }
+                        startup = Some((row_run_id.clone(), turn_id, phase));
+                        pending_terminals.push((command_id.clone(), seq, true, Some(row_run_id)));
+                    } else if matches!(
+                        phase,
+                        RunPhase::Classified | RunPhase::RunStarted | RunPhase::TurnStarted
+                    ) {
+                        pending_terminals.push((command_id.clone(), seq, true, Some(row_run_id)));
+                    } else {
                         bail!(
-                            "idle Abort cutoff requires at most one pre-user idle startup; found {command_id} in {application_kind}/{}",
+                            "Abort cutoff found unsupported pending user_message {command_id}: {application_kind}/{} {status}",
                             phase.as_str()
                         );
                     }
-                    pending_terminals.push((command_id.clone(), seq, true, Some(run_id.clone())));
-                    startup = Some((run_id, turn_id, phase));
                 }
                 _ => {
                     bail!(
-                        "idle Abort cutoff found unsupported pending command {command_id}: {kind}/{status}"
+                        "Abort cutoff found unsupported pending command {command_id}: {kind}/{status}"
                     );
                 }
             }
             terminal_ids.push(command_id);
         }
-        let abort_run_id = startup.as_ref().map(|(run_id, _, _)| run_id.clone());
-        let mut projections = Vec::with_capacity(pending_terminals.len() + 1);
+
+        let abort_run_id = run_id
+            .map(str::to_owned)
+            .or_else(|| startup.as_ref().map(|(r, _, _)| r.clone()));
+
+        if let Some(run_id) = run_id {
+            if owner_in_run.is_none() && startup.is_none() && live_owner.is_some() {
+                bail!(
+                    "active Abort cutoff run {run_id} has no durable owner or startup in that run"
+                );
+            }
+            if let Some((owner_id, _, owner_phase)) = &owner_in_run {
+                if matches!(
+                    owner_phase,
+                    RunPhase::Classified | RunPhase::RunStarted | RunPhase::TurnStarted
+                ) {
+                    // Pre-user idle startup is handled via supersede + empty close, not cancel_requested.
+                } else if !owner_seen {
+                    bail!(
+                        "active Abort cutoff run {run_id} owner {owner_id} was not found in pending scan"
+                    );
+                } else if live_owner.is_none() {
+                    bail!("active Abort cutoff run {run_id} has an owner in an unexpected phase");
+                }
+            }
+        }
+
+        let mut projections = Vec::with_capacity(pending_terminals.len() + 3);
         for (command_id, command_seq, is_user_message, stored_context) in pending_terminals {
             if is_user_message {
                 projections.push(Projection::CommandSuperseded {
@@ -1538,12 +1648,28 @@ impl EventWriter {
                 });
             }
         }
+
+        if let Some((owner_id, _, owner_phase)) = &owner_in_run
+            && !matches!(
+                owner_phase,
+                RunPhase::Classified | RunPhase::RunStarted | RunPhase::TurnStarted
+            )
+        {
+            projections.push(Projection::RunPhase {
+                command_id: owner_id.clone(),
+                run_id: abort_run_id.clone().expect("live owner requires run_id"),
+                expected: *owner_phase,
+                next: RunPhase::CancelRequested,
+            });
+        }
+
         projections.push(Projection::CommandApplied {
             command_id: abort_command_id.to_owned(),
             command_seq: sqlite_u64(abort_seq, "Abort command sequence")?,
             run_id: abort_run_id,
         });
         terminal_ids.push(abort_command_id.to_owned());
+
         let mut writes = Vec::new();
         if let Some((run_id, turn_id, phase)) = &startup {
             if *phase == RunPhase::TurnStarted {
@@ -1563,6 +1689,7 @@ impl EventWriter {
             event: None,
             projections,
         });
+
         self.apply_locked(
             EventBatch {
                 writes,
@@ -1612,6 +1739,24 @@ impl EventWriter {
             .checked_add(1)
             .ok_or_else(|| anyhow!("durable event sequence overflow"))?;
         let (prepared, transaction_bytes, event_seqs) = self.prepare_batch(batch, next_seq).await?;
+
+        #[cfg(all(test, unix))]
+        let env_failpoint_storage = test_env_abrupt_failpoint_for_prepared(&prepared);
+        #[cfg(not(all(test, unix)))]
+        let env_failpoint_storage: Option<(String, bool, std::path::PathBuf)> = None;
+        #[cfg(all(test, unix))]
+        let env_write_failpoint_storage = test_env_abrupt_failpoint_for_writes(&prepared);
+        #[cfg(not(all(test, unix)))]
+        let env_write_failpoint_storage: Option<(String, usize, std::path::PathBuf)> = None;
+        let effective_abrupt_failpoint: Option<(&str, bool, &std::path::Path)> = abrupt_failpoint
+            .or_else(|| {
+                env_failpoint_storage
+                    .as_ref()
+                    .map(|(name, after_commit, path)| {
+                        (name.as_str(), *after_commit, path.as_path())
+                    })
+            });
+
         if let Some(key_ref) = destroy_after_prepare {
             self.store.destroy_conversation_key_ref(key_ref).await?;
         }
@@ -1766,6 +1911,11 @@ impl EventWriter {
             if fail_after_writes == Some(applied_writes) {
                 bail!("EventWriter test failpoint after {applied_writes} writes");
             }
+            if let Some((name, count, readiness_path)) = env_write_failpoint_storage.as_ref()
+                && applied_writes == *count
+            {
+                abrupt_transaction_exit(name, "after_writes", readiness_path.as_path());
+            }
         }
 
         for (run_id, expected) in &classification_owner_conditions {
@@ -1785,7 +1935,7 @@ impl EventWriter {
             )
             .await?;
         }
-        if let Some((name, false, readiness_path)) = abrupt_failpoint {
+        if let Some((name, false, readiness_path)) = effective_abrupt_failpoint {
             abrupt_transaction_exit(name, "before_commit", readiness_path);
         }
         transaction
@@ -1797,7 +1947,7 @@ impl EventWriter {
             lifecycle: next_lifecycle.unwrap_or(checkpoint.lifecycle),
             historical_rows_visited: checkpoint.historical_rows_visited,
         });
-        if let Some((name, true, readiness_path)) = abrupt_failpoint {
+        if let Some((name, true, readiness_path)) = effective_abrupt_failpoint {
             abrupt_transaction_exit(name, "after_commit", readiness_path);
         }
         Ok(event_seqs)
@@ -2763,6 +2913,201 @@ fn abrupt_transaction_exit(name: &str, boundary: &str, readiness_path: &std::pat
     )
 }
 
+#[cfg(all(test, unix))]
+fn test_env_abrupt_failpoint_for_prepared(
+    prepared: &[PreparedWrite],
+) -> Option<(String, bool, std::path::PathBuf)> {
+    use std::env;
+
+    let name = env::var("SUMI_EVENT_WRITER_FAILPOINT_NAME").ok()?;
+    let boundary = env::var("SUMI_EVENT_WRITER_FAILPOINT_BOUNDARY").ok()?;
+    let readiness = env::var("SUMI_EVENT_WRITER_FAILPOINT_READY").ok()?;
+    let after_commit = match boundary.as_str() {
+        "before_commit" => false,
+        "after_commit" => true,
+        _ => return None,
+    };
+    if !batch_matches_t16_failpoint(prepared, &name) {
+        return None;
+    }
+    Some((name, after_commit, readiness.into()))
+}
+
+#[cfg(all(test, unix))]
+fn test_env_abrupt_failpoint_for_writes(
+    prepared: &[PreparedWrite],
+) -> Option<(String, usize, std::path::PathBuf)> {
+    use std::env;
+
+    let name = env::var("SUMI_EVENT_WRITER_FAILPOINT_NAME").ok()?;
+    let after_writes = env::var("SUMI_EVENT_WRITER_FAILPOINT_AFTER_WRITES").ok()?;
+    let readiness = env::var("SUMI_EVENT_WRITER_FAILPOINT_READY").ok()?;
+    let after_writes: usize = after_writes.parse().ok()?;
+    if !batch_matches_t16_failpoint(prepared, &name) {
+        return None;
+    }
+    Some((name, after_writes, readiness.into()))
+}
+
+#[cfg(all(test, unix))]
+fn batch_matches_t16_failpoint(prepared: &[PreparedWrite], name: &str) -> bool {
+    match name {
+        "hard_steer_step_zero" => prepared.iter().any(|write| {
+            write.projections.iter().any(|projection| {
+                matches!(
+                    projection,
+                    PreparedProjection::Plain(Projection::RunPhase {
+                        next: RunPhase::HardSteerRequested,
+                        ..
+                    })
+                )
+            }) && write.projections.iter().any(|projection| {
+                matches!(
+                    projection,
+                    PreparedProjection::Plain(Projection::CommandClassified {
+                        application_kind: ApplicationKind::HardSteer,
+                        ..
+                    })
+                )
+            })
+        }),
+        "hard_steer_partial_message_end" => prepared.iter().any(|write| {
+            write.projections.iter().any(|projection| {
+                matches!(
+                    projection,
+                    PreparedProjection::MessageEnd {
+                        role: "assistant",
+                        interrupted: true,
+                        ..
+                    }
+                )
+            })
+        }),
+        "hard_steer_user_injection" => {
+            let projections: Vec<_> = prepared
+                .iter()
+                .flat_map(|write| write.projections.iter())
+                .collect();
+            projections.iter().copied().any(|projection| {
+                matches!(
+                    projection,
+                    PreparedProjection::Plain(Projection::CommandApplied {
+                        run_id: Some(_),
+                        ..
+                    })
+                )
+            }) && projections.iter().copied().any(|projection| {
+                matches!(
+                    projection,
+                    PreparedProjection::MessageEnd { role: "user", .. }
+                )
+            })
+        }
+        "turn_end" => {
+            let has_turn_end = prepared.iter().any(|write| {
+                write
+                    .event
+                    .as_ref()
+                    .is_some_and(|event| event.kind == "turn_end")
+            });
+            let has_message_end = prepared.iter().any(|write| {
+                write
+                    .projections
+                    .iter()
+                    .any(|projection| matches!(projection, PreparedProjection::MessageEnd { .. }))
+            });
+            has_turn_end && !has_message_end
+        }
+        "soft_steer_injection" => {
+            prepared.iter().any(|write| {
+                write.event.as_ref().is_some_and(|event| {
+                    event.kind == "steered" && event.steer_mode == Some("soft")
+                })
+            }) && prepared.iter().any(|write| {
+                write
+                    .event
+                    .as_ref()
+                    .is_some_and(|event| event.kind == "turn_end")
+            })
+        }
+        "retry_steer_injection" => {
+            let has_soft_steer = prepared.iter().any(|write| {
+                write.event.as_ref().is_some_and(|event| {
+                    event.kind == "steered" && event.steer_mode == Some("soft")
+                })
+            });
+            let has_turn_end = prepared.iter().any(|write| {
+                write
+                    .event
+                    .as_ref()
+                    .is_some_and(|event| event.kind == "turn_end")
+            });
+            has_soft_steer && !has_turn_end
+        }
+        "group_tail_owner_transfer" => {
+            prepared.iter().any(|write| {
+                write.event.as_ref().is_some_and(|event| {
+                    event.kind == "steered" && event.steer_mode == Some("soft")
+                })
+            }) && prepared.iter().any(|write| {
+                write.projections.iter().any(|projection| {
+                    matches!(
+                        projection,
+                        PreparedProjection::Plain(Projection::CommandApplied { .. })
+                    )
+                })
+            })
+        }
+        "active_abort_cutoff" => {
+            prepared.iter().any(|write| {
+                write.projections.iter().any(|projection| {
+                    matches!(
+                        projection,
+                        PreparedProjection::Plain(Projection::CommandApplied {
+                            run_id: Some(_),
+                            ..
+                        })
+                    )
+                })
+            }) && prepared.iter().any(|write| {
+                write.projections.iter().any(|projection| {
+                    matches!(
+                        projection,
+                        PreparedProjection::Plain(Projection::RunPhase {
+                            next: RunPhase::CancelRequested,
+                            ..
+                        })
+                    )
+                })
+            })
+        }
+        "supersede_cutoff" => {
+            let has_empty_or_normal_turn_end = prepared.iter().any(|write| {
+                write
+                    .event
+                    .as_ref()
+                    .is_some_and(|event| event.kind == "turn_end")
+            });
+            let has_agent_end = prepared.iter().any(|write| {
+                write
+                    .event
+                    .as_ref()
+                    .is_some_and(|event| event.kind == "agent_end")
+            });
+            let has_superseded = prepared.iter().any(|write| {
+                write.projections.iter().any(|projection| {
+                    matches!(
+                        projection,
+                        PreparedProjection::Plain(Projection::CommandSuperseded { .. })
+                    )
+                })
+            });
+            has_empty_or_normal_turn_end && has_agent_end && has_superseded
+        }
+        _ => false,
+    }
+}
+
 fn verify_digest_bytes(incoming: &[u8], stored: &[u8]) -> Result<()> {
     if incoming.len() != stored.len() || incoming.ct_eq(stored).unwrap_u8() == 0 {
         bail!("command payload digest mismatch");
@@ -3270,8 +3615,10 @@ fn validate_batch_shape(
                     }
                     ToolExecutionMutation::Prepare { .. } => {}
                     ToolExecutionMutation::Skip { error_code, .. } => {
-                        if *error_code != "length_guard" {
-                            bail!("ToolExecution Skip only supports length_guard");
+                        if !matches!(*error_code, "length_guard" | "user_steer_cancelled") {
+                            bail!(
+                                "ToolExecution Skip only supports length_guard or user_steer_cancelled"
+                            );
                         }
                         tool_skip_mutation_ids.insert(tool_call_id.clone());
                     }
@@ -5331,7 +5678,7 @@ async fn validate_required_projection_sets(
     let mut abort_applications = Vec::new();
     for (command_id, command_seq, contextual_run_id, position) in &applied_controls {
         let row = sqlx::query(
-            "SELECT command_kind, status, run_id, run_phase,
+            "SELECT command_kind, application_kind, status, run_id, run_phase,
                     payload_key_ref, payload_ciphertext, payload_hmac
              FROM inbound_commands WHERE command_id = ? AND seq = ?",
         )
@@ -5553,9 +5900,13 @@ async fn validate_required_projection_sets(
                                 && *expected == RunPhase::TurnStarted
                                 && *next == RunPhase::UserStarted
                         });
+                let application_kind: String = row.try_get("application_kind")?;
+                let steer_handoff =
+                    matches!(application_kind.as_str(), "soft_steer" | "retry_steer");
                 match (normal_close, handoff, final_phase) {
                     (true, false, RunPhase::AssistantStarted | RunPhase::CancelRequested) => {}
                     (false, true, RunPhase::AssistantStarted | RunPhase::HardSteerRequested) => {}
+                    (false, true, RunPhase::UserCommitted) if steer_handoff => {}
                     (true, true, _) => {
                         bail!("AgentEnd cannot co-commit a same-run owner handoff")
                     }
@@ -6083,6 +6434,7 @@ enum OwnerHandoffAccounting {
     Account,
 }
 
+#[allow(dead_code)]
 fn projection_closes_owner(
     projection: &PreparedProjection,
     command_id: &str,
@@ -6229,9 +6581,11 @@ async fn validate_durable_lifecycle_suffix(
                     || run_id.is_empty()
                     || turn_id.is_empty()
                     || idempotency_key.is_empty()
-                    || *error_code != "length_guard" =>
+                    || !matches!(*error_code, "length_guard" | "user_steer_cancelled") =>
                 {
-                    bail!("ToolExecutionSkip identity must be non-empty and use length_guard")
+                    bail!(
+                        "ToolExecutionSkip identity must be non-empty and use length_guard or user_steer_cancelled"
+                    )
                 }
                 PreparedProjection::Plain(Projection::ToolExecution(
                     ToolExecutionMutation::Skip {
@@ -6378,21 +6732,69 @@ async fn require_exact_live_owner_turn(
     .bind(run_id)
     .fetch_all(&mut **transaction)
     .await?;
-    let matches =
-        rows.iter()
-            .filter(|row| {
-                let Ok(command_id) = row.try_get::<String, _>("command_id") else {
-                    return false;
-                };
-                let Ok(phase) = row.try_get::<String, _>("run_phase") else {
-                    return false;
-                };
-                let closes_owner = prepared
+    let mut matches = 0usize;
+    for row in &rows {
+        let Ok(command_id) = row.try_get::<String, _>("command_id") else {
+            continue;
+        };
+        let Ok(phase) = row.try_get::<String, _>("run_phase") else {
+            continue;
+        };
+        let Ok(mut phase) = RunPhase::parse(&phase) else {
+            continue;
+        };
+        let mut status = "applying";
+
+        if matches!(handoff_accounting, OwnerHandoffAccounting::Account) {
+            for projection in prepared.iter().flat_map(|write| &write.projections) {
+                match projection {
+                    PreparedProjection::Plain(Projection::RunPhase {
+                        command_id: target,
+                        run_id: target_run,
+                        expected,
+                        next,
+                    }) if target == &command_id
+                        && target_run == run_id
+                        && status == "applying"
+                        && phase == *expected =>
+                    {
+                        phase = *next;
+                    }
+                    PreparedProjection::Plain(Projection::CommandApplied {
+                        command_id: target,
+                        run_id: target_run,
+                        ..
+                    }) if target == &command_id
+                        && target_run.as_deref() == Some(run_id)
+                        && status == "applying"
+                        && phase.is_owner() =>
+                    {
+                        status = "applied";
+                        phase = RunPhase::Finished;
+                    }
+                    PreparedProjection::Plain(Projection::CommandSuperseded {
+                        command_id: target,
+                        run_id: target_run,
+                        ..
+                    }) if target == &command_id
+                        && target_run.as_deref() == Some(run_id)
+                        && status == "applying" =>
+                    {
+                        status = "superseded";
+                        phase = RunPhase::Finished;
+                    }
+                    _ => {}
+                }
+            }
+            if status == "applying" && phase.is_owner() {
+                matches += 1;
+            }
+        } else {
+            let opens_owner =
+                prepared
                     .iter()
                     .flat_map(|write| &write.projections)
-                    .any(|projection| projection_closes_owner(projection, &command_id, run_id));
-                let opens_owner = prepared.iter().flat_map(|write| &write.projections).any(
-                    |projection| {
+                    .any(|projection| {
                         matches!(
                             projection,
                             PreparedProjection::Plain(Projection::RunPhase {
@@ -6402,14 +6804,12 @@ async fn require_exact_live_owner_turn(
                                 ..
                             }) if target == &command_id && target_run == run_id && next.is_owner()
                         )
-                    },
-                );
-                (RunPhase::parse(&phase).is_ok_and(RunPhase::is_owner)
-                    && (!matches!(handoff_accounting, OwnerHandoffAccounting::Account)
-                        || !closes_owner))
-                    || opens_owner
-            })
-            .count();
+                    });
+            if phase.is_owner() || opens_owner {
+                matches += 1;
+            }
+        }
+    }
     if matches != 1 {
         bail!("{kind} for {run_id}/{turn_id} requires exactly one live owner; found {matches}");
     }
@@ -7198,8 +7598,8 @@ async fn apply_tool_mutation(
             idempotency_key,
             error_code,
         } => {
-            if error_code != "length_guard" {
-                bail!("ToolExecutionSkip only supports length_guard");
+            if !matches!(error_code, "length_guard" | "user_steer_cancelled") {
+                bail!("ToolExecutionSkip only supports length_guard or user_steer_cancelled");
             }
             let result = sqlx::query(
                 "INSERT INTO tool_executions(
