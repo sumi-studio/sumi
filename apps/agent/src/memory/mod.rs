@@ -70,6 +70,10 @@ impl DecryptedMemorySummary {
     pub fn expose(&self) -> &str {
         self.0.as_str()
     }
+
+    pub(crate) fn clone_zeroized(&self) -> Zeroizing<String> {
+        self.0.clone()
+    }
 }
 
 pub struct L1Entry {

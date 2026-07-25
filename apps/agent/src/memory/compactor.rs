@@ -6,8 +6,9 @@
 //! signatures, and native compaction bytes cannot be represented in it, so they
 //! cannot reach the compact HTTP body.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value, json};
+use zeroize::Zeroizing;
 
 use crate::provider::{
     canonical_request::CanonicalRequestBody,
@@ -55,11 +56,11 @@ impl RedactedMemoryProjection {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 struct DecryptedSummary {
     from: DateTime<Utc>,
     to: DateTime<Utc>,
-    text: String,
+    text: Zeroizing<String>,
 }
 
 /// Errors that can occur while selecting a compact model or building the
@@ -178,7 +179,7 @@ pub enum CompactError {
 /// };
 /// let _ = CompactionInput::from_public_batch(&[payload], None);
 /// ```
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct CompactionInput {
     conversation: Vec<PublicMessage>,
     recent_memory: Option<String>,
@@ -220,7 +221,7 @@ impl CompactionInput {
             .map(|entry| DecryptedSummary {
                 from: entry.time_range.0,
                 to: entry.time_range.1,
-                text: entry.summary.expose().to_owned(),
+                text: entry.summary.clone_zeroized(),
             })
             .collect();
         Self {
@@ -258,6 +259,12 @@ impl CompactModelSpec {
 /// The default is the conversation model. An explicit model is accepted only
 /// when its trust domain equals the conversation's domain or appears in the
 /// tenant allowlist.
+///
+/// This pure input/serializer foundation only builds Chat Completions
+/// requests, so the selected model is rejected unless it uses the
+/// `OpenAiChatCompletions` protocol. The later T20 transport integration may
+/// add protocol-specific compaction paths without weakening this serializer's
+/// input boundary.
 pub fn select_compact_model(
     conversation: &ModelSpec,
     explicit: Option<&ModelSpec>,
@@ -272,6 +279,10 @@ pub fn select_compact_model(
             trust_domain: trust_domain_id.clone(),
             conversation_domain: conversation_domain.clone(),
         });
+    }
+
+    if selected.protocol != ApiProtocol::OpenAiChatCompletions {
+        return Err(CompactError::UnsupportedProtocol);
     }
 
     Ok(CompactModelSpec {
@@ -332,9 +343,9 @@ fn build_user_content(input: &CompactionInput) -> String {
     let mut content = String::new();
 
     for summary in &input.summaries {
-        let from = summary.from.to_rfc3339();
-        let to = summary.to.to_rfc3339();
-        let escaped_summary = escape_framing_text(&summary.text);
+        let from = summary.from.to_rfc3339_opts(SecondsFormat::Secs, true);
+        let to = summary.to.to_rfc3339_opts(SecondsFormat::Secs, true);
+        let escaped_summary = escape_framing_text(summary.text.as_str());
         content.push_str(&format!(
             "<memory layer=\"l1\" from=\"{from}\" to=\"{to}\">{escaped_summary}</memory>\n"
         ));
@@ -366,10 +377,12 @@ fn build_user_content(input: &CompactionInput) -> String {
 fn serialize_public_message(message: &PublicMessage) -> String {
     match message {
         PublicMessage::User(message) => {
+            let ts = message.timestamp.to_rfc3339_opts(SecondsFormat::Secs, true);
             let text = escape_framing_text(&user_content_text(&message.content));
-            format!("[USER] {text}")
+            format!("[USER] [{ts}] {text}")
         }
         PublicMessage::Assistant(message) => {
+            let ts = message.timestamp.to_rfc3339_opts(SecondsFormat::Secs, true);
             let parts: Vec<String> = message
                 .content
                 .iter()
@@ -395,13 +408,17 @@ fn serialize_public_message(message: &PublicMessage) -> String {
                 })
                 .collect();
             let parts_text = parts.join("\n");
-            format!("[ASSISTANT] {parts_text}")
+            format!("[ASSISTANT] [{ts}] {parts_text}")
         }
         PublicMessage::ToolResult(message) => {
+            let ts = message.timestamp.to_rfc3339_opts(SecondsFormat::Secs, true);
             let name = escape_framing_text(&message.tool_name);
             let id = escape_framing_text(&message.tool_call_id);
             let text = escape_framing_text(&user_content_text(&message.content));
-            format!("[TOOL {name} id={id} is_error={}] {text}", message.is_error)
+            format!(
+                "[TOOL {name} id={id} is_error={}] [{ts}] {text}",
+                message.is_error
+            )
         }
     }
 }
@@ -761,7 +778,10 @@ mod tests {
         let input = CompactionInput::from_decrypted_summaries(&[entry]);
         assert!(input.conversation.is_empty());
         assert_eq!(input.summaries.len(), 1);
-        assert_eq!(input.summaries[0].text, "The user likes concise replies.");
+        assert_eq!(
+            input.summaries[0].text.as_str(),
+            "The user likes concise replies."
+        );
 
         let compact = select_compact_model(&chat_model(), None, &[]).expect("same model");
         let body = build_compact_request(&compact, &input).expect("build request");
@@ -831,11 +851,9 @@ mod tests {
     }
 
     #[test]
-    fn build_request_rejects_non_chat_compact_model() {
+    fn select_compact_model_rejects_non_chat_compact_model() {
         let conversation = ModelSpec::preset("anthropic").expect("anthropic preset");
-        let compact = select_compact_model(&conversation, None, &[]).expect("same model");
-        let input = CompactionInput::from_public_batch(&[user("hello")], None);
-        let error = build_compact_request(&compact, &input).expect_err("non-chat");
+        let error = select_compact_model(&conversation, None, &[]).expect_err("non-chat");
         assert_eq!(error, CompactError::UnsupportedProtocol);
     }
 
@@ -1037,5 +1055,53 @@ mod tests {
         assert!(!text.contains("signature"));
         assert!(text.contains("i'll inspect it."));
         assert!(text.contains("read_file"));
+    }
+
+    #[test]
+    fn decrypted_summary_ownership_is_zeroized() {
+        let entry = L1Entry {
+            source_batch: uuid::Uuid::now_v7(),
+            summary: super::super::DecryptedMemorySummary::new(
+                "The user likes concise replies.".to_owned(),
+            ),
+            est_tokens: 12,
+            time_range: (timestamp(), timestamp()),
+        };
+        let mut input = CompactionInput::from_decrypted_summaries(&[entry]);
+
+        // Cloning CompactionInput must preserve the zeroized ownership of the
+        // decrypted summary text, not downgrade it to an ordinary String.
+        let cloned = input.clone();
+        assert_eq!(
+            cloned.summaries[0].text.as_str(),
+            "The user likes concise replies."
+        );
+
+        // The field type is Zeroizing<String>; this would fail to compile if it
+        // ever became a plain String.
+        let type_check: Zeroizing<String> = input.summaries.remove(0).text;
+        assert_eq!(type_check.as_str(), "The user likes concise replies.");
+    }
+
+    #[test]
+    fn rfc3339_timestamps_are_included_in_serialized_request() {
+        let input = CompactionInput::from_public_batch(
+            &[
+                user("hello"),
+                assistant_text("hi"),
+                tool_result_text("done"),
+            ],
+            None,
+        );
+        let compact = select_compact_model(&chat_model(), None, &[]).expect("same model");
+        let body = build_compact_request(&compact, &input).expect("build request");
+        let text = request_text(&body);
+
+        let expected = timestamp().to_rfc3339_opts(SecondsFormat::Secs, true);
+        assert_eq!(
+            text.matches(&expected).count(),
+            3,
+            "each public message must carry an RFC3339 timestamp"
+        );
     }
 }
