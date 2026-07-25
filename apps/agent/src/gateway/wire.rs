@@ -45,6 +45,8 @@ pub enum WireError {
     RejectReasonRequired { status: String },
     #[error("command_ack with status `{status}` must not have reject_reason")]
     UnexpectedRejectReason { status: String },
+    #[error("invalid reject_reason `{reason}`")]
+    InvalidRejectReason { reason: String },
     #[error("command_id `{0}` is not a canonical UUID")]
     InvalidCommandId(String),
 }
@@ -139,14 +141,75 @@ impl From<CommandAckStatus> for WireCommandAckStatus {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireRejectReason {
+    UnknownCommand,
+    SchemaViolation,
+    AttachmentsNotEmpty,
+    Oversized,
+}
+
+fn parse_reject_reason(reason: &str) -> Result<WireRejectReason, WireError> {
+    match reason {
+        "unknown_command" => Ok(WireRejectReason::UnknownCommand),
+        "schema_violation" => Ok(WireRejectReason::SchemaViolation),
+        "attachments_not_empty" => Ok(WireRejectReason::AttachmentsNotEmpty),
+        "oversized" => Ok(WireRejectReason::Oversized),
+        _ => Err(WireError::InvalidRejectReason {
+            reason: reason.to_owned(),
+        }),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "WireCommandAckInput")]
 pub struct WireCommandAck {
     pub seq: u64,
     pub command_id: String,
     pub status: WireCommandAckStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reject_reason: Option<String>,
+    pub reject_reason: Option<WireRejectReason>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireCommandAckInput {
+    seq: u64,
+    command_id: String,
+    status: WireCommandAckStatus,
+    reject_reason: Option<WireRejectReason>,
+}
+
+impl TryFrom<WireCommandAckInput> for WireCommandAck {
+    type Error = WireError;
+    fn try_from(input: WireCommandAckInput) -> Result<Self, WireError> {
+        let reject_reason = match input.status {
+            WireCommandAckStatus::Rejected => {
+                Some(
+                    input
+                        .reject_reason
+                        .ok_or_else(|| WireError::RejectReasonRequired {
+                            status: input.status.as_str().to_owned(),
+                        })?,
+                )
+            }
+            _ => {
+                if input.reject_reason.is_some() {
+                    return Err(WireError::UnexpectedRejectReason {
+                        status: input.status.as_str().to_owned(),
+                    });
+                }
+                None
+            }
+        };
+        Ok(Self {
+            seq: input.seq,
+            command_id: input.command_id,
+            status: input.status,
+            reject_reason,
+        })
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -154,7 +217,7 @@ pub struct WireCommandAck {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "WireEnvelopeInput")]
 pub struct WireEnvelope {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
@@ -176,6 +239,26 @@ impl WireEnvelope {
             seq,
             conversation_id,
             event,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireEnvelopeInput {
+    seq: Option<u64>,
+    conversation_id: String,
+    event: WireAgentEvent,
+}
+
+impl TryFrom<WireEnvelopeInput> for WireEnvelope {
+    type Error = WireError;
+    fn try_from(input: WireEnvelopeInput) -> Result<Self, WireError> {
+        validate_seq(input.seq, &input.event)?;
+        Ok(Self {
+            seq: input.seq,
+            conversation_id: input.conversation_id,
+            event: input.event,
         })
     }
 }
@@ -612,12 +695,12 @@ impl TryFrom<CommandAck> for WireCommandAck {
         let status = WireCommandAckStatus::from(ack.status);
         let reject_reason = match status {
             WireCommandAckStatus::Rejected => {
-                Some(
-                    ack.reject_reason
-                        .ok_or_else(|| WireError::RejectReasonRequired {
-                            status: status.as_str().to_owned(),
-                        })?,
-                )
+                let reason = ack.reject_reason.as_deref().ok_or_else(|| {
+                    WireError::RejectReasonRequired {
+                        status: status.as_str().to_owned(),
+                    }
+                })?;
+                Some(parse_reject_reason(reason)?)
             }
             _ => {
                 if ack.reject_reason.is_some() {
@@ -696,6 +779,7 @@ mod tests {
         ApiProtocol, ProviderOrigin, PublicAssistantContent, PublicAssistantMessage, PublicMessage,
         StopReason, ToolCall, ToolResultMessage, Usage, UserContent, UserMessage,
     };
+    use std::path::Path;
 
     fn now() -> DateTime<Utc> {
         Utc::now()
@@ -1061,5 +1145,93 @@ mod tests {
         let json = serde_json::to_value(&wire).unwrap();
         let back: WirePublicMessage = serde_json::from_value(json).unwrap();
         assert_eq!(wire, back);
+    }
+
+    #[test]
+    fn contract_schema_validates_representative_wire_fixtures() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let schema_path = manifest_dir.join("../../contracts/agent-events.yaml");
+        let yaml = std::fs::read_to_string(&schema_path).expect("read contract schema");
+        let schema: serde_json::Value = serde_yaml::from_str(&yaml).expect("parse contract schema");
+
+        fn validator_for_def(schema: &serde_json::Value, def: &str) -> jsonschema::Validator {
+            let mut root = schema.clone();
+            let obj = root.as_object_mut().expect("schema root is an object");
+            obj.insert(
+                "$ref".to_owned(),
+                serde_json::Value::String(format!("#/$defs/{def}")),
+            );
+            jsonschema::validator_for(&root).unwrap_or_else(|e| panic!("compile {def}: {e}"))
+        }
+
+        let outbound = validator_for_def(&schema, "OutboundFrame");
+        let command_envelope = validator_for_def(&schema, "CommandEnvelope");
+
+        let durable = to_wire_frame(OutboundFrame::Event {
+            envelope: Envelope {
+                seq: Some(1),
+                conversation_id: "conv-1".to_owned(),
+                event: json!({"type": "agent_start"}),
+            },
+        })
+        .expect("durable event");
+        outbound
+            .validate(&serde_json::to_value(durable).unwrap())
+            .expect("agent_start should validate");
+
+        let volatile = to_wire_frame(OutboundFrame::Event {
+            envelope: Envelope {
+                seq: None,
+                conversation_id: "conv-1".to_owned(),
+                event: json!({
+                    "type": "message_update",
+                    "message_id": "00000000-0000-4000-8000-000000000002",
+                    "event": {"type": "text_delta", "content_index": 0, "delta": "x"}
+                }),
+            },
+        })
+        .expect("volatile event");
+        outbound
+            .validate(&serde_json::to_value(volatile).unwrap())
+            .expect("message_update should validate");
+
+        let received = to_wire_frame(OutboundFrame::CommandAck {
+            ack: CommandAck {
+                seq: 1,
+                command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+                status: CommandAckStatus::Received,
+                reject_reason: None,
+            },
+        })
+        .expect("received ack");
+        outbound
+            .validate(&serde_json::to_value(received).unwrap())
+            .expect("received ack should validate");
+
+        let rejected = to_wire_frame(OutboundFrame::CommandAck {
+            ack: CommandAck {
+                seq: 2,
+                command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+                status: CommandAckStatus::Rejected,
+                reject_reason: Some("oversized".to_owned()),
+            },
+        })
+        .expect("rejected ack");
+        outbound
+            .validate(&serde_json::to_value(rejected).unwrap())
+            .expect("rejected ack should validate");
+
+        let command = WireCommandEnvelope::try_from(CommandEnvelope {
+            seq: 1,
+            command_id: uuid_command_id(),
+            command: Command::UserMessage {
+                text: "hi".to_owned(),
+                attachments: vec![],
+            },
+        })
+        .expect("command envelope");
+        command_envelope
+            .validate(&serde_json::to_value(command).unwrap())
+            .expect("command envelope should validate");
     }
 }

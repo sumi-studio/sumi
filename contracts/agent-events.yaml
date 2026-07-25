@@ -111,7 +111,10 @@ $defs:
           type: { const: tool_execution_start }
           tool_call_id: { type: string }
           tool_name: { type: string }
-          args: { description: any JSON object }
+          args:
+            type: object
+            description: any JSON object
+            additionalProperties: true
       - type: object
         required: [type, tool_call_id, partial]
         additionalProperties: false
@@ -534,6 +537,7 @@ $defs:
             type: array
             maxItems: 0
             description: reserved for v1; must be an empty array
+            items: { $ref: '#/$defs/Attachment' }
       - type: object
         required: [type]
         additionalProperties: false

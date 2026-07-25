@@ -35,3 +35,4 @@ zeroize = "1"
 
 [dev-dependencies]
 axum = "0.8"
+serde_yaml = "0.9.34"
