@@ -473,89 +473,159 @@ fn credential_options_for_command(cmd: &str) -> Option<&'static [(&'static str, 
 fn shell_credential_spans(command: &str) -> Vec<Vec<(usize, usize, &'static str)>> {
     let token_spans = shell::tokenize_command_spans(command);
     let mut spans: Vec<Vec<(usize, usize, &'static str)>> = vec![Vec::new(); token_spans.len()];
-    let mut global_cursor = 0usize;
 
-    for segment in shell::segment_command(command) {
-        let segment_tokens = shell::tokenize_command(&segment.raw);
-        let segment_spans = shell::tokenize_command_spans(&segment.raw);
-
-        // Map each token in this segment to the global token index that contains
-        // it, and the byte offset of the segment token inside the global token
-        // text (so spans line up when a separator is glued to a word).
-        let mut local_to_global: Vec<Option<(usize, usize)>> =
-            Vec::with_capacity(segment_spans.len());
-        for (local_start, local_end, _text) in segment_spans {
-            let segment_token_start = segment.raw_start + local_start;
-            let segment_token_end = segment.raw_start + local_end;
-            while global_cursor < token_spans.len()
-                && token_spans[global_cursor].1 <= segment_token_start
-            {
-                global_cursor += 1;
-            }
-            if global_cursor < token_spans.len()
-                && token_spans[global_cursor].0 <= segment_token_start
-                && token_spans[global_cursor].1 >= segment_token_end
-            {
-                let token_offset = segment_token_start - token_spans[global_cursor].0;
-                local_to_global.push(Some((global_cursor, token_offset)));
-            } else {
-                local_to_global.push(None);
-            }
+    fn scan_region(
+        command: &str,
+        region_start: usize,
+        region_end: usize,
+        token_spans: &[(usize, usize, String)],
+        spans: &mut [Vec<(usize, usize, &'static str)>],
+        depth: usize,
+        invalid: &mut bool,
+    ) {
+        // A malformed or adversarially deeply nested command is handled by the
+        // caller's fail-closed dynamic-shell check. Do not recurse indefinitely
+        // while computing redaction metadata.
+        if depth > 32 {
+            *invalid = true;
+            return;
         }
+        if region_start >= region_end {
+            return;
+        }
+        let region = &command[region_start..region_end];
+        for segment in shell::segment_command(region) {
+            let segment_tokens = shell::tokenize_command(&segment.raw);
+            let segment_spans = shell::tokenize_command_spans(&segment.raw);
 
-        let Some(eff) = shell::effective_command(&segment_tokens, 1) else {
-            continue;
-        };
-        let cmd = shell::command_basename(eff.tokens.first().map(String::as_str).unwrap_or(""))
-            .to_ascii_lowercase();
-        let Some(options) = credential_options_for_command(&cmd) else {
-            continue;
-        };
+            // Map each token in this segment to the global token index that
+            // contains it, and retain the byte offset inside that token. This
+            // also handles separators or grouping characters glued to words.
+            let local_to_global: Vec<Option<(usize, usize)>> = segment_spans
+                .iter()
+                .map(|(local_start, local_end, local_text)| {
+                    let token_start = region_start + segment.raw_start + local_start;
+                    let token_end = region_start + segment.raw_start + local_end;
+                    token_spans.iter().enumerate().find_map(
+                        |(global_idx, (global_start, global_end, global_text))| {
+                            if *global_start <= token_start
+                                && *global_end >= token_end
+                                && token_end >= token_start
+                            {
+                                // Both tokenizers return normalized token text
+                                // (quotes/backslashes removed), so derive the
+                                // offset from the text rather than raw bytes.
+                                // Raw offsets differ when a nested token is
+                                // inside quoted or command-substitution syntax.
+                                let token_offset = if local_text.is_empty() {
+                                    0
+                                } else {
+                                    global_text.find(local_text)?
+                                };
+                                (token_offset + local_text.len() <= global_text.len())
+                                    .then_some((global_idx, token_offset))
+                            } else {
+                                None
+                            }
+                        },
+                    )
+                })
+                .collect();
 
-        let mut i = eff.index + 1;
-        while i < segment_tokens.len() {
-            let token = &segment_tokens[i];
-            let mut matched = None::<(usize, usize, usize, &'static str, usize)>;
-            for (prefix, kind) in options {
-                if prefix.starts_with("--") {
-                    let lower = token.to_ascii_lowercase();
-                    if lower == *prefix {
-                        if i + 1 < segment_tokens.len() && !segment_tokens[i + 1].starts_with('-') {
+            let Some(eff) = shell::effective_command(&segment_tokens, 1) else {
+                continue;
+            };
+            let cmd = shell::command_basename(eff.tokens.first().map(String::as_str).unwrap_or(""))
+                .to_ascii_lowercase();
+            let Some(options) = credential_options_for_command(&cmd) else {
+                continue;
+            };
+
+            let mut i = eff.index + 1;
+            while i < segment_tokens.len() {
+                let token = &segment_tokens[i];
+                let mut matched = None::<(usize, usize, usize, &'static str, usize)>;
+                for (prefix, kind) in options {
+                    if prefix.starts_with("--") {
+                        let lower = token.to_ascii_lowercase();
+                        if lower == *prefix {
+                            if i + 1 < segment_tokens.len()
+                                && !segment_tokens[i + 1].starts_with('-')
+                            {
+                                matched = Some((i + 1, 0, segment_tokens[i + 1].len(), *kind, 2));
+                            }
+                            break;
+                        }
+                        let eq = format!("{}=", prefix);
+                        if lower.starts_with(&eq) {
+                            let start = prefix.len() + 1;
+                            if start < token.len() {
+                                matched = Some((i, start, token.len(), *kind, 1));
+                            }
+                            break;
+                        }
+                    } else if token.starts_with(*prefix) {
+                        let prefix_len = prefix.len();
+                        if token.len() > prefix_len {
+                            matched = Some((i, prefix_len, token.len(), *kind, 1));
+                        } else if i + 1 < segment_tokens.len()
+                            && !segment_tokens[i + 1].starts_with('-')
+                        {
                             matched = Some((i + 1, 0, segment_tokens[i + 1].len(), *kind, 2));
                         }
                         break;
                     }
-                    let eq = format!("{}=", prefix);
-                    if lower.starts_with(&eq) {
-                        let start = prefix.len() + 1;
-                        if start < token.len() {
-                            matched = Some((i, start, token.len(), *kind, 1));
-                        }
-                        break;
-                    }
-                } else if token.starts_with(*prefix) {
-                    let prefix_len = prefix.len();
-                    if token.len() > prefix_len {
-                        matched = Some((i, prefix_len, token.len(), *kind, 1));
-                    } else if i + 1 < segment_tokens.len()
-                        && !segment_tokens[i + 1].starts_with('-')
+                }
+                if let Some((idx, start, end, kind, consumed)) = matched {
+                    let mut emitted = false;
+                    if start <= end
+                        && end <= segment_tokens[idx].len()
+                        && let Some((global_idx, token_offset)) =
+                            local_to_global.get(idx).copied().flatten()
+                        && token_offset <= token_spans[global_idx].2.len()
+                        && end.saturating_add(token_offset) <= token_spans[global_idx].2.len()
                     {
-                        matched = Some((i + 1, 0, segment_tokens[i + 1].len(), *kind, 2));
+                        spans[global_idx].push((start + token_offset, end + token_offset, kind));
+                        emitted = true;
                     }
-                    break;
+                    if !emitted {
+                        *invalid = true;
+                    }
+                    i += consumed;
+                } else {
+                    i += 1;
                 }
-            }
-            if let Some((idx, start, end, kind, consumed)) = matched {
-                if let Some((global_idx, token_offset)) =
-                    local_to_global.get(idx).copied().flatten()
-                {
-                    spans[global_idx].push((start + token_offset, end + token_offset, kind));
-                }
-                i += consumed;
-            } else {
-                i += 1;
             }
         }
+
+        for (nested_start, nested_end) in shell::nested_shell_regions(region) {
+            scan_region(
+                command,
+                region_start + nested_start,
+                region_start + nested_end,
+                token_spans,
+                spans,
+                depth + 1,
+                invalid,
+            );
+        }
+    }
+
+    let mut invalid = false;
+    scan_region(
+        command,
+        0,
+        command.len(),
+        &token_spans,
+        &mut spans,
+        0,
+        &mut invalid,
+    );
+    if invalid && !spans.is_empty() {
+        // Preserve the existing flat return type while making an impossible
+        // mapping observable to every consumer. Each consumer validates
+        // intervals before slicing and therefore fails closed on this marker.
+        spans[0].push((usize::MAX, usize::MAX, "shell_unverifiable"));
     }
     spans
 }
@@ -693,6 +763,13 @@ impl SecretAwareActionProjector {
     }
 
     fn redact_bash_command_text(&self, command: &str) -> String {
+        // Nested shell regions are not represented faithfully by the flat
+        // review-token projection. Redact the entire command rather than
+        // risking plaintext credentials from an inner command substitution or
+        // grouped command reaching the wire-visible summary.
+        if shell::has_nested_shell_construct(command) {
+            return "[REDACTED:shell_unverifiable]".to_owned();
+        }
         let credential_spans = shell_credential_spans(command);
         let mut out = String::new();
         let mut cursor = 0usize;
@@ -703,6 +780,9 @@ impl SecretAwareActionProjector {
             out.push_str(&command[cursor..start]);
             let span = &command[start..end];
             let (normalized, mapping) = Self::shell_token_normalized(span);
+            if mapping.len() != normalized.len() + 1 {
+                return "[REDACTED:shell_unverifiable]".to_owned();
+            }
             let cred = &credential_spans[idx];
             let mut intervals: Vec<(usize, usize, &'static str)> = self
                 .inventory
@@ -713,6 +793,12 @@ impl SecretAwareActionProjector {
                 .collect();
             for (cs, ce, kind) in cred.iter().copied() {
                 intervals.push((cs, ce, kind));
+            }
+            if intervals
+                .iter()
+                .any(|(s, e, _)| *s > *e || *e > normalized.len() || *e >= mapping.len())
+            {
+                return "[REDACTED:shell_unverifiable]".to_owned();
             }
             intervals.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
             if intervals.is_empty() {
@@ -726,6 +812,14 @@ impl SecretAwareActionProjector {
                 if s >= last_end {
                     let secret_start = start + mapping[s];
                     let secret_end = start + mapping[e];
+                    if secret_start > secret_end
+                        || secret_start < start
+                        || secret_end > end
+                        || !command.is_char_boundary(secret_start)
+                        || !command.is_char_boundary(secret_end)
+                    {
+                        return "[REDACTED:shell_unverifiable]".to_owned();
+                    }
                     out.push_str(&command[orig_cursor..secret_start]);
                     out.push_str("[REDACTED:");
                     out.push_str(kind);
@@ -903,6 +997,13 @@ impl SecretAwareActionProjector {
                         continue;
                     };
                     for (start, end, _kind) in spans {
+                        if *start > *end
+                            || *end > token.len()
+                            || !token.is_char_boundary(*start)
+                            || !token.is_char_boundary(*end)
+                        {
+                            return false;
+                        }
                         let secret = token[*start..*end].trim_matches(['\'', '"']);
                         let digest = keyed_digest(&self.key, secret);
                         if !projected_digests.contains(&digest.as_str()) {
@@ -928,6 +1029,18 @@ impl SecretAwareActionProjector {
         text: &str,
         credential_spans: &[(usize, usize, &'static str)],
     ) -> TokenProjection {
+        if credential_spans.iter().any(|(start, end, _)| {
+            *start > *end
+                || *end > text.len()
+                || !text.is_char_boundary(*start)
+                || !text.is_char_boundary(*end)
+        }) {
+            return TokenProjection {
+                tokens: vec![ReviewToken::Omitted],
+                has_visible_host: false,
+                has_url: false,
+            };
+        }
         let mut secrets: Vec<SecretMatch> = self
             .inventory
             .find(text)
@@ -963,6 +1076,18 @@ impl SecretAwareActionProjector {
         secrets: &[SecretMatch<'_>],
     ) -> TokenProjection {
         let intervals = merge_secret_and_dynamic(text, dynamic, secrets);
+        if intervals.iter().any(|iv| {
+            iv.start > iv.end
+                || iv.end > text.len()
+                || !text.is_char_boundary(iv.start)
+                || !text.is_char_boundary(iv.end)
+        }) {
+            return TokenProjection {
+                tokens: vec![ReviewToken::Omitted],
+                has_visible_host: false,
+                has_url: false,
+            };
+        }
         let mut tokens = Vec::new();
         let mut cursor = 0usize;
         for iv in &intervals {
@@ -1856,6 +1981,123 @@ pub(crate) mod shell {
         segments
     }
 
+    /// Return the contents of nested shell regions that may contain a command
+    /// of their own. The returned ranges exclude the delimiters and are byte
+    /// offsets into `command`; callers can recursively tokenize each range and
+    /// map any findings back to the original command.
+    pub(crate) fn nested_shell_regions(command: &str) -> Vec<(usize, usize)> {
+        let mut regions = Vec::new();
+        let bytes = command.as_bytes();
+        let mut i = 0usize;
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut escaped = false;
+
+        while i < bytes.len() {
+            let b = bytes[i];
+            if escaped {
+                escaped = false;
+                i += 1;
+                continue;
+            }
+            if b == b'\\' && !in_single {
+                escaped = true;
+                i += 1;
+                continue;
+            }
+            if !in_double && b == b'\'' {
+                in_single = !in_single;
+                i += 1;
+                continue;
+            }
+            if !in_single && b == b'"' {
+                in_double = !in_double;
+                i += 1;
+                continue;
+            }
+
+            if !in_single {
+                if b == b'$'
+                    && i + 1 < bytes.len()
+                    && bytes[i + 1] == b'('
+                    && let Some(end) = consume_delim(bytes, i + 1, b'(', b')')
+                {
+                    regions.push((i + 2, end));
+                    i = end + 1;
+                    continue;
+                }
+                if b == b'$'
+                    && i + 1 < bytes.len()
+                    && bytes[i + 1] == b'{'
+                    && let Some(end) = consume_delim(bytes, i + 1, b'{', b'}')
+                {
+                    regions.push((i + 2, end));
+                    i = end + 1;
+                    continue;
+                }
+                if b == b'`'
+                    && let Some(end) = consume_backtick(bytes, i)
+                {
+                    regions.push((i + 1, end));
+                    i = end + 1;
+                    continue;
+                }
+                if !in_double
+                    && b == b'('
+                    && let Some(end) = consume_delim(bytes, i, b'(', b')')
+                {
+                    regions.push((i + 1, end));
+                    i = end + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        regions
+    }
+
+    pub(crate) fn has_nested_shell_construct(command: &str) -> bool {
+        if !nested_shell_regions(command).is_empty() {
+            return true;
+        }
+        let bytes = command.as_bytes();
+        let mut i = 0usize;
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut escaped = false;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if escaped {
+                escaped = false;
+                i += 1;
+                continue;
+            }
+            if b == b'\\' && !in_single {
+                escaped = true;
+                i += 1;
+                continue;
+            }
+            if !in_double && b == b'\'' {
+                in_single = !in_single;
+                i += 1;
+                continue;
+            }
+            if !in_single && b == b'"' {
+                in_double = !in_double;
+                i += 1;
+                continue;
+            }
+            if !in_single && (!in_double && matches!(b, b'(' | b')' | b'`')) {
+                return true;
+            }
+            if !in_single && b == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
     fn push_segment(
         segments: &mut Vec<Segment>,
         command: &str,
@@ -1876,43 +2118,10 @@ pub(crate) mod shell {
     }
 
     pub(crate) fn tokenize_command(command: &str) -> Vec<String> {
-        let mut tokens = Vec::new();
-        let mut current = String::new();
-        let mut in_single = false;
-        let mut in_double = false;
-        let mut escaped = false;
-
-        for c in command.chars() {
-            if escaped {
-                current.push(c);
-                escaped = false;
-                continue;
-            }
-            if c == '\\' && !in_single {
-                escaped = true;
-                continue;
-            }
-            if !in_double && c == '\'' {
-                in_single = !in_single;
-                continue;
-            }
-            if !in_single && c == '"' {
-                in_double = !in_double;
-                continue;
-            }
-            if !in_single && !in_double && c.is_whitespace() {
-                if !current.is_empty() {
-                    tokens.push(current);
-                    current = String::new();
-                }
-                continue;
-            }
-            current.push(c);
-        }
-        if !current.is_empty() {
-            tokens.push(current);
-        }
-        tokens
+        tokenize_command_spans(command)
+            .into_iter()
+            .map(|(_, _, token)| token)
+            .collect()
     }
 
     pub(crate) fn tokenize_command_spans(command: &str) -> Vec<(usize, usize, String)> {
@@ -3442,6 +3651,61 @@ mod tests {
             assert!(
                 argv_text.contains("https://example.com"),
                 "projection lost host for {command}: {argv_text}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_shell_credentials_never_reach_summary_or_projection() {
+        for command in [
+            "(curl -u alice:supersecret https://example.com)",
+            "echo $(curl -u alice:supersecret https://example.com)",
+            "echo $(echo $(curl -u alice:supersecret https://example.com))",
+        ] {
+            let summary = projector()
+                .redact_arguments(&args(json!({"command": command})))
+                .unwrap();
+            let summary_text = serde_json::to_string(&summary).unwrap();
+            assert!(
+                !summary_text.contains("supersecret"),
+                "summary leaked nested credential for {command}: {summary_text}"
+            );
+
+            let projection = projector().project(&bash_action(command));
+            assert!(
+                matches!(projection, ReviewProjection::InsufficientEvidence { .. }),
+                "nested shell must fail closed: {command}: {projection:?}"
+            );
+            let projection_text = serde_json::to_string(&projection).unwrap();
+            assert!(
+                !projection_text.contains("supersecret"),
+                "projection leaked nested credential for {command}: {projection_text}"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_spans_preserve_empty_utf8_and_separator_glued_tokens() {
+        for command in [
+            "curl '' -u alice:supersecret https://example.com",
+            "curl あ -u alice:supersecret https://example.com",
+            "echo ok;curl -ualice:supersecret https://example.com",
+        ] {
+            let summary = projector().redact_bash_command_text(command);
+            assert!(
+                !summary.contains("supersecret"),
+                "summary leaked credential for {command}: {summary}"
+            );
+            assert!(
+                summary.contains("[REDACTED:curl_user]"),
+                "summary missing curl credential marker for {command}: {summary}"
+            );
+
+            let projection = projector().project(&bash_action(command));
+            let projection_text = serde_json::to_string(&projection).unwrap();
+            assert!(
+                !projection_text.contains("supersecret"),
+                "projection leaked credential for {command}: {projection_text}"
             );
         }
     }
