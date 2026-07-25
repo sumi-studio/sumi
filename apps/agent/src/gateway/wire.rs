@@ -59,6 +59,8 @@ pub enum WireError {
     InvalidRejectReason { reason: String },
     #[error("command_id `{0}` is not a canonical UUID")]
     InvalidCommandId(String),
+    #[error("approval rule must be an object")]
+    NonObjectApprovalRule,
 }
 
 /// Derive a durable user `message_id` from a canonical `command_id` using the
@@ -1172,7 +1174,10 @@ impl TryFrom<ApprovalDecision> for WireApprovalDecision {
         Ok(match decision {
             ApprovalDecision::ApproveOnce => Self::ApproveOnce,
             ApprovalDecision::ApproveAlways { rule } => Self::ApproveAlways {
-                rule: rule.0.as_object().cloned().unwrap_or_default(),
+                rule: match rule.0 {
+                    Value::Object(m) => m,
+                    _ => return Err(WireError::NonObjectApprovalRule),
+                },
             },
             ApprovalDecision::Deny => Self::Deny,
         })
@@ -1898,6 +1903,40 @@ mod tests {
             decision: ApprovalDecision::Deny,
         };
         round_trip_command(deny);
+    }
+
+    #[test]
+    fn approval_decision_rejects_non_object_deferred_rule() {
+        for bad in [json!([]), json!("literal"), json!(null)] {
+            let err = WireApprovalDecision::try_from(ApprovalDecision::ApproveAlways {
+                rule: DeferredApprovalRule(bad),
+            })
+            .expect_err("non-object deferred approval rule must be rejected");
+            assert!(matches!(err, WireError::NonObjectApprovalRule));
+        }
+    }
+
+    #[test]
+    fn approval_decision_converts_all_branches() {
+        assert_eq!(
+            WireApprovalDecision::try_from(ApprovalDecision::ApproveOnce).unwrap(),
+            WireApprovalDecision::ApproveOnce
+        );
+        assert_eq!(
+            WireApprovalDecision::try_from(ApprovalDecision::Deny).unwrap(),
+            WireApprovalDecision::Deny
+        );
+
+        let object = json!({"tool_name": "test"});
+        assert_eq!(
+            WireApprovalDecision::try_from(ApprovalDecision::ApproveAlways {
+                rule: DeferredApprovalRule(object.clone()),
+            })
+            .unwrap(),
+            WireApprovalDecision::ApproveAlways {
+                rule: object.as_object().cloned().unwrap(),
+            }
+        );
     }
 
     fn round_trip_command(command: Command) {
