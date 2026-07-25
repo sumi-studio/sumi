@@ -1075,15 +1075,16 @@ impl Runner {
                             continue;
                         }
                         RunControl::HardSteer { command, accepted } => {
+                            self.claim_control(command)?;
                             if accepted.send(true).is_ok() {
                                 cancel.cancel();
                                 // Wait for the driver to observe cancellation,
-                                // then retain the hard-steer command for the
-                                // next turn boundary.
+                                // then claim the hard-steer command for the
+                                // next turn's durable injection.
                                 let _ = future.await;
-                                self.hard_steer_command = Some(command);
                                 return Err(ExecuteToolError::Cancelled);
                             }
+                            self.in_flight_controls.pop();
                             continue;
                         }
                         RunControl::Command(command) => {
