@@ -159,16 +159,41 @@ impl SuffixRecovery {
         }
     }
 
-    /// Plans only the next missing durable action for each pending command/group.
-    /// It deliberately does not manufacture a fixed MessageEnd/TurnEnd/AgentEnd
-    /// suffix; assistant/tool/approval/cancel recovery must inspect the durable
-    /// events and phase-specific state at execution time.
+    /// Plans only the next missing durable action for the oldest pending
+    /// command/group.
     #[allow(
         dead_code,
         reason = "T12 persists prefix work; T15 only gates and returns RecoveryRequired; T17 consumes the full suffix plan"
     )]
     pub(crate) async fn plan(store: &Store) -> Result<Vec<RecoveryStep>> {
         Self::plan_next_without_history_scan(store, None).await
+    }
+
+    /// Plans the complete ordered suffix for all pending commands.
+    ///
+    /// This is the T17-owned durable recovery boundary: it returns every
+    /// remaining recovery step, including the runtime integration packets
+    /// (`ResumeAssistantFromDurableEvents`, `ResumeHardSteerFromDurableEvents`,
+    /// `ResumeCancellationFromDurableEvents`) that T16/T26 consume.  It does
+    /// not itself execute runtime behavior.
+    #[allow(
+        dead_code,
+        reason = "T17 hydration boundary consumed by T16/T26 runtime startup"
+    )]
+    pub(crate) async fn plan_full_suffix(store: &Store) -> Result<Vec<RecoveryStep>> {
+        validate_pending_window(store).await?;
+        let commands = all_pending_commands(store).await?;
+        if commands.is_empty() {
+            durable_event_evidence(store, EventEvidence::default()).await?;
+            return Ok(Vec::new());
+        }
+        let mut events = EventEvidence::required_for(&commands)?;
+        events = durable_event_evidence(store, events).await?;
+        let mut steps = Vec::with_capacity(commands.len());
+        for command in &commands {
+            steps.push(plan_one_command(store, command, &events).await?);
+        }
+        Ok(steps)
     }
 
     async fn plan_next_without_history_scan(
@@ -202,110 +227,111 @@ impl SuffixRecovery {
         } else {
             events = durable_event_evidence(store, events).await?;
         }
-        let step = match command.phase {
-            RunPhase::Received => {
-                if command.command_kind == "user_message" {
-                    RecoveryStep::Reclassify {
-                        command_id: command.command_id.clone(),
-                    }
-                } else {
-                    RecoveryStep::ApplyControl {
-                        command_id: command.command_id.clone(),
-                    }
-                }
+        Ok(vec![plan_one_command(store, &command, &events).await?])
+    }
+}
+
+async fn plan_one_command(
+    store: &Store,
+    command: &PendingCommand,
+    events: &EventEvidence,
+) -> Result<RecoveryStep> {
+    match command.phase {
+        RunPhase::Received => {
+            if command.command_kind == "user_message" {
+                Ok(RecoveryStep::Reclassify {
+                    command_id: command.command_id.clone(),
+                })
+            } else {
+                Ok(RecoveryStep::ApplyControl {
+                    command_id: command.command_id.clone(),
+                })
             }
-            RunPhase::Classified => {
-                let kind = required_kind(&command)?;
-                let run_id = required(command.run_id.as_deref(), "run_id", &command)?;
-                let turn_id = required(command.turn_id.as_deref(), "turn_id", &command)?;
-                if kind == ApplicationKind::IdleRun {
-                    RecoveryStep::EmitAgentStart {
-                        command_id: command.command_id.clone(),
-                        run_id: run_id.to_owned(),
-                    }
-                } else {
-                    RecoveryStep::InjectStoredGroup {
-                        run_id: run_id.to_owned(),
-                        turn_id: turn_id.to_owned(),
-                        application_kind: kind,
-                        command_ids: load_bounded_group(
-                            store,
-                            run_id,
-                            turn_id,
-                            kind,
-                            command.phase,
-                        )
-                        .await?,
-                    }
-                }
-            }
-            RunPhase::RunStarted => {
-                let run_id = required(command.run_id.as_deref(), "run_id", &command)?;
-                if !events.has("agent_start", Some(run_id), None) {
-                    bail!(
-                        "run_started command {} has no durable AgentStart evidence",
-                        command.command_id
-                    );
-                }
-                RecoveryStep::EmitTurnStart {
+        }
+        RunPhase::Classified => {
+            let kind = required_kind(command)?;
+            let run_id = required(command.run_id.as_deref(), "run_id", command)?;
+            let turn_id = required(command.turn_id.as_deref(), "turn_id", command)?;
+            if kind == ApplicationKind::IdleRun {
+                Ok(RecoveryStep::EmitAgentStart {
                     command_id: command.command_id.clone(),
                     run_id: run_id.to_owned(),
-                    turn_id: required(command.turn_id.as_deref(), "turn_id", &command)?.to_owned(),
-                }
-            }
-            RunPhase::TurnStarted => {
-                let kind = required_kind(&command)?;
-                let run_id = required(command.run_id.as_deref(), "run_id", &command)?;
-                let turn_id = required(command.turn_id.as_deref(), "turn_id", &command)?;
-                if kind != ApplicationKind::RetrySteer
-                    && !events.has("turn_start", Some(run_id), Some(turn_id))
-                {
-                    bail!(
-                        "turn_started command {} has no durable TurnStart evidence",
-                        command.command_id
-                    );
-                }
-                RecoveryStep::InjectStoredGroup {
+                })
+            } else {
+                Ok(RecoveryStep::InjectStoredGroup {
                     run_id: run_id.to_owned(),
                     turn_id: turn_id.to_owned(),
                     application_kind: kind,
                     command_ids: load_bounded_group(store, run_id, turn_id, kind, command.phase)
                         .await?,
-                }
+                })
             }
-            RunPhase::UserStarted => RecoveryStep::EmitUserMessageEnd {
-                command_id: command.command_id.clone(),
-                run_id: required(command.run_id.as_deref(), "run_id", &command)?.to_owned(),
-                turn_id: required(command.turn_id.as_deref(), "turn_id", &command)?.to_owned(),
-            },
-            RunPhase::UserCommitted => RecoveryStep::StartAssistant {
-                command_id: command.command_id.clone(),
-                run_id: required(command.run_id.as_deref(), "run_id", &command)?.to_owned(),
-                turn_id: required(command.turn_id.as_deref(), "turn_id", &command)?.to_owned(),
-            },
-            RunPhase::AssistantStarted => RecoveryStep::ResumeAssistantFromDurableEvents {
-                command_id: command.command_id.clone(),
-                run_id: required(command.run_id.as_deref(), "run_id", &command)?.to_owned(),
-                turn_id: required(command.turn_id.as_deref(), "turn_id", &command)?.to_owned(),
-            },
-            RunPhase::HardSteerRequested => RecoveryStep::ResumeHardSteerFromDurableEvents {
-                command_id: command.command_id.clone(),
-                run_id: required(command.run_id.as_deref(), "run_id", &command)?.to_owned(),
-                turn_id: required(command.turn_id.as_deref(), "turn_id", &command)?.to_owned(),
-            },
-            RunPhase::CancelRequested => RecoveryStep::ResumeCancellationFromDurableEvents {
-                command_id: command.command_id.clone(),
-                run_id: required(command.run_id.as_deref(), "run_id", &command)?.to_owned(),
-                turn_id: required(command.turn_id.as_deref(), "turn_id", &command)?.to_owned(),
-            },
-            RunPhase::Finished => {
+        }
+        RunPhase::RunStarted => {
+            let run_id = required(command.run_id.as_deref(), "run_id", command)?;
+            if !events.has("agent_start", Some(run_id), None) {
                 bail!(
-                    "finished command {} must have terminal status",
+                    "run_started command {} has no durable AgentStart evidence",
                     command.command_id
                 );
             }
-        };
-        Ok(vec![step])
+            Ok(RecoveryStep::EmitTurnStart {
+                command_id: command.command_id.clone(),
+                run_id: run_id.to_owned(),
+                turn_id: required(command.turn_id.as_deref(), "turn_id", command)?.to_owned(),
+            })
+        }
+        RunPhase::TurnStarted => {
+            let kind = required_kind(command)?;
+            let run_id = required(command.run_id.as_deref(), "run_id", command)?;
+            let turn_id = required(command.turn_id.as_deref(), "turn_id", command)?;
+            if kind != ApplicationKind::RetrySteer
+                && !events.has("turn_start", Some(run_id), Some(turn_id))
+            {
+                bail!(
+                    "turn_started command {} has no durable TurnStart evidence",
+                    command.command_id
+                );
+            }
+            Ok(RecoveryStep::InjectStoredGroup {
+                run_id: run_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                application_kind: kind,
+                command_ids: load_bounded_group(store, run_id, turn_id, kind, command.phase)
+                    .await?,
+            })
+        }
+        RunPhase::UserStarted => Ok(RecoveryStep::EmitUserMessageEnd {
+            command_id: command.command_id.clone(),
+            run_id: required(command.run_id.as_deref(), "run_id", command)?.to_owned(),
+            turn_id: required(command.turn_id.as_deref(), "turn_id", command)?.to_owned(),
+        }),
+        RunPhase::UserCommitted => Ok(RecoveryStep::StartAssistant {
+            command_id: command.command_id.clone(),
+            run_id: required(command.run_id.as_deref(), "run_id", command)?.to_owned(),
+            turn_id: required(command.turn_id.as_deref(), "turn_id", command)?.to_owned(),
+        }),
+        RunPhase::AssistantStarted => Ok(RecoveryStep::ResumeAssistantFromDurableEvents {
+            command_id: command.command_id.clone(),
+            run_id: required(command.run_id.as_deref(), "run_id", command)?.to_owned(),
+            turn_id: required(command.turn_id.as_deref(), "turn_id", command)?.to_owned(),
+        }),
+        RunPhase::HardSteerRequested => Ok(RecoveryStep::ResumeHardSteerFromDurableEvents {
+            command_id: command.command_id.clone(),
+            run_id: required(command.run_id.as_deref(), "run_id", command)?.to_owned(),
+            turn_id: required(command.turn_id.as_deref(), "turn_id", command)?.to_owned(),
+        }),
+        RunPhase::CancelRequested => Ok(RecoveryStep::ResumeCancellationFromDurableEvents {
+            command_id: command.command_id.clone(),
+            run_id: required(command.run_id.as_deref(), "run_id", command)?.to_owned(),
+            turn_id: required(command.turn_id.as_deref(), "turn_id", command)?.to_owned(),
+        }),
+        RunPhase::Finished => {
+            bail!(
+                "finished command {} must have terminal status",
+                command.command_id
+            );
+        }
     }
 }
 
@@ -348,6 +374,23 @@ fn pending_command_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<PendingComm
         turn_id: row.try_get("turn_id")?,
         phase: RunPhase::parse(row.try_get("run_phase")?)?,
     })
+}
+
+#[allow(
+    dead_code,
+    reason = "consumed by plan_full_suffix; kept separate for testability"
+)]
+async fn all_pending_commands(store: &Store) -> Result<Vec<PendingCommand>> {
+    let rows = sqlx::query(
+        "SELECT seq, command_id, command_kind, application_kind, run_id, turn_id, run_phase
+         FROM inbound_commands
+         WHERE status IN ('received','applying')
+         ORDER BY (command_kind = 'abort') DESC, seq ASC",
+    )
+    .fetch_all(store.pool())
+    .await
+    .context("failed to load pending commands for suffix recovery")?;
+    rows.iter().map(pending_command_from_row).collect()
 }
 
 async fn validate_pending_window(store: &Store) -> Result<()> {
@@ -1701,6 +1744,34 @@ mod tests {
         assert!(matches!(
             SuffixRecovery::plan(&store).await.expect("cancel plan")[0],
             RecoveryStep::ResumeCancellationFromDurableEvents { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn full_suffix_plan_collects_all_pending_steps_in_order() {
+        let (store, writer) = setup().await;
+        persist_run_started(&store, &writer).await;
+        persist_user(&writer, 2, "00000000-0000-4000-8000-000000000002").await;
+
+        let steps = SuffixRecovery::plan_full_suffix(&store)
+            .await
+            .expect("full suffix plan");
+
+        assert_eq!(steps.len(), 2);
+        assert!(matches!(
+            &steps[0],
+            RecoveryStep::EmitTurnStart {
+                command_id,
+                run_id,
+                turn_id,
+            } if command_id == "00000000-0000-4000-8000-000000000001"
+                && run_id == "run-1"
+                && turn_id == "turn-1"
+        ));
+        assert!(matches!(
+            &steps[1],
+            RecoveryStep::Reclassify { command_id }
+                if command_id == "00000000-0000-4000-8000-000000000002"
         ));
     }
 

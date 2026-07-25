@@ -51,6 +51,48 @@ impl Redactor {
                     .expect("static named secret pattern is valid"),
                     replacement: "$1=[REDACTED:secret]",
                 },
+                RedactionRule {
+                    pattern: Regex::new(r"(?i)Basic[ \t]+[A-Za-z0-9+/=]{8,}")
+                        .expect("static basic auth pattern is valid"),
+                    replacement: "Basic [REDACTED:basic_credentials]",
+                },
+                RedactionRule {
+                    pattern: Regex::new(r"(?i)https?://[^\s:@]+:[^\s@]+@[^\s]+")
+                        .expect("static URL credential pattern is valid"),
+                    replacement: "[REDACTED:url_with_credentials]",
+                },
+                RedactionRule {
+                    pattern: Regex::new(r"(?i)[?&]([^=]*(?:token|secret|api[_-]?key|access[_-]?token|password|passwd|pwd|credential)[^=]*)=([^&\s]{8,})")
+                        .expect("static query secret pattern is valid"),
+                    replacement: "$1=[REDACTED:secret]",
+                },
+                RedactionRule {
+                    pattern: Regex::new(r"AKIA[0-9A-Z]{16}")
+                        .expect("static AWS access key pattern is valid"),
+                    replacement: "[REDACTED:aws_access_key_id]",
+                },
+                RedactionRule {
+                    pattern: Regex::new(r"gh[pousr]_[A-Za-z0-9_]{36,}")
+                        .expect("static GitHub token pattern is valid"),
+                    replacement: "[REDACTED:github_token]",
+                },
+                RedactionRule {
+                    pattern: Regex::new(r"xox[baprs]-[0-9a-zA-Z-]{10,}")
+                        .expect("static Slack token pattern is valid"),
+                    replacement: "[REDACTED:slack_token]",
+                },
+                RedactionRule {
+                    pattern: Regex::new(r"eyJ[A-Za-z0-9_-]*\.eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*")
+                        .expect("static JWT pattern is valid"),
+                    replacement: "[REDACTED:jwt]",
+                },
+                RedactionRule {
+                    pattern: Regex::new(
+                        r"(?is)-----BEGIN\s+[A-Z0-9 ]*PRIVATE KEY-----.*?-----END\s+[A-Z0-9 ]*PRIVATE KEY-----",
+                    )
+                    .expect("static PEM private key pattern is valid"),
+                    replacement: "[REDACTED:private_key]",
+                },
             ],
         }
     }
@@ -119,7 +161,9 @@ fn structured_secret_placeholder(key: &str) -> Option<&'static str> {
         .map(|character| character.to_ascii_lowercase())
         .collect::<String>();
     match normalized.as_str() {
-        "apikey" | "accesstoken" | "secret" | "authorization" | "proxyauthorization" => {
+        "apikey" | "accesstoken" | "authtoken" | "secret" | "secretkey" | "authorization"
+        | "proxyauthorization" | "password" | "passwd" | "pwd" | "privatekey" | "credential"
+        | "credentials" | "sessiontoken" | "awssessiontoken" | "awssecretaccesskey" => {
             Some("[REDACTED:secret]")
         }
         "signature" | "xamzsignature" | "xgoogsignature" => Some("[REDACTED:signature]"),
@@ -200,8 +244,9 @@ mod tests {
     use super::*;
     use crate::{
         provider::types::{
-            ApiProtocol, ProviderOrigin, PublicAssistantMessage, RejectedToolCall, StopReason,
-            ToolArgumentError, ToolCall, ToolResultMessage, Usage, UserMessage,
+            ApiProtocol, NativeCompactionCoverage, ProviderContextAnchor, ProviderContextItem,
+            ProviderContextPayload, ProviderOrigin, PublicAssistantMessage, RejectedToolCall,
+            StopReason, ToolArgumentError, ToolCall, ToolResultMessage, Usage, UserMessage,
             ValidatedToolArguments,
         },
         store::crypto::{DATA_KEY_BYTES, DataKeyPurpose},
@@ -495,5 +540,90 @@ mod tests {
         );
         assert!(!error.to_string().contains("abcdefghijklmnop"));
         assert!(!error.to_string().contains("ponmlkjihgfedcba"));
+    }
+
+    #[test]
+    fn additional_secret_patterns_redact_common_leaks() {
+        let redactor = Redactor::v1();
+        let aws = "AKIAIOSFODNN7EXAMPLE";
+        let gh = "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        let slack = "xoxb-1111111111111-2222222222222-abcdefghijklmnopqrstuvwx";
+        let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIn0.abc";
+        let url = "https://user:p4ssw0rd@example.test/path";
+        let query = "https://example.test/?token=secrettokencode&password=hiddenpass";
+        let basic = "Basic c29tZTpzZWNyZXQ=";
+        let pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----";
+
+        let text = format!("{aws} {gh} {slack} {jwt} {url} {query} {basic} {pem}");
+        let redacted = redactor.redact_text(&text);
+
+        assert!(!redacted.contains(aws));
+        assert!(!redacted.contains(gh));
+        assert!(!redacted.contains(slack));
+        assert!(!redacted.contains(jwt));
+        assert!(!redacted.contains("p4ssw0rd"));
+        assert!(!redacted.contains("secrettokencode"));
+        assert!(!redacted.contains("hiddenpass"));
+        assert!(!redacted.contains("c29tZTpzZWNyZXQ="));
+        assert!(!redacted.contains("OPENSSH"));
+        assert!(redacted.contains("[REDACTED:aws_access_key_id]"));
+        assert!(redacted.contains("[REDACTED:github_token]"));
+        assert!(redacted.contains("[REDACTED:slack_token]"));
+        assert!(redacted.contains("[REDACTED:jwt]"));
+        assert!(redacted.contains("[REDACTED:url_with_credentials]"));
+        assert!(redacted.contains("[REDACTED:basic_credentials]"));
+        assert!(redacted.contains("[REDACTED:private_key]"));
+        assert!(redacted.contains("[REDACTED:secret]"));
+    }
+
+    #[test]
+    fn structured_secret_keys_cover_password_and_private_key_fields() {
+        let redactor = Redactor::v1();
+        let value = json!({
+            "password": "plain-password",
+            "secretKey": "plain-secret-key",
+            "privateKey": "plain-private-key",
+            "sessionToken": "plain-session-token",
+            "ordinary": "visible"
+        });
+        let encoded = serde_json::to_string(&redactor.redact_value(&value).unwrap()).unwrap();
+
+        for secret in [
+            "plain-password",
+            "plain-secret-key",
+            "plain-private-key",
+            "plain-session-token",
+        ] {
+            assert!(
+                !encoded.contains(secret),
+                "structured field leaked {secret}"
+            );
+        }
+        assert!(encoded.contains("visible"));
+        assert!(encoded.contains("[REDACTED:secret]"));
+    }
+
+    #[test]
+    fn provider_context_payload_cannot_be_reinterpreted_as_public_message() {
+        let item = ProviderContextItem {
+            origin_message: Some(ProviderContextAnchor {
+                message_id: "msg-1".to_owned(),
+                message_seq: 1,
+            }),
+            wire_item_index: Some(0),
+            ordinal: 1,
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({"secret": "plain-secret"})],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 1,
+                    context_fingerprint: "fp".to_owned(),
+                },
+            },
+        };
+        let raw = serde_json::to_vec(&item).expect("serialize provider context");
+        assert!(
+            serde_json::from_slice::<PublicMessage>(&raw).is_err(),
+            "opaque provider context must not deserialize as a public message"
+        );
     }
 }

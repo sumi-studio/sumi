@@ -288,6 +288,8 @@ pub(crate) fn finalize_hard_steer_batches(
                     role: "assistant",
                     message: message.clone(),
                     append_to_l0: true,
+                    provider_context: Vec::new(),
+                    eviction_footprint_tokens: 0,
                 }],
             },
             EventWrite {
@@ -363,6 +365,8 @@ pub(crate) fn finalize_hard_steer_batches(
                         role: "user",
                         message: user_message,
                         append_to_l0: true,
+                        provider_context: Vec::new(),
+                        eviction_footprint_tokens: 0,
                     },
                     Projection::RunPhase {
                         command_id: new_command_id,
@@ -709,6 +713,8 @@ pub(crate) fn steer_group_injection_batch(snapshot: SteerGroupSnapshot) -> Resul
                 role: "user",
                 message: user_message.clone(),
                 append_to_l0: true,
+                provider_context: Vec::new(),
+                eviction_footprint_tokens: 0,
             },
             Projection::RunPhase {
                 command_id: new_command_id.clone(),
@@ -957,6 +963,8 @@ mod tests {
                                 role: "user",
                                 message,
                                 append_to_l0: true,
+                                provider_context: Vec::new(),
+                                eviction_footprint_tokens: 0,
                             },
                             Projection::RunPhase {
                                 command_id: command_id.to_owned(),
@@ -1406,6 +1414,8 @@ mod tests {
                         role: "assistant",
                         message: owner_assistant_message.clone(),
                         append_to_l0: true,
+                        provider_context: Vec::new(),
+                        eviction_footprint_tokens: 0,
                     }],
                 }],
                 injected_commands: Vec::new(),

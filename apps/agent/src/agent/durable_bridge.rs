@@ -1082,6 +1082,8 @@ impl DurableBridge {
                         role: "assistant",
                         message: message.clone(),
                         append_to_l0,
+                        provider_context: Vec::new(),
+                        eviction_footprint_tokens: 0,
                     }],
                 }],
                 injected_commands: Vec::new(),
@@ -1122,6 +1124,8 @@ impl DurableBridge {
             },
             message: message.clone(),
             append_to_l0: true,
+            provider_context: Vec::new(),
+            eviction_footprint_tokens: 0,
         }];
         let mut writes = Vec::new();
         let mut public_prefix = Vec::new();
@@ -1311,6 +1315,8 @@ impl DurableBridge {
                 role: "assistant",
                 message: assistant.clone(),
                 append_to_l0,
+                provider_context: Vec::new(),
+                eviction_footprint_tokens: 0,
             }],
         }];
         let mut receipt_requests = vec![(assistant_id.clone(), assistant_barrier)];
@@ -1334,6 +1340,8 @@ impl DurableBridge {
                     role: "tool_result",
                     message: message.clone(),
                     append_to_l0: true,
+                    provider_context: Vec::new(),
+                    eviction_footprint_tokens: 0,
                 }],
             });
             public.push(AgentEvent::MessageStart {
