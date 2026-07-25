@@ -1,9 +1,11 @@
 //! Durable conversation, event, and memory storage.
 
 mod crypto;
+mod delivery;
 mod event_log;
 mod event_writer;
 mod memory_state;
+mod physical_recovery;
 mod provider_context;
 mod recovery;
 mod redactor;

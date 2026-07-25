@@ -23,18 +23,22 @@ use crate::{
         ApprovalDecision, Command, CommandAck, CommandAckStatus, CommandEnvelope, CommandId,
         CommandRejectReason, InboundCommand, KeyedCommandDigest, RejectedCommandPayload,
     },
-    provider::types::{PublicMessage, StopReason, ToolResultMessage},
+    provider::types::{
+        ProviderContextAnchor, ProviderContextFragment, ProviderContextItem, PublicMessage,
+        StopReason, ToolResultMessage,
+    },
     runtime::contracts::ProcessGeneration,
 };
 
 use super::{
     BatchBounds, DURABLE_ROW_OVERHEAD_BYTES, DataKeyPurpose, EventBatchSizer, InjectionApplication,
-    InjectionBatchSizeInput, InjectionCommandSizeInput, PublicProjectionBuilder, Redactor, Store,
-    command_payload_digest,
+    InjectionBatchSizeInput, InjectionCommandSizeInput, ProviderContextKeyAnchor,
+    PublicProjectionBuilder, Redactor, Store, command_payload_digest,
     event_log::{
         EVENT_DIGEST_BYTES, EventChainEntry, authenticate_event_head, extend_event_chain,
         verify_event_head,
     },
+    provider_context::EncryptedProviderContextRecord,
     redactor::search_text_from_projection,
     verify_command_payload_digest,
 };
@@ -776,6 +780,8 @@ pub(crate) enum Projection {
         role: &'static str,
         message: PublicMessage,
         append_to_l0: bool,
+        provider_context: Vec<ProviderContextFragment>,
+        eviction_footprint_tokens: u64,
     },
     CommandReceived {
         envelope: CommandEnvelope,
@@ -913,6 +919,8 @@ enum PreparedProjection {
         redaction_version: u32,
         interrupted: bool,
         l0_disposition: L0Disposition,
+        provider_context: Vec<EncryptedProviderContextRecord>,
+        eviction_footprint_tokens: u64,
     },
     CommandInsert {
         seq: u64,
@@ -2109,6 +2117,8 @@ impl EventWriter {
                         role,
                         message,
                         append_to_l0,
+                        provider_context,
+                        eviction_footprint_tokens: _,
                     } => {
                         let l0_disposition = l0_disposition(&message, append_to_l0)?;
                         let event_seq = assigned_seq
@@ -2138,6 +2148,28 @@ impl EventWriter {
                             &message,
                             PublicMessage::Assistant(message) if message.interrupted
                         );
+                        let (provider_context_records, eviction_footprint_tokens) = self
+                            .prepare_provider_context(
+                                &message_id,
+                                event_seq,
+                                &message,
+                                provider_context,
+                            )
+                            .await?;
+                        for record in &provider_context_records {
+                            charge_transaction_bytes(
+                                &mut transaction_bytes,
+                                record
+                                    .ciphertext()
+                                    .len()
+                                    .checked_add(record.key_ref().len())
+                                    .and_then(|bytes| bytes.checked_add(record.id().len()))
+                                    .and_then(|bytes| bytes.checked_add(DURABLE_ROW_OVERHEAD_BYTES))
+                                    .ok_or_else(|| {
+                                        anyhow!("provider-context record byte count overflow")
+                                    })?,
+                            )?;
+                        }
                         charge_transaction_bytes(
                             &mut transaction_bytes,
                             protected
@@ -2164,6 +2196,8 @@ impl EventWriter {
                             redaction_version: protected.redaction_version,
                             interrupted,
                             l0_disposition,
+                            provider_context: provider_context_records,
+                            eviction_footprint_tokens,
                         });
                     }
                     Projection::CommandReceived { envelope } => {
@@ -2283,6 +2317,70 @@ impl EventWriter {
             reject_reason,
             reject_actual_bytes,
         })
+    }
+
+    async fn prepare_provider_context(
+        &self,
+        message_id: &str,
+        message_seq: u64,
+        message: &PublicMessage,
+        fragments: Vec<ProviderContextFragment>,
+    ) -> Result<(Vec<EncryptedProviderContextRecord>, u64)> {
+        if fragments.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+
+        let PublicMessage::Assistant(assistant) = message else {
+            bail!("provider context may only accompany an assistant MessageEnd");
+        };
+
+        let anchor_id = format!("{message_id}:{message_seq}");
+        let key = self
+            .store
+            .provider_context_key(&ProviderContextKeyAnchor {
+                conversation_id: self.store.scope().conversation_id.clone(),
+                anchor_id,
+            })
+            .await?;
+
+        let mut records = Vec::with_capacity(fragments.len());
+        let mut eviction_footprint_tokens = 0u64;
+        let mut ordinal_counter: HashMap<Option<u32>, u32> = HashMap::new();
+        for fragment in fragments {
+            let next = ordinal_counter.entry(fragment.wire_item_index).or_insert(1);
+            let ordinal = *next;
+            *next += 1;
+
+            let item = ProviderContextItem {
+                origin_message: Some(ProviderContextAnchor {
+                    message_id: message_id.to_owned(),
+                    message_seq,
+                }),
+                wire_item_index: fragment.wire_item_index,
+                ordinal,
+                payload: fragment.payload,
+            };
+
+            let wire_label = fragment
+                .wire_item_index
+                .map_or_else(|| "_".to_owned(), |index| index.to_string());
+            let id = format!("{message_id}:{message_seq}:{wire_label}:{ordinal}");
+            let record = EncryptedProviderContextRecord::encrypt(
+                &item,
+                &assistant.origin.provider_instance_id,
+                assistant.origin.protocol,
+                &assistant.origin.model,
+                &id,
+                &id,
+                &key,
+                self.store.scope(),
+            )
+            .context("failed to encrypt provider-context record")?;
+            eviction_footprint_tokens =
+                eviction_footprint_tokens.saturating_add(record.eviction_tokens());
+            records.push(record);
+        }
+        Ok((records, eviction_footprint_tokens))
     }
 
     async fn derive_injected_command_size(
@@ -7277,13 +7375,12 @@ async fn apply_projection(
             redaction_version,
             interrupted,
             l0_disposition,
+            provider_context,
+            eviction_footprint_tokens,
         } => {
             if !matches!(role, "user" | "assistant" | "tool_result") {
                 bail!("invalid message role {role}");
             }
-            // T12 freezes the exact L0 membership decision at the MessageEnd
-            // boundary. A later membership projection must consume this typed
-            // value rather than reinterpret role or stop_reason from payload.
             match l0_disposition {
                 L0Disposition::Append | L0Disposition::ExcludeRetryError => {}
             }
@@ -7293,7 +7390,7 @@ async fn apply_projection(
                     redaction_version, interrupted, created_at
                  ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
-            .bind(message_id)
+            .bind(&message_id)
             .bind(sqlite_i64(event_seq, "message event sequence")?)
             .bind(role)
             .bind(raw_key_ref)
@@ -7306,6 +7403,34 @@ async fn apply_projection(
             .execute(&mut **transaction)
             .await
             .context("failed to apply MessageEnd projection")?;
+
+            for record in provider_context {
+                record
+                    .insert(&mut **transaction)
+                    .await
+                    .context("failed to apply provider-context record")?;
+            }
+
+            if eviction_footprint_tokens > 0
+                && let Some(batch_id) = sqlx::query_scalar::<_, String>(
+                    "SELECT batch_id FROM memory_batch_messages WHERE message_id = ?",
+                )
+                .bind(&message_id)
+                .fetch_optional(&mut **transaction)
+                .await
+                .context("failed to locate memory batch for eviction footprint")?
+            {
+                sqlx::query(
+                    "UPDATE memory_batches
+                     SET eviction_footprint_tokens = eviction_footprint_tokens + ?
+                     WHERE id = ?",
+                )
+                .bind(i64::try_from(eviction_footprint_tokens).unwrap_or(i64::MAX))
+                .bind(batch_id)
+                .execute(&mut **transaction)
+                .await
+                .context("failed to update memory batch eviction footprint")?;
+            }
         }
         PreparedProjection::CommandInsert {
             seq,
@@ -7746,7 +7871,8 @@ mod tests {
         agent::{ProjectedProviderEvent, ProviderEventProjector, ProviderTerminalKind},
         gateway::{Command, SensitiveCommandPayload},
         provider::types::{
-            ApiProtocol, AssistantContent, AssistantMessage, ProviderEvent, ProviderOrigin,
+            ApiProtocol, AssistantContent, AssistantMessage, NativeCompactionCoverage,
+            ProviderContextFragment, ProviderContextPayload, ProviderEvent, ProviderOrigin,
             ProviderOutput, PublicAssistantContent, PublicAssistantMessage, PublicMessage,
             RejectedToolCall, StopReason, ToolArgumentError, ToolCall, ToolResultMessage, Usage,
             UserContent, UserMessage,
@@ -8113,6 +8239,8 @@ mod tests {
                     role: "tool_result",
                     message: result,
                     append_to_l0: true,
+                    provider_context: Vec::new(),
+                    eviction_footprint_tokens: 0,
                 }],
             },
         ]
@@ -8241,6 +8369,8 @@ mod tests {
                         role: "user",
                         message,
                         append_to_l0: true,
+                        provider_context: Vec::new(),
+                        eviction_footprint_tokens: 0,
                     },
                     Projection::RunPhase {
                         command_id: command_id.to_owned(),
@@ -8502,6 +8632,8 @@ mod tests {
                             role: "user",
                             message: message.clone(),
                             append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         },
                         Projection::RunPhase {
                             command_id: command_id.as_str().to_owned(),
@@ -9244,6 +9376,8 @@ mod tests {
                     role: "assistant",
                     message,
                     append_to_l0: false,
+                    provider_context: Vec::new(),
+                    eviction_footprint_tokens: 0,
                 }],
             });
             writes.push(EventWrite {
@@ -9368,6 +9502,8 @@ mod tests {
                         role: "assistant",
                         message: assistant.clone(),
                         append_to_l0: true,
+                        provider_context: Vec::new(),
+                        eviction_footprint_tokens: 0,
                     }],
                 },
                 EventWrite {
@@ -9713,6 +9849,8 @@ mod tests {
                             role: "assistant",
                             message: assistant.clone(),
                             append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     },
                     EventWrite {
@@ -9868,6 +10006,8 @@ mod tests {
                             role: "tool_result",
                             message: result,
                             append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     },
                 ],
@@ -10091,6 +10231,8 @@ mod tests {
                             role: "tool_result",
                             message: end,
                             append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     },
                 ],
@@ -10210,6 +10352,8 @@ mod tests {
                         role: "assistant",
                         message: error_message,
                         append_to_l0: false,
+                        provider_context: Vec::new(),
+                        eviction_footprint_tokens: 0,
                     }],
                 }],
                 injected_commands: Vec::new(),
@@ -10292,6 +10436,8 @@ mod tests {
                             role: "assistant",
                             message: second_error,
                             append_to_l0: false,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     },
                     EventWrite {
@@ -10453,6 +10599,8 @@ mod tests {
                                 role: "user",
                                 message: user,
                                 append_to_l0: true,
+                                provider_context: Vec::new(),
+                                eviction_footprint_tokens: 0,
                             },
                             Projection::RunPhase {
                                 command_id: command_id.clone(),
@@ -10528,6 +10676,8 @@ mod tests {
                             role: "assistant",
                             message: initial_assistant.clone(),
                             append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     },
                     EventWrite {
@@ -10589,6 +10739,8 @@ mod tests {
                             role: "assistant",
                             message: continuation_assistant.clone(),
                             append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     },
                     EventWrite {
@@ -10879,6 +11031,8 @@ mod tests {
                             role: "assistant",
                             message: rejected,
                             append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     },
                     EventWrite {
@@ -10902,6 +11056,8 @@ mod tests {
                             role: "tool_result",
                             message,
                             append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     },
                 ],
@@ -11022,6 +11178,8 @@ mod tests {
                         role: "tool_result",
                         message,
                         append_to_l0: true,
+                        provider_context: Vec::new(),
+                        eviction_footprint_tokens: 0,
                     }],
                 }],
                 injected_commands: Vec::new(),
@@ -12449,6 +12607,8 @@ mod tests {
                             role: "assistant",
                             message: old_error.clone(),
                             append_to_l0: false,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     },
                     EventWrite {
@@ -12525,6 +12685,8 @@ mod tests {
                             role: "assistant",
                             message: current_error,
                             append_to_l0: false,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     },
                     EventWrite {
@@ -12992,6 +13154,8 @@ mod tests {
                                     role: "user",
                                     message,
                                     append_to_l0: true,
+                                    provider_context: Vec::new(),
+                                    eviction_footprint_tokens: 0,
                                 },
                                 Projection::RunPhase {
                                     command_id: next_id.clone(),
@@ -13376,6 +13540,8 @@ mod tests {
                             role: "user",
                             message,
                             append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         },
                         Projection::RunPhase {
                             command_id: "00000000-0000-4000-8000-000000000018".to_owned(),
@@ -14466,6 +14632,8 @@ mod tests {
                             role: "assistant",
                             message: assistant.clone(),
                             append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     },
                 ],
@@ -14496,6 +14664,8 @@ mod tests {
                                 role: "assistant",
                                 message: assistant,
                                 append_to_l0: true,
+                                provider_context: Vec::new(),
+                                eviction_footprint_tokens: 0,
                             },
                             prepare("tool-origin-a"),
                             prepare("tool-origin-b"),
@@ -14607,6 +14777,8 @@ mod tests {
                             role: "assistant",
                             message: rejected,
                             append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     },
                 ],
@@ -14912,6 +15084,8 @@ mod tests {
                             role: "tool_result",
                             message: result,
                             append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     },
                     EventWrite {
@@ -15189,6 +15363,8 @@ mod tests {
                             role: "tool_result",
                             message: tool_result,
                             append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     },
                 ],
@@ -15982,6 +16158,8 @@ mod tests {
                                 role: "tool_result",
                                 message,
                                 append_to_l0: true,
+                                provider_context: Vec::new(),
+                                eviction_footprint_tokens: 0,
                             }],
                         },
                     ],
@@ -16217,6 +16395,8 @@ mod tests {
                             role,
                             message,
                             append_to_l0,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
                         }],
                     }],
                     injected_commands: Vec::new(),
@@ -16883,6 +17063,8 @@ mod tests {
                                 role: "tool_result",
                                 message: result,
                                 append_to_l0: true,
+                                provider_context: Vec::new(),
+                                eviction_footprint_tokens: 0,
                             }],
                         },
                     ],
@@ -17334,6 +17516,203 @@ mod tests {
                     json!({"type":"message_end","message_id":assistant_id,"message":message})
                 })
                 .expect("terminal envelope")
+        );
+    }
+
+    #[tokio::test]
+    async fn message_end_persists_encrypted_provider_context_and_eviction_tokens() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000073";
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let injected =
+            classified_injection(&writer, 1, command_id, "ignored", "context fixture").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "context fixture"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("persist user injection");
+
+        let timestamp = durable_test_timestamp();
+        let message = AssistantMessage {
+            content: vec![AssistantContent::Text {
+                text: "answer with reasoning".to_owned(),
+                wire_item_index: 0,
+            }],
+            model: "model-context".to_owned(),
+            provider: "provider-context".to_owned(),
+            origin: ProviderOrigin {
+                provider_instance_id: "provider-instance-context".to_owned(),
+                protocol: ApiProtocol::OpenAiChatCompletions,
+                model: "model-context".to_owned(),
+            },
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp,
+        };
+        let assistant_id = "assistant-with-context";
+        let mut projector = ProviderEventProjector::new(assistant_id).expect("projector");
+        assert!(matches!(
+            projector.project(ProviderEvent::Start).expect("Start"),
+            ProjectedProviderEvent::Started
+        ));
+
+        let reasoning = ProviderContextFragment {
+            wire_item_index: Some(0),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiChatCompletions,
+                item: json!({"text": "plain reasoning"}),
+            },
+        };
+        let window = ProviderContextFragment {
+            wire_item_index: None,
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({"summary": "compact"})],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 1,
+                    context_fingerprint: "fp-1".to_owned(),
+                },
+            },
+        };
+
+        let ProjectedProviderEvent::Terminal(terminal) = projector
+            .project(ProviderEvent::Done {
+                reason: StopReason::Stop,
+                output: ProviderOutput {
+                    message,
+                    provider_context: vec![reasoning, window],
+                },
+            })
+            .expect("terminal projection")
+        else {
+            panic!("expected terminal");
+        };
+
+        let terminal_message = terminal.message().clone();
+        let terminal_write = terminal
+            .into_t12_write(run_id.clone(), turn_id.clone(), true)
+            .expect("terminal write with context");
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            assistant_id,
+                            &terminal_message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("open assistant attempt");
+
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    terminal_write,
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::turn_end(
+                                run_id.clone(),
+                                turn_id.clone(),
+                                terminal_message,
+                                Vec::new(),
+                            )
+                            .expect("TurnEnd"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(DurableEvent::agent_end(run_id.clone()).expect("AgentEnd")),
+                        projections: vec![Projection::CommandApplied {
+                            command_id: command_id.to_owned(),
+                            command_seq: 1,
+                            run_id: Some(run_id),
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist terminal with provider context");
+
+        let rows = sqlx::query(
+            "SELECT id, message_id, message_seq, item_ordinal, wire_item_index, kind,
+                    coverage_through_seq, context_fingerprint, eviction_tokens
+             FROM provider_context
+             WHERE message_id = ?
+             ORDER BY id",
+        )
+        .bind(assistant_id)
+        .fetch_all(store.pool())
+        .await
+        .expect("fetch provider context rows");
+        assert_eq!(rows.len(), 2, "expected two provider-context records");
+
+        for row in &rows {
+            let ordinal: i64 = row.get("item_ordinal");
+            assert!(ordinal >= 1, "item_ordinal must be positive");
+        }
+
+        let kinds: Vec<String> = rows
+            .iter()
+            .map(|row| row.get::<String, _>("kind"))
+            .collect();
+        assert!(kinds.contains(&"encrypted_reasoning".to_owned()));
+        assert!(kinds.contains(&"open_ai_compacted_window".to_owned()));
+
+        let reasoning_row = rows
+            .iter()
+            .find(|row| row.get::<String, _>("kind") == "encrypted_reasoning")
+            .expect("reasoning row");
+        let reasoning_eviction: i64 = reasoning_row.get("eviction_tokens");
+        assert!(
+            reasoning_eviction > 0,
+            "encrypted reasoning must pay eviction tokens"
+        );
+
+        let window_row = rows
+            .iter()
+            .find(|row| row.get::<String, _>("kind") == "open_ai_compacted_window")
+            .expect("window row");
+        let window_eviction: i64 = window_row.get("eviction_tokens");
+        assert_eq!(
+            window_eviction, 0,
+            "compaction window has zero eviction tokens"
+        );
+        assert_eq!(
+            window_row
+                .get::<Option<String>, _>("context_fingerprint")
+                .as_deref(),
+            Some("fp-1")
+        );
+        assert_eq!(
+            window_row.get::<Option<i64>, _>("coverage_through_seq"),
+            Some(1)
+        );
+
+        let message_seq: i64 = rows[0].get("message_seq");
+        assert!(
+            message_seq > 0,
+            "provider context must be bound to message seq"
         );
     }
 
