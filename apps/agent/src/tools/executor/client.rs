@@ -212,6 +212,38 @@ impl ArtifactBrokerClient {
     pub fn socket(&self) -> &Path {
         &self.socket
     }
+
+    pub async fn put_attachment(
+        &self,
+        artifact_id: &str,
+        content: &str,
+    ) -> Result<String, ToolError> {
+        let response = self
+            .execute(ArtifactOperation::PutAttachment {
+                conversation_id: self.conversation_id.clone(),
+                artifact_id: artifact_id.to_owned(),
+                content: content.to_owned(),
+            })
+            .await?;
+        match response {
+            ArtifactResponse::Put { handle } if handle == self.attachment_handle(artifact_id) => {
+                Ok(handle)
+            }
+            ArtifactResponse::Put { .. } => Err(ToolError::RpcIndeterminate(
+                "artifact put returned an unexpected canonical handle".to_owned(),
+            )),
+            _ => Err(ToolError::Protocol(
+                "artifact put returned the wrong response variant".to_owned(),
+            )),
+        }
+    }
+
+    fn attachment_handle(&self, artifact_id: &str) -> String {
+        format!(
+            "artifact://{}/attachments/{artifact_id}",
+            self.conversation_id
+        )
+    }
 }
 
 #[async_trait]

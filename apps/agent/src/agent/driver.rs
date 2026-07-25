@@ -18,7 +18,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    memory::transform,
+    memory::{
+        context_assembler::ContextAssembler, estimate::TokenCalibration, overflow::AssemblyMode,
+    },
     provider::{
         ModelSpec, ProviderTimingObservation, ProviderTimingObservations, ProviderTimingObserver,
         RequestOptions, stream_observed, timing_observation_channel,
@@ -129,7 +131,7 @@ impl RunTimingSamples {
 pub(crate) struct InjectedRunDriver {
     spec: ModelSpec,
     options: RequestOptions,
-    prompt: PromptContext,
+    assembler: ContextAssembler,
     registry: ToolRegistry,
     workspace: WorkspacePaths,
     executor_generation: ProcessGeneration,
@@ -173,6 +175,9 @@ impl InjectedRunDriver {
         if prompt.tools != registry.definitions() {
             bail!("prompt tool definitions do not exactly match the frozen tool registry");
         }
+        let assembler = ContextAssembler::from_prompt(prompt)
+            .with_calibration(TokenCalibration::default())
+            .with_mode(AssemblyMode::SumiThreeLayer);
         let workspace = workspace.ok_or_else(|| anyhow!("workspace paths were not supplied"))?;
         let executor_generation = executor_generation
             .ok_or_else(|| anyhow!("executor generation identity was not supplied"))?;
@@ -180,7 +185,7 @@ impl InjectedRunDriver {
         Ok(Self {
             spec,
             options,
-            prompt,
+            assembler,
             registry,
             workspace,
             executor_generation,
@@ -228,15 +233,17 @@ impl RunDriver for InjectedRunDriver {
 
     async fn start_provider_for_command(
         &self,
-        _attempt: usize,
+        attempt: usize,
         context: &[ContextMessage],
         command_received_at: Option<Instant>,
         cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
-        let mut prompt = self.prompt.clone();
         // Derive the send view immediately before the provider call.  The
         // runner's retained runtime_context anchors must not be mutated.
-        prompt.messages = transform::transform(context, &self.spec.origin());
+        let prompt = self
+            .assembler
+            .assemble(context, &self.spec.origin(), attempt)
+            .await?;
         // Re-check at use time: the frozen registry remains the authority.
         if prompt.tools != self.registry.definitions() {
             bail!("provider prompt tools diverged from the frozen registry");
@@ -321,9 +328,10 @@ impl RunDriver for InjectedRunDriver {
         &self,
         _core: &RunCore,
         _request: OverflowRecoveryRequest,
-        _active_context: &[ContextMessage],
+        active_context: &[ContextMessage],
     ) -> Result<OverflowRecoveryOutcome> {
-        bail!("overflow context assembly is not supplied; T21 must provide it explicitly")
+        let replacement = self.assembler.recover_overflow(active_context)?;
+        Ok(OverflowRecoveryOutcome::ReplacementContext(replacement))
     }
 }
 

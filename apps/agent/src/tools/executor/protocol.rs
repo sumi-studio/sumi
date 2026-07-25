@@ -174,6 +174,11 @@ pub enum ArtifactOperation {
         handle: String,
         pattern: String,
     },
+    PutAttachment {
+        conversation_id: String,
+        artifact_id: String,
+        content: String,
+    },
 }
 
 pub trait RpcOperationValidation {
@@ -277,6 +282,16 @@ impl RpcOperationValidation for ArtifactOperation {
                         "RPC grep pattern must be non-empty".to_owned(),
                     ));
                 }
+                Ok(())
+            }
+            Self::PutAttachment {
+                conversation_id,
+                artifact_id,
+                ..
+            } => {
+                validate_artifact_handle_component(conversation_id)?;
+                validate_rpc_id(conversation_id, "conversation_id")?;
+                validate_artifact_handle_component(artifact_id)?;
                 Ok(())
             }
         }

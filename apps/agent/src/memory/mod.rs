@@ -4,7 +4,9 @@
 
 pub mod batch;
 pub mod compactor;
+pub mod context_assembler;
 pub mod estimate;
+pub mod overflow;
 #[allow(dead_code)]
 pub mod transform;
 
@@ -140,6 +142,92 @@ impl ThreeLayerMemory {
 
     pub fn pending_apply(&self) -> bool {
         self.pending_apply
+    }
+
+    pub fn set_pending_apply(&mut self, pending: bool) {
+        self.pending_apply = pending;
+    }
+
+    pub fn push_l0(&mut self, batch: L0Batch) {
+        self.l0.push_back(batch);
+    }
+
+    pub fn store_compact_result(&mut self, batch_id: BatchId, result: CompactResult) {
+        self.shelf.insert(batch_id, result);
+    }
+
+    /// Promote an L0 batch to L1 using a shelf summary.  The batch must not be
+    /// open.  Provider-context footprint is cleared in the same logical
+    /// transaction because L1 stores summaries, not the original messages.
+    pub fn promote_l0_to_l1(&mut self, batch_id: BatchId) -> anyhow::Result<()> {
+        let position = self
+            .l0
+            .iter()
+            .position(|batch| batch.id == batch_id)
+            .ok_or_else(|| anyhow::anyhow!("batch {batch_id} not found in L0"))?;
+        let mut batch = self.l0.remove(position).unwrap();
+        if batch.state == BatchState::Open {
+            self.l0.insert(position, batch);
+            anyhow::bail!("cannot promote an open L0 batch");
+        }
+        let result = self
+            .shelf
+            .remove(&batch_id)
+            .ok_or_else(|| anyhow::anyhow!("no compact result for batch {batch_id}"))?;
+        let time_range = result.time_range;
+        self.l1.push_back(L1Entry {
+            source_batch: batch_id,
+            summary: result.summary,
+            est_tokens: result.est_tokens,
+            time_range,
+        });
+        batch.eviction_footprint_tokens = 0;
+        Ok(())
+    }
+
+    /// Replace L1 entries with a compacted L2 summary.  Used when L1 overflows.
+    pub fn compact_l1_to_l2(&mut self, result: CompactResult) {
+        self.l1.clear();
+        self.l2 = ConsolidatedMemory {
+            summary: result.summary,
+            est_tokens: result.est_tokens,
+        };
+    }
+
+    /// Replace the L2 summary with a consolidated summary.  Used when L2
+    /// itself grows beyond its limit.
+    pub fn consolidate_l2(&mut self, result: CompactResult) {
+        self.l2 = ConsolidatedMemory {
+            summary: result.summary,
+            est_tokens: result.est_tokens,
+        };
+    }
+
+    pub fn l0_totals(&self) -> anyhow::Result<(u64, u64)> {
+        self.l0
+            .iter()
+            .try_fold((0u64, 0u64), |(est, footprint), batch| {
+                let new_est = est
+                    .checked_add(batch.est_tokens)
+                    .ok_or_else(|| anyhow::anyhow!("L0 estimate overflow"))?;
+                let new_footprint = footprint
+                    .checked_add(batch.eviction_footprint_tokens)
+                    .ok_or_else(|| anyhow::anyhow!("L0 eviction footprint overflow"))?;
+                Ok((new_est, new_footprint))
+            })
+    }
+
+    pub fn l1_total(&self) -> anyhow::Result<u64> {
+        self.l1.iter().try_fold(0u64, |total, entry| {
+            total
+                .checked_add(entry.est_tokens)
+                .ok_or_else(|| anyhow::anyhow!("L1 estimate overflow"))
+        })
+    }
+
+    pub fn effective_l0(&self) -> anyhow::Result<u64> {
+        let (est, footprint) = self.l0_totals()?;
+        Ok(self.calib.effective_tokens(est, footprint)?)
     }
 }
 

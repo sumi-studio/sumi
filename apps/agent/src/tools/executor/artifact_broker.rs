@@ -55,6 +55,7 @@ pub enum ArtifactResponse {
     Finished,
     Read { content: Vec<u8>, eof: bool },
     Grep { matches: Vec<ArtifactGrepMatch> },
+    Put { handle: String },
 }
 
 /// A broker instance pins its root inode for its lifetime. All descendants are
@@ -150,6 +151,11 @@ impl ArtifactBroker {
                 handle,
                 pattern,
             } => self.grep_artifact(&conversation_id, &handle, &pattern),
+            ArtifactOperation::PutAttachment {
+                conversation_id,
+                artifact_id,
+                content,
+            } => self.put_attachment(&conversation_id, &artifact_id, &content),
         }
     }
 
@@ -231,6 +237,83 @@ impl ArtifactBroker {
             handle,
             offset: initial_len,
         })
+    }
+
+    fn put_attachment(
+        &self,
+        conversation_id: &str,
+        artifact_id: &str,
+        content: &str,
+    ) -> Result<ArtifactResponse, ToolError> {
+        let handle = format!("artifact://{conversation_id}/attachments/{artifact_id}");
+        let content_bytes = content.as_bytes();
+        let content_len = u64::try_from(content_bytes.len()).map_err(|_| {
+            ToolError::Protocol("artifact attachment content length overflow".to_owned())
+        })?;
+        let content_digest: [u8; 32] = Sha256::digest(content_bytes).into();
+
+        let mut state = self.lock_state()?;
+        if let Some(record) = state.artifacts.get(&handle) {
+            if record.initial_len != content_len || record.initial_digest != content_digest {
+                return Err(ToolError::Protocol(
+                    "duplicate PutAttachment has conflicting content".to_owned(),
+                ));
+            }
+            return Ok(ArtifactResponse::Put { handle });
+        }
+        if state.artifacts.len() >= MAX_TRACKED_ARTIFACTS {
+            return Err(ToolError::Protocol(format!(
+                "artifact process state capacity of {MAX_TRACKED_ARTIFACTS} was reached"
+            )));
+        }
+
+        let (conversation, kind) =
+            self.ensure_artifact_dirs(conversation_id, ArtifactKind::Attachments)?;
+        let name = cstring(artifact_id)?;
+        let created = match openat2_cstr(
+            kind.as_raw_fd(),
+            &name,
+            libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        ) {
+            Ok(fd) => (fd, true),
+            Err(ToolError::Io(error)) if error.raw_os_error() == Some(libc::EEXIST) => (
+                openat2_cstr(
+                    kind.as_raw_fd(),
+                    &name,
+                    libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    0,
+                )?,
+                false,
+            ),
+            Err(error) => return Err(error),
+        };
+        ensure_regular(&created.0, "artifact")?;
+        fchmod(created.0.as_raw_fd(), 0o600)?;
+        let mut file = File::from(created.0);
+        lock_exclusive(&file)?;
+        if created.1 {
+            file.write_all(content_bytes)?;
+            file.sync_all()?;
+            fsync_fd(kind.as_raw_fd())?;
+            fsync_fd(conversation.as_raw_fd())?;
+            fsync_fd(self.root.as_raw_fd())?;
+        } else if !file_equals(&mut file, content_bytes)? {
+            return Err(ToolError::Protocol(
+                "duplicate PutAttachment has conflicting content".to_owned(),
+            ));
+        }
+        state.artifacts.insert(
+            handle.clone(),
+            ArtifactRecord {
+                initial_len: content_len,
+                initial_digest: content_digest,
+                committed_offset: content_len,
+                last_append: None,
+                finished: true,
+            },
+        );
+        Ok(ArtifactResponse::Put { handle })
     }
 
     fn append_tool_output(
@@ -852,6 +935,33 @@ mod tests {
         assert!(matches!(
             broker.execute(append(13, b"late".to_vec())),
             Err(ToolError::Protocol(message)) if message.contains("finished artifact")
+        ));
+    }
+
+    #[test]
+    fn put_attachment_is_idempotent_and_rejects_conflicts() {
+        let root = TestRoot::new();
+        let broker = ArtifactBroker::open(&root.0).unwrap();
+        let put = ArtifactOperation::PutAttachment {
+            conversation_id: "conversation-1".to_owned(),
+            artifact_id: "artifact-1".to_owned(),
+            content: "large user text".to_owned(),
+        };
+        let expected = ArtifactResponse::Put {
+            handle: "artifact://conversation-1/attachments/artifact-1".to_owned(),
+        };
+        assert_eq!(broker.execute(put.clone()).unwrap(), expected);
+        assert_eq!(broker.execute(put.clone()).unwrap(), expected);
+
+        let conflict = ArtifactOperation::PutAttachment {
+            conversation_id: "conversation-1".to_owned(),
+            artifact_id: "artifact-1".to_owned(),
+            content: "different".to_owned(),
+        };
+        assert!(matches!(
+            broker.execute(conflict),
+            Err(ToolError::Protocol(message))
+                if message == "duplicate PutAttachment has conflicting content"
         ));
     }
 
