@@ -21,6 +21,14 @@ use crate::runtime::contracts::{
 
 use super::Store;
 
+fn sqlite_i64(value: u64, field: &str) -> Result<i64> {
+    i64::try_from(value).with_context(|| format!("{field} exceeds SQLite INTEGER range"))
+}
+
+fn sqlite_i64_usize(value: usize, field: &str) -> Result<i64> {
+    sqlite_i64(value as u64, field)
+}
+
 /// A T27 physical recovery intent for one running tool execution.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PhysicalRecoveryIntent {
@@ -329,9 +337,18 @@ impl<'a> PhysicalRecoveryApplier<'a> {
         .bind(receipt.lease.lease_id())
         .bind(receipt.fence.fence_id())
         .bind(receipt.lease.generation().as_i64())
-        .bind(i64::try_from(receipt.intents.len()).unwrap_or(i64::MAX))
-        .bind(i64::try_from(receipt.logical_suffix_first_seq).unwrap_or(i64::MAX))
-        .bind(i64::try_from(receipt.logical_suffix_last_seq).unwrap_or(i64::MAX))
+        .bind(sqlite_i64_usize(
+            receipt.intents.len(),
+            "receipt intent_count",
+        )?)
+        .bind(sqlite_i64(
+            receipt.logical_suffix_first_seq,
+            "logical_suffix_first_seq",
+        )?)
+        .bind(sqlite_i64(
+            receipt.logical_suffix_last_seq,
+            "logical_suffix_last_seq",
+        )?)
         .bind(Utc::now().to_rfc3339())
         .execute(&mut *transaction)
         .await
@@ -349,7 +366,10 @@ impl<'a> PhysicalRecoveryApplier<'a> {
             .bind(&intent.command_id)
             .bind(&intent.run_id)
             .bind(intent.executor_generation.as_i64())
-            .bind(i64::try_from(intent.indeterminate_terminal_seq).unwrap_or(i64::MAX))
+            .bind(sqlite_i64(
+                intent.indeterminate_terminal_seq,
+                "indeterminate_terminal_seq",
+            )?)
             .execute(&mut *transaction)
             .await
             .context("failed to insert physical recovery receipt intent")?;
@@ -465,9 +485,9 @@ impl<'a> PhysicalRecoveryApplier<'a> {
             || lease_id != receipt.lease.lease_id()
             || generation != receipt.lease.generation().as_i64()
             || fence_id != receipt.fence.fence_id()
-            || count != i64::try_from(receipt.intents.len()).unwrap_or(i64::MAX)
-            || first != i64::try_from(receipt.logical_suffix_first_seq).unwrap_or(i64::MAX)
-            || last != i64::try_from(receipt.logical_suffix_last_seq).unwrap_or(i64::MAX)
+            || count != sqlite_i64_usize(receipt.intents.len(), "receipt intent_count")?
+            || first != sqlite_i64(receipt.logical_suffix_first_seq, "logical_suffix_first_seq")?
+            || last != sqlite_i64(receipt.logical_suffix_last_seq, "logical_suffix_last_seq")?
         {
             bail!("conflicting physical recovery receipt already exists");
         }
@@ -516,9 +536,18 @@ impl<'a> PhysicalRecoveryApplier<'a> {
         .bind(receipt.lease.lease_id())
         .bind(receipt.fence.fence_id())
         .bind(receipt.lease.generation().as_i64())
-        .bind(i64::try_from(receipt.intents.len()).unwrap_or(i64::MAX))
-        .bind(i64::try_from(receipt.logical_suffix_first_seq).unwrap_or(i64::MAX))
-        .bind(i64::try_from(receipt.logical_suffix_last_seq).unwrap_or(i64::MAX))
+        .bind(sqlite_i64_usize(
+            receipt.intents.len(),
+            "receipt intent_count",
+        )?)
+        .bind(sqlite_i64(
+            receipt.logical_suffix_first_seq,
+            "logical_suffix_first_seq",
+        )?)
+        .bind(sqlite_i64(
+            receipt.logical_suffix_last_seq,
+            "logical_suffix_last_seq",
+        )?)
         .bind(Utc::now().to_rfc3339())
         .execute(&mut **transaction)
         .await?;
@@ -536,7 +565,10 @@ impl<'a> PhysicalRecoveryApplier<'a> {
             .bind(&intent.command_id)
             .bind(&intent.run_id)
             .bind(intent.executor_generation.as_i64())
-            .bind(i64::try_from(intent.indeterminate_terminal_seq).unwrap_or(i64::MAX))
+            .bind(sqlite_i64(
+                intent.indeterminate_terminal_seq,
+                "indeterminate_terminal_seq",
+            )?)
             .execute(&mut **transaction)
             .await?;
         }
@@ -554,7 +586,7 @@ impl<'a> PhysicalRecoveryApplier<'a> {
         .bind(&receipt.receipt_id)
         .fetch_one(&mut **transaction)
         .await?;
-        if count != i64::try_from(receipt.intents.len()).unwrap_or(i64::MAX) {
+        if count != sqlite_i64_usize(receipt.intents.len(), "receipt intent_count")? {
             bail!("physical recovery receipt intent_count does not match child rows");
         }
         Ok(())
@@ -565,8 +597,8 @@ impl<'a> PhysicalRecoveryApplier<'a> {
         transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         receipt: &PhysicalRecoveryReceipt,
     ) -> Result<()> {
-        let first = i64::try_from(receipt.logical_suffix_first_seq).unwrap_or(i64::MAX);
-        let last = i64::try_from(receipt.logical_suffix_last_seq).unwrap_or(i64::MAX);
+        let first = sqlite_i64(receipt.logical_suffix_first_seq, "logical_suffix_first_seq")?;
+        let last = sqlite_i64(receipt.logical_suffix_last_seq, "logical_suffix_last_seq")?;
         let count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE seq BETWEEN ? AND ?")
                 .bind(first)
@@ -597,12 +629,20 @@ impl<'a> PhysicalRecoveryApplier<'a> {
             "SELECT event_type, internal_metadata, envelope
              FROM agent_events WHERE seq = ?"
         };
-        let mut query = sqlx::query(query)
-            .bind(i64::try_from(intent.indeterminate_terminal_seq).unwrap_or(i64::MAX));
+        let mut query = sqlx::query(query).bind(sqlite_i64(
+            intent.indeterminate_terminal_seq,
+            "indeterminate_terminal_seq",
+        )?);
         if strict_terminal_event {
             query = query
-                .bind(i64::try_from(receipt.logical_suffix_first_seq).unwrap_or(i64::MAX))
-                .bind(i64::try_from(receipt.logical_suffix_last_seq).unwrap_or(i64::MAX));
+                .bind(sqlite_i64(
+                    receipt.logical_suffix_first_seq,
+                    "logical_suffix_first_seq",
+                )?)
+                .bind(sqlite_i64(
+                    receipt.logical_suffix_last_seq,
+                    "logical_suffix_last_seq",
+                )?);
         }
         let row = query
             .fetch_optional(&mut **transaction)
@@ -645,8 +685,8 @@ impl<'a> PhysicalRecoveryApplier<'a> {
         transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         receipt: &PhysicalRecoveryReceipt,
     ) -> Result<()> {
-        let first = i64::try_from(receipt.logical_suffix_first_seq).unwrap_or(i64::MAX);
-        let last = i64::try_from(receipt.logical_suffix_last_seq).unwrap_or(i64::MAX);
+        let first = sqlite_i64(receipt.logical_suffix_first_seq, "logical_suffix_first_seq")?;
+        let last = sqlite_i64(receipt.logical_suffix_last_seq, "logical_suffix_last_seq")?;
         let expected_tools: BTreeSet<&str> = receipt
             .intents
             .iter()
@@ -809,7 +849,7 @@ mod tests {
                     envelope, redaction_version, created_at
                  ) VALUES(?, ?, '{}', ?, X'00', ?, 1, ?)",
             )
-            .bind(i64::try_from(seq).unwrap_or(i64::MAX))
+            .bind(sqlite_i64(seq, "seed event seq").unwrap())
             .bind(event_type)
             .bind(&key.key_ref)
             .bind(envelope)
@@ -824,7 +864,7 @@ mod tests {
                 envelope, redaction_version, created_at
              ) VALUES(?, 'tool_execution_end', ?, ?, X'00', ?, 1, ?)",
         )
-        .bind(i64::try_from(terminal_seq).unwrap_or(i64::MAX))
+        .bind(sqlite_i64(terminal_seq, "terminal event seq").unwrap())
         .bind(r#"{"tool_state":"indeterminate","tool_error_code":"indeterminate"}"#)
         .bind(&key.key_ref)
         .bind(r#"{"type":"tool_execution_end","tool_call_id":"tool-call-1","result":{},"is_error":true}"#)
@@ -941,14 +981,20 @@ mod tests {
     #[tokio::test]
     async fn rejects_missing_tool_execution() {
         let store = test_store().await;
-        // seed only events, not the tool execution
-        let (_first, _last, _tool_call_id) = seed_events_and_execution(&store).await;
+        let (first, last, tool_call_id) = seed_events_and_execution(&store).await;
+        sqlx::query("DELETE FROM tool_executions WHERE tool_call_id = ?")
+            .bind(&tool_call_id)
+            .execute(store.pool())
+            .await
+            .expect("remove tool execution row");
+
         let lease = test_lease(1);
         let fence = test_fence(&lease);
-        let r = receipt(&lease, &fence, 10, 11, "missing-tool", 12);
+        let r = receipt(&lease, &fence, first, last, &tool_call_id, 12);
 
         let applier = PhysicalRecoveryApplier::new(&store);
-        assert!(applier.apply(&r).await.is_err());
+        let error = applier.apply(&r).await.expect_err("missing tool execution");
+        assert!(error.to_string().contains("tool execution"));
     }
 
     #[tokio::test]

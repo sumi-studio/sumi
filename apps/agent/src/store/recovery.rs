@@ -208,8 +208,30 @@ impl SuffixRecovery {
         let mut events = EventEvidence::required_for(&commands)?;
         events = durable_event_evidence(store, events).await?;
         let mut steps = Vec::with_capacity(commands.len());
+        let mut injected_groups = HashSet::new();
         for command in &commands {
-            steps.push(plan_one_command(store, command, &events).await?);
+            let step = plan_one_command(store, command, &events).await?;
+            if let RecoveryStep::InjectStoredGroup {
+                ref run_id,
+                ref turn_id,
+                application_kind,
+                ref command_ids,
+            } = step
+            {
+                let key = (
+                    run_id.clone(),
+                    turn_id.clone(),
+                    application_kind,
+                    command.phase,
+                );
+                if !injected_groups.insert(key) {
+                    continue;
+                }
+                if command_ids.is_empty() {
+                    bail!("InjectStoredGroup for {run_id}/{turn_id} produced no command_ids");
+                }
+            }
+            steps.push(step);
         }
         Ok(steps)
     }

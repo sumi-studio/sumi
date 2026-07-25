@@ -16,12 +16,17 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use sqlx::Row;
-use zeroize::Zeroize;
+use subtle::ConstantTimeEq;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::provider::types::{ApiProtocol, ProviderContextItem, ProviderContextPayload};
 
 use super::crypto::{RowAad, decrypt_content, encrypt_content};
 use super::{AgentScope, DataKeyMaterial, DataKeyPurpose, Store};
+
+fn sqlite_i64(value: u64, field: &str) -> Result<i64> {
+    i64::try_from(value).with_context(|| format!("{field} exceeds SQLite INTEGER range"))
+}
 
 const INTENT_HMAC_INFO: &[u8] = b"provider-context-mutation-intent/v1";
 const INTENT_HMAC_KEY_ID: &str = "mutation-intent-hmac/v1";
@@ -263,7 +268,8 @@ impl EncryptedProviderContextRecord {
         .bind(self.message_id.as_ref())
         .bind(
             self.message_seq
-                .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+                .map(|v| sqlite_i64(v, "provider_context.message_seq"))
+                .transpose()?,
         )
         .bind(self.wire_item_index.map(i64::from))
         .bind(i64::from(self.item_ordinal))
@@ -274,12 +280,16 @@ impl EncryptedProviderContextRecord {
         .bind(self.kind.as_str())
         .bind(
             self.coverage_through_seq
-                .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+                .map(|v| sqlite_i64(v, "provider_context.coverage_through_seq"))
+                .transpose()?,
         )
         .bind(self.context_fingerprint.as_ref())
         .bind(&self.key_ref)
         .bind(&self.ciphertext)
-        .bind(i64::try_from(self.eviction_tokens).unwrap_or(i64::MAX))
+        .bind(sqlite_i64(
+            self.eviction_tokens,
+            "provider_context.eviction_tokens",
+        )?)
         .bind(i64::from(self.eviction_estimator_version))
         .bind(&self.created_at)
         .execute(executor)
@@ -341,14 +351,18 @@ impl FullIntent {
 
 /// Canonical, length-delimited byte serialization for the semantic subset of a
 /// `FullIntent`.  The output is the exact payload fed to the HMAC.
-fn semantic_intent_bytes(full: &FullIntent) -> Vec<u8> {
+fn intent_bytes(full: &FullIntent, include_witness: bool) -> Vec<u8> {
     let mut writer = CanonicalWriter::with_domain(INTENT_HMAC_DOMAIN);
     writer.field(full.variant.as_bytes());
     writer.field(full.mutation_id.as_bytes());
-    writer.field(full.expected_latest_id.as_deref().unwrap_or("").as_bytes());
+    writer.optional_field(
+        include_witness
+            .then_some(full.expected_latest_id.as_deref().map(str::as_bytes))
+            .flatten(),
+    );
     writer.field(&canonical_id_list(&full.invalidate_ids));
     writer.field(full.provider_context_id.as_bytes());
-    writer.field(full.message_id.as_deref().unwrap_or("").as_bytes());
+    writer.optional_field(full.message_id.as_deref().map(str::as_bytes));
     writer.field(&opt_u64_bytes(full.message_seq));
     writer.field(&opt_u32_bytes(full.wire_item_index));
     writer.field(full.item_ordinal.to_string().as_bytes());
@@ -358,7 +372,7 @@ fn semantic_intent_bytes(full: &FullIntent) -> Vec<u8> {
     writer.field(full.model.as_bytes());
     writer.field(full.kind.as_bytes());
     writer.field(&opt_u64_bytes(full.coverage_through_seq));
-    writer.field(full.context_fingerprint.as_deref().unwrap_or("").as_bytes());
+    writer.optional_field(full.context_fingerprint.as_deref().map(str::as_bytes));
     writer.field(full.eviction_tokens.to_string().as_bytes());
     writer.field(full.eviction_estimator_version.to_string().as_bytes());
     writer.field(full.config_generation.to_string().as_bytes());
@@ -367,32 +381,14 @@ fn semantic_intent_bytes(full: &FullIntent) -> Vec<u8> {
     writer.finish()
 }
 
+fn semantic_intent_bytes(full: &FullIntent) -> Vec<u8> {
+    intent_bytes(full, true)
+}
+
 /// Semantic subset excluding `expected_latest_id`, used to detect a CAS retry
 /// where only the expected-latest witness changed.
 fn stable_intent_bytes(full: &FullIntent) -> Vec<u8> {
-    let mut writer = CanonicalWriter::with_domain(INTENT_HMAC_DOMAIN);
-    writer.field(full.variant.as_bytes());
-    writer.field(full.mutation_id.as_bytes());
-    writer.field(b"");
-    writer.field(&canonical_id_list(&full.invalidate_ids));
-    writer.field(full.provider_context_id.as_bytes());
-    writer.field(full.message_id.as_deref().unwrap_or("").as_bytes());
-    writer.field(&opt_u64_bytes(full.message_seq));
-    writer.field(&opt_u32_bytes(full.wire_item_index));
-    writer.field(full.item_ordinal.to_string().as_bytes());
-    writer.field(full.idempotency_key.as_bytes());
-    writer.field(full.provider_instance_id.as_bytes());
-    writer.field(full.protocol.as_bytes());
-    writer.field(full.model.as_bytes());
-    writer.field(full.kind.as_bytes());
-    writer.field(&opt_u64_bytes(full.coverage_through_seq));
-    writer.field(full.context_fingerprint.as_deref().unwrap_or("").as_bytes());
-    writer.field(full.eviction_tokens.to_string().as_bytes());
-    writer.field(full.eviction_estimator_version.to_string().as_bytes());
-    writer.field(full.config_generation.to_string().as_bytes());
-    writer.field(full.window_ordinal.to_string().as_bytes());
-    writer.field(&full.plaintext_hmac);
-    writer.finish()
+    intent_bytes(full, false)
 }
 
 /// Returns whether the authenticated `expected_latest_id` witness is consistent
@@ -420,6 +416,19 @@ impl CanonicalWriter {
         self.0.extend(bytes);
     }
 
+    /// Writes an optional field with an explicit one-byte presence marker.
+    /// `None` is encoded as `0`; `Some` is encoded as `1` followed by the
+    /// length-delimited value, so `None`/`Some("")`/`Some(0)` are all distinct.
+    fn optional_field(&mut self, bytes: Option<&[u8]>) {
+        match bytes {
+            None => self.0.push(0),
+            Some(bytes) => {
+                self.0.push(1);
+                self.field(bytes);
+            }
+        }
+    }
+
     fn finish(self) -> Vec<u8> {
         self.0
     }
@@ -436,11 +445,27 @@ fn canonical_id_list(ids: &[String]) -> Vec<u8> {
 }
 
 fn opt_u64_bytes(opt: Option<u64>) -> Vec<u8> {
-    opt.map(|v| v.to_string()).unwrap_or_default().into_bytes()
+    let mut bytes = Vec::with_capacity(2);
+    match opt {
+        None => bytes.push(0),
+        Some(value) => {
+            bytes.push(1);
+            bytes.extend(value.to_string().into_bytes());
+        }
+    }
+    bytes
 }
 
 fn opt_u32_bytes(opt: Option<u32>) -> Vec<u8> {
-    opt.map(|v| v.to_string()).unwrap_or_default().into_bytes()
+    let mut bytes = Vec::with_capacity(2);
+    match opt {
+        None => bytes.push(0),
+        Some(value) => {
+            bytes.push(1);
+            bytes.extend(value.to_string().into_bytes());
+        }
+    }
+    bytes
 }
 
 /// A prepared `Replace`/`Invalidate` intent ready to be persisted and applied.
@@ -491,7 +516,6 @@ impl ProviderContextMutationBuilder {
             expected_latest_id,
             sorted,
             None,
-            None,
             0,
             0,
             Vec::new(),
@@ -519,7 +543,6 @@ impl ProviderContextMutationBuilder {
             expected_latest_id,
             sorted,
             Some(insert),
-            Some(plaintext),
             config_generation,
             window_ordinal,
             plaintext_hmac,
@@ -533,7 +556,6 @@ impl ProviderContextMutationBuilder {
         expected_latest_id: Option<String>,
         invalidate_ids: Vec<String>,
         insert: Option<&EncryptedProviderContextRecord>,
-        _plaintext: Option<&ProviderContextItem>,
         config_generation: u64,
         window_ordinal: u64,
         plaintext_hmac: Vec<u8>,
@@ -542,53 +564,39 @@ impl ProviderContextMutationBuilder {
             bail!("provider-context mutation_id must not be empty");
         }
 
-        let record = insert.map(|r| {
-            (
-                r.id.clone(),
-                r.message_id.clone(),
-                r.message_seq,
-                r.wire_item_index,
-                r.item_ordinal,
-                r.idempotency_key.clone(),
-                r.provider_instance_id.clone(),
-                r.protocol.as_str().to_owned(),
-                r.model.clone(),
-                r.kind.as_str().to_owned(),
-                r.coverage_through_seq,
-                r.context_fingerprint.clone(),
-                r.eviction_tokens,
-                r.eviction_estimator_version,
-                r.key_ref.clone(),
-                r.ciphertext.clone(),
-                r.created_at.clone(),
-            )
-        });
-
         let full = FullIntent {
             variant: variant.to_owned(),
             mutation_id: self.mutation_id.clone(),
             expected_latest_id,
             invalidate_ids,
-            provider_context_id: record.as_ref().map(|r| r.0.clone()).unwrap_or_default(),
-            message_id: record.as_ref().and_then(|r| r.1.clone()),
-            message_seq: record.as_ref().and_then(|r| r.2),
-            wire_item_index: record.as_ref().and_then(|r| r.3),
-            item_ordinal: record.as_ref().map(|r| r.4).unwrap_or(1),
-            idempotency_key: record.as_ref().map(|r| r.5.clone()).unwrap_or_default(),
-            provider_instance_id: record.as_ref().map(|r| r.6.clone()).unwrap_or_default(),
-            protocol: record.as_ref().map(|r| r.7.clone()).unwrap_or_default(),
-            model: record.as_ref().map(|r| r.8.clone()).unwrap_or_default(),
-            kind: record.as_ref().map(|r| r.9.clone()).unwrap_or_default(),
-            coverage_through_seq: record.as_ref().and_then(|r| r.10),
-            context_fingerprint: record.as_ref().and_then(|r| r.11.clone()),
-            eviction_tokens: record.as_ref().map(|r| r.12).unwrap_or(0),
-            eviction_estimator_version: record.as_ref().map(|r| r.13).unwrap_or(1),
+            provider_context_id: insert.map(|r| r.id.clone()).unwrap_or_default(),
+            message_id: insert.and_then(|r| r.message_id.clone()),
+            message_seq: insert.and_then(|r| r.message_seq),
+            wire_item_index: insert.and_then(|r| r.wire_item_index),
+            item_ordinal: insert.map(|r| r.item_ordinal).unwrap_or(1),
+            idempotency_key: insert
+                .map(|r| r.idempotency_key.clone())
+                .unwrap_or_default(),
+            provider_instance_id: insert
+                .map(|r| r.provider_instance_id.clone())
+                .unwrap_or_default(),
+            protocol: insert
+                .map(|r| r.protocol.as_str().to_owned())
+                .unwrap_or_default(),
+            model: insert.map(|r| r.model.clone()).unwrap_or_default(),
+            kind: insert
+                .map(|r| r.kind.as_str().to_owned())
+                .unwrap_or_default(),
+            coverage_through_seq: insert.and_then(|r| r.coverage_through_seq),
+            context_fingerprint: insert.and_then(|r| r.context_fingerprint.clone()),
+            eviction_tokens: insert.map(|r| r.eviction_tokens).unwrap_or(0),
+            eviction_estimator_version: insert.map(|r| r.eviction_estimator_version).unwrap_or(1),
             config_generation,
             window_ordinal,
             plaintext_hmac,
-            key_ref: record.as_ref().map(|r| r.14.clone()).unwrap_or_default(),
-            ciphertext: record.as_ref().map(|r| r.15.clone()).unwrap_or_default(),
-            created_at: record.as_ref().map(|r| r.16.clone()).unwrap_or_default(),
+            key_ref: insert.map(|r| r.key_ref.clone()).unwrap_or_default(),
+            ciphertext: insert.map(|r| r.ciphertext.clone()).unwrap_or_default(),
+            created_at: insert.map(|r| r.created_at.clone()).unwrap_or_default(),
         };
 
         let intent_key = hkdf_intent_hmac_key(&self.mutation_key, &self.scope.conversation_id);
@@ -649,16 +657,18 @@ impl<'a> ProviderContextMutationApplier<'a> {
         expected_hmac: &[u8],
         label: &str,
     ) -> Result<FullIntent> {
-        let mut full_json = decrypt_content(mutation_key, ciphertext, aad)
-            .with_context(|| format!("failed to decrypt {label} mutation intent"))?;
+        let mut full_json = Zeroizing::new(
+            decrypt_content(mutation_key, ciphertext, aad)
+                .with_context(|| format!("failed to decrypt {label} mutation intent"))?,
+        );
         let full: FullIntent = serde_json::from_slice(&full_json)
             .with_context(|| format!("{label} mutation intent is invalid"))?;
-        full_json.zeroize();
         let semantic = semantic_intent_bytes(&full);
         let recomputed = hmac_sha256(intent_key, INTENT_HMAC_DOMAIN, &semantic);
-        if recomputed != expected_hmac {
+        if recomputed.as_slice().ct_eq(expected_hmac).unwrap_u8() != 1 {
             bail!("{label} provider-context mutation intent HMAC mismatch");
         }
+        full_json.zeroize();
         Ok(full)
     }
 
@@ -827,17 +837,18 @@ impl<'a> ProviderContextMutationApplier<'a> {
             mutation_id,
             DataKeyPurpose::Mutation,
         );
-        let mut full_json = decrypt_content(&mutation_key, &intent_ciphertext, &aad)?;
+        let mut full_json =
+            Zeroizing::new(decrypt_content(&mutation_key, &intent_ciphertext, &aad)?);
         let full: FullIntent = serde_json::from_slice(&full_json)
             .context("failed to deserialize full mutation intent")?;
-        full_json.zeroize();
 
         let semantic = semantic_intent_bytes(&full);
         let intent_key = hkdf_intent_hmac_key(&mutation_key, &self.store.scope().conversation_id);
         let recomputed = hmac_sha256(&intent_key, INTENT_HMAC_DOMAIN, &semantic);
-        if recomputed != stored_hmac {
+        if recomputed.as_slice().ct_eq(&stored_hmac).unwrap_u8() != 1 {
             bail!("provider-context mutation intent HMAC mismatch");
         }
+        full_json.zeroize();
 
         let outcome = self
             .apply_intent(&mut transaction, &full, mutation_id, &intent_key)
@@ -886,8 +897,8 @@ impl<'a> ProviderContextMutationApplier<'a> {
                     });
             }
 
-            let candidate_gen = i64::try_from(full.config_generation).unwrap_or(i64::MAX);
-            let candidate_ord = i64::try_from(full.window_ordinal).unwrap_or(i64::MAX);
+            let candidate_gen = sqlite_i64(full.config_generation, "config_generation")?;
+            let candidate_ord = sqlite_i64(full.window_ordinal, "window_ordinal")?;
 
             if let Some((head_gen, head_ord, head_id)) = head {
                 if (candidate_gen, candidate_ord) < (head_gen, head_ord) {
@@ -948,7 +959,8 @@ impl<'a> ProviderContextMutationApplier<'a> {
             .bind(full.message_id.as_ref())
             .bind(
                 full.message_seq
-                    .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+                    .map(|v| sqlite_i64(v, "provider_context.message_seq"))
+                    .transpose()?,
             )
             .bind(full.wire_item_index.map(i64::from))
             .bind(i64::from(full.item_ordinal))
@@ -959,12 +971,16 @@ impl<'a> ProviderContextMutationApplier<'a> {
             .bind(&full.kind)
             .bind(
                 full.coverage_through_seq
-                    .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+                    .map(|v| sqlite_i64(v, "provider_context.coverage_through_seq"))
+                    .transpose()?,
             )
             .bind(full.context_fingerprint.as_ref())
             .bind(&full.key_ref)
             .bind(&full.ciphertext)
-            .bind(i64::try_from(full.eviction_tokens).unwrap_or(i64::MAX))
+            .bind(sqlite_i64(
+                full.eviction_tokens,
+                "provider_context.eviction_tokens",
+            )?)
             .bind(i64::from(full.eviction_estimator_version))
             .bind(&full.created_at)
             .execute(&mut **transaction)
@@ -1068,8 +1084,8 @@ impl<'a> ProviderContextMutationApplier<'a> {
             return Ok(true);
         }
 
-        let candidate_gen = i64::try_from(full.config_generation).unwrap_or(i64::MAX);
-        let candidate_ord = i64::try_from(full.window_ordinal).unwrap_or(i64::MAX);
+        let candidate_gen = sqlite_i64(full.config_generation, "config_generation")?;
+        let candidate_ord = sqlite_i64(full.window_ordinal, "window_ordinal")?;
 
         match head {
             None => Ok(true),
@@ -1126,20 +1142,22 @@ impl<'a> ProviderContextMutationApplier<'a> {
                 .fetch_optional(&mut **transaction)
                 .await?;
 
-        if let Some(batch_id) = batch_id {
-            let updated = sqlx::query(
-                "UPDATE memory_batches
-                 SET eviction_footprint_tokens = eviction_footprint_tokens - ?
-                 WHERE id = ? AND eviction_footprint_tokens >= ?",
-            )
-            .bind(tokens)
-            .bind(&batch_id)
-            .bind(tokens)
-            .execute(&mut **transaction)
-            .await?;
-            if updated.rows_affected() != 1 {
-                bail!("batch footprint underflow for {batch_id}");
-            }
+        let Some(batch_id) = batch_id else {
+            return Ok(());
+        };
+        let row = sqlx::query(
+            "UPDATE memory_batches
+             SET eviction_footprint_tokens = eviction_footprint_tokens - ?
+             WHERE id = ? AND eviction_footprint_tokens >= ?
+             RETURNING eviction_footprint_tokens",
+        )
+        .bind(tokens)
+        .bind(&batch_id)
+        .bind(tokens)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        if row.is_none() {
+            bail!("batch {batch_id} footprint underflow or missing when subtracting {tokens}");
         }
         Ok(())
     }
@@ -1225,7 +1243,7 @@ mod tests {
              ) VALUES(?, ?, 'user', ?, X'00', '{}', '', 1, 0, 'now')",
         )
         .bind(id)
-        .bind(i64::try_from(seq).unwrap_or(i64::MAX))
+        .bind(sqlite_i64(seq, "messages.seq")?)
         .bind(&key.key_ref)
         .execute(store.pool())
         .await?;

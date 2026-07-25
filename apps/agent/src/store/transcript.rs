@@ -11,12 +11,18 @@
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 
-use crate::provider::types::PublicMessage;
+use crate::provider::types::{PublicAssistantMessage, PublicMessage};
 
 use super::redactor::search_text_from_projection;
 use super::{AgentScope, DataKeyMaterial, DataKeyPurpose, PublicProjectionBuilder, Redactor};
 
-#[derive(Debug)]
+fn message_interrupted(message: &PublicMessage) -> bool {
+    match message {
+        PublicMessage::Assistant(PublicAssistantMessage { interrupted, .. }) => *interrupted,
+        _ => false,
+    }
+}
+
 pub(crate) struct TranscriptRecord {
     id: String,
     seq: u64,
@@ -35,7 +41,6 @@ impl TranscriptRecord {
         message: &PublicMessage,
         id: impl Into<String>,
         seq: u64,
-        interrupted: bool,
         data_key: &DataKeyMaterial,
         scope: &AgentScope,
         redactor: &Redactor,
@@ -46,6 +51,7 @@ impl TranscriptRecord {
 
         let id = id.into();
         let role = public_message_role(message);
+        let interrupted = message_interrupted(message);
         let aad = scope.row_aad("messages", &id, DataKeyPurpose::Transcript);
         let protected = PublicProjectionBuilder::new(redactor, data_key)
             .build(message, &aad)
@@ -161,6 +167,14 @@ mod tests {
         })
     }
 
+    fn interrupted_message_fixture() -> PublicMessage {
+        let mut message = message_fixture();
+        if let PublicMessage::Assistant(ref mut assistant) = message {
+            assistant.interrupted = true;
+        }
+        message
+    }
+
     #[tokio::test]
     async fn transcript_record_rejects_non_transcript_key() {
         let store = store().await;
@@ -173,18 +187,16 @@ mod tests {
             &message_fixture(),
             "message-1",
             1,
-            false,
             &event_key,
             &scope(),
             &redactor,
         );
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("transcript data key")
-        );
+        match result {
+            Err(error) => {
+                assert!(error.to_string().contains("transcript data key"));
+            }
+            Ok(_) => panic!("expected encryption to fail with a non-transcript key"),
+        }
     }
 
     #[tokio::test]
@@ -199,7 +211,6 @@ mod tests {
             &message_fixture(),
             "message-1",
             7,
-            false,
             &transcript_key,
             &scope(),
             &redactor,
@@ -250,16 +261,9 @@ mod tests {
             .await
             .expect("mint key");
         let redactor = Redactor::v1();
-        let record = TranscriptRecord::encrypt(
-            &message,
-            "message-secret",
-            1,
-            false,
-            &key,
-            &scope(),
-            &redactor,
-        )
-        .expect("encrypt secret transcript");
+        let record =
+            TranscriptRecord::encrypt(&message, "message-secret", 1, &key, &scope(), &redactor)
+                .expect("encrypt secret transcript");
         record.insert(store.pool()).await.expect("insert");
 
         let search: String = sqlx::query_scalar("SELECT search_text FROM messages WHERE id = ?")
@@ -283,7 +287,6 @@ mod tests {
             &message_fixture(),
             "message-fts",
             1,
-            false,
             &key,
             &scope(),
             &redactor,
@@ -332,5 +335,35 @@ mod tests {
                 .await
                 .expect("probe fts after delete");
         assert_eq!(remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn transcript_record_derives_interrupted_from_public_message() {
+        let store = store().await;
+        let key = store
+            .conversation_key(DataKeyPurpose::Transcript)
+            .await
+            .expect("mint key");
+        let redactor = Redactor::v1();
+        let record = TranscriptRecord::encrypt(
+            &interrupted_message_fixture(),
+            "message-interrupted",
+            1,
+            &key,
+            &scope(),
+            &redactor,
+        )
+        .expect("encrypt interrupted transcript");
+        record.insert(store.pool()).await.expect("insert");
+
+        let interrupted: bool = sqlx::query_scalar("SELECT interrupted FROM messages WHERE id = ?")
+            .bind("message-interrupted")
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch interrupted flag");
+        assert!(
+            interrupted,
+            "interrupted must be derived from PublicMessage"
+        );
     }
 }

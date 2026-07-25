@@ -24,7 +24,8 @@ use crate::{
         CommandRejectReason, InboundCommand, KeyedCommandDigest, RejectedCommandPayload,
     },
     provider::types::{
-        ProviderContextAnchor, ProviderContextFragment, ProviderContextItem, PublicMessage,
+        ApiProtocol, ProviderContextAnchor, ProviderContextFragment, ProviderContextItem,
+        ProviderContextPayload, PublicAssistantContent, PublicAssistantMessage, PublicMessage,
         StopReason, ToolResultMessage,
     },
     runtime::contracts::{GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease},
@@ -706,7 +707,7 @@ impl ApplicationKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RunPhase {
     Received,
@@ -1415,23 +1416,6 @@ impl EventWriter {
         mut batch: EventBatch,
     ) -> Result<(ApplyReceiptOutcome, Vec<u64>)> {
         receipt.validate_for(lease, fence)?;
-        let already_present: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM physical_recovery_receipt_applications WHERE receipt_id = ?",
-        )
-        .bind(&receipt.receipt_id)
-        .fetch_one(self.store.pool())
-        .await?;
-        if already_present {
-            // Exact replay is deliberately reduced to an eventless receipt
-            // projection.  A caller cannot append a second logical suffix for
-            // an already-applied receipt.
-            batch.writes = vec![EventWrite {
-                event: None,
-                projections: vec![Projection::PhysicalRecovery(receipt)],
-            }];
-            let seqs = self.apply(batch).await?;
-            return Ok((ApplyReceiptOutcome::AlreadyApplied, seqs));
-        }
         let mut has_receipt_projection = false;
         for projection in batch.writes.iter().flat_map(|write| &write.projections) {
             if let Projection::PhysicalRecovery(existing) = projection {
@@ -1447,11 +1431,17 @@ impl EventWriter {
                 projections: vec![Projection::PhysicalRecovery(receipt)],
             });
         }
+        // Idempotency is decided inside the same SQLite transaction as the
+        // application ledger write (PhysicalRecoveryApplier::apply_in_transaction).
+        // Reading `already_present` outside the transaction would create a TOCTOU
+        // window where two callers could both observe the receipt as new.
         let seqs = self.apply(batch).await?;
-        // A fresh application is the only outcome possible for a newly
-        // appended suffix.  Replay-only batches are handled by the physical
-        // projection as an authenticated no-op and return no event sequences.
-        Ok((ApplyReceiptOutcome::Applied, seqs))
+        let outcome = if seqs.is_empty() {
+            ApplyReceiptOutcome::AlreadyApplied
+        } else {
+            ApplyReceiptOutcome::Applied
+        };
+        Ok((outcome, seqs))
     }
 
     #[cfg(test)]
@@ -2409,6 +2399,51 @@ impl EventWriter {
         })
     }
 
+    fn validate_provider_context_fragment(
+        fragment: &ProviderContextFragment,
+        assistant: &PublicAssistantMessage,
+    ) -> Result<()> {
+        match &fragment.payload {
+            ProviderContextPayload::OpenAiCompactedWindow { .. }
+            | ProviderContextPayload::AnthropicCompaction { .. } => {
+                if fragment.wire_item_index.is_some() {
+                    bail!(
+                        "native compaction provider context must be unanchored (wire_item_index=None)"
+                    );
+                }
+            }
+            ProviderContextPayload::EncryptedReasoning { protocol, .. } => {
+                let Some(wire_item_index) = fragment.wire_item_index else {
+                    bail!(
+                        "encrypted reasoning provider context must be anchored to a wire_item_index"
+                    );
+                };
+                if *protocol != assistant.origin.protocol {
+                    bail!(
+                        "encrypted reasoning protocol {:?} does not match assistant origin protocol {:?}",
+                        protocol,
+                        assistant.origin.protocol
+                    );
+                }
+                if *protocol == ApiProtocol::AnthropicMessages
+                    && !assistant.content.iter().any(|content| {
+                        matches!(
+                            content,
+                            PublicAssistantContent::Thinking { wire_item_index: index, .. }
+                                if *index == wire_item_index
+                        )
+                    })
+                {
+                    bail!(
+                        "Anthropic encrypted reasoning wire_item_index {wire_item_index} \
+                         does not match a public Thinking wire slot"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn prepare_provider_context(
         &self,
         message_id: &str,
@@ -2437,6 +2472,8 @@ impl EventWriter {
         let mut eviction_footprint_tokens = 0u64;
         let mut ordinal_counter: HashMap<Option<u32>, u32> = HashMap::new();
         for fragment in fragments {
+            Self::validate_provider_context_fragment(&fragment, assistant)?;
+
             let next = ordinal_counter.entry(fragment.wire_item_index).or_insert(1);
             let ordinal = *next;
             *next += 1;
@@ -4589,6 +4626,8 @@ fn projection_size_upper_bound(projection: &Projection) -> Result<usize> {
             .receipt_id
             .len()
             .saturating_add(receipt.digest.len())
+            .saturating_add(receipt.lease.lease_id().len())
+            .saturating_add(receipt.fence.fence_id().len())
             .saturating_add(
                 receipt
                     .intents
@@ -7781,14 +7820,11 @@ async fn apply_plain_projection(
             apply_approval_mutation(transaction, mutation).await?;
         }
         Projection::PhysicalRecovery(receipt) => {
-            let outcome = PhysicalRecoveryApplier::new(store)
+            // apply_in_transaction validates the receipt, rejects logical writes
+            // on replay, and returns AlreadyApplied for idempotent replays.
+            PhysicalRecoveryApplier::new(store)
                 .apply_in_transaction(transaction, &receipt, batch_event_seqs)
                 .await?;
-            if outcome == ApplyReceiptOutcome::AlreadyApplied {
-                // A replay must not be allowed to re-emit or mutate logical
-                // rows. EventWriter still validates the receipt, then this
-                // projection is an authenticated no-op.
-            }
         }
         #[cfg(test)]
         Projection::SizePadding(_) => {}
@@ -18094,7 +18130,8 @@ mod tests {
 
         let rows = sqlx::query(
             "SELECT id, message_id, message_seq, item_ordinal, wire_item_index, kind,
-                    coverage_through_seq, context_fingerprint, eviction_tokens
+                    coverage_through_seq, context_fingerprint, eviction_tokens,
+                    key_ref, ciphertext
              FROM provider_context
              WHERE message_id = ?
              ORDER BY id",
@@ -18152,6 +18189,55 @@ mod tests {
             message_seq > 0,
             "provider context must be bound to message seq"
         );
+
+        // Plaintext must never appear in any textual column; ciphertext is opaque.
+        let mut leak_check = String::new();
+        for row in &rows {
+            let id: String = row.get("id");
+            let message_id: Option<String> = row.get("message_id");
+            let context_fingerprint: Option<String> = row.get("context_fingerprint");
+            leak_check.push_str(&id);
+            if let Some(value) = message_id {
+                leak_check.push_str(&value);
+            }
+            if let Some(value) = context_fingerprint {
+                leak_check.push_str(&value);
+            }
+        }
+        for secret in ["plain reasoning", "compact"] {
+            assert!(
+                !leak_check.contains(secret),
+                "provider_context textual columns leaked plaintext: {secret}"
+            );
+        }
+
+        // Round-trip: decrypt each record and verify it matches the original item.
+        for row in &rows {
+            let id: String = row.get("id");
+            let key_ref: String = row.get("key_ref");
+            let ciphertext: Vec<u8> = row.get("ciphertext");
+            let data_key = store
+                .data_key_by_ref(&key_ref)
+                .await
+                .expect("provider-context data key");
+            let aad =
+                store
+                    .scope()
+                    .row_aad("provider_context", &id, DataKeyPurpose::ProviderContext);
+            let plaintext = decrypt_content(&data_key, &ciphertext, &aad)
+                .expect("decrypt provider-context ciphertext");
+            let item: ProviderContextItem =
+                serde_json::from_slice(&plaintext).expect("deserialize provider-context plaintext");
+            match &item.payload {
+                ProviderContextPayload::EncryptedReasoning { item, .. } => {
+                    assert_eq!(item.get("text"), Some(&json!("plain reasoning")));
+                }
+                ProviderContextPayload::OpenAiCompactedWindow { items, .. } => {
+                    assert_eq!(items, &vec![json!({"summary": "compact"})]);
+                }
+                _ => panic!("unexpected provider-context payload"),
+            }
+        }
     }
 
     #[cfg(not(unix))]
@@ -18319,13 +18405,12 @@ mod tests {
     async fn memory_maintenance_event_is_persisted_and_recovered() {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
+        let kind = "compact_applied";
         let batch = EventBatch {
             writes: vec![EventWrite {
                 event: Some(
-                    DurableEvent::new(
-                        &json!({"type": "memory_maintenance", "kind": "compact_applied"}),
-                    )
-                    .expect("typed memory maintenance event"),
+                    DurableEvent::new(&json!({"type": "memory_maintenance", "kind": kind}))
+                        .expect("typed memory maintenance event"),
                 ),
                 projections: Vec::new(),
             }],
@@ -18333,9 +18418,50 @@ mod tests {
         };
         let seqs = writer.apply(batch).await.expect("apply memory maintenance");
         assert_eq!(seqs, vec![1]);
-        SuffixRecovery::plan(&store)
+
+        let row = sqlx::query(
+            "SELECT event_type, internal_metadata, envelope FROM agent_events WHERE seq = 1",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("fetch memory maintenance event");
+        assert_eq!(
+            row.try_get::<String, _>("event_type").unwrap(),
+            "memory_maintenance"
+        );
+        let internal_metadata: String = row.try_get("internal_metadata").unwrap();
+        assert!(serde_json::from_str::<Value>(&internal_metadata).is_ok());
+        let envelope: String = row.try_get("envelope").unwrap();
+        assert!(envelope.contains("\"kind\":\"compact_applied\""));
+
+        let steps = SuffixRecovery::plan(&store)
             .await
             .expect("recovery accepts memory maintenance");
+        assert!(
+            steps.is_empty(),
+            "no pending commands means empty recovery plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_maintenance_rejects_empty_kind() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let batch = EventBatch {
+            writes: vec![EventWrite {
+                event: Some(
+                    DurableEvent::new(&json!({"type": "memory_maintenance", "kind": ""}))
+                        .expect("typed memory maintenance event"),
+                ),
+                projections: Vec::new(),
+            }],
+            injected_commands: Vec::new(),
+        };
+        let error = writer
+            .apply(batch)
+            .await
+            .expect_err("empty MemoryMaintenance kind must be rejected");
+        assert!(error.to_string().contains("kind must not be empty"));
     }
 
     #[tokio::test]
@@ -18502,5 +18628,541 @@ mod tests {
                 .to_string()
                 .contains("eviction_footprint_tokens mismatch")
         );
+    }
+
+    #[tokio::test]
+    async fn message_end_accepts_sparse_openai_responses_reasoning() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000090";
+        let injected = classified_injection(&writer, 1, command_id, "ignored", "responses").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "responses"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("open assistant owner turn");
+
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let message = PublicMessage::Assistant(PublicAssistantMessage {
+            content: Vec::new(),
+            model: "test-model".to_owned(),
+            provider: "test-provider".to_owned(),
+            origin: ProviderOrigin {
+                provider_instance_id: "test-instance".to_owned(),
+                protocol: ApiProtocol::OpenAiResponses,
+                model: "test-model".to_owned(),
+            },
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: durable_test_timestamp(),
+        });
+        let message_id = "assistant-responses-opaque";
+        let fragment = ProviderContextFragment {
+            wire_item_index: Some(99),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiResponses,
+                item: json!({"encrypted_content": "opaque"}),
+            },
+        };
+        let footprint = ProviderContextEvictionEstimate::from_payload(&fragment.payload).tokens;
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist assistant start");
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_end",
+                            message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageEnd"),
+                    ),
+                    projections: vec![Projection::MessageEnd {
+                        message_id: message_id.to_owned(),
+                        role: "assistant",
+                        message,
+                        append_to_l0: true,
+                        provider_context: vec![fragment],
+                        eviction_footprint_tokens: footprint,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("sparse Responses encrypted reasoning must be accepted");
+    }
+
+    #[tokio::test]
+    async fn message_end_rejects_native_compaction_with_wire_item_index() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000091";
+        let injected = classified_injection(&writer, 1, command_id, "ignored", "native").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "native"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("open assistant owner turn");
+
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let message = assistant_message(StopReason::Stop);
+        let message_id = "assistant-native-anchored";
+        let fragment = ProviderContextFragment {
+            wire_item_index: Some(0),
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({"summary": "compact"})],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 1,
+                    context_fingerprint: "fp".to_owned(),
+                },
+            },
+        };
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist assistant start");
+
+        let error = writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_end",
+                            message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageEnd"),
+                    ),
+                    projections: vec![Projection::MessageEnd {
+                        message_id: message_id.to_owned(),
+                        role: "assistant",
+                        message,
+                        append_to_l0: true,
+                        provider_context: vec![fragment],
+                        eviction_footprint_tokens: 0,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("native compaction must not carry a wire_item_index");
+        assert!(error.to_string().contains("unanchored"));
+    }
+
+    #[tokio::test]
+    async fn message_end_rejects_encrypted_reasoning_without_wire_item_index() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000092";
+        let injected = classified_injection(&writer, 1, command_id, "ignored", "noanchor").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "noanchor"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("open assistant owner turn");
+
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let message = assistant_message(StopReason::Stop);
+        let message_id = "assistant-unanchored-reasoning";
+        let fragment = ProviderContextFragment {
+            wire_item_index: None,
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiChatCompletions,
+                item: json!({"text": "opaque reasoning"}),
+            },
+        };
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist assistant start");
+
+        let error = writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_end",
+                            message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageEnd"),
+                    ),
+                    projections: vec![Projection::MessageEnd {
+                        message_id: message_id.to_owned(),
+                        role: "assistant",
+                        message,
+                        append_to_l0: true,
+                        provider_context: vec![fragment],
+                        eviction_footprint_tokens: 0,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("encrypted reasoning must be anchored");
+        assert!(error.to_string().contains("anchored"));
+    }
+
+    #[tokio::test]
+    async fn message_end_rejects_encrypted_reasoning_protocol_mismatch() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000093";
+        let injected = classified_injection(&writer, 1, command_id, "ignored", "mismatch").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "mismatch"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("open assistant owner turn");
+
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let message = assistant_message(StopReason::Stop);
+        let message_id = "assistant-protocol-mismatch";
+        let fragment = ProviderContextFragment {
+            wire_item_index: Some(0),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiResponses,
+                item: json!({"text": "opaque reasoning"}),
+            },
+        };
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist assistant start");
+
+        let error = writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_end",
+                            message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageEnd"),
+                    ),
+                    projections: vec![Projection::MessageEnd {
+                        message_id: message_id.to_owned(),
+                        role: "assistant",
+                        message,
+                        append_to_l0: true,
+                        provider_context: vec![fragment],
+                        eviction_footprint_tokens: 0,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("encrypted reasoning protocol must match assistant origin");
+        assert!(error.to_string().contains("protocol"));
+    }
+
+    #[tokio::test]
+    async fn message_end_accepts_anthropic_encrypted_reasoning_with_thinking_slot() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000094";
+        let injected = classified_injection(&writer, 1, command_id, "ignored", "anthropic").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "anthropic"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("open assistant owner turn");
+
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let message = PublicMessage::Assistant(PublicAssistantMessage {
+            content: vec![PublicAssistantContent::Thinking {
+                thinking: "redacted".to_owned(),
+                signature_field: "signature".to_owned(),
+                wire_item_index: 7,
+            }],
+            model: "test-model".to_owned(),
+            provider: "test-provider".to_owned(),
+            origin: ProviderOrigin {
+                provider_instance_id: "test-instance".to_owned(),
+                protocol: ApiProtocol::AnthropicMessages,
+                model: "test-model".to_owned(),
+            },
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: durable_test_timestamp(),
+        });
+        let message_id = "assistant-anthropic-signature";
+        let fragment = ProviderContextFragment {
+            wire_item_index: Some(7),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::AnthropicMessages,
+                item: json!({"signature": "opaque-signature"}),
+            },
+        };
+        let footprint = ProviderContextEvictionEstimate::from_payload(&fragment.payload).tokens;
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist assistant start");
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_end",
+                            message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageEnd"),
+                    ),
+                    projections: vec![Projection::MessageEnd {
+                        message_id: message_id.to_owned(),
+                        role: "assistant",
+                        message,
+                        append_to_l0: true,
+                        provider_context: vec![fragment],
+                        eviction_footprint_tokens: footprint,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("Anthropic encrypted reasoning must match a public Thinking wire slot");
+    }
+
+    #[tokio::test]
+    async fn message_end_rejects_anthropic_encrypted_reasoning_without_thinking_slot() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000095";
+        let injected =
+            classified_injection(&writer, 1, command_id, "ignored", "anthropic-bad").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "anthropic-bad"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("open assistant owner turn");
+
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let message = PublicMessage::Assistant(PublicAssistantMessage {
+            content: vec![PublicAssistantContent::Text {
+                text: "answer".to_owned(),
+                wire_item_index: 0,
+            }],
+            model: "test-model".to_owned(),
+            provider: "test-provider".to_owned(),
+            origin: ProviderOrigin {
+                provider_instance_id: "test-instance".to_owned(),
+                protocol: ApiProtocol::AnthropicMessages,
+                model: "test-model".to_owned(),
+            },
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: durable_test_timestamp(),
+        });
+        let message_id = "assistant-anthropic-no-thinking";
+        let fragment = ProviderContextFragment {
+            wire_item_index: Some(0),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::AnthropicMessages,
+                item: json!({"signature": "opaque-signature"}),
+            },
+        };
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist assistant start");
+
+        let error = writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_end",
+                            message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageEnd"),
+                    ),
+                    projections: vec![Projection::MessageEnd {
+                        message_id: message_id.to_owned(),
+                        role: "assistant",
+                        message,
+                        append_to_l0: true,
+                        provider_context: vec![fragment],
+                        eviction_footprint_tokens: 0,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("Anthropic encrypted reasoning must match a Thinking wire slot");
+        assert!(error.to_string().contains("Thinking wire slot"));
     }
 }

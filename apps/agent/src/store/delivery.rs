@@ -138,9 +138,19 @@ impl DeliveryPump {
             epoch: epoch.clone(),
         };
 
-        let head_seq = current_event_head_seq(self.store.pool()).await?;
-        if head_seq >= catch_up_from_seq {
-            send_event_range(&self.store, &self.channel, catch_up_from_seq, head_seq).await?;
+        let head_seq = match current_event_head_seq(self.store.pool()).await {
+            Ok(seq) => seq,
+            Err(err) => {
+                self.state = PumpState::Idle;
+                return Err(err);
+            }
+        };
+        if head_seq >= catch_up_from_seq
+            && let Err(err) =
+                send_event_range(&self.store, &self.channel, catch_up_from_seq, head_seq).await
+        {
+            self.state = PumpState::Idle;
+            return Err(err);
         }
 
         self.state = PumpState::Online { epoch };
@@ -162,8 +172,8 @@ impl DeliveryPump {
     }
 
     pub(crate) async fn on_volatile(&mut self, event: AgentEvent) -> Result<()> {
-        if event.durable_kind().is_some() {
-            bail!("volatile delivery rejected durable event {event:?}");
+        if let Some(kind) = event.durable_kind() {
+            bail!("volatile delivery rejected durable event of kind {kind}");
         }
         if !self.is_online() {
             return Ok(());
@@ -199,8 +209,8 @@ async fn send_event_range(
          WHERE seq >= ? AND seq <= ?
          ORDER BY seq",
     )
-    .bind(i64::try_from(first_seq).unwrap_or(i64::MAX))
-    .bind(i64::try_from(last_seq).unwrap_or(i64::MAX))
+    .bind(i64::try_from(first_seq).context("first_seq exceeds SQLite INTEGER range")?)
+    .bind(i64::try_from(last_seq).context("last_seq exceeds SQLite INTEGER range")?)
     .fetch_all(store.pool())
     .await
     .context("failed to fetch durable events for delivery")?;
@@ -216,12 +226,10 @@ async fn send_event_range(
         let (raw, projection) = match channel.mode {
             DeliveryMode::RedactionOnly => (None, Some(envelope)),
             DeliveryMode::Raw => {
-                let raw = decrypt_event(store, seq, &key_ref, &ciphertext).await.ok();
-                if let Some(event) = raw {
-                    (Some(event), None)
-                } else {
-                    (None, Some(envelope))
-                }
+                let raw = decrypt_event(store, seq, &key_ref, &ciphertext)
+                    .await
+                    .context("failed to decrypt durable event for raw delivery")?;
+                (Some(raw), None)
             }
         };
 
@@ -539,7 +547,45 @@ mod tests {
                 .is_err()
         );
 
-        let error = pump.on_volatile(assistant_event("msg-x", "x")).await;
-        assert!(error.is_err());
+        let result = pump.on_volatile(assistant_event("msg-x", "x")).await;
+        match result {
+            Err(error) => {
+                let message = format!("{error:#}");
+                assert!(
+                    message.contains("of kind message_end"),
+                    "error must identify event kind without exposing payload: {message}"
+                );
+                assert!(
+                    !message.contains("sk-"),
+                    "error must not leak event contents"
+                );
+            }
+            Ok(_) => panic!("on_volatile must reject a durable event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_decrypt_failure_returns_error_and_resets_to_idle() {
+        let store = store().await;
+        let event = assistant_event("msg-1", "hello");
+        insert_test_durable_event(&store, 1, &event).await.unwrap();
+
+        // Corrupt the durable raw ciphertext so decryption fails.
+        sqlx::query("UPDATE agent_events SET raw_ciphertext = ? WHERE seq = 1")
+            .bind(vec![0u8; 16])
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let (channel, _receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
+        let mut pump = DeliveryPump::new(store.clone(), channel);
+        let result = pump
+            .install_epoch(DeliveryEpoch::new("epoch-1").unwrap(), 1)
+            .await;
+        assert!(result.is_err(), "raw decrypt failure must propagate");
+        assert!(
+            pump.epoch().is_none(),
+            "failed install_epoch must reset pump to Idle"
+        );
     }
 }

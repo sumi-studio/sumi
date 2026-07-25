@@ -5,7 +5,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -213,7 +213,7 @@ pub(crate) struct MemoryJobRecord {
     pub kind: MemoryJobKind,
     pub batch_seq: i64,
     pub source_ids: Vec<String>,
-    pub source_versions: HashMap<String, i64>,
+    pub source_versions: BTreeMap<String, i64>,
     pub status: MemoryJobStatus,
     pub attempts: i64,
     pub result: Option<MemoryJobResult>,
@@ -227,8 +227,9 @@ impl MemoryJobRecord {
         kind: MemoryJobKind,
         batch_seq: i64,
         source_ids: Vec<String>,
-        source_versions: HashMap<String, i64>,
+        source_versions: BTreeMap<String, i64>,
     ) -> Self {
+        let now = Utc::now().to_rfc3339();
         Self {
             id: id.into(),
             kind,
@@ -238,8 +239,8 @@ impl MemoryJobRecord {
             status: MemoryJobStatus::Pending,
             attempts: 0,
             result: None,
-            created_at: Utc::now().to_rfc3339(),
-            updated_at: Utc::now().to_rfc3339(),
+            created_at: now.clone(),
+            updated_at: now,
         }
     }
 
@@ -322,11 +323,12 @@ impl MemoryApplyCursorRecord {
         let updated = sqlx::query(
             "UPDATE memory_apply_cursors
              SET next_batch_seq = ?
-             WHERE kind = ? AND next_batch_seq = ?",
+             WHERE kind = ? AND next_batch_seq = ? AND ? >= next_batch_seq",
         )
         .bind(self.next_batch_seq)
         .bind(&self.kind)
         .bind(expected)
+        .bind(self.next_batch_seq)
         .execute(executor)
         .await
         .context("failed to advance memory apply cursor")?;
@@ -364,7 +366,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     use sqlx::Row;
 
@@ -520,7 +522,7 @@ mod tests {
             MemoryJobKind::CompactL0,
             1,
             vec!["batch-1".to_owned()],
-            HashMap::new(),
+            BTreeMap::new(),
         );
         job.insert(store.pool()).await.unwrap();
 
@@ -529,7 +531,7 @@ mod tests {
             MemoryJobKind::CompactL0,
             1,
             vec!["batch-2".to_owned()],
-            HashMap::new(),
+            BTreeMap::new(),
         );
         assert!(duplicate.insert(store.pool()).await.is_err());
 
