@@ -9404,6 +9404,8 @@ mod tests {
                                 role: "assistant",
                                 message: assistant_msg.clone(),
                                 append_to_l0: assistant_append_to_l0,
+                                provider_context: Vec::new(),
+                                eviction_footprint_tokens: 0,
                             }],
                         },
                     ],
