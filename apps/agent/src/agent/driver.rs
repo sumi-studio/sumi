@@ -456,11 +456,11 @@ mod tests {
         let mut pair_digest = [0_u8; 64];
         pair_digest[..32].copy_from_slice(&assistant_digest);
         pair_digest[32..].copy_from_slice(&tool_call_digest);
-        let namespace = uuid::Uuid::from_bytes([
-            0x73, 0x75, 0x6d, 0x69, 0xa4, 0xc1, 0x48, 0x22, 0x91, 0x5d, 0xb5, 0xd2, 0x5a, 0x69,
-            0x9f, 0x31,
-        ]);
-        uuid::Uuid::new_v5(&namespace, &pair_digest).to_string()
+        uuid::Uuid::new_v5(
+            &super::super::run::TOOL_RESULT_MESSAGE_ID_NAMESPACE,
+            &pair_digest,
+        )
+        .to_string()
     }
 
     struct FakeTool {

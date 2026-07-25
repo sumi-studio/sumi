@@ -6545,7 +6545,7 @@ impl RunDriver for TurnEndKillDriver {
         _attempt: usize,
         _context: &[ContextMessage],
         _command_received_at: Option<std::time::Instant>,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
         self.provider_started.notify_one();
         let (tx, rx) = mpsc::channel(8);
@@ -6578,7 +6578,7 @@ impl RunDriver for TurnEndKillDriver {
         Ok(ProviderAttempt {
             message_id: "turn-end-assistant".to_owned(),
             initial_message: bridge_assistant(StopReason::Stop),
-            events: ProviderEventStream::new(rx, _cancel, "fixture", Self::origin()),
+            events: ProviderEventStream::new(rx, cancel, "fixture", Self::origin()),
         })
     }
 
@@ -7301,4 +7301,33 @@ async fn t16_active_abort_provider_is_atomic_before_and_after_commit() {
             .await
             .expect("remove kill-restart fixture");
     }
+}
+
+#[tokio::test]
+async fn control_acceptance_selects_accepted_or_phase_change() {
+    use tokio::sync::watch;
+
+    // Phase change before accepted returns false without awaiting accepted.
+    let (phase_tx, mut phase_rx) = watch::channel(WorkerPhase::Active);
+    let (_accepted_tx, accepted_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        phase_tx.send(WorkerPhase::RetryWait).ok();
+    });
+    let accepted = super::await_control_acceptance(&mut phase_rx, accepted_rx).await;
+    assert!(!accepted, "phase change must close the control acceptance");
+
+    // Accepted true returns true without waiting for a phase change.
+    let (_phase_tx, mut phase_rx) = watch::channel(WorkerPhase::Active);
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    accepted_tx.send(true).ok();
+    let accepted = super::await_control_acceptance(&mut phase_rx, accepted_rx).await;
+    assert!(accepted, "accepted=true must win the control acceptance");
+
+    // Closed accepted channel returns false rather than hanging.
+    let (_phase_tx, mut phase_rx) = watch::channel(WorkerPhase::Active);
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    drop(accepted_tx);
+    let accepted = super::await_control_acceptance(&mut phase_rx, accepted_rx).await;
+    assert!(!accepted, "closed accepted channel must fail closed");
 }

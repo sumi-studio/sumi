@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Result, anyhow};
 use chrono::{TimeZone, Utc};
 use serde_json::{Value, json};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use super::*;
@@ -2380,4 +2380,55 @@ async fn retryable_error_breaks_the_consecutive_length_guard() {
                 if result.content.iter().any(|content| matches!(content,
                     UserContent::Text { text } if text.contains(LENGTH_LOOP_FAILURE))))
     )));
+}
+
+#[tokio::test]
+async fn abort_requested_before_provider_start_skips_start_and_closes_normally() {
+    let driver = Arc::new(FixtureDriver::new(vec![output(assistant(
+        StopReason::Stop,
+        Vec::new(),
+        None,
+        None,
+    ))]));
+    let (_control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(8);
+    let mut runner = super::Runner::new(bound_core(1), driver.clone(), control_rx, events_tx);
+    runner
+        .claim_ordered_initial(admitted_user(1))
+        .expect("claim initial");
+    runner.abort_requested = true;
+
+    let outcome = runner.provider_attempt().await.expect("provider attempt");
+    assert!(
+        matches!(outcome, super::AttemptOutcome::ClosedError { .. }),
+        "abort before provider start must close with a synthetic error message"
+    );
+    assert_eq!(
+        driver.started_contexts.lock().expect("contexts").len(),
+        0,
+        "provider must not be started once abort was already requested"
+    );
+    while events_rx.try_recv().is_ok() {}
+}
+
+#[tokio::test]
+async fn accept_steer_control_propagates_dropped_committed_channel() {
+    let driver = Arc::new(FixtureDriver::new(vec![]));
+    let (_control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, _events_rx) = mpsc::channel(8);
+    let mut runner = super::Runner::new(bound_core(1), driver, control_rx, events_tx);
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let (committed_tx, committed_rx) = oneshot::channel::<()>();
+    drop(committed_tx);
+
+    let command = admitted_user(2);
+    let error = runner
+        .accept_steer_control(command, accepted_tx, committed_rx)
+        .await
+        .expect_err("dropped committed channel must fail closed");
+    assert!(
+        format!("{error:#}").contains("durability authorization was dropped"),
+        "unexpected error: {error:#}"
+    );
+    assert!(accepted_rx.await.expect("accepted must still be sent"));
 }

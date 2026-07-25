@@ -1477,48 +1477,64 @@ impl EventWriter {
         authentication.rollback().await?;
         let abort_seq = sqlite_i64(abort_seq, "Abort command sequence")?;
 
-        let live_owner: Option<(String, u64, RunPhase)> = sqlx::query(
+        let live_rows = sqlx::query(
             "SELECT command_id, seq, run_phase FROM inbound_commands
              WHERE command_kind='user_message' AND status='applying'
                AND run_phase IN (
                  'user_started','user_committed','assistant_started',
                  'hard_steer_requested','cancel_requested'
-               )",
+               )
+             ORDER BY seq
+             LIMIT 2",
         )
-        .fetch_optional(self.store.pool())
-        .await?
-        .map(|row| {
-            let command_id: String = row.try_get("command_id")?;
-            let seq = sqlite_u64(row.try_get::<i64, _>("seq")?, "live owner sequence")?;
-            let phase = RunPhase::parse(row.try_get("run_phase")?)?;
-            Ok::<_, anyhow::Error>((command_id, seq, phase))
-        })
-        .transpose()?;
+        .fetch_all(self.store.pool())
+        .await?;
+        if live_rows.len() > 1 {
+            bail!("multiple applying live owners violate the owner invariant");
+        }
+        let live_owner: Option<(String, u64, RunPhase)> = live_rows
+            .into_iter()
+            .next()
+            .map(|row| {
+                let command_id: String = row.try_get("command_id")?;
+                let seq = sqlite_u64(row.try_get::<i64, _>("seq")?, "live owner sequence")?;
+                let phase = RunPhase::parse(row.try_get("run_phase")?)?;
+                Ok::<_, anyhow::Error>((command_id, seq, phase))
+            })
+            .transpose()?;
 
         if run_id.is_none() && live_owner.is_some() {
             bail!("idle Abort path cannot run while a live owner exists");
         }
 
         let owner_in_run: Option<(String, u64, RunPhase)> = if let Some(run_id) = run_id {
-            sqlx::query(
+            let owner_rows = sqlx::query(
                 "SELECT command_id, seq, run_phase FROM inbound_commands
                  WHERE run_id = ? AND command_kind='user_message' AND status='applying'
                    AND run_phase IN (
                      'classified','run_started','turn_started',
                      'user_started','user_committed','assistant_started',
                      'hard_steer_requested','cancel_requested'
-                   )",
+                   )
+                 ORDER BY seq
+                 LIMIT 2",
             )
             .bind(run_id)
-            .fetch_optional(self.store.pool())
-            .await?
-            .map(|row| {
-                let command_id: String = row.try_get("command_id")?;
-                let seq = sqlite_u64(row.try_get::<i64, _>("seq")?, "run owner sequence")?;
-                let phase = RunPhase::parse(row.try_get("run_phase")?)?;
-                Ok::<_, anyhow::Error>((command_id, seq, phase))
-            })
-            .transpose()?
+            .fetch_all(self.store.pool())
+            .await?;
+            if owner_rows.len() > 1 {
+                bail!("multiple applying owners in run {run_id} violate the owner invariant");
+            }
+            owner_rows
+                .into_iter()
+                .next()
+                .map(|row| {
+                    let command_id: String = row.try_get("command_id")?;
+                    let seq = sqlite_u64(row.try_get::<i64, _>("seq")?, "run owner sequence")?;
+                    let phase = RunPhase::parse(row.try_get("run_phase")?)?;
+                    Ok::<_, anyhow::Error>((command_id, seq, phase))
+                })
+                .transpose()?
         } else {
             None
         };
@@ -1699,7 +1715,8 @@ impl EventWriter {
         )
         .await?;
 
-        let mut acks = Vec::with_capacity(terminal_ids.len());
+        let expected_acks = terminal_ids.len();
+        let mut acks = Vec::with_capacity(expected_acks);
         for command_id in terminal_ids {
             acks.push(
                 self.ack_for_command(&command_id)
@@ -1707,6 +1724,11 @@ impl EventWriter {
                     .ok_or_else(|| anyhow!("terminal command {command_id} disappeared"))?,
             );
         }
+        assert_eq!(
+            acks.len(),
+            expected_acks,
+            "Abort cutoff ACK count must match terminal command count"
+        );
         Ok(acks)
     }
 
@@ -6434,7 +6456,7 @@ enum OwnerHandoffAccounting {
     Account,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn projection_closes_owner(
     projection: &PreparedProjection,
     command_id: &str,
@@ -6734,15 +6756,9 @@ async fn require_exact_live_owner_turn(
     .await?;
     let mut matches = 0usize;
     for row in &rows {
-        let Ok(command_id) = row.try_get::<String, _>("command_id") else {
-            continue;
-        };
-        let Ok(phase) = row.try_get::<String, _>("run_phase") else {
-            continue;
-        };
-        let Ok(mut phase) = RunPhase::parse(&phase) else {
-            continue;
-        };
+        let command_id: String = row.try_get("command_id")?;
+        let phase: String = row.try_get("run_phase")?;
+        let mut phase = RunPhase::parse(&phase)?;
         let mut status = "applying";
 
         if matches!(handoff_accounting, OwnerHandoffAccounting::Account) {
@@ -7601,7 +7617,15 @@ async fn apply_tool_mutation(
             if !matches!(error_code, "length_guard" | "user_steer_cancelled") {
                 bail!("ToolExecutionSkip only supports length_guard or user_steer_cancelled");
             }
-            let result = sqlx::query(
+            // user_steer_cancelled may resolve after a hard steer or Abort moved the
+            // original owner out of assistant_started; length_guard remains restricted
+            // to the assistant's own turn.
+            let phase_condition = if error_code == "user_steer_cancelled" {
+                "run_phase IN ('assistant_started','hard_steer_requested','cancel_requested')"
+            } else {
+                "run_phase = 'assistant_started'"
+            };
+            let sql = format!(
                 "INSERT INTO tool_executions(
                     tool_call_id, command_id, run_id, executor_generation, state,
                     idempotency_key, started_at, finished_at, error_code
@@ -7609,17 +7633,18 @@ async fn apply_tool_mutation(
                  SELECT ?, command_id, run_id, ?, 'not_started', ?, NULL, ?, ?
                  FROM inbound_commands
                  WHERE command_id = ? AND run_id = ? AND command_kind = 'user_message'
-                   AND status = 'applying' AND run_phase = 'assistant_started'",
-            )
-            .bind(tool_call_id)
-            .bind(executor_generation.as_i64())
-            .bind(idempotency_key)
-            .bind(Utc::now().to_rfc3339())
-            .bind(error_code)
-            .bind(command_id)
-            .bind(run_id)
-            .execute(&mut **transaction)
-            .await?;
+                   AND status = 'applying' AND {phase_condition}"
+            );
+            let result = sqlx::query(&sql)
+                .bind(tool_call_id)
+                .bind(executor_generation.as_i64())
+                .bind(idempotency_key)
+                .bind(Utc::now().to_rfc3339())
+                .bind(error_code)
+                .bind(command_id)
+                .bind(run_id)
+                .execute(&mut **transaction)
+                .await?;
             require_single_cas(result.rows_affected(), "ToolExecutionSkip")?;
         }
     }
@@ -17318,5 +17343,158 @@ mod tests {
         eprintln!(
             "T12 abrupt transaction acceptance is Unix-only because this target has no _exit/SIGKILL-equivalent harness"
         );
+    }
+
+    #[tokio::test]
+    async fn require_exact_live_owner_turn_rejects_multiple_applying_owners() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let owner = "00000000-0000-4000-8000-000000000001";
+        let classified = "00000000-0000-4000-8000-000000000002";
+        writer
+            .persist_inbound(&user_command(1, owner, "owner one"))
+            .await
+            .expect("persist owner");
+        writer
+            .persist_inbound(&user_command(2, classified, "classified command"))
+            .await
+            .expect("persist classified command");
+        sqlx::query(
+            "UPDATE inbound_commands
+             SET status='applying', application_kind='idle_run', run_id='run-1',
+                 turn_id='turn-1', run_phase='user_started'
+             WHERE command_id = ?",
+        )
+        .bind(owner)
+        .execute(store.pool())
+        .await
+        .expect("mark owner applying");
+        sqlx::query(
+            "UPDATE inbound_commands
+             SET status='applying', application_kind='idle_run', run_id='run-1',
+                 turn_id='turn-1', run_phase='classified'
+             WHERE command_id = ?",
+        )
+        .bind(classified)
+        .execute(store.pool())
+        .await
+        .expect("mark classified applying");
+
+        let prepared = vec![super::PreparedWrite {
+            event: None,
+            projections: vec![super::PreparedProjection::Plain(
+                super::Projection::RunPhase {
+                    command_id: classified.to_owned(),
+                    run_id: "run-1".to_owned(),
+                    expected: super::RunPhase::Classified,
+                    next: super::RunPhase::UserStarted,
+                },
+            )],
+        }];
+
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
+        let error = super::require_exact_live_owner_turn(
+            &mut transaction,
+            &prepared,
+            "run-1",
+            "turn-1",
+            "test",
+            super::OwnerHandoffAccounting::Account,
+        )
+        .await
+        .expect_err("multiple applying owners must fail closed");
+        assert!(format!("{error:#}").contains("exactly one live owner"));
+    }
+
+    #[tokio::test]
+    async fn tool_execution_skip_user_steer_cancelled_accepts_post_abort_phases() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let owner_id = "00000000-0000-4000-8000-000000000001";
+        writer
+            .persist_inbound(&user_command(1, owner_id, "original owner"))
+            .await
+            .expect("persist original owner");
+        sqlx::query(
+            "UPDATE inbound_commands
+             SET status='applying', application_kind='idle_run', run_id='run-1',
+                 turn_id='turn-1', run_phase='cancel_requested'
+             WHERE command_id = ?",
+        )
+        .bind(owner_id)
+        .execute(store.pool())
+        .await
+        .expect("seed owner in cancel_requested");
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
+
+        super::apply_tool_mutation(
+            &mut transaction,
+            super::ToolExecutionMutation::Skip {
+                tool_call_id: "tool-1".to_owned(),
+                command_id: owner_id.to_owned(),
+                run_id: "run-1".to_owned(),
+                turn_id: "turn-1".to_owned(),
+                executor_generation: test_process_generation(1),
+                idempotency_key: "idem-skip-1".to_owned(),
+                error_code: "user_steer_cancelled",
+            },
+        )
+        .await
+        .expect("user_steer_cancelled must resolve after abort moves owner to cancel_requested");
+
+        let row = sqlx::query(
+            "SELECT command_id, run_id, state, error_code FROM tool_executions WHERE tool_call_id = ?",
+        )
+        .bind("tool-1")
+        .fetch_one(&mut *transaction)
+        .await
+        .expect("skip row exists");
+        assert_eq!(row.try_get::<String, _>("command_id").unwrap(), owner_id);
+        assert_eq!(row.try_get::<String, _>("run_id").unwrap(), "run-1");
+        assert_eq!(row.try_get::<String, _>("state").unwrap(), "not_started");
+        assert_eq!(
+            row.try_get::<Option<String>, _>("error_code")
+                .unwrap()
+                .as_deref(),
+            Some("user_steer_cancelled")
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_execution_skip_length_guard_requires_assistant_started() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let owner_id = "00000000-0000-4000-8000-000000000001";
+        writer
+            .persist_inbound(&user_command(1, owner_id, "original owner"))
+            .await
+            .expect("persist original owner");
+        sqlx::query(
+            "UPDATE inbound_commands
+             SET status='applying', application_kind='idle_run', run_id='run-1',
+                 turn_id='turn-1', run_phase='cancel_requested'
+             WHERE command_id = ?",
+        )
+        .bind(owner_id)
+        .execute(store.pool())
+        .await
+        .expect("seed owner in cancel_requested");
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
+
+        let error = super::apply_tool_mutation(
+            &mut transaction,
+            super::ToolExecutionMutation::Skip {
+                tool_call_id: "tool-1".to_owned(),
+                command_id: owner_id.to_owned(),
+                run_id: "run-1".to_owned(),
+                turn_id: "turn-1".to_owned(),
+                executor_generation: test_process_generation(1),
+                idempotency_key: "idem-skip-1".to_owned(),
+                error_code: "length_guard",
+            },
+        )
+        .await
+        .expect_err("length_guard must not match cancel_requested owner");
+        assert!(format!("{error:#}").contains("ToolExecutionSkip"));
     }
 }

@@ -51,7 +51,7 @@ pub(super) const LENGTH_LOOP_CODE: &str = "consecutive_length_tool_guard";
 const LENGTH_OVERFLOW_ERROR: &str = "provider response reached the context window before producing output; immediate recovery required";
 const LENGTH_OVERFLOW_CODE: &str = "context_overflow_length_usage";
 const MAX_OVERFLOW_RECOVERIES: u8 = 2;
-const TOOL_RESULT_MESSAGE_ID_NAMESPACE: Uuid = Uuid::from_bytes([
+pub(super) const TOOL_RESULT_MESSAGE_ID_NAMESPACE: Uuid = Uuid::from_bytes([
     0x73, 0x75, 0x6d, 0x69, 0xa4, 0xc1, 0x48, 0x22, 0x91, 0x5d, 0xb5, 0xd2, 0x5a, 0x69, 0x9f, 0x31,
 ]);
 const SYNTHETIC_ATTEMPT_MESSAGE_ID_NAMESPACE: Uuid = Uuid::from_bytes([
@@ -491,6 +491,14 @@ impl Runner {
         self.hard_steer_command = None;
         // abort_requested is preserved when receive_control_safe_point consumes
         // an Abort control before provider_attempt begins.
+        if self.abort_requested {
+            return self
+                .synthetic_attempt_error(
+                    "Run aborted before provider start".to_owned(),
+                    SyntheticAttemptFailure::Abort,
+                )
+                .await;
+        }
         let cancel = CancellationToken::new();
         self.provider_cancel = Some(cancel.clone());
         let start_cancel = cancel.clone();
@@ -999,7 +1007,11 @@ impl Runner {
                             accepted,
                             committed,
                         } => {
-                            let _ = self.accept_steer_control(command, accepted, committed).await;
+                            if let Err(error) =
+                                self.accept_steer_control(command, accepted, committed).await
+                            {
+                                return Err(error.into());
+                            }
                             return Err(ExecuteToolError::Cancelled);
                         }
                         RunControl::Abort { accepted, .. } => {
@@ -1667,6 +1679,7 @@ enum AttemptOutcome {
 enum SyntheticAttemptFailure {
     Start,
     InvalidMessageId,
+    Abort,
 }
 
 fn tool_calls(message: &PublicMessage) -> Vec<ToolCall> {
@@ -1910,6 +1923,7 @@ fn synthetic_attempt_message_id(
     name[72] = match failure {
         SyntheticAttemptFailure::Start => 0,
         SyntheticAttemptFailure::InvalidMessageId => 1,
+        SyntheticAttemptFailure::Abort => 2,
     };
     Ok(Uuid::new_v5(&SYNTHETIC_ATTEMPT_MESSAGE_ID_NAMESPACE, &name).to_string())
 }

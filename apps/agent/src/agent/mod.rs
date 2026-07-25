@@ -93,6 +93,10 @@ const VOLATILE_OUTBOUND_BUDGET: usize = 32;
 /// This is not provider retry backoff; it only prevents one stalled local task
 /// from blocking the Session event lane indefinitely.
 const RETRY_STEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(250);
+/// Bounds the Session↔worker hard/soft-steer and abort authorization rendezvous.
+/// This is not provider retry backoff; it only prevents one stalled local task
+/// from blocking the Session event lane indefinitely.
+const STEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(250);
 /// API admission permits 32 ordinary commands plus one reserved Abort.
 const PENDING_ORDINARY_CONTROL_CAPACITY: usize = 32;
 const PENDING_CONTROL_CAPACITY: usize = PENDING_ORDINARY_CONTROL_CAPACITY + 1;
@@ -883,11 +887,11 @@ impl<G: Gateway + 'static> Session<G> {
             command: command.clone(),
             accepted: accepted_tx,
         };
+        let mut phase_rx = active.phase_rx.clone();
         if active.control_tx.try_send(control).is_err() {
             return Ok(false);
         }
-        let accepted = accepted_rx.await.unwrap_or(false);
-        if !accepted {
+        if !await_control_acceptance(&mut phase_rx, accepted_rx).await {
             return Ok(false);
         }
         // Durable step-0 commits while the worker is still awaiting the
@@ -915,11 +919,11 @@ impl<G: Gateway + 'static> Session<G> {
             accepted: accepted_tx,
             committed: committed_rx,
         };
+        let mut phase_rx = active.phase_rx.clone();
         if active.control_tx.try_send(control).is_err() {
             return Ok(false);
         }
-        let accepted = accepted_rx.await.unwrap_or(false);
-        if !accepted {
+        if !await_control_acceptance(&mut phase_rx, accepted_rx).await {
             return Ok(false);
         }
         active
@@ -950,11 +954,11 @@ impl<G: Gateway + 'static> Session<G> {
             command: command.clone(),
             accepted: accepted_tx,
         };
+        let mut phase_rx = active.phase_rx.clone();
         if active.control_tx.try_send(control).is_err() {
             return Ok(false);
         }
-        let accepted = accepted_rx.await.unwrap_or(false);
-        if !accepted {
+        if !await_control_acceptance(&mut phase_rx, accepted_rx).await {
             return Ok(false);
         }
         let mut acks = active
@@ -970,9 +974,7 @@ impl<G: Gateway + 'static> Session<G> {
         for ack in acks.drain(..) {
             self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack }])?;
         }
-        // Active Abort also durably supersedes earlier received/deferred
-        // commands; remove them from the in-memory queue so finish_run does
-        // not try to spawn a worker for a command that is already terminal.
+        // Drop deferred commands that were durably superseded by this Abort.
         let mut retained = Vec::with_capacity(self.deferred_commands.len());
         while let Some(pending) = self.deferred_commands.pop_one() {
             if !superseded.contains(pending.envelope().command_id.as_str()) {
@@ -1493,6 +1495,21 @@ async fn await_retry_steer_acceptance(
         () = tokio::time::sleep(RETRY_STEER_HANDSHAKE_TIMEOUT) => false,
     };
     accepted
+}
+
+async fn await_control_acceptance(
+    phase_rx: &mut watch::Receiver<WorkerPhase>,
+    accepted_rx: oneshot::Receiver<bool>,
+) -> bool {
+    tokio::select! {
+        biased;
+        accepted = accepted_rx => accepted.unwrap_or(false),
+        changed = phase_rx.changed() => {
+            let _ = changed;
+            false
+        }
+        () = tokio::time::sleep(STEER_HANDSHAKE_TIMEOUT) => false,
+    }
 }
 
 fn committed_delivery_is_reliable(
