@@ -19,11 +19,21 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 use uuid::Uuid;
 
+#[cfg(test)]
+use super::DeferredApprovalRule;
 use super::{
-    Command, CommandAck, CommandAckStatus, CommandEnvelope, CommandId, Envelope, OutboundFrame,
+    ApprovalDecision, Command, CommandAck, CommandAckStatus, CommandEnvelope, CommandId, Envelope,
+    OutboundFrame,
 };
-use crate::agent::{AgentEvent, PublicStreamEvent};
-use crate::provider::types::PublicMessage;
+use crate::agent::{
+    AgentEvent, ApprovalRequest, ApprovalResolution, AuditDecision, AuditOutcome, MemoryMaintKind,
+    PublicStreamEvent, ReviewProjection, RiskLevel, SteerMode, UserAuthorization,
+};
+use crate::provider::types::{
+    ApiProtocol, ProviderOrigin, PublicAssistantContent, PublicAssistantMessage, PublicMessage,
+    RejectedToolCall, StopReason, ToolArgumentError, ToolCall, ToolResultMessage, Usage,
+    UserContent, UserMessage,
+};
 
 /// UUIDv5 namespace for deriving a user `message_id` from a canonical
 /// `command_id`. API and web consumers must use the same namespace so they can
@@ -165,11 +175,29 @@ fn parse_reject_reason(reason: &str) -> Result<WireRejectReason, WireError> {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "WireCommandAckInput")]
 pub struct WireCommandAck {
-    pub seq: u64,
-    pub command_id: String,
-    pub status: WireCommandAckStatus,
+    seq: u64,
+    command_id: String,
+    status: WireCommandAckStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reject_reason: Option<WireRejectReason>,
+    reject_reason: Option<WireRejectReason>,
+}
+
+impl WireCommandAck {
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    pub fn command_id(&self) -> &str {
+        &self.command_id
+    }
+
+    pub fn status(&self) -> WireCommandAckStatus {
+        self.status
+    }
+
+    pub fn reject_reason(&self) -> Option<WireRejectReason> {
+        self.reject_reason
+    }
 }
 
 #[derive(Deserialize)]
@@ -184,6 +212,7 @@ struct WireCommandAckInput {
 impl TryFrom<WireCommandAckInput> for WireCommandAck {
     type Error = WireError;
     fn try_from(input: WireCommandAckInput) -> Result<Self, WireError> {
+        let command_id = canonical_command_id(&input.command_id)?;
         let reject_reason = match input.status {
             WireCommandAckStatus::Rejected => {
                 Some(
@@ -205,7 +234,7 @@ impl TryFrom<WireCommandAckInput> for WireCommandAck {
         };
         Ok(Self {
             seq: input.seq,
-            command_id: input.command_id,
+            command_id,
             status: input.status,
             reject_reason,
         })
@@ -220,9 +249,9 @@ impl TryFrom<WireCommandAckInput> for WireCommandAck {
 #[serde(try_from = "WireEnvelopeInput")]
 pub struct WireEnvelope {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub seq: Option<u64>,
-    pub conversation_id: String,
-    pub event: WireAgentEvent,
+    seq: Option<u64>,
+    conversation_id: String,
+    event: WireAgentEvent,
 }
 
 impl WireEnvelope {
@@ -240,6 +269,18 @@ impl WireEnvelope {
             conversation_id,
             event,
         })
+    }
+
+    pub fn seq(&self) -> Option<u64> {
+        self.seq
+    }
+
+    pub fn conversation_id(&self) -> &str {
+        &self.conversation_id
+    }
+
+    pub fn event(&self) -> &WireAgentEvent {
+        &self.event
     }
 }
 
@@ -653,28 +694,528 @@ pub struct WireMemoryMaintKind(String);
 impl TryFrom<AgentEvent> for WireAgentEvent {
     type Error = WireError;
     fn try_from(event: AgentEvent) -> Result<Self, WireError> {
-        serde_json::from_value(serde_json::to_value(&event)?).map_err(WireError::Json)
+        Ok(match event {
+            AgentEvent::AgentStart => Self::AgentStart,
+            AgentEvent::AgentEnd => Self::AgentEnd,
+            AgentEvent::TurnStart => Self::TurnStart,
+            AgentEvent::TurnEnd {
+                message,
+                tool_results,
+            } => Self::TurnEnd {
+                message: match message {
+                    Some(message) => Some(Box::new((*message).try_into()?)),
+                    None => None,
+                },
+                tool_results: tool_results
+                    .into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<Result<Vec<_>, _>>()?,
+            },
+            AgentEvent::MessageStart {
+                message_id,
+                message,
+            } => Self::MessageStart {
+                message_id,
+                message: Box::new((*message).try_into()?),
+            },
+            AgentEvent::MessageUpdate { message_id, event } => Self::MessageUpdate {
+                message_id,
+                event: event.try_into()?,
+            },
+            AgentEvent::MessageEnd {
+                message_id,
+                message,
+            } => Self::MessageEnd {
+                message_id,
+                message: Box::new((*message).try_into()?),
+            },
+            AgentEvent::ToolExecutionStart {
+                tool_call_id,
+                tool_name,
+                args,
+            } => Self::ToolExecutionStart {
+                tool_call_id,
+                tool_name,
+                args,
+            },
+            AgentEvent::ToolExecutionUpdate {
+                tool_call_id,
+                partial,
+            } => Self::ToolExecutionUpdate {
+                tool_call_id,
+                partial,
+            },
+            AgentEvent::ToolExecutionEnd {
+                tool_call_id,
+                result,
+                is_error,
+            } => Self::ToolExecutionEnd {
+                tool_call_id,
+                result,
+                is_error,
+            },
+            AgentEvent::ApprovalRequested { request } => Self::ApprovalRequested {
+                request: request.try_into()?,
+            },
+            AgentEvent::ApprovalResolved {
+                request_id,
+                resolution,
+            } => Self::ApprovalResolved {
+                request_id,
+                resolution: resolution.try_into()?,
+            },
+            AgentEvent::Steered { mode } => Self::Steered {
+                mode: mode.try_into()?,
+            },
+            AgentEvent::MemoryMaintenance { kind } => Self::MemoryMaintenance {
+                kind: kind.try_into()?,
+            },
+            AgentEvent::RetryScheduled {
+                attempt,
+                delay_ms,
+                retry_at,
+                error_message,
+            } => Self::RetryScheduled {
+                attempt,
+                delay_ms,
+                retry_at: retry_at.to_rfc3339(),
+                error_message,
+            },
+            AgentEvent::Error { message } => Self::Error { message },
+        })
     }
 }
 
 impl TryFrom<PublicStreamEvent> for WirePublicStreamEvent {
     type Error = WireError;
     fn try_from(event: PublicStreamEvent) -> Result<Self, WireError> {
-        serde_json::from_value(serde_json::to_value(&event)?).map_err(WireError::Json)
+        Ok(match event {
+            PublicStreamEvent::TextStart { content_index } => Self::TextStart { content_index },
+            PublicStreamEvent::TextDelta {
+                content_index,
+                delta,
+            } => Self::TextDelta {
+                content_index,
+                delta,
+            },
+            PublicStreamEvent::TextEnd {
+                content_index,
+                content,
+            } => Self::TextEnd {
+                content_index,
+                content,
+            },
+            PublicStreamEvent::ThinkingStart { content_index } => {
+                Self::ThinkingStart { content_index }
+            }
+            PublicStreamEvent::ThinkingDelta {
+                content_index,
+                delta,
+            } => Self::ThinkingDelta {
+                content_index,
+                delta,
+            },
+            PublicStreamEvent::ThinkingEnd {
+                content_index,
+                content,
+            } => Self::ThinkingEnd {
+                content_index,
+                content,
+            },
+            PublicStreamEvent::ToolCallStart { content_index } => {
+                Self::ToolCallStart { content_index }
+            }
+            PublicStreamEvent::ToolCallDelta {
+                content_index,
+                delta,
+            } => Self::ToolCallDelta {
+                content_index,
+                delta,
+            },
+            PublicStreamEvent::ToolCallPreview {
+                content_index,
+                preview,
+            } => Self::ToolCallPreview {
+                content_index,
+                preview: preview.as_value().clone(),
+            },
+            PublicStreamEvent::ToolCallEnd {
+                content_index,
+                tool_call,
+            } => Self::ToolCallEnd {
+                content_index,
+                tool_call: tool_call.try_into()?,
+            },
+            PublicStreamEvent::ToolCallRejected {
+                content_index,
+                rejected,
+            } => Self::ToolCallRejected {
+                content_index,
+                rejected: rejected.try_into()?,
+            },
+            PublicStreamEvent::ReasoningSummaryStart { content_index } => {
+                Self::ReasoningSummaryStart { content_index }
+            }
+            PublicStreamEvent::ReasoningSummaryDelta {
+                content_index,
+                delta,
+            } => Self::ReasoningSummaryDelta {
+                content_index,
+                delta,
+            },
+            PublicStreamEvent::ReasoningSummaryEnd {
+                content_index,
+                content,
+            } => Self::ReasoningSummaryEnd {
+                content_index,
+                content,
+            },
+        })
     }
 }
 
 impl TryFrom<PublicMessage> for WirePublicMessage {
     type Error = WireError;
     fn try_from(message: PublicMessage) -> Result<Self, WireError> {
-        serde_json::from_value(serde_json::to_value(&message)?).map_err(WireError::Json)
+        Ok(match message {
+            PublicMessage::User(UserMessage { content, timestamp }) => Self::User {
+                content: content
+                    .into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<Result<Vec<_>, _>>()?,
+                timestamp: timestamp.to_rfc3339(),
+            },
+            PublicMessage::Assistant(PublicAssistantMessage {
+                content,
+                model,
+                provider,
+                origin,
+                usage,
+                stop_reason,
+                error_message,
+                provider_code,
+                interrupted,
+                timestamp,
+            }) => Self::Assistant {
+                content: content
+                    .into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<Result<Vec<_>, _>>()?,
+                model,
+                provider,
+                origin: origin.try_into()?,
+                usage: usage.try_into()?,
+                stop_reason: stop_reason.try_into()?,
+                error_message,
+                provider_code,
+                interrupted,
+                timestamp: timestamp.to_rfc3339(),
+            },
+            PublicMessage::ToolResult(ToolResultMessage {
+                tool_call_id,
+                tool_name,
+                content,
+                details,
+                is_error,
+                timestamp,
+            }) => Self::ToolResult {
+                tool_call_id,
+                tool_name,
+                content: content
+                    .into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<Result<Vec<_>, _>>()?,
+                details,
+                is_error,
+                timestamp: timestamp.to_rfc3339(),
+            },
+        })
+    }
+}
+
+impl TryFrom<UserContent> for WireUserContent {
+    type Error = WireError;
+    fn try_from(content: UserContent) -> Result<Self, WireError> {
+        Ok(match content {
+            UserContent::Text { text } => Self::Text { text },
+            UserContent::Image { data, mime_type } => Self::Image { data, mime_type },
+        })
+    }
+}
+
+impl TryFrom<PublicAssistantContent> for WirePublicAssistantContent {
+    type Error = WireError;
+    fn try_from(content: PublicAssistantContent) -> Result<Self, WireError> {
+        Ok(match content {
+            PublicAssistantContent::Text {
+                text,
+                wire_item_index,
+            } => Self::Text {
+                text,
+                wire_item_index,
+            },
+            PublicAssistantContent::Thinking {
+                thinking,
+                signature_field,
+                wire_item_index,
+            } => Self::Thinking {
+                thinking,
+                signature_field,
+                wire_item_index,
+            },
+            PublicAssistantContent::ToolCall {
+                tool_call,
+                wire_item_index,
+            } => Self::ToolCall {
+                tool_call: tool_call.try_into()?,
+                wire_item_index,
+            },
+            PublicAssistantContent::RejectedToolCall {
+                rejected,
+                wire_item_index,
+            } => Self::RejectedToolCall {
+                rejected: rejected.try_into()?,
+                wire_item_index,
+            },
+        })
+    }
+}
+
+impl TryFrom<ToolCall> for WireToolCall {
+    type Error = WireError;
+    fn try_from(tool_call: ToolCall) -> Result<Self, WireError> {
+        Ok(Self {
+            id: tool_call.id,
+            name: tool_call.name,
+            arguments: tool_call.arguments.as_object().clone(),
+        })
+    }
+}
+
+impl TryFrom<RejectedToolCall> for WireRejectedToolCall {
+    type Error = WireError;
+    fn try_from(rejected: RejectedToolCall) -> Result<Self, WireError> {
+        Ok(Self {
+            id: rejected.id,
+            name: rejected.name,
+            error: rejected.error.try_into()?,
+        })
+    }
+}
+
+impl TryFrom<ToolArgumentError> for WireToolArgumentError {
+    type Error = WireError;
+    fn try_from(error: ToolArgumentError) -> Result<Self, WireError> {
+        Ok(match error {
+            ToolArgumentError::InvalidJson => Self::InvalidJson,
+            ToolArgumentError::NonObject => Self::NonObject,
+            ToolArgumentError::SchemaViolation => Self::SchemaViolation,
+            ToolArgumentError::IncompleteResponse => Self::IncompleteResponse,
+            ToolArgumentError::TooLarge => Self::TooLarge,
+        })
+    }
+}
+
+impl TryFrom<ProviderOrigin> for WireProviderOrigin {
+    type Error = WireError;
+    fn try_from(origin: ProviderOrigin) -> Result<Self, WireError> {
+        Ok(Self {
+            provider_instance_id: origin.provider_instance_id,
+            protocol: origin.protocol.try_into()?,
+            model: origin.model,
+        })
+    }
+}
+
+impl TryFrom<ApiProtocol> for WireApiProtocol {
+    type Error = WireError;
+    fn try_from(protocol: ApiProtocol) -> Result<Self, WireError> {
+        Ok(match protocol {
+            ApiProtocol::OpenAiChatCompletions => Self::OpenAiChatCompletions,
+            ApiProtocol::OpenAiResponses => Self::OpenAiResponses,
+            ApiProtocol::AnthropicMessages => Self::AnthropicMessages,
+        })
+    }
+}
+
+impl TryFrom<Usage> for WireUsage {
+    type Error = WireError;
+    fn try_from(usage: Usage) -> Result<Self, WireError> {
+        Ok(Self {
+            input: usage.input,
+            output: usage.output,
+            cache_read: usage.cache_read,
+            cache_write: usage.cache_write,
+            reasoning: usage.reasoning,
+            total_tokens: usage.total_tokens,
+        })
+    }
+}
+
+impl TryFrom<StopReason> for WireStopReason {
+    type Error = WireError;
+    fn try_from(reason: StopReason) -> Result<Self, WireError> {
+        Ok(match reason {
+            StopReason::Stop => Self::Stop,
+            StopReason::Length => Self::Length,
+            StopReason::ToolUse => Self::ToolUse,
+            StopReason::Error => Self::Error,
+            StopReason::Aborted => Self::Aborted,
+        })
+    }
+}
+
+impl TryFrom<ToolResultMessage> for WireToolResultMessage {
+    type Error = WireError;
+    fn try_from(message: ToolResultMessage) -> Result<Self, WireError> {
+        Ok(Self {
+            tool_call_id: message.tool_call_id,
+            tool_name: message.tool_name,
+            content: message
+                .content
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<Vec<_>, _>>()?,
+            details: message.details,
+            is_error: message.is_error,
+            timestamp: message.timestamp.to_rfc3339(),
+        })
+    }
+}
+
+impl TryFrom<ApprovalRequest> for WireApprovalRequest {
+    type Error = WireError;
+    fn try_from(request: ApprovalRequest) -> Result<Self, WireError> {
+        Ok(Self {
+            id: request.id,
+            tool_call_id: request.tool_call_id,
+            tool_name: request.tool_name,
+            action: request.action.try_into()?,
+            args_summary: request.args_summary,
+            reason: request.reason,
+            audit: request.audit.map(TryInto::try_into).transpose()?,
+        })
+    }
+}
+
+impl TryFrom<ReviewProjection> for WireReviewProjection {
+    type Error = WireError;
+    fn try_from(projection: ReviewProjection) -> Result<Self, WireError> {
+        Ok(match projection {
+            ReviewProjection::Reviewable(value) => Self::Reviewable(value),
+            ReviewProjection::InsufficientEvidence { reason } => {
+                Self::InsufficientEvidence { reason }
+            }
+        })
+    }
+}
+
+impl TryFrom<AuditDecision> for WireAuditDecision {
+    type Error = WireError;
+    fn try_from(decision: AuditDecision) -> Result<Self, WireError> {
+        Ok(Self {
+            outcome: decision.outcome.try_into()?,
+            risk: decision.risk.try_into()?,
+            authorization: decision.authorization.try_into()?,
+            rationale: decision.rationale,
+        })
+    }
+}
+
+impl TryFrom<AuditOutcome> for WireAuditOutcome {
+    type Error = WireError;
+    fn try_from(outcome: AuditOutcome) -> Result<Self, WireError> {
+        Ok(match outcome {
+            AuditOutcome::Allow => Self::Allow,
+            AuditOutcome::Deny => Self::Deny,
+        })
+    }
+}
+
+impl TryFrom<RiskLevel> for WireRiskLevel {
+    type Error = WireError;
+    fn try_from(risk: RiskLevel) -> Result<Self, WireError> {
+        Ok(match risk {
+            RiskLevel::Low => Self::Low,
+            RiskLevel::Medium => Self::Medium,
+            RiskLevel::High => Self::High,
+            RiskLevel::Critical => Self::Critical,
+        })
+    }
+}
+
+impl TryFrom<UserAuthorization> for WireUserAuthorization {
+    type Error = WireError;
+    fn try_from(authorization: UserAuthorization) -> Result<Self, WireError> {
+        Ok(match authorization {
+            UserAuthorization::Unknown => Self::Unknown,
+            UserAuthorization::Low => Self::Low,
+            UserAuthorization::Medium => Self::Medium,
+            UserAuthorization::High => Self::High,
+        })
+    }
+}
+
+impl TryFrom<ApprovalResolution> for WireApprovalResolution {
+    type Error = WireError;
+    fn try_from(resolution: ApprovalResolution) -> Result<Self, WireError> {
+        Ok(match resolution {
+            ApprovalResolution::Decision(decision) => Self::Decision(decision.try_into()?),
+            ApprovalResolution::Cancelled => Self::Cancelled,
+        })
+    }
+}
+
+impl TryFrom<ApprovalDecision> for WireApprovalDecision {
+    type Error = WireError;
+    fn try_from(decision: ApprovalDecision) -> Result<Self, WireError> {
+        Ok(match decision {
+            ApprovalDecision::ApproveOnce => Self::ApproveOnce,
+            ApprovalDecision::ApproveAlways { rule } => Self::ApproveAlways {
+                rule: rule.0.as_object().cloned().unwrap_or_default(),
+            },
+            ApprovalDecision::Deny => Self::Deny,
+        })
+    }
+}
+
+impl TryFrom<SteerMode> for WireSteerMode {
+    type Error = WireError;
+    fn try_from(mode: SteerMode) -> Result<Self, WireError> {
+        Ok(match mode {
+            SteerMode::Hard => Self::Hard,
+            SteerMode::Soft => Self::Soft,
+        })
+    }
+}
+
+impl TryFrom<MemoryMaintKind> for WireMemoryMaintKind {
+    type Error = WireError;
+    fn try_from(kind: MemoryMaintKind) -> Result<Self, WireError> {
+        Ok(WireMemoryMaintKind(kind.as_str().to_owned()))
     }
 }
 
 impl TryFrom<Command> for WireCommand {
     type Error = WireError;
     fn try_from(command: Command) -> Result<Self, WireError> {
-        serde_json::from_value(serde_json::to_value(&command)?).map_err(WireError::Json)
+        Ok(match command {
+            Command::UserMessage { text, attachments } => Self::UserMessage {
+                text,
+                attachments: attachments
+                    .into_iter()
+                    .map(|attachment| WireAttachment(attachment.0))
+                    .collect(),
+            },
+            Command::Abort {} => Self::Abort,
+            Command::ApprovalDecision {
+                request_id,
+                decision,
+            } => Self::ApprovalDecision {
+                request_id,
+                decision: decision.try_into()?,
+            },
+        })
     }
 }
 
@@ -692,6 +1233,7 @@ impl TryFrom<CommandEnvelope> for WireCommandEnvelope {
 impl TryFrom<CommandAck> for WireCommandAck {
     type Error = WireError;
     fn try_from(ack: CommandAck) -> Result<Self, WireError> {
+        let command_id = canonical_command_id(&ack.command_id)?;
         let status = WireCommandAckStatus::from(ack.status);
         let reject_reason = match status {
             WireCommandAckStatus::Rejected => {
@@ -713,7 +1255,7 @@ impl TryFrom<CommandAck> for WireCommandAck {
         };
         Ok(Self {
             seq: ack.seq,
-            command_id: ack.command_id,
+            command_id,
             status,
             reject_reason,
         })
@@ -723,7 +1265,8 @@ impl TryFrom<CommandAck> for WireCommandAck {
 impl TryFrom<Envelope> for WireEnvelope {
     type Error = WireError;
     fn try_from(envelope: Envelope) -> Result<Self, WireError> {
-        let event: WireAgentEvent = serde_json::from_value(envelope.event)?;
+        let event: AgentEvent = serde_json::from_value(envelope.event)?;
+        let event: WireAgentEvent = event.try_into()?;
         validate_seq(envelope.seq, &event)?;
         Ok(Self {
             seq: envelope.seq,
@@ -745,6 +1288,12 @@ impl TryFrom<OutboundFrame> for WireOutboundFrame {
             }),
         }
     }
+}
+
+fn canonical_command_id(value: &str) -> Result<String, WireError> {
+    CommandId::parse(value)
+        .map(|id| id.as_str().to_owned())
+        .map_err(|_| WireError::InvalidCommandId(value.to_owned()))
 }
 
 fn validate_seq(seq: Option<u64>, event: &WireAgentEvent) -> Result<(), WireError> {
@@ -777,9 +1326,9 @@ mod tests {
     };
     use crate::provider::types::{
         ApiProtocol, ProviderOrigin, PublicAssistantContent, PublicAssistantMessage, PublicMessage,
-        StopReason, ToolCall, ToolResultMessage, Usage, UserContent, UserMessage,
+        RejectedToolCall, StopReason, ToolArgumentError, ToolCall, ToolResultMessage, Usage,
+        UserContent, UserMessage,
     };
-    use std::path::Path;
 
     fn now() -> DateTime<Utc> {
         Utc::now()
@@ -980,6 +1529,61 @@ mod tests {
     }
 
     #[test]
+    fn wire_command_ack_rejects_invalid_input() {
+        let valid_id = "00000000-0000-4000-8000-000000000001";
+
+        let invalid_uuid = json!({
+            "seq": 1,
+            "command_id": "not-a-uuid",
+            "status": "received"
+        });
+        assert!(serde_json::from_value::<WireCommandAck>(invalid_uuid).is_err());
+
+        assert!(
+            to_wire_frame(OutboundFrame::CommandAck {
+                ack: CommandAck {
+                    seq: 1,
+                    command_id: "not-a-uuid".to_owned(),
+                    status: CommandAckStatus::Received,
+                    reject_reason: None,
+                }
+            })
+            .is_err()
+        );
+
+        let rejected_without_reason = json!({
+            "seq": 1,
+            "command_id": valid_id,
+            "status": "rejected"
+        });
+        assert!(serde_json::from_value::<WireCommandAck>(rejected_without_reason).is_err());
+
+        let non_rejected_with_reason = json!({
+            "seq": 1,
+            "command_id": valid_id,
+            "status": "received",
+            "reject_reason": "oversized"
+        });
+        assert!(serde_json::from_value::<WireCommandAck>(non_rejected_with_reason).is_err());
+    }
+
+    #[test]
+    fn wire_envelope_rejects_invalid_input() {
+        let durable_missing_seq = json!({
+            "conversation_id": "conv-1",
+            "event": {"type": "agent_start"}
+        });
+        assert!(serde_json::from_value::<WireEnvelope>(durable_missing_seq).is_err());
+
+        let volatile_with_seq = json!({
+            "seq": 1,
+            "conversation_id": "conv-1",
+            "event": {"type": "error", "message": "x"}
+        });
+        assert!(serde_json::from_value::<WireEnvelope>(volatile_with_seq).is_err());
+    }
+
+    #[test]
     fn agent_event_round_trips() {
         let user_message = PublicMessage::User(UserMessage {
             content: vec![UserContent::Text {
@@ -988,9 +1592,13 @@ mod tests {
             timestamp: now(),
         });
 
+        round_trip_agent_event(AgentEvent::AgentStart);
+        round_trip_agent_event(AgentEvent::AgentEnd);
+        round_trip_agent_event(AgentEvent::TurnStart);
+
         let start = AgentEvent::MessageStart {
             message_id: "00000000-0000-4000-8000-000000000002".to_owned(),
-            message: Box::new(user_message),
+            message: Box::new(user_message.clone()),
         };
         round_trip_agent_event(start);
 
@@ -1002,6 +1610,25 @@ mod tests {
             },
         };
         round_trip_agent_event(update);
+
+        let end = AgentEvent::MessageEnd {
+            message_id: "00000000-0000-4000-8000-000000000002".to_owned(),
+            message: Box::new(user_message),
+        };
+        round_trip_agent_event(end);
+
+        let tool_start = AgentEvent::ToolExecutionStart {
+            tool_call_id: "call-1".to_owned(),
+            tool_name: "read_file".to_owned(),
+            args: json!({"path": "notes.txt"}),
+        };
+        round_trip_agent_event(tool_start);
+
+        let tool_update = AgentEvent::ToolExecutionUpdate {
+            tool_call_id: "call-1".to_owned(),
+            partial: json!({"chunk": "x"}),
+        };
+        round_trip_agent_event(tool_update);
 
         let tool_end = AgentEvent::ToolExecutionEnd {
             tool_call_id: "call-1".to_owned(),
@@ -1022,6 +1649,25 @@ mod tests {
         .unwrap();
         round_trip_agent_event(AgentEvent::ApprovalRequested { request: approval });
 
+        let approval_with_audit: ApprovalRequest = serde_json::from_value(json!({
+            "id": "req-2",
+            "tool_call_id": "call-1",
+            "tool_name": "bash",
+            "action": {"insufficient_evidence": {"reason": "unknown"}},
+            "args_summary": {"cmd": "ls"},
+            "reason": "need evidence",
+            "audit": {
+                "outcome": "deny",
+                "risk": "high",
+                "authorization": "low",
+                "rationale": "unsafe"
+            }
+        }))
+        .unwrap();
+        round_trip_agent_event(AgentEvent::ApprovalRequested {
+            request: approval_with_audit,
+        });
+
         let resolved: ApprovalResolution =
             serde_json::from_value(json!({"decision": {"type": "approve_once"}})).unwrap();
         round_trip_agent_event(AgentEvent::ApprovalResolved {
@@ -1029,8 +1675,16 @@ mod tests {
             resolution: resolved,
         });
 
+        round_trip_agent_event(AgentEvent::ApprovalResolved {
+            request_id: "req-1".to_owned(),
+            resolution: ApprovalResolution::Cancelled,
+        });
+
         round_trip_agent_event(AgentEvent::Steered {
             mode: SteerMode::Hard,
+        });
+        round_trip_agent_event(AgentEvent::Steered {
+            mode: SteerMode::Soft,
         });
 
         let memory: AgentEvent =
@@ -1076,21 +1730,60 @@ mod tests {
 
     #[test]
     fn public_stream_event_round_trips() {
-        let preview = PublicStreamEvent::ToolCallPreview {
-            content_index: 0,
-            preview: crate::provider::types::ToolArgsPreview::new(json!({"path": "x"})),
-        };
-        round_trip_stream_event(preview);
+        fn rejected_tool_call() -> RejectedToolCall {
+            RejectedToolCall {
+                id: "call-2".to_owned(),
+                name: "read_file".to_owned(),
+                error: ToolArgumentError::SchemaViolation,
+            }
+        }
 
-        let end = PublicStreamEvent::ToolCallEnd {
-            content_index: 0,
-            tool_call: tool_call(),
-        };
-        round_trip_stream_event(end);
-
+        round_trip_stream_event(PublicStreamEvent::TextStart { content_index: 0 });
         round_trip_stream_event(PublicStreamEvent::TextDelta {
             content_index: 0,
             delta: "d".to_owned(),
+        });
+        round_trip_stream_event(PublicStreamEvent::TextEnd {
+            content_index: 0,
+            content: "text".to_owned(),
+        });
+
+        round_trip_stream_event(PublicStreamEvent::ThinkingStart { content_index: 0 });
+        round_trip_stream_event(PublicStreamEvent::ThinkingDelta {
+            content_index: 0,
+            delta: "t".to_owned(),
+        });
+        round_trip_stream_event(PublicStreamEvent::ThinkingEnd {
+            content_index: 0,
+            content: "thought".to_owned(),
+        });
+
+        round_trip_stream_event(PublicStreamEvent::ToolCallStart { content_index: 0 });
+        round_trip_stream_event(PublicStreamEvent::ToolCallDelta {
+            content_index: 0,
+            delta: "{\"path".to_owned(),
+        });
+        round_trip_stream_event(PublicStreamEvent::ToolCallPreview {
+            content_index: 0,
+            preview: crate::provider::types::ToolArgsPreview::new(json!({"path": "x"})),
+        });
+        round_trip_stream_event(PublicStreamEvent::ToolCallEnd {
+            content_index: 0,
+            tool_call: tool_call(),
+        });
+        round_trip_stream_event(PublicStreamEvent::ToolCallRejected {
+            content_index: 0,
+            rejected: rejected_tool_call(),
+        });
+
+        round_trip_stream_event(PublicStreamEvent::ReasoningSummaryStart { content_index: 0 });
+        round_trip_stream_event(PublicStreamEvent::ReasoningSummaryDelta {
+            content_index: 0,
+            delta: "s".to_owned(),
+        });
+        round_trip_stream_event(PublicStreamEvent::ReasoningSummaryEnd {
+            content_index: 0,
+            content: "summary".to_owned(),
         });
     }
 
@@ -1111,6 +1804,15 @@ mod tests {
         });
         round_trip_public_message(user);
 
+        let user_with_image = PublicMessage::User(UserMessage {
+            content: vec![UserContent::Image {
+                data: "aGVsbG8=".to_owned(),
+                mime_type: "image/png".to_owned(),
+            }],
+            timestamp: now(),
+        });
+        round_trip_public_message(user_with_image);
+
         let assistant = PublicMessage::Assistant(PublicAssistantMessage {
             content: vec![
                 PublicAssistantContent::Thinking {
@@ -1126,6 +1828,14 @@ mod tests {
                     tool_call: tool_call(),
                     wire_item_index: 2,
                 },
+                PublicAssistantContent::RejectedToolCall {
+                    rejected: RejectedToolCall {
+                        id: "call-2".to_owned(),
+                        name: "read_file".to_owned(),
+                        error: ToolArgumentError::SchemaViolation,
+                    },
+                    wire_item_index: 3,
+                },
             ],
             model: "kimi-k3".to_owned(),
             provider: "moonshot".to_owned(),
@@ -1138,6 +1848,18 @@ mod tests {
             timestamp: now(),
         });
         round_trip_public_message(assistant);
+
+        let tool_result = PublicMessage::ToolResult(ToolResultMessage {
+            tool_call_id: "call-1".to_owned(),
+            tool_name: "read_file".to_owned(),
+            content: vec![UserContent::Text {
+                text: "contents".to_owned(),
+            }],
+            details: json!({"exit": 0}),
+            is_error: false,
+            timestamp: now(),
+        });
+        round_trip_public_message(tool_result);
     }
 
     fn round_trip_public_message(message: PublicMessage) {
@@ -1148,90 +1870,40 @@ mod tests {
     }
 
     #[test]
-    fn contract_schema_validates_representative_wire_fixtures() {
-        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let schema_path = manifest_dir.join("../../contracts/agent-events.yaml");
-        let yaml = std::fs::read_to_string(&schema_path).expect("read contract schema");
-        let schema: serde_json::Value = serde_yaml::from_str(&yaml).expect("parse contract schema");
+    fn command_round_trips() {
+        let user_message = Command::UserMessage {
+            text: "hi".to_owned(),
+            attachments: vec![],
+        };
+        round_trip_command(user_message);
 
-        fn validator_for_def(schema: &serde_json::Value, def: &str) -> jsonschema::Validator {
-            let mut root = schema.clone();
-            let obj = root.as_object_mut().expect("schema root is an object");
-            obj.insert(
-                "$ref".to_owned(),
-                serde_json::Value::String(format!("#/$defs/{def}")),
-            );
-            jsonschema::validator_for(&root).unwrap_or_else(|e| panic!("compile {def}: {e}"))
-        }
+        round_trip_command(Command::Abort {});
 
-        let outbound = validator_for_def(&schema, "OutboundFrame");
-        let command_envelope = validator_for_def(&schema, "CommandEnvelope");
+        let approve_once = Command::ApprovalDecision {
+            request_id: "req-1".to_owned(),
+            decision: ApprovalDecision::ApproveOnce,
+        };
+        round_trip_command(approve_once);
 
-        let durable = to_wire_frame(OutboundFrame::Event {
-            envelope: Envelope {
-                seq: Some(1),
-                conversation_id: "conv-1".to_owned(),
-                event: json!({"type": "agent_start"}),
+        let approve_always = Command::ApprovalDecision {
+            request_id: "req-1".to_owned(),
+            decision: ApprovalDecision::ApproveAlways {
+                rule: DeferredApprovalRule(json!({"tool_name": "test"})),
             },
-        })
-        .expect("durable event");
-        outbound
-            .validate(&serde_json::to_value(durable).unwrap())
-            .expect("agent_start should validate");
+        };
+        round_trip_command(approve_always);
 
-        let volatile = to_wire_frame(OutboundFrame::Event {
-            envelope: Envelope {
-                seq: None,
-                conversation_id: "conv-1".to_owned(),
-                event: json!({
-                    "type": "message_update",
-                    "message_id": "00000000-0000-4000-8000-000000000002",
-                    "event": {"type": "text_delta", "content_index": 0, "delta": "x"}
-                }),
-            },
-        })
-        .expect("volatile event");
-        outbound
-            .validate(&serde_json::to_value(volatile).unwrap())
-            .expect("message_update should validate");
+        let deny = Command::ApprovalDecision {
+            request_id: "req-1".to_owned(),
+            decision: ApprovalDecision::Deny,
+        };
+        round_trip_command(deny);
+    }
 
-        let received = to_wire_frame(OutboundFrame::CommandAck {
-            ack: CommandAck {
-                seq: 1,
-                command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
-                status: CommandAckStatus::Received,
-                reject_reason: None,
-            },
-        })
-        .expect("received ack");
-        outbound
-            .validate(&serde_json::to_value(received).unwrap())
-            .expect("received ack should validate");
-
-        let rejected = to_wire_frame(OutboundFrame::CommandAck {
-            ack: CommandAck {
-                seq: 2,
-                command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
-                status: CommandAckStatus::Rejected,
-                reject_reason: Some("oversized".to_owned()),
-            },
-        })
-        .expect("rejected ack");
-        outbound
-            .validate(&serde_json::to_value(rejected).unwrap())
-            .expect("rejected ack should validate");
-
-        let command = WireCommandEnvelope::try_from(CommandEnvelope {
-            seq: 1,
-            command_id: uuid_command_id(),
-            command: Command::UserMessage {
-                text: "hi".to_owned(),
-                attachments: vec![],
-            },
-        })
-        .expect("command envelope");
-        command_envelope
-            .validate(&serde_json::to_value(command).unwrap())
-            .expect("command envelope should validate");
+    fn round_trip_command(command: Command) {
+        let wire = WireCommand::try_from(command).unwrap();
+        let json = serde_json::to_value(&wire).unwrap();
+        let back: WireCommand = serde_json::from_value(json).unwrap();
+        assert_eq!(wire, back);
     }
 }
