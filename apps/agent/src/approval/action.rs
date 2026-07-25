@@ -894,7 +894,10 @@ impl SecretAwareActionProjector {
                 if !check_text(command) {
                     return false;
                 }
-                let tokens = shell::tokenize_command(command);
+                let tokens: Vec<String> = shell::tokenize_command_spans(command)
+                    .into_iter()
+                    .map(|(_, _, token)| token)
+                    .collect();
                 for (idx, spans) in shell_credential_spans(command).iter().enumerate() {
                     let Some(token) = tokens.get(idx) else {
                         continue;

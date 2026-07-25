@@ -403,7 +403,7 @@ impl Policy {
 }
 
 pub(crate) fn is_broad_prefix(prefix: &[String]) -> bool {
-    if prefix.is_empty() || prefix.len() < 2 {
+    if prefix.len() < 2 {
         return true;
     }
 
