@@ -607,6 +607,16 @@ fn git_config_key_is_command_executing(key: &str) -> bool {
     {
         return true;
     }
+    if parts.first().copied().unwrap_or("") == "include"
+        && parts.last().copied().unwrap_or("") == "path"
+    {
+        return true;
+    }
+    if parts.first().copied().unwrap_or("") == "includeif"
+        && parts.last().copied().unwrap_or("") == "path"
+    {
+        return true;
+    }
     if lower == "gpg.program" || lower == "core.fsmonitor" {
         return true;
     }
@@ -623,6 +633,7 @@ fn git_config_key_is_command_executing(key: &str) -> bool {
             | "smudge"
             | "helper"
             | "command"
+            | "askpass"
     )
 }
 
@@ -678,6 +689,50 @@ fn tar_short_option_has_command(token: &str) -> bool {
         }
     }
     false
+}
+
+fn short_option_token_has_flag(token: &str, canonical: &str, flag: char) -> bool {
+    if token.len() <= 1 || !token.starts_with('-') || token.starts_with("--") {
+        return false;
+    }
+    if let Some(flags) = value_taking_short_options(canonical) {
+        let mut iter = token.char_indices();
+        iter.next(); // skip leading '-'
+        for (_idx, c) in iter {
+            if c == flag {
+                return true;
+            }
+            if flags.contains(&c) {
+                // A value-taking non-target flag consumes the rest of the token.
+                return false;
+            }
+        }
+        false
+    } else {
+        // Legacy single-character extraction: the option is the first letter.
+        token.chars().nth(1).is_some_and(|c| c == flag)
+    }
+}
+
+fn network_client_option_payload(command: &str, token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    match command {
+        "nc" | "ncat" => lower == "-e" || lower.starts_with("-e"),
+        "scp" => short_option_token_has_flag(token, "scp", 'S'),
+        "sftp" => short_option_token_has_flag(token, "sftp", 'b'),
+        "lftp" => lower == "-e" || lower.starts_with("-e"),
+        "psql" => lower == "-c" || lower.starts_with("-c"),
+        "mongosh" => {
+            lower == "-e"
+                || lower.starts_with("-e")
+                || lower == "--eval"
+                || lower.starts_with("--eval=")
+        }
+        "sqlcmd" => {
+            lower == "-q" || lower.starts_with("-q") || lower == "-Q" || lower.starts_with("-Q")
+        }
+        _ => false,
+    }
 }
 
 /// Reject command-execution payloads embedded in another program's options.
@@ -813,6 +868,18 @@ fn has_embedded_execution_payload(tokens: &[String]) -> bool {
                 return true;
             }
         }
+    }
+    const NETWORK_OPTION_PAYLOAD_FAMILIES: &[&str] = &[
+        "nc", "ncat", "scp", "sftp", "lftp", "psql", "mongosh", "sqlcmd",
+    ];
+    let command = shell::canonicalize_command_name(command, NETWORK_OPTION_PAYLOAD_FAMILIES)
+        .unwrap_or(command);
+    if tokens
+        .iter()
+        .skip(1)
+        .any(|token| network_client_option_payload(command, token))
+    {
+        return true;
     }
     tokens.iter().skip(1).any(|token| {
         let lower = token.to_ascii_lowercase();
@@ -3901,5 +3968,84 @@ mod tests {
             policy().evaluate(&normal_relative).is_allow(),
             "foo/bar/../baz should stay inside workspace"
         );
+    }
+
+    #[test]
+    fn git_include_and_askpass_config_keys_are_command_executing() {
+        let cases = [
+            "git -c include.path=/workspace/malicious.conf status",
+            "git -cinclude.path=/workspace/malicious.conf status",
+            "git --config include.path=/workspace/malicious.conf status",
+            "git --config=include.path=/workspace/malicious.conf status",
+            "git --config-env include.path=MYCONF status",
+            "git -c includeIf.gitdir:/workspace/.git.path=/workspace/malicious.conf status",
+            "git -c core.askPass=/workspace/malicious status",
+            "git -c core.askpass=/workspace/malicious status",
+        ];
+        for command in cases {
+            let action = bash(command);
+            let decision = policy().evaluate(&action);
+            assert!(
+                !decision.is_allow(),
+                "'{command}' must not be allowed by default: {decision:?}"
+            );
+            assert!(
+                matches!(
+                    decision,
+                    PolicyDecision::NeedsApproval { ref reason, .. } if reason == "unmodeled shell wrapper or option payload"
+                ),
+                "'{command}' should be flagged as unmodeled option payload: {decision:?}"
+            );
+
+            let prefix: Vec<String> = shell::tokenize_command(command);
+            let rule = ApprovalRule {
+                id: "git-broad".to_owned(),
+                tool: "bash".to_owned(),
+                literal_prefix: prefix,
+                effect: RuleEffect::Allow,
+                workspace_only: true,
+                allowed_permissions: vec![Permission::Exec],
+                allowed_network_domains: vec![],
+            };
+            assert!(
+                policy().try_with_rule(rule).is_err(),
+                "'{command}' must not be persistable as an ApproveAlways rule"
+            );
+        }
+    }
+
+    #[test]
+    fn network_client_option_payloads_are_unmodeled_execution() {
+        let cases = [
+            "nc -e /workspace/malicious -l -p 1234",
+            "ncat -e /workspace/malicious -l -p 1234",
+            "scp -S /workspace/malicious user@host:/",
+            "sftp -b /workspace/batch user@host",
+            "lftp -e '!id' example.com",
+            "psql -c '\\! id' db",
+            "mongosh --eval 'sh.exit()' mongodb://example.com",
+            "sqlcmd -Q '!! id' -S example.com",
+        ];
+        for command in cases {
+            let action = bash(command);
+            let p = policy();
+            let decision = p.evaluate(&action);
+            assert!(
+                !decision.is_forbidden(),
+                "'{command}' must remain one-shot approvable: {decision:?}"
+            );
+            assert!(
+                matches!(
+                    decision,
+                    PolicyDecision::NeedsApproval { ref reason, .. } if reason == "unmodeled shell wrapper or option payload"
+                ),
+                "'{command}' should be flagged as unmodeled option payload: {decision:?}"
+            );
+            let resolved = p.resolve(&action, UserDecision::ApproveOnce, &projector());
+            assert!(
+                matches!(resolved, ResolvedDecision::ApproveOnce),
+                "'{command}' must allow explicit one-shot approval: {resolved:?}"
+            );
+        }
     }
 }

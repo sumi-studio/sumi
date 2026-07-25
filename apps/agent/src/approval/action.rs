@@ -443,7 +443,13 @@ fn credential_options_for_command(cmd: &str) -> Option<&'static [(&'static str, 
     ];
     let family = shell::canonicalize_command_name(cmd, CREDENTIAL_FAMILIES)?;
     match family {
-        "curl" => Some(&[("-u", "curl_user"), ("--user", "curl_user")]),
+        "curl" => Some(&[
+            ("-u", "curl_user"),
+            ("--user", "curl_user"),
+            ("--oauth2-bearer", "bearer_token"),
+            ("--proxy-user", "curl_user"),
+            ("--proxy-password", "curl_password"),
+        ]),
         "wget" => Some(&[
             ("--password", "wget_password"),
             ("--user", "wget_user"),
@@ -451,6 +457,8 @@ fn credential_options_for_command(cmd: &str) -> Option<&'static [(&'static str, 
             ("--http-user", "wget_user"),
             ("--ftp-password", "wget_password"),
             ("--ftp-user", "wget_user"),
+            ("--proxy-user", "wget_user"),
+            ("--proxy-password", "wget_password"),
         ]),
         "lftp" => Some(&[("-u", "lftp_user")]),
         "sshpass" => Some(&[("-p", "sshpass_password")]),
@@ -4093,5 +4101,73 @@ mod tests {
             lexical_normalize_to_string("/../../etc/passwd"),
             "/etc/passwd"
         );
+    }
+
+    #[test]
+    fn curl_oauth2_and_proxy_credentials_are_redacted() {
+        let cases = [
+            (
+                "curl --oauth2-bearer abcdef1234567890 https://example.com",
+                "abcdef1234567890",
+                "bearer_token",
+            ),
+            (
+                "curl --oauth2-bearer=abcdef1234567890 https://example.com",
+                "abcdef1234567890",
+                "bearer_token",
+            ),
+            (
+                "curl --proxy-user alice:supersecret https://example.com",
+                "supersecret",
+                "curl_user",
+            ),
+            (
+                "curl --proxy-user=alice:supersecret https://example.com",
+                "supersecret",
+                "curl_user",
+            ),
+            (
+                "curl --proxy-password supersecret https://example.com",
+                "supersecret",
+                "curl_password",
+            ),
+            (
+                "curl --proxy-password=supersecret https://example.com",
+                "supersecret",
+                "curl_password",
+            ),
+            (
+                "wget --proxy-user=alice --proxy-password=supersecret https://example.com",
+                "supersecret",
+                "wget_password",
+            ),
+        ];
+        for (command, secret, kind) in cases {
+            let summary = projector().redact_bash_command_text(command);
+            assert!(
+                !summary.contains(secret),
+                "summary leaked credential for {command}: {summary}"
+            );
+            assert!(
+                summary.contains(&format!("[REDACTED:{kind}]")),
+                "summary missing {kind} marker for {command}: {summary}"
+            );
+
+            let projection = projector().project(&bash_action(command));
+            let projection_text = serde_json::to_string(&projection).unwrap();
+            assert!(
+                !projection_text.contains(secret),
+                "projection leaked credential for {command}: {projection_text}"
+            );
+            assert!(
+                projection_text.contains(kind),
+                "projection missing {kind} marker for {command}: {projection_text}"
+            );
+
+            assert!(
+                projector().text_contains_secret(command),
+                "text_contains_secret failed for {command}"
+            );
+        }
     }
 }
