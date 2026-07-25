@@ -15,7 +15,7 @@
 //!   the public contract yet.
 
 use serde::{
-    Deserialize, Deserializer, Serialize,
+    Deserialize, Deserializer, Serialize, Serializer,
     de::{self, IgnoredAny, SeqAccess, Visitor},
 };
 use serde_json::{Map, Value};
@@ -67,6 +67,8 @@ pub enum WireError {
     InvalidRejectReason { reason: String },
     #[error("command_id `{0}` is not a canonical UUID")]
     InvalidCommandId(String),
+    #[error("message_id `{0}` is not a canonical UUID")]
+    InvalidMessageId(String),
     #[error("approval rule must be an object")]
     NonObjectApprovalRule,
     #[error("tool execution args must be an object")]
@@ -89,6 +91,44 @@ pub fn user_message_id_from_command_id(command_id: &str) -> Result<String, WireE
 /// command-ack rules from the contract.
 pub fn to_wire_frame(frame: OutboundFrame) -> Result<WireOutboundFrame, WireError> {
     frame.try_into()
+}
+
+/// Canonical lower-case hyphenated UUID used for `message_id` in message events.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageId(String);
+
+impl MessageId {
+    pub fn parse(value: &str) -> Result<Self, &'static str> {
+        let uuid = Uuid::parse_str(value).map_err(|_| "message_id is not a UUID")?;
+        let canonical = uuid.hyphenated().to_string();
+        if value != canonical {
+            return Err("message_id is not in canonical lower-case hyphenated form");
+        }
+        Ok(Self(canonical))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Serialize for MessageId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for MessageId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(|_| de::Error::custom("message_id must be a canonical UUID"))
+    }
 }
 
 /// Attachment placeholder. v1 accepts only an empty array.
@@ -379,15 +419,15 @@ pub enum WireAgentEvent {
         tool_results: Vec<WireToolResultMessage>,
     },
     MessageStart {
-        message_id: String,
+        message_id: MessageId,
         message: Box<WirePublicMessage>,
     },
     MessageUpdate {
-        message_id: String,
+        message_id: MessageId,
         event: WirePublicStreamEvent,
     },
     MessageEnd {
-        message_id: String,
+        message_id: MessageId,
         message: Box<WirePublicMessage>,
     },
     ToolExecutionStart {
@@ -786,18 +826,21 @@ impl TryFrom<AgentEvent> for WireAgentEvent {
                 message_id,
                 message,
             } => Self::MessageStart {
-                message_id,
+                message_id: MessageId::parse(&message_id)
+                    .map_err(|_| WireError::InvalidMessageId(message_id))?,
                 message: Box::new((*message).try_into()?),
             },
             AgentEvent::MessageUpdate { message_id, event } => Self::MessageUpdate {
-                message_id,
+                message_id: MessageId::parse(&message_id)
+                    .map_err(|_| WireError::InvalidMessageId(message_id))?,
                 event: event.try_into()?,
             },
             AgentEvent::MessageEnd {
                 message_id,
                 message,
             } => Self::MessageEnd {
-                message_id,
+                message_id: MessageId::parse(&message_id)
+                    .map_err(|_| WireError::InvalidMessageId(message_id))?,
                 message: Box::new((*message).try_into()?),
             },
             AgentEvent::ToolExecutionStart {
@@ -2212,5 +2255,108 @@ mod tests {
         assert_canonical_contract("Command", &json);
         let back: WireCommand = serde_json::from_value(json).unwrap();
         assert_eq!(wire, back);
+    }
+
+    #[test]
+    fn message_event_message_id_is_canonical_uuid() {
+        let valid_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let user_message = PublicMessage::User(UserMessage {
+            content: vec![UserContent::Text {
+                text: "hi".to_owned(),
+            }],
+            timestamp: now(),
+        });
+        let user_message_json = serde_json::to_value(&user_message).unwrap();
+
+        for event_type in ["message_start", "message_update", "message_end"] {
+            let mut payload = match event_type {
+                "message_start" => json!({
+                    "type": "message_start",
+                    "message_id": "__ID__",
+                    "message": user_message_json.clone(),
+                }),
+                "message_update" => json!({
+                    "type": "message_update",
+                    "message_id": "__ID__",
+                    "event": {
+                        "type": "text_delta",
+                        "content_index": 0,
+                        "delta": "d",
+                    },
+                }),
+                "message_end" => json!({
+                    "type": "message_end",
+                    "message_id": "__ID__",
+                    "message": user_message_json.clone(),
+                }),
+                _ => unreachable!(),
+            };
+
+            for bad_id in [
+                "not-a-uuid".to_owned(),
+                valid_id.to_uppercase(),
+                format!("{{{valid_id}}}"),
+            ] {
+                payload
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("message_id".to_owned(), json!(bad_id));
+                assert!(
+                    serde_json::from_value::<WireAgentEvent>(payload.clone()).is_err(),
+                    "{event_type} must reject non-canonical message_id {bad_id}"
+                );
+            }
+
+            payload
+                .as_object_mut()
+                .unwrap()
+                .insert("message_id".to_owned(), json!(valid_id));
+            let wire: WireAgentEvent = serde_json::from_value(payload).unwrap();
+            let json = serde_json::to_value(&wire).unwrap();
+            assert_canonical_contract("AgentEvent", &json);
+            assert_eq!(json["message_id"].as_str().unwrap(), valid_id);
+        }
+
+        // Outbound conversion also validates the internal message_id.
+        for bad_id in ["not-a-uuid".to_owned(), valid_id.to_uppercase()] {
+            let start = AgentEvent::MessageStart {
+                message_id: bad_id.clone(),
+                message: Box::new(user_message.clone()),
+            };
+            assert!(
+                matches!(
+                    WireAgentEvent::try_from(start),
+                    Err(WireError::InvalidMessageId(id)) if id == bad_id
+                ),
+                "message_start outbound must reject {bad_id}"
+            );
+
+            let update = AgentEvent::MessageUpdate {
+                message_id: bad_id.clone(),
+                event: PublicStreamEvent::TextDelta {
+                    content_index: 0,
+                    delta: "d".to_owned(),
+                },
+            };
+            assert!(
+                matches!(
+                    WireAgentEvent::try_from(update),
+                    Err(WireError::InvalidMessageId(id)) if id == bad_id
+                ),
+                "message_update outbound must reject {bad_id}"
+            );
+
+            let end = AgentEvent::MessageEnd {
+                message_id: bad_id.clone(),
+                message: Box::new(user_message.clone()),
+            };
+            assert!(
+                matches!(
+                    WireAgentEvent::try_from(end),
+                    Err(WireError::InvalidMessageId(id)) if id == bad_id
+                ),
+                "message_end outbound must reject {bad_id}"
+            );
+        }
     }
 }
