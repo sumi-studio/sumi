@@ -1,7 +1,7 @@
 //! Filesystem-backed artifact operations rooted at one stable directory FD.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::{CStr, CString, OsStr},
     fs::{File, OpenOptions},
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
@@ -53,6 +53,7 @@ pub enum ArtifactResponse {
     Begun { handle: String, offset: u64 },
     Appended { offset: u64 },
     Finished,
+    Deleted,
     Read { content: Vec<u8>, eof: bool },
     Grep { matches: Vec<ArtifactGrepMatch> },
 }
@@ -69,6 +70,11 @@ struct BrokerState {
     // T13 keeps bounded retry metadata for this broker process only. T26 owns
     // the durable request journal/receipt needed to reconstruct it on restart.
     artifacts: HashMap<String, ArtifactRecord>,
+    // Tombstones observed by this process.  A durable ledger is T29; this set
+    // makes replay of the same `DeleteConversationArtifacts` idempotent within
+    // a single broker lifetime.
+    applied_tombstones: HashSet<String>,
+    deleted_conversations: HashSet<String>,
 }
 
 struct ArtifactRecord {
@@ -150,6 +156,10 @@ impl ArtifactBroker {
                 handle,
                 pattern,
             } => self.grep_artifact(&conversation_id, &handle, &pattern),
+            ArtifactOperation::DeleteConversationArtifacts {
+                old_conversation_id,
+                tombstone_id,
+            } => self.delete_conversation_artifacts(&old_conversation_id, &tombstone_id),
         }
     }
 
@@ -431,6 +441,77 @@ impl ArtifactBroker {
         Ok(ArtifactResponse::Grep { matches })
     }
 
+    fn delete_conversation_artifacts(
+        &self,
+        old_conversation_id: &str,
+        tombstone_id: &str,
+    ) -> Result<ArtifactResponse, ToolError> {
+        let prefix = format!("artifact://{old_conversation_id}/");
+        let mut state = self.lock_state()?;
+
+        if state.applied_tombstones.contains(tombstone_id)
+            || state.deleted_conversations.contains(old_conversation_id)
+        {
+            // Idempotent replay: the conversation has already been deleted by
+            // this tombstone or by an earlier one in this process.
+            state
+                .artifacts
+                .retain(|handle, _| !handle.starts_with(&prefix));
+            return Ok(ArtifactResponse::Deleted);
+        }
+
+        state
+            .artifacts
+            .retain(|handle, _| !handle.starts_with(&prefix));
+
+        let name = cstring(old_conversation_id)?;
+        let conversation_fd = match openat2_cstr(
+            self.root.as_raw_fd(),
+            &name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0,
+        ) {
+            Ok(fd) => fd,
+            Err(ToolError::Io(error)) if error.raw_os_error() == Some(libc::ENOENT) => {
+                state.applied_tombstones.insert(tombstone_id.to_owned());
+                state
+                    .deleted_conversations
+                    .insert(old_conversation_id.to_owned());
+                return Ok(ArtifactResponse::Deleted);
+            }
+            Err(error) => return Err(error),
+        };
+
+        if !std::fs::File::from(conversation_fd.try_clone()?)
+            .metadata()?
+            .is_dir()
+        {
+            return Err(ToolError::InvalidPath(
+                "conversation artifact path is not a directory".to_owned(),
+            ));
+        }
+
+        remove_dir_contents(conversation_fd.as_raw_fd())?;
+        drop(conversation_fd);
+
+        let rc =
+            unsafe { libc::unlinkat(self.root.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+        if rc != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ENOENT) {
+                return Err(error.into());
+            }
+        }
+
+        state.applied_tombstones.insert(tombstone_id.to_owned());
+        state
+            .deleted_conversations
+            .insert(old_conversation_id.to_owned());
+
+        fsync_fd(self.root.as_raw_fd())?;
+        Ok(ArtifactResponse::Deleted)
+    }
+
     fn ensure_artifact_dirs(
         &self,
         conversation_id: &str,
@@ -455,6 +536,86 @@ impl ArtifactBroker {
         self.state
             .lock()
             .map_err(|_| ToolError::Protocol("artifact process state lock poisoned".to_owned()))
+    }
+}
+
+fn remove_dir_contents(dir_fd: RawFd) -> Result<(), ToolError> {
+    for name in read_dir_fd(dir_fd)? {
+        remove_dir_entry(dir_fd, &name)?;
+    }
+    Ok(())
+}
+
+fn read_dir_fd(dir_fd: RawFd) -> Result<Vec<CString>, ToolError> {
+    let mut buf = vec![0u8; 8192];
+    let mut entries = Vec::new();
+    loop {
+        let n = unsafe { libc::syscall(libc::SYS_getdents64, dir_fd, buf.as_mut_ptr(), buf.len()) }
+            as isize;
+        if n < 0 {
+            return Err(ToolError::Io(std::io::Error::last_os_error()));
+        }
+        if n == 0 {
+            break;
+        }
+        let bytes_read = n as usize;
+        let mut offset = 0usize;
+        while offset + 19 <= bytes_read {
+            let reclen = u16::from_ne_bytes([buf[offset + 16], buf[offset + 17]]) as usize;
+            if reclen == 0 || offset + reclen > bytes_read {
+                break;
+            }
+            let name_start = offset + 19;
+            let name_bytes = &buf[name_start..offset + reclen];
+            let name_len = name_bytes
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(name_bytes.len());
+            let name = &name_bytes[..name_len];
+            if name != b"." && name != b".." {
+                entries.push(CString::new(name).map_err(|_| {
+                    ToolError::InvalidPath("artifact path contains NUL".to_owned())
+                })?);
+            }
+            offset += reclen;
+        }
+    }
+    Ok(entries)
+}
+
+fn remove_dir_entry(parent_fd: RawFd, name: &CStr) -> Result<(), ToolError> {
+    match openat2_cstr(
+        parent_fd,
+        name,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        0,
+    ) {
+        Ok(dir_fd) => {
+            remove_dir_contents(dir_fd.as_raw_fd())?;
+            drop(dir_fd);
+            let rc = unsafe { libc::unlinkat(parent_fd, name.as_ptr(), libc::AT_REMOVEDIR) };
+            if rc != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ENOENT) {
+                    return Err(error.into());
+                }
+            }
+            Ok(())
+        }
+        Err(ToolError::Io(error)) => match error.raw_os_error() {
+            Some(libc::ENOTDIR) | Some(libc::ELOOP) | Some(libc::ENOENT) => {
+                let rc = unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) };
+                if rc != 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ENOENT) {
+                        return Err(error.into());
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(error.into()),
+        },
+        Err(error) => Err(error),
     }
 }
 
@@ -1138,5 +1299,58 @@ mod tests {
         assert_eq!(fs::metadata(conversation).unwrap().mode() & 0o777, 0o700);
         assert_eq!(fs::metadata(kind).unwrap().mode() & 0o777, 0o700);
         assert_eq!(fs::metadata(file).unwrap().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn delete_conversation_artifacts_removes_whole_subtree_and_is_idempotent() {
+        let root = TestRoot::new();
+        let broker = ArtifactBroker::open(&root.0).unwrap();
+
+        broker.execute(begin(b"one".to_vec())).unwrap();
+        let other = ArtifactOperation::BeginToolOutput {
+            conversation_id: "conversation-2".to_owned(),
+            execution_id: "execution-1".to_owned(),
+            content: b"two".to_vec(),
+        };
+        broker.execute(other).unwrap();
+
+        let delete = ArtifactOperation::DeleteConversationArtifacts {
+            old_conversation_id: "conversation-1".to_owned(),
+            tombstone_id: "tombstone-1".to_owned(),
+        };
+        assert_eq!(
+            broker.execute(delete.clone()).unwrap(),
+            ArtifactResponse::Deleted
+        );
+        assert!(!root.0.join("conversation-1").exists());
+        assert!(root.0.join("conversation-2").exists());
+
+        assert_eq!(broker.execute(delete).unwrap(), ArtifactResponse::Deleted);
+    }
+
+    #[test]
+    fn delete_conversation_artifacts_rejects_symlink_escape() {
+        let outside = TestRoot::new();
+        let marker = outside.0.join("marker");
+        fs::write(&marker, b"untouched").unwrap();
+
+        let root = TestRoot::new();
+        fs::create_dir(root.0.join("conversation-1")).unwrap();
+        symlink(
+            outside.0.join("marker"),
+            root.0.join("conversation-1/link-to-marker"),
+        )
+        .unwrap();
+
+        let broker = ArtifactBroker::open(&root.0).unwrap();
+        let delete = ArtifactOperation::DeleteConversationArtifacts {
+            old_conversation_id: "conversation-1".to_owned(),
+            tombstone_id: "tombstone-1".to_owned(),
+        };
+        assert_eq!(broker.execute(delete).unwrap(), ArtifactResponse::Deleted);
+        assert!(
+            marker.exists(),
+            "symlink target outside the conversation subtree must not be followed"
+        );
     }
 }

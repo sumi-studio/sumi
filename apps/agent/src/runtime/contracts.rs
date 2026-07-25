@@ -23,6 +23,84 @@ pub enum RuntimeContractError {
     ProcessGenerationLeaseMismatch,
     #[error("generation recovery fence lease/generation or opaque identity mismatch")]
     GenerationRecoveryFenceMismatch,
+    #[error("hydration receipt identity cannot be empty or exceed {MAX_OPAQUE_ID_BYTES} bytes")]
+    InvalidHydrationReceiptIdentity,
+    #[error("hydration ready is already latched for generation {generation}")]
+    HydrationAlreadyLatched { generation: u64 },
+    #[error("hydration ready latch rejected a stale or mismatched generation")]
+    HydrationGenerationMismatch,
+}
+
+/// Stable identity attached to a hydration receipt.  T17 owns the durable
+/// receipt; T26 generates the identity for clean conversations and binds it to
+/// the `Ready` state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HydrationReceiptIdentity(String);
+
+impl HydrationReceiptIdentity {
+    pub fn new(value: impl Into<String>) -> Result<Self, RuntimeContractError> {
+        Ok(Self(validate_opaque(
+            value.into(),
+            "hydration receipt identity",
+        )?))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Per-`ProcessGeneration` hydration latch.  T26 initializes this as `NotReady`,
+/// then transitions it exactly once to `Ready { generation, ... }` after the
+/// production `RunCore` composition has completed for a clean generation.
+///
+/// Rollover must invalidate the old `Ready` before the new generation is made
+/// visible to any caller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HydrationReady {
+    NotReady,
+    Ready {
+        generation: ProcessGeneration,
+        hydration_receipt_identity: HydrationReceiptIdentity,
+    },
+}
+
+impl HydrationReady {
+    pub const fn not_ready() -> Self {
+        Self::NotReady
+    }
+
+    /// Latch `Ready` exactly once.  Rejects re-latching, generation mismatches,
+    /// and attempts to move from an already-latched state for a different
+    /// generation without first invalidating it.
+    pub fn latch(
+        &mut self,
+        generation: ProcessGeneration,
+        identity: HydrationReceiptIdentity,
+    ) -> Result<(), RuntimeContractError> {
+        if let Self::Ready {
+            generation: latched,
+            ..
+        } = self
+        {
+            if *latched == generation {
+                return Err(RuntimeContractError::HydrationAlreadyLatched {
+                    generation: generation.as_u64(),
+                });
+            }
+            return Err(RuntimeContractError::HydrationGenerationMismatch);
+        }
+        *self = Self::Ready {
+            generation,
+            hydration_receipt_identity: identity,
+        };
+        Ok(())
+    }
+
+    /// Rollover helper: invalidate an existing `Ready` and reset to `NotReady`.
+    pub fn invalidate(&mut self) {
+        *self = Self::NotReady;
+    }
 }
 
 /// A process generation that is exactly representable by SQLite `INTEGER`.
@@ -195,10 +273,15 @@ impl GenerationRecoveryFence {
         lease: &ProcessGenerationLease,
         fence_id: impl Into<String>,
     ) -> Result<Self, RuntimeContractError> {
+        let fence_id = validate_opaque(fence_id.into(), "generation recovery fence identity")?;
+        let expected = format!("fence-for-{}", lease.lease_id());
+        if fence_id != expected {
+            return Err(RuntimeContractError::GenerationRecoveryFenceMismatch);
+        }
         Ok(Self {
             generation: lease.generation,
             lease_id: lease.lease_id.clone(),
-            fence_id: validate_opaque(fence_id.into(), "generation recovery fence identity")?,
+            fence_id,
         })
     }
 
@@ -296,19 +379,21 @@ mod tests {
         assert!(lease.validate_exact(other_generation, "lease-1").is_err());
         assert!(lease.validate_exact(generation, "lease-2").is_err());
 
-        let fence = GenerationRecoveryFence::new(&lease, "fence-1").unwrap();
-        assert!(fence.validate_exact(&lease, "fence-1").is_ok());
+        let fence_id = format!("fence-for-{}", lease.lease_id());
+        let other_lease_id = format!("fence-for-{}", other_identity_lease.lease_id());
+        let fence = GenerationRecoveryFence::new(&lease, &fence_id).unwrap();
+        assert!(fence.validate_exact(&lease, &fence_id).is_ok());
         assert!(
             fence
-                .validate_exact(&other_generation_lease, "fence-1")
+                .validate_exact(&other_generation_lease, &fence_id)
                 .is_err()
         );
         assert!(
             fence
-                .validate_exact(&other_identity_lease, "fence-1")
+                .validate_exact(&other_identity_lease, &other_lease_id)
                 .is_err()
         );
-        assert!(fence.validate_exact(&lease, "fence-2").is_err());
+        assert!(fence.validate_exact(&lease, "fence-for-lease-2").is_err());
         assert!(ProcessGenerationLease::new(generation, "").is_err());
         assert!(GenerationRecoveryFence::new(&lease, "").is_err());
     }

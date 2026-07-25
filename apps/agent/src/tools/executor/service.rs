@@ -502,6 +502,53 @@ pub async fn run_tool_executor_mode() -> Result<()> {
     .await
 }
 
+/// Socket-bound executor used by the T26 production supervisor.  Each accepted
+/// connection gets its own `WorkspaceFs` and `ArtifactBrokerClient` so a
+/// connection cannot carry stale state into the next.
+pub async fn run_tool_executor_socket_mode() -> Result<()> {
+    let identity = identity_from_env()?;
+    let workspace = required_path("SUMI_WORKSPACE")?;
+    let conversation_id = required_text("SUMI_CONVERSATION_ID")?;
+    let broker_socket = required_path("SUMI_ARTIFACT_BROKER_SOCKET")?;
+    let executor_socket = required_path("SUMI_EXECUTOR_SOCKET")?;
+
+    let _ = tokio::fs::remove_file(&executor_socket).await;
+    let listener = UnixListener::bind(&executor_socket).with_context(|| {
+        format!(
+            "failed to bind executor socket {}",
+            executor_socket.display()
+        )
+    })?;
+
+    loop {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .context("failed to accept executor connection")?;
+        let identity = identity.clone();
+        let workspace = workspace.clone();
+        let broker_socket = broker_socket.clone();
+        let conversation_id = conversation_id.clone();
+        tokio::spawn(async move {
+            let (read, write) = stream.into_split();
+            let fs = match WorkspaceFs::open(&workspace) {
+                Ok(fs) => fs,
+                Err(error) => {
+                    tracing::error!(%error, "failed to open executor workspace for connection");
+                    return;
+                }
+            };
+            let broker =
+                ArtifactBrokerClient::new(broker_socket, identity.clone(), conversation_id);
+            if let Err(error) =
+                run_executor_service(read, write, identity, workspace, fs, broker).await
+            {
+                tracing::warn!(%error, "executor socket connection closed with error");
+            }
+        });
+    }
+}
+
 pub async fn run_artifact_broker_mode() -> Result<()> {
     let identity = identity_from_env()?;
     let root = required_path("SUMI_ARTIFACT_ROOT")?;

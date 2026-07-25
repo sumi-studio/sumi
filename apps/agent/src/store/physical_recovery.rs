@@ -801,7 +801,8 @@ mod tests {
     }
 
     fn test_fence(lease: &ProcessGenerationLease) -> GenerationRecoveryFence {
-        GenerationRecoveryFence::new(lease, "fence-1").expect("valid fence")
+        GenerationRecoveryFence::new(lease, format!("fence-for-{}", lease.lease_id()))
+            .expect("valid fence")
     }
 
     async fn test_store() -> Arc<Store> {

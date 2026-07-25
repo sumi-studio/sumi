@@ -174,6 +174,10 @@ pub enum ArtifactOperation {
         handle: String,
         pattern: String,
     },
+    DeleteConversationArtifacts {
+        old_conversation_id: String,
+        tombstone_id: String,
+    },
 }
 
 pub trait RpcOperationValidation {
@@ -275,6 +279,21 @@ impl RpcOperationValidation for ArtifactOperation {
                 if pattern.is_empty() {
                     return Err(ToolError::Protocol(
                         "RPC grep pattern must be non-empty".to_owned(),
+                    ));
+                }
+                Ok(())
+            }
+            Self::DeleteConversationArtifacts {
+                old_conversation_id,
+                tombstone_id,
+            } => {
+                validate_artifact_handle_component(old_conversation_id)?;
+                validate_rpc_id(old_conversation_id, "old_conversation_id")?;
+                validate_artifact_handle_component(tombstone_id)?;
+                validate_rpc_id(tombstone_id, "tombstone_id")?;
+                if old_conversation_id == tombstone_id {
+                    return Err(ToolError::InvalidPath(
+                        "delete tombstone must differ from the old conversation id".to_owned(),
                     ));
                 }
                 Ok(())
@@ -1238,6 +1257,10 @@ mod tests {
                 handle: handle.to_owned(),
                 pattern: "needle".to_owned(),
             },
+            ArtifactOperation::DeleteConversationArtifacts {
+                old_conversation_id: "conversation-1".to_owned(),
+                tombstone_id: "tombstone-1".to_owned(),
+            },
         ];
         for operation in valid {
             let encoded = serde_json::to_vec(&RpcRequest {
@@ -1302,6 +1325,14 @@ mod tests {
                 conversation_id: "conversation-1".to_owned(),
                 handle: handle.to_owned(),
                 pattern: "".to_owned(),
+            },
+            ArtifactOperation::DeleteConversationArtifacts {
+                old_conversation_id: "".to_owned(),
+                tombstone_id: "tombstone-1".to_owned(),
+            },
+            ArtifactOperation::DeleteConversationArtifacts {
+                old_conversation_id: "conversation-1".to_owned(),
+                tombstone_id: "conversation-1".to_owned(),
             },
         ];
         for operation in invalid {

@@ -1,6 +1,7 @@
 mod agent;
 mod apiclient;
 mod approval;
+mod bootstrap;
 mod config;
 mod gateway;
 mod memory;
@@ -12,11 +13,12 @@ mod tools;
 
 use std::{env, io, sync::Arc};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use gateway::{
     CommandAckStatus, Envelope, Gateway, GatewayClosed, GatewayReader, GatewayWriter,
     InboundCommand, InvalidCommand, OutboundFrame, StdioGateway,
 };
+use runtime::allocator::{acquire_generation, print_shell_exports};
 use store::{
     AgentScope, DataKeyPurpose, EnvironmentKeyProvider, EventWriter, InboundAdmission, Store,
     SuffixRecovery,
@@ -32,6 +34,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("sumi_agent=info")),
         )
         .init();
+
     match env::args().nth(1).as_deref() {
         Some("--tool-executor") => {
             tracing::warn!(
@@ -41,6 +44,13 @@ async fn main() -> Result<()> {
             );
             return tools::executor::run_tool_executor_mode().await;
         }
+        Some("--tool-executor-socket") => {
+            tracing::info!(
+                service = "tool-executor-socket",
+                "starting socket-bound executor"
+            );
+            return tools::executor::run_tool_executor_socket_mode().await;
+        }
         Some("--artifact-broker") => {
             tracing::warn!(
                 service = "artifact-broker",
@@ -49,8 +59,33 @@ async fn main() -> Result<()> {
             );
             return tools::executor::run_artifact_broker_mode().await;
         }
+        Some("--allocate-generation") => {
+            let state_dir = env::var_os("SUMI_STATE_DIR")
+                .ok_or_else(|| anyhow!("SUMI_STATE_DIR is required for generation allocation"))?;
+            let allocation =
+                acquire_generation(&state_dir).context("generation allocation failed")?;
+            print_shell_exports(&allocation);
+            return Ok(());
+        }
         _ => {}
     }
+
+    // Production bootstrap boundary.  The supervisor must issue all required
+    // identity, lease, and fence variables.  When they are missing we fall
+    // through to the M0 admission harness so existing low-trust tests keep
+    // working; any actual production deployment without these variables is
+    // fail-closed because `bootstrap::run_production` would be called with
+    // missing environment and error.
+    if env::var("SUMI_RPC_GENERATION").is_ok() && env::var("SUMI_RPC_NONCE").is_ok() {
+        return bootstrap::run_production().await;
+    }
+
+    // M0 low-trust admission harness.  This path is not a production boundary;
+    // it exists only for local tests and exploratory runs without a supervisor.
+    run_low_trust_admission().await
+}
+
+async fn run_low_trust_admission() -> Result<()> {
     let config = config::Config::load().await?;
 
     let model_spec = config.model_spec()?;

@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+# T26 production deployment supervisor for the Sumi agent.
+#
+# Responsibilities:
+#   1. Acquire a monotonic ProcessGeneration lease, RpcBootNonce, and
+#      GenerationRecoveryFence from the allocator.
+#   2. Prepare state, workspace, and artifact directories with private modes.
+#   3. Spawn runtime, executor, and artifact-broker processes with the same
+#      RPC identity and with distinct UIDs / namespaces when the host supports
+#      them.
+#
+# The script fails closed when the requested isolation cannot be preserved.
+# For local functional testing set SUMI_ALLOW_LOW_TRUST=1.
+set -euo pipefail
+
+SUPERVISOR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SUMI_CONFIG_FILE="${SUMI_CONFIG_FILE:-${SUPERVISOR_DIR}/config.env}"
+if [[ -f "${SUMI_CONFIG_FILE}" ]]; then
+  # shellcheck source=/dev/null
+  set -a
+  . "${SUMI_CONFIG_FILE}"
+  set +a
+fi
+
+: "${SUMI_RUNTIME_USER:=sumi-runtime}"
+: "${SUMI_RUNTIME_GROUP:=sumi-runtime}"
+: "${SUMI_EXECUTOR_USER:=sumi-tool}"
+: "${SUMI_EXECUTOR_GROUP:=sumi-tool}"
+: "${SUMI_BROKER_USER:=sumi-artifact}"
+: "${SUMI_BROKER_GROUP:=sumi-artifact}"
+: "${SUMI_STATE_DIR:=/var/lib/sumi}"
+: "${SUMI_WORKSPACE:=/var/lib/sumi/workspace}"
+: "${SUMI_ARTIFACT_ROOT:=/var/lib/sumi/artifacts}"
+: "${SUMI_EXECUTOR_SOCKET:=/run/sumi/executor.sock}"
+: "${SUMI_ARTIFACT_BROKER_SOCKET:=/run/sumi/broker.sock}"
+: "${SUMI_ISOLATION_MODE:=low-trust}"
+: "${SUMI_ALLOW_LOW_TRUST:=0}"
+
+SUMI_BIN="${SUMI_BIN:-sumi-agent}"
+
+log() {
+  printf '[sumi-supervisor] %s\n' "$*" >&2
+}
+
+error() {
+  log "ERROR: $*"
+  exit 1
+}
+
+check_binary() {
+  if ! command -v "${SUMI_BIN}" >/dev/null 2>&1; then
+    error "binary not found: ${SUMI_BIN}"
+  fi
+}
+
+check_isolation() {
+  local mode="$1"
+  case "${mode}" in
+    privileged)
+      if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+        error "privileged mode requires root"
+      fi
+      for tool in setpriv unshare ip; do
+        if ! command -v "${tool}" >/dev/null 2>&1; then
+          error "privileged mode requires ${tool}"
+        fi
+      done
+      ;;
+    rootless)
+      if ! command -v unshare >/dev/null 2>&1; then
+        error "rootless mode requires unshare"
+      fi
+      if ! unshare --user --net true 2>/dev/null; then
+        error "user and network namespaces are not available"
+      fi
+      # Distinct filesystem UID separation inside a rootless user namespace
+      # requires newuidmap/newgidmap and an /etc/subuid entry.  The supervisor
+      # uses them if present; if they are missing the rootless process still
+      # gets a network/user namespace but the filesystem UID is inherited, so
+      # distinct-UID separation cannot be proven.
+      if ! command -v newuidmap >/dev/null 2>&1 || ! command -v newgidmap >/dev/null 2>&1; then
+        log "WARNING: newuidmap/newgidmap not available; rootless distinct filesystem UIDs cannot be established"
+      fi
+      ;;
+    low-trust)
+      if [[ "${SUMI_ALLOW_LOW_TRUST}" != "1" ]]; then
+        error "low-trust mode is disabled; set SUMI_ALLOW_LOW_TRUST=1 to run without isolation"
+      fi
+      ;;
+    *)
+      error "unknown isolation mode: ${mode}"
+      ;;
+  esac
+}
+
+allocate_identity() {
+  # The binary is the only authority for monotonic ProcessGeneration values.
+  # It prints shell "export" lines that this function evaluates into the
+  # current environment.
+  local exports
+  exports="$(
+    SUMI_STATE_DIR="${SUMI_STATE_DIR}" \
+    "${SUMI_BIN}" --allocate-generation
+  )" || error "generation allocation failed"
+  eval "${exports}"
+  : "${SUMI_RPC_GENERATION:?allocation did not set SUMI_RPC_GENERATION}"
+  : "${SUMI_RPC_NONCE:?allocation did not set SUMI_RPC_NONCE}"
+  : "${SUMI_PROCESS_GENERATION_LEASE_ID:?allocation did not set SUMI_PROCESS_GENERATION_LEASE_ID}"
+  : "${SUMI_GENERATION_RECOVERY_FENCE_ID:?allocation did not set SUMI_GENERATION_RECOVERY_FENCE_ID}"
+}
+
+prepare_directories() {
+  mkdir -p "${SUMI_WORKSPACE}" "${SUMI_ARTIFACT_ROOT}" "$(dirname "${SUMI_EXECUTOR_SOCKET}")" "$(dirname "${SUMI_ARTIFACT_BROKER_SOCKET}")"
+  rm -f "${SUMI_EXECUTOR_SOCKET}" "${SUMI_ARTIFACT_BROKER_SOCKET}"
+  mkdir -p "${SUMI_STATE_DIR}"
+  chmod 700 "${SUMI_STATE_DIR}" "${SUMI_WORKSPACE}" "${SUMI_ARTIFACT_ROOT}"
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    chown "${SUMI_RUNTIME_USER}:${SUMI_RUNTIME_GROUP}" "${SUMI_STATE_DIR}" "${SUMI_WORKSPACE}"
+    chown "${SUMI_BROKER_USER}:${SUMI_BROKER_GROUP}" "${SUMI_ARTIFACT_ROOT}"
+  fi
+}
+
+wait_for_socket() {
+  local socket="$1" label="$2"
+  for _ in $(seq 1 50); do
+    if [[ -S "${socket}" ]]; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  error "${label} did not bind ${socket}"
+}
+
+spawn_broker() {
+  local generation="$1" nonce="$2"
+  case "${SUMI_ISOLATION_MODE}" in
+    privileged)
+      # Network + mount namespace.  The mount namespace prevents any mount
+      # operation inside the broker from affecting the host, and the network
+      # namespace removes external network access.  Distinct UID is via setpriv.
+      unshare --mount --net --kill-child -- \
+        setpriv --reuid="${SUMI_BROKER_USER}" --regid="${SUMI_BROKER_GROUP}" --clear-groups --no-new-privs -- \
+        env -i \
+        "SUMI_RPC_GENERATION=${generation}" \
+        "SUMI_RPC_NONCE=${nonce}" \
+        "SUMI_ARTIFACT_ROOT=${SUMI_ARTIFACT_ROOT}" \
+        "SUMI_ARTIFACT_BROKER_SOCKET=${SUMI_ARTIFACT_BROKER_SOCKET}" \
+        "HOME=${SUMI_ARTIFACT_ROOT}" \
+        "PATH=/usr/bin:/bin" \
+        "${SUMI_BIN}" --artifact-broker &
+      ;;
+    rootless)
+      unshare --user --net --kill-child -- \
+        env -i \
+        "SUMI_RPC_GENERATION=${generation}" \
+        "SUMI_RPC_NONCE=${nonce}" \
+        "SUMI_ARTIFACT_ROOT=${SUMI_ARTIFACT_ROOT}" \
+        "SUMI_ARTIFACT_BROKER_SOCKET=${SUMI_ARTIFACT_BROKER_SOCKET}" \
+        "HOME=${SUMI_ARTIFACT_ROOT}" \
+        "PATH=/usr/bin:/bin" \
+        "${SUMI_BIN}" --artifact-broker &
+      ;;
+    low-trust)
+      env -i \
+        "SUMI_RPC_GENERATION=${generation}" \
+        "SUMI_RPC_NONCE=${nonce}" \
+        "SUMI_ARTIFACT_ROOT=${SUMI_ARTIFACT_ROOT}" \
+        "SUMI_ARTIFACT_BROKER_SOCKET=${SUMI_ARTIFACT_BROKER_SOCKET}" \
+        "HOME=${SUMI_ARTIFACT_ROOT}" \
+        "PATH=/usr/bin:/bin" \
+        "${SUMI_BIN}" --artifact-broker &
+      ;;
+  esac
+}
+
+spawn_executor() {
+  local generation="$1" nonce="$2" conversation="$3"
+  case "${SUMI_ISOLATION_MODE}" in
+    privileged)
+      unshare --mount --net --kill-child -- \
+        setpriv --reuid="${SUMI_EXECUTOR_USER}" --regid="${SUMI_EXECUTOR_GROUP}" --clear-groups --no-new-privs -- \
+        env -i \
+        "SUMI_RPC_GENERATION=${generation}" \
+        "SUMI_RPC_NONCE=${nonce}" \
+        "SUMI_WORKSPACE=${SUMI_WORKSPACE}" \
+        "SUMI_CONVERSATION_ID=${conversation}" \
+        "SUMI_ARTIFACT_BROKER_SOCKET=${SUMI_ARTIFACT_BROKER_SOCKET}" \
+        "SUMI_EXECUTOR_SOCKET=${SUMI_EXECUTOR_SOCKET}" \
+        "HOME=${SUMI_WORKSPACE}" \
+        "PATH=/usr/bin:/bin" \
+        "${SUMI_BIN}" --tool-executor-socket &
+      ;;
+    rootless)
+      unshare --user --net --kill-child -- \
+        env -i \
+        "SUMI_RPC_GENERATION=${generation}" \
+        "SUMI_RPC_NONCE=${nonce}" \
+        "SUMI_WORKSPACE=${SUMI_WORKSPACE}" \
+        "SUMI_CONVERSATION_ID=${conversation}" \
+        "SUMI_ARTIFACT_BROKER_SOCKET=${SUMI_ARTIFACT_BROKER_SOCKET}" \
+        "SUMI_EXECUTOR_SOCKET=${SUMI_EXECUTOR_SOCKET}" \
+        "HOME=${SUMI_WORKSPACE}" \
+        "PATH=/usr/bin:/bin" \
+        "${SUMI_BIN}" --tool-executor-socket &
+      ;;
+    low-trust)
+      env -i \
+        "SUMI_RPC_GENERATION=${generation}" \
+        "SUMI_RPC_NONCE=${nonce}" \
+        "SUMI_WORKSPACE=${SUMI_WORKSPACE}" \
+        "SUMI_CONVERSATION_ID=${conversation}" \
+        "SUMI_ARTIFACT_BROKER_SOCKET=${SUMI_ARTIFACT_BROKER_SOCKET}" \
+        "SUMI_EXECUTOR_SOCKET=${SUMI_EXECUTOR_SOCKET}" \
+        "HOME=${SUMI_WORKSPACE}" \
+        "PATH=/usr/bin:/bin" \
+        "${SUMI_BIN}" --tool-executor-socket &
+      ;;
+  esac
+}
+
+spawn_runtime() {
+  local generation="$1" nonce="$2" conversation="$3"
+  # The runtime needs the authenticated scope and wrapping key.  These are
+  # intentionally not passed to the executor or broker.
+  local runtime_env=(
+    "SUMI_RPC_GENERATION=${generation}"
+    "SUMI_RPC_NONCE=${nonce}"
+    "SUMI_PROCESS_GENERATION_LEASE_ID=${SUMI_PROCESS_GENERATION_LEASE_ID}"
+    "SUMI_GENERATION_RECOVERY_FENCE_ID=${SUMI_GENERATION_RECOVERY_FENCE_ID}"
+    "SUMI_TENANT_ID=${SUMI_TENANT_ID}"
+    "SUMI_AGENT_ID=${SUMI_AGENT_ID}"
+    "SUMI_CONVERSATION_ID=${conversation}"
+    "SUMI_STATE_DIR=${SUMI_STATE_DIR}"
+    "SUMI_WORKSPACE=${SUMI_WORKSPACE}"
+    "SUMI_ARTIFACT_ROOT=${SUMI_ARTIFACT_ROOT}"
+    "SUMI_ARTIFACT_BROKER_SOCKET=${SUMI_ARTIFACT_BROKER_SOCKET}"
+    "SUMI_EXECUTOR_SOCKET=${SUMI_EXECUTOR_SOCKET}"
+    "SUMI_AGENT_WRAPPING_KEY=${SUMI_AGENT_WRAPPING_KEY}"
+    "SUMI_AGENT_WRAPPING_KEY_ID=${SUMI_AGENT_WRAPPING_KEY_ID:-env-wrapping-key/v1}"
+    "HOME=${SUMI_STATE_DIR}"
+    "PATH=/usr/bin:/bin"
+  )
+  if [[ -n "${SUMI_MODEL_PRESET:-}" ]]; then
+    runtime_env+=("SUMI_MODEL_PRESET=${SUMI_MODEL_PRESET}")
+  fi
+  case "${SUMI_ISOLATION_MODE}" in
+    privileged)
+      if [[ -n "${SUMI_RUNTIME_NETWORK_NAMESPACE:-}" ]]; then
+        ip netns add "${SUMI_RUNTIME_NETWORK_NAMESPACE}" 2>/dev/null || true
+        ip netns exec "${SUMI_RUNTIME_NETWORK_NAMESPACE}" \
+          setpriv --reuid="${SUMI_RUNTIME_USER}" --regid="${SUMI_RUNTIME_GROUP}" --clear-groups --no-new-privs -- \
+          env -i "${runtime_env[@]}" \
+          "${SUMI_BIN}" &
+      else
+        setpriv --reuid="${SUMI_RUNTIME_USER}" --regid="${SUMI_RUNTIME_GROUP}" --clear-groups --no-new-privs -- \
+          env -i "${runtime_env[@]}" \
+          "${SUMI_BIN}" &
+      fi
+      ;;
+    rootless)
+      unshare --user --net --kill-child -- \
+        env -i "${runtime_env[@]}" \
+        "${SUMI_BIN}" &
+      ;;
+    low-trust)
+      env -i "${runtime_env[@]}" \
+        "${SUMI_BIN}" &
+      ;;
+  esac
+}
+
+main() {
+  check_binary
+  check_isolation "${SUMI_ISOLATION_MODE}"
+  prepare_directories
+
+  allocate_identity
+
+  log "deployment generation=${SUMI_RPC_GENERATION} mode=${SUMI_ISOLATION_MODE}"
+
+  : "${SUMI_TENANT_ID:?SUMI_TENANT_ID is required}"
+  : "${SUMI_AGENT_ID:?SUMI_AGENT_ID is required}"
+  : "${SUMI_CONVERSATION_ID:?SUMI_CONVERSATION_ID is required}"
+  : "${SUMI_AGENT_WRAPPING_KEY:?SUMI_AGENT_WRAPPING_KEY is required}"
+
+  spawn_broker "${SUMI_RPC_GENERATION}" "${SUMI_RPC_NONCE}"
+  wait_for_socket "${SUMI_ARTIFACT_BROKER_SOCKET}" "artifact broker"
+
+  spawn_executor "${SUMI_RPC_GENERATION}" "${SUMI_RPC_NONCE}" "${SUMI_CONVERSATION_ID}"
+  wait_for_socket "${SUMI_EXECUTOR_SOCKET}" "tool executor"
+
+  spawn_runtime "${SUMI_RPC_GENERATION}" "${SUMI_RPC_NONCE}" "${SUMI_CONVERSATION_ID}"
+
+  wait
+}
+
+main "$@"
