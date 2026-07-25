@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::*;
 use crate::{
-    agent::DurableRunBinding,
+    agent::{AttemptCancellation, DurableRunBinding},
     gateway::{CommandEnvelope, CommandId},
     provider::types::{
         ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, ProviderContextFragment,
@@ -581,6 +581,7 @@ fn bound_core(seq: u64) -> RunCore {
         &command,
         test_executor_generation(),
     ));
+    core.attempt_cancellation = Some(Arc::new(AttemptCancellation::default()));
     core
 }
 
@@ -2431,4 +2432,658 @@ async fn accept_steer_control_propagates_dropped_committed_channel() {
         "unexpected error: {error:#}"
     );
     assert!(accepted_rx.await.expect("accepted must still be sent"));
+}
+
+// The following drivers and tests cover the timeout/dropped-acceptance path
+// described in the RunControl handshake audit. They ensure HardSteer and Abort
+// are not applied when the Session `accepted` receiver has already been dropped.
+
+struct CancellingProbeDriver {
+    cancelled: Arc<AtomicBool>,
+    senders: Mutex<Vec<mpsc::Sender<ProviderEvent>>>,
+    started_contexts: Mutex<Vec<Vec<ContextMessage>>>,
+}
+
+impl CancellingProbeDriver {
+    fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            senders: Mutex::new(Vec::new()),
+            started_contexts: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl RunDriver for CancellingProbeDriver {
+    fn validate_executor_generation(&self, _generation: ProcessGeneration) -> Result<()> {
+        Ok(())
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        attempt: usize,
+        context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.started_contexts
+            .lock()
+            .expect("contexts")
+            .push(context.to_vec());
+        let cancelled = self.cancelled.clone();
+        let cancel_watch = cancel.clone();
+        tokio::spawn(async move {
+            cancel_watch.cancelled().await;
+            cancelled.store(true, Ordering::SeqCst);
+        });
+
+        let (tx, rx) = mpsc::channel(1);
+        tx.try_send(ProviderEvent::Start).expect("start");
+        self.senders.lock().expect("senders").push(tx);
+
+        Ok(ProviderAttempt {
+            message_id: format!("assistant-{attempt}"),
+            initial_message: public_message(&assistant(StopReason::Stop, Vec::new(), None, None)),
+            events: crate::provider::types::ProviderEventStream::new(
+                rx,
+                cancel,
+                "fixture",
+                origin(),
+            ),
+        })
+    }
+
+    async fn execute_tool_observed(
+        &self,
+        _flow_id: &str,
+        _call: &ToolCall,
+        _cancel: CancellationToken,
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage, ToolError> {
+        Err(ToolError::Protocol(
+            "CancellingProbeDriver has no tools".to_owned(),
+        ))
+    }
+
+    fn synthetic_error(&self, _message: &str) -> PublicMessage {
+        unreachable!("CancellingProbeDriver has no synthetic errors")
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        _active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        unreachable!("CancellingProbeDriver has no overflow recovery")
+    }
+}
+
+/// Drain events from `events_rx` until the worker has emitted the assistant
+/// `MessageStart` for the first provider attempt. The worker is blocked on the
+/// bounded event channel at capacity 1 after that emit.
+async fn drain_to_first_assistant_start(events_rx: &mut mpsc::Receiver<RunOutput>) -> bool {
+    let mut found_assistant = false;
+    let mut seq = 1;
+    while let Some(mut output) = events_rx.recv().await {
+        resolve_message_output(&mut output, &mut seq);
+        if let AgentEvent::MessageStart { message, .. } = output.event
+            && matches!(message.as_ref(), PublicMessage::Assistant(_))
+        {
+            found_assistant = true;
+            break;
+        }
+    }
+    found_assistant
+}
+
+#[tokio::test]
+async fn provider_streaming_abort_dropped_accept_is_no_op() {
+    let driver = Arc::new(CancellingProbeDriver::new());
+    let worker = SequentialRunWorker::new(driver.clone());
+    let (control_tx, control_rx) = mpsc::channel(8);
+    let (events_tx, mut events_rx) = mpsc::channel(1);
+
+    let handle = tokio::spawn(async move {
+        worker
+            .run(bound_core(1), admitted_user(1), control_rx, events_tx)
+            .await
+    });
+
+    let found = drain_to_first_assistant_start(&mut events_rx).await;
+    if !found {
+        if handle.is_finished() {
+            let completion = handle.await.expect("worker join");
+            let completion = match completion {
+                RunCompletion::Completed(_) => "completed".to_owned(),
+                RunCompletion::Failed { failure, .. } => format!("{failure}"),
+            };
+            panic!("worker completed before assistant MessageStart: {completion}");
+        }
+        panic!("worker must emit assistant MessageStart");
+    }
+
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    drop(accepted_rx);
+    control_tx
+        .send(RunControl::Abort {
+            command: admitted_abort(2),
+            accepted: accepted_tx,
+        })
+        .await
+        .expect("abort control");
+
+    // The worker has already unblocked; there is no extra event to receive.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !driver.cancelled.load(Ordering::SeqCst),
+        "dropped accepted receiver must not cancel the provider"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn provider_streaming_hard_steer_dropped_accept_is_no_op() {
+    let driver = Arc::new(CancellingProbeDriver::new());
+    let worker = SequentialRunWorker::new(driver.clone());
+    let (control_tx, control_rx) = mpsc::channel(8);
+    let (events_tx, mut events_rx) = mpsc::channel(1);
+
+    let handle = tokio::spawn(async move {
+        worker
+            .run(bound_core(1), admitted_user(1), control_rx, events_tx)
+            .await
+    });
+
+    let found = drain_to_first_assistant_start(&mut events_rx).await;
+    assert!(found, "worker must emit assistant MessageStart");
+
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    drop(accepted_rx);
+    control_tx
+        .send(RunControl::HardSteer {
+            command: admitted_user(2),
+            accepted: accepted_tx,
+        })
+        .await
+        .expect("hard steer control");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !driver.cancelled.load(Ordering::SeqCst),
+        "dropped accepted receiver must not cancel the provider"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+struct ControlProbeDriver {
+    released: Arc<Notify>,
+    update_dropped: Arc<Notify>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl ControlProbeDriver {
+    fn new() -> Self {
+        Self {
+            released: Arc::new(Notify::new()),
+            update_dropped: Arc::new(Notify::new()),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+#[async_trait]
+impl RunDriver for ControlProbeDriver {
+    fn validate_executor_generation(&self, _generation: ProcessGeneration) -> Result<()> {
+        Ok(())
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        _attempt: usize,
+        _context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        Err(anyhow!("ControlProbeDriver has no provider"))
+    }
+
+    async fn execute_tool_observed(
+        &self,
+        _flow_id: &str,
+        call: &ToolCall,
+        cancel: CancellationToken,
+        on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage, ToolError> {
+        self.update_dropped.notify_one();
+        let cancelled = self.cancelled.clone();
+        tokio::select! {
+            _ = self.released.notified() => {}
+            _ = cancel.cancelled() => {
+                cancelled.store(true, Ordering::SeqCst);
+            }
+        }
+        drop(on_update);
+        Ok(ToolResultMessage {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            content: vec![UserContent::Text {
+                text: "released".to_owned(),
+            }],
+            details: json!({"ok": true}),
+            is_error: false,
+            timestamp: timestamp(),
+        })
+    }
+
+    fn synthetic_error(&self, _message: &str) -> PublicMessage {
+        unreachable!("ControlProbeDriver has no synthetic errors")
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        _active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        unreachable!("ControlProbeDriver has no overflow recovery")
+    }
+}
+
+#[tokio::test]
+async fn tool_execution_abort_dropped_accept_is_no_op() {
+    let driver = Arc::new(ControlProbeDriver::new());
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(8);
+    let mut runner = super::Runner::new(bound_core(1), driver.clone(), control_rx, events_tx);
+    let call = call("probe");
+
+    let handle =
+        tokio::spawn(async move { runner.execute_tool_with_updates("assistant-1", &call).await });
+
+    driver.update_dropped.notified().await;
+
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    drop(accepted_rx);
+    control_tx
+        .send(RunControl::Abort {
+            command: admitted_abort(2),
+            accepted: accepted_tx,
+        })
+        .await
+        .expect("abort control");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    driver.released.notify_one();
+
+    let result = tokio::time::timeout(Duration::from_secs(1), handle)
+        .await
+        .expect("tool should complete")
+        .expect("runner task join");
+
+    assert!(
+        result.is_ok(),
+        "dropped accepted receiver must not cancel the tool: {result:?}"
+    );
+    assert!(
+        !driver.cancelled.load(Ordering::SeqCst),
+        "dropped accepted receiver must not cancel the tool"
+    );
+
+    // Drain any progress/terminal events to avoid a hung event collector.
+    while events_rx.try_recv().is_ok() {}
+}
+
+#[tokio::test]
+async fn tool_execution_hard_steer_dropped_accept_is_no_op() {
+    let driver = Arc::new(ControlProbeDriver::new());
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(8);
+    let mut runner = super::Runner::new(bound_core(1), driver.clone(), control_rx, events_tx);
+    let call = call("probe");
+
+    let handle =
+        tokio::spawn(async move { runner.execute_tool_with_updates("assistant-1", &call).await });
+
+    driver.update_dropped.notified().await;
+
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    drop(accepted_rx);
+    control_tx
+        .send(RunControl::HardSteer {
+            command: admitted_user(2),
+            accepted: accepted_tx,
+        })
+        .await
+        .expect("hard steer control");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    driver.released.notify_one();
+
+    let result = tokio::time::timeout(Duration::from_secs(1), handle)
+        .await
+        .expect("tool should complete")
+        .expect("runner task join");
+
+    assert!(
+        result.is_ok(),
+        "dropped accepted receiver must not cancel the tool: {result:?}"
+    );
+    assert!(!driver.cancelled.load(Ordering::SeqCst));
+
+    while events_rx.try_recv().is_ok() {}
+}
+
+#[tokio::test]
+async fn safe_point_abort_dropped_accept_is_no_op() {
+    let driver = Arc::new(FixtureDriver::new(vec![]));
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, _events_rx) = mpsc::channel(8);
+    let mut runner = super::Runner::new(bound_core(1), driver, control_rx, events_tx);
+
+    let cancel = CancellationToken::new();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancel_watch = cancel.clone();
+    let cancelled_flag = cancelled.clone();
+    tokio::spawn(async move {
+        cancel_watch.cancelled().await;
+        cancelled_flag.store(true, Ordering::SeqCst);
+    });
+    runner.provider_cancel = Some(cancel);
+
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    drop(accepted_rx);
+    control_tx
+        .send(RunControl::Abort {
+            command: admitted_abort(2),
+            accepted: accepted_tx,
+        })
+        .await
+        .expect("abort control");
+
+    runner
+        .receive_control_safe_point()
+        .await
+        .expect("safe point");
+
+    assert!(!runner.abort_requested, "abort must not be applied");
+    assert!(
+        !cancelled.load(Ordering::SeqCst),
+        "provider must not be cancelled"
+    );
+}
+
+#[tokio::test]
+async fn safe_point_hard_steer_dropped_accept_is_no_op() {
+    let driver = Arc::new(FixtureDriver::new(vec![]));
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, _events_rx) = mpsc::channel(8);
+    let mut runner = super::Runner::new(bound_core(1), driver, control_rx, events_tx);
+
+    let cancel = CancellationToken::new();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancel_watch = cancel.clone();
+    let cancelled_flag = cancelled.clone();
+    tokio::spawn(async move {
+        cancel_watch.cancelled().await;
+        cancelled_flag.store(true, Ordering::SeqCst);
+    });
+    runner.provider_cancel = Some(cancel);
+
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    drop(accepted_rx);
+    control_tx
+        .send(RunControl::HardSteer {
+            command: admitted_user(2),
+            accepted: accepted_tx,
+        })
+        .await
+        .expect("hard steer control");
+
+    runner
+        .receive_control_safe_point()
+        .await
+        .expect("safe point");
+
+    assert!(
+        runner.core.pending_controls.is_empty(),
+        "hard steer must not be queued"
+    );
+    assert!(
+        !cancelled.load(Ordering::SeqCst),
+        "provider must not be cancelled"
+    );
+}
+
+#[tokio::test]
+async fn retry_wait_hard_steer_dropped_accept_continues_without_duplicate() {
+    let driver = Arc::new(
+        FixtureDriver::new(vec![
+            output(assistant(
+                StopReason::Error,
+                Vec::new(),
+                Some("network error"),
+                Some("network_error"),
+            )),
+            output(assistant(StopReason::Stop, Vec::new(), None, None)),
+        ])
+        .blocking_retry(),
+    );
+    let worker = SequentialRunWorker::new(driver.clone());
+    let (control_tx, control_rx) = mpsc::channel(8);
+    let (events_tx, mut events_rx) = mpsc::channel(256);
+    let completion = tokio::spawn(async move {
+        worker
+            .run(bound_core(1), admitted_user(1), control_rx, events_tx)
+            .await
+    });
+    let event_collector = tokio::spawn(async move {
+        let mut events = Vec::new();
+        let mut message_seq = 1;
+        while let Some(mut output) = events_rx.recv().await {
+            resolve_message_output(&mut output, &mut message_seq);
+            if let Some(barrier) = output.commit_barrier.take() {
+                barrier.committed();
+            }
+            events.push(output.event);
+        }
+        events
+    });
+    driver.retry_waiting.notified().await;
+
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    drop(accepted_rx);
+    control_tx
+        .send(RunControl::HardSteer {
+            command: admitted_user(2),
+            accepted: accepted_tx,
+        })
+        .await
+        .expect("stale hard steer");
+
+    control_tx
+        .send(RunControl::Command(admitted_user(2)))
+        .await
+        .expect("normal durable deferral");
+
+    assert_completed(completion.await.expect("worker join"));
+    let events = event_collector.await.expect("event collector");
+    let user_message_id = user_message_id(&admitted_user(2).envelope().command_id);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                matches!(event, AgentEvent::MessageEnd { message_id, .. } if message_id == &user_message_id)
+            })
+            .count(),
+        1,
+        "dropped hard steer must not be injected in addition to the durable deferral"
+    );
+}
+
+#[tokio::test]
+async fn retry_wait_abort_dropped_accept_continues_without_cancelling() {
+    let driver = Arc::new(
+        FixtureDriver::new(vec![
+            output(assistant(
+                StopReason::Error,
+                Vec::new(),
+                Some("network error"),
+                Some("network_error"),
+            )),
+            output(assistant(StopReason::Stop, Vec::new(), None, None)),
+        ])
+        .blocking_retry(),
+    );
+    let worker = SequentialRunWorker::new(driver.clone());
+    let (control_tx, control_rx) = mpsc::channel(8);
+    let (events_tx, mut events_rx) = mpsc::channel(256);
+    let completion = tokio::spawn(async move {
+        worker
+            .run(bound_core(1), admitted_user(1), control_rx, events_tx)
+            .await
+    });
+    let event_collector = tokio::spawn(async move {
+        let mut events = Vec::new();
+        let mut message_seq = 1;
+        while let Some(mut output) = events_rx.recv().await {
+            resolve_message_output(&mut output, &mut message_seq);
+            if let Some(barrier) = output.commit_barrier.take() {
+                barrier.committed();
+            }
+            events.push(output.event);
+        }
+        events
+    });
+    driver.retry_waiting.notified().await;
+
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    drop(accepted_rx);
+    control_tx
+        .send(RunControl::Abort {
+            command: admitted_abort(2),
+            accepted: accepted_tx,
+        })
+        .await
+        .expect("stale abort");
+
+    control_tx
+        .send(RunControl::Command(admitted_user(2)))
+        .await
+        .expect("normal durable deferral");
+
+    assert_completed(completion.await.expect("worker join"));
+    let events = event_collector.await.expect("event collector");
+    let user_message_id = user_message_id(&admitted_user(2).envelope().command_id);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                matches!(event, AgentEvent::MessageEnd { message_id, .. } if message_id == &user_message_id)
+            })
+            .count(),
+        1,
+        "dropped abort must not cancel the worker before the durable deferral"
+    );
+}
+
+#[tokio::test]
+async fn provider_attempt_cancellation_deferred_until_hard_steer_commit() {
+    let driver = Arc::new(CancellingProbeDriver::new());
+    let cancellation = Arc::new(AttemptCancellation::default());
+    let mut core = bound_core(1);
+    core.attempt_cancellation = Some(cancellation.clone());
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(1);
+    let mut runner = Runner::new(core, driver.clone(), control_rx, events_tx);
+    let handle = tokio::spawn(async move { runner.provider_attempt().await });
+
+    assert!(drain_to_first_assistant_start(&mut events_rx).await);
+    assert!(!driver.cancelled.load(Ordering::SeqCst));
+
+    let (accepted_tx, _accepted_rx) = oneshot::channel();
+    control_tx
+        .send(RunControl::HardSteer {
+            command: admitted_user(2),
+            accepted: accepted_tx,
+        })
+        .await
+        .expect("send hard steer");
+
+    let reservation = cancellation.reserve().expect("reserve active attempt");
+    assert!(!driver.cancelled.load(Ordering::SeqCst));
+    reservation.cancel_after_commit();
+    tokio::task::yield_now().await;
+    assert!(driver.cancelled.load(Ordering::SeqCst));
+
+    let mut seq = 1;
+    let mut output = events_rx
+        .recv()
+        .await
+        .expect("hard-steer partial MessageEnd");
+    resolve_message_output(&mut output, &mut seq);
+
+    let outcome = handle
+        .await
+        .expect("provider attempt join")
+        .expect("provider attempt");
+    assert!(matches!(outcome, super::AttemptOutcome::HardSteer));
+}
+
+#[tokio::test]
+async fn failed_hard_steer_reservation_restores_provider_for_abort() {
+    let driver = Arc::new(CancellingProbeDriver::new());
+    let cancellation = Arc::new(AttemptCancellation::default());
+    let mut core = bound_core(1);
+    core.attempt_cancellation = Some(cancellation.clone());
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(1);
+    let mut runner = Runner::new(core, driver.clone(), control_rx, events_tx);
+    let handle = tokio::spawn(async move { runner.provider_attempt().await });
+
+    assert!(drain_to_first_assistant_start(&mut events_rx).await);
+    assert!(!driver.cancelled.load(Ordering::SeqCst));
+
+    let (accepted_tx, _accepted_rx) = oneshot::channel();
+    control_tx
+        .send(RunControl::HardSteer {
+            command: admitted_user(2),
+            accepted: accepted_tx,
+        })
+        .await
+        .expect("send hard steer");
+
+    let reservation = cancellation.reserve().expect("reserve active attempt");
+    assert!(!driver.cancelled.load(Ordering::SeqCst));
+    reservation.restore().expect("restore reservation");
+    assert!(!driver.cancelled.load(Ordering::SeqCst));
+
+    let (abort_accepted_tx, _abort_accepted_rx) = oneshot::channel();
+    control_tx
+        .send(RunControl::Abort {
+            command: admitted_abort(3),
+            accepted: abort_accepted_tx,
+        })
+        .await
+        .expect("send abort");
+
+    let mut seq = 1;
+    let mut output = events_rx
+        .recv()
+        .await
+        .expect("aborted assistant MessageEnd");
+    resolve_message_output(&mut output, &mut seq);
+
+    let outcome = handle
+        .await
+        .expect("provider attempt join")
+        .expect("provider attempt");
+    assert!(matches!(outcome, super::AttemptOutcome::ClosedError { .. }));
+    tokio::task::yield_now().await;
+    assert!(driver.cancelled.load(Ordering::SeqCst));
 }

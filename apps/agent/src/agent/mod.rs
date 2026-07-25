@@ -202,6 +202,10 @@ pub(crate) struct RunCore {
     runtime_context: Vec<ContextMessage>,
     durable_binding: Option<DurableRunBinding>,
     worker_phase: Option<watch::Sender<WorkerPhase>>,
+    /// Shared cancellation registry for the one live provider attempt. The
+    /// Session reserves the token around `bind_hard_steer` so the provider is
+    /// only cancelled after the durable step-zero commit succeeds.
+    attempt_cancellation: Option<Arc<AttemptCancellation>>,
 }
 
 impl RunCore {
@@ -214,6 +218,7 @@ impl RunCore {
             runtime_context: Vec::new(),
             durable_binding: None,
             worker_phase: None,
+            attempt_cancellation: None,
         }
     }
 
@@ -465,6 +470,7 @@ pub(crate) struct ActiveRun {
     completion_rx: oneshot::Receiver<RunCompletion>,
     join: JoinHandle<()>,
     bridge: DurableBridge,
+    attempt_cancellation: Arc<AttemptCancellation>,
 }
 
 impl Drop for ActiveRun {
@@ -894,14 +900,20 @@ impl<G: Gateway + 'static> Session<G> {
         if !await_control_acceptance(&mut phase_rx, accepted_rx).await {
             return Ok(false);
         }
-        // Durable step-0 commits while the worker is still awaiting the
-        // MessageEnd receipt, so the partial assistant will find the hard-steer
-        // anchor when the Session event loop resumes.
+        // Reserve the provider attempt cancellation token before the durable
+        // step-zero commit. If the commit succeeds, cancel the provider; if it
+        // fails, the reservation restores the token on drop so the provider can
+        // be cancelled later by an abort/EOF.
+        let reservation = active
+            .attempt_cancellation
+            .reserve()
+            .map_err(|error| SessionFailure::Worker(WorkerFailure::Error(error.to_string())))?;
         active
             .bridge
             .bind_hard_steer(&self.writer, command)
             .await
             .map_err(|error| SessionFailure::Worker(WorkerFailure::Error(error.to_string())))?;
+        reservation.cancel_after_commit();
         Ok(true)
     }
 
@@ -1132,6 +1144,8 @@ impl<G: Gateway + 'static> Session<G> {
         let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let (phase_tx, phase_rx) = watch::channel(WorkerPhase::Active);
         core.worker_phase = Some(phase_tx);
+        let attempt_cancellation = Arc::new(AttemptCancellation::default());
+        core.attempt_cancellation = Some(attempt_cancellation.clone());
         let (completion_tx, completion_rx) = oneshot::channel();
         let future = catch_unwind(AssertUnwindSafe(|| {
             self.worker.run(core, initial, control_rx, events_tx)
@@ -1150,6 +1164,7 @@ impl<G: Gateway + 'static> Session<G> {
             completion_rx,
             join,
             bridge: DurableBridge::new(binding),
+            attempt_cancellation,
         });
         Ok(())
     }
