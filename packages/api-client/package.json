@@ -7,11 +7,13 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "generate": "openapi-typescript ../../contracts/openapi.yaml -o src/generated/schema.d.ts",
-    "check-types": "tsc --noEmit"
+    "generate": "openapi-typescript ../../contracts/openapi.yaml -o src/generated/schema.d.ts && json2ts --unreachableDefinitions ../../contracts/agent-events.yaml -o src/generated/agent-events.d.ts",
+    "check-types": "tsc --noEmit",
+    "test": "node scripts/contract-roundtrip.mjs"
   },
   "devDependencies": {
     "@sumi/typescript-config": "workspace:*",
+    "json-schema-to-typescript": "^15.0.4",
     "openapi-typescript": "^7.13.0",
     "typescript": "^6.0.3"
   }

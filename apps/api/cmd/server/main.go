@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/handler"
 )
 
@@ -16,6 +17,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handler.Health)
+	mux.Handle("GET /agent/ws", agentevents.NewFailClosedServer())
 
 	log.Printf("sumi api listening on :%s", port)
 	if err := http.ListenAndServe(":"+port, mux); err != nil {

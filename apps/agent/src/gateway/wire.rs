@@ -2777,4 +2777,60 @@ mod tests {
             "ApprovalDecision",
         );
     }
+    #[test]
+    fn contract_fixtures_round_trip_through_wire_types() {
+        use std::path::PathBuf;
+
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let path = manifest.join("../../contracts/agent-events-fixtures.json");
+        let raw = std::fs::read_to_string(&path).expect("read fixtures");
+        let fixtures: Value = serde_json::from_str(&raw).expect("parse fixtures");
+        let fixtures = fixtures.as_object().expect("fixtures object");
+
+        let mut passed = 0;
+        for (name, fixture) in fixtures {
+            let kind = fixture
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let wire = fixture.get("wire").expect("wire field").clone();
+
+            match kind {
+                "outbound_frame" => round_trip_value::<WireOutboundFrame>(name, &wire),
+                "command_envelope" => round_trip_value::<WireCommandEnvelope>(name, &wire),
+                "agent_event" => round_trip_value::<WireAgentEvent>(name, &wire),
+                "public_message" => round_trip_value::<WirePublicMessage>(name, &wire),
+                other => panic!("unknown fixture kind '{other}' for '{name}'"),
+            }
+            passed += 1;
+        }
+        assert!(passed >= 10, "expected at least 10 fixtures, got {passed}");
+    }
+
+    fn round_trip_value<T: for<'de> Deserialize<'de> + Serialize>(name: &str, wire: &Value) {
+        let typed: T = serde_json::from_value(wire.clone())
+            .unwrap_or_else(|e| panic!("deserialize fixture '{name}' failed: {e}"));
+        let serialized = serde_json::to_value(&typed)
+            .unwrap_or_else(|e| panic!("serialize fixture '{name}' failed: {e}"));
+        let normalized_original = normalize_fixture(wire.clone());
+        let normalized_roundtrip = normalize_fixture(serialized);
+        assert_eq!(
+            normalized_original, normalized_roundtrip,
+            "fixture '{name}' round-trip mismatch"
+        );
+    }
+
+    fn normalize_fixture(value: Value) -> Value {
+        match value {
+            Value::Object(map) => {
+                let sorted: std::collections::BTreeMap<String, Value> = map
+                    .into_iter()
+                    .map(|(k, v)| (k, normalize_fixture(v)))
+                    .collect();
+                Value::Object(sorted.into_iter().collect())
+            }
+            Value::Array(arr) => Value::Array(arr.into_iter().map(normalize_fixture).collect()),
+            other => other,
+        }
+    }
 }

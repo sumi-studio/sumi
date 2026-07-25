@@ -1524,7 +1524,7 @@ mod tests {
 
         let attempts = counter.load(Ordering::SeqCst);
         assert!(
-            attempts >= 1 && attempts <= 5,
+            (1..=5).contains(&attempts),
             "auth retries must be bounded, got {attempts}"
         );
     }
