@@ -14,9 +14,10 @@ use zeroize::{Zeroize, Zeroizing};
 
 use super::wire::to_wire_frame;
 use super::{
-    CommandDigestFactory, CommandEnvelope, CommandId, CommandRejectReason, Gateway, GatewayClosed,
-    GatewayReader, GatewayWriter, InboundCommand, IncrementalCommandDigest, KeyedCommandDigest,
-    OutboundFrame, RejectedCommandPayload, SensitiveCommandPayload,
+    AgentHello, ApiHello, CommandDigestFactory, CommandEnvelope, CommandId, CommandRejectReason,
+    ConnectorError, Gateway, GatewayClosed, GatewayConnector, GatewayCredential, GatewayReader,
+    GatewayWriter, InboundCommand, IncrementalCommandDigest, KeyedCommandDigest, OutboundFrame,
+    RejectedCommandPayload, SensitiveCommandPayload,
 };
 
 const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
@@ -91,6 +92,7 @@ impl<R, W> InjectedStdioGateway<R, W> {
     }
 }
 
+#[async_trait]
 impl<R, W> Gateway for InjectedStdioGateway<R, W>
 where
     R: AsyncBufRead + Unpin + Send + 'static,
@@ -98,6 +100,14 @@ where
 {
     type Reader = InjectedStdioGatewayReader<R>;
     type Writer = InjectedStdioGatewayWriter<W>;
+
+    async fn authenticate_hello(&mut self, hello: AgentHello) -> Result<ApiHello> {
+        Ok(ApiHello {
+            accepted_generation: hello.generation,
+            last_received_event_seq: 0,
+            next_command_seq: 0,
+        })
+    }
 
     fn split(self) -> (Self::Reader, Self::Writer) {
         (
@@ -142,9 +152,18 @@ impl StdioGateway {
     }
 }
 
+#[async_trait]
 impl Gateway for StdioGateway {
     type Reader = StdioGatewayReader;
     type Writer = StdioGatewayWriter;
+
+    async fn authenticate_hello(&mut self, hello: AgentHello) -> Result<ApiHello> {
+        Ok(ApiHello {
+            accepted_generation: hello.generation,
+            last_received_event_seq: 0,
+            next_command_seq: 0,
+        })
+    }
 
     fn split(self) -> (Self::Reader, Self::Writer) {
         (
@@ -214,7 +233,7 @@ impl<'de> Deserialize<'de> for CommandFieldPresence {
     }
 }
 
-async fn read_command<R>(
+pub(crate) async fn read_command<R>(
     input: &mut R,
     digest_factory: &dyn CommandDigestFactory,
 ) -> Result<InboundCommand>
@@ -1328,4 +1347,44 @@ mod tests {
             })
         );
     }
+}
+
+/// A `GatewayConnector` that yields a single stdio connection and refuses
+/// reconnects. This aligns the local injection harness to the same supervisor
+/// interface without changing the `EOF == process exit` semantics of stdio.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct SingleConnectionConnector<G> {
+    gateway: Option<G>,
+}
+
+impl<G: Gateway> SingleConnectionConnector<G> {
+    pub fn new(gateway: G) -> Self {
+        Self {
+            gateway: Some(gateway),
+        }
+    }
+}
+
+#[async_trait]
+impl<G: Gateway> GatewayConnector for SingleConnectionConnector<G> {
+    type Connection = G;
+
+    async fn connect(
+        &mut self,
+        _credential: GatewayCredential,
+    ) -> Result<Self::Connection, ConnectorError> {
+        self.gateway.take().ok_or_else(|| {
+            ConnectorError::Other(anyhow!("single stdio connection already consumed"))
+        })
+    }
+}
+
+/// Convenience constructor for the production stdin/stdout single-connection
+/// harness.
+#[allow(dead_code)]
+pub fn stdio_single_connector(
+    digest_factory: Arc<dyn CommandDigestFactory>,
+) -> SingleConnectionConnector<StdioGateway> {
+    SingleConnectionConnector::new(StdioGateway::new(digest_factory))
 }
