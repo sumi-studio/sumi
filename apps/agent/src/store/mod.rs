@@ -38,7 +38,7 @@ use self::crypto::{
 pub(crate) use crypto::{DATA_KEY_BYTES, WrappingKey};
 pub(crate) use crypto::{
     DataKeyMaterial, DataKeyPurpose, EnvironmentKeyProvider, KeyProvider, RowAad,
-    command_payload_digest, verify_command_payload_digest,
+    command_payload_digest, decrypt_content, encrypt_content, verify_command_payload_digest,
 };
 #[allow(
     unused_imports,
@@ -49,6 +49,9 @@ pub(crate) use event_writer::{
     InboundAdmission, InboundReceipt, InboundReceiptOrigin, InjectedCommand, Projection,
     RecoveryRequired, RunPhase, ToolExecutionMutation, USER_MESSAGE_ID_NAMESPACE, user_message_id,
 };
+#[cfg(test)]
+pub(crate) use memory_state::{MemoryBatchMessageRecord, MemoryBatchRecord, MemoryJobRecord};
+pub(crate) use memory_state::{MemoryBatchState, MemoryJobKind, MemoryJobStatus, MemoryLayer};
 #[allow(
     unused_imports,
     reason = "T12 exposes the recovery plan boundary consumed by T15"
@@ -63,6 +66,8 @@ pub(crate) use sizer::{
     BatchBounds, CommandSizeInput, DURABLE_ROW_OVERHEAD_BYTES, EventBatchSizer,
     InjectionApplication, InjectionBatchSizeInput, InjectionCommandSizeInput,
 };
+#[cfg(test)]
+pub(crate) use transcript::TranscriptRecord;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
