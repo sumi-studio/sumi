@@ -736,12 +736,15 @@ async fn event_forwarder(
         let Some(sender) = sender else {
             continue;
         };
-        // Drop every Event frame until the epoch has caught up and published
-        // Online. A durable Event sent while catch-up is running could also be
-        // emitted by DurableSource::events_after, so forwarding it here would
-        // duplicate the seq. CommandAck frames are terminal command feedback and
-        // must be delivered even while catch-up is in progress.
-        if !*online.borrow() && matches!(frame, OutboundFrame::Event { .. }) {
+        // Volatile/delta Events (no seq) that arrive before the epoch has caught
+        // up are stale; drop them. Durable Events (seq present) are held in the
+        // writer channel so writer_task can deduplicate them against the durable
+        // cursor after Online. CommandAck frames are terminal command feedback
+        // and must be delivered even while catch-up is in progress.
+        if !*online.borrow()
+            && let OutboundFrame::Event { envelope } = &frame
+            && envelope.seq.is_none()
+        {
             continue;
         }
         if let Some(notify) = writer_send_blocked_notify.as_ref()
@@ -874,10 +877,29 @@ where
             _ = token.cancelled() => return Ok(()),
             frame = writer_rx.recv() => {
                 let Some(frame) = frame else { return Ok(()); };
+
+                let event_seq = if let OutboundFrame::Event { envelope } = &frame {
+                    envelope.seq
+                } else {
+                    None
+                };
+                if let Some(seq) = event_seq
+                    && seq <= last_received
+                {
+                    // Already delivered by the durable catch-up; the live
+                    // producer raced the Online boundary.
+                    continue;
+                }
+
                 tokio::select! {
                     biased;
                     _ = token.cancelled() => return Ok(()),
-                    result = send_with_timeout(&mut writer, frame, config.send_timeout) => result?,
+                    result = send_with_timeout(&mut writer, frame, config.send_timeout) => {
+                        result?;
+                        if let Some(seq) = event_seq {
+                            last_received = seq;
+                        }
+                    }
                 }
             }
         }
@@ -1101,7 +1123,7 @@ impl HydrationLatch for WatchHydrationLatch {
 mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     use anyhow::{Result, anyhow};
@@ -1265,6 +1287,7 @@ mod tests {
     struct CountingCredentialProvider {
         counter: Arc<AtomicU64>,
         prefix: String,
+        tokens: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl CountingCredentialProvider {
@@ -1272,6 +1295,7 @@ mod tests {
             Self {
                 counter: Arc::new(AtomicU64::new(0)),
                 prefix: prefix.into(),
+                tokens: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
     }
@@ -1280,7 +1304,9 @@ mod tests {
     impl CredentialProvider for CountingCredentialProvider {
         async fn fresh_credential(&mut self) -> Result<GatewayCredential> {
             let n = self.counter.fetch_add(1, Ordering::SeqCst);
-            Ok(GatewayCredential::new(format!("{}-{}", self.prefix, n)))
+            let token = format!("{}-{}", self.prefix, n);
+            self.tokens.lock().unwrap().push(token.clone());
+            Ok(GatewayCredential::new(token))
         }
     }
 
@@ -1555,7 +1581,7 @@ mod tests {
         });
 
         let supervisor =
-            ConnectionSupervisor::new(connector, credentials, source, latch, make_config());
+            ConnectionSupervisor::new(connector, credentials.clone(), source, latch, make_config());
         let handle = supervisor.start();
 
         // Abort as soon as two fresh credentials have been used; this avoids a
@@ -1576,6 +1602,13 @@ mod tests {
             hellos.len() >= 2,
             "each hello attempt must use a fresh credential"
         );
+
+        let tokens = credentials.tokens.lock().unwrap();
+        assert!(
+            tokens.len() >= 2,
+            "each connection attempt must fetch a fresh credential"
+        );
+        assert_ne!(tokens[0], tokens[1], "successive credentials must differ");
     }
 
     #[tokio::test]
@@ -3480,5 +3513,406 @@ mod tests {
         let api_json =
             r#"{"accepted_generation":1,"last_received_event_seq":0,"next_command_seq":1}"#;
         assert!(serde_json::from_str::<ApiHello>(api_json).is_ok());
+    }
+
+    /// A durable source that replays the same events on every catch-up, so
+    /// reconnect tests can observe repeated catch-up without losing the queue.
+    #[derive(Clone)]
+    struct ReplaySource {
+        events: Arc<Mutex<Vec<OutboundFrame>>>,
+        command_cursor: CommandCursors,
+    }
+
+    impl ReplaySource {
+        fn new(events: Vec<OutboundFrame>, command_cursor: CommandCursors) -> Self {
+            Self {
+                events: Arc::new(Mutex::new(events)),
+                command_cursor,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DurableSource for ReplaySource {
+        async fn event_cursor(&self) -> Result<EventCursors> {
+            let events = self.events.lock().unwrap();
+            let last_sent = events
+                .last()
+                .map_or(0, |f| outbound_frame_event_seq(f).unwrap_or(0));
+            Ok(EventCursors { last_sent })
+        }
+
+        async fn events_after(&self, after_seq: u64, _limit: usize) -> Result<Vec<OutboundFrame>> {
+            let events = self.events.lock().unwrap();
+            Ok(events
+                .iter()
+                .filter(|f| outbound_frame_event_seq(f).unwrap_or(0) > after_seq)
+                .cloned()
+                .collect())
+        }
+
+        async fn command_cursors(&self) -> Result<CommandCursors> {
+            Ok(self.command_cursor)
+        }
+    }
+
+    /// A durable source that blocks a configurable `event_cursor` call so a test
+    /// can inject a live durable event between the final cursor read and Online.
+    #[derive(Clone)]
+    struct FinalCursorRaceSource {
+        events: Arc<Mutex<Vec<OutboundFrame>>>,
+        command_cursor: CommandCursors,
+        cursor_calls: Arc<AtomicU64>,
+        block_on_call: u64,
+        released: Arc<AtomicBool>,
+        notify: Arc<tokio::sync::Notify>,
+    }
+
+    impl FinalCursorRaceSource {
+        fn new(
+            events: Vec<OutboundFrame>,
+            command_cursor: CommandCursors,
+            block_on_call: u64,
+        ) -> Self {
+            Self {
+                events: Arc::new(Mutex::new(events)),
+                command_cursor,
+                cursor_calls: Arc::new(AtomicU64::new(0)),
+                block_on_call,
+                released: Arc::new(AtomicBool::new(false)),
+                notify: Arc::new(tokio::sync::Notify::new()),
+            }
+        }
+
+        fn release_cursor(&self) {
+            self.released.store(true, Ordering::SeqCst);
+            self.notify.notify_one();
+        }
+
+        fn is_blocked(&self) -> bool {
+            self.cursor_calls.load(Ordering::SeqCst) > self.block_on_call
+                && !self.released.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl DurableSource for FinalCursorRaceSource {
+        async fn event_cursor(&self) -> Result<EventCursors> {
+            let call = self.cursor_calls.fetch_add(1, Ordering::SeqCst);
+            if call == self.block_on_call {
+                self.notify.notified().await;
+            }
+            let events = self.events.lock().unwrap();
+            let last_sent = events
+                .last()
+                .map_or(0, |f| outbound_frame_event_seq(f).unwrap_or(0));
+            Ok(EventCursors { last_sent })
+        }
+
+        async fn events_after(&self, after_seq: u64, _limit: usize) -> Result<Vec<OutboundFrame>> {
+            let events = self.events.lock().unwrap();
+            Ok(events
+                .iter()
+                .filter(|f| outbound_frame_event_seq(f).unwrap_or(0) > after_seq)
+                .cloned()
+                .collect())
+        }
+
+        async fn command_cursors(&self) -> Result<CommandCursors> {
+            Ok(self.command_cursor)
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_event_racing_final_cursor_is_not_dropped() {
+        // Block the third event_cursor call, which is the final recheck right
+        // before Online. Inject a durable event while the writer_task is blocked
+        // there; the old implementation would drop it because Online was not yet
+        // published, while the new one holds it and deduplicates after Online.
+        let source = FinalCursorRaceSource::new(vec![event_frame(1)], CommandCursors::default(), 2);
+
+        let sent_hellos = Arc::new(Mutex::new(Vec::new()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut gateway = MockGateway::new(VecDeque::new());
+        gateway.writer.sent = sent.clone();
+        gateway.sent_hellos = sent_hellos.clone();
+        let connector = MockConnector::new(sent_hellos.clone(), VecDeque::from([Ok(gateway)]));
+        let credentials = CountingCredentialProvider::new("token");
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: ProcessGeneration::from_wire(7).unwrap(),
+            receipt_identity: "r".to_owned(),
+        });
+
+        let supervisor =
+            ConnectionSupervisor::new(connector, credentials, source.clone(), latch, make_config());
+        let handle = supervisor.start();
+
+        let mut epochs = handle.epochs.clone();
+        while epochs.borrow().is_none() {
+            epochs.changed().await.unwrap();
+        }
+        let epoch = epochs.borrow().unwrap();
+
+        // Wait until writer_task is blocked on the final cursor recheck.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !source.is_blocked() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        // This durable event arrives after catch-up finished seq 1 but before
+        // Online is published. The source cursor will still report last_sent=1.
+        handle.events.send((epoch, event_frame(2))).await.unwrap();
+
+        // Release the final cursor recheck and let the epoch go Online.
+        source.release_cursor();
+        let mut online = handle.online.clone();
+        while !*online.borrow() {
+            online.changed().await.unwrap();
+        }
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        handle.abort();
+        assert!(handle.join().await.is_ok());
+
+        let seqs: Vec<_> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|f| outbound_frame_event_seq(f).ok())
+            .collect();
+        assert_eq!(
+            seqs,
+            vec![1, 2],
+            "durable event committed between final cursor read and Online must be delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_send_timeout_triggers_reconnect() {
+        let mut config = make_config();
+        config.send_timeout = Duration::from_millis(10);
+        config.initial_backoff = Duration::from_millis(1);
+        config.max_backoff = Duration::from_millis(5);
+
+        let sent_hellos = Arc::new(Mutex::new(Vec::new()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+
+        // First writer is slow enough that the send timeout fires; second writer
+        // is normal and should deliver the catch-up event.
+        let mut gateway1 = MockGateway::new(VecDeque::new());
+        gateway1.writer.sent = sent.clone();
+        gateway1.writer.delay = Some(Duration::from_millis(100));
+        gateway1.sent_hellos = sent_hellos.clone();
+
+        let mut gateway2 = MockGateway::new(VecDeque::new());
+        gateway2.writer.sent = sent.clone();
+        gateway2.sent_hellos = sent_hellos.clone();
+
+        let connector = MockConnector::new(
+            sent_hellos.clone(),
+            VecDeque::from([Ok(gateway1), Ok(gateway2)]),
+        );
+        let credentials = CountingCredentialProvider::new("token");
+        let source = ReplaySource::new(vec![event_frame(1)], CommandCursors::default());
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: ProcessGeneration::from_wire(7).unwrap(),
+            receipt_identity: "r".to_owned(),
+        });
+
+        let supervisor =
+            ConnectionSupervisor::new(connector, credentials.clone(), source, latch, config);
+        let handle = supervisor.start();
+
+        // Wait for the second epoch to install.
+        let mut epochs = handle.epochs.clone();
+        let _epoch2 = loop {
+            if let Some(e) = *epochs.borrow() {
+                break e;
+            }
+            tokio::time::timeout(Duration::from_secs(1), epochs.changed())
+                .await
+                .unwrap()
+                .unwrap();
+        };
+
+        // The second epoch must eventually go Online and deliver the catch-up.
+        let mut online = handle.online.clone();
+        while !*online.borrow() {
+            online.changed().await.unwrap();
+        }
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        handle.abort();
+        assert!(handle.join().await.is_ok());
+
+        let hellos = sent_hellos.lock().unwrap();
+        assert_eq!(
+            hellos.len(),
+            2,
+            "send timeout must trigger a fresh reconnect"
+        );
+
+        let tokens = credentials.tokens.lock().unwrap();
+        assert!(
+            tokens.len() >= 2,
+            "each reconnect must fetch a fresh credential"
+        );
+        assert_ne!(tokens[0], tokens[1]);
+
+        let seqs: Vec<_> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|f| outbound_frame_event_seq(f).ok())
+            .collect();
+        assert!(
+            seqs.contains(&1),
+            "catch-up event must be delivered after reconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_before_hello_releases_immediately() {
+        let generation = ProcessGeneration::from_wire(7).unwrap();
+        let (tx, rx) = watch::channel(HydrationState::NotReady);
+        tx.send_replace(HydrationState::Ready(HydrationReady {
+            generation,
+            receipt_identity: "ready-before-hello".to_owned(),
+        }));
+        let latch = WatchHydrationLatch::new(rx);
+
+        let source = MockDurableSource::new(CommandCursors::default());
+        let sent_hellos = Arc::new(Mutex::new(Vec::new()));
+        let mut gateway = MockGateway::new(VecDeque::from([Ok(valid_command(
+            1,
+            "00000000-0000-4000-8000-000000000001",
+        ))]));
+        gateway.sent_hellos = sent_hellos.clone();
+        let connector = MockConnector::new(sent_hellos, VecDeque::from([Ok(gateway)]));
+        let credentials = CountingCredentialProvider::new("token");
+
+        let supervisor =
+            ConnectionSupervisor::new(connector, credentials, source, latch, make_config());
+        let mut handle = supervisor.start();
+
+        let cmd = tokio::time::timeout(Duration::from_millis(200), handle.commands.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cmd_seq(&cmd), 1);
+
+        handle.abort();
+        assert!(handle.join().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn api_restart_reconnects_with_catchup_and_invalidates_old_epoch() {
+        let source = ReplaySource::new(vec![event_frame(1)], CommandCursors::default());
+        let sent_hellos = Arc::new(Mutex::new(Vec::new()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+
+        let mut gateway1 = MockGateway::new(VecDeque::from([Err(anyhow!("api restart"))]));
+        gateway1.writer.sent = sent.clone();
+        gateway1.sent_hellos = sent_hellos.clone();
+
+        let mut gateway2 = MockGateway::new(VecDeque::from([Ok(valid_command(
+            1,
+            "00000000-0000-4000-8000-000000000001",
+        ))]));
+        gateway2.writer.sent = sent.clone();
+        gateway2.sent_hellos = sent_hellos.clone();
+
+        let connector = MockConnector::new(
+            sent_hellos.clone(),
+            VecDeque::from([Ok(gateway1), Ok(gateway2)]),
+        );
+        let credentials = CountingCredentialProvider::new("token");
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: ProcessGeneration::from_wire(7).unwrap(),
+            receipt_identity: "r".to_owned(),
+        });
+
+        let supervisor =
+            ConnectionSupervisor::new(connector, credentials.clone(), source, latch, make_config());
+        let mut handle = supervisor.start();
+
+        // The first epoch may end before the test can sample `handle.epochs`, so
+        // wait for the second hello and the second active epoch, then derive the
+        // first DeliveryEpoch from the deterministic epoch counter.
+        let epochs = handle.epochs.clone();
+        let epoch2 = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if sent_hellos.lock().unwrap().len() >= 2
+                    && let Some(e) = *epochs.borrow()
+                {
+                    return e;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            epoch2.as_u64() > 0,
+            "the second reconnect must mint a new DeliveryEpoch"
+        );
+        let epoch1 = DeliveryEpoch(epoch2.as_u64() - 1);
+
+        // The new epoch must deliver commands.
+        let cmd = tokio::time::timeout(Duration::from_millis(200), handle.commands.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cmd_seq(&cmd), 1);
+
+        // A frame tagged with the old DeliveryEpoch must be dropped.
+        handle.events.send((epoch1, event_frame(2))).await.unwrap();
+        // A frame tagged with the new DeliveryEpoch must be delivered.
+        handle.events.send((epoch2, event_frame(3))).await.unwrap();
+
+        let mut online = handle.online.clone();
+        while !*online.borrow() {
+            online.changed().await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        handle.abort();
+        assert!(handle.join().await.is_ok());
+
+        let hellos = sent_hellos.lock().unwrap();
+        assert_eq!(
+            hellos.len(),
+            2,
+            "api restart requires re-hello with fresh credential"
+        );
+
+        let tokens = credentials.tokens.lock().unwrap();
+        assert!(tokens.len() >= 2);
+        assert_ne!(
+            tokens[0], tokens[1],
+            "each restart attempt must use a fresh credential"
+        );
+
+        let event_seqs: Vec<_> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|f| outbound_frame_event_seq(f).ok())
+            .collect();
+        assert!(
+            event_seqs.contains(&1),
+            "durable catch-up must replay event 1 after restart"
+        );
+        assert!(
+            event_seqs.contains(&3),
+            "live event 3 must be delivered on the new epoch"
+        );
+        assert!(
+            !event_seqs.contains(&2),
+            "stale DeliveryEpoch frame 2 must be dropped"
+        );
     }
 }
