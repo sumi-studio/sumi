@@ -27,6 +27,26 @@ use super::{Gateway, GatewayClosed, GatewayReader, GatewayWriter, InboundCommand
 
 static RUSTLS_INIT: Once = Once::new();
 
+fn init_crypto_provider() -> Result<(), ConnectorError> {
+    RUSTLS_INIT.call_once(|| {
+        if CryptoProvider::get_default().is_some() {
+            return;
+        }
+        // If another thread installs a provider between the check above and this
+        // call, install_default returns an error; the subsequent get_default() check
+        // will still see a usable provider and proceed.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+
+    if CryptoProvider::get_default().is_some() {
+        Ok(())
+    } else {
+        Err(ConnectorError::Fatal(anyhow!(
+            "no rustls crypto provider is available"
+        )))
+    }
+}
+
 /// Outbound connector for `wss://` (production). `ws://` is only allowed when
 /// constructed with [`WebSocketConnector::new_insecure`], which is exposed for
 /// test fixtures that spin a local plaintext server.
@@ -80,13 +100,7 @@ impl GatewayConnector for WebSocketConnector {
         &mut self,
         credential: GatewayCredential,
     ) -> Result<Self::Connection, ConnectorError> {
-        RUSTLS_INIT.call_once(|| {
-            if CryptoProvider::get_default().is_none() {
-                rustls::crypto::ring::default_provider()
-                    .install_default()
-                    .expect("rustls ring crypto provider should install");
-            }
-        });
+        init_crypto_provider()?;
 
         let (scheme, _rest) = self
             .url
@@ -257,13 +271,21 @@ async fn decode_command_bytes(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
+    use futures_util::{SinkExt, StreamExt};
     use sha2::{Digest, Sha256};
+    use tokio::net::TcpListener;
+    use tokio::time::timeout;
+    use tokio_tungstenite::{accept_async, accept_hdr_async};
 
     use super::super::{
-        CommandDigestFactory, GatewayConnector, GatewayCredential, IncrementalCommandDigest,
+        AgentHello, ApiHello, CommandDigestFactory, Envelope, Gateway, GatewayConnector,
+        GatewayCredential, GatewayReader, GatewayWriter, InboundCommand, IncrementalCommandDigest,
+        OutboundFrame,
     };
-    use super::{WebSocketConnector, decode_command_bytes};
+    use super::{CryptoProvider, WebSocketConnector, decode_command_bytes, init_crypto_provider};
+    use crate::runtime::contracts::ProcessGeneration;
 
     struct TestDigestFactory;
 
@@ -348,5 +370,364 @@ mod tests {
             result.is_err() && format!("{:?}", result).contains("trailing bytes"),
             "expected trailing bytes rejection, got {result:?}"
         );
+    }
+
+    // M5 gate 10: real local mock WebSocket server integration tests.
+
+    fn test_agent_hello() -> AgentHello {
+        AgentHello {
+            agent_id: "test-agent".to_owned(),
+            generation: ProcessGeneration::from_wire(7).unwrap(),
+            last_sent_event_seq: 1,
+            last_received_command_seq: 0,
+            last_applied_command_seq: 1,
+        }
+    }
+
+    fn test_api_hello() -> ApiHello {
+        ApiHello {
+            accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
+            last_received_event_seq: 1,
+            next_command_seq: 2,
+        }
+    }
+
+    fn test_event_frame() -> OutboundFrame {
+        OutboundFrame::Event {
+            envelope: Envelope {
+                seq: Some(1),
+                conversation_id: "conversation-1".to_owned(),
+                event: serde_json::json!({"type": "agent_start"}),
+            },
+        }
+    }
+
+    fn test_command_message() -> tokio_tungstenite::tungstenite::Message {
+        tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"seq":2,"command_id":"00000000-0000-4000-8000-000000000002","command":{"type":"abort"}}"#.to_owned(),
+        )
+    }
+
+    async fn read_agent_hello<R>(ws: &mut tokio_tungstenite::WebSocketStream<R>)
+    where
+        R: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let msg = ws.next().await.unwrap().unwrap();
+        let text = match msg {
+            tokio_tungstenite::tungstenite::Message::Text(s) => s,
+            tokio_tungstenite::tungstenite::Message::Binary(b) => String::from_utf8(b).unwrap(),
+            other => panic!("unexpected server message: {other:?}"),
+        };
+        let _: AgentHello = serde_json::from_str(&text).unwrap();
+    }
+
+    async fn send_api_hello<R>(ws: &mut tokio_tungstenite::WebSocketStream<R>, api: ApiHello)
+    where
+        R: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let text = serde_json::to_string(&api).unwrap();
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(text))
+            .await
+            .unwrap();
+    }
+
+    fn listener_addr() -> std::net::SocketAddr {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into()
+    }
+
+    struct AuthCallback {
+        expected: &'static str,
+    }
+
+    impl tokio_tungstenite::tungstenite::handshake::server::Callback for AuthCallback {
+        fn on_request(
+            self,
+            request: &tokio_tungstenite::tungstenite::http::Request<()>,
+            response: tokio_tungstenite::tungstenite::http::Response<()>,
+        ) -> Result<
+            tokio_tungstenite::tungstenite::http::Response<()>,
+            tokio_tungstenite::tungstenite::http::Response<Option<String>>,
+        > {
+            let auth = request
+                .headers()
+                .get("Authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if auth == self.expected {
+                Ok(response)
+            } else {
+                Err(tokio_tungstenite::tungstenite::http::Response::builder()
+                    .status(401)
+                    .body(Some("Unauthorized".to_owned()))
+                    .unwrap())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reader_eof_returns_gateway_closed() {
+        let listener = TcpListener::bind(listener_addr()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            read_agent_hello(&mut ws).await;
+            send_api_hello(&mut ws, test_api_hello()).await;
+            // Server sends a graceful Close, then drops the connection.
+            ws.send(tokio_tungstenite::tungstenite::Message::Close(None))
+                .await
+                .unwrap();
+        });
+
+        let mut connector =
+            WebSocketConnector::new_insecure(format!("ws://{addr}"), Arc::new(TestDigestFactory));
+        let mut gateway = connector
+            .connect(GatewayCredential::new("valid"))
+            .await
+            .unwrap();
+        let api_hello = gateway
+            .authenticate_hello(test_agent_hello())
+            .await
+            .unwrap();
+        assert_eq!(
+            api_hello.accepted_generation,
+            test_api_hello().accepted_generation
+        );
+
+        let (mut reader, _writer) = gateway.split();
+        let result = reader.next_command().await;
+        assert!(
+            result.is_err(),
+            "reader must report EOF/closure: {result:?}"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("gateway input closed")
+        );
+
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn expired_bearer_token_rejected_with_auth_rejected() {
+        let listener = TcpListener::bind(listener_addr()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let callback = AuthCallback {
+                expected: "Bearer valid",
+            };
+            // Reject non-matching Authorization header with HTTP 401.
+            let _ = accept_hdr_async(stream, callback).await;
+        });
+
+        let mut connector =
+            WebSocketConnector::new_insecure(format!("ws://{addr}"), Arc::new(TestDigestFactory));
+        let err = connector
+            .connect(GatewayCredential::new("expired"))
+            .await
+            .err()
+            .expect("connect must fail");
+        assert!(
+            matches!(err, super::super::ConnectorError::AuthRejected),
+            "expired token must be rejected as AuthRejected: {err:?}"
+        );
+
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn hello_response_timeout_is_detectable_by_caller() {
+        let listener = TcpListener::bind(listener_addr()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            // Read the agent hello but never send the API hello.
+            read_agent_hello(&mut ws).await;
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let mut connector =
+            WebSocketConnector::new_insecure(format!("ws://{addr}"), Arc::new(TestDigestFactory));
+        let mut gateway = connector
+            .connect(GatewayCredential::new("valid"))
+            .await
+            .unwrap();
+        let result = timeout(
+            Duration::from_millis(50),
+            gateway.authenticate_hello(test_agent_hello()),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "authenticate_hello must be cancellable/timeoutable when server stalls"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn writer_send_delivers_to_server() {
+        let listener = TcpListener::bind(listener_addr()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            read_agent_hello(&mut ws).await;
+            send_api_hello(&mut ws, test_api_hello()).await;
+            let msg = ws.next().await.unwrap().unwrap();
+            let text = match msg {
+                tokio_tungstenite::tungstenite::Message::Text(s) => s,
+                other => panic!("expected text frame, got {other:?}"),
+            };
+            let envelope: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(envelope["frame_type"], "event");
+            assert_eq!(envelope["envelope"]["seq"], 1);
+        });
+
+        let mut connector =
+            WebSocketConnector::new_insecure(format!("ws://{addr}"), Arc::new(TestDigestFactory));
+        let mut gateway = connector
+            .connect(GatewayCredential::new("valid"))
+            .await
+            .unwrap();
+        let _ = gateway
+            .authenticate_hello(test_agent_hello())
+            .await
+            .unwrap();
+        let (_reader, mut writer) = gateway.split();
+        writer.send(test_event_frame()).await.unwrap();
+
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn writer_send_fails_when_server_closes() {
+        let listener = TcpListener::bind(listener_addr()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            read_agent_hello(&mut ws).await;
+            send_api_hello(&mut ws, test_api_hello()).await;
+            // Send a graceful Close so the client reader observes the EOF.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            ws.send(tokio_tungstenite::tungstenite::Message::Close(None))
+                .await
+                .unwrap();
+            // Keep the socket open briefly so the close frame is delivered.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+
+        let mut connector =
+            WebSocketConnector::new_insecure(format!("ws://{addr}"), Arc::new(TestDigestFactory));
+        let mut gateway = connector
+            .connect(GatewayCredential::new("valid"))
+            .await
+            .unwrap();
+        let _ = gateway
+            .authenticate_hello(test_agent_hello())
+            .await
+            .unwrap();
+        let (mut reader, mut writer) = gateway.split();
+
+        // Reader observes the close first; writer should then refuse to send.
+        let read_result = reader.next_command().await;
+        assert!(
+            read_result.is_err(),
+            "reader must observe close: {read_result:?}"
+        );
+
+        let result = writer.send(test_event_frame()).await;
+        assert!(
+            result.is_err(),
+            "writer must fail after peer closes: {result:?}"
+        );
+
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn reconnect_succeeds_after_server_close() {
+        let listener = TcpListener::bind(listener_addr()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            // First connection: handshake, read a sent frame, then close.
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            read_agent_hello(&mut ws).await;
+            send_api_hello(&mut ws, test_api_hello()).await;
+            let msg = ws.next().await.unwrap().unwrap();
+            assert!(matches!(
+                msg,
+                tokio_tungstenite::tungstenite::Message::Text(_)
+            ));
+            let _ = ws.close(None).await;
+
+            // Second connection: handshake, send a command (API restart/reconnect).
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            read_agent_hello(&mut ws).await;
+            send_api_hello(&mut ws, test_api_hello()).await;
+            ws.send(test_command_message()).await.unwrap();
+            // Keep connection alive until client reads.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        let mut connector =
+            WebSocketConnector::new_insecure(format!("ws://{addr}"), Arc::new(TestDigestFactory));
+
+        // First epoch.
+        let mut gateway = connector
+            .connect(GatewayCredential::new("valid"))
+            .await
+            .unwrap();
+        let _ = gateway
+            .authenticate_hello(test_agent_hello())
+            .await
+            .unwrap();
+        let (mut reader, mut writer) = gateway.split();
+        writer.send(test_event_frame()).await.unwrap();
+        let result = reader.next_command().await;
+        assert!(
+            result.is_err(),
+            "first reader must EOF when server closes: {result:?}"
+        );
+
+        // Reconnect to the same listener (API restart).
+        let mut gateway = connector
+            .connect(GatewayCredential::new("valid"))
+            .await
+            .unwrap();
+        let _ = gateway
+            .authenticate_hello(test_agent_hello())
+            .await
+            .unwrap();
+        let (mut reader, _writer) = gateway.split();
+        let cmd = reader.next_command().await.unwrap();
+        assert!(matches!(cmd, InboundCommand::Valid(_)));
+
+        let _ = server.await;
+    }
+
+    #[test]
+    fn crypto_provider_initializes_without_panic() {
+        // This tests the non-panicking path and the race-tolerant behavior of
+        // init_crypto_provider. It is safe to run before/after other tests
+        // because the provider install is process-global and the function is
+        // idempotent.
+        assert!(init_crypto_provider().is_ok());
+        assert!(CryptoProvider::get_default().is_some());
+        assert!(init_crypto_provider().is_ok());
     }
 }
