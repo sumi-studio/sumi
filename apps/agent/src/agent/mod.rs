@@ -31,10 +31,13 @@ use crate::{
         Command, CommandAckStatus, CommandEnvelope, Gateway, GatewayClosed, GatewayReader,
         GatewayWriter, InboundCommand, OutboundFrame,
     },
-    provider::{overflow::OverflowSource, types::ContextMessage},
+    provider::{
+        overflow::OverflowSource,
+        types::{ContextMessage, PublicMessage, StopReason},
+    },
     runtime::contracts::ProcessGeneration,
     store::{
-        DataKeyPurpose, EventWriter, InboundAdmission, InboundReceiptOrigin,
+        ApplicationKind, DataKeyPurpose, EventWriter, InboundAdmission, InboundReceiptOrigin,
         RecoveryRequired as AdmissionRecoveryRequired, RecoveryStep, Store, SuffixRecovery,
     },
 };
@@ -45,6 +48,7 @@ mod events;
 mod provider_projection;
 mod queue;
 mod run;
+mod steer;
 
 use durable_bridge::{
     CommittedOutput, DurableBridge, DurableRunBinding, MessageCommitBarrier, MessageCommitReceipt,
@@ -72,6 +76,14 @@ pub(crate) use provider_projection::{
 pub(crate) use run::{
     OverflowRecoveryOutcome, OverflowRecoveryRequest, ProviderAttempt, RunDriver,
     SequentialRunWorker,
+};
+#[allow(
+    unused_imports,
+    reason = "T16 classification and group injection consumed by Session and DurableBridge"
+)]
+pub(crate) use steer::{
+    AttemptCancellation, AttemptGuard, AttemptReservation, SteerGroup, SteerGroupSnapshot,
+    SteerStage, bound_steer_group, hard_steer_step_zero_batch,
 };
 
 const CONTROL_CHANNEL_CAPACITY: usize = 32;
@@ -286,6 +298,19 @@ impl AdmittedCommand {
 
 pub(crate) enum RunControl {
     Command(AdmittedCommand),
+    HardSteer {
+        command: AdmittedCommand,
+        accepted: oneshot::Sender<bool>,
+    },
+    SoftSteer {
+        command: AdmittedCommand,
+        accepted: oneshot::Sender<bool>,
+        committed: oneshot::Receiver<()>,
+    },
+    Abort {
+        command: AdmittedCommand,
+        accepted: oneshot::Sender<bool>,
+    },
     RetrySteer {
         command: AdmittedCommand,
         accepted: oneshot::Sender<bool>,
@@ -752,6 +777,9 @@ impl<G: Gateway + 'static> Session<G> {
             if self.route_retry_wait_command(&command).await? {
                 return Ok(());
             }
+            if self.route_active_control(command.clone()).await? {
+                return Ok(());
+            }
             self.defer_active_command(command)?;
             return Ok(());
         }
@@ -769,7 +797,7 @@ impl<G: Gateway + 'static> Session<G> {
         }
         let eligible = self.active.as_ref().is_some_and(|active| {
             *active.phase_rx.borrow() == WorkerPhase::RetryWait
-                && active.bridge.can_bind_retry_steer()
+                && active.bridge.can_bind_retry_steer(&self.writer, command)
         });
         if !eligible {
             return Ok(false);
@@ -798,6 +826,11 @@ impl<G: Gateway + 'static> Session<G> {
             return Ok(false);
         }
         if !await_retry_steer_acceptance(&mut phase_rx, accepted_rx).await {
+            self.active
+                .as_mut()
+                .expect("retry eligibility requires an active run")
+                .bridge
+                .set_retry_steer_accept_failed(true);
             return Ok(false);
         }
         self.active
@@ -811,6 +844,150 @@ impl<G: Gateway + 'static> Session<G> {
                 "retry worker exited before durable steer authorization".to_owned(),
             ))
         })?;
+        Ok(true)
+    }
+
+    async fn route_active_control(
+        &mut self,
+        command: AdmittedCommand,
+    ) -> Result<bool, SessionFailure> {
+        if matches!(command.envelope().command, Command::Abort {}) {
+            return self.route_active_abort(command).await;
+        }
+        if !matches!(command.envelope().command, Command::UserMessage { .. }) {
+            return Ok(false);
+        }
+        let Some(active) = self.active.as_ref() else {
+            return Ok(false);
+        };
+        let stage = active.bridge.steer_stage();
+        let Some(application_kind) = stage.classify_user_command() else {
+            return Ok(false);
+        };
+        match application_kind {
+            ApplicationKind::HardSteer => self.route_hard_steer(command).await,
+            ApplicationKind::SoftSteer => self.route_soft_steer(command).await,
+            ApplicationKind::RetrySteer => Ok(false), // handled by route_retry_wait_command
+            _ => Ok(false),
+        }
+    }
+
+    async fn route_hard_steer(&mut self, command: AdmittedCommand) -> Result<bool, SessionFailure> {
+        let Some(active) = self.active.as_mut() else {
+            return Ok(false);
+        };
+        if !active.bridge.can_bind_hard_steer() {
+            return Ok(false);
+        }
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let control = RunControl::HardSteer {
+            command: command.clone(),
+            accepted: accepted_tx,
+        };
+        if active.control_tx.try_send(control).is_err() {
+            return Ok(false);
+        }
+        let accepted = accepted_rx.await.unwrap_or(false);
+        if !accepted {
+            return Ok(false);
+        }
+        // Durable step-0 commits while the worker is still awaiting the
+        // MessageEnd receipt, so the partial assistant will find the hard-steer
+        // anchor when the Session event loop resumes.
+        active
+            .bridge
+            .bind_hard_steer(&self.writer, command)
+            .await
+            .map_err(|error| SessionFailure::Worker(WorkerFailure::Error(error.to_string())))?;
+        Ok(true)
+    }
+
+    async fn route_soft_steer(&mut self, command: AdmittedCommand) -> Result<bool, SessionFailure> {
+        let Some(active) = self.active.as_mut() else {
+            return Ok(false);
+        };
+        if !active.bridge.can_bind_soft_steer(&self.writer, &command) {
+            return Ok(false);
+        }
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let (committed_tx, committed_rx) = oneshot::channel();
+        let control = RunControl::SoftSteer {
+            command: command.clone(),
+            accepted: accepted_tx,
+            committed: committed_rx,
+        };
+        if active.control_tx.try_send(control).is_err() {
+            return Ok(false);
+        }
+        let accepted = accepted_rx.await.unwrap_or(false);
+        if !accepted {
+            return Ok(false);
+        }
+        active
+            .bridge
+            .bind_soft_steer(&self.writer, command)
+            .await
+            .map_err(|error| SessionFailure::Worker(WorkerFailure::Error(error.to_string())))?;
+        committed_tx.send(()).map_err(|_| {
+            SessionFailure::Worker(WorkerFailure::Error(
+                "soft steer worker exited before durability authorization".to_owned(),
+            ))
+        })?;
+        Ok(true)
+    }
+
+    async fn route_active_abort(
+        &mut self,
+        command: AdmittedCommand,
+    ) -> Result<bool, SessionFailure> {
+        let Some(active) = self.active.as_mut() else {
+            return Ok(false);
+        };
+        if !active.bridge.can_bind_abort() {
+            return Ok(false);
+        }
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let control = RunControl::Abort {
+            command: command.clone(),
+            accepted: accepted_tx,
+        };
+        if active.control_tx.try_send(control).is_err() {
+            return Ok(false);
+        }
+        let accepted = accepted_rx.await.unwrap_or(false);
+        if !accepted {
+            return Ok(false);
+        }
+        let mut acks = active
+            .bridge
+            .bind_abort(&self.writer, command)
+            .await
+            .map_err(|error| SessionFailure::Worker(WorkerFailure::Error(error.to_string())))?;
+        let superseded: std::collections::HashSet<String> = acks
+            .iter()
+            .filter(|ack| ack.status == CommandAckStatus::Superseded)
+            .map(|ack| ack.command_id.clone())
+            .collect();
+        for ack in acks.drain(..) {
+            self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack }])?;
+        }
+        // Active Abort also durably supersedes earlier received/deferred
+        // commands; remove them from the in-memory queue so finish_run does
+        // not try to spawn a worker for a command that is already terminal.
+        let mut retained = Vec::with_capacity(self.deferred_commands.len());
+        while let Some(pending) = self.deferred_commands.pop_one() {
+            if !superseded.contains(pending.envelope().command_id.as_str()) {
+                retained.push(pending);
+            }
+        }
+        for pending in retained {
+            self.deferred_commands
+                .push(pending)
+                .map_err(anyhow::Error::from)?;
+        }
+        // Durable CancelRequested commits while the worker is still awaiting the
+        // MessageEnd receipt, so the cutoff ordering and final AgentEnd owner
+        // are correct when the Session event loop resumes.
         Ok(true)
     }
 
@@ -841,6 +1018,33 @@ impl<G: Gateway + 'static> Session<G> {
         self.deferred_commands
             .push(command)
             .map_err(anyhow::Error::from)?;
+        Ok(())
+    }
+
+    /// Re-examine deferred controls in sequence order whenever the active run
+    /// reaches a phase where an earlier deferred command could now be routed.
+    /// Only processes the front of the queue so later commands can never
+    /// overtake an earlier deferred one.
+    async fn reclassify_deferred(&mut self) -> Result<(), SessionFailure> {
+        while let Some(command) = self.deferred_commands.pop_one() {
+            let routed = match &command.envelope().command {
+                Command::UserMessage { .. } => {
+                    if self.route_retry_wait_command(&command).await? {
+                        true
+                    } else {
+                        self.route_active_control(command.clone()).await?
+                    }
+                }
+                Command::Abort {} => self.route_active_abort(command.clone()).await?,
+                _ => false,
+            };
+            if !routed {
+                self.deferred_commands
+                    .push_front(command)
+                    .map_err(anyhow::Error::from)?;
+                break;
+            }
+        }
         Ok(())
     }
 
@@ -1115,12 +1319,30 @@ impl<G: Gateway + 'static> Session<G> {
         if let Some(barrier) = retry_wait_commit_barrier {
             barrier.committed();
         }
+        let assistant_started = outputs.iter().any(|output| {
+            matches!(
+                &output.event,
+                AgentEvent::MessageStart { message, .. }
+                    if matches!(
+                        message.as_ref(),
+                        PublicMessage::Assistant(assistant)
+                            if !matches!(
+                                assistant.stop_reason,
+                                StopReason::Error | StopReason::Aborted
+                            )
+                    )
+            )
+        });
         let command_id = self
             .active
             .as_ref()
             .map(|active| active.bridge.command_id().to_owned());
         self.send_committed(outputs, command_id, terminal_command_ids)
-            .await
+            .await?;
+        if assistant_started {
+            self.reclassify_deferred().await?;
+        }
+        Ok(())
     }
 
     async fn send_committed(
@@ -1153,7 +1375,8 @@ impl<G: Gateway + 'static> Session<G> {
                 },
             });
         }
-        for command_id in terminal_command_ids {
+        for command_id in &terminal_command_ids {
+            let command_id = command_id.clone();
             let ack = self
                 .writer
                 .ack_for_command(&command_id)
@@ -1167,8 +1390,10 @@ impl<G: Gateway + 'static> Session<G> {
             }
             frames.push(OutboundFrame::CommandAck { ack });
         }
-        if applied_command {
-            let command_id = command_id.ok_or(SessionFailure::CompletionChannelClosed)?;
+        if applied_command
+            && let Some(command_id) = command_id
+            && !terminal_command_ids.iter().any(|id| id == &command_id)
+        {
             let ack = self
                 .writer
                 .ack_for_command(&command_id)

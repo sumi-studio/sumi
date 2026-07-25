@@ -5,9 +5,10 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
+    time::Duration,
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -15,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use serde_json::Value;
 
 use super::*;
+use crate::store::KeyProvider;
 use crate::{
     gateway::{CommandAck, CommandId},
     provider::types::{
@@ -25,7 +27,7 @@ use crate::{
         UserMessage, ValidatedToolArguments,
     },
     runtime::contracts::{MAX_PROCESS_GENERATION, ProcessGeneration},
-    store::{Store, user_message_id},
+    store::{AgentScope, DATA_KEY_BYTES, Store, WrappingKey, user_message_id},
     tools::ToolError,
 };
 
@@ -2096,7 +2098,11 @@ async fn delay_zero_retry_schedule_never_opens_the_durable_retry_wait_gate() {
         )
         .await
         .expect("commit zero-delay retry schedule");
-    assert!(!bridge.can_bind_retry_steer());
+    let InboundCommand::Valid(envelope) = user(42) else {
+        unreachable!()
+    };
+    let command = AdmittedCommand::new(envelope, Utc::now());
+    assert!(!bridge.can_bind_retry_steer(&writer, &command));
 }
 
 #[test]
@@ -2457,6 +2463,148 @@ async fn active_abort_then_user_applies_abort_before_starting_later_user() {
     assert_eq!(states[2].1, "applied");
     assert!(states[2].2.is_some());
     assert_eq!(run_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn active_abort_supersedes_deferred_user_message_and_owner_applied() {
+    let store = Store::session_test_store("active-abort-supersede-deferred")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (gateway, commands, frames) = gateway();
+    let run_count = Arc::new(AtomicUsize::new(0));
+    let worker: Arc<dyn RunWorker> = Arc::new({
+        let run_count = run_count.clone();
+        move |core: RunCore,
+              initial: AdmittedCommand,
+              mut controls: mpsc::Receiver<RunControl>,
+              events: mpsc::Sender<AgentEvent>| {
+            let run_count = run_count.clone();
+            async move {
+                run_count.fetch_add(1, Ordering::SeqCst);
+                emit_idle_injection(&events, &initial).await;
+
+                let control = controls.recv().await.expect("abort control arrives");
+                let RunControl::Abort { accepted, .. } = control else {
+                    panic!("expected Abort control")
+                };
+                accepted.send(true).expect("abort accepted");
+
+                let assistant_id = "active-abort-assistant".to_owned();
+                events
+                    .send(AgentEvent::MessageStart {
+                        message_id: assistant_id.clone(),
+                        message: Box::new(bridge_assistant(StopReason::Stop)),
+                    })
+                    .await
+                    .expect("assistant start");
+
+                let mut aborted = match bridge_assistant(StopReason::Aborted) {
+                    PublicMessage::Assistant(message) => message,
+                    _ => unreachable!(),
+                };
+                aborted.interrupted = true;
+                let aborted = PublicMessage::Assistant(aborted);
+                events
+                    .send(AgentEvent::MessageEnd {
+                        message_id: assistant_id.clone(),
+                        message: Box::new(aborted.clone()),
+                    })
+                    .await
+                    .expect("assistant end");
+                events
+                    .send(AgentEvent::TurnEnd {
+                        message: Some(Box::new(aborted)),
+                        tool_results: Vec::new(),
+                    })
+                    .await
+                    .expect("turn end");
+                events.send(AgentEvent::AgentEnd).await.expect("agent end");
+                RunCompletion::Completed(core)
+            }
+        }
+    });
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        worker,
+        test_executor_generation(),
+    )
+    .await
+    .expect("session");
+    let task = tokio::spawn(session.run());
+
+    commands.send(user(1)).await.expect("first user");
+    // Wait for the user turn (AgentStart, TurnStart, MessageStart, MessageEnd) to
+    // be durably committed so the abort will be routed to the active run.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let event_count = frames
+                .lock()
+                .expect("frame mutex")
+                .iter()
+                .filter(|frame| matches!(frame, OutboundFrame::Event { .. }))
+                .count();
+            if event_count >= 4 || task.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("user turn events");
+    commands.send(user(2)).await.expect("deferred user");
+    commands.send(abort(3)).await.expect("abort");
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let (applied, superseded) = {
+                let frames_guard = frames.lock().expect("frame mutex");
+                let terminal = frames_guard.iter().filter_map(|frame| match frame {
+                    OutboundFrame::CommandAck { ack }
+                        if matches!(
+                            ack.status,
+                            CommandAckStatus::Applied | CommandAckStatus::Superseded
+                        ) =>
+                    {
+                        Some(ack.clone())
+                    }
+                    _ => None,
+                });
+                (
+                    terminal
+                        .clone()
+                        .filter(|ack| ack.status == CommandAckStatus::Applied)
+                        .count(),
+                    terminal
+                        .filter(|ack| ack.status == CommandAckStatus::Superseded)
+                        .count(),
+                )
+            };
+            if (applied == 2 && superseded == 1) || task.is_finished() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("terminal acks");
+
+    drop(commands);
+    completed(task.await.expect("session join"));
+
+    let states: Vec<(i64, String, Option<String>)> =
+        sqlx::query_as("SELECT seq, status, run_id FROM inbound_commands ORDER BY seq")
+            .fetch_all(&pool)
+            .await
+            .expect("command states");
+    assert_eq!(states[0].1, "applied");
+    assert!(states[0].2.is_some());
+    assert_eq!(states[1], (2, "superseded".to_owned(), None));
+    assert_eq!(states[2].1, "applied");
+    assert_eq!(states[2].2, None);
+    assert_eq!(run_count.load(Ordering::SeqCst), 1);
 }
 
 struct OpaqueContextDriver;
@@ -5864,4 +6012,1293 @@ async fn tool_execution_update_after_end_is_rejected_while_result_pairing_is_pen
             .await
             .expect("running tool audit row");
     assert_eq!(state, "running");
+}
+
+struct RetryGroupDriver {
+    retry_wait_entered: Notify,
+    contexts: Mutex<Vec<Vec<ContextMessage>>>,
+}
+
+impl RetryGroupDriver {
+    fn origin() -> ProviderOrigin {
+        ProviderOrigin {
+            provider_instance_id: "session-retry-group".to_owned(),
+            protocol: ApiProtocol::OpenAiChatCompletions,
+            model: "bridge-model".to_owned(),
+        }
+    }
+
+    fn assistant_with(reason: StopReason) -> PublicMessage {
+        let mut message = match bridge_assistant(reason) {
+            PublicMessage::Assistant(message) => message,
+            _ => unreachable!(),
+        };
+        if reason == StopReason::Error {
+            message.error_message = Some("network error".to_owned());
+            message.provider_code = Some("network_error".to_owned());
+        }
+        PublicMessage::Assistant(message)
+    }
+}
+
+#[async_trait]
+impl RunDriver for RetryGroupDriver {
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+        validate_test_generation(generation)
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        attempt: usize,
+        context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.contexts
+            .lock()
+            .expect("contexts mutex")
+            .push(context.to_vec());
+        let (tx, rx) = mpsc::channel(4);
+        tx.try_send(ProviderEvent::Start)?;
+        let (reason, message) = if attempt == 0 {
+            let message = AssistantMessage {
+                content: Vec::new(),
+                model: "bridge-model".to_owned(),
+                provider: "fixture".to_owned(),
+                origin: Self::origin(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Error,
+                error_message: Some("network error".to_owned()),
+                provider_code: Some("network_error".to_owned()),
+                interrupted: false,
+                timestamp: Utc::now(),
+            };
+            (StopReason::Error, message)
+        } else {
+            let message = AssistantMessage {
+                content: Vec::new(),
+                model: "bridge-model".to_owned(),
+                provider: "fixture".to_owned(),
+                origin: Self::origin(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                provider_code: None,
+                interrupted: false,
+                timestamp: Utc::now(),
+            };
+            (StopReason::Stop, message)
+        };
+        let output = ProviderOutput {
+            message,
+            provider_context: Vec::new(),
+        };
+        if attempt == 0 {
+            tx.try_send(ProviderEvent::Error { reason, output })?;
+        } else {
+            tx.try_send(ProviderEvent::Done { reason, output })?;
+        }
+        drop(tx);
+        Ok(ProviderAttempt {
+            message_id: format!("retry-group-assistant-{attempt}"),
+            initial_message: Self::assistant_with(reason),
+            events: ProviderEventStream::new(rx, cancel, "fixture", Self::origin()),
+        })
+    }
+
+    async fn execute_tool_observed(
+        &self,
+        _flow_id: &str,
+        _call: &ToolCall,
+        _cancel: CancellationToken,
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage, ToolError> {
+        Err(ToolError::Protocol(
+            "retry group fixture has no tools".to_owned(),
+        ))
+    }
+
+    fn synthetic_error(&self, message: &str) -> PublicMessage {
+        let mut assistant = match bridge_assistant(StopReason::Error) {
+            PublicMessage::Assistant(message) => message,
+            _ => unreachable!(),
+        };
+        assistant.error_message = Some(message.to_owned());
+        assistant.provider_code = Some("network_error".to_owned());
+        PublicMessage::Assistant(assistant)
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        _active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        Err(anyhow!("retry group fixture has no overflow recovery"))
+    }
+
+    async fn wait_retry(&self, _delay: std::time::Duration, _cancel: &CancellationToken) -> bool {
+        self.retry_wait_entered.notify_one();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        true
+    }
+}
+
+#[tokio::test]
+async fn retry_wait_group_of_two_is_injected_before_next_attempt() {
+    let store = Store::session_test_store("session-retry-group-two")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (gateway, commands, frames) = gateway();
+    let driver = Arc::new(RetryGroupDriver {
+        retry_wait_entered: Notify::new(),
+        contexts: Mutex::new(Vec::new()),
+    });
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        Arc::new(SequentialRunWorker::new(driver.clone())),
+        test_executor_generation(),
+    )
+    .await
+    .expect("session");
+    let task = tokio::spawn(session.run());
+
+    commands.send(user(1)).await.expect("initial command");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        driver.retry_wait_entered.notified(),
+    )
+    .await
+    .expect("retry wait entered");
+    commands.send(user(2)).await.expect("retry steer first");
+    commands.send(user(3)).await.expect("retry steer second");
+
+    let terminal_result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if frames.lock().expect("frame mutex").iter().any(|frame| {
+                matches!(frame, OutboundFrame::Event { envelope }
+                    if envelope.event["type"] == "agent_end")
+            }) || task.is_finished()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    if terminal_result.is_err() {
+        let kinds: Vec<String> =
+            sqlx::query_scalar("SELECT event_type FROM agent_events ORDER BY seq")
+                .fetch_all(&pool)
+                .await
+                .expect("durable kinds");
+        eprintln!("durable kinds on terminal timeout: {kinds:?}");
+    }
+    terminal_result.expect("retry group run terminal");
+    drop(commands);
+    completed(task.await.expect("session join"));
+
+    let kinds: Vec<String> = sqlx::query_scalar("SELECT event_type FROM agent_events ORDER BY seq")
+        .fetch_all(&pool)
+        .await
+        .expect("durable event sequence");
+    let retry = kinds
+        .iter()
+        .position(|kind| kind == "retry_scheduled")
+        .expect("RetryScheduled");
+    assert!(
+        kinds.len() > retry + 8,
+        "retry suffix contains group injection and assistant"
+    );
+    assert_eq!(&kinds[retry + 1..retry + 3], ["steered", "steered"]);
+    assert_eq!(
+        &kinds[retry + 3..retry + 5],
+        ["message_start", "message_end"]
+    );
+    assert_eq!(
+        &kinds[retry + 5..retry + 7],
+        ["message_start", "message_end"]
+    );
+    assert_eq!(kinds[retry + 7], "message_start");
+    assert_eq!(kinds[retry + 8], "message_end");
+    assert_eq!(kinds[retry + 9], "turn_end");
+    assert_eq!(kinds[retry + 10], "agent_end");
+
+    let steer_command_ids: Vec<String> = [user(2), user(3)]
+        .iter()
+        .map(|command| match command {
+            InboundCommand::Valid(envelope) => envelope.command_id.to_string(),
+            InboundCommand::Invalid { .. } => unreachable!(),
+        })
+        .collect();
+    for command_id in &steer_command_ids {
+        let state: (String, String, String) = sqlx::query_as(
+            "SELECT application_kind, run_phase, status FROM inbound_commands WHERE command_id=?",
+        )
+        .bind(command_id)
+        .fetch_one(&pool)
+        .await
+        .expect("retry steer durable state");
+        assert_eq!(
+            state,
+            (
+                "retry_steer".to_owned(),
+                "finished".to_owned(),
+                "applied".to_owned()
+            )
+        );
+    }
+
+    let contexts = driver.contexts.lock().expect("retry context mutex");
+    assert_eq!(contexts.len(), 2);
+    let context_ids: Vec<String> = contexts[1]
+        .iter()
+        .filter_map(|context| match context {
+            ContextMessage::Persisted { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    let expected_ids: Vec<String> = steer_command_ids
+        .iter()
+        .map(|command_id| crate::store::user_message_id(command_id.as_str()))
+        .collect();
+    assert!(
+        context_ids.ends_with(&expected_ids),
+        "retry group members appear in context order"
+    );
+}
+
+#[tokio::test]
+async fn retry_wait_group_of_three_is_injected_before_next_attempt() {
+    let store = Store::session_test_store("session-retry-group-three")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (gateway, commands, frames) = gateway();
+    let driver = Arc::new(RetryGroupDriver {
+        retry_wait_entered: Notify::new(),
+        contexts: Mutex::new(Vec::new()),
+    });
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        Arc::new(SequentialRunWorker::new(driver.clone())),
+        test_executor_generation(),
+    )
+    .await
+    .expect("session");
+    let task = tokio::spawn(session.run());
+
+    commands.send(user(1)).await.expect("initial command");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        driver.retry_wait_entered.notified(),
+    )
+    .await
+    .expect("retry wait entered");
+    commands.send(user(2)).await.expect("retry steer first");
+    commands.send(user(3)).await.expect("retry steer second");
+    commands.send(user(4)).await.expect("retry steer third");
+
+    let terminal_result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if frames.lock().expect("frame mutex").iter().any(|frame| {
+                matches!(frame, OutboundFrame::Event { envelope }
+                    if envelope.event["type"] == "agent_end")
+            }) || task.is_finished()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    if terminal_result.is_err() {
+        let kinds: Vec<String> =
+            sqlx::query_scalar("SELECT event_type FROM agent_events ORDER BY seq")
+                .fetch_all(&pool)
+                .await
+                .expect("durable kinds");
+        eprintln!("durable kinds on terminal timeout: {kinds:?}");
+    }
+    terminal_result.expect("retry group run terminal");
+    drop(commands);
+    completed(task.await.expect("session join"));
+
+    let kinds: Vec<String> = sqlx::query_scalar("SELECT event_type FROM agent_events ORDER BY seq")
+        .fetch_all(&pool)
+        .await
+        .expect("durable event sequence");
+    let retry = kinds
+        .iter()
+        .position(|kind| kind == "retry_scheduled")
+        .expect("RetryScheduled");
+    assert!(
+        kinds.len() > retry + 13,
+        "retry suffix contains group injection and assistant"
+    );
+    assert_eq!(
+        &kinds[retry + 1..retry + 4],
+        ["steered", "steered", "steered"]
+    );
+    assert_eq!(
+        &kinds[retry + 4..retry + 10],
+        [
+            "message_start",
+            "message_end",
+            "message_start",
+            "message_end",
+            "message_start",
+            "message_end",
+        ]
+    );
+    assert_eq!(kinds[retry + 10], "message_start");
+    assert_eq!(kinds[retry + 11], "message_end");
+    assert_eq!(kinds[retry + 12], "turn_end");
+    assert_eq!(kinds[retry + 13], "agent_end");
+
+    let steer_command_ids: Vec<String> = [user(2), user(3), user(4)]
+        .iter()
+        .map(|command| match command {
+            InboundCommand::Valid(envelope) => envelope.command_id.to_string(),
+            InboundCommand::Invalid { .. } => unreachable!(),
+        })
+        .collect();
+    for command_id in &steer_command_ids {
+        let state: (String, String, String) = sqlx::query_as(
+            "SELECT application_kind, run_phase, status FROM inbound_commands WHERE command_id=?",
+        )
+        .bind(command_id)
+        .fetch_one(&pool)
+        .await
+        .expect("retry steer durable state");
+        assert_eq!(
+            state,
+            (
+                "retry_steer".to_owned(),
+                "finished".to_owned(),
+                "applied".to_owned()
+            )
+        );
+    }
+
+    let contexts = driver.contexts.lock().expect("retry context mutex");
+    assert_eq!(contexts.len(), 2);
+    let context_ids: Vec<String> = contexts[1]
+        .iter()
+        .filter_map(|context| match context {
+            ContextMessage::Persisted { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    let expected_ids: Vec<String> = steer_command_ids
+        .iter()
+        .map(|command_id| crate::store::user_message_id(command_id.as_str()))
+        .collect();
+    assert!(
+        context_ids.ends_with(&expected_ids),
+        "retry group members appear in context order"
+    );
+}
+
+#[derive(Clone)]
+struct KillRestartKeyProvider(WrappingKey);
+
+#[async_trait]
+impl KeyProvider for KillRestartKeyProvider {
+    async fn current_key(&self) -> Result<WrappingKey> {
+        Ok(self.0.clone())
+    }
+
+    async fn key_by_id(&self, key_id: &str) -> Result<WrappingKey> {
+        if key_id != self.0.key_id() {
+            bail!("unknown kill-restart wrapping key {key_id}");
+        }
+        Ok(self.0.clone())
+    }
+}
+
+async fn open_kill_restart_store(path: &std::path::Path) -> Store {
+    let scope = AgentScope {
+        tenant_id: "kill-restart-tenant".to_owned(),
+        agent_id: "kill-restart-agent".to_owned(),
+        conversation_id: "kill-restart-conversation".to_owned(),
+    };
+    let key = WrappingKey::new("kill-restart-key/v1", [0x5a; DATA_KEY_BYTES]);
+    Store::open(path, scope, Arc::new(KillRestartKeyProvider(key)))
+        .await
+        .expect("open kill-restart store")
+}
+
+struct HardSteerKillDriver {
+    provider_started: Notify,
+    emit_partial: bool,
+}
+
+impl HardSteerKillDriver {
+    fn origin() -> ProviderOrigin {
+        ProviderOrigin {
+            provider_instance_id: "kill-restart-provider".to_owned(),
+            protocol: ApiProtocol::OpenAiChatCompletions,
+            model: "kill-restart-model".to_owned(),
+        }
+    }
+}
+
+#[async_trait]
+impl RunDriver for HardSteerKillDriver {
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+        validate_test_generation(generation)
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        _attempt: usize,
+        _context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.provider_started.notify_one();
+        let (tx, rx) = mpsc::channel(8);
+        tx.try_send(ProviderEvent::Start)?;
+        if self.emit_partial {
+            tx.try_send(ProviderEvent::TextStart { content_index: 0 })?;
+            tx.try_send(ProviderEvent::TextDelta {
+                content_index: 0,
+                delta: "partial assistant".to_owned(),
+            })?;
+        }
+        let initial = match bridge_assistant(StopReason::Stop) {
+            PublicMessage::Assistant(message) => message,
+            _ => unreachable!(),
+        };
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move {
+            cancel_clone.cancelled().await;
+            drop(tx);
+        });
+        Ok(ProviderAttempt {
+            message_id: "kill-restart-assistant".to_owned(),
+            initial_message: PublicMessage::Assistant(initial),
+            events: ProviderEventStream::new(rx, cancel, "fixture", Self::origin()),
+        })
+    }
+
+    async fn execute_tool_observed(
+        &self,
+        _flow_id: &str,
+        _call: &ToolCall,
+        _cancel: CancellationToken,
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage, ToolError> {
+        Err(ToolError::Protocol(
+            "hard-steer kill fixture has no tools".to_owned(),
+        ))
+    }
+
+    fn synthetic_error(&self, message: &str) -> PublicMessage {
+        let mut assistant = match bridge_assistant(StopReason::Error) {
+            PublicMessage::Assistant(message) => message,
+            _ => unreachable!(),
+        };
+        assistant.error_message = Some(message.to_owned());
+        assistant.provider_code = Some("network_error".to_owned());
+        PublicMessage::Assistant(assistant)
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        _active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        Err(anyhow!("hard-steer kill fixture has no overflow recovery"))
+    }
+}
+
+struct TurnEndKillDriver {
+    provider_started: Notify,
+}
+
+impl TurnEndKillDriver {
+    fn origin() -> ProviderOrigin {
+        ProviderOrigin {
+            provider_instance_id: "turn-end-provider".to_owned(),
+            protocol: ApiProtocol::OpenAiChatCompletions,
+            model: "turn-end-model".to_owned(),
+        }
+    }
+}
+
+#[async_trait]
+impl RunDriver for TurnEndKillDriver {
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+        validate_test_generation(generation)
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        _attempt: usize,
+        _context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.provider_started.notify_one();
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(ProviderEvent::Start).await?;
+        let final_message = AssistantMessage {
+            content: Vec::new(),
+            model: "bridge-model".to_owned(),
+            provider: "fixture".to_owned(),
+            origin: ProviderOrigin {
+                provider_instance_id: "bridge-fixture".to_owned(),
+                protocol: ApiProtocol::OpenAiChatCompletions,
+                model: "bridge-model".to_owned(),
+            },
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: Utc::now(),
+        };
+        tx.send(ProviderEvent::Done {
+            reason: StopReason::Stop,
+            output: ProviderOutput {
+                message: final_message,
+                provider_context: Vec::new(),
+            },
+        })
+        .await?;
+        drop(tx);
+        Ok(ProviderAttempt {
+            message_id: "turn-end-assistant".to_owned(),
+            initial_message: bridge_assistant(StopReason::Stop),
+            events: ProviderEventStream::new(rx, _cancel, "fixture", Self::origin()),
+        })
+    }
+
+    async fn execute_tool_observed(
+        &self,
+        _flow_id: &str,
+        _call: &ToolCall,
+        _cancel: CancellationToken,
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage, ToolError> {
+        Err(ToolError::Protocol(
+            "turn-end kill fixture has no tools".to_owned(),
+        ))
+    }
+
+    fn synthetic_error(&self, message: &str) -> PublicMessage {
+        let mut assistant = match bridge_assistant(StopReason::Error) {
+            PublicMessage::Assistant(message) => message,
+            _ => unreachable!(),
+        };
+        assistant.error_message = Some(message.to_owned());
+        assistant.provider_code = Some("network_error".to_owned());
+        PublicMessage::Assistant(assistant)
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        _active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        Err(anyhow!("turn-end kill fixture has no overflow recovery"))
+    }
+}
+
+struct AbortProviderKillDriver {
+    provider_started: Notify,
+}
+
+impl AbortProviderKillDriver {
+    fn origin() -> ProviderOrigin {
+        ProviderOrigin {
+            provider_instance_id: "abort-provider".to_owned(),
+            protocol: ApiProtocol::OpenAiChatCompletions,
+            model: "abort-provider-model".to_owned(),
+        }
+    }
+}
+
+#[async_trait]
+impl RunDriver for AbortProviderKillDriver {
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+        validate_test_generation(generation)
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        _attempt: usize,
+        _context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.provider_started.notify_one();
+        let (tx, rx) = mpsc::channel(8);
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move {
+            cancel_clone.cancelled().await;
+            drop(tx);
+        });
+        Ok(ProviderAttempt {
+            message_id: "abort-provider-assistant".to_owned(),
+            initial_message: bridge_assistant(StopReason::Stop),
+            events: ProviderEventStream::new(rx, cancel, "fixture", Self::origin()),
+        })
+    }
+
+    async fn execute_tool_observed(
+        &self,
+        _flow_id: &str,
+        _call: &ToolCall,
+        _cancel: CancellationToken,
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage, ToolError> {
+        Err(ToolError::Protocol(
+            "abort-provider kill fixture has no tools".to_owned(),
+        ))
+    }
+
+    fn synthetic_error(&self, message: &str) -> PublicMessage {
+        let mut assistant = match bridge_assistant(StopReason::Error) {
+            PublicMessage::Assistant(message) => message,
+            _ => unreachable!(),
+        };
+        assistant.error_message = Some(message.to_owned());
+        assistant.provider_code = Some("network_error".to_owned());
+        PublicMessage::Assistant(assistant)
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        _active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        Err(anyhow!(
+            "abort-provider kill fixture has no overflow recovery"
+        ))
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "subprocess entry point for T16 kill/restart tests"]
+async fn t16_hard_steer_kill_restart_child() {
+    let scenario = std::env::var("SUMI_T16_SCENARIO").expect("T16 scenario env");
+    let boundary = std::env::var("SUMI_T16_BOUNDARY").expect("T16 boundary env");
+    let database_path = std::env::var("SUMI_T16_DATABASE").expect("T16 database env");
+    let readiness_path = std::env::var("SUMI_T16_READY").expect("T16 ready env");
+
+    unsafe {
+        std::env::set_var("SUMI_EVENT_WRITER_FAILPOINT_NAME", &scenario);
+        std::env::set_var("SUMI_EVENT_WRITER_FAILPOINT_BOUNDARY", &boundary);
+        std::env::set_var("SUMI_EVENT_WRITER_FAILPOINT_READY", &readiness_path);
+    }
+
+    let emit_partial = std::env::var("SUMI_T16_EMIT_PARTIAL").ok() == Some("1".to_owned());
+
+    let store = open_kill_restart_store(std::path::Path::new(&database_path)).await;
+    let (gateway, commands, _frames) = gateway();
+    let driver = Arc::new(HardSteerKillDriver {
+        provider_started: Notify::new(),
+        emit_partial,
+    });
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        Arc::new(SequentialRunWorker::new(driver.clone())),
+        test_executor_generation(),
+    )
+    .await
+    .expect("start kill-restart session");
+    let task = tokio::spawn(session.run());
+
+    commands.send(user(1)).await.expect("send initial command");
+    tokio::time::timeout(Duration::from_secs(2), driver.provider_started.notified())
+        .await
+        .expect("provider started");
+
+    commands
+        .send(user(2))
+        .await
+        .expect("send hard steer command");
+
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    panic!("t16 hard-steer child should have been killed by EventWriter failpoint");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "subprocess entry point for T16 turn_end kill/restart tests"]
+async fn t16_turn_end_kill_restart_child() {
+    let boundary = std::env::var("SUMI_T16_BOUNDARY").expect("T16 boundary env");
+    let database_path = std::env::var("SUMI_T16_DATABASE").expect("T16 database env");
+    let readiness_path = std::env::var("SUMI_T16_READY").expect("T16 ready env");
+
+    unsafe {
+        std::env::set_var("SUMI_EVENT_WRITER_FAILPOINT_NAME", "turn_end");
+        std::env::set_var("SUMI_EVENT_WRITER_FAILPOINT_BOUNDARY", &boundary);
+        std::env::set_var("SUMI_EVENT_WRITER_FAILPOINT_READY", &readiness_path);
+    }
+
+    let store = open_kill_restart_store(std::path::Path::new(&database_path)).await;
+    let (gateway, commands, _frames) = gateway();
+    let driver = Arc::new(TurnEndKillDriver {
+        provider_started: Notify::new(),
+    });
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        Arc::new(SequentialRunWorker::new(driver.clone())),
+        test_executor_generation(),
+    )
+    .await
+    .expect("start turn-end kill-restart session");
+    let task = tokio::spawn(session.run());
+
+    commands.send(user(1)).await.expect("send initial command");
+    tokio::time::timeout(Duration::from_secs(2), driver.provider_started.notified())
+        .await
+        .expect("provider started");
+
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    panic!("t16 turn-end child should have been killed by EventWriter failpoint");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "subprocess entry point for T16 active abort provider kill/restart tests"]
+async fn t16_active_abort_provider_kill_restart_child() {
+    let boundary = std::env::var("SUMI_T16_BOUNDARY").expect("T16 boundary env");
+    let database_path = std::env::var("SUMI_T16_DATABASE").expect("T16 database env");
+    let readiness_path = std::env::var("SUMI_T16_READY").expect("T16 ready env");
+
+    unsafe {
+        std::env::set_var("SUMI_EVENT_WRITER_FAILPOINT_NAME", "active_abort_cutoff");
+        std::env::set_var("SUMI_EVENT_WRITER_FAILPOINT_BOUNDARY", &boundary);
+        std::env::set_var("SUMI_EVENT_WRITER_FAILPOINT_READY", &readiness_path);
+    }
+
+    let store = open_kill_restart_store(std::path::Path::new(&database_path)).await;
+    let (gateway, commands, _frames) = gateway();
+    let driver = Arc::new(AbortProviderKillDriver {
+        provider_started: Notify::new(),
+    });
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        Arc::new(SequentialRunWorker::new(driver.clone())),
+        test_executor_generation(),
+    )
+    .await
+    .expect("start active abort provider kill-restart session");
+    let task = tokio::spawn(session.run());
+
+    commands.send(user(1)).await.expect("send initial command");
+    tokio::time::timeout(Duration::from_secs(2), driver.provider_started.notified())
+        .await
+        .expect("provider started");
+    commands.send(abort(2)).await.expect("send abort command");
+
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    panic!("t16 active abort provider child should have been killed by EventWriter failpoint");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn t16_hard_steer_step_zero_is_atomic_before_and_after_commit() {
+    for boundary in ["before_commit", "after_commit"] {
+        let root = std::env::temp_dir().join(format!(
+            "sumi-t16-hard-steer-step-zero-{boundary}-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&root).expect("create kill-restart fixture root");
+        let database_path = root.join("agent.db");
+        let readiness_path = root.join("ready");
+
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("current unit test executable"),
+        )
+        .arg("--exact")
+        .arg("agent::session_tests::t16_hard_steer_kill_restart_child")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env("SUMI_T16_SCENARIO", "hard_steer_step_zero")
+        .env("SUMI_T16_BOUNDARY", boundary)
+        .env("SUMI_T16_EMIT_PARTIAL", "0")
+        .env("SUMI_T16_DATABASE", &database_path)
+        .env("SUMI_T16_READY", &readiness_path)
+        .output()
+        .expect("run t16 hard-steer child");
+
+        assert_eq!(
+            output.status.code(),
+            Some(86),
+            "{boundary} child did not exit at failpoint:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&readiness_path).expect("read readiness marker"),
+            format!("hard_steer_step_zero.{boundary}\n")
+        );
+
+        let store = open_kill_restart_store(&database_path).await;
+        let state: (String, String, String) = sqlx::query_as(
+            "SELECT application_kind, run_phase, status FROM inbound_commands WHERE seq=?",
+        )
+        .bind(2i64)
+        .fetch_one(store.pool())
+        .await
+        .expect("read hard steer command state");
+
+        if boundary == "before_commit" {
+            assert_eq!(
+                state,
+                ("".to_owned(), "received".to_owned(), "received".to_owned()),
+                "before_commit must not classify the hard steer"
+            );
+            let owner: (String, String) =
+                sqlx::query_as("SELECT run_phase, status FROM inbound_commands WHERE seq=?")
+                    .bind(1i64)
+                    .fetch_one(store.pool())
+                    .await
+                    .expect("read owner state");
+            assert_eq!(
+                owner,
+                ("assistant_started".to_owned(), "applying".to_owned()),
+                "before_commit must keep the original owner intact"
+            );
+        } else {
+            assert_eq!(
+                state,
+                (
+                    "hard_steer".to_owned(),
+                    "classified".to_owned(),
+                    "applying".to_owned()
+                ),
+                "after_commit must classify the hard steer"
+            );
+            let owner: (String, String) =
+                sqlx::query_as("SELECT run_phase, status FROM inbound_commands WHERE seq=?")
+                    .bind(1i64)
+                    .fetch_one(store.pool())
+                    .await
+                    .expect("read owner state");
+            assert_eq!(
+                owner,
+                ("hard_steer_requested".to_owned(), "applying".to_owned()),
+                "after_commit must advance the original owner to hard_steer_requested"
+            );
+        }
+
+        store.pool().close().await;
+        tokio::fs::remove_dir_all(root)
+            .await
+            .expect("remove kill-restart fixture");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn t16_hard_steer_partial_message_end_is_atomic_before_and_after_commit() {
+    for boundary in ["before_commit", "after_commit"] {
+        let root = std::env::temp_dir().join(format!(
+            "sumi-t16-hard-steer-partial-{boundary}-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&root).expect("create kill-restart fixture root");
+        let database_path = root.join("agent.db");
+        let readiness_path = root.join("ready");
+
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("current unit test executable"),
+        )
+        .arg("--exact")
+        .arg("agent::session_tests::t16_hard_steer_kill_restart_child")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env("SUMI_T16_SCENARIO", "hard_steer_partial_message_end")
+        .env("SUMI_T16_BOUNDARY", boundary)
+        .env("SUMI_T16_EMIT_PARTIAL", "1")
+        .env("SUMI_T16_DATABASE", &database_path)
+        .env("SUMI_T16_READY", &readiness_path)
+        .output()
+        .expect("run t16 hard-steer partial child");
+
+        assert_eq!(
+            output.status.code(),
+            Some(86),
+            "{boundary} child did not exit at failpoint:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&readiness_path).expect("read readiness marker"),
+            format!("hard_steer_partial_message_end.{boundary}\n")
+        );
+
+        let store = open_kill_restart_store(&database_path).await;
+        let message_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE role='assistant'")
+                .fetch_one(store.pool())
+                .await
+                .expect("count assistant messages");
+
+        let steer_state: (String, String) =
+            sqlx::query_as("SELECT run_phase, status FROM inbound_commands WHERE seq=?")
+                .bind(2i64)
+                .fetch_one(store.pool())
+                .await
+                .expect("read hard steer command state");
+
+        assert_eq!(
+            steer_state,
+            ("classified".to_owned(), "applying".to_owned()),
+            "close-batch boundary must not advance the steering command beyond classification"
+        );
+        if boundary == "before_commit" {
+            assert_eq!(
+                message_count, 0,
+                "before_commit must not persist a partial assistant MessageEnd"
+            );
+        } else {
+            assert_eq!(
+                message_count, 1,
+                "after_commit must persist exactly one partial assistant message"
+            );
+        }
+
+        store.pool().close().await;
+        tokio::fs::remove_dir_all(root)
+            .await
+            .expect("remove kill-restart fixture");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn t16_hard_steer_user_injection_is_atomic_before_and_after_commit() {
+    for boundary in ["before_commit", "after_commit"] {
+        let root = std::env::temp_dir().join(format!(
+            "sumi-t16-hard-steer-user-injection-{boundary}-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&root).expect("create kill-restart fixture root");
+        let database_path = root.join("agent.db");
+        let readiness_path = root.join("ready");
+
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("current unit test executable"),
+        )
+        .arg("--exact")
+        .arg("agent::session_tests::t16_hard_steer_kill_restart_child")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env("SUMI_T16_SCENARIO", "hard_steer_user_injection")
+        .env("SUMI_T16_BOUNDARY", boundary)
+        .env("SUMI_T16_EMIT_PARTIAL", "1")
+        .env("SUMI_T16_DATABASE", &database_path)
+        .env("SUMI_T16_READY", &readiness_path)
+        .output()
+        .expect("run t16 hard-steer user injection child");
+
+        assert_eq!(
+            output.status.code(),
+            Some(86),
+            "{boundary} child did not exit at failpoint:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&readiness_path).expect("read readiness marker"),
+            format!("hard_steer_user_injection.{boundary}\n")
+        );
+
+        let store = open_kill_restart_store(&database_path).await;
+        let user_message_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE role='user'")
+                .fetch_one(store.pool())
+                .await
+                .expect("count user messages");
+        let assistant_message_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE role='assistant'")
+                .fetch_one(store.pool())
+                .await
+                .expect("count assistant messages");
+
+        let steer_state: (String, String) =
+            sqlx::query_as("SELECT run_phase, status FROM inbound_commands WHERE seq=?")
+                .bind(2i64)
+                .fetch_one(store.pool())
+                .await
+                .expect("read hard steer command state");
+        let owner_state: (String, String) =
+            sqlx::query_as("SELECT run_phase, status FROM inbound_commands WHERE seq=?")
+                .bind(1i64)
+                .fetch_one(store.pool())
+                .await
+                .expect("read owner state");
+
+        if boundary == "before_commit" {
+            assert_eq!(
+                steer_state,
+                ("classified".to_owned(), "applying".to_owned()),
+                "before_commit must not advance the steering command"
+            );
+            assert_eq!(
+                owner_state,
+                ("hard_steer_requested".to_owned(), "applying".to_owned()),
+                "before_commit must keep the original owner in hard_steer_requested"
+            );
+            assert_eq!(
+                user_message_count, 1,
+                "before_commit must persist only the original owner user message"
+            );
+            assert_eq!(
+                assistant_message_count, 1,
+                "before_commit must persist the partial assistant MessageEnd from the close batch"
+            );
+        } else {
+            assert_eq!(
+                steer_state,
+                ("user_committed".to_owned(), "applying".to_owned()),
+                "after_commit must advance the steering command through injection"
+            );
+            assert_eq!(
+                owner_state,
+                ("finished".to_owned(), "applied".to_owned()),
+                "after_commit must apply the original owner"
+            );
+            assert_eq!(
+                user_message_count, 2,
+                "after_commit must persist the injected user message in addition to the owner"
+            );
+            assert_eq!(
+                assistant_message_count, 1,
+                "after_commit must persist exactly one partial assistant message"
+            );
+        }
+
+        store.pool().close().await;
+        tokio::fs::remove_dir_all(root)
+            .await
+            .expect("remove kill-restart fixture");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn t16_turn_end_is_atomic_before_and_after_commit() {
+    for boundary in ["before_commit", "after_commit"] {
+        let root = std::env::temp_dir().join(format!(
+            "sumi-t16-turn-end-{boundary}-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&root).expect("create kill-restart fixture root");
+        let database_path = root.join("agent.db");
+        let readiness_path = root.join("ready");
+
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("current unit test executable"),
+        )
+        .arg("--exact")
+        .arg("agent::session_tests::t16_turn_end_kill_restart_child")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env("SUMI_T16_BOUNDARY", boundary)
+        .env("SUMI_T16_DATABASE", &database_path)
+        .env("SUMI_T16_READY", &readiness_path)
+        .output()
+        .expect("run t16 turn-end child");
+
+        assert_eq!(
+            output.status.code(),
+            Some(86),
+            "{boundary} child did not exit at failpoint:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&readiness_path).expect("read readiness marker"),
+            format!("turn_end.{boundary}\n")
+        );
+
+        let store = open_kill_restart_store(&database_path).await;
+        let assistant_message_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE role='assistant'")
+                .fetch_one(store.pool())
+                .await
+                .expect("count assistant messages");
+        let turn_end_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE event_type='turn_end'")
+                .fetch_one(store.pool())
+                .await
+                .expect("count turn_end events");
+        let owner_state: (String, String) =
+            sqlx::query_as("SELECT run_phase, status FROM inbound_commands WHERE seq=?")
+                .bind(1i64)
+                .fetch_one(store.pool())
+                .await
+                .expect("read owner state");
+
+        assert_eq!(
+            assistant_message_count, 1,
+            "assistant MessageEnd must be committed before the separate TurnEnd batch"
+        );
+        assert_eq!(
+            owner_state,
+            ("assistant_started".to_owned(), "applying".to_owned()),
+            "owner must remain open until AgentEnd"
+        );
+        if boundary == "before_commit" {
+            assert_eq!(
+                turn_end_count, 0,
+                "before_commit must not persist the turn_end event"
+            );
+        } else {
+            assert_eq!(
+                turn_end_count, 1,
+                "after_commit must persist exactly one turn_end event"
+            );
+        }
+
+        store.pool().close().await;
+        tokio::fs::remove_dir_all(root)
+            .await
+            .expect("remove kill-restart fixture");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn t16_active_abort_provider_is_atomic_before_and_after_commit() {
+    for boundary in ["before_commit", "after_commit"] {
+        let root = std::env::temp_dir().join(format!(
+            "sumi-t16-active-abort-provider-{boundary}-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&root).expect("create kill-restart fixture root");
+        let database_path = root.join("agent.db");
+        let readiness_path = root.join("ready");
+
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("current unit test executable"),
+        )
+        .arg("--exact")
+        .arg("agent::session_tests::t16_active_abort_provider_kill_restart_child")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env("SUMI_T16_BOUNDARY", boundary)
+        .env("SUMI_T16_DATABASE", &database_path)
+        .env("SUMI_T16_READY", &readiness_path)
+        .output()
+        .expect("run t16 active abort provider child");
+
+        assert_eq!(
+            output.status.code(),
+            Some(86),
+            "{boundary} child did not exit at failpoint:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&readiness_path).expect("read readiness marker"),
+            format!("active_abort_cutoff.{boundary}\n")
+        );
+
+        let store = open_kill_restart_store(&database_path).await;
+        let user_message_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE role='user'")
+                .fetch_one(store.pool())
+                .await
+                .expect("count user messages");
+        let assistant_message_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE role='assistant'")
+                .fetch_one(store.pool())
+                .await
+                .expect("count assistant messages");
+        let message_start_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_events WHERE event_type='message_start'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("count message_start events");
+        let message_end_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE event_type='message_end'")
+                .fetch_one(store.pool())
+                .await
+                .expect("count message_end events");
+
+        let abort_state: (String, String) =
+            sqlx::query_as("SELECT run_phase, status FROM inbound_commands WHERE seq=?")
+                .bind(2i64)
+                .fetch_one(store.pool())
+                .await
+                .expect("read abort command state");
+        let owner_state: (String, String) =
+            sqlx::query_as("SELECT run_phase, status FROM inbound_commands WHERE seq=?")
+                .bind(1i64)
+                .fetch_one(store.pool())
+                .await
+                .expect("read owner state");
+
+        assert_eq!(
+            user_message_count, 1,
+            "the original owner user message must already be committed"
+        );
+        assert_eq!(
+            assistant_message_count, 0,
+            "abort must not persist an assistant MessageEnd"
+        );
+        assert_eq!(
+            message_start_count, 2,
+            "provider Start must emit MessageStart before the cutoff"
+        );
+        assert_eq!(
+            message_end_count, 1,
+            "only the user MessageEnd should be committed before the cutoff"
+        );
+
+        if boundary == "before_commit" {
+            assert_eq!(
+                abort_state,
+                ("received".to_owned(), "received".to_owned()),
+                "before_commit must not apply the abort command"
+            );
+            assert_eq!(
+                owner_state,
+                ("assistant_started".to_owned(), "applying".to_owned()),
+                "before_commit must keep the live owner in assistant_started"
+            );
+        } else {
+            assert_eq!(
+                abort_state,
+                ("received".to_owned(), "applied".to_owned()),
+                "after_commit must apply the abort command but leave run_phase unchanged"
+            );
+            assert_eq!(
+                owner_state,
+                ("cancel_requested".to_owned(), "applying".to_owned()),
+                "after_commit must transition the live owner to cancel_requested"
+            );
+        }
+
+        store.pool().close().await;
+        tokio::fs::remove_dir_all(root)
+            .await
+            .expect("remove kill-restart fixture");
+    }
 }
