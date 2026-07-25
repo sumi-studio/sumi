@@ -22,12 +22,12 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 use uuid::Uuid;
 
-#[cfg(test)]
-use super::DeferredApprovalRule;
 use super::{
     ApprovalDecision, Command, CommandAck, CommandAckStatus, CommandEnvelope, CommandId, Envelope,
     OutboundFrame,
 };
+#[cfg(test)]
+use super::{Attachment, DeferredApprovalRule};
 use crate::agent::{
     AgentEvent, ApprovalRequest, ApprovalResolution, AuditDecision, AuditOutcome, MemoryMaintKind,
     PublicStreamEvent, ReviewProjection, RiskLevel, SteerMode, UserAuthorization,
@@ -49,6 +49,72 @@ pub const USER_MESSAGE_ID_NAMESPACE: Uuid = Uuid::from_bytes([
 /// `number` type. Wire indices are bounded to this value so generated clients
 /// have one architecture-independent, lossless representation.
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+/// A wire field that must be present but may be JSON `null`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RequiredNullable<T>(Option<T>);
+
+impl<T> RequiredNullable<T> {
+    pub fn some(value: T) -> Self {
+        Self(Some(value))
+    }
+
+    pub fn none() -> Self {
+        Self(None)
+    }
+
+    pub fn into_option(self) -> Option<T> {
+        self.0
+    }
+
+    pub fn as_ref(&self) -> Option<&T> {
+        self.0.as_ref()
+    }
+
+    pub fn is_some(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+impl<T> From<T> for RequiredNullable<T> {
+    fn from(value: T) -> Self {
+        Self(Some(value))
+    }
+}
+
+impl<T> From<Option<T>> for RequiredNullable<T> {
+    fn from(value: Option<T>) -> Self {
+        Self(value)
+    }
+}
+
+impl<T: Serialize> Serialize for RequiredNullable<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match &self.0 {
+            Some(value) => value.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for RequiredNullable<T> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        if value.is_null() {
+            Ok(Self(None))
+        } else {
+            T::deserialize(value)
+                .map(Self::some)
+                .map_err(de::Error::custom)
+        }
+    }
+}
 
 /// Errors that can occur while converting an internal value to its wire form.
 #[derive(Debug, Error)]
@@ -77,6 +143,8 @@ pub enum WireError {
     ContentIndexOutOfRange(u64),
     #[error("usage value `{0}` exceeds the JSON-safe integer range")]
     UsageValueOutOfRange(u64),
+    #[error("user message attachments must be empty")]
+    NonEmptyAttachments,
 }
 
 /// Derive a durable user `message_id` from a canonical `command_id` using the
@@ -429,7 +497,7 @@ pub enum WireAgentEvent {
     AgentEnd,
     TurnStart,
     TurnEnd {
-        message: Option<Box<WirePublicMessage>>,
+        message: RequiredNullable<Box<WirePublicMessage>>,
         tool_results: Vec<WireToolResultMessage>,
     },
     MessageStart {
@@ -605,8 +673,8 @@ pub enum WirePublicMessage {
         origin: WireProviderOrigin,
         usage: WireUsage,
         stop_reason: WireStopReason,
-        error_message: Option<String>,
-        provider_code: Option<String>,
+        error_message: RequiredNullable<String>,
+        provider_code: RequiredNullable<String>,
         interrupted: bool,
         timestamp: String,
     },
@@ -828,8 +896,8 @@ impl TryFrom<AgentEvent> for WireAgentEvent {
                 tool_results,
             } => Self::TurnEnd {
                 message: match message {
-                    Some(message) => Some(Box::new((*message).try_into()?)),
-                    None => None,
+                    Some(message) => RequiredNullable::some(Box::new((*message).try_into()?)),
+                    None => RequiredNullable::none(),
                 },
                 tool_results: tool_results
                     .into_iter()
@@ -1041,8 +1109,8 @@ impl TryFrom<PublicMessage> for WirePublicMessage {
                 origin: origin.try_into()?,
                 usage: usage.try_into()?,
                 stop_reason: stop_reason.try_into()?,
-                error_message,
-                provider_code,
+                error_message: error_message.into(),
+                provider_code: provider_code.into(),
                 interrupted,
                 timestamp: timestamp.to_rfc3339(),
             },
@@ -1338,13 +1406,15 @@ impl TryFrom<Command> for WireCommand {
     type Error = WireError;
     fn try_from(command: Command) -> Result<Self, WireError> {
         Ok(match command {
-            Command::UserMessage { text, attachments } => Self::UserMessage {
-                text,
-                attachments: attachments
-                    .into_iter()
-                    .map(|attachment| WireAttachment(attachment.0))
-                    .collect(),
-            },
+            Command::UserMessage { text, attachments } => {
+                if !attachments.is_empty() {
+                    return Err(WireError::NonEmptyAttachments);
+                }
+                Self::UserMessage {
+                    text,
+                    attachments: vec![],
+                }
+            }
             Command::Abort {} => Self::Abort,
             Command::ApprovalDecision {
                 request_id,
@@ -2374,5 +2444,109 @@ mod tests {
                 "message_end outbound must reject {bad_id}"
             );
         }
+    }
+
+    #[test]
+    fn required_nullable_fields_reject_omission() {
+        // TurnEnd.message is required and nullable.
+        let missing_message = json!({
+            "type": "turn_end",
+            "tool_results": []
+        });
+        assert!(
+            serde_json::from_value::<WireAgentEvent>(missing_message).is_err(),
+            "turn_end must reject omitted message"
+        );
+
+        let null_message = json!({
+            "type": "turn_end",
+            "message": null,
+            "tool_results": []
+        });
+        let event: WireAgentEvent = serde_json::from_value(null_message).unwrap();
+        assert!(
+            matches!(event, WireAgentEvent::TurnEnd { message, .. } if message.as_ref().is_none()),
+            "turn_end must accept explicit null message"
+        );
+
+        // Assistant error_message and provider_code are required and nullable.
+        let base_assistant = json!({
+            "role": "assistant",
+            "content": [],
+            "model": "kimi-k3",
+            "provider": "moonshot",
+            "origin": {
+                "provider_instance_id": "p",
+                "protocol": "open_ai_chat_completions",
+                "model": "kimi-k3"
+            },
+            "usage": {
+                "input": 0,
+                "output": 0,
+                "cache_read": 0,
+                "cache_write": 0,
+                "reasoning": 0,
+                "total_tokens": 0
+            },
+            "stop_reason": "stop",
+            "interrupted": false,
+            "timestamp": now().to_rfc3339()
+        });
+
+        for omitted in ["error_message", "provider_code"] {
+            let mut payload = base_assistant.as_object().cloned().unwrap();
+            payload.remove(omitted);
+            assert!(
+                serde_json::from_value::<WirePublicMessage>(Value::Object(payload)).is_err(),
+                "assistant must reject omitted {omitted}"
+            );
+        }
+
+        for (error_message, provider_code) in
+            [(Value::Null, Value::Null), (json!("err"), json!("code"))]
+        {
+            let mut payload = base_assistant.as_object().cloned().unwrap();
+            payload.insert("error_message".to_owned(), error_message);
+            payload.insert("provider_code".to_owned(), provider_code);
+            let wire: WirePublicMessage = serde_json::from_value(Value::Object(payload)).unwrap();
+            assert!(
+                matches!(wire, WirePublicMessage::Assistant { .. }),
+                "assistant must accept explicit null or string values"
+            );
+        }
+    }
+
+    #[test]
+    fn try_from_command_rejects_non_empty_attachments() {
+        let non_empty = Command::UserMessage {
+            text: "inspect".to_owned(),
+            attachments: vec![Attachment(json!({"name": "secret.txt"}))],
+        };
+        assert!(
+            matches!(
+                WireCommand::try_from(non_empty),
+                Err(WireError::NonEmptyAttachments)
+            ),
+            "TryFrom<Command> must reject non-empty attachments"
+        );
+    }
+
+    #[test]
+    fn try_from_command_envelope_rejects_non_empty_attachments() {
+        let envelope = CommandEnvelope {
+            seq: 1,
+            command_id: uuid_command_id(),
+            command: Command::UserMessage {
+                text: "inspect".to_owned(),
+                attachments: vec![Attachment(json!({"name": "secret.txt"}))],
+            },
+        };
+        assert!(
+            matches!(
+                WireCommandEnvelope::try_from(envelope),
+                Err(WireError::NonEmptyAttachments)
+            ),
+            "TryFrom<CommandEnvelope> must reject non-empty attachments"
+        );
     }
 }
