@@ -16,14 +16,15 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use futures_util::future::{Either, select};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroize;
+
+use crate::runtime::contracts::ProcessGeneration;
 
 use super::{Gateway, GatewayReader, GatewayWriter, InboundCommand, OutboundFrame};
 
@@ -88,7 +89,7 @@ impl Drop for GatewayCredential {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentHello {
     pub agent_id: String,
-    pub generation: u64,
+    pub generation: ProcessGeneration,
     pub last_sent_event_seq: u64,
     pub last_received_command_seq: u64,
     pub last_applied_command_seq: u64,
@@ -97,7 +98,7 @@ pub struct AgentHello {
 /// API → Agent hello response.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ApiHello {
-    pub accepted_generation: u64,
+    pub accepted_generation: ProcessGeneration,
     pub last_received_event_seq: u64,
     pub next_command_seq: u64,
 }
@@ -124,7 +125,7 @@ pub enum HydrationState {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HydrationReady {
-    pub generation: u64,
+    pub generation: ProcessGeneration,
     pub receipt_identity: String,
 }
 
@@ -168,13 +169,13 @@ pub trait DurableSource: Clone + Send + Sync + 'static {
 /// underlying `watch` channel; `T17HydrationLatch` is a compile-safe seam.
 #[async_trait]
 pub trait HydrationLatch: Clone + Send + Sync + 'static {
-    async fn wait_for(&self, generation: u64) -> Result<HydrationReady>;
+    async fn wait_for(&self, generation: ProcessGeneration) -> Result<HydrationReady>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SupervisorConfig {
     pub agent_id: String,
-    pub generation: u64,
+    pub generation: ProcessGeneration,
     pub initial_backoff: Duration,
     pub max_backoff: Duration,
     pub send_timeout: Duration,
@@ -182,14 +183,16 @@ pub struct SupervisorConfig {
     pub command_buffer_size: usize,
     pub catch_up_page_size: usize,
     pub max_reconnect_attempts: Option<u32>,
+    pub max_auth_attempts: Option<u32>,
     pub hello_timeout: Duration,
+    pub connect_timeout: Duration,
 }
 
 impl Default for SupervisorConfig {
     fn default() -> Self {
         Self {
             agent_id: String::new(),
-            generation: 0,
+            generation: ProcessGeneration::MIN,
             initial_backoff: Duration::from_millis(500),
             max_backoff: Duration::from_secs(30),
             send_timeout: Duration::from_secs(30),
@@ -197,7 +200,9 @@ impl Default for SupervisorConfig {
             command_buffer_size: 64,
             catch_up_page_size: 64,
             max_reconnect_attempts: None,
+            max_auth_attempts: Some(3),
             hello_timeout: Duration::from_secs(30),
+            connect_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -207,12 +212,13 @@ pub struct SupervisorHandle {
     pub commands: mpsc::Receiver<InboundCommand>,
     pub events: mpsc::Sender<(DeliveryEpoch, OutboundFrame)>,
     pub epochs: watch::Receiver<Option<DeliveryEpoch>>,
+    cancel: CancellationToken,
     task: JoinHandle<Result<()>>,
 }
 
 impl SupervisorHandle {
     pub fn abort(&self) {
-        self.task.abort();
+        self.cancel.cancel();
     }
 
     pub async fn join(self) -> Result<()> {
@@ -239,6 +245,7 @@ where
     epoch_counter: Arc<AtomicU64>,
     current_writer: CurrentWriterSlot,
     current_epoch: watch::Sender<Option<DeliveryEpoch>>,
+    cancel: CancellationToken,
 }
 
 impl<C, P, S, L> ConnectionSupervisor<C, P, S, L>
@@ -265,6 +272,7 @@ where
             epoch_counter: Arc::new(AtomicU64::new(0)),
             current_writer: Arc::new(std::sync::Mutex::new(None)),
             current_epoch,
+            cancel: CancellationToken::new(),
         }
     }
 
@@ -275,11 +283,13 @@ where
         let (commands_tx, commands_rx) = mpsc::channel(self.config.command_buffer_size);
         let (events_tx, events_rx) = mpsc::channel(self.config.event_buffer_size);
         let epochs_rx = self.current_epoch.subscribe();
+        let cancel = self.cancel.clone();
         let task = tokio::spawn(self.run(commands_tx, events_rx));
         SupervisorHandle {
             commands: commands_rx,
             events: events_tx,
             epochs: epochs_rx,
+            cancel,
             task,
         }
     }
@@ -290,9 +300,15 @@ where
         events_rx: mpsc::Receiver<(DeliveryEpoch, OutboundFrame)>,
     ) -> Result<()> {
         let current_writer = self.current_writer.clone();
-        let forwarder = tokio::spawn(event_forwarder(events_rx, current_writer));
+        let cancel = self.cancel.clone();
+        let forwarder = tokio::spawn(event_forwarder(events_rx, current_writer, cancel));
 
-        let result = self.run_loop(commands_tx).await;
+        let cancel = self.cancel.clone();
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Ok(()),
+            result = self.run_loop(commands_tx) => result,
+        };
 
         forwarder.abort();
         let _ = forwarder.await;
@@ -302,40 +318,61 @@ where
     async fn run_loop(&mut self, commands_tx: mpsc::Sender<InboundCommand>) -> Result<()> {
         const DEFAULT_MAX_AUTH_ATTEMPTS: u32 = 3;
 
-        let mut attempt: u32 = 0;
+        let mut auth_attempt: u32 = 0;
+        let mut reconnect_attempt: u32 = 0;
+
         loop {
+            if self.cancel.is_cancelled() {
+                return Ok(());
+            }
+
             match self.connect_and_run_epoch(commands_tx.clone()).await {
                 Ok(()) => return Ok(()),
                 Err(SupervisorError::Fatal(e)) => return Err(e),
                 Err(SupervisorError::AuthRejected) => {
-                    attempt = attempt.saturating_add(1);
+                    auth_attempt = auth_attempt.saturating_add(1);
+                    reconnect_attempt = 0;
                     let max = self
                         .config
-                        .max_reconnect_attempts
+                        .max_auth_attempts
                         .unwrap_or(DEFAULT_MAX_AUTH_ATTEMPTS);
-                    if attempt > max {
+                    if auth_attempt > max {
                         return Err(anyhow!("max auth attempts exceeded"));
                     }
-                    Self::backoff_sleep(&self.config, attempt).await?;
+                    tokio::select! {
+                        biased;
+                        _ = self.cancel.cancelled() => return Ok(()),
+                        result = Self::backoff_sleep(&self.config, auth_attempt) => result?,
+                    }
                 }
                 Err(SupervisorError::Reconnect { reason }) => {
-                    attempt = attempt.saturating_add(1);
+                    reconnect_attempt = reconnect_attempt.saturating_add(1);
                     if let Some(max) = self.config.max_reconnect_attempts
-                        && attempt > max
+                        && reconnect_attempt > max
                     {
                         return Err(anyhow!("max reconnect attempts exceeded: {reason}"));
                     }
-                    Self::backoff_sleep(&self.config, attempt).await?;
+                    tokio::select! {
+                        biased;
+                        _ = self.cancel.cancelled() => return Ok(()),
+                        result = Self::backoff_sleep(&self.config, reconnect_attempt) => result?,
+                    }
                 }
                 Err(SupervisorError::EstablishedReconnect { reason }) => {
-                    attempt = 0;
-                    attempt = attempt.saturating_add(1);
+                    // A healthy epoch ended; reset failure streaks and reconnect.
+                    auth_attempt = 0;
+                    reconnect_attempt = 0;
+                    reconnect_attempt = reconnect_attempt.saturating_add(1);
                     if let Some(max) = self.config.max_reconnect_attempts
-                        && attempt > max
+                        && reconnect_attempt > max
                     {
                         return Err(anyhow!("max reconnect attempts exceeded: {reason}"));
                     }
-                    Self::backoff_sleep(&self.config, attempt).await?;
+                    tokio::select! {
+                        biased;
+                        _ = self.cancel.cancelled() => return Ok(()),
+                        result = Self::backoff_sleep(&self.config, reconnect_attempt) => result?,
+                    }
                 }
             }
         }
@@ -347,92 +384,154 @@ where
     ) -> Result<(), SupervisorError> {
         let source = self.source.clone();
         let config = self.config.clone();
+        let cancel = self.cancel.clone();
 
-        let credential =
-            self.credentials
-                .fresh_credential()
-                .await
-                .map_err(|e| SupervisorError::Reconnect {
-                    reason: format!("failed to obtain credential: {e}"),
-                })?;
+        let credential = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Ok(()),
+            result = self.credentials.fresh_credential() => result.map_err(|e| SupervisorError::Reconnect {
+                reason: format!("failed to obtain credential: {e}"),
+            })?,
+        };
 
-        let mut gateway = match self.connector.connect(credential).await {
-            Ok(g) => g,
-            Err(ConnectorError::AuthRejected) => return Err(SupervisorError::AuthRejected),
-            Err(ConnectorError::Fatal(e)) => return Err(SupervisorError::Fatal(e)),
-            Err(ConnectorError::Other(e)) => {
-                return Err(SupervisorError::Reconnect {
+        let mut gateway = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Ok(()),
+            result = time::timeout(config.connect_timeout, self.connector.connect(credential)) => match result {
+                Ok(Ok(g)) => g,
+                Ok(Err(ConnectorError::AuthRejected)) => return Err(SupervisorError::AuthRejected),
+                Ok(Err(ConnectorError::Fatal(e))) => return Err(SupervisorError::Fatal(e)),
+                Ok(Err(ConnectorError::Other(e))) => return Err(SupervisorError::Reconnect {
                     reason: format!("connect failed: {e}"),
-                });
-            }
+                }),
+                Err(_) => return Err(SupervisorError::Reconnect {
+                    reason: "connect timeout".to_owned(),
+                }),
+            },
         };
 
         let agent_hello = build_agent_hello(&source, &config).await?;
-        let api_hello = tokio::time::timeout(
-            config.hello_timeout,
-            gateway.authenticate_hello(agent_hello.clone()),
-        )
-        .await
-        .map_err(|_| SupervisorError::Reconnect {
-            reason: "hello response timeout".to_owned(),
-        })?
-        .map_err(|e| SupervisorError::Reconnect {
-            reason: format!("hello failed: {e}"),
-        })?;
+        let api_hello = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Ok(()),
+            result = time::timeout(config.hello_timeout, gateway.authenticate_hello(agent_hello.clone())) => match result {
+                Ok(Ok(h)) => h,
+                Ok(Err(e)) => return Err(SupervisorError::Reconnect {
+                    reason: format!("hello failed: {e}"),
+                }),
+                Err(_) => return Err(SupervisorError::Reconnect {
+                    reason: "hello response timeout".to_owned(),
+                }),
+            },
+        };
 
-        validate_hello(&source, &agent_hello, &api_hello).await?;
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Ok(()),
+            result = validate_hello(&source, &agent_hello, &api_hello) => result?,
+        }
 
         let (connection_epoch, delivery_epoch) = self.next_epoch();
         let (reader, writer) = gateway.split();
 
-        let token = CancellationToken::new();
+        let epoch_token = cancel.child_token();
         let (writer_tx, writer_rx) = mpsc::channel(config.event_buffer_size);
 
         *self.current_writer.lock().unwrap() = Some((delivery_epoch, writer_tx));
         self.current_epoch.send_replace(Some(delivery_epoch));
 
-        let reader_handle = tokio::spawn(reader_task(
+        let mut reader_handle = tokio::spawn(reader_task(
             reader,
             commands_tx,
             self.latch.clone(),
             api_hello.clone(),
-            token.child_token(),
+            epoch_token.child_token(),
         ));
 
-        let writer_handle = tokio::spawn(writer_task(
+        let mut writer_handle = tokio::spawn(writer_task(
             writer,
             writer_rx,
             source,
             api_hello,
             config,
-            token.child_token(),
+            epoch_token.child_token(),
         ));
 
-        let result = select(reader_handle, writer_handle).await;
-        token.cancel();
-        let result = match result {
-            Either::Left((reader_result, writer_handle)) => {
-                let _ = writer_handle.await;
-                reader_result
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                epoch_token.cancel();
+                let reader_result = reader_handle.await;
+                let writer_result = writer_handle.await;
+                *self.current_writer.lock().unwrap() = None;
+                self.current_epoch.send_replace(None);
+                for result in [&reader_result, &writer_result] {
+                    if let Err(join_err) = result {
+                        if join_err.is_panic() {
+                            return Err(SupervisorError::Fatal(anyhow!(
+                                "epoch task panicked: {join_err}"
+                            )));
+                        }
+                        return Err(SupervisorError::Fatal(anyhow!(
+                            "epoch task join error: {join_err}"
+                        )));
+                    }
+                }
+                return Ok(());
             }
-            Either::Right((writer_result, reader_handle)) => {
-                let _ = reader_handle.await;
-                writer_result
+            reader_result = &mut reader_handle => {
+                epoch_token.cancel();
+                *self.current_writer.lock().unwrap() = None;
+                self.current_epoch.send_replace(None);
+                Self::inspect_epoch_results(reader_result, writer_handle.await)
+            }
+            writer_result = &mut writer_handle => {
+                epoch_token.cancel();
+                *self.current_writer.lock().unwrap() = None;
+                self.current_epoch.send_replace(None);
+                Self::inspect_epoch_results(reader_handle.await, writer_result)
             }
         };
 
-        *self.current_writer.lock().unwrap() = None;
-        self.current_epoch.send_replace(None);
+        if let Err(SupervisorError::EstablishedReconnect { .. }) = &result {
+            tracing::debug!(
+                connection_epoch = connection_epoch.as_u64(),
+                delivery_epoch = delivery_epoch.as_u64(),
+                "epoch ended"
+            );
+        }
 
-        tracing::debug!(
-            connection_epoch = connection_epoch.as_u64(),
-            delivery_epoch = delivery_epoch.as_u64(),
-            "epoch ended"
-        );
+        result
+    }
 
-        Err(SupervisorError::EstablishedReconnect {
-            reason: format!("reader/writer task ended: {result:?}"),
-        })
+    fn inspect_epoch_results(
+        reader_result: Result<Result<()>, JoinError>,
+        writer_result: Result<Result<()>, JoinError>,
+    ) -> Result<(), SupervisorError> {
+        for result in [&reader_result, &writer_result] {
+            if let Err(join_err) = result {
+                if join_err.is_panic() {
+                    return Err(SupervisorError::Fatal(anyhow!(
+                        "epoch task panicked: {join_err}"
+                    )));
+                }
+                return Err(SupervisorError::Fatal(anyhow!(
+                    "epoch task join error: {join_err}"
+                )));
+            }
+        }
+
+        let reader_result = reader_result.unwrap();
+        let writer_result = writer_result.unwrap();
+
+        match (reader_result, writer_result) {
+            (Ok(()), Ok(())) => Err(SupervisorError::EstablishedReconnect {
+                reason: "reader/writer task ended".to_owned(),
+            }),
+            (Err(e), _) | (_, Err(e)) => Err(SupervisorError::EstablishedReconnect {
+                reason: format!("epoch task error: {e}"),
+            }),
+        }
     }
 
     fn next_epoch(&self) -> (ConnectionEpoch, DeliveryEpoch) {
@@ -495,34 +594,36 @@ async fn validate_hello<S: DurableSource>(
             agent.generation
         )));
     }
-    if api.last_received_event_seq > agent.last_sent_event_seq {
-        return Err(SupervisorError::Fatal(anyhow!(
-            "event cursor claim mismatch: api received {} but agent only sent {}",
-            api.last_received_event_seq,
-            agent.last_sent_event_seq
-        )));
-    }
-    let cursor = source
+
+    // Re-fetch cursors so the hello is validated against the durable source
+    // at the moment of authentication, not the snapshot used to build AgentHello.
+    let event_cursor = source
         .event_cursor()
         .await
         .map_err(SupervisorError::Fatal)?;
-    if api.last_received_event_seq > cursor.last_sent {
+    if api.last_received_event_seq > event_cursor.last_sent {
         return Err(SupervisorError::Fatal(anyhow!(
             "API claims event seq {} beyond durable cursor {}",
             api.last_received_event_seq,
-            cursor.last_sent
+            event_cursor.last_sent
         )));
     }
-    if api.next_command_seq > agent.last_received_command_seq.saturating_add(1) {
+
+    let command_cursor = source
+        .command_cursors()
+        .await
+        .map_err(SupervisorError::Fatal)?;
+    if api.next_command_seq > command_cursor.received.saturating_add(1) {
         return Err(SupervisorError::Fatal(anyhow!(
             "command cursor claim mismatch: next_command_seq {} > received {} + 1",
             api.next_command_seq,
-            agent.last_received_command_seq
+            command_cursor.received
         )));
     }
     Ok(())
 }
 
+#[derive(Debug)]
 enum SupervisorError {
     AuthRejected,
     Fatal(anyhow::Error),
@@ -533,8 +634,17 @@ enum SupervisorError {
 async fn event_forwarder(
     mut event_rx: mpsc::Receiver<(DeliveryEpoch, OutboundFrame)>,
     current_writer: CurrentWriterSlot,
+    cancel: CancellationToken,
 ) {
-    while let Some((epoch, frame)) = event_rx.recv().await {
+    loop {
+        let frame = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            frame = event_rx.recv() => frame,
+        };
+        let Some((epoch, frame)) = frame else {
+            break;
+        };
         let sender = {
             let guard = current_writer.lock().unwrap();
             guard
@@ -564,13 +674,19 @@ where
 {
     let mut last_received = api_hello.last_received_event_seq;
     loop {
-        let cursor = source.event_cursor().await?;
+        let cursor = tokio::select! {
+            biased;
+            _ = token.cancelled() => return Ok(()),
+            result = source.event_cursor() => result?,
+        };
         if last_received >= cursor.last_sent {
             break;
         }
-        let events = source
-            .events_after(last_received, config.catch_up_page_size)
-            .await?;
+        let events = tokio::select! {
+            biased;
+            _ = token.cancelled() => return Ok(()),
+            result = source.events_after(last_received, config.catch_up_page_size) => result?,
+        };
         if events.is_empty() {
             bail!("event source returned empty page before cursor");
         }
@@ -709,7 +825,7 @@ impl WatchHydrationLatch {
 
 #[async_trait]
 impl HydrationLatch for WatchHydrationLatch {
-    async fn wait_for(&self, generation: u64) -> Result<HydrationReady> {
+    async fn wait_for(&self, generation: ProcessGeneration) -> Result<HydrationReady> {
         let mut rx = self.rx.clone();
         loop {
             let state = rx.borrow().clone();
@@ -732,6 +848,7 @@ impl HydrationLatch for WatchHydrationLatch {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
@@ -807,7 +924,7 @@ mod tests {
 
     #[async_trait]
     impl HydrationLatch for StaticHydrationLatch {
-        async fn wait_for(&self, generation: u64) -> Result<HydrationReady> {
+        async fn wait_for(&self, generation: ProcessGeneration) -> Result<HydrationReady> {
             if self.0.generation != generation {
                 bail!("generation mismatch");
             }
@@ -829,7 +946,7 @@ mod tests {
 
     #[async_trait]
     impl HydrationLatch for DynamicHydrationLatch {
-        async fn wait_for(&self, generation: u64) -> Result<HydrationReady> {
+        async fn wait_for(&self, generation: ProcessGeneration) -> Result<HydrationReady> {
             WatchHydrationLatch::new(self.tx.subscribe())
                 .wait_for(generation)
                 .await
@@ -861,6 +978,14 @@ mod tests {
 
     struct MockGatewayReader {
         commands: VecDeque<Result<InboundCommand>>,
+        panic: bool,
+    }
+
+    impl MockGatewayReader {
+        fn with_panic(mut self) -> Self {
+            self.panic = true;
+            self
+        }
     }
 
     struct MockGatewayWriter {
@@ -872,6 +997,9 @@ mod tests {
     #[async_trait]
     impl GatewayReader for MockGatewayReader {
         async fn next_command(&mut self) -> Result<InboundCommand> {
+            if self.panic {
+                panic!("mock reader panic");
+            }
             match self.commands.pop_front() {
                 Some(Ok(cmd)) => Ok(cmd),
                 Some(Err(e)) => Err(e),
@@ -901,7 +1029,7 @@ mod tests {
         reader: MockGatewayReader,
         writer: MockGatewayWriter,
         sent_hellos: Arc<std::sync::Mutex<Vec<AgentHello>>>,
-        hello_generation: Option<u64>,
+        hello_generation: Option<ProcessGeneration>,
         last_received_event_seq: u64,
         hello_delay: Option<Duration>,
     }
@@ -909,7 +1037,10 @@ mod tests {
     impl MockGateway {
         fn new(commands: VecDeque<Result<InboundCommand>>) -> Self {
             Self {
-                reader: MockGatewayReader { commands },
+                reader: MockGatewayReader {
+                    commands,
+                    panic: false,
+                },
                 writer: MockGatewayWriter {
                     fail_after: None,
                     sent: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -923,7 +1054,7 @@ mod tests {
         }
 
         fn with_hello_generation(mut self, generation: u64) -> Self {
-            self.hello_generation = Some(generation);
+            self.hello_generation = Some(ProcessGeneration::from_wire(generation).unwrap());
             self
         }
 
@@ -968,6 +1099,7 @@ mod tests {
     struct MockConnector {
         responses: VecDeque<Result<MockGateway, ConnectorError>>,
         sent_hellos: Arc<std::sync::Mutex<Vec<AgentHello>>>,
+        connect_delay: Option<Duration>,
     }
 
     impl MockConnector {
@@ -978,7 +1110,13 @@ mod tests {
             Self {
                 responses,
                 sent_hellos,
+                connect_delay: None,
             }
+        }
+
+        fn with_connect_delay(mut self, delay: Duration) -> Self {
+            self.connect_delay = Some(delay);
+            self
         }
     }
 
@@ -994,6 +1132,9 @@ mod tests {
                 .responses
                 .pop_front()
                 .expect("mock connector has a queued response")?;
+            if let Some(delay) = self.connect_delay {
+                tokio::time::sleep(delay).await;
+            }
             // Share the hello tracker so the test can observe all attempts.
             gateway.sent_hellos = self.sent_hellos.clone();
             Ok(gateway)
@@ -1003,7 +1144,7 @@ mod tests {
     fn make_config() -> SupervisorConfig {
         SupervisorConfig {
             agent_id: "test-agent".to_owned(),
-            generation: 7,
+            generation: ProcessGeneration::from_wire(7).unwrap(),
             initial_backoff: Duration::from_millis(1),
             max_backoff: Duration::from_millis(5),
             send_timeout: Duration::from_millis(50),
@@ -1011,7 +1152,9 @@ mod tests {
             command_buffer_size: 16,
             catch_up_page_size: 16,
             max_reconnect_attempts: Some(10),
+            max_auth_attempts: Some(3),
             hello_timeout: Duration::from_secs(5),
+            connect_timeout: Duration::from_millis(50),
         }
     }
 
@@ -1048,21 +1191,16 @@ mod tests {
     #[tokio::test]
     async fn fresh_credential_per_attempt() {
         let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let connector = MockConnector::new(
-            sent_hellos.clone(),
-            VecDeque::from([
-                Ok(MockGateway::new(VecDeque::from([Err(anyhow!(
-                    "reader EOF"
-                ))]))),
-                Ok(MockGateway::new(VecDeque::from([Err(anyhow!(
-                    "reader EOF"
-                ))]))),
-            ]),
-        );
+        let responses = VecDeque::from_iter((0..5).map(|_| {
+            Ok(MockGateway::new(VecDeque::from([Err(anyhow!(
+                "reader EOF"
+            ))])))
+        }));
+        let connector = MockConnector::new(sent_hellos.clone(), responses);
         let credentials = CountingCredentialProvider::new("token");
         let source = MockDurableSource::new(CommandCursors::default());
         let latch = StaticHydrationLatch(HydrationReady {
-            generation: 7,
+            generation: ProcessGeneration::from_wire(7).unwrap(),
             receipt_identity: "receipt-1".to_owned(),
         });
 
@@ -1070,12 +1208,24 @@ mod tests {
             ConnectionSupervisor::new(connector, credentials, source, latch, make_config());
         let handle = supervisor.start();
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Abort as soon as two fresh credentials have been used; this avoids a
+        // timing race between the fixed-duration sleep and mock exhaustion.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while sent_hellos.lock().unwrap().len() < 2 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+
         handle.abort();
-        let _ = handle.join().await;
+        assert!(handle.join().await.is_ok());
 
         let hellos = sent_hellos.lock().unwrap();
-        assert_eq!(hellos.len(), 2, "two hello attempts with fresh credentials");
+        assert!(
+            hellos.len() >= 2,
+            "each hello attempt must use a fresh credential"
+        );
     }
 
     #[tokio::test]
@@ -1090,7 +1240,7 @@ mod tests {
         let credentials = CountingCredentialProvider::new("token");
         let source = MockDurableSource::new(CommandCursors::default());
         let latch = StaticHydrationLatch(HydrationReady {
-            generation: 7,
+            generation: ProcessGeneration::from_wire(7).unwrap(),
             receipt_identity: "receipt-1".to_owned(),
         });
 
@@ -1106,21 +1256,16 @@ mod tests {
     #[tokio::test]
     async fn reader_eof_triggers_reconnect() {
         let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let connector = MockConnector::new(
-            sent_hellos.clone(),
-            VecDeque::from([
-                Ok(MockGateway::new(VecDeque::from([Err(anyhow!(
-                    "reader EOF"
-                ))]))),
-                Ok(MockGateway::new(VecDeque::from([Err(anyhow!(
-                    "reader EOF"
-                ))]))),
-            ]),
-        );
+        let responses = VecDeque::from_iter((0..5).map(|_| {
+            Ok(MockGateway::new(VecDeque::from([Err(anyhow!(
+                "reader EOF"
+            ))])))
+        }));
+        let connector = MockConnector::new(sent_hellos.clone(), responses);
         let credentials = CountingCredentialProvider::new("token");
         let source = MockDurableSource::new(CommandCursors::default());
         let latch = StaticHydrationLatch(HydrationReady {
-            generation: 7,
+            generation: ProcessGeneration::from_wire(7).unwrap(),
             receipt_identity: "receipt-1".to_owned(),
         });
 
@@ -1128,9 +1273,16 @@ mod tests {
             ConnectionSupervisor::new(connector, credentials, source, latch, make_config());
         let handle = supervisor.start();
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while sent_hellos.lock().unwrap().len() < 2 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+
         handle.abort();
-        let _ = handle.join().await;
+        assert!(handle.join().await.is_ok());
 
         assert!(sent_hellos.lock().unwrap().len() >= 2);
     }
@@ -1142,6 +1294,7 @@ mod tests {
 
         let gateway1 = MockGateway {
             reader: MockGatewayReader {
+                panic: false,
                 commands: VecDeque::from([Ok(valid_command(
                     1,
                     "00000000-0000-4000-8000-000000000001",
@@ -1159,6 +1312,7 @@ mod tests {
         };
         let gateway2 = MockGateway {
             reader: MockGatewayReader {
+                panic: false,
                 commands: VecDeque::new(),
             },
             writer: MockGatewayWriter {
@@ -1179,7 +1333,7 @@ mod tests {
         let credentials = CountingCredentialProvider::new("token");
         let source = MockDurableSource::new(CommandCursors::default());
         let latch = StaticHydrationLatch(HydrationReady {
-            generation: 7,
+            generation: ProcessGeneration::from_wire(7).unwrap(),
             receipt_identity: "receipt-1".to_owned(),
         });
 
@@ -1213,7 +1367,7 @@ mod tests {
         };
 
         handle.abort();
-        let _ = handle.join().await;
+        assert!(handle.join().await.is_ok());
 
         assert!(sent_hellos.lock().unwrap().len() >= 2);
     }
@@ -1227,6 +1381,7 @@ mod tests {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let gateway = MockGateway {
             reader: MockGatewayReader {
+                panic: false,
                 commands: VecDeque::new(),
             },
             writer: MockGatewayWriter {
@@ -1246,7 +1401,7 @@ mod tests {
         );
         let credentials = CountingCredentialProvider::new("token");
         let latch = StaticHydrationLatch(HydrationReady {
-            generation: 7,
+            generation: ProcessGeneration::from_wire(7).unwrap(),
             receipt_identity: "receipt-1".to_owned(),
         });
 
@@ -1256,7 +1411,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         handle.abort();
-        let _ = handle.join().await;
+        assert!(handle.join().await.is_ok());
 
         let sent = sent.lock().unwrap();
         assert_eq!(sent.len(), 2);
@@ -1273,6 +1428,7 @@ mod tests {
 
         let gateway1 = MockGateway {
             reader: MockGatewayReader {
+                panic: false,
                 commands: VecDeque::new(),
             },
             writer: MockGatewayWriter {
@@ -1287,6 +1443,7 @@ mod tests {
         };
         let gateway2 = MockGateway {
             reader: MockGatewayReader {
+                panic: false,
                 commands: VecDeque::new(),
             },
             writer: MockGatewayWriter {
@@ -1306,7 +1463,7 @@ mod tests {
         );
         let credentials = CountingCredentialProvider::new("token");
         let latch = StaticHydrationLatch(HydrationReady {
-            generation: 7,
+            generation: ProcessGeneration::from_wire(7).unwrap(),
             receipt_identity: "receipt-1".to_owned(),
         });
 
@@ -1342,7 +1499,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         handle.abort();
-        let _ = handle.join().await;
+        assert!(handle.join().await.is_ok());
 
         let sent = sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
@@ -1358,6 +1515,7 @@ mod tests {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let gateway = MockGateway {
             reader: MockGatewayReader {
+                panic: false,
                 commands: VecDeque::from([Ok(valid_command(
                     1,
                     "00000000-0000-4000-8000-000000000001",
@@ -1392,7 +1550,7 @@ mod tests {
         );
 
         tx.send(HydrationState::Ready(HydrationReady {
-            generation: 7,
+            generation: ProcessGeneration::from_wire(7).unwrap(),
             receipt_identity: "receipt-1".to_owned(),
         }))
         .unwrap();
@@ -1404,7 +1562,7 @@ mod tests {
         assert_eq!(cmd_seq(&cmd), 1);
 
         handle.abort();
-        let _ = handle.join().await;
+        assert!(handle.join().await.is_ok());
     }
 
     #[tokio::test]
@@ -1414,6 +1572,7 @@ mod tests {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let gateway = MockGateway {
             reader: MockGatewayReader {
+                panic: false,
                 commands: VecDeque::from([Ok(rejected_oversized_command(
                     1,
                     "00000000-0000-4000-8000-000000000001",
@@ -1437,7 +1596,7 @@ mod tests {
         );
         let credentials = CountingCredentialProvider::new("token");
         let latch = StaticHydrationLatch(HydrationReady {
-            generation: 7,
+            generation: ProcessGeneration::from_wire(7).unwrap(),
             receipt_identity: "receipt-1".to_owned(),
         });
 
@@ -1478,7 +1637,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         handle.abort();
-        let _ = handle.join().await;
+        assert!(handle.join().await.is_ok());
 
         let sent = sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
@@ -1519,7 +1678,7 @@ mod tests {
         );
         let source = MockDurableSource::new(CommandCursors::default());
         let latch = StaticHydrationLatch(HydrationReady {
-            generation: 7,
+            generation: ProcessGeneration::from_wire(7).unwrap(),
             receipt_identity: "receipt-1".to_owned(),
         });
 
@@ -1547,7 +1706,7 @@ mod tests {
         let credentials = CountingCredentialProvider::new("token");
         let source = MockDurableSource::new(CommandCursors::default());
         let latch = StaticHydrationLatch(HydrationReady {
-            generation: 7,
+            generation: ProcessGeneration::from_wire(7).unwrap(),
             receipt_identity: "receipt-1".to_owned(),
         });
 
@@ -1581,7 +1740,7 @@ mod tests {
         let credentials = CountingCredentialProvider::new("token");
         let source = MockDurableSource::new(CommandCursors::default());
         let latch = StaticHydrationLatch(HydrationReady {
-            generation: 7,
+            generation: ProcessGeneration::from_wire(7).unwrap(),
             receipt_identity: "receipt-1".to_owned(),
         });
 
@@ -1641,7 +1800,7 @@ mod tests {
         );
         let source = MockDurableSource::new(CommandCursors::default());
         let latch = StaticHydrationLatch(HydrationReady {
-            generation: 7,
+            generation: ProcessGeneration::from_wire(7).unwrap(),
             receipt_identity: "receipt-1".to_owned(),
         });
 
@@ -1689,7 +1848,7 @@ mod tests {
         let credentials = CountingCredentialProvider::new("token");
         let source = MockDurableSource::new(CommandCursors::default());
         let latch = StaticHydrationLatch(HydrationReady {
-            generation: 7,
+            generation: ProcessGeneration::from_wire(7).unwrap(),
             receipt_identity: "receipt-1".to_owned(),
         });
 
@@ -1705,6 +1864,256 @@ mod tests {
             4,
             "healthy epoch reconnects must not exhaust a finite limit"
         );
+    }
+
+    #[tokio::test]
+    async fn connect_timeout_rejects_black_hole_and_counts_as_reconnect() {
+        let mut config = make_config();
+        config.connect_timeout = Duration::from_millis(1);
+        config.initial_backoff = Duration::from_millis(1);
+        config.max_reconnect_attempts = Some(1);
+
+        let credentials = CountingCredentialProvider::new("token");
+        let counter = credentials.counter.clone();
+        let connector = MockConnector::new(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            VecDeque::from([
+                Ok(MockGateway::new(VecDeque::new())),
+                Ok(MockGateway::new(VecDeque::new())),
+            ]),
+        )
+        .with_connect_delay(Duration::from_secs(60));
+
+        let source = MockDurableSource::new(CommandCursors::default());
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: ProcessGeneration::from_wire(7).unwrap(),
+            receipt_identity: "receipt-1".to_owned(),
+        });
+
+        let supervisor = ConnectionSupervisor::new(connector, credentials, source, latch, config);
+        let handle = supervisor.start();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle.join()).await;
+        assert!(result.is_ok(), "supervisor must stop on connect timeout");
+        assert!(result.unwrap().is_err());
+
+        let attempts = counter.load(Ordering::SeqCst);
+        assert_eq!(
+            attempts, 2,
+            "connect timeouts must consume fresh credentials per attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_rejected_uses_its_own_limit_independent_of_reconnect() {
+        let mut config = make_config();
+        config.max_reconnect_attempts = None;
+        config.max_auth_attempts = Some(1);
+        config.initial_backoff = Duration::from_millis(1);
+
+        let credentials = CountingCredentialProvider::new("token");
+        let counter = credentials.counter.clone();
+        let connector = MockConnector::new(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            VecDeque::from([
+                Err(ConnectorError::AuthRejected),
+                Err(ConnectorError::AuthRejected),
+                Err(ConnectorError::AuthRejected),
+            ]),
+        );
+        let source = MockDurableSource::new(CommandCursors::default());
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: ProcessGeneration::from_wire(7).unwrap(),
+            receipt_identity: "receipt-1".to_owned(),
+        });
+
+        let supervisor = ConnectionSupervisor::new(connector, credentials, source, latch, config);
+        let handle = supervisor.start();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle.join()).await;
+        assert!(result.is_ok(), "supervisor must stop within bounded time");
+        let err = result.unwrap().expect_err("auth limit must fail");
+        assert!(format!("{err:#}").contains("max auth attempts"));
+
+        let attempts = counter.load(Ordering::SeqCst);
+        assert_eq!(
+            attempts, 2,
+            "auth limit should stop after max_auth_attempts + 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn reader_panic_is_fatal_and_propagates() {
+        let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gateway = MockGateway {
+            reader: MockGatewayReader {
+                panic: true,
+                commands: VecDeque::new(),
+            },
+            writer: MockGatewayWriter {
+                fail_after: None,
+                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+                delay: None,
+            },
+            sent_hellos: sent_hellos.clone(),
+            hello_generation: None,
+            last_received_event_seq: 0,
+            hello_delay: None,
+        };
+        let connector = MockConnector::new(sent_hellos, VecDeque::from([Ok(gateway)]));
+        let credentials = CountingCredentialProvider::new("token");
+        let source = MockDurableSource::new(CommandCursors::default());
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: ProcessGeneration::from_wire(7).unwrap(),
+            receipt_identity: "receipt-1".to_owned(),
+        });
+
+        let supervisor =
+            ConnectionSupervisor::new(connector, credentials, source, latch, make_config());
+        let handle = supervisor.start();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle.join()).await;
+        assert!(result.is_ok(), "supervisor must stop on reader panic");
+        assert!(result.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn abort_propagates_to_child_tasks_and_join_returns_ok() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gateway = MockGateway {
+            reader: MockGatewayReader {
+                panic: false,
+                commands: VecDeque::new(),
+            },
+            writer: MockGatewayWriter {
+                fail_after: None,
+                sent: sent.clone(),
+                delay: None,
+            },
+            sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
+            hello_generation: None,
+            last_received_event_seq: 0,
+            hello_delay: None,
+        };
+        let connector = MockConnector::new(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            VecDeque::from([Ok(gateway)]),
+        );
+        let credentials = CountingCredentialProvider::new("token");
+        let source = MockDurableSource::new(CommandCursors::default());
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: ProcessGeneration::from_wire(7).unwrap(),
+            receipt_identity: "receipt-1".to_owned(),
+        });
+
+        let supervisor =
+            ConnectionSupervisor::new(connector, credentials, source, latch, make_config());
+        let mut handle = supervisor.start();
+
+        // Wait for the epoch to be installed and then abort.
+        tokio::time::timeout(Duration::from_millis(200), handle.epochs.changed())
+            .await
+            .unwrap()
+            .unwrap();
+
+        handle.abort();
+        let result = tokio::time::timeout(Duration::from_secs(1), handle.join()).await;
+        assert!(
+            result.is_ok(),
+            "abort must stop the supervisor within bounded time"
+        );
+        assert!(
+            result.unwrap().is_ok(),
+            "abort must produce a clean shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_hello_refetches_command_cursors() {
+        // Simulate the durable source advancing between build_agent_hello and validate_hello.
+        let cursor_calls = VecDeque::from([
+            CommandCursors {
+                received: 5,
+                applied: 5,
+            },
+            CommandCursors {
+                received: 10,
+                applied: 5,
+            },
+        ]);
+
+        struct CursorsSource {
+            event_cursor_value: Arc<AtomicU64>,
+            cursors: Mutex<VecDeque<CommandCursors>>,
+        }
+
+        impl CursorsSource {
+            fn new(cursors: VecDeque<CommandCursors>) -> Self {
+                Self {
+                    event_cursor_value: Arc::new(AtomicU64::new(0)),
+                    cursors: Mutex::new(cursors),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl DurableSource for CursorsSource {
+            async fn event_cursor(&self) -> Result<EventCursors> {
+                Ok(EventCursors {
+                    last_sent: self.event_cursor_value.load(Ordering::SeqCst),
+                })
+            }
+
+            async fn events_after(
+                &self,
+                _after_seq: u64,
+                _limit: usize,
+            ) -> Result<Vec<OutboundFrame>> {
+                Ok(Vec::new())
+            }
+
+            async fn command_cursors(&self) -> Result<CommandCursors> {
+                Ok(self.cursors.lock().unwrap().pop_front().unwrap())
+            }
+        }
+
+        impl Clone for CursorsSource {
+            fn clone(&self) -> Self {
+                Self {
+                    event_cursor_value: self.event_cursor_value.clone(),
+                    cursors: Mutex::new(self.cursors.lock().unwrap().clone()),
+                }
+            }
+        }
+
+        let source = CursorsSource::new(cursor_calls);
+        let agent = build_agent_hello(&source, &make_config()).await.unwrap();
+        assert_eq!(agent.last_received_command_seq, 5);
+
+        let api = ApiHello {
+            accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
+            last_received_event_seq: 0,
+            next_command_seq: 11,
+        };
+
+        // If validate_hello used the stale agent snapshot, next_command_seq=11
+        // would be > 5 + 1 and fail. With re-fetched cursors (received=10),
+        // 11 > 10 + 1 is false, so validation succeeds.
+        validate_hello(&source, &agent, &api).await.unwrap();
+    }
+
+    #[test]
+    fn hello_generation_out_of_range_rejects_on_wire() {
+        let oversized = i64::MAX as u64 + 1;
+        let api_json = format!(
+            r#"{{"accepted_generation":{oversized},"last_received_event_seq":0,"next_command_seq":1}}"#
+        );
+        assert!(serde_json::from_str::<ApiHello>(&api_json).is_err());
+
+        let agent_json = format!(
+            r#"{{"agent_id":"x","generation":{oversized},"last_sent_event_seq":0,"last_received_command_seq":0,"last_applied_command_seq":0}}"#
+        );
+        assert!(serde_json::from_str::<AgentHello>(&agent_json).is_err());
     }
 
     fn cmd_seq(cmd: &InboundCommand) -> u64 {

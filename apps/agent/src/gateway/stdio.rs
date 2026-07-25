@@ -844,6 +844,7 @@ mod tests {
 
     use super::*;
     use crate::gateway::{AgentHello, Command, ConnectorError, GatewayCredential};
+    use crate::runtime::contracts::ProcessGeneration;
 
     struct TestDigestFactory;
 
@@ -1356,13 +1357,16 @@ mod tests {
     fn stdio_hello_returns_last_applied_plus_one_and_durable_event_cursor() {
         let hello = AgentHello {
             agent_id: "test-agent".to_owned(),
-            generation: 7,
+            generation: ProcessGeneration::from_wire(7).unwrap(),
             last_sent_event_seq: 42,
             last_received_command_seq: 10,
             last_applied_command_seq: 9,
         };
         let api = stdio_hello(&hello);
-        assert_eq!(api.accepted_generation, 7);
+        assert_eq!(
+            api.accepted_generation,
+            ProcessGeneration::from_wire(7).unwrap()
+        );
         assert_eq!(api.last_received_event_seq, 42);
         assert_eq!(api.next_command_seq, 10);
     }

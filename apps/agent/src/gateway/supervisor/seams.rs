@@ -14,6 +14,7 @@ use super::{
     CommandCursors, CredentialProvider, DurableSource, EventCursors, GatewayCredential,
     HydrationLatch, HydrationReady, OutboundFrame,
 };
+use crate::runtime::contracts::ProcessGeneration;
 
 /// Compile-safe T17 hydration seam. T17 will replace this with a
 /// `WatchHydrationLatch` driven by the production hydration receipt.
@@ -22,7 +23,7 @@ pub struct T17HydrationLatch;
 
 #[async_trait]
 impl HydrationLatch for T17HydrationLatch {
-    async fn wait_for(&self, generation: u64) -> Result<HydrationReady> {
+    async fn wait_for(&self, generation: ProcessGeneration) -> Result<HydrationReady> {
         let _ = generation;
         bail!(
             "T17 integration seam: HydrationLatch::wait_for({generation}) is not wired. \
