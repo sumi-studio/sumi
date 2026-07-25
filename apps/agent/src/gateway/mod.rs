@@ -1,5 +1,8 @@
 //! Connections between an agent session and its external command/event transport.
 
+#[allow(dead_code)]
+pub mod wire;
+
 mod stdio;
 
 use std::fmt;
