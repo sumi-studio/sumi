@@ -102,11 +102,7 @@ where
     type Writer = InjectedStdioGatewayWriter<W>;
 
     async fn authenticate_hello(&mut self, hello: AgentHello) -> Result<ApiHello> {
-        Ok(ApiHello {
-            accepted_generation: hello.generation,
-            last_received_event_seq: 0,
-            next_command_seq: 0,
-        })
+        Ok(stdio_hello(&hello))
     }
 
     fn split(self) -> (Self::Reader, Self::Writer) {
@@ -158,11 +154,7 @@ impl Gateway for StdioGateway {
     type Writer = StdioGatewayWriter;
 
     async fn authenticate_hello(&mut self, hello: AgentHello) -> Result<ApiHello> {
-        Ok(ApiHello {
-            accepted_generation: hello.generation,
-            last_received_event_seq: 0,
-            next_command_seq: 0,
-        })
+        Ok(stdio_hello(&hello))
     }
 
     fn split(self) -> (Self::Reader, Self::Writer) {
@@ -205,6 +197,18 @@ async fn write_frame<W: AsyncWrite + Unpin>(output: &mut W, frame: OutboundFrame
         .flush()
         .await
         .context("failed to flush gateway frame")
+}
+
+/// Compute the `ApiHello` for a stdio (single-connection, no catch-up) peer.
+/// The peer is assumed to have received all events already sent, so catch-up
+/// begins at the durable cursor. The next command starts after the last applied
+/// durable command.
+pub(crate) fn stdio_hello(hello: &AgentHello) -> ApiHello {
+    ApiHello {
+        accepted_generation: hello.generation,
+        last_received_event_seq: hello.last_sent_event_seq,
+        next_command_seq: hello.last_applied_command_seq.saturating_add(1),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -839,7 +843,7 @@ mod tests {
     use tokio::io::{AsyncWriteExt, BufReader, sink};
 
     use super::*;
-    use crate::gateway::Command;
+    use crate::gateway::{AgentHello, Command, ConnectorError, GatewayCredential};
 
     struct TestDigestFactory;
 
@@ -1347,6 +1351,34 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn stdio_hello_returns_last_applied_plus_one_and_durable_event_cursor() {
+        let hello = AgentHello {
+            agent_id: "test-agent".to_owned(),
+            generation: 7,
+            last_sent_event_seq: 42,
+            last_received_command_seq: 10,
+            last_applied_command_seq: 9,
+        };
+        let api = stdio_hello(&hello);
+        assert_eq!(api.accepted_generation, 7);
+        assert_eq!(api.last_received_event_seq, 42);
+        assert_eq!(api.next_command_seq, 10);
+    }
+
+    #[tokio::test]
+    async fn single_connection_connector_returns_fatal_after_consumed() {
+        let gateway = StdioGateway::new(Arc::new(TestDigestFactory));
+        let mut connector = SingleConnectionConnector::new(gateway);
+
+        let credential = GatewayCredential::new("test-token");
+        assert!(connector.connect(credential.clone()).await.is_ok());
+
+        let result = connector.connect(credential).await;
+        let err = result.err().expect("second connect must fail");
+        assert!(matches!(err, ConnectorError::Fatal(_)));
+    }
 }
 
 /// A `GatewayConnector` that yields a single stdio connection and refuses
@@ -1375,7 +1407,7 @@ impl<G: Gateway> GatewayConnector for SingleConnectionConnector<G> {
         _credential: GatewayCredential,
     ) -> Result<Self::Connection, ConnectorError> {
         self.gateway.take().ok_or_else(|| {
-            ConnectorError::Other(anyhow!("single stdio connection already consumed"))
+            ConnectorError::Fatal(anyhow!("single stdio connection already consumed"))
         })
     }
 }

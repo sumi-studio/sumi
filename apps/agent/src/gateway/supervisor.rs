@@ -148,6 +148,8 @@ pub trait GatewayConnector: Send + 'static {
 pub enum ConnectorError {
     #[error("authentication rejected")]
     AuthRejected,
+    #[error("fatal: {0}")]
+    Fatal(anyhow::Error),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -292,21 +294,29 @@ where
 
         let result = self.run_loop(commands_tx).await;
 
-        if result.is_err() {
-            forwarder.abort();
-        }
+        forwarder.abort();
+        let _ = forwarder.await;
         result
     }
 
     async fn run_loop(&mut self, commands_tx: mpsc::Sender<InboundCommand>) -> Result<()> {
+        const DEFAULT_MAX_AUTH_ATTEMPTS: u32 = 3;
+
         let mut attempt: u32 = 0;
         loop {
             match self.connect_and_run_epoch(commands_tx.clone()).await {
                 Ok(()) => return Ok(()),
                 Err(SupervisorError::Fatal(e)) => return Err(e),
                 Err(SupervisorError::AuthRejected) => {
-                    attempt = 0;
-                    continue;
+                    attempt = attempt.saturating_add(1);
+                    let max = self
+                        .config
+                        .max_reconnect_attempts
+                        .unwrap_or(DEFAULT_MAX_AUTH_ATTEMPTS);
+                    if attempt > max {
+                        return Err(anyhow!("max auth attempts exceeded"));
+                    }
+                    Self::backoff_sleep(&self.config, attempt).await?;
                 }
                 Err(SupervisorError::Reconnect { reason }) => {
                     attempt = attempt.saturating_add(1);
@@ -339,6 +349,7 @@ where
         let mut gateway = match self.connector.connect(credential).await {
             Ok(g) => g,
             Err(ConnectorError::AuthRejected) => return Err(SupervisorError::AuthRejected),
+            Err(ConnectorError::Fatal(e)) => return Err(SupervisorError::Fatal(e)),
             Err(ConnectorError::Other(e)) => {
                 return Err(SupervisorError::Reconnect {
                     reason: format!("connect failed: {e}"),
@@ -347,12 +358,17 @@ where
         };
 
         let agent_hello = build_agent_hello(&source, &config).await?;
-        let api_hello = gateway
-            .authenticate_hello(agent_hello.clone())
-            .await
-            .map_err(|e| SupervisorError::Reconnect {
-                reason: format!("hello failed: {e}"),
-            })?;
+        let api_hello = tokio::time::timeout(
+            config.hello_timeout,
+            gateway.authenticate_hello(agent_hello.clone()),
+        )
+        .await
+        .map_err(|_| SupervisorError::Reconnect {
+            reason: "hello response timeout".to_owned(),
+        })?
+        .map_err(|e| SupervisorError::Reconnect {
+            reason: format!("hello failed: {e}"),
+        })?;
 
         validate_hello(&source, &agent_hello, &api_hello).await?;
 
@@ -424,7 +440,7 @@ where
         let jitter = if delay_ms == 0 {
             0
         } else {
-            rand::rng().random_range(0..=delay_ms)
+            rand::rng().random_range(1..=delay_ms)
         };
         time::sleep(Duration::from_millis(jitter)).await;
         Ok(())
@@ -617,18 +633,12 @@ where
                 }
                 ready = Some(hydration_ready);
                 for cmd in pending.drain(..) {
-                    if command_tx.is_closed() {
-                        return Ok(());
-                    }
                     next_expected = send_validated(cmd, next_expected, &mut command_tx).await?;
                 }
             }
             cmd = reader.next_command() => {
                 let cmd = cmd?;
                 if let Some(_ready) = &ready {
-                    if command_tx.is_closed() {
-                        return Ok(());
-                    }
                     next_expected = send_validated(cmd, next_expected, &mut command_tx).await?;
                 } else {
                     if pending.len() >= MAX_PENDING_BEFORE_READY {
@@ -651,7 +661,7 @@ async fn send_validated(
         bail!("command seq gap: expected {next_expected}, got {seq}");
     }
     if command_tx.send(cmd).await.is_err() {
-        return Ok(next_expected);
+        bail!("command consumer closed");
     }
     Ok(next_expected + 1)
 }
@@ -712,12 +722,13 @@ impl HydrationLatch for WatchHydrationLatch {
 mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use anyhow::{Result, anyhow};
     use tokio::sync::watch;
 
     use super::*;
+    use crate::gateway::stdio::SingleConnectionConnector;
     use crate::gateway::wire::to_wire_frame;
     use crate::gateway::{
         Command, CommandAck, CommandAckStatus, CommandEnvelope, CommandId, CommandRejectReason,
@@ -881,6 +892,7 @@ mod tests {
         sent_hellos: Arc<std::sync::Mutex<Vec<AgentHello>>>,
         hello_generation: Option<u64>,
         last_received_event_seq: u64,
+        hello_delay: Option<Duration>,
     }
 
     impl MockGateway {
@@ -895,6 +907,7 @@ mod tests {
                 sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
                 hello_generation: None,
                 last_received_event_seq: 0,
+                hello_delay: None,
             }
         }
 
@@ -905,6 +918,11 @@ mod tests {
 
         fn with_last_received_event_seq(mut self, seq: u64) -> Self {
             self.last_received_event_seq = seq;
+            self
+        }
+
+        fn with_hello_delay(mut self, delay: Duration) -> Self {
+            self.hello_delay = Some(delay);
             self
         }
 
@@ -920,6 +938,9 @@ mod tests {
 
         async fn authenticate_hello(&mut self, hello: AgentHello) -> Result<ApiHello> {
             self.sent_hellos.lock().unwrap().push(hello.clone());
+            if let Some(delay) = self.hello_delay {
+                tokio::time::sleep(delay).await;
+            }
             let accepted_generation = self.hello_generation.unwrap_or(hello.generation);
             Ok(ApiHello {
                 accepted_generation,
@@ -1123,6 +1144,7 @@ mod tests {
             sent_hellos: sent_hellos.clone(),
             hello_generation: None,
             last_received_event_seq: 0,
+            hello_delay: None,
         };
         let gateway2 = MockGateway {
             reader: MockGatewayReader {
@@ -1136,6 +1158,7 @@ mod tests {
             sent_hellos: sent_hellos.clone(),
             hello_generation: None,
             last_received_event_seq: 0,
+            hello_delay: None,
         };
 
         let connector = MockConnector::new(
@@ -1203,6 +1226,7 @@ mod tests {
             sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
             hello_generation: None,
             last_received_event_seq: 0,
+            hello_delay: None,
         };
 
         let connector = MockConnector::new(
@@ -1248,6 +1272,7 @@ mod tests {
             sent_hellos: sent_hellos.clone(),
             hello_generation: None,
             last_received_event_seq: 0,
+            hello_delay: None,
         };
         let gateway2 = MockGateway {
             reader: MockGatewayReader {
@@ -1261,6 +1286,7 @@ mod tests {
             sent_hellos: sent_hellos.clone(),
             hello_generation: None,
             last_received_event_seq: 0,
+            hello_delay: None,
         };
 
         let connector = MockConnector::new(
@@ -1334,6 +1360,7 @@ mod tests {
             sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
             hello_generation: None,
             last_received_event_seq: 0,
+            hello_delay: None,
         };
 
         let connector = MockConnector::new(
@@ -1390,6 +1417,7 @@ mod tests {
             sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
             hello_generation: None,
             last_received_event_seq: 0,
+            hello_delay: None,
         };
 
         let connector = MockConnector::new(
@@ -1444,6 +1472,143 @@ mod tests {
         let sent = sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
         assert!(matches!(sent[0], OutboundFrame::CommandAck { .. }));
+    }
+
+    #[tokio::test]
+    async fn send_validated_errors_when_command_consumer_is_closed() {
+        let (mut tx, rx) = mpsc::channel::<InboundCommand>(1);
+        drop(rx);
+        let result = send_validated(
+            valid_command(1, "00000000-0000-4000-8000-000000000001"),
+            1,
+            &mut tx,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(format!("{:#}", result.unwrap_err()).contains("command consumer closed"));
+    }
+
+    #[tokio::test]
+    async fn auth_rejected_does_not_spin_forever_when_unlimited() {
+        let mut config = make_config();
+        config.max_reconnect_attempts = None;
+        config.hello_timeout = Duration::from_millis(5);
+
+        let credentials = CountingCredentialProvider::new("token");
+        let counter = credentials.counter.clone();
+        let connector = MockConnector::new(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            VecDeque::from([
+                Err(ConnectorError::AuthRejected),
+                Err(ConnectorError::AuthRejected),
+                Err(ConnectorError::AuthRejected),
+                Err(ConnectorError::AuthRejected),
+                Err(ConnectorError::AuthRejected),
+            ]),
+        );
+        let source = MockDurableSource::new(CommandCursors::default());
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: 7,
+            receipt_identity: "receipt-1".to_owned(),
+        });
+
+        let supervisor = ConnectionSupervisor::new(connector, credentials, source, latch, config);
+        let handle = supervisor.start();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle.join()).await;
+        assert!(
+            result.is_ok(),
+            "supervisor must stop within bounded time when auth is rejected"
+        );
+        assert!(result.unwrap().is_err());
+
+        let attempts = counter.load(Ordering::SeqCst);
+        assert!(
+            attempts >= 1 && attempts <= 5,
+            "auth retries must be bounded, got {attempts}"
+        );
+    }
+
+    #[tokio::test]
+    async fn consumed_single_connection_connector_is_fatal() {
+        let gateway = MockGateway::new(VecDeque::from([Err(anyhow!("reader EOF"))]));
+        let connector = SingleConnectionConnector::new(gateway);
+        let credentials = CountingCredentialProvider::new("token");
+        let source = MockDurableSource::new(CommandCursors::default());
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: 7,
+            receipt_identity: "receipt-1".to_owned(),
+        });
+
+        let supervisor =
+            ConnectionSupervisor::new(connector, credentials, source, latch, make_config());
+        let handle = supervisor.start();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle.join()).await;
+        assert!(
+            result.is_ok(),
+            "supervisor must stop on a fatal connector error"
+        );
+        assert!(result.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn hello_timeout_is_enforced_by_supervisor_config() {
+        let mut config = make_config();
+        config.hello_timeout = Duration::from_millis(1);
+        config.initial_backoff = Duration::from_millis(1);
+        config.max_reconnect_attempts = Some(1);
+
+        let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let connector = MockConnector::new(
+            sent_hellos.clone(),
+            VecDeque::from([
+                Ok(MockGateway::new(VecDeque::new()).with_hello_delay(Duration::from_secs(60))),
+                Ok(MockGateway::new(VecDeque::new()).with_hello_delay(Duration::from_secs(60))),
+            ]),
+        );
+        let credentials = CountingCredentialProvider::new("token");
+        let source = MockDurableSource::new(CommandCursors::default());
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: 7,
+            receipt_identity: "receipt-1".to_owned(),
+        });
+
+        let supervisor = ConnectionSupervisor::new(connector, credentials, source, latch, config);
+        let handle = supervisor.start();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle.join()).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_err());
+
+        assert_eq!(
+            sent_hellos.lock().unwrap().len(),
+            2,
+            "hello timeout must reconnect with a fresh connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn backoff_jitter_keeps_nonzero_lower_bound() {
+        let mut config = make_config();
+        config.initial_backoff = Duration::from_millis(5);
+        config.max_backoff = Duration::from_millis(10);
+
+        let start = Instant::now();
+        ConnectionSupervisor::<
+            MockConnector,
+            CountingCredentialProvider,
+            MockDurableSource,
+            StaticHydrationLatch,
+        >::backoff_sleep(&config, 1)
+        .await
+        .expect("backoff sleep should succeed");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(1),
+            "nonzero delay must have nonzero jitter lower bound, elapsed {elapsed:?}"
+        );
     }
 
     fn cmd_seq(cmd: &InboundCommand) -> u64 {
