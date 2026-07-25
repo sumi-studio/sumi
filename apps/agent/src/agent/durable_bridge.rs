@@ -373,11 +373,12 @@ impl DurableBridge {
         writer: &EventWriter,
         command: &AdmittedCommand,
     ) -> bool {
-        let stage_ok = matches!(self.steer_stage(), SteerStage::ToolOrApproval)
-            || (self.phase == RunPhase::AssistantStarted
-                && self.assistant_open.is_none()
-                && !self.turn_open
-                && self.pending_tool_end.is_empty());
+        let stage_ok = !self.pending_steer_collecting
+            && (matches!(self.steer_stage(), SteerStage::ToolOrApproval)
+                || (self.phase == RunPhase::AssistantStarted
+                    && self.assistant_open.is_none()
+                    && !self.turn_open
+                    && self.pending_tool_end.is_empty()));
         if !stage_ok || !matches!(command.envelope().command, Command::UserMessage { .. }) {
             return false;
         }
@@ -860,13 +861,8 @@ impl DurableBridge {
             } => {
                 let message =
                     message.ok_or_else(|| anyhow!("T15 run cannot emit empty TurnEnd"))?;
-                if self.pending_steer_group.is_some()
-                    && self
-                        .pending_steer_group
-                        .as_ref()
-                        .unwrap()
-                        .application_kind()
-                        == ApplicationKind::SoftSteer
+                if let Some(group) = self.pending_steer_group.as_ref()
+                    && group.application_kind() == ApplicationKind::SoftSteer
                     && self.pending_steer_turn_end.is_none()
                 {
                     self.pending_steer_turn_end = Some(((*message).clone(), tool_results.clone()));
@@ -1202,9 +1198,16 @@ impl DurableBridge {
                 if !result.is_error {
                     bail!("Cancelled ToolResult must be is_error=true");
                 }
+                // After an Abort the binding has advanced to the abort control;
+                // the cancelled tool call still belongs to the original owner.
+                let owner_id = self
+                    .aborted_owner
+                    .as_ref()
+                    .map(|(id, _)| id.clone())
+                    .unwrap_or_else(|| self.binding.command_id.clone());
                 projections.push(Projection::ToolExecution(ToolExecutionMutation::Skip {
                     tool_call_id: tool_call_id.clone(),
-                    command_id: self.binding.command_id.clone(),
+                    command_id: owner_id,
                     run_id: self.binding.run_id.clone(),
                     turn_id: self.binding.turn_id.clone(),
                     executor_generation: self.binding.executor_generation,
@@ -1640,7 +1643,6 @@ impl DurableBridge {
         let (closing_turn_message, closing_tool_results) =
             self.pending_steer_turn_end.take().unzip();
         let closing_tool_results = closing_tool_results.unwrap_or_default();
-        let _ = self.pending_steer_turn_start; // consumed by the snapshot
         let messages = std::mem::take(&mut self.pending_steer_messages);
         self.pending_steer_collecting = false;
         self.pending_steer_open_start = None;
@@ -1672,8 +1674,13 @@ impl DurableBridge {
         // Build public events in batch order.
         let mut public = Vec::with_capacity(expected_writes);
         let mut seq_iter = seqs.into_iter();
+        let mut next_seq = || {
+            seq_iter
+                .next()
+                .ok_or_else(|| anyhow!("steer group committed fewer durable seqs than expected"))
+        };
         if is_soft {
-            let turn_end_seq = seq_iter.next().unwrap();
+            let turn_end_seq = next_seq()?;
             public.push(CommittedOutput {
                 event: AgentEvent::TurnEnd {
                     message: closing_turn_message.map(Box::new),
@@ -1683,7 +1690,7 @@ impl DurableBridge {
             });
         }
         for _ in 0..group_len {
-            let seq = seq_iter.next().unwrap();
+            let seq = next_seq()?;
             public.push(CommittedOutput {
                 event: AgentEvent::Steered {
                     mode: super::SteerMode::Soft,
@@ -1692,7 +1699,7 @@ impl DurableBridge {
             });
         }
         if is_soft {
-            let turn_start_seq = seq_iter.next().unwrap();
+            let turn_start_seq = next_seq()?;
             public.push(CommittedOutput {
                 event: AgentEvent::TurnStart,
                 seq: Some(turn_start_seq),
@@ -1702,8 +1709,8 @@ impl DurableBridge {
         for (index, command) in commands.iter().enumerate() {
             let user_message = super::steer::build_user_message(command)?;
             let user_message_id = crate::store::user_message_id(&command.envelope().command_id);
-            let start_seq = seq_iter.next().unwrap();
-            let end_seq = seq_iter.next().unwrap();
+            let start_seq = next_seq()?;
+            let end_seq = next_seq()?;
             public.push(CommittedOutput {
                 event: AgentEvent::MessageStart {
                     message_id: user_message_id.clone(),
@@ -1744,6 +1751,12 @@ impl DurableBridge {
                 },
             ));
         }
+
+        assert_eq!(
+            public.len(),
+            expected_writes,
+            "steer group public event count mismatch"
+        );
 
         // Update durable ownership to the last group member.
         if let Some(last) = commands.last() {
@@ -1870,5 +1883,39 @@ mod tests {
         let public = serde_json::to_value(output.event).expect("serialize public event");
         assert_eq!(public, serde_json::json!({"type":"agent_start"}));
         assert!(public.get("executor_generation").is_none());
+    }
+
+    #[tokio::test]
+    async fn can_bind_soft_steer_rejects_while_collecting_group_messages() {
+        use crate::gateway::{CommandEnvelope, CommandId};
+        use chrono::Utc;
+
+        let store = std::sync::Arc::new(
+            crate::store::Store::session_test_store("test-soft-steer-collecting")
+                .await
+                .expect("open test store"),
+        );
+        let writer = EventWriter::new(store);
+        let mut bridge = DurableBridge::new(binding("00000000-0000-4000-8000-000000000001"));
+        bridge.phase = RunPhase::AssistantStarted;
+        bridge.pending_steer_collecting = true;
+
+        let command = AdmittedCommand::new(
+            CommandEnvelope {
+                seq: 2,
+                command_id: CommandId::parse("00000000-0000-4000-8000-000000000002")
+                    .expect("canonical test command id"),
+                command: Command::UserMessage {
+                    text: "interleaved user".to_owned(),
+                    attachments: Vec::new(),
+                },
+            },
+            Utc::now(),
+        );
+
+        assert!(
+            !bridge.can_bind_soft_steer(&writer, &command),
+            "soft steer must not bind while a steer group is collecting messages"
+        );
     }
 }
