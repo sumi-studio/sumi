@@ -35,7 +35,7 @@ pub(crate) enum MemoryBatchState {
 }
 
 impl MemoryBatchState {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Open => "open",
             Self::Sealed => "sealed",
@@ -56,7 +56,7 @@ pub(crate) enum MemoryJobKind {
 }
 
 impl MemoryJobKind {
-    fn as_str(&self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Self::CompactL0 => "compact_l0",
             Self::CompactL1 => "compact_l1",
@@ -75,7 +75,7 @@ pub(crate) enum MemoryJobStatus {
 }
 
 impl MemoryJobStatus {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
             Self::Running => "running",

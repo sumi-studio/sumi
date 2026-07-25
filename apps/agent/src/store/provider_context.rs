@@ -33,6 +33,8 @@ const INTENT_HMAC_KEY_ID: &str = "mutation-intent-hmac/v1";
 const PLAINTEXT_HMAC_DOMAIN: &[u8] = b"sumi-provider-context-plaintext/v1";
 const INTENT_HMAC_DOMAIN: &[u8] = b"sumi-provider-context-mutation-intent/v1";
 const SCOPE_KEY_DOMAIN: &[u8] = b"sumi-provider-context-scope/v1";
+const PREPARED_KEY_MATERIAL_PROOF_DOMAIN: &[u8] = b"sumi-event-batch-prepared-key-material/v1";
+const PREPARED_KEY_MATERIAL_PROOF: &[u8] = b"active-key-material";
 
 /// HKDF-Extract/Expand with HMAC-SHA256, keyed by the durable mutation data key
 /// and conversation-scoped salt.  This key is used for both the plaintext HMAC
@@ -123,6 +125,7 @@ impl ProviderContextEvictionEstimate {
 /// A durable `provider_context` row.  Plaintext is not retained after
 /// construction; the record exposes only the encrypted ciphertext and the
 /// metadata required for ordering, eviction accounting, and mutation intent.
+#[derive(Clone)]
 pub(crate) struct EncryptedProviderContextRecord {
     id: String,
     message_id: Option<String>,
@@ -314,7 +317,7 @@ impl ApiProtocol {
 /// and a *non-semantic* subset (`key_ref`, `ciphertext`, `created_at`) that is
 /// excluded from the HMAC so that key rotation and re-encryption do not
 /// invalidate the prepared intent.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct FullIntent {
     variant: String,
     mutation_id: String,
@@ -638,6 +641,24 @@ pub(crate) enum ApplyOutcome {
     Superseded { reason: String },
 }
 
+/// EventWriter projection handle for a prepared `Replace`/`Invalidate`.
+/// Construction is private to the provider-context builder; EventWriter loads
+/// and revalidates the stored intent inside its transaction.
+#[derive(Clone)]
+pub(crate) struct ProviderContextMutation {
+    pub(crate) mutation_id: String,
+}
+
+/// Size and prepared-key proof bundle computed outside the EventWriter
+/// transaction for projection byte accounting and `revalidate_prepared_key_refs`.
+pub(in crate::store) struct ProviderContextProjectionSize {
+    pub(crate) size: usize,
+    pub(crate) intent_key_ref: String,
+    pub(crate) intent_key_proof: Vec<u8>,
+    pub(crate) insert_key_ref: Option<String>,
+    pub(crate) insert_key_proof: Option<Vec<u8>>,
+}
+
 /// Transactional owner for `provider_context_mutations` prepare/apply.
 pub(crate) struct ProviderContextMutationApplier<'a> {
     store: &'a Store,
@@ -803,15 +824,117 @@ impl<'a> ProviderContextMutationApplier<'a> {
         Ok(())
     }
 
-    pub(crate) async fn apply(&self, mutation_id: &str) -> Result<ApplyOutcome> {
+    /// Recompute the projection byte bound and the prepared-key proofs for a
+    /// pending provider-context mutation.  The intent is decrypted and its HMAC
+    /// verified so that EventWriter can account for its exact durable cost and
+    /// bind the key material into the EventBatch revalidation check.
+    pub(in crate::store) async fn verify_and_size(
+        &self,
+        mutation_id: &str,
+    ) -> Result<ProviderContextProjectionSize> {
         let mut transaction = self.store.pool().begin().await?;
+        let (full, mutation_key, _intent_key) = self
+            .load_and_verify_full_intent(&mut transaction, mutation_id)
+            .await?;
 
+        let size = full
+            .invalidate_ids
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
+            .saturating_add(full.provider_context_id.len())
+            .saturating_add(full.ciphertext.len())
+            .saturating_add(512);
+
+        let (insert_key_ref, insert_key_proof) = if full.is_replace() && !full.key_ref.is_empty() {
+            let provider_context_key = self
+                .store
+                .data_key_by_ref_in_transaction(&mut transaction, &full.key_ref)
+                .await?;
+            if provider_context_key.purpose != DataKeyPurpose::ProviderContext {
+                bail!(
+                    "provider-context insert key {full_key_ref} has wrong purpose",
+                    full_key_ref = full.key_ref
+                );
+            }
+            let proof = super::crypto::keyed_proof(
+                &provider_context_key,
+                PREPARED_KEY_MATERIAL_PROOF_DOMAIN,
+                PREPARED_KEY_MATERIAL_PROOF,
+            );
+            (Some(full.key_ref.clone()), Some(proof))
+        } else {
+            (None, None)
+        };
+
+        transaction.commit().await?;
+        Ok(ProviderContextProjectionSize {
+            size,
+            intent_key_ref: mutation_key.key_ref.clone(),
+            intent_key_proof: super::crypto::keyed_proof(
+                &mutation_key,
+                PREPARED_KEY_MATERIAL_PROOF_DOMAIN,
+                PREPARED_KEY_MATERIAL_PROOF,
+            ),
+            insert_key_ref,
+            insert_key_proof,
+        })
+    }
+
+    /// Apply one prepared provider-context mutation inside an EventWriter
+    /// transaction.  The intent and, for Replace, the encrypted plaintext HMAC
+    /// are revalidated before any durable writes.
+    pub(in crate::store) async fn apply_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        mutation_id: &str,
+    ) -> Result<ApplyOutcome> {
+        let (full, _mutation_key, intent_key) = self
+            .load_and_verify_full_intent(transaction, mutation_id)
+            .await?;
+
+        if full.is_replace() {
+            if full.key_ref.is_empty() || full.ciphertext.is_empty() {
+                bail!("Replace provider-context mutation is missing encrypted insert");
+            }
+            let provider_context_key = self
+                .store
+                .data_key_by_ref_in_transaction(transaction, &full.key_ref)
+                .await?;
+            if provider_context_key.purpose != DataKeyPurpose::ProviderContext {
+                bail!("provider-context insert key has wrong purpose");
+            }
+            let aad = self.store.scope().row_aad(
+                "provider_context",
+                &full.provider_context_id,
+                DataKeyPurpose::ProviderContext,
+            );
+            let plaintext = Zeroizing::new(
+                decrypt_content(&provider_context_key, &full.ciphertext, &aad).context(
+                    "failed to decrypt provider-context insert for plaintext HMAC check",
+                )?,
+            );
+            let expected = hmac_sha256(&intent_key, PLAINTEXT_HMAC_DOMAIN, &plaintext);
+            if expected.as_slice().ct_eq(&full.plaintext_hmac).unwrap_u8() != 1 {
+                bail!("Replace provider-context mutation plaintext HMAC mismatch");
+            }
+        }
+
+        self.apply_full_intent(transaction, &full, mutation_id, &intent_key)
+            .await
+    }
+
+    async fn load_and_verify_full_intent(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        mutation_id: &str,
+    ) -> Result<(FullIntent, DataKeyMaterial, [u8; 32])> {
         let row = sqlx::query(
             "SELECT state, intent_key_ref, intent_ciphertext, intent_hmac
              FROM provider_context_mutations WHERE mutation_id = ?",
         )
         .bind(mutation_id)
-        .fetch_optional(&mut *transaction)
+        .fetch_optional(&mut **transaction)
         .await
         .context("failed to load mutation for apply")?;
 
@@ -830,7 +953,7 @@ impl<'a> ProviderContextMutationApplier<'a> {
 
         let mutation_key = self
             .store
-            .data_key_by_ref_in_transaction(&mut transaction, &intent_key_ref)
+            .data_key_by_ref_in_transaction(transaction, &intent_key_ref)
             .await?;
         let aad = self.store.scope().row_aad(
             "provider_context_mutations",
@@ -850,15 +973,10 @@ impl<'a> ProviderContextMutationApplier<'a> {
         }
         full_json.zeroize();
 
-        let outcome = self
-            .apply_intent(&mut transaction, &full, mutation_id, &intent_key)
-            .await?;
-
-        transaction.commit().await?;
-        Ok(outcome)
+        Ok((full, mutation_key, intent_key))
     }
 
-    async fn apply_intent(
+    async fn apply_full_intent(
         &self,
         transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         full: &FullIntent,
@@ -1019,7 +1137,29 @@ impl<'a> ProviderContextMutationApplier<'a> {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn apply(&self, mutation_id: &str) -> Result<ApplyOutcome> {
+        use super::event_writer::{EventBatch, EventWrite, EventWriter};
+        EventWriter::new(std::sync::Arc::new(self.store.clone()))
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![super::event_writer::Projection::ProviderContextMutation(
+                        ProviderContextMutation {
+                            mutation_id: mutation_id.to_owned(),
+                        },
+                    )],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .context("EventWriter provider-context apply failed")?;
+        Self::outcome_from_row(self.store.pool(), mutation_id).await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn recover(&self) -> Result<()> {
+        use super::event_writer::{EventBatch, EventWrite, EventWriter};
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT mutation_id FROM provider_context_mutations
              WHERE state = 'prepared'
@@ -1030,11 +1170,52 @@ impl<'a> ProviderContextMutationApplier<'a> {
         .context("failed to list prepared provider-context mutations")?;
 
         for (mutation_id,) in rows {
-            self.apply(&mutation_id).await.with_context(|| {
-                format!("failed to recover provider-context mutation {mutation_id}")
-            })?;
+            EventWriter::new(std::sync::Arc::new(self.store.clone()))
+                .apply(EventBatch {
+                    writes: vec![EventWrite {
+                        event: None,
+                        projections: vec![
+                            super::event_writer::Projection::ProviderContextMutation(
+                                ProviderContextMutation {
+                                    mutation_id: mutation_id.clone(),
+                                },
+                            ),
+                        ],
+                    }],
+                    injected_commands: Vec::new(),
+                })
+                .await
+                .with_context(|| {
+                    format!("failed to recover provider-context mutation {mutation_id}")
+                })?;
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    async fn outcome_from_row(pool: &sqlx::SqlitePool, mutation_id: &str) -> Result<ApplyOutcome> {
+        let row = sqlx::query(
+            "SELECT state, terminal_reason FROM provider_context_mutations WHERE mutation_id = ?",
+        )
+        .bind(mutation_id)
+        .fetch_optional(pool)
+        .await
+        .context("failed to load mutation outcome")?;
+        match row {
+            Some(row) => {
+                let state: String = row.try_get("state")?;
+                let reason: Option<String> = row.try_get("terminal_reason")?;
+                match (state.as_str(), reason.as_deref()) {
+                    ("applied", Some("already_satisfied")) => Ok(ApplyOutcome::AlreadySatisfied),
+                    ("superseded", Some("newer_replace")) => Ok(ApplyOutcome::Superseded {
+                        reason: "newer_replace".to_owned(),
+                    }),
+                    ("applied", _) => Ok(ApplyOutcome::Applied),
+                    _ => bail!("unexpected mutation state {state} with reason {reason:?}"),
+                }
+            }
+            None => bail!("mutation {mutation_id} not found after apply"),
+        }
     }
 
     fn replace_scope_key(&self, full: &FullIntent, intent_key: &[u8]) -> String {

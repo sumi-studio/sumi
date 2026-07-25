@@ -10,13 +10,13 @@ use super::crypto::{DataKeyMaterial, RowAad, encrypt_content};
 
 pub const REDACTION_VERSION: u32 = 1;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct RedactionRule {
     pattern: Regex,
     replacement: &'static str,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Redactor {
     version: u32,
     rules: Vec<RedactionRule>,

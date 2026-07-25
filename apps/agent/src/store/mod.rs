@@ -44,7 +44,6 @@ pub(crate) use self::physical_recovery::{
     PhysicalRecoveryIntentRequest, PhysicalRecoveryReceipt,
 };
 pub(crate) use self::provider_context::ProviderContextEvictionEstimate;
-use self::provider_context::ProviderContextMutationApplier;
 #[cfg(test)]
 pub(crate) use crypto::{DATA_KEY_BYTES, WrappingKey};
 pub(crate) use crypto::{
@@ -121,6 +120,7 @@ impl AgentScope {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Store {
     pool: SqlitePool,
     scope: AgentScope,
@@ -221,19 +221,19 @@ impl Store {
         .await
         .context("failed to initialize agent scope")?;
 
-        let store = Self {
+        let store = Arc::new(Self {
             pool,
             scope,
             key_provider,
             redactor: Redactor::v1(),
             event_writer_state: Arc::new(Mutex::new(event_writer::WriterState::default())),
-        };
+        });
         store.validate_startup().await?;
-        ProviderContextMutationApplier::new(&store)
-            .recover()
+        event_writer::EventWriter::new(store.clone())
+            .recover_provider_context_mutations()
             .await
             .context("failed to recover prepared provider-context mutations")?;
-        Ok(store)
+        Arc::try_unwrap(store).map_err(|_| anyhow!("recovery must not retain Store references"))
     }
 
     pub(crate) fn pool(&self) -> &SqlitePool {

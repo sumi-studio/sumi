@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt::Display,
     hash::Hash,
     sync::Arc,
@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, Transaction};
 use subtle::ConstantTimeEq;
@@ -23,6 +23,7 @@ use crate::{
         ApprovalDecision, Command, CommandAck, CommandAckStatus, CommandEnvelope, CommandId,
         CommandRejectReason, InboundCommand, KeyedCommandDigest, RejectedCommandPayload,
     },
+    memory::{BatchId, CompactResult},
     provider::types::{
         ApiProtocol, ProviderContextAnchor, ProviderContextFragment, ProviderContextItem,
         ProviderContextPayload, PublicAssistantContent, PublicAssistantMessage, PublicMessage,
@@ -39,8 +40,13 @@ use super::{
         EVENT_DIGEST_BYTES, EventChainEntry, authenticate_event_head, extend_event_chain,
         verify_event_head,
     },
+    memory_state::{
+        MemoryApplyCursorRecord, MemoryBatchState, MemoryBatchSummary, MemoryJobResult,
+    },
     physical_recovery::{ApplyReceiptOutcome, PhysicalRecoveryApplier, PhysicalRecoveryReceipt},
-    provider_context::EncryptedProviderContextRecord,
+    provider_context::{
+        EncryptedProviderContextRecord, ProviderContextMutation, ProviderContextMutationApplier,
+    },
     redactor::search_text_from_projection,
     verify_command_payload_digest,
 };
@@ -768,6 +774,75 @@ impl RunPhase {
 
 #[allow(
     dead_code,
+    reason = "T17 durable memory state transitions wired by the T20 maintainer"
+)]
+#[derive(Clone)]
+pub(crate) struct MemoryBatchMutation {
+    pub batch_id: BatchId,
+    pub expected_version: u64,
+    pub new_state: MemoryBatchState,
+    pub summary: Option<CompactResult>,
+    pub est_tokens: u64,
+    pub footprint_delta: i64,
+}
+
+#[allow(
+    dead_code,
+    reason = "T17 durable memory state transitions wired by the T20 maintainer"
+)]
+#[derive(Clone)]
+pub(crate) enum MemoryJobMutation {
+    Claim {
+        job_id: String,
+        lease_until: String,
+    },
+    Complete {
+        job_id: String,
+        result: CompactResult,
+    },
+    Fail {
+        job_id: String,
+    },
+    Apply {
+        job_id: String,
+    },
+}
+
+#[allow(
+    dead_code,
+    reason = "T17 durable memory state transitions wired by the T20 maintainer"
+)]
+#[derive(Clone)]
+pub(crate) struct MemoryJobUpdate {
+    pub expected_source_versions: BTreeMap<BatchId, u64>,
+    pub job_mutations: Vec<MemoryJobMutation>,
+}
+
+#[allow(
+    dead_code,
+    reason = "T17 durable memory state transitions wired by the T20 maintainer"
+)]
+#[derive(Clone)]
+pub(crate) struct MemoryApplyCursorAdvance {
+    pub kind: String,
+    pub expected: u64,
+    pub next: u64,
+}
+
+#[allow(
+    dead_code,
+    reason = "T17 durable memory state transitions wired by the T20 maintainer"
+)]
+#[derive(Clone)]
+pub(crate) struct MemoryTransition {
+    pub expected_source_versions: BTreeMap<BatchId, u64>,
+    pub batch_mutations: Vec<MemoryBatchMutation>,
+    pub job_mutations: Vec<MemoryJobMutation>,
+    pub cursor_advance: Option<MemoryApplyCursorAdvance>,
+}
+
+#[allow(
+    dead_code,
     reason = "T12 freezes projections that the T15 run loop will construct"
 )]
 #[derive(Clone)]
@@ -818,6 +893,14 @@ pub(crate) enum Projection {
     /// projection only after the complete logical suffix is in the same
     /// EventWriter transaction.
     PhysicalRecovery(PhysicalRecoveryReceipt),
+    /// Prepared provider-context mutation terminal application. EventWriter
+    /// decrypts and revalidates the stored intent, HMAC, and Replace plaintext
+    /// HMAC inside its SQLite transaction.
+    ProviderContextMutation(ProviderContextMutation),
+    /// Atomic durable memory job state update with source-version CAS.
+    MemoryJobUpdate(MemoryJobUpdate),
+    /// Atomic durable memory batch + job transition with source-version CAS.
+    MemoryTransition(MemoryTransition),
     #[cfg(test)]
     SizePadding(usize),
 }
@@ -907,6 +990,28 @@ enum L0Disposition {
     ExcludeRetryError,
 }
 
+#[derive(Clone)]
+struct PreparedMemoryBatchMutation {
+    batch_id: String,
+    expected_version: i64,
+    old_state: MemoryBatchState,
+    new_state: MemoryBatchState,
+    summary: Option<MemoryBatchSummary>,
+    est_tokens: i64,
+    footprint_delta: i64,
+}
+
+#[derive(Clone)]
+struct PreparedMemoryJobMutation {
+    job_id: String,
+    expected_status: &'static str,
+    new_status: &'static str,
+    attempts: i64,
+    lease_until: Option<String>,
+    source_versions: Option<String>,
+    result: Option<MemoryJobResult>,
+}
+
 enum PreparedProjection {
     MessageEnd {
         event_seq: u64,
@@ -921,6 +1026,8 @@ enum PreparedProjection {
         interrupted: bool,
         l0_disposition: L0Disposition,
         provider_context: Vec<EncryptedProviderContextRecord>,
+        provider_context_key_ref: Option<String>,
+        provider_context_key_proof: Option<Vec<u8>>,
         eviction_footprint_tokens: u64,
     },
     CommandInsert {
@@ -934,6 +1041,27 @@ enum PreparedProjection {
         status: &'static str,
         reject_reason: Option<&'static str>,
         reject_actual_bytes: Option<u64>,
+    },
+    ProviderContextMutation {
+        mutation_id: String,
+        intent_key_ref: String,
+        intent_key_proof: Vec<u8>,
+        insert_key_ref: Option<String>,
+        insert_key_proof: Option<Vec<u8>>,
+    },
+    MemoryJobUpdate {
+        expected_source_versions: BTreeMap<String, i64>,
+        job_mutations: Vec<PreparedMemoryJobMutation>,
+        memory_summary_key_ref: Option<String>,
+        memory_summary_key_proof: Option<Vec<u8>>,
+    },
+    MemoryTransition {
+        expected_source_versions: BTreeMap<String, i64>,
+        batch_mutations: Vec<PreparedMemoryBatchMutation>,
+        job_mutations: Vec<PreparedMemoryJobMutation>,
+        cursor_advance: Option<MemoryApplyCursorAdvance>,
+        memory_summary_key_ref: Option<String>,
+        memory_summary_key_proof: Option<Vec<u8>>,
     },
     Plain(Projection),
 }
@@ -1118,6 +1246,36 @@ impl EventWriter {
     pub(crate) fn new(store: Arc<Store>) -> Self {
         let gate = store.event_writer_state();
         Self { store, gate }
+    }
+
+    pub(in crate::store) async fn recover_provider_context_mutations(&self) -> Result<()> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT mutation_id FROM provider_context_mutations
+             WHERE state = 'prepared'
+             ORDER BY prepared_at, mutation_id",
+        )
+        .fetch_all(self.store.pool())
+        .await
+        .context("failed to list prepared provider-context mutations")?;
+
+        for (mutation_id,) in rows {
+            self.apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![Projection::ProviderContextMutation(
+                        super::provider_context::ProviderContextMutation {
+                            mutation_id: mutation_id.clone(),
+                        },
+                    )],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .with_context(|| {
+                format!("failed to recover provider-context mutation {mutation_id}")
+            })?;
+        }
+        Ok(())
     }
 
     pub(crate) fn store(&self) -> &Arc<Store> {
@@ -2095,6 +2253,23 @@ impl EventWriter {
         } else {
             None
         };
+        let needs_memory_summary_key = batch.writes.iter().any(|write| {
+            write.projections.iter().any(|projection| {
+                matches!(
+                    projection,
+                    Projection::MemoryJobUpdate { .. } | Projection::MemoryTransition { .. }
+                )
+            })
+        });
+        let mut memory_summary_key = if needs_memory_summary_key {
+            Some(
+                self.store
+                    .conversation_key(DataKeyPurpose::MemorySummary)
+                    .await?,
+            )
+        } else {
+            None
+        };
 
         let mut next_seq = first_seq;
         let mut prepared = Vec::with_capacity(batch.writes.len());
@@ -2223,7 +2398,11 @@ impl EventWriter {
                             &message,
                             PublicMessage::Assistant(message) if message.interrupted
                         );
-                        let (provider_context_records, eviction_footprint_tokens) = self
+                        let (
+                            provider_context_records,
+                            eviction_footprint_tokens,
+                            provider_context_key,
+                        ) = self
                             .prepare_provider_context(
                                 &message_id,
                                 event_seq,
@@ -2277,6 +2456,10 @@ impl EventWriter {
                             interrupted,
                             l0_disposition,
                             provider_context: provider_context_records,
+                            provider_context_key_ref: provider_context_key
+                                .as_ref()
+                                .map(|(r, _)| r.clone()),
+                            provider_context_key_proof: provider_context_key.map(|(_, p)| p),
                             eviction_footprint_tokens,
                         });
                     }
@@ -2316,6 +2499,41 @@ impl EventWriter {
                         charge_transaction_bytes(
                             &mut transaction_bytes,
                             prepared_projection_size(&prepared),
+                        )?;
+                        projections.push(prepared);
+                    }
+                    Projection::ProviderContextMutation(
+                        super::provider_context::ProviderContextMutation { mutation_id },
+                    ) => {
+                        let sized = ProviderContextMutationApplier::new(&self.store)
+                            .verify_and_size(&mutation_id)
+                            .await?;
+                        charge_transaction_bytes(&mut transaction_bytes, sized.size)?;
+                        projections.push(PreparedProjection::ProviderContextMutation {
+                            mutation_id,
+                            intent_key_ref: sized.intent_key_ref,
+                            intent_key_proof: sized.intent_key_proof,
+                            insert_key_ref: sized.insert_key_ref,
+                            insert_key_proof: sized.insert_key_proof,
+                        });
+                    }
+                    Projection::MemoryJobUpdate(update) => {
+                        let prepared = self
+                            .prepare_memory_job_update(&mut memory_summary_key, update)
+                            .await?;
+                        charge_transaction_bytes(
+                            &mut transaction_bytes,
+                            memory_projection_size(&prepared),
+                        )?;
+                        projections.push(prepared);
+                    }
+                    Projection::MemoryTransition(transition) => {
+                        let prepared = self
+                            .prepare_memory_transition(&mut memory_summary_key, transition)
+                            .await?;
+                        charge_transaction_bytes(
+                            &mut transaction_bytes,
+                            memory_projection_size(&prepared),
                         )?;
                         projections.push(prepared);
                     }
@@ -2450,9 +2668,13 @@ impl EventWriter {
         message_seq: u64,
         message: &PublicMessage,
         fragments: Vec<ProviderContextFragment>,
-    ) -> Result<(Vec<EncryptedProviderContextRecord>, u64)> {
+    ) -> Result<(
+        Vec<EncryptedProviderContextRecord>,
+        u64,
+        Option<(String, Vec<u8>)>,
+    )> {
         if fragments.is_empty() {
-            return Ok((Vec::new(), 0));
+            return Ok((Vec::new(), 0, None));
         }
 
         let PublicMessage::Assistant(assistant) = message else {
@@ -2467,6 +2689,13 @@ impl EventWriter {
                 anchor_id,
             })
             .await?;
+
+        let key_ref = key.key_ref.clone();
+        let key_proof = super::crypto::keyed_proof(
+            &key,
+            PREPARED_KEY_MATERIAL_PROOF_DOMAIN,
+            PREPARED_KEY_MATERIAL_PROOF,
+        );
 
         let mut records = Vec::with_capacity(fragments.len());
         let mut eviction_footprint_tokens = 0u64;
@@ -2507,7 +2736,284 @@ impl EventWriter {
                 eviction_footprint_tokens.saturating_add(record.eviction_tokens());
             records.push(record);
         }
-        Ok((records, eviction_footprint_tokens))
+        Ok((
+            records,
+            eviction_footprint_tokens,
+            Some((key_ref, key_proof)),
+        ))
+    }
+
+    async fn prepare_memory_job_update(
+        &self,
+        memory_summary_key: &mut Option<super::crypto::DataKeyMaterial>,
+        update: MemoryJobUpdate,
+    ) -> Result<PreparedProjection> {
+        let expected_source_versions = convert_batch_versions(update.expected_source_versions);
+        let source_versions_json = serde_json::to_string(&expected_source_versions)
+            .context("failed to serialize memory job source versions")?;
+        let mut job_mutations = Vec::with_capacity(update.job_mutations.len());
+        for mutation in update.job_mutations {
+            let source_json = if matches!(mutation, MemoryJobMutation::Claim { .. }) {
+                None
+            } else {
+                Some(source_versions_json.clone())
+            };
+            job_mutations.push(
+                self.prepare_memory_job_mutation(memory_summary_key, mutation, source_json)
+                    .await?,
+            );
+        }
+        let (key_ref, key_proof) = memory_summary_key
+            .as_ref()
+            .map(|key| {
+                (
+                    Some(key.key_ref.clone()),
+                    Some(super::crypto::keyed_proof(
+                        key,
+                        PREPARED_KEY_MATERIAL_PROOF_DOMAIN,
+                        PREPARED_KEY_MATERIAL_PROOF,
+                    )),
+                )
+            })
+            .unwrap_or((None, None));
+        Ok(PreparedProjection::MemoryJobUpdate {
+            expected_source_versions,
+            job_mutations,
+            memory_summary_key_ref: key_ref,
+            memory_summary_key_proof: key_proof,
+        })
+    }
+
+    async fn prepare_memory_transition(
+        &self,
+        memory_summary_key: &mut Option<super::crypto::DataKeyMaterial>,
+        transition: MemoryTransition,
+    ) -> Result<PreparedProjection> {
+        let pre_source_versions = convert_batch_versions(transition.expected_source_versions);
+        let mut post_source_versions = pre_source_versions.clone();
+        let mut batch_mutations = Vec::with_capacity(transition.batch_mutations.len());
+        for batch in transition.batch_mutations {
+            let row = sqlx::query("SELECT version, state FROM memory_batches WHERE id = ?")
+                .bind(batch.batch_id.to_string())
+                .fetch_optional(self.store.pool())
+                .await
+                .context("failed to load memory batch for transition")?
+                .ok_or_else(|| anyhow!("memory batch {} does not exist", batch.batch_id))?;
+            let old_version: i64 = row.try_get("version")?;
+            let old_state_str: String = row.try_get("state")?;
+            let old_state = parse_memory_batch_state(&old_state_str)?;
+            if old_version != sqlite_i64(batch.expected_version, "expected batch version")? {
+                bail!(
+                    "memory batch {} expected version {} but found {}",
+                    batch.batch_id,
+                    batch.expected_version,
+                    old_version
+                );
+            }
+
+            let version_increments = batch.summary.is_some() || batch.new_state != old_state;
+            let new_version = if version_increments {
+                old_version
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("memory batch version overflow"))?
+            } else {
+                old_version
+            };
+            post_source_versions.insert(batch.batch_id.to_string(), new_version);
+
+            let summary = if let Some(result) = batch.summary {
+                if memory_summary_key.is_none() {
+                    *memory_summary_key = Some(
+                        self.store
+                            .conversation_key(DataKeyPurpose::MemorySummary)
+                            .await?,
+                    );
+                }
+                let key = memory_summary_key
+                    .as_ref()
+                    .expect("memory summary key loaded");
+                Some(
+                    self.encrypt_memory_batch_summary(result, &batch.batch_id.to_string(), key)
+                        .await?,
+                )
+            } else {
+                None
+            };
+
+            batch_mutations.push(PreparedMemoryBatchMutation {
+                batch_id: batch.batch_id.to_string(),
+                expected_version: sqlite_i64(batch.expected_version, "expected batch version")?,
+                old_state,
+                new_state: batch.new_state,
+                summary,
+                est_tokens: sqlite_i64(batch.est_tokens, "batch est_tokens")?,
+                footprint_delta: batch.footprint_delta,
+            });
+        }
+
+        let source_versions_json = serde_json::to_string(&post_source_versions)
+            .context("failed to serialize memory transition source versions")?;
+        let mut job_mutations = Vec::with_capacity(transition.job_mutations.len());
+        for mutation in transition.job_mutations {
+            let source_json = if matches!(mutation, MemoryJobMutation::Claim { .. }) {
+                None
+            } else {
+                Some(source_versions_json.clone())
+            };
+            job_mutations.push(
+                self.prepare_memory_job_mutation(memory_summary_key, mutation, source_json)
+                    .await?,
+            );
+        }
+
+        let (key_ref, key_proof) = memory_summary_key
+            .as_ref()
+            .map(|key| {
+                (
+                    Some(key.key_ref.clone()),
+                    Some(super::crypto::keyed_proof(
+                        key,
+                        PREPARED_KEY_MATERIAL_PROOF_DOMAIN,
+                        PREPARED_KEY_MATERIAL_PROOF,
+                    )),
+                )
+            })
+            .unwrap_or((None, None));
+
+        Ok(PreparedProjection::MemoryTransition {
+            expected_source_versions: pre_source_versions,
+            batch_mutations,
+            job_mutations,
+            cursor_advance: transition.cursor_advance,
+            memory_summary_key_ref: key_ref,
+            memory_summary_key_proof: key_proof,
+        })
+    }
+
+    async fn prepare_memory_job_mutation(
+        &self,
+        memory_summary_key: &mut Option<super::crypto::DataKeyMaterial>,
+        mutation: MemoryJobMutation,
+        source_versions_json: Option<String>,
+    ) -> Result<PreparedMemoryJobMutation> {
+        let (job_id, expected_status, new_status, lease_until, result) = match mutation {
+            MemoryJobMutation::Claim {
+                job_id,
+                lease_until,
+            } => (job_id, "pending", "running", Some(lease_until), None),
+            MemoryJobMutation::Complete { job_id, result } => {
+                if memory_summary_key.is_none() {
+                    *memory_summary_key = Some(
+                        self.store
+                            .conversation_key(DataKeyPurpose::MemorySummary)
+                            .await?,
+                    );
+                }
+                let key = memory_summary_key
+                    .as_ref()
+                    .expect("memory summary key loaded");
+                let encrypted = self.encrypt_memory_job_result(result, &job_id, key).await?;
+                (job_id, "running", "completed", None, Some(encrypted))
+            }
+            MemoryJobMutation::Fail { job_id } => (job_id, "running", "failed", None, None),
+            MemoryJobMutation::Apply { job_id } => (job_id, "completed", "applied", None, None),
+        };
+
+        let row = sqlx::query("SELECT status, attempts, lease_until FROM memory_jobs WHERE id = ?")
+            .bind(&job_id)
+            .fetch_optional(self.store.pool())
+            .await
+            .context("failed to load memory job for mutation")?
+            .ok_or_else(|| anyhow!("memory job {job_id} does not exist"))?;
+        let status: String = row.try_get("status")?;
+        if status != expected_status {
+            bail!("memory job {job_id} is in status {status}, expected {expected_status}");
+        }
+        let attempts: i64 = row.try_get("attempts")?;
+        let lease_until_stored: Option<String> = row.try_get("lease_until")?;
+
+        Ok(PreparedMemoryJobMutation {
+            job_id,
+            expected_status,
+            new_status,
+            attempts,
+            lease_until: if new_status == "running" {
+                lease_until
+            } else {
+                lease_until_stored
+            },
+            source_versions: source_versions_json,
+            result,
+        })
+    }
+
+    async fn encrypt_memory_batch_summary(
+        &self,
+        result: CompactResult,
+        batch_id: &str,
+        key: &super::crypto::DataKeyMaterial,
+    ) -> Result<MemoryBatchSummary> {
+        let (ciphertext, projection, redaction_version) = self
+            .encrypt_memory_summary(result, "memory_batches", batch_id, key)
+            .await?;
+        Ok(MemoryBatchSummary {
+            key_ref: key.key_ref.clone(),
+            ciphertext,
+            projection,
+            redaction_version,
+        })
+    }
+
+    async fn encrypt_memory_job_result(
+        &self,
+        result: CompactResult,
+        job_id: &str,
+        key: &super::crypto::DataKeyMaterial,
+    ) -> Result<MemoryJobResult> {
+        let (ciphertext, projection, redaction_version) = self
+            .encrypt_memory_summary(result, "memory_jobs", job_id, key)
+            .await?;
+        Ok(MemoryJobResult {
+            key_ref: key.key_ref.clone(),
+            ciphertext,
+            projection,
+            redaction_version,
+        })
+    }
+
+    async fn encrypt_memory_summary(
+        &self,
+        result: CompactResult,
+        table: &str,
+        row_id: &str,
+        key: &super::crypto::DataKeyMaterial,
+    ) -> Result<(Vec<u8>, String, u32)> {
+        let mut summary = result.summary.clone_zeroized();
+        let mut raw = Zeroizing::new(
+            serde_json::to_vec(&json!({
+                "summary": summary.as_str(),
+                "est_tokens": result.est_tokens,
+                "from": result.time_range.0,
+                "to": result.time_range.1,
+            }))
+            .context("failed to serialize memory summary payload")?,
+        );
+        summary.zeroize();
+        let aad = self
+            .store
+            .scope()
+            .row_aad(table, row_id, DataKeyPurpose::MemorySummary);
+        let protected = PublicProjectionBuilder::new(self.store.redactor(), key)
+            .build_serialized(&raw, &aad)
+            .context("failed to build memory summary projection")?;
+        let ciphertext = super::crypto::encrypt_content(key, &raw, &aad)
+            .context("failed to encrypt memory summary ciphertext")?;
+        raw.zeroize();
+        Ok((
+            ciphertext,
+            protected.projection,
+            protected.redaction_version,
+        ))
     }
 
     async fn derive_injected_command_size(
@@ -3054,6 +3560,8 @@ async fn revalidate_prepared_key_refs(
                 PreparedProjection::MessageEnd {
                     raw_key_ref,
                     raw_key_proof,
+                    provider_context_key_ref,
+                    provider_context_key_proof,
                     ..
                 } => {
                     insert_prepared_key_expectation(
@@ -3062,6 +3570,16 @@ async fn revalidate_prepared_key_refs(
                         DataKeyPurpose::Transcript,
                         raw_key_proof,
                     )?;
+                    if let (Some(key_ref), Some(proof)) =
+                        (provider_context_key_ref, provider_context_key_proof)
+                    {
+                        insert_prepared_key_expectation(
+                            &mut refs,
+                            key_ref,
+                            DataKeyPurpose::ProviderContext,
+                            proof,
+                        )?;
+                    }
                 }
                 PreparedProjection::CommandInsert {
                     payload_key_ref,
@@ -3073,7 +3591,44 @@ async fn revalidate_prepared_key_refs(
                     DataKeyPurpose::Command,
                     payload_key_proof,
                 )?,
-                PreparedProjection::Plain(_) => {}
+                PreparedProjection::ProviderContextMutation {
+                    intent_key_ref,
+                    intent_key_proof,
+                    insert_key_ref,
+                    insert_key_proof,
+                    ..
+                } => {
+                    insert_prepared_key_expectation(
+                        &mut refs,
+                        intent_key_ref,
+                        DataKeyPurpose::Mutation,
+                        intent_key_proof,
+                    )?;
+                    if let (Some(key_ref), Some(proof)) = (insert_key_ref, insert_key_proof) {
+                        insert_prepared_key_expectation(
+                            &mut refs,
+                            key_ref,
+                            DataKeyPurpose::ProviderContext,
+                            proof,
+                        )?;
+                    }
+                }
+                PreparedProjection::MemoryJobUpdate {
+                    memory_summary_key_ref: Some(key_ref),
+                    memory_summary_key_proof: Some(proof),
+                    ..
+                }
+                | PreparedProjection::MemoryTransition {
+                    memory_summary_key_ref: Some(key_ref),
+                    memory_summary_key_proof: Some(proof),
+                    ..
+                } => insert_prepared_key_expectation(
+                    &mut refs,
+                    key_ref,
+                    DataKeyPurpose::MemorySummary,
+                    proof,
+                )?,
+                _ => {}
             }
         }
     }
@@ -4285,7 +4840,107 @@ fn validate_batch_shape(
             bail!("approval resolution event and mutation disagree for {request_id}");
         }
     }
+    for write in &batch.writes {
+        let mut has_memory_maintenance = false;
+        if let Some(event) = &write.event
+            && matches!(event.value, AgentEvent::MemoryMaintenance { .. })
+        {
+            has_memory_maintenance = true;
+        }
+        let mut memory_transition_seen = false;
+        let mut memory_job_update_seen = false;
+        let mut provider_context_seen = false;
+        let mut batch_ids = HashSet::new();
+        let mut job_ids = HashSet::new();
+        for projection in &write.projections {
+            match projection {
+                Projection::ProviderContextMutation(_) => {
+                    if write.event.is_some() {
+                        bail!("ProviderContextMutation projection must be eventless");
+                    }
+                    if memory_transition_seen || memory_job_update_seen || provider_context_seen {
+                        bail!("only one terminal mutation projection is allowed per EventWrite");
+                    }
+                    provider_context_seen = true;
+                }
+                Projection::MemoryJobUpdate(update) => {
+                    if write.event.is_some() {
+                        bail!("MemoryJobUpdate projection must be eventless");
+                    }
+                    if memory_transition_seen || memory_job_update_seen || provider_context_seen {
+                        bail!("only one terminal mutation projection is allowed per EventWrite");
+                    }
+                    memory_job_update_seen = true;
+                    for mutation in &update.job_mutations {
+                        if !job_ids.insert(job_id_for_mutation(mutation)) {
+                            bail!("duplicate job_id in MemoryJobUpdate");
+                        }
+                        validate_memory_job_mutation_shape(mutation)?;
+                    }
+                }
+                Projection::MemoryTransition(transition) => {
+                    if memory_transition_seen || memory_job_update_seen || provider_context_seen {
+                        bail!("only one terminal mutation projection is allowed per EventWrite");
+                    }
+                    memory_transition_seen = true;
+                    for batch in &transition.batch_mutations {
+                        if !batch_ids.insert(batch.batch_id) {
+                            bail!("duplicate batch_id in MemoryTransition");
+                        }
+                        if batch.new_state == MemoryBatchState::Compacted && batch.summary.is_none()
+                        {
+                            bail!("Compacted MemoryBatchMutation requires a summary");
+                        }
+                        if batch.summary.is_some()
+                            && !matches!(
+                                batch.new_state,
+                                MemoryBatchState::Compacted | MemoryBatchState::Promoted
+                            )
+                        {
+                            bail!(
+                                "MemoryBatchMutation summary is only valid for Compacted or Promoted states"
+                            );
+                        }
+                    }
+                    for mutation in &transition.job_mutations {
+                        if !job_ids.insert(job_id_for_mutation(mutation)) {
+                            bail!("duplicate job_id in MemoryTransition");
+                        }
+                        validate_memory_job_mutation_shape(mutation)?;
+                    }
+                    if !has_memory_maintenance && write.event.is_some() {
+                        bail!(
+                            "MemoryTransition projection must be eventless unless paired with a MemoryMaintenance event"
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     Ok(expected_injections)
+}
+
+fn job_id_for_mutation(mutation: &MemoryJobMutation) -> &str {
+    match mutation {
+        MemoryJobMutation::Claim { job_id, .. }
+        | MemoryJobMutation::Complete { job_id, .. }
+        | MemoryJobMutation::Fail { job_id }
+        | MemoryJobMutation::Apply { job_id } => job_id.as_str(),
+    }
+}
+
+fn validate_memory_job_mutation_shape(mutation: &MemoryJobMutation) -> Result<()> {
+    match mutation {
+        MemoryJobMutation::Complete { result, .. } => {
+            if result.est_tokens == 0 && result.summary.expose().is_empty() {
+                bail!("MemoryJobMutation::Complete result must not be empty");
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 fn validate_approval_resolution(resolution: &str) -> Result<()> {
@@ -4641,6 +5296,59 @@ fn projection_size_upper_bound(projection: &Projection) -> Result<usize> {
                     })
                     .sum::<usize>(),
             ),
+        Projection::ProviderContextMutation(inner) => inner.mutation_id.len().saturating_add(4096),
+        Projection::MemoryJobUpdate(update) => update
+            .job_mutations
+            .iter()
+            .map(|mutation| {
+                let result_bytes = match mutation {
+                    MemoryJobMutation::Complete { result, .. } => {
+                        (result.est_tokens as usize).saturating_add(result.summary.expose().len())
+                    }
+                    _ => 0,
+                };
+                job_id_for_mutation(mutation)
+                    .len()
+                    .saturating_add(result_bytes)
+                    .saturating_add(512)
+            })
+            .sum::<usize>(),
+        Projection::MemoryTransition(transition) => transition
+            .batch_mutations
+            .iter()
+            .map(|batch| {
+                let summary_bytes = batch
+                    .summary
+                    .as_ref()
+                    .map_or(0, |result| {
+                        (result.est_tokens as usize).saturating_add(result.summary.expose().len())
+                    })
+                    .saturating_add(512);
+                batch
+                    .batch_id
+                    .to_string()
+                    .len()
+                    .saturating_add(summary_bytes)
+            })
+            .sum::<usize>()
+            .saturating_add(
+                transition
+                    .job_mutations
+                    .iter()
+                    .map(|mutation| {
+                        let result_bytes = match mutation {
+                            MemoryJobMutation::Complete { result, .. } => (result.est_tokens
+                                as usize)
+                                .saturating_add(result.summary.expose().len()),
+                            _ => 0,
+                        };
+                        job_id_for_mutation(mutation)
+                            .len()
+                            .saturating_add(result_bytes)
+                            .saturating_add(512)
+                    })
+                    .sum::<usize>(),
+            ),
         Projection::MessageEnd { .. } => 0,
         #[cfg(test)]
         Projection::SizePadding(bytes) => return Ok(*bytes),
@@ -4662,6 +5370,53 @@ fn prepared_projection_size(projection: &PreparedProjection) -> usize {
             .saturating_add(payload_ciphertext.as_ref().map_or(0, Vec::len))
             .saturating_add(payload_hmac.len())
             .saturating_add(512),
+        _ => 0,
+    }
+}
+
+fn convert_batch_versions(versions: BTreeMap<BatchId, u64>) -> BTreeMap<String, i64> {
+    versions
+        .into_iter()
+        .map(|(id, version)| {
+            (
+                id.to_string(),
+                sqlite_i64(version, "source version").unwrap_or(i64::MAX),
+            )
+        })
+        .collect()
+}
+
+fn parse_memory_batch_state(value: &str) -> Result<MemoryBatchState> {
+    match value {
+        "open" => Ok(MemoryBatchState::Open),
+        "sealed" => Ok(MemoryBatchState::Sealed),
+        "compacting" => Ok(MemoryBatchState::Compacting),
+        "compact_failed" => Ok(MemoryBatchState::CompactFailed),
+        "compacted" => Ok(MemoryBatchState::Compacted),
+        "promoted" => Ok(MemoryBatchState::Promoted),
+        "dropped" => Ok(MemoryBatchState::Dropped),
+        _ => bail!("unknown memory batch state {value}"),
+    }
+}
+
+fn memory_projection_size(projection: &PreparedProjection) -> usize {
+    match projection {
+        PreparedProjection::MemoryJobUpdate { job_mutations, .. }
+        | PreparedProjection::MemoryTransition { job_mutations, .. } => job_mutations
+            .iter()
+            .map(|job| {
+                job.job_id
+                    .len()
+                    .saturating_add(job.attempts as usize)
+                    .saturating_add(
+                        job.lease_until
+                            .as_ref()
+                            .map_or(0, String::len)
+                            .saturating_add(job.result.as_ref().map_or(0, |r| r.ciphertext.len())),
+                    )
+                    .saturating_add(512)
+            })
+            .sum::<usize>(),
         _ => 0,
     }
 }
@@ -4771,6 +5526,7 @@ fn prepared_injection_bytes(
                 PreparedProjection::Plain(projection) => {
                     bytes = bytes.saturating_add(projection_size_upper_bound(projection)?);
                 }
+                _ => {}
             }
         }
     }
@@ -7545,6 +8301,7 @@ async fn apply_projection(
             l0_disposition,
             provider_context,
             eviction_footprint_tokens,
+            ..
         } => {
             if !matches!(role, "user" | "assistant" | "tool_result") {
                 bail!("invalid message role {role}");
@@ -7641,6 +8398,35 @@ async fn apply_projection(
             .execute(&mut **transaction)
             .await
             .context("failed to persist inbound command")?;
+        }
+        PreparedProjection::ProviderContextMutation { mutation_id, .. } => {
+            ProviderContextMutationApplier::new(store)
+                .apply_in_transaction(transaction, &mutation_id)
+                .await
+                .context("failed to apply provider-context mutation projection")?;
+        }
+        PreparedProjection::MemoryJobUpdate {
+            expected_source_versions,
+            job_mutations,
+            ..
+        } => {
+            apply_memory_job_update(transaction, expected_source_versions, job_mutations).await?;
+        }
+        PreparedProjection::MemoryTransition {
+            expected_source_versions,
+            batch_mutations,
+            job_mutations,
+            cursor_advance,
+            ..
+        } => {
+            apply_memory_transition(
+                transaction,
+                expected_source_versions,
+                batch_mutations,
+                job_mutations,
+                cursor_advance,
+            )
+            .await?;
         }
         PreparedProjection::Plain(projection) => {
             apply_plain_projection(store, transaction, projection, batch_event_seqs).await?;
@@ -7826,9 +8612,201 @@ async fn apply_plain_projection(
                 .apply_in_transaction(transaction, &receipt, batch_event_seqs)
                 .await?;
         }
+        Projection::ProviderContextMutation(_)
+        | Projection::MemoryJobUpdate(_)
+        | Projection::MemoryTransition(_) => {
+            bail!("memory and provider-context mutations must be prepared before apply");
+        }
         #[cfg(test)]
         Projection::SizePadding(_) => {}
     }
+    Ok(())
+}
+
+async fn verify_source_versions(
+    transaction: &mut Transaction<'_, Sqlite>,
+    expected: &BTreeMap<String, i64>,
+    job_id: Option<&str>,
+) -> Result<()> {
+    let mut actual: BTreeMap<String, i64> = BTreeMap::new();
+    for batch_id in expected.keys() {
+        let row = sqlx::query("SELECT version FROM memory_batches WHERE id = ?")
+            .bind(batch_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .context("failed to read source version for memory CAS")?
+            .ok_or_else(|| {
+                anyhow!(
+                    "memory source batch {batch_id} referenced by {job:?} does not exist",
+                    job = job_id.unwrap_or("transition")
+                )
+            })?;
+        let version: i64 = row.try_get("version")?;
+        actual.insert(batch_id.clone(), version);
+    }
+    if actual != *expected {
+        bail!(
+            "memory source version mismatch for {job}: expected {expected:?}, actual {actual:?}",
+            job = job_id.unwrap_or("transition")
+        );
+    }
+    Ok(())
+}
+
+async fn apply_memory_job_update(
+    transaction: &mut Transaction<'_, Sqlite>,
+    expected_source_versions: BTreeMap<String, i64>,
+    job_mutations: Vec<PreparedMemoryJobMutation>,
+) -> Result<()> {
+    verify_source_versions(transaction, &expected_source_versions, None).await?;
+    for job in job_mutations {
+        apply_memory_job_mutation(transaction, job).await?;
+    }
+    Ok(())
+}
+
+async fn apply_memory_transition(
+    transaction: &mut Transaction<'_, Sqlite>,
+    expected_source_versions: BTreeMap<String, i64>,
+    batch_mutations: Vec<PreparedMemoryBatchMutation>,
+    job_mutations: Vec<PreparedMemoryJobMutation>,
+    cursor_advance: Option<MemoryApplyCursorAdvance>,
+) -> Result<()> {
+    verify_source_versions(transaction, &expected_source_versions, None).await?;
+    for batch in batch_mutations {
+        apply_memory_batch_mutation(transaction, batch).await?;
+    }
+    for job in job_mutations {
+        apply_memory_job_mutation(transaction, job).await?;
+    }
+    if let Some(cursor) = cursor_advance {
+        let advanced = MemoryApplyCursorRecord {
+            kind: cursor.kind,
+            next_batch_seq: sqlite_i64(cursor.next, "memory apply cursor next")?,
+        }
+        .advance(
+            &mut **transaction,
+            sqlite_i64(cursor.expected, "memory apply cursor expected")?,
+        )
+        .await?;
+        if !advanced {
+            bail!("memory apply cursor CAS failed");
+        }
+    }
+    Ok(())
+}
+
+async fn apply_memory_batch_mutation(
+    transaction: &mut Transaction<'_, Sqlite>,
+    batch: PreparedMemoryBatchMutation,
+) -> Result<()> {
+    let version_increments = batch.summary.is_some() || batch.new_state != batch.old_state;
+    let new_version = if version_increments {
+        batch
+            .expected_version
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("memory batch version overflow"))?
+    } else {
+        batch.expected_version
+    };
+
+    let (key_ref, ciphertext, projection, redaction_version) = match batch.summary {
+        Some(summary) => (
+            Some(summary.key_ref),
+            Some(summary.ciphertext),
+            Some(summary.projection),
+            Some(i64::from(summary.redaction_version)),
+        ),
+        None => (None, None, None, None),
+    };
+
+    let result = sqlx::query(
+        "UPDATE memory_batches
+         SET state = ?, version = ?, est_tokens = ?,
+             eviction_footprint_tokens = eviction_footprint_tokens + ?,
+             summary_key_ref = COALESCE(?, summary_key_ref),
+             summary_ciphertext = COALESCE(?, summary_ciphertext),
+             summary_projection = COALESCE(?, summary_projection),
+             summary_redaction_version = COALESCE(?, summary_redaction_version),
+             updated_at = ?
+         WHERE id = ? AND version = ? AND state = ?",
+    )
+    .bind(batch.new_state.as_str())
+    .bind(new_version)
+    .bind(batch.est_tokens)
+    .bind(batch.footprint_delta)
+    .bind(key_ref.as_ref())
+    .bind(ciphertext.as_ref())
+    .bind(projection.as_ref())
+    .bind(redaction_version)
+    .bind(Utc::now().to_rfc3339())
+    .bind(&batch.batch_id)
+    .bind(batch.expected_version)
+    .bind(batch.old_state.as_str())
+    .execute(&mut **transaction)
+    .await?;
+    require_single_cas(result.rows_affected(), "MemoryBatchMutation")?;
+    Ok(())
+}
+
+async fn apply_memory_job_mutation(
+    transaction: &mut Transaction<'_, Sqlite>,
+    job: PreparedMemoryJobMutation,
+) -> Result<()> {
+    let (result_key_ref, result_ciphertext, result_projection, result_redaction_version) =
+        match job.result {
+            Some(result) => (
+                Some(result.key_ref),
+                Some(result.ciphertext),
+                Some(result.projection),
+                Some(i64::from(result.redaction_version)),
+            ),
+            None => (None, None, None, None),
+        };
+
+    let result = if job.expected_status == "pending" {
+        sqlx::query(
+            "UPDATE memory_jobs
+             SET status = ?, attempts = attempts + 1, lease_until = ?,
+                 source_versions = COALESCE(?, source_versions), updated_at = ?
+             WHERE id = ? AND status = ?",
+        )
+        .bind(job.new_status)
+        .bind(job.lease_until.as_ref())
+        .bind(job.source_versions.as_ref())
+        .bind(Utc::now().to_rfc3339())
+        .bind(&job.job_id)
+        .bind(job.expected_status)
+        .execute(&mut **transaction)
+        .await?
+    } else {
+        sqlx::query(
+            "UPDATE memory_jobs
+             SET status = ?, attempts = attempts, lease_until = ?,
+                 source_versions = COALESCE(?, source_versions),
+                 result_key_ref = COALESCE(?, result_key_ref),
+                 result_ciphertext = COALESCE(?, result_ciphertext),
+                 result_projection = COALESCE(?, result_projection),
+                 result_redaction_version = COALESCE(?, result_redaction_version),
+                 updated_at = ?
+             WHERE id = ? AND status = ? AND attempts = ? AND lease_until = ?",
+        )
+        .bind(job.new_status)
+        .bind(job.lease_until.as_ref())
+        .bind(job.source_versions.as_ref())
+        .bind(result_key_ref.as_ref())
+        .bind(result_ciphertext.as_ref())
+        .bind(result_projection.as_ref())
+        .bind(result_redaction_version)
+        .bind(Utc::now().to_rfc3339())
+        .bind(&job.job_id)
+        .bind(job.expected_status)
+        .bind(job.attempts)
+        .bind(job.lease_until.as_ref())
+        .execute(&mut **transaction)
+        .await?
+    };
+    require_single_cas(result.rows_affected(), "MemoryJobMutation")?;
     Ok(())
 }
 
@@ -14327,6 +15305,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_context_key_material_replaced_after_prepare_is_rejected_in_transaction() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let message = assistant_message(StopReason::Stop);
+        let message_id = "assistant-provider-context-key-race";
+        let fragment = ProviderContextFragment {
+            wire_item_index: None,
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({"summary": "opaque"})],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 1,
+                    context_fingerprint: "fp".to_owned(),
+                },
+            },
+        };
+        let batch = EventBatch {
+            writes: vec![EventWrite {
+                event: Some(
+                    DurableEvent::message("message_end", message_id, &message)
+                        .expect("durable message_end event"),
+                ),
+                projections: vec![Projection::MessageEnd {
+                    message_id: message_id.to_owned(),
+                    role: "assistant",
+                    message,
+                    append_to_l0: true,
+                    provider_context: vec![fragment],
+                    eviction_footprint_tokens: 0,
+                }],
+            }],
+            injected_commands: Vec::new(),
+        };
+        let (prepared, _, _) = writer
+            .prepare_batch(batch, 1)
+            .await
+            .expect("prepare message_end with provider-context key material");
+
+        let provider_context_key_ref = match &prepared[0].projections[0] {
+            PreparedProjection::MessageEnd {
+                provider_context_key_ref: Some(key_ref),
+                ..
+            } => key_ref.clone(),
+            _ => panic!("prepared MessageEnd must carry a provider-context key proof"),
+        };
+
+        let wrapping_key = WrappingKey::new("test-wrap-v1", [0x53; DATA_KEY_BYTES]);
+        let replacement = DataKeyMaterial::generate(
+            provider_context_key_ref.clone(),
+            DataKeyPurpose::ProviderContext,
+        )
+        .expect("replacement provider-context data key");
+        let aad = KeyWrapAad {
+            key_ref: provider_context_key_ref.clone(),
+            scope: DataKeyScope::Conversation,
+            purpose: DataKeyPurpose::ProviderContext,
+            conversation_id: Some(scope().conversation_id),
+            wrap_key_id: wrapping_key.key_id().to_owned(),
+        };
+        let (wrap_nonce, wrapped_key) =
+            wrap_data_key(&replacement, &wrapping_key, &aad).expect("wrap replacement key");
+        sqlx::query(
+            "UPDATE data_keys SET wrap_nonce=?, wrapped_key=? WHERE key_ref=? AND state='active'",
+        )
+        .bind(wrap_nonce.as_slice())
+        .bind(wrapped_key)
+        .bind(&provider_context_key_ref)
+        .execute(store.pool())
+        .await
+        .expect("replace wrapped provider-context key material between prepare and transaction");
+
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
+        let error = super::revalidate_prepared_key_refs(&store, &mut transaction, &prepared)
+            .await
+            .expect_err("changed provider-context material must fail closed");
+        assert!(error.to_string().contains("changed material"), "{error:#}");
+        transaction.rollback().await.expect("roll back validation");
+    }
+
+    #[tokio::test]
     async fn writer_derives_command_limits_from_durable_inbound_payloads() {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
@@ -18462,6 +19519,68 @@ mod tests {
             .await
             .expect_err("empty MemoryMaintenance kind must be rejected");
         assert!(error.to_string().contains("kind must not be empty"));
+    }
+
+    #[tokio::test]
+    async fn memory_transition_failpoint_rolls_back_before_commit() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let batch_id = BatchId::from_u128(1);
+        sqlx::query(
+            "INSERT INTO memory_batches(
+                id, layer, ord, batch_seq, version, state, est_tokens,
+                eviction_footprint_tokens, updated_at
+             ) VALUES(?, 1, 0, 0, 1, 'open', 0, 0, 'now')",
+        )
+        .bind(batch_id.to_string())
+        .execute(store.pool())
+        .await
+        .expect("seed memory batch");
+
+        let batch = EventBatch {
+            writes: vec![EventWrite {
+                event: Some(
+                    DurableEvent::new(&json!({
+                        "type": "memory_maintenance",
+                        "kind": "compact_applied"
+                    }))
+                    .expect("typed memory maintenance event"),
+                ),
+                projections: vec![Projection::MemoryTransition(MemoryTransition {
+                    expected_source_versions: BTreeMap::new(),
+                    batch_mutations: vec![MemoryBatchMutation {
+                        batch_id,
+                        expected_version: 1,
+                        new_state: MemoryBatchState::Sealed,
+                        summary: None,
+                        est_tokens: 0,
+                        footprint_delta: 0,
+                    }],
+                    job_mutations: Vec::new(),
+                    cursor_advance: None,
+                })],
+            }],
+            injected_commands: Vec::new(),
+        };
+
+        let error = writer
+            .apply_with_failpoint(batch, 1)
+            .await
+            .expect_err("failpoint must interrupt memory transition");
+        assert!(error.to_string().contains("test failpoint"), "{error:#}");
+
+        let row = sqlx::query("SELECT version, state FROM memory_batches WHERE id = ?")
+            .bind(batch_id.to_string())
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch batch");
+        assert_eq!(row.get::<i64, _>("version"), 1);
+        assert_eq!(row.get::<String, _>("state"), "open");
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+            .fetch_one(store.pool())
+            .await
+            .expect("count agent events");
+        assert_eq!(events, 0);
     }
 
     #[tokio::test]
