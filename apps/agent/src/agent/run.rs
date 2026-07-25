@@ -499,8 +499,32 @@ impl Runner {
                 )
                 .await;
         }
+        let attempt_cancellation = self
+            .core
+            .attempt_cancellation
+            .as_ref()
+            .ok_or_else(|| {
+                WorkerFailure::Error("RunCore has no attempt cancellation registry".to_owned())
+            })?
+            .clone();
         let cancel = CancellationToken::new();
+        let _guard = attempt_cancellation
+            .register(cancel.clone())
+            .map_err(|error| WorkerFailure::Error(error.to_string()))?;
         self.provider_cancel = Some(cancel.clone());
+        let outcome = self.provider_attempt_loop(cancel).await;
+        if outcome.is_ok() {
+            attempt_cancellation
+                .retire_committed()
+                .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+        }
+        outcome
+    }
+
+    async fn provider_attempt_loop(
+        &mut self,
+        cancel: CancellationToken,
+    ) -> Result<AttemptOutcome, WorkerFailure> {
         let start_cancel = cancel.clone();
         // A command ingress timestamp has exactly one causal consumer: the
         // first provider request started after that command is injected.
@@ -511,7 +535,7 @@ impl Runner {
             self.attempt_sequence,
             &self.context,
             command_received_at,
-            cancel,
+            cancel.clone(),
         );
         let mut attempt = match CancelOnDrop::new(start, start_cancel).await {
             Ok(attempt) => attempt,
@@ -538,18 +562,40 @@ impl Runner {
         loop {
             tokio::select! {
                 biased;
-                event = attempt.events.recv() => {
-                    let Some(event) = event else {
-                        // EOF or cancellation.
-                        drop(rejected_results);
-                        if let Some(command) = self.hard_steer_command.take() {
-                            return self.close_hard_steer_attempt(
-                                &attempt.message_id,
-                                message_started,
-                                attempt.initial_message.clone(),
-                                command,
-                            ).await;
+                control = self.controls.recv() => {
+                    let Some(control) = control else {
+                        return Err(WorkerFailure::Cancelled);
+                    };
+                    match control {
+                        RunControl::HardSteer { command, accepted } => {
+                            if accepted.send(true).is_ok() {
+                                self.hard_steer_command = Some(command);
+                                // The Session will cancel the provider attempt
+                                // only after `bind_hard_steer` commits.
+                            }
                         }
+                        RunControl::Abort { accepted, .. } => {
+                            if accepted.send(true).is_ok() {
+                                self.abort_requested = true;
+                                self.cancel_provider();
+                            }
+                        }
+                        RunControl::SoftSteer { accepted, committed, .. }
+                        | RunControl::RetrySteer { accepted, committed, .. } => {
+                            let _ = accepted.send(false);
+                            drop(committed);
+                        }
+                        RunControl::Command(command) => {
+                            self.core
+                                .queue_followup(command)
+                                .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+                        }
+                    }
+                }
+                event = attempt.events.recv(), if self.hard_steer_command.is_none() => {
+                    let Some(event) = event else {
+                        // EOF while not hard-steering.
+                        drop(rejected_results);
                         if self.abort_requested {
                             return self.close_aborted_attempt(
                                 &attempt.message_id,
@@ -744,32 +790,28 @@ impl Runner {
                         }
                     }
                 }
-                control = self.controls.recv() => {
-                    let Some(control) = control else {
-                        return Err(WorkerFailure::Cancelled);
-                    };
-                    match control {
-                        RunControl::HardSteer { command, accepted } => {
-                            let _ = accepted.send(true);
-                            self.hard_steer_command = Some(command);
-                            self.cancel_provider();
-                        }
-                        RunControl::Abort { accepted, .. } => {
-                            let _ = accepted.send(true);
-                            self.abort_requested = true;
-                            self.cancel_provider();
-                        }
-                        RunControl::SoftSteer { accepted, committed, .. }
-                        | RunControl::RetrySteer { accepted, committed, .. } => {
-                            let _ = accepted.send(false);
-                            drop(committed);
-                        }
-                        RunControl::Command(command) => {
-                            self.core
-                                .queue_followup(command)
-                                .map_err(|error| WorkerFailure::Error(error.to_string()))?;
-                        }
+                () = cancel.cancelled() => {
+                    drop(rejected_results);
+                    if self.abort_requested {
+                        return self.close_aborted_attempt(
+                            &attempt.message_id,
+                            message_started,
+                            attempt.initial_message.clone(),
+                        ).await;
                     }
+                    if let Some(command) = self.hard_steer_command.take() {
+                        return self.close_hard_steer_attempt(
+                            &attempt.message_id,
+                            message_started,
+                            attempt.initial_message.clone(),
+                            command,
+                        ).await;
+                    }
+                    return self.close_broken_attempt(
+                        &attempt.message_id,
+                        message_started,
+                        "provider was cancelled".to_owned(),
+                    ).await;
                 }
             }
         }
@@ -992,10 +1034,6 @@ impl Runner {
                     let Some(control) = control else {
                         return Err(WorkerFailure::Cancelled.into());
                     };
-                    cancel.cancel();
-                    // Wait for the driver to observe cancellation, then handle
-                    // the control that interrupted this tool.
-                    let _ = future.await;
                     match control {
                         RunControl::SoftSteer {
                             command,
@@ -1007,24 +1045,53 @@ impl Runner {
                             accepted,
                             committed,
                         } => {
-                            if let Err(error) =
-                                self.accept_steer_control(command, accepted, committed).await
-                            {
-                                return Err(error.into());
+                            self.claim_control(command)?;
+                            if accepted.send(true).is_ok() {
+                                cancel.cancel();
+                                // Wait for the driver to observe cancellation,
+                                // then verify durability authorization before
+                                // returning the steered tool result.
+                                let _ = future.await;
+                                committed.await.map_err(|_| {
+                                    WorkerFailure::Error(
+                                        "steer control durability authorization was dropped"
+                                            .to_owned(),
+                                    )
+                                })?;
+                                return Err(ExecuteToolError::Cancelled);
                             }
-                            return Err(ExecuteToolError::Cancelled);
+                            self.in_flight_controls.pop();
+                            continue;
                         }
                         RunControl::Abort { accepted, .. } => {
-                            self.abort_requested = true;
-                            let _ = accepted.send(true);
-                            return Err(ExecuteToolError::Cancelled);
+                            if accepted.send(true).is_ok() {
+                                cancel.cancel();
+                                // Wait for the driver to observe cancellation,
+                                // then record that this run has been aborted.
+                                let _ = future.await;
+                                self.abort_requested = true;
+                                return Err(ExecuteToolError::Cancelled);
+                            }
+                            continue;
                         }
                         RunControl::HardSteer { command, accepted } => {
-                            self.hard_steer_command = Some(command);
-                            let _ = accepted.send(true);
-                            return Err(ExecuteToolError::Cancelled);
+                            if accepted.send(true).is_ok() {
+                                cancel.cancel();
+                                // Wait for the driver to observe cancellation,
+                                // then retain the hard-steer command for the
+                                // next turn boundary.
+                                let _ = future.await;
+                                self.hard_steer_command = Some(command);
+                                return Err(ExecuteToolError::Cancelled);
+                            }
+                            continue;
                         }
                         RunControl::Command(command) => {
+                            cancel.cancel();
+                            // Wait for the driver to observe cancellation, then
+                            // queue the ordinary follow-up that interrupted this
+                            // tool.
+                            let _ = future.await;
                             self.core
                                 .queue_followup(command)
                                 .map_err(|error| WorkerFailure::Error(error.to_string()))?;
@@ -1292,31 +1359,28 @@ impl Runner {
                     return Ok(());
                 }
                 RunControl::HardSteer { command, accepted } => {
-                    self.cancel_provider();
-                    self.core
-                        .queue_followup(command)
-                        .map_err(|error| WorkerFailure::Error(error.to_string()))?;
-                    let _ = accepted.send(true);
-                    return Ok(());
+                    if accepted.send(true).is_ok() {
+                        self.cancel_provider();
+                        self.core
+                            .queue_followup(command)
+                            .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+                        return Ok(());
+                    }
                 }
                 RunControl::SoftSteer {
                     command,
                     accepted,
                     committed,
                 } => {
-                    let _ = accepted.send(true);
-                    committed.await.map_err(|_| {
-                        WorkerFailure::Error(
-                            "soft steer durability authorization was dropped".to_owned(),
-                        )
-                    })?;
-                    self.claim_control(command)?;
+                    self.accept_steer_control(command, accepted, committed)
+                        .await?;
                 }
                 RunControl::Abort { accepted, .. } => {
-                    self.cancel_provider();
-                    self.abort_requested = true;
-                    let _ = accepted.send(true);
-                    return Ok(());
+                    if accepted.send(true).is_ok() {
+                        self.cancel_provider();
+                        self.abort_requested = true;
+                        return Ok(());
+                    }
                 }
                 RunControl::RetrySteer {
                     accepted,
@@ -1413,15 +1477,17 @@ impl Runner {
                     continue;
                 }
                 RunControl::HardSteer { command, accepted } => {
-                    self.cancel_provider();
-                    self.claim_control(command)?;
-                    let _ = accepted.send(true);
-                    return Ok(true);
+                    if accepted.send(true).is_ok() {
+                        self.cancel_provider();
+                        self.claim_control(command)?;
+                        return Ok(true);
+                    }
                 }
                 RunControl::Abort { accepted, .. } => {
-                    self.cancel_provider();
-                    let _ = accepted.send(true);
-                    return Err(WorkerFailure::Cancelled);
+                    if accepted.send(true).is_ok() {
+                        self.cancel_provider();
+                        return Err(WorkerFailure::Cancelled);
+                    }
                 }
                 RunControl::SoftSteer {
                     command,

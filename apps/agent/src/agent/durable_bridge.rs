@@ -1518,6 +1518,13 @@ impl DurableBridge {
             .pending_hard_steer_user_message_id
             .take()
             .ok_or_else(|| anyhow!("hard-steer user MessageEnd has no expected message id"))?;
+        let (start_id, start_message) = self
+            .pending_start
+            .take()
+            .ok_or_else(|| anyhow!("hard-steer user MessageEnd has no buffered MessageStart"))?;
+        if start_id != message_id || start_message != message {
+            bail!("hard-steer user MessageStart/End pair is not exact");
+        }
         if message_id != expected_message_id {
             bail!("hard-steer user message id does not derive from the steering command");
         }
@@ -1835,6 +1842,232 @@ impl DurableBridge {
 mod tests {
     use super::*;
 
+    use crate::{
+        gateway::{Command, CommandEnvelope, CommandId, InboundCommand},
+        provider::types::{
+            PublicAssistantMessage, PublicMessage, StopReason, ToolResultMessage, UserContent,
+            UserMessage,
+        },
+        store::{
+            ApplicationKind, DurableEvent, EventBatch, EventWriter, InjectedCommand, Projection,
+            RunPhase, Store,
+        },
+    };
+
+    fn test_timestamp() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-07-20T01:02:03.456789Z")
+            .expect("valid test timestamp")
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn test_user_command(seq: u64, command_id: &str, text: &str) -> InboundCommand {
+        InboundCommand::Valid(CommandEnvelope {
+            seq,
+            command_id: CommandId::parse(command_id).expect("canonical test UUID"),
+            command: Command::UserMessage {
+                text: text.to_owned(),
+                attachments: Vec::new(),
+            },
+        })
+    }
+
+    fn test_admitted(seq: u64, command_id: &str, text: &str) -> AdmittedCommand {
+        AdmittedCommand::new(
+            CommandEnvelope {
+                seq,
+                command_id: CommandId::parse(command_id).expect("canonical test UUID"),
+                command: Command::UserMessage {
+                    text: text.to_owned(),
+                    attachments: Vec::new(),
+                },
+            },
+            test_timestamp(),
+        )
+    }
+
+    async fn test_store() -> std::sync::Arc<Store> {
+        Store::session_test_store("durable-bridge-test")
+            .await
+            .expect("open test store")
+            .into()
+    }
+
+    async fn persist_and_pin(
+        store: &Store,
+        writer: &EventWriter,
+        seq: u64,
+        command_id: &str,
+        text: &str,
+    ) -> chrono::DateTime<chrono::Utc> {
+        let timestamp = test_timestamp();
+        writer
+            .persist_inbound(&test_user_command(seq, command_id, text))
+            .await
+            .expect("persist command");
+        sqlx::query("UPDATE inbound_commands SET received_at=? WHERE command_id=?")
+            .bind(timestamp.to_rfc3339())
+            .bind(command_id)
+            .execute(store.pool())
+            .await
+            .expect("pin durable timestamp");
+        timestamp
+    }
+
+    async fn owner_in_phase(
+        store: &Store,
+        writer: &EventWriter,
+        command_id: &str,
+        run_id: &str,
+        turn_id: &str,
+        phase: RunPhase,
+    ) -> (DurableRunBinding, Option<(String, PublicMessage)>) {
+        let binding = DurableRunBinding {
+            command_id: command_id.to_owned(),
+            command_seq: 1,
+            run_id: run_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            executor_generation: crate::runtime::contracts::ProcessGeneration::MIN,
+        };
+        let assistant_message_id = format!("{}-assistant", command_id);
+
+        let _ = persist_and_pin(store, writer, 1, command_id, "owner").await;
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![Projection::CommandClassified {
+                        command_id: command_id.to_owned(),
+                        application_kind: ApplicationKind::IdleRun,
+                        run_id: run_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("classify owner");
+
+        let message_id = crate::store::user_message_id(command_id);
+        let message = PublicMessage::User(UserMessage {
+            content: vec![UserContent::Text {
+                text: "owner".to_owned(),
+            }],
+            timestamp: test_timestamp(),
+        });
+
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(DurableEvent::agent_start(run_id).expect("AgentStart")),
+                        projections: vec![Projection::RunPhase {
+                            command_id: command_id.to_owned(),
+                            run_id: run_id.to_owned(),
+                            expected: RunPhase::Classified,
+                            next: RunPhase::RunStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(DurableEvent::turn_start(run_id, turn_id).expect("TurnStart")),
+                        projections: vec![Projection::RunPhase {
+                            command_id: command_id.to_owned(),
+                            run_id: run_id.to_owned(),
+                            expected: RunPhase::RunStarted,
+                            next: RunPhase::TurnStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_start", &message_id, &message)
+                                .expect("MessageStart"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: command_id.to_owned(),
+                            run_id: run_id.to_owned(),
+                            expected: RunPhase::TurnStarted,
+                            next: RunPhase::UserStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_end", &message_id, &message)
+                                .expect("MessageEnd"),
+                        ),
+                        projections: vec![
+                            Projection::MessageEnd {
+                                message_id: message_id.clone(),
+                                role: "user",
+                                message,
+                                append_to_l0: true,
+                            },
+                            Projection::RunPhase {
+                                command_id: command_id.to_owned(),
+                                run_id: run_id.to_owned(),
+                                expected: RunPhase::UserStarted,
+                                next: RunPhase::UserCommitted,
+                            },
+                        ],
+                    },
+                ],
+                injected_commands: vec![InjectedCommand::new(
+                    1,
+                    CommandId::parse(command_id).expect("canonical"),
+                )],
+            })
+            .await
+            .expect("inject owner");
+
+        let mut assistant_message: Option<(String, PublicMessage)> = None;
+        if phase == RunPhase::AssistantStarted {
+            let assistant = PublicMessage::Assistant(PublicAssistantMessage {
+                content: Vec::new(),
+                model: "test".to_owned(),
+                provider: "test".to_owned(),
+                origin: crate::provider::types::ProviderOrigin {
+                    provider_instance_id: "test".to_owned(),
+                    protocol: crate::provider::types::ApiProtocol::OpenAiChatCompletions,
+                    model: "test".to_owned(),
+                },
+                usage: crate::provider::types::Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                provider_code: None,
+                interrupted: false,
+                timestamp: test_timestamp(),
+            });
+            writer
+                .apply(EventBatch {
+                    writes: vec![EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_start",
+                                &assistant_message_id,
+                                &assistant,
+                                Some(run_id.to_owned()),
+                                Some(turn_id.to_owned()),
+                            )
+                            .expect("assistant MessageStart"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: command_id.to_owned(),
+                            run_id: run_id.to_owned(),
+                            expected: RunPhase::UserCommitted,
+                            next: RunPhase::AssistantStarted,
+                        }],
+                    }],
+                    injected_commands: Vec::new(),
+                })
+                .await
+                .expect("transition owner to assistant_started");
+            assistant_message = Some((assistant_message_id.clone(), assistant.clone()));
+        } else if phase != RunPhase::UserCommitted {
+            panic!("owner_in_phase does not support {}", phase.as_str());
+        }
+
+        (binding, assistant_message)
+    }
+
     fn binding(command_id: &str) -> DurableRunBinding {
         DurableRunBinding {
             command_id: command_id.to_owned(),
@@ -1917,5 +2150,154 @@ mod tests {
             !bridge.can_bind_soft_steer(&writer, &command),
             "soft steer must not bind while a steer group is collecting messages"
         );
+    }
+
+    #[tokio::test]
+    async fn hard_steer_user_message_consumes_pending_start_and_allows_tool_result() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+
+        let owner_id = "00000000-0000-4000-8000-000000000001";
+        let run_id = "run-001";
+        let turn_id = "turn-001";
+        let (owner_binding, owner_assistant) = owner_in_phase(
+            &store,
+            &writer,
+            owner_id,
+            run_id,
+            turn_id,
+            RunPhase::AssistantStarted,
+        )
+        .await;
+        let (owner_assistant_id, _) = owner_assistant.expect("owner in assistant started");
+
+        let mut bridge = DurableBridge::new(owner_binding);
+        bridge.phase = RunPhase::AssistantStarted;
+        bridge.turn_open = true;
+        bridge.assistant_open = Some(owner_assistant_id.clone());
+
+        let steer_id = "00000000-0000-4000-8000-000000000002";
+        let _ = persist_and_pin(&store, &writer, 2, steer_id, "steer now").await;
+        let steer_command = test_admitted(2, steer_id, "steer now");
+
+        bridge
+            .bind_hard_steer(&writer, steer_command.clone())
+            .await
+            .expect("bind hard steer");
+
+        let partial = PublicMessage::Assistant(PublicAssistantMessage {
+            content: Vec::new(),
+            model: "test".to_owned(),
+            provider: "test".to_owned(),
+            origin: crate::provider::types::ProviderOrigin {
+                provider_instance_id: "test".to_owned(),
+                protocol: crate::provider::types::ApiProtocol::OpenAiChatCompletions,
+                model: "test".to_owned(),
+            },
+            usage: crate::provider::types::Usage::default(),
+            stop_reason: StopReason::Aborted,
+            error_message: None,
+            provider_code: None,
+            interrupted: true,
+            timestamp: test_timestamp(),
+        });
+
+        let (assistant_barrier, _) = MessageCommitBarrier::channel();
+        let committed = bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: bridge.binding.clone(),
+                    event: AgentEvent::MessageEnd {
+                        message_id: owner_assistant_id,
+                        message: Box::new(partial),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: Some(assistant_barrier),
+                    retry_wait_commit_barrier: None,
+                },
+            )
+            .await
+            .expect("commit hard-steer partial assistant");
+        committed.resolve_message_receipts();
+
+        let user_message_id = crate::store::user_message_id(&steer_command.envelope().command_id);
+        let user_message = PublicMessage::User(UserMessage {
+            content: vec![UserContent::Text {
+                text: "steer now".to_owned(),
+            }],
+            timestamp: steer_command.received_at(),
+        });
+
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: bridge.binding.clone(),
+                    event: AgentEvent::MessageStart {
+                        message_id: user_message_id.clone(),
+                        message: Box::new(user_message.clone()),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                },
+            )
+            .await
+            .expect("commit hard-steer user MessageStart");
+
+        let (user_barrier, _) = MessageCommitBarrier::channel();
+        let committed = bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: bridge.binding.clone(),
+                    event: AgentEvent::MessageEnd {
+                        message_id: user_message_id,
+                        message: Box::new(user_message),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: Some(user_barrier),
+                    retry_wait_commit_barrier: None,
+                },
+            )
+            .await
+            .expect("commit hard-steer user MessageEnd");
+        committed.resolve_message_receipts();
+
+        let tool_message_id = "tool-result-1".to_owned();
+        let tool_message = PublicMessage::ToolResult(ToolResultMessage {
+            tool_call_id: "call-1".to_owned(),
+            tool_name: "read_file".to_owned(),
+            content: vec![UserContent::Text {
+                text: "result".to_owned(),
+            }],
+            details: serde_json::json!({"ok": true}),
+            is_error: false,
+            timestamp: test_timestamp(),
+        });
+        let tool_binding = DurableRunBinding {
+            command_id: owner_id.to_owned(),
+            command_seq: 1,
+            run_id: run_id.to_owned(),
+            turn_id: bridge.binding.turn_id.clone(),
+            executor_generation: bridge.binding.executor_generation,
+        };
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: tool_binding,
+                    event: AgentEvent::MessageStart {
+                        message_id: tool_message_id,
+                        message: Box::new(tool_message),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                },
+            )
+            .await
+            .expect("tool result MessageStart accepted after hard-steer user");
     }
 }
