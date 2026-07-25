@@ -186,9 +186,23 @@ pub enum WireCommand {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "WireCommandEnvelopeInput")]
 pub struct WireCommandEnvelope {
-    pub seq: u64,
-    pub command_id: String,
-    pub command: WireCommand,
+    seq: u64,
+    command_id: String,
+    command: WireCommand,
+}
+
+impl WireCommandEnvelope {
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    pub fn command_id(&self) -> &str {
+        &self.command_id
+    }
+
+    pub fn command(&self) -> &WireCommand {
+        &self.command
+    }
 }
 
 #[derive(Deserialize)]
@@ -1510,8 +1524,10 @@ mod tests {
             "$ref": format!("#/$defs/{definition}"),
             "$defs": contract["$defs"].clone(),
         });
-        let validator =
-            jsonschema::validator_for(&schema).expect("canonical agent-events schema compiles");
+        let validator = jsonschema::options()
+            .should_validate_formats(true)
+            .build(&schema)
+            .expect("canonical agent-events schema compiles");
         validator.is_valid(value)
     }
 
@@ -1645,7 +1661,7 @@ mod tests {
         assert_canonical_contract("CommandEnvelope", &serde_json::to_value(&wire).unwrap());
         let back: WireCommandEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(wire, back);
-        assert_eq!(back.command_id, "00000000-0000-4000-8000-000000000001");
+        assert_eq!(back.command_id(), "00000000-0000-4000-8000-000000000001");
     }
 
     #[test]
