@@ -8,13 +8,12 @@
 
 #![allow(dead_code)]
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Once};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
-use tokio::io::BufReader;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest, http::HeaderValue};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite};
@@ -25,13 +24,19 @@ use super::supervisor::{
 use super::wire;
 use super::{Gateway, GatewayClosed, GatewayReader, GatewayWriter, InboundCommand, OutboundFrame};
 
-/// Outbound connector for `wss://` (production) or `ws://` (tests).
+static RUSTLS_INIT: Once = Once::new();
+
+/// Outbound connector for `wss://` (production). `ws://` is only allowed when
+/// constructed with [`WebSocketConnector::new_insecure`], which is exposed for
+/// test fixtures that spin a local plaintext server.
 pub struct WebSocketConnector {
     url: String,
     digest_factory: Arc<dyn crate::gateway::CommandDigestFactory>,
+    allow_insecure: bool,
 }
 
 impl WebSocketConnector {
+    /// Create a production connector that requires `wss://`.
     pub fn new(
         url: impl Into<String>,
         digest_factory: Arc<dyn crate::gateway::CommandDigestFactory>,
@@ -39,6 +44,20 @@ impl WebSocketConnector {
         Self {
             url: url.into(),
             digest_factory,
+            allow_insecure: false,
+        }
+    }
+
+    /// Create a test-only connector that permits `ws://`.
+    #[cfg(test)]
+    pub fn new_insecure(
+        url: impl Into<String>,
+        digest_factory: Arc<dyn crate::gateway::CommandDigestFactory>,
+    ) -> Self {
+        Self {
+            url: url.into(),
+            digest_factory,
+            allow_insecure: true,
         }
     }
 }
@@ -47,6 +66,7 @@ impl std::fmt::Debug for WebSocketConnector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WebSocketConnector")
             .field("url", &self.url)
+            .field("allow_insecure", &self.allow_insecure)
             .finish_non_exhaustive()
     }
 }
@@ -59,6 +79,16 @@ impl GatewayConnector for WebSocketConnector {
         &mut self,
         credential: GatewayCredential,
     ) -> Result<Self::Connection, ConnectorError> {
+        RUSTLS_INIT.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+
+        if self.url.starts_with("ws://") && !self.allow_insecure {
+            return Err(ConnectorError::Other(anyhow!(
+                "refusing to send bearer credential over insecure ws://"
+            )));
+        }
+
         let mut request = self
             .url
             .as_str()
@@ -72,7 +102,9 @@ impl GatewayConnector for WebSocketConnector {
 
         match connect_async(request).await {
             Ok((ws, _)) => Ok(WebSocketGateway::new(ws, self.digest_factory.clone())),
-            Err(tungstenite::Error::Http(response)) if response.status() == 401 => {
+            Err(tungstenite::Error::Http(response))
+                if matches!(response.status().as_u16(), 401 | 403) =>
+            {
                 Err(ConnectorError::AuthRejected)
             }
             Err(e) => Err(ConnectorError::Other(anyhow!(
@@ -110,9 +142,10 @@ impl Gateway for WebSocketGateway {
             .await
             .context("send agent hello")?;
 
-        let msg = tokio::time::timeout(Duration::from_secs(30), self.ws.next())
+        let msg = self
+            .ws
+            .next()
             .await
-            .context("hello response timeout")?
             .context("websocket closed before hello response")?
             .context("websocket error")?;
 
@@ -196,5 +229,73 @@ async fn decode_command_bytes(
     factory: &dyn crate::gateway::CommandDigestFactory,
 ) -> Result<InboundCommand> {
     let mut input = BufReader::new(bytes.as_slice());
-    crate::gateway::stdio::read_command(&mut input, factory).await
+    let command = crate::gateway::stdio::read_command(&mut input, factory).await?;
+    let remaining = input
+        .fill_buf()
+        .await
+        .context("drain websocket command buffer")?;
+    if !remaining.is_empty() {
+        bail!("websocket message contains trailing bytes");
+    }
+    Ok(command)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use sha2::{Digest, Sha256};
+
+    use super::super::{
+        CommandDigestFactory, GatewayConnector, GatewayCredential, IncrementalCommandDigest,
+    };
+    use super::{WebSocketConnector, decode_command_bytes};
+
+    struct TestDigestFactory;
+
+    impl CommandDigestFactory for TestDigestFactory {
+        fn start(&self) -> Box<dyn IncrementalCommandDigest> {
+            Box::new(TestDigest(Sha256::new()))
+        }
+    }
+
+    struct TestDigest(Sha256);
+
+    impl IncrementalCommandDigest for TestDigest {
+        fn update(&mut self, data: &[u8]) {
+            self.0.update(data);
+        }
+
+        fn finish(self: Box<Self>) -> crate::gateway::KeyedCommandDigest {
+            let hash = self.0.finalize();
+            let mut hmac = [0u8; 32];
+            hmac.copy_from_slice(&hash[..32.min(hash.len())]);
+            crate::gateway::KeyedCommandDigest {
+                key_ref: "test".to_owned(),
+                hmac,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_insecure_ws_without_explicit_flag() {
+        let mut connector =
+            WebSocketConnector::new("ws://localhost:1234", Arc::new(TestDigestFactory));
+        let result = connector.connect(GatewayCredential::new("token")).await;
+        let err = result.err().expect("connect must fail");
+        assert!(
+            matches!(err, super::super::ConnectorError::Other(ref e) if e.to_string().contains("insecure ws://")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn decode_command_bytes_rejects_multiple_frames_in_one_message() {
+        let bytes = b"{\"seq\":1,\"command_id\":\"00000000-0000-4000-8000-000000000001\",\"command\":{\"type\":\"abort\"}}\n{\"seq\":2,\"command_id\":\"00000000-0000-4000-8000-000000000002\",\"command\":{\"type\":\"abort\"}}\n".to_vec();
+        let result = decode_command_bytes(bytes, &TestDigestFactory).await;
+        assert!(
+            result.is_err() && format!("{:?}", result).contains("trailing bytes"),
+            "expected trailing bytes rejection, got {result:?}"
+        );
+    }
 }
