@@ -1,0 +1,3314 @@
+//! Canonical action representation and secret-aware projection for approval.
+
+use std::{
+    ffi::OsString,
+    fmt,
+    path::{Component, Path, PathBuf},
+};
+
+use hmac::{Hmac, Mac};
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
+use sha2::Sha256;
+use zeroize::Zeroize;
+
+use crate::provider::types::ValidatedToolArguments;
+use crate::store::Redactor;
+
+pub const BASH_TOOL_NAME: &str = "bash";
+
+/// Runtime-internal representation of a tool call. Not serializable, not stored,
+/// and its `Debug` implementation redacts `argv`, `cwd`, `affected_paths`, and
+/// `justification` so secret material never leaks through diagnostics.
+pub struct CanonicalAction {
+    pub tool: String,
+    pub operation: String,
+    pub argv: Vec<String>,
+    pub cwd: PathBuf,
+    pub affected_paths: Vec<PathBuf>,
+    pub sandbox: SandboxSummary,
+    pub requested_permissions: Vec<Permission>,
+    pub justification: Option<String>,
+}
+
+impl CanonicalAction {
+    /// Best-effort conversion from a validated tool call into a runtime-internal
+    /// canonical action. The mapping is intentionally minimal: it only knows
+    /// the standard workspace tool vocabulary used by the current executor.
+    pub fn from_tool_call(
+        workspace_root: PathBuf,
+        tool_name: &str,
+        args: &ValidatedToolArguments,
+    ) -> Result<Self, ActionError> {
+        let map = args.as_object();
+        let mut action = match tool_name {
+            "read_file" => Self {
+                tool: tool_name.to_owned(),
+                operation: "read".to_owned(),
+                argv: vec![tool_name.to_owned(), get_path_arg(map, "path")?],
+                cwd: workspace_root.clone(),
+                affected_paths: vec![PathBuf::from(get_path_arg(map, "path")?)],
+                sandbox: SandboxSummary::workspace(),
+                requested_permissions: vec![Permission::ReadWorkspace],
+                justification: None,
+            },
+            "write_file" => Self {
+                tool: tool_name.to_owned(),
+                operation: "write".to_owned(),
+                argv: vec![tool_name.to_owned(), get_path_arg(map, "path")?],
+                cwd: workspace_root.clone(),
+                affected_paths: vec![PathBuf::from(get_path_arg(map, "path")?)],
+                sandbox: SandboxSummary::workspace(),
+                requested_permissions: vec![Permission::WriteWorkspace],
+                justification: None,
+            },
+            "edit_file" => Self {
+                tool: tool_name.to_owned(),
+                operation: "edit".to_owned(),
+                argv: vec![tool_name.to_owned(), get_path_arg(map, "path")?],
+                cwd: workspace_root.clone(),
+                affected_paths: vec![PathBuf::from(get_path_arg(map, "path")?)],
+                sandbox: SandboxSummary::workspace(),
+                requested_permissions: vec![Permission::EditWorkspace],
+                justification: None,
+            },
+            "delete" => Self {
+                tool: tool_name.to_owned(),
+                operation: "delete".to_owned(),
+                argv: vec![tool_name.to_owned(), get_path_arg(map, "path")?],
+                cwd: workspace_root.clone(),
+                affected_paths: vec![PathBuf::from(get_path_arg(map, "path")?)],
+                sandbox: SandboxSummary::workspace(),
+                requested_permissions: vec![Permission::DeleteWorkspace],
+                justification: None,
+            },
+            "list_dir" => Self {
+                tool: tool_name.to_owned(),
+                operation: "read".to_owned(),
+                argv: vec![tool_name.to_owned(), get_path_arg(map, "path")?],
+                cwd: workspace_root.clone(),
+                affected_paths: vec![PathBuf::from(get_path_arg(map, "path")?)],
+                sandbox: SandboxSummary::workspace(),
+                requested_permissions: vec![Permission::ReadWorkspace],
+                justification: None,
+            },
+            "glob" => Self {
+                tool: tool_name.to_owned(),
+                operation: "read".to_owned(),
+                argv: vec![tool_name.to_owned(), get_path_arg(map, "pattern")?],
+                cwd: workspace_root.clone(),
+                affected_paths: vec![PathBuf::from(get_path_arg(map, "pattern")?)],
+                sandbox: SandboxSummary::workspace(),
+                requested_permissions: vec![Permission::ReadWorkspace],
+                justification: None,
+            },
+            "grep" => Self {
+                tool: tool_name.to_owned(),
+                operation: "read".to_owned(),
+                argv: vec![
+                    tool_name.to_owned(),
+                    get_path_arg(map, "path")?,
+                    get_string(map, "pattern")?,
+                ],
+                cwd: workspace_root.clone(),
+                affected_paths: vec![PathBuf::from(get_path_arg(map, "path")?)],
+                sandbox: SandboxSummary::workspace(),
+                requested_permissions: vec![Permission::ReadWorkspace],
+                justification: None,
+            },
+            "bash" => {
+                let command = get_string(map, "command")?;
+                let mut permissions = vec![Permission::Exec];
+                if network_indicators_in_command(&command) {
+                    permissions.push(Permission::Network);
+                }
+                permissions.sort();
+                permissions.dedup();
+                Self {
+                    tool: tool_name.to_owned(),
+                    operation: "exec".to_owned(),
+                    argv: vec![command],
+                    cwd: workspace_root.clone(),
+                    affected_paths: vec![],
+                    sandbox: SandboxSummary::workspace(),
+                    requested_permissions: permissions,
+                    justification: None,
+                }
+            }
+            _ => return Err(ActionError::UnknownTool(tool_name.to_owned())),
+        };
+        action.cwd = workspace_root;
+        action.requested_permissions.sort();
+        action.requested_permissions.dedup();
+        action.validate()?;
+        Ok(action)
+    }
+
+    /// Validate the invariants that make a canonical action meaningful to the
+    /// approval policy. The fields remain runtime-internal in spirit (the
+    /// struct is not serializable), but callers can still construct one in
+    /// tests or integration glue, so the policy boundary must not trust a
+    /// forged tool/operation/permission tuple.
+    pub fn validate(&self) -> Result<(), ActionError> {
+        let expected_operation = match self.tool.as_str() {
+            "read_file" | "list_dir" | "glob" | "grep" => "read",
+            "write_file" => "write",
+            "edit_file" => "edit",
+            "delete" => "delete",
+            BASH_TOOL_NAME => "exec",
+            _ => return Err(ActionError::InvalidAction("unknown canonical tool")),
+        };
+        if self.operation != expected_operation {
+            return Err(ActionError::InvalidAction("tool operation mismatch"));
+        }
+
+        let expected_permission = match self.tool.as_str() {
+            "read_file" | "list_dir" | "glob" | "grep" => Permission::ReadWorkspace,
+            "write_file" => Permission::WriteWorkspace,
+            "edit_file" => Permission::EditWorkspace,
+            "delete" => Permission::DeleteWorkspace,
+            BASH_TOOL_NAME => Permission::Exec,
+            _ => unreachable!("tool matched above"),
+        };
+        if !self.requested_permissions.contains(&expected_permission)
+            || self
+                .requested_permissions
+                .contains(&Permission::PrivilegeEscalation)
+        {
+            return Err(ActionError::InvalidAction("permission scope mismatch"));
+        }
+
+        if self.requested_permissions.windows(2).any(|w| w[1] <= w[0]) {
+            return Err(ActionError::InvalidAction(
+                "duplicate or unsorted permissions",
+            ));
+        }
+
+        if !is_lexically_normalized(&self.cwd) {
+            return Err(ActionError::InvalidAction("noncanonical cwd"));
+        }
+        for path in &self.affected_paths {
+            if !is_lexically_normalized(path) {
+                return Err(ActionError::InvalidAction("noncanonical affected path"));
+            }
+        }
+
+        if self.tool == BASH_TOOL_NAME {
+            let command = self.argv.first().map(String::as_str).unwrap_or("");
+            if self.argv.len() != 1
+                || !self.affected_paths.is_empty()
+                || self
+                    .requested_permissions
+                    .iter()
+                    .any(|permission| !matches!(permission, Permission::Exec | Permission::Network))
+                || network_indicators_in_command(command)
+                    != self.requested_permissions.contains(&Permission::Network)
+            {
+                return Err(ActionError::InvalidAction("shell action shape mismatch"));
+            }
+        } else if self.affected_paths.len() != 1 {
+            return Err(ActionError::InvalidAction(
+                "path action has no affected path",
+            ));
+        } else {
+            let expected_argv_len = if self.tool == "grep" { 3 } else { 2 };
+            if self.argv.len() != expected_argv_len
+                || self.argv.first().map(String::as_str) != Some(self.tool.as_str())
+                || self
+                    .argv
+                    .get(1)
+                    .is_none_or(|path| Path::new(path) != self.affected_paths[0])
+                || self
+                    .requested_permissions
+                    .iter()
+                    .any(|permission| *permission != expected_permission)
+            {
+                return Err(ActionError::InvalidAction("path action shape mismatch"));
+            }
+        }
+
+        if !self.cwd.is_absolute() {
+            return Err(ActionError::InvalidAction("canonical cwd must be absolute"));
+        }
+        if self.sandbox.network_allowed
+            && !self.requested_permissions.contains(&Permission::Network)
+        {
+            return Err(ActionError::InvalidAction(
+                "sandbox and permission scope mismatch",
+            ));
+        }
+        if !self.sandbox.workspace_only {
+            return Err(ActionError::InvalidAction(
+                "sandbox scope is broader than canonical workspace tools",
+            ));
+        }
+
+        for (index, value) in self.argv.iter().enumerate() {
+            if let Some(handle) = value.strip_prefix("artifact://") {
+                if !matches!(self.tool.as_str(), "read_file" | "grep")
+                    || index != 1
+                    || !is_valid_artifact_handle(handle)
+                {
+                    return Err(ActionError::InvalidAction(
+                        "artifact handle is not valid for this tool",
+                    ));
+                }
+            } else if value.contains("artifact://") {
+                return Err(ActionError::InvalidAction(
+                    "artifact handle is not valid for this tool",
+                ));
+            }
+        }
+        if self.cwd.to_string_lossy().contains("artifact://") {
+            return Err(ActionError::InvalidAction(
+                "artifact handle is not valid for this tool",
+            ));
+        }
+        if self
+            .justification
+            .as_deref()
+            .is_some_and(|text| text.contains("artifact://"))
+        {
+            return Err(ActionError::InvalidAction(
+                "artifact handle is not valid for this tool",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for CanonicalAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CanonicalAction")
+            .field("tool", &self.tool)
+            .field("operation", &self.operation)
+            .field(
+                "argv",
+                &format_args!("[{} tokens redacted]", self.argv.len()),
+            )
+            .field("cwd", &"[REDACTED]")
+            .field(
+                "affected_paths",
+                &format_args!("[{} paths redacted]", self.affected_paths.len()),
+            )
+            .field("sandbox", &self.sandbox)
+            .field("requested_permissions", &self.requested_permissions)
+            .field(
+                "justification",
+                &self.justification.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Permission {
+    ReadWorkspace,
+    WriteWorkspace,
+    EditWorkspace,
+    DeleteWorkspace,
+    Exec,
+    Network,
+    DomainMutation,
+    PrivilegeEscalation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxSummary {
+    pub network_allowed: bool,
+    pub workspace_only: bool,
+}
+
+impl SandboxSummary {
+    pub fn workspace() -> Self {
+        Self {
+            network_allowed: false,
+            workspace_only: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReviewToken {
+    Literal { text: String },
+    SecretRef { kind: String, digest: String },
+    Omitted,
+}
+
+impl ReviewToken {
+    fn is_empty_literal(&self) -> bool {
+        matches!(self, Self::Literal { text } if text.is_empty())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReviewPathComponent {
+    Literal { text: String },
+    SecretRef { kind: String, digest: String },
+    Omitted,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewPath(pub Vec<ReviewPathComponent>);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RedactedText(pub String);
+
+impl fmt::Display for RedactedText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewableAction {
+    pub tool: String,
+    pub operation: String,
+    pub argv: Vec<ReviewToken>,
+    pub cwd: ReviewPath,
+    pub affected_paths: Vec<ReviewPath>,
+    pub sandbox: SandboxSummary,
+    pub requested_permissions: Vec<Permission>,
+    pub justification: Option<RedactedText>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewProjection {
+    Reviewable(ReviewableAction),
+    InsufficientEvidence { reason: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretRef {
+    pub kind: String,
+    pub digest: String,
+}
+
+/// Keyed digest for secret identity comparison without value reconstruction.
+#[derive(Clone)]
+pub struct SecretDigestKey([u8; 32]);
+
+impl SecretDigestKey {
+    pub fn new(key: [u8; 32]) -> Self {
+        Self(key)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    #[cfg(test)]
+    pub const fn fixture() -> Self {
+        Self([0u8; 32])
+    }
+}
+
+impl Zeroize for SecretDigestKey {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl Drop for SecretDigestKey {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+/// Redactor plus credential inventory that turns a `CanonicalAction` into a
+/// review projection where secret material is replaced by `SecretRef` tokens.
+pub struct SecretAwareActionProjector {
+    redactor: Redactor,
+    inventory: SecretInventory,
+    key: SecretDigestKey,
+}
+
+fn credential_options_for_command(cmd: &str) -> Option<&'static [(&'static str, &'static str)]> {
+    const CREDENTIAL_FAMILIES: &[&str] = &[
+        "curl",
+        "wget",
+        "lftp",
+        "sshpass",
+        "mysql",
+        "mariadb",
+        "mongosh",
+        "cqlsh",
+        "sqlcmd",
+        "redis-cli",
+    ];
+    let family = shell::canonicalize_command_name(cmd, CREDENTIAL_FAMILIES)?;
+    match family {
+        "curl" => Some(&[("-u", "curl_user"), ("--user", "curl_user")]),
+        "wget" => Some(&[
+            ("--password", "wget_password"),
+            ("--user", "wget_user"),
+            ("--http-password", "wget_password"),
+            ("--http-user", "wget_user"),
+            ("--ftp-password", "wget_password"),
+            ("--ftp-user", "wget_user"),
+        ]),
+        "lftp" => Some(&[("-u", "lftp_user")]),
+        "sshpass" => Some(&[("-p", "sshpass_password")]),
+        "mysql" | "mariadb" => Some(&[("-p", "mysql_password"), ("--password", "mysql_password")]),
+        "mongosh" => Some(&[
+            ("-p", "mongosh_password"),
+            ("--password", "mongosh_password"),
+        ]),
+        "cqlsh" => Some(&[("-p", "cqlsh_password"), ("--password", "cqlsh_password")]),
+        "sqlcmd" => Some(&[("-P", "sqlcmd_password"), ("--password", "sqlcmd_password")]),
+        "redis-cli" => Some(&[
+            ("-a", "redis_auth"),
+            ("--pass", "redis_auth"),
+            ("--password", "redis_auth"),
+        ]),
+        _ => None,
+    }
+}
+
+fn shell_credential_spans(command: &str) -> Vec<Vec<(usize, usize, &'static str)>> {
+    let tokens = shell::tokenize_command(command);
+    let mut spans: Vec<Vec<(usize, usize, &'static str)>> = vec![Vec::new(); tokens.len()];
+    let Some(eff) = shell::effective_command(&tokens, 1) else {
+        return spans;
+    };
+    let cmd = shell::command_basename(eff.tokens.first().map(String::as_str).unwrap_or(""))
+        .to_ascii_lowercase();
+    let Some(options) = credential_options_for_command(&cmd) else {
+        return spans;
+    };
+    let base = tokens.len() - eff.tokens.len();
+    let mut i = base + 1;
+    while i < tokens.len() {
+        let token = &tokens[i];
+        let mut matched = None::<(usize, usize, usize, &'static str, usize)>;
+        for (prefix, kind) in options {
+            if prefix.starts_with("--") {
+                let lower = token.to_ascii_lowercase();
+                if lower == *prefix {
+                    if i + 1 < tokens.len() && !tokens[i + 1].starts_with('-') {
+                        matched = Some((i + 1, 0, tokens[i + 1].len(), *kind, 2));
+                    }
+                    break;
+                }
+                let eq = format!("{}=", prefix);
+                if lower.starts_with(&eq) {
+                    let start = prefix.len() + 1;
+                    if start < token.len() {
+                        matched = Some((i, start, token.len(), *kind, 1));
+                    }
+                    break;
+                }
+            } else if token.starts_with(*prefix) {
+                let prefix_len = prefix.len();
+                if token.len() > prefix_len {
+                    matched = Some((i, prefix_len, token.len(), *kind, 1));
+                } else if i + 1 < tokens.len() && !tokens[i + 1].starts_with('-') {
+                    matched = Some((i + 1, 0, tokens[i + 1].len(), *kind, 2));
+                }
+                break;
+            }
+        }
+        if let Some((idx, start, end, kind, consumed)) = matched {
+            spans[idx].push((start, end, kind));
+            i += consumed;
+        } else {
+            i += 1;
+        }
+    }
+    spans
+}
+
+fn contains_shell_credential(text: &str) -> bool {
+    shell_credential_spans(text)
+        .iter()
+        .any(|token_spans| !token_spans.is_empty())
+}
+
+impl SecretAwareActionProjector {
+    pub fn new(redactor: Redactor, key: SecretDigestKey) -> Self {
+        Self {
+            redactor,
+            inventory: SecretInventory::new(),
+            key,
+        }
+    }
+
+    /// Redact a raw tool-argument summary for the wire-visible `args_summary`
+    /// field. First applies the injected versioned `Redactor` (which preserves
+    /// durable-projection semantics and structured-key redaction), then the
+    /// projector's own `SecretInventory` to catch URL userinfo and generic query
+    /// secrets that the Store redactor does not yet cover.
+    pub fn redact_arguments(&self, args: &ValidatedToolArguments) -> anyhow::Result<JsonValue> {
+        let value = JsonValue::Object(args.as_object().clone());
+        let redacted = self.redactor.redact_value(&value)?;
+        self.redact_json_with_inventory(&redacted)
+    }
+
+    fn redact_json_with_inventory(&self, value: &JsonValue) -> anyhow::Result<JsonValue> {
+        match value {
+            JsonValue::String(text) => Ok(JsonValue::String(self.redact_text_with_inventory(text))),
+            JsonValue::Array(values) => Ok(JsonValue::Array(
+                values
+                    .iter()
+                    .map(|v| self.redact_json_with_inventory(v))
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+            )),
+            JsonValue::Object(object) => {
+                let mut redacted = serde_json::Map::with_capacity(object.len());
+                for (key, value) in object {
+                    let value = if key == "command" {
+                        match value {
+                            JsonValue::String(text) => {
+                                JsonValue::String(self.redact_bash_command_text(text))
+                            }
+                            _ => self.redact_json_with_inventory(value)?,
+                        }
+                    } else {
+                        self.redact_json_with_inventory(value)?
+                    };
+                    if redacted.insert(key.clone(), value).is_some() {
+                        return Err(anyhow::anyhow!(
+                            "JSON object keys collide after inventory redaction"
+                        ));
+                    }
+                }
+                Ok(JsonValue::Object(redacted))
+            }
+            scalar => Ok(scalar.clone()),
+        }
+    }
+
+    fn redact_text_with_inventory(&self, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut cursor = 0usize;
+        for m in self.inventory.find(text) {
+            out.push_str(&text[cursor..m.start]);
+            let secret = &text[m.start..m.end];
+            if !looks_like_redacted_placeholder(secret) {
+                out.push_str("[REDACTED:");
+                out.push_str(m.kind);
+                out.push(']');
+            } else {
+                out.push_str(secret);
+            }
+            cursor = m.end;
+        }
+        out.push_str(&text[cursor..]);
+        out
+    }
+
+    fn shell_token_normalized(span: &str) -> (String, Vec<usize>) {
+        let mut out = String::with_capacity(span.len());
+        let mut mapping = Vec::with_capacity(span.len() + 1);
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut escaped = false;
+        let mut orig_pos = 0usize;
+        let mut end_after_last = 0usize;
+
+        while orig_pos < span.len() {
+            if escaped {
+                let c = span[orig_pos..].chars().next().unwrap();
+                let start = orig_pos - 1;
+                out.push(c);
+                for _ in 0..c.len_utf8() {
+                    mapping.push(start);
+                }
+                end_after_last = orig_pos + c.len_utf8();
+                orig_pos += c.len_utf8();
+                escaped = false;
+                continue;
+            }
+            let c = span[orig_pos..].chars().next().unwrap();
+            if c == '\\' && !in_single {
+                escaped = true;
+                orig_pos += c.len_utf8();
+                continue;
+            }
+            if !in_double && c == '\'' {
+                in_single = !in_single;
+                orig_pos += c.len_utf8();
+                continue;
+            }
+            if !in_single && c == '"' {
+                in_double = !in_double;
+                orig_pos += c.len_utf8();
+                continue;
+            }
+            out.push(c);
+            mapping.push(orig_pos);
+            end_after_last = orig_pos + c.len_utf8();
+            orig_pos += c.len_utf8();
+        }
+        mapping.push(end_after_last);
+        (out, mapping)
+    }
+
+    fn redact_bash_command_text(&self, command: &str) -> String {
+        let credential_spans = shell_credential_spans(command);
+        let mut out = String::new();
+        let mut cursor = 0usize;
+        for (idx, (start, end, _)) in shell::tokenize_command_spans(command)
+            .into_iter()
+            .enumerate()
+        {
+            out.push_str(&command[cursor..start]);
+            let span = &command[start..end];
+            let (normalized, mapping) = Self::shell_token_normalized(span);
+            let cred = &credential_spans[idx];
+            let mut intervals: Vec<(usize, usize, &'static str)> = self
+                .inventory
+                .find(&normalized)
+                .into_iter()
+                .filter(|m| !cred.iter().any(|(s, e, _)| m.start < *e && m.end > *s))
+                .map(|m| (m.start, m.end, m.kind))
+                .collect();
+            for (cs, ce, kind) in cred.iter().copied() {
+                intervals.push((cs, ce, kind));
+            }
+            intervals.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+            if intervals.is_empty() {
+                out.push_str(span);
+                cursor = end;
+                continue;
+            }
+            let mut orig_cursor = start;
+            let mut last_end = 0usize;
+            for (s, e, kind) in intervals {
+                if s >= last_end {
+                    let secret_start = start + mapping[s];
+                    let secret_end = start + mapping[e];
+                    out.push_str(&command[orig_cursor..secret_start]);
+                    out.push_str("[REDACTED:");
+                    out.push_str(kind);
+                    out.push(']');
+                    orig_cursor = secret_end;
+                    last_end = e;
+                }
+            }
+            out.push_str(&command[orig_cursor..end]);
+            cursor = end;
+        }
+        out.push_str(&command[cursor..]);
+        out
+    }
+
+    /// Project a `CanonicalAction` into a reviewable form. If redaction removes
+    /// information needed to judge host, operation, path, or permission scope,
+    /// returns `InsufficientEvidence` instead of guessing.
+    pub fn project(&self, action: &CanonicalAction) -> ReviewProjection {
+        if action.validate().is_err() {
+            return ReviewProjection::InsufficientEvidence {
+                reason: "canonical action failed invariant validation".to_owned(),
+            };
+        }
+
+        let mut token_projections: Vec<TokenProjection> = Vec::new();
+        if action.tool == BASH_TOOL_NAME && action.operation == "exec" {
+            let command = action.argv.first().map(String::as_str).unwrap_or("");
+            if shell::has_unverifiable_construct(command) {
+                return ReviewProjection::InsufficientEvidence {
+                    reason: "shell construct is not representable as a literal review token"
+                        .to_owned(),
+                };
+            }
+            let credential_spans = shell_credential_spans(command);
+            for (idx, (start, end, text)) in shell::tokenize_command_spans(command)
+                .into_iter()
+                .enumerate()
+            {
+                let span = &command[start..end];
+                if shell::has_unverifiable_construct(span) {
+                    token_projections.push(TokenProjection {
+                        tokens: vec![ReviewToken::Omitted],
+                        has_visible_host: false,
+                        has_url: false,
+                    });
+                } else {
+                    token_projections.push(self.project_bash_token(&text, &credential_spans[idx]));
+                }
+            }
+        } else {
+            for raw in &action.argv {
+                token_projections.push(self.project_token(raw));
+            }
+        }
+
+        let argv: Vec<ReviewToken> = token_projections
+            .iter()
+            .flat_map(|tp| tp.tokens.clone())
+            .filter(|t| !t.is_empty_literal())
+            .collect();
+
+        if argv.is_empty() {
+            return ReviewProjection::InsufficientEvidence {
+                reason: "argv is empty or omitted".to_owned(),
+            };
+        }
+
+        if token_projections
+            .iter()
+            .any(|tp| tp.tokens.iter().any(|t| matches!(t, ReviewToken::Omitted)))
+        {
+            return ReviewProjection::InsufficientEvidence {
+                reason: "argv contains dynamic or omitted material".to_owned(),
+            };
+        }
+
+        if !self.all_argv_secrets_projected(action, &token_projections) {
+            return ReviewProjection::InsufficientEvidence {
+                reason: "argv secret could not be projected without loss".to_owned(),
+            };
+        }
+
+        if (action.requested_permissions.contains(&Permission::Network)
+            || action
+                .requested_permissions
+                .contains(&Permission::DomainMutation))
+            && (!token_projections.iter().any(|tp| tp.has_visible_host)
+                || token_projections
+                    .iter()
+                    .any(|tp| tp.has_url && !tp.has_visible_host))
+        {
+            return ReviewProjection::InsufficientEvidence {
+                reason: "network destination is redacted, dynamic, or missing".to_owned(),
+            };
+        }
+
+        let cwd = self.project_path(&action.cwd);
+        let affected_paths: Vec<ReviewPath> = action
+            .affected_paths
+            .iter()
+            .map(|p| self.project_path(p))
+            .collect();
+
+        if has_lost_material_path_component(&cwd) {
+            return ReviewProjection::InsufficientEvidence {
+                reason: "cwd component is redacted or omitted".to_owned(),
+            };
+        }
+
+        for path in &affected_paths {
+            if has_lost_material_path_component(path) {
+                return ReviewProjection::InsufficientEvidence {
+                    reason: "affected path component is redacted or omitted".to_owned(),
+                };
+            }
+        }
+
+        let justification = action
+            .justification
+            .as_ref()
+            .map(|text| RedactedText(self.render_redacted_text(text)));
+
+        ReviewProjection::Reviewable(ReviewableAction {
+            tool: self.render_redacted_text(&action.tool),
+            operation: self.render_redacted_text(&action.operation),
+            argv,
+            cwd,
+            affected_paths,
+            sandbox: action.sandbox.clone(),
+            requested_permissions: action.requested_permissions.clone(),
+            justification,
+        })
+    }
+
+    /// True if `text` contains a known secret pattern, regardless of any dynamic
+    /// constructs around it. Used to fail-closed on `ApproveAlways` candidate
+    /// rules that would otherwise persist credentials.
+    pub(crate) fn text_contains_secret(&self, text: &str) -> bool {
+        !self.inventory.find(text).is_empty() || contains_shell_credential(text)
+    }
+
+    fn all_argv_secrets_projected(
+        &self,
+        action: &CanonicalAction,
+        token_projections: &[TokenProjection],
+    ) -> bool {
+        let projected_digests: Vec<&str> = token_projections
+            .iter()
+            .flat_map(|projection| projection.tokens.iter())
+            .filter_map(|token| match token {
+                ReviewToken::SecretRef { digest, .. } => Some(digest.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        let check_text = |text: &str| {
+            self.inventory.find(text).into_iter().all(|secret| {
+                let normalized = secret.secret.trim_matches(['\'', '"']);
+                let digest = keyed_digest(&self.key, normalized);
+                projected_digests.contains(&digest.as_str())
+            })
+        };
+        if action.tool == BASH_TOOL_NAME && action.operation == "exec" {
+            if let Some(command) = action.argv.first() {
+                if !check_text(command) {
+                    return false;
+                }
+                let tokens = shell::tokenize_command(command);
+                for (idx, spans) in shell_credential_spans(command).iter().enumerate() {
+                    let Some(token) = tokens.get(idx) else {
+                        continue;
+                    };
+                    for (start, end, _kind) in spans {
+                        let secret = token[*start..*end].trim_matches(['\'', '"']);
+                        let digest = keyed_digest(&self.key, secret);
+                        if !projected_digests.contains(&digest.as_str()) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            true
+        } else {
+            action.argv.iter().all(|token| check_text(token))
+        }
+    }
+
+    fn project_token(&self, text: &str) -> TokenProjection {
+        let dynamic = find_dynamic_spans(text);
+        let secrets = self.inventory.find(text);
+        self.emit_tokens_with_host_check(text, &dynamic, &secrets)
+    }
+
+    fn project_bash_token(
+        &self,
+        text: &str,
+        credential_spans: &[(usize, usize, &'static str)],
+    ) -> TokenProjection {
+        let mut secrets: Vec<SecretMatch> = self
+            .inventory
+            .find(text)
+            .into_iter()
+            .filter(|m| {
+                !credential_spans
+                    .iter()
+                    .any(|(s, e, _)| m.start < *e && m.end > *s)
+            })
+            .collect();
+        for (start, end, kind) in credential_spans.iter().copied() {
+            secrets.push(SecretMatch {
+                start,
+                end,
+                kind,
+                secret: &text[start..end],
+                order: 0,
+            });
+        }
+        secrets.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+        self.emit_tokens_with_host_check(text, &[], &secrets)
+    }
+
+    fn project_literal_token(&self, text: &str) -> TokenProjection {
+        let secrets = self.inventory.find(text);
+        self.emit_tokens_with_host_check(text, &[], &secrets)
+    }
+
+    fn emit_tokens_with_host_check(
+        &self,
+        text: &str,
+        dynamic: &[(usize, usize)],
+        secrets: &[SecretMatch<'_>],
+    ) -> TokenProjection {
+        let intervals = merge_secret_and_dynamic(text, dynamic, secrets);
+        let mut tokens = Vec::new();
+        let mut cursor = 0usize;
+        for iv in &intervals {
+            if iv.start > cursor {
+                tokens.push(ReviewToken::Literal {
+                    text: text[cursor..iv.start].to_owned(),
+                });
+            }
+            match iv.kind {
+                IntervalKind::Dynamic => tokens.push(ReviewToken::Omitted),
+                IntervalKind::Secret { kind } => {
+                    let digest = keyed_digest(&self.key, &text[iv.start..iv.end]);
+                    tokens.push(ReviewToken::SecretRef {
+                        kind: kind.to_owned(),
+                        digest,
+                    });
+                }
+            }
+            cursor = iv.end;
+        }
+        if cursor < text.len() {
+            tokens.push(ReviewToken::Literal {
+                text: text[cursor..].to_owned(),
+            });
+        }
+
+        let (has_url, all_hosts_visible) = url_host_visibility(text, &intervals);
+        TokenProjection {
+            tokens,
+            has_visible_host: has_url && all_hosts_visible,
+            has_url,
+        }
+    }
+
+    fn project_path(&self, path: &Path) -> ReviewPath {
+        let components: Vec<_> = path
+            .components()
+            .filter(|c| {
+                !matches!(
+                    c,
+                    std::path::Component::RootDir | std::path::Component::CurDir
+                )
+            })
+            .map(|c| match c {
+                std::path::Component::Normal(s) => s.to_string_lossy().into_owned(),
+                std::path::Component::ParentDir => "..".to_owned(),
+                _ => String::new(),
+            })
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let mut projected = Vec::with_capacity(components.len());
+        for comp in components {
+            let tokens = self.project_token(&comp).tokens;
+            projected.push(component_from_tokens(&comp, &tokens));
+        }
+        ReviewPath(projected)
+    }
+
+    fn render_redacted_text(&self, text: &str) -> String {
+        let tp = self.project_token(text);
+        let mut out = String::new();
+        for token in tp.tokens {
+            match token {
+                ReviewToken::Literal { text } => out.push_str(&text),
+                ReviewToken::SecretRef { kind, digest } => {
+                    out.push_str("[REDACTED:");
+                    out.push_str(&kind);
+                    out.push(':');
+                    out.push_str(&digest);
+                    out.push(']');
+                }
+                ReviewToken::Omitted => out.push_str("[OMITTED]"),
+            }
+        }
+        out
+    }
+}
+
+fn component_from_tokens(original: &str, tokens: &[ReviewToken]) -> ReviewPathComponent {
+    if tokens.is_empty() {
+        return ReviewPathComponent::Literal {
+            text: original.to_owned(),
+        };
+    }
+    if tokens.len() == 1 {
+        match &tokens[0] {
+            ReviewToken::Literal { text } => {
+                return ReviewPathComponent::Literal { text: text.clone() };
+            }
+            ReviewToken::SecretRef { kind, digest } => {
+                return ReviewPathComponent::SecretRef {
+                    kind: kind.clone(),
+                    digest: digest.clone(),
+                };
+            }
+            ReviewToken::Omitted => return ReviewPathComponent::Omitted,
+        }
+    }
+    if tokens.iter().any(|t| matches!(t, ReviewToken::Omitted)) {
+        ReviewPathComponent::Omitted
+    } else if let Some(secret) = tokens.iter().find_map(|t| match t {
+        ReviewToken::SecretRef { kind, digest } => Some((kind.clone(), digest.clone())),
+        _ => None,
+    }) {
+        ReviewPathComponent::SecretRef {
+            kind: secret.0,
+            digest: secret.1,
+        }
+    } else {
+        ReviewPathComponent::Literal {
+            text: original.to_owned(),
+        }
+    }
+}
+
+fn has_lost_material_path_component(path: &ReviewPath) -> bool {
+    path.0
+        .iter()
+        .any(|c| !matches!(c, ReviewPathComponent::Literal { .. }))
+}
+
+fn looks_like_redacted_placeholder(s: &str) -> bool {
+    s.starts_with("[REDACTED:") && s.ends_with(']')
+}
+
+struct TokenProjection {
+    tokens: Vec<ReviewToken>,
+    has_visible_host: bool,
+    has_url: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ActionError {
+    #[error("missing required argument '{0}' for tool '{1}'")]
+    MissingArgument(&'static str, String),
+    #[error("tool '{0}' is not supported by the approval boundary")]
+    UnknownTool(String),
+    #[error("canonical action failed invariant validation")]
+    InvalidAction(&'static str),
+}
+
+fn get_string(
+    map: &serde_json::Map<String, JsonValue>,
+    key: &'static str,
+) -> Result<String, ActionError> {
+    map.get(key)
+        .and_then(JsonValue::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or(ActionError::MissingArgument(key, "(unknown)".to_owned()))
+}
+
+fn get_path_arg(
+    map: &serde_json::Map<String, JsonValue>,
+    key: &'static str,
+) -> Result<String, ActionError> {
+    let raw = get_string(map, key)?;
+    if raw.starts_with("artifact://") {
+        Ok(raw)
+    } else {
+        Ok(lexical_normalize_to_string(&raw))
+    }
+}
+
+fn lexical_normalize_to_string(raw: &str) -> String {
+    lexical_normalize(Path::new(raw))
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut comps: Vec<OsString> = Vec::new();
+    let mut absolute = false;
+    for c in path.components() {
+        match c {
+            Component::Prefix(_) => {}
+            Component::RootDir => {
+                absolute = true;
+                comps.clear();
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if comps.pop().is_none() && !absolute {
+                    comps.push(OsString::from(".."));
+                }
+            }
+            Component::Normal(s) => comps.push(s.to_os_string()),
+        }
+    }
+    let mut out = PathBuf::new();
+    if absolute {
+        out.push(std::path::MAIN_SEPARATOR_STR);
+    }
+    for c in comps {
+        out.push(c);
+    }
+    out
+}
+
+fn is_lexically_normalized(path: &Path) -> bool {
+    lexical_normalize(path).components().eq(path.components())
+}
+
+fn network_indicators_in_command(command: &str) -> bool {
+    shell::segment_command(command)
+        .iter()
+        .map(|segment| shell::tokenize_command(&segment.raw))
+        .any(|tokens| shell::is_network_command(&tokens))
+}
+
+fn is_valid_artifact_handle(handle: &str) -> bool {
+    let parts: Vec<&str> = handle.split('/').collect();
+    parts.len() == 3
+        && matches!(parts[1], "attachments" | "tool-output")
+        && parts[0].len() <= 128
+        && parts[2].len() <= 200
+        && parts.iter().enumerate().all(|(index, part)| {
+            let max = if index == 0 { 128 } else { 200 };
+            !part.is_empty()
+                && part.len() <= max
+                && *part != "."
+                && *part != ".."
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
+}
+
+fn keyed_digest(key: &SecretDigestKey, secret: &str) -> String {
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac =
+        HmacSha256::new_from_slice(key.as_bytes()).expect("32-byte key is valid for HMAC-SHA256");
+    mac.update(secret.as_bytes());
+    hex_lower(&mac.finalize().into_bytes())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        write!(s, "{:02x}", b).expect("string write cannot fail");
+    }
+    s
+}
+
+#[derive(Clone, Copy)]
+struct SecretMatch<'a> {
+    start: usize,
+    end: usize,
+    kind: &'static str,
+    secret: &'a str,
+    order: usize,
+}
+
+struct SecretPattern {
+    regex: Regex,
+    secret_group: usize,
+    kind: &'static str,
+}
+
+struct SecretInventory {
+    patterns: Vec<SecretPattern>,
+}
+
+impl SecretInventory {
+    fn new() -> Self {
+        let patterns = vec![
+            SecretPattern {
+                regex: Regex::new(r"sk-[A-Za-z0-9_-]{12,}").expect("static API key regex"),
+                secret_group: 0,
+                kind: "api_key",
+            },
+            SecretPattern {
+                regex: Regex::new(
+                    r#"(?i)\b(?:authorization|proxy-authorization)\s*:\s*bearer[ \t]+([A-Za-z0-9._~+/=-]+)"#,
+                )
+                .expect("static bearer authorization regex"),
+                secret_group: 1,
+                kind: "bearer_token",
+            },
+            SecretPattern {
+                regex: Regex::new(
+                    r#"(?i)\b(?:authorization|proxy-authorization)\s*:\s*basic[ \t]+([A-Za-z0-9._~+/=-]+)"#,
+                )
+                .expect("static basic authorization regex"),
+                secret_group: 1,
+                kind: "basic_token",
+            },
+            SecretPattern {
+                regex: Regex::new(
+                    r#"(?i)\b(?:authorization|proxy-authorization)\s*:\s*([A-Za-z][A-Za-z0-9+.\-/]*)(?:[ \t]*=[ \t]*|[ \t]+)([A-Za-z0-9._~+/=-]+)"#,
+                )
+                .expect("static generic authorization regex"),
+                secret_group: 2,
+                kind: "authorization_token",
+            },
+            SecretPattern {
+                regex: Regex::new(r#"(?i)\bBearer[ \t]+([A-Za-z0-9._~+/=-]+)"#)
+                    .expect("static bearer regex"),
+                secret_group: 1,
+                kind: "bearer_token",
+            },
+            SecretPattern {
+                regex: Regex::new(r#"(?i)\bBasic[ \t]+([A-Za-z0-9._~+/=-]+)"#)
+                    .expect("static basic regex"),
+                secret_group: 1,
+                kind: "basic_token",
+            },
+            SecretPattern {
+                regex: Regex::new(
+                    r#"(?i)\b(?:[A-Z0-9_]*(?:API[_-]?KEY|ACCESS[_-]?TOKEN|AUTH[_-]?TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE[_-]?KEY|TOKEN)[A-Z0-9_]*)\s*=\s*[\"']?([A-Za-z0-9._~+/=-]+)"#,
+                )
+                .expect("static secret environment regex"),
+                secret_group: 1,
+                kind: "secret_env",
+            },
+            SecretPattern {
+                regex: Regex::new(
+                    r#"(?i)(X-Amz-Signature|X-Goog-Signature|signature)=([A-Za-z0-9%._~-]{8,})"#,
+                )
+                .expect("static signed-url regex"),
+                secret_group: 2,
+                kind: "signature",
+            },
+            SecretPattern {
+                regex: Regex::new(
+                    r#"(?i)\b(api[_-]?key|access[_-]?token|secret|password|passwd|pwd|pass)[ \t]*[:=][ \t]*['\"]?([A-Za-z0-9._~+/=-]+)"#,
+                )
+                .expect("static named-secret regex"),
+                secret_group: 2,
+                kind: "secret",
+            },
+            SecretPattern {
+                regex: Regex::new(r#"://([^/:]+):([^@]+)@"#).expect("static url-userinfo regex"),
+                secret_group: 2,
+                kind: "url_credential",
+            },
+            SecretPattern {
+                regex: Regex::new(r#"://([^@:/]+)@"#).expect("static url-userinfo-token regex"),
+                secret_group: 1,
+                kind: "url_credential",
+            },
+            SecretPattern {
+                regex: Regex::new(
+                    r#"(?i)([?&])(?:X-Amz-Signature|X-Goog-Signature|signature)=([^&]+)"#,
+                )
+                .expect("static signed-url-query regex"),
+                secret_group: 2,
+                kind: "signature",
+            },
+            SecretPattern {
+                regex: Regex::new(
+                    r#"(?i)([?&])(token|api[_-]?key|access[_-]?token|secret|password|passwd|pwd|pass)=([^&]+)"#,
+                )
+                .expect("static secret-query regex"),
+                secret_group: 3,
+                kind: "url_query_secret",
+            },
+        ];
+        Self { patterns }
+    }
+}
+
+fn pattern_priority(index: usize) -> usize {
+    match index {
+        0 => 0,   // api_key
+        1 => 1,   // auth_bearer
+        2 => 2,   // auth_basic
+        3 => 3,   // auth_generic
+        4 => 4,   // standalone_bearer
+        5 => 5,   // standalone_basic
+        11 => 6,  // signed_url_query
+        7 => 7,   // signed_url
+        8 => 8,   // named_secret
+        12 => 9,  // secret_query
+        6 => 10,  // secret_env
+        9 => 11,  // url_userinfo_password
+        10 => 12, // url_userinfo_token
+        _ => index,
+    }
+}
+
+impl SecretInventory {
+    fn find<'a>(&self, text: &'a str) -> Vec<SecretMatch<'a>> {
+        let mut matches = Vec::new();
+        for (index, pattern) in self.patterns.iter().enumerate() {
+            for caps in pattern.regex.captures_iter(text) {
+                if let Some(m) = caps.get(pattern.secret_group) {
+                    matches.push(SecretMatch {
+                        start: m.start(),
+                        end: m.end(),
+                        kind: pattern.kind,
+                        secret: m.as_str(),
+                        order: pattern_priority(index),
+                    });
+                }
+            }
+        }
+        matches.sort_by(|a, b| {
+            a.start
+                .cmp(&b.start)
+                .then_with(|| a.order.cmp(&b.order))
+                .then_with(|| b.end.cmp(&a.end))
+        });
+        let mut selected: Vec<SecretMatch<'a>> = Vec::new();
+        let mut last_end = 0usize;
+        for m in matches {
+            if m.start >= last_end {
+                selected.push(m);
+                last_end = m.end;
+            }
+        }
+        selected
+    }
+}
+
+/// Check persisted metadata without retaining or returning the matching
+/// material. Policy rule diagnostics deliberately expose only the typed error,
+/// never the matched value.
+pub(crate) fn text_contains_secret_material(text: &str) -> bool {
+    !SecretInventory::new().find(text).is_empty() || contains_shell_credential(text)
+}
+
+#[derive(Clone, Copy)]
+enum IntervalKind {
+    Dynamic,
+    Secret { kind: &'static str },
+}
+
+struct Interval {
+    start: usize,
+    end: usize,
+    kind: IntervalKind,
+}
+
+fn merge_secret_and_dynamic(
+    _text: &str,
+    dynamic: &[(usize, usize)],
+    secrets: &[SecretMatch<'_>],
+) -> Vec<Interval> {
+    let mut intervals: Vec<Interval> = dynamic
+        .iter()
+        .map(|&(s, e)| Interval {
+            start: s,
+            end: e,
+            kind: IntervalKind::Dynamic,
+        })
+        .chain(secrets.iter().map(|m| Interval {
+            start: m.start,
+            end: m.end,
+            kind: IntervalKind::Secret { kind: m.kind },
+        }))
+        .collect();
+
+    intervals.sort_by(|a, b| {
+        a.start
+            .cmp(&b.start)
+            .then_with(|| b.end.cmp(&a.end))
+            .then_with(|| {
+                matches!(a.kind, IntervalKind::Dynamic)
+                    .cmp(&matches!(b.kind, IntervalKind::Dynamic))
+            })
+    });
+
+    let mut merged: Vec<Interval> = Vec::new();
+    for iv in intervals {
+        if let Some(last) = merged.last_mut()
+            && iv.start <= last.end
+        {
+            last.end = last.end.max(iv.end);
+            if matches!(iv.kind, IntervalKind::Dynamic)
+                || matches!(last.kind, IntervalKind::Dynamic)
+            {
+                last.kind = IntervalKind::Dynamic;
+            }
+            // When two secrets overlap, keep the first (longer/earliest) kind.
+            continue;
+        }
+        merged.push(iv);
+    }
+    merged
+}
+
+pub(crate) fn find_dynamic_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if b == b'\\' && !in_single {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if !in_double && b == b'\'' {
+            in_single = !in_single;
+            i += 1;
+            continue;
+        }
+        if !in_single && b == b'"' {
+            in_double = !in_double;
+            i += 1;
+            continue;
+        }
+        if in_single || in_double {
+            i += 1;
+            continue;
+        }
+
+        if b == b'$' && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'(' => {
+                    if let Some(end) = consume_delim(bytes, i + 1, b'(', b')') {
+                        spans.push((i, end + 1));
+                        i = end + 1;
+                        continue;
+                    }
+                }
+                b'{' => {
+                    if let Some(end) = consume_delim(bytes, i + 1, b'{', b'}') {
+                        spans.push((i, end + 1));
+                        i = end + 1;
+                        continue;
+                    }
+                }
+                _ => {
+                    if let Some(end) = consume_var_name(bytes, i) {
+                        spans.push((i, end));
+                        i = end;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        if b == b'`'
+            && let Some(end) = consume_backtick(bytes, i)
+        {
+            spans.push((i, end + 1));
+            i = end + 1;
+            continue;
+        }
+
+        if b == b'<' && i + 1 < bytes.len() && bytes[i + 1] == b'<' {
+            // Heredoc: treat the remainder of this token as dynamic.
+            spans.push((i, text.len()));
+            break;
+        }
+
+        i += 1;
+    }
+    spans
+}
+
+fn consume_delim(bytes: &[u8], open_idx: usize, open: u8, close: u8) -> Option<usize> {
+    if bytes[open_idx] != open {
+        return None;
+    }
+    let mut depth = 1usize;
+    let mut i = open_idx + 1;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if b == b'\\' && !in_single {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if !in_double && b == b'\'' {
+            in_single = !in_single;
+            i += 1;
+            continue;
+        }
+        if !in_single && b == b'"' {
+            in_double = !in_double;
+            i += 1;
+            continue;
+        }
+        if !in_single && !in_double {
+            if b == open {
+                depth += 1;
+            } else if b == close {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn consume_var_name(bytes: &[u8], dollar_idx: usize) -> Option<usize> {
+    if bytes.get(dollar_idx) != Some(&b'$') {
+        return None;
+    }
+    let mut i = dollar_idx + 1;
+    if i < bytes.len() && (bytes[i] == b'_' || bytes[i].is_ascii_alphabetic()) {
+        i += 1;
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+        return Some(i);
+    }
+    None
+}
+
+fn consume_backtick(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes[start] != b'`' {
+        return None;
+    }
+    let mut i = start + 1;
+    let mut escaped = false;
+    while i < bytes.len() {
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'\\' {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'`' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn url_host_visibility(text: &str, intervals: &[Interval]) -> (bool, bool) {
+    static HOST_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = HOST_RE.get_or_init(|| {
+        Regex::new(r"(?i)([a-z][a-z0-9+.-]*)://(?:[^/?#@]+@)?([^/?#:]+)")
+            .expect("static host regex")
+    });
+    let mut has_url = false;
+    let mut all_visible = true;
+    for caps in re.captures_iter(text) {
+        has_url = true;
+        let host = caps.get(2).expect("host capture");
+        let mut host_range = host.start()..host.end();
+        if !host_range.all(|pos| !intervals.iter().any(|iv| iv.start <= pos && pos < iv.end)) {
+            all_visible = false;
+        }
+    }
+    (has_url, all_visible)
+}
+
+pub(crate) mod shell {
+    use super::*;
+
+    #[derive(Debug, Clone)]
+    pub(crate) struct Segment {
+        pub raw: String,
+        pub is_subshell: bool,
+    }
+
+    impl Segment {
+        pub fn is_dynamic(&self) -> bool {
+            self.is_subshell || has_unverifiable_construct(&self.raw)
+        }
+    }
+
+    /// Fail-closed classifier for shell constructs that a literal-prefix policy
+    /// cannot prove. Returns `true` for unquoted/unescaped redirection operators
+    /// (`>`, `<`), pathname/brace expansion, unmodelled grouping, tilde expansion
+    /// at the start of a word, special shell parameters (`$$`, `$?`, `$!`,
+    /// `$0`..`$9`, `$@`, `$*`, `$#`, `$-`), command substitution, parameter
+    /// expansion, and backticks.
+    pub(crate) fn has_unverifiable_construct(raw: &str) -> bool {
+        let bytes = raw.as_bytes();
+        let mut i = 0usize;
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut escaped = false;
+        let mut word_start = true; // segment raw is trimmed
+
+        while i < bytes.len() {
+            let b = bytes[i];
+            if escaped {
+                escaped = false;
+                i += 1;
+                continue;
+            }
+            if b == b'\\' && !in_single {
+                escaped = true;
+                i += 1;
+                continue;
+            }
+            if !in_double && b == b'\'' {
+                in_single = !in_single;
+                i += 1;
+                continue;
+            }
+            if !in_single && b == b'"' {
+                in_double = !in_double;
+                i += 1;
+                continue;
+            }
+            if in_single {
+                i += 1;
+                continue;
+            }
+
+            if b == b'$' && i + 1 < bytes.len() && is_dollar_special(bytes[i + 1], in_double) {
+                return true;
+            }
+            if b == b'`' {
+                return true;
+            }
+            if !in_double && matches!(b, b'>' | b'<') {
+                return true;
+            }
+            if !in_double && matches!(b, b'*' | b'?' | b'[' | b']') {
+                return true;
+            }
+            if !in_double && matches!(b, b'{' | b'}' | b'(' | b')') {
+                return true;
+            }
+            if !in_double && b == b'~' && word_start {
+                return true;
+            }
+
+            word_start = b.is_ascii_whitespace()
+                || matches!(b, b'=' | b':' | b';' | b'(' | b')' | b'|' | b'&');
+
+            i += 1;
+        }
+        escaped || in_single || in_double
+    }
+
+    fn is_dollar_special(b: u8, in_double: bool) -> bool {
+        if matches!(b, b'(' | b'{') {
+            return true;
+        }
+        if b == b'_' || b.is_ascii_alphabetic() || b.is_ascii_digit() {
+            return true;
+        }
+        if matches!(b, b'*' | b'@' | b'#' | b'?' | b'-' | b'$' | b'!') {
+            return true;
+        }
+        // $'...' and $"...' quoting expansions occur only outside quotes.
+        !in_double && (b == b'\'' || b == b'"')
+    }
+
+    pub(crate) fn segment_command(command: &str) -> Vec<Segment> {
+        let mut segments = Vec::new();
+        let bytes = command.as_bytes();
+        let mut start = 0usize;
+        let mut i = 0usize;
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut escaped = false;
+        let mut is_subshell = false;
+
+        while i < bytes.len() {
+            let b = bytes[i];
+            if escaped {
+                escaped = false;
+                i += 1;
+                continue;
+            }
+            if b == b'\\' && !in_single {
+                escaped = true;
+                i += 1;
+                continue;
+            }
+            if !in_double && b == b'\'' {
+                in_single = !in_single;
+                i += 1;
+                continue;
+            }
+            if !in_single && b == b'"' {
+                in_double = !in_double;
+                i += 1;
+                continue;
+            }
+
+            if !in_single && !in_double {
+                if b == b'$'
+                    && i + 1 < bytes.len()
+                    && bytes[i + 1] == b'('
+                    && let Some(end) = consume_delim(bytes, i + 1, b'(', b')')
+                {
+                    i = end + 1;
+                    continue;
+                }
+                if b == b'$'
+                    && i + 1 < bytes.len()
+                    && bytes[i + 1] == b'{'
+                    && let Some(end) = consume_delim(bytes, i + 1, b'{', b'}')
+                {
+                    i = end + 1;
+                    continue;
+                }
+                if b == b'`'
+                    && let Some(end) = consume_backtick(bytes, i)
+                {
+                    i = end + 1;
+                    continue;
+                }
+                if b == b'(' {
+                    is_subshell = true;
+                    if let Some(end) = consume_delim(bytes, i, b'(', b')') {
+                        i = end + 1;
+                        continue;
+                    }
+                }
+
+                if b == b'\n' || b == b'\r' {
+                    push_segment(&mut segments, command, start, i, is_subshell);
+                    is_subshell = false;
+                    start = i + 1;
+                    i += 1;
+                    continue;
+                }
+                if b == b';' {
+                    push_segment(&mut segments, command, start, i, is_subshell);
+                    is_subshell = false;
+                    start = i + 1;
+                    i += 1;
+                    continue;
+                }
+                if b == b'|' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'|' {
+                        push_segment(&mut segments, command, start, i, is_subshell);
+                        is_subshell = false;
+                        start = i + 2;
+                        i += 2;
+                        continue;
+                    }
+                    push_segment(&mut segments, command, start, i, is_subshell);
+                    is_subshell = false;
+                    start = i + 1;
+                    i += 1;
+                    continue;
+                }
+                if b == b'&' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'&' {
+                        push_segment(&mut segments, command, start, i, is_subshell);
+                        is_subshell = false;
+                        start = i + 2;
+                        i += 2;
+                        continue;
+                    }
+                    push_segment(&mut segments, command, start, i, is_subshell);
+                    is_subshell = false;
+                    start = i + 1;
+                    i += 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+
+        if start < command.len() {
+            push_segment(&mut segments, command, start, command.len(), is_subshell);
+        }
+        segments
+    }
+
+    fn push_segment(
+        segments: &mut Vec<Segment>,
+        command: &str,
+        start: usize,
+        end: usize,
+        is_subshell: bool,
+    ) {
+        let raw = command[start..end].trim().to_owned();
+        if !raw.is_empty() {
+            segments.push(Segment { raw, is_subshell });
+        }
+    }
+
+    pub(crate) fn tokenize_command(command: &str) -> Vec<String> {
+        let mut tokens = Vec::new();
+        let mut current = String::new();
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut escaped = false;
+
+        for c in command.chars() {
+            if escaped {
+                current.push(c);
+                escaped = false;
+                continue;
+            }
+            if c == '\\' && !in_single {
+                escaped = true;
+                continue;
+            }
+            if !in_double && c == '\'' {
+                in_single = !in_single;
+                continue;
+            }
+            if !in_single && c == '"' {
+                in_double = !in_double;
+                continue;
+            }
+            if !in_single && !in_double && c.is_whitespace() {
+                if !current.is_empty() {
+                    tokens.push(current);
+                    current = String::new();
+                }
+                continue;
+            }
+            current.push(c);
+        }
+        if !current.is_empty() {
+            tokens.push(current);
+        }
+        tokens
+    }
+
+    pub(crate) fn tokenize_command_spans(command: &str) -> Vec<(usize, usize, String)> {
+        let mut tokens = Vec::new();
+        let mut current = String::new();
+        let mut current_start = 0usize;
+        let mut started = false;
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut escaped = false;
+
+        for (i, c) in command.char_indices() {
+            if escaped {
+                current.push(c);
+                escaped = false;
+                continue;
+            }
+            if c == '\\' && !in_single {
+                escaped = true;
+                if !started {
+                    current_start = i;
+                    started = true;
+                }
+                continue;
+            }
+            if !in_double && c == '\'' {
+                if !started {
+                    current_start = i;
+                    started = true;
+                }
+                in_single = !in_single;
+                continue;
+            }
+            if !in_single && c == '"' {
+                if !started {
+                    current_start = i;
+                    started = true;
+                }
+                in_double = !in_double;
+                continue;
+            }
+            if !in_single && !in_double && c.is_whitespace() {
+                if !current.is_empty() {
+                    tokens.push((current_start, i, current));
+                    current = String::new();
+                    started = false;
+                }
+                continue;
+            }
+            if !started {
+                current_start = i;
+                started = true;
+            }
+            current.push(c);
+        }
+        if !current.is_empty() || started {
+            tokens.push((current_start, command.len(), current));
+        }
+        tokens
+    }
+
+    pub(crate) fn unescape_backslashes(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' && chars.peek().is_some() {
+                out.push(chars.next().unwrap());
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    pub(crate) fn command_basename(token: &str) -> String {
+        Path::new(token)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(token)
+            .to_ascii_lowercase()
+    }
+
+    /// Return the candidate from `candidates` that `name` belongs to as a
+    /// versioned or variant executable family member (e.g. `python3.11`,
+    /// `mount.nfs`, `bash-5.2`), or `None` if `name` is not a known family
+    /// variant. The match is longest-prefix so `python3` stays `python3` while
+    /// `python3.11` collapses to `python`.
+    pub(crate) fn canonicalize_command_name<'a>(
+        name: &'a str,
+        candidates: &[&'a str],
+    ) -> Option<&'a str> {
+        let mut best: Option<&'a str> = None;
+        for candidate in candidates {
+            let candidate_len = candidate.len();
+            if (name == *candidate
+                || (name.starts_with(candidate)
+                    && is_command_version_suffix(&name[candidate_len..])))
+                && best.is_none_or(|b| candidate_len > b.len())
+            {
+                best = Some(*candidate);
+            }
+        }
+        best
+    }
+
+    fn is_command_version_suffix(suffix: &str) -> bool {
+        if suffix.is_empty() {
+            return false;
+        }
+        match suffix.as_bytes()[0] {
+            b'.' => is_dotted_extension_suffix(suffix),
+            b'-' => {
+                suffix.len() > 1
+                    && suffix.as_bytes()[1].is_ascii_digit()
+                    && is_numeric_version_suffix(&suffix[1..])
+            }
+            b'0'..=b'9' => is_numeric_version_suffix(suffix),
+            _ => false,
+        }
+    }
+
+    fn is_dotted_extension_suffix(suffix: &str) -> bool {
+        let bytes = suffix.as_bytes();
+        if bytes.is_empty() || bytes[0] != b'.' {
+            return false;
+        }
+        let mut i = 1;
+        if i >= bytes.len() || !bytes[i].is_ascii_lowercase() {
+            return false;
+        }
+        while i < bytes.len() && bytes[i].is_ascii_lowercase() {
+            i += 1;
+        }
+        if i == bytes.len() {
+            return true;
+        }
+        if bytes[i].is_ascii_digit() {
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i == bytes.len() {
+                return true;
+            }
+            if i + 1 == bytes.len() && bytes[i].is_ascii_lowercase() {
+                return true;
+            }
+            return false;
+        }
+        if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i == bytes.len() {
+                return true;
+            }
+            if i + 1 == bytes.len() && bytes[i].is_ascii_lowercase() {
+                return true;
+            }
+            return false;
+        }
+        false
+    }
+
+    fn is_numeric_version_suffix(suffix: &str) -> bool {
+        let bytes = suffix.as_bytes();
+        if bytes.is_empty() || !bytes[0].is_ascii_digit() {
+            return false;
+        }
+        let mut i = 0;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        loop {
+            if i == bytes.len() {
+                return true;
+            }
+            if i + 1 == bytes.len() && bytes[i].is_ascii_lowercase() {
+                return true;
+            }
+            if bytes[i] != b'.' {
+                return false;
+            }
+            i += 1;
+            if i >= bytes.len() || !bytes[i].is_ascii_digit() {
+                return false;
+            }
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+        }
+    }
+
+    pub(crate) fn is_assignment_token(token: &str) -> bool {
+        let Some((name, _value)) = token.split_once('=') else {
+            return false;
+        };
+        let name = name.strip_suffix('+').unwrap_or(name);
+        if name.is_empty() {
+            return false;
+        }
+        let bracketed = name.find('[').map(|start| {
+            name.ends_with(']')
+                && start > 0
+                && !name[start + 1..name.len() - 1].contains(|ch: char| {
+                    !(ch == '_' || ch.is_ascii_alphanumeric() || ch == '@' || ch == '*')
+                })
+        });
+        if bracketed == Some(true) {
+            return name[..name.find('[').unwrap()]
+                .bytes()
+                .enumerate()
+                .all(|(i, b)| {
+                    (i == 0 && (b == b'_' || b.is_ascii_alphabetic()))
+                        || (i > 0 && (b == b'_' || b.is_ascii_alphanumeric()))
+                });
+        }
+        name.bytes().enumerate().all(|(i, b)| {
+            (i == 0 && (b == b'_' || b.is_ascii_alphabetic()))
+                || (i > 0 && (b == b'_' || b.is_ascii_alphanumeric()))
+        })
+    }
+
+    #[derive(Debug, Clone)]
+    pub(crate) struct CommandView<'a> {
+        pub tokens: &'a [String],
+        pub leading_assignments: usize,
+        pub had_exec: bool,
+        pub had_generic_wrapper: bool,
+    }
+
+    pub(crate) fn effective_command(tokens: &[String], depth: usize) -> Option<CommandView<'_>> {
+        const MAX_DEPTH: usize = 5;
+        if depth > MAX_DEPTH {
+            return None;
+        }
+        let mut index = 0usize;
+        let mut leading = 0usize;
+        while index < tokens.len() && is_assignment_token(&tokens[index]) {
+            leading += 1;
+            index += 1;
+        }
+        if index >= tokens.len() {
+            return None;
+        }
+        let first = command_basename(&tokens[index]);
+        if first == "exec" {
+            return parse_exec_wrapper(tokens, index, leading, depth);
+        }
+        if is_generic_wrapper(&first) {
+            return parse_generic_wrapper(tokens, index, leading, depth);
+        }
+        Some(CommandView {
+            tokens: &tokens[index..],
+            leading_assignments: leading,
+            had_exec: false,
+            had_generic_wrapper: false,
+        })
+    }
+
+    fn is_rsync_remote_spec(operand: &str) -> bool {
+        if operand.starts_with("rsync://") {
+            return true;
+        }
+        if let Some(colon) = operand.find(':') {
+            let before = &operand[..colon];
+            if before.contains('@') && !before.contains('/') {
+                return true;
+            }
+            if colon + 1 < operand.len()
+                && operand.as_bytes()[colon + 1] == b':'
+                && !before.contains('/')
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn rsync_is_remote(tokens: &[String]) -> bool {
+        let mut i = 0usize;
+        while i < tokens.len() {
+            let lower = tokens[i].to_ascii_lowercase();
+            if lower.starts_with('-') {
+                if matches!(lower.as_str(), "-e" | "--rsh") {
+                    i += 2;
+                    continue;
+                }
+                if lower.starts_with("-e=") || lower.starts_with("--rsh=") {
+                    i += 1;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            if is_rsync_remote_spec(&tokens[i]) {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    pub(crate) fn is_network_command(tokens: &[String]) -> bool {
+        const NETWORK_FAMILIES: &[&str] = &[
+            "curl",
+            "wget",
+            "nc",
+            "ncat",
+            "ssh",
+            "scp",
+            "sftp",
+            "lftp",
+            "ftp",
+            "telnet",
+            "aws",
+            "gcloud",
+            "az",
+            "gh",
+            "rclone",
+            "redis-cli",
+            "mysql",
+            "mariadb",
+            "psql",
+            "mongosh",
+            "sqlcmd",
+            "cqlsh",
+            "sshpass",
+            "git",
+            "rsync",
+            "openssl",
+        ];
+        let Some(eff) = effective_command(tokens, 1) else {
+            return false;
+        };
+        let Some(first) = eff.tokens.first() else {
+            return false;
+        };
+        let base = command_basename(first);
+        let family = canonicalize_command_name(&base, NETWORK_FAMILIES).unwrap_or(&base);
+        match family {
+            "curl" | "wget" | "nc" | "ssh" | "scp" | "sftp" | "lftp" | "ftp" | "telnet"
+            | "ncat" | "aws" | "gcloud" | "az" | "gh" | "rclone" | "redis-cli" | "mysql"
+            | "mariadb" | "psql" | "mongosh" | "sqlcmd" | "cqlsh" | "sshpass" => true,
+            "git" => git_is_network_operation(&eff.tokens[1..]),
+            "rsync" => rsync_is_remote(&eff.tokens[1..]),
+            "openssl" => {
+                let mut i = 1;
+                while i < eff.tokens.len() {
+                    if eff.tokens[i].starts_with('-') {
+                        i += 1;
+                        continue;
+                    }
+                    return matches!(eff.tokens[i].as_str(), "s_client" | "s_server");
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn is_generic_wrapper(name: &str) -> bool {
+        matches!(
+            name,
+            "nice" | "nohup" | "setsid" | "stdbuf" | "chrt" | "busybox"
+        )
+    }
+
+    fn parse_exec_wrapper(
+        tokens: &[String],
+        exec_index: usize,
+        leading_before: usize,
+        depth: usize,
+    ) -> Option<CommandView<'_>> {
+        let mut i = exec_index + 1;
+        while i < tokens.len() {
+            let t = &tokens[i];
+            if t == "--" {
+                i += 1;
+                break;
+            }
+            if t.starts_with('-') {
+                if t == "-a" && i + 1 < tokens.len() {
+                    i += 2;
+                    continue;
+                }
+                if t == "-c" || t == "-l" {
+                    i += 1;
+                    continue;
+                }
+                return None;
+            }
+            break;
+        }
+        if i >= tokens.len() {
+            return None;
+        }
+        let inner = effective_command(&tokens[i..], depth + 1)?;
+        Some(CommandView {
+            tokens: inner.tokens,
+            leading_assignments: leading_before + inner.leading_assignments,
+            had_exec: true,
+            had_generic_wrapper: inner.had_generic_wrapper,
+        })
+    }
+
+    fn parse_generic_wrapper(
+        tokens: &[String],
+        wrapper_index: usize,
+        leading_before: usize,
+        depth: usize,
+    ) -> Option<CommandView<'_>> {
+        let name = command_basename(&tokens[wrapper_index]);
+        let cmd_index = match name.as_str() {
+            "nice" => parse_nice_options(tokens, wrapper_index),
+            "nohup" => parse_nohup_options(tokens, wrapper_index),
+            "setsid" => parse_setsid_options(tokens, wrapper_index),
+            "stdbuf" => parse_stdbuf_options(tokens, wrapper_index),
+            "chrt" => parse_chrt_options(tokens, wrapper_index),
+            "busybox" => Some(wrapper_index + 1),
+            _ => return None,
+        }?;
+        if cmd_index >= tokens.len() {
+            return None;
+        }
+        let inner = effective_command(&tokens[cmd_index..], depth + 1)?;
+        Some(CommandView {
+            tokens: inner.tokens,
+            leading_assignments: leading_before + inner.leading_assignments,
+            had_exec: inner.had_exec,
+            had_generic_wrapper: true,
+        })
+    }
+
+    fn parse_nice_options(tokens: &[String], wrapper_index: usize) -> Option<usize> {
+        let mut i = wrapper_index + 1;
+        while i < tokens.len() {
+            let t = &tokens[i];
+            if t == "--" {
+                return Some(i + 1);
+            }
+            if t == "-n" || t == "--adjustment" {
+                if i + 1 >= tokens.len() {
+                    return None;
+                }
+                i += 2;
+                continue;
+            }
+            if t.starts_with("--adjustment=") {
+                i += 1;
+                continue;
+            }
+            if t.starts_with('-') && t.len() > 1 && t[1..].parse::<i32>().is_ok() {
+                i += 1;
+                continue;
+            }
+            if t.starts_with('-') {
+                return None;
+            }
+            return Some(i);
+        }
+        None
+    }
+
+    fn parse_nohup_options(tokens: &[String], wrapper_index: usize) -> Option<usize> {
+        let mut i = wrapper_index + 1;
+        if i < tokens.len() && tokens[i] == "--" {
+            i += 1;
+        }
+        Some(i)
+    }
+
+    fn parse_setsid_options(tokens: &[String], wrapper_index: usize) -> Option<usize> {
+        const KNOWN: &[&str] = &[
+            "-c",
+            "-f",
+            "-w",
+            "-V",
+            "--wait",
+            "--fork",
+            "--ctty",
+            "--version",
+            "--help",
+        ];
+        let mut i = wrapper_index + 1;
+        while i < tokens.len() {
+            let t = &tokens[i];
+            if t == "--" {
+                return Some(i + 1);
+            }
+            if t.starts_with('-') {
+                if KNOWN.contains(&t.as_str()) {
+                    i += 1;
+                    continue;
+                }
+                return None;
+            }
+            return Some(i);
+        }
+        None
+    }
+
+    fn parse_stdbuf_options(tokens: &[String], wrapper_index: usize) -> Option<usize> {
+        let mut i = wrapper_index + 1;
+        while i < tokens.len() {
+            let t = &tokens[i];
+            if t == "--" {
+                return Some(i + 1);
+            }
+            if matches!(t.as_str(), "-i" | "-o" | "-e") {
+                if i + 1 >= tokens.len() {
+                    return None;
+                }
+                i += 2;
+                continue;
+            }
+            if t.starts_with("--input=")
+                || t.starts_with("--output=")
+                || t.starts_with("--error=")
+                || (t.starts_with("-i=") || t.starts_with("-o=") || t.starts_with("-e="))
+            {
+                i += 1;
+                continue;
+            }
+            if t.starts_with('-') {
+                return None;
+            }
+            return Some(i);
+        }
+        None
+    }
+
+    fn parse_chrt_options(tokens: &[String], wrapper_index: usize) -> Option<usize> {
+        const KNOWN_NO_ARG: &[&str] = &[
+            "-a",
+            "-b",
+            "-d",
+            "-f",
+            "-i",
+            "-m",
+            "-R",
+            "-T",
+            "-v",
+            "-z",
+            "-V",
+            "-h",
+            "--all-tasks",
+            "--batch",
+            "--deadline",
+            "--fifo",
+            "--idle",
+            "--max",
+            "--reset-on-fork",
+            "--strict",
+            "--verbose",
+            "--help",
+            "--version",
+        ];
+        let mut i = wrapper_index + 1;
+        while i < tokens.len() {
+            let t = &tokens[i];
+            if t == "-p" {
+                if i + 1 >= tokens.len() {
+                    return None;
+                }
+                i += 2;
+                continue;
+            }
+            if t.starts_with('-') {
+                if KNOWN_NO_ARG.contains(&t.as_str()) {
+                    i += 1;
+                    continue;
+                }
+                return None;
+            }
+            if t.parse::<u64>().is_ok() && i + 1 < tokens.len() {
+                i += 1;
+            }
+            return Some(i);
+        }
+        None
+    }
+
+    fn git_is_network_operation(tokens: &[String]) -> bool {
+        let mut i = 0usize;
+        while i < tokens.len() {
+            let t_lower = tokens[i].to_ascii_lowercase();
+            if t_lower.starts_with('-') {
+                if matches!(
+                    t_lower.as_str(),
+                    "-c" | "--config"
+                        | "--config-env"
+                        | "--git-dir"
+                        | "--work-tree"
+                        | "--exec-path"
+                        | "--namespace"
+                ) {
+                    i += 2;
+                    continue;
+                }
+                if matches!(
+                    t_lower.as_str(),
+                    "--no-pager"
+                        | "-p"
+                        | "--paginate"
+                        | "--no-replace-objects"
+                        | "--bare"
+                        | "--version"
+                        | "--help"
+                ) {
+                    i += 1;
+                    continue;
+                }
+                if t_lower.starts_with("--git-dir=")
+                    || t_lower.starts_with("--work-tree=")
+                    || t_lower.starts_with("--exec-path=")
+                    || t_lower.starts_with("--namespace=")
+                    || t_lower.starts_with("--config=")
+                    || t_lower.starts_with("--config-env=")
+                    || (t_lower.starts_with("-c") && t_lower.contains('='))
+                    || t_lower.starts_with("-C")
+                {
+                    i += 1;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            if matches!(
+                t_lower.as_str(),
+                "push" | "clone" | "fetch" | "pull" | "ls-remote"
+            ) {
+                return true;
+            }
+            if t_lower == "submodule"
+                && tokens
+                    .get(i + 1)
+                    .is_some_and(|t| t.eq_ignore_ascii_case("update"))
+            {
+                return true;
+            }
+            if t_lower == "remote"
+                && tokens
+                    .get(i + 1)
+                    .is_some_and(|t| t.eq_ignore_ascii_case("update"))
+            {
+                return true;
+            }
+            if t_lower == "archive"
+                && tokens[i + 1..].iter().any(|t| {
+                    let l = t.to_ascii_lowercase();
+                    l == "--remote" || l.starts_with("--remote=")
+                })
+            {
+                return true;
+            }
+            return false;
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::provider::types::ValidatedToolArguments;
+
+    fn projector() -> SecretAwareActionProjector {
+        SecretAwareActionProjector::new(Redactor::v1(), SecretDigestKey::fixture())
+    }
+
+    fn args(value: serde_json::Value) -> ValidatedToolArguments {
+        serde_json::from_value(value).expect("valid args")
+    }
+
+    fn bash_action(command: &str) -> CanonicalAction {
+        let mut perms = vec![Permission::Exec];
+        if network_indicators_in_command(command) {
+            perms.push(Permission::Network);
+        }
+        CanonicalAction {
+            tool: BASH_TOOL_NAME.to_owned(),
+            operation: "exec".to_owned(),
+            argv: vec![command.to_owned()],
+            cwd: PathBuf::from("/workspace"),
+            affected_paths: vec![],
+            sandbox: SandboxSummary::workspace(),
+            requested_permissions: perms,
+            justification: None,
+        }
+    }
+
+    #[test]
+    fn canonical_action_debug_does_not_leak_argv_or_justification() {
+        let action = CanonicalAction {
+            tool: "bash".to_owned(),
+            operation: "exec".to_owned(),
+            argv: vec!["curl -H Authorization: Bearer sk-abc".to_owned()],
+            cwd: PathBuf::from("/workspace"),
+            affected_paths: vec![],
+            sandbox: SandboxSummary::workspace(),
+            requested_permissions: vec![Permission::Exec],
+            justification: Some("secret password foo".to_owned()),
+        };
+        let text = format!("{:?}", action);
+        assert!(!text.contains("sk-abc"));
+        assert!(!text.contains("password"));
+        assert!(text.contains("1 tokens redacted"));
+        assert!(text.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn projector_redacts_bearer_token_and_preserves_host() {
+        let action =
+            bash_action(r#"curl -H "Authorization: Bearer abcdef1234567890" https://example.com"#);
+        let ReviewProjection::Reviewable(projected) = projector().project(&action) else {
+            panic!("expected reviewable");
+        };
+        let argv_text = serde_json::to_string(&projected.argv).unwrap();
+        assert!(!argv_text.contains("abcdef1234567890"));
+        assert!(argv_text.contains("bearer_token"));
+        assert!(argv_text.contains("https://example.com"));
+    }
+
+    #[test]
+    fn projector_redacts_signed_url_signature() {
+        let action = bash_action(r#"curl "https://example.com?X-Amz-Signature=abcdef1234567890""#);
+        let ReviewProjection::Reviewable(projected) = projector().project(&action) else {
+            panic!("expected reviewable");
+        };
+        let argv_text = serde_json::to_string(&projected.argv).unwrap();
+        assert!(!argv_text.contains("abcdef1234567890"));
+        assert!(argv_text.contains("signature"));
+        assert!(argv_text.contains("https://example.com"));
+    }
+
+    #[test]
+    fn projector_returns_insufficient_evidence_when_host_is_fully_redacted() {
+        let action = bash_action(r#"curl https://sk-abcdefghijklmnop.example.com"#);
+        assert!(matches!(
+            projector().project(&action),
+            ReviewProjection::InsufficientEvidence { .. }
+        ));
+    }
+
+    #[test]
+    fn shell_tokenizer_respects_quotes_and_escapes() {
+        let tokens = shell::tokenize_command(r#"echo "a && b" 'c || d' e\ f"#);
+        assert_eq!(tokens, vec!["echo", "a && b", "c || d", "e f"]);
+    }
+
+    #[test]
+    fn shell_segmenter_does_not_split_inside_quotes() {
+        let segments = shell::segment_command(r#"echo "a && b" ; echo c"#);
+        assert_eq!(segments.len(), 2);
+        assert!(segments[0].raw.contains("a && b"));
+    }
+
+    #[test]
+    fn from_tool_call_maps_workspace_tools() {
+        let args = serde_json::from_value::<ValidatedToolArguments>(json!({
+            "path": "notes.txt",
+            "offset": 0,
+            "limit": 100
+        }))
+        .unwrap();
+        let action =
+            CanonicalAction::from_tool_call(PathBuf::from("/workspace"), "read_file", &args)
+                .expect("read_file");
+        assert_eq!(action.tool, "read_file");
+        assert_eq!(action.operation, "read");
+        assert_eq!(action.argv, vec!["read_file", "notes.txt"]);
+    }
+
+    #[test]
+    fn network_classification_uses_effective_command_positions() {
+        assert!(network_indicators_in_command("curl https://example.com"));
+        assert!(network_indicators_in_command(
+            "echo safe; curl https://example.com"
+        ));
+        assert!(network_indicators_in_command("exec git push origin main"));
+        assert!(network_indicators_in_command("git push origin main"));
+        assert!(network_indicators_in_command(
+            "git clone https://example.com/repo"
+        ));
+        assert!(!network_indicators_in_command("git status"));
+        assert!(!network_indicators_in_command(
+            "echo 'curl https://example.com'"
+        ));
+        assert!(!network_indicators_in_command(
+            "printf 'https://example.com'"
+        ));
+    }
+
+    #[test]
+    fn remote_copy_and_file_transfer_commands_are_network() {
+        for command in [
+            "rsync user@host:/path /workspace/backup",
+            "rsync -e 'ssh -p 2222' user@host:/path /workspace/backup",
+            "rsync 'rsync://host/module/path' /workspace/backup",
+            "rsync /workspace/src host::module",
+            "sftp user@host",
+            "lftp -u user,pass sftp://host",
+        ] {
+            assert!(
+                network_indicators_in_command(command),
+                "expected network indicator: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_local_rsync_is_not_network() {
+        for command in [
+            "rsync src/ dst/",
+            "rsync -avz /workspace/src/ /workspace/dst/",
+            "rsync --exclude='*.so' src/ dst/",
+        ] {
+            assert!(
+                !network_indicators_in_command(command),
+                "expected no network indicator: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_network_subcommands_require_network() {
+        for command in [
+            "git push origin main",
+            "git clone https://example.com/repo",
+            "git submodule update --init",
+            "git remote update",
+            "git ls-remote origin",
+            "git archive --remote=origin main",
+            "git --config-env=core.pager=MY_PAGER ls-remote origin",
+        ] {
+            assert!(
+                network_indicators_in_command(command),
+                "expected network indicator: {command}"
+            );
+        }
+        for command in [
+            "git status",
+            "git archive --format=tar HEAD",
+            "git submodule status",
+            "git remote -v",
+        ] {
+            assert!(
+                !network_indicators_in_command(command),
+                "expected no network indicator: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_handles_are_opaque_read_only_references() {
+        let read = CanonicalAction::from_tool_call(
+            PathBuf::from("/workspace"),
+            "read_file",
+            &args(json!({"path": "artifact://conversation/tool-output/execution-1"})),
+        );
+        assert!(read.is_ok());
+
+        let grep = CanonicalAction::from_tool_call(
+            PathBuf::from("/workspace"),
+            "grep",
+            &args(json!({
+                "path": "artifact://conversation/tool-output/execution-1",
+                "pattern": "needle"
+            })),
+        );
+        assert!(grep.is_ok());
+
+        for tool in ["write_file", "edit_file", "delete", "list_dir", "glob"] {
+            let key = if tool == "glob" { "pattern" } else { "path" };
+            let args = args(json!({key: "artifact://conversation/tool-output/execution-1"}));
+            assert!(
+                CanonicalAction::from_tool_call(PathBuf::from("/workspace"), tool, &args).is_err(),
+                "{tool} must not consume artifact handles"
+            );
+        }
+        assert!(
+            CanonicalAction::from_tool_call(
+                PathBuf::from("/workspace"),
+                "read_file",
+                &args(json!({"path": "artifact://conversation/tool-output"})),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn projector_redacts_generic_authorization_and_password_forms() {
+        let action = bash_action(
+            r#"curl -H "Authorization: OAuth abc" "https://example.com/?password=x&pass=short""#,
+        );
+        let ReviewProjection::Reviewable(projected) = projector().project(&action) else {
+            panic!("literal host should remain reviewable after redaction");
+        };
+        let text = format!("{projected:?}");
+        assert!(!text.contains("abc"));
+        assert!(!text.contains("short"));
+        assert!(text.contains("authorization_token"));
+        assert!(text.contains("secret"));
+    }
+
+    #[test]
+    fn projector_rejects_unverifiable_shell_glob_and_unmatched_quote() {
+        for action in [bash_action("echo *.rs"), bash_action("echo 'unterminated")] {
+            assert!(matches!(
+                projector().project(&action),
+                ReviewProjection::InsufficientEvidence { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn canonical_action_debug_redacts_cwd_and_affected_paths() {
+        let action = CanonicalAction {
+            tool: "test_tool".to_owned(),
+            operation: "test_operation".to_owned(),
+            argv: vec!["arg_with_SECRET_ARGV".to_owned()],
+            cwd: PathBuf::from("/workspace/SECRET_CWD"),
+            affected_paths: vec![
+                PathBuf::from("/workspace/SECRET_PATH_1"),
+                PathBuf::from("/workspace/SECRET_PATH_2"),
+            ],
+            sandbox: SandboxSummary::workspace(),
+            requested_permissions: vec![Permission::Exec, Permission::Network],
+            justification: Some("user said SECRET_JUSTIFICATION".to_owned()),
+        };
+        let out = format!("{:?}", action);
+        assert!(!out.contains("SECRET_CWD"), "cwd leaked: {}", out);
+        assert!(
+            !out.contains("SECRET_PATH_1"),
+            "affected_paths leaked: {}",
+            out
+        );
+        assert!(!out.contains("SECRET_PATH_2"));
+        assert!(!out.contains("SECRET_ARGV"));
+        assert!(!out.contains("SECRET_JUSTIFICATION"));
+        assert!(out.contains("test_tool"), "tool missing: {}", out);
+        assert!(out.contains("test_operation"));
+        assert!(out.contains("Exec"));
+        assert!(out.contains("Network"));
+        assert!(out.contains("[1 tokens redacted]"));
+        assert!(out.contains("[2 paths redacted]"));
+        assert!(out.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn has_unverifiable_construct_respects_double_quotes_and_escapes() {
+        // Double-quoted expansions must remain unverifiable.
+        assert!(
+            shell::has_unverifiable_construct(r#"echo "$TOKEN""#),
+            "double-quoted $VAR"
+        );
+        assert!(
+            shell::has_unverifiable_construct(r#"echo "${TOKEN}""#),
+            "double-quoted braced parameter expansion"
+        );
+        assert!(
+            shell::has_unverifiable_construct(r#"echo "$(cmd)""#),
+            "double-quoted $(...)"
+        );
+        assert!(
+            shell::has_unverifiable_construct("echo \"`cmd`\""),
+            "double-quoted backticks"
+        );
+
+        // Double-quoted > and < are literal characters, not redirections.
+        assert!(
+            !shell::has_unverifiable_construct(r#"echo ">""#),
+            "double-quoted >"
+        );
+        assert!(
+            !shell::has_unverifiable_construct(r#"echo "<""#),
+            "double-quoted <"
+        );
+        assert!(
+            !shell::has_unverifiable_construct(r#"echo "a > b""#),
+            "double-quoted > inside a word"
+        );
+
+        // Escaped $ and backticks are literal, both inside and outside double quotes.
+        assert!(
+            !shell::has_unverifiable_construct(r#"echo \$"#),
+            "escaped $ outside quotes"
+        );
+        assert!(
+            !shell::has_unverifiable_construct(r##"echo \`"##),
+            "escaped backtick outside quotes"
+        );
+        assert!(
+            !shell::has_unverifiable_construct("echo \"\\$TOKEN\""),
+            "escaped $ inside double quotes"
+        );
+        assert!(
+            !shell::has_unverifiable_construct("echo \"\\`cmd\\`\""),
+            "escaped backticks inside double quotes"
+        );
+
+        // Single-quoted contents are always literal.
+        assert!(
+            !shell::has_unverifiable_construct(r#"echo '$TOKEN'"#),
+            "single-quoted $VAR"
+        );
+        assert!(
+            !shell::has_unverifiable_construct(r#"echo '`cmd`'"#),
+            "single-quoted backticks"
+        );
+
+        // Unparseable/trailing quote or escape states must be unverifiable.
+        assert!(
+            shell::has_unverifiable_construct(r#"echo 'unmatched"#),
+            "unmatched single quote"
+        );
+        assert!(
+            shell::has_unverifiable_construct(r#"echo "unmatched"#),
+            "unmatched double quote"
+        );
+        assert!(
+            shell::has_unverifiable_construct(r#"echo trailing\"#),
+            "trailing backslash"
+        );
+
+        // Balanced quoted literals remain non-dynamic.
+        assert!(
+            !shell::has_unverifiable_construct(r#"echo 'literal' and "literal""#),
+            "balanced quoted literals"
+        );
+    }
+
+    #[test]
+    fn redact_arguments_redacts_url_userinfo_credential() {
+        let args = args(json!({
+            "command": "git clone https://deploy:hunter2@example.com/repo.git"
+        }));
+        let redacted = projector().redact_arguments(&args).unwrap();
+        let text = serde_json::to_string(&redacted).unwrap();
+        assert!(
+            !text.contains("hunter2"),
+            "userinfo password leaked: {text}"
+        );
+        assert!(
+            text.contains("[REDACTED:url_credential]"),
+            "url_credential placeholder missing: {text}"
+        );
+        assert!(text.contains("https://deploy:"), "user part lost: {text}");
+        assert!(
+            text.contains("@example.com/repo.git"),
+            "host part lost: {text}"
+        );
+    }
+
+    #[test]
+    fn redact_arguments_redacts_generic_query_secret() {
+        let args = args(json!({
+            "url": "https://example.com/api?token=foo%bar"
+        }));
+        let redacted = projector().redact_arguments(&args).unwrap();
+        let text = serde_json::to_string(&redacted).unwrap();
+        assert!(!text.contains("foo%bar"), "query secret leaked: {text}");
+        assert!(
+            text.contains("[REDACTED:url_query_secret]"),
+            "url_query_secret placeholder missing: {text}"
+        );
+        assert!(
+            text.contains("https://example.com/api?token="),
+            "url structure lost: {text}"
+        );
+    }
+
+    #[test]
+    fn redact_arguments_preserves_structured_authorization_and_signed_url() {
+        let auth = args(json!({"Authorization": "Bearer abcdef1234567890"}));
+        let redacted = projector().redact_arguments(&auth).unwrap();
+        let text = serde_json::to_string(&redacted).unwrap();
+        assert!(
+            !text.contains("abcdef1234567890"),
+            "bearer token leaked: {text}"
+        );
+        assert!(
+            text.contains("bearer_token"),
+            "bearer_token placeholder missing: {text}"
+        );
+
+        let signed = args(json!({"X-Amz-Signature": "abcdef1234567890"}));
+        let redacted = projector().redact_arguments(&signed).unwrap();
+        let text = serde_json::to_string(&redacted).unwrap();
+        assert!(
+            !text.contains("abcdef1234567890"),
+            "signed URL signature leaked: {text}"
+        );
+        assert!(
+            text.contains("signature"),
+            "signature placeholder missing: {text}"
+        );
+    }
+
+    #[test]
+    fn projector_redacts_basic_proxy_authorization_and_secret_environment() {
+        for text in [
+            "Proxy-Authorization: Basic abcdef1234567890",
+            "Authorization: Basic abcdef1234567890",
+            "AWS_SECRET_ACCESS_KEY=abcdef1234567890",
+        ] {
+            assert!(
+                projector().text_contains_secret(text),
+                "secret not detected: {text}"
+            );
+            let action = bash_action(text);
+            let projection = projector().project(&action);
+            let encoded = serde_json::to_string(&projection).unwrap();
+            assert!(
+                !encoded.contains("abcdef1234567890"),
+                "secret leaked: {encoded}"
+            );
+        }
+    }
+
+    #[test]
+    fn projector_rejects_dynamic_argv_as_insufficient_evidence() {
+        let action = bash_action("echo $UNTRUSTED");
+        assert!(matches!(
+            projector().project(&action),
+            ReviewProjection::InsufficientEvidence { .. }
+        ));
+    }
+
+    #[test]
+    fn projector_rejects_secret_in_final_affected_path_component() {
+        let action = CanonicalAction {
+            tool: "read_file".to_owned(),
+            operation: "read".to_owned(),
+            argv: vec![
+                "read_file".to_owned(),
+                "/workspace/sk-abcdefghijklmnop".to_owned(),
+            ],
+            cwd: PathBuf::from("/workspace"),
+            affected_paths: vec![PathBuf::from("/workspace/sk-abcdefghijklmnop")],
+            sandbox: SandboxSummary::workspace(),
+            requested_permissions: vec![Permission::ReadWorkspace],
+            justification: None,
+        };
+        assert!(matches!(
+            projector().project(&action),
+            ReviewProjection::InsufficientEvidence { .. }
+        ));
+    }
+
+    #[test]
+    fn projector_rejects_secret_or_omitted_cwd_component() {
+        let with_secret = CanonicalAction {
+            tool: "read_file".to_owned(),
+            operation: "read".to_owned(),
+            argv: vec!["read_file".to_owned(), "/workspace/notes.txt".to_owned()],
+            cwd: PathBuf::from("/workspace/sk-abcdefghijklmnop"),
+            affected_paths: vec![PathBuf::from("/workspace/notes.txt")],
+            sandbox: SandboxSummary::workspace(),
+            requested_permissions: vec![Permission::ReadWorkspace],
+            justification: None,
+        };
+        assert!(matches!(
+            projector().project(&with_secret),
+            ReviewProjection::InsufficientEvidence { .. }
+        ));
+
+        let with_dynamic = CanonicalAction {
+            tool: "read_file".to_owned(),
+            operation: "read".to_owned(),
+            argv: vec!["read_file".to_owned(), "/workspace/notes.txt".to_owned()],
+            cwd: PathBuf::from("/workspace/$(echo secret)"),
+            affected_paths: vec![PathBuf::from("/workspace/notes.txt")],
+            sandbox: SandboxSummary::workspace(),
+            requested_permissions: vec![Permission::ReadWorkspace],
+            justification: None,
+        };
+        assert!(matches!(
+            projector().project(&with_dynamic),
+            ReviewProjection::InsufficientEvidence { .. }
+        ));
+    }
+
+    #[test]
+    fn projector_accepts_fully_literal_cwd_and_affected_paths() {
+        let action = CanonicalAction {
+            tool: "read_file".to_owned(),
+            operation: "read".to_owned(),
+            argv: vec!["read_file".to_owned(), "/workspace/notes.txt".to_owned()],
+            cwd: PathBuf::from("/workspace"),
+            affected_paths: vec![PathBuf::from("/workspace/notes.txt")],
+            sandbox: SandboxSummary::workspace(),
+            requested_permissions: vec![Permission::ReadWorkspace],
+            justification: None,
+        };
+        let projection = projector().project(&action);
+        assert!(
+            matches!(projection, ReviewProjection::Reviewable(_)),
+            "expected reviewable, got {projection:?}"
+        );
+    }
+
+    #[test]
+    fn redact_arguments_redacts_backslash_escaped_secret() {
+        let args = args(json!({
+            "command": "curl https://example.com/api?token=foo\\\\&bar"
+        }));
+        let redacted = projector().redact_arguments(&args).unwrap();
+        let text = serde_json::to_string(&redacted).unwrap();
+        assert!(
+            !text.contains("foo"),
+            "backslash-escaped secret leaked: {text}"
+        );
+        assert!(
+            text.contains("[REDACTED:url_query_secret]"),
+            "url_query_secret placeholder missing: {text}"
+        );
+        assert!(text.contains("?token="), "url structure lost: {text}");
+    }
+
+    #[test]
+    fn redact_arguments_redacts_token_only_url_userinfo() {
+        let args = args(json!({
+            "command": "git clone https://ghp_abc123@github.com/repo.git"
+        }));
+        let redacted = projector().redact_arguments(&args).unwrap();
+        let text = serde_json::to_string(&redacted).unwrap();
+        assert!(
+            !text.contains("ghp_abc123"),
+            "token-only userinfo leaked: {text}"
+        );
+        assert!(
+            text.contains("[REDACTED:url_credential]"),
+            "url_credential placeholder missing: {text}"
+        );
+        assert!(text.contains("https://"), "scheme lost: {text}");
+        assert!(
+            text.contains("@github.com/repo.git"),
+            "host part lost: {text}"
+        );
+    }
+
+    #[test]
+    fn redact_arguments_redacts_generic_authorization_forms() {
+        for (header, value) in [
+            ("Authorization", "token=abc123"),
+            ("Proxy-Authorization", "OAuth abc123"),
+            ("Authorization", "Basic abc123"),
+        ] {
+            let text = format!("{header}: {value}");
+            let redacted = projector().redact_text_with_inventory(&text);
+            assert!(!redacted.contains("abc123"), "secret leaked: {redacted}");
+            assert!(
+                redacted.contains("[REDACTED:"),
+                "placeholder missing: {redacted}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_action_validate_rejects_noncanonical_metadata() {
+        let mut action = CanonicalAction {
+            tool: "read_file".to_owned(),
+            operation: "read".to_owned(),
+            argv: vec!["read_file".to_owned(), "/workspace/notes.txt".to_owned()],
+            cwd: PathBuf::from("/workspace"),
+            affected_paths: vec![PathBuf::from("/workspace/notes.txt")],
+            sandbox: SandboxSummary::workspace(),
+            requested_permissions: vec![Permission::ReadWorkspace, Permission::ReadWorkspace],
+            justification: None,
+        };
+        assert!(
+            action.validate().is_err(),
+            "duplicate permissions must be rejected"
+        );
+
+        action.requested_permissions = vec![Permission::ReadWorkspace];
+        action.cwd = PathBuf::from("/workspace/../etc");
+        assert!(
+            action.validate().is_err(),
+            "noncanonical cwd must be rejected"
+        );
+
+        action.cwd = PathBuf::from("/workspace");
+        action.affected_paths = vec![PathBuf::from("/workspace/../etc/notes.txt")];
+        assert!(
+            action.validate().is_err(),
+            "noncanonical affected path must be rejected"
+        );
+    }
+
+    #[test]
+    fn artifact_handle_rejected_in_non_path_argument() {
+        let grep_pattern = CanonicalAction::from_tool_call(
+            PathBuf::from("/workspace"),
+            "grep",
+            &args(json!({
+                "path": "/workspace/notes.txt",
+                "pattern": "artifact://conversation/tool-output/execution-1"
+            })),
+        );
+        assert!(
+            grep_pattern.is_err(),
+            "artifact handle in grep pattern must be rejected"
+        );
+    }
+
+    #[test]
+    fn from_tool_call_rejects_remove_file_alias() {
+        let result = CanonicalAction::from_tool_call(
+            PathBuf::from("/workspace"),
+            "remove_file",
+            &args(json!({"path": "notes.txt"})),
+        );
+        assert!(
+            matches!(result, Err(ActionError::UnknownTool(_))),
+            "remove_file alias must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn project_rejects_forged_canonical_action() {
+        let mut forged = bash_action("echo safe");
+        forged.operation = "write".to_owned();
+        assert!(matches!(
+            projector().project(&forged),
+            ReviewProjection::InsufficientEvidence { .. }
+        ));
+
+        let mut forged_perms = bash_action("echo safe");
+        forged_perms
+            .requested_permissions
+            .push(Permission::WriteWorkspace);
+        assert!(matches!(
+            projector().project(&forged_perms),
+            ReviewProjection::InsufficientEvidence { .. }
+        ));
+    }
+
+    #[test]
+    fn projector_preserves_single_quoted_and_escaped_dollar() {
+        for command in ["echo '$TOKEN'", r#"echo \$TOKEN"#] {
+            let action = bash_action(command);
+            let ReviewProjection::Reviewable(projected) = projector().project(&action) else {
+                panic!("expected reviewable for literal dollar: {command}");
+            };
+            let argv_text = serde_json::to_string(&projected.argv).unwrap();
+            assert!(
+                argv_text.contains("$TOKEN"),
+                "literal $ should remain: {argv_text}"
+            );
+        }
+    }
+
+    #[test]
+    fn projector_rejects_unquoted_and_double_quoted_dollar() {
+        for command in ["echo $TOKEN", r#"echo "$TOKEN""#] {
+            let action = bash_action(command);
+            assert!(
+                matches!(
+                    projector().project(&action),
+                    ReviewProjection::InsufficientEvidence { .. }
+                ),
+                "dynamic $ should require approval: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn projector_rejects_network_when_one_of_two_hosts_redacted() {
+        let action =
+            bash_action("curl https://example.com https://sk-abcdefghijklmnop.example.com");
+        assert!(matches!(
+            projector().project(&action),
+            ReviewProjection::InsufficientEvidence { .. }
+        ));
+    }
+
+    #[test]
+    fn redact_bash_command_text_preserves_quotes_and_nonsecret_separators() {
+        let redacted = projector().redact_bash_command_text(
+            r#"curl "https://example.com?token=foo" "https://example.com?token=bar""#,
+        );
+        assert!(!redacted.contains("foo"), "foo leaked: {redacted}");
+        assert!(!redacted.contains("bar"), "bar leaked: {redacted}");
+        assert!(
+            redacted.contains(r#""https://example.com?token=[REDACTED:url_query_secret]""#),
+            "closing quote missing: {redacted}"
+        );
+        assert!(
+            redacted.matches("https://example.com").count() == 2,
+            "both hosts must remain visible: {redacted}"
+        );
+    }
+
+    #[test]
+    fn redacts_inline_credential_option_forms() {
+        let cases = [
+            ("curl -u user:pass https://example.com", "curl_user"),
+            ("curl --user user:pass https://example.com", "curl_user"),
+            ("curl -uuser:pass https://example.com", "curl_user"),
+            (
+                "wget --user=foo --password=bar https://example.com",
+                "wget_password",
+            ),
+            ("wget --password bar https://example.com", "wget_password"),
+            ("lftp -u user,pass sftp://host", "lftp_user"),
+            ("sshpass -p secret ssh user@host", "sshpass_password"),
+            ("sshpass -psecret ssh user@host", "sshpass_password"),
+            ("mysql -psecret -h db", "mysql_password"),
+            ("mysql -p secret -h db", "mysql_password"),
+            ("mongosh -u user -psecret", "mongosh_password"),
+            ("sqlcmd -S db -P secret", "sqlcmd_password"),
+            ("cqlsh db -psecret", "cqlsh_password"),
+            ("redis-cli -a secret ping", "redis_auth"),
+        ];
+        for (command, expected_kind) in cases {
+            let redacted = projector().redact_bash_command_text(command);
+            let placeholder = format!("[REDACTED:{expected_kind}]");
+            assert!(
+                redacted.contains(&placeholder),
+                "{command} did not produce {placeholder}: {redacted}"
+            );
+
+            let action = bash_action(command);
+            if let ReviewProjection::Reviewable(projected) = projector().project(&action) {
+                let kinds: Vec<&str> = projected
+                    .argv
+                    .iter()
+                    .filter_map(|token| match token {
+                        ReviewToken::SecretRef { kind, .. } => Some(kind.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(
+                    kinds.contains(&expected_kind),
+                    "{command} did not project {expected_kind}: {:?}",
+                    projected.argv
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn credential_detection_is_command_aware() {
+        // ssh -p is a port, not a password.
+        let ssh = "ssh -p 2222 user@host";
+        assert!(
+            !projector().text_contains_secret(ssh),
+            "ssh port misclassified as secret"
+        );
+        // wget -p is page requisites, not a password.
+        let wget = "wget -p https://example.com";
+        assert!(
+            !projector().text_contains_secret(wget),
+            "wget -p misclassified as secret"
+        );
+    }
+}
