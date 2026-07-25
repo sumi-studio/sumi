@@ -209,7 +209,7 @@ impl CanonicalAction {
             }
         } else if self.affected_paths.len() != 1 {
             return Err(ActionError::InvalidAction(
-                "path action has no affected path",
+                "path action must have exactly one affected path",
             ));
         } else {
             let expected_argv_len = if self.tool == "grep" { 3 } else { 2 };

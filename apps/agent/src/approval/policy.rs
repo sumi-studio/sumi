@@ -805,11 +805,7 @@ fn network_client_option_payload(command: &str, token: &str) -> bool {
                 || (token.starts_with("-i") && token.len() > 2)
                 || lower == "--input-file"
                 || lower.starts_with("--input-file=");
-            is_input_file
-                || lower == "-q"
-                || lower.starts_with("-q")
-                || lower == "-Q"
-                || lower.starts_with("-Q")
+            is_input_file || lower == "-q" || lower.starts_with("-q")
         }
         _ => false,
     }
@@ -1425,7 +1421,7 @@ enum PathCheck {
     WorkspaceEscape,
 }
 
-const INTERNAL_STATE_MARKERS: &[&str] = &[".sumi", "agent.db", "secrets", ".git", ".git/hooks"];
+const INTERNAL_STATE_MARKERS: &[&str] = &[".sumi", "agent.db", "secrets", ".git"];
 
 fn non_bash_read_covers_internal_state(
     action: &CanonicalAction,
@@ -1654,17 +1650,22 @@ fn from_effects(effects: Vec<(RuleEffect, String)>) -> PolicyDecision {
     }
     ids.sort();
     ids.dedup();
-    let reason = format!("matched rules: {}", ids.join(", "));
     match effect {
         RuleEffect::Allow => PolicyDecision::Allow { matched_rules: ids },
-        RuleEffect::NeedsApproval => PolicyDecision::NeedsApproval {
-            matched_rules: ids,
-            reason,
-        },
-        RuleEffect::Forbidden => PolicyDecision::Forbidden {
-            matched_rules: ids,
-            reason,
-        },
+        RuleEffect::NeedsApproval => {
+            let reason = format!("matched rules: {}", ids.join(", "));
+            PolicyDecision::NeedsApproval {
+                matched_rules: ids,
+                reason,
+            }
+        }
+        RuleEffect::Forbidden => {
+            let reason = format!("matched rules: {}", ids.join(", "));
+            PolicyDecision::Forbidden {
+                matched_rules: ids,
+                reason,
+            }
+        }
     }
 }
 
