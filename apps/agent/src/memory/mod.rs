@@ -3,6 +3,7 @@
 #![allow(dead_code)] // T20/T21 consume these foundations.
 
 pub mod batch;
+pub mod compactor;
 pub mod estimate;
 #[allow(dead_code)]
 pub mod transform;
@@ -68,6 +69,10 @@ impl DecryptedMemorySummary {
 
     pub fn expose(&self) -> &str {
         self.0.as_str()
+    }
+
+    pub(crate) fn clone_zeroized(&self) -> Zeroizing<String> {
+        self.0.clone()
     }
 }
 
