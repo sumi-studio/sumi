@@ -40,10 +40,14 @@ pub(crate) enum DeliveryMode {
 pub(crate) enum DeliveryFrame {
     Durable {
         seq: u64,
+        epoch: DeliveryEpoch,
         raw: Option<AgentEvent>,
         projection: Option<String>,
     },
-    Volatile(AgentEvent),
+    Volatile {
+        epoch: DeliveryEpoch,
+        event: AgentEvent,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -146,8 +150,14 @@ impl DeliveryPump {
             }
         };
         if head_seq >= catch_up_from_seq
-            && let Err(err) =
-                send_event_range(&self.store, &self.channel, catch_up_from_seq, head_seq).await
+            && let Err(err) = send_event_range(
+                &self.store,
+                &self.channel,
+                &epoch,
+                catch_up_from_seq,
+                head_seq,
+            )
+            .await
         {
             self.state = PumpState::Idle;
             return Err(err);
@@ -165,8 +175,8 @@ impl DeliveryPump {
         match &self.state {
             PumpState::Idle => Ok(()),
             PumpState::CatchingUp { .. } => Ok(()),
-            PumpState::Online { .. } => {
-                send_event_range(&self.store, &self.channel, seq, seq).await
+            PumpState::Online { epoch } => {
+                send_event_range(&self.store, &self.channel, epoch, seq, seq).await
             }
         }
     }
@@ -175,13 +185,16 @@ impl DeliveryPump {
         if let Some(kind) = event.durable_kind() {
             bail!("volatile delivery rejected durable event of kind {kind}");
         }
-        if !self.is_online() {
-            return Ok(());
-        }
+        let epoch = match &self.state {
+            PumpState::Online { epoch } => epoch.clone(),
+            PumpState::Idle | PumpState::CatchingUp { .. } => return Ok(()),
+        };
         if matches!(self.channel.mode, DeliveryMode::RedactionOnly) {
             return Ok(());
         }
-        self.channel.send(DeliveryFrame::Volatile(event)).await
+        self.channel
+            .send(DeliveryFrame::Volatile { epoch, event })
+            .await
     }
 }
 
@@ -197,6 +210,7 @@ async fn current_event_head_seq(pool: &sqlx::SqlitePool) -> Result<u64> {
 async fn send_event_range(
     store: &Store,
     channel: &DeliveryChannel,
+    epoch: &DeliveryEpoch,
     first_seq: u64,
     last_seq: u64,
 ) -> Result<()> {
@@ -236,6 +250,7 @@ async fn send_event_range(
         channel
             .send(DeliveryFrame::Durable {
                 seq,
+                epoch: epoch.clone(),
                 raw,
                 projection,
             })
@@ -366,6 +381,7 @@ mod tests {
                 seq: 1,
                 raw: Some(AgentEvent::MessageEnd { message_id, .. }),
                 projection: None,
+                ..
             } => assert_eq!(message_id, "msg-1"),
             other => panic!("unexpected frame {other:?}"),
         }
@@ -393,6 +409,7 @@ mod tests {
                 seq: 1,
                 raw: None,
                 projection: Some(proj),
+                ..
             } => {
                 assert!(proj.contains("[REDACTED:api_key]"));
                 assert!(!proj.contains("sk-abcdefghijklmnop"));
@@ -438,7 +455,7 @@ mod tests {
         while let Ok(Some(frame)) = timeout(Duration::from_millis(200), receiver.recv()).await {
             match frame {
                 DeliveryFrame::Durable { seq, .. } => seqs.push(seq),
-                DeliveryFrame::Volatile(_) => panic!("volatile must not appear in catch-up"),
+                DeliveryFrame::Volatile { .. } => panic!("volatile must not appear in catch-up"),
             }
         }
         assert_eq!(seqs, vec![1, 2]);
@@ -561,6 +578,71 @@ mod tests {
                 );
             }
             Ok(_) => panic!("on_volatile must reject a durable event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_frame_retains_attached_epoch_across_invalidation() {
+        let store = store().await;
+        let (channel, mut receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
+        let mut pump = DeliveryPump::new(store.clone(), channel);
+
+        let epoch_a = DeliveryEpoch::new("epoch-a").unwrap();
+        pump.install_epoch(epoch_a, 1).await.unwrap();
+
+        let volatile_a = AgentEvent::MessageUpdate {
+            message_id: "msg-a".to_owned(),
+            event: PublicStreamEvent::TextDelta {
+                content_index: 0,
+                delta: "a".to_owned(),
+            },
+        };
+        pump.on_volatile(volatile_a).await.unwrap();
+
+        pump.invalidate_epoch();
+
+        let durable_b = assistant_event("msg-b", "b");
+        insert_test_durable_event(&store, 1, &durable_b)
+            .await
+            .unwrap();
+
+        let epoch_b = DeliveryEpoch::new("epoch-b").unwrap();
+        pump.install_epoch(epoch_b, 1).await.unwrap();
+
+        let volatile_b = AgentEvent::MessageUpdate {
+            message_id: "msg-b".to_owned(),
+            event: PublicStreamEvent::TextDelta {
+                content_index: 0,
+                delta: "b".to_owned(),
+            },
+        };
+        pump.on_volatile(volatile_b).await.unwrap();
+
+        // Volatile enqueued under epoch A must still carry A after invalidation.
+        let frame = receiver.recv().await.unwrap();
+        match frame {
+            DeliveryFrame::Volatile { epoch, .. } => {
+                assert_eq!(epoch, DeliveryEpoch::new("epoch-a").unwrap());
+            }
+            other => panic!("expected volatile frame from epoch A: {other:?}"),
+        }
+
+        // Durable catch-up frame enqueued under epoch B must carry B.
+        let frame = receiver.recv().await.unwrap();
+        match frame {
+            DeliveryFrame::Durable { seq: 1, epoch, .. } => {
+                assert_eq!(epoch, DeliveryEpoch::new("epoch-b").unwrap());
+            }
+            other => panic!("expected durable catch-up frame from epoch B: {other:?}"),
+        }
+
+        // New volatile enqueued under epoch B must carry B.
+        let frame = receiver.recv().await.unwrap();
+        match frame {
+            DeliveryFrame::Volatile { epoch, .. } => {
+                assert_eq!(epoch, DeliveryEpoch::new("epoch-b").unwrap());
+            }
+            other => panic!("expected volatile frame from epoch B: {other:?}"),
         }
     }
 
