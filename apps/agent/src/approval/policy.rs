@@ -3456,4 +3456,37 @@ mod tests {
             vec!["/workspace"]
         );
     }
+
+    #[test]
+    fn multiple_parent_traversal_is_forbidden() {
+        for path in [
+            "../../etc/passwd",
+            "../etc/passwd",
+            "/workspace/../etc/passwd",
+            "foo/../../etc/passwd",
+            "foo/bar/../../../etc/passwd",
+        ] {
+            let action = CanonicalAction::from_tool_call(
+                PathBuf::from("/workspace"),
+                "write_file",
+                &args(json!({"path": path, "content": "x"})),
+            )
+            .unwrap_or_else(|e| panic!("{path} should parse: {e:?}"));
+            assert!(
+                policy().evaluate(&action).is_forbidden(),
+                "{path} should escape workspace and be forbidden"
+            );
+        }
+
+        let normal_relative = CanonicalAction::from_tool_call(
+            PathBuf::from("/workspace"),
+            "write_file",
+            &args(json!({"path": "foo/bar/../baz", "content": "x"})),
+        )
+        .unwrap();
+        assert!(
+            policy().evaluate(&normal_relative).is_allow(),
+            "foo/bar/../baz should stay inside workspace"
+        );
+    }
 }
