@@ -13,6 +13,7 @@ use std::sync::{Arc, Once};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
+use rustls::crypto::CryptoProvider;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest, http::HeaderValue};
@@ -80,7 +81,11 @@ impl GatewayConnector for WebSocketConnector {
         credential: GatewayCredential,
     ) -> Result<Self::Connection, ConnectorError> {
         RUSTLS_INIT.call_once(|| {
-            let _ = rustls::crypto::ring::default_provider().install_default();
+            if CryptoProvider::get_default().is_none() {
+                rustls::crypto::ring::default_provider()
+                    .install_default()
+                    .expect("rustls ring crypto provider should install");
+            }
         });
 
         let (scheme, _rest) = self
@@ -171,13 +176,8 @@ impl Gateway for WebSocketGateway {
         };
 
         let api_hello: ApiHello = serde_json::from_slice(&bytes).context("parse api hello")?;
-        if api_hello.accepted_generation != hello.generation {
-            bail!(
-                "generation claim mismatch: got {}, expected {}",
-                api_hello.accepted_generation,
-                hello.generation
-            );
-        }
+        // Generation claim validation is the supervisor's responsibility so it
+        // can classify a mismatch as a fatal error instead of a reconnect.
         Ok(api_hello)
     }
 
