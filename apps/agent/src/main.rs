@@ -13,9 +13,10 @@ mod tools;
 use std::{env, io, sync::Arc};
 
 use anyhow::{Result, anyhow};
+use gateway::stdio::{InvalidCommand, StdioGateway};
 use gateway::{
     CommandAckStatus, Envelope, Gateway, GatewayClosed, GatewayReader, GatewayWriter,
-    InboundCommand, InvalidCommand, OutboundFrame, StdioGateway,
+    InboundCommand, OutboundFrame,
 };
 use store::{
     AgentScope, DataKeyPurpose, EnvironmentKeyProvider, EventWriter, InboundAdmission, Store,
