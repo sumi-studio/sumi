@@ -71,7 +71,7 @@ $defs:
               - { $ref: '#/$defs/PublicMessage' }
           tool_results:
             type: array
-            items: { $ref: '#/$defs/ToolResultMessage' }
+            items: { $ref: '#/$defs/ToolResultPayload' }
       - type: object
         required: [type, message_id, message]
         additionalProperties: false
@@ -180,94 +180,94 @@ $defs:
         additionalProperties: false
         properties:
           type: { const: text_start }
-          content_index: { type: integer, minimum: 0 }
+          content_index: { $ref: '#/$defs/ContentIndex' }
       - type: object
         required: [type, content_index, delta]
         additionalProperties: false
         properties:
           type: { const: text_delta }
-          content_index: { type: integer, minimum: 0 }
+          content_index: { $ref: '#/$defs/ContentIndex' }
           delta: { type: string }
       - type: object
         required: [type, content_index, content]
         additionalProperties: false
         properties:
           type: { const: text_end }
-          content_index: { type: integer, minimum: 0 }
+          content_index: { $ref: '#/$defs/ContentIndex' }
           content: { type: string }
       - type: object
         required: [type, content_index]
         additionalProperties: false
         properties:
           type: { const: thinking_start }
-          content_index: { type: integer, minimum: 0 }
+          content_index: { $ref: '#/$defs/ContentIndex' }
       - type: object
         required: [type, content_index, delta]
         additionalProperties: false
         properties:
           type: { const: thinking_delta }
-          content_index: { type: integer, minimum: 0 }
+          content_index: { $ref: '#/$defs/ContentIndex' }
           delta: { type: string }
       - type: object
         required: [type, content_index, content]
         additionalProperties: false
         properties:
           type: { const: thinking_end }
-          content_index: { type: integer, minimum: 0 }
+          content_index: { $ref: '#/$defs/ContentIndex' }
           content: { type: string }
       - type: object
         required: [type, content_index]
         additionalProperties: false
         properties:
           type: { const: tool_call_start }
-          content_index: { type: integer, minimum: 0 }
+          content_index: { $ref: '#/$defs/ContentIndex' }
       - type: object
         required: [type, content_index, delta]
         additionalProperties: false
         properties:
           type: { const: tool_call_delta }
-          content_index: { type: integer, minimum: 0 }
+          content_index: { $ref: '#/$defs/ContentIndex' }
           delta: { type: string }
       - type: object
         required: [type, content_index, preview]
         additionalProperties: false
         properties:
           type: { const: tool_call_preview }
-          content_index: { type: integer, minimum: 0 }
+          content_index: { $ref: '#/$defs/ContentIndex' }
           preview: { description: any JSON value }
       - type: object
         required: [type, content_index, tool_call]
         additionalProperties: false
         properties:
           type: { const: tool_call_end }
-          content_index: { type: integer, minimum: 0 }
+          content_index: { $ref: '#/$defs/ContentIndex' }
           tool_call: { $ref: '#/$defs/ToolCall' }
       - type: object
         required: [type, content_index, rejected]
         additionalProperties: false
         properties:
           type: { const: tool_call_rejected }
-          content_index: { type: integer, minimum: 0 }
+          content_index: { $ref: '#/$defs/ContentIndex' }
           rejected: { $ref: '#/$defs/RejectedToolCall' }
       - type: object
         required: [type, content_index]
         additionalProperties: false
         properties:
           type: { const: reasoning_summary_start }
-          content_index: { type: integer, minimum: 0 }
+          content_index: { $ref: '#/$defs/ContentIndex' }
       - type: object
         required: [type, content_index, delta]
         additionalProperties: false
         properties:
           type: { const: reasoning_summary_delta }
-          content_index: { type: integer, minimum: 0 }
+          content_index: { $ref: '#/$defs/ContentIndex' }
           delta: { type: string }
       - type: object
         required: [type, content_index, content]
         additionalProperties: false
         properties:
           type: { const: reasoning_summary_end }
-          content_index: { type: integer, minimum: 0 }
+          content_index: { $ref: '#/$defs/ContentIndex' }
           content: { type: string }
 
   PublicMessage:
@@ -318,6 +318,21 @@ $defs:
     additionalProperties: false
     properties:
       role: { const: tool_result }
+      tool_call_id: { type: string }
+      tool_name: { type: string }
+      content:
+        type: array
+        items: { $ref: '#/$defs/UserContent' }
+      details: { description: any JSON value }
+      is_error: { type: boolean }
+      timestamp: { type: string, format: date-time }
+
+  ToolResultPayload:
+    type: object
+    description: tool result nested in TurnEnd; the enclosing event supplies its type
+    required: [tool_call_id, tool_name, content, details, is_error, timestamp]
+    additionalProperties: false
+    properties:
       tool_call_id: { type: string }
       tool_name: { type: string }
       content:
@@ -399,6 +414,18 @@ $defs:
     type: string
     enum: [invalid_json, non_object, schema_violation, incomplete_response, too_large]
 
+  ContentIndex:
+    type: integer
+    minimum: 0
+    maximum: 9007199254740991
+    description: non-negative index representable exactly by JavaScript number clients
+
+  JsonSafeInteger:
+    type: integer
+    minimum: 0
+    maximum: 9007199254740991
+    description: non-negative integer representable exactly by JavaScript number clients
+
   ProviderOrigin:
     type: object
     required: [provider_instance_id, protocol, model]
@@ -417,12 +444,12 @@ $defs:
     required: [input, output, cache_read, cache_write, reasoning, total_tokens]
     additionalProperties: false
     properties:
-      input: { type: integer, minimum: 0 }
-      output: { type: integer, minimum: 0 }
-      cache_read: { type: integer, minimum: 0 }
-      cache_write: { type: integer, minimum: 0 }
-      reasoning: { type: integer, minimum: 0 }
-      total_tokens: { type: integer, minimum: 0 }
+      input: { $ref: '#/$defs/JsonSafeInteger' }
+      output: { $ref: '#/$defs/JsonSafeInteger' }
+      cache_read: { $ref: '#/$defs/JsonSafeInteger' }
+      cache_write: { $ref: '#/$defs/JsonSafeInteger' }
+      reasoning: { $ref: '#/$defs/JsonSafeInteger' }
+      total_tokens: { $ref: '#/$defs/JsonSafeInteger' }
 
   StopReason:
     type: string

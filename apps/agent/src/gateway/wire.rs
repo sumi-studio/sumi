@@ -14,7 +14,10 @@
 //!   surface; the opaque values inside `provider/types.rs` are not wired to
 //!   the public contract yet.
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{self, IgnoredAny, SeqAccess, Visitor},
+};
 use serde_json::{Map, Value};
 use thiserror::Error;
 use uuid::Uuid;
@@ -42,6 +45,11 @@ pub const USER_MESSAGE_ID_NAMESPACE: Uuid = Uuid::from_bytes([
     0x78, 0xf6, 0x2d, 0x15, 0xb9, 0x45, 0x4a, 0x4f, 0x9d, 0x84, 0xd7, 0x3c, 0x7f, 0x93, 0x2b, 0x51,
 ]);
 
+/// JSON numbers above this value cannot be represented exactly by JavaScript's
+/// `number` type. Wire indices are bounded to this value so generated clients
+/// have one architecture-independent, lossless representation.
+pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
 /// Errors that can occur while converting an internal value to its wire form.
 #[derive(Debug, Error)]
 pub enum WireError {
@@ -61,6 +69,12 @@ pub enum WireError {
     InvalidCommandId(String),
     #[error("approval rule must be an object")]
     NonObjectApprovalRule,
+    #[error("tool execution args must be an object")]
+    NonObjectToolExecutionArgs,
+    #[error("content_index `{0}` exceeds the JSON-safe integer range")]
+    ContentIndexOutOfRange(u64),
+    #[error("usage value `{0}` exceeds the JSON-safe integer range")]
+    UsageValueOutOfRange(u64),
 }
 
 /// Derive a durable user `message_id` from a canonical `command_id` using the
@@ -86,12 +100,27 @@ fn deserialize_empty_attachments<'de, D>(deserializer: D) -> Result<Vec<WireAtta
 where
     D: Deserializer<'de>,
 {
-    let attachments = Vec::<WireAttachment>::deserialize(deserializer)?;
-    if attachments.is_empty() {
-        Ok(attachments)
-    } else {
-        Err(serde::de::Error::custom("attachments must be empty"))
+    struct EmptyAttachmentsVisitor;
+
+    impl<'de> Visitor<'de> for EmptyAttachmentsVisitor {
+        type Value = Vec<WireAttachment>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an empty attachments array")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            if sequence.next_element::<IgnoredAny>()?.is_some() {
+                return Err(de::Error::custom("attachments must be empty"));
+            }
+            Ok(Vec::new())
+        }
     }
+
+    deserializer.deserialize_seq(EmptyAttachmentsVisitor)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -115,11 +144,31 @@ pub enum WireCommand {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "WireCommandEnvelopeInput")]
 pub struct WireCommandEnvelope {
     pub seq: u64,
     pub command_id: String,
     pub command: WireCommand,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireCommandEnvelopeInput {
+    seq: u64,
+    command_id: String,
+    command: WireCommand,
+}
+
+impl TryFrom<WireCommandEnvelopeInput> for WireCommandEnvelope {
+    type Error = WireError;
+
+    fn try_from(input: WireCommandEnvelopeInput) -> Result<Self, Self::Error> {
+        Ok(Self {
+            seq: input.seq,
+            command_id: canonical_command_id(&input.command_id)?,
+            command: input.command,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -344,7 +393,7 @@ pub enum WireAgentEvent {
     ToolExecutionStart {
         tool_call_id: String,
         tool_name: String,
-        args: Value,
+        args: Map<String, Value>,
     },
     ToolExecutionUpdate {
         tool_call_id: String,
@@ -417,55 +466,69 @@ impl WireAgentEvent {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WirePublicStreamEvent {
     TextStart {
-        content_index: usize,
+        #[serde(deserialize_with = "deserialize_json_safe_index")]
+        content_index: u64,
     },
     TextDelta {
-        content_index: usize,
+        #[serde(deserialize_with = "deserialize_json_safe_index")]
+        content_index: u64,
         delta: String,
     },
     TextEnd {
-        content_index: usize,
+        #[serde(deserialize_with = "deserialize_json_safe_index")]
+        content_index: u64,
         content: String,
     },
     ThinkingStart {
-        content_index: usize,
+        #[serde(deserialize_with = "deserialize_json_safe_index")]
+        content_index: u64,
     },
     ThinkingDelta {
-        content_index: usize,
+        #[serde(deserialize_with = "deserialize_json_safe_index")]
+        content_index: u64,
         delta: String,
     },
     ThinkingEnd {
-        content_index: usize,
+        #[serde(deserialize_with = "deserialize_json_safe_index")]
+        content_index: u64,
         content: String,
     },
     ToolCallStart {
-        content_index: usize,
+        #[serde(deserialize_with = "deserialize_json_safe_index")]
+        content_index: u64,
     },
     ToolCallDelta {
-        content_index: usize,
+        #[serde(deserialize_with = "deserialize_json_safe_index")]
+        content_index: u64,
         delta: String,
     },
     ToolCallPreview {
-        content_index: usize,
+        #[serde(deserialize_with = "deserialize_json_safe_index")]
+        content_index: u64,
         preview: Value,
     },
     ToolCallEnd {
-        content_index: usize,
+        #[serde(deserialize_with = "deserialize_json_safe_index")]
+        content_index: u64,
         tool_call: WireToolCall,
     },
     ToolCallRejected {
-        content_index: usize,
+        #[serde(deserialize_with = "deserialize_json_safe_index")]
+        content_index: u64,
         rejected: WireRejectedToolCall,
     },
     ReasoningSummaryStart {
-        content_index: usize,
+        #[serde(deserialize_with = "deserialize_json_safe_index")]
+        content_index: u64,
     },
     ReasoningSummaryDelta {
-        content_index: usize,
+        #[serde(deserialize_with = "deserialize_json_safe_index")]
+        content_index: u64,
         delta: String,
     },
     ReasoningSummaryEnd {
-        content_index: usize,
+        #[serde(deserialize_with = "deserialize_json_safe_index")]
+        content_index: u64,
         content: String,
     },
 }
@@ -577,11 +640,17 @@ pub enum WireApiProtocol {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WireUsage {
+    #[serde(deserialize_with = "deserialize_json_safe_integer")]
     pub input: u64,
+    #[serde(deserialize_with = "deserialize_json_safe_integer")]
     pub output: u64,
+    #[serde(deserialize_with = "deserialize_json_safe_integer")]
     pub cache_read: u64,
+    #[serde(deserialize_with = "deserialize_json_safe_integer")]
     pub cache_write: u64,
+    #[serde(deserialize_with = "deserialize_json_safe_integer")]
     pub reasoning: u64,
+    #[serde(deserialize_with = "deserialize_json_safe_integer")]
     pub total_tokens: u64,
 }
 
@@ -738,7 +807,10 @@ impl TryFrom<AgentEvent> for WireAgentEvent {
             } => Self::ToolExecutionStart {
                 tool_call_id,
                 tool_name,
-                args,
+                args: args
+                    .as_object()
+                    .cloned()
+                    .ok_or(WireError::NonObjectToolExecutionArgs)?,
             },
             AgentEvent::ToolExecutionUpdate {
                 tool_call_id,
@@ -792,84 +864,88 @@ impl TryFrom<PublicStreamEvent> for WirePublicStreamEvent {
     type Error = WireError;
     fn try_from(event: PublicStreamEvent) -> Result<Self, WireError> {
         Ok(match event {
-            PublicStreamEvent::TextStart { content_index } => Self::TextStart { content_index },
+            PublicStreamEvent::TextStart { content_index } => Self::TextStart {
+                content_index: wire_content_index(content_index)?,
+            },
             PublicStreamEvent::TextDelta {
                 content_index,
                 delta,
             } => Self::TextDelta {
-                content_index,
+                content_index: wire_content_index(content_index)?,
                 delta,
             },
             PublicStreamEvent::TextEnd {
                 content_index,
                 content,
             } => Self::TextEnd {
-                content_index,
+                content_index: wire_content_index(content_index)?,
                 content,
             },
-            PublicStreamEvent::ThinkingStart { content_index } => {
-                Self::ThinkingStart { content_index }
-            }
+            PublicStreamEvent::ThinkingStart { content_index } => Self::ThinkingStart {
+                content_index: wire_content_index(content_index)?,
+            },
             PublicStreamEvent::ThinkingDelta {
                 content_index,
                 delta,
             } => Self::ThinkingDelta {
-                content_index,
+                content_index: wire_content_index(content_index)?,
                 delta,
             },
             PublicStreamEvent::ThinkingEnd {
                 content_index,
                 content,
             } => Self::ThinkingEnd {
-                content_index,
+                content_index: wire_content_index(content_index)?,
                 content,
             },
-            PublicStreamEvent::ToolCallStart { content_index } => {
-                Self::ToolCallStart { content_index }
-            }
+            PublicStreamEvent::ToolCallStart { content_index } => Self::ToolCallStart {
+                content_index: wire_content_index(content_index)?,
+            },
             PublicStreamEvent::ToolCallDelta {
                 content_index,
                 delta,
             } => Self::ToolCallDelta {
-                content_index,
+                content_index: wire_content_index(content_index)?,
                 delta,
             },
             PublicStreamEvent::ToolCallPreview {
                 content_index,
                 preview,
             } => Self::ToolCallPreview {
-                content_index,
+                content_index: wire_content_index(content_index)?,
                 preview: preview.as_value().clone(),
             },
             PublicStreamEvent::ToolCallEnd {
                 content_index,
                 tool_call,
             } => Self::ToolCallEnd {
-                content_index,
+                content_index: wire_content_index(content_index)?,
                 tool_call: tool_call.try_into()?,
             },
             PublicStreamEvent::ToolCallRejected {
                 content_index,
                 rejected,
             } => Self::ToolCallRejected {
-                content_index,
+                content_index: wire_content_index(content_index)?,
                 rejected: rejected.try_into()?,
             },
             PublicStreamEvent::ReasoningSummaryStart { content_index } => {
-                Self::ReasoningSummaryStart { content_index }
+                Self::ReasoningSummaryStart {
+                    content_index: wire_content_index(content_index)?,
+                }
             }
             PublicStreamEvent::ReasoningSummaryDelta {
                 content_index,
                 delta,
             } => Self::ReasoningSummaryDelta {
-                content_index,
+                content_index: wire_content_index(content_index)?,
                 delta,
             },
             PublicStreamEvent::ReasoningSummaryEnd {
                 content_index,
                 content,
             } => Self::ReasoningSummaryEnd {
-                content_index,
+                content_index: wire_content_index(content_index)?,
                 content,
             },
         })
@@ -1044,12 +1120,12 @@ impl TryFrom<Usage> for WireUsage {
     type Error = WireError;
     fn try_from(usage: Usage) -> Result<Self, WireError> {
         Ok(Self {
-            input: usage.input,
-            output: usage.output,
-            cache_read: usage.cache_read,
-            cache_write: usage.cache_write,
-            reasoning: usage.reasoning,
-            total_tokens: usage.total_tokens,
+            input: wire_usage_value(usage.input)?,
+            output: wire_usage_value(usage.output)?,
+            cache_read: wire_usage_value(usage.cache_read)?,
+            cache_write: wire_usage_value(usage.cache_write)?,
+            reasoning: wire_usage_value(usage.reasoning)?,
+            total_tokens: wire_usage_value(usage.total_tokens)?,
         })
     }
 }
@@ -1301,6 +1377,47 @@ fn canonical_command_id(value: &str) -> Result<String, WireError> {
         .map_err(|_| WireError::InvalidCommandId(value.to_owned()))
 }
 
+fn wire_content_index(value: usize) -> Result<u64, WireError> {
+    let value = u64::try_from(value).map_err(|_| WireError::ContentIndexOutOfRange(u64::MAX))?;
+    if value > MAX_JSON_SAFE_INTEGER {
+        return Err(WireError::ContentIndexOutOfRange(value));
+    }
+    Ok(value)
+}
+
+fn deserialize_json_safe_index<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = u64::deserialize(deserializer)?;
+    if value > MAX_JSON_SAFE_INTEGER {
+        return Err(de::Error::custom(
+            "content_index exceeds the JSON-safe integer range",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_json_safe_integer<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = u64::deserialize(deserializer)?;
+    if value > MAX_JSON_SAFE_INTEGER {
+        return Err(de::Error::custom(
+            "integer exceeds the JSON-safe integer range",
+        ));
+    }
+    Ok(value)
+}
+
+fn wire_usage_value(value: u64) -> Result<u64, WireError> {
+    if value > MAX_JSON_SAFE_INTEGER {
+        return Err(WireError::UsageValueOutOfRange(value));
+    }
+    Ok(value)
+}
+
 fn validate_seq(seq: Option<u64>, event: &WireAgentEvent) -> Result<(), WireError> {
     if event.is_volatile() {
         if seq.is_some() {
@@ -1337,6 +1454,29 @@ mod tests {
 
     fn now() -> DateTime<Utc> {
         Utc::now()
+    }
+
+    fn canonical_contract_is_valid(definition: &str, value: &Value) -> bool {
+        let contract: Value = serde_yaml::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../contracts/agent-events.yaml"
+        )))
+        .expect("canonical agent-events schema is valid YAML");
+        let schema = json!({
+            "$schema": contract["$schema"].clone(),
+            "$ref": format!("#/$defs/{definition}"),
+            "$defs": contract["$defs"].clone(),
+        });
+        let validator =
+            jsonschema::validator_for(&schema).expect("canonical agent-events schema compiles");
+        validator.is_valid(value)
+    }
+
+    fn assert_canonical_contract(definition: &str, value: &Value) {
+        assert!(
+            canonical_contract_is_valid(definition, value),
+            "{definition} sample violates canonical schema"
+        );
     }
 
     fn uuid_command_id() -> CommandId {
@@ -1440,6 +1580,14 @@ mod tests {
     }
 
     #[test]
+    fn attachments_reject_non_empty_array() {
+        let malformed_tail = br#"{"type":"user_message","text":"inspect","attachments":[null,{}]}"#;
+        let error = serde_json::from_slice::<WireCommand>(malformed_tail)
+            .expect_err("non-empty attachments must be rejected");
+        assert!(error.to_string().contains("attachments must be empty"));
+    }
+
+    #[test]
     fn command_envelope_round_trips() {
         let envelope = CommandEnvelope {
             seq: 7,
@@ -1451,9 +1599,28 @@ mod tests {
         };
         let wire = WireCommandEnvelope::try_from(envelope).unwrap();
         let json = serde_json::to_string(&wire).unwrap();
+        assert_canonical_contract("CommandEnvelope", &serde_json::to_value(&wire).unwrap());
         let back: WireCommandEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(wire, back);
         assert_eq!(back.command_id, "00000000-0000-4000-8000-000000000001");
+    }
+
+    #[test]
+    fn command_envelope_requires_canonical_command_id() {
+        for command_id in [
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_uppercase(),
+            "{aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa}".to_owned(),
+        ] {
+            let value = json!({
+                "seq": 1,
+                "command_id": command_id,
+                "command": {"type": "abort"},
+            });
+            assert!(
+                serde_json::from_value::<WireCommandEnvelope>(value).is_err(),
+                "non-canonical command_id must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -1503,6 +1670,7 @@ mod tests {
             },
         };
         let wire = to_wire_frame(durable).unwrap();
+        assert_canonical_contract("OutboundFrame", &serde_json::to_value(&wire).unwrap());
         assert!(matches!(wire, WireOutboundFrame::Event { envelope } if envelope.seq == Some(1)));
 
         let durable_missing_seq = OutboundFrame::Event {
@@ -1716,7 +1884,12 @@ mod tests {
             timestamp: now(),
         };
         let turn_end = AgentEvent::TurnEnd {
-            message: None,
+            message: Some(Box::new(PublicMessage::User(UserMessage {
+                content: vec![UserContent::Text {
+                    text: "assistant context".to_owned(),
+                }],
+                timestamp: now(),
+            }))),
             tool_results: vec![tool_result],
         };
         round_trip_agent_event(turn_end);
@@ -1729,8 +1902,59 @@ mod tests {
     fn round_trip_agent_event(event: AgentEvent) {
         let wire = WireAgentEvent::try_from(event).unwrap();
         let json = serde_json::to_value(&wire).unwrap();
+        assert_canonical_contract("AgentEvent", &json);
         let back: WireAgentEvent = serde_json::from_value(json).unwrap();
         assert_eq!(wire, back);
+    }
+
+    #[test]
+    fn tool_execution_start_args_must_be_an_object() {
+        for args in [json!(null), json!([]), json!("scalar")] {
+            let value = json!({
+                "type": "tool_execution_start",
+                "tool_call_id": "call-1",
+                "tool_name": "read_file",
+                "args": args,
+            });
+            assert!(
+                serde_json::from_value::<WireAgentEvent>(value).is_err(),
+                "non-object tool args must be rejected by the wire DTO"
+            );
+        }
+
+        let error = WireAgentEvent::try_from(AgentEvent::ToolExecutionStart {
+            tool_call_id: "call-1".to_owned(),
+            tool_name: "read_file".to_owned(),
+            args: json!([]),
+        })
+        .expect_err("internal non-object args must not cross the wire boundary");
+        assert!(matches!(error, WireError::NonObjectToolExecutionArgs));
+    }
+
+    #[test]
+    fn canonical_schema_distinguishes_nested_and_top_level_tool_results() {
+        let payload = json!({
+            "tool_call_id": "call-1",
+            "tool_name": "read_file",
+            "content": [{"type": "text", "text": "contents"}],
+            "details": {"exit": 0},
+            "is_error": false,
+            "timestamp": now().to_rfc3339(),
+        });
+        let nested_event = json!({
+            "type": "turn_end",
+            "message": null,
+            "tool_results": [payload.clone()],
+        });
+        assert_canonical_contract("AgentEvent", &nested_event);
+        assert!(
+            !canonical_contract_is_valid("PublicMessage", &payload),
+            "nested tool result payload must not be accepted as a top-level message"
+        );
+
+        let mut top_level = payload.as_object().cloned().expect("object payload");
+        top_level.insert("role".to_owned(), json!("tool_result"));
+        assert_canonical_contract("PublicMessage", &Value::Object(top_level));
     }
 
     #[test]
@@ -1795,8 +2019,50 @@ mod tests {
     fn round_trip_stream_event(event: PublicStreamEvent) {
         let wire = WirePublicStreamEvent::try_from(event).unwrap();
         let json = serde_json::to_value(&wire).unwrap();
+        assert_canonical_contract("PublicStreamEvent", &json);
         let back: WirePublicStreamEvent = serde_json::from_value(json).unwrap();
         assert_eq!(wire, back);
+    }
+
+    #[test]
+    fn content_index_is_bounded_to_json_safe_integer_range() {
+        let event = json!({
+            "type": "text_start",
+            "content_index": MAX_JSON_SAFE_INTEGER + 1,
+        });
+        assert!(serde_json::from_value::<WirePublicStreamEvent>(event).is_err());
+
+        let event = PublicStreamEvent::TextStart {
+            content_index: usize::MAX,
+        };
+        if usize::BITS > 53 {
+            assert!(matches!(
+                WirePublicStreamEvent::try_from(event),
+                Err(WireError::ContentIndexOutOfRange(_))
+            ));
+        } else {
+            assert!(WirePublicStreamEvent::try_from(event).is_ok());
+        }
+    }
+
+    #[test]
+    fn usage_values_are_bounded_to_json_safe_integer_range() {
+        let value = json!({
+            "input": MAX_JSON_SAFE_INTEGER + 1,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0,
+            "total_tokens": 0,
+        });
+        assert!(serde_json::from_value::<WireUsage>(value).is_err());
+
+        let mut internal = usage();
+        internal.total_tokens = MAX_JSON_SAFE_INTEGER + 1;
+        assert!(matches!(
+            WireUsage::try_from(internal),
+            Err(WireError::UsageValueOutOfRange(_))
+        ));
     }
 
     #[test]
@@ -1870,6 +2136,7 @@ mod tests {
     fn round_trip_public_message(message: PublicMessage) {
         let wire = WirePublicMessage::try_from(message).unwrap();
         let json = serde_json::to_value(&wire).unwrap();
+        assert_canonical_contract("PublicMessage", &json);
         let back: WirePublicMessage = serde_json::from_value(json).unwrap();
         assert_eq!(wire, back);
     }
@@ -1942,6 +2209,7 @@ mod tests {
     fn round_trip_command(command: Command) {
         let wire = WireCommand::try_from(command).unwrap();
         let json = serde_json::to_value(&wire).unwrap();
+        assert_canonical_contract("Command", &json);
         let back: WireCommand = serde_json::from_value(json).unwrap();
         assert_eq!(wire, back);
     }

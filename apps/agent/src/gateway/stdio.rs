@@ -12,6 +12,7 @@ use tokio::io::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
+use super::wire::to_wire_frame;
 use super::{
     CommandDigestFactory, CommandEnvelope, CommandId, CommandRejectReason, Gateway, GatewayClosed,
     GatewayReader, GatewayWriter, InboundCommand, IncrementalCommandDigest, KeyedCommandDigest,
@@ -173,7 +174,9 @@ impl GatewayWriter for StdioGatewayWriter {
 }
 
 async fn write_frame<W: AsyncWrite + Unpin>(output: &mut W, frame: OutboundFrame) -> Result<()> {
-    let mut line = serde_json::to_vec(&frame).context("failed to encode gateway frame JSON")?;
+    let wire_frame = to_wire_frame(frame).context("failed to convert gateway frame to wire DTO")?;
+    let mut line =
+        serde_json::to_vec(&wire_frame).context("failed to encode gateway frame JSON")?;
     line.push(b'\n');
     output
         .write_all(&line)
@@ -814,7 +817,7 @@ where
 #[cfg(test)]
 mod tests {
     use sha2::{Digest, Sha256};
-    use tokio::io::{AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncWriteExt, BufReader, sink};
 
     use super::*;
     use crate::gateway::Command;
@@ -844,6 +847,23 @@ mod tests {
         R: AsyncBufRead + Unpin,
     {
         read_command(input, &TestDigestFactory).await
+    }
+
+    #[tokio::test]
+    async fn writer_converts_frames_through_the_wire_contract() {
+        let mut output = sink();
+        let invalid = OutboundFrame::Event {
+            envelope: super::super::Envelope {
+                seq: Some(1),
+                conversation_id: "conversation-1".to_owned(),
+                event: serde_json::json!({"type": "error", "message": "volatile"}),
+            },
+        };
+
+        let error = write_frame(&mut output, invalid)
+            .await
+            .expect_err("wire conversion must reject a volatile event with seq");
+        assert!(format!("{error:#}").contains("volatile event"));
     }
 
     fn frame_with_total_bytes(total_bytes: usize) -> Vec<u8> {
