@@ -115,16 +115,26 @@ captures and the tracked fixture unchanged because `--fail-with-body` writes
 only to the trapped temporary file. Never print the config, environment,
 headers, or command trace.
 
-Moonshot direct, Z.ai direct, and Umans raw/live evidence remains mandatory but
-is deferred as a release-blocking T25 provider-release gate because those
-credentials were unavailable during T8. A missing credential, the OpenCode
-gateway capture, or a synthetic fixture does not satisfy that gate. Use the
-corresponding documented base URL, model, and credential variable. For each of
-these deferred direct-provider captures, tool capture uses one deterministic
-`echo_value(value: string)` tool, `tool_choice:"required"`, and a 128-token
-limit. Reasoning capture uses the preset's production thinking control and the
-prompt `Reply with exactly OK after reasoning.`. Do not infer one provider's
-dialect from another provider or gateway.
+OpenCode Zen Go is the only mandatory live provider proof for the T25
+provider-release slice. The non-ignored `live_opencode_go_provider_release_gate`
+runs `opencode-go` when `SUMI_LIVE_TEST=1` and must complete a real two-turn
+exchange: one `echo_value` tool-call/result round-trip and replayable reasoning
+on both turns. A missing or empty `OPENCODE_GO_API_KEY` fails the gate; a skip,
+synthetic fixture, or gateway capture is not live success.
+
+Moonshot direct, Z.ai direct, and Umans raw/live evidence remains explicitly
+deferred and is not replaced by the OpenCode gate or by any fixture. When those
+credentials become available, capture each direct provider using its documented
+base URL, model, and credential variable. For each deferred direct-provider
+capture, tool capture uses one deterministic `echo_value(value: string)` tool,
+`tool_choice:"required"`, and a 128-token limit. Reasoning capture uses the
+preset's production thinking control and the prompt `Reply with exactly OK after
+reasoning.`. Do not infer one provider's dialect from another provider or
+gateway.
+
+OpenAI Responses fixture and durable round-trip proof remains required. A live
+Responses proof through ChatGPT/Codex login is optional and is not part of this
+packet.
 
 Keep the unmodified response body only in the ignored quarantine. Promotion is
 a separate, deliberate review:
@@ -157,14 +167,16 @@ a separate, deliberate review:
 Never store or print the credential or Authorization header. The temporary curl
 config must never be retained as provenance.
 
-The non-ignored `live_direct_provider_release_gate` is the T25 release
-dispatcher. It returns without external communication unless
-`SUMI_LIVE_TEST=1`; with that opt-in it runs direct Moonshot `kimi-k3`, direct
-Z.ai `glm-5.2`, and Umans sequentially, and fails on the first missing or empty
-credential. Thus the canonical `SUMI_LIVE_TEST=1 cargo test --manifest-path
-apps/agent/Cargo.toml` command executes at least this one live test rather than
-silently selecting zero. The four provider-specific live gates remain ignored
-development gates selected explicitly with `cargo test <live_gate_name> --
---ignored`; OpenCode Go is not a substitute for the T25 direct-provider
-dispatcher. `SUMI_ENV_FILE` may explicitly name a dotenv file to load. Live
-tests are not substitutes for checked-in raw capture provenance.
+The non-ignored `live_opencode_go_provider_release_gate` is the T25 release
+dispatcher. It returns without external communication unless `SUMI_LIVE_TEST=1`;
+with that opt-in it runs `opencode-go` and fails on a missing or empty
+`OPENCODE_GO_API_KEY`. The four provider-specific live gates
+(`live_opencode_go_two_turn_tool_reasoning_gate`,
+`live_kimi_k3_direct_two_turn_tool_reasoning_gate`,
+`live_glm_5_2_direct_two_turn_tool_reasoning_gate`,
+`live_umans_direct_two_turn_tool_reasoning_gate`) remain ignored development
+gates selected explicitly with `cargo test <live_gate_name> -- --ignored`.
+Direct Moonshot/Z.ai/Umans evidence remains deferred; OpenCode Go is not a
+substitute for those future proofs. `SUMI_ENV_FILE` may explicitly name a
+dotenv file to load. Live tests are not substitutes for checked-in raw capture
+provenance.

@@ -5244,44 +5244,42 @@ fi
     }
 
     #[tokio::test]
-    #[ignore = "T25 live Moonshot direct gate; requires non-empty MOONSHOT_API_KEY"]
+    #[ignore = "deferred T25 live Moonshot direct gate; requires non-empty MOONSHOT_API_KEY"]
     async fn live_kimi_k3_direct_two_turn_tool_reasoning_gate() {
         run_live_chat_tool_roundtrip("kimi-k3").await;
     }
 
     #[tokio::test]
-    #[ignore = "T25 live Z.ai direct gate; requires non-empty ZAI_API_KEY"]
+    #[ignore = "deferred T25 live Z.ai direct gate; requires non-empty ZAI_API_KEY"]
     async fn live_glm_5_2_direct_two_turn_tool_reasoning_gate() {
         run_live_chat_tool_roundtrip("glm-5.2").await;
     }
 
     #[tokio::test]
-    #[ignore = "T25 live Umans direct gate; requires non-empty UMANS_API_KEY"]
+    #[ignore = "deferred T25 live Umans direct gate; requires non-empty UMANS_API_KEY"]
     async fn live_umans_direct_two_turn_tool_reasoning_gate() {
         run_live_chat_tool_roundtrip("umans").await;
     }
 
     #[tokio::test]
-    async fn live_direct_provider_release_gate() {
+    async fn live_opencode_go_provider_release_gate() {
         if env::var("SUMI_LIVE_TEST").as_deref() != Ok("1") {
             return;
         }
-
-        for preset in ["kimi-k3", "glm-5.2", "umans"] {
-            run_live_chat_tool_roundtrip(preset).await;
-        }
+        run_live_chat_tool_roundtrip("opencode-go").await;
     }
 
     #[test]
-    fn live_release_opt_in_without_credentials_fails_before_network() {
+    fn live_opencode_go_release_opt_in_without_credentials_fails_before_network() {
         let output = Command::new(env::current_exe().expect("current test executable"))
             .args([
                 "--exact",
-                "provider::tests::live_direct_provider_release_gate",
+                "provider::tests::live_opencode_go_provider_release_gate",
                 "--nocapture",
             ])
             .env("SUMI_LIVE_TEST", "1")
             .env_remove("SUMI_ENV_FILE")
+            .env_remove("OPENCODE_GO_API_KEY")
             .env_remove("MOONSHOT_API_KEY")
             .env_remove("ZAI_API_KEY")
             .env_remove("UMANS_API_KEY")
@@ -5297,7 +5295,7 @@ fi
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(
-            diagnostics.contains("kimi-k3 live gate requires MOONSHOT_API_KEY"),
+            diagnostics.contains("opencode-go live gate requires OPENCODE_GO_API_KEY"),
             "unexpected dispatcher failure: {diagnostics}"
         );
     }

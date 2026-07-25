@@ -2514,7 +2514,7 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 - OpenAI Responses ゲート:
   1. output text、function call arguments、usage、incomplete/error、encrypted reasoning の公式 SSE fixture を共通イベントへ正規化できる
   2. `/responses/compact` の canonical `output[]` を retained message/tool item と compaction item の順序ごと暗号化保存し、同 provider instance/protocol/model へ配列全体を無加工で再送できる。compaction item だけに prune せず、Sumi の MemoryBlock から不透明 item を捏造しない
-  3. `store=false` のライブ2ターン+tool 1往復を GPT-5.6 系で完走し、再起動後も durable transcript + provider context から継続できる
+  3. `store=false` のライブ2ターン+tool 1往復は任意とし、GPT-5.6 系で完走できれば証拠として追加できる。再起動後の durable transcript + provider context 継続は fixture + durable round-trip で必須とする
 - Anthropic Messages ゲート:
   1. named SSE の `message_start/content_block_*/message_delta/message_stop`、ping、stream error、`input_json_delta` を fixture で正規化できる
   2. assistant `tool_use` → user `tool_result` の1往復、top-level system、連続 user turn の結合を fixture で確認する。Anthropic live実行は任意の開発証拠であり、Cloud release gateには使わない

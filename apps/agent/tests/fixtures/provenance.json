@@ -128,6 +128,31 @@
     }
   },
   "evidence_gaps": {
+    "opencode_go_live_two_turn_tool_reasoning": {
+      "provider": "opencode-go",
+      "model": "kimi-k2.7-code",
+      "required_cases": [
+        "two_turn_tool_call_result_round_trip",
+        "reasoning_exposure_and_replay"
+      ],
+      "status": "live_proof_pending",
+      "latest_attempt": {
+        "observed_at": "2026-07-25T23:39:09Z",
+        "result": "http_429_weekly_usage_limit"
+      },
+      "release_blocking": true
+    },
+    "responses_fixture_and_durable_round_trip": {
+      "provider": "openai-responses",
+      "model": null,
+      "required_cases": [
+        "encrypted_reasoning_durable_round_trip",
+        "store_false_two_turn_tool_fixture",
+        "native_compaction_ordered_output"
+      ],
+      "status": "fixture_and_durable_proof_required",
+      "release_blocking": true
+    },
     "moonshot_direct_text_tool_reasoning": {
       "provider": "moonshot",
       "model": "kimi-k3",
