@@ -2779,6 +2779,183 @@ async fn tool_execution_hard_steer_dropped_accept_is_no_op() {
     while events_rx.try_recv().is_ok() {}
 }
 
+struct HardSteerToolDriver {
+    started_contexts: Mutex<Vec<Vec<ContextMessage>>>,
+    tool_started: Arc<Notify>,
+    tool_released: Arc<Notify>,
+    tool_cancelled: Arc<AtomicBool>,
+}
+
+impl HardSteerToolDriver {
+    fn new() -> Self {
+        Self {
+            started_contexts: Mutex::new(Vec::new()),
+            tool_started: Arc::new(Notify::new()),
+            tool_released: Arc::new(Notify::new()),
+            tool_cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+#[async_trait]
+impl RunDriver for HardSteerToolDriver {
+    fn validate_executor_generation(&self, _generation: ProcessGeneration) -> Result<()> {
+        Ok(())
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        attempt: usize,
+        context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        let mut contexts = self.started_contexts.lock().expect("contexts");
+        let first = contexts.is_empty();
+        contexts.push(context.to_vec());
+        let message = if first {
+            assistant(
+                StopReason::ToolUse,
+                vec![AssistantContent::ToolCall {
+                    tool_call: call("probe"),
+                    wire_item_index: 0,
+                }],
+                None,
+                None,
+            )
+        } else {
+            assistant(StopReason::Stop, Vec::new(), None, None)
+        };
+        Ok(provider_attempt(attempt, message))
+    }
+
+    async fn execute_tool_observed(
+        &self,
+        _flow_id: &str,
+        call: &ToolCall,
+        cancel: CancellationToken,
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage, ToolError> {
+        self.tool_started.notify_one();
+        tokio::select! {
+            _ = self.tool_released.notified() => {}
+            _ = cancel.cancelled() => {
+                self.tool_cancelled.store(true, Ordering::SeqCst);
+            }
+        }
+        Ok(ToolResultMessage {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            content: vec![UserContent::Text {
+                text: "cancelled".to_owned(),
+            }],
+            details: json!({"ok": true}),
+            is_error: false,
+            timestamp: timestamp(),
+        })
+    }
+
+    fn synthetic_error(&self, message: &str) -> PublicMessage {
+        public_message(&assistant(
+            StopReason::Error,
+            Vec::new(),
+            Some(message),
+            None,
+        ))
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        _active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        Err(anyhow!("HardSteerToolDriver has no overflow recovery"))
+    }
+}
+
+#[tokio::test]
+async fn hard_steer_during_tool_execution_survives_cancellation() {
+    let driver = Arc::new(HardSteerToolDriver::new());
+    let worker = SequentialRunWorker::new(driver.clone());
+    let (control_tx, control_rx) = mpsc::channel(8);
+    let (events_tx, mut events_rx) = mpsc::channel(256);
+
+    let completion = tokio::spawn(async move {
+        worker
+            .run(bound_core(1), admitted_user(1), control_rx, events_tx)
+            .await
+    });
+    let event_collector = tokio::spawn(async move {
+        let mut events = Vec::new();
+        let mut message_seq = 1;
+        while let Some(mut output) = events_rx.recv().await {
+            resolve_message_output(&mut output, &mut message_seq);
+            if let Some(barrier) = output.commit_barrier.take() {
+                barrier.committed();
+            }
+            events.push(output.event);
+        }
+        events
+    });
+
+    driver.tool_started.notified().await;
+
+    let (accepted_tx, _accepted_rx) = oneshot::channel();
+    control_tx
+        .send(RunControl::HardSteer {
+            command: admitted_user(2),
+            accepted: accepted_tx,
+        })
+        .await
+        .expect("hard steer control");
+
+    let completion = tokio::time::timeout(Duration::from_secs(2), completion)
+        .await
+        .expect("worker should complete")
+        .expect("worker join");
+    let events = tokio::time::timeout(Duration::from_secs(2), event_collector)
+        .await
+        .expect("collector should complete")
+        .expect("event collector join");
+
+    assert_completed(completion);
+    assert!(
+        driver.tool_cancelled.load(Ordering::SeqCst),
+        "hard steer must cancel the running tool"
+    );
+
+    let hard_steer_id = user_message_id(&admitted_user(2).envelope().command_id);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    AgentEvent::MessageEnd { message_id, .. } if message_id == &hard_steer_id
+                )
+            })
+            .count(),
+        1,
+        "hard-steer user message must be injected exactly once on the next turn: {events:#?}"
+    );
+
+    let contexts = driver.started_contexts.lock().expect("contexts");
+    assert_eq!(
+        contexts.len(),
+        2,
+        "there must be a second provider attempt after the hard steer"
+    );
+    assert!(
+        contexts[1].iter().any(|message| matches!(
+            context_message(message),
+            Message::User(user)
+                if matches!(&user.content[0], UserContent::Text { text } if text == "message 2")
+        )),
+        "second provider context must include the hard-steer user message: {contexts:?}"
+    );
+}
+
 #[tokio::test]
 async fn safe_point_abort_dropped_accept_is_no_op() {
     let driver = Arc::new(FixtureDriver::new(vec![]));
