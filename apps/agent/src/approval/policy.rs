@@ -660,12 +660,14 @@ fn git_config_key_is_command_executing(key: &str) -> bool {
 fn git_config_option_key(tokens: &[String], i: usize) -> Option<(String, usize)> {
     let token = tokens.get(i)?;
     let lower = token.to_ascii_lowercase();
-    if matches!(lower.as_str(), "-c" | "--config" | "--config-env") {
+    // `-c` is case-sensitive: uppercase `-C` is the global "change directory"
+    // option and must not be interpreted as a config option.
+    if token == "-c" || lower == "--config" || lower == "--config-env" {
         let next = tokens.get(i + 1)?;
         let key = next.split_once('=').map(|(k, _)| k).unwrap_or(next);
         return Some((key.to_owned(), 2));
     }
-    if let Some(rest) = lower.strip_prefix("-c") {
+    if let Some(rest) = token.strip_prefix("-c") {
         let key = rest.split_once('=').map(|(k, _)| k).unwrap_or(rest);
         if !key.is_empty() {
             return Some((key.to_owned(), 1));
@@ -805,6 +807,84 @@ fn network_client_option_payload(command: &str, token: &str) -> bool {
     }
 }
 
+/// Scan git tokens after `start` for a case-insensitive `action`, skipping
+/// option tokens. `value_options` lists long options that consume a following
+/// argument (e.g. `--term-good <term>`). Self-contained `--opt=value` forms
+/// are skipped in a single step. Stop at `--` or the first non-option token.
+fn git_find_action_token(
+    tokens: &[String],
+    start: usize,
+    action: &str,
+    value_options: &[&str],
+) -> bool {
+    let mut i = start;
+    while i < tokens.len() {
+        let token = &tokens[i];
+        let lower = token.to_ascii_lowercase();
+        if lower == action {
+            return true;
+        }
+        if lower == "--" || !token.starts_with('-') {
+            return false;
+        }
+        if lower.contains('=') {
+            i += 1;
+            continue;
+        }
+        if value_options.iter().any(|opt| lower == *opt) {
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Scan git `reset` tokens after the subcommand for working-tree-mutating
+/// modes (`--hard`, `--merge`, `--keep`), skipping known quiet/debug flags.
+/// Stop at pathspecs, `--`, or other reset modes (`--soft`, `--mixed`, `-p`).
+fn git_reset_touches_working_tree(tokens: &[String], start: usize) -> bool {
+    const RESET_QUIET: &[&str] = &[
+        "-q",
+        "--quiet",
+        "-v",
+        "--verbose",
+        "--no-quiet",
+        "--no-progress",
+        "-N",
+        "--intent-to-add",
+    ];
+    let mut i = start;
+    while i < tokens.len() {
+        let token = &tokens[i];
+        let lower = token.to_ascii_lowercase();
+        if matches!(lower.as_str(), "--hard" | "--merge" | "--keep") {
+            return true;
+        }
+        if lower == "--"
+            || !token.starts_with('-')
+            || lower.starts_with("--soft")
+            || lower.starts_with("--mixed")
+            || lower == "-p"
+            || lower.starts_with("--patch")
+            || lower.starts_with("--pathspec-from-file")
+        {
+            return false;
+        }
+        if lower.contains('=') {
+            i += 1;
+            continue;
+        }
+        if RESET_QUIET.contains(&lower.as_str()) {
+            i += 1;
+            continue;
+        }
+        // Unknown option before a mode: stop to avoid false positives.
+        return false;
+    }
+    false
+}
+
 /// Reject command-execution payloads embedded in another program's options.
 /// T22 intentionally does not attempt to model every tool-specific option
 /// grammar; an option whose name advertises command/exec/checkpoint/filter
@@ -830,6 +910,8 @@ fn has_embedded_execution_payload(tokens: &[String]) -> bool {
     }
     if command == "git" {
         let mut i = 1usize;
+        let mut subcommand: Option<&str> = None;
+        let mut subcommand_index: usize = 0;
         while i < tokens.len() {
             if let Some((key, consumed)) = git_config_option_key(tokens, i) {
                 if git_config_key_is_command_executing(&key) {
@@ -838,37 +920,14 @@ fn has_embedded_execution_payload(tokens: &[String]) -> bool {
                 i += consumed;
                 continue;
             }
+            // `-C` is case-sensitive: uppercase is the global change-directory
+            // option and consumes the following directory argument.
+            if tokens[i] == "-C" {
+                i += 2;
+                continue;
+            }
             let lower = tokens[i].to_ascii_lowercase();
-            if matches!(
-                lower.as_str(),
-                "hooks"
-                    | "hook"
-                    | "cherry-pick"
-                    | "commit"
-                    | "foreach"
-                    | "merge"
-                    | "rebase"
-                    | "revert"
-                    | "am"
-                    | "checkout"
-                    | "switch"
-                    | "pull"
-                    | "push"
-                    | "worktree"
-            ) {
-                return true;
-            }
-            if lower == "bisect"
-                && tokens
-                    .get(i + 1)
-                    .is_some_and(|t| t.eq_ignore_ascii_case("run"))
-            {
-                return true;
-            }
-            if matches!(
-                lower.as_str(),
-                "-C" | "--git-dir" | "--work-tree" | "--exec-path"
-            ) {
+            if matches!(lower.as_str(), "--git-dir" | "--work-tree" | "--exec-path") {
                 if tokens.get(i + 1).is_some_and(|t| is_dotgit_hooks_path(t)) {
                     return true;
                 }
@@ -891,7 +950,55 @@ fn has_embedded_execution_payload(tokens: &[String]) -> bool {
             if is_dotgit_hooks_path(&tokens[i]) {
                 return true;
             }
+            if subcommand.is_none() && !tokens[i].starts_with('-') {
+                subcommand = Some(tokens[i].as_str());
+                subcommand_index = i;
+            }
             i += 1;
+        }
+
+        if let Some(sub) = subcommand {
+            let sub_lower = sub.to_ascii_lowercase();
+            if matches!(
+                sub_lower.as_str(),
+                "hooks"
+                    | "hook"
+                    | "cherry-pick"
+                    | "commit"
+                    | "merge"
+                    | "rebase"
+                    | "revert"
+                    | "am"
+                    | "checkout"
+                    | "switch"
+                    | "pull"
+                    | "push"
+                    | "worktree"
+                    | "add"
+                    | "restore"
+                    | "stash"
+            ) {
+                return true;
+            }
+            if sub_lower == "bisect"
+                && git_find_action_token(
+                    tokens,
+                    subcommand_index + 1,
+                    "run",
+                    &["--term-good", "--term-bad", "--term-old", "--term-new"],
+                )
+            {
+                return true;
+            }
+            if sub_lower == "submodule"
+                && git_find_action_token(tokens, subcommand_index + 1, "foreach", &[])
+            {
+                return true;
+            }
+            if sub_lower == "reset" && git_reset_touches_working_tree(tokens, subcommand_index + 1)
+            {
+                return true;
+            }
         }
     }
     if command == "rsync"
@@ -924,7 +1031,12 @@ fn has_embedded_execution_payload(tokens: &[String]) -> bool {
     if command == "openssl" {
         return tokens.iter().skip(1).any(|token| {
             let lower = token.to_ascii_lowercase();
-            lower == "-provider"
+            // The `engine` subcommand loads and initializes engines; `-pre` and
+            // `SO_PATH:` can dynamically load an arbitrary shared object.
+            lower == "engine"
+                || lower.starts_with("-pre")
+                || lower.starts_with("so_path:")
+                || lower == "-provider"
                 || lower.starts_with("-provider=")
                 || lower == "--provider"
                 || lower.starts_with("--provider=")
@@ -3217,11 +3329,26 @@ mod tests {
 
     #[test]
     fn git_network_subcommands_require_network_and_do_not_persist() {
+        let p = policy();
         for command in [
-            "git submodule update --init",
-            "git remote update",
+            "git push origin main",
+            "git clone https://example.com/repo",
+            "git fetch origin",
+            "git pull origin main",
             "git ls-remote origin",
+            "git submodule update --init",
+            "git submodule add https://example.com/repo .",
+            "git remote update",
+            "git remote show origin",
+            "git remote prune origin",
             "git archive --remote=origin main",
+            "git send-email --to foo@example.com HEAD",
+            "git imap-send",
+            "git smtp-send",
+            "git p4 sync",
+            "git svn clone https://example.com/repo",
+            "git send-pack origin main",
+            "git fetch-pack origin main",
             "git --config-env=core.pager=PAGER ls-remote origin",
         ] {
             let action = bash(command);
@@ -3229,10 +3356,30 @@ mod tests {
                 action.requested_permissions.contains(&Permission::Network),
                 "expected network permission: {command}"
             );
+            assert!(
+                !p.evaluate(&action).is_allow(),
+                "{command} must not be allowed by default"
+            );
             let tokens = shell::tokenize_command(command);
             assert!(
                 is_broad_prefix(&tokens),
                 "network git prefix must not persist: {command}"
+            );
+            let rule = ApprovalRule {
+                id: command.to_owned(),
+                tool: "bash".to_owned(),
+                literal_prefix: tokens,
+                effect: RuleEffect::Allow,
+                workspace_only: true,
+                allowed_permissions: vec![Permission::Exec],
+                allowed_network_domains: vec![],
+            };
+            assert!(
+                matches!(
+                    p.clone().try_with_rule(rule),
+                    Err(RuleValidationError::BroadPrefix)
+                ),
+                "{command} must not be persistable as an Exec-only rule"
             );
         }
     }
@@ -4285,11 +4432,102 @@ mod tests {
     }
 
     #[test]
+    fn git_clean_smudge_filter_and_hard_reset_are_embedded() {
+        // `add`, `restore`, `stash`, and `reset --hard` all move content
+        // between the working tree and the object database and can run
+        // clean/smudge filters configured in `.git/config` or `~/.gitconfig`.
+        // Those filters are arbitrary external commands, so these commands
+        // cannot be allowed as persistent Exec-only rules.
+        for command in [
+            "git add file.txt",
+            "git restore --source=HEAD -- file.txt",
+            "git stash",
+            "git reset --hard",
+        ] {
+            let tokens = shell::tokenize_command(command);
+            assert!(
+                is_broad_prefix(&tokens),
+                "'{command}' must be a broad prefix: {tokens:?}"
+            );
+            let action = bash(command);
+            let p = policy();
+            assert!(
+                !p.evaluate(&action).is_allow(),
+                "'{command}' must not be allowed by default"
+            );
+            let rule = ApprovalRule {
+                id: command.to_owned(),
+                tool: "bash".to_owned(),
+                literal_prefix: tokens,
+                effect: RuleEffect::Allow,
+                workspace_only: true,
+                allowed_permissions: vec![Permission::Exec],
+                allowed_network_domains: vec![],
+            };
+            assert!(
+                matches!(
+                    p.clone().try_with_rule(rule),
+                    Err(RuleValidationError::BroadPrefix)
+                ),
+                "'{command}' must not be persistable as an Exec-only rule"
+            );
+        }
+
+        // `git reset` modes that do not touch the working tree remain narrow.
+        for command in ["git reset --soft HEAD~1", "git reset HEAD -- file.txt"] {
+            let tokens = shell::tokenize_command(command);
+            assert!(
+                !is_broad_prefix(&tokens),
+                "'{command}' should be a narrow prefix: {tokens:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_global_options_before_embedded_subcommands_are_fail_closed() {
+        // Global `-C`, `--git-dir`, `--work-tree`, and quiet/debug options must
+        // be consumed when locating the git subcommand and its action/mode.
+        for command in [
+            "git -C /workspace/repo add file.txt",
+            "git -C repo restore --source=HEAD -- file.txt",
+            "git --git-dir /workspace/repo/.git add file.txt",
+            "git --work-tree /workspace/repo restore --source=HEAD -- file.txt",
+            "git reset -q --hard HEAD",
+            "git reset --quiet --merge HEAD",
+            "git bisect --no-color run id",
+            "git submodule --quiet foreach 'rm -rf /'",
+        ] {
+            let tokens = shell::tokenize_command(command);
+            assert!(
+                is_broad_prefix(&tokens),
+                "'{command}' must be a broad prefix: {tokens:?}"
+            );
+        }
+
+        // Safe forms must stay narrow.
+        for command in [
+            "git reset --soft HEAD~1",
+            "git reset HEAD -- file.txt",
+            "git bisect start",
+            "git submodule status",
+        ] {
+            let tokens = shell::tokenize_command(command);
+            assert!(
+                !is_broad_prefix(&tokens),
+                "'{command}' should be a narrow prefix: {tokens:?}"
+            );
+        }
+    }
+
+    #[test]
     fn openssl_provider_and_engine_are_embedded_code_loading() {
+        let p = policy();
         for command in [
             "openssl x509 -provider /workspace/malicious.so -in cert.pem",
             "openssl x509 -provider-path /workspace/malicious -in cert.pem",
             "openssl x509 -engine /workspace/malicious.so -in cert.pem",
+            "openssl engine -pre SO_PATH:/workspace/malicious.so",
+            "openssl engine -t",
         ] {
             let tokens = shell::tokenize_command(command);
             assert!(
@@ -4298,8 +4536,24 @@ mod tests {
             );
             let action = bash(command);
             assert!(
-                !policy().evaluate(&action).is_allow(),
+                !p.evaluate(&action).is_allow(),
                 "'{command}' must not be allowed by default"
+            );
+            let rule = ApprovalRule {
+                id: command.to_owned(),
+                tool: "bash".to_owned(),
+                literal_prefix: tokens,
+                effect: RuleEffect::Allow,
+                workspace_only: true,
+                allowed_permissions: vec![Permission::Exec],
+                allowed_network_domains: vec![],
+            };
+            assert!(
+                matches!(
+                    p.clone().try_with_rule(rule),
+                    Err(RuleValidationError::BroadPrefix)
+                ),
+                "'{command}' must not be persistable as a rule"
             );
         }
     }

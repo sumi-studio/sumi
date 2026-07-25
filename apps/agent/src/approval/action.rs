@@ -3071,21 +3071,61 @@ pub(crate) mod shell {
             }
             if matches!(
                 t_lower.as_str(),
-                "push" | "clone" | "fetch" | "pull" | "ls-remote"
+                "push"
+                    | "clone"
+                    | "fetch"
+                    | "pull"
+                    | "ls-remote"
+                    | "send-email"
+                    | "imap-send"
+                    | "smtp-send"
+                    | "send-pack"
+                    | "fetch-pack"
             ) {
                 return true;
             }
             if t_lower == "submodule"
-                && tokens
-                    .get(i + 1)
-                    .is_some_and(|t| t.eq_ignore_ascii_case("update"))
+                && tokens.get(i + 1).is_some_and(|t| {
+                    t.eq_ignore_ascii_case("add") || t.eq_ignore_ascii_case("update")
+                })
             {
                 return true;
             }
             if t_lower == "remote"
-                && tokens
-                    .get(i + 1)
-                    .is_some_and(|t| t.eq_ignore_ascii_case("update"))
+                && tokens.get(i + 1).is_some_and(|t| {
+                    t.eq_ignore_ascii_case("update")
+                        || t.eq_ignore_ascii_case("show")
+                        || t.eq_ignore_ascii_case("prune")
+                })
+            {
+                return true;
+            }
+            if t_lower == "p4"
+                && tokens.get(i + 1).is_some_and(|t| {
+                    matches!(
+                        t.to_ascii_lowercase().as_str(),
+                        "clone" | "sync" | "submit" | "rebase" | "rollback" | "cherry-pick"
+                    )
+                })
+            {
+                return true;
+            }
+            if t_lower == "svn"
+                && tokens.get(i + 1).is_some_and(|t| {
+                    matches!(
+                        t.to_ascii_lowercase().as_str(),
+                        "clone"
+                            | "fetch"
+                            | "dcommit"
+                            | "rebase"
+                            | "log"
+                            | "blame"
+                            | "info"
+                            | "commit-diff"
+                            | "set-tree"
+                            | "mkdirs"
+                    )
+                })
             {
                 return true;
             }
@@ -3324,10 +3364,22 @@ mod tests {
         for command in [
             "git push origin main",
             "git clone https://example.com/repo",
-            "git submodule update --init",
-            "git remote update",
+            "git fetch origin",
+            "git pull origin main",
             "git ls-remote origin",
+            "git submodule update --init",
+            "git submodule add https://example.com/repo .",
+            "git remote update",
+            "git remote show origin",
+            "git remote prune origin",
             "git archive --remote=origin main",
+            "git send-email --to foo@example.com HEAD",
+            "git imap-send",
+            "git smtp-send",
+            "git p4 sync",
+            "git svn clone https://example.com/repo",
+            "git send-pack origin main",
+            "git fetch-pack origin main",
             "git --config-env=core.pager=MY_PAGER ls-remote origin",
         ] {
             assert!(
@@ -3340,6 +3392,7 @@ mod tests {
             "git archive --format=tar HEAD",
             "git submodule status",
             "git remote -v",
+            "git remote add origin https://example.com/repo",
         ] {
             assert!(
                 !network_indicators_in_command(command),
