@@ -3,7 +3,9 @@
 #[allow(dead_code)]
 pub mod wire;
 
-mod stdio;
+pub mod stdio;
+pub mod supervisor;
+pub mod ws;
 
 use std::fmt;
 
@@ -18,8 +20,9 @@ use zeroize::Zeroize;
     unused_imports,
     reason = "T15 injected loop harness; T26 constructs production IO"
 )]
-pub(crate) use stdio::InjectedStdioGateway;
-pub use stdio::{InvalidCommand, StdioGateway};
+pub(crate) use stdio::{InjectedStdioGateway, read_command};
+
+pub use supervisor::{AgentHello, ApiHello, ConnectorError, GatewayConnector, GatewayCredential};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -333,10 +336,18 @@ pub trait GatewayWriter: Send {
 /// An established transport that can transfer each half to its sole owner.
 /// Neither half is shared behind a mutex: the Session owns the reader and a
 /// dedicated task owns the writer.
+#[async_trait]
 pub trait Gateway: Send + 'static {
     type Reader: GatewayReader + 'static;
     type Writer: GatewayWriter + 'static;
 
+    async fn authenticate_hello(&mut self, hello: AgentHello) -> Result<ApiHello> {
+        Ok(ApiHello {
+            accepted_generation: hello.generation,
+            last_received_event_seq: 0,
+            next_command_seq: 0,
+        })
+    }
     fn split(self) -> (Self::Reader, Self::Writer);
 }
 
