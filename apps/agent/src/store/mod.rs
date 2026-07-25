@@ -3,9 +3,12 @@
 mod crypto;
 mod event_log;
 mod event_writer;
+mod memory_state;
+mod provider_context;
 mod recovery;
 mod redactor;
 mod sizer;
+mod transcript;
 
 use std::{path::Path, sync::Arc};
 
@@ -25,11 +28,15 @@ use sqlx::{
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use self::crypto::{
+    ConversationCommandDigestFactory, DataKeyScope, KeyWrapAad, WRAP_ALGORITHM, unwrap_data_key,
+    wrap_data_key,
+};
 #[cfg(test)]
 pub(crate) use crypto::{DATA_KEY_BYTES, WrappingKey};
 pub(crate) use crypto::{
-    DataKeyPurpose, EnvironmentKeyProvider, KeyProvider, RowAad, command_payload_digest,
-    verify_command_payload_digest,
+    DataKeyMaterial, DataKeyPurpose, EnvironmentKeyProvider, KeyProvider, RowAad,
+    command_payload_digest, verify_command_payload_digest,
 };
 #[allow(
     unused_imports,
@@ -53,11 +60,6 @@ pub(crate) use redactor::{PublicProjectionBuilder, Redactor};
 pub(crate) use sizer::{
     BatchBounds, CommandSizeInput, DURABLE_ROW_OVERHEAD_BYTES, EventBatchSizer,
     InjectionApplication, InjectionBatchSizeInput, InjectionCommandSizeInput,
-};
-
-use self::crypto::{
-    ConversationCommandDigestFactory, DataKeyMaterial, DataKeyScope, KeyWrapAad, WRAP_ALGORITHM,
-    unwrap_data_key, wrap_data_key,
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -277,14 +279,18 @@ impl Store {
         // so an unsupported rule version must stop startup before any command
         // admission. These bounded existence probes avoid replaying projections
         // whose exact event parity is authenticated separately by EventWriter.
-        for (table, label) in [
-            ("messages", "message"),
-            ("approval_log", "approval"),
-            ("agent_events", "event"),
+        for (table, column, label) in [
+            ("messages", "redaction_version", "message"),
+            ("approval_log", "redaction_version", "approval"),
+            ("agent_events", "redaction_version", "event"),
+            (
+                "memory_batches",
+                "summary_redaction_version",
+                "memory batch",
+            ),
+            ("memory_jobs", "result_redaction_version", "memory job"),
         ] {
-            let sql = format!(
-                "SELECT EXISTS(SELECT 1 FROM {table} WHERE redaction_version <> ? LIMIT 1)"
-            );
+            let sql = format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {column} <> ? LIMIT 1)");
             let unsupported: i64 = sqlx::query_scalar(&sql)
                 .bind(i64::from(self.redactor.version()))
                 .fetch_one(&self.pool)
