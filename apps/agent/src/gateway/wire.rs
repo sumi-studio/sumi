@@ -244,7 +244,7 @@ pub enum WireCommand {
         #[serde(deserialize_with = "deserialize_empty_attachments")]
         attachments: Vec<WireAttachment>,
     },
-    Abort,
+    Abort {},
     ApprovalDecision {
         request_id: String,
         decision: WireApprovalDecision,
@@ -493,9 +493,9 @@ pub enum WireOutboundFrame {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WireAgentEvent {
-    AgentStart,
-    AgentEnd,
-    TurnStart,
+    AgentStart {},
+    AgentEnd {},
+    TurnStart {},
     TurnEnd {
         message: RequiredNullable<Box<WirePublicMessage>>,
         tool_results: Vec<WireToolResultMessage>,
@@ -560,9 +560,9 @@ impl WireAgentEvent {
 
     fn event_type(&self) -> &'static str {
         match self {
-            Self::AgentStart => "agent_start",
-            Self::AgentEnd => "agent_end",
-            Self::TurnStart => "turn_start",
+            Self::AgentStart {} => "agent_start",
+            Self::AgentEnd {} => "agent_end",
+            Self::TurnStart {} => "turn_start",
             Self::TurnEnd { .. } => "turn_end",
             Self::MessageStart { .. } => "message_start",
             Self::MessageUpdate { .. } => "message_update",
@@ -864,9 +864,9 @@ pub enum WireApprovalResolution {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WireApprovalDecision {
-    ApproveOnce,
+    ApproveOnce {},
     ApproveAlways { rule: Map<String, Value> },
-    Deny,
+    Deny {},
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -888,9 +888,9 @@ impl TryFrom<AgentEvent> for WireAgentEvent {
     type Error = WireError;
     fn try_from(event: AgentEvent) -> Result<Self, WireError> {
         Ok(match event {
-            AgentEvent::AgentStart => Self::AgentStart,
-            AgentEvent::AgentEnd => Self::AgentEnd,
-            AgentEvent::TurnStart => Self::TurnStart,
+            AgentEvent::AgentStart => Self::AgentStart {},
+            AgentEvent::AgentEnd => Self::AgentEnd {},
+            AgentEvent::TurnStart => Self::TurnStart {},
             AgentEvent::TurnEnd {
                 message,
                 tool_results,
@@ -1373,14 +1373,14 @@ impl TryFrom<ApprovalDecision> for WireApprovalDecision {
     type Error = WireError;
     fn try_from(decision: ApprovalDecision) -> Result<Self, WireError> {
         Ok(match decision {
-            ApprovalDecision::ApproveOnce => Self::ApproveOnce,
+            ApprovalDecision::ApproveOnce => Self::ApproveOnce {},
             ApprovalDecision::ApproveAlways { rule } => Self::ApproveAlways {
                 rule: match rule.0 {
                     Value::Object(m) => m,
                     _ => return Err(WireError::NonObjectApprovalRule),
                 },
             },
-            ApprovalDecision::Deny => Self::Deny,
+            ApprovalDecision::Deny => Self::Deny {},
         })
     }
 }
@@ -1415,7 +1415,7 @@ impl TryFrom<Command> for WireCommand {
                     attachments: vec![],
                 }
             }
-            Command::Abort {} => Self::Abort,
+            Command::Abort {} => Self::Abort {},
             Command::ApprovalDecision {
                 request_id,
                 decision,
@@ -2316,11 +2316,11 @@ mod tests {
     fn approval_decision_converts_all_branches() {
         assert_eq!(
             WireApprovalDecision::try_from(ApprovalDecision::ApproveOnce).unwrap(),
-            WireApprovalDecision::ApproveOnce
+            WireApprovalDecision::ApproveOnce {}
         );
         assert_eq!(
             WireApprovalDecision::try_from(ApprovalDecision::Deny).unwrap(),
-            WireApprovalDecision::Deny
+            WireApprovalDecision::Deny {}
         );
 
         let object = json!({"tool_name": "test"});
@@ -2547,6 +2547,68 @@ mod tests {
                 Err(WireError::NonEmptyAttachments)
             ),
             "TryFrom<CommandEnvelope> must reject non-empty attachments"
+        );
+    }
+
+    fn assert_unit_variant_rejects_extras<T>(
+        name: &str,
+        extra: Value,
+        canonical: Value,
+        definition: &str,
+    ) where
+        T: for<'de> Deserialize<'de> + Serialize,
+    {
+        assert!(
+            serde_json::from_value::<T>(extra).is_err(),
+            "{name} must reject extra fields"
+        );
+        let parsed: T = serde_json::from_value(canonical.clone())
+            .unwrap_or_else(|_| panic!("{name} canonical form must parse"));
+        let back =
+            serde_json::to_value(&parsed).unwrap_or_else(|_| panic!("{name} must serialize"));
+        assert_eq!(back, canonical, "{name} canonical round trip");
+        assert_canonical_contract(definition, &back);
+    }
+
+    #[test]
+    fn unit_wire_variants_reject_unknown_fields_and_round_trip() {
+        assert_unit_variant_rejects_extras::<WireCommand>(
+            "WireCommand::Abort",
+            json!({"type": "abort", "extra": true}),
+            json!({"type": "abort"}),
+            "Command",
+        );
+
+        assert_unit_variant_rejects_extras::<WireAgentEvent>(
+            "WireAgentEvent::AgentStart",
+            json!({"type": "agent_start", "extra": true}),
+            json!({"type": "agent_start"}),
+            "AgentEvent",
+        );
+        assert_unit_variant_rejects_extras::<WireAgentEvent>(
+            "WireAgentEvent::AgentEnd",
+            json!({"type": "agent_end", "extra": true}),
+            json!({"type": "agent_end"}),
+            "AgentEvent",
+        );
+        assert_unit_variant_rejects_extras::<WireAgentEvent>(
+            "WireAgentEvent::TurnStart",
+            json!({"type": "turn_start", "extra": true}),
+            json!({"type": "turn_start"}),
+            "AgentEvent",
+        );
+
+        assert_unit_variant_rejects_extras::<WireApprovalDecision>(
+            "WireApprovalDecision::ApproveOnce",
+            json!({"type": "approve_once", "extra": true}),
+            json!({"type": "approve_once"}),
+            "ApprovalDecision",
+        );
+        assert_unit_variant_rejects_extras::<WireApprovalDecision>(
+            "WireApprovalDecision::Deny",
+            json!({"type": "deny", "extra": true}),
+            json!({"type": "deny"}),
+            "ApprovalDecision",
         );
     }
 }
