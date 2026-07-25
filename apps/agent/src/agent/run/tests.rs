@@ -3667,3 +3667,251 @@ async fn failed_hard_steer_reservation_restores_provider_for_abort() {
     tokio::task::yield_now().await;
     assert!(driver.cancelled.load(Ordering::SeqCst));
 }
+
+async fn abort_during_tool_with_steer_event_sequence(
+    steer: Option<(RunControl, oneshot::Receiver<bool>, oneshot::Sender<()>)>,
+) -> (RunCompletion, Vec<AgentEvent>, Arc<HardSteerToolDriver>) {
+    let driver = Arc::new(HardSteerToolDriver::new());
+    let worker = SequentialRunWorker::new(driver.clone());
+    let (control_tx, control_rx) = mpsc::channel(8);
+    let (events_tx, mut events_rx) = mpsc::channel(256);
+
+    let completion = tokio::spawn(async move {
+        worker
+            .run(bound_core(1), admitted_user(1), control_rx, events_tx)
+            .await
+    });
+    let event_collector = tokio::spawn(async move {
+        let mut events = Vec::new();
+        let mut message_seq = 1;
+        while let Some(mut output) = events_rx.recv().await {
+            resolve_message_output(&mut output, &mut message_seq);
+            if let Some(barrier) = output.commit_barrier.take() {
+                barrier.committed();
+            }
+            events.push(output.event);
+        }
+        events
+    });
+
+    driver.tool_started.notified().await;
+
+    if let Some((steer, accepted_rx, committed_tx)) = steer {
+        control_tx.send(steer).await.expect("send steer control");
+        assert!(accepted_rx.await.expect("worker accepts steer"));
+        committed_tx.send(()).expect("authorize durable steer");
+    }
+
+    let (abort_accepted_tx, abort_accepted_rx) = oneshot::channel();
+    let (abort_committed_tx, abort_committed_rx) = oneshot::channel();
+    control_tx
+        .send(RunControl::Abort {
+            command: admitted_abort(3),
+            accepted: abort_accepted_tx,
+            committed: abort_committed_rx,
+        })
+        .await
+        .expect("send abort");
+    assert!(abort_accepted_rx.await.expect("worker accepts abort"));
+    abort_committed_tx
+        .send(())
+        .expect("authorize durable abort");
+
+    let completion = tokio::time::timeout(Duration::from_secs(2), completion)
+        .await
+        .expect("worker should complete")
+        .expect("worker join");
+    let events = tokio::time::timeout(Duration::from_secs(2), event_collector)
+        .await
+        .expect("event collector should complete")
+        .expect("event collector join");
+
+    (completion, events, driver)
+}
+
+#[tokio::test]
+async fn abort_during_tool_execution_closes_normally_without_steer() {
+    let (completion, events, driver) = abort_during_tool_with_steer_event_sequence(None).await;
+
+    assert_completed(completion);
+    assert!(driver.tool_cancelled.load(Ordering::SeqCst));
+
+    let user_message_id = user_message_id(&admitted_user(2).envelope().command_id);
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::MessageEnd { message_id, .. } if message_id == &user_message_id
+        )),
+        "abort must not inject a steer user message: {events:#?}"
+    );
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::TurnEnd { .. }))
+            .count(),
+        1,
+        "abort during tool must emit exactly one TurnEnd: {events:#?}"
+    );
+    assert_eq!(
+        events.last(),
+        Some(&AgentEvent::AgentEnd),
+        "abort during tool must end with AgentEnd: {events:#?}"
+    );
+}
+
+#[tokio::test]
+async fn abort_during_tool_execution_drops_claimed_soft_steer_and_closes_normally() {
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let (committed_tx, committed_rx) = oneshot::channel();
+    let steer = RunControl::SoftSteer {
+        command: admitted_user(2),
+        accepted: accepted_tx,
+        committed: committed_rx,
+    };
+    let (completion, events, driver) =
+        abort_during_tool_with_steer_event_sequence(Some((steer, accepted_rx, committed_tx))).await;
+
+    assert_completed(completion);
+    assert!(driver.tool_cancelled.load(Ordering::SeqCst));
+
+    let user_message_id = user_message_id(&admitted_user(2).envelope().command_id);
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::MessageEnd { message_id, .. } if message_id == &user_message_id
+        )),
+        "abort must discard an already-claimed soft steer and not inject it: {events:#?}"
+    );
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::TurnEnd { .. }))
+            .count(),
+        1,
+        "abort during tool with soft steer must emit exactly one TurnEnd: {events:#?}"
+    );
+    assert_eq!(
+        events.last(),
+        Some(&AgentEvent::AgentEnd),
+        "abort during tool with soft steer must end with AgentEnd: {events:#?}"
+    );
+}
+
+#[tokio::test]
+async fn abort_during_tool_execution_drops_claimed_retry_steer_and_closes_normally() {
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let (committed_tx, committed_rx) = oneshot::channel();
+    let steer = RunControl::RetrySteer {
+        command: admitted_user(2),
+        accepted: accepted_tx,
+        committed: committed_rx,
+    };
+    let (completion, events, driver) =
+        abort_during_tool_with_steer_event_sequence(Some((steer, accepted_rx, committed_tx))).await;
+
+    assert_completed(completion);
+    assert!(driver.tool_cancelled.load(Ordering::SeqCst));
+
+    let user_message_id = user_message_id(&admitted_user(2).envelope().command_id);
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::MessageEnd { message_id, .. } if message_id == &user_message_id
+        )),
+        "abort must discard an already-claimed retry steer and not inject it: {events:#?}"
+    );
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::TurnEnd { .. }))
+            .count(),
+        1,
+        "abort during tool with retry steer must emit exactly one TurnEnd: {events:#?}"
+    );
+    assert_eq!(
+        events.last(),
+        Some(&AgentEvent::AgentEnd),
+        "abort during tool with retry steer must end with AgentEnd: {events:#?}"
+    );
+}
+
+#[tokio::test]
+async fn abort_during_retry_wait_reaches_turn_end_and_agent_end() {
+    let driver = Arc::new(
+        FixtureDriver::new(vec![
+            output(assistant(
+                StopReason::Error,
+                Vec::new(),
+                Some("network error"),
+                Some("network_error"),
+            )),
+            output(assistant(StopReason::Stop, Vec::new(), None, None)),
+        ])
+        .blocking_retry(),
+    );
+    let worker = SequentialRunWorker::new(driver.clone());
+    let (control_tx, control_rx) = mpsc::channel(8);
+    let (events_tx, mut events_rx) = mpsc::channel(256);
+    let completion = tokio::spawn(async move {
+        worker
+            .run(bound_core(1), admitted_user(1), control_rx, events_tx)
+            .await
+    });
+    let event_collector = tokio::spawn(async move {
+        let mut events = Vec::new();
+        let mut message_seq = 1;
+        while let Some(mut output) = events_rx.recv().await {
+            resolve_message_output(&mut output, &mut message_seq);
+            if let Some(barrier) = output.commit_barrier.take() {
+                barrier.committed();
+            }
+            events.push(output.event);
+        }
+        events
+    });
+
+    driver.retry_waiting.notified().await;
+
+    let (abort_accepted_tx, abort_accepted_rx) = oneshot::channel();
+    let (abort_committed_tx, abort_committed_rx) = oneshot::channel();
+    control_tx
+        .send(RunControl::Abort {
+            command: admitted_abort(2),
+            accepted: abort_accepted_tx,
+            committed: abort_committed_rx,
+        })
+        .await
+        .expect("send abort during retry wait");
+    assert!(abort_accepted_rx.await.expect("worker accepts abort"));
+    abort_committed_tx
+        .send(())
+        .expect("authorize durable abort during retry wait");
+
+    let completion = tokio::time::timeout(Duration::from_secs(2), completion)
+        .await
+        .expect("worker should complete")
+        .expect("worker join");
+    let events = tokio::time::timeout(Duration::from_secs(2), event_collector)
+        .await
+        .expect("event collector should complete")
+        .expect("event collector join");
+
+    assert_completed(completion);
+    let turn_end_events: Vec<_> = events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::TurnEnd { .. }))
+        .collect();
+    assert_eq!(
+        turn_end_events.len(),
+        1,
+        "abort during retry wait must emit exactly one TurnEnd: {events:#?}"
+    );
+    assert_eq!(
+        events.last(),
+        Some(&AgentEvent::AgentEnd),
+        "abort during retry wait must end with AgentEnd: {events:#?}"
+    );
+}

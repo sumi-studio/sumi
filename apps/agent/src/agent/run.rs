@@ -302,9 +302,20 @@ impl Runner {
                         let _ = self.phase.send(WorkerPhase::Active);
                         return Err(failure);
                     }
-                    let injected = self.wait_retry_or_control(delay).await;
+                    let injected = match self.wait_retry_or_control(delay).await {
+                        Ok(injected) => injected,
+                        Err(WorkerFailure::Cancelled) if self.abort_requested => {
+                            self.in_flight_controls.clear();
+                            self.close_turn(message, Vec::new()).await?;
+                            break;
+                        }
+                        Err(failure) => {
+                            let _ = self.phase.send(WorkerPhase::Active);
+                            return Err(failure);
+                        }
+                    };
                     let _ = self.phase.send(WorkerPhase::Active);
-                    if injected? {
+                    if injected {
                         self.emit(AgentEvent::Steered {
                             mode: SteerMode::Soft,
                         })
@@ -449,6 +460,11 @@ impl Runner {
                     })
                     .await?;
                     self.receive_control_safe_point().await?;
+
+                    if self.abort_requested {
+                        self.in_flight_controls.clear();
+                        break;
+                    }
 
                     if length_guarded {
                         break;
@@ -1539,6 +1555,7 @@ impl Runner {
                 } => {
                     if self.accept_abort_control(accepted, committed).await? {
                         self.cancel_provider();
+                        self.abort_requested = true;
                         return Err(WorkerFailure::Cancelled);
                     }
                 }

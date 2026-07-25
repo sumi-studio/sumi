@@ -366,6 +366,17 @@ impl DurableBridge {
         self.pending_hard_steer_partial = None;
         self.pending_hard_steer_message_barrier = None;
 
+        // Abort also supersedes any soft/retry steer group that has been
+        // classified but not yet durably injected.  Clear the staged group
+        // and all buffered turn-boundary state so the cutoff cannot be
+        // followed by a stale group injection on the original owner.
+        self.pending_steer_group = None;
+        self.pending_steer_turn_end = None;
+        self.pending_steer_turn_start = false;
+        self.pending_steer_collecting = false;
+        self.pending_steer_messages = Vec::new();
+        self.pending_steer_open_start = None;
+
         // The abort CommandApplied ACK is delayed until the worker emits AgentEnd,
         // so the Session sends only the earlier terminal ACKs (superseded/applied)
         // now and the final Applied ACK with the run's terminal events.
@@ -3019,5 +3030,99 @@ mod tests {
             owner_status.1, "finished",
             "original owner must be finished"
         );
+    }
+
+    #[tokio::test]
+    async fn bind_abort_clears_pending_soft_steer_group_state() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+
+        let owner_id = "00000000-0000-4000-8000-000000000501";
+        let run_id = "run-1";
+        let turn_id = "turn-1";
+        let (owner_binding, _) = owner_in_phase(
+            &store,
+            &writer,
+            owner_id,
+            run_id,
+            turn_id,
+            RunPhase::AssistantStarted,
+        )
+        .await;
+
+        let mut bridge = DurableBridge::new(owner_binding);
+        bridge.phase = RunPhase::AssistantStarted;
+        bridge.turn_open = true;
+        bridge.assistant_open = None;
+        bridge.pending_tool_calls.insert("tool-1".to_owned());
+
+        let steer_id = "00000000-0000-4000-8000-000000000502";
+        persist_and_pin(&store, &writer, 2, steer_id, "steer now").await;
+        let steer_command = test_admitted(2, steer_id, "steer now");
+        bridge
+            .bind_soft_steer(&writer, steer_command)
+            .await
+            .expect("bind soft steer");
+
+        assert!(bridge.pending_steer_group.is_some());
+        bridge.pending_steer_turn_end = Some((
+            PublicMessage::Assistant(PublicAssistantMessage {
+                content: Vec::new(),
+                model: "test".to_owned(),
+                provider: "test".to_owned(),
+                origin: crate::provider::types::ProviderOrigin {
+                    provider_instance_id: "test".to_owned(),
+                    protocol: crate::provider::types::ApiProtocol::OpenAiChatCompletions,
+                    model: "test".to_owned(),
+                },
+                usage: crate::provider::types::Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                provider_code: None,
+                interrupted: false,
+                timestamp: test_timestamp(),
+            }),
+            Vec::new(),
+        ));
+        bridge.pending_steer_turn_start = true;
+        bridge.pending_steer_collecting = true;
+        let (barrier, _) = MessageCommitBarrier::channel();
+        bridge.pending_steer_messages.push(PendingSteerMessage {
+            message_id: "pending-start".to_owned(),
+            message: PublicMessage::User(UserMessage {
+                content: vec![UserContent::Text {
+                    text: "pending".to_owned(),
+                }],
+                timestamp: test_timestamp(),
+            }),
+            barrier,
+        });
+        bridge.pending_steer_open_start = Some((
+            "open-start".to_owned(),
+            PublicMessage::User(UserMessage {
+                content: vec![UserContent::Text {
+                    text: "open".to_owned(),
+                }],
+                timestamp: test_timestamp(),
+            }),
+        ));
+
+        let abort_id = "00000000-0000-4000-8000-000000000503";
+        writer
+            .persist_inbound(&test_abort_command(3, abort_id))
+            .await
+            .expect("persist abort");
+        let abort_command = test_admitted_abort(3, abort_id);
+        bridge
+            .bind_abort(&writer, abort_command)
+            .await
+            .expect("bind abort");
+
+        assert!(bridge.pending_steer_group.is_none());
+        assert!(bridge.pending_steer_turn_end.is_none());
+        assert!(!bridge.pending_steer_turn_start);
+        assert!(!bridge.pending_steer_collecting);
+        assert!(bridge.pending_steer_messages.is_empty());
+        assert!(bridge.pending_steer_open_start.is_none());
     }
 }

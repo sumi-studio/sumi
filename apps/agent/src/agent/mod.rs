@@ -50,8 +50,10 @@ mod queue;
 mod run;
 mod steer;
 
+pub(crate) use durable_bridge::DurableRunBinding;
+
 use durable_bridge::{
-    CommittedOutput, DurableBridge, DurableRunBinding, MessageCommitBarrier, MessageCommitReceipt,
+    CommittedOutput, DurableBridge, MessageCommitBarrier, MessageCommitReceipt,
     RetryWaitCommitBarrier, RunOutput, ToolStartCommitBarrier,
 };
 use queue::MessageQueue;
@@ -83,7 +85,7 @@ pub(crate) use run::{
 )]
 pub(crate) use steer::{
     AttemptCancellation, AttemptGuard, AttemptReservation, SteerGroup, SteerGroupSnapshot,
-    SteerStage, bound_steer_group, hard_steer_step_zero_batch,
+    SteerStage, bound_steer_group, hard_steer_step_zero_batch, steer_group_injection_batch,
 };
 
 const CONTROL_CHANNEL_CAPACITY: usize = 32;

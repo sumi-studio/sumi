@@ -7759,20 +7759,24 @@ mod tests {
     use std::sync::Arc;
 
     use anyhow::{Result, bail};
-    use chrono::Utc;
+    use chrono::{Duration, Utc};
     use serde_json::json;
     use sqlx::Row;
 
     use super::*;
     use crate::{
-        agent::{ProjectedProviderEvent, ProviderEventProjector, ProviderTerminalKind},
-        gateway::{Command, SensitiveCommandPayload},
+        agent::{
+            AdmittedCommand, DurableRunBinding, ProjectedProviderEvent, ProviderEventProjector,
+            ProviderTerminalKind, SteerGroup, steer_group_injection_batch,
+        },
+        gateway::{Command, CommandEnvelope, CommandId, SensitiveCommandPayload},
         provider::types::{
             ApiProtocol, AssistantContent, AssistantMessage, ProviderEvent, ProviderOrigin,
             ProviderOutput, PublicAssistantContent, PublicAssistantMessage, PublicMessage,
             RejectedToolCall, StopReason, ToolArgumentError, ToolCall, ToolResultMessage, Usage,
             UserContent, UserMessage,
         },
+        runtime::contracts::ProcessGeneration,
         store::{
             AgentScope, KeyProvider, RecoveryStep, SuffixRecovery,
             crypto::{
@@ -9067,6 +9071,298 @@ mod tests {
         tokio::fs::remove_dir_all(root)
             .await
             .expect("remove failpoint fixture");
+    }
+
+    #[tokio::test]
+    async fn steer_group_injection_survives_kill_restart_at_injection_boundary() {
+        for application_kind in [ApplicationKind::SoftSteer, ApplicationKind::RetrySteer] {
+            let root = std::env::temp_dir().join(format!(
+                "sumi-steer-group-failpoint-{}-{}",
+                application_kind.as_str(),
+                uuid::Uuid::now_v7()
+            ));
+            let _ = tokio::fs::remove_dir_all(&root).await;
+            let path = root.join("agent.db");
+            let store: Arc<Store> = Store::open(&path, scope(), test_provider())
+                .await
+                .expect("open fresh file-backed store")
+                .into();
+            let writer = EventWriter::new(store.clone());
+
+            let owner_id = "00000000-0000-4000-8000-000000000001";
+            let run_id = format!("run-{owner_id}");
+            let old_turn_id = format!("turn-{owner_id}");
+            let group_turn_id = if application_kind == ApplicationKind::SoftSteer {
+                "turn-00000000-0000-4000-8000-000000000002".to_owned()
+            } else {
+                old_turn_id.clone()
+            };
+
+            let owner_injected =
+                classified_injection(&writer, 1, owner_id, "ignored", "owner").await;
+            writer
+                .apply(EventBatch {
+                    writes: injection_writes(owner_id, "ignored", "owner"),
+                    injected_commands: vec![owner_injected],
+                })
+                .await
+                .expect("inject owner");
+
+            let assistant_id = "assistant-1";
+            let assistant_stop_reason = if application_kind == ApplicationKind::SoftSteer {
+                StopReason::Stop
+            } else {
+                StopReason::Error
+            };
+            let assistant_msg = assistant_message(assistant_stop_reason);
+            let assistant_append_to_l0 = assistant_stop_reason != StopReason::Error;
+            writer
+                .apply(EventBatch {
+                    writes: vec![
+                        EventWrite {
+                            event: Some(
+                                DurableEvent::message_in_turn(
+                                    "message_start",
+                                    assistant_id,
+                                    &assistant_msg,
+                                    Some(run_id.clone()),
+                                    Some(old_turn_id.clone()),
+                                )
+                                .expect("assistant MessageStart"),
+                            ),
+                            projections: vec![Projection::RunPhase {
+                                command_id: owner_id.to_owned(),
+                                run_id: run_id.clone(),
+                                expected: RunPhase::UserCommitted,
+                                next: RunPhase::AssistantStarted,
+                            }],
+                        },
+                        EventWrite {
+                            event: Some(
+                                DurableEvent::message_in_turn(
+                                    "message_end",
+                                    assistant_id,
+                                    &assistant_msg,
+                                    Some(run_id.clone()),
+                                    Some(old_turn_id.clone()),
+                                )
+                                .expect("assistant MessageEnd"),
+                            ),
+                            projections: vec![Projection::MessageEnd {
+                                message_id: assistant_id.to_owned(),
+                                role: "assistant",
+                                message: assistant_msg.clone(),
+                                append_to_l0: assistant_append_to_l0,
+                            }],
+                        },
+                    ],
+                    injected_commands: Vec::new(),
+                })
+                .await
+                .expect("close assistant message");
+
+            if application_kind == ApplicationKind::RetrySteer {
+                let retry_at = durable_test_timestamp() + Duration::seconds(4);
+                writer
+                    .apply(EventBatch {
+                        writes: vec![EventWrite {
+                            event: Some(
+                                DurableEvent::retry_scheduled(
+                                    &run_id,
+                                    &old_turn_id,
+                                    1,
+                                    4000,
+                                    retry_at,
+                                    "retryable fixture",
+                                )
+                                .expect("retry scheduled"),
+                            ),
+                            projections: Vec::new(),
+                        }],
+                        injected_commands: Vec::new(),
+                    })
+                    .await
+                    .expect("schedule retry");
+            }
+
+            let steer_id = "00000000-0000-4000-8000-000000000002";
+            writer
+                .persist_inbound(&user_command(2, steer_id, "steer now"))
+                .await
+                .expect("persist steer command");
+            sqlx::query("UPDATE inbound_commands SET received_at=? WHERE command_id=?")
+                .bind(durable_test_timestamp().to_rfc3339())
+                .bind(steer_id)
+                .execute(store.pool())
+                .await
+                .expect("pin steer receipt timestamp");
+            writer
+                .apply(EventBatch {
+                    writes: vec![EventWrite {
+                        event: None,
+                        projections: vec![Projection::CommandClassified {
+                            command_id: steer_id.to_owned(),
+                            application_kind,
+                            run_id: run_id.clone(),
+                            turn_id: group_turn_id.to_owned(),
+                        }],
+                    }],
+                    injected_commands: Vec::new(),
+                })
+                .await
+                .expect("classify steer command");
+
+            let steer_command = AdmittedCommand::new(
+                CommandEnvelope {
+                    seq: 2,
+                    command_id: CommandId::parse(steer_id).expect("canonical test UUID"),
+                    command: Command::UserMessage {
+                        text: "steer now".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                },
+                durable_test_timestamp(),
+            );
+
+            let previous_owner = DurableRunBinding {
+                command_id: owner_id.to_owned(),
+                command_seq: 1,
+                run_id: run_id.clone(),
+                turn_id: old_turn_id.clone(),
+                executor_generation: ProcessGeneration::MIN,
+            };
+            let mut group = SteerGroup::new(application_kind, run_id.clone(), group_turn_id)
+                .expect("create steer group");
+            group
+                .push(steer_command, store.redactor())
+                .expect("push steer command");
+            let closing_turn_message =
+                (application_kind == ApplicationKind::SoftSteer).then(|| assistant_msg.clone());
+            let snapshot = group.snapshot(previous_owner, closing_turn_message);
+            let batch = steer_group_injection_batch(snapshot).expect("build steer group batch");
+
+            let fail_after_writes = if application_kind == ApplicationKind::SoftSteer {
+                2
+            } else {
+                1
+            };
+            let error = writer
+                .apply_with_failpoint(batch.clone(), fail_after_writes)
+                .await
+                .expect_err("failpoint must interrupt the steer group injection");
+            assert!(error.to_string().contains("test failpoint"));
+            drop(writer);
+            drop(store);
+
+            let reopened: Arc<Store> = Store::open(&path, scope(), test_provider())
+                .await
+                .expect("restart store after interrupted steer group injection")
+                .into();
+
+            let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+                .fetch_one(reopened.pool())
+                .await
+                .expect("count events after restart");
+            let messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+                .fetch_one(reopened.pool())
+                .await
+                .expect("count messages after restart");
+            let (expected_pre_events, expected_pre_messages) =
+                if application_kind == ApplicationKind::SoftSteer {
+                    (6, 2)
+                } else {
+                    (7, 2)
+                };
+            assert_eq!(
+                (events, messages),
+                (expected_pre_events, expected_pre_messages),
+                "partial {} steer group injection must roll back completely",
+                application_kind.as_str()
+            );
+
+            let owner_status: (String, String) = sqlx::query_as(
+                "SELECT status, run_phase FROM inbound_commands WHERE command_id = ?",
+            )
+            .bind(owner_id)
+            .fetch_one(reopened.pool())
+            .await
+            .expect("owner status after restart");
+            assert_eq!(owner_status.0, "applying", "owner must remain applying");
+            assert_eq!(
+                owner_status.1, "assistant_started",
+                "owner must remain assistant_started"
+            );
+
+            let steer_status: (String, String) = sqlx::query_as(
+                "SELECT status, run_phase FROM inbound_commands WHERE command_id = ?",
+            )
+            .bind(steer_id)
+            .fetch_one(reopened.pool())
+            .await
+            .expect("steer status after restart");
+            assert_eq!(steer_status.0, "applying", "steer must remain applying");
+            assert_eq!(steer_status.1, "classified", "steer must remain classified");
+
+            EventWriter::new(reopened.clone())
+                .apply(batch)
+                .await
+                .expect("same steer group batch succeeds once after restart");
+
+            let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+                .fetch_one(reopened.pool())
+                .await
+                .expect("count committed events after reapply");
+            let messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+                .fetch_one(reopened.pool())
+                .await
+                .expect("count committed messages after reapply");
+            let (expected_events, expected_messages) =
+                if application_kind == ApplicationKind::SoftSteer {
+                    (11, 3)
+                } else {
+                    (10, 3)
+                };
+            assert_eq!(
+                (events, messages),
+                (expected_events, expected_messages),
+                "{} steer group must commit exactly after restart",
+                application_kind.as_str()
+            );
+
+            let owner_status: (String, String) = sqlx::query_as(
+                "SELECT status, run_phase FROM inbound_commands WHERE command_id = ?",
+            )
+            .bind(owner_id)
+            .fetch_one(reopened.pool())
+            .await
+            .expect("owner status after reapply");
+            assert_eq!(
+                owner_status.0, "applied",
+                "owner must close after steer injection"
+            );
+            assert_eq!(
+                owner_status.1, "finished",
+                "owner must finish after steer injection"
+            );
+
+            let steer_status: (String, String) = sqlx::query_as(
+                "SELECT status, run_phase FROM inbound_commands WHERE command_id = ?",
+            )
+            .bind(steer_id)
+            .fetch_one(reopened.pool())
+            .await
+            .expect("steer status after reapply");
+            assert_eq!(steer_status.0, "applying", "steer must remain applying");
+            assert_eq!(
+                steer_status.1, "user_committed",
+                "steer must reach user_committed"
+            );
+
+            reopened.pool().close().await;
+            tokio::fs::remove_dir_all(root)
+                .await
+                .expect("remove steer group failpoint fixture");
+        }
     }
 
     #[tokio::test]
