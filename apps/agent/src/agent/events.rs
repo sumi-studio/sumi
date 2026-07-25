@@ -224,3 +224,9 @@ pub(crate) enum SteerMode {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(transparent)]
 pub(crate) struct MemoryMaintKind(String);
+
+impl MemoryMaintKind {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
