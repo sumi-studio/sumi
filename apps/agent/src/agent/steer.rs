@@ -427,19 +427,10 @@ pub(crate) fn normalize_partial_assistant(partial: PublicMessage) -> Result<Publ
         }
     }
 
-    // Append the interruption marker so the model recognizes the cutoff.
-    let marker = "[この応答はユーザーの割り込みにより中断された]";
-    if let Some(PublicAssistantContent::Text { text, .. }) = kept.last_mut() {
-        if !text.ends_with(marker) {
-            *text = format!("{text}\n\n{marker}");
-        }
-    } else {
-        kept.push(PublicAssistantContent::Text {
-            text: marker.to_owned(),
-            wire_item_index: u32::MAX,
-        });
-    }
-
+    // The durable transcript contains only provider-authored content. Replay
+    // normalization adds the hard-steer marker to the send view exactly once;
+    // persisting it here would duplicate it and would also fabricate a
+    // steer-only marker for an Abort, which uses this same partial finalizer.
     assistant.content = kept;
     assistant.interrupted = true;
     assistant.stop_reason = StopReason::Aborted;
@@ -1298,8 +1289,9 @@ mod tests {
             vec!["event", "event", "event", "event", "event", "event"]
         );
 
-        // The partial assistant MessageEnd projection dropped the tool-call and
-        // appended the interruption marker.
+        // The durable partial assistant drops the tool-call and preserves only
+        // provider-authored text. The replay-only interruption marker must not
+        // be persisted here.
         let projection = batches[0].writes[0]
             .projections
             .first()
@@ -1315,10 +1307,7 @@ mod tests {
             assert_eq!(assistant.stop_reason, StopReason::Aborted);
             assert_eq!(assistant.content.len(), 1);
             if let PublicAssistantContent::Text { text, .. } = &assistant.content[0] {
-                assert!(
-                    text.ends_with("[この応答はユーザーの割り込みにより中断された]"),
-                    "marker appended to partial text"
-                );
+                assert_eq!(text, "partial");
             } else {
                 panic!("partial assistant kept a non-text block");
             }

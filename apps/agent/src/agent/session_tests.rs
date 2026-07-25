@@ -2485,10 +2485,16 @@ async fn active_abort_supersedes_deferred_user_message_and_owner_applied() {
                 emit_idle_injection(&events, &initial).await;
 
                 let control = controls.recv().await.expect("abort control arrives");
-                let RunControl::Abort { accepted, .. } = control else {
+                let RunControl::Abort {
+                    accepted,
+                    committed,
+                    ..
+                } = control
+                else {
                     panic!("expected Abort control")
                 };
                 accepted.send(true).expect("abort accepted");
+                committed.await.expect("durable abort authorization");
 
                 let assistant_id = "active-abort-assistant".to_owned();
                 events

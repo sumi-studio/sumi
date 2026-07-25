@@ -319,6 +319,7 @@ pub(crate) enum RunControl {
     Abort {
         command: AdmittedCommand,
         accepted: oneshot::Sender<bool>,
+        committed: oneshot::Receiver<()>,
     },
     RetrySteer {
         command: AdmittedCommand,
@@ -963,9 +964,11 @@ impl<G: Gateway + 'static> Session<G> {
             return Ok(false);
         }
         let (accepted_tx, accepted_rx) = oneshot::channel();
+        let (committed_tx, committed_rx) = oneshot::channel();
         let control = RunControl::Abort {
             command: command.clone(),
             accepted: accepted_tx,
+            committed: committed_rx,
         };
         let mut phase_rx = active.phase_rx.clone();
         if active.control_tx.try_send(control).is_err() {
@@ -979,6 +982,11 @@ impl<G: Gateway + 'static> Session<G> {
             .bind_abort(&self.writer, command)
             .await
             .map_err(|error| SessionFailure::Worker(WorkerFailure::Error(error.to_string())))?;
+        committed_tx.send(()).map_err(|_| {
+            SessionFailure::Worker(WorkerFailure::Error(
+                "abort worker exited before durability authorization".to_owned(),
+            ))
+        })?;
         let superseded: std::collections::HashSet<String> = acks
             .iter()
             .filter(|ack| ack.status == CommandAckStatus::Superseded)
