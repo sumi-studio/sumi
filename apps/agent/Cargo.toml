@@ -5,6 +5,11 @@ edition = "2024"
 rust-version = "1.88"
 publish = false
 
+[lib]
+name = "sumi_agent_doctest"
+path = "src/lib.rs"
+test = false
+
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
