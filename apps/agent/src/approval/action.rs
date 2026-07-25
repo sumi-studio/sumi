@@ -391,7 +391,6 @@ pub struct SecretRef {
 }
 
 /// Keyed digest for secret identity comparison without value reconstruction.
-#[derive(Clone)]
 pub struct SecretDigestKey([u8; 32]);
 
 impl SecretDigestKey {
@@ -472,8 +471,9 @@ fn credential_options_for_command(cmd: &str) -> Option<&'static [(&'static str, 
 }
 
 fn shell_credential_spans(command: &str) -> Vec<Vec<(usize, usize, &'static str)>> {
-    let tokens = shell::tokenize_command(command);
-    let mut spans: Vec<Vec<(usize, usize, &'static str)>> = vec![Vec::new(); tokens.len()];
+    let token_spans = shell::tokenize_command_spans(command);
+    let tokens: Vec<String> = token_spans.iter().map(|(_, _, t)| t.clone()).collect();
+    let mut spans: Vec<Vec<(usize, usize, &'static str)>> = vec![Vec::new(); token_spans.len()];
     let Some(eff) = shell::effective_command(&tokens, 1) else {
         return spans;
     };
@@ -482,7 +482,7 @@ fn shell_credential_spans(command: &str) -> Vec<Vec<(usize, usize, &'static str)
     let Some(options) = credential_options_for_command(&cmd) else {
         return spans;
     };
-    let base = tokens.len() - eff.tokens.len();
+    let base = eff.leading_assignments;
     let mut i = base + 1;
     while i < tokens.len() {
         let token = &tokens[i];
@@ -632,21 +632,27 @@ impl SecretAwareActionProjector {
                 continue;
             }
             if !in_double && c == '\'' {
-                in_single = !in_single;
                 orig_pos += c.len_utf8();
+                in_single = !in_single;
                 continue;
             }
             if !in_single && c == '"' {
-                in_double = !in_double;
                 orig_pos += c.len_utf8();
+                in_double = !in_double;
                 continue;
             }
             out.push(c);
-            mapping.push(orig_pos);
+            for _ in 0..c.len_utf8() {
+                mapping.push(orig_pos);
+            }
             end_after_last = orig_pos + c.len_utf8();
             orig_pos += c.len_utf8();
         }
-        mapping.push(end_after_last);
+        mapping.push(if out.is_empty() {
+            span.len()
+        } else {
+            end_after_last
+        });
         (out, mapping)
     }
 
@@ -1334,11 +1340,16 @@ impl SecretInventory {
     }
 }
 
+fn secret_inventory() -> &'static SecretInventory {
+    static INVENTORY: std::sync::OnceLock<SecretInventory> = std::sync::OnceLock::new();
+    INVENTORY.get_or_init(SecretInventory::new)
+}
+
 /// Check persisted metadata without retaining or returning the matching
 /// material. Policy rule diagnostics deliberately expose only the typed error,
 /// never the matched value.
 pub(crate) fn text_contains_secret_material(text: &str) -> bool {
-    !SecretInventory::new().find(text).is_empty() || contains_shell_credential(text)
+    !secret_inventory().find(text).is_empty() || contains_shell_credential(text)
 }
 
 #[derive(Clone, Copy)]
@@ -3310,5 +3321,31 @@ mod tests {
             !projector().text_contains_secret(wget),
             "wget -p misclassified as secret"
         );
+    }
+
+    #[test]
+    fn projector_redacts_secret_after_non_ascii_prefix() {
+        let action = bash_action("printf 'あsk-abcdefghijklmnop'");
+        let ReviewProjection::Reviewable(projected) = projector().project(&action) else {
+            panic!("expected reviewable projection");
+        };
+        let argv_text = serde_json::to_string(&projected.argv).unwrap();
+        assert!(
+            !argv_text.contains("sk-abcdefghijklmnop"),
+            "secret leaked: {argv_text}"
+        );
+        assert!(
+            argv_text.contains("api_key"),
+            "api_key placeholder missing: {argv_text}"
+        );
+    }
+
+    #[test]
+    fn empty_quoted_tokens_do_not_cause_projection_panic() {
+        // tokenize_command_spans emits spans for empty '' tokens; shell_credential_spans
+        // must stay aligned so project/redact never indexes out of bounds.
+        let action = bash_action("echo '' ''");
+        let _ = projector().project(&action);
+        let _ = projector().redact_bash_command_text("echo '' ''");
     }
 }

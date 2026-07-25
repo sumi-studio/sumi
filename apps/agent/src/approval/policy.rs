@@ -853,12 +853,16 @@ fn option_path_values(tokens: &[String]) -> Vec<String> {
             continue;
         }
 
-        if token.starts_with('-')
-            && !token.starts_with("--")
-            && token.len() > 2
-            && token_looks_like_path(&token[2..])
-        {
-            paths.push(token[2..].to_owned());
+        if token.starts_with('-') && !token.starts_with("--") {
+            if let Some((idx, c)) = token.char_indices().nth(1) {
+                let value_start = idx + c.len_utf8();
+                if value_start < token.len() {
+                    let value = &token[value_start..];
+                    if token_looks_like_path(value) {
+                        paths.push(value.to_owned());
+                    }
+                }
+            }
         } else if token_looks_like_path(token) {
             paths.push(token.clone());
         }
@@ -3429,5 +3433,27 @@ mod tests {
                 "{command} must not be persistable"
             );
         }
+    }
+
+    #[test]
+    fn short_option_path_values_are_utf8_safe() {
+        // ASCII short option with a path value.
+        assert_eq!(
+            option_path_values(&["tar".to_owned(), "-I/workspace/src".to_owned()]),
+            vec!["/workspace/src"]
+        );
+
+        // Multi-byte option characters; no value for -あ and a value for -á.
+        assert!(option_path_values(&["cmd".to_owned(), "-あ".to_owned()]).is_empty());
+        assert_eq!(
+            option_path_values(&["cmd".to_owned(), "-á/etc".to_owned()]),
+            vec!["/etc"]
+        );
+
+        // Plain paths are still detected.
+        assert_eq!(
+            option_path_values(&["cmd".to_owned(), "/workspace".to_owned()]),
+            vec!["/workspace"]
+        );
     }
 }

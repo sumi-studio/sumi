@@ -140,19 +140,42 @@ mod tests {
         .expect("bash");
         assert!(!default_broker().evaluate(&dynamic).is_allow());
 
-        // Broad prefixes reject ApproveAlways. A forbidden action is also
-        // rejected rather than being downgraded to executable ApproveOnce.
+        // Broad prefixes downgrade ApproveAlways rather than persisting it.
+        let broad_action = CanonicalAction::from_tool_call(
+            PathBuf::from("/workspace"),
+            "bash",
+            &args(json!({"command": "echo hello"})),
+        )
+        .expect("bash");
         let broad = ApprovalRule {
             id: "broad".to_owned(),
             tool: "bash".to_owned(),
-            literal_prefix: vec!["bash".to_owned()],
+            literal_prefix: vec!["echo".to_owned()],
             effect: RuleEffect::Allow,
             workspace_only: true,
             allowed_permissions: vec![Permission::Exec],
             allowed_network_domains: vec![],
         };
         let resolved =
-            default_broker().resolve(&multi, UserDecision::ApproveAlways { rule: broad });
+            default_broker().resolve(&broad_action, UserDecision::ApproveAlways { rule: broad });
+        assert!(matches!(resolved, ResolvedDecision::ApproveOnce));
+
+        // A forbidden action is rejected rather than downgraded to executable ApproveOnce.
+        let forbidden_rule = ApprovalRule {
+            id: "git-status".to_owned(),
+            tool: "bash".to_owned(),
+            literal_prefix: vec!["git".to_owned(), "status".to_owned()],
+            effect: RuleEffect::Allow,
+            workspace_only: true,
+            allowed_permissions: vec![Permission::Exec],
+            allowed_network_domains: vec![],
+        };
+        let resolved = default_broker().resolve(
+            &multi,
+            UserDecision::ApproveAlways {
+                rule: forbidden_rule,
+            },
+        );
         assert!(matches!(resolved, ResolvedDecision::Rejected { .. }));
 
         // Signed URL and Authorization secret handling + ApproveAlways downgrade
