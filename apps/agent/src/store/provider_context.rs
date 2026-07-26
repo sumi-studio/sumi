@@ -89,6 +89,34 @@ impl ProviderContextKind {
     }
 }
 
+/// Extracts the request/message identity from a native provider-context record id.
+///
+/// Native compaction rows use the canonical id form
+/// `{request_id}:{message_seq}:{wire_label}:{ordinal}` where `message_seq` and
+/// `ordinal` are decimal and `wire_label` is `"_"` for unanchored native windows.
+/// Because `request_id` may itself contain `':'` separators, this parses from the
+/// fixed trailing fields rather than splitting naively from the start.
+pub(crate) fn native_request_id_from_record_id(id: &str) -> Option<String> {
+    let mut parts = id.rsplitn(4, ':');
+    let ordinal = parts.next()?;
+    if ordinal.parse::<u32>().is_err() {
+        return None;
+    }
+    let wire_label = parts.next()?;
+    if wire_label != "_" {
+        return None;
+    }
+    let message_seq = parts.next()?;
+    if message_seq.parse::<u64>().is_err() {
+        return None;
+    }
+    let request_id = parts.next()?;
+    if request_id.is_empty() {
+        return None;
+    }
+    Some(request_id.to_owned())
+}
+
 /// Canonical idempotency key for provider-context records.
 ///
 /// Regular reasoning items use `message_id:wire_item_index:ordinal:kind`;
@@ -1566,6 +1594,24 @@ mod tests {
         Ok(())
     }
 
+    async fn seed_non_message_event(store: &Store, seq: u64) -> anyhow::Result<()> {
+        let key = store
+            .conversation_key(DataKeyPurpose::Event)
+            .await
+            .expect("mint event key");
+        sqlx::query(
+            "INSERT INTO agent_events(
+                seq, event_type, internal_metadata, raw_key_ref, raw_ciphertext,
+                envelope, redaction_version, created_at
+             ) VALUES(?, 'test_non_message', '{}', ?, X'00', '{}', 1, 'now')",
+        )
+        .bind(sqlite_i64(seq, "agent_events.seq")?)
+        .bind(&key.key_ref)
+        .execute(store.pool())
+        .await?;
+        Ok(())
+    }
+
     fn reasoning_origin() -> ProviderOrigin {
         ProviderOrigin {
             provider_instance_id: "provider-instance-1".to_owned(),
@@ -2190,6 +2236,69 @@ mod tests {
         }
     }
 
+    fn native_compaction_item(anthropic: bool, coverage: u64) -> ProviderContextItem {
+        let provider_origin = ProviderOrigin {
+            provider_instance_id: "provider-instance-1".to_owned(),
+            protocol: if anthropic {
+                ApiProtocol::AnthropicMessages
+            } else {
+                ApiProtocol::OpenAiResponses
+            },
+            model: "model-1".to_owned(),
+        };
+        let coverage = NativeCompactionCoverage {
+            through_message_seq: coverage,
+            context_fingerprint: "fp-1".to_owned(),
+        };
+        ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 1,
+            provider_origin,
+            payload: if anthropic {
+                ProviderContextPayload::AnthropicCompaction {
+                    block: json!({"type": "compaction", "content": "summary"}),
+                    coverage,
+                }
+            } else {
+                ProviderContextPayload::OpenAiCompactedWindow {
+                    items: vec![json!({"summary": "compacted"})],
+                    coverage,
+                }
+            },
+        }
+    }
+
+    async fn insert_native_compaction(
+        store: &Store,
+        request_id: &str,
+        item: &ProviderContextItem,
+    ) -> String {
+        let key = store
+            .provider_context_key(&ProviderContextKeyAnchor {
+                conversation_id: store.scope().conversation_id.clone(),
+                anchor_id: "native:0".to_owned(),
+            })
+            .await
+            .expect("mint native provider-context key");
+        let id = format!("{request_id}:4:_:{}", item.ordinal);
+        EncryptedProviderContextRecord::encrypt(
+            item,
+            &item.provider_origin.provider_instance_id,
+            item.provider_origin.protocol,
+            &item.provider_origin.model,
+            &id,
+            provider_context_idempotency_key(request_id, item),
+            &key,
+            store.scope(),
+        )
+        .expect("encrypt native compaction")
+        .insert(store.pool())
+        .await
+        .expect("insert native compaction");
+        id
+    }
+
     #[tokio::test]
     async fn compaction_idempotency_key_is_request_coverage_fingerprint() {
         let store = store().await;
@@ -2602,12 +2711,15 @@ mod tests {
                 },
             },
         };
+        // Native row ids are canonical `{request_id}:{message_seq}:{wire_label}:{ordinal}`;
+        // the request identity may contain ':' separators, so it is parsed from the
+        // fixed trailing fields during hydration.
         let later = EncryptedProviderContextRecord::encrypt(
             &item,
             "provider-instance-1",
             ApiProtocol::OpenAiResponses,
             "model-1",
-            "pc-later",
+            "message-1:1:_:1",
             provider_context_idempotency_key("message-1", &item),
             &key,
             store.scope(),
@@ -2631,7 +2743,7 @@ mod tests {
             "provider-instance-1",
             ApiProtocol::OpenAiResponses,
             "model-2",
-            "pc-earlier",
+            "message-1:1:_:2",
             provider_context_idempotency_key("message-1", &item),
             &key,
             store.scope(),
@@ -2705,7 +2817,7 @@ mod tests {
             "provider-instance-1",
             ApiProtocol::OpenAiResponses,
             "model-1",
-            "pc-compaction",
+            "request-1:2:_:1",
             provider_context_idempotency_key("request-1", &compaction_item),
             &compaction_key,
             store.scope(),
@@ -3368,7 +3480,104 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hydrate_rejects_gapped_native_compaction_suffix() {
+    async fn hydrate_native_compaction_accepts_real_global_event_gaps_for_both_protocols() {
+        for anthropic in [false, true] {
+            let store = store().await;
+            for seq in [1, 2, 3, 5] {
+                seed_non_message_event(&store, seq).await.unwrap();
+            }
+            seed_message(&store, "message-4", 4).await.unwrap();
+            seed_message(&store, "message-6", 6).await.unwrap();
+
+            let item = native_compaction_item(anthropic, 4);
+            insert_native_compaction(&store, "request:with:colons", &item).await;
+            let messages = vec![
+                ContextMessage::Persisted {
+                    id: "message-4".to_owned(),
+                    seq: 4,
+                    message: assistant_message(item.provider_origin.clone()),
+                },
+                ContextMessage::Persisted {
+                    id: "message-6".to_owned(),
+                    seq: 6,
+                    message: assistant_message(item.provider_origin.clone()),
+                },
+            ];
+
+            let hydrated = store
+                .hydrate_provider_context(&messages)
+                .await
+                .expect("global event gaps must not invalidate native compaction hydration");
+            assert_eq!(hydrated, vec![item]);
+        }
+    }
+
+    #[tokio::test]
+    async fn hydrate_native_compaction_rejects_tampered_idempotency_for_both_protocols() {
+        for anthropic in [false, true] {
+            let store = store().await;
+            seed_message(&store, "message-4", 4).await.unwrap();
+            seed_message(&store, "message-6", 6).await.unwrap();
+            let item = native_compaction_item(anthropic, 4);
+            let id = insert_native_compaction(&store, "request:with:colons", &item).await;
+            sqlx::query("UPDATE provider_context SET idempotency_key = 'tampered' WHERE id = ?")
+                .bind(&id)
+                .execute(store.pool())
+                .await
+                .expect("tamper stored idempotency key");
+
+            let messages = vec![
+                ContextMessage::Persisted {
+                    id: "message-4".to_owned(),
+                    seq: 4,
+                    message: assistant_message(item.provider_origin.clone()),
+                },
+                ContextMessage::Persisted {
+                    id: "message-6".to_owned(),
+                    seq: 6,
+                    message: assistant_message(item.provider_origin.clone()),
+                },
+            ];
+            let error = store
+                .hydrate_provider_context(&messages)
+                .await
+                .expect_err("tampered native idempotency key must fail hydration");
+            assert!(
+                format!("{error:#}")
+                    .contains("idempotency key does not match authenticated native item"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hydrate_native_compaction_rejects_reordered_messages() {
+        let store = store().await;
+        seed_message(&store, "message-4", 4).await.unwrap();
+        seed_message(&store, "message-6", 6).await.unwrap();
+        let item = native_compaction_item(false, 4);
+        insert_native_compaction(&store, "request-1", &item).await;
+        let messages = vec![
+            ContextMessage::Persisted {
+                id: "message-6".to_owned(),
+                seq: 6,
+                message: assistant_message(item.provider_origin.clone()),
+            },
+            ContextMessage::Persisted {
+                id: "message-4".to_owned(),
+                seq: 4,
+                message: assistant_message(item.provider_origin.clone()),
+            },
+        ];
+        let error = store
+            .hydrate_provider_context(&messages)
+            .await
+            .expect_err("reordered persisted messages must fail hydration");
+        assert!(format!("{error:#}").contains("reordered"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_native_compaction_coverage_out_of_range() {
         let store = store().await;
         seed_message(&store, "message-1", 1).await.unwrap();
         seed_message(&store, "message-3", 3).await.unwrap();
@@ -3381,6 +3590,7 @@ mod tests {
             .await
             .unwrap();
 
+        // Persisted messages at seq 1 and 3 (gaps are legal), but coverage claims seq 5.
         let item = ProviderContextItem {
             origin_message: None,
             wire_item_index: None,
@@ -3389,7 +3599,7 @@ mod tests {
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({"summary": "compacted"})],
                 coverage: NativeCompactionCoverage {
-                    through_message_seq: 1,
+                    through_message_seq: 5,
                     context_fingerprint: "fp-1".to_owned(),
                 },
             },
@@ -3399,7 +3609,7 @@ mod tests {
             "provider-instance-1",
             ApiProtocol::OpenAiResponses,
             "model-1",
-            "pc-gap",
+            "request-1:1:_:1",
             provider_context_idempotency_key("request-1", &item),
             &key,
             store.scope(),
@@ -3424,10 +3634,10 @@ mod tests {
         let error = store
             .hydrate_provider_context(&messages)
             .await
-            .expect_err("hydration must reject gapped native compaction suffix");
+            .expect_err("hydration must reject out-of-range native compaction coverage");
         let message = format!("{error:#}");
         assert!(
-            message.contains("gapped, duplicated, or reordered"),
+            message.contains("coverage does not identify a persisted message"),
             "{message}"
         );
     }

@@ -932,6 +932,56 @@ pub fn validate_native_suffix(messages: &[ContextMessage], coverage: u64) -> Res
     Ok(())
 }
 
+/// Hydration-specific validation for native compaction windows.
+///
+/// Unlike `validate_native_suffix`, this does not require `messages` to be a
+/// contiguous 1-indexed sequence. Persisted message `seq` values are the global
+/// `agent_events.seq` assigned to each `MessageEnd`, so non-message durable
+/// events (lifecycle/tool events) create gaps. This validator only enforces:
+///
+/// 1. Persisted messages are strictly increasing (no duplicates or reordering).
+/// 2. Any synthetic messages appear only before the first persisted message.
+/// 3. `coverage` identifies one of the persisted messages. It is the global
+///    event sequence of the last transcript message replaced by the window,
+///    not an arbitrary event sequence between two messages.
+///
+/// The covered prefix and the suffix are therefore coherent even when `seq`
+/// values are not contiguous.
+pub fn validate_native_suffix_for_hydration(
+    messages: &[ContextMessage],
+    coverage: u64,
+) -> Result<(), String> {
+    let mut persisted_started = false;
+    let mut previous: Option<u64> = None;
+    let mut coverage_seen = false;
+    for message in messages {
+        let ContextMessage::Persisted { seq, .. } = message else {
+            if persisted_started {
+                return Err(
+                    "native suffix contains synthetic content after persisted history".into(),
+                );
+            }
+            continue;
+        };
+        persisted_started = true;
+        if *seq == 0 {
+            return Err("native replay sequence must not contain seq 0".into());
+        }
+        if previous.is_some_and(|value: u64| value >= *seq) {
+            return Err(
+                "persisted native replay sequence is duplicated, reordered, or not strictly increasing".into(),
+            );
+        }
+        coverage_seen |= *seq == coverage;
+        previous = Some(*seq);
+    }
+    previous.ok_or("native compaction requires persisted replay history")?;
+    if !coverage_seen {
+        return Err("native compaction coverage does not identify a persisted message".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone;
@@ -1788,5 +1838,50 @@ mod tests {
             },
         ];
         validate_native_suffix(&messages, 1).expect("leading synthetic + seq 1 start must pass");
+    }
+
+    #[test]
+    fn hydration_native_suffix_accepts_global_event_gaps() {
+        let messages = vec![
+            ContextMessage::Persisted {
+                id: "m-4".to_owned(),
+                seq: 4,
+                message: Message::Assistant(assistant_message()),
+            },
+            ContextMessage::Persisted {
+                id: "m-6".to_owned(),
+                seq: 6,
+                message: Message::Assistant(assistant_message()),
+            },
+        ];
+        validate_native_suffix_for_hydration(&messages, 4)
+            .expect("non-message durable events may create gaps between messages");
+    }
+
+    #[test]
+    fn hydration_native_suffix_rejects_non_message_coverage_and_reordering() {
+        let ordered = vec![
+            ContextMessage::Persisted {
+                id: "m-4".to_owned(),
+                seq: 4,
+                message: Message::Assistant(assistant_message()),
+            },
+            ContextMessage::Persisted {
+                id: "m-6".to_owned(),
+                seq: 6,
+                message: Message::Assistant(assistant_message()),
+            },
+        ];
+        let error = validate_native_suffix_for_hydration(&ordered, 5)
+            .expect_err("coverage must identify the last covered message");
+        assert!(
+            error.contains("does not identify a persisted message"),
+            "{error}"
+        );
+
+        let reordered = vec![ordered[1].clone(), ordered[0].clone()];
+        let error = validate_native_suffix_for_hydration(&reordered, 4)
+            .expect_err("persisted messages must remain ordered");
+        assert!(error.contains("reordered"), "{error}");
     }
 }

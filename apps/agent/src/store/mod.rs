@@ -33,11 +33,11 @@ use sqlx::{
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::provider::types::{
     ApiProtocol, ContextMessage, Message, ProviderContextItem, ProviderContextPayload,
-    PublicMessage, validate_native_suffix,
+    PublicMessage, validate_native_suffix_for_hydration,
 };
 use crate::runtime::contracts::{
     GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease,
@@ -52,7 +52,9 @@ pub(crate) use self::physical_recovery::{
     ApplyReceiptOutcome, HydrationReceiptIdentity, PhysicalRecoveryApplier, PhysicalRecoveryIntent,
     PhysicalRecoveryIntentRequest, PhysicalRecoveryReceipt,
 };
-pub(crate) use self::provider_context::{ProviderContextEvictionEstimate, ProviderContextKind};
+pub(crate) use self::provider_context::{
+    ProviderContextEvictionEstimate, ProviderContextKind, provider_context_idempotency_key,
+};
 pub(crate) use self::transcript::{message_interrupted, public_message_role};
 #[cfg(test)]
 pub(crate) use crypto::{DATA_KEY_BYTES, WrappingKey};
@@ -494,8 +496,10 @@ impl Store {
             let aad = self
                 .scope
                 .row_aad("provider_context", &id, DataKeyPurpose::ProviderContext);
-            let plaintext = decrypt_content(&key, &ciphertext, &aad)
-                .with_context(|| format!("failed to decrypt provider-context record {id}"))?;
+            let plaintext = Zeroizing::new(
+                decrypt_content(&key, &ciphertext, &aad)
+                    .with_context(|| format!("failed to decrypt provider-context record {id}"))?,
+            );
             let item: ProviderContextItem =
                 serde_json::from_slice(&plaintext).with_context(|| {
                     format!("provider-context record {id} is not a valid ProviderContextItem")
@@ -664,9 +668,26 @@ impl Store {
                             "provider-context record {id} context_fingerprint does not match decrypted payload"
                         );
                     }
-                    validate_native_suffix(messages, coverage.through_message_seq).map_err(
-                        |message| anyhow!("provider-context record {id} failed native suffix validation: {message}"),
-                    )?;
+
+                    let request_id =
+                        crate::store::provider_context::native_request_id_from_record_id(&id)
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "provider-context record {id} has a non-canonical native row id"
+                                )
+                            })?;
+                    let expected_idempotency_key =
+                        provider_context_idempotency_key(&request_id, &item);
+                    if stored_idempotency_key != expected_idempotency_key {
+                        bail!(
+                            "provider-context record {id} idempotency key does not match authenticated native item"
+                        );
+                    }
+
+                    validate_native_suffix_for_hydration(messages, coverage.through_message_seq)
+                        .map_err(|message| {
+                            anyhow!("provider-context record {id} failed native suffix validation: {message}")
+                        })?;
                 }
                 ProviderContextPayload::EncryptedReasoning { .. } => {
                     if stored_coverage_seq.is_some() || stored_fingerprint.is_some() {

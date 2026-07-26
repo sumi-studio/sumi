@@ -386,13 +386,20 @@ impl<'a> PhysicalRecoveryApplier<'a> {
     /// All event rows and typed projections have already been inserted by the
     /// caller; this method only validates their exact relationship to the
     /// injected receipt and writes the parent/children atomically.
+    ///
+    /// The `lease` and `fence` must be the exact recovery binding passed to
+    /// `EventWriter::apply_physical_recovery`; `apply_in_transaction` revalidates
+    /// the receipt against them inside the transaction so that generic `apply`
+    /// paths cannot admit an unbound receipt.
     pub(crate) async fn apply_in_transaction(
         &self,
         transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         receipt: &PhysicalRecoveryReceipt,
         batch_event_seqs: &[u64],
+        lease: &ProcessGenerationLease,
+        fence: &GenerationRecoveryFence,
     ) -> Result<ApplyReceiptOutcome> {
-        receipt.validate()?;
+        receipt.validate_for(lease, fence)?;
 
         let existing = sqlx::query(
             "SELECT receipt_digest, lease_id, generation, fence_id, intent_count,

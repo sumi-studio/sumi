@@ -63,6 +63,15 @@ struct MemorySummaryPayload<'a> {
     to: &'a DateTime<Utc>,
 }
 
+/// Recovery binding carried through an `EventWriter` transaction. Only
+/// `EventWriter::apply_physical_recovery` may supply this context; generic
+/// `apply` rejects `Projection::PhysicalRecovery` outright.
+struct PhysicalRecoveryContext<'a> {
+    lease: &'a ProcessGenerationLease,
+    fence: &'a GenerationRecoveryFence,
+    receipt: &'a PhysicalRecoveryReceipt,
+}
+
 #[derive(Clone)]
 pub(crate) struct DurableEvent {
     value: AgentEvent,
@@ -1485,6 +1494,7 @@ impl EventWriter {
                 }],
                 injected_commands: Vec::new(),
             },
+            None,
             &mut guard,
         )
         .await?;
@@ -1567,7 +1577,7 @@ impl EventWriter {
     )]
     pub(crate) async fn apply(&self, batch: EventBatch) -> Result<Vec<u64>> {
         let mut guard = self.gate.lock().await;
-        self.apply_locked(batch, &mut guard).await
+        self.apply_locked(batch, None, &mut guard).await
     }
 
     /// Hydration entry point for a T27 physical recovery proof.  The receipt
@@ -1595,14 +1605,22 @@ impl EventWriter {
         if !has_receipt_projection {
             batch.writes.push(EventWrite {
                 event: None,
-                projections: vec![Projection::PhysicalRecovery(receipt)],
+                projections: vec![Projection::PhysicalRecovery(receipt.clone())],
             });
         }
         // Idempotency is decided inside the same SQLite transaction as the
         // application ledger write (PhysicalRecoveryApplier::apply_in_transaction).
         // Reading `already_present` outside the transaction would create a TOCTOU
         // window where two callers could both observe the receipt as new.
-        let seqs = self.apply(batch).await?;
+        let mut guard = self.gate.lock().await;
+        let context = PhysicalRecoveryContext {
+            lease,
+            fence,
+            receipt: &receipt,
+        };
+        let seqs = self
+            .apply_locked_with_failpoint(batch, None, None, None, Some(context), &mut guard)
+            .await?;
         let outcome = if seqs.is_empty() {
             ApplyReceiptOutcome::AlreadyApplied
         } else {
@@ -1618,17 +1636,25 @@ impl EventWriter {
         fail_after_writes: usize,
     ) -> Result<Vec<u64>> {
         let mut guard = self.gate.lock().await;
-        self.apply_locked_with_failpoint(batch, Some(fail_after_writes), None, None, &mut guard)
-            .await
+        self.apply_locked_with_failpoint(
+            batch,
+            Some(fail_after_writes),
+            None,
+            None,
+            None,
+            &mut guard,
+        )
+        .await
     }
 
     #[cfg(all(test, unix))]
-    async fn apply_with_abrupt_transaction_failpoint(
+    async fn apply_with_abrupt_transaction_failpoint<'a>(
         &self,
         batch: EventBatch,
         name: &str,
         after_commit: bool,
         readiness_path: &std::path::Path,
+        physical_recovery: Option<PhysicalRecoveryContext<'a>>,
     ) -> Result<Vec<u64>> {
         let mut guard = self.gate.lock().await;
         self.apply_locked_with_failpoint(
@@ -1636,6 +1662,7 @@ impl EventWriter {
             None,
             Some((name, after_commit, readiness_path)),
             None,
+            physical_recovery,
             &mut guard,
         )
         .await
@@ -1648,7 +1675,7 @@ impl EventWriter {
         key_ref: &str,
     ) -> Result<Vec<u64>> {
         let mut guard = self.gate.lock().await;
-        self.apply_locked_with_failpoint(batch, None, None, Some(key_ref), &mut guard)
+        self.apply_locked_with_failpoint(batch, None, None, Some(key_ref), None, &mut guard)
             .await
     }
 
@@ -1950,6 +1977,7 @@ impl EventWriter {
                 writes,
                 injected_commands: Vec::new(),
             },
+            None,
             &mut guard,
         )
         .await?;
@@ -1971,8 +1999,13 @@ impl EventWriter {
         Ok(acks)
     }
 
-    async fn apply_locked(&self, batch: EventBatch, state: &mut WriterState) -> Result<Vec<u64>> {
-        self.apply_locked_with_failpoint(batch, None, None, None, state)
+    async fn apply_locked(
+        &self,
+        batch: EventBatch,
+        physical_recovery: Option<PhysicalRecoveryContext<'_>>,
+        state: &mut WriterState,
+    ) -> Result<Vec<u64>> {
+        self.apply_locked_with_failpoint(batch, None, None, None, physical_recovery, state)
             .await
     }
 
@@ -1982,11 +2015,16 @@ impl EventWriter {
         fail_after_writes: Option<usize>,
         abrupt_failpoint: Option<(&str, bool, &std::path::Path)>,
         destroy_after_prepare: Option<&str>,
+        physical_recovery: Option<PhysicalRecoveryContext<'_>>,
         state: &mut WriterState,
     ) -> Result<Vec<u64>> {
         self.ensure_checkpoint(state).await?;
         preflight_materialization_bounds(self.store.redactor(), &batch)?;
-        let expected_injections = validate_batch_shape(self.store.redactor(), &batch)?;
+        let expected_injections = validate_batch_shape_with_recovery(
+            self.store.redactor(),
+            &batch,
+            physical_recovery.as_ref(),
+        )?;
         let injected_commands = batch.injected_commands.clone();
         let checkpoint = state
             .checkpoint
@@ -2171,6 +2209,7 @@ impl EventWriter {
                     &mut transaction,
                     projection,
                     &event_seqs,
+                    physical_recovery.as_ref(),
                 )
                 .await?;
             }
@@ -3958,9 +3997,18 @@ fn verify_digest_bytes(incoming: &[u8], stored: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_batch_shape(
     _redactor: &Redactor,
     batch: &EventBatch,
+) -> Result<Vec<ExpectedInjection>> {
+    validate_batch_shape_with_recovery(_redactor, batch, None)
+}
+
+fn validate_batch_shape_with_recovery(
+    _redactor: &Redactor,
+    batch: &EventBatch,
+    physical_recovery: Option<&PhysicalRecoveryContext<'_>>,
 ) -> Result<Vec<ExpectedInjection>> {
     if batch.writes.is_empty() {
         bail!("EventBatch must contain at least one write");
@@ -4276,9 +4324,16 @@ fn validate_batch_shape(
         }
         for projection in &write.projections {
             if let Projection::PhysicalRecovery(receipt) = projection {
-                receipt.validate()?;
                 if write.event.is_some() {
                     bail!("PhysicalRecovery projection must be eventless");
+                }
+                let Some(ctx) = physical_recovery else {
+                    bail!(
+                        "PhysicalRecovery projection must be applied through EventWriter::apply_physical_recovery"
+                    );
+                };
+                if ctx.receipt != receipt {
+                    bail!("PhysicalRecovery projection disagrees with the bound recovery receipt");
                 }
                 physical_recovery_positions.push(write_position);
             }
@@ -8321,6 +8376,7 @@ async fn apply_projection(
     transaction: &mut Transaction<'_, Sqlite>,
     projection: PreparedProjection,
     batch_event_seqs: &[u64],
+    physical_recovery: Option<&PhysicalRecoveryContext<'_>>,
 ) -> Result<()> {
     match projection {
         PreparedProjection::MessageEnd {
@@ -8476,7 +8532,14 @@ async fn apply_projection(
             .await?;
         }
         PreparedProjection::Plain(projection) => {
-            apply_plain_projection(store, transaction, projection, batch_event_seqs).await?;
+            apply_plain_projection(
+                store,
+                transaction,
+                projection,
+                batch_event_seqs,
+                physical_recovery,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -8487,6 +8550,7 @@ async fn apply_plain_projection(
     transaction: &mut Transaction<'_, Sqlite>,
     projection: Projection,
     batch_event_seqs: &[u64],
+    physical_recovery: Option<&PhysicalRecoveryContext<'_>>,
 ) -> Result<()> {
     match projection {
         Projection::MessageEnd { .. } => unreachable!("MessageEnd is prepared separately"),
@@ -8653,10 +8717,25 @@ async fn apply_plain_projection(
             apply_approval_mutation(transaction, mutation).await?;
         }
         Projection::PhysicalRecovery(receipt) => {
-            // apply_in_transaction validates the receipt, rejects logical writes
-            // on replay, and returns AlreadyApplied for idempotent replays.
+            // Generic apply paths reject PhysicalRecovery before reaching here;
+            // only apply_physical_recovery supplies a bound recovery context.
+            let Some(ctx) = physical_recovery else {
+                bail!(
+                    "PhysicalRecovery projection must be applied through EventWriter::apply_physical_recovery"
+                );
+            };
+            if &receipt != ctx.receipt {
+                bail!("PhysicalRecovery projection disagrees with the bound recovery receipt");
+            }
+            receipt.validate_for(ctx.lease, ctx.fence)?;
             PhysicalRecoveryApplier::new(store)
-                .apply_in_transaction(transaction, &receipt, batch_event_seqs)
+                .apply_in_transaction(
+                    transaction,
+                    &receipt,
+                    batch_event_seqs,
+                    ctx.lease,
+                    ctx.fence,
+                )
                 .await?;
         }
         Projection::ProviderContextMutation(_)
@@ -18897,6 +18976,7 @@ mod tests {
                 &scenario,
                 boundary == "after_commit",
                 &readiness_path,
+                None,
             )
             .await
             .expect("abrupt failpoint must not return");
@@ -20838,6 +20918,51 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn generic_apply_rejects_unbound_physical_recovery_but_dedicated_apply_replays() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let run_id = "run-1";
+        let tool_call_id = "tool-1";
+        let (lease, fence) = t17_setup_running_tool(&store, &writer, run_id, tool_call_id).await;
+        let (batch, receipt) =
+            t17_physical_recovery_batch(&store, run_id, tool_call_id, &lease, &fence).await;
+
+        let error = writer
+            .apply(batch.clone())
+            .await
+            .expect_err("generic apply must not admit an unbound physical recovery receipt");
+        assert!(
+            format!("{error:#}").contains(
+                "PhysicalRecovery projection must be applied through EventWriter::apply_physical_recovery"
+            ),
+            "{error:#}"
+        );
+
+        let (outcome, seqs) = writer
+            .apply_physical_recovery(&lease, &fence, receipt.clone(), batch)
+            .await
+            .expect("dedicated physical recovery apply must accept the bound receipt");
+        assert_eq!(outcome, ApplyReceiptOutcome::Applied);
+        assert_eq!(seqs.len(), 3);
+
+        let (outcome, seqs) = writer
+            .apply_physical_recovery(
+                &lease,
+                &fence,
+                receipt,
+                EventBatch {
+                    writes: Vec::new(),
+                    injected_commands: Vec::new(),
+                },
+            )
+            .await
+            .expect("dedicated physical recovery replay must be idempotent");
+        assert_eq!(outcome, ApplyReceiptOutcome::AlreadyApplied);
+        assert!(seqs.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     #[ignore = "subprocess entry point for T17 abrupt transaction tests"]
     async fn t17_logical_suffix_transaction_child() {
         let scenario = std::env::var("SUMI_T17_SCENARIO").expect("child scenario environment");
@@ -20856,14 +20981,20 @@ mod tests {
         let run_id = "run-1";
         let tool_call_id = "tool-1";
         let (lease, fence) = t17_setup_running_tool(&store, &writer, run_id, tool_call_id).await;
-        let (batch, _) =
+        let (batch, receipt) =
             t17_physical_recovery_batch(&store, run_id, tool_call_id, &lease, &fence).await;
+        let physical_recovery = Some(PhysicalRecoveryContext {
+            lease: &lease,
+            fence: &fence,
+            receipt: &receipt,
+        });
         writer
             .apply_with_abrupt_transaction_failpoint(
                 batch,
                 &scenario,
                 boundary == "after_commit",
                 &readiness_path,
+                physical_recovery,
             )
             .await
             .expect("abrupt failpoint must not return");
@@ -21134,7 +21265,7 @@ mod tests {
             eviction_footprint_tokens: 1,
         };
 
-        let error = apply_projection(&store, &mut transaction, projection, &[])
+        let error = apply_projection(&store, &mut transaction, projection, &[], None)
             .await
             .expect_err("eviction footprint overflow must fail closed");
         assert!(error.to_string().contains("overflow"), "{error:#}");
