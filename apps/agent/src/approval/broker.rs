@@ -12,6 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use sha2::{Digest as _, Sha256};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -59,6 +60,30 @@ struct PendingEntry {
     run_id: String,
     turn_id: String,
     sender: oneshot::Sender<WaiterResult>,
+}
+
+/// Immutable snapshot of a broker entry needed to durably close a request that
+/// is no longer attached to a live run.
+#[derive(Clone, Debug)]
+pub struct PendingSummary {
+    pub tool_call_id: String,
+    pub tool_name: String,
+}
+
+/// Supplies the current runtime-captured environment for audit review.
+/// Implementations must return metadata already collected by the runtime; the
+/// broker never invokes tools or shells out while evaluating an approval.
+pub trait TrustedEnvironmentProvider: Send + Sync {
+    fn current(&self) -> Result<TrustedEnvironment>;
+}
+
+#[derive(Clone)]
+struct FixedTrustedEnvironment(TrustedEnvironment);
+
+impl TrustedEnvironmentProvider for FixedTrustedEnvironment {
+    fn current(&self) -> Result<TrustedEnvironment> {
+        Ok(self.0.clone())
+    }
 }
 
 /// The worker-side ownership of an unresolved approval request.
@@ -111,7 +136,7 @@ pub struct ApprovalBroker {
     reviewer: Option<Arc<Reviewer>>,
     mode: ReviewerMode,
     headless: bool,
-    trusted_env: TrustedEnvironment,
+    trusted_environment: Arc<dyn TrustedEnvironmentProvider>,
     pending: Arc<Mutex<HashMap<String, PendingEntry>>>,
 }
 
@@ -133,13 +158,34 @@ impl ApprovalBroker {
         headless: bool,
         trusted_env: TrustedEnvironment,
     ) -> Self {
+        Self::new_with_environment_provider(
+            policy,
+            projector,
+            reviewer,
+            mode,
+            headless,
+            Arc::new(FixedTrustedEnvironment(trusted_env)),
+        )
+    }
+
+    /// Construct a broker with an injected runtime environment seam. The
+    /// provider is queried for every reviewer request so cwd/repository state
+    /// changes cannot reuse a decision cached for an earlier environment.
+    pub fn new_with_environment_provider(
+        policy: Policy,
+        projector: SecretAwareActionProjector,
+        reviewer: Option<Arc<Reviewer>>,
+        mode: ReviewerMode,
+        headless: bool,
+        trusted_environment: Arc<dyn TrustedEnvironmentProvider>,
+    ) -> Self {
         Self {
             policy: Arc::new(RwLock::new(policy)),
             projector: Arc::new(projector),
             reviewer,
             mode,
             headless,
-            trusted_env,
+            trusted_environment,
             pending: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -392,6 +438,18 @@ impl ApprovalBroker {
             .map(|e| e.tool_call_id.clone())
     }
 
+    /// Return a snapshot of a pending request, if any.
+    pub fn pending_summary(&self, request_id: &str) -> Option<PendingSummary> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(request_id)
+            .map(|entry| PendingSummary {
+                tool_call_id: entry.tool_call_id.clone(),
+                tool_name: entry.action.tool.clone(),
+            })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn make_pending(
         &self,
@@ -500,13 +558,19 @@ impl ApprovalBroker {
             });
         }
 
+        let trusted_environment = self
+            .trusted_environment
+            .current()
+            .context("capture trusted environment for reviewer")?;
+        let environment_version =
+            trusted_environment_version(context_version, &trusted_environment)?;
         let request = ReviewRequest {
             mode: self.mode,
             projection: projection.clone(),
             transcript: transcript.to_vec(),
-            trusted_environment: self.trusted_env.clone(),
+            trusted_environment,
             policy_hash: self.policy.read().unwrap_or_else(|e| e.into_inner()).hash(),
-            context_version: context_version.to_owned(),
+            context_version: environment_version,
             run_id: run_id.to_owned(),
             turn_id: Some(turn_id.to_owned()),
         };
@@ -528,6 +592,18 @@ impl ApprovalBroker {
             }
         }
     }
+}
+
+fn trusted_environment_version(
+    context_version: &str,
+    environment: &TrustedEnvironment,
+) -> Result<String> {
+    let environment = serde_json::to_vec(environment)
+        .context("serialize trusted environment for reviewer cache version")?;
+    Ok(format!(
+        "{context_version}:environment:{:x}",
+        Sha256::digest(environment)
+    ))
 }
 
 fn synthetic_audit(reason: impl Into<String>) -> AuditDecision {
@@ -677,6 +753,43 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    #[derive(Clone)]
+    struct CapturingTransport {
+        response: String,
+        calls: Arc<AtomicUsize>,
+        prompts: Arc<Mutex<Vec<ReviewerPrompt>>>,
+    }
+
+    #[async_trait]
+    impl ReviewerTransport for CapturingTransport {
+        async fn complete(
+            &self,
+            prompt: &ReviewerPrompt,
+            _cancel: CancellationToken,
+        ) -> Result<String, ReviewerTransportError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.prompts
+                .lock()
+                .expect("captured reviewer prompts")
+                .push(prompt.clone());
+            Ok(self.response.clone())
+        }
+    }
+
+    struct MutableEnvironmentProvider {
+        environment: Arc<Mutex<TrustedEnvironment>>,
+    }
+
+    impl TrustedEnvironmentProvider for MutableEnvironmentProvider {
+        fn current(&self) -> Result<TrustedEnvironment> {
+            Ok(self
+                .environment
+                .lock()
+                .expect("mutable trusted environment")
+                .clone())
+        }
+    }
+
     #[async_trait]
     impl ReviewerTransport for CountingTransport {
         async fn complete(
@@ -784,6 +897,97 @@ mod tests {
             run_id: "run-1".to_owned(),
             turn_id: Some("turn-1".to_owned()),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repo_state_change_rebuilds_prompt_and_invalidates_allow_cache() {
+        let model = ReviewerModelSpec::new(
+            "reviewer-model",
+            "reviewer-provider",
+            "https://reviewer.example.test/v1",
+            "default",
+            "reviewer-domain",
+            "tenant-policy",
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let reviewer = Arc::new(Reviewer::new(
+            model,
+            ReviewerTrustSet::new("reviewer-domain", Vec::new()),
+            Arc::new(CapturingTransport {
+                response: allow_json(),
+                calls: calls.clone(),
+                prompts: prompts.clone(),
+            }),
+            Arc::new(projector()),
+        ));
+        let environment = Arc::new(Mutex::new(trusted_env()));
+        let broker = ApprovalBroker::new_with_environment_provider(
+            Policy::new("/workspace"),
+            projector(),
+            Some(reviewer),
+            ReviewerMode::AutoReview,
+            false,
+            Arc::new(MutableEnvironmentProvider {
+                environment: environment.clone(),
+            }),
+        );
+        let call = bash_call("git status");
+
+        assert!(matches!(
+            broker
+                .start_request(
+                    &call,
+                    &[],
+                    "run-1",
+                    "turn-1",
+                    "context-1",
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("first review"),
+            ApprovalOutcome::Allowed
+        ));
+        environment
+            .lock()
+            .expect("mutable trusted environment")
+            .git_status = Some("M src/critical.rs".to_owned());
+        assert!(matches!(
+            broker
+                .start_request(
+                    &call,
+                    &[],
+                    "run-1",
+                    "turn-2",
+                    "context-1",
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("review after repo change"),
+            ApprovalOutcome::Allowed
+        ));
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "repo change must miss cache"
+        );
+        let prompts = prompts.lock().expect("captured reviewer prompts");
+        assert_eq!(prompts.len(), 2);
+        assert!(
+            !prompts[0]
+                .messages
+                .iter()
+                .any(|message| message.content.contains("M src/critical.rs")),
+            "first prompt must use the initial environment"
+        );
+        assert!(
+            prompts[1]
+                .messages
+                .iter()
+                .any(|message| message.content.contains("M src/critical.rs")),
+            "cache version and prompt must use the same updated environment"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

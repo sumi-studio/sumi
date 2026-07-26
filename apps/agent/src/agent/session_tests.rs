@@ -33,7 +33,7 @@ use crate::{
 };
 
 use crate::approval::{
-    ApprovalBroker,
+    ApprovalBroker, ApprovalOutcome,
     action::{SandboxSummary, SecretAwareActionProjector, SecretDigestKey},
     prompt::{ReviewerPrompt, TrustedEnvironment},
     reviewer::{
@@ -2035,6 +2035,169 @@ async fn fixture_pending_and_runtime_cancellation_cross_the_durable_bridge_atomi
         .expect("cancelled prepared tool"),
         ("cancelled".to_owned(), "approval_cancelled".to_owned(), 1)
     );
+}
+
+#[tokio::test]
+async fn idle_approval_cancellation_keeps_broker_pending_until_durable_retry_commits() {
+    let (store, writer, mut bridge, binding, _) =
+        approval_fixture_bridge("idle-approval-cancellation-atomic").await;
+    let broker = Arc::new(ApprovalBroker::new(
+        crate::approval::policy::Policy::new("/workspace"),
+        SecretAwareActionProjector::new(Redactor::v1(), SecretDigestKey::fixture()),
+        None,
+        ReviewerMode::User,
+        false,
+        trusted_env(),
+    ));
+    let call = ToolCall {
+        id: "approval-tool".to_owned(),
+        name: "bash".to_owned(),
+        arguments: serde_json::from_value(serde_json::json!({"command": "git status"}))
+            .expect("validated bash arguments"),
+    };
+    let pending = match broker
+        .start_request(
+            &call,
+            &[],
+            &binding.run_id,
+            &binding.turn_id,
+            "v1",
+            CancellationToken::new(),
+        )
+        .await
+        .expect("start pending approval")
+    {
+        ApprovalOutcome::Pending { pending } => pending,
+        outcome => panic!("expected pending approval, got {outcome:?}"),
+    };
+    let request = pending.request().clone();
+    bridge
+        .commit(
+            &writer,
+            RunOutput::detached(
+                binding,
+                AgentEvent::ApprovalRequested {
+                    request: request.clone(),
+                },
+                None,
+            ),
+        )
+        .await
+        .expect("persist pending approval");
+    let pool = store.pool().clone();
+    sqlx::query(
+        "CREATE TRIGGER reject_idle_approval_cancel
+         BEFORE UPDATE OF state ON tool_executions
+         WHEN NEW.state = 'cancelled'
+         BEGIN SELECT RAISE(ABORT, 'fixture rejects idle cancellation'); END",
+    )
+    .execute(&pool)
+    .await
+    .expect("install cancellation failpoint");
+
+    drop(bridge);
+    drop(writer);
+    let store = match Arc::try_unwrap(store) {
+        Ok(store) => store,
+        Err(_) => panic!("fixture bridge must release the Store before Session starts"),
+    };
+    let (gateway, _commands, frames) = gateway();
+    let worker: Arc<dyn RunWorker> = Arc::new(SequentialRunWorker::new(
+        ApprovalTestDriver::with_tool_call(Arc::new(AtomicBool::new(false))),
+    ));
+    let mut core = RunCore::new();
+    core.set_approval(broker.clone());
+    let mut session = Session::start(store, gateway, core, worker, test_executor_generation())
+        .await
+        .expect("session startup");
+    let decision = approval_always_decision(2, &request.id);
+    let replay = decision.clone();
+    session
+        .writer
+        .persist_inbound(&decision)
+        .await
+        .expect("persist approval decision");
+    let InboundCommand::Valid(envelope) = decision else {
+        unreachable!("fixture decision is valid")
+    };
+    let command = AdmittedCommand::new(envelope, Utc::now());
+
+    session
+        .apply_idle_approval_decision(command.clone())
+        .await
+        .expect("failed durable cancellation returns a rejected ACK, not Session failure");
+    assert!(
+        broker.has_pending(&request.id),
+        "broker must remain pending after rollback"
+    );
+    assert_eq!(
+        sqlx::query_as::<_, (String, String, i64)>(
+            "SELECT
+                (SELECT state FROM approval_log WHERE id = ?),
+                (SELECT state FROM tool_executions WHERE tool_call_id = 'approval-tool'),
+                (SELECT COUNT(*) FROM approval_rules)",
+        )
+        .bind(&request.id)
+        .fetch_one(&pool)
+        .await
+        .expect("rollback state"),
+        ("pending".to_owned(), "prepared".to_owned(), 0)
+    );
+    assert!(
+        frames.lock().expect("frames").iter().any(|frame| matches!(
+            frame,
+            OutboundFrame::CommandAck { ack } if ack.status == CommandAckStatus::Rejected
+        )),
+        "failed batch must reject rather than falsely apply the command"
+    );
+
+    sqlx::query("DROP TRIGGER reject_idle_approval_cancel")
+        .execute(&pool)
+        .await
+        .expect("remove cancellation failpoint");
+    session
+        .apply_idle_approval_decision(command)
+        .await
+        .expect("retry idle approval cancellation");
+    assert!(
+        !broker.has_pending(&request.id),
+        "retry must release broker pending entry; frames={:?}",
+        frames.lock().expect("frames")
+    );
+    assert_eq!(
+        sqlx::query_as::<_, (String, String, String, i64)>(
+            "SELECT
+                (SELECT state FROM approval_log WHERE id = ?),
+                (SELECT state FROM tool_executions WHERE tool_call_id = 'approval-tool'),
+                (SELECT status FROM inbound_commands WHERE seq = 2),
+                (SELECT COUNT(*) FROM approval_rules)",
+        )
+        .bind(&request.id)
+        .fetch_one(&pool)
+        .await
+        .expect("committed retry state"),
+        (
+            "cancelled".to_owned(),
+            "cancelled".to_owned(),
+            "applied".to_owned(),
+            0,
+        )
+    );
+    session
+        .admit_and_route(replay)
+        .await
+        .expect("replaying an applied idle approval decision");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM agent_events WHERE event_type = 'approval_resolved'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("replayed command must not create a second cancellation"),
+        1,
+        "the applied command must replay its durable ACK without rerunning terminalization"
+    );
+    drop(pending);
 }
 
 #[tokio::test]

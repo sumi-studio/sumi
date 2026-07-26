@@ -17,8 +17,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use serde_json::json;
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot, watch},
@@ -34,12 +35,14 @@ use crate::{
     },
     provider::{
         overflow::OverflowSource,
-        types::{ContextMessage, PublicMessage, StopReason},
+        types::{ContextMessage, PublicMessage, StopReason, ToolResultMessage, UserContent},
     },
     runtime::contracts::ProcessGeneration,
     store::{
-        ApplicationKind, DataKeyPurpose, EventWriter, InboundAdmission, InboundReceiptOrigin,
+        ApplicationKind, ApprovalMutation, DataKeyPurpose, DurableEvent, EventBatch, EventWrite,
+        EventWriter, InboundAdmission, InboundReceiptOrigin, Projection,
         RecoveryRequired as AdmissionRecoveryRequired, RecoveryStep, Store, SuffixRecovery,
+        ToolExecutionMutation,
     },
 };
 
@@ -1130,23 +1133,127 @@ impl<G: Gateway + 'static> Session<G> {
     ) -> Result<(), SessionFailure> {
         let command_id = command.envelope().command_id.to_string();
         let seq = command.envelope().seq;
-        if let Some(broker) = self.core.as_ref().and_then(|c| c.approval.as_ref())
-            && let Command::ApprovalDecision {
-                request_id,
-                decision,
-            } = &command.envelope().command
-            && broker.has_pending(request_id)
-        {
-            // Resolve the lingering pending entry so the broker does not
-            // retain a stale waiter for a run that has already ended.
-            broker.resolve(request_id, decision);
+        let request_id = match &command.envelope().command {
+            Command::ApprovalDecision { request_id, .. } => request_id,
+            _ => unreachable!("caller matched ApprovalDecision"),
+        };
+
+        let pending_broker = self.core.as_ref().and_then(|core| core.approval.clone());
+        let pending_summary = pending_broker
+            .as_ref()
+            .and_then(|broker| broker.pending_summary(request_id));
+        if let Some(summary) = pending_summary.as_ref() {
+            // Keep the in-memory pending entry intact until this entire durable
+            // cancellation batch commits. A failed transaction must leave both
+            // the broker and approval_log/tool state pending for an idempotent
+            // retry; only the successful commit may release its waiter.
+            //
+            // The late user decision itself is deliberately not part of this
+            // batch. EventWriter correctly requires an active approval command
+            // to resolve to that command's exact decision; this run has already
+            // ended. Terminalize the abandoned request as a runtime cancellation
+            // first, then apply the now-terminal command as a durable no-op.
+            // In particular, a late ApproveAlways must not install a rule.
+            let mut writes = Vec::with_capacity(4);
+
+            let result_message = ToolResultMessage {
+                tool_call_id: summary.tool_call_id.clone(),
+                tool_name: summary.tool_name.clone(),
+                content: vec![UserContent::Text {
+                    text: "Approval decision arrived after the owning run ended; the tool was not started.".to_owned(),
+                }],
+                details: json!({"error": "approval_cancelled"}),
+                is_error: true,
+                timestamp: Utc::now(),
+            };
+            let result_value = serde_json::to_value(&result_message)
+                .context("failed to serialize idle tool result")?;
+            let message_id = format!("{}-idle-result", summary.tool_call_id);
+            let tool_result = PublicMessage::ToolResult(result_message);
+
+            writes.push(EventWrite {
+                event: Some(DurableEvent::tool_execution_end(
+                    summary.tool_call_id.clone(),
+                    result_value,
+                    true,
+                    "cancelled".to_owned(),
+                    Some("approval_cancelled".to_owned()),
+                )?),
+                projections: vec![Projection::ToolExecution(ToolExecutionMutation::Finish {
+                    tool_call_id: summary.tool_call_id.clone(),
+                    expected: "prepared",
+                    state: "cancelled",
+                    error_code: Some("approval_cancelled"),
+                })],
+            });
+            writes.push(EventWrite {
+                event: Some(DurableEvent::message(
+                    "message_start",
+                    &message_id,
+                    &tool_result,
+                )?),
+                projections: vec![],
+            });
+            writes.push(EventWrite {
+                event: Some(DurableEvent::message(
+                    "message_end",
+                    &message_id,
+                    &tool_result,
+                )?),
+                projections: vec![Projection::MessageEnd {
+                    message_id,
+                    role: "tool_result",
+                    message: tool_result,
+                    append_to_l0: true,
+                }],
+            });
+            writes.push(EventWrite {
+                event: Some(DurableEvent::approval_resolved(
+                    request_id.clone(),
+                    ApprovalResolution::Cancelled,
+                    "runtime".to_owned(),
+                )?),
+                projections: vec![Projection::Approval(ApprovalMutation::Resolve {
+                    request_id: request_id.clone(),
+                    state: "cancelled",
+                    actor: "runtime".to_owned(),
+                })],
+            });
+            if let Err(error) = self
+                .writer
+                .apply(EventBatch {
+                    writes,
+                    injected_commands: Vec::new(),
+                })
+                .await
+            {
+                tracing::error!(%error, %command_id, "idle approval cancellation could not be committed");
+                let ack = CommandAck {
+                    seq,
+                    command_id,
+                    status: CommandAckStatus::Rejected,
+                    reject_reason: Some("approval decision could not be applied".to_owned()),
+                };
+                self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack }])?;
+                return Ok(());
+            }
+
+            pending_broker
+                .as_ref()
+                .expect("pending summary has its broker")
+                .cancel(request_id);
         }
-        let result = self
+
+        // Once the cancellation transaction is durable, this command cannot
+        // carry ApprovalResolved and is validated as the intended terminal
+        // no-op. Retrying after a failure here is safe: the broker and durable
+        // approval/tool state already agree on the cancellation.
+        let ack = match self
             .writer
-            .apply(crate::store::EventBatch {
-                writes: vec![crate::store::EventWrite {
+            .apply(EventBatch {
+                writes: vec![EventWrite {
                     event: None,
-                    projections: vec![crate::store::Projection::CommandApplied {
+                    projections: vec![Projection::CommandApplied {
                         command_id: command_id.clone(),
                         command_seq: seq,
                         run_id: None,
@@ -1154,8 +1261,8 @@ impl<G: Gateway + 'static> Session<G> {
                 }],
                 injected_commands: Vec::new(),
             })
-            .await;
-        let ack = match result {
+            .await
+        {
             Ok(_) => CommandAck {
                 seq,
                 command_id: command_id.clone(),

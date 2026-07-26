@@ -492,7 +492,10 @@ impl Reviewer {
                 &projection_hash,
                 &request.context_version,
             ) {
-                return ReviewOutcome::Allow(decision.clone());
+                let decision = decision.clone();
+                drop(allow_cache);
+                self.record_outcome(&request.run_id, AuditOutcome::Allow);
+                return ReviewOutcome::Allow(decision);
             }
         }
 
@@ -776,6 +779,14 @@ mod tests {
     }
 
     fn reviewable_projection() -> ReviewProjection {
+        git_projection("status")
+    }
+
+    fn git_log_projection() -> ReviewProjection {
+        git_projection("log")
+    }
+
+    fn git_projection(command: &str) -> ReviewProjection {
         ReviewProjection::Reviewable(ReviewableAction {
             tool: "bash".to_owned(),
             operation: "exec".to_owned(),
@@ -784,7 +795,7 @@ mod tests {
                     text: "git".to_owned(),
                 },
                 ReviewToken::Literal {
-                    text: "status".to_owned(),
+                    text: command.to_owned(),
                 },
             ],
             cwd: ReviewPath(vec![ReviewPathComponent::Literal {
@@ -1204,6 +1215,106 @@ mod tests {
         let outcome2 = reviewer.review(req, CancellationToken::new()).await;
         assert!(matches!(outcome2, ReviewOutcome::Allow(_)));
         assert_eq!(fake.called_count(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cached_allow_records_outcome_and_resets_circuit_breaker() {
+        // Fresh denys for a different action, a fresh allow for "git status",
+        // then a cached allow for the same "git status" request.
+        let fake = FakeTransport::sequence(vec![
+            Ok(deny_json()),  // deny git log #1
+            Ok(deny_json()),  // deny git log #2
+            Ok(allow_json()), // allow git status #1 (fills cache)
+            Ok(deny_json()),  // deny git log #3
+            Ok(deny_json()),  // deny git log #4
+            Ok(deny_json()),  // deny git log #5
+            Ok(deny_json()),  // deny git log #6
+            Ok(deny_json()),  // deny git log #7
+        ]);
+        let reviewer = make_reviewer(fake.clone());
+
+        let mut deny_req = review_request(git_log_projection());
+        deny_req.turn_id = None; // disable per-turn deny cache
+        let allow_req = review_request(reviewable_projection());
+
+        // Two denys -> consecutive_denies = 2
+        assert!(matches!(
+            reviewer
+                .review(deny_req.clone(), CancellationToken::new())
+                .await,
+            ReviewOutcome::Deny(_)
+        ));
+        assert!(matches!(
+            reviewer
+                .review(deny_req.clone(), CancellationToken::new())
+                .await,
+            ReviewOutcome::Deny(_)
+        ));
+
+        // Fresh allow fills the cache and resets the counter.
+        assert!(matches!(
+            reviewer
+                .review(allow_req.clone(), CancellationToken::new())
+                .await,
+            ReviewOutcome::Allow(_)
+        ));
+        assert_eq!(fake.called_count(), 3);
+
+        // Two denys -> consecutive_denies = 2 again
+        assert!(matches!(
+            reviewer
+                .review(deny_req.clone(), CancellationToken::new())
+                .await,
+            ReviewOutcome::Deny(_)
+        ));
+        assert!(matches!(
+            reviewer
+                .review(deny_req.clone(), CancellationToken::new())
+                .await,
+            ReviewOutcome::Deny(_)
+        ));
+
+        // Cached allow must record an Allow outcome so that the counter resets.
+        assert!(matches!(
+            reviewer
+                .review(allow_req.clone(), CancellationToken::new())
+                .await,
+            ReviewOutcome::Allow(_)
+        ));
+        assert_eq!(fake.called_count(), 5);
+
+        // Three fresh denys after the cached allow: with the fix the counter is
+        // reset, so all three are fresh model calls. The third one opens the
+        // breaker; the next call returns the breaker without calling transport.
+        assert!(matches!(
+            reviewer
+                .review(deny_req.clone(), CancellationToken::new())
+                .await,
+            ReviewOutcome::Deny(_)
+        ));
+        assert_eq!(fake.called_count(), 6);
+        assert!(matches!(
+            reviewer
+                .review(deny_req.clone(), CancellationToken::new())
+                .await,
+            ReviewOutcome::Deny(_)
+        ));
+        assert_eq!(fake.called_count(), 7);
+        assert!(matches!(
+            reviewer
+                .review(deny_req.clone(), CancellationToken::new())
+                .await,
+            ReviewOutcome::Deny(_)
+        ));
+        assert_eq!(fake.called_count(), 8);
+
+        let outcome = reviewer
+            .review(deny_req.clone(), CancellationToken::new())
+            .await;
+        assert!(
+            matches!(outcome, ReviewOutcome::Deny(d) if d.rationale.contains("circuit breaker"))
+        );
+        assert_eq!(fake.called_count(), 8);
     }
 
     #[tokio::test(flavor = "current_thread")]
