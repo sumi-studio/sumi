@@ -425,11 +425,11 @@ impl Store {
         let rows = sqlx::query(
             "SELECT id, message_id, message_seq, wire_item_index, item_ordinal,
                     idempotency_key, kind, coverage_through_seq, context_fingerprint,
-                    provider_instance_id, protocol, model, key_ref, ciphertext
+                    provider_instance_id, protocol, model, key_ref, ciphertext,
+                    eviction_tokens, eviction_estimator_version
              FROM provider_context
-             ORDER BY message_seq NULLS LAST,
-                      coverage_through_seq,
-                      wire_item_index NULLS LAST,
+             ORDER BY COALESCE(message_seq, coverage_through_seq),
+                      wire_item_index,
                       item_ordinal,
                       id",
         )
@@ -461,6 +461,9 @@ impl Store {
             let stored_protocol: String = row.try_get("protocol")?;
             let stored_model: String = row.try_get("model")?;
             let key_ref: String = row.try_get("key_ref")?;
+            let stored_eviction_tokens: i64 = row.try_get("eviction_tokens")?;
+            let stored_eviction_estimator_version: i64 =
+                row.try_get("eviction_estimator_version")?;
 
             let key = self.load_hydration_key(&mut key_cache, &key_ref).await?;
             let ciphertext: Vec<u8> = row.try_get("ciphertext")?;
@@ -536,6 +539,34 @@ impl Store {
             };
             if stored_protocol != expected_protocol {
                 bail!("provider-context record {id} protocol does not match decrypted payload");
+            }
+
+            match &item.payload {
+                ProviderContextPayload::OpenAiCompactedWindow { .. }
+                | ProviderContextPayload::AnthropicCompaction { .. } => {
+                    if item.origin_message.is_some() {
+                        bail!(
+                            "provider-context record {id} native compaction must not have an origin message"
+                        );
+                    }
+                    if item.wire_item_index.is_some() {
+                        bail!(
+                            "provider-context record {id} native compaction must not have a wire_item_index"
+                        );
+                    }
+                }
+                ProviderContextPayload::EncryptedReasoning { .. } => {
+                    if item.origin_message.is_none() {
+                        bail!(
+                            "provider-context record {id} encrypted reasoning must have an origin message"
+                        );
+                    }
+                    if item.wire_item_index.is_none() {
+                        bail!(
+                            "provider-context record {id} encrypted reasoning must have a wire_item_index"
+                        );
+                    }
+                }
             }
 
             match &item.payload {
@@ -619,6 +650,28 @@ impl Store {
                         );
                     }
                 }
+            }
+
+            let stored_eviction_version = u32::try_from(stored_eviction_estimator_version)
+                .with_context(|| {
+                    format!(
+                        "provider-context record {id} eviction_estimator_version out of u32 range"
+                    )
+                })?;
+            if stored_eviction_version != ProviderContextEvictionEstimate::V1 {
+                bail!(
+                    "provider-context record {id} uses unsupported eviction estimator version {stored_eviction_version}"
+                );
+            }
+            let stored_eviction_tokens_u64 =
+                u64::try_from(stored_eviction_tokens).with_context(|| {
+                    format!("provider-context record {id} eviction_tokens out of u64 range")
+                })?;
+            let expected_eviction = ProviderContextEvictionEstimate::v1(&item);
+            if stored_eviction_tokens_u64 != expected_eviction.tokens {
+                bail!(
+                    "provider-context record {id} eviction_tokens do not match the decrypted payload"
+                );
             }
 
             provider_context.push(item);

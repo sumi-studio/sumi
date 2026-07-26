@@ -689,6 +689,12 @@ pub(crate) enum ApplyOutcome {
     Superseded { reason: String },
 }
 
+#[derive(Debug, Default)]
+struct InvalidatedIds {
+    key_refs: BTreeSet<String>,
+    deleted_ids: BTreeSet<String>,
+}
+
 /// EventWriter projection handle for a prepared `Replace`/`Invalidate`.
 /// Construction is private to the provider-context builder; EventWriter loads
 /// and revalidates the stored intent inside its transaction.
@@ -1110,7 +1116,7 @@ impl<'a> ProviderContextMutationApplier<'a> {
                 }
             }
 
-            let invalidated_key_refs = self
+            let invalidated = self
                 .invalidate_ids(transaction, &full.invalidate_ids)
                 .await?;
 
@@ -1171,7 +1177,7 @@ impl<'a> ProviderContextMutationApplier<'a> {
             .execute(&mut **transaction)
             .await?;
 
-            self.destroy_unreferenced_provider_context_keys(transaction, invalidated_key_refs)
+            self.destroy_unreferenced_provider_context_keys(transaction, invalidated.key_refs)
                 .await?;
 
             self.finish_mutation(transaction, mutation_id, "applied", None)
@@ -1181,14 +1187,25 @@ impl<'a> ProviderContextMutationApplier<'a> {
             if full.invalidate_ids.is_empty() {
                 bail!("Invalidate intent requires a non-empty target set");
             }
-            let invalidated_key_refs = self
+            let invalidated = self
                 .invalidate_ids(transaction, &full.invalidate_ids)
                 .await?;
-            self.destroy_unreferenced_provider_context_keys(transaction, invalidated_key_refs)
+            self.destroy_unreferenced_provider_context_keys(transaction, invalidated.key_refs)
                 .await?;
-            self.finish_mutation(transaction, mutation_id, "applied", None)
+            if invalidated.deleted_ids.is_empty() {
+                self.finish_mutation(
+                    transaction,
+                    mutation_id,
+                    "applied",
+                    Some("already_satisfied"),
+                )
                 .await?;
-            Ok(ApplyOutcome::Applied)
+                Ok(ApplyOutcome::AlreadySatisfied)
+            } else {
+                self.finish_mutation(transaction, mutation_id, "applied", None)
+                    .await?;
+                Ok(ApplyOutcome::Applied)
+            }
         }
     }
 
@@ -1336,44 +1353,57 @@ impl<'a> ProviderContextMutationApplier<'a> {
         &self,
         transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         ids: &[String],
-    ) -> Result<BTreeSet<String>> {
-        let mut key_refs = BTreeSet::new();
+    ) -> Result<InvalidatedIds> {
+        let mut result = InvalidatedIds::default();
         for id in ids {
             let row = sqlx::query(
-                "SELECT pc.message_id, pc.eviction_tokens, pc.key_ref
-                 FROM provider_context pc
-                 JOIN data_keys dk ON dk.key_ref = pc.key_ref
-                 WHERE pc.id = ?
-                   AND dk.scope = 'conversation'
-                   AND dk.conversation_id = ?",
+                "SELECT message_id, eviction_tokens, key_ref
+                 FROM provider_context
+                 WHERE id = ?",
             )
             .bind(id)
-            .bind(&self.store.scope().conversation_id)
             .fetch_optional(&mut **transaction)
             .await?;
 
-            if let Some(row) = row {
-                let message_id: Option<String> = row.try_get("message_id")?;
-                let tokens: i64 = row.try_get("eviction_tokens")?;
-                let key_ref: String = row.try_get("key_ref")?;
+            let Some(row) = row else {
+                // The target is already gone; converge rather than fail.
+                continue;
+            };
 
-                if let Some(message_id) = message_id {
-                    self.decrement_batch_footprint(transaction, &message_id, tokens)
-                        .await?;
-                }
+            let message_id: Option<String> = row.try_get("message_id")?;
+            let tokens: i64 = row.try_get("eviction_tokens")?;
+            let key_ref: String = row.try_get("key_ref")?;
 
-                sqlx::query("DELETE FROM provider_context WHERE id = ?")
-                    .bind(id)
-                    .execute(&mut **transaction)
+            // The row exists, so fail closed if its data key belongs to another conversation.
+            let key_scope: Option<(String, String)> =
+                sqlx::query_as("SELECT scope, conversation_id FROM data_keys WHERE key_ref = ?")
+                    .bind(&key_ref)
+                    .fetch_optional(&mut **transaction)
                     .await?;
-                key_refs.insert(key_ref);
-            } else {
-                bail!(
-                    "provider-context row {id} is outside the active conversation scope or does not exist"
-                );
+            match key_scope {
+                Some((scope, conversation_id))
+                    if scope == "conversation"
+                        && conversation_id == self.store.scope().conversation_id => {}
+                _ => {
+                    bail!(
+                        "provider-context row {id} is outside the active conversation scope or does not exist"
+                    );
+                }
             }
+
+            if let Some(message_id) = message_id {
+                self.decrement_batch_footprint(transaction, &message_id, tokens)
+                    .await?;
+            }
+
+            sqlx::query("DELETE FROM provider_context WHERE id = ?")
+                .bind(id)
+                .execute(&mut **transaction)
+                .await?;
+            result.key_refs.insert(key_ref);
+            result.deleted_ids.insert(id.clone());
         }
-        Ok(key_refs)
+        Ok(result)
     }
 
     async fn destroy_unreferenced_provider_context_keys(
@@ -2621,6 +2651,482 @@ mod tests {
             coverage_seq(&hydrated[1]),
             7,
             "higher coverage seq must sort after lower coverage seq"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_orders_native_compaction_before_anchored_reasoning_by_coverage() {
+        let store = store().await;
+        seed_message(&store, "message-7", 7).await.unwrap();
+
+        // Native compaction covering seq 5.
+        let compaction_key = store
+            .provider_context_key(&ProviderContextKeyAnchor {
+                conversation_id: store.scope().conversation_id.clone(),
+                anchor_id: "native:0".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let compaction_item = ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 1,
+            provider_origin: openai_responses_origin(),
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({"summary": "compacted"})],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 5,
+                    context_fingerprint: "fp-5".to_owned(),
+                },
+            },
+        };
+        let compaction = EncryptedProviderContextRecord::encrypt(
+            &compaction_item,
+            "provider-instance-1",
+            ApiProtocol::OpenAiResponses,
+            "model-1",
+            "pc-compaction",
+            provider_context_idempotency_key("request-1", &compaction_item),
+            &compaction_key,
+            store.scope(),
+        )
+        .expect("encrypt compaction");
+        compaction.insert(store.pool()).await.unwrap();
+
+        // Anchored reasoning at seq 7.
+        let reasoning = reasoning_record_with(&store, "message-7", 7, "pc-reasoning", 0, 1).await;
+        reasoning.insert(store.pool()).await.unwrap();
+
+        let origin = openai_responses_origin();
+        let messages = vec![ContextMessage::Persisted {
+            id: "message-7".to_owned(),
+            seq: 7,
+            message: assistant_message(origin),
+        }];
+
+        let hydrated = store
+            .hydrate_provider_context(&messages)
+            .await
+            .expect("hydration should succeed");
+
+        assert_eq!(hydrated.len(), 2);
+        assert!(
+            matches!(
+                &hydrated[0].payload,
+                ProviderContextPayload::OpenAiCompactedWindow { .. }
+            ),
+            "native compaction with lower coverage seq must sort before anchored reasoning"
+        );
+        assert!(
+            matches!(
+                &hydrated[1].payload,
+                ProviderContextPayload::EncryptedReasoning { .. }
+            ),
+            "anchored reasoning at higher message seq must sort after native compaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidate_converges_when_all_targets_already_deleted() {
+        let store = store().await;
+        seed_message(&store, "message-1", 7).await.unwrap();
+
+        let record = reasoning_record(&store, "message-1", 7, "pc-1").await;
+        record.insert(store.pool()).await.unwrap();
+
+        // Simulate a previous successful apply (or external deletion) by removing the target.
+        sqlx::query("DELETE FROM provider_context WHERE id = ?")
+            .bind("pc-1")
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let mutation_key = store
+            .conversation_key(DataKeyPurpose::Mutation)
+            .await
+            .expect("mint mutation key");
+        let applier = ProviderContextMutationApplier::new(&store);
+        let intent = ProviderContextMutationBuilder::new(
+            mutation_key,
+            store.scope().clone(),
+            "invalidate-all-gone".to_owned(),
+        )
+        .build_invalidate(None, vec!["pc-1".to_owned()])
+        .expect("build invalidate intent");
+
+        applier.prepare(&intent).await.unwrap();
+        assert_eq!(
+            applier.apply("invalidate-all-gone").await.unwrap(),
+            ApplyOutcome::AlreadySatisfied
+        );
+
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE id = ?")
+                .bind("pc-1")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(remaining, 0);
+
+        let reason: Option<String> = sqlx::query_scalar(
+            "SELECT terminal_reason FROM provider_context_mutations WHERE mutation_id = ?",
+        )
+        .bind("invalidate-all-gone")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(reason.as_deref(), Some("already_satisfied"));
+    }
+
+    #[tokio::test]
+    async fn invalidate_converges_when_some_targets_already_deleted() {
+        let store = store().await;
+        seed_message(&store, "message-1", 7).await.unwrap();
+        seed_message(&store, "message-2", 9).await.unwrap();
+
+        let record1 = reasoning_record_with(&store, "message-1", 7, "pc-1", 0, 1).await;
+        let record2 = reasoning_record_with(&store, "message-2", 9, "pc-2", 0, 1).await;
+        record1.insert(store.pool()).await.unwrap();
+        record2.insert(store.pool()).await.unwrap();
+
+        // One target disappears before the intent is applied.
+        sqlx::query("DELETE FROM provider_context WHERE id = ?")
+            .bind("pc-1")
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let mutation_key = store
+            .conversation_key(DataKeyPurpose::Mutation)
+            .await
+            .expect("mint mutation key");
+        let applier = ProviderContextMutationApplier::new(&store);
+        let intent = ProviderContextMutationBuilder::new(
+            mutation_key,
+            store.scope().clone(),
+            "invalidate-partial".to_owned(),
+        )
+        .build_invalidate(None, vec!["pc-1".to_owned(), "pc-2".to_owned()])
+        .expect("build invalidate intent");
+
+        applier.prepare(&intent).await.unwrap();
+        assert_eq!(
+            applier.apply("invalidate-partial").await.unwrap(),
+            ApplyOutcome::Applied
+        );
+
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM provider_context WHERE id IN ('pc-1', 'pc-2')",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0);
+
+        let reason: Option<String> = sqlx::query_scalar(
+            "SELECT terminal_reason FROM provider_context_mutations WHERE mutation_id = ?",
+        )
+        .bind("invalidate-partial")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(reason, None);
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_native_compaction_with_origin_message() {
+        let store = store().await;
+        seed_message(&store, "message-1", 7).await.unwrap();
+
+        let key = store
+            .provider_context_key(&ProviderContextKeyAnchor {
+                conversation_id: store.scope().conversation_id.clone(),
+                anchor_id: "native:0".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let item = ProviderContextItem {
+            origin_message: Some(ProviderContextAnchor {
+                message_id: "message-1".to_owned(),
+                message_seq: 7,
+            }),
+            wire_item_index: None,
+            ordinal: 1,
+            provider_origin: openai_responses_origin(),
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({"summary": "compacted"})],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 7,
+                    context_fingerprint: "fp-7".to_owned(),
+                },
+            },
+        };
+        let record = EncryptedProviderContextRecord::encrypt(
+            &item,
+            "provider-instance-1",
+            ApiProtocol::OpenAiResponses,
+            "model-1",
+            "pc-tamper-origin",
+            provider_context_idempotency_key("request-1", &item),
+            &key,
+            store.scope(),
+        )
+        .expect("encrypt compaction with origin");
+
+        record.insert(store.pool()).await.unwrap();
+
+        let error = store
+            .hydrate_provider_context(&[])
+            .await
+            .expect_err("hydration must reject native compaction with an origin message");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("native compaction must not have an origin message"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_native_compaction_with_wire_item_index() {
+        let store = store().await;
+
+        let key = store
+            .provider_context_key(&ProviderContextKeyAnchor {
+                conversation_id: store.scope().conversation_id.clone(),
+                anchor_id: "native:0".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let item = ProviderContextItem {
+            origin_message: None,
+            wire_item_index: Some(0),
+            ordinal: 1,
+            provider_origin: openai_responses_origin(),
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({"summary": "compacted"})],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 7,
+                    context_fingerprint: "fp-7".to_owned(),
+                },
+            },
+        };
+        let record = EncryptedProviderContextRecord::encrypt(
+            &item,
+            "provider-instance-1",
+            ApiProtocol::OpenAiResponses,
+            "model-1",
+            "pc-tamper-wire",
+            provider_context_idempotency_key("request-1", &item),
+            &key,
+            store.scope(),
+        )
+        .expect("encrypt compaction with wire item index");
+
+        record.insert(store.pool()).await.unwrap();
+
+        let error = store
+            .hydrate_provider_context(&[])
+            .await
+            .expect_err("hydration must reject native compaction with a wire_item_index");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("native compaction must not have a wire_item_index"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_encrypted_reasoning_without_wire_item_index() {
+        let store = store().await;
+        seed_message(&store, "message-1", 7).await.unwrap();
+
+        let key = store
+            .provider_context_key(&ProviderContextKeyAnchor {
+                conversation_id: store.scope().conversation_id.clone(),
+                anchor_id: "message-1:7".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let item = ProviderContextItem {
+            origin_message: Some(ProviderContextAnchor {
+                message_id: "message-1".to_owned(),
+                message_seq: 7,
+            }),
+            wire_item_index: None,
+            ordinal: 1,
+            provider_origin: reasoning_origin(),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiChatCompletions,
+                item: json!({"text": "opaque reasoning"}),
+            },
+        };
+        let record = EncryptedProviderContextRecord::encrypt(
+            &item,
+            "provider-instance-1",
+            ApiProtocol::OpenAiChatCompletions,
+            "model-1",
+            "pc-tamper-reasoning-wire",
+            provider_context_idempotency_key("message-1", &item),
+            &key,
+            store.scope(),
+        )
+        .expect("encrypt reasoning without wire item index");
+
+        record.insert(store.pool()).await.unwrap();
+
+        let messages = vec![ContextMessage::Persisted {
+            id: "message-1".to_owned(),
+            seq: 7,
+            message: assistant_message(reasoning_origin()),
+        }];
+        let error = store
+            .hydrate_provider_context(&messages)
+            .await
+            .expect_err("hydration must reject encrypted reasoning without a wire_item_index");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("encrypted reasoning must have a wire_item_index"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_encrypted_reasoning_without_origin_message() {
+        let store = store().await;
+
+        let key = store
+            .provider_context_key(&ProviderContextKeyAnchor {
+                conversation_id: store.scope().conversation_id.clone(),
+                anchor_id: "tamper:0".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let item = ProviderContextItem {
+            origin_message: None,
+            wire_item_index: Some(0),
+            ordinal: 1,
+            provider_origin: reasoning_origin(),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiChatCompletions,
+                item: json!({"text": "opaque reasoning"}),
+            },
+        };
+        let record = EncryptedProviderContextRecord::encrypt(
+            &item,
+            "provider-instance-1",
+            ApiProtocol::OpenAiChatCompletions,
+            "model-1",
+            "pc-tamper-reasoning-origin",
+            provider_context_idempotency_key("message-1", &item),
+            &key,
+            store.scope(),
+        )
+        .expect("encrypt reasoning without origin");
+
+        // Direct insert with message_id/message_seq NULL and eviction_tokens=0 to satisfy the
+        // schema CHECK while preserving the plaintext tamper.
+        sqlx::query(
+            "INSERT INTO provider_context(
+                id, message_id, message_seq, wire_item_index, item_ordinal,
+                idempotency_key, provider_instance_id, protocol, model, kind,
+                coverage_through_seq, context_fingerprint, key_ref, ciphertext,
+                eviction_tokens, eviction_estimator_version, created_at
+             ) VALUES(?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, 0, 1, 'now')",
+        )
+        .bind(record.id())
+        .bind(0i64)
+        .bind(1i64)
+        .bind(record.idempotency_key())
+        .bind(record.provider_instance_id())
+        .bind(record.protocol().as_str())
+        .bind(record.model())
+        .bind(record.kind().as_str())
+        .bind(record.key_ref())
+        .bind(record.ciphertext())
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let messages = vec![ContextMessage::Persisted {
+            id: "message-1".to_owned(),
+            seq: 7,
+            message: assistant_message(reasoning_origin()),
+        }];
+        let error = store
+            .hydrate_provider_context(&messages)
+            .await
+            .expect_err("hydration must reject encrypted reasoning without an origin message");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("encrypted reasoning must have an origin message"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_eviction_token_mismatch() {
+        let store = store().await;
+        seed_message(&store, "message-1", 7).await.unwrap();
+
+        let record = reasoning_record(&store, "message-1", 7, "pc-1").await;
+        record.insert(store.pool()).await.unwrap();
+
+        sqlx::query("UPDATE provider_context SET eviction_tokens = ? WHERE id = ?")
+            .bind(999i64)
+            .bind("pc-1")
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let messages = vec![ContextMessage::Persisted {
+            id: "message-1".to_owned(),
+            seq: 7,
+            message: assistant_message(reasoning_origin()),
+        }];
+        let error = store
+            .hydrate_provider_context(&messages)
+            .await
+            .expect_err("hydration must reject mismatched eviction tokens");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("eviction_tokens do not match the decrypted payload"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_unsupported_eviction_estimator_version() {
+        let store = store().await;
+        seed_message(&store, "message-1", 7).await.unwrap();
+
+        let record = reasoning_record(&store, "message-1", 7, "pc-1").await;
+        record.insert(store.pool()).await.unwrap();
+
+        sqlx::query("UPDATE provider_context SET eviction_estimator_version = ? WHERE id = ?")
+            .bind(2i64)
+            .bind("pc-1")
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let messages = vec![ContextMessage::Persisted {
+            id: "message-1".to_owned(),
+            seq: 7,
+            message: assistant_message(reasoning_origin()),
+        }];
+        let error = store
+            .hydrate_provider_context(&messages)
+            .await
+            .expect_err("hydration must reject unsupported eviction estimator version");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("uses unsupported eviction estimator version"),
+            "{message}"
         );
     }
 }

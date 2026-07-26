@@ -20565,7 +20565,7 @@ mod tests {
         assistant.origin.protocol = ApiProtocol::OpenAiResponses;
         let message_id = "assistant-reasoning-hydrate";
         // Persist deliberately out of wire order. Hydration must reconstruct
-        // the provider send order by `(message_seq, wire_item_index, ordinal)`
+        // canonical order by `(COALESCE(message_seq, coverage_through_seq), wire_item_index, item_ordinal, id)`
         // and must leave native compaction unanchored.
         let fragments = vec![
             ProviderContextFragment {
@@ -20676,11 +20676,18 @@ mod tests {
                         .iter()
                         .map(|item| item.wire_item_index)
                         .collect::<Vec<_>>(),
-                    vec![Some(1), Some(2), None],
-                    "hydration must restore wire-slot order and append the native window"
+                    vec![None, Some(1), Some(2)],
+                    "native compaction with lower coverage seq must precede anchored reasoning (coverage-prefix order)"
                 );
                 assert!(
-                    state.provider_context[..2].iter().all(|item| {
+                    matches!(
+                        &state.provider_context[0].payload,
+                        ProviderContextPayload::OpenAiCompactedWindow { .. }
+                    ) && state.provider_context[0].origin_message.is_none(),
+                    "native compaction must not acquire an assistant anchor"
+                );
+                assert!(
+                    state.provider_context[1..].iter().all(|item| {
                         item.origin_message
                             .as_ref()
                             .is_some_and(|anchor| anchor.message_id == message_id)
@@ -20690,13 +20697,6 @@ mod tests {
                             )
                     }),
                     "reasoning must remain anchored to its persisted assistant"
-                );
-                assert!(
-                    matches!(
-                        &state.provider_context[2].payload,
-                        ProviderContextPayload::OpenAiCompactedWindow { .. }
-                    ) && state.provider_context[2].origin_message.is_none(),
-                    "native compaction must not acquire an assistant anchor"
                 );
             }
             HydrationOutcome::RecoveryRequired(_) => panic!("clean assistant turn must complete"),
