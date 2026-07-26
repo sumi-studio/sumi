@@ -23,6 +23,9 @@ use super::{
 const MAX_USER_COMMAND_BYTES: usize = 1024 * 1024;
 const MAX_ENVELOPE_METADATA_BYTES: usize = 64 * 1024;
 const MAX_ENVELOPE_KEY_BYTES: usize = 256;
+/// A readable envelope may be terminal-rejected after crossing the transport
+/// limit, but its line must still end within this bounded drain window.
+const MAX_IDENTIFIED_OVERSIZED_FRAME_BYTES: usize = MAX_FRAME_BYTES + MAX_ENVELOPE_METADATA_BYTES;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 #[error("command was {actual} bytes and exceeded the {limit} byte limit")]
@@ -762,8 +765,33 @@ impl EnvelopeScanner {
         Ok(())
     }
 
+    fn is_done(&self) -> bool {
+        matches!(self.state, EnvelopeState::Done)
+    }
+
+    /// Whether the prefix seen before the command body already contains a
+    /// complete, schema-valid outer identity. The synthetic closing brace is
+    /// safe because command values are represented by the placeholder `{}` in
+    /// `identity`; the full envelope is still validated before it is returned.
+    fn has_readable_outer_identity(&self) -> bool {
+        if !self.command_found {
+            return false;
+        }
+
+        if serde_json::from_slice::<RawCommandIdentityEnvelope>(&self.identity)
+            .is_ok_and(|raw| matches!(raw.command, CommandFieldPresence::Present))
+        {
+            return true;
+        }
+
+        let mut candidate = Zeroizing::new(self.identity.to_vec());
+        candidate.push(b'}');
+        serde_json::from_slice::<RawCommandIdentityEnvelope>(&candidate)
+            .is_ok_and(|raw| matches!(raw.command, CommandFieldPresence::Present))
+    }
+
     fn finish(mut self) -> Result<ReadCommandFrame> {
-        if !matches!(self.state, EnvelopeState::Done) {
+        if !self.is_done() {
             self.invalidate()?;
         }
         Ok(ReadCommandFrame {
@@ -784,10 +812,11 @@ where
     R: AsyncBufRead + Unpin,
 {
     let mut scanner = EnvelopeScanner::new(digest);
-    let mut actual_bytes = 0usize;
-    let mut terminator_bytes = 0usize;
+    let mut line_bytes = 0usize;
     let mut previous_byte = None;
     let mut saw_input = false;
+    let mut readable_identity_at_transport_limit = None;
+    let mut ended_by_newline = false;
 
     loop {
         let available = input.fill_buf().await.context("failed to read command")?;
@@ -801,38 +830,69 @@ where
 
         let newline = available.iter().position(|byte| *byte == b'\n');
         let consumed = newline.map_or(available.len(), |position| position + 1);
-        let segment = &available[..consumed];
-        actual_bytes = actual_bytes.saturating_add(segment.len());
-        scanner.feed(&segment[..newline.unwrap_or(segment.len())])?;
+        let content = &available[..newline.unwrap_or(available.len())];
 
-        if let Some(position) = newline {
-            let before_newline = if position > 0 {
-                Some(available[position - 1])
+        let mut remaining = content;
+        while !remaining.is_empty() {
+            // Stop exactly one byte past the transport limit so the identity
+            // decision cannot be influenced by later command bytes. A trailing
+            // CR gets this one-byte grace until its following byte disambiguates
+            // CRLF from command content.
+            let until_transport_probe =
+                MAX_FRAME_BYTES.saturating_add(1).saturating_sub(line_bytes);
+            let take = if readable_identity_at_transport_limit.is_none() {
+                remaining.len().min(until_transport_probe)
             } else {
-                previous_byte
+                remaining.len()
             };
-            terminator_bytes = 1 + usize::from(before_newline == Some(b'\r'));
-        } else {
-            previous_byte = segment.last().copied();
+            let (segment, rest) = remaining.split_at(take);
+            scanner.feed(segment)?;
+            line_bytes = line_bytes.saturating_add(segment.len());
+            previous_byte = segment.last().copied().or(previous_byte);
+            remaining = rest;
+
+            if readable_identity_at_transport_limit.is_none()
+                && line_bytes == MAX_FRAME_BYTES.saturating_add(1)
+            {
+                readable_identity_at_transport_limit = Some(scanner.has_readable_outer_identity());
+            }
+
+            let minimum_content_bytes =
+                line_bytes.saturating_sub(usize::from(previous_byte == Some(b'\r')));
+            if minimum_content_bytes > MAX_FRAME_BYTES
+                && readable_identity_at_transport_limit != Some(true)
+            {
+                return Err(CommandTooLarge {
+                    limit: MAX_FRAME_BYTES,
+                    actual: minimum_content_bytes,
+                }
+                .into());
+            }
+            if minimum_content_bytes > MAX_IDENTIFIED_OVERSIZED_FRAME_BYTES {
+                return Err(CommandTooLarge {
+                    limit: MAX_FRAME_BYTES,
+                    actual: minimum_content_bytes,
+                }
+                .into());
+            }
         }
         input.consume(consumed);
 
         if newline.is_some() {
+            ended_by_newline = true;
             break;
-        }
-        let minimum_content_bytes =
-            actual_bytes.saturating_sub(usize::from(previous_byte == Some(b'\r')));
-        if minimum_content_bytes > MAX_FRAME_BYTES {
-            return Err(CommandTooLarge {
-                limit: MAX_FRAME_BYTES,
-                actual: minimum_content_bytes,
-            }
-            .into());
         }
     }
 
-    let content_bytes = actual_bytes.saturating_sub(terminator_bytes);
-    if content_bytes > MAX_FRAME_BYTES {
+    let content_bytes = if ended_by_newline {
+        line_bytes.saturating_sub(usize::from(previous_byte == Some(b'\r')))
+    } else {
+        line_bytes
+    };
+    if content_bytes > MAX_IDENTIFIED_OVERSIZED_FRAME_BYTES
+        || (content_bytes > MAX_FRAME_BYTES
+            && (readable_identity_at_transport_limit != Some(true) || !scanner.is_done()))
+    {
         return Err(CommandTooLarge {
             limit: MAX_FRAME_BYTES,
             actual: content_bytes,
@@ -899,6 +959,18 @@ mod tests {
         let prefix =
             br#"{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command":{"type":"user_message","text":""#;
         let suffix = br#"","attachments":[]}}"#;
+        assert!(total_bytes >= prefix.len() + suffix.len());
+        let mut frame = Vec::with_capacity(total_bytes);
+        frame.extend_from_slice(prefix);
+        frame.resize(total_bytes - suffix.len(), b'x');
+        frame.extend_from_slice(suffix);
+        frame
+    }
+
+    fn frame_with_identity_after_command(total_bytes: usize) -> Vec<u8> {
+        let prefix = br#"{"command":{"type":"user_message","text":""#;
+        let suffix =
+            br#"","attachments":[]},"seq":1,"command_id":"00000000-0000-4000-8000-000000000001"}"#;
         assert!(total_bytes >= prefix.len() + suffix.len());
         let mut frame = Vec::with_capacity(total_bytes);
         frame.extend_from_slice(prefix);
@@ -1264,18 +1336,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_an_oversized_command_line() {
+    async fn rejects_a_readable_oversized_command_line_without_poisoning_the_next_command() {
         let mut bytes = frame_with_total_bytes(MAX_FRAME_BYTES + 1);
         bytes.push(b'\n');
-        let mut input = BufReader::new(bytes.as_slice());
-        let error = read_test_command(&mut input)
+        bytes.extend_from_slice(&envelope(serde_json::json!({"type": "abort"})));
+        bytes.push(b'\n');
+        let mut input = BufReader::with_capacity(13, bytes.as_slice());
+
+        let inbound = read_test_command(&mut input)
             .await
-            .expect_err("oversized input must fail");
+            .expect("readable oversized outer envelope must be terminal-rejected");
+        let InboundCommand::Invalid {
+            seq,
+            command_id,
+            reason,
+            raw_command,
+            payload_digest,
+        } = inbound
+        else {
+            panic!("oversized command line must produce a typed rejection");
+        };
+        assert_eq!(seq, 1);
+        assert_eq!(command_id.as_str(), "00000000-0000-4000-8000-000000000001");
+        let CommandRejectReason::Oversized { actual_bytes } = reason else {
+            panic!("expected Oversized rejection, got {reason:?}");
+        };
+        assert!(actual_bytes > MAX_USER_COMMAND_BYTES as u64);
+        assert!(
+            actual_bytes < (MAX_FRAME_BYTES + 1) as u64,
+            "reported command bytes must be bounded by the frame size"
+        );
+        assert!(matches!(
+            raw_command,
+            RejectedCommandPayload::DiscardedOversized
+        ));
+        assert!(payload_digest.is_some());
+
         assert_eq!(
-            error.downcast_ref::<CommandTooLarge>(),
-            Some(&CommandTooLarge {
-                limit: MAX_FRAME_BYTES,
-                actual: MAX_FRAME_BYTES + 1,
+            read_test_command(&mut input)
+                .await
+                .expect("next command is not poisoned"),
+            InboundCommand::Valid(CommandEnvelope {
+                seq: 1,
+                command_id: CommandId::parse("00000000-0000-4000-8000-000000000001")
+                    .expect("canonical test UUID"),
+                command: Command::Abort {},
             })
         );
     }
@@ -1295,9 +1400,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_an_unterminated_oversized_frame_while_the_writer_is_open() {
+    async fn rejects_an_unterminated_identified_frame_beyond_the_drain_ceiling() {
         let (mut writer, reader) = tokio::io::duplex(64 * 1024);
-        let oversized = frame_with_total_bytes(MAX_FRAME_BYTES + 1);
+        let oversized = frame_with_total_bytes(MAX_IDENTIFIED_OVERSIZED_FRAME_BYTES + 1);
         let writer_task = tokio::spawn(async move {
             writer
                 .write_all(&oversized)
@@ -1312,14 +1417,68 @@ mod tests {
             read_test_command(&mut input),
         )
         .await
-        .expect("oversized frame must not wait for newline or EOF")
+        .expect("drain ceiling must not wait for newline or EOF")
         .expect_err("oversized input must fail");
         writer_task.abort();
         assert_eq!(
             error.downcast_ref::<CommandTooLarge>(),
             Some(&CommandTooLarge {
                 limit: MAX_FRAME_BYTES,
+                actual: MAX_IDENTIFIED_OVERSIZED_FRAME_BYTES + 1,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn unreadable_oversized_frame_is_fail_closed() {
+        let mut bytes = vec![b'x'; MAX_FRAME_BYTES + 1];
+        bytes.push(b'\n');
+        let mut input = BufReader::with_capacity(13, bytes.as_slice());
+
+        let error = read_test_command(&mut input)
+            .await
+            .expect_err("unreadable oversized frame must close fail-closed");
+        assert_eq!(
+            error.downcast_ref::<CommandTooLarge>(),
+            Some(&CommandTooLarge {
+                limit: MAX_FRAME_BYTES,
                 actual: MAX_FRAME_BYTES + 1,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_after_the_transport_threshold_is_fail_closed() {
+        let mut bytes = frame_with_identity_after_command(MAX_FRAME_BYTES + 1024);
+        bytes.push(b'\n');
+        let mut input = BufReader::with_capacity(13, bytes.as_slice());
+
+        let error = read_test_command(&mut input)
+            .await
+            .expect_err("identity unavailable at the transport threshold must close");
+        assert_eq!(
+            error.downcast_ref::<CommandTooLarge>(),
+            Some(&CommandTooLarge {
+                limit: MAX_FRAME_BYTES,
+                actual: MAX_FRAME_BYTES + 1,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn identified_oversized_frame_cannot_drain_without_bound() {
+        let mut bytes = frame_with_total_bytes(MAX_IDENTIFIED_OVERSIZED_FRAME_BYTES + 1);
+        bytes.push(b'\n');
+        let mut input = BufReader::with_capacity(4 * 1024, bytes.as_slice());
+
+        let error = read_test_command(&mut input)
+            .await
+            .expect_err("identified oversized frame must obey the drain ceiling");
+        assert_eq!(
+            error.downcast_ref::<CommandTooLarge>(),
+            Some(&CommandTooLarge {
+                limit: MAX_FRAME_BYTES,
+                actual: MAX_IDENTIFIED_OVERSIZED_FRAME_BYTES + 1,
             })
         );
     }
