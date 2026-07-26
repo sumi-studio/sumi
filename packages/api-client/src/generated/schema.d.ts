@@ -21,10 +21,47 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/conversations/{conversation_id}/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create a user command in a conversation
+         * @description Admits a user_message command from the web client. The request is
+         *     validated for UTF-8 JSON shape, empty attachments, and a 1 MiB wire-size
+         *     limit before any command_id or seq is allocated. Rejections are returned
+         *     as typed 4xx responses with no command_id/seq, so they cannot create a
+         *     sequence gap in the durable command log.
+         */
+        post: operations["createUserCommand"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
-    schemas: never;
+    schemas: {
+        CommandEnvelope: {
+            seq: number;
+            /** Format: uuid */
+            command_id: string;
+            command: components["schemas"]["UserMessageCommand"];
+        };
+        UserMessageCommand: {
+            /** @enum {string} */
+            type: "user_message";
+            text: string;
+            attachments: unknown[];
+        };
+    };
     responses: never;
     parameters: never;
     requestBodies: never;
@@ -51,6 +88,51 @@ export interface operations {
                     "application/json": {
                         /** @enum {string} */
                         status: "ok";
+                    };
+                };
+            };
+        };
+    };
+    createUserCommand: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @enum {string} */
+                    type: "user_message";
+                    text: string;
+                    attachments: unknown[];
+                };
+            };
+        };
+        responses: {
+            /** @description Command accepted and allocated a durable seq and command_id */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommandEnvelope"];
+                };
+            };
+            /** @description Command rejected before seq/command_id allocation */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @enum {string} */
+                        error: "invalid_command";
+                        /** @enum {string} */
+                        reject_reason: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized";
                     };
                 };
             };
