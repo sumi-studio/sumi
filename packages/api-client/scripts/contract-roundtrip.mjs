@@ -120,10 +120,14 @@ function assertProcessGenerationBounds(schema) {
     /^ {2}ProcessGeneration:\n([\s\S]*?)(?=^ {2}[A-Za-z][A-Za-z0-9_]*:|(?![\s\S]))/m,
   )?.[0];
   if (definition === undefined) {
-    throw new Error("agent-events schema is missing the ProcessGeneration definition");
+    throw new Error(
+      "agent-events schema is missing the ProcessGeneration definition",
+    );
   }
   if (!definition.includes("maximum: 9007199254740991")) {
-    throw new Error("ProcessGeneration must be bounded to the JSON-safe integer range");
+    throw new Error(
+      "ProcessGeneration must be bounded to the JSON-safe integer range",
+    );
   }
 }
 
@@ -133,6 +137,8 @@ function assertProcessGenerationRuntimeBounds() {
     throw new Error("expected 9007199254740991 to be a safe integer");
   }
   if (Number.isSafeInteger(maxSafe + 1)) {
-    throw new Error("expected 9007199254740992 to be outside the safe-integer range");
+    throw new Error(
+      "expected 9007199254740992 to be outside the safe-integer range",
+    );
   }
 }
