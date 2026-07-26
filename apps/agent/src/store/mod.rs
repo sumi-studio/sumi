@@ -1619,6 +1619,7 @@ mod tests {
     use crate::store::transcript::TranscriptRecord;
     use chrono::Utc;
     use serde_json::json;
+    use sha2::Sha384;
 
     struct TestKeyProvider {
         key: WrappingKey,
@@ -1656,6 +1657,126 @@ mod tests {
         Store::in_memory(scope(), provider())
             .await
             .expect("open in-memory store")
+    }
+
+    #[tokio::test]
+    async fn shipped_0001_upgrades_without_checksum_drift_and_backfills_fts() {
+        const SHIPPED_0001_SHA384: &str = "11c6ab3e0d06b6cd663810c0607e7d01f5ec9ab1ec42894e651b807216bd451370fc2c8ee54f4d79f215aec46bdc2989";
+        let shipped_0001 = include_bytes!("../../migrations/0001_init.sql");
+        let digest = Sha384::digest(shipped_0001)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            digest, SHIPPED_0001_SHA384,
+            "migration 0001 is immutable after release"
+        );
+
+        let root = std::env::temp_dir().join(format!("sumi-store-migration-{}", Uuid::now_v7()));
+        let old_migrations = root.join("old-migrations");
+        let database = root.join("conversation.sqlite");
+        std::fs::create_dir_all(&old_migrations).expect("create old migration directory");
+        std::fs::write(old_migrations.join("0001_init.sql"), shipped_0001)
+            .expect("write shipped migration fixture");
+
+        let old_migrator = sqlx::migrate::Migrator::new(old_migrations.clone())
+            .await
+            .expect("load shipped migration");
+        let options = SqliteConnectOptions::new()
+            .filename(&database)
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("open legacy database");
+        old_migrator
+            .run(&pool)
+            .await
+            .expect("apply shipped migration");
+        let wrapping_key = WrappingKey::new("test-wrap-v1", [0x42; DATA_KEY_BYTES]);
+        let legacy_key = DataKeyMaterial::from_bytes(
+            "legacy-transcript-key",
+            DataKeyPurpose::Transcript,
+            [0x24; DATA_KEY_BYTES],
+        );
+        let wrap_aad = KeyWrapAad {
+            key_ref: legacy_key.key_ref.clone(),
+            scope: DataKeyScope::Conversation,
+            purpose: DataKeyPurpose::Transcript,
+            conversation_id: Some("conversation-1".to_owned()),
+            wrap_key_id: wrapping_key.key_id().to_owned(),
+        };
+        let (wrap_nonce, wrapped_key) =
+            wrap_data_key(&legacy_key, &wrapping_key, &wrap_aad).expect("wrap legacy data key");
+        sqlx::query(
+            "INSERT INTO agent_scope(
+                singleton, tenant_id, agent_id, conversation_id, created_at
+             ) VALUES(1, 'tenant-1', 'agent-1', 'conversation-1', 'now')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert legacy scope");
+        sqlx::query(
+            "INSERT INTO data_keys(
+                key_ref, scope, purpose, conversation_id, algorithm, wrap_key_id,
+                wrap_nonce, wrapped_key, state, created_at
+             ) VALUES(
+                'legacy-transcript-key', 'conversation', 'transcript',
+                'conversation-1', ?, 'test-wrap-v1', ?, ?, 'active', 'now'
+             )",
+        )
+        .bind(WRAP_ALGORITHM)
+        .bind(wrap_nonce.as_slice())
+        .bind(wrapped_key)
+        .execute(&pool)
+        .await
+        .expect("insert legacy data key");
+        sqlx::query(
+            "INSERT INTO messages(
+                id, seq, role, raw_key_ref, raw_ciphertext, payload, search_text,
+                redaction_version, interrupted, created_at
+             ) VALUES(
+                'legacy-message', 1, 'user', 'legacy-transcript-key', X'00',
+                '{}', 'legacy searchable text', 1, 0, 'now'
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert legacy message");
+        pool.close().await;
+
+        let upgraded = Store::open(&database, scope(), provider())
+            .await
+            .expect("current migrator upgrades shipped database");
+        let search_text: String =
+            sqlx::query_scalar("SELECT search_text FROM messages WHERE id = 'legacy-message'")
+                .fetch_one(upgraded.pool())
+                .await
+                .expect("legacy message remains readable");
+        assert_eq!(search_text, "legacy searchable text");
+        let indexed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages_fts
+             WHERE rowid = (SELECT rowid FROM messages WHERE id = 'legacy-message')
+               AND search_text = 'legacy searchable text'",
+        )
+        .fetch_one(upgraded.pool())
+        .await
+        .expect("query backfilled FTS row");
+        assert_eq!(indexed, 1, "pre-upgrade message must be indexed");
+        let t17_tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table'
+               AND name IN ('provider_context', 'memory_batches', 'approval_rules')",
+        )
+        .fetch_one(upgraded.pool())
+        .await
+        .expect("query T17 schema");
+        assert_eq!(t17_tables, 3, "all representative T17 tables must exist");
+
+        drop(upgraded);
+        std::fs::remove_dir_all(root).expect("remove migration test directory");
     }
 
     fn assert_not_null_violation(error: &sqlx::Error) {
