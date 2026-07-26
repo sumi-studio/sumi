@@ -540,11 +540,8 @@ impl ProcessGroupGuard {
 
 impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
-        if let Some(ref path) = self.cgroup_path {
-            let _ = cgroup_kill(path);
-        }
         if let Some(pid) = self.pid {
-            let _ = kill_process_group(pid);
+            let _ = kill_sandbox(self.cgroup_path.as_deref(), pid);
         }
     }
 }
@@ -1271,12 +1268,42 @@ fn cgroup_kill(path: &Path) -> Result<(), ToolError> {
     Ok(())
 }
 
-fn kill_sandbox(cgroup_path: Option<&Path>, pid: u32) -> Result<(), ToolError> {
-    if let Some(path) = cgroup_path
-        && cgroup_kill(path).is_ok()
-    {
+fn kill_pids_in_cgroup(path: &Path) {
+    let procs = path.join("cgroup.procs");
+    let Ok(contents) = std::fs::read_to_string(&procs) else {
+        return;
+    };
+    for line in contents.lines() {
+        if let Ok(pid) = line.trim().parse::<u32>() {
+            let _ = kill_pid(pid);
+        }
+    }
+}
+
+fn kill_pid(pid: u32) -> Result<(), ToolError> {
+    let pid = i32::try_from(pid)
+        .map_err(|_| ToolError::Protocol("process id exceeded i32".to_owned()))?;
+    let result = unsafe { libc::kill(pid, libc::SIGKILL) };
+    if result == 0 {
         return Ok(());
     }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(ToolError::Io(error))
+}
+
+fn kill_sandbox(cgroup_path: Option<&Path>, pid: u32) -> Result<(), ToolError> {
+    if let Some(path) = cgroup_path {
+        // cgroup.kill is the authoritative whole-cgroup kill when available.
+        // Fall back to SIGKILLing every PID listed in cgroup.procs for older
+        // kernels or races where the descendant escaped the process group.
+        let _ = cgroup_kill(path);
+        kill_pids_in_cgroup(path);
+    }
+    // Always attempt the process group of the original bash child as a last
+    // resort for non-cgroup and shallow-escape cases.
     kill_process_group(pid)
 }
 

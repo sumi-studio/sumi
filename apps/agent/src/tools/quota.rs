@@ -420,6 +420,18 @@ fn best_available_boundary() -> Result<Box<dyn QuotaBoundary>, ToolError> {
     }
 }
 
+/// Whether this test host can exercise every cgroup-v2 controller required by
+/// the Cloud quota contract. Local/CI hosts without delegated cgroups run the
+/// low-trust fallback and must not claim the cgroup release acceptance.
+#[cfg(test)]
+pub(crate) fn cgroup_v2_release_gate_available() -> bool {
+    CgroupV2Boundary::probe().is_some_and(|boundary| {
+        ["cpu", "memory", "pids"]
+            .iter()
+            .all(|controller| boundary.supports(controller))
+    })
+}
+
 /// Cgroup-v2 boundary. Created only when the current cgroup is writable.
 struct CgroupV2Boundary {
     base: PathBuf,
@@ -459,21 +471,47 @@ impl CgroupV2Boundary {
 
         let needed = ["cpu", "memory", "pids"];
 
-        // A `domain threaded` or `threaded` cgroup cannot accept process
-        // migrations through `cgroup.procs`; child cgroups there would get
-        // `EOPNOTSUPP` when we try to move the spawned command into them.
-        let kind = read_cgroup_type(&candidate)
-            .map(|s| s.trim().to_owned())
-            .unwrap_or_default();
-        if kind == "threaded" || kind == "domain threaded" {
+        // A `domain threaded`, `threaded`, or `domain invalid` ancestor cannot
+        // host process cgroups; child cgroups there would get `EOPNOTSUPP`
+        // when we try to move the spawned command into them. The root cgroup
+        // does not always expose `cgroup.type`, so the probe child below is
+        // the authoritative test.
+        if let Ok(kind) = read_cgroup_type(&candidate)
+            && kind.trim() != "domain"
+        {
             return None;
         }
 
         let available = read_controllers(&candidate).unwrap_or_default();
-        let mut enabled = read_subtree_control(&candidate).unwrap_or_default();
         if !available.iter().any(|c| needed.contains(&c.as_str())) {
             return None;
         }
+
+        // Creating a directory is not enough: some `domain` parents still
+        // produce `domain invalid` children under certain controller/thread
+        // modes. Create a probe, verify it can hold processes, and confirm
+        // the controller limit files are actually writable.
+        let probe = candidate.join(format!(
+            "sumi-quota-probe-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        if std::fs::create_dir(&probe).is_err() {
+            return None;
+        }
+
+        let probe_kind = read_cgroup_type(&probe)
+            .map(|s| s.trim().to_owned())
+            .unwrap_or_default();
+        // A command is migrated through `cgroup.procs`; `domain threaded`
+        // cannot accept that migration.  Do not mistake directory creation
+        // for a usable process-cgroup boundary.
+        if probe_kind != "domain" {
+            let _ = std::fs::remove_dir(&probe);
+            return None;
+        }
+
+        let mut enabled = read_subtree_control(&candidate).unwrap_or_default();
 
         // Try to delegate the controllers we need into this ancestor.
         for c in &needed {
@@ -486,24 +524,34 @@ impl CgroupV2Boundary {
             }
         }
 
-        let probe = candidate.join(format!(
-            "sumi-quota-probe-{}-{}",
-            std::process::id(),
-            Uuid::now_v7()
-        ));
-        if std::fs::create_dir(&probe).is_ok() {
-            let _ = std::fs::remove_dir(&probe);
-            let usable: Vec<String> = enabled
-                .into_iter()
-                .filter(|c| needed.contains(&c.as_str()))
-                .collect();
-            return Some(Self {
-                base: candidate,
-                controllers: usable,
-            });
+        // Only claim a controller is usable if the probe cgroup's limit
+        // file can actually be written. This prevents silent fallback to
+        // wall time when a controller is listed in `cgroup.subtree_control`
+        // but not effective for child cgroups.
+        let mut usable = Vec::new();
+        for c in &needed {
+            if !enabled.iter().any(|e| e == c) {
+                continue;
+            }
+            let ok = match *c {
+                // memory.swap.max is optional; its absence just means we
+                // cannot disable swap, but memory.max may still be effective.
+                "memory" => write_cgroup_file(probe.join("memory.max"), "max\n").is_ok(),
+                "pids" => write_cgroup_file(probe.join("pids.max"), "max\n").is_ok(),
+                "cpu" => write_cgroup_file(probe.join("cpu.max"), "max 100000\n").is_ok(),
+                _ => false,
+            };
+            if ok {
+                usable.push(c.to_string());
+            }
         }
 
-        None
+        let _ = std::fs::remove_dir(&probe);
+
+        Some(Self {
+            base: candidate,
+            controllers: usable,
+        })
     }
 
     fn supports(&self, controller: &str) -> bool {
@@ -536,7 +584,8 @@ impl QuotaBoundary for CgroupV2Boundary {
 
         if let Some(memory) = policy.memory_bytes {
             if self.supports("memory") {
-                let _ = write_cgroup_file(cgroup_path.join("memory.max"), memory.to_string());
+                write_cgroup_file(cgroup_path.join("memory.max"), memory.to_string())
+                    .map_err(ToolError::Io)?;
                 // Disable swap so the hard limit cannot be bypassed by
                 // swapping. Ignore errors if swap accounting is unavailable.
                 let _ = write_cgroup_file(cgroup_path.join("memory.swap.max"), "0");
@@ -550,7 +599,8 @@ impl QuotaBoundary for CgroupV2Boundary {
 
         if let Some(pids) = policy.pids_max {
             if self.supports("pids") {
-                let _ = write_cgroup_file(cgroup_path.join("pids.max"), pids.to_string());
+                write_cgroup_file(cgroup_path.join("pids.max"), pids.to_string())
+                    .map_err(ToolError::Io)?;
             } else {
                 skips.push(HostFeatureSkip {
                     feature: "pids",
@@ -562,8 +612,8 @@ impl QuotaBoundary for CgroupV2Boundary {
         if let Some(throttle) = policy.cpu_throttle_us_per_100ms {
             if self.supports("cpu") {
                 // 100ms period; quota is microseconds per period.
-                let _ =
-                    write_cgroup_file(cgroup_path.join("cpu.max"), format!("{throttle} 100000"));
+                write_cgroup_file(cgroup_path.join("cpu.max"), format!("{throttle} 100000"))
+                    .map_err(ToolError::Io)?;
             } else {
                 skips.push(HostFeatureSkip {
                     feature: "cpu_throttle",
