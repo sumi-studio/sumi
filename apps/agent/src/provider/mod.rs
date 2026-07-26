@@ -1957,6 +1957,25 @@ async fn finish_responses_terminal(
             }
         }
     }
+    if let Some(observed_model) = terminal.response_model.as_deref()
+        && observed_model != spec.id
+    {
+        finish_failure_with_context(
+            priority_terminal_tx,
+            assembler,
+            spec,
+            terminal.usage,
+            format!(
+                "provider reported model {observed_model:?}, requested model {:?}",
+                spec.id
+            ),
+            "response_model_mismatch",
+            cancel.is_cancelled(),
+            terminal.provider_context,
+        )
+        .await;
+        return;
+    }
     if terminal.reason == StopReason::Error {
         finish_failure_with_context(
             priority_terminal_tx,
@@ -1997,9 +2016,14 @@ async fn finish_responses_terminal(
             Err(_) => return,
         }
     };
+    let mut origin = spec.origin();
+    origin.model = terminal
+        .response_model
+        .clone()
+        .unwrap_or_else(|| spec.id.clone());
     let metadata = TerminalMetadata {
         provider: spec.provider.clone(),
-        origin: spec.origin(),
+        origin,
         usage: terminal.usage.clone(),
         stop_reason: terminal.reason,
         error_message: terminal.error_message,
@@ -3865,6 +3889,7 @@ fi
                 usage: Usage::default(),
                 error_message: Some("late error".into()),
                 provider_code: Some("late_error".into()),
+                response_model: None,
                 provider_context: vec![],
             },
             &cancel,
@@ -3950,6 +3975,79 @@ fi
             Some("normalized_event_contract_violation")
         );
         assert!(!committed.is_committed());
+    }
+
+    #[tokio::test]
+    async fn responses_terminal_uses_observed_model_and_rejects_mismatch() {
+        let spec = ModelSpec::preset("openai-responses").expect("preset");
+        let cancel = CancellationToken::new();
+
+        // Matching observed model -> success and origin model is the observed value.
+        let (tx, mut rx) = mpsc::channel(1);
+        let (priority_tx, _priority_rx) = mpsc::channel(1);
+        let mut assembler = MessageAssembler::new();
+        assembler.apply(&ProviderEvent::Start).expect("Start");
+        let committed = SuccessTerminalCommit::new();
+        finish_responses_terminal(
+            &tx,
+            &priority_tx,
+            &mut assembler,
+            &spec,
+            ResponsesTerminal {
+                events: vec![],
+                reason: StopReason::Stop,
+                usage: Usage::default(),
+                error_message: None,
+                provider_code: Some("stop".to_owned()),
+                response_model: Some(spec.id.clone()),
+                provider_context: vec![],
+            },
+            &cancel,
+            &committed,
+        )
+        .await;
+        let ProviderEvent::Done { output, .. } = rx.recv().await.expect("terminal") else {
+            panic!("expected Done terminal")
+        };
+        assert_eq!(output.message.model, spec.id);
+        assert_eq!(output.message.origin.model, spec.id);
+        assert!(committed.is_committed());
+
+        // Mismatched observed model -> fail-closed Error, no durable success message.
+        let (tx2, _rx2) = mpsc::channel(1);
+        let (priority_tx2, mut priority_rx2) = mpsc::channel(1);
+        let mut assembler2 = MessageAssembler::new();
+        assembler2.apply(&ProviderEvent::Start).expect("Start");
+        let committed2 = SuccessTerminalCommit::new();
+        finish_responses_terminal(
+            &tx2,
+            &priority_tx2,
+            &mut assembler2,
+            &spec,
+            ResponsesTerminal {
+                events: vec![],
+                reason: StopReason::Stop,
+                usage: Usage::default(),
+                error_message: None,
+                provider_code: Some("stop".to_owned()),
+                response_model: Some("other-model".to_owned()),
+                provider_context: vec![],
+            },
+            &cancel,
+            &committed2,
+        )
+        .await;
+        let ProviderEvent::Error { reason, output } = priority_rx2.recv().await.expect("terminal")
+        else {
+            panic!("expected Error terminal")
+        };
+        assert_eq!(reason, StopReason::Error);
+        assert_eq!(output.message.stop_reason, StopReason::Error);
+        assert_eq!(
+            output.message.provider_code.as_deref(),
+            Some("response_model_mismatch")
+        );
+        assert!(!committed2.is_committed());
     }
 
     #[tokio::test]
@@ -5537,8 +5635,13 @@ fi
         );
 
         let mut spec = ModelSpec::preset("openai-responses").expect("Responses preset");
-        spec.id =
-            env::var("SUMI_CODEX_RESPONSES_MODEL").unwrap_or_else(|_| "gpt-5.6-luna".to_owned());
+        spec.id = match env::var("SUMI_CODEX_RESPONSES_MODEL") {
+            Ok(model) if !model.trim().is_empty() => model,
+            Ok(_) => panic!(
+                "live Codex Responses release gate requires a non-empty SUMI_CODEX_RESPONSES_MODEL when set"
+            ),
+            Err(_) => "gpt-5.6-luna".to_owned(),
+        };
         spec.base_url = base_url;
         spec.api_key_env = "SUMI_CODEX_RESPONSES_PROXY_SECRET".to_owned();
         run_live_responses_tool_roundtrip(spec, proxy_secret).await;
@@ -5681,7 +5784,7 @@ fi
                 .content
                 .iter()
                 .any(|content| matches!(content, AssistantContent::ToolCall { .. })),
-            "the two-turn release proof must contain exactly one tool call"
+            "second turn must not contain a tool call"
         );
         let text: String = second
             .content

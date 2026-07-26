@@ -34,7 +34,7 @@ import urllib.request
 import uuid
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, ClassVar
 
 
 UPSTREAM = "https://chatgpt.com/backend-api/codex/responses"
@@ -43,6 +43,12 @@ MAX_CAPTURE_NAME_ATTEMPTS = 8
 
 
 def load_codex_auth(path: pathlib.Path) -> tuple[str, str]:
+    mode = stat.S_IMODE(path.stat().st_mode)
+    if mode & 0o077:
+        raise RuntimeError(
+            f"auth file {path} has group/world permissions ({oct(mode)}); "
+            "must be owner-only (0600)"
+        )
     document = json.loads(path.read_text(encoding="utf-8"))
     tokens = document.get("tokens", document)
     access_token = tokens.get("access_token")
@@ -56,10 +62,10 @@ def load_codex_auth(path: pathlib.Path) -> tuple[str, str]:
 
 class ResponsesBridge(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
-    auth_path: pathlib.Path
-    capture_dir: pathlib.Path | None = None
-    expected_secret: str = ""
-    upstream_url: str = UPSTREAM
+    auth_path: ClassVar[pathlib.Path]
+    capture_dir: ClassVar[pathlib.Path | None] = None
+    expected_secret: ClassVar[str] = ""
+    upstream_url: ClassVar[str] = UPSTREAM
 
     def log_message(self, format: str, *args: Any) -> None:
         return
@@ -118,7 +124,7 @@ class ResponsesBridge(BaseHTTPRequestHandler):
             self._reject(401, "missing or invalid secret")
             return
 
-        if self.headers.get("content-type") != "application/json":
+        if self.headers.get_content_type() != "application/json":
             self._reject(415, "content-type must be application/json")
             return
 
@@ -247,11 +253,15 @@ def _self_test_auth(path: pathlib.Path) -> None:
         json.dumps({"access_token": "test-token", "account_id": "test-account"}),
         encoding="utf-8",
     )
+    os.chmod(path, 0o600)
 
 
 class _SelfTestUpstream(BaseHTTPRequestHandler):
-    requests: list[dict[str, str]] = []
-    bodies: list[dict[str, Any]] = []
+    protocol_version = "HTTP/1.0"
+    requests: ClassVar[list[dict[str, str]]] = []
+    bodies: ClassVar[list[dict[str, Any]]] = []
+    delayed: ClassVar[bool] = False
+    resume: ClassVar[threading.Event] = threading.Event()
 
     def log_message(self, format: str, *args: Any) -> None:
         return
@@ -261,13 +271,32 @@ class _SelfTestUpstream(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length))
         self.__class__.requests.append(dict(self.headers.items()))
         self.__class__.bodies.append(body)
-        body = b"data: first\n\ndata: second\n\n"
+
+        if _SelfTestUpstream.delayed:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            first = b"data: first\n"
+            second = b"data: second\n"
+            self.wfile.write(first)
+            self.wfile.flush()
+            # Wait for the test to consume the first chunk and close the
+            # client connection before sending the second chunk.
+            if _SelfTestUpstream.resume.wait(timeout=2.0):
+                try:
+                    self.wfile.write(second)
+                    self.wfile.flush()
+                except (ConnectionResetError, BrokenPipeError):
+                    pass
+            return
+
+        full = b"data: first\n\ndata: second\n\n"
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(len(full)))
         self.end_headers()
         try:
-            self.wfile.write(body)
+            self.wfile.write(full)
             self.wfile.flush()
         except (ConnectionResetError, BrokenPipeError):
             pass
@@ -312,6 +341,24 @@ def _run_self_test() -> int:
                 print(f"FAIL {name}", flush=True)
             else:
                 print(f"PASS {name}", flush=True)
+
+        # Owner-only auth files are accepted; group/world-readable are rejected.
+        check(
+            "auth_file_owner_only_accepted",
+            load_codex_auth(auth_path) == ("test-token", "test-account"),
+        )
+        bad_auth = tmp / "auth-bad.json"
+        bad_auth.write_text(
+            json.dumps({"access_token": "x", "account_id": "y"}),
+            encoding="utf-8",
+        )
+        os.chmod(bad_auth, 0o644)
+        try:
+            load_codex_auth(bad_auth)
+            auth_permission_rejected = False
+        except RuntimeError:
+            auth_permission_rejected = True
+        check("auth_file_group_readable_rejected", auth_permission_rejected)
 
         # Missing Authorization: must fail before reading the body.
         response = _reject_without_body(proxy_server)
@@ -396,11 +443,16 @@ def _run_self_test() -> int:
             proxy_server,
             {
                 "Authorization": f"Bearer {secret}",
-                "content-type": "application/json",
+                "content-type": "application/json; charset=utf-8",
             },
             b'{"max_output_tokens": 2}',
         )
         check("second_request_accepted", status == 200, f"status={status}")
+        check(
+            "content_type_with_charset_accepted",
+            status == 200,
+            f"status={status}",
+        )
         captures = sorted(capture_dir.iterdir())
         check(
             "unique_exclusive_captures",
@@ -409,6 +461,8 @@ def _run_self_test() -> int:
         )
 
         # Client disconnect before the full stream: cleanup must close the capture.
+        _SelfTestUpstream.delayed = True
+        _SelfTestUpstream.resume = threading.Event()
         status, first = _request(
             proxy_server,
             {
@@ -418,11 +472,22 @@ def _run_self_test() -> int:
             b'{"max_output_tokens": 3}',
             read_first_line=True,
         )
-        check("disconnect_partial_read", status == 200 and first.startswith(b"data:") and not first.startswith(b"data: second"))
-        # Give the proxy thread time to run its finally block.
-        time.sleep(0.2)
-        captures_after = sorted(capture_dir.iterdir())
-        check("disconnect_cleanup_file_closed", len(captures_after) == 3)
+        _SelfTestUpstream.resume.set()
+        check(
+            "disconnect_partial_read",
+            status == 200 and first == b"data: first\n",
+            f"first={first!r}",
+        )
+
+        # Poll for the proxy to finish its finally block and close the capture.
+        captures_after: list[pathlib.Path] = []
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            captures_after = sorted(capture_dir.iterdir())
+            if len(captures_after) == 3:
+                break
+            time.sleep(0.01)
+        check("disconnect_cleanup_file_closed", len(captures_after) == 3, f"count={len(captures_after)}")
 
         proxy_server.shutdown()
         proxy_server.server_close()

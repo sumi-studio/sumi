@@ -74,6 +74,7 @@ pub struct ResponsesTerminal {
     pub usage: Usage,
     pub error_message: Option<String>,
     pub provider_code: Option<String>,
+    pub response_model: Option<String>,
     pub provider_context: Vec<ProviderContextFragment>,
 }
 
@@ -2322,6 +2323,7 @@ impl ResponsesReceiveState {
                     } else {
                         None
                     },
+                    response_model: self.response_model.clone(),
                     provider_context: self.provider_context(),
                 }),
             })
@@ -2449,6 +2451,7 @@ impl ResponsesReceiveState {
                     usage: self.usage.clone(),
                     error_message: Some(message),
                     provider_code: Some(code),
+                    response_model: self.response_model.clone(),
                     provider_context: self.provider_context(),
                 }),
             })

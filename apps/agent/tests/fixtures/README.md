@@ -18,7 +18,8 @@ OAuth bridge for OpenAI Responses:
 - required environment:
   - `SUMI_CODEX_RESPONSES_BASE_URL` — loopback bridge URL, e.g. `http://127.0.0.1:8765`
   - `SUMI_CODEX_RESPONSES_PROXY_SECRET` — shared startup secret for the bridge
-  - `SUMI_CODEX_RESPONSES_MODEL` — optional, defaults to `gpt-5.6-luna`
+  - `SUMI_CODEX_RESPONSES_MODEL` — optional, defaults to `gpt-5.6-luna`; if set, must be non-empty
+  - `SUMI_CODEX_REQUIRE_ENCRYPTED_REASONING` — optional; set to `1` to require the first turn to return non-empty encrypted provider context. When unset (the default), the gate preserves and replays whatever provider context the model actually returns, including none
 
 Start the bridge and export its secret:
 
