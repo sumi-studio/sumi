@@ -101,6 +101,21 @@ func NewServer(tv TokenVerifier, gv GenerationVerifier, cs CommandSource, es Eve
 	}
 }
 
+// NewServerWithTokenVerifier returns a Server that uses the supplied real
+// TokenVerifier and fail-closed placeholders for the remaining T17/T26 seams.
+// It is the T28 production wiring point for short-lived agent token
+// verification; the other production dependencies must still be injected before
+// the gateway can carry a real session.
+func NewServerWithTokenVerifier(tv TokenVerifier) *Server {
+	return NewServer(
+		tv,
+		failClosedGenerationVerifier{},
+		failClosedCommandSource{},
+		failClosedEventSink{},
+		failClosedHydrationLatch{},
+	)
+}
+
 // ServeHTTP implements http.Handler for GET /agent/ws.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()

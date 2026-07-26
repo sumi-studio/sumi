@@ -1,0 +1,146 @@
+package agentevents
+
+import (
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gorilla/websocket"
+)
+
+func TestWebSocketRealTokenHelloAndCatchUp(t *testing.T) {
+	claims := tokenClaims{
+		TenantID:       "tenant-1",
+		AgentID:        "agent-1",
+		ConversationID: "conversation-1",
+		Generation:     7,
+		Exp:            time.Now().Add(time.Hour).Unix(),
+		Aud:            defaultAgentAudience,
+	}
+	srv, cs, token := newTokenVerifiedTestServer(t, claims)
+
+	cmd := CommandEnvelope{
+		Seq:       1,
+		CommandID: "00000000-0000-4000-8000-000000000001",
+		Command:   []byte(`{"type":"user_message","text":"hi","attachments":[]}`),
+	}
+	cs.pushCommand(cmd)
+
+	server := httptest.NewServer(srv)
+	defer server.Close()
+
+	wsURL := strings.Replace(server.URL, "http", "ws", 1) + "/agent/ws"
+	header := map[string][]string{"Authorization": {"Bearer " + token}}
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("dial: %v (status %d)", err, resp.StatusCode)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteJSON(AgentHello{
+		AgentID:                "agent-1",
+		Generation:             7,
+		LastSentEventSeq:       0,
+		LastReceivedCommandSeq: 0,
+		LastAppliedCommandSeq:  0,
+	}); err != nil {
+		t.Fatalf("write hello: %v", err)
+	}
+
+	var apiHello ApiHello
+	if err := conn.ReadJSON(&apiHello); err != nil {
+		t.Fatalf("read api hello: %v", err)
+	}
+	if apiHello.AcceptedGeneration != 7 || apiHello.NextCommandSeq != 1 {
+		t.Fatalf("unexpected api hello: %+v", apiHello)
+	}
+
+	var received CommandEnvelope
+	if err := conn.ReadJSON(&received); err != nil {
+		t.Fatalf("read command: %v", err)
+	}
+	if received.Seq != 1 {
+		t.Fatalf("unexpected command seq: %d", received.Seq)
+	}
+}
+
+func TestWebSocketRealTokenExpiredIsRejected(t *testing.T) {
+	claims := tokenClaims{
+		TenantID:       "tenant-1",
+		AgentID:        "agent-1",
+		ConversationID: "conversation-1",
+		Generation:     7,
+		Exp:            time.Now().Add(-time.Hour).Unix(),
+		Aud:            defaultAgentAudience,
+	}
+	srv, _, token := newTokenVerifiedTestServer(t, claims)
+
+	server := httptest.NewServer(srv)
+	defer server.Close()
+
+	wsURL := strings.Replace(server.URL, "http", "ws", 1) + "/agent/ws"
+	header := map[string][]string{"Authorization": {"Bearer " + token}}
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err == nil {
+		t.Fatal("expected expired token to be rejected before upgrade")
+	}
+	if resp.StatusCode != 401 {
+		t.Fatalf("expected 401, got %d", resp.StatusCode)
+	}
+}
+
+func TestWebSocketRealTokenHelloGenerationMismatchCloses(t *testing.T) {
+	claims := tokenClaims{
+		TenantID:       "tenant-1",
+		AgentID:        "agent-1",
+		ConversationID: "conversation-1",
+		Generation:     7,
+		Exp:            time.Now().Add(time.Hour).Unix(),
+		Aud:            defaultAgentAudience,
+	}
+	srv, _, token := newTokenVerifiedTestServer(t, claims)
+
+	server := httptest.NewServer(srv)
+	defer server.Close()
+
+	wsURL := strings.Replace(server.URL, "http", "ws", 1) + "/agent/ws"
+	header := map[string][]string{"Authorization": {"Bearer " + token}}
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteJSON(AgentHello{
+		AgentID:                "agent-1",
+		Generation:             99,
+		LastSentEventSeq:       0,
+		LastReceivedCommandSeq: 0,
+		LastAppliedCommandSeq:  0,
+	}); err != nil {
+		t.Fatalf("write hello: %v", err)
+	}
+
+	conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	var apiHello ApiHello
+	if err := conn.ReadJSON(&apiHello); err == nil {
+		t.Fatal("expected connection to close on generation claim mismatch")
+	}
+}
+
+func newTokenVerifiedTestServer(t *testing.T, claims tokenClaims) (*Server, *fakeCommandSource, string) {
+	t.Helper()
+	token := signTestToken(t, testSecret, claims)
+	v, err := NewHMACTokenVerifier(testSecret, "")
+	if err != nil {
+		t.Fatalf("new verifier: %v", err)
+	}
+	gv := &fakeGenerationVerifier{latest: claims.Generation}
+	cs := newFakeCommandSource()
+	es := &fakeEventSink{}
+	hl := newFakeHydrationLatch()
+	hl.setReady()
+	srv := NewServer(v, gv, cs, es, hl)
+	return srv, cs, token
+}
