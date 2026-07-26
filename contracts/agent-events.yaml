@@ -26,9 +26,7 @@ $defs:
         type: string
       event:
         $ref: '#/$defs/AgentEvent'
-      seq:
-        type: integer
-        minimum: 0
+      seq: { $ref: '#/$defs/JsonSafeInteger' }
     allOf:
       - if:
           properties:
@@ -583,7 +581,7 @@ $defs:
     required: [seq, command_id, command]
     additionalProperties: false
     properties:
-      seq: { type: integer, minimum: 0 }
+      seq: { $ref: '#/$defs/JsonSafeInteger' }
       command_id:
         type: string
         format: uuid
@@ -596,7 +594,7 @@ $defs:
     required: [seq, command_id, status]
     additionalProperties: false
     properties:
-      seq: { type: integer, minimum: 0 }
+      seq: { $ref: '#/$defs/JsonSafeInteger' }
       command_id:
         type: string
         format: uuid

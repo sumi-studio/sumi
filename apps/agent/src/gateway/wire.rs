@@ -144,6 +144,8 @@ pub enum WireError {
     ContentIndexOutOfRange(u64),
     #[error("usage value `{0}` exceeds the JSON-safe integer range")]
     UsageValueOutOfRange(u64),
+    #[error("seq `{0}` exceeds the JSON-safe integer range")]
+    SeqOutOfRange(u64),
     #[error("user message attachments must be empty")]
     NonEmptyAttachments,
 }
@@ -300,6 +302,9 @@ impl TryFrom<WireCommandEnvelopeInput> for WireCommandEnvelope {
     type Error = WireError;
 
     fn try_from(input: WireCommandEnvelopeInput) -> Result<Self, Self::Error> {
+        if input.seq > MAX_JSON_SAFE_INTEGER {
+            return Err(WireError::SeqOutOfRange(input.seq));
+        }
         Ok(Self {
             seq: input.seq,
             command_id: canonical_command_id(&input.command_id)?,
@@ -404,6 +409,9 @@ struct WireCommandAckInput {
 impl TryFrom<WireCommandAckInput> for WireCommandAck {
     type Error = WireError;
     fn try_from(input: WireCommandAckInput) -> Result<Self, WireError> {
+        if input.seq > MAX_JSON_SAFE_INTEGER {
+            return Err(WireError::SeqOutOfRange(input.seq));
+        }
         let command_id = canonical_command_id(&input.command_id)?;
         let reject_reason = match input.status {
             WireCommandAckStatus::Rejected => {
@@ -1575,10 +1583,15 @@ fn validate_seq(seq: Option<u64>, event: &WireAgentEvent) -> Result<(), WireErro
                 event_type: event.event_type(),
             });
         }
-    } else if seq.is_none() {
+        return Ok(());
+    }
+    let Some(seq) = seq else {
         return Err(WireError::SeqRequired {
             event_type: event.event_type(),
         });
+    };
+    if seq > MAX_JSON_SAFE_INTEGER {
+        return Err(WireError::SeqOutOfRange(seq));
     }
     Ok(())
 }
@@ -2805,6 +2818,39 @@ mod tests {
             passed += 1;
         }
         assert!(passed >= 10, "expected at least 10 fixtures, got {passed}");
+    }
+
+    #[test]
+    fn seq_exceeds_json_safe_integer_is_rejected() {
+        let oversized = json!({
+            "seq": MAX_JSON_SAFE_INTEGER + 1,
+            "command_id": "00000000-0000-4000-8000-000000000001",
+            "command": { "type": "abort" }
+        });
+        assert!(
+            serde_json::from_value::<WireCommandEnvelope>(oversized).is_err(),
+            "command envelope seq above JSON-safe max must be rejected"
+        );
+
+        let ack = json!({
+            "seq": MAX_JSON_SAFE_INTEGER + 1,
+            "command_id": "00000000-0000-4000-8000-000000000001",
+            "status": "received"
+        });
+        assert!(
+            serde_json::from_value::<WireCommandAck>(ack).is_err(),
+            "command ack seq above JSON-safe max must be rejected"
+        );
+
+        let event = json!({
+            "seq": MAX_JSON_SAFE_INTEGER + 1,
+            "conversation_id": "conversation-1",
+            "event": { "type": "agent_start" }
+        });
+        assert!(
+            serde_json::from_value::<WireEnvelope>(event).is_err(),
+            "envelope seq above JSON-safe max must be rejected"
+        );
     }
 
     fn round_trip_value<T: for<'de> Deserialize<'de> + Serialize>(name: &str, wire: &Value) {

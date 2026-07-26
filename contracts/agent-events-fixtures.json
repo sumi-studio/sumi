@@ -312,5 +312,16 @@
       "result": { "ok": true },
       "is_error": false
     }
+  },
+  "durable_seq_max_safe_integer": {
+    "kind": "outbound_frame",
+    "wire": {
+      "frame_type": "event",
+      "envelope": {
+        "seq": 9007199254740991,
+        "conversation_id": "conversation-1",
+        "event": { "type": "agent_start" }
+      }
+    }
   }
 }

@@ -58,10 +58,18 @@ func TestContractFixturesRoundTrip(t *testing.T) {
 				t.Fatalf("fixture %q: validate command: %v", name, err)
 			}
 			roundTripJSON(t, name, wireRaw, &env)
-		default:
-			// For agent_event and public_message fixtures, ensure generic JSON
-			// round-trips so the contract shapes remain stable in Go as well.
+		case "agent_event":
+			if err := validateEvent(wireRaw); err != nil {
+				t.Fatalf("fixture %q: validate AgentEvent: %v", name, err)
+			}
 			roundTripGeneric(t, name, wireRaw)
+		case "public_message":
+			if err := validatePublicMessage(wireRaw); err != nil {
+				t.Fatalf("fixture %q: validate PublicMessage: %v", name, err)
+			}
+			roundTripGeneric(t, name, wireRaw)
+		default:
+			t.Fatalf("unknown fixture kind %q for %q", kind, name)
 		}
 		passed++
 	}

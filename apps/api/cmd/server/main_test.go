@@ -191,11 +191,17 @@ func TestNewRouter_CommandRouteIdempotency(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if resp1.StatusCode != http.StatusCreated {
+		t.Fatalf("expected first response 201, got %d", resp1.StatusCode)
+	}
 	var env1 agentevents.CommandEnvelope
 	if err := json.NewDecoder(resp1.Body).Decode(&env1); err != nil {
 		t.Fatal(err)
 	}
 	resp1.Body.Close()
+	if env1.Seq == 0 || env1.CommandID == "" {
+		t.Fatalf("expected non-empty first command envelope, got %+v", env1)
+	}
 
 	req2, err := http.NewRequest(http.MethodPost, server.URL+"/conversations/c-1/commands", bytes.NewReader(body))
 	if err != nil {
@@ -215,6 +221,9 @@ func TestNewRouter_CommandRouteIdempotency(t *testing.T) {
 	resp2, err := http.DefaultClient.Do(req2)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if resp2.StatusCode != http.StatusCreated {
+		t.Fatalf("expected second response 201, got %d", resp2.StatusCode)
 	}
 	var env2 agentevents.CommandEnvelope
 	if err := json.NewDecoder(resp2.Body).Decode(&env2); err != nil {

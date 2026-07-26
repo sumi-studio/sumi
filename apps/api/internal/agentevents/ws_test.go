@@ -185,7 +185,7 @@ func TestWebSocketMissingTokenRejected(t *testing.T) {
 
 func TestWebSocketRejectedToken(t *testing.T) {
 	srv, tv, _, _, _, _ := newTestServer(t)
-	tv.reject = true
+	tv.setReject(true)
 	server := startTestServer(t, srv)
 	defer server.Close()
 
@@ -610,6 +610,130 @@ func TestWebSocketRejectsInvalidCommandID(t *testing.T) {
 	var received CommandEnvelope
 	if err := conn.ReadJSON(&received); err == nil {
 		t.Fatal("expected connection to close on invalid command_id")
+	}
+}
+
+func TestWebSocketCatchUpGapFromLastReceivedCommandSeq(t *testing.T) {
+	srv, _, _, cs, _, hl := newTestServer(t)
+	hl.setReady()
+
+	// The retained log begins at seq 5, but the agent has only received up to 3.
+	cs.pushCommand(CommandEnvelope{
+		Seq:       5,
+		CommandID: "00000000-0000-4000-8000-000000000005",
+		Command:   []byte(`{"type":"user_message","text":"hi","attachments":[]}`),
+	})
+
+	server := startTestServer(t, srv)
+	defer server.Close()
+
+	header := map[string][]string{"Authorization": {"Bearer test-token"}}
+	conn, resp, err := dialTestWS(t, server, header)
+	if err != nil {
+		t.Fatalf("dial: %v (status %d)", err, resp.StatusCode)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteJSON(AgentHello{
+		AgentID:                "agent-1",
+		Generation:             7,
+		LastSentEventSeq:       0,
+		LastReceivedCommandSeq: 3,
+		LastAppliedCommandSeq:  2,
+	}); err != nil {
+		t.Fatalf("write hello: %v", err)
+	}
+
+	conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	var apiHello ApiHello
+	if err := conn.ReadJSON(&apiHello); err == nil {
+		t.Fatal("expected connection to close when retained log begins beyond agent's last received seq")
+	}
+}
+
+func TestWebSocketOversizedFrameClosesConnection(t *testing.T) {
+	srv, _, _, _, _, hl := newTestServer(t)
+	hl.setReady()
+	srv.MaxReadLimit = 128
+
+	server := startTestServer(t, srv)
+	defer server.Close()
+
+	header := map[string][]string{"Authorization": {"Bearer test-token"}}
+	conn, resp, err := dialTestWS(t, server, header)
+	if err != nil {
+		t.Fatalf("dial: %v (status %d)", err, resp.StatusCode)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteJSON(AgentHello{
+		AgentID:                "agent-1",
+		Generation:             7,
+		LastSentEventSeq:       0,
+		LastReceivedCommandSeq: 0,
+		LastAppliedCommandSeq:  0,
+	}); err != nil {
+		t.Fatalf("write hello: %v", err)
+	}
+
+	var apiHello ApiHello
+	if err := conn.ReadJSON(&apiHello); err != nil {
+		t.Fatalf("read api hello: %v", err)
+	}
+
+	// Send a valid event body that is larger than the 64 byte read limit.
+	largeEvent := `{"frame_type":"event","envelope":{"seq":1,"conversation_id":"conversation-1","event":{"type":"error","message":"this message exceeds the configured read limit"}}}`
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(largeEvent)); err != nil {
+		t.Fatalf("write oversized frame: %v", err)
+	}
+
+	conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	defer conn.SetReadDeadline(time.Time{})
+	var frame OutboundFrame
+	if err := conn.ReadJSON(&frame); err == nil {
+		t.Fatal("expected connection to close on oversized read")
+	}
+}
+
+func TestWebSocketSilentPeerClosesConnection(t *testing.T) {
+	srv, _, _, _, _, hl := newTestServer(t)
+	hl.setReady()
+	srv.PongWait = 100 * time.Millisecond
+	srv.PingInterval = 50 * time.Millisecond
+
+	server := startTestServer(t, srv)
+	defer server.Close()
+
+	header := map[string][]string{"Authorization": {"Bearer test-token"}}
+	conn, resp, err := dialTestWS(t, server, header)
+	if err != nil {
+		t.Fatalf("dial: %v (status %d)", err, resp.StatusCode)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteJSON(AgentHello{
+		AgentID:                "agent-1",
+		Generation:             7,
+		LastSentEventSeq:       0,
+		LastReceivedCommandSeq: 0,
+		LastAppliedCommandSeq:  0,
+	}); err != nil {
+		t.Fatalf("write hello: %v", err)
+	}
+
+	var apiHello ApiHello
+	if err := conn.ReadJSON(&apiHello); err != nil {
+		t.Fatalf("read api hello: %v", err)
+	}
+
+	// Disable the client's automatic pong response so the server sees a silent peer.
+	conn.SetPingHandler(func(string) error { return nil })
+
+	conn.SetReadDeadline(time.Now().Add(time.Second))
+	defer conn.SetReadDeadline(time.Time{})
+	var received CommandEnvelope
+	if err := conn.ReadJSON(&received); err == nil {
+		t.Fatal("expected connection to close on silent peer (no pong)")
 	}
 }
 

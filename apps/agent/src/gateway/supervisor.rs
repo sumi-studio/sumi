@@ -305,7 +305,12 @@ where
         let mut attempt: u32 = 0;
         loop {
             match self.connect_and_run_epoch(commands_tx.clone()).await {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    // A real epoch was established and then ended; reset the
+                    // pre-establishment failure counter and backoff.
+                    attempt = 0;
+                    continue;
+                }
                 Err(SupervisorError::Fatal(e)) => return Err(e),
                 Err(SupervisorError::AuthRejected) => {
                     attempt = attempt.saturating_add(1);
@@ -414,15 +419,36 @@ where
         *self.current_writer.lock().unwrap() = None;
         self.current_epoch.send_replace(None);
 
-        tracing::debug!(
-            connection_epoch = connection_epoch.as_u64(),
-            delivery_epoch = delivery_epoch.as_u64(),
-            "epoch ended"
-        );
+        match result {
+            Ok(Err(ref e)) => {
+                tracing::debug!(
+                    connection_epoch = connection_epoch.as_u64(),
+                    delivery_epoch = delivery_epoch.as_u64(),
+                    error = ?e,
+                    "epoch ended with task error"
+                );
+            }
+            Err(ref e) => {
+                tracing::debug!(
+                    connection_epoch = connection_epoch.as_u64(),
+                    delivery_epoch = delivery_epoch.as_u64(),
+                    error = ?e,
+                    "epoch ended with task panic"
+                );
+            }
+            Ok(Ok(())) => {
+                tracing::debug!(
+                    connection_epoch = connection_epoch.as_u64(),
+                    delivery_epoch = delivery_epoch.as_u64(),
+                    "epoch ended cleanly"
+                );
+            }
+        }
 
-        Err(SupervisorError::Reconnect {
-            reason: format!("reader/writer task ended: {result:?}"),
-        })
+        // The epoch was successfully established (hello validated and reader/writer
+        // started). Any termination after that point resets the attempt/backoff
+        // counter so a later healthy disconnect does not exhaust reconnects.
+        Ok(())
     }
 
     fn next_epoch(&self) -> (ConnectionEpoch, DeliveryEpoch) {
@@ -1657,6 +1683,47 @@ mod tests {
         validate_hello(&source, &agent, &api_valid)
             .await
             .expect("next_command_seq at last_applied+1 is valid");
+    }
+
+    #[tokio::test]
+    async fn reset_attempt_counter_after_established_epoch() {
+        let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gateway = MockGateway::new(VecDeque::from([
+            Ok(valid_command(1, "00000000-0000-4000-8000-000000000001")),
+            Err(anyhow!("reader EOF")),
+        ]));
+
+        let connector = MockConnector::new(
+            sent_hellos.clone(),
+            VecDeque::from([
+                Ok(gateway),
+                Err(ConnectorError::AuthRejected),
+                Err(ConnectorError::AuthRejected),
+            ]),
+        );
+        let credentials = CountingCredentialProvider::new("token");
+        let counter = credentials.counter.clone();
+        let source = MockDurableSource::new(CommandCursors::default());
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: 7,
+            receipt_identity: "receipt-1".to_owned(),
+        });
+
+        let mut config = make_config();
+        config.max_reconnect_attempts = Some(1);
+
+        let supervisor = ConnectionSupervisor::new(connector, credentials, source, latch, config);
+        let handle = supervisor.start();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle.join()).await;
+        assert!(
+            result.is_ok(),
+            "supervisor should stop after exhausting post-reset auth attempts"
+        );
+        assert!(result.unwrap().is_err());
+
+        // credential count: 1 for successful epoch, then 2 auth rejections after reset.
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
     }
 
     fn cmd_seq(cmd: &InboundCommand) -> u64 {

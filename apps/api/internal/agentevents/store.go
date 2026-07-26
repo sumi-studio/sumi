@@ -500,16 +500,13 @@ func (s *CommandStore) scanLogLocked(st *conversationState, conversationID strin
 	return nil
 }
 
-// refreshStateLocked resets the in-memory state for st and rescan the log from
-// disk. It skips the rescan when the file size has not changed since the last
-// observation. The caller must hold CommandStore.mu and an exclusive flock.
+// refreshStateLocked resets the in-memory state for st and rescans the log from
+// disk under the existing exclusive flock. A conservative rescan is used rather
+// than a file-size short-circuit so that a same-size truncate/rewrite by
+// another process cannot leave stale nextSeq or idempotency maps.
 func (s *CommandStore) refreshStateLocked(st *conversationState, conversationID string) error {
-	size, err := st.file.Seek(0, io.SeekEnd)
-	if err != nil {
+	if _, err := st.file.Seek(0, io.SeekEnd); err != nil {
 		return fmt.Errorf("seek command log for %q: %w", conversationID, err)
-	}
-	if size == st.fileSize {
-		return nil
 	}
 
 	st.commands = st.commands[:0]

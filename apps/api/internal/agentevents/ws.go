@@ -83,6 +83,18 @@ type Server struct {
 	// context cancellation from the underlying connection.
 	HelloTimeout time.Duration
 
+	// MaxReadLimit is the largest WebSocket message the server will accept
+	// after the hello exchange. A value of zero disables the limit.
+	MaxReadLimit int64
+
+	// PongWait is the duration the server will wait for a pong after the
+	// hello exchange before closing the connection.
+	PongWait time.Duration
+
+	// PingInterval is how often the server sends ping control frames from the
+	// writer goroutine. It must be shorter than PongWait.
+	PingInterval time.Duration
+
 	// AllowedOrigins lists the exact origins allowed to open a WebSocket.
 	// An empty list is fail-closed (no origin is accepted). Wildcards are not
 	// supported: every accepted origin must be named explicitly.
@@ -101,6 +113,9 @@ func NewServer(tv TokenVerifier, gv GenerationVerifier, cs CommandSource, es Eve
 		Events:       es,
 		Latch:        hl,
 		HelloTimeout: 30 * time.Second,
+		MaxReadLimit: 4 * 1024 * 1024,
+		PongWait:     60 * time.Second,
+		PingInterval: 54 * time.Second,
 	}
 	s.upgrader = websocket.Upgrader{CheckOrigin: s.checkOrigin}
 	return s
@@ -171,6 +186,10 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	if s.MaxReadLimit > 0 {
+		conn.SetReadLimit(s.MaxReadLimit)
+	}
+
 	helloCtx, helloDone := context.WithTimeout(ctx, s.HelloTimeout)
 	defer helloDone()
 
@@ -183,12 +202,6 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 	var hello AgentHello
 	if err := conn.ReadJSON(&hello); err != nil {
 		return fmt.Errorf("read hello: %w", err)
-	}
-
-	// Remove the hello-specific deadline so catch-up and live reads are not
-	// bounded by the handshake timeout.
-	if err := conn.SetReadDeadline(time.Time{}); err != nil {
-		return fmt.Errorf("clear hello read deadline: %w", err)
 	}
 
 	if hello.AgentID != claims.AgentID {
@@ -209,6 +222,14 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 	if err != nil {
 		return fmt.Errorf("first command seq: %w", err)
 	}
+
+	// The retained log must begin no later than the agent's expected next
+	// command; otherwise the server would advertise a guaranteed gap that the
+	// agent cannot recover from.
+	if firstSeq > hello.LastReceivedCommandSeq+1 {
+		return fmt.Errorf("command log gap: first seq %d is beyond agent last received %d", firstSeq, hello.LastReceivedCommandSeq)
+	}
+
 	nextSeq := hello.LastAppliedCommandSeq + 1
 	if nextSeq < firstSeq {
 		nextSeq = firstSeq
@@ -221,6 +242,20 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 	}
 	if err := conn.WriteJSON(apiHello); err != nil {
 		return fmt.Errorf("write api hello: %w", err)
+	}
+
+	// Install the pong handler and the first post-hello read deadline before
+	// starting the read pump.
+	if s.PongWait > 0 {
+		if err := conn.SetReadDeadline(time.Now().Add(s.PongWait)); err != nil {
+			return fmt.Errorf("set pong read deadline: %w", err)
+		}
+		conn.SetPongHandler(func(string) error {
+			if s.PongWait > 0 {
+				_ = conn.SetReadDeadline(time.Now().Add(s.PongWait))
+			}
+			return nil
+		})
 	}
 
 	commands, err := s.Commands.CatchUp(ctx, claims, nextSeq)
@@ -266,6 +301,11 @@ func (s *Server) readPump(ctx context.Context, conn *websocket.Conn, claims Toke
 		if err := conn.ReadJSON(&frame); err != nil {
 			return err
 		}
+		if s.PongWait > 0 {
+			if err := conn.SetReadDeadline(time.Now().Add(s.PongWait)); err != nil {
+				return err
+			}
+		}
 		if err := frame.Validate(); err != nil {
 			return err
 		}
@@ -287,6 +327,24 @@ func (s *Server) readPump(ctx context.Context, conn *websocket.Conn, claims Toke
 }
 
 func (s *Server) writePump(ctx context.Context, conn *websocket.Conn, live <-chan CommandEnvelope) error {
+	if s.PingInterval <= 0 {
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case cmd, ok := <-live:
+				if !ok {
+					return errors.New("command source closed")
+				}
+				if err := sendCommandEnvelope(conn, cmd); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	ticker := time.NewTicker(s.PingInterval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -298,11 +356,18 @@ func (s *Server) writePump(ctx context.Context, conn *websocket.Conn, live <-cha
 			if err := sendCommandEnvelope(conn, cmd); err != nil {
 				return err
 			}
+		case <-ticker.C:
+			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return err
+			}
 		}
 	}
 }
 
 func sendCommandEnvelope(conn *websocket.Conn, cmd CommandEnvelope) error {
+	if cmd.Seq > maxJSONSafeInteger {
+		return fmt.Errorf("command envelope seq exceeds JSON-safe integer range")
+	}
 	if cmd.CommandID == "" {
 		return fmt.Errorf("command envelope missing command_id")
 	}

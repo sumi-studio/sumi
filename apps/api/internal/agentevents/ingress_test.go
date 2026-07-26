@@ -27,19 +27,26 @@ type appendCall struct {
 }
 
 type fakeTokenVerifier struct {
+	mu             sync.Mutex
 	conversationID string
 	reject         bool
 	err            error
 }
 
 func (f *fakeTokenVerifier) Verify(ctx context.Context, token string) (TokenClaims, error) {
-	if f.reject {
+	f.mu.Lock()
+	reject := f.reject
+	err := f.err
+	conversationID := f.conversationID
+	f.mu.Unlock()
+
+	if reject {
 		return TokenClaims{}, fmt.Errorf("rejected")
 	}
-	if f.err != nil {
-		return TokenClaims{}, f.err
+	if err != nil {
+		return TokenClaims{}, err
 	}
-	conv := f.conversationID
+	conv := conversationID
 	if conv == "" {
 		conv = "conversation-1"
 	}
@@ -49,6 +56,12 @@ func (f *fakeTokenVerifier) Verify(ctx context.Context, token string) (TokenClai
 		ConversationID: conv,
 		Generation:     7,
 	}, nil
+}
+
+func (f *fakeTokenVerifier) setReject(reject bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reject = reject
 }
 
 type errorReadCloser struct{}
@@ -386,7 +399,7 @@ func TestUserCommandIngress_RejectsInvalidAndWrongConversationToken(t *testing.T
 		t.Fatalf("expected 0 append calls, got %d", appender.callCount())
 	}
 
-	verifier.reject = true
+	verifier.setReject(true)
 	req2, err := http.NewRequest(http.MethodPost, server.URL+"/conversations/conv-1/commands", bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)

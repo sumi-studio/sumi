@@ -2,6 +2,7 @@ package agentevents
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -76,3 +77,85 @@ func TestIngressDuplicateKeysCounterexample(t *testing.T) {
 
 func strPtr(s string) *string { return &s }
 func u64Ptr(u uint64) *uint64 { return &u }
+
+func TestValidateCommandAttachmentsRejectsAnyNonEmptyElement(t *testing.T) {
+	cases := []string{
+		`[1]`,
+		`["x"]`,
+		`[null]`,
+		`[{}]`,
+		`[[{}]]`,
+	}
+	for _, arr := range cases {
+		raw := json.RawMessage(`{"type":"user_message","text":"hi","attachments":` + arr + `}`)
+		err := ValidateCommand(raw)
+		if !errors.Is(err, errAttachmentsNotEmpty) {
+			t.Fatalf("expected attachments_not_empty for %s, got %v", arr, err)
+		}
+	}
+}
+
+func TestAgentHelloUnmarshalJSONStrict(t *testing.T) {
+	valid := `{
+		"agent_id":"agent-1",
+		"generation":7,
+		"last_sent_event_seq":0,
+		"last_received_command_seq":0,
+		"last_applied_command_seq":0
+	}`
+	var h AgentHello
+	if err := json.Unmarshal([]byte(valid), &h); err != nil {
+		t.Fatalf("valid hello rejected: %v", err)
+	}
+
+	unknownField := valid[:len(valid)-1] + `,"extra":true}`
+	if err := json.Unmarshal([]byte(unknownField), &h); err == nil {
+		t.Fatal("agent hello accepted unknown field")
+	}
+
+	missingField := `{"agent_id":"agent-1","generation":7}`
+	if err := json.Unmarshal([]byte(missingField), &h); err == nil {
+		t.Fatal("agent hello accepted missing fields")
+	}
+
+	trailing := valid + ` {}`
+	if err := json.Unmarshal([]byte(trailing), &h); err == nil {
+		t.Fatal("agent hello accepted trailing data")
+	}
+}
+
+func TestEnvelopeRejectsMalformedEventBody(t *testing.T) {
+	cases := []string{
+		`{"seq":1,"conversation_id":"c","event":{"type":"message_end","message_id":"not-a-uuid","message":{"role":"user","content":[{"type":"text","text":"x"}],"timestamp":"2026-07-25T20:00:00Z"}}}`,
+		`{"seq":1,"conversation_id":"c","event":{"type":"tool_execution_start","tool_call_id":"call-1","tool_name":"read_file","args":null}}`,
+		`{"seq":1,"conversation_id":"c","event":{"type":"approval_resolved","request_id":"req-1","resolution":{"decision":{"type":"approve_once","extra":1}}}}`,
+	}
+	for _, raw := range cases {
+		var env Envelope
+		if err := json.Unmarshal([]byte(raw), &env); err == nil {
+			t.Fatalf("envelope accepted malformed event: %s", raw)
+		}
+	}
+}
+
+func TestEnvelopeRejectsSeqExceedsJSONSafeInteger(t *testing.T) {
+	raw := `{"seq":9007199254740992,"conversation_id":"c","event":{"type":"agent_start"}}`
+	var env Envelope
+	if err := json.Unmarshal([]byte(raw), &env); err == nil {
+		t.Fatal("envelope accepted out-of-range seq")
+	}
+}
+
+func TestOutboundFrameRejectsCommandAckSeqExceedsJSONSafeInteger(t *testing.T) {
+	frame := OutboundFrame{
+		FrameType: "command_ack",
+		Ack: &CommandAck{
+			Seq:        9007199254740992,
+			CommandID:  "00000000-0000-4000-8000-000000000001",
+			Status:     "received",
+		},
+	}
+	if err := frame.Validate(); err == nil {
+		t.Fatal("command_ack accepted out-of-range seq")
+	}
+}

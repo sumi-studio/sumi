@@ -386,6 +386,65 @@ func TestCommandStore_IdempotencyKeyPersistsAcrossRestart(t *testing.T) {
 	}
 }
 
+func TestCommandStore_SameSizeReplacementIsRescanned(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenCommandStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// The original command has a 40-character text so that a same-length
+	// replacement with a 7-character text plus an idempotency_key field has
+	// exactly the same JSON size.
+	originalCmd := json.RawMessage(`{"type":"user_message","text":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx","attachments":[]}`)
+	_, err = store.Append(context.Background(), "conv-1", "", originalCmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	replacementCmd := json.RawMessage(`{"type":"user_message","text":"yyyyyyy","attachments":[]}`)
+	replacementID := "00000000-0000-4000-8000-000000000002"
+	replacementRecord := LogRecord{
+		CommandEnvelope: CommandEnvelope{
+			Seq:       1,
+			CommandID: replacementID,
+			Command:   replacementCmd,
+		},
+		IdempotencyKey: "replaced-key",
+	}
+	replacementLine, err := json.Marshal(replacementRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacementLine = append(replacementLine, '\n')
+
+	path := commandLogPath(dir, "conv-1")
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replacementLine) != len(original) {
+		t.Fatalf("test setup: replacement length %d != original length %d", len(replacementLine), len(original))
+	}
+	if err := os.WriteFile(path, replacementLine, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// A same-size rewrite should be detected by refreshStateLocked and the
+	// idempotency key must be visible on the next Append.
+	env, err := store.Append(context.Background(), "conv-1", "replaced-key", replacementCmd)
+	if err != nil {
+		t.Fatalf("append after replacement: %v", err)
+	}
+	if env.Seq != 1 {
+		t.Fatalf("expected existing seq 1 after rescan, got %d", env.Seq)
+	}
+	if env.CommandID != replacementID {
+		t.Fatalf("expected replacement command_id %q, got %q", replacementID, env.CommandID)
+	}
+}
+
 func TestCommandStore_PartialTailRecovery(t *testing.T) {
 	dir := t.TempDir()
 	env := func(seq uint64) string {

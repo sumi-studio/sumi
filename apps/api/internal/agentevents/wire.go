@@ -12,7 +12,12 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"strings"
 )
+
+// maxJSONSafeInteger is the largest integer representable exactly by JavaScript's
+// number type and by the contract's JsonSafeInteger definition.
+const maxJSONSafeInteger uint64 = 9_007_199_254_740_991
 
 // AgentHello is sent by the agent immediately after the WebSocket upgrade.
 // Generation is the ProcessGeneration bound to the short-lived credential claim.
@@ -22,6 +27,49 @@ type AgentHello struct {
 	LastSentEventSeq       uint64 `json:"last_sent_event_seq"`
 	LastReceivedCommandSeq uint64 `json:"last_received_command_seq"`
 	LastAppliedCommandSeq  uint64 `json:"last_applied_command_seq"`
+}
+
+// UnmarshalJSON decodes an AgentHello with the same strict discipline used by
+// the other production wire DTOs: duplicate keys, unknown fields, and trailing
+// bytes are rejected, and every required field must be present.
+func (h *AgentHello) UnmarshalJSON(data []byte) error {
+	if err := checkDuplicateKeys(data); err != nil {
+		return fmt.Errorf("agent hello json: %w", err)
+	}
+	type rawHello struct {
+		AgentID                *string `json:"agent_id"`
+		Generation             *uint64 `json:"generation"`
+		LastSentEventSeq       *uint64 `json:"last_sent_event_seq"`
+		LastReceivedCommandSeq *uint64 `json:"last_received_command_seq"`
+		LastAppliedCommandSeq  *uint64 `json:"last_applied_command_seq"`
+	}
+	var raw rawHello
+	if err := unmarshalStrict(data, &raw); err != nil {
+		return err
+	}
+	if raw.AgentID == nil {
+		return fmt.Errorf("agent_id is required")
+	}
+	if raw.Generation == nil {
+		return fmt.Errorf("generation is required")
+	}
+	if raw.LastSentEventSeq == nil {
+		return fmt.Errorf("last_sent_event_seq is required")
+	}
+	if raw.LastReceivedCommandSeq == nil {
+		return fmt.Errorf("last_received_command_seq is required")
+	}
+	if raw.LastAppliedCommandSeq == nil {
+		return fmt.Errorf("last_applied_command_seq is required")
+	}
+	*h = AgentHello{
+		AgentID:                *raw.AgentID,
+		Generation:             *raw.Generation,
+		LastSentEventSeq:       *raw.LastSentEventSeq,
+		LastReceivedCommandSeq: *raw.LastReceivedCommandSeq,
+		LastAppliedCommandSeq:  *raw.LastAppliedCommandSeq,
+	}
+	return nil
 }
 
 // ApiHello is returned by the API after verifying the token and generation.
@@ -126,19 +174,35 @@ type userMessageWire struct {
 }
 
 // emptyArray unmarshals only the literal empty JSON array. null or a non-empty
-// array both return distinct sentinel errors.
+// array both return distinct sentinel errors. Elements are decoded independently
+// so that a non-empty array of primitives, null, or objects is reported as
+// attachments_not_empty rather than a generic JSON unmarshal error.
 type emptyArray []struct{}
 
 func (e *emptyArray) UnmarshalJSON(data []byte) error {
-	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+	if strings.EqualFold(strings.TrimSpace(string(data)), "null") {
 		return errAttachmentsNull
 	}
-	var arr []struct{}
-	if err := json.Unmarshal(data, &arr); err != nil {
+
+	dec := json.NewDecoder(bytes.NewReader(data))
+	tok, err := dec.Token()
+	if err != nil {
 		return err
 	}
-	if len(arr) != 0 {
+	delim, ok := tok.(json.Delim)
+	if !ok || delim != '[' {
+		return fmt.Errorf("attachments must be an array")
+	}
+
+	if dec.More() {
+		if _, err := dec.Token(); err != nil {
+			return err
+		}
 		return errAttachmentsNotEmpty
+	}
+
+	if _, err := dec.Token(); err != nil {
+		return err
 	}
 	*e = emptyArray{}
 	return nil
@@ -314,6 +378,9 @@ func (o OutboundFrame) Validate() error {
 }
 
 func validateCommandAck(ack CommandAck) error {
+	if ack.Seq > maxJSONSafeInteger {
+		return fmt.Errorf("command_ack seq exceeds JSON-safe integer range")
+	}
 	if ack.CommandID == "" {
 		return fmt.Errorf("command_ack command_id is required")
 	}
@@ -369,7 +436,10 @@ func validateEnvelope(e Envelope) error {
 	if !volatile && e.Seq == nil {
 		return fmt.Errorf("durable event %q requires seq", d.Type)
 	}
-	return nil
+	if e.Seq != nil && *e.Seq > maxJSONSafeInteger {
+		return fmt.Errorf("envelope seq exceeds JSON-safe integer range")
+	}
+	return validateEvent(e.Event)
 }
 
 // UnmarshalJSON decodes an Envelope and rejects an explicit JSON null in the
@@ -395,44 +465,49 @@ func (e *Envelope) UnmarshalJSON(data []byte) error {
 	if len(raw.Event) == 0 || !json.Valid(raw.Event) {
 		return fmt.Errorf("envelope event must be valid JSON")
 	}
-	type discriminator struct {
-		Type string `json:"type"`
-	}
-	var d discriminator
-	if err := json.Unmarshal(raw.Event, &d); err != nil {
-		return fmt.Errorf("envelope event type: %w", err)
-	}
-	if d.Type == "" {
-		return fmt.Errorf("envelope event type is required")
-	}
 
-	volatile := volatileEventTypes[d.Type]
+	eventType := eventType(raw.Event)
+	volatile := volatileEventTypes[eventType]
 	switch {
 	case raw.Seq == nil:
 		if !volatile {
-			return fmt.Errorf("durable event %q requires seq", d.Type)
+			return fmt.Errorf("durable event %q requires seq", eventType)
 		}
 	case bytes.Equal(bytes.TrimSpace(raw.Seq), []byte("null")):
 		// Explicit null is not allowed for any event: volatile events must
 		// not have seq, and durable events require a real integer.
 		if volatile {
-			return fmt.Errorf("volatile event %q must not have seq", d.Type)
+			return fmt.Errorf("volatile event %q must not have seq", eventType)
 		}
-		return fmt.Errorf("durable event %q requires seq", d.Type)
+		return fmt.Errorf("durable event %q requires seq", eventType)
 	default:
 		var seq uint64
 		if err := json.Unmarshal(raw.Seq, &seq); err != nil {
 			return fmt.Errorf("envelope seq: %w", err)
 		}
+		if seq > maxJSONSafeInteger {
+			return fmt.Errorf("envelope seq exceeds JSON-safe integer range")
+		}
 		if volatile {
-			return fmt.Errorf("volatile event %q must not have seq", d.Type)
+			return fmt.Errorf("volatile event %q must not have seq", eventType)
 		}
 		e.Seq = &seq
 	}
 
 	e.ConversationID = raw.ConversationID
 	e.Event = raw.Event
-	return nil
+	return validateEnvelope(*e)
+}
+
+func eventType(raw json.RawMessage) string {
+	type discriminator struct {
+		Type string `json:"type"`
+	}
+	var d discriminator
+	if err := json.Unmarshal(raw, &d); err != nil {
+		return ""
+	}
+	return d.Type
 }
 
 // unmarshalStrict decodes one top-level JSON value with DisallowUnknownFields

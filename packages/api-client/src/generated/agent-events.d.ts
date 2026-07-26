@@ -14,7 +14,7 @@ export type Envelope = {
 } & {
   conversation_id: string;
   event: AgentEvent;
-  seq?: number;
+  seq?: JsonSafeInteger;
 };
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
@@ -521,7 +521,7 @@ export interface DeferredApprovalRule {
  * via the `definition` "CommandEnvelope".
  */
 export interface CommandEnvelope {
-  seq: number;
+  seq: JsonSafeInteger;
   /**
    * canonical lower-case hyphenated UUID
    */
@@ -533,7 +533,7 @@ export interface CommandEnvelope {
  * via the `definition` "CommandAck".
  */
 export interface CommandAck {
-  seq: number;
+  seq: JsonSafeInteger;
   command_id: string;
   status: "received" | "applied" | "superseded" | "rejected";
   reject_reason?: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized";
