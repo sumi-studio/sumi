@@ -891,6 +891,41 @@ fn git_reset_touches_working_tree(tokens: &[String], start: usize) -> bool {
     false
 }
 
+/// OpenSSH `-o` / `--option` keywords that can execute arbitrary local code,
+/// load an arbitrary config, or load an arbitrary shared library/program.
+const SSH_FAMILY_FORBIDDEN_O_KEYWORDS: &[&str] = &[
+    "proxycommand",
+    "localcommand",
+    "remotecommand",
+    "match",
+    "include",
+    "pkcs11provider",
+    "securitykeyprovider",
+    "knownhostscommand",
+    "xauthlocation",
+];
+
+/// Returns true if `option_value` is an ssh `-o` / `--option` argument whose
+/// keyword is in the forbidden set. Leading ASCII whitespace and `key=value` /
+/// `key value` forms are normalized.
+fn ssh_o_value_is_forbidden(option_value: &str) -> bool {
+    let lower = option_value.to_ascii_lowercase();
+    let after_prefix = lower
+        .strip_prefix("-o=")
+        .or_else(|| lower.strip_prefix("--option="))
+        .or_else(|| lower.strip_prefix("-o"))
+        .unwrap_or(&lower)
+        .trim_start();
+    if after_prefix.is_empty() {
+        return false;
+    }
+    let key_end = after_prefix.find(|c: char| c == '=' || c.is_ascii_whitespace());
+    let key = key_end
+        .map(|idx| &after_prefix[..idx])
+        .unwrap_or(after_prefix);
+    SSH_FAMILY_FORBIDDEN_O_KEYWORDS.contains(&key)
+}
+
 /// Reject command-execution payloads embedded in another program's options.
 /// T22 intentionally does not attempt to model every tool-specific option
 /// grammar; an option whose name advertises command/exec/checkpoint/filter
@@ -1125,6 +1160,14 @@ fn has_embedded_execution_payload(tokens: &[String]) -> bool {
                     return true;
                 }
             }
+            // `ssh -I <library>` loads an arbitrary PKCS#11 shared library.
+            if command == "ssh" && short_option_token_has_flag(t, "ssh", 'I') {
+                return true;
+            }
+            // `sftp -S <program>` substitutes an arbitrary ssh transport program.
+            if command == "sftp" && short_option_token_has_flag(t, "sftp", 'S') {
+                return true;
+            }
             let option_token = if t == "-o" || t == "--option" {
                 i += 1;
                 tokens.get(i)
@@ -1136,26 +1179,8 @@ fn has_embedded_execution_payload(tokens: &[String]) -> bool {
             } else {
                 None
             };
-            if let Some(option_token) = option_token {
-                let lower = option_token.to_ascii_lowercase();
-                let after_prefix = lower
-                    .strip_prefix("-o=")
-                    .or_else(|| lower.strip_prefix("--option="))
-                    .or_else(|| lower.strip_prefix("-o"))
-                    .unwrap_or(&lower);
-                // OpenSSH `-o` accepts both `key=value` and `key value` (a single
-                // quoted argument or glued token with whitespace separating the
-                // keyword from the value). Split on either delimiter.
-                let key_end = after_prefix.find(|c: char| c == '=' || c.is_ascii_whitespace());
-                let key = key_end
-                    .map(|idx| &after_prefix[..idx])
-                    .unwrap_or(after_prefix);
-                if matches!(
-                    key,
-                    "proxycommand" | "localcommand" | "remotecommand" | "match"
-                ) {
-                    return true;
-                }
+            if option_token.is_some_and(|v| ssh_o_value_is_forbidden(v)) {
+                return true;
             }
             i += 1;
         }
@@ -1220,8 +1245,18 @@ fn ssh_family_forbidden_payload(tokens: &[String]) -> bool {
             return true;
         }
 
+        // `sftp -S <program>` substitutes an arbitrary ssh transport program.
+        if canonical == "sftp" && short_option_token_has_flag(t, "sftp", 'S') {
+            return true;
+        }
+
         // `sftp -D <program>` executes an arbitrary local SFTP server.
         if canonical == "sftp" && short_option_token_has_flag(t, "sftp", 'D') {
+            return true;
+        }
+
+        // `ssh -I <library>` loads an arbitrary PKCS#11 shared library.
+        if canonical == "ssh" && short_option_token_has_flag(t, "ssh", 'I') {
             return true;
         }
 
@@ -1238,23 +1273,8 @@ fn ssh_family_forbidden_payload(tokens: &[String]) -> bool {
         } else {
             None
         };
-        if let Some(option_token) = option_token {
-            let opt_lower = option_token.to_ascii_lowercase();
-            let after_prefix = opt_lower
-                .strip_prefix("-o=")
-                .or_else(|| opt_lower.strip_prefix("--option="))
-                .or_else(|| opt_lower.strip_prefix("-o"))
-                .unwrap_or(&opt_lower);
-            let key_end = after_prefix.find(|c: char| c == '=' || c.is_ascii_whitespace());
-            let key = key_end
-                .map(|idx| &after_prefix[..idx])
-                .unwrap_or(after_prefix);
-            if matches!(
-                key,
-                "proxycommand" | "localcommand" | "remotecommand" | "match"
-            ) {
-                return true;
-            }
+        if option_token.is_some_and(|v| ssh_o_value_is_forbidden(v)) {
+            return true;
         }
 
         i += 1;
@@ -1359,9 +1379,9 @@ fn value_taking_short_options(canonical: &str) -> Option<&'static [char]> {
         "curl" => Some(&['D', 'E', 'F', 'H', 'K', 'T', 'b', 'c', 'd', 'o', 'w']),
         "wget" => Some(&['O', 'P', 'i', 'o']),
         "rsync" => Some(&['T', 'e']),
-        "ssh" => Some(&['E', 'F', 'S', 'i']),
+        "ssh" => Some(&['E', 'F', 'I', 'S', 'i']),
         "scp" => Some(&['F', 'S', 'i']),
-        "sftp" => Some(&['D', 'F', 'b', 'i']),
+        "sftp" => Some(&['D', 'F', 'S', 'b', 'i']),
         "git" => Some(&['C', 'F', 'c']),
         "psql" => Some(&['L', 'f', 'o']),
         "mysql" | "mariadb" => Some(&['S']),
@@ -3737,6 +3757,34 @@ mod tests {
     }
 
     #[test]
+    fn approve_always_downgrades_dash_prefixed_credential_rules() {
+        let p = policy();
+        let command = "sshpass -p -secret ssh user@host";
+        let action = bash(command);
+        let candidate = ApprovalRule {
+            id: "sshpass-dash-auth".to_owned(),
+            tool: "bash".to_owned(),
+            literal_prefix: shell::tokenize_command(command),
+            effect: RuleEffect::Allow,
+            workspace_only: true,
+            allowed_permissions: vec![Permission::Exec, Permission::Network],
+            allowed_network_domains: vec![],
+        };
+        assert!(
+            p.clone().try_with_rule(candidate.clone()).is_err(),
+            "dash-prefixed credential rule must not be persisted"
+        );
+        assert!(matches!(
+            p.resolve(
+                &action,
+                UserDecision::ApproveAlways { rule: candidate },
+                &projector()
+            ),
+            ResolvedDecision::ApproveOnce
+        ));
+    }
+
+    #[test]
     fn t22_security_gaps_fail_closed() {
         let p = policy();
 
@@ -5031,5 +5079,40 @@ mod tests {
             PathCheck::InsideWorkspace,
             "leading whitespace in a workspace path must not misclassify it as an escape"
         );
+    }
+
+    #[test]
+    fn additional_ssh_family_local_execution_options_are_forbidden() {
+        let cases = [
+            // Leading whitespace in -o values must not bypass keyword detection.
+            r#"ssh -o " ProxyCommand=sh -c id" example.com"#,
+            r#"ssh -o ' ProxyCommand sh -c id' example.com"#,
+            "ssh -o' ProxyCommand=sh -c id' example.com",
+            // Additional dangerous -o keywords.
+            "ssh -o Include=/workspace/malicious_config example.com",
+            "ssh -oPKCS11Provider=/workspace/malicious.so example.com",
+            "ssh -o SecurityKeyProvider=/workspace/malicious.so example.com",
+            "ssh -o KnownHostsCommand='sh -c id' example.com",
+            "ssh -o XAuthLocation=/workspace/malicious -X example.com",
+            // Short option PKCS#11/shared library and sftp program substitution.
+            "ssh -I /workspace/malicious.so example.com",
+            "ssh -I/workspace/malicious.so example.com",
+            "sftp -S /workspace/malicious user@host",
+            "sftp -S/workspace/malicious user@host",
+        ];
+        for command in cases {
+            let action = bash(command);
+            let p = policy();
+            let decision = p.evaluate(&action);
+            assert!(
+                decision.is_forbidden(),
+                "'{command}' must be forbidden as a local execution payload: {decision:?}"
+            );
+            let resolved = p.resolve(&action, UserDecision::ApproveOnce, &projector());
+            assert!(
+                matches!(resolved, ResolvedDecision::Rejected { .. }),
+                "'{command}' must reject ApproveOnce: {resolved:?}"
+            );
+        }
     }
 }

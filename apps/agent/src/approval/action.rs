@@ -431,7 +431,14 @@ pub struct SecretAwareActionProjector {
     key: SecretDigestKey,
 }
 
-fn credential_options_for_command(cmd: &str) -> Option<&'static [(&'static str, &'static str)]> {
+/// Credential-bearing command-line options recognized by the shell credential
+/// projector. The trailing `bool` is `true` when the option takes an *optional*
+/// argument: if a following token starts with `-` it should not be consumed as
+/// the credential value. Required-argument options consume the next token
+/// regardless of a leading `-`.
+fn credential_options_for_command(
+    cmd: &str,
+) -> Option<&'static [(&'static str, &'static str, bool)]> {
     const CREDENTIAL_FAMILIES: &[&str] = &[
         "curl",
         "wget",
@@ -447,35 +454,44 @@ fn credential_options_for_command(cmd: &str) -> Option<&'static [(&'static str, 
     let family = shell::canonicalize_command_name(cmd, CREDENTIAL_FAMILIES)?;
     match family {
         "curl" => Some(&[
-            ("-u", "curl_user"),
-            ("--user", "curl_user"),
-            ("--oauth2-bearer", "bearer_token"),
-            ("--proxy-user", "curl_user"),
-            ("--proxy-password", "curl_password"),
+            ("-u", "curl_user", false),
+            ("--user", "curl_user", false),
+            ("--oauth2-bearer", "bearer_token", false),
+            ("--proxy-user", "curl_user", false),
+            ("--proxy-password", "curl_password", false),
         ]),
         "wget" => Some(&[
-            ("--password", "wget_password"),
-            ("--user", "wget_user"),
-            ("--http-password", "wget_password"),
-            ("--http-user", "wget_user"),
-            ("--ftp-password", "wget_password"),
-            ("--ftp-user", "wget_user"),
-            ("--proxy-user", "wget_user"),
-            ("--proxy-password", "wget_password"),
+            ("--password", "wget_password", false),
+            ("--user", "wget_user", false),
+            ("--http-password", "wget_password", false),
+            ("--http-user", "wget_user", false),
+            ("--ftp-password", "wget_password", false),
+            ("--ftp-user", "wget_user", false),
+            ("--proxy-user", "wget_user", false),
+            ("--proxy-password", "wget_password", false),
         ]),
-        "lftp" => Some(&[("-u", "lftp_user")]),
-        "sshpass" => Some(&[("-p", "sshpass_password")]),
-        "mysql" | "mariadb" => Some(&[("-p", "mysql_password"), ("--password", "mysql_password")]),
+        "lftp" => Some(&[("-u", "lftp_user", false)]),
+        "sshpass" => Some(&[("-p", "sshpass_password", false)]),
+        "mysql" | "mariadb" => Some(&[
+            ("-p", "mysql_password", true),
+            ("--password", "mysql_password", true),
+        ]),
         "mongosh" => Some(&[
-            ("-p", "mongosh_password"),
-            ("--password", "mongosh_password"),
+            ("-p", "mongosh_password", true),
+            ("--password", "mongosh_password", true),
         ]),
-        "cqlsh" => Some(&[("-p", "cqlsh_password"), ("--password", "cqlsh_password")]),
-        "sqlcmd" => Some(&[("-P", "sqlcmd_password"), ("--password", "sqlcmd_password")]),
+        "cqlsh" => Some(&[
+            ("-p", "cqlsh_password", false),
+            ("--password", "cqlsh_password", false),
+        ]),
+        "sqlcmd" => Some(&[
+            ("-P", "sqlcmd_password", false),
+            ("--password", "sqlcmd_password", false),
+        ]),
         "redis-cli" => Some(&[
-            ("-a", "redis_auth"),
-            ("--pass", "redis_auth"),
-            ("--password", "redis_auth"),
+            ("-a", "redis_auth", false),
+            ("--pass", "redis_auth", false),
+            ("--password", "redis_auth", false),
         ]),
         _ => None,
     }
@@ -561,14 +577,14 @@ fn shell_credential_spans(command: &str) -> Option<ShellCredentialSpans> {
             while i < segment_tokens.len() {
                 let token = &segment_tokens[i];
                 let mut matched = None::<(usize, usize, usize, &'static str, usize)>;
-                for (prefix, kind) in options {
+                for &(prefix, kind, value_optional) in options {
                     if prefix.starts_with("--") {
                         let lower = token.to_ascii_lowercase();
-                        if lower == *prefix {
+                        if lower == prefix {
                             if i + 1 < segment_tokens.len()
-                                && !segment_tokens[i + 1].starts_with('-')
+                                && (!value_optional || !segment_tokens[i + 1].starts_with('-'))
                             {
-                                matched = Some((i + 1, 0, segment_tokens[i + 1].len(), *kind, 2));
+                                matched = Some((i + 1, 0, segment_tokens[i + 1].len(), kind, 2));
                             }
                             break;
                         }
@@ -576,18 +592,18 @@ fn shell_credential_spans(command: &str) -> Option<ShellCredentialSpans> {
                         if lower.starts_with(&eq) {
                             let start = prefix.len() + 1;
                             if start < token.len() {
-                                matched = Some((i, start, token.len(), *kind, 1));
+                                matched = Some((i, start, token.len(), kind, 1));
                             }
                             break;
                         }
-                    } else if token.starts_with(*prefix) {
+                    } else if token.starts_with(prefix) {
                         let prefix_len = prefix.len();
                         if token.len() > prefix_len {
-                            matched = Some((i, prefix_len, token.len(), *kind, 1));
+                            matched = Some((i, prefix_len, token.len(), kind, 1));
                         } else if i + 1 < segment_tokens.len()
-                            && !segment_tokens[i + 1].starts_with('-')
+                            && (!value_optional || !segment_tokens[i + 1].starts_with('-'))
                         {
-                            matched = Some((i + 1, 0, segment_tokens[i + 1].len(), *kind, 2));
+                            matched = Some((i + 1, 0, segment_tokens[i + 1].len(), kind, 2));
                         }
                         break;
                     }
@@ -4427,6 +4443,51 @@ mod tests {
             assert!(
                 !projection_text.contains("abcdef1234567890"),
                 "projection leaked header credential for {command}: {projection_text}"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_values_starting_with_dash_are_redacted() {
+        for command in [
+            // Required-argument options consume the next token even if it starts with '-'.
+            "sshpass -p -secret ssh user@host",
+            "redis-cli -a -secret ping",
+            "curl -u -xuser:pass https://example.com",
+            // Optional-argument options still redact glued or `--opt=-value` forms.
+            "mysql -p-secret -h db",
+            "mysql --password=-secret -h db",
+            "mongosh -p-secret -h db",
+            "mongosh --password=-secret -h db",
+        ] {
+            let redacted = projector().redact_bash_command_text(command);
+            assert!(
+                !redacted.contains("-secret") && !redacted.contains("-xuser:pass"),
+                "credential value starting with '-' leaked for {command}: {redacted}"
+            );
+            let projection = projector().project(&bash_action(command));
+            let projection_text = serde_json::to_string(&projection).unwrap();
+            assert!(
+                !projection_text.contains("-secret") && !projection_text.contains("-xuser:pass"),
+                "projection leaked credential starting with '-' for {command}: {projection_text}"
+            );
+        }
+    }
+
+    #[test]
+    fn optional_credential_arguments_preserve_following_minus_options() {
+        // MySQL / mongosh -p are optional: a following option should not be
+        // swallowed as a password.
+        for command in [
+            "mysql -p -h db",
+            "mysql -p -secret -h db",
+            "mongosh -u root -p -h db",
+            "mongosh -u root -p -secret -h db",
+        ] {
+            let redacted = projector().redact_bash_command_text(command);
+            assert!(
+                !redacted.contains("[REDACTED"),
+                "optional credential option misredacted following option for {command}: {redacted}"
             );
         }
     }
