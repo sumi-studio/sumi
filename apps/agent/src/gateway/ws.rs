@@ -177,7 +177,9 @@ impl Gateway for WebSocketGateway {
         &mut self,
         hello: AgentHello,
     ) -> std::result::Result<ApiHello, HelloError> {
-        let hello_text = serde_json::to_string(&hello).context("serialize agent hello")?;
+        let hello_text = serde_json::to_string(&hello)
+            .context("serialize agent hello")
+            .map_err(HelloError::Fatal)?;
         self.ws
             .send(Message::Text(hello_text))
             .await
@@ -202,7 +204,9 @@ impl Gateway for WebSocketGateway {
             }
         };
 
-        let api_hello: ApiHello = serde_json::from_slice(&bytes).context("parse api hello")?;
+        let api_hello: ApiHello = serde_json::from_slice(&bytes)
+            .context("parse api hello")
+            .map_err(HelloError::Fatal)?;
         // Generation claim validation is the supervisor's responsibility so it
         // can classify a mismatch as a fatal error instead of a reconnect.
         Ok(api_hello)
@@ -822,6 +826,37 @@ mod tests {
         assert!(
             matches!(result, Err(HelloError::AuthRejected)),
             "authenticate_hello must classify Close before hello as AuthRejected, got {result:?}"
+        );
+
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn authenticate_hello_treats_malformed_api_hello_as_fatal() {
+        let listener = TcpListener::bind(listener_addr()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            read_agent_hello(&mut ws).await;
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"accepted_generation":"not-a-generation"}"#.to_owned(),
+            ))
+            .await
+            .unwrap();
+        });
+
+        let mut connector =
+            WebSocketConnector::new_insecure(format!("ws://{addr}"), Arc::new(TestDigestFactory));
+        let mut gateway = connector
+            .connect(GatewayCredential::new("valid"))
+            .await
+            .unwrap();
+        let result = gateway.authenticate_hello(test_agent_hello()).await;
+        assert!(
+            matches!(result, Err(HelloError::Fatal(_))),
+            "malformed API hello must be fatal instead of reconnectable, got {result:?}"
         );
 
         let _ = server.await;
