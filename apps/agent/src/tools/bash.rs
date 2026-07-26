@@ -198,18 +198,6 @@ impl<'a> LowTrustLocalBash<'a> {
             .stdin(Stdio::null())
             .stdout(Stdio::from(output_write))
             .stderr(Stdio::from(output_stderr));
-        let applied_quota = self
-            .quota_policy
-            .apply_to_command(&mut process, execution_id)?;
-        for skip in &applied_quota.skipped_features {
-            tracing::warn!(
-                target: "sumi_agent::tools",
-                feature = skip.feature,
-                reason = skip.reason,
-                "skipped resource quota because host feature is unavailable"
-            );
-        }
-
         #[cfg(test)]
         let force_close_range_fallback = self.force_close_range_fallback;
         #[cfg(not(test))]
@@ -224,6 +212,21 @@ impl<'a> LowTrustLocalBash<'a> {
             &self.workspace,
             enforce_broker_socket_isolation,
         );
+        // Register namespace isolation before quota hooks. The low-trust memory
+        // fallback sets RLIMIT_AS; applying that before CLONE_NEWUSER can make
+        // the namespace setup fault in the child. Both boundaries still run in
+        // the child before exec, with the same fail-closed behavior.
+        let applied_quota = self
+            .quota_policy
+            .apply_to_command(&mut process, execution_id)?;
+        for skip in &applied_quota.skipped_features {
+            tracing::warn!(
+                target: "sumi_agent::tools",
+                feature = skip.feature,
+                reason = skip.reason,
+                "skipped resource quota because host feature is unavailable"
+            );
+        }
 
         process.kill_on_drop(true);
         let mut child = process.spawn()?;
