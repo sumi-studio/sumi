@@ -1452,7 +1452,6 @@ mod tests {
             self
         }
 
-        #[allow(dead_code)]
         fn with_hello_error(mut self, err: HelloError) -> Self {
             self.hello_error = Some(err);
             self
