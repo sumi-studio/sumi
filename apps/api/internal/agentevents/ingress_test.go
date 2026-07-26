@@ -26,6 +26,31 @@ type appendCall struct {
 	Command        json.RawMessage
 }
 
+type fakeTokenVerifier struct {
+	conversationID string
+	reject         bool
+	err            error
+}
+
+func (f *fakeTokenVerifier) Verify(ctx context.Context, token string) (TokenClaims, error) {
+	if f.reject {
+		return TokenClaims{}, fmt.Errorf("rejected")
+	}
+	if f.err != nil {
+		return TokenClaims{}, f.err
+	}
+	conv := f.conversationID
+	if conv == "" {
+		conv = "conversation-1"
+	}
+	return TokenClaims{
+		TenantID:       "tenant-1",
+		AgentID:        "agent-1",
+		ConversationID: conv,
+		Generation:     7,
+	}, nil
+}
+
 type errorReadCloser struct{}
 
 func (errorReadCloser) Read([]byte) (int, error) {
@@ -57,11 +82,27 @@ func (f *fakeCommandAppender) callCount() int {
 func newTestIngress(t *testing.T) (*UserCommandIngress, *fakeCommandAppender) {
 	t.Helper()
 	appender := &fakeCommandAppender{}
-	ingress, err := NewUserCommandIngress(appender)
+	verifier := &fakeTokenVerifier{conversationID: "conv-1"}
+	ingress, err := NewUserCommandIngress(appender, verifier)
 	if err != nil {
 		t.Fatalf("new ingress: %v", err)
 	}
 	return ingress, appender
+}
+
+func postAuthorized(t *testing.T, url string, body []byte) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	return resp
 }
 
 func newCommandMux(ingress *UserCommandIngress) *http.ServeMux {
@@ -76,10 +117,7 @@ func TestUserCommandIngress_ValidRequestAllocatesSeq(t *testing.T) {
 	defer server.Close()
 
 	body := []byte(`{"type":"user_message","text":"hi","attachments":[]}`)
-	resp, err := http.Post(server.URL+"/conversations/conv-1/commands", "application/json", bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("post: %v", err)
-	}
+	resp := postAuthorized(t, server.URL+"/conversations/conv-1/commands", body)
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusCreated {
@@ -114,10 +152,7 @@ func TestUserCommandIngress_OversizedRejectedWithoutAllocatingSeq(t *testing.T) 
 		t.Fatalf("test fixture not oversized: %d bytes", len(body))
 	}
 
-	resp, err := http.Post(server.URL+"/conversations/conv-1/commands", "application/json", bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("post: %v", err)
-	}
+	resp := postAuthorized(t, server.URL+"/conversations/conv-1/commands", body)
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusBadRequest {
@@ -130,10 +165,7 @@ func TestUserCommandIngress_OversizedRejectedWithoutAllocatingSeq(t *testing.T) 
 
 	// A subsequent valid request must receive the first contiguous sequence.
 	valid := []byte(`{"type":"user_message","text":"hi","attachments":[]}`)
-	resp2, err := http.Post(server.URL+"/conversations/conv-1/commands", "application/json", bytes.NewReader(valid))
-	if err != nil {
-		t.Fatalf("post valid after reject: %v", err)
-	}
+	resp2 := postAuthorized(t, server.URL+"/conversations/conv-1/commands", valid)
 	defer resp2.Body.Close()
 	if resp2.StatusCode != http.StatusCreated {
 		t.Fatalf("expected 201 after reject, got %d", resp2.StatusCode)
@@ -156,10 +188,7 @@ func TestUserCommandIngress_NonEmptyAttachmentsRejected(t *testing.T) {
 	defer server.Close()
 
 	body := []byte(`{"type":"user_message","text":"hi","attachments":[{"name":"x"}]}`)
-	resp, err := http.Post(server.URL+"/conversations/conv-1/commands", "application/json", bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("post: %v", err)
-	}
+	resp := postAuthorized(t, server.URL+"/conversations/conv-1/commands", body)
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusBadRequest {
@@ -171,10 +200,7 @@ func TestUserCommandIngress_NonEmptyAttachmentsRejected(t *testing.T) {
 	assertRejectReason(t, resp.Body, RejectAttachmentsNotEmpty)
 
 	valid := []byte(`{"type":"user_message","text":"hi","attachments":[]}`)
-	resp2, err := http.Post(server.URL+"/conversations/conv-1/commands", "application/json", bytes.NewReader(valid))
-	if err != nil {
-		t.Fatalf("post valid: %v", err)
-	}
+	resp2 := postAuthorized(t, server.URL+"/conversations/conv-1/commands", valid)
 	defer resp2.Body.Close()
 	var env CommandEnvelope
 	if err := json.NewDecoder(resp2.Body).Decode(&env); err != nil {
@@ -224,10 +250,7 @@ func TestUserCommandIngress_MalformedAndUnknownRejected(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			resp, err := http.Post(server.URL+"/conversations/conv-1/commands", "application/json", strings.NewReader(tc.body))
-			if err != nil {
-				t.Fatalf("post: %v", err)
-			}
+			resp := postAuthorized(t, server.URL+"/conversations/conv-1/commands", []byte(tc.body))
 			defer resp.Body.Close()
 			if resp.StatusCode != http.StatusBadRequest {
 				t.Fatalf("expected 400, got %d", resp.StatusCode)
@@ -250,10 +273,7 @@ func TestUserCommandIngress_InvalidUTF8RejectedWithoutAllocatingSeq(t *testing.T
 		0xff,
 	)
 	body = append(body, []byte(`","attachments":[]}`)...)
-	resp, err := http.Post(server.URL+"/conversations/conv-1/commands", "application/json", bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("post: %v", err)
-	}
+	resp := postAuthorized(t, server.URL+"/conversations/conv-1/commands", body)
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusBadRequest {
@@ -273,6 +293,7 @@ func TestUserCommandIngress_BodyReadFailureIsNotMisclassifiedAsOversized(t *test
 		nil,
 	)
 	req.SetPathValue("conversation_id", "conv-1")
+	req.Header.Set("Authorization", "Bearer test-token")
 	req.Body = errorReadCloser{}
 	recorder := httptest.NewRecorder()
 
@@ -294,10 +315,7 @@ func TestUserCommandIngress_MultipleValidRequestsAreContiguous(t *testing.T) {
 
 	for i := 1; i <= 3; i++ {
 		body := []byte(fmt.Sprintf(`{"type":"user_message","text":"msg %d","attachments":[]}`, i))
-		resp, err := http.Post(server.URL+"/conversations/conv-1/commands", "application/json", bytes.NewReader(body))
-		if err != nil {
-			t.Fatalf("post %d: %v", i, err)
-		}
+		resp := postAuthorized(t, server.URL+"/conversations/conv-1/commands", body)
 		if resp.StatusCode != http.StatusCreated {
 			t.Fatalf("expected 201 for request %d, got %d", i, resp.StatusCode)
 		}
@@ -315,8 +333,78 @@ func TestUserCommandIngress_MultipleValidRequestsAreContiguous(t *testing.T) {
 	}
 }
 
+func TestUserCommandIngress_RequiresAuthorization(t *testing.T) {
+	appender := &fakeCommandAppender{}
+	ingress, err := NewUserCommandIngress(appender, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.Handle("POST /conversations/{conversation_id}/commands", ingress)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	body := []byte(`{"type":"user_message","text":"hi","attachments":[]}`)
+	resp := postAuthorized(t, server.URL+"/conversations/conv-1/commands", body)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unconfigured verifier, got %d", resp.StatusCode)
+	}
+	if appender.callCount() != 0 {
+		t.Fatalf("expected 0 append calls, got %d", appender.callCount())
+	}
+}
+
+func TestUserCommandIngress_RejectsInvalidAndWrongConversationToken(t *testing.T) {
+	appender := &fakeCommandAppender{}
+	verifier := &fakeTokenVerifier{conversationID: "other-conversation"}
+	ingress, err := NewUserCommandIngress(appender, verifier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.Handle("POST /conversations/{conversation_id}/commands", ingress)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	body := []byte(`{"type":"user_message","text":"hi","attachments":[]}`)
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/conversations/conv-1/commands", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for wrong conversation, got %d", resp.StatusCode)
+	}
+	if appender.callCount() != 0 {
+		t.Fatalf("expected 0 append calls, got %d", appender.callCount())
+	}
+
+	verifier.reject = true
+	req2, err := http.NewRequest(http.MethodPost, server.URL+"/conversations/conv-1/commands", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("Authorization", "Bearer test-token")
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for rejected token, got %d", resp2.StatusCode)
+	}
+}
+
 func TestUserCommandIngress_NilAppenderFailsClosed(t *testing.T) {
-	if _, err := NewUserCommandIngress(nil); err == nil {
+	if _, err := NewUserCommandIngress(nil, nil); err == nil {
 		t.Fatal("expected nil appender to fail closed")
 	}
 }

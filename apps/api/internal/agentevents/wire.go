@@ -173,10 +173,16 @@ func validateApprovalDecision(raw json.RawMessage) error {
 		if len(v.Rule) == 0 {
 			return fmt.Errorf("approve_always requires rule")
 		}
+		if string(v.Rule) == "null" {
+			return fmt.Errorf("approve_always rule must be an object")
+		}
 		// DeferredApprovalRule must be a JSON object with open properties.
 		var rule map[string]json.RawMessage
 		if err := json.Unmarshal(v.Rule, &rule); err != nil {
 			return fmt.Errorf("rule must be an object: %w", err)
+		}
+		if rule == nil {
+			return fmt.Errorf("approve_always rule must be an object")
 		}
 	default:
 		return fmt.Errorf("unknown approval decision type: %q", d.Type)
@@ -233,25 +239,54 @@ func (o *OutboundFrame) UnmarshalJSON(data []byte) error {
 		Envelope:  raw.Envelope,
 	}
 	if raw.Ack != nil {
-		if raw.Ack.Seq == nil {
-			return fmt.Errorf("command_ack seq is required")
+		ack, err := assembleCommandAck(*raw.Ack)
+		if err != nil {
+			return err
 		}
-		o.Ack = &CommandAck{
-			Seq:          *raw.Ack.Seq,
-			CommandID:    raw.Ack.CommandID,
-			Status:       raw.Ack.Status,
-			RejectReason: raw.Ack.RejectReason,
-		}
+		o.Ack = ack
 	}
 	return o.Validate()
 }
 
+// assembleCommandAck converts rawCommandAck into CommandAck and enforces the
+// schema rule that reject_reason is a string when status is rejected, and is
+// absent (not null) for any other status.
+func assembleCommandAck(raw rawCommandAck) (*CommandAck, error) {
+	if raw.Seq == nil {
+		return nil, fmt.Errorf("command_ack seq is required")
+	}
+
+	ack := CommandAck{
+		Seq:       *raw.Seq,
+		CommandID: raw.CommandID,
+		Status:    raw.Status,
+	}
+
+	switch len(raw.RejectReason) {
+	case 0:
+		// Field is absent.
+	case 4:
+		if string(raw.RejectReason) == "null" {
+			return nil, fmt.Errorf("command_ack reject_reason must not be explicit null")
+		}
+		fallthrough
+	default:
+		var reason string
+		if err := json.Unmarshal(raw.RejectReason, &reason); err != nil {
+			return nil, fmt.Errorf("command_ack reject_reason must be a string: %w", err)
+		}
+		ack.RejectReason = &reason
+	}
+
+	return &ack, nil
+}
+
 // rawCommandAck uses a pointer Seq so we can tell "missing" from "zero".
 type rawCommandAck struct {
-	Seq          *uint64 `json:"seq"`
-	CommandID    string  `json:"command_id"`
-	Status       string  `json:"status"`
-	RejectReason *string `json:"reject_reason,omitempty"`
+	Seq          *uint64         `json:"seq"`
+	CommandID    string          `json:"command_id"`
+	Status       string          `json:"status"`
+	RejectReason json.RawMessage `json:"reject_reason,omitempty"`
 }
 
 // Validate returns an error if the frame does not match the public contract.

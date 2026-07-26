@@ -45,8 +45,9 @@ type GenerationVerifier interface {
 // CommandSource is the durable command log. It is authoritative for seq numbers
 // and retransmission. Production wiring belongs to T17.
 type CommandSource interface {
-	// NextCommandSeq returns the next seq the API expects the agent to apply.
-	NextCommandSeq(ctx context.Context, claims TokenClaims) (uint64, error)
+	// FirstCommandSeq returns the first seq present in the durable command log.
+	// It is used as a lower bound so catch-up cannot skip unapplied commands.
+	FirstCommandSeq(ctx context.Context, claims TokenClaims) (uint64, error)
 	// CatchUp returns commands starting from fromSeq up to the durable tail.
 	CatchUp(ctx context.Context, claims TokenClaims, fromSeq uint64) ([]CommandEnvelope, error)
 	// Live returns a channel of new commands after catch-up has reached the tail.
@@ -173,9 +174,21 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 	helloCtx, helloDone := context.WithTimeout(ctx, s.HelloTimeout)
 	defer helloDone()
 
+	if s.HelloTimeout > 0 {
+		if err := conn.SetReadDeadline(time.Now().Add(s.HelloTimeout)); err != nil {
+			return fmt.Errorf("set hello read deadline: %w", err)
+		}
+	}
+
 	var hello AgentHello
 	if err := conn.ReadJSON(&hello); err != nil {
 		return fmt.Errorf("read hello: %w", err)
+	}
+
+	// Remove the hello-specific deadline so catch-up and live reads are not
+	// bounded by the handshake timeout.
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		return fmt.Errorf("clear hello read deadline: %w", err)
 	}
 
 	if hello.AgentID != claims.AgentID {
@@ -192,12 +205,13 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 		return fmt.Errorf("hydration wait: %w", err)
 	}
 
-	nextSeq, err := s.Commands.NextCommandSeq(helloCtx, claims)
+	firstSeq, err := s.Commands.FirstCommandSeq(helloCtx, claims)
 	if err != nil {
-		return fmt.Errorf("next command seq: %w", err)
+		return fmt.Errorf("first command seq: %w", err)
 	}
-	if nextSeq < hello.LastAppliedCommandSeq+1 {
-		nextSeq = hello.LastAppliedCommandSeq + 1
+	nextSeq := hello.LastAppliedCommandSeq + 1
+	if nextSeq < firstSeq {
+		nextSeq = firstSeq
 	}
 
 	apiHello := ApiHello{
@@ -289,6 +303,12 @@ func (s *Server) writePump(ctx context.Context, conn *websocket.Conn, live <-cha
 }
 
 func sendCommandEnvelope(conn *websocket.Conn, cmd CommandEnvelope) error {
+	if cmd.CommandID == "" {
+		return fmt.Errorf("command envelope missing command_id")
+	}
+	if !canonicalUUIDRegexp.MatchString(cmd.CommandID) {
+		return fmt.Errorf("command_id %q is not a canonical lowercase UUID", cmd.CommandID)
+	}
 	if err := ValidateCommand(cmd.Command); err != nil {
 		return err
 	}

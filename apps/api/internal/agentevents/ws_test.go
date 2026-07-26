@@ -13,22 +13,6 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-type fakeTokenVerifier struct {
-	reject bool
-}
-
-func (f *fakeTokenVerifier) Verify(ctx context.Context, token string) (TokenClaims, error) {
-	if f.reject || token == "" {
-		return TokenClaims{}, fmt.Errorf("rejected")
-	}
-	return TokenClaims{
-		TenantID:       "tenant-1",
-		AgentID:        "agent-1",
-		ConversationID: "conversation-1",
-		Generation:     7,
-	}, nil
-}
-
 type fakeGenerationVerifier struct {
 	mu     sync.Mutex
 	latest uint64
@@ -61,7 +45,7 @@ func newFakeCommandSource() *fakeCommandSource {
 	return &fakeCommandSource{live: make(chan CommandEnvelope, 16)}
 }
 
-func (f *fakeCommandSource) NextCommandSeq(ctx context.Context, claims TokenClaims) (uint64, error) {
+func (f *fakeCommandSource) FirstCommandSeq(ctx context.Context, claims TokenClaims) (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if len(f.commands) == 0 {
@@ -533,6 +517,100 @@ func TestWebSocketOriginPolicy(t *testing.T) {
 		t.Fatalf("expected allowed origin to upgrade: %v", err)
 	}
 	conn.Close()
+}
+
+func TestWebSocketCatchUpFromLastAppliedDoesNotSkip(t *testing.T) {
+	srv, _, _, cs, _, hl := newTestServer(t)
+	hl.setReady()
+
+	for i := 1; i <= 2; i++ {
+		cs.pushCommand(CommandEnvelope{
+			Seq:       uint64(i),
+			CommandID: fmt.Sprintf("00000000-0000-4000-8000-%012d", i),
+			Command:   []byte(`{"type":"user_message","text":"hi","attachments":[]}`),
+		})
+	}
+
+	server := startTestServer(t, srv)
+	defer server.Close()
+
+	header := map[string][]string{"Authorization": {"Bearer test-token"}}
+	conn, resp, err := dialTestWS(t, server, header)
+	if err != nil {
+		t.Fatalf("dial: %v (status %d)", err, resp.StatusCode)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteJSON(AgentHello{
+		AgentID:                "agent-1",
+		Generation:             7,
+		LastSentEventSeq:       0,
+		LastReceivedCommandSeq: 0,
+		LastAppliedCommandSeq:  1,
+	}); err != nil {
+		t.Fatalf("write hello: %v", err)
+	}
+
+	var apiHello ApiHello
+	if err := conn.ReadJSON(&apiHello); err != nil {
+		t.Fatalf("read api hello: %v", err)
+	}
+	if apiHello.NextCommandSeq != 2 {
+		t.Fatalf("expected NextCommandSeq 2, got %d", apiHello.NextCommandSeq)
+	}
+
+	var received CommandEnvelope
+	if err := conn.ReadJSON(&received); err != nil {
+		t.Fatalf("read command: %v", err)
+	}
+	if received.Seq != 2 {
+		t.Fatalf("expected catch-up command seq 2, got %d", received.Seq)
+	}
+}
+
+func TestWebSocketRejectsInvalidCommandID(t *testing.T) {
+	srv, _, _, cs, _, hl := newTestServer(t)
+	hl.setReady()
+	cs.pushCommand(CommandEnvelope{
+		Seq:       1,
+		CommandID: "not-a-canonical-uuid",
+		Command:   []byte(`{"type":"user_message","text":"hi","attachments":[]}`),
+	})
+
+	server := startTestServer(t, srv)
+	defer server.Close()
+
+	header := map[string][]string{"Authorization": {"Bearer test-token"}}
+	conn, resp, err := dialTestWS(t, server, header)
+	if err != nil {
+		t.Fatalf("dial: %v (status %d)", err, resp.StatusCode)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteJSON(AgentHello{
+		AgentID:                "agent-1",
+		Generation:             7,
+		LastSentEventSeq:       0,
+		LastReceivedCommandSeq: 0,
+		LastAppliedCommandSeq:  0,
+	}); err != nil {
+		t.Fatalf("write hello: %v", err)
+	}
+
+	var apiHello ApiHello
+	if err := conn.ReadJSON(&apiHello); err != nil {
+		t.Fatalf("read api hello: %v", err)
+	}
+	if apiHello.NextCommandSeq != 1 {
+		t.Fatalf("expected NextCommandSeq 1, got %d", apiHello.NextCommandSeq)
+	}
+
+	conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	defer conn.SetReadDeadline(time.Time{})
+	var received CommandEnvelope
+	if err := conn.ReadJSON(&received); err == nil {
+		t.Fatal("expected connection to close on invalid command_id")
+	}
 }
 
 func startTestServer(t *testing.T, srv *Server) *httptest.Server {

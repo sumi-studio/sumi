@@ -3,7 +3,12 @@ package agentevents
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -335,5 +340,614 @@ func TestCommandStore_RaceNoDuplicateSeqUnderPressure(t *testing.T) {
 
 	if len(seqs) != workers {
 		t.Fatalf("expected %d unique seqs, got %d", workers, len(seqs))
+	}
+}
+
+func TestCommandStore_IdempotencyKeyPersistsAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenCommandStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := json.RawMessage(`{"type":"user_message","text":"idem","attachments":[]}`)
+	env1, err := store.Append(context.Background(), "conv-1", "key-1", cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store2, err := OpenCommandStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store2.Close()
+
+	env2, err := store2.Append(context.Background(), "conv-1", "key-1", cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env2.Seq != env1.Seq || env2.CommandID != env1.CommandID {
+		t.Fatalf("restart lost idempotency: got %+v vs %+v", env2, env1)
+	}
+
+	cmd3 := json.RawMessage(`{"type":"user_message","text":"different","attachments":[]}`)
+	_, err = store2.Append(context.Background(), "conv-1", "key-1", cmd3)
+	if err == nil {
+		t.Fatal("expected idempotency conflict after restart for different command body")
+	}
+	if !isIdempotencyConflict(err) {
+		t.Fatalf("expected idempotency conflict, got %v", err)
+	}
+}
+
+func TestCommandStore_PartialTailRecovery(t *testing.T) {
+	dir := t.TempDir()
+	env := func(seq uint64) string {
+		b, _ := json.Marshal(LogRecord{
+			CommandEnvelope: CommandEnvelope{
+				Seq:       seq,
+				CommandID: "00000000-0000-4000-8000-00000000000" + string(rune('1'+seq-1)),
+				Command:   json.RawMessage(`{"type":"user_message","text":"x","attachments":[]}`),
+			},
+		})
+		return string(b)
+	}
+
+	// Two complete records followed by a partial third (no trailing newline).
+	contents := env(1) + "\n" + env(2) + "\n" + env(3)[:len(env(3))-3]
+	path := commandLogPath(dir, "conv-1")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := OpenCommandStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	caught, err := store.CatchUp(context.Background(), "conv-1", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(caught) != 2 || caught[0].Seq != 1 || caught[1].Seq != 2 {
+		t.Fatalf("expected seq [1,2], got %+v", caught)
+	}
+
+	next, err := store.NextCommandSeq(context.Background(), "conv-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != 3 {
+		t.Fatalf("expected next seq 3 after tail truncation, got %d", next)
+	}
+
+	env3, err := store.Append(context.Background(), "conv-1", "", json.RawMessage(`{"type":"user_message","text":"third","attachments":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env3.Seq != 3 {
+		t.Fatalf("expected seq 3 after recovery, got %d", env3.Seq)
+	}
+}
+
+func TestCommandStore_InteriorMalformedRecordIsRejected(t *testing.T) {
+	dir := t.TempDir()
+	env := func(seq uint64) string {
+		b, _ := json.Marshal(LogRecord{
+			CommandEnvelope: CommandEnvelope{
+				Seq:       seq,
+				CommandID: "00000000-0000-4000-8000-00000000000" + string(rune('1'+seq-1)),
+				Command:   json.RawMessage(`{"type":"user_message","text":"x","attachments":[]}`),
+			},
+		})
+		return string(b)
+	}
+
+	// A complete record, then a malformed complete interior record, then a
+	// partial final record. Only the final tail may be truncated; the interior
+	// malformed record must fail the load.
+	contents := env(1) + "\n" + `{"not":"valid"` + "\n" + env(2)[:len(env(2))-3]
+	path := commandLogPath(dir, "conv-1")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := OpenCommandStore(dir)
+	if err == nil {
+		t.Fatal("expected OpenCommandStore to reject malformed interior record")
+	}
+	if !strings.Contains(err.Error(), "decode command log") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestCommandStore_FirstCommandSeqAndCatchUp(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenCommandStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	first, err := store.FirstCommandSeq(context.Background(), "conv-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != 1 {
+		t.Fatalf("expected FirstCommandSeq 1 for empty log, got %d", first)
+	}
+
+	for i := 1; i <= 3; i++ {
+		cmd := json.RawMessage(fmt.Sprintf(`{"type":"user_message","text":"msg %d","attachments":[]}`, i))
+		if _, err := store.Append(context.Background(), "conv-1", "", cmd); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	first, err = store.FirstCommandSeq(context.Background(), "conv-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != 1 {
+		t.Fatalf("expected FirstCommandSeq 1, got %d", first)
+	}
+
+	// Catch-up from LastAppliedCommandSeq+1 (2) must return seq 2 and 3.
+	caught, err := store.CatchUp(context.Background(), "conv-1", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(caught) != 2 || caught[0].Seq != 2 || caught[1].Seq != 3 {
+		t.Fatalf("expected catch-up [2,3], got %+v", caught)
+	}
+}
+
+func TestCommandStore_RejectsSymlinkedLogFile(t *testing.T) {
+	dir := t.TempDir()
+	outside, err := os.MkdirTemp("", "sumi-command-escape")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(outside)
+
+	target := filepath.Join(outside, "real.jsonl")
+	if err := os.WriteFile(target, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	link := filepath.Join(dir, "commands-conv.jsonl")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = OpenCommandStore(dir)
+	if err == nil {
+		t.Fatal("expected OpenCommandStore to reject symlinked log file")
+	}
+	if !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("expected symlink error, got %v", err)
+	}
+}
+
+func TestCommandStore_DuplicateSeqOnDiskIsRejected(t *testing.T) {
+	dir := t.TempDir()
+	rec := LogRecord{
+		CommandEnvelope: CommandEnvelope{
+			Seq:       1,
+			CommandID: "00000000-0000-4000-8000-000000000001",
+			Command:   json.RawMessage(`{"type":"user_message","text":"x","attachments":[]}`),
+		},
+	}
+	line, _ := json.Marshal(rec)
+	// Write the same seq twice, simulating a crash where a committed line was
+	// appended again before nextSeq advanced.
+	contents := string(line) + "\n" + string(line) + "\n"
+	path := commandLogPath(dir, "conv-1")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := OpenCommandStore(dir)
+	if err == nil {
+		t.Fatal("expected OpenCommandStore to reject duplicate seq on disk")
+	}
+	if !strings.Contains(err.Error(), "duplicate seq") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// failingFile wraps *os.File and can fail on a specific 1-indexed call to a
+// method, giving tests deterministic control over write/sync/truncate failures.
+type failingFile struct {
+	*os.File
+	mu             sync.Mutex
+	writeCalls     int
+	failWriteOn    int
+	syncCalls      int
+	failSyncOn     int
+	truncateCalls  int
+	failTruncateOn int
+	seekCalls      int
+	failSeekOn     int
+}
+
+func (f *failingFile) Write(p []byte) (int, error) {
+	f.mu.Lock()
+	f.writeCalls++
+	fail := f.writeCalls == f.failWriteOn
+	f.mu.Unlock()
+	if fail {
+		return 0, errors.New("injected write failure")
+	}
+	return f.File.Write(p)
+}
+
+func (f *failingFile) Sync() error {
+	f.mu.Lock()
+	f.syncCalls++
+	fail := f.syncCalls == f.failSyncOn
+	f.mu.Unlock()
+	if fail {
+		return errors.New("injected sync failure")
+	}
+	return f.File.Sync()
+}
+
+func (f *failingFile) Truncate(size int64) error {
+	f.mu.Lock()
+	f.truncateCalls++
+	fail := f.truncateCalls == f.failTruncateOn
+	f.mu.Unlock()
+	if fail {
+		return errors.New("injected truncate failure")
+	}
+	return f.File.Truncate(size)
+}
+
+func (f *failingFile) Seek(offset int64, whence int) (int64, error) {
+	f.mu.Lock()
+	f.seekCalls++
+	fail := f.seekCalls == f.failSeekOn
+	f.mu.Unlock()
+	if fail {
+		return 0, errors.New("injected seek failure")
+	}
+	return f.File.Seek(offset, whence)
+}
+
+func injectFailingFile(t *testing.T, store *CommandStore, conversationID string) *failingFile {
+	t.Helper()
+	st := store.states[conversationID]
+	if st == nil {
+		t.Fatalf("no state for conversation %q", conversationID)
+	}
+	ff := &failingFile{File: st.file.(*os.File)}
+	st.file = ff
+	return ff
+}
+
+func TestCommandStore_PoisonOnWriteRollbackFailure(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenCommandStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// Seed the file so the append path seeks to end and then fails.
+	if _, err := store.Append(context.Background(), "conv-1", "", json.RawMessage(`{"type":"noop"}`)); err != nil {
+		t.Fatal(err)
+	}
+
+	ff := injectFailingFile(t, store, "conv-1")
+	ff.failWriteOn = 1
+	ff.failTruncateOn = 1
+
+	_, err = store.Append(context.Background(), "conv-1", "", json.RawMessage(`{"type":"noop"}`))
+	if err == nil {
+		t.Fatal("expected append to fail")
+	}
+	if !strings.Contains(err.Error(), "rollback could not be confirmed") {
+		t.Fatalf("expected compound rollback error, got %v", err)
+	}
+
+	_, err = store.Append(context.Background(), "conv-1", "", json.RawMessage(`{"type":"noop"}`))
+	if err == nil || !strings.Contains(err.Error(), "poisoned") {
+		t.Fatalf("expected poisoned state error, got %v", err)
+	}
+}
+
+func TestCommandStore_PoisonOnSyncRollbackFailure(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenCommandStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if _, err := store.Append(context.Background(), "conv-1", "", json.RawMessage(`{"type":"noop"}`)); err != nil {
+		t.Fatal(err)
+	}
+
+	ff := injectFailingFile(t, store, "conv-1")
+	ff.failSyncOn = 1
+	ff.failTruncateOn = 1
+
+	_, err = store.Append(context.Background(), "conv-1", "", json.RawMessage(`{"type":"noop"}`))
+	if err == nil {
+		t.Fatal("expected append to fail")
+	}
+	if !strings.Contains(err.Error(), "rollback could not be confirmed") {
+		t.Fatalf("expected compound rollback error, got %v", err)
+	}
+
+	_, err = store.NextCommandSeq(context.Background(), "conv-1")
+	if err == nil || !strings.Contains(err.Error(), "poisoned") {
+		t.Fatalf("expected poisoned state error, got %v", err)
+	}
+}
+
+func TestCommandStore_NoPoisonOnRollbackSuccess(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenCommandStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if _, err := store.Append(context.Background(), "conv-1", "", json.RawMessage(`{"type":"noop"}`)); err != nil {
+		t.Fatal(err)
+	}
+
+	ff := injectFailingFile(t, store, "conv-1")
+	ff.failSyncOn = 1
+
+	_, err = store.Append(context.Background(), "conv-1", "", json.RawMessage(`{"type":"noop"}`))
+	if err == nil {
+		t.Fatal("expected append to fail")
+	}
+	if strings.Contains(err.Error(), "poisoned") {
+		t.Fatalf("expected non-poisoning sync error, got %v", err)
+	}
+
+	next, err := store.NextCommandSeq(context.Background(), "conv-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != 2 {
+		t.Fatalf("expected next seq to remain 2 after rollback, got %d", next)
+	}
+
+	env, err := store.Append(context.Background(), "conv-1", "", json.RawMessage(`{"type":"noop"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env.Seq != 2 {
+		t.Fatalf("expected seq 2 after successful retry, got %d", env.Seq)
+	}
+}
+
+func TestCommandStore_LoadIncompleteTailWithoutNewline(t *testing.T) {
+	dir := t.TempDir()
+	rec := func(seq uint64) []byte {
+		r := LogRecord{
+			CommandEnvelope: CommandEnvelope{
+				Seq:       seq,
+				CommandID: fmt.Sprintf("00000000-0000-4000-8000-%012d", seq),
+				Command:   json.RawMessage(`{"type":"user_message","text":"x","attachments":[]}`),
+			},
+		}
+		b, _ := json.Marshal(r)
+		return b
+	}
+
+	partial := string(rec(2))[:len(rec(2))-7]
+	contents := string(rec(1)) + "\n" + partial
+	path := commandLogPath(dir, "conv-1")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := OpenCommandStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	first, err := store.FirstCommandSeq(context.Background(), "conv-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != 1 {
+		t.Fatalf("expected first seq 1, got %d", first)
+	}
+	next, err := store.NextCommandSeq(context.Background(), "conv-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != 2 {
+		t.Fatalf("expected next seq 2 after truncating incomplete tail, got %d", next)
+	}
+}
+
+func TestCommandStore_LoadMalformedFinalRecordWithoutNewlineFails(t *testing.T) {
+	dir := t.TempDir()
+	rec := LogRecord{
+		CommandEnvelope: CommandEnvelope{
+			Seq:       1,
+			CommandID: "00000000-0000-4000-8000-000000000001",
+			Command:   json.RawMessage(`{"type":"user_message","text":"x","attachments":[]}`),
+		},
+	}
+	line, _ := json.Marshal(rec)
+	// A complete (all braces present) but syntactically invalid final record with no newline.
+	malformed := `{"seq":2,"command_id":"00000000-0000-4000-8000-000000000002","command":{}}}`
+	contents := string(line) + "\n" + malformed
+	path := commandLogPath(dir, "conv-1")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := OpenCommandStore(dir)
+	if err == nil {
+		t.Fatal("expected OpenCommandStore to reject complete-but-malformed final record")
+	}
+	if !strings.Contains(err.Error(), "malformed but complete") {
+		t.Fatalf("expected malformed-but-complete error, got %v", err)
+	}
+}
+
+func TestCommandStore_LoadValidFinalRecordWithoutNewline(t *testing.T) {
+	dir := t.TempDir()
+	rec := func(seq uint64) []byte {
+		r := LogRecord{
+			CommandEnvelope: CommandEnvelope{
+				Seq:       seq,
+				CommandID: fmt.Sprintf("00000000-0000-4000-8000-%012d", seq),
+				Command:   json.RawMessage(`{"type":"user_message","text":"x","attachments":[]}`),
+			},
+		}
+		b, _ := json.Marshal(r)
+		return b
+	}
+
+	contents := string(rec(1)) + "\n" + string(rec(2))
+	path := commandLogPath(dir, "conv-1")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := OpenCommandStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	next, err := store.NextCommandSeq(context.Background(), "conv-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != 3 {
+		t.Fatalf("expected next seq 3, got %d", next)
+	}
+}
+
+func TestCommandStore_RepairMissingTrailingNewlineEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	rec := func(seq uint64, text string) []byte {
+		r := LogRecord{
+			CommandEnvelope: CommandEnvelope{
+				Seq:       seq,
+				CommandID: fmt.Sprintf("00000000-0000-4000-8000-%012d", seq),
+				Command:   json.RawMessage(fmt.Sprintf(`{"type":"user_message","text":%q,"attachments":[]}`, text)),
+			},
+		}
+		b, _ := json.Marshal(r)
+		return b
+	}
+
+	// Two valid records; the second is missing its trailing newline.
+	contents := string(rec(1, "first")) + "\n" + string(rec(2, "second"))
+	path := commandLogPath(dir, "conv-1")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := OpenCommandStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	env3, err := store.Append(context.Background(), "conv-1", "", json.RawMessage(`{"type":"user_message","text":"third","attachments":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env3.Seq != 3 {
+		t.Fatalf("expected seq 3, got %d", env3.Seq)
+	}
+
+	all, err := store.CatchUp(context.Background(), "conv-1", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 3 || all[0].Seq != 1 || all[1].Seq != 2 || all[2].Seq != 3 {
+		t.Fatalf("expected [1,2,3], got %+v", all)
+	}
+
+	texts := []string{"first", "second", "third"}
+	for i, env := range all {
+		if !strings.Contains(string(env.Command), texts[i]) {
+			t.Fatalf("command %d does not contain %q: %s", env.Seq, texts[i], env.Command)
+		}
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store2, err := OpenCommandStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store2.Close()
+
+	all2, err := store2.CatchUp(context.Background(), "conv-1", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all2) != 3 || all2[0].Seq != 1 || all2[1].Seq != 2 || all2[2].Seq != 3 {
+		t.Fatalf("after reopen expected [1,2,3], got %+v", all2)
+	}
+
+	seen := make(map[string]bool)
+	for _, env := range all2 {
+		if seen[env.CommandID] {
+			t.Fatalf("duplicate command_id %q", env.CommandID)
+		}
+		seen[env.CommandID] = true
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trimmed := strings.TrimSuffix(string(raw), "\n")
+	lines := strings.Split(trimmed, "\n")
+	if len(lines) != 3 {
+		t.Fatalf("expected exactly 3 JSONL lines, got %d: %s", len(lines), string(raw))
+	}
+	for i, l := range lines {
+		if len(l) == 0 {
+			t.Fatalf("line %d is empty", i)
+		}
+		var lr LogRecord
+		if err := json.Unmarshal([]byte(l), &lr); err != nil {
+			t.Fatalf("line %d is not valid JSON: %v: %q", i, err, l)
+		}
 	}
 }

@@ -45,22 +45,25 @@ type CommandAppender interface {
 }
 
 // UserCommandIngress is the HTTP handler for web → API user command admission.
-// It rejects oversized payloads, non-empty attachments, and malformed commands
-// before calling CommandAppender.Append, so rejected requests never allocate a
-// command_id or seq and cannot poison later commands.
+// It authenticates the caller, authorizes the conversation, then rejects
+// oversized payloads, non-empty attachments, and malformed commands before
+// calling CommandAppender.Append. Rejected requests never allocate a command_id
+// or seq and cannot poison later commands.
 type UserCommandIngress struct {
 	Appender CommandAppender
+	Verifier TokenVerifier
 	MaxBytes int64
 }
 
 // NewUserCommandIngress returns an ingress handler wired to the given appender.
 // It fail-closes: a nil appender returns an error so cmd/server cannot expose
-// the route with an unbacked log.
-func NewUserCommandIngress(appender CommandAppender) (*UserCommandIngress, error) {
+// the route with an unbacked log. A nil Verifier causes every request to be
+// rejected with 401 until a production TokenVerifier is wired.
+func NewUserCommandIngress(appender CommandAppender, verifier TokenVerifier) (*UserCommandIngress, error) {
 	if appender == nil {
 		return nil, errors.New("CommandAppender is required")
 	}
-	return &UserCommandIngress{Appender: appender, MaxBytes: MaxUserCommandBytes}, nil
+	return &UserCommandIngress{Appender: appender, Verifier: verifier, MaxBytes: MaxUserCommandBytes}, nil
 }
 
 func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -72,6 +75,23 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	conversationID := r.PathValue("conversation_id")
 	if conversationID == "" {
 		http.Error(w, "missing conversation_id", http.StatusBadRequest)
+		return
+	}
+
+	token, ok := bearerToken(r.Header.Get("Authorization"))
+	if !ok || h.Verifier == nil {
+		http.Error(w, "missing authorization", http.StatusUnauthorized)
+		return
+	}
+
+	claims, err := h.Verifier.Verify(r.Context(), token)
+	if err != nil {
+		http.Error(w, "invalid authorization", http.StatusUnauthorized)
+		return
+	}
+
+	if claims.ConversationID != conversationID {
+		http.Error(w, "conversation authorization failed", http.StatusForbidden)
 		return
 	}
 

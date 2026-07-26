@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/handler"
@@ -24,16 +25,29 @@ func main() {
 		log.Fatal(err)
 	}
 
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
 	log.Printf("sumi api listening on :%s", port)
-	if err := http.ListenAndServe(":"+port, mux); err != nil {
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }
 
 func newRouter() (*http.ServeMux, error) {
+	tv, err := tokenVerifierFromEnv()
+	if err != nil && !errors.Is(err, errTokenSecretMissing) {
+		return nil, fmt.Errorf("agent token verifier: %w", err)
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handler.Health)
-	mux.Handle("GET /agent/ws", wsHandler())
+	mux.Handle("GET /agent/ws", wsHandler(tv))
 
 	cmdDir := os.Getenv("SUMI_COMMAND_LOG_DIR")
 	if cmdDir == "" {
@@ -43,7 +57,7 @@ func newRouter() (*http.ServeMux, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open command store: %w", err)
 	}
-	ingress, err := agentevents.NewUserCommandIngress(store)
+	ingress, err := agentevents.NewUserCommandIngress(store, tv)
 	if err != nil {
 		_ = store.Close()
 		return nil, fmt.Errorf("create command ingress: %w", err)
@@ -57,17 +71,14 @@ func newRouter() (*http.ServeMux, error) {
 // configured, and falls back to a fail-closed server while the remaining T17
 // (durable source/hydration) and T26 (generation lease) seams are not yet
 // injected.
-func wsHandler() http.Handler {
-	tv, err := tokenVerifierFromEnv()
-	if err == nil {
+func wsHandler(tv agentevents.TokenVerifier) http.Handler {
+	if tv != nil {
 		log.Print("agent WS token verification wired")
 		srv := agentevents.NewServerWithTokenVerifier(tv)
 		srv.AllowedOrigins = allowedOriginsFromEnv()
 		return srv
 	}
-	if !errors.Is(err, errTokenSecretMissing) {
-		log.Fatalf("agent WS token verifier misconfigured: %v", err)
-	}
+
 	log.Print("agent WS running fail-closed: T17/T26 production seams not wired")
 	srv := agentevents.NewFailClosedServer()
 	srv.AllowedOrigins = allowedOriginsFromEnv()

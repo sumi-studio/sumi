@@ -3,6 +3,7 @@ package agentevents
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -143,6 +144,41 @@ func normalizeValue(v any) any {
 		return f
 	default:
 		return v
+	}
+}
+
+func TestValidateApprovalDecisionRejectsNullRule(t *testing.T) {
+	raw := []byte(`{"type":"approval_decision","request_id":"r-1","decision":{"type":"approve_always","rule":null}}`)
+	if err := ValidateCommand(raw); err == nil {
+		t.Fatal("expected approve_always with rule:null to be rejected")
+	}
+
+	raw = []byte(`{"type":"approval_decision","request_id":"r-1","decision":{"type":"approve_always","rule":{}}}`)
+	if err := ValidateCommand(raw); err != nil {
+		t.Fatalf("expected empty object rule to be accepted, got %v", err)
+	}
+}
+
+func TestOutboundFrameRejectsExplicitNullRejectReason(t *testing.T) {
+	for _, status := range []string{"received", "applied", "superseded"} {
+		raw := []byte(fmt.Sprintf(`{"frame_type":"command_ack","ack":{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","status":"%s","reject_reason":null}}`, status))
+		var frame OutboundFrame
+		if err := json.Unmarshal(raw, &frame); err == nil {
+			t.Fatalf("expected reject_reason:null to be rejected for status %s", status)
+		}
+	}
+
+	// rejected status with null reject_reason must also be rejected.
+	raw := []byte(`{"frame_type":"command_ack","ack":{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","status":"rejected","reject_reason":null}}`)
+	var frame OutboundFrame
+	if err := json.Unmarshal(raw, &frame); err == nil {
+		t.Fatal("expected reject_reason:null to be rejected for rejected status")
+	}
+
+	// rejected status with a valid string reject_reason must be accepted.
+	raw = []byte(`{"frame_type":"command_ack","ack":{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","status":"rejected","reject_reason":"unknown_command"}}`)
+	if err := json.Unmarshal(raw, &frame); err != nil {
+		t.Fatalf("expected valid rejected ack to be accepted, got %v", err)
 	}
 }
 

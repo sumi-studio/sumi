@@ -1,7 +1,6 @@
 package agentevents
 
 import (
-	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -58,7 +57,7 @@ func TestOutboundFrameValidateCounterexamples(t *testing.T) {
 
 func TestIngressDuplicateKeysCounterexample(t *testing.T) {
 	appender := &fakeCommandAppender{}
-	ingress, err := NewUserCommandIngress(appender)
+	ingress, err := NewUserCommandIngress(appender, &fakeTokenVerifier{conversationID: "conv-1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,10 +67,7 @@ func TestIngressDuplicateKeysCounterexample(t *testing.T) {
 	defer server.Close()
 
 	body := []byte(`{"type":"user_message","type":"user_message","text":"x","text":"hi","attachments":[]}`)
-	resp, err := http.Post(server.URL+"/conversations/c/commands", "application/json", bytes.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp := postAuthorized(t, server.URL+"/conversations/conv-1/commands", body)
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusCreated {
 		t.Fatalf("ingress accepted body with duplicate keys (status %d)", resp.StatusCode)

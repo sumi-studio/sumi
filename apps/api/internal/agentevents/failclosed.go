@@ -26,7 +26,7 @@ func (failClosedGenerationVerifier) VerifyGeneration(ctx context.Context, agentI
 
 type failClosedCommandSource struct{}
 
-func (failClosedCommandSource) NextCommandSeq(ctx context.Context, claims TokenClaims) (uint64, error) {
+func (failClosedCommandSource) FirstCommandSeq(ctx context.Context, claims TokenClaims) (uint64, error) {
 	return 0, errNotWired
 }
 
