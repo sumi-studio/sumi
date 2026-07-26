@@ -195,10 +195,10 @@
         "reasoning",
         "two_turn_reasoning_content_replay"
       ],
-      "status": "post_deadline_provider_qualification_debt",
+      "status": "release_blocking_missing_evidence",
       "deferred_gate": "T25_provider_release",
-      "release_blocking": false,
-      "note": "Direct Moonshot proof remains post-deadline provider-qualification debt, not deleted or substituted by the Responses T25 release gate."
+      "release_blocking": true,
+      "note": "Direct Moonshot proof remains release-blocking missing evidence for the Chat Completions provider track. It is not completed, deleted, skipped, or substituted by the Responses T25 release gate."
     },
     "zai_direct_tool_and_finish_reasons": {
       "provider": "zai",
@@ -210,10 +210,10 @@
         "provider_finish_reason_model_context_window_exceeded",
         "two_turn_tool_reasoning"
       ],
-      "status": "post_deadline_provider_qualification_debt",
+      "status": "release_blocking_missing_evidence",
       "deferred_gate": "T25_provider_release",
-      "release_blocking": false,
-      "note": "Direct Z.ai proof remains post-deadline provider-qualification debt, not deleted or substituted by the Responses T25 release gate."
+      "release_blocking": true,
+      "note": "Direct Z.ai proof remains release-blocking missing evidence for the Chat Completions provider track. It is not completed, deleted, skipped, or substituted by the Responses T25 release gate."
     },
     "umans_direct_text_tool_reasoning": {
       "provider": "umans",
@@ -224,10 +224,10 @@
         "reasoning",
         "two_turn_tool_reasoning"
       ],
-      "status": "post_deadline_provider_qualification_debt",
+      "status": "release_blocking_missing_evidence",
       "deferred_gate": "T25_provider_release",
-      "release_blocking": false,
-      "note": "Direct Umans proof remains post-deadline provider-qualification debt, not deleted or substituted by the Responses T25 release gate."
+      "release_blocking": true,
+      "note": "Direct Umans proof remains release-blocking missing evidence for the Chat Completions provider track. It is not completed, deleted, skipped, or substituted by the Responses T25 release gate."
     }
   }
 }
