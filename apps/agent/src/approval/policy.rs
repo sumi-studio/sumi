@@ -640,6 +640,7 @@ fn action_contains_secret(
 fn is_privilege_escalation_command(command: &str) -> bool {
     const PRIVILEGE_FAMILIES: &[&str] = &[
         "sudo",
+        "sudoedit",
         "su",
         "doas",
         "pkexec",
@@ -1139,6 +1140,7 @@ fn has_embedded_execution_payload(tokens: &[String]) -> bool {
 
         if let Some(sub) = subcommand {
             let sub_lower = sub.to_ascii_lowercase();
+            let subcommand_args = &tokens[subcommand_index + 1..];
             if matches!(
                 sub_lower.as_str(),
                 "hooks"
@@ -1180,6 +1182,12 @@ fn has_embedded_execution_payload(tokens: &[String]) -> bool {
                 return true;
             }
             if sub_lower == "config" {
+                if subcommand_args
+                    .iter()
+                    .any(|token| matches!(token.as_str(), "-e" | "--edit"))
+                {
+                    return true;
+                }
                 let mut j = subcommand_index + 1;
                 while j < tokens.len() {
                     if tokens[j].starts_with('-') {
@@ -1199,6 +1207,16 @@ fn has_embedded_execution_payload(tokens: &[String]) -> bool {
                     }
                     break;
                 }
+            }
+            if sub_lower == "grep"
+                && subcommand_args.iter().any(|token| {
+                    token == "-O"
+                        || (token.starts_with("-O") && token.len() > 2)
+                        || token == "--open-files-in-pager"
+                        || token.starts_with("--open-files-in-pager=")
+                })
+            {
+                return true;
             }
             if !KNOWN_SAFE_GIT_SUBCOMMANDS.contains(&sub_lower.as_str()) {
                 return true;
@@ -3171,6 +3189,41 @@ mod tests {
     }
 
     #[test]
+    fn sudoedit_is_a_non_overridable_privilege_boundary() {
+        let p = policy();
+        for command in ["sudoedit notes.txt", "/usr/bin/sudoedit notes.txt"] {
+            let action = bash(command);
+            assert!(
+                p.evaluate(&action).is_forbidden(),
+                "{command} must be hard-denied"
+            );
+            assert!(
+                matches!(
+                    p.resolve(&action, UserDecision::ApproveOnce, &projector()),
+                    ResolvedDecision::Rejected { .. }
+                ),
+                "ApproveOnce must not override {command}"
+            );
+            let rule = ApprovalRule {
+                id: "sudoedit".to_owned(),
+                tool: "bash".to_owned(),
+                literal_prefix: shell::tokenize_command(command),
+                effect: RuleEffect::Allow,
+                workspace_only: true,
+                allowed_permissions: vec![Permission::Exec],
+                allowed_network_domains: vec![],
+            };
+            assert!(
+                matches!(
+                    p.clone().try_with_rule(rule),
+                    Err(RuleValidationError::BroadPrefix)
+                ),
+                "{command} must not become a persistent Allow rule"
+            );
+        }
+    }
+
+    #[test]
     fn adversarial_option_payloads_are_not_persisted_or_allowed() {
         let p = policy();
         let checkpoint = ApprovalRule {
@@ -3518,6 +3571,58 @@ mod tests {
             p.try_with_rule(candidate),
             Err(RuleValidationError::BroadPrefix)
         ));
+    }
+
+    #[test]
+    fn persistent_git_prefixes_cannot_gain_process_launching_options() {
+        for (safe_prefix, unsafe_command) in [
+            (
+                vec!["git".to_owned(), "grep".to_owned()],
+                "git grep --open-files-in-pager=\"sh -c 'id'\" pattern",
+            ),
+            (
+                vec!["git".to_owned(), "grep".to_owned()],
+                "git grep -O\"sh -c 'id'\" pattern",
+            ),
+            (
+                vec!["git".to_owned(), "config".to_owned()],
+                "git config --edit",
+            ),
+            (vec!["git".to_owned(), "config".to_owned()], "git config -e"),
+        ] {
+            let p = policy()
+                .try_with_rule(ApprovalRule {
+                    id: "git-safe-prefix".to_owned(),
+                    tool: "bash".to_owned(),
+                    literal_prefix: safe_prefix,
+                    effect: RuleEffect::Allow,
+                    workspace_only: true,
+                    allowed_permissions: vec![Permission::Exec],
+                    allowed_network_domains: vec![],
+                })
+                .expect("the base Git prefix is intentionally persistable");
+            assert!(
+                !p.evaluate(&bash(unsafe_command)).is_allow(),
+                "process-launching suffix inherited an Allow rule: {unsafe_command}"
+            );
+
+            let unsafe_rule = ApprovalRule {
+                id: "git-process-launch".to_owned(),
+                tool: "bash".to_owned(),
+                literal_prefix: shell::tokenize_command(unsafe_command),
+                effect: RuleEffect::Allow,
+                workspace_only: true,
+                allowed_permissions: vec![Permission::Exec],
+                allowed_network_domains: vec![],
+            };
+            assert!(
+                matches!(
+                    policy().try_with_rule(unsafe_rule),
+                    Err(RuleValidationError::BroadPrefix)
+                ),
+                "process-launching Git command must not persist: {unsafe_command}"
+            );
+        }
     }
 
     #[test]
@@ -4215,8 +4320,8 @@ mod tests {
             allowed_permissions: vec![Permission::Exec, Permission::Network],
             allowed_network_domains: vec![],
         };
-        // Network rules cannot persist anyway (T22 no domain extraction), but the
-        // runtime should not allow either.
+        // This payload is forbidden independently of the narrow curl-only
+        // domain-constrained rule path.
         assert!(
             p.clone().try_with_rule(ssh_rule.clone()).is_err(),
             "glued ssh -o prefix must not persist"

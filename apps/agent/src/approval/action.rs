@@ -1553,7 +1553,7 @@ impl SecretInventory {
             },
             SecretPattern {
                 regex: Regex::new(
-                    r#"(?i)\b(?:[A-Z0-9_]*(?:API[_-]?KEY|ACCESS[_-]?TOKEN|AUTH[_-]?TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE[_-]?KEY|TOKEN)[A-Z0-9_]*)\s*=\s*[\"']?([A-Za-z0-9._~+/=-]+)"#,
+                    r#"(?i)\b(?:MYSQL_PWD|REDISCLI_AUTH|SSHPASS|[A-Z0-9_]*(?:API[_-]?KEY|ACCESS[_-]?TOKEN|AUTH[_-]?TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE[_-]?KEY|TOKEN)[A-Z0-9_]*)\s*=\s*[\"']?([A-Za-z0-9._~+/=-]+)"#,
                 )
                 .expect("static secret environment regex"),
                 secret_group: 1,
@@ -3836,6 +3836,41 @@ mod tests {
             assert!(
                 !encoded.contains("abcdef1234567890"),
                 "secret leaked: {encoded}"
+            );
+        }
+    }
+
+    #[test]
+    fn known_credential_environment_aliases_are_redacted_from_args_summary() {
+        for (command, secret) in [
+            (
+                "MYSQL_PWD=mysqlsecret123 mysql -h db.example -u root",
+                "mysqlsecret123",
+            ),
+            (
+                "REDISCLI_AUTH=redissecret123 redis-cli -h cache.example ping",
+                "redissecret123",
+            ),
+            (
+                "SSHPASS=sshsecret123 sshpass ssh user@example.com",
+                "sshsecret123",
+            ),
+        ] {
+            assert!(
+                projector().text_contains_secret(command),
+                "credential environment alias was not detected: {command}"
+            );
+            let redacted = projector()
+                .redact_arguments(&args(json!({"command": command})))
+                .unwrap();
+            let encoded = serde_json::to_string(&redacted).unwrap();
+            assert!(
+                !encoded.contains(secret),
+                "credential environment value leaked from args_summary: {encoded}"
+            );
+            assert!(
+                encoded.contains("[REDACTED:secret_env]"),
+                "secret_env placeholder missing: {encoded}"
             );
         }
     }
