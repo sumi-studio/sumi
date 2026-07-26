@@ -1349,8 +1349,29 @@ fn option_path_values(tokens: &[String]) -> Vec<String> {
         }
 
         if token.starts_with('-') && !token.starts_with("--") {
-            if let Some(value) = extract_short_option_value(token, canonical) {
-                maybe_push_path(&mut paths, value);
+            if value_taking_short_options(canonical).is_some() {
+                if let Some(value) = extract_short_option_value(token, canonical) {
+                    maybe_push_path(&mut paths, value);
+                }
+            } else {
+                // For commands whose short-option grammar is not explicitly
+                // modeled, we cannot tell where option letters end and the
+                // option-argument begins. Enumerate every possible split and
+                // check any suffix that looks path-like; `bash_path_check`
+                // returns the most restrictive result, so an absolute or
+                // escaping path cannot hide behind an earlier no-arg flag.
+                let mut iter = token.char_indices();
+                iter.next(); // skip leading '-'
+                for (idx, c) in iter {
+                    let value_start = idx + c.len_utf8();
+                    if value_start >= token.len() {
+                        continue;
+                    }
+                    let value = &token[value_start..];
+                    if token_looks_like_path(value) {
+                        maybe_push_path(&mut paths, value);
+                    }
+                }
             }
         } else if !skip_remote_operands || !shell::is_remote_spec(token) {
             maybe_push_path(&mut paths, token);
@@ -2097,6 +2118,54 @@ mod tests {
             &args(json!({"command": command})),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn unlisted_command_combined_short_options_fail_closed_on_escape() {
+        // Commands outside COMMANDS_WITH_VALUE_SHORT_OPTIONS can combine a
+        // no-arg short flag with a value-taking short flag in a single token.
+        // The legacy parser would extract the suffix after the *first* option
+        // character, hiding the real absolute path. It must be forbidden.
+        let p = policy();
+        for command in [
+            "patch -ud/etc --dry-run",
+            "patch -uo/tmp/out --dry-run",
+            "patch -ui/etc/passwd",
+            "patch -uB/etc/backup --dry-run",
+            "grep -Ff/etc/passwd /workspace/file",
+            "sort -uT/tmp",
+        ] {
+            let action = bash(command);
+            assert!(
+                p.evaluate(&action).is_forbidden(),
+                "{command} must be forbidden as workspace escape"
+            );
+            assert!(
+                matches!(
+                    p.resolve(&action, UserDecision::ApproveOnce, &projector()),
+                    ResolvedDecision::Rejected { .. }
+                ),
+                "{command} ApproveOnce must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn combined_short_option_relative_workspace_paths_are_not_false_forbidden() {
+        // A relative workspace path glued to a value-taking short option must
+        // not be misclassified as an escape, and an ApproveOnce must not be
+        // rejected for the wrong reason.
+        let p = policy();
+        for command in [
+            "patch -ui workspace.patch --dry-run",
+            "grep -Ff workspace.patterns /workspace/file",
+        ] {
+            let action = bash(command);
+            assert!(
+                !p.evaluate(&action).is_forbidden(),
+                "{command} must not be forbidden as workspace escape"
+            );
+        }
     }
 
     #[test]
