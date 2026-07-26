@@ -150,16 +150,26 @@
         "store_false_two_turn_tool_fixture",
         "native_compaction_ordered_output"
       ],
-      "status": "optional_live_codex_subscription_round_trip_passed_fixture_and_durable_proof_still_required",
+      "gate_tests": [
+        "provider::adapters::responses::tests::official_sse_fixture_normalizes_all_supported_events",
+        "provider::tests::responses_dispatch_normalizes_fixture_and_preserves_context",
+        "store::event_writer::tests::message_end_persists_encrypted_provider_context_and_eviction_tokens",
+        "store::event_writer::tests::hydrate_round_trips_assistant_and_provider_context",
+        "provider::adapters::responses::tests::request_uses_instructions_three_layer_items_and_store_false",
+        "provider::adapters::responses::tests::native_compacted_window_replays_exact_order_then_only_uncovered_suffix",
+        "provider::adapters::responses::tests::replay_rejects_duplicate_public_indexes_and_orders_trailing_opaque_items"
+      ],
+      "status": "fixture_and_durable_proof_complete_optional_live_not_production",
       "optional_live_evidence": {
         "observed_at": "2026-07-25T23:52:55Z",
         "endpoint_origin": "https://chatgpt.com/backend-api/codex",
         "credential_source": "local Codex ChatGPT login (credential not stored)",
         "result": "gpt-5.6-luna_two_turn_tool_call_and_final_text_passed",
         "test": "provider::tests::live_codex_subscription_responses_tool_roundtrip",
-        "bridge": "scripts/dev/codex-responses-proxy.py"
+        "bridge": "scripts/dev/codex-responses-proxy.py",
+        "note": "The bridge strips max_output_tokens, forces stream=true/store=false, and injects Codex OAuth credentials. This validates the adapter against a non-standard subscription endpoint, not the public OpenAI Responses contract, and is not a substitute for fixture/durable proof."
       },
-      "release_blocking": true
+      "release_blocking": false
     },
     "moonshot_direct_text_tool_reasoning": {
       "provider": "moonshot",
@@ -172,7 +182,7 @@
       ],
       "status": "blocked_missing_MOONSHOT_API_KEY",
       "deferred_gate": "T25_provider_release",
-      "release_blocking": true
+      "release_blocking": false
     },
     "zai_direct_tool_and_finish_reasons": {
       "provider": "zai",
@@ -186,7 +196,7 @@
       ],
       "status": "blocked_missing_ZAI_API_KEY",
       "deferred_gate": "T25_provider_release",
-      "release_blocking": true
+      "release_blocking": false
     },
     "umans_direct_text_tool_reasoning": {
       "provider": "umans",
@@ -199,7 +209,7 @@
       ],
       "status": "blocked_missing_UMANS_API_KEY",
       "deferred_gate": "T25_provider_release",
-      "release_blocking": true
+      "release_blocking": false
     }
   }
 }

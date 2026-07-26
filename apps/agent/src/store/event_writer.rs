@@ -2838,7 +2838,7 @@ impl EventWriter {
         for fragment in fragments {
             Self::validate_provider_context_fragment(&fragment, assistant)?;
 
-            let next = ordinal_counter.entry(fragment.wire_item_index).or_insert(1);
+            let next = ordinal_counter.entry(fragment.wire_item_index).or_insert(0);
             let ordinal = *next;
             *next += 1;
 
@@ -19629,7 +19629,7 @@ mod tests {
             ProviderContextItem {
                 origin_message: None,
                 wire_item_index: window.wire_item_index,
-                ordinal: 1,
+                ordinal: 0,
                 provider_origin: provider_origin.clone(),
                 payload: window.payload.clone(),
             },
@@ -19639,7 +19639,7 @@ mod tests {
                     message_seq: 0,
                 }),
                 wire_item_index: reasoning.wire_item_index,
-                ordinal: 1,
+                ordinal: 0,
                 provider_origin,
                 payload: reasoning.payload.clone(),
             },
@@ -19732,7 +19732,7 @@ mod tests {
 
         for row in &rows {
             let ordinal: i64 = row.get("item_ordinal");
-            assert!(ordinal >= 1, "item_ordinal must be positive");
+            assert!(ordinal >= 0, "item_ordinal must be non-negative");
         }
 
         let kinds: Vec<String> = rows
@@ -19860,6 +19860,215 @@ mod tests {
             expected_context
         );
         reopened.pool().close().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    }
+
+    #[tokio::test]
+    async fn message_end_opaque_provider_context_does_not_leak_to_public_transcript() {
+        let path = std::env::current_dir()
+            .expect("current package directory")
+            .join("target")
+            .join(format!(
+                "sumi-message-end-opaque-leak-{}.sqlite",
+                Uuid::now_v7()
+            ));
+        let store = file_test_store(&path).await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000079";
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let injected =
+            classified_injection(&writer, 1, command_id, "ignored", "leak fixture").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "leak fixture"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("persist user injection");
+
+        let timestamp = durable_test_timestamp();
+        let message = AssistantMessage {
+            content: vec![AssistantContent::Text {
+                text: "visible answer".to_owned(),
+                wire_item_index: 0,
+            }],
+            model: "model-leak".to_owned(),
+            provider: "provider-leak".to_owned(),
+            origin: ProviderOrigin {
+                provider_instance_id: "provider-instance-leak".to_owned(),
+                protocol: ApiProtocol::OpenAiResponses,
+                model: "model-leak".to_owned(),
+            },
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp,
+        };
+        let assistant_id = "assistant-with-opaque";
+        let mut projector = ProviderEventProjector::new(assistant_id).expect("projector");
+        assert!(matches!(
+            projector.project(ProviderEvent::Start).expect("Start"),
+            ProjectedProviderEvent::Started
+        ));
+
+        let reasoning_marker = "OPAQUE_PROVIDER_REASONING_a1b2c3d4";
+        let compact_marker = "OPAQUE_PROVIDER_COMPACT_e5f6a7b8";
+
+        let reasoning = ProviderContextFragment {
+            wire_item_index: Some(0),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiResponses,
+                item: json!({
+                    "text": reasoning_marker,
+                    "encrypted_content": reasoning_marker,
+                }),
+            },
+        };
+        let window = ProviderContextFragment {
+            wire_item_index: None,
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({
+                    "summary": compact_marker,
+                    "encrypted_content": compact_marker,
+                })],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 1,
+                    context_fingerprint: "fp-2".to_owned(),
+                },
+            },
+        };
+
+        let ProjectedProviderEvent::Terminal(terminal) = projector
+            .project(ProviderEvent::Done {
+                reason: StopReason::Stop,
+                output: ProviderOutput {
+                    message,
+                    provider_context: vec![reasoning, window],
+                },
+            })
+            .expect("terminal projection")
+        else {
+            panic!("expected terminal");
+        };
+
+        let terminal_message = terminal.message().clone();
+        let terminal_write = terminal
+            .into_t12_write(run_id.clone(), turn_id.clone(), true)
+            .expect("terminal write with context");
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            assistant_id,
+                            &terminal_message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("open assistant attempt");
+
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    terminal_write,
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::turn_end(
+                                run_id.clone(),
+                                turn_id.clone(),
+                                terminal_message.clone(),
+                                Vec::new(),
+                            )
+                            .expect("TurnEnd"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(DurableEvent::agent_end(run_id.clone()).expect("AgentEnd")),
+                        projections: vec![Projection::CommandApplied {
+                            command_id: command_id.to_owned(),
+                            command_seq: 1,
+                            run_id: Some(run_id),
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist terminal with opaque provider context");
+
+        // Ensure the public transcript actually recorded the visible assistant message.
+        let message_payload: String =
+            sqlx::query_scalar("SELECT payload FROM messages WHERE id=? AND role='assistant'")
+                .bind(assistant_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("durable message projection");
+        assert!(
+            message_payload.contains("visible answer"),
+            "public payload must contain the visible assistant text"
+        );
+
+        for marker in [reasoning_marker, compact_marker] {
+            let like = format!("%{marker}%");
+
+            let message_hits: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM messages WHERE payload LIKE ? OR search_text LIKE ?",
+            )
+            .bind(&like)
+            .bind(&like)
+            .fetch_one(store.pool())
+            .await
+            .expect("scan messages for opaque marker");
+
+            let event_hits: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE envelope LIKE ?")
+                    .bind(&like)
+                    .fetch_one(store.pool())
+                    .await
+                    .expect("scan agent_events for opaque marker");
+
+            let fts_hits: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM messages_fts WHERE search_text LIKE ?")
+                    .bind(&like)
+                    .fetch_one(store.pool())
+                    .await
+                    .expect("scan messages_fts for opaque marker");
+
+            assert_eq!(
+                message_hits, 0,
+                "opaque provider bytes leaked into messages.payload or search_text: {marker}"
+            );
+            assert_eq!(
+                event_hits, 0,
+                "opaque provider bytes leaked into agent_events.envelope: {marker}"
+            );
+            assert_eq!(
+                fts_hits, 0,
+                "opaque provider bytes leaked into messages_fts: {marker}"
+            );
+        }
+
+        store.pool().close().await;
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
         let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));

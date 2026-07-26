@@ -5270,8 +5270,13 @@ fi
     }
 
     #[tokio::test]
-    #[ignore = "development-only Codex subscription Responses gate; requires the local OAuth bridge"]
+    #[ignore = "development-only Codex subscription Responses gate; routes through a local bridge that mutates the request and is not a public-Responses production proof"]
     async fn live_codex_subscription_responses_tool_roundtrip() {
+        // This test targets the ChatGPT Codex subscription endpoint through a
+        // local dev bridge. The bridge strips production fields (e.g.
+        // max_output_tokens), forces stream/store, and injects Codex OAuth
+        // credentials. It therefore validates the adapter against a
+        // non-standard endpoint, not the public OpenAI Responses contract.
         let base_url = env::var("SUMI_CODEX_RESPONSES_BASE_URL")
             .expect("SUMI_CODEX_RESPONSES_BASE_URL must point to the local OAuth bridge");
         let mut spec = ModelSpec::preset("openai-responses").expect("Responses preset");

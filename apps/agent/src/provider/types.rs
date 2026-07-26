@@ -123,6 +123,8 @@ pub struct ProviderOrigin {
 pub struct ProviderContextItem {
     pub origin_message: Option<ProviderContextAnchor>,
     pub wire_item_index: Option<u32>,
+    /// Tie-breaker within the same `wire_item_index`, zero-based and assigned
+    /// deterministically by the consumer that assembles the context list.
     pub ordinal: u32,
     pub provider_origin: ProviderOrigin,
     pub payload: ProviderContextPayload,

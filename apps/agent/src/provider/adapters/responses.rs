@@ -3890,9 +3890,9 @@ mod tests {
 
     #[test]
     fn official_sse_fixture_normalizes_all_supported_events() {
-        // Adapted from the official Responses streaming API example. Durable encrypted
-        // round-trip and live two-turn/tool evidence remain release-blocking until
-        // T17/T25; this fixture does not claim either gate.
+        // Adapted from the official Responses streaming API example. This test covers
+        // normalization only; the provenance ledger binds the separate durable
+        // round-trip, replay-order, and store=false gates that complete T25.
         let fixture = include_str!("../../../tests/fixtures/openai_responses_official.sse");
         let mut state = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
         let mut events = Vec::new();

@@ -450,9 +450,6 @@ impl Store {
                 .transpose()?;
             let ordinal = u32::try_from(row.try_get::<i64, _>("item_ordinal")?)
                 .context("provider-context item_ordinal is out of range")?;
-            if ordinal == 0 {
-                bail!("provider-context item_ordinal must be positive");
-            }
             let provider_instance_id: String = row.try_get("provider_instance_id")?;
             let protocol = ApiProtocol::from_storage(&row.try_get::<String, _>("protocol")?)?;
             let model: String = row.try_get("model")?;
@@ -1944,7 +1941,7 @@ mod tests {
                 message_seq: 1,
             }),
             wire_item_index: Some(1),
-            ordinal: 1,
+            ordinal: 0,
             provider_origin: origin.clone(),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::OpenAiResponses,

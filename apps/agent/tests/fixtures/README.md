@@ -134,7 +134,11 @@ gateway.
 
 OpenAI Responses fixture and durable round-trip proof remains required. A live
 Responses proof through ChatGPT/Codex login is optional and is not part of this
-packet.
+packet; the local Codex bridge (`scripts/dev/codex-responses-proxy.py`) mutates
+the production request by removing `max_output_tokens`, forcing
+`stream=true`/`store=false`, and injecting OAuth headers, so it validates the
+adapter against a non-standard endpoint rather than the public Responses
+contract.
 
 Keep the unmodified response body only in the ignored quarantine. Promotion is
 a separate, deliberate review:
