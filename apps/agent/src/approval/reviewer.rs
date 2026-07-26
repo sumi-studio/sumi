@@ -440,14 +440,26 @@ impl DenyCache {
         }
     }
 
-    fn get(&self, projection_hash: &str, turn_id: Option<&str>) -> Option<&AuditDecision> {
+    fn get(
+        &self,
+        policy_hash: &str,
+        projection_hash: &str,
+        turn_id: Option<&str>,
+    ) -> Option<&AuditDecision> {
         if turn_id.is_none() || self.turn_id.as_deref() != turn_id {
             return None;
         }
-        self.entries.get(projection_hash)
+        let key = format!("{policy_hash}:{projection_hash}");
+        self.entries.get(&key)
     }
 
-    fn put(&mut self, turn_id: Option<&str>, projection_hash: &str, decision: AuditDecision) {
+    fn put(
+        &mut self,
+        turn_id: Option<&str>,
+        policy_hash: &str,
+        projection_hash: &str,
+        decision: AuditDecision,
+    ) {
         if decision.outcome != AuditOutcome::Deny {
             return;
         }
@@ -458,7 +470,8 @@ impl DenyCache {
             self.turn_id = Some(turn_id.to_owned());
             self.entries.clear();
         }
-        self.entries.insert(projection_hash.to_owned(), decision);
+        let key = format!("{policy_hash}:{projection_hash}");
+        self.entries.insert(key, decision);
     }
 }
 
@@ -595,7 +608,11 @@ impl Reviewer {
 
         {
             let deny_cache = self.deny_cache.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(decision) = deny_cache.get(&projection_hash, request.turn_id.as_deref()) {
+            if let Some(decision) = deny_cache.get(
+                &request.policy_hash,
+                &projection_hash,
+                request.turn_id.as_deref(),
+            ) {
                 self.record_outcome(&request.run_id, AuditOutcome::Deny);
                 return ReviewOutcome::Deny(decision.clone());
             }
@@ -765,6 +782,7 @@ impl Reviewer {
                     .unwrap_or_else(|e| e.into_inner())
                     .put(
                         request.turn_id.as_deref(),
+                        &request.policy_hash,
                         projection_hash,
                         decision.clone(),
                     );
@@ -1487,6 +1505,31 @@ mod tests {
         assert!(matches!(outcome2, ReviewOutcome::Deny(_)));
         // Different turn => not cached, so the second transport is called.
         assert_eq!(fake2.called_count(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deny_cache_does_not_cross_policy_mutation_within_same_turn() {
+        let fake = FakeTransport::sequence(vec![Ok(deny_json()), Ok(allow_json())]);
+        let reviewer = make_reviewer(fake.clone());
+        let mut request = review_request(reviewable_projection());
+
+        assert!(matches!(
+            reviewer
+                .review(request.clone(), CancellationToken::new())
+                .await,
+            ReviewOutcome::Deny(_)
+        ));
+
+        request.policy_hash = "policy-hash-after-approve-always".to_owned();
+        assert!(matches!(
+            reviewer.review(request, CancellationToken::new()).await,
+            ReviewOutcome::Allow(_)
+        ));
+        assert_eq!(
+            fake.called_count(),
+            2,
+            "a policy mutation must invalidate a same-turn cached deny"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
