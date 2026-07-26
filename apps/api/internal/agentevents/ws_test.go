@@ -654,7 +654,8 @@ func TestWebSocketCatchUpGapFromLastReceivedCommandSeq(t *testing.T) {
 func TestWebSocketOversizedFrameClosesConnection(t *testing.T) {
 	srv, _, _, _, _, hl := newTestServer(t)
 	hl.setReady()
-	srv.MaxReadLimit = 128
+	const readLimit = 1024
+	srv.MaxReadLimit = readLimit
 
 	server := startTestServer(t, srv)
 	defer server.Close()
@@ -681,8 +682,9 @@ func TestWebSocketOversizedFrameClosesConnection(t *testing.T) {
 		t.Fatalf("read api hello: %v", err)
 	}
 
-	// Send a valid event body that is larger than the 64 byte read limit.
-	largeEvent := `{"frame_type":"event","envelope":{"seq":1,"conversation_id":"conversation-1","event":{"type":"error","message":"this message exceeds the configured read limit"}}}`
+	// The limit leaves ample room for AgentHello. This structurally valid frame
+	// is deliberately more than twice the post-hello limit.
+	largeEvent := `{"frame_type":"event","envelope":{"seq":1,"conversation_id":"conversation-1","event":{"type":"error","message":"` + strings.Repeat("x", 2*readLimit) + `"}}}`
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(largeEvent)); err != nil {
 		t.Fatalf("write oversized frame: %v", err)
 	}
@@ -692,6 +694,23 @@ func TestWebSocketOversizedFrameClosesConnection(t *testing.T) {
 	var frame OutboundFrame
 	if err := conn.ReadJSON(&frame); err == nil {
 		t.Fatal("expected connection to close on oversized read")
+	}
+}
+
+func TestNewServerConfiguresBoundedWriteTimeout(t *testing.T) {
+	srv, _, _, _, _, _ := newTestServer(t)
+	if srv.WriteTimeout <= 0 {
+		t.Fatalf("WriteTimeout = %v, want a positive bound", srv.WriteTimeout)
+	}
+}
+
+func TestServerWriteDeadlineUsesConfiguredTimeout(t *testing.T) {
+	srv, _, _, _, _, _ := newTestServer(t)
+	srv.WriteTimeout = time.Second
+	before := time.Now()
+	deadline := srv.writeDeadline()
+	if deadline.Before(before.Add(900*time.Millisecond)) || deadline.After(before.Add(1100*time.Millisecond)) {
+		t.Fatalf("write deadline = %v, want approximately one second after %v", deadline, before)
 	}
 }
 

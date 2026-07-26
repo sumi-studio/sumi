@@ -767,6 +767,9 @@ func validateUUID(raw json.RawMessage) error {
 }
 
 func validateString(raw json.RawMessage) error {
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return fmt.Errorf("expected string, got null")
+	}
 	var s string
 	return json.Unmarshal(raw, &s)
 }
@@ -779,6 +782,9 @@ func validateStringOrNull(raw json.RawMessage) error {
 }
 
 func validateBool(raw json.RawMessage) error {
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return fmt.Errorf("expected boolean, got null")
+	}
 	var b bool
 	return json.Unmarshal(raw, &b)
 }
@@ -847,11 +853,11 @@ func requireAndAllow(obj map[string]json.RawMessage, required, allowed []string)
 }
 
 var (
-	steerModes        = map[string]bool{"hard": true, "soft": true}
-	stopReasons       = map[string]bool{"stop": true, "length": true, "tool_use": true, "error": true, "aborted": true}
-	auditOutcomes     = map[string]bool{"allow": true, "deny": true}
-	riskLevels        = map[string]bool{"low": true, "medium": true, "high": true, "critical": true}
+	steerModes         = map[string]bool{"hard": true, "soft": true}
+	stopReasons        = map[string]bool{"stop": true, "length": true, "tool_use": true, "error": true, "aborted": true}
+	auditOutcomes      = map[string]bool{"allow": true, "deny": true}
+	riskLevels         = map[string]bool{"low": true, "medium": true, "high": true, "critical": true}
 	userAuthorizations = map[string]bool{"unknown": true, "low": true, "medium": true, "high": true}
 	toolArgumentErrors = map[string]bool{"invalid_json": true, "non_object": true, "schema_violation": true, "incomplete_response": true, "too_large": true}
-	apiProtocols      = map[string]bool{"open_ai_chat_completions": true, "open_ai_responses": true, "anthropic_messages": true}
+	apiProtocols       = map[string]bool{"open_ai_chat_completions": true, "open_ai_responses": true, "anthropic_messages": true}
 )

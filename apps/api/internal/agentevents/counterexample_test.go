@@ -138,6 +138,21 @@ func TestEnvelopeRejectsMalformedEventBody(t *testing.T) {
 	}
 }
 
+func TestScalarValidatorsRejectNullCounterexample(t *testing.T) {
+	if err := validateString([]byte(`null`)); err == nil {
+		t.Fatal("validateString accepted null")
+	}
+	if err := validateBool([]byte(`null`)); err == nil {
+		t.Fatal("validateBool accepted null")
+	}
+	if err := validateStringOrNull([]byte(`null`)); err != nil {
+		t.Fatalf("validateStringOrNull rejected null: %v", err)
+	}
+	if err := validateStringOrNull([]byte(`true`)); err == nil {
+		t.Fatal("validateStringOrNull accepted a non-string value")
+	}
+}
+
 func TestEnvelopeRejectsSeqExceedsJSONSafeInteger(t *testing.T) {
 	raw := `{"seq":9007199254740992,"conversation_id":"c","event":{"type":"agent_start"}}`
 	var env Envelope
@@ -150,9 +165,9 @@ func TestOutboundFrameRejectsCommandAckSeqExceedsJSONSafeInteger(t *testing.T) {
 	frame := OutboundFrame{
 		FrameType: "command_ack",
 		Ack: &CommandAck{
-			Seq:        9007199254740992,
-			CommandID:  "00000000-0000-4000-8000-000000000001",
-			Status:     "received",
+			Seq:       9007199254740992,
+			CommandID: "00000000-0000-4000-8000-000000000001",
+			Status:    "received",
 		},
 	}
 	if err := frame.Validate(); err == nil {

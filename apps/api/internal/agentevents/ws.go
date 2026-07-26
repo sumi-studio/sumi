@@ -83,8 +83,12 @@ type Server struct {
 	// context cancellation from the underlying connection.
 	HelloTimeout time.Duration
 
-	// MaxReadLimit is the largest WebSocket message the server will accept
-	// after the hello exchange. A value of zero disables the limit.
+	// WriteTimeout bounds each WebSocket write. Non-positive values use
+	// the safe default so a stalled peer cannot leave the writer blocked.
+	WriteTimeout time.Duration
+
+	// MaxReadLimit is the largest WebSocket message the server will accept from
+	// the hello onward. A value of zero disables the limit.
 	MaxReadLimit int64
 
 	// PongWait is the duration the server will wait for a pong after the
@@ -113,6 +117,7 @@ func NewServer(tv TokenVerifier, gv GenerationVerifier, cs CommandSource, es Eve
 		Events:       es,
 		Latch:        hl,
 		HelloTimeout: 30 * time.Second,
+		WriteTimeout: 10 * time.Second,
 		MaxReadLimit: 4 * 1024 * 1024,
 		PongWait:     60 * time.Second,
 		PingInterval: 54 * time.Second,
@@ -178,7 +183,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// caller; the agent treats any close as a reconnect signal.
 		_ = conn.WriteControl(websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseNormalClosure, "gateway closed"),
-			time.Now().Add(time.Second))
+			s.writeDeadline())
 	}
 }
 
@@ -240,7 +245,7 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 		LastReceivedEventSeq: hello.LastSentEventSeq,
 		NextCommandSeq:       nextSeq,
 	}
-	if err := conn.WriteJSON(apiHello); err != nil {
+	if err := s.writeJSON(conn, apiHello); err != nil {
 		return fmt.Errorf("write api hello: %w", err)
 	}
 
@@ -263,7 +268,7 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 		return fmt.Errorf("command catch-up: %w", err)
 	}
 	for _, cmd := range commands {
-		if err := sendCommandEnvelope(conn, cmd); err != nil {
+		if err := s.sendCommandEnvelope(conn, cmd); err != nil {
 			return fmt.Errorf("send catch-up command: %w", err)
 		}
 	}
@@ -336,7 +341,7 @@ func (s *Server) writePump(ctx context.Context, conn *websocket.Conn, live <-cha
 				if !ok {
 					return errors.New("command source closed")
 				}
-				if err := sendCommandEnvelope(conn, cmd); err != nil {
+				if err := s.sendCommandEnvelope(conn, cmd); err != nil {
 					return err
 				}
 			}
@@ -353,18 +358,18 @@ func (s *Server) writePump(ctx context.Context, conn *websocket.Conn, live <-cha
 			if !ok {
 				return errors.New("command source closed")
 			}
-			if err := sendCommandEnvelope(conn, cmd); err != nil {
+			if err := s.sendCommandEnvelope(conn, cmd); err != nil {
 				return err
 			}
 		case <-ticker.C:
-			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			if err := conn.WriteControl(websocket.PingMessage, nil, s.writeDeadline()); err != nil {
 				return err
 			}
 		}
 	}
 }
 
-func sendCommandEnvelope(conn *websocket.Conn, cmd CommandEnvelope) error {
+func (s *Server) sendCommandEnvelope(conn *websocket.Conn, cmd CommandEnvelope) error {
 	if cmd.Seq > maxJSONSafeInteger {
 		return fmt.Errorf("command envelope seq exceeds JSON-safe integer range")
 	}
@@ -377,7 +382,22 @@ func sendCommandEnvelope(conn *websocket.Conn, cmd CommandEnvelope) error {
 	if err := ValidateCommand(cmd.Command); err != nil {
 		return err
 	}
-	return conn.WriteJSON(cmd)
+	return s.writeJSON(conn, cmd)
+}
+
+func (s *Server) writeJSON(conn *websocket.Conn, value any) error {
+	if err := conn.SetWriteDeadline(s.writeDeadline()); err != nil {
+		return fmt.Errorf("set write deadline: %w", err)
+	}
+	return conn.WriteJSON(value)
+}
+
+func (s *Server) writeDeadline() time.Time {
+	timeout := s.WriteTimeout
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	return time.Now().Add(timeout)
 }
 
 func bearerToken(header string) (string, bool) {
