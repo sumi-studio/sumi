@@ -26,25 +26,25 @@ func (failClosedGenerationVerifier) VerifyGeneration(ctx context.Context, agentI
 
 type failClosedCommandSource struct{}
 
-func (failClosedCommandSource) NextCommandSeq(ctx context.Context, agentID string, generation uint64) (uint64, error) {
+func (failClosedCommandSource) NextCommandSeq(ctx context.Context, claims TokenClaims) (uint64, error) {
 	return 0, errNotWired
 }
 
-func (failClosedCommandSource) CatchUp(ctx context.Context, agentID string, generation uint64, fromSeq uint64) ([]CommandEnvelope, error) {
+func (failClosedCommandSource) CatchUp(ctx context.Context, claims TokenClaims, fromSeq uint64) ([]CommandEnvelope, error) {
 	return nil, errNotWired
 }
 
-func (failClosedCommandSource) Live(ctx context.Context, agentID string, generation uint64) (<-chan CommandEnvelope, error) {
+func (failClosedCommandSource) Live(ctx context.Context, claims TokenClaims) (<-chan CommandEnvelope, error) {
 	return nil, errNotWired
 }
 
-func (failClosedCommandSource) ApplyAck(ctx context.Context, agentID string, generation uint64, ack CommandAck) error {
+func (failClosedCommandSource) ApplyAck(ctx context.Context, claims TokenClaims, ack CommandAck) error {
 	return errNotWired
 }
 
 type failClosedEventSink struct{}
 
-func (failClosedEventSink) Receive(ctx context.Context, agentID string, generation uint64, envelope Envelope) error {
+func (failClosedEventSink) Receive(ctx context.Context, claims TokenClaims, envelope Envelope) error {
 	return errNotWired
 }
 

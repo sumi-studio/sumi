@@ -49,17 +49,18 @@ func (f *fakeGenerationVerifier) setLatest(latest uint64) {
 }
 
 type fakeCommandSource struct {
-	mu       sync.Mutex
-	commands []CommandEnvelope
-	ackSeq   uint64
-	live     chan CommandEnvelope
+	mu           sync.Mutex
+	commands     []CommandEnvelope
+	ackSeq       uint64
+	catchUpCalls uint64
+	live         chan CommandEnvelope
 }
 
 func newFakeCommandSource() *fakeCommandSource {
 	return &fakeCommandSource{live: make(chan CommandEnvelope, 16)}
 }
 
-func (f *fakeCommandSource) NextCommandSeq(ctx context.Context, agentID string, generation uint64) (uint64, error) {
+func (f *fakeCommandSource) NextCommandSeq(ctx context.Context, claims TokenClaims) (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if len(f.commands) == 0 {
@@ -69,9 +70,10 @@ func (f *fakeCommandSource) NextCommandSeq(ctx context.Context, agentID string, 
 	return f.commands[0].Seq, nil
 }
 
-func (f *fakeCommandSource) CatchUp(ctx context.Context, agentID string, generation uint64, fromSeq uint64) ([]CommandEnvelope, error) {
+func (f *fakeCommandSource) CatchUp(ctx context.Context, claims TokenClaims, fromSeq uint64) ([]CommandEnvelope, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.catchUpCalls++
 	var out []CommandEnvelope
 	for _, cmd := range f.commands {
 		if cmd.Seq >= fromSeq {
@@ -81,11 +83,17 @@ func (f *fakeCommandSource) CatchUp(ctx context.Context, agentID string, generat
 	return out, nil
 }
 
-func (f *fakeCommandSource) Live(ctx context.Context, agentID string, generation uint64) (<-chan CommandEnvelope, error) {
+func (f *fakeCommandSource) catchUpCount() uint64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.catchUpCalls
+}
+
+func (f *fakeCommandSource) Live(ctx context.Context, claims TokenClaims) (<-chan CommandEnvelope, error) {
 	return f.live, nil
 }
 
-func (f *fakeCommandSource) ApplyAck(ctx context.Context, agentID string, generation uint64, ack CommandAck) error {
+func (f *fakeCommandSource) ApplyAck(ctx context.Context, claims TokenClaims, ack CommandAck) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.ackSeq = ack.Seq
@@ -107,7 +115,7 @@ type fakeEventSink struct {
 	envelopes []Envelope
 }
 
-func (f *fakeEventSink) Receive(ctx context.Context, agentID string, generation uint64, envelope Envelope) error {
+func (f *fakeEventSink) Receive(ctx context.Context, claims TokenClaims, envelope Envelope) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.envelopes = append(f.envelopes, envelope)
@@ -115,13 +123,17 @@ func (f *fakeEventSink) Receive(ctx context.Context, agentID string, generation 
 }
 
 type fakeHydrationLatch struct {
-	mu    sync.Mutex
-	ready bool
-	ch    chan struct{}
+	mu          sync.Mutex
+	ready       bool
+	ch          chan struct{}
+	waitStarted chan struct{}
 }
 
 func newFakeHydrationLatch() *fakeHydrationLatch {
-	return &fakeHydrationLatch{ch: make(chan struct{})}
+	return &fakeHydrationLatch{
+		ch:          make(chan struct{}),
+		waitStarted: make(chan struct{}, 4),
+	}
 }
 
 func (f *fakeHydrationLatch) WaitFor(ctx context.Context, generation uint64) error {
@@ -133,10 +145,23 @@ func (f *fakeHydrationLatch) WaitFor(ctx context.Context, generation uint64) err
 	ch := f.ch
 	f.mu.Unlock()
 	select {
+	case f.waitStarted <- struct{}{}:
+	default:
+	}
+	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-ch:
 		return nil
+	}
+}
+
+func (f *fakeHydrationLatch) waitUntilBlocked(t *testing.T) {
+	t.Helper()
+	select {
+	case <-f.waitStarted:
+	case <-time.After(time.Second):
+		t.Fatal("expected gateway epoch to observe NotReady hydration state")
 	}
 }
 
@@ -303,6 +328,7 @@ func TestWebSocketReadyAfterReconnectHoldsCommands(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("write hello: %v", err)
 	}
+	hl.waitUntilBlocked(t)
 	conn1.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 	var apiHello ApiHello
 	if err := conn1.ReadJSON(&apiHello); err == nil {
@@ -310,11 +336,9 @@ func TestWebSocketReadyAfterReconnectHoldsCommands(t *testing.T) {
 	}
 	conn1.Close()
 
-	// Latch becomes Ready for this generation.
-	hl.setReady()
-
-	// Reconnect with the same generation; the new epoch must observe Ready and
-	// deliver the pending command.
+	// Reconnect with the same generation while it is still NotReady. The new
+	// epoch must independently observe NotReady and keep its hello/command
+	// path held; it must not inherit a release from the old connection epoch.
 	conn2, _, err := websocket.DefaultDialer.Dial(wsURL, header)
 	if err != nil {
 		t.Fatalf("dial reconnect: %v", err)
@@ -329,6 +353,13 @@ func TestWebSocketReadyAfterReconnectHoldsCommands(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("write hello: %v", err)
 	}
+	hl.waitUntilBlocked(t)
+	if calls := cs.catchUpCount(); calls != 0 {
+		t.Fatalf("expected no command catch-up before Ready, got %d calls", calls)
+	}
+
+	// Only a Ready latch for the same generation may release the new epoch.
+	hl.setReady()
 	if err := conn2.ReadJSON(&apiHello); err != nil {
 		t.Fatalf("read api hello after reconnect: %v", err)
 	}
@@ -410,6 +441,57 @@ func TestWebSocketAgentSendsAckAndEvent(t *testing.T) {
 		t.Fatalf("expected ack seq 1, got %d", cs.ackSeq)
 	}
 	cs.mu.Unlock()
+}
+
+func TestWebSocketRejectsEventForAnotherConversation(t *testing.T) {
+	srv, _, _, _, es, hl := newTestServer(t)
+	hl.setReady()
+
+	server := httptest.NewServer(srv)
+	defer server.Close()
+
+	wsURL := strings.Replace(server.URL, "http", "ws", 1) + "/agent/ws"
+	header := map[string][]string{"Authorization": {"Bearer test-token"}}
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteJSON(AgentHello{
+		AgentID:                "agent-1",
+		Generation:             7,
+		LastSentEventSeq:       0,
+		LastReceivedCommandSeq: 0,
+		LastAppliedCommandSeq:  0,
+	}); err != nil {
+		t.Fatalf("write hello: %v", err)
+	}
+	var apiHello ApiHello
+	if err := conn2Wait(conn, &apiHello, time.Second); err != nil {
+		t.Fatalf("read api hello: %v", err)
+	}
+
+	if err := conn.WriteJSON(OutboundFrame{
+		FrameType: "event",
+		Envelope: &Envelope{
+			ConversationID: "other-conversation",
+			Event:          []byte(`{"type":"agent_start"}`),
+		},
+	}); err != nil {
+		t.Fatalf("write mismatched event: %v", err)
+	}
+	conn.SetReadDeadline(time.Now().Add(time.Second))
+	defer conn.SetReadDeadline(time.Time{})
+	if err := conn.ReadJSON(&apiHello); err == nil {
+		t.Fatal("expected conversation mismatch to close the connection")
+	}
+
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	if len(es.envelopes) != 0 {
+		t.Fatalf("expected no event delivery on conversation mismatch, got %d", len(es.envelopes))
+	}
 }
 
 func conn2Wait(conn *websocket.Conn, v any, timeout time.Duration) error {

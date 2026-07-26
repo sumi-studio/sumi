@@ -46,20 +46,20 @@ type GenerationVerifier interface {
 // and retransmission. Production wiring belongs to T17.
 type CommandSource interface {
 	// NextCommandSeq returns the next seq the API expects the agent to apply.
-	NextCommandSeq(ctx context.Context, agentID string, generation uint64) (uint64, error)
+	NextCommandSeq(ctx context.Context, claims TokenClaims) (uint64, error)
 	// CatchUp returns commands starting from fromSeq up to the durable tail.
-	CatchUp(ctx context.Context, agentID string, generation uint64, fromSeq uint64) ([]CommandEnvelope, error)
+	CatchUp(ctx context.Context, claims TokenClaims, fromSeq uint64) ([]CommandEnvelope, error)
 	// Live returns a channel of new commands after catch-up has reached the tail.
 	// The channel is closed when the source becomes invalid.
-	Live(ctx context.Context, agentID string, generation uint64) (<-chan CommandEnvelope, error)
+	Live(ctx context.Context, claims TokenClaims) (<-chan CommandEnvelope, error)
 	// ApplyAck records a terminal command acknowledgement.
-	ApplyAck(ctx context.Context, agentID string, generation uint64, ack CommandAck) error
+	ApplyAck(ctx context.Context, claims TokenClaims, ack CommandAck) error
 }
 
 // EventSink receives durable outbound event envelopes from the agent.
 // Production wiring belongs to T17.
 type EventSink interface {
-	Receive(ctx context.Context, agentID string, generation uint64, envelope Envelope) error
+	Receive(ctx context.Context, claims TokenClaims, envelope Envelope) error
 }
 
 // HydrationLatch waits for the current ProcessGeneration to become Ready.
@@ -158,7 +158,7 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 		return fmt.Errorf("hydration wait: %w", err)
 	}
 
-	nextSeq, err := s.Commands.NextCommandSeq(helloCtx, claims.AgentID, hello.Generation)
+	nextSeq, err := s.Commands.NextCommandSeq(helloCtx, claims)
 	if err != nil {
 		return fmt.Errorf("next command seq: %w", err)
 	}
@@ -175,7 +175,7 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 		return fmt.Errorf("write api hello: %w", err)
 	}
 
-	commands, err := s.Commands.CatchUp(ctx, claims.AgentID, claims.Generation, nextSeq)
+	commands, err := s.Commands.CatchUp(ctx, claims, nextSeq)
 	if err != nil {
 		return fmt.Errorf("command catch-up: %w", err)
 	}
@@ -185,7 +185,7 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 		}
 	}
 
-	live, err := s.Commands.Live(ctx, claims.AgentID, claims.Generation)
+	live, err := s.Commands.Live(ctx, claims)
 	if err != nil {
 		return fmt.Errorf("live commands: %w", err)
 	}
@@ -224,11 +224,14 @@ func (s *Server) readPump(ctx context.Context, conn *websocket.Conn, claims Toke
 
 		switch frame.FrameType {
 		case "event":
-			if err := s.Events.Receive(ctx, claims.AgentID, claims.Generation, *frame.Envelope); err != nil {
+			if frame.Envelope.ConversationID != claims.ConversationID {
+				return errors.New("event conversation_id claim mismatch")
+			}
+			if err := s.Events.Receive(ctx, claims, *frame.Envelope); err != nil {
 				return err
 			}
 		case "command_ack":
-			if err := s.Commands.ApplyAck(ctx, claims.AgentID, claims.Generation, *frame.Ack); err != nil {
+			if err := s.Commands.ApplyAck(ctx, claims, *frame.Ack); err != nil {
 				return err
 			}
 		}
