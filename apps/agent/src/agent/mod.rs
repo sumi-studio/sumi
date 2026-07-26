@@ -35,7 +35,7 @@ use crate::{
         overflow::OverflowSource,
         types::{ContextMessage, PublicMessage, StopReason},
     },
-    runtime::contracts::ProcessGeneration,
+    runtime::contracts::{HydrationReady, ProcessGeneration},
     store::{
         ApplicationKind, DataKeyPurpose, EventWriter, InboundAdmission, InboundReceiptOrigin,
         RecoveryRequired as AdmissionRecoveryRequired, RecoveryStep, Store, SuffixRecovery,
@@ -192,7 +192,6 @@ async fn own_gateway_writer<W: GatewayWriter>(
 
 /// The sole mutable conversation value transferred into and out of a worker.
 /// It is intentionally neither `Clone` nor wrapped in shared mutability.
-#[derive(Debug)]
 pub(crate) struct RunCore {
     ownership_id: Uuid,
     mutation_epoch: u64,
@@ -203,6 +202,12 @@ pub(crate) struct RunCore {
     /// production; keeping this injected representation in `RunCore` prevents
     /// a second Session run from silently losing the first run.
     runtime_context: Vec<ContextMessage>,
+    /// Hydrated recovery steps supplied by T17. When present, the Session
+    /// consumes them directly instead of recomputing a T12-safe prefix.
+    recovery_steps: Option<Vec<RecoveryStep>>,
+    /// Generation-bound hydration latch. The Session waits here before it
+    /// admits any command, and rejects a stale-generation Ready.
+    hydration: Option<watch::Receiver<HydrationReady>>,
     durable_binding: Option<DurableRunBinding>,
     worker_phase: Option<watch::Sender<WorkerPhase>>,
     /// Shared cancellation registry for the one live provider attempt. The
@@ -219,10 +224,27 @@ impl RunCore {
             pending_controls: MessageQueue::bounded(PENDING_CONTROL_CAPACITY),
             pending_overflow_apply: None,
             runtime_context: Vec::new(),
+            recovery_steps: None,
+            hydration: None,
             durable_binding: None,
             worker_phase: None,
             attempt_cancellation: None,
         }
+    }
+
+    pub(crate) fn with_runtime_context(mut self, context: Vec<ContextMessage>) -> Self {
+        self.runtime_context = context;
+        self
+    }
+
+    pub(crate) fn with_recovery_steps(mut self, steps: Vec<RecoveryStep>) -> Self {
+        self.recovery_steps = Some(steps);
+        self
+    }
+
+    pub(crate) fn with_hydration(mut self, hydration: watch::Receiver<HydrationReady>) -> Self {
+        self.hydration = Some(hydration);
+        self
     }
 
     pub(crate) fn ownership_id(&self) -> Uuid {
@@ -257,6 +279,23 @@ impl RunCore {
 
     pub(crate) fn pending_overflow_apply(&self) -> Option<OverflowSource> {
         self.pending_overflow_apply
+    }
+}
+
+impl std::fmt::Debug for RunCore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunCore")
+            .field("ownership_id", &self.ownership_id)
+            .field("mutation_epoch", &self.mutation_epoch)
+            .field("pending_controls", &self.pending_controls)
+            .field("pending_overflow_apply", &self.pending_overflow_apply)
+            .field("runtime_context_len", &self.runtime_context.len())
+            .field("recovery_steps", &self.recovery_steps.is_some())
+            .field("hydration", &self.hydration.is_some())
+            .field("durable_binding", &self.durable_binding)
+            .field("worker_phase", &self.worker_phase.is_some())
+            .field("attempt_cancellation", &self.attempt_cancellation.is_some())
+            .finish()
     }
 }
 
@@ -484,6 +523,7 @@ impl Drop for ActiveRun {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum RunOwnership {
     Recovered(RunCore),
     Lost,
@@ -565,6 +605,30 @@ impl<G: Gateway + 'static> Session<G> {
         executor_generation: ProcessGeneration,
     ) -> Result<Self> {
         worker.validate_executor_generation(executor_generation)?;
+
+        // Wait for the generation-bound hydration latch before loading keys or
+        // admitting any command. A stale-generation Ready is fail-closed; a
+        // dropped sender before Ready is also fail-closed.
+        let mut core = core;
+        if let Some(mut hydration) = core.hydration.take() {
+            loop {
+                let state = hydration.borrow_and_update().clone();
+                if let Some(ready_generation) = state.generation() {
+                    if ready_generation != executor_generation {
+                        return Err(anyhow::anyhow!(
+                            "hydration ready latched for generation {ready_generation}, expected {executor_generation}"
+                        ));
+                    }
+                    break;
+                }
+                if hydration.changed().await.is_err() {
+                    return Err(anyhow::anyhow!(
+                        "hydration ready signal closed before becoming ready"
+                    ));
+                }
+            }
+        }
+
         let conversation_id = store.scope().conversation_id.clone();
         let store = Arc::new(store);
         for purpose in [
@@ -576,7 +640,12 @@ impl<G: Gateway + 'static> Session<G> {
         }
         let writer = EventWriter::new(store.clone());
         writer.initialize_recovery_checkpoint().await?;
-        let recovery_steps = SuffixRecovery::recover_t12_prefix(&store, &writer).await?;
+        let recovery_steps = core.recovery_steps.take().unwrap_or_default();
+        let recovery_steps = if recovery_steps.is_empty() {
+            SuffixRecovery::recover_t12_prefix(&store, &writer).await?
+        } else {
+            recovery_steps
+        };
         let admission = InboundAdmission::after_t12_recovery(!recovery_steps.is_empty());
         let (gateway_reader, gateway_writer) = gateway.split();
         let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_CHANNEL_CAPACITY);

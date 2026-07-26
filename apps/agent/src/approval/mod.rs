@@ -225,3 +225,49 @@ mod tests {
         ));
     }
 }
+
+use crate::{
+    agent::{ApprovalRequest, ApprovalResolution},
+    gateway::ApprovalDecision,
+    tools::ToolRisk,
+};
+
+/// Runtime approval broker interface.
+///
+/// Implementations evaluate a concrete tool call and return an
+/// `ApprovalResolution` that the `InjectedRunDriver` enforces before executing
+/// any tool that is not read-only.
+pub trait RuntimeApprovalBroker: Send + Sync {
+    fn request(&self, request: &ApprovalRequest, risk: ToolRisk) -> ApprovalResolution;
+}
+
+/// Production fail-closed broker.
+///
+/// Read-only tools are approved for a single execution. All mutating and
+/// exec-risk tools are denied until an interactive or policy broker replaces
+/// this stub. This keeps T26 production fail-closed while still allowing the
+/// policy `ApprovalBroker` to be composed and tested.
+pub struct FailClosedApprovalBroker;
+
+impl FailClosedApprovalBroker {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for FailClosedApprovalBroker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RuntimeApprovalBroker for FailClosedApprovalBroker {
+    fn request(&self, _request: &ApprovalRequest, risk: ToolRisk) -> ApprovalResolution {
+        match risk {
+            ToolRisk::ReadOnly => ApprovalResolution::Decision(ApprovalDecision::ApproveOnce),
+            ToolRisk::Mutating | ToolRisk::Exec => {
+                ApprovalResolution::Decision(ApprovalDecision::Deny)
+            }
+        }
+    }
+}

@@ -607,6 +607,16 @@ pub async fn run_artifact_broker_mode() -> Result<()> {
     let identity = identity_from_env()?;
     let root = required_path("SUMI_ARTIFACT_ROOT")?;
     let socket = required_path("SUMI_ARTIFACT_BROKER_SOCKET")?;
+
+    // A stale socket inode from a previous run on a persistent IPC volume
+    // would otherwise cause `bind` to fail. Remove only the expected socket
+    // path; if something else is at that path the bind will surface it.
+    if socket.exists() {
+        tokio::fs::remove_file(&socket).await.with_context(|| {
+            format!("failed to remove stale broker socket {}", socket.display())
+        })?;
+    }
+
     let broker = Arc::new(ArtifactBroker::open(&root).context("failed to open artifact root")?);
     let listener = UnixListener::bind(&socket)
         .with_context(|| format!("failed to bind artifact broker socket {}", socket.display()))?;

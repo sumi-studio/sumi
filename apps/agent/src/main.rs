@@ -55,6 +55,14 @@ async fn async_main(mode: Option<String>) -> Result<()> {
         .init();
 
     match mode.as_deref() {
+        Some("--low-trust") => {
+            tracing::warn!(
+                service = "sumi-agent",
+                trust = "low-trust-local",
+                "starting low-trust admission harness; not for production"
+            );
+            return run_low_trust_admission().await;
+        }
         Some("--tool-executor") => {
             tracing::warn!(
                 service = "tool-executor",
@@ -89,19 +97,18 @@ async fn async_main(mode: Option<String>) -> Result<()> {
         _ => {}
     }
 
-    // Production bootstrap boundary.  The supervisor must issue all required
-    // identity, lease, and fence variables.  When they are missing we fall
-    // through to the M0 admission harness so existing low-trust tests keep
-    // working; any actual production deployment without these variables is
-    // fail-closed because `bootstrap::run_production` would be called with
-    // missing environment and error.
+    // Production bootstrap boundary. The supervisor must issue all required
+    // identity, lease, and fence variables. Missing identity is fail-closed;
+    // the low-trust admission harness is only selectable explicitly with
+    // `--low-trust` and must never be reachable by accident in production.
     if env::var("SUMI_RPC_GENERATION").is_ok() && env::var("SUMI_RPC_NONCE").is_ok() {
         return bootstrap::run_production().await;
     }
 
-    // M0 low-trust admission harness.  This path is not a production boundary;
-    // it exists only for local tests and exploratory runs without a supervisor.
-    run_low_trust_admission().await
+    Err(anyhow!(
+        "production identity (SUMI_RPC_GENERATION and SUMI_RPC_NONCE) is required; \
+         use --low-trust only for test/development"
+    ))
 }
 
 async fn run_low_trust_admission() -> Result<()> {

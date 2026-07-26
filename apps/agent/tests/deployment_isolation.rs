@@ -8,7 +8,7 @@
 //! the blocker and passes after documenting it, rather than silently degrading.
 
 use std::{
-    os::unix::fs::MetadataExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -982,5 +982,186 @@ async fn cli_allocate_generation_is_monotonic_and_persistent() {
     let second = allocate(&root);
     assert_eq!(second, first + 1);
 
+    let _ = tokio::fs::remove_dir_all(&root).await;
+}
+
+#[tokio::test]
+async fn artifact_broker_rebinds_stale_socket_on_restart() {
+    let root = std::env::temp_dir().join(format!("sumi-broker-restart-{}-", Uuid::now_v7()));
+    let artifacts = root.join("artifacts");
+    let broker_ipc = root.join("broker-ipc");
+    let socket = broker_ipc.join("broker.sock");
+    tokio::fs::create_dir_all(&artifacts).await.unwrap();
+    tokio::fs::create_dir_all(&broker_ipc).await.unwrap();
+
+    let spawn_broker = || {
+        Command::new(env!("CARGO_BIN_EXE_sumi-agent"))
+            .arg("--artifact-broker")
+            .env_clear()
+            .env("SUMI_RPC_GENERATION", GENERATION.to_string())
+            .env("SUMI_RPC_NONCE", NONCE)
+            .env("SUMI_ARTIFACT_ROOT", &artifacts)
+            .env("SUMI_ARTIFACT_BROKER_SOCKET", &socket)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+
+    let mut first = spawn_broker();
+    timeout(Duration::from_secs(5), async {
+        while UnixStream::connect(&socket).await.is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first broker socket");
+
+    first.kill().await.unwrap();
+    first.wait().await.unwrap();
+
+    let mut second = spawn_broker();
+    timeout(Duration::from_secs(5), async {
+        while UnixStream::connect(&socket).await.is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("second broker must rebind the stale socket");
+
+    let _ = second.kill().await;
+    let _ = tokio::fs::remove_dir_all(&root).await;
+}
+
+#[tokio::test]
+async fn ipc_sockets_inherit_setgid_group_and_remain_reachable() {
+    let root = std::env::temp_dir().join(format!("sumi-ipc-setgid-{}-", Uuid::now_v7()));
+    let workspace = root.join("workspace");
+    let artifacts = root.join("artifacts");
+    let runtime_ipc = root.join("runtime-ipc");
+    let broker_ipc = root.join("broker-ipc");
+    let executor_socket = runtime_ipc.join("executor.sock");
+    let broker_socket = broker_ipc.join("broker.sock");
+
+    for dir in [&workspace, &artifacts, &runtime_ipc, &broker_ipc] {
+        tokio::fs::create_dir_all(dir).await.unwrap();
+    }
+
+    for ipc_dir in [&runtime_ipc, &broker_ipc] {
+        let mut perms = std::fs::metadata(ipc_dir).unwrap().permissions();
+        perms.set_mode(0o2770);
+        tokio::fs::set_permissions(ipc_dir, perms).await.unwrap();
+    }
+
+    // Start the artifact broker in the broker IPC directory.
+    let mut broker = Command::new(env!("CARGO_BIN_EXE_sumi-agent"))
+        .arg("--artifact-broker")
+        .env_clear()
+        .env("SUMI_RPC_GENERATION", GENERATION.to_string())
+        .env("SUMI_RPC_NONCE", NONCE)
+        .env("SUMI_ARTIFACT_ROOT", &artifacts)
+        .env("SUMI_ARTIFACT_BROKER_SOCKET", &broker_socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    timeout(Duration::from_secs(5), async {
+        while UnixStream::connect(&broker_socket).await.is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("broker socket");
+
+    // Start a socket-bound executor in the runtime IPC directory.
+    let mut executor = Command::new(env!("CARGO_BIN_EXE_sumi-agent"))
+        .arg("--tool-executor-socket")
+        .env_clear()
+        .env("SUMI_RPC_GENERATION", GENERATION.to_string())
+        .env("SUMI_RPC_NONCE", NONCE)
+        .env("SUMI_WORKSPACE", &workspace)
+        .env("SUMI_CONVERSATION_ID", CONVERSATION)
+        .env("SUMI_ARTIFACT_BROKER_SOCKET", &broker_socket)
+        .env("SUMI_EXECUTOR_SOCKET", &executor_socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    timeout(Duration::from_secs(5), async {
+        while UnixStream::connect(&executor_socket).await.is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("executor socket");
+
+    // Socket inodes must inherit the shared IPC group from their directories.
+    let broker_dir_gid = tokio::fs::metadata(&broker_ipc).await.unwrap().gid();
+    let broker_sock_gid = tokio::fs::metadata(&broker_socket).await.unwrap().gid();
+    assert_eq!(
+        broker_sock_gid, broker_dir_gid,
+        "broker socket group must inherit the setgid directory group"
+    );
+
+    let runtime_dir_gid = tokio::fs::metadata(&runtime_ipc).await.unwrap().gid();
+    let executor_sock_gid = tokio::fs::metadata(&executor_socket).await.unwrap().gid();
+    assert_eq!(
+        executor_sock_gid, runtime_dir_gid,
+        "executor socket group must inherit the setgid directory group"
+    );
+
+    // The runtime process (this test) must be able to connect to both sockets,
+    // and the executor process must have been able to connect to the broker.
+    let broker_response = broker_rpc(
+        &broker_socket,
+        &json!({
+            "generation": GENERATION,
+            "nonce": NONCE,
+            "request_id": "broker-1",
+            "operation": {
+                "type": "begin_tool_output",
+                "conversation_id": CONVERSATION,
+                "execution_id": "exec-1",
+                "content": [104, 101, 108, 108, 111]
+            }
+        }),
+    )
+    .await;
+    assert!(
+        broker_response.is_some(),
+        "runtime must be able to exchange with the broker socket"
+    );
+
+    let executor_request = json!({
+        "generation": GENERATION,
+        "nonce": NONCE,
+        "request_id": "exec-1",
+        "operation": {
+            "type": "read_file",
+            "path": "missing.txt",
+            "offset": 0,
+            "limit": 1024,
+            "execution_id": "exec-1"
+        }
+    });
+    let mut bytes = serde_json::to_vec(&executor_request).unwrap();
+    bytes.push(b'\n');
+    let mut stream = UnixStream::connect(&executor_socket).await.unwrap();
+    stream.write_all(&bytes).await.unwrap();
+    stream.shutdown().await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    assert!(
+        !response.is_empty(),
+        "runtime must be able to exchange with the executor socket"
+    );
+
+    let _ = broker.kill().await;
+    let _ = executor.kill().await;
     let _ = tokio::fs::remove_dir_all(&root).await;
 }

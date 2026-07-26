@@ -101,6 +101,30 @@ impl HydrationReady {
     pub fn invalidate(&mut self) {
         *self = Self::NotReady;
     }
+
+    /// Returns `true` once the latch has transitioned to `Ready`.
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready { .. })
+    }
+
+    /// The generation for which the latch is `Ready`, if any.
+    pub fn generation(&self) -> Option<ProcessGeneration> {
+        match self {
+            Self::Ready { generation, .. } => Some(*generation),
+            Self::NotReady => None,
+        }
+    }
+
+    /// The stable hydration receipt identity bound to the `Ready` state, if any.
+    pub fn receipt_identity(&self) -> Option<&HydrationReceiptIdentity> {
+        match self {
+            Self::Ready {
+                hydration_receipt_identity,
+                ..
+            } => Some(hydration_receipt_identity),
+            Self::NotReady => None,
+        }
+    }
 }
 
 /// A process generation that is exactly representable by SQLite `INTEGER`.

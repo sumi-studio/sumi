@@ -12,6 +12,7 @@ static DATABASE_ID: AtomicU64 = AtomicU64::new(1);
 fn agent_command(database_path: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_sumi-agent"));
     command
+        .arg("--low-trust")
         .env_remove("SUMI_CONFIG")
         .env_remove("SUMI_ENV_FILE")
         .env(

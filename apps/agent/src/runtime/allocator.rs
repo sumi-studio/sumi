@@ -41,12 +41,22 @@ impl GenerationAllocation {
     }
 }
 
+/// Current content of the generation ledger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GenerationLedger {
+    /// The next generation value to issue.
+    Next(u64),
+    /// `i64::MAX` has already been issued; no further generations are valid.
+    Exhausted,
+}
+
 /// Acquire the next `ProcessGeneration` lease from the allocator rooted at
 /// `state_dir`.
 ///
 /// The generation file is stored in `state_dir/.generation`.  The domain is
 /// `0..=i64::MAX`; `i64::MAX` is a valid generation, but the allocator will
-/// refuse to issue a generation beyond it and will not wrap.
+/// issue it only once and then persist an `exhausted` sentinel so the next
+/// bootstrap fails closed without wrap or reuse.
 pub fn acquire_generation(state_dir: impl AsRef<Path>) -> Result<GenerationAllocation> {
     let _process_guard = PROCESS_ALLOCATOR_MUTEX
         .lock()
@@ -70,15 +80,24 @@ pub fn acquire_generation(state_dir: impl AsRef<Path>) -> Result<GenerationAlloc
     // state directory, including concurrent supervisor processes.
     lock_exclusive(file.as_raw_fd()).context("failed to lock generation ledger")?;
 
-    let current = read_generation(&file)?;
-    let next = current
-        .checked_add(1)
-        .filter(|value| *value <= ProcessGeneration::MAX.as_u64())
-        .ok_or_else(|| anyhow!("process generation exhausted at i64::MAX; refuse wrap/reuse"))?;
-    let generation = ProcessGeneration::from_wire(current)
-        .context("allocator produced an out-of-domain generation")?;
+    let ledger = read_generation(&file)?;
+    let (generation, next_ledger) = match ledger {
+        GenerationLedger::Exhausted => {
+            bail!("process generation exhausted at i64::MAX; refuse wrap/reuse");
+        }
+        GenerationLedger::Next(value) => {
+            let generation = ProcessGeneration::from_wire(value)
+                .context("allocator produced an out-of-domain generation")?;
+            let next_ledger = if value == ProcessGeneration::MAX.as_u64() {
+                GenerationLedger::Exhausted
+            } else {
+                GenerationLedger::Next(value + 1)
+            };
+            (generation, next_ledger)
+        }
+    };
 
-    write_generation(&temp_path, next)?;
+    write_ledger(&temp_path, next_ledger)?;
     fs::rename(&temp_path, &generation_path)
         .context("failed to commit generation ledger update")?;
     sync_dir(state_dir).context("failed to fsync allocator state directory")?;
@@ -98,7 +117,7 @@ pub fn acquire_generation(state_dir: impl AsRef<Path>) -> Result<GenerationAlloc
     })
 }
 
-fn read_generation(file: &File) -> Result<u64> {
+fn read_generation(file: &File) -> Result<GenerationLedger> {
     use std::io::{BufRead, BufReader};
     let reader = BufReader::new(file);
     let line = reader
@@ -107,15 +126,20 @@ fn read_generation(file: &File) -> Result<u64> {
         .transpose()
         .context("failed to read generation ledger")?
         .unwrap_or_default();
-    if line.trim().is_empty() {
-        return Ok(0);
+    let line = line.trim();
+    if line.is_empty() {
+        return Ok(GenerationLedger::Next(0));
     }
-    line.trim()
+    if line == "exhausted" {
+        return Ok(GenerationLedger::Exhausted);
+    }
+    let value = line
         .parse::<u64>()
-        .with_context(|| format!("generation ledger contains non-integer value: {line:?}"))
+        .with_context(|| format!("generation ledger contains non-integer value: {line:?}"))?;
+    Ok(GenerationLedger::Next(value))
 }
 
-fn write_generation(path: &Path, value: u64) -> Result<()> {
+fn write_ledger(path: &Path, ledger: GenerationLedger) -> Result<()> {
     let mut temp = OpenOptions::new()
         .write(true)
         .create(true)
@@ -128,7 +152,11 @@ fn write_generation(path: &Path, value: u64) -> Result<()> {
             )
         })?;
     use std::io::Write;
-    writeln!(&mut temp, "{value}").context("failed to write generation ledger")?;
+    match ledger {
+        GenerationLedger::Exhausted => writeln!(&mut temp, "exhausted"),
+        GenerationLedger::Next(value) => writeln!(&mut temp, "{value}"),
+    }
+    .context("failed to write generation ledger")?;
     temp.sync_all()
         .context("failed to fsync temporary generation file")?;
     Ok(())
@@ -235,11 +263,54 @@ mod tests {
     }
 
     #[test]
-    fn allocator_refuses_to_wrap_past_i64_max() {
+    fn allocator_issues_i64_max_once_then_refuses_next() {
         let dir = test_dir("sumi-alloc-max");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(GENERATION_FILE_NAME);
-        fs::write(&path, format!("{}\n", ProcessGeneration::MAX.as_u64())).unwrap();
+        let max = ProcessGeneration::MAX.as_u64();
+        // The ledger stores the next generation to issue; seeding it with
+        // i64::MAX should issue exactly that valid generation and then latch
+        // the ledger as exhausted.
+        fs::write(&path, format!("{}\n", max)).unwrap();
+
+        let alloc = acquire_generation(&dir).unwrap();
+        assert_eq!(alloc.generation().as_u64(), max);
+
+        assert!(acquire_generation(&dir).is_err());
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.trim() == "exhausted");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn allocator_exhausted_state_survives_restart() {
+        let dir = test_dir("sumi-alloc-restart");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(GENERATION_FILE_NAME);
+        let max = ProcessGeneration::MAX.as_u64();
+        fs::write(&path, format!("{}\n", max)).unwrap();
+
+        let first = acquire_generation(&dir).unwrap();
+        assert_eq!(first.generation().as_u64(), max);
+
+        // Simulate a fresh process invocation against the same persistent ledger.
+        let second = acquire_generation(&dir);
+        assert!(
+            second.is_err(),
+            "post-MAX allocation must remain refused after restart"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn allocator_refuses_exhausted_seed() {
+        let dir = test_dir("sumi-alloc-exhausted");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(GENERATION_FILE_NAME);
+        fs::write(&path, "exhausted\n").unwrap();
         assert!(acquire_generation(&dir).is_err());
         let _ = fs::remove_dir_all(&dir);
     }

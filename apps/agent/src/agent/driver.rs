@@ -18,6 +18,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
+    approval::RuntimeApprovalBroker,
+    gateway::ApprovalDecision,
     memory::transform,
     provider::{
         ModelSpec, ProviderTimingObservation, ProviderTimingObservations, ProviderTimingObserver,
@@ -28,11 +30,13 @@ use crate::{
         },
     },
     runtime::contracts::ProcessGeneration,
-    tools::{ToolCtx, ToolError, ToolRegistry, WorkspacePaths},
+    store::HydratedRunState,
+    tools::{ToolCtx, ToolError, ToolRegistry, ToolRisk, WorkspacePaths},
 };
 
 use super::{
-    OverflowRecoveryOutcome, OverflowRecoveryRequest, ProviderAttempt, RunCore, RunDriver,
+    ApprovalRequest, ApprovalResolution, OverflowRecoveryOutcome, OverflowRecoveryRequest,
+    ProviderAttempt, ReviewProjection, RunCore, RunDriver,
 };
 
 type StreamStarter = dyn Fn(
@@ -136,6 +140,8 @@ pub(crate) struct InjectedRunDriver {
     stream_starter: Arc<StreamStarter>,
     timings: RunTimingSamples,
     timing_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    approval_broker: Option<Arc<dyn RuntimeApprovalBroker>>,
+    hydrated_state: Option<HydratedRunState>,
 }
 
 impl InjectedRunDriver {
@@ -187,7 +193,22 @@ impl InjectedRunDriver {
             stream_starter,
             timings: RunTimingSamples::default(),
             timing_tasks: Mutex::new(Vec::new()),
+            approval_broker: None,
+            hydrated_state: None,
         })
+    }
+
+    pub(crate) fn with_approval_broker(
+        mut self,
+        broker: Option<Arc<dyn RuntimeApprovalBroker>>,
+    ) -> Self {
+        self.approval_broker = broker;
+        self
+    }
+
+    pub(crate) fn with_hydrated_state(mut self, state: Option<HydratedRunState>) -> Self {
+        self.hydrated_state = state;
+        self
     }
 
     pub(crate) fn timings(&self) -> RunTimingSamples {
@@ -283,6 +304,35 @@ impl RunDriver for InjectedRunDriver {
             .registry
             .get(&call.name)
             .ok_or_else(|| ToolError::Protocol(format!("unknown frozen tool: {}", call.name)))?;
+        let risk = tool.risk();
+        if !matches!(risk, ToolRisk::ReadOnly) {
+            let args_value = serde_json::to_value(&call.arguments).unwrap_or(Value::Null);
+            let request = ApprovalRequest {
+                id: Uuid::now_v7().to_string(),
+                tool_call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                action: ReviewProjection::Reviewable(args_value.clone()),
+                args_summary: args_value,
+                reason: Some(format!("tool risk is {risk:?}")),
+                audit: None,
+            };
+            let resolution = self
+                .approval_broker
+                .as_ref()
+                .map(|broker| broker.request(&request, risk))
+                .unwrap_or(ApprovalResolution::Decision(ApprovalDecision::Deny));
+            match resolution {
+                ApprovalResolution::Decision(ApprovalDecision::ApproveOnce)
+                | ApprovalResolution::Decision(ApprovalDecision::ApproveAlways { .. }) => {}
+                ApprovalResolution::Decision(ApprovalDecision::Deny)
+                | ApprovalResolution::Cancelled => {
+                    return Err(ToolError::Protocol(format!(
+                        "tool `{}` denied by approval policy",
+                        call.name
+                    )));
+                }
+            }
+        }
         let output = tool
             .execute(ToolCtx {
                 flow_id,
@@ -323,7 +373,14 @@ impl RunDriver for InjectedRunDriver {
         _request: OverflowRecoveryRequest,
         _active_context: &[ContextMessage],
     ) -> Result<OverflowRecoveryOutcome> {
-        bail!("overflow context assembly is not supplied; T21 must provide it explicitly")
+        bail!(
+            "overflow recovery requested with {} hydrated memory inputs; \
+             context assembly must be supplied by T21",
+            self.hydrated_state
+                .as_ref()
+                .map(|s| s.memory_batches.len())
+                .unwrap_or(0)
+        )
     }
 }
 
@@ -2166,5 +2223,111 @@ mod tests {
             }],
             "destination-sensitive cross-model thinking must not be replayed"
         );
+    }
+
+    #[tokio::test]
+    async fn non_readonly_tool_is_denied_without_approval_broker() {
+        let (spec, prompt, _registry, workspace) = dependencies();
+        let mut builder = ToolRegistryBuilder::default();
+        builder.register(Arc::new(ExecRiskTool)).expect("register");
+        let registry = builder.build();
+        let prompt = PromptContext {
+            tools: registry.definitions(),
+            ..prompt
+        };
+        let driver = InjectedRunDriver::with_stream_starter(
+            spec,
+            RequestOptions::default(),
+            Some(prompt),
+            Some(registry),
+            Some(workspace),
+            Some(generation(0)),
+            inert_starter(),
+        )
+        .expect("driver");
+
+        let call = ToolCall {
+            id: "call-1".to_owned(),
+            name: "exec_risk_tool".to_owned(),
+            arguments: serde_json::from_value::<ValidatedToolArguments>(json!({}))
+                .expect("empty arguments"),
+        };
+        let result = driver
+            .execute_tool_observed("flow-1", &call, CancellationToken::new(), Arc::new(|_| {}))
+            .await;
+        assert!(
+            result.is_err(),
+            "non-read-only tool must be denied without an approval broker"
+        );
+        assert!(result.unwrap_err().to_string().contains("approval policy"));
+    }
+
+    #[tokio::test]
+    async fn approval_broker_can_approve_non_readonly_tool() {
+        let (spec, prompt, _registry, workspace) = dependencies();
+        let mut builder = ToolRegistryBuilder::default();
+        builder.register(Arc::new(ExecRiskTool)).expect("register");
+        let registry = builder.build();
+        let prompt = PromptContext {
+            tools: registry.definitions(),
+            ..prompt
+        };
+        let driver = InjectedRunDriver::with_stream_starter(
+            spec,
+            RequestOptions::default(),
+            Some(prompt),
+            Some(registry),
+            Some(workspace),
+            Some(generation(0)),
+            inert_starter(),
+        )
+        .expect("driver")
+        .with_approval_broker(Some(Arc::new(AlwaysApproveBroker)));
+
+        let call = ToolCall {
+            id: "call-1".to_owned(),
+            name: "exec_risk_tool".to_owned(),
+            arguments: serde_json::from_value::<ValidatedToolArguments>(json!({}))
+                .expect("empty arguments"),
+        };
+        let result = driver
+            .execute_tool_observed("flow-1", &call, CancellationToken::new(), Arc::new(|_| {}))
+            .await;
+        assert!(result.is_ok(), "approval broker must allow the tool");
+    }
+
+    struct ExecRiskTool;
+
+    #[async_trait]
+    impl Tool for ExecRiskTool {
+        fn def(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "exec_risk_tool".to_owned(),
+                description: "fixture exec-risk tool".to_owned(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+
+        fn risk(&self) -> ToolRisk {
+            ToolRisk::Exec
+        }
+
+        async fn execute(&self, _ctx: ToolCtx<'_>) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput {
+                content: vec![UserContent::Text {
+                    text: "done".to_owned(),
+                }],
+                details: json!({}),
+                is_error: false,
+            })
+        }
+    }
+
+    struct AlwaysApproveBroker;
+
+    impl crate::approval::RuntimeApprovalBroker for AlwaysApproveBroker {
+        fn request(&self, _request: &ApprovalRequest, _risk: ToolRisk) -> ApprovalResolution {
+            ApprovalResolution::Decision(crate::gateway::ApprovalDecision::ApproveOnce)
+        }
     }
 }

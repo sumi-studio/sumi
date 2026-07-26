@@ -9,25 +9,25 @@
 use std::{env, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result, bail};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::{
     agent::{InjectedRunDriver, RunCore, RunWorker, SequentialRunWorker, Session},
+    approval::{FailClosedApprovalBroker, RuntimeApprovalBroker},
     config::Config,
     gateway::StdioGateway,
     provider::{
         ProviderTimingObserver,
         model::{ModelSpec, RequestOptions},
-        types::{
-            ContextMessage, MemoryBlock, PromptContext, ProviderContextItem, ProviderEventStream,
-        },
+        types::{MemoryBlock, PromptContext, ProviderEventStream},
     },
     runtime::contracts::{
         GenerationRecoveryFence, HydrationReady, HydrationReceiptIdentity, ProcessGeneration,
         ProcessGenerationLease, RpcBootNonce,
     },
-    store::{AgentScope, EnvironmentKeyProvider, EventWriter, Store, SuffixRecovery},
+    store::{AgentScope, EnvironmentKeyProvider, HydrationOutcome, Store},
     tools::{
         ToolRegistry, WorkspacePaths, executor::ExecutorClient, executor::remote_executor_registry,
     },
@@ -44,7 +44,6 @@ struct BootstrapContext {
     conversation_id: String,
     state_dir: PathBuf,
     executor_socket: PathBuf,
-    wrapping_key: String,
     wrapping_key_id: String,
 }
 
@@ -70,9 +69,13 @@ impl BootstrapContext {
         let state_dir = required_path("SUMI_STATE_DIR")?;
         let executor_socket = required_path("SUMI_EXECUTOR_SOCKET")?;
 
-        let wrapping_key = required("SUMI_AGENT_WRAPPING_KEY")?;
         let wrapping_key_id = env::var("SUMI_AGENT_WRAPPING_KEY_ID")
             .unwrap_or_else(|_| "env-wrapping-key/v1".to_owned());
+
+        // Validate presence of the wrapping key without retaining the raw string.
+        // `EnvironmentKeyProvider::from_env` re-reads and zeroizes the value
+        // when the bootstrap builds the sole key provider.
+        let _ = Zeroizing::new(required("SUMI_AGENT_WRAPPING_KEY")?);
 
         Ok(Self {
             generation,
@@ -84,7 +87,6 @@ impl BootstrapContext {
             conversation_id,
             state_dir,
             executor_socket,
-            wrapping_key,
             wrapping_key_id,
         })
     }
@@ -125,12 +127,18 @@ fn parse_generation(value: &str) -> Result<ProcessGeneration> {
 
 /// Run the production bootstrap with the real provider stream starter.
 pub async fn run_production() -> Result<()> {
-    run_production_with_driver(Arc::new(crate::provider::stream_observed), None).await
+    run_production_with_driver_and_broker(
+        Arc::new(crate::provider::stream_observed),
+        None,
+        Some(Arc::new(FailClosedApprovalBroker::new())),
+    )
+    .await
 }
 
 /// Run the production bootstrap with an injected stream starter and optional
 /// tool registry.  `tool_registry` is intended for tests; when `None` the
 /// production remote executor registry is built from `SUMI_EXECUTOR_SOCKET`.
+#[allow(dead_code)]
 pub async fn run_production_with_driver(
     stream_starter: Arc<
         dyn Fn(
@@ -144,6 +152,25 @@ pub async fn run_production_with_driver(
             + Sync,
     >,
     tool_registry: Option<ToolRegistry>,
+) -> Result<()> {
+    run_production_with_driver_and_broker(stream_starter, tool_registry, None).await
+}
+
+/// Internal bootstrap seam that lets tests inject a `RuntimeApprovalBroker`.
+pub(crate) async fn run_production_with_driver_and_broker(
+    stream_starter: Arc<
+        dyn Fn(
+                ModelSpec,
+                PromptContext,
+                RequestOptions,
+                CancellationToken,
+                ProviderTimingObserver,
+            ) -> ProviderEventStream
+            + Send
+            + Sync,
+    >,
+    tool_registry: Option<ToolRegistry>,
+    approval_broker: Option<Arc<dyn RuntimeApprovalBroker>>,
 ) -> Result<()> {
     let ctx = BootstrapContext::from_env()?;
 
@@ -167,7 +194,6 @@ pub async fn run_production_with_driver(
         .model_spec()
         .context("failed to resolve production model spec")?;
 
-    let _ = ctx.wrapping_key; // validated to exist; `from_env` re-reads the variable for zeroization
     let key_provider: Arc<dyn crate::store::KeyProvider> = Arc::new(
         EnvironmentKeyProvider::from_env("SUMI_AGENT_WRAPPING_KEY", &ctx.wrapping_key_id)
             .context("failed to initialize wrapping key provider")?,
@@ -178,46 +204,17 @@ pub async fn run_production_with_driver(
         .await
         .context("failed to open durable store")?;
 
-    // Hydration latch starts NotReady for the current generation.
-    let mut hydration = HydrationReady::not_ready();
-
-    let event_writer = EventWriter::new(Arc::new(store.clone()));
-    event_writer
-        .initialize_recovery_checkpoint()
-        .await
-        .context("failed to initialize recovery checkpoint")?;
-    let pending_recovery = SuffixRecovery::recover_t12_prefix(&store, &event_writer)
-        .await
-        .context("T12 prefix recovery failed")?;
-
-    if !pending_recovery.is_empty() {
-        bail!(
-            "durable suffix recovery is required; T17 production hydration must resolve {:?} before T26 composition",
-            pending_recovery
-        );
-    }
-
-    // A clean existing conversation is empty of durable transcript.  Anything
-    // non-empty requires T17 typed hydration, which is not present here.
-    let message_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
-        .fetch_one(store.pool())
-        .await
-        .context("failed to probe durable transcript")?;
-    if message_count > 0 {
-        bail!(
-            "existing durable transcript found; T17 production hydration is required before T26 composition"
-        );
-    }
-
-    let memory_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_batches")
-        .fetch_one(store.pool())
-        .await
-        .context("failed to probe durable memory")?;
-    if memory_count > 0 {
-        bail!(
-            "existing durable memory found; T21 memory hydration is required before T26 composition"
-        );
-    }
+    // T17 typed hydration. Non-empty physical recovery intents remain
+    // fail-closed until T27 receipt integration, as T26 canon says.
+    let state = match store.hydrate(&ctx.lease, &ctx.fence).await? {
+        HydrationOutcome::RecoveryRequired(intents) => {
+            bail!(
+                "durable physical recovery is required; T27 must resolve {:?} before T26 composition",
+                intents
+            );
+        }
+        HydrationOutcome::Complete(state) => state,
+    };
 
     // Bind the generation recovery fence to the store scope.  This is an
     // in-memory binding for this run because T17 owns durable fence injection.
@@ -232,18 +229,14 @@ pub async fn run_production_with_driver(
         None => build_remote_tool_registry(&ctx)?,
     };
 
-    // Fail closed if an Exec-risk tool is present without an ApprovalBroker.
-    // T23 owns approval policy; until it is integrated we refuse to start with
-    // tools that require user approval.
-    if registry_has_exec_risk(&registry) && !approval_broker_available() {
-        bail!("Exec-risk tools require the T23 ApprovalBroker, which is not integrated");
-    }
-
     let prompt = PromptContext {
         system_prompt: config.system_prompt.clone(),
+        // T21 owns memory-block assembly from the hydrated memory records.
+        // We preserve the raw `HydratedRunState` in the driver so T21 can
+        // project it without introducing a fresh-only/empty-context fallback.
         memory_blocks: Vec::<MemoryBlock>::new(),
-        messages: Vec::<ContextMessage>::new(),
-        provider_context: Vec::<ProviderContextItem>::new(),
+        messages: state.messages.clone(),
+        provider_context: state.provider_context.clone(),
         tools: registry.definitions(),
     };
 
@@ -265,25 +258,40 @@ pub async fn run_production_with_driver(
         Some(ctx.generation),
         stream_starter,
     )
-    .context("failed to construct the production run driver")?;
+    .context("failed to construct the production run driver")?
+    .with_approval_broker(approval_broker)
+    .with_hydrated_state(Some(state.clone()));
 
-    // Latch Ready only after all composition checks succeed.  The receipt
-    // identity is generated here for clean conversations; T17 will supply a
-    // stable durable receipt once it is integrated.
-    let receipt_identity = HydrationReceiptIdentity::new(Uuid::now_v7().to_string())
-        .context("failed to mint hydration receipt identity")?;
-    hydration
-        .latch(ctx.generation, receipt_identity)
-        .context("failed to latch hydration ready state")?;
+    // Latch Ready only after all composition checks succeed. The receipt
+    // identity comes from the stable T17 hydration result, not a random UUID.
+    let runtime_receipt = HydrationReceiptIdentity::new(format!(
+        "{}:{}:{}:{}",
+        state.receipt.lease_id,
+        state.receipt.fence_id,
+        state.receipt.generation.as_u64(),
+        state.receipt.intent_count
+    ))
+    .context("failed to construct hydration receipt identity")?;
+    let (hydration_tx, hydration_rx) = watch::channel(HydrationReady::not_ready());
+    let ready = HydrationReady::Ready {
+        generation: ctx.generation,
+        hydration_receipt_identity: runtime_receipt.clone(),
+    };
+    hydration_tx
+        .send(ready)
+        .context("failed to publish hydration ready state")?;
     tracing::info!(
         generation = ctx.generation.as_u64(),
         lease_id = ctx.lease.lease_id(),
         fence_id = ctx.fence.fence_id(),
-        hydration_receipt_identity = %ctx.generation,
+        hydration_receipt_identity = %runtime_receipt.as_str(),
         "production hydration ready latched"
     );
 
-    let core = RunCore::new();
+    let core = RunCore::new()
+        .with_runtime_context(state.messages)
+        .with_recovery_steps(state.recovery_steps)
+        .with_hydration(hydration_rx);
     let worker: Arc<dyn RunWorker> = Arc::new(SequentialRunWorker::new(Arc::new(driver)));
 
     let command_digest_factory = store
@@ -316,28 +324,13 @@ fn build_remote_tool_registry(ctx: &BootstrapContext) -> Result<ToolRegistry> {
     remote_executor_registry(client).context("failed to build remote tool registry")
 }
 
-fn registry_has_exec_risk(registry: &ToolRegistry) -> bool {
-    registry.definitions().iter().any(|definition| {
-        // The registry is built from `RemoteToolKind` tools; the `Tool::risk()`
-        // information is not preserved on `ToolDefinition`.  For now, every
-        // registered tool that is not `read_file`/`list_dir`/`glob`/`grep` is
-        // treated as Exec or Mutating until T23 supplies the approval broker.
-        !["read_file", "list_dir", "glob", "grep"].contains(&definition.name.as_str())
-    })
-}
-
-fn approval_broker_available() -> bool {
-    // T23 ApprovalBroker integration is not yet present.  The module is a stub
-    // and no approval broker instance can be composed.
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use std::{fs, path::Path};
 
     use super::*;
     use crate::tools::ToolRegistryBuilder;
+    use uuid::Uuid;
 
     // Environment mutation is `unsafe` in Rust 2024; centralize it so tests
     // stay readable and the unsafe boundary is explicit.

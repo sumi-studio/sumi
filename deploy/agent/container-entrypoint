@@ -42,7 +42,7 @@ load_identity() {
 
 case "${role}" in
   init)
-    install -d -m 0770 -o root -g "${IPC_GID}" "${RUNTIME_IPC}" "${BROKER_IPC}"
+    install -d -m 02770 -o root -g "${IPC_GID}" "${RUNTIME_IPC}" "${BROKER_IPC}"
     install -d -m 0700 -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" /var/lib/sumi
     install -d -m 0700 -o "${EXECUTOR_UID}" -g "${EXECUTOR_GID}" /workspace
     install -d -m 0700 -o "${BROKER_UID}" -g "${BROKER_GID}" /var/lib/sumi-artifacts

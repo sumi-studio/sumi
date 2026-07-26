@@ -19,6 +19,7 @@ fn startup_loads_an_explicitly_selected_env_file() {
     .expect("write .env.local");
 
     let output = Command::new(env!("CARGO_BIN_EXE_sumi-agent"))
+        .arg("--low-trust")
         .current_dir(&directory)
         .env("SUMI_ENV_FILE", directory.join(".env.local"))
         .env_remove("SUMI_CONFIG")
@@ -52,6 +53,7 @@ fn startup_does_not_implicitly_trust_dot_env_local_in_the_working_directory() {
     .expect("write .env.local");
 
     let output = Command::new(env!("CARGO_BIN_EXE_sumi-agent"))
+        .arg("--low-trust")
         .current_dir(&directory)
         .env_remove("SUMI_CONFIG")
         .env_remove("SUMI_ENV_FILE")
