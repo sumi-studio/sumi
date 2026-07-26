@@ -46,9 +46,9 @@ impl CanonicalAction {
             "read_file" => Self {
                 tool: tool_name.to_owned(),
                 operation: "read".to_owned(),
-                argv: vec![tool_name.to_owned(), get_path_arg(map, "path")?],
+                argv: vec![tool_name.to_owned(), get_path_arg(map, tool_name, "path")?],
                 cwd: workspace_root.clone(),
-                affected_paths: vec![PathBuf::from(get_path_arg(map, "path")?)],
+                affected_paths: vec![PathBuf::from(get_path_arg(map, tool_name, "path")?)],
                 sandbox: SandboxSummary::workspace(),
                 requested_permissions: vec![Permission::ReadWorkspace],
                 justification: None,
@@ -56,9 +56,9 @@ impl CanonicalAction {
             "write_file" => Self {
                 tool: tool_name.to_owned(),
                 operation: "write".to_owned(),
-                argv: vec![tool_name.to_owned(), get_path_arg(map, "path")?],
+                argv: vec![tool_name.to_owned(), get_path_arg(map, tool_name, "path")?],
                 cwd: workspace_root.clone(),
-                affected_paths: vec![PathBuf::from(get_path_arg(map, "path")?)],
+                affected_paths: vec![PathBuf::from(get_path_arg(map, tool_name, "path")?)],
                 sandbox: SandboxSummary::workspace(),
                 requested_permissions: vec![Permission::WriteWorkspace],
                 justification: None,
@@ -66,9 +66,9 @@ impl CanonicalAction {
             "edit_file" => Self {
                 tool: tool_name.to_owned(),
                 operation: "edit".to_owned(),
-                argv: vec![tool_name.to_owned(), get_path_arg(map, "path")?],
+                argv: vec![tool_name.to_owned(), get_path_arg(map, tool_name, "path")?],
                 cwd: workspace_root.clone(),
-                affected_paths: vec![PathBuf::from(get_path_arg(map, "path")?)],
+                affected_paths: vec![PathBuf::from(get_path_arg(map, tool_name, "path")?)],
                 sandbox: SandboxSummary::workspace(),
                 requested_permissions: vec![Permission::EditWorkspace],
                 justification: None,
@@ -76,9 +76,9 @@ impl CanonicalAction {
             "delete" => Self {
                 tool: tool_name.to_owned(),
                 operation: "delete".to_owned(),
-                argv: vec![tool_name.to_owned(), get_path_arg(map, "path")?],
+                argv: vec![tool_name.to_owned(), get_path_arg(map, tool_name, "path")?],
                 cwd: workspace_root.clone(),
-                affected_paths: vec![PathBuf::from(get_path_arg(map, "path")?)],
+                affected_paths: vec![PathBuf::from(get_path_arg(map, tool_name, "path")?)],
                 sandbox: SandboxSummary::workspace(),
                 requested_permissions: vec![Permission::DeleteWorkspace],
                 justification: None,
@@ -86,9 +86,9 @@ impl CanonicalAction {
             "list_dir" => Self {
                 tool: tool_name.to_owned(),
                 operation: "read".to_owned(),
-                argv: vec![tool_name.to_owned(), get_path_arg(map, "path")?],
+                argv: vec![tool_name.to_owned(), get_path_arg(map, tool_name, "path")?],
                 cwd: workspace_root.clone(),
-                affected_paths: vec![PathBuf::from(get_path_arg(map, "path")?)],
+                affected_paths: vec![PathBuf::from(get_path_arg(map, tool_name, "path")?)],
                 sandbox: SandboxSummary::workspace(),
                 requested_permissions: vec![Permission::ReadWorkspace],
                 justification: None,
@@ -96,9 +96,12 @@ impl CanonicalAction {
             "glob" => Self {
                 tool: tool_name.to_owned(),
                 operation: "read".to_owned(),
-                argv: vec![tool_name.to_owned(), get_path_arg(map, "pattern")?],
+                argv: vec![
+                    tool_name.to_owned(),
+                    get_path_arg(map, tool_name, "pattern")?,
+                ],
                 cwd: workspace_root.clone(),
-                affected_paths: vec![PathBuf::from(get_path_arg(map, "pattern")?)],
+                affected_paths: vec![PathBuf::from(get_path_arg(map, tool_name, "pattern")?)],
                 sandbox: SandboxSummary::workspace(),
                 requested_permissions: vec![Permission::ReadWorkspace],
                 justification: None,
@@ -108,17 +111,17 @@ impl CanonicalAction {
                 operation: "read".to_owned(),
                 argv: vec![
                     tool_name.to_owned(),
-                    get_path_arg(map, "path")?,
-                    get_string(map, "pattern")?,
+                    get_path_arg(map, tool_name, "path")?,
+                    get_string(map, tool_name, "pattern")?,
                 ],
                 cwd: workspace_root.clone(),
-                affected_paths: vec![PathBuf::from(get_path_arg(map, "path")?)],
+                affected_paths: vec![PathBuf::from(get_path_arg(map, tool_name, "path")?)],
                 sandbox: SandboxSummary::workspace(),
                 requested_permissions: vec![Permission::ReadWorkspace],
                 justification: None,
             },
             "bash" => {
-                let command = get_string(map, "command")?;
+                let command = get_string(map, tool_name, "command")?;
                 let mut permissions = vec![Permission::Exec];
                 if network_indicators_in_command(&command) {
                     permissions.push(Permission::Network);
@@ -424,7 +427,7 @@ impl Drop for SecretDigestKey {
 /// review projection where secret material is replaced by `SecretRef` tokens.
 pub struct SecretAwareActionProjector {
     redactor: Redactor,
-    inventory: SecretInventory,
+    inventory: &'static SecretInventory,
     key: SecretDigestKey,
 }
 
@@ -478,7 +481,12 @@ fn credential_options_for_command(cmd: &str) -> Option<&'static [(&'static str, 
     }
 }
 
-fn shell_credential_spans(command: &str) -> Vec<Vec<(usize, usize, &'static str)>> {
+type ShellCredentialSpans = Vec<Vec<(usize, usize, &'static str)>>;
+
+/// Returns the per-token credential spans, or `None` when the command's
+/// credential mapping could not be verified. Callers must treat `None` as
+/// an unverifiable result and fail closed rather than slicing.
+fn shell_credential_spans(command: &str) -> Option<ShellCredentialSpans> {
     let token_spans = shell::tokenize_command_spans(command);
     let mut spans: Vec<Vec<(usize, usize, &'static str)>> = vec![Vec::new(); token_spans.len()];
 
@@ -629,13 +637,10 @@ fn shell_credential_spans(command: &str) -> Vec<Vec<(usize, usize, &'static str)
         0,
         &mut invalid,
     );
-    if invalid && !spans.is_empty() {
-        // Preserve the existing flat return type while making an impossible
-        // mapping observable to every consumer. Each consumer validates
-        // intervals before slicing and therefore fails closed on this marker.
-        spans[0].push((usize::MAX, usize::MAX, "shell_unverifiable"));
+    if invalid {
+        return None;
     }
-    spans
+    Some(spans)
 }
 
 /// Append a normalized shell fragment and its one-past-end byte mapping.
@@ -667,15 +672,14 @@ fn append_normalized_shell_piece(
 
 fn contains_shell_credential(text: &str) -> bool {
     shell_credential_spans(text)
-        .iter()
-        .any(|token_spans| !token_spans.is_empty())
+        .is_none_or(|spans| spans.iter().any(|token_spans| !token_spans.is_empty()))
 }
 
 impl SecretAwareActionProjector {
     pub fn new(redactor: Redactor, key: SecretDigestKey) -> Self {
         Self {
             redactor,
-            inventory: SecretInventory::new(),
+            inventory: secret_inventory(),
             key,
         }
     }
@@ -882,7 +886,9 @@ impl SecretAwareActionProjector {
             prev_end = end;
         }
         let command = self.redact_text_with_mapping(command, &normalized, &mapping);
-        let credential_spans = shell_credential_spans(&command);
+        let Some(credential_spans) = shell_credential_spans(&command) else {
+            return "[REDACTED:shell_unverifiable]".to_owned();
+        };
         let mut out = String::new();
         let mut cursor = 0usize;
         for (idx, (start, end, _)) in shell::tokenize_command_spans(&command)
@@ -966,7 +972,11 @@ impl SecretAwareActionProjector {
                         .to_owned(),
                 };
             }
-            let credential_spans = shell_credential_spans(command);
+            let Some(credential_spans) = shell_credential_spans(command) else {
+                return ReviewProjection::InsufficientEvidence {
+                    reason: "shell credential mapping is unverifiable".to_owned(),
+                };
+            };
             for (idx, (start, end, text)) in shell::tokenize_command_spans(command)
                 .into_iter()
                 .enumerate()
@@ -1104,7 +1114,10 @@ impl SecretAwareActionProjector {
                     .into_iter()
                     .map(|(_, _, token)| token)
                     .collect();
-                for (idx, spans) in shell_credential_spans(command).iter().enumerate() {
+                let Some(credential_spans) = shell_credential_spans(command) else {
+                    return false;
+                };
+                for (idx, spans) in credential_spans.iter().enumerate() {
                     let Some(token) = tokens.get(idx) else {
                         continue;
                     };
@@ -1344,19 +1357,21 @@ pub enum ActionError {
 
 fn get_string(
     map: &serde_json::Map<String, JsonValue>,
+    tool_name: &str,
     key: &'static str,
 ) -> Result<String, ActionError> {
     map.get(key)
         .and_then(JsonValue::as_str)
         .map(ToOwned::to_owned)
-        .ok_or(ActionError::MissingArgument(key, "(unknown)".to_owned()))
+        .ok_or(ActionError::MissingArgument(key, tool_name.to_owned()))
 }
 
 fn get_path_arg(
     map: &serde_json::Map<String, JsonValue>,
+    tool_name: &str,
     key: &'static str,
 ) -> Result<String, ActionError> {
-    let raw = get_string(map, key)?;
+    let raw = get_string(map, tool_name, key)?;
     if raw.starts_with("artifact://") {
         Ok(raw)
     } else {
@@ -1462,6 +1477,7 @@ struct SecretMatch<'a> {
 struct SecretPattern {
     regex: Regex,
     secret_group: usize,
+    priority: usize,
     kind: &'static str,
 }
 
@@ -1476,6 +1492,7 @@ impl SecretInventory {
                 regex: Regex::new(r"sk-[A-Za-z0-9_-]{12,}").expect("static API key regex"),
                 secret_group: 0,
                 kind: "api_key",
+                priority: 0,
             },
             SecretPattern {
                 regex: Regex::new(
@@ -1484,6 +1501,7 @@ impl SecretInventory {
                 .expect("static bearer authorization regex"),
                 secret_group: 1,
                 kind: "bearer_token",
+                priority: 1,
             },
             SecretPattern {
                 regex: Regex::new(
@@ -1492,6 +1510,7 @@ impl SecretInventory {
                 .expect("static basic authorization regex"),
                 secret_group: 1,
                 kind: "basic_token",
+                priority: 2,
             },
             SecretPattern {
                 regex: Regex::new(
@@ -1500,18 +1519,21 @@ impl SecretInventory {
                 .expect("static generic authorization regex"),
                 secret_group: 2,
                 kind: "authorization_token",
+                priority: 3,
             },
             SecretPattern {
                 regex: Regex::new(r#"(?i)\bBearer[ \t]+([A-Za-z0-9._~+/=-]+)"#)
                     .expect("static bearer regex"),
                 secret_group: 1,
                 kind: "bearer_token",
+                priority: 4,
             },
             SecretPattern {
                 regex: Regex::new(r#"(?i)\bBasic[ \t]+([A-Za-z0-9._~+/=-]+)"#)
                     .expect("static basic regex"),
                 secret_group: 1,
                 kind: "basic_token",
+                priority: 5,
             },
             SecretPattern {
                 regex: Regex::new(
@@ -1520,6 +1542,7 @@ impl SecretInventory {
                 .expect("static secret environment regex"),
                 secret_group: 1,
                 kind: "secret_env",
+                priority: 10,
             },
             SecretPattern {
                 regex: Regex::new(
@@ -1528,6 +1551,7 @@ impl SecretInventory {
                 .expect("static signed-url regex"),
                 secret_group: 2,
                 kind: "signature",
+                priority: 7,
             },
             SecretPattern {
                 regex: Regex::new(
@@ -1536,18 +1560,21 @@ impl SecretInventory {
                 .expect("static named-secret regex"),
                 secret_group: 2,
                 kind: "secret",
+                priority: 8,
             },
             SecretPattern {
                 regex: Regex::new(r#"://([^/:]+):([^@\s]+)@"#)
                     .expect("static url-userinfo regex"),
                 secret_group: 2,
                 kind: "url_credential",
+                priority: 11,
             },
             SecretPattern {
                 regex: Regex::new(r#"://([^@:/\s]+)@"#)
                     .expect("static url-userinfo-token regex"),
                 secret_group: 1,
                 kind: "url_credential",
+                priority: 12,
             },
             SecretPattern {
                 regex: Regex::new(
@@ -1556,6 +1583,7 @@ impl SecretInventory {
                 .expect("static signed-url-query regex"),
                 secret_group: 2,
                 kind: "signature",
+                priority: 6,
             },
             SecretPattern {
                 regex: Regex::new(
@@ -1564,35 +1592,17 @@ impl SecretInventory {
                 .expect("static secret-query regex"),
                 secret_group: 3,
                 kind: "url_query_secret",
+                priority: 9,
             },
         ];
         Self { patterns }
     }
 }
 
-fn pattern_priority(index: usize) -> usize {
-    match index {
-        0 => 0,   // api_key
-        1 => 1,   // auth_bearer
-        2 => 2,   // auth_basic
-        3 => 3,   // auth_generic
-        4 => 4,   // standalone_bearer
-        5 => 5,   // standalone_basic
-        11 => 6,  // signed_url_query
-        7 => 7,   // signed_url
-        8 => 8,   // named_secret
-        12 => 9,  // secret_query
-        6 => 10,  // secret_env
-        9 => 11,  // url_userinfo_password
-        10 => 12, // url_userinfo_token
-        _ => index,
-    }
-}
-
 impl SecretInventory {
     fn find<'a>(&self, text: &'a str) -> Vec<SecretMatch<'a>> {
         let mut matches = Vec::new();
-        for (index, pattern) in self.patterns.iter().enumerate() {
+        for pattern in &self.patterns {
             for caps in pattern.regex.captures_iter(text) {
                 if let Some(m) = caps.get(pattern.secret_group) {
                     matches.push(SecretMatch {
@@ -1600,7 +1610,7 @@ impl SecretInventory {
                         end: m.end(),
                         kind: pattern.kind,
                         secret: m.as_str(),
-                        order: pattern_priority(index),
+                        order: pattern.priority,
                     });
                 }
             }
@@ -3368,6 +3378,18 @@ mod tests {
         assert_eq!(action.tool, "read_file");
         assert_eq!(action.operation, "read");
         assert_eq!(action.argv, vec!["read_file", "notes.txt"]);
+    }
+
+    #[test]
+    fn from_tool_call_mentions_tool_name_in_missing_argument() {
+        let args =
+            serde_json::from_value::<ValidatedToolArguments>(json!({"offset": 0, "limit": 100}))
+                .unwrap();
+        let err = CanonicalAction::from_tool_call(PathBuf::from("/workspace"), "read_file", &args)
+            .unwrap_err();
+        let message = format!("{err}");
+        assert!(message.contains("path"), "{message}");
+        assert!(message.contains("read_file"), "{message}");
     }
 
     #[test]

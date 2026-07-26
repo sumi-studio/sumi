@@ -324,6 +324,9 @@ impl Policy {
             };
         }
 
+        // Defense-in-depth: `validate_action_context` already enforces the same
+        // checks before `evaluate` dispatches here; keep this guard for direct
+        // callers of `evaluate_non_bash` and to survive future refactorings.
         match path_check_all(action, &self.workspace_root) {
             PathCheck::WorkspaceEscape => {
                 return PolicyDecision::Forbidden {
@@ -1092,48 +1095,65 @@ fn has_embedded_execution_payload(tokens: &[String]) -> bool {
         });
     }
     if matches!(command, "ssh" | "scp" | "sftp") {
-        for window in tokens.windows(2) {
+        let mut i = 1usize;
+        while i < tokens.len() {
+            let t = &tokens[i];
             // -F / --config loads an ssh config file that may define ProxyCommand.
-            if window[0] == "-F"
-                || window[0] == "--config"
-                || (window[1].starts_with("-F") && window[1].len() > 2)
-                || window[1].starts_with("--config=")
-            {
+            if t == "-F" || t == "--config" {
+                if i + 1 < tokens.len() {
+                    return true;
+                }
+                i += 1;
+                continue;
+            }
+            if t.starts_with("-F") && t.len() > 2 {
+                return true;
+            }
+            if t.starts_with("--config=") {
                 return true;
             }
             // `sftp -D <program>` executes an arbitrary local program as the
             // SFTP server, so it is an embedded local execution payload.
-            if command == "sftp"
-                && (window[0] == "-D"
-                    || (window[0].starts_with("-D") && window[0].len() > 2)
-                    || (window[1].starts_with("-D") && window[1].len() > 2))
-            {
-                return true;
+            if command == "sftp" {
+                if t == "-D" {
+                    if i + 1 < tokens.len() {
+                        return true;
+                    }
+                    i += 1;
+                    continue;
+                }
+                if t.starts_with("-D") && t.len() > 2 {
+                    return true;
+                }
             }
-            let option_token = if window[0] == "-o"
-                || window[0] == "--option"
-                || (window[1].starts_with("-o") && window[1].len() > 2)
-                || window[1].starts_with("-o=")
-                || window[1].starts_with("--option=")
+            let option_token = if t == "-o" || t == "--option" {
+                i += 1;
+                tokens.get(i)
+            } else if (t.starts_with("-o") && t.len() > 2)
+                || t.starts_with("-o=")
+                || t.starts_with("--option=")
             {
-                &window[1]
+                Some(t)
             } else {
-                continue;
+                None
             };
-            let lower = option_token.to_ascii_lowercase();
-            let after_prefix = lower
-                .strip_prefix("-o=")
-                .or_else(|| lower.strip_prefix("--option="))
-                .or_else(|| lower.strip_prefix("-o"))
-                .unwrap_or(&lower);
-            if let Some((key, _)) = after_prefix.split_once('=')
-                && matches!(
-                    key,
-                    "proxycommand" | "localcommand" | "remotecommand" | "match"
-                )
-            {
-                return true;
+            if let Some(option_token) = option_token {
+                let lower = option_token.to_ascii_lowercase();
+                let after_prefix = lower
+                    .strip_prefix("-o=")
+                    .or_else(|| lower.strip_prefix("--option="))
+                    .or_else(|| lower.strip_prefix("-o"))
+                    .unwrap_or(&lower);
+                if let Some((key, _)) = after_prefix.split_once('=')
+                    && matches!(
+                        key,
+                        "proxycommand" | "localcommand" | "remotecommand" | "match"
+                    )
+                {
+                    return true;
+                }
             }
+            i += 1;
         }
     }
     const NETWORK_OPTION_PAYLOAD_FAMILIES: &[&str] = &[
@@ -4864,6 +4884,7 @@ mod tests {
     fn ssh_config_file_options_are_forbidden() {
         for command in [
             "ssh -F /workspace/config example.com",
+            "ssh -F/workspace/config example.com",
             "ssh --config /workspace/config example.com",
             "ssh --config=/workspace/config example.com",
         ] {
