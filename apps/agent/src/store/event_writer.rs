@@ -18,7 +18,7 @@ use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
-    agent::{AgentEvent, ApprovalRequest, ApprovalResolution, SteerMode},
+    agent::{AgentEvent, ApprovalRequest, ApprovalResolution, MemoryMaintKind, SteerMode},
     gateway::{
         ApprovalDecision, Command, CommandAck, CommandAckStatus, CommandEnvelope, CommandId,
         CommandRejectReason, InboundCommand, KeyedCommandDigest, RejectedCommandPayload,
@@ -174,6 +174,23 @@ impl DurableEvent {
                 turn_id: Some(turn_id),
                 ..DurableEventMetadata::default()
             },
+        )
+    }
+
+    #[allow(
+        dead_code,
+        reason = "T17 memory maintenance events are wired by the T20 maintainer"
+    )]
+    pub(crate) fn memory_maintenance(kind: impl Into<String>) -> Result<Self> {
+        let kind = kind.into();
+        if kind.is_empty() {
+            bail!("durable MemoryMaintenance kind must not be empty");
+        }
+        Self::from_parts(
+            AgentEvent::MemoryMaintenance {
+                kind: MemoryMaintKind::new(kind),
+            },
+            DurableEventMetadata::default(),
         )
     }
 
@@ -793,6 +810,11 @@ pub(crate) struct MemoryBatchMutation {
     pub summary: Option<CompactResult>,
     pub est_tokens: u64,
     pub footprint_delta: i64,
+    /// When true, `apply_memory_batch_mutation` deletes all
+    /// `memory_batch_messages` rows for this batch and zeroes its
+    /// `eviction_footprint_tokens`. This is used when an L0 source batch is
+    /// dropped during promotion.
+    pub delete_membership: bool,
 }
 
 #[allow(
@@ -1008,6 +1030,7 @@ struct PreparedMemoryBatchMutation {
     summary: Option<MemoryBatchSummary>,
     est_tokens: i64,
     footprint_delta: i64,
+    delete_membership: bool,
 }
 
 #[derive(Clone)]
@@ -2825,12 +2848,15 @@ impl EventWriter {
         let mut post_source_versions = pre_source_versions.clone();
         let mut batch_mutations = Vec::with_capacity(transition.batch_mutations.len());
         for batch in transition.batch_mutations {
-            let row = sqlx::query("SELECT version, state FROM memory_batches WHERE id = ?")
-                .bind(batch.batch_id.to_string())
-                .fetch_optional(self.store.pool())
-                .await
-                .context("failed to load memory batch for transition")?
-                .ok_or_else(|| anyhow!("memory batch {} does not exist", batch.batch_id))?;
+            let row = sqlx::query(
+                "SELECT version, state, est_tokens, eviction_footprint_tokens
+                 FROM memory_batches WHERE id = ?",
+            )
+            .bind(batch.batch_id.to_string())
+            .fetch_optional(self.store.pool())
+            .await
+            .context("failed to load memory batch for transition")?
+            .ok_or_else(|| anyhow!("memory batch {} does not exist", batch.batch_id))?;
             let old_version: i64 = row.try_get("version")?;
             let old_state_str: String = row.try_get("state")?;
             let old_state = parse_memory_batch_state(&old_state_str)?;
@@ -2843,6 +2869,9 @@ impl EventWriter {
                 );
             }
 
+            let old_est_tokens: i64 = row.try_get("est_tokens")?;
+            let old_footprint: i64 = row.try_get("eviction_footprint_tokens")?;
+
             let version_increments = batch.summary.is_some() || batch.new_state != old_state;
             let new_version = if version_increments {
                 old_version
@@ -2852,6 +2881,22 @@ impl EventWriter {
                 old_version
             };
             post_source_versions.insert(batch.batch_id.to_string(), new_version);
+
+            // State-only transitions must preserve the existing token estimate,
+            // and dropping an L0 source batch must zero its eviction footprint.
+            let has_summary = batch.summary.is_some();
+            let est_tokens = if has_summary {
+                sqlite_i64(batch.est_tokens, "batch est_tokens")?
+            } else {
+                old_est_tokens
+            };
+            let footprint_delta = if batch.delete_membership {
+                old_footprint
+                    .checked_neg()
+                    .ok_or_else(|| anyhow!("memory batch footprint overflow"))?
+            } else {
+                batch.footprint_delta
+            };
 
             let summary = if let Some(result) = batch.summary {
                 if memory_summary_key.is_none() {
@@ -2878,8 +2923,9 @@ impl EventWriter {
                 old_state,
                 new_state: batch.new_state,
                 summary,
-                est_tokens: sqlite_i64(batch.est_tokens, "batch est_tokens")?,
-                footprint_delta: batch.footprint_delta,
+                est_tokens,
+                footprint_delta,
+                delete_membership: batch.delete_membership,
             });
         }
 
@@ -8735,6 +8781,14 @@ async fn apply_memory_batch_mutation(
     transaction: &mut Transaction<'_, Sqlite>,
     batch: PreparedMemoryBatchMutation,
 ) -> Result<()> {
+    if batch.delete_membership {
+        sqlx::query("DELETE FROM memory_batch_messages WHERE batch_id = ?")
+            .bind(&batch.batch_id)
+            .execute(&mut **transaction)
+            .await
+            .context("failed to delete memory batch membership")?;
+    }
+
     let version_increments = batch.summary.is_some() || batch.new_state != batch.old_state;
     let new_version = if version_increments {
         batch
@@ -19663,6 +19717,7 @@ mod tests {
                         summary: None,
                         est_tokens: 0,
                         footprint_delta: 0,
+                        delete_membership: false,
                     }],
                     job_mutations: Vec::new(),
                     cursor_advance: None,

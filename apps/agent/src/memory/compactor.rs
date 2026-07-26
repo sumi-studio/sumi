@@ -6,7 +6,12 @@
 //! signatures, and native compaction bytes cannot be represented in it, so they
 //! cannot reach the compact HTTP body.
 
-use std::{collections::HashMap, env, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    env,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -26,11 +31,14 @@ use crate::provider::{
     types::{ApiProtocol, PublicAssistantContent, PublicMessage, UserContent},
 };
 use crate::store::{
-    DataKeyMaterial, DataKeyPurpose, MemoryBatchState, MemoryJobKind, MemoryJobStatus, MemoryLayer,
-    PublicProjectionBuilder, Redactor, RowAad, Store, decrypt_content, encrypt_content,
+    DataKeyMaterial, DataKeyPurpose, DurableEvent, EventBatch, EventWrite, EventWriter,
+    MemoryApplyCursorAdvance, MemoryBatchMutation, MemoryBatchRecord, MemoryBatchState,
+    MemoryJobKind, MemoryJobMutation, MemoryJobRecord, MemoryJobStatus, MemoryLayer,
+    MemoryTransition, Projection, PublicProjectionBuilder, Redactor, RowAad, Store,
+    decrypt_content, encrypt_content,
 };
 
-use super::{CompactResult, DecryptedMemorySummary, L1Entry};
+use super::{BatchId, CompactResult, DecryptedMemorySummary, L1Entry};
 
 const COMPACT_SYSTEM_PROMPT: &str = "あなたは記憶の圧縮係。会話を続けるな。要約だけ出力せよ。";
 
@@ -122,7 +130,6 @@ impl CompactError {
                 | Self::BodyIdleTimeout(_)
                 | Self::Transport(_)
                 | Self::InvalidResponse(_)
-                | Self::ResponseLimitExceeded { .. }
         ) || matches!(self, Self::Http { status, .. } if *status == 429 || *status >= 500)
     }
 }
@@ -984,7 +991,7 @@ fn parse_batch_row(row: &SqliteRow) -> Result<BatchRow> {
 
 fn target_layer_for_kind(kind: MemoryJobKind) -> MemoryLayer {
     match kind {
-        MemoryJobKind::CompactL0 => MemoryLayer::L0,
+        MemoryJobKind::CompactL0 => MemoryLayer::L1,
         MemoryJobKind::CompactL1 | MemoryJobKind::ConsolidateL2 => MemoryLayer::L2,
     }
 }
@@ -1442,47 +1449,98 @@ async fn recover_expired_running_jobs(store: &Store) -> Result<()> {
 
 async fn recover_compacting_batches(store: &Store) -> Result<()> {
     let rows = sqlx::query(
-        "SELECT id, batch_seq, version
+        "SELECT id, layer, batch_seq, version, summary_key_ref
          FROM memory_batches
-         WHERE layer = 0 AND state = 'compacting'",
+         WHERE state = 'compacting'",
     )
     .fetch_all(store.pool())
     .await?;
 
     for row in rows {
-        let batch_id: String = row.try_get("id")?;
-        let batch_seq: i64 = row.try_get("batch_seq")?;
+        let source_id: String = row.try_get("id")?;
+        let layer: i64 = row.try_get("layer")?;
         let version: i64 = row.try_get("version")?;
 
-        let kind = MemoryJobKind::CompactL0.as_str();
-        let source_ids = serde_json::to_string(std::slice::from_ref(&batch_id))
-            .context("serialize source_ids")?;
-        let source_versions =
-            serde_json::to_string(&HashMap::<String, i64>::from([(batch_id.clone(), version)]))
-                .context("serialize source_versions")?;
-        let now = Utc::now().to_rfc3339();
+        let (kind, target_layer) = match MemoryLayer::from_i64(layer) {
+            Some(MemoryLayer::L0) => (MemoryJobKind::CompactL0, MemoryLayer::L1),
+            Some(MemoryLayer::L1) => (MemoryJobKind::CompactL1, MemoryLayer::L2),
+            Some(MemoryLayer::L2) => (MemoryJobKind::ConsolidateL2, MemoryLayer::L2),
+            None => {
+                bail!("recovering compacting batch with unknown layer {layer}");
+            }
+        };
 
-        let inserted = sqlx::query(
-            "INSERT OR IGNORE INTO memory_jobs(
-                id, kind, batch_seq, source_ids, source_versions, status, lease_until, attempts,
-                result_key_ref, result_ciphertext, result_projection, result_redaction_version,
-                created_at, updated_at
-             ) VALUES(?, ?, ?, ?, ?, 'pending', NULL, 0, NULL, NULL, NULL, NULL, ?, ?)",
-        )
-        .bind(Uuid::now_v7().to_string())
-        .bind(kind)
-        .bind(batch_seq)
-        .bind(&source_ids)
-        .bind(&source_versions)
-        .bind(&now)
-        .bind(&now)
-        .execute(store.pool())
-        .await
-        .context("recover compacting batch")?;
-
-        if inserted.rows_affected() > 0 {
-            tracing::debug!("reinserted compacting L0 batch {batch_id} as pending job");
+        // L1/L2 source batches must already carry a summary; a summary-less
+        // compacting L1/L2 row is an in-flight target, not a source.
+        if layer != MemoryLayer::L0.as_i64() {
+            let summary_key_ref: Option<String> = row.try_get("summary_key_ref")?;
+            if summary_key_ref.is_none() {
+                tracing::debug!("skipping compacting {layer} batch {source_id} without a summary");
+                continue;
+            }
         }
+
+        // Skip if a job already references this source batch.
+        let referenced: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM memory_jobs
+             WHERE EXISTS (
+                 SELECT 1 FROM json_each(source_ids) WHERE json_each.value = ?
+             ) LIMIT 1",
+        )
+        .bind(&source_id)
+        .fetch_optional(store.pool())
+        .await
+        .context("check existing memory job for source batch")?;
+        if referenced.is_some() {
+            continue;
+        }
+
+        let mut tx = store.pool().begin().await?;
+
+        let next_batch_seq: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(batch_seq), 0) + 1 FROM memory_batches WHERE layer = ?",
+        )
+        .bind(target_layer.as_i64())
+        .fetch_one(&mut *tx)
+        .await
+        .context("compute recovered target batch_seq")?;
+        let next_ord: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(ord), 0) + 1 FROM memory_batches WHERE layer = ?",
+        )
+        .bind(target_layer.as_i64())
+        .fetch_one(&mut *tx)
+        .await
+        .context("compute recovered target ord")?;
+
+        let target_id = Uuid::now_v7().to_string();
+        let target = MemoryBatchRecord::new(
+            &target_id,
+            target_layer,
+            next_ord,
+            next_batch_seq,
+            MemoryBatchState::Compacting,
+            0,
+            0,
+        );
+        target
+            .insert(&mut *tx)
+            .await
+            .context("insert recovered target batch")?;
+
+        let source_versions = BTreeMap::from([(source_id.clone(), version)]);
+        let job = MemoryJobRecord::new(
+            Uuid::now_v7().to_string(),
+            kind,
+            next_batch_seq,
+            vec![source_id.clone()],
+            source_versions,
+        );
+        job.insert(&mut *tx)
+            .await
+            .context("insert recovered compaction job")?;
+
+        tx.commit().await?;
+        tracing::debug!("reinserted compacting {layer} batch {source_id} as {kind:?} job");
     }
 
     Ok(())
@@ -1498,7 +1556,7 @@ async fn recover_jobs(store: &Store) -> Result<()> {
 /// separate from this short transaction so provider latency never holds the
 /// memory tables. A later batch can finish first, but its `completed` row stays
 /// on the shelf until this cursor reaches it.
-async fn apply_next_completed_job(store: &Store, kind: MemoryJobKind) -> Result<bool> {
+async fn apply_next_completed_job(store: Arc<Store>, kind: MemoryJobKind) -> Result<bool> {
     let kind_name = kind.as_str();
     let mut tx = store.pool().begin().await?;
 
@@ -1534,7 +1592,8 @@ async fn apply_next_completed_job(store: &Store, kind: MemoryJobKind) -> Result<
     // over them before looking for the next completed shelf.
     loop {
         let row = sqlx::query(
-            "SELECT id, source_ids, status FROM memory_jobs
+            "SELECT id, source_ids, source_versions, status, batch_seq
+             FROM memory_jobs
              WHERE kind = ? AND batch_seq = ?",
         )
         .bind(kind_name)
@@ -1562,7 +1621,9 @@ async fn apply_next_completed_job(store: &Store, kind: MemoryJobKind) -> Result<
             };
             if first != next {
                 sqlx::query(
-                    "UPDATE memory_apply_cursors SET next_batch_seq = ? WHERE kind = ? AND next_batch_seq = ?",
+                    "UPDATE memory_apply_cursors
+                     SET next_batch_seq = ?
+                     WHERE kind = ? AND next_batch_seq = ?",
                 )
                 .bind(first)
                 .bind(kind_name)
@@ -1583,7 +1644,8 @@ async fn apply_next_completed_job(store: &Store, kind: MemoryJobKind) -> Result<
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("memory apply cursor overflow"))?;
             sqlx::query(
-                "UPDATE memory_apply_cursors SET next_batch_seq = ?
+                "UPDATE memory_apply_cursors
+                 SET next_batch_seq = ?
                  WHERE kind = ? AND next_batch_seq = ?",
             )
             .bind(next)
@@ -1599,73 +1661,145 @@ async fn apply_next_completed_job(store: &Store, kind: MemoryJobKind) -> Result<
         }
 
         let job_id: String = row.try_get("id")?;
-        let source_ids: Vec<String> =
-            serde_json::from_str(row.try_get::<String, _>("source_ids")?.as_str())
-                .context("deserialize apply source_ids")?;
-        let mut ids = source_ids;
-        let target_layer = target_layer_for_kind(kind).as_i64();
-        if let Some(target_id) = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM memory_batches WHERE layer = ? AND batch_seq = ?",
-        )
-        .bind(target_layer)
-        .bind(next)
-        .fetch_optional(&mut *tx)
-        .await?
-            && !ids.iter().any(|id| id == &target_id)
-        {
-            ids.push(target_id);
-        }
+        let source_ids_json: String = row.try_get("source_ids")?;
+        let source_versions_json: String = row.try_get("source_versions")?;
+        let batch_seq: i64 = row.try_get("batch_seq")?;
 
-        // Membership is the L0 public-message index. The transcript itself is
-        // retained as the encrypted source of truth; only its layer membership
-        // is removed once the summary has been promoted.
-        for id in &ids {
-            sqlx::query("DELETE FROM memory_batch_messages WHERE batch_id = ?")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query(
-                "UPDATE memory_batches
-                 SET state = 'promoted', version = version + 1,
-                     eviction_footprint_tokens = 0, updated_at = ?
-                 WHERE id = ? AND state = 'compacted'",
-            )
-            .bind(Utc::now().to_rfc3339())
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        let advanced = next
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("memory apply cursor overflow"))?;
-        let updated_job = sqlx::query(
-            "UPDATE memory_jobs SET status = 'applied', lease_until = NULL, updated_at = ?
-             WHERE id = ? AND status = 'completed'",
-        )
-        .bind(Utc::now().to_rfc3339())
-        .bind(&job_id)
-        .execute(&mut *tx)
-        .await?;
-        if updated_job.rows_affected() != 1 {
-            tx.rollback().await?;
-            return Ok(false);
-        }
-        let cursor_update = sqlx::query(
-            "UPDATE memory_apply_cursors SET next_batch_seq = ?
-             WHERE kind = ? AND next_batch_seq = ?",
-        )
-        .bind(advanced)
-        .bind(kind_name)
-        .bind(next)
-        .execute(&mut *tx)
-        .await?;
-        if cursor_update.rows_affected() != 1 {
-            bail!("memory apply cursor CAS failed for {kind_name}:{next}");
-        }
         tx.commit().await?;
-        return Ok(true);
+        return apply_completed_job(
+            store.clone(),
+            kind,
+            &job_id,
+            batch_seq,
+            &source_ids_json,
+            &source_versions_json,
+        )
+        .await;
     }
+}
+
+async fn apply_completed_job(
+    store: Arc<Store>,
+    kind: MemoryJobKind,
+    job_id: &str,
+    batch_seq: i64,
+    source_ids_json: &str,
+    source_versions_json: &str,
+) -> Result<bool> {
+    let source_ids: Vec<String> =
+        serde_json::from_str(source_ids_json).context("deserialize apply source_ids")?;
+    let source_versions: BTreeMap<String, i64> =
+        serde_json::from_str(source_versions_json).context("deserialize apply source_versions")?;
+
+    // Load the target batch and all source batches for the transition.
+    let target_layer = target_layer_for_kind(kind).as_i64();
+    let target_row = sqlx::query(
+        "SELECT id, layer, version, state, est_tokens, eviction_footprint_tokens
+         FROM memory_batches
+         WHERE layer = ? AND batch_seq = ?",
+    )
+    .bind(target_layer)
+    .bind(batch_seq)
+    .fetch_one(store.pool())
+    .await
+    .context("load apply target batch")?;
+    let target_id: String = target_row.try_get("id")?;
+
+    let mut batch_mutations = Vec::with_capacity(source_ids.len() + 1);
+    let mut expected_source_versions = BTreeMap::new();
+
+    for source_id in &source_ids {
+        let row = sqlx::query(
+            "SELECT id, layer, version
+             FROM memory_batches
+             WHERE id = ?",
+        )
+        .bind(source_id)
+        .fetch_one(store.pool())
+        .await
+        .with_context(|| format!("load apply source batch {source_id}"))?;
+        let layer: i64 = row.try_get("layer")?;
+        let version: i64 = row.try_get("version")?;
+
+        let expected = source_versions
+            .get(source_id)
+            .copied()
+            .ok_or_else(|| anyhow!("source version missing for {source_id} in job {job_id}"))?;
+        if version != expected {
+            bail!("source batch {source_id} version changed from {expected} to {version}");
+        }
+
+        let batch_uuid = BatchId::parse_str(source_id)
+            .with_context(|| format!("source batch id {source_id} is not a UUID"))?;
+        expected_source_versions.insert(batch_uuid, version as u64);
+
+        batch_mutations.push(MemoryBatchMutation {
+            batch_id: batch_uuid,
+            expected_version: version as u64,
+            new_state: MemoryBatchState::Dropped,
+            summary: None,
+            est_tokens: 0,
+            footprint_delta: 0,
+            delete_membership: MemoryLayer::from_i64(layer) == Some(MemoryLayer::L0),
+        });
+    }
+
+    let target_version: i64 = target_row.try_get("version")?;
+    let target_state: String = target_row.try_get("state")?;
+    let target_expected = source_versions
+        .get(&target_id)
+        .copied()
+        .ok_or_else(|| anyhow!("target version missing for {target_id} in job {job_id}"))?;
+    if target_version != target_expected {
+        bail!(
+            "target batch {target_id} version changed from {target_expected} to {target_version}"
+        );
+    }
+    if target_state != MemoryBatchState::Compacted.as_str() {
+        bail!("target batch {target_id} is not compacted");
+    }
+
+    let target_uuid = BatchId::parse_str(&target_id)
+        .with_context(|| format!("target batch id {target_id} is not a UUID"))?;
+    expected_source_versions.insert(target_uuid, target_version as u64);
+
+    batch_mutations.push(MemoryBatchMutation {
+        batch_id: target_uuid,
+        expected_version: target_version as u64,
+        new_state: MemoryBatchState::Promoted,
+        summary: None,
+        est_tokens: 0,
+        footprint_delta: 0,
+        delete_membership: false,
+    });
+
+    let next_batch_seq = batch_seq
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("memory apply cursor overflow"))?;
+
+    let transition = MemoryTransition {
+        expected_source_versions,
+        batch_mutations,
+        job_mutations: vec![MemoryJobMutation::Apply {
+            job_id: job_id.to_owned(),
+        }],
+        cursor_advance: Some(MemoryApplyCursorAdvance {
+            kind: kind.as_str().to_owned(),
+            expected: batch_seq as u64,
+            next: next_batch_seq as u64,
+        }),
+    };
+
+    let batch = EventBatch {
+        writes: vec![EventWrite {
+            event: Some(DurableEvent::memory_maintenance("compact_applied")?),
+            projections: vec![Projection::MemoryTransition(transition)],
+        }],
+        injected_commands: Vec::new(),
+    };
+
+    EventWriter::new(store.clone()).apply(batch).await?;
+    Ok(true)
 }
 
 /// Single durable compaction worker. `mpsc` is wake-up only; the durable job
@@ -1738,7 +1872,7 @@ impl CompactWorker {
                 MemoryJobKind::CompactL1,
                 MemoryJobKind::ConsolidateL2,
             ] {
-                if apply_next_completed_job(&self.store, kind).await? {
+                if apply_next_completed_job(self.store.clone(), kind).await? {
                     applied += 1;
                     progress = true;
                 }
@@ -1755,6 +1889,15 @@ impl CompactWorker {
         let mut interval = tokio::time::interval(LEASE_CHECK_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // Run process/apply immediately on startup so recovered jobs are not
+        // stalled behind the 60-second lease-check interval.
+        if let Err(error) = self.process_all_pending().await {
+            tracing::error!("compactor worker error: {error}");
+        }
+        if let Err(error) = self.apply_ready().await {
+            tracing::error!("compactor apply error: {error}");
+        }
+
         loop {
             tokio::select! {
                 biased;
@@ -1769,6 +1912,9 @@ impl CompactWorker {
 
             if let Err(error) = self.process_all_pending().await {
                 tracing::error!("compactor worker error: {error}");
+            }
+            if let Err(error) = self.apply_ready().await {
+                tracing::error!("compactor apply error: {error}");
             }
         }
 
@@ -1851,7 +1997,7 @@ mod tests {
     };
     use crate::store::{
         DataKeyPurpose, MemoryBatchMessageRecord, MemoryBatchRecord, MemoryBatchState,
-        MemoryJobKind, MemoryJobRecord, MemoryLayer, Store, TranscriptRecord,
+        MemoryBatchSummary, MemoryJobKind, MemoryJobRecord, MemoryLayer, Store, TranscriptRecord,
     };
     use tokio_util::sync::CancellationToken;
 
@@ -2564,16 +2710,15 @@ mod tests {
         )
     }
 
-    async fn insert_l0_batch(store: &Store, batch_id: &str, messages: &[PublicMessage]) {
-        insert_l0_batch_with_seq(store, batch_id, 1, messages).await;
+    async fn insert_l0_batch(store: &Store, messages: &[PublicMessage]) -> (String, String) {
+        insert_l0_batch_with_seq(store, 1, messages).await
     }
 
     async fn insert_l0_batch_with_seq(
         store: &Store,
-        batch_id: &str,
         batch_seq: i64,
         messages: &[PublicMessage],
-    ) {
+    ) -> (String, String) {
         let key = store
             .conversation_key(DataKeyPurpose::Transcript)
             .await
@@ -2581,8 +2726,9 @@ mod tests {
         let redactor = store.redactor();
         let scope = store.scope();
 
+        let source_id = Uuid::now_v7().to_string();
         let batch = MemoryBatchRecord::new(
-            batch_id,
+            &source_id,
             MemoryLayer::L0,
             0,
             batch_seq,
@@ -2590,10 +2736,28 @@ mod tests {
             100,
             0,
         );
-        batch.insert(store.pool()).await.expect("insert batch");
+        batch
+            .insert(store.pool())
+            .await
+            .expect("insert source batch");
+
+        let target_id = Uuid::now_v7().to_string();
+        let target = MemoryBatchRecord::new(
+            &target_id,
+            MemoryLayer::L1,
+            0,
+            batch_seq,
+            MemoryBatchState::Compacting,
+            0,
+            0,
+        );
+        target
+            .insert(store.pool())
+            .await
+            .expect("insert target batch");
 
         for (seq, message) in messages.iter().enumerate() {
-            let message_id = format!("{batch_id}-msg-{seq}");
+            let message_id = format!("{source_id}-msg-{seq}");
             let record = TranscriptRecord::encrypt(
                 message,
                 &message_id,
@@ -2607,7 +2771,7 @@ mod tests {
             .expect("encrypt message");
             record.insert(store.pool()).await.expect("insert message");
             MemoryBatchMessageRecord {
-                batch_id: batch_id.to_owned(),
+                batch_id: source_id.clone(),
                 message_id: record.id().to_owned(),
                 ord: seq as i64,
             }
@@ -2615,15 +2779,140 @@ mod tests {
             .await
             .expect("insert batch message");
         }
+
+        (source_id, target_id)
     }
 
-    async fn insert_compact_l0_job(store: &Store, job_id: &str, batch_id: &str) {
-        let source_versions = BTreeMap::from([(batch_id.to_owned(), 0)]);
+    async fn insert_compact_l0_job(store: &Store, job_id: &str, source_id: &str, batch_seq: i64) {
+        let source_versions = BTreeMap::from([(source_id.to_owned(), 0)]);
         let job = MemoryJobRecord::new(
             job_id,
             MemoryJobKind::CompactL0,
-            1,
-            vec![batch_id.to_owned()],
+            batch_seq,
+            vec![source_id.to_owned()],
+            source_versions,
+        );
+        job.insert(store.pool()).await.expect("insert job");
+    }
+
+    async fn encrypt_summary(store: &Store, batch_id: &str, summary: &str) -> MemoryBatchSummary {
+        let key = store
+            .conversation_key(DataKeyPurpose::MemorySummary)
+            .await
+            .expect("memory summary key");
+        let now = Utc::now();
+        let plaintext = serde_json::to_vec(&super::MemorySummaryPayload {
+            summary: summary.to_owned(),
+            est_tokens: 1,
+            from: now,
+            to: now,
+        })
+        .expect("serialize summary payload");
+        let aad = store
+            .scope()
+            .row_aad("memory_batches", batch_id, DataKeyPurpose::MemorySummary);
+        let ciphertext = encrypt_content(&key, &plaintext, &aad).expect("encrypt summary");
+        MemoryBatchSummary {
+            key_ref: key.key_ref.clone(),
+            ciphertext,
+            projection: summary.to_owned(),
+            redaction_version: 1,
+        }
+    }
+
+    async fn insert_l1_batch(store: &Store, batch_seq: i64, summary: &str) -> (String, String) {
+        let source_id = Uuid::now_v7().to_string();
+        let summary = encrypt_summary(store, &source_id, summary).await;
+        let source = MemoryBatchRecord {
+            id: source_id.clone(),
+            layer: MemoryLayer::L1,
+            ord: 0,
+            batch_seq,
+            version: 0,
+            state: MemoryBatchState::Compacting,
+            est_tokens: 50,
+            eviction_footprint_tokens: 0,
+            summary: Some(summary),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        source.insert(store.pool()).await.expect("insert l1 source");
+
+        let target_id = Uuid::now_v7().to_string();
+        let target = MemoryBatchRecord::new(
+            &target_id,
+            MemoryLayer::L2,
+            0,
+            batch_seq,
+            MemoryBatchState::Compacting,
+            0,
+            0,
+        );
+        target.insert(store.pool()).await.expect("insert l2 target");
+
+        (source_id, target_id)
+    }
+
+    async fn insert_l2_batch(
+        store: &Store,
+        source_seq: i64,
+        target_seq: i64,
+        summary: &str,
+    ) -> (String, String) {
+        let source_id = Uuid::now_v7().to_string();
+        let summary = encrypt_summary(store, &source_id, summary).await;
+        let source = MemoryBatchRecord {
+            id: source_id.clone(),
+            layer: MemoryLayer::L2,
+            ord: 0,
+            batch_seq: source_seq,
+            version: 0,
+            state: MemoryBatchState::Compacting,
+            est_tokens: 50,
+            eviction_footprint_tokens: 0,
+            summary: Some(summary),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        source.insert(store.pool()).await.expect("insert l2 source");
+
+        let target_id = Uuid::now_v7().to_string();
+        let target = MemoryBatchRecord::new(
+            &target_id,
+            MemoryLayer::L2,
+            0,
+            target_seq,
+            MemoryBatchState::Compacting,
+            0,
+            0,
+        );
+        target.insert(store.pool()).await.expect("insert l2 target");
+
+        (source_id, target_id)
+    }
+
+    async fn insert_compact_l1_job(store: &Store, job_id: &str, source_id: &str, batch_seq: i64) {
+        let source_versions = BTreeMap::from([(source_id.to_owned(), 0)]);
+        let job = MemoryJobRecord::new(
+            job_id,
+            MemoryJobKind::CompactL1,
+            batch_seq,
+            vec![source_id.to_owned()],
+            source_versions,
+        );
+        job.insert(store.pool()).await.expect("insert job");
+    }
+
+    async fn insert_consolidate_l2_job(
+        store: &Store,
+        job_id: &str,
+        source_ids: &[String],
+        batch_seq: i64,
+    ) {
+        let source_versions = BTreeMap::from_iter(source_ids.iter().map(|id| (id.clone(), 0)));
+        let job = MemoryJobRecord::new(
+            job_id,
+            MemoryJobKind::ConsolidateL2,
+            batch_seq,
+            source_ids.to_owned(),
             source_versions,
         );
         job.insert(store.pool()).await.expect("insert job");
@@ -2647,18 +2936,16 @@ mod tests {
     #[tokio::test]
     async fn worker_stores_encrypted_summary_and_redacted_projection() {
         let store = test_store().await;
-        let batch_id = "l0-redaction";
         let secret = "sk-123456789012";
-        insert_l0_batch(
+        let (source_id, target_id) = insert_l0_batch(
             &store,
-            batch_id,
             &[
                 user(&format!("My api_key is {secret}")),
                 assistant_text("noted"),
             ],
         )
         .await;
-        insert_compact_l0_job(&store, "job-redaction", batch_id).await;
+        insert_compact_l0_job(&store, "job-redaction", &source_id, 1).await;
 
         let provider = Arc::new(FakeProvider {
             text: Mutex::new(format!("User disclosed api_key {secret}")),
@@ -2670,7 +2957,7 @@ mod tests {
             "SELECT state, summary_key_ref, summary_ciphertext, summary_projection
              FROM memory_batches WHERE id = ?",
         )
-        .bind(batch_id)
+        .bind(&target_id)
         .fetch_one(store.pool())
         .await
         .expect("fetch batch");
@@ -2692,9 +2979,10 @@ mod tests {
             .data_key_by_ref(&key_ref)
             .await
             .expect("load summary key");
-        let aad = store
-            .scope()
-            .row_aad("memory_batches", batch_id, DataKeyPurpose::MemorySummary);
+        let aad =
+            store
+                .scope()
+                .row_aad("memory_batches", &target_id, DataKeyPurpose::MemorySummary);
         let plaintext =
             crate::store::decrypt_content(&key, &ciphertext, &aad).expect("decrypt summary");
         let payload: super::MemorySummaryPayload =
@@ -2732,9 +3020,8 @@ mod tests {
     #[tokio::test]
     async fn worker_retries_retryable_errors_until_success() {
         let store = test_store().await;
-        let batch_id = "l0-retry";
-        insert_l0_batch(&store, batch_id, &[user("hello")]).await;
-        insert_compact_l0_job(&store, "job-retry", batch_id).await;
+        let (source_id, target_id) = insert_l0_batch(&store, &[user("hello")]).await;
+        insert_compact_l0_job(&store, "job-retry", &source_id, 1).await;
 
         let provider = Arc::new(FakeProvider {
             text: Mutex::new("retry summary".into()),
@@ -2752,7 +3039,7 @@ mod tests {
         assert_eq!(job.get::<i64, _>("attempts"), 3);
 
         let batch = sqlx::query("SELECT state FROM memory_batches WHERE id = ?")
-            .bind(batch_id)
+            .bind(&target_id)
             .fetch_one(store.pool())
             .await
             .expect("fetch batch");
@@ -2762,9 +3049,8 @@ mod tests {
     #[tokio::test]
     async fn worker_fails_after_max_attempts() {
         let store = test_store().await;
-        let batch_id = "l0-fail";
-        insert_l0_batch(&store, batch_id, &[user("hello")]).await;
-        insert_compact_l0_job(&store, "job-fail", batch_id).await;
+        let (source_id, target_id) = insert_l0_batch(&store, &[user("hello")]).await;
+        insert_compact_l0_job(&store, "job-fail", &source_id, 1).await;
 
         let provider = Arc::new(FakeProvider {
             text: Mutex::new("never used".into()),
@@ -2782,7 +3068,7 @@ mod tests {
         assert_eq!(job.get::<i64, _>("attempts"), 3);
 
         let batch = sqlx::query("SELECT state FROM memory_batches WHERE id = ?")
-            .bind(batch_id)
+            .bind(&target_id)
             .fetch_one(store.pool())
             .await
             .expect("fetch batch");
@@ -2792,13 +3078,12 @@ mod tests {
     #[tokio::test]
     async fn worker_resets_job_when_source_version_is_stale() {
         let store = test_store().await;
-        let batch_id = "l0-stale";
-        insert_l0_batch(&store, batch_id, &[user("hello")]).await;
-        insert_compact_l0_job(&store, "job-stale", batch_id).await;
+        let (source_id, _target_id) = insert_l0_batch(&store, &[user("hello")]).await;
+        insert_compact_l0_job(&store, "job-stale", &source_id, 1).await;
 
         // Simulate a concurrent update that advanced the source version.
         sqlx::query("UPDATE memory_batches SET version = 1 WHERE id = ?")
-            .bind(batch_id)
+            .bind(&source_id)
             .execute(store.pool())
             .await
             .expect("bump version");
@@ -2818,7 +3103,7 @@ mod tests {
         assert_eq!(job.get::<i64, _>("attempts"), 1);
 
         let batch = sqlx::query("SELECT state, version FROM memory_batches WHERE id = ?")
-            .bind(batch_id)
+            .bind(&source_id)
             .fetch_one(store.pool())
             .await
             .expect("fetch batch");
@@ -2829,11 +3114,23 @@ mod tests {
     #[tokio::test]
     async fn worker_recover_reinserts_lost_compacting_batches() {
         let store = test_store().await;
-        let batch_id = "l0-recover";
-        insert_l0_batch(&store, batch_id, &[user("recover me")]).await;
+        // Simulate a crash where the L0 source is compacting but neither the
+        // target nor the job row was written.
+        let source_id = Uuid::now_v7().to_string();
+        let source = MemoryBatchRecord::new(
+            &source_id,
+            MemoryLayer::L0,
+            0,
+            1,
+            MemoryBatchState::Compacting,
+            100,
+            0,
+        );
+        source
+            .insert(store.pool())
+            .await
+            .expect("insert source batch");
 
-        // No job row: simulate a crash where the batch is compacting but the job
-        // was never written or was lost.
         let cancel = CancellationToken::new();
         let worker = CompactWorker {
             store: store.clone(),
@@ -2858,20 +3155,20 @@ mod tests {
             .await
             .expect("process recovered job");
 
-        let batch = sqlx::query("SELECT state FROM memory_batches WHERE id = ?")
-            .bind(batch_id)
-            .fetch_one(store.pool())
-            .await
-            .expect("fetch batch");
-        assert_eq!(batch.get::<String, _>("state"), "compacted");
+        let target_state: String = sqlx::query_scalar(
+            "SELECT state FROM memory_batches WHERE layer = 1 ORDER BY batch_seq LIMIT 1",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("fetch target batch");
+        assert_eq!(target_state, "compacted");
     }
 
     #[tokio::test]
     async fn worker_recovery_requeues_expired_lease() {
         let store = test_store().await;
-        let batch_id = "l0-expired-lease";
-        insert_l0_batch(&store, batch_id, &[user("recover lease")]).await;
-        insert_compact_l0_job(&store, "job-expired-lease", batch_id).await;
+        let (source_id, _target_id) = insert_l0_batch(&store, &[user("recover lease")]).await;
+        insert_compact_l0_job(&store, "job-expired-lease", &source_id, 1).await;
         sqlx::query(
             "UPDATE memory_jobs
              SET status = 'running', attempts = 1, lease_until = '2000-01-01T00:00:00Z'
@@ -2901,15 +3198,15 @@ mod tests {
     #[tokio::test]
     async fn apply_ready_advances_only_contiguous_completed_jobs() {
         let store = test_store().await;
-        insert_l0_batch(&store, "l0-apply-1", &[user("first")]).await;
-        insert_l0_batch_with_seq(&store, "l0-apply-2", 2, &[user("second")]).await;
-        insert_compact_l0_job(&store, "job-apply-1", "l0-apply-1").await;
-        let source_versions = BTreeMap::from([("l0-apply-2".to_owned(), 0)]);
+        let (source_1, _target_1) = insert_l0_batch(&store, &[user("first")]).await;
+        let (source_2, _target_2) = insert_l0_batch_with_seq(&store, 2, &[user("second")]).await;
+        insert_compact_l0_job(&store, "job-apply-1", &source_1, 1).await;
+        let source_versions = BTreeMap::from([(source_2.clone(), 0)]);
         MemoryJobRecord::new(
             "job-apply-2",
             MemoryJobKind::CompactL0,
             2,
-            vec!["l0-apply-2".to_owned()],
+            vec![source_2.clone()],
             source_versions,
         )
         .insert(store.pool())
@@ -2936,13 +3233,23 @@ mod tests {
                 .await
                 .expect("job statuses");
         assert_eq!(statuses, ["applied", "applied"]);
-        let states: Vec<String> = sqlx::query_scalar(
+
+        // L0 source batches are dropped; L1 target batches are promoted.
+        let l0_states: Vec<String> = sqlx::query_scalar(
             "SELECT state FROM memory_batches WHERE layer = 0 ORDER BY batch_seq",
         )
         .fetch_all(store.pool())
         .await
-        .expect("batch states");
-        assert_eq!(states, ["promoted", "promoted"]);
+        .expect("l0 batch states");
+        assert_eq!(l0_states, ["dropped", "dropped"]);
+        let l1_states: Vec<String> = sqlx::query_scalar(
+            "SELECT state FROM memory_batches WHERE layer = 1 ORDER BY batch_seq",
+        )
+        .fetch_all(store.pool())
+        .await
+        .expect("l1 batch states");
+        assert_eq!(l1_states, ["promoted", "promoted"]);
+
         let membership: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_batch_messages")
             .fetch_one(store.pool())
             .await
@@ -2955,5 +3262,236 @@ mod tests {
         .await
         .expect("apply cursor");
         assert_eq!(cursor, 3);
+
+        // Ensure the apply produced a MemoryMaintenance event for each job.
+        let maintenance_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_events WHERE event_type = 'memory_maintenance'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("count maintenance events");
+        assert_eq!(maintenance_count, 2);
+    }
+
+    #[tokio::test]
+    async fn worker_compacts_l1_to_l2_and_applies() {
+        let store = test_store().await;
+        let (source_id, target_id) = insert_l1_batch(&store, 1, "L1 source summary").await;
+        insert_compact_l1_job(&store, "job-l1", &source_id, 1).await;
+
+        let provider = Arc::new(FakeProvider {
+            text: Mutex::new("L2 compacted summary".into()),
+            ..FakeProvider::default()
+        });
+        run_worker(store.clone(), provider).await;
+
+        let target = sqlx::query("SELECT state FROM memory_batches WHERE id = ?")
+            .bind(&target_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch target");
+        assert_eq!(target.get::<String, _>("state"), "compacted");
+
+        let worker = CompactWorker {
+            store: store.clone(),
+            spec: select_compact_model(&chat_model(), None, &[]).expect("select model"),
+            provider: Arc::new(FakeProvider::default()),
+            cancel: CancellationToken::new(),
+        };
+        assert_eq!(worker.apply_ready().await.expect("apply"), 1);
+
+        let source_state: String =
+            sqlx::query_scalar("SELECT state FROM memory_batches WHERE id = ?")
+                .bind(&source_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("fetch source");
+        assert_eq!(source_state, "dropped");
+
+        let target_state: String =
+            sqlx::query_scalar("SELECT state FROM memory_batches WHERE id = ?")
+                .bind(&target_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("fetch target");
+        assert_eq!(target_state, "promoted");
+    }
+
+    #[tokio::test]
+    async fn worker_consolidates_l2_and_applies() {
+        let store = test_store().await;
+        let (source_1, _target_1) = insert_l2_batch(&store, 1, 20, "L2 first summary").await;
+        let (source_2, _target_2) = insert_l2_batch(&store, 2, 21, "L2 second summary").await;
+        let target_id = Uuid::now_v7().to_string();
+        MemoryBatchRecord::new(
+            &target_id,
+            MemoryLayer::L2,
+            0,
+            10,
+            MemoryBatchState::Compacting,
+            0,
+            0,
+        )
+        .insert(store.pool())
+        .await
+        .expect("insert consolidate target");
+        insert_consolidate_l2_job(&store, "job-l2", &[source_1.clone(), source_2.clone()], 10)
+            .await;
+
+        let provider = Arc::new(FakeProvider {
+            text: Mutex::new("Consolidated L2 summary".into()),
+            ..FakeProvider::default()
+        });
+        run_worker(store.clone(), provider).await;
+
+        let target = sqlx::query("SELECT state FROM memory_batches WHERE id = ?")
+            .bind(&target_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch target");
+        assert_eq!(target.get::<String, _>("state"), "compacted");
+
+        let worker = CompactWorker {
+            store: store.clone(),
+            spec: select_compact_model(&chat_model(), None, &[]).expect("select model"),
+            provider: Arc::new(FakeProvider::default()),
+            cancel: CancellationToken::new(),
+        };
+        assert_eq!(worker.apply_ready().await.expect("apply"), 1);
+
+        for source_id in [source_1, source_2] {
+            let state: String = sqlx::query_scalar("SELECT state FROM memory_batches WHERE id = ?")
+                .bind(&source_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("fetch source");
+            assert_eq!(state, "dropped");
+        }
+        let target_state: String =
+            sqlx::query_scalar("SELECT state FROM memory_batches WHERE id = ?")
+                .bind(&target_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("fetch target");
+        assert_eq!(target_state, "promoted");
+    }
+
+    #[tokio::test]
+    async fn recover_compacting_l1_and_l2_batches() {
+        let store = test_store().await;
+        let (_l1_source, _l1_target) = insert_l1_batch(&store, 1, "lost l1").await;
+        let (_l2_source, _l2_target) = insert_l2_batch(&store, 2, 3, "lost l2").await;
+
+        // Drop the jobs to simulate a crash where only compacting batches remain.
+        sqlx::query("DELETE FROM memory_jobs")
+            .execute(store.pool())
+            .await
+            .expect("delete jobs");
+
+        let worker = CompactWorker {
+            store: store.clone(),
+            spec: select_compact_model(&chat_model(), None, &[]).expect("select model"),
+            provider: Arc::new(FakeProvider {
+                text: Mutex::new("recovered summary".into()),
+                ..FakeProvider::default()
+            }),
+            cancel: CancellationToken::new(),
+        };
+        worker.recover().await.expect("recover");
+
+        let pending: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM memory_jobs WHERE status = 'pending'")
+                .fetch_one(store.pool())
+                .await
+                .expect("count pending");
+        assert_eq!(pending, 2);
+
+        worker.process_all_pending().await.expect("process");
+        assert_eq!(worker.apply_ready().await.expect("apply"), 2);
+
+        let dropped: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM memory_batches WHERE state = 'dropped'")
+                .fetch_one(store.pool())
+                .await
+                .expect("count dropped");
+        assert_eq!(dropped, 2);
+
+        let promoted: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM memory_batches WHERE state = 'promoted'")
+                .fetch_one(store.pool())
+                .await
+                .expect("count promoted");
+        assert_eq!(promoted, 2);
+    }
+
+    #[tokio::test]
+    async fn recover_skips_summary_less_in_flight_targets() {
+        let store = test_store().await;
+        // A summary-less compacting L1 row is an in-flight CompactL0 target,
+        // not a source, and must not be recovered as a new job.
+        let in_flight_target = Uuid::now_v7().to_string();
+        MemoryBatchRecord::new(
+            &in_flight_target,
+            MemoryLayer::L1,
+            0,
+            1,
+            MemoryBatchState::Compacting,
+            0,
+            0,
+        )
+        .insert(store.pool())
+        .await
+        .expect("insert in-flight target");
+
+        recover_compacting_batches(&store)
+            .await
+            .expect("recover compacting batches");
+
+        let pending: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM memory_jobs WHERE status = 'pending'")
+                .fetch_one(store.pool())
+                .await
+                .expect("count pending");
+        assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn response_limit_exceeded_is_not_retryable() {
+        let error = CompactError::ResponseLimitExceeded { limit: 100 };
+        assert!(
+            !error.is_retryable(),
+            "ResponseLimitExceeded must not be retryable"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_ready_rejects_stale_source_version() {
+        let store = test_store().await;
+        let (source_id, _target_id) = insert_l0_batch(&store, &[user("stale apply")]).await;
+        insert_compact_l0_job(&store, "job-stale-apply", &source_id, 1).await;
+
+        let provider = Arc::new(FakeProvider {
+            text: Mutex::new("summary".into()),
+            ..FakeProvider::default()
+        });
+        run_worker(store.clone(), provider).await;
+
+        // Tamper with the source after completion but before apply.
+        sqlx::query("UPDATE memory_batches SET version = version + 1 WHERE id = ?")
+            .bind(&source_id)
+            .execute(store.pool())
+            .await
+            .expect("bump source version");
+
+        let worker = CompactWorker {
+            store: store.clone(),
+            spec: select_compact_model(&chat_model(), None, &[]).expect("select model"),
+            provider: Arc::new(FakeProvider::default()),
+            cancel: CancellationToken::new(),
+        };
+        assert!(
+            worker.apply_ready().await.is_err(),
+            "apply must fail when source version is stale"
+        );
     }
 }

@@ -60,8 +60,10 @@ pub(crate) use crypto::{
 )]
 pub(crate) use event_writer::{
     ApplicationKind, ApprovalMutation, DurableEvent, EventBatch, EventWrite, EventWriter,
-    InboundAdmission, InboundReceipt, InboundReceiptOrigin, InjectedCommand, Projection,
-    RecoveryRequired, RunPhase, ToolExecutionMutation, USER_MESSAGE_ID_NAMESPACE, user_message_id,
+    InboundAdmission, InboundReceipt, InboundReceiptOrigin, InjectedCommand,
+    MemoryApplyCursorAdvance, MemoryBatchMutation, MemoryJobMutation, MemoryJobUpdate,
+    MemoryTransition, Projection, RecoveryRequired, RunPhase, ToolExecutionMutation,
+    USER_MESSAGE_ID_NAMESPACE, user_message_id,
 };
 #[allow(
     unused_imports,
