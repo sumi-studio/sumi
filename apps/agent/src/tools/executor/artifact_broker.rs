@@ -548,8 +548,14 @@ impl ArtifactBroker {
     fn delete_conversation_artifacts(
         &self,
         conversation_id: &str,
-        _tombstone_id: &str,
+        tombstone_id: &str,
     ) -> Result<ArtifactResponse, ToolError> {
+        // Tombstone authorization is owned by the deployment supervisor: this
+        // broker only sees the conversation id and has no access to the control
+        // plane tombstone repository. The supervisor must validate the tombstone
+        // before dispatching this RPC.
+        let _ = tombstone_id;
+
         let name = cstring(conversation_id)?;
         // Open the conversation directory relative to the pinned root FD with
         // no-symlink / no-magic-link / no-escape resolution.
@@ -565,10 +571,9 @@ impl ArtifactBroker {
             }
             Err(e) => return Err(e),
         };
-        // Transfer ownership of the conversation directory fd to fdopendir.
-        let deleted = unsafe { delete_dir_contents_recursive(conversation_fd.into_raw_fd()) }?;
-        // The fd is consumed by fdopendir inside the helper, so we only need
-        // to remove the now-empty conversation directory from the root.
+        let deleted = delete_dir_contents_recursive(conversation_fd)?;
+        // The helper consumed the conversation fd; remove the now-empty
+        // conversation directory from the root.
         if unsafe { libc::unlinkat(self.root.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0
         {
             return Err(std::io::Error::last_os_error().into());
@@ -580,16 +585,49 @@ impl ArtifactBroker {
     }
 }
 
-unsafe fn delete_dir_contents_recursive(dir_fd: RawFd) -> Result<u64, ToolError> {
-    unsafe {
-        let dir = libc::fdopendir(dir_fd);
+/// RAII wrapper around a `DIR*` obtained from an owned fd. Ensures `closedir`
+/// runs even when an error path returns early, preventing fd leaks in the
+/// recursive artifact deletion path.
+struct DirGuard {
+    dir: *mut libc::DIR,
+}
+
+impl DirGuard {
+    fn new(fd: OwnedFd) -> Result<Self, ToolError> {
+        let raw = fd.into_raw_fd();
+        let dir = unsafe { libc::fdopendir(raw) };
         if dir.is_null() {
+            unsafe { libc::close(raw) };
             return Err(std::io::Error::last_os_error().into());
         }
+        Ok(Self { dir })
+    }
 
-        let mut entries = Vec::new();
+    fn as_ptr(&self) -> *mut libc::DIR {
+        self.dir
+    }
+
+    fn as_fd(&self) -> RawFd {
+        // SAFETY: `dir` is a valid `DIR*` created by `fdopendir` above.
+        unsafe { libc::dirfd(self.dir) }
+    }
+}
+
+impl Drop for DirGuard {
+    fn drop(&mut self) {
+        if !self.dir.is_null() {
+            // SAFETY: `dir` is a valid `DIR*` and we are the sole owner.
+            unsafe { libc::closedir(self.dir) };
+        }
+    }
+}
+
+fn delete_dir_contents_recursive(dir_fd: OwnedFd) -> Result<u64, ToolError> {
+    let dir = DirGuard::new(dir_fd)?;
+    let mut entries = Vec::new();
+    unsafe {
         loop {
-            let entry = libc::readdir(dir);
+            let entry = libc::readdir(dir.as_ptr());
             if entry.is_null() {
                 break;
             }
@@ -599,47 +637,48 @@ unsafe fn delete_dir_contents_recursive(dir_fd: RawFd) -> Result<u64, ToolError>
             }
             entries.push(name_cstr.to_owned());
         }
+    }
 
-        let mut deleted = 0u64;
-        for name in entries {
-            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-            if libc::fstatat(
-                dir_fd,
+    let mut deleted = 0u64;
+    for name in entries {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                dir.as_fd(),
                 name.as_ptr(),
                 stat.as_mut_ptr(),
                 libc::AT_SYMLINK_NOFOLLOW,
-            ) != 0
-            {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            let stat = stat.assume_init();
-            let is_dir = (stat.st_mode & libc::S_IFMT) == libc::S_IFDIR;
-
-            if is_dir {
-                let sub_fd = libc::openat(
-                    dir_fd,
-                    name.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                );
-                if sub_fd < 0 {
-                    return Err(std::io::Error::last_os_error().into());
-                }
-                deleted = deleted
-                    .checked_add(delete_dir_contents_recursive(sub_fd)?)
-                    .ok_or_else(|| ToolError::Protocol("delete count overflow".to_owned()))?;
-                if libc::unlinkat(dir_fd, name.as_ptr(), libc::AT_REMOVEDIR) != 0 {
-                    return Err(std::io::Error::last_os_error().into());
-                }
-            } else if libc::unlinkat(dir_fd, name.as_ptr(), 0) != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            deleted = deleted
-                .checked_add(1)
-                .ok_or_else(|| ToolError::Protocol("delete count overflow".to_owned()))?;
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
         }
-        libc::closedir(dir);
-        Ok(deleted)
+        let stat = unsafe { stat.assume_init() };
+        let is_dir = (stat.st_mode & libc::S_IFMT) == libc::S_IFDIR;
+
+        if is_dir {
+            // Use the same openat2/resolve policy for subdirectories as for
+            // the conversation directory itself.
+            let sub_fd = openat2_cstr(
+                dir.as_fd(),
+                &name,
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0,
+            )?;
+            deleted = deleted
+                .checked_add(delete_dir_contents_recursive(sub_fd)?)
+                .ok_or_else(|| ToolError::Protocol("delete count overflow".to_owned()))?;
+            if unsafe { libc::unlinkat(dir.as_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        } else if unsafe { libc::unlinkat(dir.as_fd(), name.as_ptr(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        deleted = deleted
+            .checked_add(1)
+            .ok_or_else(|| ToolError::Protocol("delete count overflow".to_owned()))?;
     }
+    Ok(deleted)
 }
 
 fn checked_handle<'a>(

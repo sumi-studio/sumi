@@ -15,10 +15,7 @@ mod redactor;
 mod sizer;
 mod transcript;
 
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{path::Path, sync::Arc};
 
 #[cfg(test)]
 use std::str::FromStr;
@@ -136,7 +133,6 @@ pub(crate) struct Store {
     key_provider: Arc<dyn KeyProvider>,
     redactor: Redactor,
     event_writer_state: Arc<Mutex<event_writer::WriterState>>,
-    db_path: Option<PathBuf>,
 }
 
 impl Store {
@@ -157,8 +153,7 @@ impl Store {
             .connect_with(options)
             .await
             .with_context(|| format!("failed to open SQLite database {}", path.display()))?;
-        let db_path = Some(path.to_path_buf());
-        let store = Self::finish_open(pool, scope, key_provider, db_path).await?;
+        let store = Self::finish_open(pool, scope, key_provider).await?;
         secure_sqlite_files(path).await?;
         Ok(store)
     }
@@ -172,7 +167,7 @@ impl Store {
             .max_connections(1)
             .connect_with(options)
             .await?;
-        Self::finish_open(pool, scope, key_provider, None).await
+        Self::finish_open(pool, scope, key_provider).await
     }
 
     #[cfg(test)]
@@ -212,7 +207,6 @@ impl Store {
         pool: SqlitePool,
         scope: AgentScope,
         key_provider: Arc<dyn KeyProvider>,
-        db_path: Option<PathBuf>,
     ) -> Result<Self> {
         MIGRATOR
             .run(&pool)
@@ -239,7 +233,6 @@ impl Store {
             key_provider,
             redactor: Redactor::v1(),
             event_writer_state: Arc::new(Mutex::new(event_writer::WriterState::default())),
-            db_path,
         };
         store.validate_startup().await?;
         Ok(store)
@@ -265,10 +258,6 @@ impl Store {
 
     pub(crate) fn redactor(&self) -> &Redactor {
         &self.redactor
-    }
-
-    pub(crate) fn db_path(&self) -> Option<&Path> {
-        self.db_path.as_deref()
     }
 
     fn event_writer_state(&self) -> Arc<Mutex<event_writer::WriterState>> {
@@ -726,10 +715,12 @@ impl Store {
         Ok(())
     }
 
-    /// Re-wrap every active conversation data key with the current wrapping
-    /// key from `KeyProvider` without re-encrypting row ciphertext.  Old
-    /// wrapping keys must still be available (not yet disabled) for this to
-    /// succeed; a disabled/revoked KMS key fails closed.
+    /// Re-wrap every active data key owned by this agent with the current
+    /// wrapping key from `KeyProvider` without re-encrypting row ciphertext.
+    /// This includes the agent-scoped workspace key, which survives a
+    /// conversation reset but must not remain wrapped by a retired agent key.
+    /// Old wrapping keys must still be available (not yet disabled) for this
+    /// to succeed; a disabled/revoked KMS key fails closed.
     #[allow(
         dead_code,
         reason = "T29 rotation boundary wired by lifecycle tests and runtime bootstrap"
@@ -748,8 +739,11 @@ impl Store {
             "SELECT key_ref, scope, purpose, conversation_id, wrap_key_id,
                     wrap_nonce, wrapped_key
              FROM data_keys
-             WHERE state = 'active' AND scope = 'conversation'
-               AND conversation_id = ?",
+             WHERE state = 'active'
+               AND (
+                    (scope = 'conversation' AND conversation_id = ?)
+                    OR (scope = 'agent' AND conversation_id IS NULL AND purpose = 'workspace')
+               )",
         )
         .bind(&runtime_conversation_id)
         .fetch_all(&mut *transaction)
@@ -758,7 +752,11 @@ impl Store {
 
         for row in rows {
             let key_ref: String = row.try_get("key_ref")?;
-            let _scope: String = row.try_get("scope")?;
+            let scope = match row.try_get::<String, _>("scope")?.as_str() {
+                "conversation" => DataKeyScope::Conversation,
+                "agent" => DataKeyScope::Agent,
+                value => bail!("active data key {key_ref} has unknown scope {value}"),
+            };
             let purpose = DataKeyPurpose::parse(row.try_get("purpose")?)?;
             let conversation_id: Option<String> = row.try_get("conversation_id")?;
             let old_wrap_key_id: String = row.try_get("wrap_key_id")?;
@@ -772,7 +770,7 @@ impl Store {
 
             let old_aad = KeyWrapAad {
                 key_ref: key_ref.clone(),
-                scope: DataKeyScope::Conversation,
+                scope,
                 purpose,
                 conversation_id: conversation_id.clone(),
                 wrap_key_id: old_wrap_key_id,
@@ -789,7 +787,7 @@ impl Store {
 
             let new_aad = KeyWrapAad {
                 key_ref: key_ref.clone(),
-                scope: DataKeyScope::Conversation,
+                scope,
                 purpose,
                 conversation_id,
                 wrap_key_id: new_key_id.clone(),
@@ -801,7 +799,10 @@ impl Store {
                 "UPDATE data_keys
                  SET wrap_key_id = ?, wrap_nonce = ?, wrapped_key = ?
                  WHERE key_ref = ? AND state = 'active'
-                   AND scope = 'conversation' AND conversation_id = ?",
+                   AND (
+                        (scope = 'conversation' AND conversation_id = ?)
+                        OR (scope = 'agent' AND conversation_id IS NULL AND purpose = 'workspace')
+                   )",
             )
             .bind(&new_key_id)
             .bind(new_nonce.as_slice())
@@ -1586,7 +1587,7 @@ mod tests {
             conversation_id: "conversation-2".to_owned(),
             ..scope()
         };
-        let error = match Store::finish_open(pool, wrong_scope, provider(), None).await {
+        let error = match Store::finish_open(pool, wrong_scope, provider()).await {
             Ok(_) => panic!("scope mismatch must fail closed"),
             Err(error) => error,
         };
@@ -1607,7 +1608,7 @@ mod tests {
         let pool = store.pool.clone();
         drop(store);
 
-        let error = match Store::finish_open(pool, scope(), provider(), None).await {
+        let error = match Store::finish_open(pool, scope(), provider()).await {
             Ok(_) => panic!("tampered key must fail startup validation"),
             Err(error) => error,
         };
@@ -1632,7 +1633,7 @@ mod tests {
         let pool = store.pool.clone();
         drop(store);
 
-        let error = match Store::finish_open(pool, scope(), provider(), None).await {
+        let error = match Store::finish_open(pool, scope(), provider()).await {
             Ok(_) => panic!("unknown active key algorithm must fail startup"),
             Err(error) => error,
         };
@@ -1659,7 +1660,7 @@ mod tests {
         let pool = store.pool.clone();
         drop(store);
 
-        let error = match Store::finish_open(pool, scope(), provider(), None).await {
+        let error = match Store::finish_open(pool, scope(), provider()).await {
             Ok(_) => panic!("message projection version 2 must fail startup"),
             Err(error) => error,
         };
@@ -1686,7 +1687,7 @@ mod tests {
         let pool = store.pool.clone();
         drop(store);
 
-        let error = match Store::finish_open(pool, scope(), provider(), None).await {
+        let error = match Store::finish_open(pool, scope(), provider()).await {
             Ok(_) => panic!("approval projection version 2 must fail startup"),
             Err(error) => error,
         };

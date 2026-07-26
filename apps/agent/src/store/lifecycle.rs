@@ -98,7 +98,6 @@ pub struct LifecycleWorker {
     store: Arc<Store>,
     tombstones: Arc<dyn TombstoneRepository>,
     broker: Arc<dyn ArtifactLifecycleBroker>,
-    artifact_root: Option<PathBuf>,
 }
 
 impl LifecycleWorker {
@@ -106,13 +105,12 @@ impl LifecycleWorker {
         store: Arc<Store>,
         tombstones: Arc<dyn TombstoneRepository>,
         broker: Arc<dyn ArtifactLifecycleBroker>,
-        artifact_root: Option<PathBuf>,
+        _artifact_root: Option<PathBuf>,
     ) -> Self {
         Self {
             store,
             tombstones,
             broker,
-            artifact_root,
         }
     }
 
@@ -247,78 +245,20 @@ impl LifecycleWorker {
         Ok(())
     }
 
-    /// Agent deletion: tombstone the agent, close the store, delete the SQLite
-    /// file and artifact volume.  The compliance store outlives this call.
+    /// Agent deletion is a supervisor-owned operation. The runtime must not
+    /// mark an inbound command applied and then self-delete its database or
+    /// artifact root: a crash in between makes the durable command unretryable
+    /// and direct filesystem removal crosses the broker/supervisor boundary.
+    ///
+    /// The control plane creates the durable agent tombstone and its deployment
+    /// supervisor fences the runtime, destroys agent/workspace keys, and removes
+    /// the agent DB and volumes. This local runtime fails closed until that
+    /// boundary is available.
     pub async fn delete_agent(&self) -> Result<()> {
-        let scope = self.store.scope();
-
-        let purge_after = "2099-12-31T23:59:59Z";
-        let tombstone_id = self
-            .tombstones
-            .request(
-                &scope.tenant_id,
-                &scope.agent_id,
-                None,
-                TombstoneScope::Agent,
-                purge_after,
-            )
-            .await
-            .context("failed to record agent deletion tombstone")?;
-        self.tombstones
-            .advance(
-                &tombstone_id,
-                TombstoneStatus::Requested,
-                TombstoneStatus::Fenced,
-            )
-            .await
-            .context("failed to fence agent deletion tombstone")?;
-
-        // Persist tombstone before destroying local storage so a crash replay
-        // can still observe the deletion intent.
-        self.tombstones
-            .advance(
-                &tombstone_id,
-                TombstoneStatus::Fenced,
-                TombstoneStatus::LivePurged,
-            )
-            .await
-            .context("failed to mark agent deletion live-purged")?;
-
-        // Close the SQLite pool and remove the database files.
-        self.store.pool().close().await;
-        if let Some(db_path) = self.store.db_path() {
-            let owned = db_path.to_path_buf();
-            let paths = [
-                owned.clone(),
-                owned.with_extension("db-wal"),
-                owned.with_extension("db-shm"),
-            ];
-            for path in paths.iter().filter(|p| p.exists()) {
-                tokio::fs::remove_file(path)
-                    .await
-                    .with_context(|| format!("failed to remove {path:?}"))?;
-            }
-        }
-
-        // Remove the artifact volume if one was provided.
-        if let Some(artifact_root) = self.artifact_root.as_ref()
-            && artifact_root.exists()
-        {
-            tokio::fs::remove_dir_all(artifact_root)
-                .await
-                .with_context(|| format!("failed to remove artifact root {artifact_root:?}"))?;
-        }
-
-        self.tombstones
-            .advance(
-                &tombstone_id,
-                TombstoneStatus::LivePurged,
-                TombstoneStatus::BackupExpired,
-            )
-            .await
-            .context("failed to mark agent deletion backup-expired")?;
-
-        Ok(())
+        bail!(
+            "DeleteAgent must be executed by the control-plane deployment supervisor; \
+             runtime-side deletion is disabled"
+        )
     }
 
     /// Rotate the agent's wrapping key (e.g. after a KMS re-key) by re-wrapping
@@ -377,6 +317,34 @@ impl LifecycleWorker {
         Ok(lines.join("\n").into_bytes())
     }
 
+    /// Escape a redacted or user-supplied query so it is treated as a literal
+    /// sequence of tokens by FTS5. FTS5 metacharacters (`:`, `[`, `"`, `*`, etc.)
+    /// inside the redaction replacement would otherwise produce syntax errors or
+    /// unintended column/filter semantics.
+    fn fts5_literal_query(redacted: &str) -> Result<String> {
+        let sanitized: String = redacted
+            .chars()
+            .map(|c| {
+                if c.is_whitespace() || c.is_ascii_control() {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let tokens: Vec<String> = sanitized
+            .split_whitespace()
+            .map(|token| {
+                let escaped = token.replace('"', "\"\"");
+                format!("\"{escaped}\"")
+            })
+            .collect();
+        if tokens.is_empty() {
+            bail!("search query contains no searchable tokens after redaction");
+        }
+        Ok(tokens.join(" "))
+    }
+
     /// Search conversation messages with FTS5 and return redacted payloads.
     pub async fn search_conversation(&self, actor_id: &str, query: &str) -> Result<Vec<u8>> {
         let scope = self.store.scope();
@@ -384,6 +352,7 @@ impl LifecycleWorker {
             bail!("search query must not be empty");
         }
         let redacted_query = self.store.redactor().redact_text(query);
+        let literal_query = Self::fts5_literal_query(&redacted_query)?;
 
         let rows = sqlx::query(
             "SELECT m.id, m.seq, m.role, m.payload, m.search_text, m.created_at
@@ -392,7 +361,7 @@ impl LifecycleWorker {
              WHERE messages_fts MATCH ?
              ORDER BY m.seq",
         )
-        .bind(&redacted_query)
+        .bind(&literal_query)
         .fetch_all(self.store.pool())
         .await
         .context("failed to search messages")?;
@@ -518,9 +487,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::store::crypto::{DataKeyScope, KeyWrapAad, WRAP_ALGORITHM, wrap_data_key};
     use crate::store::{
-        AgentScope, DATA_KEY_BYTES, DataKeyPurpose, InMemoryTombstoneRepository, KeyProvider,
-        KmsClient, KmsKeyProvider, MockKmsClient, TombstoneRepository, TombstoneScope,
+        AgentScope, DATA_KEY_BYTES, DataKeyMaterial, DataKeyPurpose, InMemoryTombstoneRepository,
+        KeyProvider, KmsClient, KmsKeyProvider, MockKmsClient, TombstoneRepository, TombstoneScope,
         TombstoneStatus, WrappingKey,
     };
     use crate::tools::executor::{ArtifactBroker, ArtifactOperation};
@@ -585,6 +555,35 @@ mod tests {
         .expect("seed message");
     }
 
+    async fn seed_workspace_key(store: &Store, wrapping_key: &WrappingKey) {
+        let key_ref = "workspace-key";
+        let data_key =
+            DataKeyMaterial::from_bytes(key_ref, DataKeyPurpose::Workspace, [0x42; DATA_KEY_BYTES]);
+        let aad = KeyWrapAad {
+            key_ref: key_ref.to_owned(),
+            scope: DataKeyScope::Agent,
+            purpose: DataKeyPurpose::Workspace,
+            conversation_id: None,
+            wrap_key_id: wrapping_key.key_id().to_owned(),
+        };
+        let (wrap_nonce, wrapped_key) = wrap_data_key(&data_key, wrapping_key, &aad).unwrap();
+        sqlx::query(
+            "INSERT INTO data_keys(
+                key_ref, scope, purpose, conversation_id, algorithm, wrap_key_id,
+                wrap_nonce, wrapped_key, state, created_at, destroyed_at
+             ) VALUES(?, 'agent', 'workspace', NULL, ?, ?, ?, ?, 'active', ?, NULL)",
+        )
+        .bind(key_ref)
+        .bind(WRAP_ALGORITHM)
+        .bind(wrapping_key.key_id())
+        .bind(wrap_nonce.as_slice())
+        .bind(wrapped_key)
+        .bind(Utc::now().to_rfc3339())
+        .execute(store.pool())
+        .await
+        .expect("seed workspace key");
+    }
+
     fn open_broker(root: &std::path::Path) -> crate::tools::executor::ArtifactBroker {
         std::fs::create_dir_all(root).unwrap();
         ArtifactBroker::open(root).unwrap()
@@ -642,10 +641,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_deletion_removes_db_and_artifacts_and_advances_tombstone() {
+    async fn agent_deletion_fails_closed_without_supervisor_and_preserves_local_state() {
         let client = Arc::new(MockKmsClient::new("tenant-1", "agent-1", test_kek()));
         let (store, _) = open_test_store("conversation-del", client.clone()).await;
-        let db_path = store.db_path().unwrap().to_path_buf();
         let store = Arc::new(store);
 
         let tombstones: Arc<dyn TombstoneRepository> = Arc::new(InMemoryTombstoneRepository::new());
@@ -659,27 +657,37 @@ mod tests {
             Some(artifact_root.clone()),
         );
 
-        worker.delete_agent().await.unwrap();
+        let error = worker
+            .delete_agent()
+            .await
+            .expect_err("runtime deletion must fail closed");
+        assert!(error.to_string().contains("deployment supervisor"));
 
-        assert!(!db_path.exists());
-        assert!(!artifact_root.exists());
+        assert!(artifact_root.exists());
 
-        let tombstone = tombstones
+        let scope_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_scope")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(scope_count, 1, "runtime database remains open");
+
+        let tombstones = tombstones
             .list_for_agent("tenant-1", "agent-1")
             .await
-            .unwrap()
-            .pop()
-            .expect("tombstone exists");
-        assert_eq!(tombstone.status, TombstoneStatus::BackupExpired);
-        assert_eq!(tombstone.scope, TombstoneScope::Agent);
+            .unwrap();
+        assert!(
+            tombstones.is_empty(),
+            "runtime cannot mint a control-plane tombstone"
+        );
     }
 
     #[tokio::test]
     async fn kms_rotation_rewraps_active_conversation_keys() {
         let client = Arc::new(MockKmsClient::new("tenant-1", "agent-1", test_kek()));
-        let (store, _) = open_test_store("conversation-rot", client.clone()).await;
+        let (store, agent_key) = open_test_store("conversation-rot", client.clone()).await;
         let store = Arc::new(store);
         seed_message(&store, "conversation-rot", 1).await;
+        seed_workspace_key(&store, &agent_key).await;
 
         let tombstones: Arc<dyn TombstoneRepository> = Arc::new(InMemoryTombstoneRepository::new());
         let worker = LifecycleWorker::new(
@@ -697,12 +705,17 @@ mod tests {
 
         worker.rotate_conversation_keys().await.unwrap();
 
-        let wrap_key_id: String =
-            sqlx::query_scalar("SELECT wrap_key_id FROM data_keys WHERE state = 'active' LIMIT 1")
-                .fetch_one(store.pool())
-                .await
-                .unwrap();
-        assert_eq!(wrap_key_id, "agent-key/v2");
+        let stale_key_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM data_keys
+             WHERE state = 'active' AND wrap_key_id != 'agent-key/v2'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            stale_key_count, 0,
+            "all active keys, including workspace, rewrapped"
+        );
 
         // The conversation key can still be loaded under the new wrapping key.
         assert!(
@@ -799,5 +812,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(audit.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn search_redacts_secret_query_and_escapes_fts_metacharacters() {
+        let client = Arc::new(MockKmsClient::new("tenant-1", "agent-1", test_kek()));
+        let (store, _) = open_test_store("conversation-fts", client.clone()).await;
+        let store = Arc::new(store);
+
+        // Insert a message whose payload contains the secret but whose
+        // search_text has already been redacted, as the real transcript path
+        // does before indexing.
+        let key = store
+            .conversation_key(DataKeyPurpose::Transcript)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO messages(
+                id, seq, role, raw_key_ref, raw_ciphertext, payload, search_text,
+                redaction_version, interrupted, created_at
+             ) VALUES('msg-secret', 1, 'user', ?, X'00', ?, ?, 1, 0, ?)",
+        )
+        .bind(key.key_ref.clone())
+        .bind(r#"{"text":"token is sk-1234567890abcdef"}"#)
+        .bind("token is [REDACTED:api_key]")
+        .bind(Utc::now().to_rfc3339())
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let tombstones: Arc<dyn TombstoneRepository> = Arc::new(InMemoryTombstoneRepository::new());
+        let worker = LifecycleWorker::new(
+            store.clone(),
+            tombstones,
+            Arc::new(DirectArtifactBroker::new(open_broker(&temp_test_dir()))),
+            None,
+        );
+
+        // Searching the raw secret must redact to the placeholder and not error.
+        let search = worker
+            .search_conversation("actor-1", "sk-1234567890abcdef")
+            .await
+            .unwrap();
+        let search_text = String::from_utf8(search).unwrap();
+        assert!(search_text.contains("[REDACTED:api_key]"));
+        assert!(!search_text.contains("sk-1234567890abcdef"));
+
+        // FTS5 metacharacters in the user query must not cause syntax errors.
+        for metachar_query in ["[", "]", ":", "\"", "*", "[REDACTED:api_key]"] {
+            worker
+                .search_conversation("actor-1", metachar_query)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("FTS5 query {metachar_query:?} produced an error: {error}")
+                });
+        }
     }
 }

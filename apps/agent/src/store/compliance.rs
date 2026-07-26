@@ -470,9 +470,9 @@ impl TombstoneRepository for SqliteTombstoneRepository {
         next: TombstoneStatus,
     ) -> Result<()> {
         validate_transition(expected, next)?;
-        if expected == next {
-            return Ok(());
-        }
+        // Same-state re-application must still verify the tombstone exists.
+        // A no-op UPDATE of an existing row returns rows_affected == 1; a
+        // missing row returns 0 and is handled by the CAS failure path below.
         let updated = sqlx::query(
             "UPDATE deletion_tombstones
              SET status = ?
@@ -755,6 +755,21 @@ mod tests {
             )
             .await
             .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_same_state_advance_requires_existing_tombstone() {
+        let repo = SqliteTombstoneRepository::open_in_memory().await.unwrap();
+        assert!(
+            repo.advance(
+                "missing-id",
+                TombstoneStatus::Requested,
+                TombstoneStatus::Requested,
+            )
+            .await
+            .is_err(),
+            "same-state re-application of a missing tombstone must fail closed"
         );
     }
 

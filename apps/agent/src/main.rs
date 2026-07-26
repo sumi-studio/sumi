@@ -177,15 +177,6 @@ async fn main() -> Result<()> {
         if let InboundCommand::Valid(command) = &inbound
             && is_lifecycle_command(&command.command)
         {
-            let is_delete = matches!(command.command, gateway::Command::DeleteAgent {});
-
-            // DeleteAgent removes the SQLite file; mark applied first.
-            if is_delete {
-                lifecycle_worker
-                    .apply_command(command.command_id.as_str(), command.seq)
-                    .await?;
-            }
-
             let result = lifecycle_worker
                 .handle_command(&command.command)
                 .await
@@ -193,11 +184,9 @@ async fn main() -> Result<()> {
                     format!("lifecycle command {} failed", command.command_id.as_str())
                 })?;
 
-            if !is_delete {
-                lifecycle_worker
-                    .apply_command(command.command_id.as_str(), command.seq)
-                    .await?;
-            }
+            lifecycle_worker
+                .apply_command(command.command_id.as_str(), command.seq)
+                .await?;
 
             gateway_writer
                 .send(OutboundFrame::CommandAck {
@@ -227,10 +216,6 @@ async fn main() -> Result<()> {
                     .await?;
             }
 
-            // DeleteAgent has destroyed local storage; stop reading commands.
-            if is_delete {
-                break;
-            }
             continue;
         }
 

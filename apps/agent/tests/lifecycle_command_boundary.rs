@@ -48,7 +48,10 @@ fn envelope(seq: u64, command_id: &str, command: serde_json::Value) -> String {
         + "\n"
 }
 
-async fn send_commands(child: &mut Child, commands: &[String]) -> (Vec<serde_json::Value>, String) {
+async fn send_commands_allow_failure(
+    child: &mut Child,
+    commands: &[String],
+) -> (Vec<serde_json::Value>, String, std::process::ExitStatus) {
     let stdin = child.stdin.as_mut().unwrap();
     for line in commands {
         stdin.write_all(line.as_bytes()).await.unwrap();
@@ -80,6 +83,11 @@ async fn send_commands(child: &mut Child, commands: &[String]) -> (Vec<serde_jso
         }
         String::from_utf8_lossy(&bytes).to_string()
     };
+    (frames, stderr, status)
+}
+
+async fn send_commands(child: &mut Child, commands: &[String]) -> (Vec<serde_json::Value>, String) {
+    let (frames, stderr, status) = send_commands_allow_failure(child, commands).await;
     assert!(status.success(), "agent exited with {status:?}: {stderr}");
     (frames, stderr)
 }
@@ -237,11 +245,11 @@ async fn conversation_reset_only_removes_target_conversation_artifacts() {
 }
 
 #[tokio::test]
-async fn delete_agent_removes_database_and_artifacts() {
+async fn delete_agent_fails_closed_without_a_supervisor() {
     let dir = test_directory();
     tokio::fs::create_dir(&dir).await.unwrap();
 
-    // Create an artifact file that should be removed.
+    // A runtime process must never remove this root directly.
     let artifact_root = dir.join("workspace").join("artifacts");
     tokio::fs::create_dir_all(&artifact_root).await.unwrap();
     tokio::fs::write(artifact_root.join("stale.txt"), "stale")
@@ -254,16 +262,20 @@ async fn delete_agent_removes_database_and_artifacts() {
         "00000000-0000-4000-8000-000000000001",
         serde_json::json!({"type": "delete_agent"}),
     )];
-    let (frames, _stderr) = send_commands(&mut child, &commands).await;
-    let ack = find_ack(&frames, 1).expect("delete ack");
-    assert_eq!(
-        ack.get("ack").unwrap().get("status").unwrap().as_str(),
-        Some("applied")
+    let (frames, stderr, status) = send_commands_allow_failure(&mut child, &commands).await;
+    assert!(
+        !status.success(),
+        "DeleteAgent unexpectedly succeeded: {frames:?}"
+    );
+    assert!(stderr.contains("deployment supervisor"));
+    assert!(
+        find_ack(&frames, 1).is_none(),
+        "unsafe delete was acknowledged"
     );
 
     let db_path = dir.join("state").join("agent.db");
-    assert!(!db_path.exists(), "database file was not removed");
-    assert!(!artifact_root.exists(), "artifact root was not removed");
+    assert!(db_path.exists(), "runtime database was removed directly");
+    assert!(artifact_root.exists(), "artifact root was removed directly");
 
     tokio::fs::remove_dir_all(&dir).await.ok();
 }

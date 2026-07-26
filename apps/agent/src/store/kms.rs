@@ -201,7 +201,7 @@ impl KmsClient for MockKmsClient {
 /// Bounded HTTP KMS client. The tenant KEK lives in the remote KMS; only the
 /// plaintext agent key ever enters this process, and only over TLS (or explicit
 /// test HTTP).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HttpKmsClient {
     client: reqwest::Client,
     base_url: Url,
@@ -210,6 +210,20 @@ pub struct HttpKmsClient {
     agent_id: String,
     current_key_id: Option<String>,
     allow_http: bool,
+}
+
+impl fmt::Debug for HttpKmsClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HttpKmsClient")
+            .field("base_url", &self.base_url)
+            .field("tenant_id", &self.tenant_id)
+            .field("agent_id", &self.agent_id)
+            .field("current_key_id", &self.current_key_id)
+            .field("allow_http", &self.allow_http)
+            .field("api_token", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -350,15 +364,13 @@ impl KmsClient for HttpKmsClient {
 }
 
 /// `KeyProvider` implementation backed by a KMS / control-plane tenant KEK.
-/// The current agent key is cached in locked memory and zeroized on drop.
+///
+/// A current-key request always performs an unwrap.  Caching a plaintext
+/// current key is unsafe because a control plane can revoke that key without
+/// changing its id; the unwrap is the authorization check as well as the key
+/// retrieval operation.
 pub struct KmsKeyProvider {
     client: std::sync::Arc<dyn KmsClient>,
-    current_cache: Mutex<Option<CurrentKeyCache>>,
-}
-
-struct CurrentKeyCache {
-    key_id: String,
-    key: WrappingKey,
 }
 
 impl fmt::Debug for KmsKeyProvider {
@@ -371,22 +383,7 @@ impl fmt::Debug for KmsKeyProvider {
 
 impl KmsKeyProvider {
     pub fn new(client: std::sync::Arc<dyn KmsClient>) -> Result<Self> {
-        Ok(Self {
-            client,
-            current_cache: Mutex::new(None),
-        })
-    }
-
-    async fn current_cached(&self, key_id: &str) -> Option<WrappingKey> {
-        self.current_cache.lock().ok().and_then(|cache| {
-            cache.as_ref().and_then(|entry| {
-                if entry.key_id == key_id {
-                    Some(entry.key.clone())
-                } else {
-                    None
-                }
-            })
-        })
+        Ok(Self { client })
     }
 }
 
@@ -398,21 +395,10 @@ impl super::KeyProvider for KmsKeyProvider {
             .current_key_id()
             .await
             .context("failed to retrieve current KMS key id")?;
-        if let Some(key) = self.current_cached(&key_id).await {
-            return Ok(key);
-        }
-        let key = self
-            .client
+        self.client
             .unwrap_agent_key(&key_id)
             .await
-            .with_context(|| format!("KMS refused current agent key {key_id}"))?;
-        if let Ok(mut cache) = self.current_cache.lock() {
-            *cache = Some(CurrentKeyCache {
-                key_id: key_id.clone(),
-                key: key.clone(),
-            });
-        }
-        Ok(key)
+            .with_context(|| format!("KMS refused current agent key {key_id}"))
     }
 
     async fn key_by_id(&self, key_id: &str) -> Result<WrappingKey> {
@@ -437,21 +423,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kms_key_provider_unwraps_and_caches_current_agent_key() {
-        let client = MockKmsClient::new("tenant-1", "agent-1", test_kek());
+    async fn kms_key_provider_rechecks_current_key_authorization() {
+        let client = std::sync::Arc::new(MockKmsClient::new("tenant-1", "agent-1", test_kek()));
         client
             .register_agent_key("agent-key/v1", &test_agent_key("agent-key/v1", 0x22))
             .unwrap();
         client.set_current_key_id("agent-key/v1");
 
-        let provider = KmsKeyProvider::new(std::sync::Arc::new(client)).unwrap();
+        let provider = KmsKeyProvider::new(client.clone()).unwrap();
 
         let key = provider.current_key().await.unwrap();
         assert_eq!(key.key_id(), "agent-key/v1");
 
-        // Caching returns the same plaintext without re-calling the KMS.
+        // The same key id must still be unwrapped, because revocation does
+        // not necessarily change the control-plane current key id.
         let again = provider.current_key().await.unwrap();
         assert_eq!(again.bytes(), key.bytes());
+
+        client.disable_key("agent-key/v1");
+        assert!(provider.current_key().await.is_err());
     }
 
     #[tokio::test]
@@ -561,14 +551,13 @@ mod tests {
             assert_eq!(key.key_id(), "agent-key-v1");
             assert_eq!(key.bytes(), &[0x44; DATA_KEY_BYTES]);
 
-            // Revoke the key on the server side and move the current key id to
-            // an unknown key, simulating a control-plane rotation.
+            // Revoke the current key without changing its id. This must fail
+            // even though the key was successfully unwrapped above.
             state
                 .disabled
                 .lock()
                 .unwrap()
                 .insert("agent-key-v1".to_owned());
-            *state.current.lock().unwrap() = "agent-key-revoked".to_owned();
             assert!(provider.current_key().await.is_err());
             assert!(provider.key_by_id("agent-key-v1").await.is_err());
         }
