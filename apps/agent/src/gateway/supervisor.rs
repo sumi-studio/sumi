@@ -29,8 +29,8 @@ use crate::runtime::contracts::ProcessGeneration;
 
 use super::wire::MAX_JSON_SAFE_INTEGER;
 use super::{
-    Gateway, GatewayReader, GatewayWriter, HelloError, InboundCommand, OutboundFrame,
-    OversizedFrameError,
+    Gateway, GatewayClosed, GatewayReader, GatewayWriter, HelloError, InboundCommand,
+    OutboundFrame, OversizedFrameError,
 };
 
 pub mod seams;
@@ -512,7 +512,7 @@ where
                     // consecutive failure bursts, not lifetime disconnects.
                     auth_attempt = 0;
                     if healthy {
-                        reconnect_attempt = 1;
+                        reconnect_attempt = 0;
                     } else {
                         reconnect_attempt = reconnect_attempt.saturating_add(1);
                         if let Some(max) = self.config.max_reconnect_attempts
@@ -629,30 +629,7 @@ where
                 *self.current_writer.lock().unwrap() = None;
                 self.current_epoch.send_replace(None);
                 let _ = self.online.send(false);
-                for result in [&reader_result, &writer_result] {
-                    if let Err(join_err) = result {
-                        if join_err.is_panic() {
-                            return Err(SupervisorError::Fatal(anyhow!(
-                                "epoch task panicked: {join_err}"
-                            )));
-                        }
-                        return Err(SupervisorError::Fatal(anyhow!(
-                            "epoch task join error: {join_err}"
-                        )));
-                    }
-                }
-                let reader_result = reader_result.unwrap();
-                let writer_result = writer_result.unwrap();
-                if let Some(e) = first_oversized_error(&reader_result, &writer_result) {
-                    return Err(SupervisorError::Fatal(anyhow::Error::new(e)));
-                }
-                match (reader_result, writer_result) {
-                    (Ok(()), Ok(())) => Ok(()),
-                    (Err(e), _) | (_, Err(e)) => Err(SupervisorError::EstablishedReconnect {
-                        reason: format!("epoch task error during cancel: {e}"),
-                        healthy: false,
-                    }),
-                }
+                Self::inspect_epoch_results(reader_result, writer_result, || Ok(()))
             }
             reader_result = &mut reader_handle => {
                 epoch_token.cancel();
@@ -667,7 +644,12 @@ where
                 let healthy = was_online
                     && reader_result.as_ref().ok().is_some_and(|r| r.is_ok())
                     && writer_result.as_ref().ok().is_some_and(|r| r.is_ok());
-                Self::inspect_epoch_results(reader_result, writer_result, healthy)
+                Self::inspect_epoch_results(reader_result, writer_result, || {
+                    Err(SupervisorError::EstablishedReconnect {
+                        reason: "reader/writer task ended".to_owned(),
+                        healthy,
+                    })
+                })
             }
             writer_result = &mut writer_handle => {
                 epoch_token.cancel();
@@ -682,7 +664,12 @@ where
                 let healthy = was_online
                     && reader_result.as_ref().ok().is_some_and(|r| r.is_ok())
                     && writer_result.as_ref().ok().is_some_and(|r| r.is_ok());
-                Self::inspect_epoch_results(reader_result, writer_result, healthy)
+                Self::inspect_epoch_results(reader_result, writer_result, || {
+                    Err(SupervisorError::EstablishedReconnect {
+                        reason: "reader/writer task ended".to_owned(),
+                        healthy,
+                    })
+                })
             }
         };
 
@@ -697,40 +684,51 @@ where
         result
     }
 
-    fn inspect_epoch_results(
-        reader_result: Result<Result<()>, JoinError>,
+    fn inspect_epoch_results<F>(
+        reader_result: Result<Result<(), ReaderError>, JoinError>,
         writer_result: Result<Result<()>, JoinError>,
-        healthy: bool,
-    ) -> Result<(), SupervisorError> {
-        for result in [&reader_result, &writer_result] {
-            if let Err(join_err) = result {
-                if join_err.is_panic() {
-                    return Err(SupervisorError::Fatal(anyhow!(
-                        "epoch task panicked: {join_err}"
-                    )));
-                }
+        on_both_ok: F,
+    ) -> Result<(), SupervisorError>
+    where
+        F: FnOnce() -> Result<(), SupervisorError>,
+    {
+        if let Err(join_err) = &reader_result {
+            if join_err.is_panic() {
                 return Err(SupervisorError::Fatal(anyhow!(
-                    "epoch task join error: {join_err}"
+                    "epoch task panicked: {join_err}"
                 )));
             }
+            return Err(SupervisorError::Fatal(anyhow!(
+                "epoch task join error: {join_err}"
+            )));
+        }
+        if let Err(join_err) = &writer_result {
+            if join_err.is_panic() {
+                return Err(SupervisorError::Fatal(anyhow!(
+                    "epoch task panicked: {join_err}"
+                )));
+            }
+            return Err(SupervisorError::Fatal(anyhow!(
+                "epoch task join error: {join_err}"
+            )));
         }
 
         let reader_result = reader_result.unwrap();
         let writer_result = writer_result.unwrap();
 
-        if let Some(e) = first_oversized_error(&reader_result, &writer_result) {
+        if let Some(e) = first_oversized_error(&writer_result) {
             return Err(SupervisorError::Fatal(anyhow::Error::new(e)));
         }
 
         match (reader_result, writer_result) {
-            (Ok(()), Ok(())) => Err(SupervisorError::EstablishedReconnect {
-                reason: "reader/writer task ended".to_owned(),
-                healthy,
-            }),
-            (Err(e), _) | (_, Err(e)) => Err(SupervisorError::EstablishedReconnect {
-                reason: format!("epoch task error: {e}"),
-                healthy: false,
-            }),
+            (Ok(()), Ok(())) => on_both_ok(),
+            (Err(ReaderError::Fatal(e)), _) => Err(SupervisorError::Fatal(e)),
+            (Err(ReaderError::Reconnect(e)), _) | (_, Err(e)) => {
+                Err(SupervisorError::EstablishedReconnect {
+                    reason: format!("epoch task error: {e}"),
+                    healthy: false,
+                })
+            }
         }
     }
 
@@ -761,14 +759,11 @@ where
     }
 }
 
-fn first_oversized_error(
-    reader_result: &Result<()>,
-    writer_result: &Result<()>,
-) -> Option<OversizedFrameError> {
-    [reader_result.as_ref().err(), writer_result.as_ref().err()]
-        .into_iter()
-        .flatten()
-        .find_map(|e| e.downcast_ref::<OversizedFrameError>().copied())
+fn first_oversized_error(result: &Result<()>) -> Option<OversizedFrameError> {
+    result
+        .as_ref()
+        .err()
+        .and_then(|e| e.downcast_ref::<OversizedFrameError>().copied())
 }
 
 async fn build_agent_hello<S: DurableSource>(
@@ -835,7 +830,10 @@ async fn validate_hello<S: DurableSource>(
             .map_err(|e| SupervisorError::Reconnect {
                 reason: format!("command cursor unavailable for hello validation: {e}"),
             })?;
-    let min_next_command_seq = command_cursor.applied.saturating_add(1);
+    // The peer's claim must be compatible with the AgentHello snapshot we sent,
+    // not with a newer local applied cursor that may have advanced during the
+    // round-trip. Retransmissions of already-applied commands are safe.
+    let min_next_command_seq = agent.last_applied_command_seq.saturating_add(1);
     let max_next_command_seq = command_cursor.received.checked_add(1).ok_or_else(|| {
         SupervisorError::Fatal(anyhow!(
             "command received cursor overflow: received={}",
@@ -844,11 +842,11 @@ async fn validate_hello<S: DurableSource>(
     })?;
     if !(min_next_command_seq..=max_next_command_seq).contains(&api.next_command_seq) {
         return Err(SupervisorError::Fatal(anyhow!(
-            "command cursor claim outside durable bounds: next_command_seq {} not in {}..={}; applied={}, received={}",
+            "command cursor claim outside durable bounds: next_command_seq {} not in {}..={}; agent_applied={}, received={}",
             api.next_command_seq,
             min_next_command_seq,
             max_next_command_seq,
-            command_cursor.applied,
+            agent.last_applied_command_seq,
             command_cursor.received
         )));
     }
@@ -861,6 +859,22 @@ enum SupervisorError {
     Fatal(anyhow::Error),
     Reconnect { reason: String },
     EstablishedReconnect { reason: String, healthy: bool },
+}
+
+/// Classifies errors from `reader_task` so the supervisor can decide whether
+/// to reconnect or fail closed.
+#[derive(Debug, thiserror::Error)]
+enum ReaderError {
+    #[error("fatal reader error: {0}")]
+    Fatal(#[source] anyhow::Error),
+    #[error("reconnectable reader error: {0}")]
+    Reconnect(#[source] anyhow::Error),
+}
+
+impl From<anyhow::Error> for ReaderError {
+    fn from(e: anyhow::Error) -> Self {
+        ReaderError::Reconnect(e)
+    }
 }
 
 async fn event_forwarder(
@@ -1485,7 +1499,7 @@ async fn reader_task<R, L>(
     api_hello: ApiHello,
     token: CancellationToken,
     command_send_blocked_notify: Option<Arc<Notify>>,
-) -> Result<()>
+) -> Result<(), ReaderError>
 where
     R: GatewayReader + 'static,
     L: HydrationLatch,
@@ -1526,15 +1540,15 @@ where
     let mut pending: Vec<InboundCommand> = Vec::with_capacity(MAX_PENDING_BEFORE_READY);
     let mut next_expected = api_hello.next_command_seq;
 
-    let result: Result<()> = 'task: {
+    let result: Result<(), ReaderError> = 'task: {
         loop {
             tokio::select! {
                 biased;
                 _ = token.cancelled() => break 'task Ok(()),
                 result = latch.wait_for(api_hello.accepted_generation), if ready.is_none() => {
-                    let hydration_ready = result?;
+                    let hydration_ready = result.map_err(ReaderError::Fatal)?;
                     if hydration_ready.generation != api_hello.accepted_generation {
-                        break 'task Err(anyhow!("hydration generation mismatch"));
+                        break 'task Err(ReaderError::Fatal(anyhow!("hydration generation mismatch")));
                     }
                     ready = Some(hydration_ready);
                     for cmd in pending.drain(..) {
@@ -1549,11 +1563,12 @@ where
                             } else if pending.len() < MAX_PENDING_BEFORE_READY {
                                 pending.push(cmd);
                             } else {
-                                break 'task Err(anyhow!("max pending commands before hydration reached"));
+                                break 'task Err(ReaderError::Fatal(anyhow!("max pending commands before hydration reached")));
                             }
                         }
-                        Some(Err(e)) => break 'task Err(e),
-                        None => break 'task Err(anyhow!("command reader closed unexpectedly")),
+                        Some(Err(e)) if e.is::<GatewayClosed>() => break 'task Ok(()),
+                        Some(Err(e)) => break 'task Err(ReaderError::Reconnect(e)),
+                        None => break 'task Err(ReaderError::Reconnect(anyhow!("command reader closed unexpectedly"))),
                     }
                 }
             }
@@ -1696,7 +1711,8 @@ mod tests {
     use crate::gateway::wire::to_wire_frame;
     use crate::gateway::{
         Command, CommandAck, CommandAckStatus, CommandEnvelope, CommandId, CommandRejectReason,
-        Envelope, Gateway, GatewayReader, GatewayWriter, InboundCommand, OutboundFrame,
+        Envelope, Gateway, GatewayClosed, GatewayReader, GatewayWriter, InboundCommand,
+        OutboundFrame,
     };
 
     struct TestDigestFactory;
@@ -3460,6 +3476,99 @@ mod tests {
         validate_hello(&source, &agent, &api).await.unwrap();
     }
 
+    #[tokio::test]
+    async fn validate_hello_accepts_applied_cursor_advancement() {
+        // If the local applied cursor advances between building AgentHello and
+        // validating the peer's claim, the claim must be judged against the
+        // original AgentHello snapshot, not the newer applied cursor.
+        let cursor_calls = VecDeque::from([
+            CommandCursors {
+                received: 5,
+                applied: 5,
+            },
+            CommandCursors {
+                received: 10,
+                applied: 7,
+            },
+        ]);
+
+        struct CursorsSource {
+            event_cursor_value: Arc<AtomicU64>,
+            cursors: Mutex<VecDeque<CommandCursors>>,
+        }
+
+        impl CursorsSource {
+            fn new(cursors: VecDeque<CommandCursors>) -> Self {
+                Self {
+                    event_cursor_value: Arc::new(AtomicU64::new(0)),
+                    cursors: Mutex::new(cursors),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl DurableSource for CursorsSource {
+            async fn event_cursor(&self) -> Result<EventCursors> {
+                Ok(EventCursors {
+                    last_sent: self.event_cursor_value.load(Ordering::SeqCst),
+                })
+            }
+
+            async fn events_after(
+                &self,
+                _after_seq: u64,
+                _limit: usize,
+            ) -> Result<Vec<OutboundFrame>> {
+                Ok(Vec::new())
+            }
+
+            async fn command_cursors(&self) -> Result<CommandCursors> {
+                let mut cursors = self.cursors.lock().unwrap();
+                if cursors.len() > 1 {
+                    Ok(cursors.pop_front().unwrap())
+                } else {
+                    Ok(*cursors.front().unwrap())
+                }
+            }
+        }
+
+        impl Clone for CursorsSource {
+            fn clone(&self) -> Self {
+                Self {
+                    event_cursor_value: self.event_cursor_value.clone(),
+                    cursors: Mutex::new(self.cursors.lock().unwrap().clone()),
+                }
+            }
+        }
+
+        let source = CursorsSource::new(cursor_calls);
+        let agent = build_agent_hello(&source, &make_config()).await.unwrap();
+        assert_eq!(agent.last_applied_command_seq, 5);
+
+        // The peer responded to the original snapshot: it may send the original
+        // applied+1 command, even though the local applied cursor has since
+        // moved to 7.
+        let api = ApiHello {
+            accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
+            last_received_event_seq: 0,
+            next_command_seq: 6,
+        };
+        validate_hello(&source, &agent, &api)
+            .await
+            .expect("original legal resend point must be accepted");
+
+        // A claim below the original applied+1 is still impossible.
+        let api = ApiHello {
+            accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
+            last_received_event_seq: 0,
+            next_command_seq: 5,
+        };
+        assert!(
+            validate_hello(&source, &agent, &api).await.is_err(),
+            "claim before the original applied cursor must fail closed"
+        );
+    }
+
     #[test]
     fn hello_generation_out_of_range_rejects_on_wire() {
         let oversized = i64::MAX as u64 + 1;
@@ -4494,7 +4603,9 @@ mod tests {
     #[tokio::test]
     async fn hydration_hold_limit_fails_closed() {
         // Latch never becomes ready, so the reader must fail closed once the
-        // pre-hydration command ceiling is reached instead of stalling.
+        // pre-hydration command ceiling is reached instead of stalling or
+        // looping. The single queued gateway response must be consumed by the
+        // first (and only) connect attempt.
         let latch = DynamicHydrationLatch::new().0;
         let commands: VecDeque<_> = (1..=17)
             .map(|seq| {
@@ -4504,11 +4615,9 @@ mod tests {
                 ))
             })
             .collect();
+        let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
         let gateway = MockGateway::new(commands);
-        let connector = MockConnector::new(
-            Arc::new(std::sync::Mutex::new(Vec::new())),
-            VecDeque::from([Ok(gateway)]),
-        );
+        let connector = MockConnector::new(sent_hellos.clone(), VecDeque::from([Ok(gateway)]));
         let credentials = CountingCredentialProvider::new("token");
         let source = MockDurableSource::new(CommandCursors::default());
 
@@ -4518,10 +4627,224 @@ mod tests {
 
         let result = tokio::time::timeout(Duration::from_secs(1), handle.join()).await;
         assert!(result.is_ok(), "exceeding the pending limit must not hang");
+        let err = result
+            .unwrap()
+            .expect_err("exceeding the pending limit must fail closed");
+        let msg = format!("{:#}", err);
         assert!(
-            result.unwrap().is_err(),
-            "exceeding the pending limit must fail closed"
+            msg.contains("max pending commands before hydration reached"),
+            "expected fatal pre-hydration overflow, got: {msg}"
         );
+        assert_eq!(
+            sent_hellos.lock().unwrap().len(),
+            1,
+            "must not attempt a second connection after fatal overflow"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydration_generation_mismatch_is_fatal() {
+        // A HydrationLatch that returns a different generation is a contract
+        // violation, not a transient transport error. The supervisor must fail
+        // closed instead of reconnect-looping.
+        let generation = ProcessGeneration::from_wire(7).unwrap();
+        let wrong_generation = ProcessGeneration::from_wire(8).unwrap();
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: wrong_generation,
+            receipt_identity: "receipt".to_owned(),
+        });
+
+        let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gateway = MockGateway::new(VecDeque::from([Ok(valid_command(
+            1,
+            "00000000-0000-4000-8000-000000000001",
+        ))]));
+        let connector = MockConnector::new(sent_hellos.clone(), VecDeque::from([Ok(gateway)]));
+        let source = MockDurableSource::new(CommandCursors::default());
+        let mut config = make_config();
+        config.generation = generation;
+
+        let supervisor = ConnectionSupervisor::new(
+            connector,
+            CountingCredentialProvider::new("token"),
+            source,
+            latch,
+            config,
+        );
+        let handle = supervisor.start();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle.join()).await;
+        assert!(result.is_ok(), "must terminate within bounded time");
+        let err = result
+            .unwrap()
+            .expect_err("hydration generation mismatch must fail closed");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("generation mismatch"),
+            "expected fatal generation mismatch, got: {msg}"
+        );
+        assert_eq!(
+            sent_hellos.lock().unwrap().len(),
+            1,
+            "must not reconnect after fatal latch error"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydration_identity_mismatch_is_fatal() {
+        // A HydrationLatch that changes receipt identity for the same generation
+        // is a contract violation. The supervisor must fail closed.
+        let generation = ProcessGeneration::from_wire(7).unwrap();
+        let (tx, rx) = watch::channel(HydrationState::NotReady);
+        let latch = WatchHydrationLatch::new(rx);
+
+        // Seed the latch with one identity.
+        tx.send(HydrationState::Ready(HydrationReady {
+            generation,
+            receipt_identity: "first".to_owned(),
+        }))
+        .unwrap();
+        let _ = latch.wait_for(generation).await.unwrap();
+
+        // Then publish a different identity for the same generation.
+        tx.send(HydrationState::Ready(HydrationReady {
+            generation,
+            receipt_identity: "second".to_owned(),
+        }))
+        .unwrap();
+
+        let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gateway = MockGateway::new(VecDeque::from([Ok(valid_command(
+            1,
+            "00000000-0000-4000-8000-000000000001",
+        ))]));
+        let connector = MockConnector::new(sent_hellos.clone(), VecDeque::from([Ok(gateway)]));
+        let source = MockDurableSource::new(CommandCursors::default());
+        let supervisor = ConnectionSupervisor::new(
+            connector,
+            CountingCredentialProvider::new("token"),
+            source,
+            latch.clone(),
+            make_config(),
+        );
+        let handle = supervisor.start();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle.join()).await;
+        assert!(result.is_ok(), "must terminate within bounded time");
+        let err = result
+            .unwrap()
+            .expect_err("hydration identity mismatch must fail closed");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("identity changed"),
+            "expected fatal identity mismatch, got: {msg}"
+        );
+        assert_eq!(
+            sent_hellos.lock().unwrap().len(),
+            1,
+            "must not reconnect after fatal latch error"
+        );
+    }
+
+    #[tokio::test]
+    async fn healthy_reconnect_resets_attempt_budget() {
+        // A clean gateway close after reaching Online must reset the reconnect
+        // attempt budget. max=2 is the smallest configured budget that exposes
+        // the off-by-one reset bug: a healthy epoch plus two failed reconnects
+        // should consume three gateway responses. max=1 still permits one failed
+        // reconnect after a healthy epoch.
+        let generation = ProcessGeneration::from_wire(7).unwrap();
+
+        fn healthy_gateway() -> MockGateway {
+            MockGateway::new(VecDeque::from([
+                Ok(valid_command(1, "00000000-0000-4000-8000-000000000001")),
+                Err(GatewayClosed.into()),
+            ]))
+        }
+
+        fn failing_gateway() -> MockGateway {
+            MockGateway::new(VecDeque::from([Err(anyhow!("reader EOF"))]))
+        }
+
+        // Budget = 2: healthy epoch + two failed reconnects.
+        {
+            let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let connector = MockConnector::new(
+                sent_hellos.clone(),
+                VecDeque::from([
+                    Ok(healthy_gateway()),
+                    Ok(failing_gateway()),
+                    Ok(failing_gateway()),
+                ]),
+            );
+            let mut config = make_config();
+            config.max_reconnect_attempts = Some(2);
+            let source = MockDurableSource::new(CommandCursors::default());
+            let supervisor = ConnectionSupervisor::new(
+                connector,
+                CountingCredentialProvider::new("token"),
+                source,
+                StaticHydrationLatch(HydrationReady {
+                    generation,
+                    receipt_identity: "r".to_owned(),
+                }),
+                config,
+            );
+            let handle = supervisor.start();
+
+            let result = tokio::time::timeout(Duration::from_secs(1), handle.join()).await;
+            assert!(result.is_ok(), "must terminate within bounded time");
+            let err = result
+                .unwrap()
+                .expect_err("max reconnect attempts must be exceeded");
+            assert!(
+                format!("{:#}", err).contains("max reconnect attempts exceeded"),
+                "unexpected error: {err:#}"
+            );
+            assert_eq!(
+                sent_hellos.lock().unwrap().len(),
+                3,
+                "budget=2 must allow two failed reconnects after a healthy epoch"
+            );
+        }
+
+        // Budget = 1: healthy epoch + one failed reconnect.
+        {
+            let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let connector = MockConnector::new(
+                sent_hellos.clone(),
+                VecDeque::from([Ok(healthy_gateway()), Ok(failing_gateway())]),
+            );
+            let mut config = make_config();
+            config.max_reconnect_attempts = Some(1);
+            let source = MockDurableSource::new(CommandCursors::default());
+            let supervisor = ConnectionSupervisor::new(
+                connector,
+                CountingCredentialProvider::new("token"),
+                source,
+                StaticHydrationLatch(HydrationReady {
+                    generation,
+                    receipt_identity: "r".to_owned(),
+                }),
+                config,
+            );
+            let handle = supervisor.start();
+
+            let result = tokio::time::timeout(Duration::from_secs(1), handle.join()).await;
+            assert!(result.is_ok(), "must terminate within bounded time");
+            let err = result
+                .unwrap()
+                .expect_err("max reconnect attempts must be exceeded");
+            assert!(
+                format!("{:#}", err).contains("max reconnect attempts exceeded"),
+                "unexpected error: {err:#}"
+            );
+            assert_eq!(
+                sent_hellos.lock().unwrap().len(),
+                2,
+                "budget=1 must allow one failed reconnect after a healthy epoch"
+            );
+        }
     }
 
     #[tokio::test]
