@@ -12,11 +12,13 @@
 //! publish `Ready` over a newer generation.
 
 use std::{
-    fs::{self, File, OpenOptions, Permissions},
+    fs::{self, DirBuilder, File, OpenOptions, Permissions},
     io::{BufReader, Read, Write},
     os::fd::AsRawFd,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -29,6 +31,8 @@ const RUNTIME_STATE_FILE_PREFIX: &str = "runtime-";
 const RUNTIME_STATE_FILE_SUFFIX: &str = ".json";
 const RUNTIME_LOCK_SUFFIX: &str = ".lock";
 const RUNTIME_TEMP_SUFFIX: &str = ".tmp";
+const RUNTIME_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const RUNTIME_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 /// URL-safe base64 alphabet without padding (Go `base64.RawURLEncoding`).
 const BASE64URL_ALPHABET: &[u8; 64] =
@@ -245,7 +249,10 @@ fn prepare_runtime_state_dir(dir: &Path) -> Result<PathBuf> {
         );
     }
 
-    fs::create_dir_all(dir)
+    let mut builder = DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder
+        .create(dir)
         .with_context(|| format!("failed to create runtime state directory {}", dir.display()))?;
 
     let meta = fs::symlink_metadata(dir).with_context(|| {
@@ -286,6 +293,7 @@ fn write_temp_file(path: &Path, payload: &[u8]) -> Result<()> {
     let mut temp = OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .open(path)
         .with_context(|| {
             format!(
@@ -325,6 +333,7 @@ fn open_lock_file(path: &Path) -> Result<File> {
         .write(true)
         .create(true)
         .truncate(false)
+        .mode(0o600)
         .open(path)
         .with_context(|| format!("failed to open runtime state lock file {}", path.display()))?;
 
@@ -381,11 +390,33 @@ fn read_current_state(path: &Path) -> Result<Option<RuntimeState>> {
 }
 
 fn lock_exclusive(fd: std::os::fd::RawFd) -> Result<()> {
-    let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
-    if rc != 0 {
-        bail!("flock(LOCK_EX) failed: {}", std::io::Error::last_os_error());
+    lock_exclusive_with_timeout(fd, RUNTIME_LOCK_TIMEOUT)
+}
+
+fn lock_exclusive_with_timeout(fd: std::os::fd::RawFd, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(());
+        }
+
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EAGAIN) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    bail!(
+                        "timed out after {}ms waiting for runtime state lock",
+                        timeout.as_millis()
+                    );
+                }
+                thread::sleep(RUNTIME_LOCK_RETRY_INTERVAL.min(deadline - now));
+            }
+            _ => bail!("flock(LOCK_EX | LOCK_NB) failed: {error}"),
+        }
     }
-    Ok(())
 }
 
 fn sync_dir(dir: &Path) -> Result<()> {
@@ -588,6 +619,7 @@ mod tests {
         fs::create_dir_all(&link_parent).unwrap();
         let real = link_parent.join("real");
         let link = link_parent.join("link");
+        fs::create_dir_all(&real).unwrap();
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
         let result =
@@ -596,6 +628,22 @@ mod tests {
 
         let _ = fs::remove_file(&link);
         let _ = fs::remove_dir_all(&link_parent);
+    }
+
+    #[test]
+    fn runtime_state_lock_wait_is_bounded() {
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("runtime.lock");
+        let first = open_lock_file(&path).unwrap();
+        let second = open_lock_file(&path).unwrap();
+        lock_exclusive(first.as_raw_fd()).unwrap();
+
+        let error = lock_exclusive_with_timeout(second.as_raw_fd(), Duration::from_millis(20))
+            .expect_err("second lock must time out");
+        assert!(error.to_string().contains("timed out"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
