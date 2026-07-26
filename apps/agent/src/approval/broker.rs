@@ -40,8 +40,7 @@ pub enum ApprovalOutcome {
         audit: Option<AuditDecision>,
     },
     Pending {
-        request: ApprovalRequest,
-        receiver: oneshot::Receiver<WaiterResult>,
+        pending: PendingApproval,
     },
 }
 
@@ -60,6 +59,47 @@ struct PendingEntry {
     run_id: String,
     turn_id: String,
     sender: oneshot::Sender<WaiterResult>,
+}
+
+/// The worker-side ownership of an unresolved approval request.
+///
+/// A request is only live while this value is retained by the caller.  This
+/// makes dropping a completed `start_request` future (for example when a
+/// simultaneously-ready steer or abort wins the Runner select) fail closed:
+/// the broker entry is removed rather than retaining a receiver with no
+/// worker left to observe it.
+pub struct PendingApproval {
+    request: ApprovalRequest,
+    receiver: oneshot::Receiver<WaiterResult>,
+    pending: Arc<Mutex<HashMap<String, PendingEntry>>>,
+}
+
+impl PendingApproval {
+    pub fn request(&self) -> &ApprovalRequest {
+        &self.request
+    }
+
+    pub(crate) fn receiver_mut(&mut self) -> &mut oneshot::Receiver<WaiterResult> {
+        &mut self.receiver
+    }
+}
+
+impl std::fmt::Debug for PendingApproval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingApproval")
+            .field("request_id", &self.request.id)
+            .field("tool_call_id", &self.request.tool_call_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for PendingApproval {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.request.id);
+    }
 }
 
 /// Runtime approval broker. Clone is cheap: all mutable state lives behind
@@ -393,8 +433,11 @@ impl ApprovalBroker {
             );
 
         Ok(ApprovalOutcome::Pending {
-            request,
-            receiver: rx,
+            pending: PendingApproval {
+                request,
+                receiver: rx,
+                pending: self.pending.clone(),
+            },
         })
     }
 
@@ -722,13 +765,10 @@ mod tests {
             .await
             .expect("start_request");
 
-        let ApprovalOutcome::Pending {
-            request,
-            mut receiver,
-        } = outcome
-        else {
+        let ApprovalOutcome::Pending { mut pending } = outcome else {
             panic!("expected pending approval");
         };
+        let request = pending.request().clone();
 
         let resolved = broker
             .resolve(&request.id, &GatewayApprovalDecision::ApproveOnce)
@@ -736,10 +776,42 @@ mod tests {
         assert!(matches!(resolved, ResolvedDecision::ApproveOnce));
         assert!(!broker.any_pending());
 
-        let waiter = receiver.try_recv().expect("waiter receives");
+        let waiter = pending.receiver_mut().try_recv().expect("waiter receives");
         assert_eq!(
             waiter,
             WaiterResult::Resolved(ResolvedDecision::ApproveOnce)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_unconsumed_pending_outcome_removes_broker_waiter() {
+        let mut broker = broker();
+        broker.headless = false;
+        let outcome = broker
+            .start_request(
+                &bash_call("git status"),
+                &[],
+                "run-1",
+                "turn-1",
+                "v1",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("start_request");
+        let request_id = match &outcome {
+            ApprovalOutcome::Pending { pending } => pending.request().id.clone(),
+            other => panic!("expected pending approval, got {other:?}"),
+        };
+        assert!(broker.has_pending(&request_id));
+
+        // `Runner::evaluate_call` can receive a soft-steer or Abort in the
+        // same poll in which `start_request` completes. Dropping this outcome
+        // must therefore clean the broker entry instead of leaving a waiter
+        // that no worker will ever consume.
+        drop(outcome);
+        assert!(
+            !broker.has_pending(&request_id),
+            "discarded pending outcome must not leak a broker waiter"
         );
     }
 
@@ -759,9 +831,10 @@ mod tests {
             )
             .await
             .expect("start_request");
-        let ApprovalOutcome::Pending { request, .. } = outcome else {
+        let ApprovalOutcome::Pending { pending } = outcome else {
             panic!("expected pending approval, got {outcome:?}");
         };
+        let request = pending.request();
         let rule = serde_json::from_value::<crate::gateway::DeferredApprovalRule>(json!({
             "id": "rule-1",
             "tool": "bash",
@@ -819,19 +892,16 @@ mod tests {
             .await
             .expect("start_request");
 
-        let ApprovalOutcome::Pending {
-            request,
-            mut receiver,
-        } = outcome
-        else {
+        let ApprovalOutcome::Pending { mut pending } = outcome else {
             panic!("expected pending");
         };
+        let request = pending.request().clone();
 
         let cancelled = broker.cancel_all();
         assert_eq!(cancelled.len(), 1);
         assert_eq!(cancelled[0].1, "call-2");
 
-        let waiter = receiver.try_recv().expect("waiter cancelled");
+        let waiter = pending.receiver_mut().try_recv().expect("waiter cancelled");
         assert_eq!(waiter, WaiterResult::Cancelled);
         assert!(!broker.has_pending(&request.id));
     }
@@ -852,9 +922,10 @@ mod tests {
             .await
             .expect("start_request");
 
-        let ApprovalOutcome::Pending { request, .. } = outcome else {
+        let ApprovalOutcome::Pending { pending } = outcome else {
             panic!("expected pending");
         };
+        let request = pending.request();
 
         let _ = broker.resolve(&request.id, &GatewayApprovalDecision::ApproveOnce);
         // A second identical bash call must still require approval.
@@ -889,12 +960,17 @@ mod tests {
             )
             .await
             .expect("start_request");
-        assert!(matches!(
-            outcome,
-            ApprovalOutcome::Pending { request, .. }
-                if request.reason.as_deref().is_some_and(|reason| reason.contains("critical risk"))
-                    && request.audit.is_some()
-        ));
+        let ApprovalOutcome::Pending { pending } = outcome else {
+            panic!("critical reviewer rejection must fall back to pending");
+        };
+        assert!(
+            pending
+                .request()
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("critical risk"))
+                && pending.request().audit.is_some()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -914,12 +990,17 @@ mod tests {
             )
             .await
             .expect("start_request");
-        assert!(matches!(
-            outcome,
-            ApprovalOutcome::Pending { request, .. }
-                if request.reason.as_deref().is_some_and(|reason| reason.contains("high authorization"))
-                    && request.audit.is_some()
-        ));
+        let ApprovalOutcome::Pending { pending } = outcome else {
+            panic!("high reviewer rejection must fall back to pending");
+        };
+        assert!(
+            pending
+                .request()
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("high authorization"))
+                && pending.request().audit.is_some()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -959,12 +1040,13 @@ mod tests {
             )
             .await
             .expect("interactive review");
-        assert!(matches!(
-            outcome,
-            ApprovalOutcome::Pending { request, .. }
-                if request.audit.is_some()
-                    && request.reason.as_deref() == Some("manual review required")
-        ));
+        let ApprovalOutcome::Pending { pending } = outcome else {
+            panic!("interactive reviewer denial must fall back to pending");
+        };
+        assert!(
+            pending.request().audit.is_some()
+                && pending.request().reason.as_deref() == Some("manual review required")
+        );
 
         let mut headless = reviewer_broker(
             r#"{"outcome":"deny","risk":"high","authorization":"unknown","rationale":"manual review required"}"#,

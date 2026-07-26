@@ -6751,14 +6751,17 @@ async fn validate_required_projection_sets(
         let request_id: String = approval.try_get("id")?;
         let state: String = approval.try_get("state")?;
         let approval_run_id: String = approval.try_get("run_id")?;
-        let approved_in_batch = approval_resolutions
-            .get(request_id.as_str())
-            .is_some_and(|(resolution, _)| *resolution == "approved_once")
-            && approval_resolution_bindings.get(&request_id).is_some_and(
-                |(run_id, approved_tool)| {
-                    run_id == *contextual_run_id && approved_tool == *tool_call_id
-                },
-            );
+        let approved_in_batch =
+            approval_resolutions
+                .get(request_id.as_str())
+                .is_some_and(|(resolution, _)| {
+                    matches!(*resolution, "approved_once" | "approved_always")
+                })
+                && approval_resolution_bindings.get(&request_id).is_some_and(
+                    |(run_id, approved_tool)| {
+                        run_id == *contextual_run_id && approved_tool == *tool_call_id
+                    },
+                );
         let approved_event_before_start = durable_event_envelope_identity_position(
             prepared,
             "approval_resolved",
@@ -6780,7 +6783,7 @@ async fn validate_required_projection_sets(
                     approval_position < start_position
                 })
             && approved_event_before_start;
-        let already_approved = state == "approved_once"
+        let already_approved = matches!(state.as_str(), "approved_once" | "approved_always")
             && approval_run_id == *contextual_run_id
             && lifecycle
                 .approved_once
@@ -7337,7 +7340,7 @@ async fn validate_required_projection_sets(
             bail!(
                 "ApprovalResolved for {request_id} requires its active ApprovalDecision CommandApplied"
             );
-        } else if *resolution == "approved_once" {
+        } else if matches!(*resolution, "approved_once" | "approved_always") {
             let (_, tool_call_id) = approval_resolution_bindings
                 .get(*request_id)
                 .expect("validated approval resolution binding");
@@ -8591,7 +8594,7 @@ fn apply_lifecycle_event(
                 .and_then(|resolution| resolution.get("decision"))
                 .and_then(|decision| decision.get("type"))
                 .and_then(Value::as_str);
-            if decision == Some("approve_once") {
+            if matches!(decision, Some("approve_once" | "approve_always")) {
                 state
                     .approved_once
                     .insert(request_id.to_owned(), tool_call_id);

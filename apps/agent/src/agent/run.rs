@@ -44,10 +44,7 @@ use super::{
     RunCompletion, RunControl, RunCore, RunOutput, RunWorker, SteerMode, ToolStartCommitBarrier,
     WorkerFailure, WorkerFuture, WorkerPhase, steer,
 };
-use crate::{
-    agent::events::ApprovalRequest,
-    approval::{ApprovalOutcome, WaiterResult},
-};
+use crate::approval::{ApprovalOutcome, WaiterResult};
 
 const LENGTH_TOOL_FAILURE: &str = "Tool call was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.";
 const LENGTH_LOOP_FAILURE: &str = "provider produced tool calls at the output token limit twice consecutively; refusing a third provider call";
@@ -207,8 +204,7 @@ enum CallDisposition {
         approval_denied: bool,
     },
     Pending {
-        request: ApprovalRequest,
-        receiver: oneshot::Receiver<WaiterResult>,
+        pending: crate::approval::broker::PendingApproval,
     },
 }
 
@@ -1078,13 +1074,17 @@ impl Runner {
                     );
                     results.push(result);
                 }
-                CallDisposition::Pending { request, receiver } => {
+                CallDisposition::Pending { mut pending } => {
+                    let request = pending.request().clone();
                     self.emit(AgentEvent::ApprovalRequested {
                         request: request.clone(),
                     })
                     .await?;
                     self.phase.send(WorkerPhase::Approval).ok();
-                    match self.wait_for_approval(request.id.clone(), receiver).await? {
+                    match self
+                        .wait_for_approval(request.id.clone(), pending.receiver_mut())
+                        .await?
+                    {
                         ApprovalWaitOutcome::Resolved { decision, command } => {
                             self.emit_approval_resolved(
                                 request.id.clone(),
@@ -1286,21 +1286,19 @@ impl Runner {
                 reason,
                 approval_denied: true,
             },
-            ApprovalOutcome::Pending { request, receiver } => {
-                CallDisposition::Pending { request, receiver }
-            }
+            ApprovalOutcome::Pending { pending } => CallDisposition::Pending { pending },
         })
     }
 
     async fn wait_for_approval(
         &mut self,
         request_id: String,
-        mut receiver: oneshot::Receiver<WaiterResult>,
+        receiver: &mut oneshot::Receiver<WaiterResult>,
     ) -> Result<ApprovalWaitOutcome, WorkerFailure> {
         use crate::gateway::Command;
         loop {
             tokio::select! {
-                result = &mut receiver => {
+                result = &mut *receiver => {
                     return match result {
                         Ok(WaiterResult::Resolved(_)) => Err(WorkerFailure::Error(
                             "approval resolved without an authenticated command".to_owned(),

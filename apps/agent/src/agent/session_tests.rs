@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     future::{Future, pending},
     sync::{
         Arc, Mutex,
@@ -27,8 +28,18 @@ use crate::{
         UserMessage, ValidatedToolArguments,
     },
     runtime::contracts::{MAX_PROCESS_GENERATION, ProcessGeneration},
-    store::{AgentScope, DATA_KEY_BYTES, Store, WrappingKey, user_message_id},
+    store::{AgentScope, DATA_KEY_BYTES, Redactor, Store, WrappingKey, user_message_id},
     tools::ToolError,
+};
+
+use crate::approval::{
+    ApprovalBroker,
+    action::{SandboxSummary, SecretAwareActionProjector, SecretDigestKey},
+    prompt::{ReviewerPrompt, TrustedEnvironment},
+    reviewer::{
+        AuditDecision, AuditOutcome, Reviewer, ReviewerMode, ReviewerModelSpec, ReviewerTransport,
+        ReviewerTransportError, ReviewerTrustSet, RiskLevel, UserAuthorization,
+    },
 };
 
 fn test_executor_generation() -> ProcessGeneration {
@@ -7393,4 +7404,593 @@ async fn control_acceptance_selects_accepted_or_phase_change() {
     drop(accepted_tx);
     let accepted = super::await_control_acceptance(&mut phase_rx, accepted_rx).await;
     assert!(!accepted, "closed accepted channel must fail closed");
+}
+
+// ---------------------------------------------------------------------------
+// ApprovalBroker end-to-end fixtures
+// ---------------------------------------------------------------------------
+
+fn fixture_origin() -> ProviderOrigin {
+    ProviderOrigin {
+        provider_instance_id: "fixture:https://example.invalid".to_owned(),
+        protocol: ApiProtocol::OpenAiChatCompletions,
+        model: "fixture-model".to_owned(),
+    }
+}
+
+fn fixture_timestamp() -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now()
+}
+
+fn fixture_assistant_message(
+    content: Vec<AssistantContent>,
+    reason: StopReason,
+) -> AssistantMessage {
+    AssistantMessage {
+        content,
+        model: fixture_origin().model.clone(),
+        provider: "fixture".to_owned(),
+        origin: fixture_origin(),
+        usage: Usage::default(),
+        stop_reason: reason,
+        error_message: None,
+        provider_code: None,
+        interrupted: reason == StopReason::Aborted,
+        timestamp: fixture_timestamp(),
+    }
+}
+
+fn public_initial_message() -> PublicMessage {
+    PublicMessage::Assistant(PublicAssistantMessage {
+        content: Vec::new(),
+        model: fixture_origin().model.clone(),
+        provider: "fixture".to_owned(),
+        origin: fixture_origin(),
+        usage: Usage::default(),
+        stop_reason: StopReason::Stop,
+        error_message: None,
+        provider_code: None,
+        interrupted: false,
+        timestamp: fixture_timestamp(),
+    })
+}
+
+fn bash_tool_call(id: &str) -> ToolCall {
+    ToolCall {
+        id: id.to_owned(),
+        name: "bash".to_owned(),
+        arguments: serde_json::from_value::<ValidatedToolArguments>(
+            serde_json::json!({"command": "git status"}),
+        )
+        .expect("validated bash arguments"),
+    }
+}
+
+fn provider_attempt_from_tool_call(attempt: usize, tool_call: ToolCall) -> ProviderAttempt {
+    let message = fixture_assistant_message(
+        vec![AssistantContent::ToolCall {
+            tool_call: tool_call.clone(),
+            wire_item_index: 0,
+        }],
+        StopReason::ToolUse,
+    );
+    let (tx, rx) = mpsc::channel(16);
+    tx.try_send(ProviderEvent::Start).expect("start");
+    tx.try_send(ProviderEvent::ToolCallStart { content_index: 0 })
+        .expect("tool call start");
+    tx.try_send(ProviderEvent::ToolCallEnd {
+        content_index: 0,
+        tool_call,
+    })
+    .expect("tool call end");
+    tx.try_send(ProviderEvent::Done {
+        reason: StopReason::ToolUse,
+        output: ProviderOutput {
+            message,
+            provider_context: Vec::new(),
+        },
+    })
+    .expect("done");
+    drop(tx);
+    ProviderAttempt {
+        message_id: format!("assistant-{attempt}"),
+        initial_message: public_initial_message(),
+        events: ProviderEventStream::new(rx, CancellationToken::new(), "fixture", fixture_origin()),
+    }
+}
+
+fn provider_attempt_stop(attempt: usize) -> ProviderAttempt {
+    let message = fixture_assistant_message(Vec::new(), StopReason::Stop);
+    let (tx, rx) = mpsc::channel(16);
+    tx.try_send(ProviderEvent::Start).expect("start");
+    tx.try_send(ProviderEvent::Done {
+        reason: StopReason::Stop,
+        output: ProviderOutput {
+            message,
+            provider_context: Vec::new(),
+        },
+    })
+    .expect("done");
+    drop(tx);
+    ProviderAttempt {
+        message_id: format!("assistant-{attempt}"),
+        initial_message: public_initial_message(),
+        events: ProviderEventStream::new(rx, CancellationToken::new(), "fixture", fixture_origin()),
+    }
+}
+
+#[derive(Clone)]
+enum ApprovalTestScript {
+    ToolCall(ToolCall),
+    Stop,
+}
+
+struct ApprovalTestDriver {
+    scripts: Mutex<VecDeque<ApprovalTestScript>>,
+    executed: Arc<AtomicBool>,
+    result_text: String,
+}
+
+impl ApprovalTestDriver {
+    fn with_tool_call(executed: Arc<AtomicBool>) -> Arc<Self> {
+        let mut scripts = VecDeque::new();
+        scripts.push_back(ApprovalTestScript::ToolCall(bash_tool_call("call-1")));
+        scripts.push_back(ApprovalTestScript::Stop);
+        Arc::new(Self {
+            scripts: Mutex::new(scripts),
+            executed,
+            result_text: "ok".to_owned(),
+        })
+    }
+}
+
+#[async_trait]
+impl RunDriver for ApprovalTestDriver {
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+        validate_test_generation(generation)
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        attempt: usize,
+        _context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        let script = self
+            .scripts
+            .lock()
+            .expect("scripts")
+            .pop_front()
+            .unwrap_or(ApprovalTestScript::Stop);
+        match script {
+            ApprovalTestScript::ToolCall(tool_call) => {
+                Ok(provider_attempt_from_tool_call(attempt, tool_call))
+            }
+            ApprovalTestScript::Stop => Ok(provider_attempt_stop(attempt)),
+        }
+    }
+
+    async fn execute_tool_observed(
+        &self,
+        _flow_id: &str,
+        call: &ToolCall,
+        _cancel: CancellationToken,
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage, ToolError> {
+        self.executed.store(true, Ordering::SeqCst);
+        Ok(ToolResultMessage {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            content: vec![UserContent::Text {
+                text: self.result_text.clone(),
+            }],
+            details: serde_json::Value::Null,
+            is_error: false,
+            timestamp: fixture_timestamp(),
+        })
+    }
+
+    fn synthetic_error(&self, message: &str) -> PublicMessage {
+        PublicMessage::Assistant(PublicAssistantMessage {
+            content: Vec::new(),
+            model: fixture_origin().model.clone(),
+            provider: "fixture".to_owned(),
+            origin: fixture_origin(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Error,
+            error_message: Some(message.to_owned()),
+            provider_code: None,
+            interrupted: false,
+            timestamp: fixture_timestamp(),
+        })
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        Ok(OverflowRecoveryOutcome::ReplacementContext(
+            active_context.to_vec(),
+        ))
+    }
+}
+
+struct DenyingReviewerTransport;
+
+#[async_trait]
+impl ReviewerTransport for DenyingReviewerTransport {
+    async fn complete(
+        &self,
+        _prompt: &ReviewerPrompt,
+        _cancel: CancellationToken,
+    ) -> Result<String, ReviewerTransportError> {
+        let decision = AuditDecision {
+            outcome: AuditOutcome::Deny,
+            risk: RiskLevel::High,
+            authorization: UserAuthorization::Unknown,
+            rationale: "fixture denial".to_owned(),
+        };
+        Ok(serde_json::to_string(&decision).unwrap())
+    }
+}
+
+fn make_projector() -> SecretAwareActionProjector {
+    SecretAwareActionProjector::new(Redactor::v1(), SecretDigestKey::fixture())
+}
+
+fn make_deny_reviewer() -> Arc<Reviewer> {
+    let model = ReviewerModelSpec::new(
+        "fixture-reviewer",
+        "fixture",
+        "https://example.invalid",
+        "test",
+        "fixture-trust-domain",
+        "none",
+    );
+    let trust_set = ReviewerTrustSet::new("fixture-trust-domain", Vec::new());
+    Arc::new(Reviewer::new(
+        model,
+        trust_set,
+        Arc::new(DenyingReviewerTransport),
+        Arc::new(make_projector()),
+    ))
+}
+
+fn trusted_env() -> TrustedEnvironment {
+    TrustedEnvironment {
+        workspace_root: "/workspace".to_owned(),
+        sandbox: SandboxSummary::workspace(),
+        denied_paths: Vec::new(),
+        denied_network_domains: Vec::new(),
+        repo_visibility: None,
+        git_status: None,
+    }
+}
+
+fn approval_core(broker: Arc<ApprovalBroker>) -> RunCore {
+    let mut core = RunCore::new();
+    core.set_approval(broker);
+    core
+}
+
+async fn wait_for_agent_end(
+    frames: &Arc<Mutex<Vec<OutboundFrame>>>,
+    task: &tokio::task::JoinHandle<SessionResult>,
+) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if frames.lock().expect("frame mutex").iter().any(|frame| {
+                matches!(frame, OutboundFrame::Event { envelope }
+                    if envelope.event.get("type").and_then(Value::as_str) == Some("agent_end"))
+            }) {
+                break;
+            }
+            if task.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("session reached agent_end within timeout");
+}
+
+#[tokio::test]
+async fn session_auto_review_fail_closed_denies_bash_without_executing() {
+    let store = Store::session_test_store("session-auto-review-fail-closed")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+
+    let policy = store
+        .load_approval_policy("/workspace")
+        .await
+        .expect("seed broker policy from durable rules");
+    let broker = Arc::new(ApprovalBroker::new(
+        policy,
+        make_projector(),
+        Some(make_deny_reviewer()),
+        ReviewerMode::AutoReview,
+        true,
+        trusted_env(),
+    ));
+
+    let executed = Arc::new(AtomicBool::new(false));
+    let driver = ApprovalTestDriver::with_tool_call(executed.clone());
+    let worker: Arc<dyn RunWorker> = Arc::new(SequentialRunWorker::new(driver));
+
+    let (gateway, commands, frames) = gateway();
+    let session = Session::start(
+        store,
+        gateway,
+        approval_core(broker),
+        worker,
+        test_executor_generation(),
+    )
+    .await
+    .expect("session startup");
+
+    let task = tokio::spawn(session.run());
+    commands.send(user(1)).await.expect("user command");
+    wait_for_agent_end(&frames, &task).await;
+    drop(commands);
+    let _ = task.await;
+
+    assert!(
+        !executed.load(Ordering::SeqCst),
+        "denied bash must not execute"
+    );
+
+    let row: (String, Option<String>) = sqlx::query_as(
+        "SELECT state, error_code FROM tool_executions WHERE tool_call_id = 'call-1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("tool execution row");
+    assert_eq!(row.0, "not_started");
+    assert_eq!(row.1.as_deref(), Some("approval_denied"));
+}
+
+fn approval_decision(seq: u64, request_id: &str) -> InboundCommand {
+    InboundCommand::Valid(CommandEnvelope {
+        seq,
+        command_id: CommandId::parse(&format!("20000000-0000-4000-8000-{seq:012}"))
+            .expect("canonical command id"),
+        command: Command::ApprovalDecision {
+            request_id: request_id.to_owned(),
+            decision: crate::gateway::ApprovalDecision::ApproveOnce,
+        },
+    })
+}
+
+fn approval_always_decision(seq: u64, request_id: &str) -> InboundCommand {
+    let rule = serde_json::from_value::<crate::gateway::DeferredApprovalRule>(serde_json::json!({
+        "id": "rule-git-status",
+        "tool": "bash",
+        "literal_prefix": ["git", "status"],
+        "effect": "allow",
+        "workspace_only": true,
+        "allowed_permissions": ["exec"],
+        "allowed_network_domains": []
+    }))
+    .expect("valid narrow ApproveAlways rule");
+    InboundCommand::Valid(CommandEnvelope {
+        seq,
+        command_id: CommandId::parse(&format!("20000000-0000-4000-8000-{seq:012}"))
+            .expect("canonical command id"),
+        command: Command::ApprovalDecision {
+            request_id: request_id.to_owned(),
+            decision: crate::gateway::ApprovalDecision::ApproveAlways { rule },
+        },
+    })
+}
+
+#[tokio::test]
+async fn session_user_approve_once_allows_bash_and_executes() {
+    let store = Store::session_test_store("session-user-approve-once")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+
+    let policy = store
+        .load_approval_policy("/workspace")
+        .await
+        .expect("seed broker policy from durable rules");
+    let broker = Arc::new(ApprovalBroker::new(
+        policy,
+        make_projector(),
+        None,
+        ReviewerMode::User,
+        false,
+        trusted_env(),
+    ));
+
+    let executed = Arc::new(AtomicBool::new(false));
+    let driver = ApprovalTestDriver::with_tool_call(executed.clone());
+    let worker: Arc<dyn RunWorker> = Arc::new(SequentialRunWorker::new(driver));
+
+    let (gateway, commands, frames) = gateway();
+    let session = Session::start(
+        store,
+        gateway,
+        approval_core(broker),
+        worker,
+        test_executor_generation(),
+    )
+    .await
+    .expect("session startup");
+
+    let task = tokio::spawn(session.run());
+    commands.send(user(1)).await.expect("user command");
+
+    let request_id = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let maybe = frames
+                .lock()
+                .expect("frame mutex")
+                .iter()
+                .find_map(|frame| {
+                    if let OutboundFrame::Event { envelope } = frame
+                        && envelope.event.get("type").and_then(Value::as_str)
+                            == Some("approval_requested")
+                    {
+                        return envelope
+                            .event
+                            .get("request")
+                            .and_then(|r| r.get("id").and_then(Value::as_str).map(String::from));
+                    }
+                    None
+                });
+            if let Some(id) = maybe {
+                break id;
+            }
+            if task.is_finished() {
+                panic!("session ended without approval request");
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("approval request emitted");
+
+    commands
+        .send(approval_decision(2, &request_id))
+        .await
+        .expect("approve-once decision");
+
+    wait_for_agent_end(&frames, &task).await;
+    drop(commands);
+    let _ = task.await;
+
+    assert!(
+        executed.load(Ordering::SeqCst),
+        "approved bash must execute"
+    );
+
+    let row: (String, Option<String>) = sqlx::query_as(
+        "SELECT state, error_code FROM tool_executions WHERE tool_call_id = 'call-1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("tool execution row");
+    assert_eq!(row.0, "succeeded");
+    assert!(row.1.is_none());
+
+    let state: String = sqlx::query_scalar("SELECT state FROM approval_log WHERE id = ?")
+        .bind(&request_id)
+        .fetch_one(&pool)
+        .await
+        .expect("approval log row");
+    assert_eq!(state, "approved_once");
+}
+
+#[tokio::test]
+async fn session_user_approve_always_persists_rule_and_executes() {
+    let store = Store::session_test_store("session-user-approve-always")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let policy = store
+        .load_approval_policy("/workspace")
+        .await
+        .expect("seed broker policy from durable rules");
+    let broker = Arc::new(ApprovalBroker::new(
+        policy,
+        make_projector(),
+        None,
+        ReviewerMode::User,
+        false,
+        trusted_env(),
+    ));
+    let executed = Arc::new(AtomicBool::new(false));
+    let worker: Arc<dyn RunWorker> = Arc::new(SequentialRunWorker::new(
+        ApprovalTestDriver::with_tool_call(executed.clone()),
+    ));
+    let (gateway, commands, frames) = gateway();
+    let session = Session::start(
+        store,
+        gateway,
+        approval_core(broker),
+        worker,
+        test_executor_generation(),
+    )
+    .await
+    .expect("session startup");
+    let task = tokio::spawn(session.run());
+    commands.send(user(1)).await.expect("user command");
+
+    let request_id = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let request_id = frames
+                .lock()
+                .expect("frame mutex")
+                .iter()
+                .find_map(|frame| {
+                    let OutboundFrame::Event { envelope } = frame else {
+                        return None;
+                    };
+                    (envelope.event.get("type").and_then(Value::as_str)
+                        == Some("approval_requested"))
+                    .then(|| {
+                        envelope
+                            .event
+                            .get("request")?
+                            .get("id")?
+                            .as_str()
+                            .map(str::to_owned)
+                    })
+                    .flatten()
+                });
+            if let Some(request_id) = request_id {
+                break request_id;
+            }
+            if task.is_finished() {
+                panic!("session ended without approval request");
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("approval request emitted");
+    commands
+        .send(approval_always_decision(2, &request_id))
+        .await
+        .expect("approve-always decision");
+    wait_for_agent_end(&frames, &task).await;
+    drop(commands);
+    match task.await.expect("session join") {
+        SessionResult::Completed(_) => {}
+        SessionResult::Failed { failure, .. } => panic!("approve-always session failed: {failure}"),
+    }
+
+    assert!(
+        executed.load(Ordering::SeqCst),
+        "approved bash must execute"
+    );
+    let (approval_state, execution_state, rule_count, requested, resolved): (
+        String,
+        String,
+        i64,
+        i64,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT
+           (SELECT state FROM approval_log WHERE id = ?),
+           (SELECT state FROM tool_executions WHERE tool_call_id = 'call-1'),
+           (SELECT COUNT(*) FROM approval_rules WHERE id = 'rule-git-status'),
+           (SELECT COUNT(*) FROM agent_events WHERE event_type = 'approval_requested'),
+           (SELECT COUNT(*) FROM agent_events WHERE event_type = 'approval_resolved')",
+    )
+    .bind(&request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("durable approval and execution records");
+    assert_eq!(approval_state, "approved_always");
+    assert_eq!(execution_state, "succeeded");
+    assert_eq!(rule_count, 1);
+    assert_eq!(requested, 1);
+    assert_eq!(resolved, 1);
 }

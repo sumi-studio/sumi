@@ -1147,6 +1147,49 @@ impl Store {
         &self.redactor
     }
 
+    /// Load persisted approval rules in durable creation order.
+    ///
+    /// Each stored `pattern` is deserialized as an `ApprovalRule`; fail-closed
+    /// on malformed JSON or a column/pattern mismatch. The returned rules are
+    /// not validated here; callers must feed them through `Policy::from_rules`
+    /// (or `try_with_rule`) before trusting them.
+    #[allow(dead_code)] // Production bootstrap (T26) owns construction of the broker.
+    pub(crate) async fn load_approval_rules(
+        &self,
+    ) -> Result<Vec<crate::approval::policy::ApprovalRule>> {
+        let rows: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT id, tool, pattern FROM approval_rules ORDER BY created_at")
+                .fetch_all(&self.pool)
+                .await
+                .context("failed to load approval rules")?;
+
+        let mut rules = Vec::with_capacity(rows.len());
+        for (id, tool, pattern) in rows {
+            let rule: crate::approval::policy::ApprovalRule = serde_json::from_str(&pattern)
+                .with_context(|| format!("approval rule {id} has malformed pattern"))?;
+            if rule.id != id || rule.tool != tool {
+                bail!("approval rule {id} stored columns do not match pattern contents");
+            }
+            rules.push(rule);
+        }
+        Ok(rules)
+    }
+
+    /// Reconstruct the deterministic approval policy from durable rules.
+    ///
+    /// This is the Store-to-broker read boundary: both malformed persisted
+    /// data and rules invalid under the current narrow-prefix/secret policy
+    /// reject startup rather than silently widening or dropping authority.
+    #[allow(dead_code)] // T23 Session fixtures exercise this pre-bootstrap boundary.
+    pub(crate) async fn load_approval_policy(
+        &self,
+        workspace_root: impl Into<std::path::PathBuf>,
+    ) -> Result<crate::approval::policy::Policy> {
+        let rules = self.load_approval_rules().await?;
+        crate::approval::policy::Policy::from_rules(workspace_root, rules)
+            .context("stored approval rules failed current-policy validation")
+    }
+
     fn event_writer_state(&self) -> Arc<Mutex<event_writer::WriterState>> {
         self.event_writer_state.clone()
     }
@@ -1771,6 +1814,7 @@ mod tests {
     use chrono::Utc;
     use serde_json::json;
     use sha2::Sha384;
+    use tokio_util::sync::CancellationToken;
 
     struct TestKeyProvider {
         key: WrappingKey,
@@ -3437,6 +3481,170 @@ mod tests {
                 .await
                 .expect("foreign_key_check")
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_rules_survive_store_reopen_and_affect_evaluation() {
+        use crate::approval::action::{Permission, SecretAwareActionProjector, SecretDigestKey};
+        use crate::approval::policy::{ApprovalRule, RuleEffect};
+        use crate::approval::{ApprovalBroker, broker::ApprovalOutcome};
+        use crate::provider::types::{ToolCall, ValidatedToolArguments};
+
+        let rule = ApprovalRule {
+            id: "rule-git-status".to_owned(),
+            tool: "bash".to_owned(),
+            literal_prefix: vec!["git".to_owned(), "status".to_owned()],
+            effect: RuleEffect::Allow,
+            workspace_only: true,
+            allowed_permissions: vec![Permission::Exec],
+            allowed_network_domains: vec![],
+        };
+
+        let dir = std::env::temp_dir().join(format!("sumi-approval-restart-{}", Uuid::now_v7()));
+        let path = dir.join("agent.db");
+
+        let store = Store::open(&path, scope(), provider())
+            .await
+            .expect("open file-backed store");
+        let pattern = serde_json::to_string(&rule).expect("serialize rule");
+        sqlx::query(
+            "INSERT INTO approval_rules(id, tool, pattern, created_at)
+             VALUES(?, ?, ?, ?)",
+        )
+        .bind(&rule.id)
+        .bind(&rule.tool)
+        .bind(&pattern)
+        .bind(Utc::now().to_rfc3339())
+        .execute(store.pool())
+        .await
+        .expect("persist approval rule");
+        store.pool().close().await;
+        drop(store);
+
+        let store = Store::open(&path, scope(), provider())
+            .await
+            .expect("reopen file-backed store");
+        let policy = store
+            .load_approval_policy("/workspace")
+            .await
+            .expect("load persisted rules into policy");
+        let projector = SecretAwareActionProjector::new(Redactor::v1(), SecretDigestKey::fixture());
+        let broker = ApprovalBroker::headless(policy, projector);
+
+        let arguments = serde_json::from_value::<ValidatedToolArguments>(
+            serde_json::json!({"command": "git status"}),
+        )
+        .expect("validated bash arguments");
+        let tool_call = ToolCall {
+            id: "call-1".to_owned(),
+            name: "bash".to_owned(),
+            arguments,
+        };
+        let outcome = broker
+            .start_request(
+                &tool_call,
+                &[],
+                "run-1",
+                "turn-1",
+                "v1",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("start request");
+        assert!(
+            matches!(outcome, ApprovalOutcome::Allowed),
+            "loaded ApproveAlways rule must allow matching bash command"
+        );
+
+        store.pool().close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn load_approval_rules_rejects_malformed_and_invalid_stored_rules() {
+        use crate::approval::action::Permission;
+        use crate::approval::policy::{ApprovalRule, RuleEffect, RuleValidationError};
+
+        // Malformed JSON must fail closed.
+        let store_malformed = store().await;
+        sqlx::query(
+            "INSERT INTO approval_rules(id, tool, pattern, created_at)
+             VALUES('rule-bad', 'bash', 'not-json', '2026-07-26T00:00:00Z')",
+        )
+        .execute(store_malformed.pool())
+        .await
+        .expect("insert malformed fixture rule");
+
+        let error = match store_malformed.load_approval_policy("/workspace").await {
+            Err(error) => error,
+            Ok(_) => panic!("malformed stored rule must fail closed"),
+        };
+        assert!(
+            error.to_string().contains("malformed pattern"),
+            "error must name the bad rule: {error}"
+        );
+
+        // A rule whose stored columns disagree with its pattern must fail closed.
+        let store_mismatch = store().await;
+        let mismatched = ApprovalRule {
+            id: "rule-mismatch".to_owned(),
+            tool: "bash".to_owned(),
+            literal_prefix: vec!["git".to_owned(), "status".to_owned()],
+            effect: RuleEffect::Allow,
+            workspace_only: true,
+            allowed_permissions: vec![Permission::Exec],
+            allowed_network_domains: vec![],
+        };
+        sqlx::query(
+            "INSERT INTO approval_rules(id, tool, pattern, created_at)
+             VALUES('rule-mismatch', 'edit_file', ?, '2026-07-26T00:00:01Z')",
+        )
+        .bind(serde_json::to_string(&mismatched).expect("serialize rule"))
+        .execute(store_mismatch.pool())
+        .await
+        .expect("insert column mismatch rule");
+
+        let error = match store_mismatch.load_approval_policy("/workspace").await {
+            Err(error) => error,
+            Ok(_) => panic!("column/pattern mismatch must fail closed"),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("stored columns do not match pattern"),
+            "error must name the mismatch: {error}"
+        );
+
+        // A once-valid rule that is now too broad for current policy must fail closed.
+        let store_broad = store().await;
+        let broad = ApprovalRule {
+            id: "rule-broad".to_owned(),
+            tool: "bash".to_owned(),
+            literal_prefix: vec!["bash".to_owned()],
+            effect: RuleEffect::Allow,
+            workspace_only: true,
+            allowed_permissions: vec![Permission::Exec],
+            allowed_network_domains: vec![],
+        };
+        sqlx::query(
+            "INSERT INTO approval_rules(id, tool, pattern, created_at)
+             VALUES('rule-broad', 'bash', ?, '2026-07-26T00:00:02Z')",
+        )
+        .bind(serde_json::to_string(&broad).expect("serialize rule"))
+        .execute(store_broad.pool())
+        .await
+        .expect("insert broad fixture rule");
+
+        let error = match store_broad.load_approval_policy("/workspace").await {
+            Err(error) => error,
+            Ok(_) => panic!("broad stored rule must fail closed during policy seeding"),
+        };
+        assert!(
+            error
+                .downcast_ref::<RuleValidationError>()
+                .is_some_and(|error| *error == RuleValidationError::BroadPrefix),
+            "broad stored rule must fail with BroadPrefix, got {error}"
         );
     }
 

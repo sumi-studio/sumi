@@ -204,6 +204,20 @@ impl Policy {
         Ok(self)
     }
 
+    /// Build a policy seeded with a set of persisted rules, revalidating each
+    /// one through the same narrow-prefix and secret-material checks used at
+    /// write time. Fail-closed on any invalid stored rule.
+    pub fn from_rules(
+        workspace_root: impl Into<PathBuf>,
+        rules: Vec<ApprovalRule>,
+    ) -> Result<Self, RuleValidationError> {
+        let mut policy = Self::new(workspace_root);
+        for rule in rules {
+            policy = policy.try_with_rule(rule)?;
+        }
+        Ok(policy)
+    }
+
     pub fn evaluate(&self, action: &CanonicalAction) -> PolicyDecision {
         if action.validate().is_err() {
             return PolicyDecision::Forbidden {

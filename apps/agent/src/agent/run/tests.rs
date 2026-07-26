@@ -740,7 +740,7 @@ async fn resolved_matching_approval_is_consumed_without_blocking_followup_queue(
     let (control_tx, control_rx) = mpsc::channel(2);
     let (events_tx, _events_rx) = mpsc::channel(1);
     let mut runner = Runner::new(core, driver, control_rx, events_tx);
-    let (_waiter_tx, waiter_rx) = oneshot::channel();
+    let (_waiter_tx, mut waiter_rx) = oneshot::channel();
     let send_controls = async {
         control_tx
             .send(RunControl::Command(admitted_approval(2, "unrelated")))
@@ -755,7 +755,7 @@ async fn resolved_matching_approval_is_consumed_without_blocking_followup_queue(
             .expect("send matching terminal decision");
     };
     let (outcome, ()) = tokio::join!(
-        runner.wait_for_approval("already-terminal".to_owned(), waiter_rx),
+        runner.wait_for_approval("already-terminal".to_owned(), &mut waiter_rx),
         send_controls
     );
     assert!(matches!(
