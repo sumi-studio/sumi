@@ -12,7 +12,11 @@ mod redactor;
 mod sizer;
 mod transcript;
 
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+    sync::Arc,
+};
 
 #[cfg(test)]
 use std::str::FromStr;
@@ -31,7 +35,8 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::provider::types::{
-    ContextMessage, Message, ProviderContextItem, ProviderContextPayload, PublicMessage,
+    ApiProtocol, ContextMessage, Message, ProviderContextItem, ProviderContextPayload,
+    PublicMessage,
 };
 use crate::runtime::contracts::{
     GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease,
@@ -411,7 +416,7 @@ impl Store {
         Ok(messages)
     }
 
-    async fn hydrate_provider_context(
+    pub(crate) async fn hydrate_provider_context(
         &self,
         messages: &[ContextMessage],
     ) -> Result<Vec<ProviderContextItem>> {
@@ -420,13 +425,26 @@ impl Store {
         let rows = sqlx::query(
             "SELECT id, message_id, message_seq, wire_item_index, item_ordinal,
                     idempotency_key, kind, coverage_through_seq, context_fingerprint,
-                    key_ref, ciphertext
+                    provider_instance_id, protocol, model, key_ref, ciphertext
              FROM provider_context
-             ORDER BY message_seq NULLS LAST, wire_item_index NULLS LAST, item_ordinal",
+             ORDER BY message_seq NULLS LAST,
+                      coverage_through_seq,
+                      wire_item_index NULLS LAST,
+                      item_ordinal,
+                      id",
         )
         .fetch_all(&self.pool)
         .await
         .context("failed to hydrate provider context")?;
+
+        // Persisted messages indexed by seq for anchor and provider-origin lookups.
+        let seq_to_message: BTreeMap<u64, &ContextMessage> = messages
+            .iter()
+            .filter_map(|message| match message {
+                ContextMessage::Persisted { seq, .. } => Some((*seq, message)),
+                ContextMessage::Synthetic { .. } => None,
+            })
+            .collect();
 
         let mut provider_context = Vec::with_capacity(rows.len());
         for row in rows {
@@ -439,6 +457,9 @@ impl Store {
             let stored_kind: String = row.try_get("kind")?;
             let stored_coverage_seq: Option<i64> = row.try_get("coverage_through_seq")?;
             let stored_fingerprint: Option<String> = row.try_get("context_fingerprint")?;
+            let stored_provider_instance_id: String = row.try_get("provider_instance_id")?;
+            let stored_protocol: String = row.try_get("protocol")?;
+            let stored_model: String = row.try_get("model")?;
             let key_ref: String = row.try_get("key_ref")?;
 
             let key = self.load_hydration_key(&mut key_cache, &key_ref).await?;
@@ -488,6 +509,70 @@ impl Store {
                 bail!("provider-context record {id} kind does not match decrypted payload");
             }
 
+            if stored_provider_instance_id.is_empty()
+                || stored_protocol.is_empty()
+                || stored_model.is_empty()
+            {
+                bail!("provider-context record {id} has an empty provider origin field");
+            }
+
+            if stored_provider_instance_id != item.provider_origin.provider_instance_id
+                || stored_protocol != item.provider_origin.protocol.as_str()
+                || stored_model != item.provider_origin.model
+            {
+                bail!(
+                    "provider-context record {id} stored provider origin does not match authenticated plaintext origin"
+                );
+            }
+
+            let expected_protocol = match &item.payload {
+                ProviderContextPayload::OpenAiCompactedWindow { .. } => {
+                    ApiProtocol::OpenAiResponses.as_str()
+                }
+                ProviderContextPayload::AnthropicCompaction { .. } => {
+                    ApiProtocol::AnthropicMessages.as_str()
+                }
+                ProviderContextPayload::EncryptedReasoning { protocol, .. } => protocol.as_str(),
+            };
+            if stored_protocol != expected_protocol {
+                bail!("provider-context record {id} protocol does not match decrypted payload");
+            }
+
+            match &item.payload {
+                ProviderContextPayload::OpenAiCompactedWindow { .. }
+                | ProviderContextPayload::AnthropicCompaction { .. } => {
+                    // Native compaction is unanchored; the authenticated plaintext origin is the
+                    // source of truth for provider identity. Do not infer from prior messages.
+                }
+                ProviderContextPayload::EncryptedReasoning { .. } => {
+                    let anchor = item.origin_message.as_ref().ok_or_else(|| {
+                        anyhow!(
+                            "provider-context record {id} encrypted reasoning is missing an anchor"
+                        )
+                    })?;
+                    let anchor_ok =
+                        seq_to_message
+                            .get(&anchor.message_seq)
+                            .is_some_and(|message| {
+                                matches!(
+                                    message,
+                                    ContextMessage::Persisted {
+                                        id,
+                                        message: Message::Assistant(_),
+                                        ..
+                                    } if id == &anchor.message_id
+                                )
+                            });
+                    if !anchor_ok {
+                        bail!(
+                            "provider-context record {id} anchor {}:{} does not resolve to a persisted assistant message",
+                            anchor.message_id,
+                            anchor.message_seq
+                        );
+                    }
+                }
+            }
+
             match &item.payload {
                 ProviderContextPayload::OpenAiCompactedWindow { coverage, .. }
                 | ProviderContextPayload::AnthropicCompaction { coverage, .. } => {
@@ -533,24 +618,6 @@ impl Store {
                             "provider-context record {id} idempotency key does not match decrypted reasoning item"
                         );
                     }
-                }
-            }
-
-            if let Some(anchor) = &item.origin_message {
-                let anchor_found = messages.iter().any(|message| match message {
-                    ContextMessage::Persisted { id, seq, message } => {
-                        id == &anchor.message_id
-                            && *seq == anchor.message_seq
-                            && matches!(message, Message::Assistant(_))
-                    }
-                    ContextMessage::Synthetic { .. } => false,
-                });
-                if !anchor_found {
-                    bail!(
-                        "provider-context record {id} anchor {}:{} does not resolve to a persisted assistant message",
-                        anchor.message_id,
-                        anchor.message_seq
-                    );
                 }
             }
 
@@ -1122,24 +1189,22 @@ impl Store {
         )
     }
 
-    /// Transactionally destroys one conversation-owned data key by its durable
-    /// reference. This is the narrow product boundary used by conversation
-    /// reset and provider-context anchor eviction.
-    #[allow(
-        dead_code,
-        reason = "T11 product crypto-erase boundary is wired to lifecycle callers in M3"
-    )]
-    pub(crate) async fn destroy_conversation_key_ref(&self, key_ref: &str) -> Result<()> {
+    /// Destroys one conversation-owned data key inside an existing transaction.
+    /// The caller is responsible for committing the transaction.
+    pub(crate) async fn destroy_conversation_key_ref_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        key_ref: &str,
+    ) -> Result<()> {
         if key_ref.is_empty() {
             bail!("crypto-erase key_ref must not be empty");
         }
-        let mut transaction = self.pool.begin().await?;
         let row = sqlx::query(
             "SELECT scope, purpose, conversation_id, state, wrapped_key, wrap_nonce, destroyed_at
              FROM data_keys WHERE key_ref = ?",
         )
         .bind(key_ref)
-        .fetch_optional(&mut *transaction)
+        .fetch_optional(&mut **transaction)
         .await
         .context("failed to load crypto-erase target")?
         .ok_or_else(|| anyhow!("crypto-erase key_ref {key_ref} does not exist"))?;
@@ -1173,7 +1238,7 @@ impl Store {
                 .bind(Utc::now().to_rfc3339())
                 .bind(key_ref)
                 .bind(&self.scope.conversation_id)
-                .execute(&mut *transaction)
+                .execute(&mut **transaction)
                 .await?;
                 if result.rows_affected() != 1 {
                     bail!("crypto-erase CAS failed for key_ref {key_ref}");
@@ -1188,6 +1253,20 @@ impl Store {
             }
             value => bail!("crypto-erase key_ref {key_ref} has invalid state {value}"),
         }
+        Ok(())
+    }
+
+    /// Transactionally destroys one conversation-owned data key by its durable
+    /// reference. This is the narrow product boundary used by conversation
+    /// reset and provider-context anchor eviction.
+    #[allow(
+        dead_code,
+        reason = "T11 product crypto-erase boundary is wired to lifecycle callers in M3"
+    )]
+    pub(crate) async fn destroy_conversation_key_ref(&self, key_ref: &str) -> Result<()> {
+        let mut transaction = self.pool.begin().await?;
+        self.destroy_conversation_key_ref_in_transaction(&mut transaction, key_ref)
+            .await?;
         transaction.commit().await?;
         Ok(())
     }

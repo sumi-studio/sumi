@@ -715,6 +715,7 @@ mod tests {
             }),
             wire_item_index: Some(0),
             ordinal: 1,
+            provider_origin: provider_origin(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({"secret": "plain-secret"})],
                 coverage: NativeCompactionCoverage {

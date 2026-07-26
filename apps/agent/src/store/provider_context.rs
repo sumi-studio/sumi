@@ -19,9 +19,12 @@ use sqlx::Row;
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::provider::types::{ApiProtocol, ProviderContextItem, ProviderContextPayload};
+use crate::provider::types::{
+    ApiProtocol, ProviderContextItem, ProviderContextPayload, ProviderOrigin,
+};
 
 use super::crypto::{RowAad, decrypt_content, encrypt_content};
+use super::event_writer::require_single_cas;
 use super::{AgentScope, DataKeyMaterial, DataKeyPurpose, Store};
 
 fn sqlite_i64(value: u64, field: &str) -> Result<i64> {
@@ -249,6 +252,17 @@ impl EncryptedProviderContextRecord {
         }
 
         let id = id.into();
+        let provider_instance_id = provider_instance_id.into();
+        let model = model.into();
+        let expected_origin = ProviderOrigin {
+            provider_instance_id: provider_instance_id.clone(),
+            protocol,
+            model: model.clone(),
+        };
+        if item.provider_origin != expected_origin {
+            bail!("provider-context item origin does not match the encryption origin arguments");
+        }
+
         let aad = scope.row_aad("provider_context", &id, DataKeyPurpose::ProviderContext);
         let mut plaintext =
             serde_json::to_vec(item).context("failed to serialize provider-context plaintext")?;
@@ -275,9 +289,9 @@ impl EncryptedProviderContextRecord {
             wire_item_index: item.wire_item_index,
             item_ordinal: item.ordinal,
             idempotency_key: idempotency_key.into(),
-            provider_instance_id: provider_instance_id.into(),
+            provider_instance_id,
             protocol,
-            model: model.into(),
+            model,
             kind: ProviderContextKind::from_payload(&item.payload),
             coverage_through_seq,
             context_fingerprint,
@@ -337,7 +351,7 @@ impl EncryptedProviderContextRecord {
 }
 
 impl ApiProtocol {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::OpenAiChatCompletions => "open_ai_chat_completions",
             Self::OpenAiResponses => "open_ai_responses",
@@ -1096,7 +1110,8 @@ impl<'a> ProviderContextMutationApplier<'a> {
                 }
             }
 
-            self.invalidate_ids(transaction, &full.invalidate_ids)
+            let invalidated_key_refs = self
+                .invalidate_ids(transaction, &full.invalidate_ids)
                 .await?;
 
             sqlx::query(
@@ -1156,6 +1171,9 @@ impl<'a> ProviderContextMutationApplier<'a> {
             .execute(&mut **transaction)
             .await?;
 
+            self.destroy_unreferenced_provider_context_keys(transaction, invalidated_key_refs)
+                .await?;
+
             self.finish_mutation(transaction, mutation_id, "applied", None)
                 .await?;
             Ok(ApplyOutcome::Applied)
@@ -1163,7 +1181,10 @@ impl<'a> ProviderContextMutationApplier<'a> {
             if full.invalidate_ids.is_empty() {
                 bail!("Invalidate intent requires a non-empty target set");
             }
-            self.invalidate_ids(transaction, &full.invalidate_ids)
+            let invalidated_key_refs = self
+                .invalidate_ids(transaction, &full.invalidate_ids)
+                .await?;
+            self.destroy_unreferenced_provider_context_keys(transaction, invalidated_key_refs)
                 .await?;
             self.finish_mutation(transaction, mutation_id, "applied", None)
                 .await?;
@@ -1315,18 +1336,26 @@ impl<'a> ProviderContextMutationApplier<'a> {
         &self,
         transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         ids: &[String],
-    ) -> Result<()> {
+    ) -> Result<BTreeSet<String>> {
+        let mut key_refs = BTreeSet::new();
         for id in ids {
             let row = sqlx::query(
-                "SELECT message_id, eviction_tokens FROM provider_context WHERE id = ?",
+                "SELECT pc.message_id, pc.eviction_tokens, pc.key_ref
+                 FROM provider_context pc
+                 JOIN data_keys dk ON dk.key_ref = pc.key_ref
+                 WHERE pc.id = ?
+                   AND dk.scope = 'conversation'
+                   AND dk.conversation_id = ?",
             )
             .bind(id)
+            .bind(&self.store.scope().conversation_id)
             .fetch_optional(&mut **transaction)
             .await?;
 
             if let Some(row) = row {
                 let message_id: Option<String> = row.try_get("message_id")?;
                 let tokens: i64 = row.try_get("eviction_tokens")?;
+                let key_ref: String = row.try_get("key_ref")?;
 
                 if let Some(message_id) = message_id {
                     self.decrement_batch_footprint(transaction, &message_id, tokens)
@@ -1337,6 +1366,34 @@ impl<'a> ProviderContextMutationApplier<'a> {
                     .bind(id)
                     .execute(&mut **transaction)
                     .await?;
+                key_refs.insert(key_ref);
+            } else {
+                bail!(
+                    "provider-context row {id} is outside the active conversation scope or does not exist"
+                );
+            }
+        }
+        Ok(key_refs)
+    }
+
+    async fn destroy_unreferenced_provider_context_keys(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        key_refs: BTreeSet<String>,
+    ) -> Result<()> {
+        for key_ref in key_refs {
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE key_ref = ?")
+                    .bind(&key_ref)
+                    .fetch_one(&mut **transaction)
+                    .await?;
+            if count == 0 {
+                self.store
+                    .destroy_conversation_key_ref_in_transaction(transaction, &key_ref)
+                    .await
+                    .with_context(|| {
+                        format!("failed to crypto-erase provider-context data key {key_ref}")
+                    })?;
             }
         }
         Ok(())
@@ -1384,7 +1441,7 @@ impl<'a> ProviderContextMutationApplier<'a> {
         state: &str,
         terminal_reason: Option<&str>,
     ) -> Result<()> {
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE provider_context_mutations
              SET state = ?, finished_at = ?, terminal_reason = ?
              WHERE mutation_id = ?",
@@ -1395,6 +1452,7 @@ impl<'a> ProviderContextMutationApplier<'a> {
         .bind(mutation_id)
         .execute(&mut **transaction)
         .await?;
+        require_single_cas(result.rows_affected(), "ProviderContextMutationFinish")?;
         Ok(())
     }
 }
@@ -1433,13 +1491,15 @@ fn encode_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
     use serde_json::json;
     use sqlx::Row;
 
     use super::*;
     use crate::provider::types::{
-        ApiProtocol, NativeCompactionCoverage, ProviderContextAnchor, ProviderContextItem,
-        ProviderContextPayload,
+        ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, Message,
+        NativeCompactionCoverage, ProviderContextAnchor, ProviderContextItem,
+        ProviderContextPayload, ProviderOrigin, StopReason, Usage,
     };
     use crate::store::{DataKeyPurpose, ProviderContextKeyAnchor, Store};
 
@@ -1468,6 +1528,14 @@ mod tests {
         Ok(())
     }
 
+    fn reasoning_origin() -> ProviderOrigin {
+        ProviderOrigin {
+            provider_instance_id: "provider-instance-1".to_owned(),
+            protocol: ApiProtocol::OpenAiChatCompletions,
+            model: "model-1".to_owned(),
+        }
+    }
+
     fn reasoning_item(message_id: impl Into<String>, message_seq: u64) -> ProviderContextItem {
         ProviderContextItem {
             origin_message: Some(ProviderContextAnchor {
@@ -1476,6 +1544,7 @@ mod tests {
             }),
             wire_item_index: Some(0),
             ordinal: 1,
+            provider_origin: reasoning_origin(),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::OpenAiChatCompletions,
                 item: json!({"text": "opaque reasoning"}),
@@ -1489,6 +1558,38 @@ mod tests {
         message_seq: u64,
         id: &str,
     ) -> EncryptedProviderContextRecord {
+        reasoning_record_with(store, message_id, message_seq, id, 0, 1).await
+    }
+
+    fn reasoning_item_with(
+        message_id: impl Into<String>,
+        message_seq: u64,
+        wire_item_index: u32,
+        ordinal: u32,
+    ) -> ProviderContextItem {
+        ProviderContextItem {
+            origin_message: Some(ProviderContextAnchor {
+                message_id: message_id.into(),
+                message_seq,
+            }),
+            wire_item_index: Some(wire_item_index),
+            ordinal,
+            provider_origin: reasoning_origin(),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiChatCompletions,
+                item: json!({"text": "opaque reasoning"}),
+            },
+        }
+    }
+
+    async fn reasoning_record_with(
+        store: &Store,
+        message_id: &str,
+        message_seq: u64,
+        id: &str,
+        wire_item_index: u32,
+        ordinal: u32,
+    ) -> EncryptedProviderContextRecord {
         let anchor = ProviderContextKeyAnchor {
             conversation_id: store.scope().conversation_id.clone(),
             anchor_id: format!("{message_id}:{message_seq}"),
@@ -1497,7 +1598,7 @@ mod tests {
             .provider_context_key(&anchor)
             .await
             .expect("mint reasoning anchor key");
-        let item = reasoning_item(message_id, message_seq);
+        let item = reasoning_item_with(message_id, message_seq, wire_item_index, ordinal);
         EncryptedProviderContextRecord::encrypt(
             &item,
             "provider-instance-1",
@@ -1509,6 +1610,32 @@ mod tests {
             store.scope(),
         )
         .expect("encrypt reasoning record")
+    }
+
+    fn assistant_message(origin: ProviderOrigin) -> Message {
+        Message::Assistant(AssistantMessage {
+            content: vec![AssistantContent::Text {
+                text: "assistant".to_owned(),
+                wire_item_index: 0,
+            }],
+            model: origin.model.clone(),
+            provider: origin.provider_instance_id.clone(),
+            origin,
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: Utc::now(),
+        })
+    }
+
+    async fn data_key_state(store: &Store, key_ref: &str) -> Option<String> {
+        sqlx::query_scalar::<_, String>("SELECT state FROM data_keys WHERE key_ref = ?")
+            .bind(key_ref)
+            .fetch_optional(store.pool())
+            .await
+            .expect("read data key state")
     }
 
     #[tokio::test]
@@ -2009,6 +2136,14 @@ mod tests {
         );
     }
 
+    fn openai_responses_origin() -> ProviderOrigin {
+        ProviderOrigin {
+            provider_instance_id: "provider-instance-1".to_owned(),
+            protocol: ApiProtocol::OpenAiResponses,
+            model: "model-1".to_owned(),
+        }
+    }
+
     #[tokio::test]
     async fn compaction_idempotency_key_is_request_coverage_fingerprint() {
         let store = store().await;
@@ -2029,6 +2164,7 @@ mod tests {
             }),
             wire_item_index: None,
             ordinal: 1,
+            provider_origin: openai_responses_origin(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({"summary": "a"})],
                 coverage: NativeCompactionCoverage {
@@ -2041,7 +2177,7 @@ mod tests {
         let a = EncryptedProviderContextRecord::encrypt(
             &base,
             "provider-instance-1",
-            ApiProtocol::OpenAiChatCompletions,
+            ApiProtocol::OpenAiResponses,
             "model-1",
             "pc-a",
             provider_context_idempotency_key("message-1", &base),
@@ -2058,7 +2194,7 @@ mod tests {
         let b = EncryptedProviderContextRecord::encrypt(
             &base,
             "provider-instance-1",
-            ApiProtocol::OpenAiChatCompletions,
+            ApiProtocol::OpenAiResponses,
             "model-1",
             "pc-b",
             provider_context_idempotency_key("message-1", &base),
@@ -2085,10 +2221,12 @@ mod tests {
                 context_fingerprint: "fp-b".to_owned(),
             },
         };
+        // keep the plaintext origin in sync with the payload kind
+        base.provider_origin = openai_responses_origin();
         let c = EncryptedProviderContextRecord::encrypt(
             &base,
             "provider-instance-1",
-            ApiProtocol::OpenAiChatCompletions,
+            ApiProtocol::OpenAiResponses,
             "model-1",
             "pc-c",
             provider_context_idempotency_key("message-1", &base),
@@ -2099,5 +2237,390 @@ mod tests {
         c.insert(store.pool())
             .await
             .expect("different fingerprint must not collide");
+    }
+
+    #[tokio::test]
+    async fn invalidation_crypto_erases_data_key_when_unreferenced() {
+        let store = store().await;
+        seed_message(&store, "message-1", 7).await.unwrap();
+        let record = reasoning_record(&store, "message-1", 7, "pc-1").await;
+        let key_ref = record.key_ref.clone();
+        record.insert(store.pool()).await.unwrap();
+
+        let mutation_key = store
+            .conversation_key(DataKeyPurpose::Mutation)
+            .await
+            .expect("mint mutation key");
+        let applier = ProviderContextMutationApplier::new(&store);
+        let prepared = ProviderContextMutationBuilder::new(
+            mutation_key,
+            store.scope().clone(),
+            "mutation-1".to_owned(),
+        )
+        .build_invalidate(None, vec!["pc-1".to_owned()])
+        .expect("build invalidate");
+
+        applier.prepare(&prepared).await.unwrap();
+        applier.apply("mutation-1").await.unwrap();
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE id = ?")
+            .bind("pc-1")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "provider_context row must be deleted");
+
+        let state = data_key_state(&store, &key_ref).await.expect("key exists");
+        assert_eq!(
+            state, "destroyed",
+            "unreferenced provider-context key must be crypto-erased"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_preserves_data_key_when_same_anchor_is_reinserted() {
+        let store = store().await;
+        seed_message(&store, "message-1", 7).await.unwrap();
+        let old_record = reasoning_record(&store, "message-1", 7, "pc-1").await;
+        let key_ref = old_record.key_ref.clone();
+        old_record.insert(store.pool()).await.unwrap();
+
+        let new_record = reasoning_record_with(&store, "message-1", 7, "pc-2", 0, 1).await;
+
+        let mutation_key = store
+            .conversation_key(DataKeyPurpose::Mutation)
+            .await
+            .expect("mint mutation key");
+        let applier = ProviderContextMutationApplier::new(&store);
+        let prepared = ProviderContextMutationBuilder::new(
+            mutation_key,
+            store.scope().clone(),
+            "mutation-1".to_owned(),
+        )
+        .build_replace(
+            None,
+            vec!["pc-1".to_owned()],
+            &new_record,
+            &reasoning_item_with("message-1", 7, 0, 1),
+            1,
+            1,
+        )
+        .expect("build replace");
+
+        applier.prepare(&prepared).await.unwrap();
+        applier.apply("mutation-1").await.unwrap();
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE id = ?")
+            .bind("pc-1")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "old provider_context row must be deleted");
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE id = ?")
+            .bind("pc-2")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "new provider_context row must be inserted");
+
+        let state = data_key_state(&store, &key_ref).await.expect("key exists");
+        assert_eq!(
+            state, "active",
+            "shared anchor key must stay active while replacement row references it"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_data_key_survives_until_last_reference_is_invalidated() {
+        let store = store().await;
+        seed_message(&store, "message-1", 7).await.unwrap();
+
+        let a = reasoning_record_with(&store, "message-1", 7, "pc-a", 0, 1).await;
+        let key_ref = a.key_ref.clone();
+        a.insert(store.pool()).await.unwrap();
+
+        let b = reasoning_record_with(&store, "message-1", 7, "pc-b", 1, 2).await;
+        b.insert(store.pool()).await.unwrap();
+
+        let mutation_key_a = store
+            .conversation_key(DataKeyPurpose::Mutation)
+            .await
+            .expect("mint mutation key a");
+        let mutation_key_b = store
+            .conversation_key(DataKeyPurpose::Mutation)
+            .await
+            .expect("mint mutation key b");
+        let applier = ProviderContextMutationApplier::new(&store);
+
+        let invalidate_a = ProviderContextMutationBuilder::new(
+            mutation_key_a,
+            store.scope().clone(),
+            "mutation-a".to_owned(),
+        )
+        .build_invalidate(None, vec!["pc-a".to_owned()])
+        .expect("build invalidate a");
+        applier.prepare(&invalidate_a).await.unwrap();
+        applier.apply("mutation-a").await.unwrap();
+
+        let state = data_key_state(&store, &key_ref).await.expect("key exists");
+        assert_eq!(
+            state, "active",
+            "shared key must stay active while pc-b references it"
+        );
+
+        let invalidate_b = ProviderContextMutationBuilder::new(
+            mutation_key_b,
+            store.scope().clone(),
+            "mutation-b".to_owned(),
+        )
+        .build_invalidate(None, vec!["pc-b".to_owned()])
+        .expect("build invalidate b");
+        applier.prepare(&invalidate_b).await.unwrap();
+        applier.apply("mutation-b").await.unwrap();
+
+        let state = data_key_state(&store, &key_ref).await.expect("key exists");
+        assert_eq!(
+            state, "destroyed",
+            "shared key must be destroyed after last reference"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidation_rejects_cross_conversation_provider_context() {
+        let store = store().await;
+        seed_message(&store, "message-1", 7).await.unwrap();
+        seed_message(&store, "message-2", 9).await.unwrap();
+
+        let cross_record = reasoning_record(&store, "message-1", 7, "pc-cross").await;
+        let cross_key_ref = cross_record.key_ref.clone();
+        cross_record.insert(store.pool()).await.unwrap();
+
+        // Tamper with the data_keys row so it appears to belong to another conversation,
+        // simulating a cross-conversation row referenced by this conversation's store.
+        sqlx::query(
+            "UPDATE data_keys SET conversation_id = 'other-conversation' WHERE key_ref = ?",
+        )
+        .bind(&cross_key_ref)
+        .execute(store.pool())
+        .await
+        .expect("tamper fixture");
+
+        let replacement = reasoning_record(&store, "message-2", 9, "pc-replacement").await;
+
+        let mutation_key = store
+            .conversation_key(DataKeyPurpose::Mutation)
+            .await
+            .expect("mint mutation key");
+        let applier = ProviderContextMutationApplier::new(&store);
+        let prepared = ProviderContextMutationBuilder::new(
+            mutation_key,
+            store.scope().clone(),
+            "mutation-1".to_owned(),
+        )
+        .build_replace(
+            None,
+            vec!["pc-cross".to_owned()],
+            &replacement,
+            &reasoning_item("message-2", 9),
+            1,
+            1,
+        )
+        .expect("build replace");
+
+        applier.prepare(&prepared).await.unwrap();
+        let error = applier
+            .apply("mutation-1")
+            .await
+            .expect_err("cross-conversation id must fail closed");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("outside the active conversation scope"),
+            "{message}"
+        );
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE id = ?")
+            .bind("pc-cross")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "cross-conversation row must not be deleted");
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE id = ?")
+            .bind("pc-replacement")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "replacement must not be inserted when invalidation fails closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_mutation_requires_exactly_one_row() {
+        let store = store().await;
+        let applier = ProviderContextMutationApplier::new(&store);
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
+
+        let error = applier
+            .finish_mutation(&mut transaction, "missing-mutation", "applied", None)
+            .await
+            .expect_err("finishing a missing mutation must fail CAS");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("ProviderContextMutationFinish CAS expected one row, updated 0"),
+            "{message}"
+        );
+        transaction.rollback().await.ok();
+    }
+
+    #[tokio::test]
+    async fn hydrate_validates_provider_origin_against_plaintext() {
+        let store = store().await;
+        seed_message(&store, "message-1", 7).await.unwrap();
+
+        let record = reasoning_record(&store, "message-1", 7, "pc-1").await;
+        record.insert(store.pool()).await.unwrap();
+
+        let messages = vec![ContextMessage::Persisted {
+            id: "message-1".to_owned(),
+            seq: 7,
+            message: assistant_message(reasoning_origin()),
+        }];
+        let hydrated = store
+            .hydrate_provider_context(&messages)
+            .await
+            .expect("hydration should succeed with matching origin");
+        assert_eq!(hydrated.len(), 1);
+        assert_eq!(hydrated[0].origin_message.as_ref().unwrap().message_seq, 7);
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_stored_provider_origin_mismatch() {
+        let store = store().await;
+        seed_message(&store, "message-1", 7).await.unwrap();
+
+        let record = reasoning_record(&store, "message-1", 7, "pc-1").await;
+        record.insert(store.pool()).await.unwrap();
+
+        // Tamper with the stored provider-origin metadata. The authenticated plaintext
+        // still carries the real origin, so hydration must detect the mismatch.
+        sqlx::query("UPDATE provider_context SET provider_instance_id = 'tampered' WHERE id = ?")
+            .bind("pc-1")
+            .execute(store.pool())
+            .await
+            .expect("tamper stored provider instance id");
+
+        let messages = vec![ContextMessage::Persisted {
+            id: "message-1".to_owned(),
+            seq: 7,
+            message: assistant_message(reasoning_origin()),
+        }];
+        let error = store
+            .hydrate_provider_context(&messages)
+            .await
+            .expect_err("hydration must reject origin mismatch");
+        let message = format!("{error:#}");
+        assert!(
+            message
+                .contains("stored provider origin does not match authenticated plaintext origin"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_uses_canonical_order_by_coverage_and_id() {
+        let store = store().await;
+        seed_message(&store, "message-5", 5).await.unwrap();
+        seed_message(&store, "message-7", 7).await.unwrap();
+
+        let key = store
+            .provider_context_key(&ProviderContextKeyAnchor {
+                conversation_id: store.scope().conversation_id.clone(),
+                anchor_id: "message-1:7".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let mut item = ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 1,
+            provider_origin: openai_responses_origin(),
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({"summary": "a"})],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 5,
+                    context_fingerprint: "fp-a".to_owned(),
+                },
+            },
+        };
+        let later = EncryptedProviderContextRecord::encrypt(
+            &item,
+            "provider-instance-1",
+            ApiProtocol::OpenAiResponses,
+            "model-1",
+            "pc-later",
+            provider_context_idempotency_key("message-1", &item),
+            &key,
+            store.scope(),
+        )
+        .expect("encrypt later compaction");
+        later.insert(store.pool()).await.unwrap();
+
+        item.ordinal = 2;
+        item.payload = ProviderContextPayload::OpenAiCompactedWindow {
+            items: vec![json!({"summary": "b"})],
+            coverage: NativeCompactionCoverage {
+                through_message_seq: 7,
+                context_fingerprint: "fp-b".to_owned(),
+            },
+        };
+        item.provider_origin = openai_responses_origin();
+        let earlier_reasoning = EncryptedProviderContextRecord::encrypt(
+            &item,
+            "provider-instance-1",
+            ApiProtocol::OpenAiResponses,
+            "model-1",
+            "pc-earlier",
+            provider_context_idempotency_key("message-1", &item),
+            &key,
+            store.scope(),
+        )
+        .expect("encrypt earlier compaction");
+        earlier_reasoning.insert(store.pool()).await.unwrap();
+
+        let origin = openai_responses_origin();
+        let messages = vec![
+            ContextMessage::Persisted {
+                id: "message-5".to_owned(),
+                seq: 5,
+                message: assistant_message(origin.clone()),
+            },
+            ContextMessage::Persisted {
+                id: "message-7".to_owned(),
+                seq: 7,
+                message: assistant_message(origin),
+            },
+        ];
+        let hydrated = store
+            .hydrate_provider_context(&messages)
+            .await
+            .expect("hydration should succeed");
+        assert_eq!(hydrated.len(), 2);
+        // Native compaction is unanchored; sort order is by coverage seq.
+        let coverage_seq = |item: &ProviderContextItem| match &item.payload {
+            ProviderContextPayload::OpenAiCompactedWindow { coverage, .. } => {
+                coverage.through_message_seq
+            }
+            _ => panic!("expected OpenAI compacted window"),
+        };
+        assert_eq!(coverage_seq(&hydrated[0]), 5);
+        assert_eq!(
+            coverage_seq(&hydrated[1]),
+            7,
+            "higher coverage seq must sort after lower coverage seq"
+        );
     }
 }

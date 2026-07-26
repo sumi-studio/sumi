@@ -190,10 +190,12 @@ fn build_replay_probe_request_with_usage(
         message_id: "replay-probe-v1-assistant".into(),
         message_seq: 1,
     };
+    let origin = spec.origin();
     let mut provider_context = vec![ProviderContextItem {
         origin_message: Some(anchor.clone()),
         wire_item_index: Some(0),
         ordinal: 0,
+        provider_origin: origin.clone(),
         payload: ProviderContextPayload::EncryptedReasoning {
             protocol: ApiProtocol::OpenAiResponses,
             item: json!({
@@ -209,6 +211,7 @@ fn build_replay_probe_request_with_usage(
             origin_message: Some(anchor),
             wire_item_index: Some(1),
             ordinal: 0,
+            provider_origin: origin,
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::OpenAiResponses,
                 item: fragment.clone(),
@@ -4238,6 +4241,7 @@ mod tests {
                 origin_message: Some(anchor),
                 wire_item_index: Some(0),
                 ordinal: 0,
+                provider_origin: ProviderContextItem::test_origin(),
                 payload: ProviderContextPayload::EncryptedReasoning {
                     protocol: ApiProtocol::OpenAiResponses,
                     item: json!({
@@ -4535,6 +4539,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: window.clone(),
                 coverage: NativeCompactionCoverage {
@@ -4582,6 +4587,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({"id":"cmp","type":"compaction","encrypted_content":"opaque"})],
                 coverage: NativeCompactionCoverage {
@@ -4685,6 +4691,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({"id":"cmp","type":"compaction","encrypted_content":"NATIVE"})],
                 coverage,
@@ -4722,6 +4729,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::AnthropicCompaction {
                 block: json!({"type":"compaction","content":"FOREIGN_NATIVE"}),
                 coverage: NativeCompactionCoverage {
@@ -4910,6 +4918,7 @@ mod tests {
             }),
             wire_item_index: Some(1),
             ordinal: 1,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::OpenAiResponses,
                 item: json!({
@@ -4927,6 +4936,7 @@ mod tests {
             }),
             wire_item_index: Some(1),
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::OpenAiResponses,
                 item: json!({
@@ -5235,6 +5245,7 @@ mod tests {
                 origin_message: Some(anchor.clone()),
                 wire_item_index: Some(0),
                 ordinal: 0,
+                provider_origin: ProviderContextItem::test_origin(),
                 payload: ProviderContextPayload::EncryptedReasoning {
                     protocol: ApiProtocol::OpenAiResponses,
                     item: json!({
@@ -5283,6 +5294,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({
                     "id": "cmp",

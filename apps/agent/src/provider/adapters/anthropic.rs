@@ -13,8 +13,8 @@ use crate::provider::{
     types::{
         ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, MemoryLayer, Message,
         NativeCompactionCoverage, PromptContext, ProviderContextAnchor, ProviderContextFragment,
-        ProviderContextItem, ProviderContextPayload, ProviderEvent, StopReason, ToolDefinition,
-        Usage, UserContent, UserMessage,
+        ProviderContextItem, ProviderContextPayload, ProviderEvent, ProviderOrigin, StopReason,
+        ToolDefinition, Usage, UserContent, UserMessage,
     },
 };
 
@@ -180,6 +180,11 @@ fn build_replay_probe_request_with_usage(
         message_id: "replay-probe-v1-assistant".into(),
         message_seq: 2,
     };
+    let origin = ProviderOrigin {
+        provider_instance_id: "anthropic".into(),
+        protocol: ApiProtocol::AnthropicMessages,
+        model: "claude".into(),
+    };
     let mut content = vec![AssistantContent::Thinking {
         thinking: "replay-probe-v1-sentinel".into(),
         signature_field: "thinking.signature".into(),
@@ -189,6 +194,7 @@ fn build_replay_probe_request_with_usage(
         origin_message: Some(anchor.clone()),
         wire_item_index: Some(0),
         ordinal: 0,
+        provider_origin: origin.clone(),
         payload: ProviderContextPayload::EncryptedReasoning {
             protocol: ApiProtocol::AnthropicMessages,
             item: json!({
@@ -212,6 +218,7 @@ fn build_replay_probe_request_with_usage(
             origin_message: Some(anchor),
             wire_item_index: Some(1),
             ordinal: 0,
+            provider_origin: origin,
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::AnthropicMessages,
                 item: fragment.clone(),
@@ -2210,6 +2217,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::AnthropicCompaction {
                 block: json!({"type":"compaction","content":"NATIVE_MARKER"}),
                 coverage,
@@ -2294,6 +2302,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({
                     "id":"cmp",
@@ -2733,6 +2742,7 @@ mod tests {
             origin_message: Some(anchor),
             wire_item_index: Some(0),
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::AnthropicMessages,
                 item: json!({"type":"thinking_signature","signature":"opaque-sig"}),
@@ -2814,6 +2824,7 @@ mod tests {
             origin_message: Some(anchor),
             wire_item_index: Some(0),
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::AnthropicMessages,
                 item: json!({"type":"thinking_signature","signature":"OPAQUE_MARKER"}),
@@ -2901,6 +2912,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::AnthropicCompaction {
                 block: json!({"type":"compaction","content":"opaque-compact"}),
                 coverage: coverage.clone(),
@@ -3074,6 +3086,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::AnthropicCompaction {
                 block,
                 coverage: coverage.clone(),
@@ -3138,6 +3151,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::AnthropicCompaction {
                 block: json!({"type":"compaction","content":"opaque"}),
                 coverage,
@@ -3165,6 +3179,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::AnthropicCompaction {
                 block: json!({"type":"compaction","content":"STALE"}),
                 coverage: NativeCompactionCoverage {
@@ -3189,6 +3204,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::AnthropicCompaction {
                 block: json!({"type":"compaction","content":"GAP"}),
                 coverage: NativeCompactionCoverage {

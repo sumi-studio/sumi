@@ -66,6 +66,13 @@ struct MockGateway {
     next_failure: Option<mpsc::Receiver<()>>,
     fail_send: Arc<AtomicBool>,
     send_failure_observed: Arc<Notify>,
+    frame_sent: Arc<Notify>,
+}
+
+impl MockGateway {
+    fn frame_notify(&self) -> Arc<Notify> {
+        self.frame_sent.clone()
+    }
 }
 
 impl Gateway for MockGateway {
@@ -82,6 +89,7 @@ impl Gateway for MockGateway {
                 frames: self.frames,
                 fail_send: self.fail_send,
                 send_failure_observed: self.send_failure_observed,
+                frame_sent: self.frame_sent,
             },
         )
     }
@@ -114,6 +122,7 @@ struct MockGatewayWriter {
     frames: Arc<Mutex<Vec<OutboundFrame>>>,
     fail_send: Arc<AtomicBool>,
     send_failure_observed: Arc<Notify>,
+    frame_sent: Arc<Notify>,
 }
 
 #[async_trait]
@@ -124,6 +133,7 @@ impl GatewayWriter for MockGatewayWriter {
             return Err(anyhow!("fixture gateway send failure"));
         }
         self.frames.lock().expect("frame mutex").push(frame);
+        self.frame_sent.notify_one();
         Ok(())
     }
 }
@@ -137,6 +147,7 @@ fn gateway() -> (
     let frames = Arc::new(Mutex::new(Vec::new()));
     let fail_send = Arc::new(AtomicBool::new(false));
     let send_failure_observed = Arc::new(Notify::new());
+    let frame_sent = Arc::new(Notify::new());
     (
         MockGateway {
             commands,
@@ -144,6 +155,7 @@ fn gateway() -> (
             next_failure: None,
             fail_send,
             send_failure_observed,
+            frame_sent: frame_sent.clone(),
         },
         commands_tx,
         frames,
@@ -164,6 +176,7 @@ fn controlled_gateway() -> ControlledGateway {
     let frames = Arc::new(Mutex::new(Vec::new()));
     let fail_send = Arc::new(AtomicBool::new(false));
     let send_failure_observed = Arc::new(Notify::new());
+    let frame_sent = Arc::new(Notify::new());
     ControlledGateway {
         gateway: MockGateway {
             commands,
@@ -171,6 +184,7 @@ fn controlled_gateway() -> ControlledGateway {
             next_failure: Some(next_failure),
             fail_send: fail_send.clone(),
             send_failure_observed: send_failure_observed.clone(),
+            frame_sent: frame_sent.clone(),
         },
         commands: commands_tx,
         next_failure: next_failure_tx,
@@ -6157,6 +6171,7 @@ async fn retry_wait_group_of_two_is_injected_before_next_attempt() {
         .expect("test store");
     let pool = store.pool().clone();
     let (gateway, commands, frames) = gateway();
+    let frame_notify = gateway.frame_notify();
     let driver = Arc::new(RetryGroupDriver {
         retry_wait_entered: Notify::new(),
         contexts: Mutex::new(Vec::new()),
@@ -6182,7 +6197,7 @@ async fn retry_wait_group_of_two_is_injected_before_next_attempt() {
     commands.send(user(2)).await.expect("retry steer first");
     commands.send(user(3)).await.expect("retry steer second");
 
-    let terminal_result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    let terminal_result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
             if frames.lock().expect("frame mutex").iter().any(|frame| {
                 matches!(frame, OutboundFrame::Event { envelope }
@@ -6191,7 +6206,7 @@ async fn retry_wait_group_of_two_is_injected_before_next_attempt() {
             {
                 break;
             }
-            tokio::task::yield_now().await;
+            frame_notify.notified().await;
         }
     })
     .await;

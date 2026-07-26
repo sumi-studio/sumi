@@ -2745,6 +2745,7 @@ impl EventWriter {
                 },
                 wire_item_index: fragment.wire_item_index,
                 ordinal,
+                provider_origin: assistant.origin.clone(),
                 payload: fragment.payload,
             };
 
@@ -9032,7 +9033,7 @@ async fn apply_approval_mutation(
     Ok(())
 }
 
-fn require_single_cas(rows_affected: u64, operation: &str) -> Result<()> {
+pub(crate) fn require_single_cas(rows_affected: u64, operation: &str) -> Result<()> {
     if rows_affected != 1 {
         bail!("{operation} CAS expected one row, updated {rows_affected}");
     }

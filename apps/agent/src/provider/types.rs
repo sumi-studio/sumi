@@ -124,7 +124,22 @@ pub struct ProviderContextItem {
     pub origin_message: Option<ProviderContextAnchor>,
     pub wire_item_index: Option<u32>,
     pub ordinal: u32,
+    pub provider_origin: ProviderOrigin,
     pub payload: ProviderContextPayload,
+}
+
+#[cfg(test)]
+impl ProviderContextItem {
+    /// Test-only origin fixture for provider-context item construction.
+    /// Production callers must supply the real provider origin that produced
+    /// the assistant turn or compaction window.
+    pub fn test_origin() -> ProviderOrigin {
+        ProviderOrigin {
+            provider_instance_id: "test-provider-instance".to_owned(),
+            protocol: ApiProtocol::OpenAiResponses,
+            model: "test-model".to_owned(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
