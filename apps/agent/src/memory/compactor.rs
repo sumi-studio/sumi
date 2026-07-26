@@ -554,6 +554,9 @@ fn parse_compact_summary(protocol: ApiProtocol, value: &Value) -> Result<String,
                 .ok_or_else(|| CompactError::InvalidResponse("missing response output".into()))?;
             let mut text = String::new();
             for item in output {
+                if item.get("type").and_then(Value::as_str) != Some("message") {
+                    continue;
+                }
                 let Some(content) = item.get("content").and_then(Value::as_array) else {
                     continue;
                 };
@@ -1195,7 +1198,7 @@ async fn claim_next_pending_job(store: &Store) -> Result<Option<Job>> {
 }
 
 async fn reset_job_to_pending(store: &Store, job: &Job) -> Result<()> {
-    sqlx::query(
+    let result = sqlx::query(
         "UPDATE memory_jobs
          SET status = 'pending', lease_until = NULL, updated_at = ?
          WHERE id = ? AND status = 'running' AND attempts = ? AND lease_until = ?",
@@ -1207,6 +1210,28 @@ async fn reset_job_to_pending(store: &Store, job: &Job) -> Result<()> {
     .execute(store.pool())
     .await
     .context("reset job to pending")?;
+    if result.rows_affected() != 1 {
+        bail!("reset job to pending CAS failed for {}", job.id);
+    }
+    Ok(())
+}
+
+async fn release_claimed_job(store: &Store, job: &Job) -> Result<()> {
+    let result = sqlx::query(
+        "UPDATE memory_jobs
+         SET status = 'pending', attempts = attempts - 1, lease_until = NULL, updated_at = ?
+         WHERE id = ? AND status = 'running' AND attempts = ? AND lease_until = ?",
+    )
+    .bind(Utc::now().to_rfc3339())
+    .bind(&job.id)
+    .bind(job.attempts)
+    .bind(job.lease_until.as_ref())
+    .execute(store.pool())
+    .await
+    .context("release claimed job")?;
+    if result.rows_affected() != 1 {
+        bail!("release claimed job CAS failed for {}", job.id);
+    }
     Ok(())
 }
 
@@ -1927,6 +1952,9 @@ impl CompactWorker {
         };
 
         if self.cancel.is_cancelled() {
+            // Cancellation immediately after claiming must not consume an
+            // attempt or leave the job checked out for the lease duration.
+            release_claimed_job(&self.store, &job).await?;
             return Ok(false);
         }
 
@@ -1958,7 +1986,7 @@ impl CompactWorker {
                 // A worker shutdown is not a compaction failure. Return the
                 // leased row to the durable queue so the next process can
                 // recover it without consuming the retry budget.
-                reset_job_to_pending(&self.store, &job).await?;
+                release_claimed_job(&self.store, &job).await?;
             }
             Err(error) if error.is_retryable() && job.attempts < MAX_ATTEMPTS => {
                 reset_job_to_pending(&self.store, &job).await?;
@@ -3493,5 +3521,79 @@ mod tests {
             worker.apply_ready().await.is_err(),
             "apply must fail when source version is stale"
         );
+    }
+
+    #[test]
+    fn responses_ignores_non_message_output_items() {
+        let output = json!({
+            "output": [
+                {
+                    "type": "reasoning",
+                    "content": [{"type": "thinking", "text": "ignore this"}]
+                },
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "use this"}]
+                },
+                {
+                    "type": "function_call",
+                    "content": [{"text": "ignore too"}]
+                }
+            ]
+        });
+        assert_eq!(
+            parse_compact_summary(ApiProtocol::OpenAiResponses, &output)
+                .expect("responses summary"),
+            "use this"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_job_to_pending_rejects_cas_mismatch() {
+        let store = test_store().await;
+        let (source_id, _target_id) = insert_l0_batch(&store, &[user("cas test")]).await;
+        insert_compact_l0_job(&store, "job-cas", &source_id, 1).await;
+        let job = claim_next_pending_job(&store)
+            .await
+            .expect("claim")
+            .expect("pending job");
+
+        // Another process changed the job row after it was claimed.
+        sqlx::query("UPDATE memory_jobs SET status = 'completed' WHERE id = ?")
+            .bind(&job.id)
+            .execute(store.pool())
+            .await
+            .expect("tamper with job");
+
+        assert!(
+            reset_job_to_pending(&store, &job).await.is_err(),
+            "reset must error when the expected running row is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_claim_cancellation_releases_job() {
+        let store = test_store().await;
+        let (source_id, _target_id) = insert_l0_batch(&store, &[user("cancel test")]).await;
+        insert_compact_l0_job(&store, "job-cancel", &source_id, 1).await;
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let worker = CompactWorker {
+            store: store.clone(),
+            spec: select_compact_model(&chat_model(), None, &[]).expect("select model"),
+            provider: Arc::new(FakeProvider::default()),
+            cancel,
+        };
+        assert!(!worker.process_next_job().await.expect("process next"));
+
+        let row = sqlx::query("SELECT status, attempts, lease_until FROM memory_jobs WHERE id = ?")
+            .bind("job-cancel")
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch job");
+        assert_eq!(row.get::<String, _>("status"), "pending");
+        assert_eq!(row.get::<i64, _>("attempts"), 0);
+        assert!(row.get::<Option<String>, _>("lease_until").is_none());
     }
 }
