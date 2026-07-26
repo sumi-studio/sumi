@@ -84,8 +84,8 @@ func validateEvent(raw json.RawMessage) error {
 		if err := validateString(obj["tool_call_id"]); err != nil {
 			return fmt.Errorf("tool_execution_update.tool_call_id: %w", err)
 		}
-		if !json.Valid(obj["partial"]) {
-			return fmt.Errorf("tool_execution_update.partial: invalid JSON")
+		if err := validateAnyJSON(obj["partial"]); err != nil {
+			return fmt.Errorf("tool_execution_update.partial: %w", err)
 		}
 		return nil
 
@@ -96,8 +96,8 @@ func validateEvent(raw json.RawMessage) error {
 		if err := validateString(obj["tool_call_id"]); err != nil {
 			return fmt.Errorf("tool_execution_end.tool_call_id: %w", err)
 		}
-		if !json.Valid(obj["result"]) {
-			return fmt.Errorf("tool_execution_end.result: invalid JSON")
+		if err := validateAnyJSON(obj["result"]); err != nil {
+			return fmt.Errorf("tool_execution_end.result: %w", err)
 		}
 		if err := validateBool(obj["is_error"]); err != nil {
 			return fmt.Errorf("tool_execution_end.is_error: %w", err)
@@ -253,8 +253,8 @@ func validatePublicMessage(raw json.RawMessage) error {
 		if err := validateArray(obj["content"], validateUserContent); err != nil {
 			return fmt.Errorf("tool_result message content: %w", err)
 		}
-		if !json.Valid(obj["details"]) {
-			return fmt.Errorf("tool_result message details: invalid JSON")
+		if err := validateAnyJSON(obj["details"]); err != nil {
+			return fmt.Errorf("tool_result message details: %w", err)
 		}
 		if err := validateBool(obj["is_error"]); err != nil {
 			return fmt.Errorf("tool_result message is_error: %w", err)
@@ -324,8 +324,8 @@ func validatePublicStreamEvent(raw json.RawMessage) error {
 		if err := validateJSONSafeInteger(obj["content_index"]); err != nil {
 			return fmt.Errorf("tool_call_preview.content_index: %w", err)
 		}
-		if !json.Valid(obj["preview"]) {
-			return fmt.Errorf("tool_call_preview.preview: invalid JSON")
+		if err := validateAnyJSON(obj["preview"]); err != nil {
+			return fmt.Errorf("tool_call_preview.preview: %w", err)
 		}
 		return nil
 
@@ -523,8 +523,8 @@ func validateToolResultPayload(raw json.RawMessage) error {
 	if err := validateArray(obj["content"], validateUserContent); err != nil {
 		return fmt.Errorf("tool result content: %w", err)
 	}
-	if !json.Valid(obj["details"]) {
-		return fmt.Errorf("tool result details: invalid JSON")
+	if err := validateAnyJSON(obj["details"]); err != nil {
+		return fmt.Errorf("tool result details: %w", err)
 	}
 	if err := validateBool(obj["is_error"]); err != nil {
 		return fmt.Errorf("tool result is_error: %w", err)
@@ -558,8 +558,8 @@ func validateApprovalRequest(raw json.RawMessage) error {
 	if err := validateReviewProjection(obj["action"]); err != nil {
 		return fmt.Errorf("approval request action: %w", err)
 	}
-	if !json.Valid(obj["args_summary"]) {
-		return fmt.Errorf("approval request args_summary: invalid JSON")
+	if err := validateAnyJSON(obj["args_summary"]); err != nil {
+		return fmt.Errorf("approval request args_summary: %w", err)
 	}
 	if reason, ok := obj["reason"]; ok {
 		if err := validateStringOrNull(reason); err != nil {
@@ -598,8 +598,10 @@ func validateReviewProjection(raw json.RawMessage) error {
 			return err
 		}
 	}
-	if hasReviewable && !json.Valid(obj["reviewable"]) {
-		return fmt.Errorf("reviewable: invalid JSON")
+	if hasReviewable {
+		if err := validateAnyJSON(obj["reviewable"]); err != nil {
+			return fmt.Errorf("reviewable: %w", err)
+		}
 	}
 	return nil
 }
@@ -736,7 +738,58 @@ func validateObjectNotNull(raw json.RawMessage) error {
 	if obj == nil {
 		return fmt.Errorf("value must be an object")
 	}
-	return nil
+	return validateAnyJSON(raw)
+}
+
+// validateAnyJSON enforces AnyJSON's recursive JavaScript-safe number bound.
+// A top-level validation alone would allow nested unsafe integers to lose
+// precision when they reach generated TypeScript clients.
+func validateAnyJSON(raw json.RawMessage) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var value any
+	if err := dec.Decode(&value); err != nil {
+		return fmt.Errorf("invalid JSON: %w", err)
+	}
+	if dec.More() {
+		return fmt.Errorf("trailing data after JSON value")
+	}
+	return validateAnyJSONValue(value)
+}
+
+func validateAnyJSONValue(value any) error {
+	switch value := value.(type) {
+	case nil, bool, string:
+		return nil
+	case json.Number:
+		if i, err := value.Int64(); err == nil {
+			if i < -int64(maxJSONSafeInteger) || i > int64(maxJSONSafeInteger) {
+				return fmt.Errorf("number exceeds JSON-safe range")
+			}
+			return nil
+		}
+		f, err := value.Float64()
+		if err != nil || f < -float64(maxJSONSafeInteger) || f > float64(maxJSONSafeInteger) {
+			return fmt.Errorf("number exceeds JSON-safe range")
+		}
+		return nil
+	case []any:
+		for i, child := range value {
+			if err := validateAnyJSONValue(child); err != nil {
+				return fmt.Errorf("array element %d: %w", i, err)
+			}
+		}
+		return nil
+	case map[string]any:
+		for key, child := range value {
+			if err := validateAnyJSONValue(child); err != nil {
+				return fmt.Errorf("object key %q: %w", key, err)
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported JSON value %T", value)
+	}
 }
 
 func validateArray(raw json.RawMessage, fn func(json.RawMessage) error) error {

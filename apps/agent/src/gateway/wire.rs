@@ -144,6 +144,8 @@ pub enum WireError {
     ContentIndexOutOfRange(u64),
     #[error("usage value `{0}` exceeds the JSON-safe integer range")]
     UsageValueOutOfRange(u64),
+    #[error("AnyJSON contains a number outside the JavaScript-safe range")]
+    AnyJSONNumberOutOfRange,
     #[error("seq `{0}` exceeds the JSON-safe integer range")]
     SeqOutOfRange(u64),
     #[error("user message attachments must be empty")]
@@ -161,7 +163,13 @@ pub fn user_message_id_from_command_id(command_id: &str) -> Result<String, WireE
 /// Convert an outbound frame to its explicit wire DTO, validating the seq and
 /// command-ack rules from the contract.
 pub fn to_wire_frame(frame: OutboundFrame) -> Result<WireOutboundFrame, WireError> {
-    frame.try_into()
+    let wire: WireOutboundFrame = frame.try_into()?;
+    // Internal event values contain opaque JSON. Validate the final public
+    // representation at the production writer boundary so nested values cannot
+    // lose integer precision in the TypeScript consumer.
+    let value = serde_json::to_value(&wire)?;
+    validate_json_safe_numbers(&value)?;
+    Ok(wire)
 }
 
 /// Canonical lower-case hyphenated UUID used for `message_id` in message events.
@@ -571,7 +579,9 @@ pub enum WireAgentEvent {
         kind: WireMemoryMaintKind,
     },
     RetryScheduled {
-        attempt: u32,
+        #[serde(deserialize_with = "deserialize_json_safe_integer")]
+        attempt: u64,
+        #[serde(deserialize_with = "deserialize_json_safe_integer")]
         delay_ms: u64,
         retry_at: DateTime<Utc>,
         error_message: String,
@@ -731,20 +741,24 @@ pub enum WireUserContent {
 pub enum WirePublicAssistantContent {
     Text {
         text: String,
-        wire_item_index: u32,
+        #[serde(deserialize_with = "deserialize_json_safe_integer")]
+        wire_item_index: u64,
     },
     Thinking {
         thinking: String,
         signature_field: String,
-        wire_item_index: u32,
+        #[serde(deserialize_with = "deserialize_json_safe_integer")]
+        wire_item_index: u64,
     },
     ToolCall {
         tool_call: WireToolCall,
-        wire_item_index: u32,
+        #[serde(deserialize_with = "deserialize_json_safe_integer")]
+        wire_item_index: u64,
     },
     RejectedToolCall {
         rejected: WireRejectedToolCall,
-        wire_item_index: u32,
+        #[serde(deserialize_with = "deserialize_json_safe_integer")]
+        wire_item_index: u64,
     },
 }
 
@@ -1006,8 +1020,8 @@ impl TryFrom<AgentEvent> for WireAgentEvent {
                 retry_at,
                 error_message,
             } => Self::RetryScheduled {
-                attempt,
-                delay_ms,
+                attempt: wire_json_safe_integer(u64::from(attempt))?,
+                delay_ms: wire_json_safe_integer(delay_ms)?,
                 retry_at,
                 error_message,
             },
@@ -1186,7 +1200,7 @@ impl TryFrom<PublicAssistantContent> for WirePublicAssistantContent {
                 wire_item_index,
             } => Self::Text {
                 text,
-                wire_item_index,
+                wire_item_index: wire_json_safe_integer(u64::from(wire_item_index))?,
             },
             PublicAssistantContent::Thinking {
                 thinking,
@@ -1195,21 +1209,21 @@ impl TryFrom<PublicAssistantContent> for WirePublicAssistantContent {
             } => Self::Thinking {
                 thinking,
                 signature_field,
-                wire_item_index,
+                wire_item_index: wire_json_safe_integer(u64::from(wire_item_index))?,
             },
             PublicAssistantContent::ToolCall {
                 tool_call,
                 wire_item_index,
             } => Self::ToolCall {
                 tool_call: tool_call.try_into()?,
-                wire_item_index,
+                wire_item_index: wire_json_safe_integer(u64::from(wire_item_index))?,
             },
             PublicAssistantContent::RejectedToolCall {
                 rejected,
                 wire_item_index,
             } => Self::RejectedToolCall {
                 rejected: rejected.try_into()?,
-                wire_item_index,
+                wire_item_index: wire_json_safe_integer(u64::from(wire_item_index))?,
             },
         })
     }
@@ -1576,6 +1590,41 @@ fn wire_usage_value(value: u64) -> Result<u64, WireError> {
     Ok(value)
 }
 
+fn wire_json_safe_integer(value: u64) -> Result<u64, WireError> {
+    if value > MAX_JSON_SAFE_INTEGER {
+        return Err(WireError::SeqOutOfRange(value));
+    }
+    Ok(value)
+}
+
+fn validate_json_safe_numbers(value: &Value) -> Result<(), WireError> {
+    match value {
+        Value::Null | Value::Bool(_) | Value::String(_) => Ok(()),
+        Value::Number(number) => {
+            let within_range = number
+                .as_i64()
+                .map(|value| {
+                    value >= -(MAX_JSON_SAFE_INTEGER as i64)
+                        && value <= MAX_JSON_SAFE_INTEGER as i64
+                })
+                .or_else(|| number.as_u64().map(|value| value <= MAX_JSON_SAFE_INTEGER))
+                .or_else(|| {
+                    number.as_f64().map(|value| {
+                        value.is_finite() && value.abs() <= MAX_JSON_SAFE_INTEGER as f64
+                    })
+                })
+                .unwrap_or(false);
+            if within_range {
+                Ok(())
+            } else {
+                Err(WireError::AnyJSONNumberOutOfRange)
+            }
+        }
+        Value::Array(values) => values.iter().try_for_each(validate_json_safe_numbers),
+        Value::Object(values) => values.values().try_for_each(validate_json_safe_numbers),
+    }
+}
+
 fn validate_seq(seq: Option<u64>, event: &WireAgentEvent) -> Result<(), WireError> {
     if event.is_volatile() {
         if seq.is_some() {
@@ -1642,6 +1691,25 @@ mod tests {
             canonical_contract_is_valid(definition, value),
             "{definition} sample violates canonical schema"
         );
+    }
+
+    #[test]
+    fn any_json_number_validation_is_recursive_and_keeps_fractions() {
+        let valid = json!({
+            "minimum": -9_007_199_254_740_991i64,
+            "maximum": 9_007_199_254_740_991u64,
+            "fraction": 0.5,
+            "nested": [{ "fraction": -1.25 }],
+        });
+        assert!(validate_json_safe_numbers(&valid).is_ok());
+        assert!(matches!(
+            validate_json_safe_numbers(&json!({"nested": [9_007_199_254_740_992u64]})),
+            Err(WireError::AnyJSONNumberOutOfRange)
+        ));
+        assert!(matches!(
+            validate_json_safe_numbers(&json!({"nested": [-9_007_199_254_740_992i64]})),
+            Err(WireError::AnyJSONNumberOutOfRange)
+        ));
     }
 
     fn uuid_command_id() -> CommandId {

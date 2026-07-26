@@ -44,6 +44,7 @@ func signTestToken(t *testing.T, secret []byte, claims testTokenClaims) string {
 func setTokenSecret(t *testing.T) {
 	t.Helper()
 	t.Setenv("SUMI_AGENT_TOKEN_SECRET", base64.StdEncoding.EncodeToString(testTokenSecret))
+	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", t.TempDir())
 }
 
 func postAuthorized(t *testing.T, serverURL, conversationID string, body []byte) *http.Response {

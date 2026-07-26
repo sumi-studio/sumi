@@ -461,15 +461,17 @@ func (s *CommandStore) scanLogLocked(st *conversationState, conversationID strin
 		if rec.Seq > maxJSONSafeInteger {
 			return fmt.Errorf("command log for %q contains seq %d exceeding JSON-safe integer range", conversationID, rec.Seq)
 		}
-
-		idx := len(st.commands)
-		st.commands = append(st.commands, rec.CommandEnvelope)
-		if rec.Seq >= st.nextSeq {
-			st.nextSeq = rec.Seq + 1
-		}
 		if existing, ok := st.bySeq[rec.Seq]; ok {
 			return fmt.Errorf("duplicate seq %d in log for %q (existing %d)", rec.Seq, conversationID, existing)
 		}
+		expectedSeq := uint64(len(st.commands) + 1)
+		if rec.Seq != expectedSeq {
+			return fmt.Errorf("command log for %q has non-contiguous seq: got %d, want %d", conversationID, rec.Seq, expectedSeq)
+		}
+
+		idx := len(st.commands)
+		st.commands = append(st.commands, rec.CommandEnvelope)
+		st.nextSeq = rec.Seq + 1
 		st.bySeq[rec.Seq] = idx
 		if _, ok := st.byCommandID[rec.CommandID]; ok {
 			return fmt.Errorf("duplicate command_id %q in log for %q", rec.CommandID, conversationID)

@@ -47,8 +47,6 @@ func newRouter() (*http.ServeMux, error) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handler.Health)
-	mux.Handle("GET /agent/ws", wsHandler(tv))
-
 	cmdDir := os.Getenv("SUMI_COMMAND_LOG_DIR")
 	if cmdDir == "" {
 		return nil, errors.New("SUMI_COMMAND_LOG_DIR not set")
@@ -57,6 +55,13 @@ func newRouter() (*http.ServeMux, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open command store: %w", err)
 	}
+	runtimeDir := os.Getenv("SUMI_AGENT_RUNTIME_STATE_DIR")
+	runtime, err := agentevents.OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("open agent runtime gateway: %w", err)
+	}
+	mux.Handle("GET /agent/ws", wsHandler(tv, runtime))
 	ingress, err := agentevents.NewUserCommandIngress(store, tv)
 	if err != nil {
 		_ = store.Close()
@@ -67,20 +72,17 @@ func newRouter() (*http.ServeMux, error) {
 	return mux, nil
 }
 
-// wsHandler wires a real HMAC token verifier when SUMI_AGENT_TOKEN_SECRET is
-// configured, and falls back to a fail-closed server while the remaining T17
-// (durable source/hydration) and T26 (generation lease) seams are not yet
-// injected.
-func wsHandler(tv agentevents.TokenVerifier) http.Handler {
-	if tv != nil {
-		log.Print("agent WS token verification wired")
-		srv := agentevents.NewServerWithTokenVerifier(tv)
+// wsHandler assembles the production token, generation, durable command/event,
+// and hydration adapters. A missing token verifier remains fail-closed, but a
+// configured production route never substitutes placeholder T17/T26 seams.
+func wsHandler(tv agentevents.TokenVerifier, runtime *agentevents.DurableGateway) http.Handler {
+	if tv == nil || runtime == nil {
+		srv := agentevents.NewFailClosedServer()
 		srv.AllowedOrigins = allowedOriginsFromEnv()
 		return srv
 	}
-
-	log.Print("agent WS running fail-closed: T17/T26 production seams not wired")
-	srv := agentevents.NewFailClosedServer()
+	log.Print("agent WS token, generation, durable command/event, and hydration wiring ready")
+	srv := agentevents.NewServer(tv, runtime, runtime, runtime, runtime)
 	srv.AllowedOrigins = allowedOriginsFromEnv()
 	return srv
 }

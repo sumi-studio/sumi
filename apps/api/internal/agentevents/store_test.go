@@ -1,6 +1,7 @@
 package agentevents
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1201,55 +1202,32 @@ func TestCommandStore_MultiProcessRollbackDoesNotDestroyPeerRecord(t *testing.T)
 	}
 }
 
-func TestCommandStore_AppendAtJsonSafeIntegerMax(t *testing.T) {
-	dir := t.TempDir()
-	conv := "conv-max"
-
-	// Seed the log so the next allocated seq will be the JSON-safe maximum.
-	seed := LogRecord{
-		CommandEnvelope: CommandEnvelope{
-			Seq:       maxJSONSafeInteger - 1,
-			CommandID: "00000000-0000-4000-8000-000000000000",
-			Command:   json.RawMessage(`{"type":"user_message","text":"seed","attachments":[]}`),
-		},
-	}
-	seedLine, _ := json.Marshal(seed)
-	path := commandLogPath(dir, conv)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, append(seedLine, '\n'), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	store, err := OpenCommandStore(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-
-	cmd := json.RawMessage(`{"type":"user_message","text":"max","attachments":[]}`)
-	env, err := store.Append(context.Background(), conv, "", cmd)
-	if err != nil {
-		t.Fatalf("expected max seq append to succeed, got %v", err)
-	}
-	if env.Seq != maxJSONSafeInteger {
-		t.Fatalf("expected seq %d, got %d", maxJSONSafeInteger, env.Seq)
-	}
-
-	// A subsequent append must fail before allocating max+1.
-	env2, err := store.Append(context.Background(), conv, "", cmd)
-	if !errors.Is(err, ErrSeqExhausted) {
-		t.Fatalf("expected ErrSeqExhausted, got env=%+v err=%v", env2, err)
-	}
-
-	// max+1 must not be persisted.
-	all, err := store.CatchUp(context.Background(), conv, maxJSONSafeInteger-1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(all) != 2 || all[1].Seq != maxJSONSafeInteger {
-		t.Fatalf("expected exactly 2 records with max seq as last, got %+v", all)
+func TestCommandStore_RejectsCorruptNonContiguousLogsOnOpen(t *testing.T) {
+	for _, seqs := range [][]uint64{{2}, {1, 3}, {2, 1}, {1, 1}} {
+		t.Run(fmt.Sprintf("seqs_%v", seqs), func(t *testing.T) {
+			dir := t.TempDir()
+			conv := "conv-corrupt"
+			var log bytes.Buffer
+			for i, seq := range seqs {
+				record := LogRecord{CommandEnvelope: CommandEnvelope{
+					Seq:       seq,
+					CommandID: fmt.Sprintf("00000000-0000-4000-8000-%012d", i+1),
+					Command:   json.RawMessage(`{"type":"user_message","text":"x","attachments":[]}`),
+				}}
+				line, err := json.Marshal(record)
+				if err != nil {
+					t.Fatal(err)
+				}
+				log.Write(line)
+				log.WriteByte('\n')
+			}
+			if err := os.WriteFile(commandLogPath(dir, conv), log.Bytes(), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := OpenCommandStore(dir); err == nil || (!strings.Contains(err.Error(), "non-contiguous") && !strings.Contains(err.Error(), "duplicate seq")) {
+				t.Fatalf("expected corrupt log rejection, got %v", err)
+			}
+		})
 	}
 }
 

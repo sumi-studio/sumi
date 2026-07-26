@@ -74,7 +74,7 @@ func (f *fakeCommandSource) catchUpCount() uint64 {
 	return f.catchUpCalls
 }
 
-func (f *fakeCommandSource) Live(ctx context.Context, claims TokenClaims) (<-chan CommandEnvelope, error) {
+func (f *fakeCommandSource) Live(ctx context.Context, claims TokenClaims, fromSeq uint64) (<-chan CommandEnvelope, error) {
 	return f.live, nil
 }
 
@@ -107,6 +107,18 @@ func (f *fakeEventSink) Receive(ctx context.Context, claims TokenClaims, envelop
 	return nil
 }
 
+func (f *fakeEventSink) LastReceivedEventSeq(ctx context.Context, claims TokenClaims) (uint64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var last uint64
+	for _, envelope := range f.envelopes {
+		if envelope.Seq != nil && *envelope.Seq > last {
+			last = *envelope.Seq
+		}
+	}
+	return last, nil
+}
+
 type fakeHydrationLatch struct {
 	mu          sync.Mutex
 	ready       bool
@@ -121,7 +133,7 @@ func newFakeHydrationLatch() *fakeHydrationLatch {
 	}
 }
 
-func (f *fakeHydrationLatch) WaitFor(ctx context.Context, generation uint64) error {
+func (f *fakeHydrationLatch) WaitFor(ctx context.Context, claims TokenClaims, generation uint64) error {
 	f.mu.Lock()
 	if f.ready {
 		f.mu.Unlock()
@@ -244,6 +256,38 @@ func TestWebSocketHelloAndCommandCatchUp(t *testing.T) {
 	}
 	if received.Seq != 1 {
 		t.Fatalf("unexpected command seq: %d", received.Seq)
+	}
+}
+
+func TestWebSocketHelloUsesDurableEventCursorNotAgentEcho(t *testing.T) {
+	srv, _, _, _, es, hl := newTestServer(t)
+	hl.setReady()
+	seq := uint64(3)
+	es.envelopes = []Envelope{{
+		Seq:            &seq,
+		ConversationID: "conversation-1",
+		Event:          []byte(`{"type":"agent_start"}`),
+	}}
+
+	server := startTestServer(t, srv)
+	defer server.Close()
+	conn, _, err := dialTestWS(t, server, map[string][]string{"Authorization": {"Bearer test-token"}})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	if err := conn.WriteJSON(AgentHello{
+		AgentID: "agent-1", Generation: 7, LastSentEventSeq: 99,
+		LastReceivedCommandSeq: 0, LastAppliedCommandSeq: 0,
+	}); err != nil {
+		t.Fatalf("write hello: %v", err)
+	}
+	var hello ApiHello
+	if err := conn.ReadJSON(&hello); err != nil {
+		t.Fatalf("read api hello: %v", err)
+	}
+	if hello.LastReceivedEventSeq != 3 {
+		t.Fatalf("expected durable event cursor 3, got %d", hello.LastReceivedEventSeq)
 	}
 }
 
@@ -491,13 +535,19 @@ func TestWebSocketOriginPolicy(t *testing.T) {
 	wsURL := strings.Replace(server.URL, "http", "ws", 1) + "/agent/ws"
 	header := map[string][]string{"Authorization": {"Bearer test-token"}}
 
-	// Missing origin header is rejected.
-	_, resp, err := websocket.DefaultDialer.Dial(wsURL, header)
-	if err == nil {
-		t.Fatal("expected missing origin to be rejected")
+	// Native agents authenticate without Origin. Browser requests still need a
+	// matching allow-listed origin below.
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("expected authenticated native handshake without Origin: %v", err)
 	}
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("expected 403, got %d", resp.StatusCode)
+	conn.Close()
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err == nil {
+		t.Fatal("expected unauthenticated origin-less handshake to be rejected")
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", resp.StatusCode)
 	}
 
 	// Wrong origin is rejected.
@@ -512,7 +562,7 @@ func TestWebSocketOriginPolicy(t *testing.T) {
 
 	// Allowed origin upgrades.
 	header["Origin"] = []string{server.URL}
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+	conn, _, err = websocket.DefaultDialer.Dial(wsURL, header)
 	if err != nil {
 		t.Fatalf("expected allowed origin to upgrade: %v", err)
 	}

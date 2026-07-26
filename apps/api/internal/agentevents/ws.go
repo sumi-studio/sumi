@@ -50,9 +50,11 @@ type CommandSource interface {
 	FirstCommandSeq(ctx context.Context, claims TokenClaims) (uint64, error)
 	// CatchUp returns commands starting from fromSeq up to the durable tail.
 	CatchUp(ctx context.Context, claims TokenClaims, fromSeq uint64) ([]CommandEnvelope, error)
-	// Live returns a channel of new commands after catch-up has reached the tail.
+	// Live returns commands from fromSeq onward. The source must bind this cursor
+	// before returning so an append between catch-up and subscription cannot be
+	// lost.
 	// The channel is closed when the source becomes invalid.
-	Live(ctx context.Context, claims TokenClaims) (<-chan CommandEnvelope, error)
+	Live(ctx context.Context, claims TokenClaims, fromSeq uint64) (<-chan CommandEnvelope, error)
 	// ApplyAck records a terminal command acknowledgement.
 	ApplyAck(ctx context.Context, claims TokenClaims, ack CommandAck) error
 }
@@ -61,6 +63,9 @@ type CommandSource interface {
 // Production wiring belongs to T17.
 type EventSink interface {
 	Receive(ctx context.Context, claims TokenClaims, envelope Envelope) error
+	// LastReceivedEventSeq returns the durable consumed prefix for this API
+	// identity. It must not be inferred from an agent-provided hello cursor.
+	LastReceivedEventSeq(ctx context.Context, claims TokenClaims) (uint64, error)
 }
 
 // HydrationLatch waits for the current ProcessGeneration to become Ready.
@@ -68,7 +73,7 @@ type EventSink interface {
 type HydrationLatch interface {
 	// WaitFor blocks until the given generation is Ready or the context is done.
 	// If the generation is already Ready it returns immediately.
-	WaitFor(ctx context.Context, generation uint64) error
+	WaitFor(ctx context.Context, claims TokenClaims, generation uint64) error
 }
 
 // Server is the production WebSocket gateway handler.
@@ -126,12 +131,15 @@ func NewServer(tv TokenVerifier, gv GenerationVerifier, cs CommandSource, es Eve
 	return s
 }
 
-// checkOrigin implements an explicit allow-list. The zero-value (empty list)
-// rejects every origin, including requests that omit the header.
+// checkOrigin implements an explicit browser-origin allow-list. Native agents
+// authenticate with a short-lived bearer token and do not send Origin; that
+// deliberate non-browser path must remain available without weakening browser
+// CSRF protection.
 func (s *Server) checkOrigin(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
-		return false
+		_, ok := bearerToken(r.Header.Get("Authorization"))
+		return ok
 	}
 	for _, allowed := range s.AllowedOrigins {
 		if allowed == origin {
@@ -219,7 +227,7 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 		return fmt.Errorf("verify generation: %w", err)
 	}
 
-	if err := s.Latch.WaitFor(helloCtx, hello.Generation); err != nil {
+	if err := s.Latch.WaitFor(helloCtx, claims, hello.Generation); err != nil {
 		return fmt.Errorf("hydration wait: %w", err)
 	}
 
@@ -240,9 +248,13 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 		nextSeq = firstSeq
 	}
 
+	lastReceivedEventSeq, err := s.Events.LastReceivedEventSeq(helloCtx, claims)
+	if err != nil {
+		return fmt.Errorf("last received event seq: %w", err)
+	}
 	apiHello := ApiHello{
 		AcceptedGeneration:   claims.Generation,
-		LastReceivedEventSeq: hello.LastSentEventSeq,
+		LastReceivedEventSeq: lastReceivedEventSeq,
 		NextCommandSeq:       nextSeq,
 	}
 	if err := s.writeJSON(conn, apiHello); err != nil {
@@ -271,9 +283,10 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 		if err := s.sendCommandEnvelope(conn, cmd); err != nil {
 			return fmt.Errorf("send catch-up command: %w", err)
 		}
+		nextSeq = cmd.Seq + 1
 	}
 
-	live, err := s.Commands.Live(ctx, claims)
+	live, err := s.Commands.Live(ctx, claims, nextSeq)
 	if err != nil {
 		return fmt.Errorf("live commands: %w", err)
 	}

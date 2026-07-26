@@ -470,11 +470,12 @@ func TestUserCommandIngress_OversizedIdempotencyKeyRejected(t *testing.T) {
 	assertRejectReason(t, resp.Body, RejectOversized)
 }
 
-func TestUserCommandIngress_ExhaustedSeqDoesNotAllocateOrPersist(t *testing.T) {
+func TestUserCommandIngress_RejectsNonContiguousPersistedSeq(t *testing.T) {
 	dir := t.TempDir()
 	conv := "conv-ingress-max"
 
-	// Seed the log with the maximum JSON-safe seq; next append should exhaust.
+	// A persisted jump must be rejected at startup: CatchUp assumes a
+	// contiguous durable log rather than a sparse sorted sequence.
 	seed := LogRecord{
 		CommandEnvelope: CommandEnvelope{
 			Seq:       maxJSONSafeInteger,
@@ -491,38 +492,8 @@ func TestUserCommandIngress_ExhaustedSeqDoesNotAllocateOrPersist(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	store, err := OpenCommandStore(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-
-	verifier := &fakeTokenVerifier{conversationID: conv}
-	ingress, err := NewUserCommandIngress(store, verifier)
-	if err != nil {
-		t.Fatalf("new ingress: %v", err)
-	}
-	server := httptest.NewServer(newCommandMux(ingress))
-	defer server.Close()
-
-	body := []byte(`{"type":"user_message","text":"over","attachments":[]}`)
-	resp := postAuthorized(t, server.URL+"/conversations/"+conv+"/commands", body)
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusCreated {
-		t.Fatalf("expected non-201 for exhausted seq, got %d", resp.StatusCode)
-	}
-
-	// max+1 must not be allocated, persisted, or returned.
-	if _, err := store.Append(context.Background(), conv, "", json.RawMessage(body)); !errors.Is(err, ErrSeqExhausted) {
-		t.Fatalf("expected ErrSeqExhausted on direct append, got %v", err)
-	}
-	all, err := store.CatchUp(context.Background(), conv, maxJSONSafeInteger)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(all) != 1 || all[0].Seq != maxJSONSafeInteger {
-		t.Fatalf("expected only the seed record, got %+v", all)
+	if _, err := OpenCommandStore(dir); err == nil || !strings.Contains(err.Error(), "non-contiguous") {
+		t.Fatalf("expected non-contiguous log rejection, got %v", err)
 	}
 }
 

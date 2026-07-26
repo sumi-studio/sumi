@@ -174,3 +174,23 @@ func TestOutboundFrameRejectsCommandAckSeqExceedsJSONSafeInteger(t *testing.T) {
 		t.Fatal("command_ack accepted out-of-range seq")
 	}
 }
+
+func TestAnyJSONRejectsUnsafeNestedIntegersButKeepsFractions(t *testing.T) {
+	valid := []string{
+		`{"type":"tool_execution_update","tool_call_id":"call-1","partial":{"low":-9007199254740991,"high":9007199254740991,"fraction":0.5,"nested":[{"also_fraction":-1.25}]}}`,
+		`{"type":"tool_execution_end","tool_call_id":"call-1","result":[0.25,{"value":9007199254740991}],"is_error":false}`,
+	}
+	for _, raw := range valid {
+		if err := validateEvent([]byte(raw)); err != nil {
+			t.Fatalf("valid AnyJSON rejected: %v", err)
+		}
+	}
+	for _, raw := range []string{
+		`{"type":"tool_execution_update","tool_call_id":"call-1","partial":{"nested":[9007199254740992]}}`,
+		`{"type":"tool_execution_end","tool_call_id":"call-1","result":{"nested":-9007199254740992},"is_error":false}`,
+	} {
+		if err := validateEvent([]byte(raw)); err == nil {
+			t.Fatalf("unsafe AnyJSON accepted: %s", raw)
+		}
+	}
+}

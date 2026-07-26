@@ -100,8 +100,8 @@ export type AgentEvent =
     }
   | {
       type: "retry_scheduled";
-      attempt: number;
-      delay_ms: number;
+      attempt: JsonSafeInteger;
+      delay_ms: JsonSafeInteger;
       retry_at: string;
       error_message: string;
     }
@@ -136,24 +136,31 @@ export type PublicAssistantContent =
   | {
       type: "text";
       text: string;
-      wire_item_index: number;
+      wire_item_index: JsonSafeInteger;
     }
   | {
       type: "thinking";
       thinking: string;
       signature_field: string;
-      wire_item_index: number;
+      wire_item_index: JsonSafeInteger;
     }
   | {
       type: "tool_call";
       tool_call: ToolCall;
-      wire_item_index: number;
+      wire_item_index: JsonSafeInteger;
     }
   | {
       type: "rejected_tool_call";
       rejected: RejectedToolCall;
-      wire_item_index: number;
+      wire_item_index: JsonSafeInteger;
     };
+/**
+ * non-negative integer representable exactly by JavaScript number clients
+ *
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "JsonSafeInteger".
+ */
+export type JsonSafeInteger = number;
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "ToolArgumentError".
@@ -165,13 +172,6 @@ export type ToolArgumentError =
  * via the `definition` "ApiProtocol".
  */
 export type ApiProtocol = "open_ai_chat_completions" | "open_ai_responses" | "anthropic_messages";
-/**
- * non-negative integer representable exactly by JavaScript number clients
- *
- * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
- * via the `definition` "JsonSafeInteger".
- */
-export type JsonSafeInteger = number;
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "StopReason".

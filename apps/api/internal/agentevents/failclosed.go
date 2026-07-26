@@ -34,7 +34,7 @@ func (failClosedCommandSource) CatchUp(ctx context.Context, claims TokenClaims, 
 	return nil, errNotWired
 }
 
-func (failClosedCommandSource) Live(ctx context.Context, claims TokenClaims) (<-chan CommandEnvelope, error) {
+func (failClosedCommandSource) Live(ctx context.Context, claims TokenClaims, fromSeq uint64) (<-chan CommandEnvelope, error) {
 	return nil, errNotWired
 }
 
@@ -48,9 +48,13 @@ func (failClosedEventSink) Receive(ctx context.Context, claims TokenClaims, enve
 	return errNotWired
 }
 
+func (failClosedEventSink) LastReceivedEventSeq(ctx context.Context, claims TokenClaims) (uint64, error) {
+	return 0, errNotWired
+}
+
 type failClosedHydrationLatch struct{}
 
-func (failClosedHydrationLatch) WaitFor(ctx context.Context, generation uint64) error {
+func (failClosedHydrationLatch) WaitFor(ctx context.Context, claims TokenClaims, generation uint64) error {
 	return errNotWired
 }
 

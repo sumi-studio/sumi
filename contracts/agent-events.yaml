@@ -160,8 +160,8 @@ $defs:
         additionalProperties: false
         properties:
           type: { const: retry_scheduled }
-          attempt: { type: integer, minimum: 0 }
-          delay_ms: { type: integer, minimum: 0 }
+          attempt: { $ref: '#/$defs/JsonSafeInteger' }
+          delay_ms: { $ref: '#/$defs/JsonSafeInteger' }
           retry_at: { type: string, format: date-time }
           error_message: { type: string }
       - type: object
@@ -364,7 +364,7 @@ $defs:
         properties:
           type: { const: text }
           text: { type: string }
-          wire_item_index: { type: integer, minimum: 0 }
+          wire_item_index: { $ref: '#/$defs/JsonSafeInteger' }
       - type: object
         required: [type, thinking, signature_field, wire_item_index]
         additionalProperties: false
@@ -372,21 +372,21 @@ $defs:
           type: { const: thinking }
           thinking: { type: string }
           signature_field: { type: string }
-          wire_item_index: { type: integer, minimum: 0 }
+          wire_item_index: { $ref: '#/$defs/JsonSafeInteger' }
       - type: object
         required: [type, tool_call, wire_item_index]
         additionalProperties: false
         properties:
           type: { const: tool_call }
           tool_call: { $ref: '#/$defs/ToolCall' }
-          wire_item_index: { type: integer, minimum: 0 }
+          wire_item_index: { $ref: '#/$defs/JsonSafeInteger' }
       - type: object
         required: [type, rejected, wire_item_index]
         additionalProperties: false
         properties:
           type: { const: rejected_tool_call }
           rejected: { $ref: '#/$defs/RejectedToolCall' }
-          wire_item_index: { type: integer, minimum: 0 }
+          wire_item_index: { $ref: '#/$defs/JsonSafeInteger' }
 
   ToolCall:
     type: object

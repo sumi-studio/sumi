@@ -36,6 +36,7 @@ for (const [name, fixture] of Object.entries(fixtures)) {
   }
 
   const original = normalize(wire);
+  assertAnyJSONRuntimeBounds(original, `fixture '${name}'`);
   const json = JSON.stringify(wire);
   const reparsed = normalize(JSON.parse(json));
 
@@ -86,4 +87,27 @@ function normalize(value) {
     out[key] = normalize(value[key]);
   }
   return out;
+}
+
+function assertAnyJSONRuntimeBounds(value, path) {
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || Math.abs(value) > Number.MAX_SAFE_INTEGER) {
+      throw new Error(
+        `${path} contains a number outside the AnyJSON safe range`,
+      );
+    }
+    return;
+  }
+  if (value === null || typeof value !== "object") {
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((child, index) => {
+      assertAnyJSONRuntimeBounds(child, `${path}[${index}]`);
+    });
+    return;
+  }
+  for (const [key, child] of Object.entries(value)) {
+    assertAnyJSONRuntimeBounds(child, `${path}.${key}`);
+  }
 }

@@ -249,6 +249,9 @@ func validateApprovalDecision(raw json.RawMessage) error {
 		if rule == nil {
 			return fmt.Errorf("approve_always rule must be an object")
 		}
+		if err := validateAnyJSON(v.Rule); err != nil {
+			return fmt.Errorf("approve_always rule: %w", err)
+		}
 	default:
 		return fmt.Errorf("unknown approval decision type: %q", d.Type)
 	}
