@@ -254,3 +254,21 @@ func TestAnyJSONRejectsUnsafeNestedIntegersButKeepsFractions(t *testing.T) {
 		}
 	}
 }
+
+func TestObjectValuedFieldsRejectUnsafeNestedIntegers(t *testing.T) {
+	toolStart := `{"seq":1,"conversation_id":"c","event":{"type":"tool_execution_start","tool_call_id":"call-1","tool_name":"read_file","args":{"overflow":9007199254740992}}}`
+	var toolStartEnvelope Envelope
+	if err := json.Unmarshal([]byte(toolStart), &toolStartEnvelope); err == nil {
+		t.Fatal("tool_execution_start args accepted an unsafe nested integer")
+	}
+
+	toolCallEnd := `{"type":"message_update","message_id":"00000000-0000-4000-8000-000000000003","event":{"type":"tool_call_end","content_index":0,"tool_call":{"id":"call-1","name":"read_file","arguments":{"overflow":9007199254740992}}}}`
+	if err := validateEvent([]byte(toolCallEnd)); err == nil {
+		t.Fatal("tool_call arguments accepted an unsafe nested integer")
+	}
+
+	approvalRule := `{"type":"approval_decision","request_id":"r-1","decision":{"type":"approve_always","rule":{"overflow":9007199254740992}}}`
+	if err := ValidateCommand(json.RawMessage(approvalRule)); err == nil {
+		t.Fatal("deferred approval rule accepted an unsafe nested integer")
+	}
+}

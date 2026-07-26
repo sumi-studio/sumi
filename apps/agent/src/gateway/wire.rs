@@ -1729,6 +1729,56 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn object_valued_wire_fields_reject_unsafe_nested_numbers() {
+        let tool_start = OutboundFrame::Event {
+            envelope: Envelope {
+                seq: Some(1),
+                conversation_id: "conv-1".to_owned(),
+                event: json!({
+                    "type": "tool_execution_start",
+                    "tool_call_id": "call-1",
+                    "tool_name": "read_file",
+                    "args": {"overflow": 9_007_199_254_740_992u64}
+                }),
+            },
+        };
+        assert!(matches!(
+            to_wire_frame(tool_start),
+            Err(WireError::AnyJSONNumberOutOfRange)
+        ));
+
+        let tool_call_end = OutboundFrame::Event {
+            envelope: Envelope {
+                seq: None,
+                conversation_id: "conv-1".to_owned(),
+                event: json!({
+                    "type": "message_update",
+                    "message_id": "00000000-0000-4000-8000-000000000003",
+                    "event": {
+                        "type": "tool_call_end",
+                        "content_index": 0,
+                        "tool_call": {
+                            "id": "call-1",
+                            "name": "read_file",
+                            "arguments": {"overflow": 9_007_199_254_740_992u64}
+                        }
+                    }
+                }),
+            },
+        };
+        assert!(matches!(
+            to_wire_frame(tool_call_end),
+            Err(WireError::AnyJSONNumberOutOfRange)
+        ));
+
+        let approval_rule = json!({"overflow": 9_007_199_254_740_992u64});
+        assert!(matches!(
+            validate_json_safe_numbers(&approval_rule),
+            Err(WireError::AnyJSONNumberOutOfRange)
+        ));
+    }
+
     fn uuid_command_id() -> CommandId {
         CommandId::parse("00000000-0000-4000-8000-000000000001").expect("canonical UUID")
     }

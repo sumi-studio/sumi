@@ -17,159 +17,224 @@ $comment: |
   context) so they can be updated once T17 lands without a compatibility break.
 
 $defs:
-  Envelope:
+  DurableEnvelope:
+    type: object
+    required: [conversation_id, event, seq]
+    additionalProperties: false
+    properties:
+      conversation_id: { type: string }
+      event: { $ref: '#/$defs/DurableAgentEvent' }
+      seq: { $ref: '#/$defs/JsonSafeInteger' }
+
+  VolatileEnvelope:
     type: object
     required: [conversation_id, event]
     additionalProperties: false
     properties:
-      conversation_id:
+      conversation_id: { type: string }
+      event: { $ref: '#/$defs/VolatileAgentEvent' }
+
+  Envelope:
+    oneOf:
+      - { $ref: '#/$defs/DurableEnvelope' }
+      - { $ref: '#/$defs/VolatileEnvelope' }
+
+  AgentStartEvent:
+    type: object
+    required: [type]
+    additionalProperties: false
+    properties:
+      type: { const: agent_start }
+
+  AgentEndEvent:
+    type: object
+    required: [type]
+    additionalProperties: false
+    properties:
+      type: { const: agent_end }
+
+  TurnStartEvent:
+    type: object
+    required: [type]
+    additionalProperties: false
+    properties:
+      type: { const: turn_start }
+
+  TurnEndEvent:
+    type: object
+    required: [type, message, tool_results]
+    additionalProperties: false
+    properties:
+      type: { const: turn_end }
+      message:
+        oneOf:
+          - type: 'null'
+          - { $ref: '#/$defs/PublicMessage' }
+      tool_results:
+        type: array
+        items: { $ref: '#/$defs/ToolResultPayload' }
+
+  MessageStartEvent:
+    type: object
+    required: [type, message_id, message]
+    additionalProperties: false
+    properties:
+      type: { const: message_start }
+      message_id:
         type: string
-      event:
-        $ref: '#/$defs/AgentEvent'
-      seq: { $ref: '#/$defs/JsonSafeInteger' }
-    allOf:
-      - if:
-          properties:
-            event:
-              properties:
-                type:
-                  enum: [message_update, tool_execution_update, error]
-              required: [type]
-        then:
-          properties:
-            seq: false
-        else:
-          required: [seq]
+        format: uuid
+        pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        description: durable messages.id; user messages are UUIDv5(command_id, namespace)
+      message: { $ref: '#/$defs/PublicMessage' }
+
+  MessageUpdateEvent:
+    type: object
+    required: [type, message_id, event]
+    additionalProperties: false
+    properties:
+      type: { const: message_update }
+      message_id:
+        type: string
+        format: uuid
+        pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+      event: { $ref: '#/$defs/PublicStreamEvent' }
+
+  MessageEndEvent:
+    type: object
+    required: [type, message_id, message]
+    additionalProperties: false
+    properties:
+      type: { const: message_end }
+      message_id:
+        type: string
+        format: uuid
+        pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        description: durable messages.id; user messages are UUIDv5(command_id, namespace)
+      message: { $ref: '#/$defs/PublicMessage' }
+
+  ToolExecutionStartEvent:
+    type: object
+    required: [type, tool_call_id, tool_name, args]
+    additionalProperties: false
+    properties:
+      type: { const: tool_execution_start }
+      tool_call_id: { type: string }
+      tool_name: { type: string }
+      args: { $ref: '#/$defs/AnyJSONObject' }
+
+  ToolExecutionUpdateEvent:
+    type: object
+    required: [type, tool_call_id, partial]
+    additionalProperties: false
+    properties:
+      type: { const: tool_execution_update }
+      tool_call_id: { type: string }
+      partial: { $ref: '#/$defs/AnyJSON' }
+
+  ToolExecutionEndEvent:
+    type: object
+    required: [type, tool_call_id, result, is_error]
+    additionalProperties: false
+    properties:
+      type: { const: tool_execution_end }
+      tool_call_id: { type: string }
+      result: { $ref: '#/$defs/AnyJSON' }
+      is_error: { type: boolean }
+
+  ApprovalRequestedEvent:
+    type: object
+    required: [type, request]
+    additionalProperties: false
+    properties:
+      type: { const: approval_requested }
+      request: { $ref: '#/$defs/ApprovalRequest' }
+
+  ApprovalResolvedEvent:
+    type: object
+    required: [type, request_id, resolution]
+    additionalProperties: false
+    properties:
+      type: { const: approval_resolved }
+      request_id: { type: string }
+      resolution: { $ref: '#/$defs/ApprovalResolution' }
+
+  SteeredEvent:
+    type: object
+    required: [type, mode]
+    additionalProperties: false
+    properties:
+      type: { const: steered }
+      mode: { $ref: '#/$defs/SteerMode' }
+
+  MemoryMaintenanceEvent:
+    type: object
+    required: [type, kind]
+    additionalProperties: false
+    properties:
+      type: { const: memory_maintenance }
+      kind:
+        type: string
+        description: unresolved T17 vocabulary; consumers must not assume a closed enum
+
+  RetryScheduledEvent:
+    type: object
+    required: [type, attempt, delay_ms, retry_at, error_message]
+    additionalProperties: false
+    properties:
+      type: { const: retry_scheduled }
+      attempt: { $ref: '#/$defs/JsonSafeInteger' }
+      delay_ms: { $ref: '#/$defs/JsonSafeInteger' }
+      retry_at: { type: string, format: date-time }
+      error_message: { type: string }
+
+  ErrorEvent:
+    type: object
+    required: [type, message]
+    additionalProperties: false
+    properties:
+      type: { const: error }
+      message: { type: string }
 
   AgentEvent:
     oneOf:
-      - type: object
-        required: [type]
-        additionalProperties: false
-        properties:
-          type: { const: agent_start }
-      - type: object
-        required: [type]
-        additionalProperties: false
-        properties:
-          type: { const: agent_end }
-      - type: object
-        required: [type]
-        additionalProperties: false
-        properties:
-          type: { const: turn_start }
-      - type: object
-        required: [type, message, tool_results]
-        additionalProperties: false
-        properties:
-          type: { const: turn_end }
-          message:
-            oneOf:
-              - type: 'null'
-              - { $ref: '#/$defs/PublicMessage' }
-          tool_results:
-            type: array
-            items: { $ref: '#/$defs/ToolResultPayload' }
-      - type: object
-        required: [type, message_id, message]
-        additionalProperties: false
-        properties:
-          type: { const: message_start }
-          message_id:
-            type: string
-            format: uuid
-            pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-            description: durable messages.id; user messages are UUIDv5(command_id, namespace)
-          message: { $ref: '#/$defs/PublicMessage' }
-      - type: object
-        required: [type, message_id, event]
-        additionalProperties: false
-        properties:
-          type: { const: message_update }
-          message_id:
-            type: string
-            format: uuid
-            pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-          event: { $ref: '#/$defs/PublicStreamEvent' }
-      - type: object
-        required: [type, message_id, message]
-        additionalProperties: false
-        properties:
-          type: { const: message_end }
-          message_id:
-            type: string
-            format: uuid
-            pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-            description: durable messages.id; user messages are UUIDv5(command_id, namespace)
-          message: { $ref: '#/$defs/PublicMessage' }
-      - type: object
-        required: [type, tool_call_id, tool_name, args]
-        additionalProperties: false
-        properties:
-          type: { const: tool_execution_start }
-          tool_call_id: { type: string }
-          tool_name: { type: string }
-          args:
-            type: object
-            description: any JSON object
-            additionalProperties: true
-      - type: object
-        required: [type, tool_call_id, partial]
-        additionalProperties: false
-        properties:
-          type: { const: tool_execution_update }
-          tool_call_id: { type: string }
-          partial: { $ref: '#/$defs/AnyJSON' }
-      - type: object
-        required: [type, tool_call_id, result, is_error]
-        additionalProperties: false
-        properties:
-          type: { const: tool_execution_end }
-          tool_call_id: { type: string }
-          result: { $ref: '#/$defs/AnyJSON' }
-          is_error: { type: boolean }
-      - type: object
-        required: [type, request]
-        additionalProperties: false
-        properties:
-          type: { const: approval_requested }
-          request: { $ref: '#/$defs/ApprovalRequest' }
-      - type: object
-        required: [type, request_id, resolution]
-        additionalProperties: false
-        properties:
-          type: { const: approval_resolved }
-          request_id: { type: string }
-          resolution: { $ref: '#/$defs/ApprovalResolution' }
-      - type: object
-        required: [type, mode]
-        additionalProperties: false
-        properties:
-          type: { const: steered }
-          mode: { $ref: '#/$defs/SteerMode' }
-      - type: object
-        required: [type, kind]
-        additionalProperties: false
-        properties:
-          type: { const: memory_maintenance }
-          kind:
-            type: string
-            description: unresolved T17 vocabulary; consumers must not assume a closed enum
-      - type: object
-        required: [type, attempt, delay_ms, retry_at, error_message]
-        additionalProperties: false
-        properties:
-          type: { const: retry_scheduled }
-          attempt: { $ref: '#/$defs/JsonSafeInteger' }
-          delay_ms: { $ref: '#/$defs/JsonSafeInteger' }
-          retry_at: { type: string, format: date-time }
-          error_message: { type: string }
-      - type: object
-        required: [type, message]
-        additionalProperties: false
-        properties:
-          type: { const: error }
-          message: { type: string }
+      - { $ref: '#/$defs/AgentStartEvent' }
+      - { $ref: '#/$defs/AgentEndEvent' }
+      - { $ref: '#/$defs/TurnStartEvent' }
+      - { $ref: '#/$defs/TurnEndEvent' }
+      - { $ref: '#/$defs/MessageStartEvent' }
+      - { $ref: '#/$defs/MessageUpdateEvent' }
+      - { $ref: '#/$defs/MessageEndEvent' }
+      - { $ref: '#/$defs/ToolExecutionStartEvent' }
+      - { $ref: '#/$defs/ToolExecutionUpdateEvent' }
+      - { $ref: '#/$defs/ToolExecutionEndEvent' }
+      - { $ref: '#/$defs/ApprovalRequestedEvent' }
+      - { $ref: '#/$defs/ApprovalResolvedEvent' }
+      - { $ref: '#/$defs/SteeredEvent' }
+      - { $ref: '#/$defs/MemoryMaintenanceEvent' }
+      - { $ref: '#/$defs/RetryScheduledEvent' }
+      - { $ref: '#/$defs/ErrorEvent' }
+
+  DurableAgentEvent:
+    oneOf:
+      - { $ref: '#/$defs/AgentStartEvent' }
+      - { $ref: '#/$defs/AgentEndEvent' }
+      - { $ref: '#/$defs/TurnStartEvent' }
+      - { $ref: '#/$defs/TurnEndEvent' }
+      - { $ref: '#/$defs/MessageStartEvent' }
+      - { $ref: '#/$defs/MessageEndEvent' }
+      - { $ref: '#/$defs/ToolExecutionStartEvent' }
+      - { $ref: '#/$defs/ToolExecutionEndEvent' }
+      - { $ref: '#/$defs/ApprovalRequestedEvent' }
+      - { $ref: '#/$defs/ApprovalResolvedEvent' }
+      - { $ref: '#/$defs/SteeredEvent' }
+      - { $ref: '#/$defs/MemoryMaintenanceEvent' }
+      - { $ref: '#/$defs/RetryScheduledEvent' }
+
+  VolatileAgentEvent:
+    oneOf:
+      - { $ref: '#/$defs/MessageUpdateEvent' }
+      - { $ref: '#/$defs/ToolExecutionUpdateEvent' }
+      - { $ref: '#/$defs/ErrorEvent' }
 
   PublicStreamEvent:
     oneOf:
@@ -398,6 +463,7 @@ $defs:
       arguments:
         type: object
         description: JSON object validated against the tool schema at execution time
+        additionalProperties: { $ref: '#/$defs/AnyJSON' }
 
   RejectedToolCall:
     type: object
@@ -441,6 +507,11 @@ $defs:
       - type: boolean
       - type: 'null'
     description: any JSON value
+
+  AnyJSONObject:
+    type: object
+    additionalProperties: { $ref: '#/$defs/AnyJSON' }
+    description: any JSON object whose property values are JSON-safe AnyJSON values
 
   ProviderOrigin:
     type: object
@@ -562,7 +633,7 @@ $defs:
   DeferredApprovalRule:
     type: object
     description: object boundary preserved for T22/T23; properties are intentionally open
-    additionalProperties: true
+    additionalProperties: { $ref: '#/$defs/AnyJSON' }
 
   SteerMode:
     type: string

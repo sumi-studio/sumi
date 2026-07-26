@@ -7,108 +7,22 @@
 
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
- * via the `definition` "Envelope".
+ * via the `definition` "DurableAgentEvent".
  */
-export type Envelope = {
-  [k: string]: unknown;
-} & {
-  conversation_id: string;
-  event: AgentEvent;
-  seq?: JsonSafeInteger;
-};
-/**
- * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
- * via the `definition` "AgentEvent".
- */
-export type AgentEvent =
-  | {
-      type: "agent_start";
-    }
-  | {
-      type: "agent_end";
-    }
-  | {
-      type: "turn_start";
-    }
-  | {
-      type: "turn_end";
-      message: null | PublicMessage;
-      tool_results: ToolResultPayload[];
-    }
-  | {
-      type: "message_start";
-      /**
-       * durable messages.id; user messages are UUIDv5(command_id, namespace)
-       */
-      message_id: string;
-      message: PublicMessage;
-    }
-  | {
-      type: "message_update";
-      message_id: string;
-      event: PublicStreamEvent;
-    }
-  | {
-      type: "message_end";
-      /**
-       * durable messages.id; user messages are UUIDv5(command_id, namespace)
-       */
-      message_id: string;
-      message: PublicMessage;
-    }
-  | {
-      type: "tool_execution_start";
-      tool_call_id: string;
-      tool_name: string;
-      /**
-       * any JSON object
-       */
-      args: {
-        [k: string]: unknown;
-      };
-    }
-  | {
-      type: "tool_execution_update";
-      tool_call_id: string;
-      partial: AnyJSON;
-    }
-  | {
-      type: "tool_execution_end";
-      tool_call_id: string;
-      result: AnyJSON;
-      is_error: boolean;
-    }
-  | {
-      type: "approval_requested";
-      request: ApprovalRequest;
-    }
-  | {
-      type: "approval_resolved";
-      request_id: string;
-      resolution: ApprovalResolution;
-    }
-  | {
-      type: "steered";
-      mode: SteerMode;
-    }
-  | {
-      type: "memory_maintenance";
-      /**
-       * unresolved T17 vocabulary; consumers must not assume a closed enum
-       */
-      kind: string;
-    }
-  | {
-      type: "retry_scheduled";
-      attempt: JsonSafeInteger;
-      delay_ms: JsonSafeInteger;
-      retry_at: string;
-      error_message: string;
-    }
-  | {
-      type: "error";
-      message: string;
-    };
+export type DurableAgentEvent =
+  | AgentStartEvent
+  | AgentEndEvent
+  | TurnStartEvent
+  | TurnEndEvent
+  | MessageStartEvent
+  | MessageEndEvent
+  | ToolExecutionStartEvent
+  | ToolExecutionEndEvent
+  | ApprovalRequestedEvent
+  | ApprovalResolvedEvent
+  | SteeredEvent
+  | MemoryMaintenanceEvent
+  | RetryScheduledEvent;
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "PublicMessage".
@@ -162,6 +76,21 @@ export type PublicAssistantContent =
  */
 export type JsonSafeInteger = number;
 /**
+ * any JSON value
+ *
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "AnyJSON".
+ */
+export type AnyJSON =
+  | {
+      [k: string]: AnyJSON;
+    }
+  | AnyJSON[]
+  | string
+  | number
+  | boolean
+  | null;
+/**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "ToolArgumentError".
  */
@@ -178,20 +107,67 @@ export type ApiProtocol = "open_ai_chat_completions" | "open_ai_responses" | "an
  */
 export type StopReason = "stop" | "length" | "tool_use" | "error" | "aborted";
 /**
- * any JSON value
- *
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
- * via the `definition` "AnyJSON".
+ * via the `definition` "ReviewProjection".
  */
-export type AnyJSON =
+export type ReviewProjection =
   | {
-      [k: string]: AnyJSON;
+      reviewable: AnyJSON;
     }
-  | AnyJSON[]
-  | string
-  | number
-  | boolean
-  | null;
+  | {
+      insufficient_evidence: {
+        reason: string;
+      };
+    };
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "AuditOutcome".
+ */
+export type AuditOutcome = "allow" | "deny";
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "RiskLevel".
+ */
+export type RiskLevel = "low" | "medium" | "high" | "critical";
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "UserAuthorization".
+ */
+export type UserAuthorization = "unknown" | "low" | "medium" | "high";
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "ApprovalResolution".
+ */
+export type ApprovalResolution =
+  | "cancelled"
+  | {
+      decision: ApprovalDecision;
+    };
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "ApprovalDecision".
+ */
+export type ApprovalDecision =
+  | {
+      type: "approve_once";
+    }
+  | {
+      type: "approve_always";
+      rule: DeferredApprovalRule;
+    }
+  | {
+      type: "deny";
+    };
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "SteerMode".
+ */
+export type SteerMode = "hard" | "soft";
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "VolatileAgentEvent".
+ */
+export type VolatileAgentEvent = MessageUpdateEvent | ToolExecutionUpdateEvent | ErrorEvent;
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "PublicStreamEvent".
@@ -272,61 +248,30 @@ export type PublicStreamEvent =
 export type ContentIndex = number;
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
- * via the `definition` "ReviewProjection".
+ * via the `definition` "Envelope".
  */
-export type ReviewProjection =
-  | {
-      reviewable: AnyJSON;
-    }
-  | {
-      insufficient_evidence: {
-        reason: string;
-      };
-    };
+export type Envelope = DurableEnvelope | VolatileEnvelope;
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
- * via the `definition` "AuditOutcome".
+ * via the `definition` "AgentEvent".
  */
-export type AuditOutcome = "allow" | "deny";
-/**
- * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
- * via the `definition` "RiskLevel".
- */
-export type RiskLevel = "low" | "medium" | "high" | "critical";
-/**
- * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
- * via the `definition` "UserAuthorization".
- */
-export type UserAuthorization = "unknown" | "low" | "medium" | "high";
-/**
- * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
- * via the `definition` "ApprovalResolution".
- */
-export type ApprovalResolution =
-  | "cancelled"
-  | {
-      decision: ApprovalDecision;
-    };
-/**
- * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
- * via the `definition` "ApprovalDecision".
- */
-export type ApprovalDecision =
-  | {
-      type: "approve_once";
-    }
-  | {
-      type: "approve_always";
-      rule: DeferredApprovalRule;
-    }
-  | {
-      type: "deny";
-    };
-/**
- * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
- * via the `definition` "SteerMode".
- */
-export type SteerMode = "hard" | "soft";
+export type AgentEvent =
+  | AgentStartEvent
+  | AgentEndEvent
+  | TurnStartEvent
+  | TurnEndEvent
+  | MessageStartEvent
+  | MessageUpdateEvent
+  | MessageEndEvent
+  | ToolExecutionStartEvent
+  | ToolExecutionUpdateEvent
+  | ToolExecutionEndEvent
+  | ApprovalRequestedEvent
+  | ApprovalResolvedEvent
+  | SteeredEvent
+  | MemoryMaintenanceEvent
+  | RetryScheduledEvent
+  | ErrorEvent;
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "Command".
@@ -376,6 +321,45 @@ export interface HttpsSumiDevContractsAgentEventsYaml {
 }
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "DurableEnvelope".
+ */
+export interface DurableEnvelope {
+  conversation_id: string;
+  event: DurableAgentEvent;
+  seq: JsonSafeInteger;
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "AgentStartEvent".
+ */
+export interface AgentStartEvent {
+  type: "agent_start";
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "AgentEndEvent".
+ */
+export interface AgentEndEvent {
+  type: "agent_end";
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "TurnStartEvent".
+ */
+export interface TurnStartEvent {
+  type: "turn_start";
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "TurnEndEvent".
+ */
+export interface TurnEndEvent {
+  type: "turn_end";
+  message: null | PublicMessage;
+  tool_results: ToolResultPayload[];
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "UserMessage".
  */
 export interface UserMessage {
@@ -411,7 +395,7 @@ export interface ToolCall {
    * JSON object validated against the tool schema at execution time
    */
   arguments: {
-    [k: string]: unknown;
+    [k: string]: AnyJSON;
   };
 }
 /**
@@ -473,6 +457,67 @@ export interface ToolResultPayload {
 }
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "MessageStartEvent".
+ */
+export interface MessageStartEvent {
+  type: "message_start";
+  /**
+   * durable messages.id; user messages are UUIDv5(command_id, namespace)
+   */
+  message_id: string;
+  message: PublicMessage;
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "MessageEndEvent".
+ */
+export interface MessageEndEvent {
+  type: "message_end";
+  /**
+   * durable messages.id; user messages are UUIDv5(command_id, namespace)
+   */
+  message_id: string;
+  message: PublicMessage;
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "ToolExecutionStartEvent".
+ */
+export interface ToolExecutionStartEvent {
+  type: "tool_execution_start";
+  tool_call_id: string;
+  tool_name: string;
+  args: AnyJSONObject;
+}
+/**
+ * any JSON object whose property values are JSON-safe AnyJSON values
+ *
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "AnyJSONObject".
+ */
+export interface AnyJSONObject {
+  [k: string]: AnyJSON;
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "ToolExecutionEndEvent".
+ */
+export interface ToolExecutionEndEvent {
+  type: "tool_execution_end";
+  tool_call_id: string;
+  result: AnyJSON;
+  is_error: boolean;
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "ApprovalRequestedEvent".
+ */
+export interface ApprovalRequestedEvent {
+  type: "approval_requested";
+  request: ApprovalRequest;
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "ApprovalRequest".
  */
 export interface ApprovalRequest {
@@ -495,13 +540,86 @@ export interface AuditDecision {
   rationale: string;
 }
 /**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "ApprovalResolvedEvent".
+ */
+export interface ApprovalResolvedEvent {
+  type: "approval_resolved";
+  request_id: string;
+  resolution: ApprovalResolution;
+}
+/**
  * object boundary preserved for T22/T23; properties are intentionally open
  *
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "DeferredApprovalRule".
  */
 export interface DeferredApprovalRule {
-  [k: string]: unknown;
+  [k: string]: AnyJSON;
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "SteeredEvent".
+ */
+export interface SteeredEvent {
+  type: "steered";
+  mode: SteerMode;
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "MemoryMaintenanceEvent".
+ */
+export interface MemoryMaintenanceEvent {
+  type: "memory_maintenance";
+  /**
+   * unresolved T17 vocabulary; consumers must not assume a closed enum
+   */
+  kind: string;
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "RetryScheduledEvent".
+ */
+export interface RetryScheduledEvent {
+  type: "retry_scheduled";
+  attempt: JsonSafeInteger;
+  delay_ms: JsonSafeInteger;
+  retry_at: string;
+  error_message: string;
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "VolatileEnvelope".
+ */
+export interface VolatileEnvelope {
+  conversation_id: string;
+  event: VolatileAgentEvent;
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "MessageUpdateEvent".
+ */
+export interface MessageUpdateEvent {
+  type: "message_update";
+  message_id: string;
+  event: PublicStreamEvent;
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "ToolExecutionUpdateEvent".
+ */
+export interface ToolExecutionUpdateEvent {
+  type: "tool_execution_update";
+  tool_call_id: string;
+  partial: AnyJSON;
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "ErrorEvent".
+ */
+export interface ErrorEvent {
+  type: "error";
+  message: string;
 }
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema

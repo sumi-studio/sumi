@@ -809,8 +809,11 @@ where
                     bail!("hydration generation mismatch");
                 }
                 ready = Some(hydration_ready);
+                let became_healthy = !pending.is_empty();
                 for cmd in pending.drain(..) {
                     next_expected = send_validated(cmd, next_expected, &mut command_tx).await?;
+                }
+                if became_healthy {
                     health.store(true, Ordering::SeqCst);
                 }
             }

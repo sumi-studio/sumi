@@ -5,6 +5,14 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+function interfaceHasIndexSignature(text, name) {
+  const match = text.match(
+    new RegExp(`export interface ${name} \\{([\\s\\S]*?)\\n\\}`, "m"),
+  );
+  if (!match) return true;
+  return /\[k: string\]: unknown/.test(match[1]);
+}
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, "..", "..", "..");
 const generatedDir = join(__dirname, "..", "src", "generated");
@@ -34,6 +42,23 @@ try {
       failed = true;
       console.error(
         `Generated ${name} differs from committed file. Run 'pnpm --filter @sumi/api-client generate' and commit the result.`,
+      );
+    }
+  }
+
+  const agentEvents = readFileSync(join(tmp, "agent-events.d.ts"), "utf8");
+  const envelopeMatch = agentEvents.match(/export type Envelope = ([^;]+);/s);
+  if (!envelopeMatch || envelopeMatch[1].includes("[k: string]")) {
+    failed = true;
+    console.error(
+      "Generated Envelope type is permissive (allows extra properties). The schema must keep durable and volatile envelopes strict.",
+    );
+  }
+  for (const name of ["DurableEnvelope", "VolatileEnvelope"]) {
+    if (interfaceHasIndexSignature(agentEvents, name)) {
+      failed = true;
+      console.error(
+        `Generated ${name} allows extra properties via an index signature. additionalProperties: false must be preserved.`,
       );
     }
   }
