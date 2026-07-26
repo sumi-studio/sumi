@@ -942,6 +942,11 @@ impl Store {
         table: &str,
         row_id: &str,
     ) -> Result<()> {
+        if redaction_version != self.redactor.version() {
+            bail!(
+                "{table} projection for {row_id} uses unsupported redaction version {redaction_version}"
+            );
+        }
         let key = self
             .load_hydration_key(key_cache, key_ref, DataKeyPurpose::MemorySummary)
             .await
@@ -949,17 +954,13 @@ impl Store {
         let aad = self
             .scope
             .row_aad(table, row_id, DataKeyPurpose::MemorySummary);
-        let plaintext = decrypt_content(&key, ciphertext, &aad)
+        let mut plaintext = decrypt_content(&key, ciphertext, &aad)
             .with_context(|| format!("failed to decrypt {table} projection for {row_id}"))?;
-        if redaction_version != self.redactor.version() {
-            bail!(
-                "{table} projection for {row_id} uses unsupported redaction version {redaction_version}"
-            );
-        }
         let derived = self
             .redactor
             .redact_serialized(&plaintext)
             .with_context(|| format!("failed to redact {table} plaintext for {row_id}"))?;
+        plaintext.zeroize();
         if derived != projection {
             bail!("{table} projection for {row_id} does not match re-derived redacted plaintext");
         }
