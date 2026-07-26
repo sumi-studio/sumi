@@ -53,7 +53,7 @@ process.exit(0);
 
 function assertAnyJSONNumberBounds(schema) {
   const definition = schema.match(
-    /^  AnyJSON:\n([\s\S]*?)(?=^  [A-Za-z][A-Za-z0-9_]*:|(?![\s\S]))/m,
+    /^ {2}AnyJSON:\n([\s\S]*?)(?=^ {2}[A-Za-z][A-Za-z0-9_]*:|(?![\s\S]))/m,
   )?.[0];
   if (definition === undefined) {
     throw new Error("agent-events schema is missing the AnyJSON definition");
@@ -61,9 +61,7 @@ function assertAnyJSONNumberBounds(schema) {
 
   const min = "minimum: -9007199254740991";
   const max = "maximum: 9007199254740991";
-  const integer = new RegExp(
-    `- type: integer\\n\\s+${min}\\n\\s+${max}`,
-  );
+  const integer = new RegExp(`- type: integer\\n\\s+${min}\\n\\s+${max}`);
   const nonIntegerNumber = new RegExp(
     `- type: number\\n\\s+not: \\{ type: integer \\}\\n\\s+${min}\\n\\s+${max}`,
   );
