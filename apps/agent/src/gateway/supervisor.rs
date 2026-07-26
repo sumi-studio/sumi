@@ -10,7 +10,7 @@
 use std::fmt;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
 
@@ -425,9 +425,11 @@ where
         let (connection_epoch, delivery_epoch) = self.next_epoch();
         let (reader, writer) = gateway.split();
 
-        // From this point the epoch is healthy; a later disconnect resets the
-        // reconnect-attempt budget instead of consuming it.
-        let healthy = true;
+        // An epoch only becomes healthy once a peer-originated command has
+        // been validated and delivered to the consumer. Outbound sends (even
+        // successful catch-up) do not prove the peer stayed alive after hello,
+        // so an immediate post-hello EOF must consume the reconnect budget.
+        let epoch_health = Arc::new(AtomicBool::new(false));
 
         let token = CancellationToken::new();
         let reader_token = token.child_token();
@@ -438,12 +440,14 @@ where
         *self.current_writer.lock().unwrap() = Some((delivery_epoch, writer_tx));
         self.current_epoch.send_replace(Some(delivery_epoch));
 
+        let reader_health = epoch_health.clone();
         let reader_handle = tokio::spawn(reader_task(
             reader,
             commands_tx,
             self.latch.clone(),
             api_hello.clone(),
             reader_token,
+            reader_health,
         ));
 
         let writer_handle = tokio::spawn(writer_task(
@@ -490,6 +494,8 @@ where
                 );
             }
         }
+
+        let healthy = epoch_health.load(Ordering::SeqCst);
 
         let outcome = match (first, second) {
             (Err(e), _) => Err(SupervisorError::Fatal(anyhow!("epoch task panicked: {e}"))),
@@ -781,6 +787,7 @@ async fn reader_task<R, L>(
     latch: L,
     api_hello: ApiHello,
     token: CancellationToken,
+    health: Arc<AtomicBool>,
 ) -> Result<()>
 where
     R: GatewayReader,
@@ -804,12 +811,14 @@ where
                 ready = Some(hydration_ready);
                 for cmd in pending.drain(..) {
                     next_expected = send_validated(cmd, next_expected, &mut command_tx).await?;
+                    health.store(true, Ordering::SeqCst);
                 }
             }
             cmd = reader.next_command() => {
                 let cmd = cmd?;
                 if let Some(_ready) = &ready {
                     next_expected = send_validated(cmd, next_expected, &mut command_tx).await?;
+                    health.store(true, Ordering::SeqCst);
                 } else {
                     if pending.len() >= MAX_PENDING_BEFORE_READY {
                         bail!("hydration hold buffer full");
@@ -895,7 +904,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use anyhow::{Result, anyhow};
-    use tokio::sync::watch;
+    use tokio::sync::{oneshot, watch};
 
     use super::*;
     use crate::gateway::stdio::SingleConnectionConnector;
@@ -952,6 +961,54 @@ mod tests {
                         }
                     }
                     None => break,
+                }
+            }
+            Ok(out)
+        }
+
+        async fn command_cursors(&self) -> Result<CommandCursors> {
+            Ok(self.command_cursor)
+        }
+    }
+
+    /// A durable source that replays the same events for every epoch. This is
+    /// useful for tests where multiple reconnects must all observe the same
+    /// catch-up backlog without draining the source.
+    #[derive(Clone)]
+    struct ReplayDurableSource {
+        events: Arc<Vec<OutboundFrame>>,
+        command_cursor: CommandCursors,
+    }
+
+    impl ReplayDurableSource {
+        fn new(events: Vec<OutboundFrame>, command_cursor: CommandCursors) -> Self {
+            Self {
+                events: Arc::new(events),
+                command_cursor,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DurableSource for ReplayDurableSource {
+        async fn event_cursor(&self) -> Result<EventCursors> {
+            let last_sent = self
+                .events
+                .iter()
+                .filter_map(|f| outbound_frame_event_seq(f).ok())
+                .max()
+                .unwrap_or(0);
+            Ok(EventCursors { last_sent })
+        }
+
+        async fn events_after(&self, after_seq: u64, limit: usize) -> Result<Vec<OutboundFrame>> {
+            let mut out = Vec::with_capacity(limit);
+            for frame in self.events.iter() {
+                if out.len() >= limit {
+                    break;
+                }
+                if outbound_frame_event_seq(frame)? > after_seq {
+                    out.push(frame.clone());
                 }
             }
             Ok(out)
@@ -1033,16 +1090,20 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
     struct MockGatewayReader {
         commands: VecDeque<Result<InboundCommand>>,
         drop_count: Option<Arc<AtomicU64>>,
+        wait_for_send: Option<oneshot::Receiver<()>>,
     }
 
+    #[derive(Default)]
     struct MockGatewayWriter {
         fail_after: Option<usize>,
         sent: Arc<std::sync::Mutex<Vec<OutboundFrame>>>,
         delay: Option<Duration>,
         drop_count: Option<Arc<AtomicU64>>,
+        signal_after_send: Option<oneshot::Sender<()>>,
     }
 
     #[async_trait]
@@ -1052,6 +1113,9 @@ mod tests {
                 .drop_count
                 .as_ref()
                 .map(|c| CountOnDrop::new(c.clone()));
+            if let Some(rx) = self.wait_for_send.take() {
+                let _ = rx.await;
+            }
             match self.commands.pop_front() {
                 Some(Ok(cmd)) => Ok(cmd),
                 Some(Err(e)) => Err(e),
@@ -1077,6 +1141,9 @@ mod tests {
                 bail!("writer failure");
             }
             sent.push(frame);
+            if let Some(tx) = self.signal_after_send.take() {
+                let _ = tx.send(());
+            }
             Ok(())
         }
     }
@@ -1095,13 +1162,13 @@ mod tests {
             Self {
                 reader: MockGatewayReader {
                     commands,
-                    drop_count: None,
+                    ..Default::default()
                 },
                 writer: MockGatewayWriter {
                     fail_after: None,
                     sent: Arc::new(std::sync::Mutex::new(Vec::new())),
                     delay: None,
-                    drop_count: None,
+                    ..Default::default()
                 },
                 sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
                 hello_generation: None,
@@ -1334,13 +1401,13 @@ mod tests {
                     1,
                     "00000000-0000-4000-8000-000000000001",
                 ))]),
-                drop_count: None,
+                ..Default::default()
             },
             writer: MockGatewayWriter {
                 fail_after: Some(0),
                 sent: sent.clone(),
                 delay: None,
-                drop_count: None,
+                ..Default::default()
             },
             sent_hellos: sent_hellos.clone(),
             hello_generation: None,
@@ -1350,13 +1417,13 @@ mod tests {
         let gateway2 = MockGateway {
             reader: MockGatewayReader {
                 commands: VecDeque::new(),
-                drop_count: None,
+                ..Default::default()
             },
             writer: MockGatewayWriter {
                 fail_after: None,
                 sent: sent.clone(),
                 delay: None,
-                drop_count: None,
+                ..Default::default()
             },
             sent_hellos: sent_hellos.clone(),
             hello_generation: None,
@@ -1420,13 +1487,13 @@ mod tests {
         let gateway = MockGateway {
             reader: MockGatewayReader {
                 commands: VecDeque::new(),
-                drop_count: None,
+                ..Default::default()
             },
             writer: MockGatewayWriter {
                 fail_after: None,
                 sent: sent.clone(),
                 delay: None,
-                drop_count: None,
+                ..Default::default()
             },
             sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
             hello_generation: None,
@@ -1468,13 +1535,13 @@ mod tests {
         let gateway1 = MockGateway {
             reader: MockGatewayReader {
                 commands: VecDeque::new(),
-                drop_count: None,
+                ..Default::default()
             },
             writer: MockGatewayWriter {
                 fail_after: Some(0),
                 sent: sent.clone(),
                 delay: None,
-                drop_count: None,
+                ..Default::default()
             },
             sent_hellos: sent_hellos.clone(),
             hello_generation: None,
@@ -1484,13 +1551,13 @@ mod tests {
         let gateway2 = MockGateway {
             reader: MockGatewayReader {
                 commands: VecDeque::new(),
-                drop_count: None,
+                ..Default::default()
             },
             writer: MockGatewayWriter {
                 fail_after: None,
                 sent: sent.clone(),
                 delay: None,
-                drop_count: None,
+                ..Default::default()
             },
             sent_hellos: sent_hellos.clone(),
             hello_generation: None,
@@ -1560,13 +1627,13 @@ mod tests {
                     1,
                     "00000000-0000-4000-8000-000000000001",
                 ))]),
-                drop_count: None,
+                ..Default::default()
             },
             writer: MockGatewayWriter {
                 fail_after: None,
                 sent: sent.clone(),
                 delay: None,
-                drop_count: None,
+                ..Default::default()
             },
             sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
             hello_generation: None,
@@ -1619,13 +1686,13 @@ mod tests {
                     "00000000-0000-4000-8000-000000000001",
                     1_200_000,
                 ))]),
-                drop_count: None,
+                ..Default::default()
             },
             writer: MockGatewayWriter {
                 fail_after: None,
                 sent: sent.clone(),
                 delay: None,
-                drop_count: None,
+                ..Default::default()
             },
             sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
             hello_generation: None,
@@ -1906,10 +1973,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn long_stable_epoch_allows_fresh_reconnect_burst_after_disconnect() {
+    async fn repeated_healthy_epochs_reset_reconnect_budget() {
         let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
 
-        // First gateway runs long enough to prove a stable epoch, then EOFs.
+        // Each gateway processes at least one command, so the epoch is healthy.
+        // The first successful exchange is the health signal; the subsequent
+        // command count is irrelevant to the reconnect budget.
         let first = MockGateway::new(VecDeque::from([
             Ok(valid_command(1, "00000000-0000-4000-8000-000000000001")),
             Ok(valid_command(2, "00000000-0000-4000-8000-000000000002")),
@@ -1963,6 +2032,122 @@ mod tests {
         // 4. auth rejected (attempt 1, allowed)
         // 5. auth rejected (attempt 2, stops)
         assert_eq!(counter.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn immediate_post_hello_eof_exhausts_reconnect_budget() {
+        let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // Both gateways EOF immediately after hello validation, before any
+        // successful exchange. Each EOF must consume a reconnect attempt.
+        let connector = MockConnector::new(
+            sent_hellos.clone(),
+            VecDeque::from([
+                Ok(MockGateway::new(VecDeque::from([Err(anyhow!(
+                    "reader EOF"
+                ))]))),
+                Ok(MockGateway::new(VecDeque::from([Err(anyhow!(
+                    "reader EOF"
+                ))]))),
+            ]),
+        );
+        let credentials = CountingCredentialProvider::new("token");
+        let counter = credentials.counter.clone();
+        let source = MockDurableSource::new(CommandCursors::default());
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: 7,
+            receipt_identity: "receipt-1".to_owned(),
+        });
+
+        let mut config = make_config();
+        config.max_reconnect_attempts = Some(1);
+
+        let supervisor = ConnectionSupervisor::new(connector, credentials, source, latch, config);
+        let handle = supervisor.start();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle.join()).await;
+        assert!(
+            result.is_ok(),
+            "supervisor should stop after exhausting bounded reconnect attempts"
+        );
+        assert!(result.unwrap().is_err());
+
+        // First EOF: attempt 1 (allowed). Second EOF: attempt 2 > max 1 (stops).
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        assert_eq!(sent_hellos.lock().unwrap().len(), 2);
+    }
+
+    // Returns a MockGateway whose reader EOFs only after the writer has
+    // successfully sent at least one frame. Used to prove that outbound sends
+    // alone do not make an epoch healthy.
+    fn eof_after_writer_sends(sent: Arc<std::sync::Mutex<Vec<OutboundFrame>>>) -> MockGateway {
+        let (tx, rx) = oneshot::channel();
+        MockGateway {
+            reader: MockGatewayReader {
+                commands: VecDeque::from([Err(anyhow!("reader EOF"))]),
+                wait_for_send: Some(rx),
+                ..Default::default()
+            },
+            writer: MockGatewayWriter {
+                sent,
+                signal_after_send: Some(tx),
+                ..Default::default()
+            },
+            sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
+            hello_generation: None,
+            last_received_event_seq: 0,
+            hello_delay: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn catch_up_send_then_post_hello_eof_exhausts_reconnect_budget() {
+        let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // Every epoch has durable catch-up data and a writer that succeeds.
+        // The reader EOFs as soon as the writer has sent a frame, without any
+        // peer-originated command. The budget must still be consumed.
+        let source = ReplayDurableSource::new(
+            vec![event_frame(1), event_frame(2)],
+            CommandCursors::default(),
+        );
+
+        let connector = MockConnector::new(
+            sent_hellos.clone(),
+            VecDeque::from([
+                Ok(eof_after_writer_sends(sent.clone())),
+                Ok(eof_after_writer_sends(sent.clone())),
+            ]),
+        );
+        let credentials = CountingCredentialProvider::new("token");
+        let counter = credentials.counter.clone();
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: 7,
+            receipt_identity: "receipt-1".to_owned(),
+        });
+
+        let mut config = make_config();
+        config.max_reconnect_attempts = Some(1);
+
+        let supervisor = ConnectionSupervisor::new(connector, credentials, source, latch, config);
+        let handle = supervisor.start();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle.join()).await;
+        assert!(
+            result.is_ok(),
+            "supervisor should stop after exhausting bounded reconnect attempts"
+        );
+        assert!(result.unwrap().is_err());
+
+        assert!(
+            !sent.lock().unwrap().is_empty(),
+            "writer must have successfully sent at least one catch-up frame"
+        );
+        // First epoch: writer sends, then EOF (attempt 1, allowed).
+        // Second epoch: writer sends, then EOF (attempt 2 > max 1, stops).
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        assert_eq!(sent_hellos.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -2151,12 +2336,14 @@ mod tests {
             reader: MockGatewayReader {
                 commands: VecDeque::new(),
                 drop_count: Some(reader_drop.clone()),
+                ..Default::default()
             },
             writer: MockGatewayWriter {
                 fail_after: None,
                 sent: Arc::new(std::sync::Mutex::new(Vec::new())),
                 delay: Some(Duration::from_secs(60)),
                 drop_count: Some(writer_drop.clone()),
+                ..Default::default()
             },
             sent_hellos: sent_hellos.clone(),
             hello_generation: None,
