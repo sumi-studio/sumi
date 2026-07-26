@@ -268,7 +268,22 @@ pub(crate) async fn read_command<R>(
 where
     R: AsyncBufRead + Unpin,
 {
-    let mut frame = read_frame(input, digest_factory.start()).await?;
+    let frame = read_frame(input, digest_factory.start(), true).await?;
+    decode_command_frame(frame)
+}
+
+pub(crate) async fn read_command_message<R>(
+    input: &mut R,
+    digest_factory: &dyn CommandDigestFactory,
+) -> Result<InboundCommand>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let frame = read_frame(input, digest_factory.start(), false).await?;
+    decode_command_frame(frame)
+}
+
+fn decode_command_frame(mut frame: ReadCommandFrame) -> Result<InboundCommand> {
     let raw = parse_outer_identity(&frame.identity).map_err(InvalidCommand)?;
     if matches!(raw.command, CommandFieldPresence::Missing) || !frame.command_found {
         return Ok(InboundCommand::Invalid {
@@ -827,6 +842,7 @@ impl EnvelopeScanner {
 async fn read_frame<R>(
     input: &mut R,
     digest: Box<dyn IncrementalCommandDigest>,
+    stop_at_newline: bool,
 ) -> Result<ReadCommandFrame>
 where
     R: AsyncBufRead + Unpin,
@@ -848,7 +864,11 @@ where
         }
         saw_input = true;
 
-        let newline = available.iter().position(|byte| *byte == b'\n');
+        let newline = if stop_at_newline {
+            available.iter().position(|byte| *byte == b'\n')
+        } else {
+            None
+        };
         let consumed = newline.map_or(available.len(), |position| position + 1);
         let content = &available[..newline.unwrap_or(available.len())];
 
@@ -877,8 +897,11 @@ where
                 readable_identity_at_transport_limit = Some(scanner.has_readable_outer_identity());
             }
 
-            let minimum_content_bytes =
-                line_bytes.saturating_sub(usize::from(previous_byte == Some(b'\r')));
+            let minimum_content_bytes = if stop_at_newline {
+                line_bytes.saturating_sub(usize::from(previous_byte == Some(b'\r')))
+            } else {
+                line_bytes
+            };
             if minimum_content_bytes > MAX_FRAME_BYTES
                 && readable_identity_at_transport_limit != Some(true)
             {
@@ -898,7 +921,7 @@ where
         }
         input.consume(consumed);
 
-        if newline.is_some() {
+        if stop_at_newline && newline.is_some() {
             ended_by_newline = true;
             break;
         }
@@ -1475,7 +1498,7 @@ mod tests {
         bytes.extend_from_slice(b"\r\n");
         let mut input = BufReader::with_capacity(MAX_FRAME_BYTES + 1, bytes.as_slice());
 
-        let frame = read_frame(&mut input, TestDigestFactory.start())
+        let frame = read_frame(&mut input, TestDigestFactory.start(), true)
             .await
             .expect("maximum frame with CRLF is valid");
         assert!(frame.command_bytes > MAX_USER_COMMAND_BYTES);

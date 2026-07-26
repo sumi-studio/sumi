@@ -282,7 +282,7 @@ async fn decode_command_bytes(
     factory: &dyn crate::gateway::CommandDigestFactory,
 ) -> Result<InboundCommand> {
     let mut input = BufReader::new(bytes.as_slice());
-    let command = crate::gateway::stdio::read_command(&mut input, factory).await?;
+    let command = crate::gateway::stdio::read_command_message(&mut input, factory).await?;
     let remaining = input
         .fill_buf()
         .await
@@ -305,9 +305,10 @@ mod tests {
     use tokio_tungstenite::{accept_async, accept_hdr_async};
 
     use super::super::{
-        AgentHello, ApiHello, CommandDigestFactory, Envelope, Gateway, GatewayConnector,
-        GatewayCredential, GatewayReader, GatewayWriter, HelloError, InboundCommand,
-        IncrementalCommandDigest, MAX_FRAME_BYTES, OutboundFrame, OversizedFrameError,
+        AgentHello, ApiHello, Command, CommandDigestFactory, CommandEnvelope, Envelope, Gateway,
+        GatewayConnector, GatewayCredential, GatewayReader, GatewayWriter, HelloError,
+        InboundCommand, IncrementalCommandDigest, MAX_FRAME_BYTES, OutboundFrame,
+        OversizedFrameError,
     };
     use super::{WebSocketConnector, decode_command_bytes};
     use crate::gateway::wire::to_wire_frame;
@@ -411,9 +412,39 @@ mod tests {
         let bytes = b"{\"seq\":1,\"command_id\":\"00000000-0000-4000-8000-000000000001\",\"command\":{\"type\":\"abort\"}}\n{\"seq\":2,\"command_id\":\"00000000-0000-4000-8000-000000000002\",\"command\":{\"type\":\"abort\"}}\n".to_vec();
         let result = decode_command_bytes(bytes, &TestDigestFactory).await;
         assert!(
-            result.is_err() && format!("{:?}", result).contains("trailing bytes"),
-            "expected trailing bytes rejection, got {result:?}"
+            result.is_err() && format!("{:?}", result).contains("trailing characters"),
+            "expected trailing characters rejection, got {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn decode_command_bytes_accepts_pretty_printed_json_with_newlines() {
+        let value = serde_json::json!({
+            "seq": 42,
+            "command_id": "00000000-0000-4000-8000-000000000042",
+            "command": {
+                "type": "abort"
+            }
+        });
+        let text = serde_json::to_string_pretty(&value).unwrap();
+        assert!(
+            text.contains('\n'),
+            "fixture must contain literal newlines between tokens"
+        );
+
+        let result = decode_command_bytes(text.into_bytes(), &TestDigestFactory).await;
+        assert!(
+            result.is_ok(),
+            "pretty-printed JSON should be one complete websocket command: {result:?}"
+        );
+        assert!(matches!(
+            result.unwrap(),
+            InboundCommand::Valid(CommandEnvelope {
+                seq: 42,
+                command: Command::Abort {},
+                ..
+            })
+        ));
     }
 
     // M5 gate 10: real local mock WebSocket server integration tests.
