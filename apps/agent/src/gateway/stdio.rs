@@ -886,6 +886,10 @@ where
                 remaining.len()
             };
             let (segment, rest) = remaining.split_at(take);
+            // `take == 0` would spin forever. It cannot happen because the
+            // transport probe caps `line_bytes` at exactly MAX_FRAME_BYTES + 1,
+            // after which `readable_identity_at_transport_limit` is always `Some`.
+            debug_assert!(take > 0, "read_frame must always make progress");
             scanner.feed(segment)?;
             line_bytes = line_bytes.saturating_add(segment.len());
             previous_byte = segment.last().copied().or(previous_byte);
@@ -943,6 +947,46 @@ where
         .into());
     }
     scanner.finish()
+}
+
+/// A `GatewayConnector` that yields a single stdio connection and refuses
+/// reconnects. This aligns the local injection harness to the same supervisor
+/// interface without changing the `EOF == process exit` semantics of stdio.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct SingleConnectionConnector<G> {
+    gateway: Option<G>,
+}
+
+impl<G: Gateway> SingleConnectionConnector<G> {
+    pub fn new(gateway: G) -> Self {
+        Self {
+            gateway: Some(gateway),
+        }
+    }
+}
+
+#[async_trait]
+impl<G: Gateway> GatewayConnector for SingleConnectionConnector<G> {
+    type Connection = G;
+
+    async fn connect(
+        &mut self,
+        _credential: GatewayCredential,
+    ) -> Result<Self::Connection, ConnectorError> {
+        self.gateway.take().ok_or_else(|| {
+            ConnectorError::Fatal(anyhow!("single stdio connection already consumed"))
+        })
+    }
+}
+
+/// Convenience constructor for the production stdin/stdout single-connection
+/// harness.
+#[allow(dead_code)]
+pub fn stdio_single_connector(
+    digest_factory: Arc<dyn CommandDigestFactory>,
+) -> SingleConnectionConnector<StdioGateway> {
+    SingleConnectionConnector::new(StdioGateway::new(digest_factory))
 }
 
 #[cfg(test)]
@@ -1673,7 +1717,11 @@ mod tests {
 
     #[tokio::test]
     async fn single_connection_connector_returns_fatal_after_consumed() {
-        let gateway = StdioGateway::new(Arc::new(TestDigestFactory));
+        let gateway = InjectedStdioGateway::new(
+            tokio::io::empty(),
+            tokio::io::sink(),
+            Arc::new(TestDigestFactory),
+        );
         let mut connector = SingleConnectionConnector::new(gateway);
 
         let credential = GatewayCredential::new("test-token");
@@ -1683,44 +1731,4 @@ mod tests {
         let err = result.err().expect("second connect must fail");
         assert!(matches!(err, ConnectorError::Fatal(_)));
     }
-}
-
-/// A `GatewayConnector` that yields a single stdio connection and refuses
-/// reconnects. This aligns the local injection harness to the same supervisor
-/// interface without changing the `EOF == process exit` semantics of stdio.
-#[allow(dead_code)]
-#[derive(Debug)]
-pub struct SingleConnectionConnector<G> {
-    gateway: Option<G>,
-}
-
-impl<G: Gateway> SingleConnectionConnector<G> {
-    pub fn new(gateway: G) -> Self {
-        Self {
-            gateway: Some(gateway),
-        }
-    }
-}
-
-#[async_trait]
-impl<G: Gateway> GatewayConnector for SingleConnectionConnector<G> {
-    type Connection = G;
-
-    async fn connect(
-        &mut self,
-        _credential: GatewayCredential,
-    ) -> Result<Self::Connection, ConnectorError> {
-        self.gateway.take().ok_or_else(|| {
-            ConnectorError::Fatal(anyhow!("single stdio connection already consumed"))
-        })
-    }
-}
-
-/// Convenience constructor for the production stdin/stdout single-connection
-/// harness.
-#[allow(dead_code)]
-pub fn stdio_single_connector(
-    digest_factory: Arc<dyn CommandDigestFactory>,
-) -> SingleConnectionConnector<StdioGateway> {
-    SingleConnectionConnector::new(StdioGateway::new(digest_factory))
 }

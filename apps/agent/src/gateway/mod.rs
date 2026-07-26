@@ -333,10 +333,11 @@ pub struct GatewayClosed;
 /// non-recoverable claim mismatches. `Reconnect` covers transient failures.
 #[derive(Debug, Error)]
 pub enum HelloError {
-    #[allow(dead_code)]
+    // `AuthRejected` is only constructed by test gateways today; keep it
+    // available for the T26 authentication-rejection wiring.
+    #[allow(dead_code, reason = "T26 gateway authentication path")]
     #[error("authentication rejected")]
     AuthRejected,
-    #[allow(dead_code)]
     #[error("fatal: {0}")]
     Fatal(#[source] anyhow::Error),
     #[error("hello failed: {0}")]

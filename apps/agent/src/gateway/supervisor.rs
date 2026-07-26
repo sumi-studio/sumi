@@ -514,7 +514,7 @@ where
                     tokio::select! {
                         biased;
                         _ = self.cancel.cancelled() => return Ok(()),
-                        result = Self::backoff_sleep(&self.config, auth_attempt) => result?,
+                        _ = Self::backoff_sleep(&self.config, auth_attempt) => {},
                     }
                 }
                 Err(SupervisorError::Reconnect { reason }) => {
@@ -527,7 +527,7 @@ where
                     tokio::select! {
                         biased;
                         _ = self.cancel.cancelled() => return Ok(()),
-                        result = Self::backoff_sleep(&self.config, reconnect_attempt) => result?,
+                        _ = Self::backoff_sleep(&self.config, reconnect_attempt) => {},
                     }
                 }
                 Err(SupervisorError::EstablishedReconnect { reason, healthy }) => {
@@ -548,7 +548,7 @@ where
                     tokio::select! {
                         biased;
                         _ = self.cancel.cancelled() => return Ok(()),
-                        result = Self::backoff_sleep(&self.config, reconnect_attempt) => result?,
+                        _ = Self::backoff_sleep(&self.config, reconnect_attempt) => {},
                     }
                 }
             }
@@ -771,7 +771,7 @@ where
         ((delay_ms.saturating_add(1)) / 2, delay_ms)
     }
 
-    async fn backoff_sleep(config: &SupervisorConfig, attempt: u32) -> Result<()> {
+    async fn backoff_sleep(config: &SupervisorConfig, attempt: u32) {
         let (lower_ms, upper_ms) = Self::backoff_window_ms(config, attempt);
         let jitter = if upper_ms == 0 {
             0
@@ -779,7 +779,6 @@ where
             rand::rng().random_range(lower_ms..=upper_ms)
         };
         time::sleep(Duration::from_millis(jitter)).await;
-        Ok(())
     }
 }
 
@@ -998,13 +997,10 @@ fn prune_pending_events(
     pending_events: &mut BTreeMap<u64, (u64, OutboundFrame)>,
     last_received: u64,
 ) {
-    let stale: Vec<u64> = pending_events
-        .keys()
-        .filter(|&&s| s <= last_received)
-        .cloned()
-        .collect();
-    for seq in stale {
-        pending_events.remove(&seq);
+    if let Some(next) = last_received.checked_add(1) {
+        *pending_events = pending_events.split_off(&next);
+    } else {
+        pending_events.clear();
     }
 }
 
@@ -1991,7 +1987,7 @@ mod tests {
                     bail!("writer failure");
                 }
                 sent.push(frame);
-                let blocked = self.block_after.map_or(false, |n| sent.len() == n);
+                let blocked = self.block_after.is_some_and(|n| sent.len() == n);
                 (blocked, self.block_notify.clone(), self.release.clone())
             };
             if blocked {
@@ -3133,8 +3129,7 @@ mod tests {
             MockDurableSource,
             StaticHydrationLatch,
         >::backoff_sleep(&config, 1)
-        .await
-        .expect("backoff sleep should succeed");
+        .await;
         let elapsed = start.elapsed();
 
         assert!(

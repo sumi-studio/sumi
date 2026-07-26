@@ -110,10 +110,10 @@ impl<'de> Deserialize<'de> for ProcessGeneration {
             type Value = ProcessGeneration;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str(concat!(
-                    "a process generation in 0..=",
-                    stringify!(MAX_PROCESS_GENERATION)
-                ))
+                write!(
+                    formatter,
+                    "a process generation in 0..={MAX_PROCESS_GENERATION}"
+                )
             }
 
             fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {

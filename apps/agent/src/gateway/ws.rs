@@ -6,7 +6,9 @@
 //! `WebSocketGateway` performs the agent/API hello exchange and then splits into
 //! a `WsGatewayReader` / `WsGatewayWriter` pair for the epoch.
 
-#![allow(dead_code)]
+// TODO(T26): Remove this once `WebSocketConnector`/`WsGatewayReader`/`WsGatewayWriter`
+// are wired into the process bootstrap. The whole module is dead-code until then.
+#![allow(dead_code, reason = "T26 production wiring not yet connected")]
 
 use std::sync::Arc;
 
@@ -122,6 +124,10 @@ impl GatewayConnector for WebSocketConnector {
             ..WebSocketConfig::default()
         };
 
+        // The TLS client uses the bundled public Web PKI roots selected by the
+        // `rustls-tls-webpki-roots` Cargo feature. Enterprise or native OS trust
+        // roots require an explicit future configuration/contract and must not
+        // be silently blended here.
         match connect_async_with_config(request, Some(ws_config), true).await {
             Ok((ws, _)) => Ok(WebSocketGateway::new(ws, self.digest_factory.clone())),
             Err(tungstenite::Error::Http(response))
@@ -196,6 +202,10 @@ impl Gateway for WebSocketGateway {
             match msg {
                 Message::Text(s) => break s.into_bytes(),
                 Message::Binary(b) => break b,
+                // No API contract currently assigns specific close codes such as
+                // 1008 or 4xxx to authentication rejection. Until that contract
+                // exists, every pre-hello Close is treated as a transient,
+                // reconnectable condition, including status-less closes.
                 Message::Close(close) => {
                     return Err(HelloError::Reconnect(anyhow!(
                         "websocket closed before hello response: {close:?}"
@@ -283,6 +293,10 @@ async fn decode_command_bytes(
 ) -> Result<InboundCommand> {
     let mut input = BufReader::new(bytes.as_slice());
     let command = crate::gateway::stdio::read_command_message(&mut input, factory).await?;
+    // `read_command_message` currently drains the whole message to EOF, so this
+    // is a defensive guard against a future change in the frame-reader contract.
+    // Multiple frames in one WebSocket message are rejected by `EnvelopeScanner`
+    // before this point.
     let remaining = input
         .fill_buf()
         .await
@@ -330,13 +344,7 @@ mod tests {
         }
 
         fn finish(self: Box<Self>) -> crate::gateway::KeyedCommandDigest {
-            let hash = self.0.finalize();
-            let mut hmac = [0u8; 32];
-            hmac.copy_from_slice(&hash[..32.min(hash.len())]);
-            crate::gateway::KeyedCommandDigest {
-                key_ref: "test".to_owned(),
-                hmac,
-            }
+            crate::gateway::KeyedCommandDigest::new("test", self.0.finalize().into())
         }
     }
 
@@ -861,6 +869,45 @@ mod tests {
         );
 
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn authenticate_hello_reconnects_on_close_codes_before_hello() {
+        use tokio_tungstenite::tungstenite::protocol::frame::{CloseFrame, coding::CloseCode};
+
+        for code in [1008u16, 4401, 4403] {
+            let listener = TcpListener::bind(listener_addr()).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = accept_async(stream).await.unwrap();
+                read_agent_hello(&mut ws).await;
+                let close = CloseFrame {
+                    code: CloseCode::from(code),
+                    reason: "policy".into(),
+                };
+                ws.send(tokio_tungstenite::tungstenite::Message::Close(Some(close)))
+                    .await
+                    .unwrap();
+            });
+
+            let mut connector = WebSocketConnector::new_insecure(
+                format!("ws://{addr}"),
+                Arc::new(TestDigestFactory),
+            );
+            let mut gateway = connector
+                .connect(GatewayCredential::new("valid"))
+                .await
+                .unwrap();
+            let result = gateway.authenticate_hello(test_agent_hello()).await;
+            assert!(
+                matches!(result, Err(HelloError::Reconnect(_))),
+                "pre-hello Close code {code} must remain reconnectable until an explicit API contract assigns auth-rejection codes, got {result:?}"
+            );
+
+            let _ = server.await;
+        }
     }
 
     #[tokio::test]
