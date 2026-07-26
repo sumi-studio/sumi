@@ -624,17 +624,22 @@ where
         (ConnectionEpoch(n), DeliveryEpoch(n))
     }
 
-    async fn backoff_sleep(config: &SupervisorConfig, attempt: u32) -> Result<()> {
+    fn backoff_window_ms(config: &SupervisorConfig, attempt: u32) -> (u64, u64) {
         let base_ms = config.initial_backoff.as_millis() as u64;
         let max_ms = config.max_backoff.as_millis() as u64;
         let shift = attempt.saturating_sub(1).min(31);
         let delay_ms = base_ms
             .saturating_mul(2u64.saturating_pow(shift))
             .min(max_ms);
-        let jitter = if delay_ms == 0 {
+        ((delay_ms.saturating_add(1)) / 2, delay_ms)
+    }
+
+    async fn backoff_sleep(config: &SupervisorConfig, attempt: u32) -> Result<()> {
+        let (lower_ms, upper_ms) = Self::backoff_window_ms(config, attempt);
+        let jitter = if upper_ms == 0 {
             0
         } else {
-            rand::rng().random_range(1..=delay_ms)
+            rand::rng().random_range(lower_ms..=upper_ms)
         };
         time::sleep(Duration::from_millis(jitter)).await;
         Ok(())
@@ -2389,10 +2394,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backoff_jitter_keeps_nonzero_lower_bound() {
+    async fn backoff_jitter_lower_bound_grows_with_attempt() {
         let mut config = make_config();
-        config.initial_backoff = Duration::from_millis(5);
-        config.max_backoff = Duration::from_millis(10);
+        config.initial_backoff = Duration::from_millis(20);
+        config.max_backoff = Duration::from_millis(80);
+
+        assert_eq!(
+            ConnectionSupervisor::<
+                MockConnector,
+                CountingCredentialProvider,
+                MockDurableSource,
+                StaticHydrationLatch,
+            >::backoff_window_ms(&config, 1),
+            (10, 20)
+        );
+        assert_eq!(
+            ConnectionSupervisor::<
+                MockConnector,
+                CountingCredentialProvider,
+                MockDurableSource,
+                StaticHydrationLatch,
+            >::backoff_window_ms(&config, 3),
+            (40, 80)
+        );
 
         let start = Instant::now();
         ConnectionSupervisor::<
@@ -2406,8 +2430,8 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert!(
-            elapsed >= Duration::from_millis(1),
-            "nonzero delay must have nonzero jitter lower bound, elapsed {elapsed:?}"
+            elapsed >= Duration::from_millis(10),
+            "jitter must preserve the attempt's exponential lower bound, elapsed {elapsed:?}"
         );
     }
 
