@@ -115,6 +115,35 @@ mod tests {
         ApprovalBroker::new(Policy::new("/workspace"), projector())
     }
 
+    fn approval_request() -> ApprovalRequest {
+        ApprovalRequest {
+            id: "approval-1".to_owned(),
+            tool_call_id: "tool-call-1".to_owned(),
+            tool_name: "read_file".to_owned(),
+            action: crate::agent::ReviewProjection::Reviewable(json!({"path": "notes.txt"})),
+            args_summary: json!({"path": "notes.txt"}),
+            reason: None,
+            audit: None,
+        }
+    }
+
+    #[test]
+    fn fail_closed_broker_only_allows_read_only_once() {
+        let broker = FailClosedApprovalBroker::new();
+        let request = approval_request();
+
+        assert_eq!(
+            broker.request(&request, ToolRisk::ReadOnly),
+            ApprovalResolution::Decision(ApprovalDecision::ApproveOnce)
+        );
+        for risk in [ToolRisk::Mutating, ToolRisk::Exec] {
+            assert_eq!(
+                broker.request(&request, risk),
+                ApprovalResolution::Decision(ApprovalDecision::Deny)
+            );
+        }
+    }
+
     #[test]
     fn adversarial_table() {
         // D3 workspace read fast path

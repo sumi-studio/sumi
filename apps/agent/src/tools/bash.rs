@@ -535,18 +535,50 @@ fn configure_child_process(
     workspace: &Path,
     enforce_broker_socket_isolation: bool,
 ) {
+    let mask_broker_parent = broker_socket
+        .and_then(Path::parent)
+        .is_some_and(|parent| should_mask_broker_parent(parent, workspace));
     let broker_socket = broker_socket.map(|p| p.to_path_buf());
-    let workspace = workspace.to_path_buf();
     #[allow(unsafe_code)]
     unsafe {
         process.process_group(0);
         process.pre_exec(move || {
             if enforce_broker_socket_isolation {
-                isolate_broker_socket_path(broker_socket.as_deref(), &workspace)?;
+                isolate_broker_socket_path(broker_socket.as_deref(), mask_broker_parent)?;
             }
             sanitize_inherited_fds(inherited_fd_limit, force_close_range_fallback)
         });
     }
+}
+
+fn normalize_absolute_path(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::Normal(component) => normalized.push(component),
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            std::path::Component::Prefix(_) => return None,
+        }
+    }
+    path.is_absolute().then_some(normalized)
+}
+
+/// Mask the broker's parent only when it is outside the workspace. Masking a
+/// directory inside the workspace would hide unrelated tenant files, while a
+/// raw string-prefix/equality check mishandles `..` and sibling prefixes.
+fn should_mask_broker_parent(parent: &Path, workspace: &Path) -> bool {
+    let Some(parent) = normalize_absolute_path(parent) else {
+        return true;
+    };
+    let Some(workspace) = normalize_absolute_path(workspace) else {
+        return true;
+    };
+    parent != Path::new("/") && !parent.starts_with(workspace)
 }
 
 /// Fill `buf` with lowercase hex digits from getrandom(2). `buf.len()` must be
@@ -640,7 +672,7 @@ fn create_isolation_file(path: *const libc::c_char) -> std::io::Result<libc::c_i
 /// locks, only raw syscalls and stack buffers.
 fn isolate_broker_socket_path(
     broker_socket: Option<&Path>,
-    workspace: &Path,
+    mask_parent: bool,
 ) -> std::io::Result<()> {
     let socket = match broker_socket {
         Some(path) => path,
@@ -678,8 +710,6 @@ fn isolate_broker_socket_path(
         }
     };
     let parent_bytes = parent.as_os_str().as_bytes();
-    let workspace_bytes = workspace.as_os_str().as_bytes();
-    let mask_parent = parent_bytes != workspace_bytes && parent_bytes != b"/";
 
     let target_bytes = if mask_parent {
         parent_bytes
@@ -1548,6 +1578,31 @@ mod tests {
                 .expect_err("exec failure must reach the parent through Command's errpipe");
             assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
         }
+    }
+
+    #[test]
+    fn broker_parent_masking_uses_normalized_workspace_containment() {
+        let workspace = std::path::Path::new("/workspace");
+        assert!(!should_mask_broker_parent(
+            std::path::Path::new("/workspace"),
+            workspace
+        ));
+        assert!(!should_mask_broker_parent(
+            std::path::Path::new("/workspace/broker"),
+            workspace
+        ));
+        assert!(should_mask_broker_parent(
+            std::path::Path::new("/workspace/../run/sumi"),
+            workspace
+        ));
+        assert!(should_mask_broker_parent(
+            std::path::Path::new("/workspace-other"),
+            workspace
+        ));
+        assert!(!should_mask_broker_parent(
+            std::path::Path::new("/"),
+            workspace
+        ));
     }
 
     #[tokio::test]

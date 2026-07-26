@@ -31,6 +31,7 @@ services:
       - /tmp:rw,noexec,nosuid,nodev,size=32m
     volumes:
       - state:/var/lib/sumi
+      - runtime-state:/var/lib/sumi-runtime-state
       - workspace:/workspace
       - artifacts:/var/lib/sumi-artifacts
       - runtime-ipc:/run/sumi/runtime
@@ -51,6 +52,7 @@ services:
       SUMI_AGENT_WRAPPING_KEY: ${SUMI_AGENT_WRAPPING_KEY:?SUMI_AGENT_WRAPPING_KEY is required}
       SUMI_PROVIDER_API_KEY: ${SUMI_PROVIDER_API_KEY:?SUMI_PROVIDER_API_KEY is required}
       SUMI_MODEL_PRESET: ${SUMI_MODEL_PRESET:-kimi-k3}
+      SUMI_AGENT_RUNTIME_STATE_DIR: /var/lib/sumi-runtime-state
     depends_on:
       init:
         condition: service_completed_successfully
@@ -58,6 +60,7 @@ services:
         condition: service_healthy
     volumes:
       - state:/var/lib/sumi
+      - runtime-state:/var/lib/sumi-runtime-state
       - runtime-ipc:/run/sumi/runtime:ro
 
   executor:
@@ -117,6 +120,7 @@ services:
 
 volumes:
   state: {}
+  runtime-state: {}
   workspace: {}
   artifacts: {}
   runtime-ipc: {}

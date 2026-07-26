@@ -2,3 +2,4 @@
 
 pub mod allocator;
 pub mod contracts;
+pub mod publisher;

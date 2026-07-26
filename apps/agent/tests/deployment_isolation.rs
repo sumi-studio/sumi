@@ -571,6 +571,9 @@ async fn executor_preflight_validates_namespace_support() {
         .status()
         .await;
     if !unshare_probe.is_ok_and(|s| s.success()) {
+        eprintln!(
+            "skipping namespace preflight: host cannot unshare user, network, and mount namespaces"
+        );
         return;
     }
 
@@ -847,6 +850,20 @@ fn compose_service<'a>(source: &'a str, service: &str) -> &'a str {
     &rest[..end]
 }
 
+fn compose_service_volumes(compose: &serde_yaml::Value, service: &str) -> Vec<String> {
+    compose["services"][service]["volumes"]
+        .as_sequence()
+        .unwrap_or_else(|| panic!("compose service {service} volumes are missing"))
+        .iter()
+        .map(|volume| {
+            volume
+                .as_str()
+                .unwrap_or_else(|| panic!("compose service {service} has a non-string volume"))
+                .to_owned()
+        })
+        .collect()
+}
+
 #[test]
 fn compose_deployment_has_disjoint_mounts_identities_and_sidecar_policy() {
     let deploy_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -863,25 +880,49 @@ fn compose_deployment_has_disjoint_mounts_identities_and_sidecar_policy() {
     let runtime = compose_service(&compose, "runtime");
     let executor = compose_service(&compose, "executor");
     let broker = compose_service(&compose, "broker");
+    let compose_value: serde_yaml::Value = serde_yaml::from_str(&compose).unwrap();
+    let runtime_volumes = compose_service_volumes(&compose_value, "runtime");
+    let executor_volumes = compose_service_volumes(&compose_value, "executor");
+    let broker_volumes = compose_service_volumes(&compose_value, "broker");
 
     // The runtime only sees durable state and its executor IPC endpoint. It
     // must not receive either tenant workspace or artifact storage.
     assert!(runtime.contains("user: \"10001:10001\""));
-    assert!(runtime.contains("state:/var/lib/sumi"));
-    assert!(runtime.contains("runtime-ipc:/run/sumi/runtime:ro"));
-    assert!(!runtime.contains("workspace:/workspace"));
-    assert!(!runtime.contains("artifacts:/var/lib/sumi-artifacts"));
-    assert!(!runtime.contains("broker-ipc:"));
+    assert!(runtime_volumes.contains(&"state:/var/lib/sumi".to_owned()));
+    assert!(runtime_volumes.contains(&"runtime-ipc:/run/sumi/runtime:ro".to_owned()));
+    assert!(
+        !runtime_volumes
+            .iter()
+            .any(|volume| volume.starts_with("workspace:"))
+    );
+    assert!(
+        !runtime_volumes
+            .iter()
+            .any(|volume| volume.starts_with("artifacts:"))
+    );
+    assert!(
+        !runtime_volumes
+            .iter()
+            .any(|volume| volume.starts_with("broker-ipc:"))
+    );
 
     // The executor receives only workspace and the two constrained IPC
     // directories. It cannot mount durable state or the artifact volume.
     assert!(executor.contains("user: \"10002:10002\""));
     assert!(executor.contains("network_mode: none"));
-    assert!(executor.contains("workspace:/workspace"));
-    assert!(executor.contains("runtime-ipc:/run/sumi/runtime"));
-    assert!(executor.contains("broker-ipc:/run/sumi/broker:ro"));
-    assert!(!executor.contains("state:/var/lib/sumi"));
-    assert!(!executor.contains("artifacts:/var/lib/sumi-artifacts"));
+    assert!(executor_volumes.contains(&"workspace:/workspace".to_owned()));
+    assert!(executor_volumes.contains(&"runtime-ipc:/run/sumi/runtime".to_owned()));
+    assert!(executor_volumes.contains(&"broker-ipc:/run/sumi/broker:ro".to_owned()));
+    assert!(
+        !executor_volumes
+            .iter()
+            .any(|volume| volume.starts_with("state:"))
+    );
+    assert!(
+        !executor_volumes
+            .iter()
+            .any(|volume| volume.starts_with("artifacts:"))
+    );
     assert!(executor.contains("apparmor:sumi-agent-executor"));
     assert!(executor.contains("SUMI_READINESS_SOCKET=/run/sumi/runtime/executor.sock"));
 
@@ -889,11 +930,23 @@ fn compose_deployment_has_disjoint_mounts_identities_and_sidecar_policy() {
     assert!(broker.contains("user: \"10003:10003\""));
     assert!(broker.contains("network_mode: none"));
     assert!(broker.contains("SUMI_READINESS_SOCKET=/run/sumi/broker/broker.sock"));
-    assert!(broker.contains("artifacts:/var/lib/sumi-artifacts"));
-    assert!(broker.contains("broker-ipc:/run/sumi/broker"));
-    assert!(!broker.contains("workspace:/workspace"));
-    assert!(!broker.contains("state:/var/lib/sumi"));
-    assert!(!broker.contains("runtime-ipc:"));
+    assert!(broker_volumes.contains(&"artifacts:/var/lib/sumi-artifacts".to_owned()));
+    assert!(broker_volumes.contains(&"broker-ipc:/run/sumi/broker".to_owned()));
+    assert!(
+        !broker_volumes
+            .iter()
+            .any(|volume| volume.starts_with("workspace:"))
+    );
+    assert!(
+        !broker_volumes
+            .iter()
+            .any(|volume| volume.starts_with("state:"))
+    );
+    assert!(
+        !broker_volumes
+            .iter()
+            .any(|volume| volume.starts_with("runtime-ipc:"))
+    );
 
     for service in [runtime, executor, broker] {
         assert!(service.contains("<<: *sidecar-hardening"));

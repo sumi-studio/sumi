@@ -23,9 +23,12 @@ use crate::{
         model::{ModelSpec, RequestOptions},
         types::{MemoryBlock, PromptContext, ProviderEventStream},
     },
-    runtime::contracts::{
-        GenerationRecoveryFence, HydrationReady, HydrationReceiptIdentity, ProcessGeneration,
-        ProcessGenerationLease, RpcBootNonce,
+    runtime::{
+        contracts::{
+            GenerationRecoveryFence, HydrationReady, HydrationReceiptIdentity, ProcessGeneration,
+            ProcessGenerationLease, RpcBootNonce,
+        },
+        publisher::RuntimeStatePublisher,
     },
     store::{AgentScope, EnvironmentKeyProvider, HydrationOutcome, Store},
     tools::{
@@ -44,6 +47,7 @@ struct BootstrapContext {
     agent_id: String,
     conversation_id: String,
     state_dir: PathBuf,
+    runtime_state_dir: PathBuf,
     executor_socket: PathBuf,
     wrapping_key_id: String,
 }
@@ -65,6 +69,7 @@ impl BootstrapContext {
         let conversation_id = required("SUMI_CONVERSATION_ID")?;
 
         let state_dir = required_path("SUMI_STATE_DIR")?;
+        let runtime_state_dir = required_path("SUMI_AGENT_RUNTIME_STATE_DIR")?;
         let executor_socket = required_path("SUMI_EXECUTOR_SOCKET")?;
 
         let wrapping_key_id = env::var("SUMI_AGENT_WRAPPING_KEY_ID")
@@ -84,6 +89,7 @@ impl BootstrapContext {
             agent_id,
             conversation_id,
             state_dir,
+            runtime_state_dir,
             executor_socket,
             wrapping_key_id,
         })
@@ -175,6 +181,16 @@ pub(crate) async fn run_production_with_driver_and_broker(
     // key from the environment. Production runtime processes must never hold
     // those secrets while dumpable.
     let ctx = BootstrapContext::from_env()?;
+
+    // Publish the current generation as NotReady before any ready state can be
+    // observed or admitted. The file is the durable boundary T28 uses; the
+    // in-process watch channel alone is not enough.
+    let runtime_state_publisher =
+        RuntimeStatePublisher::new(&ctx.runtime_state_dir, &ctx.agent_id, ctx.generation)
+            .context("failed to create runtime state publisher")?;
+    runtime_state_publisher
+        .publish_not_ready()
+        .context("failed to publish initial not-ready runtime state")?;
 
     // Load config last so missing model/system files are surfaced after the
     // identity boundary is validated.
@@ -271,6 +287,9 @@ pub(crate) async fn run_production_with_driver_and_broker(
     ready
         .latch(ctx.generation, runtime_receipt.clone())
         .context("failed to latch hydration ready state")?;
+    runtime_state_publisher
+        .publish_ready(&runtime_receipt)
+        .context("failed to publish ready runtime state")?;
     hydration_tx
         .send(ready)
         .context("failed to publish hydration ready state")?;
@@ -356,6 +375,10 @@ mod tests {
             (
                 "SUMI_STATE_DIR",
                 dir.join("state").to_string_lossy().into_owned(),
+            ),
+            (
+                "SUMI_AGENT_RUNTIME_STATE_DIR",
+                dir.join("runtime-state").to_string_lossy().into_owned(),
             ),
             (
                 "SUMI_WORKSPACE",

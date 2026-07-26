@@ -27,4 +27,5 @@ COPY --from=build /src/apps/agent/target/release/sumi-agent /usr/local/bin/sumi-
 COPY deploy/agent/container-entrypoint /usr/local/bin/sumi-entrypoint
 RUN chmod 0755 /usr/local/bin/sumi-agent /usr/local/bin/sumi-entrypoint
 
+USER 10001:10001
 ENTRYPOINT ["/usr/local/bin/sumi-entrypoint"]
