@@ -242,7 +242,6 @@ pub(super) struct DurableBridge {
     approval_request_tools: HashMap<String, String>,
     approval_prepared_tools: HashSet<String>,
     pending_approval_resolved: Option<(String, ApprovalResolution, AdmittedCommand)>,
-    current_tool_calls: HashSet<String>,
     committed_terminal_command_ids: Vec<String>,
 }
 
@@ -286,7 +285,6 @@ impl DurableBridge {
             approval_request_tools: HashMap::new(),
             approval_prepared_tools: HashSet::new(),
             pending_approval_resolved: None,
-            current_tool_calls: HashSet::new(),
             committed_terminal_command_ids: Vec::new(),
         }
     }
@@ -539,14 +537,6 @@ impl DurableBridge {
 
     pub(super) fn take_terminal_command_ids(&mut self) -> Vec<String> {
         std::mem::take(&mut self.committed_terminal_command_ids)
-    }
-
-    pub(super) fn mark_approval_not_started(&mut self, tool_call_id: String) {
-        self.approval_not_started.insert(tool_call_id);
-    }
-
-    pub(super) fn set_approval_command(&mut self, command: AdmittedCommand) {
-        self.approval_command = Some(command);
     }
 
     pub(super) async fn bind_retry_steer(
@@ -1272,16 +1262,8 @@ impl DurableBridge {
         self.assistant_open = None;
         self.length_not_started.clear();
         self.pending_tool_calls.clear();
-        self.current_tool_calls.clear();
         let mut rejected = HashSet::new();
         if let PublicMessage::Assistant(assistant) = &message {
-            self.current_tool_calls
-                .extend(assistant.content.iter().filter_map(|item| match item {
-                    PublicAssistantContent::ToolCall { tool_call, .. } => {
-                        Some(tool_call.id.clone())
-                    }
-                    _ => None,
-                }));
             let is_length = assistant.stop_reason == StopReason::Length
                 || (assistant.stop_reason == StopReason::Error
                     && assistant.provider_code.as_deref() == Some(LENGTH_LOOP_CODE));

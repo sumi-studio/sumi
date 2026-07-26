@@ -7839,10 +7839,7 @@ fn approval_core(broker: Arc<ApprovalBroker>) -> RunCore {
     core
 }
 
-async fn wait_for_agent_end(
-    frames: &Arc<Mutex<Vec<OutboundFrame>>>,
-    task: &tokio::task::JoinHandle<SessionResult>,
-) {
+async fn wait_for_agent_end(frames: &Arc<Mutex<Vec<OutboundFrame>>>) {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if frames.lock().expect("frame mutex").iter().any(|frame| {
@@ -7851,14 +7848,18 @@ async fn wait_for_agent_end(
             }) {
                 break;
             }
-            if task.is_finished() {
-                break;
-            }
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("session reached agent_end within timeout");
+    assert!(
+        frames.lock().expect("frame mutex").iter().any(|frame| {
+            matches!(frame, OutboundFrame::Event { envelope }
+                if envelope.event.get("type").and_then(Value::as_str) == Some("agent_end"))
+        }),
+        "session completed without emitting agent_end"
+    );
 }
 
 #[tokio::test]
@@ -7898,7 +7899,7 @@ async fn session_auto_review_fail_closed_denies_bash_without_executing() {
 
     let task = tokio::spawn(session.run());
     commands.send(user(1)).await.expect("user command");
-    wait_for_agent_end(&frames, &task).await;
+    wait_for_agent_end(&frames).await;
     drop(commands);
     let _ = task.await;
 
@@ -8133,7 +8134,7 @@ async fn session_user_approve_once_allows_bash_and_executes() {
         .await
         .expect("approve-once decision");
 
-    wait_for_agent_end(&frames, &task).await;
+    wait_for_agent_end(&frames).await;
     drop(commands);
     let _ = task.await;
 
@@ -8231,7 +8232,7 @@ async fn session_user_approve_always_persists_rule_and_executes() {
         .send(approval_always_decision(2, &request_id))
         .await
         .expect("approve-always decision");
-    wait_for_agent_end(&frames, &task).await;
+    wait_for_agent_end(&frames).await;
     drop(commands);
     match task.await.expect("session join") {
         SessionResult::Completed(_) => {}

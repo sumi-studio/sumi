@@ -223,7 +223,18 @@ impl Policy {
     ) -> Result<Self, RuleValidationError> {
         let mut policy = Self::new(workspace_root);
         for rule in rules {
-            policy = policy.try_with_rule(rule)?;
+            let rule_id = rule.id.clone();
+            policy = match policy.try_with_rule(rule) {
+                Ok(policy) => policy,
+                Err(error) => {
+                    tracing::error!(
+                        rule_id = %rule_id,
+                        %error,
+                        "approval policy rule failed validation"
+                    );
+                    return Err(error);
+                }
+            };
         }
         Ok(policy)
     }

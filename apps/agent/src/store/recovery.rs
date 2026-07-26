@@ -1059,6 +1059,44 @@ mod tests {
         (store, writer)
     }
 
+    async fn seed_pending_approval_decision(
+        store: &Store,
+        writer: &EventWriter,
+        command_id: &str,
+        request_id: &str,
+        decision: ApprovalDecision,
+    ) {
+        writer
+            .persist_inbound(&InboundCommand::Valid(CommandEnvelope {
+                seq: 1,
+                command_id: crate::gateway::CommandId::parse(command_id).expect("command ID"),
+                command: Command::ApprovalDecision {
+                    request_id: request_id.to_owned(),
+                    decision,
+                },
+            }))
+            .await
+            .expect("persist approval decision before simulated restart");
+
+        let suffix = request_id
+            .strip_prefix("request-approve-")
+            .unwrap_or(request_id);
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO approval_log
+             (id, tool_call_id, run_id, turn_id, state, request_projection, redaction_version, created_at)
+             VALUES (?, ?, ?, ?, 'pending', '{}', 1, ?)",
+        )
+        .bind(request_id)
+        .bind(format!("tool-call-{suffix}"))
+        .bind(format!("run-{suffix}"))
+        .bind(format!("turn-{suffix}"))
+        .bind(now)
+        .execute(store.pool())
+        .await
+        .expect("seed pending approval log");
+    }
+
     async fn persist_user(writer: &EventWriter, seq: u64, id: &str) {
         writer
             .persist_inbound(&InboundCommand::Valid(CommandEnvelope {
@@ -1508,35 +1546,17 @@ mod tests {
     async fn t12_prefix_preserves_pending_approved_once_for_recovery() {
         let (store, writer) = setup().await;
         let command_id = "00000000-0000-4000-8000-000000000002";
-        writer
-            .persist_inbound(&InboundCommand::Valid(CommandEnvelope {
-                seq: 1,
-                command_id: crate::gateway::CommandId::parse(command_id).expect("command ID"),
-                command: Command::ApprovalDecision {
-                    request_id: "request-approve-once".to_owned(),
-                    decision: ApprovalDecision::ApproveOnce,
-                },
-            }))
-            .await
-            .expect("persist ApproveOnce decision before simulated restart");
-
         // Simulate a crash where the approval decision was received but the
         // tool was never started: approval_log is still pending and the command
         // must not be silently applied as a no-op.
-        let now = chrono::Utc::now().to_rfc3339();
-        sqlx::query(
-            "INSERT INTO approval_log
-             (id, tool_call_id, run_id, turn_id, state, request_projection, redaction_version, created_at)
-             VALUES (?, ?, ?, ?, 'pending', '{}', 1, ?)",
+        seed_pending_approval_decision(
+            &store,
+            &writer,
+            command_id,
+            "request-approve-once",
+            ApprovalDecision::ApproveOnce,
         )
-        .bind("request-approve-once")
-        .bind("tool-call-once")
-        .bind("run-once")
-        .bind("turn-once")
-        .bind(now)
-        .execute(store.pool())
-        .await
-        .expect("seed pending approval log");
+        .await;
 
         let steps = SuffixRecovery::recover_t12_prefix(&store, &writer)
             .await
@@ -1586,35 +1606,16 @@ mod tests {
             "allowed_permissions": ["exec"],
             "allowed_network_domains": []
         });
-        writer
-            .persist_inbound(&InboundCommand::Valid(CommandEnvelope {
-                seq: 1,
-                command_id: crate::gateway::CommandId::parse(command_id).expect("command ID"),
-                command: Command::ApprovalDecision {
-                    request_id: "request-approve-always".to_owned(),
-                    decision: ApprovalDecision::ApproveAlways {
-                        rule: serde_json::from_value::<DeferredApprovalRule>(rule)
-                            .expect("deferred rule"),
-                    },
-                },
-            }))
-            .await
-            .expect("persist ApproveAlways decision before simulated restart");
-
-        let now = chrono::Utc::now().to_rfc3339();
-        sqlx::query(
-            "INSERT INTO approval_log
-             (id, tool_call_id, run_id, turn_id, state, request_projection, redaction_version, created_at)
-             VALUES (?, ?, ?, ?, 'pending', '{}', 1, ?)",
+        seed_pending_approval_decision(
+            &store,
+            &writer,
+            command_id,
+            "request-approve-always",
+            ApprovalDecision::ApproveAlways {
+                rule: serde_json::from_value::<DeferredApprovalRule>(rule).expect("deferred rule"),
+            },
         )
-        .bind("request-approve-always")
-        .bind("tool-call-always")
-        .bind("run-always")
-        .bind("turn-always")
-        .bind(now)
-        .execute(store.pool())
-        .await
-        .expect("seed pending approval log");
+        .await;
 
         let steps = SuffixRecovery::recover_t12_prefix(&store, &writer)
             .await

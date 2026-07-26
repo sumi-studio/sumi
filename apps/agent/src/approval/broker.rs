@@ -21,7 +21,10 @@ use crate::{
     agent::events::{self, ApprovalRequest},
     approval::{
         action::{CanonicalAction, SandboxSummary, SecretAwareActionProjector},
-        policy::{ApprovalRule, Policy, PolicyDecision, ResolvedDecision, UserDecision},
+        policy::{
+            ApprovalRule, Policy, PolicyDecision, ResolvedDecision, RuleValidationError,
+            UserDecision,
+        },
         prompt::TrustedEnvironment,
         reviewer::{
             AuditDecision, ReviewOutcome, ReviewRequest, Reviewer, ReviewerMode, RiskLevel,
@@ -357,7 +360,16 @@ impl ApprovalBroker {
         let mut resolved = resolved;
         if let ResolvedDecision::ApproveAlways(ref rule) = resolved {
             let guard = self.policy.read().unwrap_or_else(|e| e.into_inner());
-            if guard.clone().try_with_rule(rule.clone()).is_err() {
+            if let Err(error) = guard.clone().try_with_rule(rule.clone()) {
+                let literal_prefix = matches!(&error, RuleValidationError::BroadPrefix)
+                    .then_some(rule.literal_prefix.as_slice());
+                tracing::warn!(
+                    rule_id = %rule.id,
+                    tool = %rule.tool,
+                    literal_prefix = ?literal_prefix,
+                    %error,
+                    "downgrading invalid ApproveAlways candidate to ApproveOnce"
+                );
                 // The candidate rule cannot be safely persisted; never claim an
                 // `ApproveAlways` decision that would not actually be durable.
                 resolved = ResolvedDecision::ApproveOnce;
