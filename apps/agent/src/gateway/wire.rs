@@ -1477,6 +1477,9 @@ impl TryFrom<Command> for WireCommand {
 impl TryFrom<CommandEnvelope> for WireCommandEnvelope {
     type Error = WireError;
     fn try_from(envelope: CommandEnvelope) -> Result<Self, WireError> {
+        if envelope.seq > MAX_JSON_SAFE_INTEGER {
+            return Err(WireError::SeqOutOfRange(envelope.seq));
+        }
         Ok(Self {
             seq: envelope.seq,
             command_id: envelope.command_id.as_str().to_owned(),

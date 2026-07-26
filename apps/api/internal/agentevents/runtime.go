@@ -141,7 +141,7 @@ func (g *DurableGateway) VerifyGeneration(ctx context.Context, agentID string, g
 		return err
 	}
 	if !state.present {
-		return nil
+		return errors.New("durable runtime state is absent")
 	}
 	if state.Generation != generation {
 		return fmt.Errorf("stale generation: got %d, current %d", generation, state.Generation)
@@ -184,6 +184,10 @@ func (g *DurableGateway) WaitFor(ctx context.Context, claims TokenClaims, genera
 
 func (g *DurableGateway) FirstCommandSeq(ctx context.Context, claims TokenClaims) (uint64, error) {
 	return g.commands.FirstCommandSeq(ctx, claims.ConversationID)
+}
+
+func (g *DurableGateway) HasCommands(ctx context.Context, claims TokenClaims) (bool, error) {
+	return g.commands.HasCommands(ctx, claims.ConversationID)
 }
 
 func (g *DurableGateway) CatchUp(ctx context.Context, claims TokenClaims, fromSeq uint64) ([]CommandEnvelope, error) {
@@ -366,6 +370,9 @@ func (g *DurableGateway) state(ctx context.Context, agentID string) (runtimeStat
 	}
 	if state.HydrationReceiptIdentity != nil && *state.HydrationReceiptIdentity == "" {
 		return runtimeState{}, errors.New("hydration receipt identity must not be empty")
+	}
+	if state.Generation > maxProcessGeneration {
+		return runtimeState{}, fmt.Errorf("runtime generation %d exceeds ProcessGeneration range", state.Generation)
 	}
 	state.present = true
 	return state, nil
@@ -696,6 +703,9 @@ func findAckLocked(file durableFileHandle, seq uint64) (CommandAck, bool, error)
 }
 
 func (g *DurableGateway) publishRuntimeState(agentID string, state runtimeState) error {
+	if state.Generation > maxProcessGeneration {
+		return fmt.Errorf("runtime generation %d exceeds ProcessGeneration range", state.Generation)
+	}
 	raw, err := json.Marshal(state)
 	if err != nil {
 		return err

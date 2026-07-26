@@ -24,13 +24,13 @@ func openRuntimeGateway(t *testing.T) *DurableGateway {
 	return gateway
 }
 
-func TestDurableGatewayMissingStateWaitsUntilReceiptIsPublished(t *testing.T) {
+func TestDurableGatewayMissingStateFailsGenerationVerificationUntilPublished(t *testing.T) {
 	gateway := openRuntimeGateway(t)
 	const agentID = "agent-1"
 	const generation = uint64(7)
 
-	if err := gateway.VerifyGeneration(context.Background(), agentID, generation); err != nil {
-		t.Fatalf("missing state must not reject the generation before publication: %v", err)
+	if err := gateway.VerifyGeneration(context.Background(), agentID, generation); err == nil {
+		t.Fatal("missing runtime state must fail generation verification")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -45,6 +45,12 @@ func TestDurableGatewayMissingStateWaitsUntilReceiptIsPublished(t *testing.T) {
 		HydrationReceiptIdentity: nil,
 	}); err != nil {
 		t.Fatal(err)
+	}
+	if err := gateway.VerifyGeneration(context.Background(), agentID, generation); err != nil {
+		t.Fatalf("published matching runtime state rejected generation: %v", err)
+	}
+	if err := gateway.VerifyGeneration(context.Background(), agentID, generation+1); err == nil {
+		t.Fatal("mismatched runtime generation must fail verification")
 	}
 	select {
 	case err := <-done:

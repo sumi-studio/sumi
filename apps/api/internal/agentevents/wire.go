@@ -19,6 +19,10 @@ import (
 // number type and by the contract's JsonSafeInteger definition.
 const maxJSONSafeInteger uint64 = 9_007_199_254_740_991
 
+// maxProcessGeneration is the largest generation that can round-trip through
+// the agent's signed SQLite representation (i64).
+const maxProcessGeneration uint64 = 9_223_372_036_854_775_807
+
 // AgentHello is sent by the agent immediately after the WebSocket upgrade.
 // Generation is the ProcessGeneration bound to the short-lived credential claim.
 type AgentHello struct {
@@ -62,6 +66,18 @@ func (h *AgentHello) UnmarshalJSON(data []byte) error {
 	if raw.LastAppliedCommandSeq == nil {
 		return fmt.Errorf("last_applied_command_seq is required")
 	}
+	if *raw.Generation > maxProcessGeneration {
+		return fmt.Errorf("generation %d exceeds ProcessGeneration range", *raw.Generation)
+	}
+	for name, seq := range map[string]uint64{
+		"last_sent_event_seq":       *raw.LastSentEventSeq,
+		"last_received_command_seq": *raw.LastReceivedCommandSeq,
+		"last_applied_command_seq":  *raw.LastAppliedCommandSeq,
+	} {
+		if seq > maxJSONSafeInteger {
+			return fmt.Errorf("%s %d exceeds JSON-safe integer range", name, seq)
+		}
+	}
 	*h = AgentHello{
 		AgentID:                *raw.AgentID,
 		Generation:             *raw.Generation,
@@ -84,6 +100,37 @@ type CommandEnvelope struct {
 	Seq       uint64          `json:"seq"`
 	CommandID string          `json:"command_id"`
 	Command   json.RawMessage `json:"command"`
+}
+
+// UnmarshalJSON is deliberately strict because command envelopes cross both
+// the WebSocket and durable-log trust boundaries.
+func (c *CommandEnvelope) UnmarshalJSON(data []byte) error {
+	if err := checkDuplicateKeys(data); err != nil {
+		return fmt.Errorf("command envelope json: %w", err)
+	}
+	type rawEnvelope struct {
+		Seq       *uint64         `json:"seq"`
+		CommandID *string         `json:"command_id"`
+		Command   json.RawMessage `json:"command"`
+	}
+	var raw rawEnvelope
+	if err := unmarshalStrict(data, &raw); err != nil {
+		return err
+	}
+	if raw.Seq == nil || raw.CommandID == nil || len(raw.Command) == 0 {
+		return errors.New("seq, command_id, and command are required")
+	}
+	if *raw.Seq > maxJSONSafeInteger {
+		return fmt.Errorf("seq %d exceeds JSON-safe integer range", *raw.Seq)
+	}
+	if !canonicalUUIDRegexp.MatchString(*raw.CommandID) {
+		return fmt.Errorf("command_id must be a canonical UUID")
+	}
+	if err := ValidateCommand(raw.Command); err != nil {
+		return fmt.Errorf("invalid command: %w", err)
+	}
+	*c = CommandEnvelope{Seq: *raw.Seq, CommandID: *raw.CommandID, Command: raw.Command}
+	return nil
 }
 
 // CommandType returns the value of the command object's top-level "type" field.

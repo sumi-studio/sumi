@@ -50,6 +50,8 @@ type CommandSource interface {
 	// FirstCommandSeq returns the first seq present in the durable command log.
 	// It is used as a lower bound so catch-up cannot skip unapplied commands.
 	FirstCommandSeq(ctx context.Context, claims TokenClaims) (uint64, error)
+	// HasCommands distinguishes an empty log from a retained log starting at 1.
+	HasCommands(ctx context.Context, claims TokenClaims) (bool, error)
 	// CatchUp returns commands starting from fromSeq up to the durable tail.
 	CatchUp(ctx context.Context, claims TokenClaims, fromSeq uint64) ([]CommandEnvelope, error)
 	// Live returns commands from fromSeq onward. The source must bind this cursor
@@ -229,6 +231,9 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 	if hello.Generation != claims.Generation {
 		return fmt.Errorf("generation claim mismatch")
 	}
+	if hello.LastAppliedCommandSeq > hello.LastReceivedCommandSeq {
+		return fmt.Errorf("last applied command seq %d exceeds last received %d", hello.LastAppliedCommandSeq, hello.LastReceivedCommandSeq)
+	}
 	if err := s.Generation.VerifyGeneration(helloCtx, claims.AgentID, hello.Generation); err != nil {
 		return fmt.Errorf("verify generation: %w", err)
 	}
@@ -241,11 +246,18 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 	if err != nil {
 		return fmt.Errorf("first command seq: %w", err)
 	}
+	hasCommands, err := s.Commands.HasCommands(helloCtx, claims)
+	if err != nil {
+		return fmt.Errorf("inspect command log: %w", err)
+	}
+	if !hasCommands && hello.LastAppliedCommandSeq > 0 {
+		return fmt.Errorf("command log is empty despite agent last applied seq %d", hello.LastAppliedCommandSeq)
+	}
 
 	// The retained log must begin no later than the agent's expected next
 	// command; otherwise the server would advertise a guaranteed gap that the
 	// agent cannot recover from.
-	if firstSeq > hello.LastReceivedCommandSeq+1 {
+	if hello.LastReceivedCommandSeq == maxJSONSafeInteger || firstSeq > hello.LastReceivedCommandSeq+1 {
 		return fmt.Errorf("command log gap: first seq %d is beyond agent last received %d", firstSeq, hello.LastReceivedCommandSeq)
 	}
 

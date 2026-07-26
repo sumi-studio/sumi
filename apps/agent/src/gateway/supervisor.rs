@@ -25,6 +25,9 @@ use tokio::time;
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroize;
 
+use super::wire::MAX_JSON_SAFE_INTEGER;
+use crate::runtime::contracts::ProcessGeneration;
+
 use super::{Gateway, GatewayReader, GatewayWriter, InboundCommand, OutboundFrame};
 
 pub mod seams;
@@ -305,12 +308,7 @@ where
         let mut attempt: u32 = 0;
         loop {
             match self.connect_and_run_epoch(commands_tx.clone()).await {
-                Ok(()) => {
-                    // A real epoch was established and then ended; reset the
-                    // pre-establishment failure counter and backoff.
-                    attempt = 0;
-                    continue;
-                }
+                Ok(()) => continue,
                 Err(SupervisorError::Fatal(e)) => return Err(e),
                 Err(SupervisorError::AuthRejected) => {
                     attempt = attempt.saturating_add(1);
@@ -405,22 +403,16 @@ where
 
         let result = select(reader_handle, writer_handle).await;
         token.cancel();
-        let result = match result {
-            Either::Left((reader_result, writer_handle)) => {
-                let _ = writer_handle.await;
-                reader_result
-            }
-            Either::Right((writer_result, reader_handle)) => {
-                let _ = reader_handle.await;
-                writer_result
-            }
+        let (first, second) = match result {
+            Either::Left((reader_result, writer_handle)) => (reader_result, writer_handle.await),
+            Either::Right((writer_result, reader_handle)) => (writer_result, reader_handle.await),
         };
 
         *self.current_writer.lock().unwrap() = None;
         self.current_epoch.send_replace(None);
 
-        match result {
-            Ok(Err(ref e)) => {
+        match (&first, &second) {
+            (Ok(Err(e)), _) | (_, Ok(Err(e))) => {
                 tracing::debug!(
                     connection_epoch = connection_epoch.as_u64(),
                     delivery_epoch = delivery_epoch.as_u64(),
@@ -428,7 +420,7 @@ where
                     "epoch ended with task error"
                 );
             }
-            Err(ref e) => {
+            (Err(e), _) | (_, Err(e)) => {
                 tracing::debug!(
                     connection_epoch = connection_epoch.as_u64(),
                     delivery_epoch = delivery_epoch.as_u64(),
@@ -436,7 +428,7 @@ where
                     "epoch ended with task panic"
                 );
             }
-            Ok(Ok(())) => {
+            _ => {
                 tracing::debug!(
                     connection_epoch = connection_epoch.as_u64(),
                     delivery_epoch = delivery_epoch.as_u64(),
@@ -445,10 +437,16 @@ where
             }
         }
 
-        // The epoch was successfully established (hello validated and reader/writer
-        // started). Any termination after that point resets the attempt/backoff
-        // counter so a later healthy disconnect does not exhaust reconnects.
-        Ok(())
+        match (first, second) {
+            (Err(e), _) => Err(SupervisorError::Fatal(anyhow!("epoch task panicked: {e}"))),
+            (_, Err(e)) => Err(SupervisorError::Fatal(anyhow!(
+                "epoch sibling task panicked: {e}"
+            ))),
+            (Ok(Err(e)), _) | (_, Ok(Err(e))) => Err(classify_epoch_error(e)),
+            _ => Err(SupervisorError::Reconnect {
+                reason: "epoch task ended unexpectedly".to_owned(),
+            }),
+        }
     }
 
     fn next_epoch(&self) -> (ConnectionEpoch, DeliveryEpoch) {
@@ -477,6 +475,9 @@ async fn build_agent_hello<S: DurableSource>(
     source: &S,
     config: &SupervisorConfig,
 ) -> Result<AgentHello, SupervisorError> {
+    ProcessGeneration::from_wire(config.generation).map_err(|e| {
+        SupervisorError::Fatal(anyhow!("invalid configured ProcessGeneration: {e}"))
+    })?;
     let event_cursor = source
         .event_cursor()
         .await
@@ -490,6 +491,17 @@ async fn build_agent_hello<S: DurableSource>(
             .map_err(|e| SupervisorError::Reconnect {
                 reason: format!("command cursor unavailable: {e}"),
             })?;
+    for (name, cursor) in [
+        ("last_sent_event_seq", event_cursor.last_sent),
+        ("last_received_command_seq", command_cursor.received),
+        ("last_applied_command_seq", command_cursor.applied),
+    ] {
+        if cursor > MAX_JSON_SAFE_INTEGER {
+            return Err(SupervisorError::Fatal(anyhow!(
+                "{name} exceeds JSON-safe integer range"
+            )));
+        }
+    }
     Ok(AgentHello {
         agent_id: config.agent_id.clone(),
         generation: config.generation,
@@ -504,6 +516,19 @@ async fn validate_hello<S: DurableSource>(
     agent: &AgentHello,
     api: &ApiHello,
 ) -> Result<(), SupervisorError> {
+    ProcessGeneration::from_wire(agent.generation)
+        .and_then(|_| ProcessGeneration::from_wire(api.accepted_generation))
+        .map_err(|e| SupervisorError::Fatal(anyhow!("invalid ProcessGeneration in hello: {e}")))?;
+    for (name, cursor) in [
+        ("api last_received_event_seq", api.last_received_event_seq),
+        ("api next_command_seq", api.next_command_seq),
+    ] {
+        if cursor > MAX_JSON_SAFE_INTEGER {
+            return Err(SupervisorError::Fatal(anyhow!(
+                "{name} exceeds JSON-safe integer range"
+            )));
+        }
+    }
     if api.accepted_generation != agent.generation {
         return Err(SupervisorError::Fatal(anyhow!(
             "generation claim mismatch: api={}, agent={}",
@@ -552,6 +577,26 @@ enum SupervisorError {
     AuthRejected,
     Fatal(anyhow::Error),
     Reconnect { reason: String },
+}
+
+fn classify_epoch_error(error: anyhow::Error) -> SupervisorError {
+    let reason = format!("{error:#}");
+    // These failures demonstrate a violated durable/wire invariant. Reconnects
+    // cannot repair them and would only hide a bad state transition.
+    if [
+        "generation",
+        "hydration",
+        "command seq gap",
+        "cursor",
+        "non-monotonic",
+    ]
+    .iter()
+    .any(|marker| reason.contains(marker))
+    {
+        SupervisorError::Fatal(anyhow!(reason))
+    } else {
+        SupervisorError::Reconnect { reason }
+    }
 }
 
 async fn event_forwarder(
@@ -1686,7 +1731,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reset_attempt_counter_after_established_epoch() {
+    async fn established_epoch_failure_preserves_reconnect_backoff() {
         let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
         let gateway = MockGateway::new(VecDeque::from([
             Ok(valid_command(1, "00000000-0000-4000-8000-000000000001")),
@@ -1718,12 +1763,13 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(1), handle.join()).await;
         assert!(
             result.is_ok(),
-            "supervisor should stop after exhausting post-reset auth attempts"
+            "supervisor should stop after exhausting bounded reconnect attempts"
         );
         assert!(result.unwrap().is_err());
 
-        // credential count: 1 for successful epoch, then 2 auth rejections after reset.
-        assert_eq!(counter.load(Ordering::SeqCst), 3);
+        // The reader's transport failure consumes an attempt; the following
+        // auth rejection exhausts the configured bound rather than resetting it.
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
     }
 
     fn cmd_seq(cmd: &InboundCommand) -> u64 {

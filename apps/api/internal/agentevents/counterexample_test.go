@@ -122,6 +122,23 @@ func TestAgentHelloUnmarshalJSONStrict(t *testing.T) {
 	if err := json.Unmarshal([]byte(trailing), &h); err == nil {
 		t.Fatal("agent hello accepted trailing data")
 	}
+
+	overGeneration := `{"agent_id":"agent-1","generation":9223372036854775808,"last_sent_event_seq":0,"last_received_command_seq":0,"last_applied_command_seq":0}`
+	if err := json.Unmarshal([]byte(overGeneration), &h); err == nil {
+		t.Fatal("agent hello accepted ProcessGeneration above i64::MAX")
+	}
+}
+
+func TestDurableCommandLogRecordRejectsDuplicateAndUnknownFields(t *testing.T) {
+	for _, raw := range []string{
+		`{"seq":1,"seq":2,"command_id":"00000000-0000-4000-8000-000000000001","command":{"type":"abort"}}`,
+		`{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command":{"type":"abort"},"unexpected":true}`,
+	} {
+		var record LogRecord
+		if err := json.Unmarshal([]byte(raw), &record); err == nil {
+			t.Fatalf("durable log accepted corrupt record: %s", raw)
+		}
+	}
 }
 
 func TestEnvelopeRejectsMalformedEventBody(t *testing.T) {

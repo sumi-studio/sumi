@@ -92,6 +92,41 @@ type LogRecord struct {
 	IdempotencyKey string `json:"idempotency_key,omitempty"`
 }
 
+// UnmarshalJSON makes durable corruption fail closed: JSON's default decoder
+// accepts duplicate fields, which would otherwise let a later key silently
+// rewrite a command record during recovery.
+func (r *LogRecord) UnmarshalJSON(data []byte) error {
+	if err := checkDuplicateKeys(data); err != nil {
+		return fmt.Errorf("command log record json: %w", err)
+	}
+	type rawRecord struct {
+		Seq            *uint64         `json:"seq"`
+		CommandID      *string         `json:"command_id"`
+		Command        json.RawMessage `json:"command"`
+		IdempotencyKey string          `json:"idempotency_key"`
+	}
+	var raw rawRecord
+	if err := unmarshalStrict(data, &raw); err != nil {
+		return err
+	}
+	if raw.Seq == nil || raw.CommandID == nil || len(raw.Command) == 0 {
+		return errors.New("seq, command_id, and command are required")
+	}
+	if *raw.Seq > maxJSONSafeInteger {
+		return fmt.Errorf("seq %d exceeds JSON-safe integer range", *raw.Seq)
+	}
+	if !canonicalUUIDRegexp.MatchString(*raw.CommandID) {
+		return errors.New("command_id must be a canonical UUID")
+	}
+	// The durable log predates the current public command vocabulary. Recovery
+	// must reject record-shape corruption without reinterpreting a previously
+	// accepted payload under a newer vocabulary.
+	*r = LogRecord{CommandEnvelope: CommandEnvelope{
+		Seq: *raw.Seq, CommandID: *raw.CommandID, Command: raw.Command,
+	}, IdempotencyKey: raw.IdempotencyKey}
+	return nil
+}
+
 // ErrSeqExhausted is returned by CommandStore.Append when the next allocated
 // sequence number would exceed the JSON-safe integer boundary exposed to clients.
 var ErrSeqExhausted = errors.New("command sequence number exhausted")
@@ -353,6 +388,35 @@ func (s *CommandStore) FirstCommandSeq(ctx context.Context, conversationID strin
 		return 1, nil
 	}
 	return st.commands[0].Seq, nil
+}
+
+// HasCommands distinguishes an empty log from a log whose first retained
+// sequence happens to be one. Reconnecting agents with durable progress must
+// never be silently stranded by a lost command log.
+func (s *CommandStore) HasCommands(ctx context.Context, conversationID string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return false, errors.New("command store is closed")
+	}
+	st, err := s.ensureStateLocked(conversationID)
+	if err != nil {
+		return false, err
+	}
+	if st.poisoned {
+		return false, fmt.Errorf("command log for %q is poisoned: %w", conversationID, st.poisonErr)
+	}
+	if err := lockFile(st.file); err != nil {
+		return false, fmt.Errorf("lock command log for %q: %w", conversationID, err)
+	}
+	defer func() { _ = unlockFile(st.file) }()
+	if err := s.refreshStateLocked(st, conversationID); err != nil {
+		return false, err
+	}
+	return len(st.commands) != 0, nil
 }
 
 // GetCommand returns a single command by exact seq. It is preferred over

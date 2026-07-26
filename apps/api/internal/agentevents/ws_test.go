@@ -70,6 +70,12 @@ func (f *fakeCommandSource) FirstCommandSeq(ctx context.Context, claims TokenCla
 	return f.commands[0].Seq, nil
 }
 
+func (f *fakeCommandSource) HasCommands(ctx context.Context, claims TokenClaims) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.commands) != 0, nil
+}
+
 func (f *fakeCommandSource) CatchUp(ctx context.Context, claims TokenClaims, fromSeq uint64) ([]CommandEnvelope, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -610,7 +616,7 @@ func TestWebSocketCatchUpFromLastAppliedDoesNotSkip(t *testing.T) {
 		AgentID:                "agent-1",
 		Generation:             7,
 		LastSentEventSeq:       0,
-		LastReceivedCommandSeq: 0,
+		LastReceivedCommandSeq: 1,
 		LastAppliedCommandSeq:  1,
 	}); err != nil {
 		t.Fatalf("write hello: %v", err)
@@ -630,6 +636,29 @@ func TestWebSocketCatchUpFromLastAppliedDoesNotSkip(t *testing.T) {
 	}
 	if received.Seq != 2 {
 		t.Fatalf("expected catch-up command seq 2, got %d", received.Seq)
+	}
+}
+
+func TestWebSocketRejectsEmptyCommandLogAfterDurableProgress(t *testing.T) {
+	srv, _, _, _, _, hl := newTestServer(t)
+	hl.setReady()
+	server := startTestServer(t, srv)
+	defer server.Close()
+
+	conn, resp, err := dialTestWS(t, server, map[string][]string{"Authorization": {"Bearer test-token"}})
+	if err != nil {
+		t.Fatalf("dial: %v (status %d)", err, resp.StatusCode)
+	}
+	defer conn.Close()
+	if err := conn.WriteJSON(AgentHello{
+		AgentID: "agent-1", Generation: 7,
+		LastReceivedCommandSeq: 1, LastAppliedCommandSeq: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var apiHello ApiHello
+	if err := conn.ReadJSON(&apiHello); err == nil {
+		t.Fatal("empty command log must not acknowledge durable agent progress")
 	}
 }
 

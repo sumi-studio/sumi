@@ -12,6 +12,7 @@ use tokio::io::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
+use super::wire::MAX_JSON_SAFE_INTEGER;
 use super::wire::to_wire_frame;
 use super::{
     AgentHello, ApiHello, CommandDigestFactory, CommandEnvelope, CommandId, CommandRejectReason,
@@ -245,8 +246,12 @@ where
     R: AsyncBufRead + Unpin,
 {
     let mut frame = read_frame(input, digest_factory.start()).await?;
+    let identity = parse_command_value(&frame.identity).map_err(InvalidCommand)?;
     let raw: RawCommandIdentityEnvelope =
-        serde_json::from_slice(&frame.identity).map_err(InvalidCommand)?;
+        serde_json::from_value(identity).map_err(InvalidCommand)?;
+    if raw.seq > MAX_JSON_SAFE_INTEGER {
+        bail!("command seq {} exceeds JSON-safe integer range", raw.seq);
+    }
     if matches!(raw.command, CommandFieldPresence::Missing) || !frame.command_found {
         return Ok(InboundCommand::Invalid {
             seq: raw.seq,
@@ -930,6 +935,18 @@ mod tests {
                 command: Command::Abort {},
             })
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_outer_identity_keys_and_out_of_range_seq() {
+        for raw in [
+            r#"{"seq":1,"seq":2,"command_id":"00000000-0000-4000-8000-000000000001","command":{"type":"abort"}}"#,
+            r#"{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command_id":"00000000-0000-4000-8000-000000000002","command":{"type":"abort"}}"#,
+            r#"{"seq":9007199254740992,"command_id":"00000000-0000-4000-8000-000000000001","command":{"type":"abort"}}"#,
+        ] {
+            let mut input = BufReader::new(raw.as_bytes());
+            assert!(read_test_command(&mut input).await.is_err(), "{raw}");
+        }
     }
 
     #[tokio::test]

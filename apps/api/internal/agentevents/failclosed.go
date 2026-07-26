@@ -30,6 +30,10 @@ func (failClosedCommandSource) FirstCommandSeq(ctx context.Context, claims Token
 	return 0, errNotWired
 }
 
+func (failClosedCommandSource) HasCommands(ctx context.Context, claims TokenClaims) (bool, error) {
+	return false, errNotWired
+}
+
 func (failClosedCommandSource) CatchUp(ctx context.Context, claims TokenClaims, fromSeq uint64) ([]CommandEnvelope, error) {
 	return nil, errNotWired
 }
