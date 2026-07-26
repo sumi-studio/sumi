@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
-use uuid::Uuid;
 
 use super::action::{
     BASH_TOOL_NAME, CanonicalAction, Permission, SecretAwareActionProjector, shell,
@@ -147,6 +146,8 @@ pub enum RuleValidationError {
     SecretMaterial,
     #[error("a rule with the same id already exists")]
     DuplicateId,
+    #[error("approval rule must be workspace-only")]
+    WorkspaceOnlyRequired,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -210,11 +211,18 @@ impl Policy {
             Ok(bytes) => bytes,
             Err(_) => {
                 // Fail-closed: a broken serialization must not share a cache key
-                // with a valid policy.
-                return Uuid::now_v7().to_string();
+                // with a valid policy. Use a deterministic, domain-separated
+                // sentinel digest so cache behavior is stable across restarts.
+                return Self::hex_digest(&Sha256::digest(
+                    b"sumi-agent:approval:policy:serialization_error",
+                ));
             }
         };
         let digest = Sha256::digest(&bytes);
+        Self::hex_digest(&digest)
+    }
+
+    fn hex_digest(digest: &[u8]) -> String {
         let mut s = String::with_capacity(digest.len() * 2);
         for b in digest {
             let _ = write!(s, "{b:02x}");
@@ -223,12 +231,16 @@ impl Policy {
     }
 
     /// Load `rule` after validating that its literal prefix is narrow enough
-    /// to be safely persisted and that its `id` is unique within the policy.
-    /// Broad, secret-bearing, or duplicate rules are rejected with a typed
-    /// error rather than silently accepted.
+    /// to be safely persisted, that its `id` is unique within the policy, and
+    /// that it is workspace-only. Broad, secret-bearing, duplicate, or
+    /// non-workspace-only rules are rejected with a typed error rather than
+    /// silently accepted.
     pub fn try_with_rule(mut self, rule: ApprovalRule) -> Result<Self, RuleValidationError> {
         if self.rules.iter().any(|r| r.id == rule.id) {
             return Err(RuleValidationError::DuplicateId);
+        }
+        if !rule.workspace_only {
+            return Err(RuleValidationError::WorkspaceOnlyRequired);
         }
         if is_broad_prefix(&rule.literal_prefix) && !is_narrow_network_rule(&rule) {
             return Err(RuleValidationError::BroadPrefix);
@@ -241,8 +253,8 @@ impl Policy {
     }
 
     /// Build a policy seeded with a set of persisted rules, revalidating each
-    /// one through the same narrow-prefix and secret-material checks used at
-    /// write time. Fail-closed on any invalid stored rule.
+    /// one through the same workspace-only, narrow-prefix, and secret-material
+    /// checks used at write time. Fail-closed on any invalid stored rule.
     pub fn from_rules(
         workspace_root: impl Into<PathBuf>,
         rules: Vec<ApprovalRule>,
@@ -3046,6 +3058,29 @@ mod tests {
         assert_eq!(from_rules, Err(RuleValidationError::DuplicateId));
     }
 
+    #[test]
+    fn workspace_only_false_is_rejected_for_direct_load_and_rehydration() {
+        let non_workspace_rule = ApprovalRule {
+            id: "git-status".to_owned(),
+            tool: "bash".to_owned(),
+            literal_prefix: vec!["git".to_owned(), "status".to_owned()],
+            effect: RuleEffect::Allow,
+            workspace_only: false,
+            allowed_permissions: vec![Permission::Exec],
+            allowed_network_domains: vec![],
+        };
+        assert_eq!(
+            Policy::new("/workspace").try_with_rule(non_workspace_rule.clone()),
+            Err(RuleValidationError::WorkspaceOnlyRequired),
+            "non-workspace-only rule must be rejected by try_with_rule"
+        );
+        assert_eq!(
+            Policy::from_rules("/workspace", vec![non_workspace_rule]),
+            Err(RuleValidationError::WorkspaceOnlyRequired),
+            "non-workspace-only persisted rule must fail rehydration"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn distinct_non_utf8_workspace_roots_produce_distinct_policy_hashes() {
@@ -3077,6 +3112,25 @@ mod tests {
             a, b,
             "distinct non-UTF-8 workspace roots must not share a policy hash"
         );
+    }
+
+    #[test]
+    fn policy_hash_is_stable_and_hex() {
+        let rule = ApprovalRule {
+            id: "git-status".to_owned(),
+            tool: "bash".to_owned(),
+            literal_prefix: vec!["git".to_owned(), "status".to_owned()],
+            effect: RuleEffect::Allow,
+            workspace_only: true,
+            allowed_permissions: vec![Permission::Exec],
+            allowed_network_domains: vec![],
+        };
+        let p = Policy::new("/workspace").try_with_rule(rule).unwrap();
+        let first = p.hash();
+        let second = p.hash();
+        assert_eq!(first, second, "policy hash must be deterministic");
+        assert_eq!(first.len(), 64, "SHA-256 hex digest is 64 characters");
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]

@@ -770,45 +770,19 @@ async fn resolved_matching_approval_is_consumed_without_blocking_followup_queue(
 }
 
 async fn run_fixture(driver: Arc<FixtureDriver>) -> (RunCompletion, Vec<AgentEvent>) {
-    run_fixture_with_initial(driver, admitted_user(1)).await
+    run_fixture_with(driver, bound_core(1), admitted_user(1)).await
 }
 
-async fn run_fixture_with_initial(
+async fn run_fixture_with(
     driver: Arc<FixtureDriver>,
+    core: RunCore,
     initial: AdmittedCommand,
 ) -> (RunCompletion, Vec<AgentEvent>) {
     let worker = SequentialRunWorker::new(driver);
     let (_control_tx, control_rx) = mpsc::channel(8);
     let (events_tx, mut events_rx) = mpsc::channel(256);
-    let completion = tokio::spawn(async move {
-        worker
-            .run(bound_core(1), initial, control_rx, events_tx)
-            .await
-    });
-    let mut events = Vec::new();
-    let mut message_seq = 1;
-    while let Some(mut output) = events_rx.recv().await {
-        resolve_message_output(&mut output, &mut message_seq);
-        if let Some(barrier) = output.commit_barrier.take() {
-            barrier.committed();
-        }
-        events.push(output.event);
-    }
-    (completion.await.expect("worker join"), events)
-}
-
-async fn run_fixture_with_core(
-    driver: Arc<FixtureDriver>,
-    core: RunCore,
-) -> (RunCompletion, Vec<AgentEvent>) {
-    let worker = SequentialRunWorker::new(driver);
-    let (_control_tx, control_rx) = mpsc::channel(8);
-    let (events_tx, mut events_rx) = mpsc::channel(256);
-    let completion = tokio::spawn(async move {
-        worker
-            .run(core, admitted_user(1), control_rx, events_tx)
-            .await
-    });
+    let completion =
+        tokio::spawn(async move { worker.run(core, initial, control_rx, events_tx).await });
     let mut events = Vec::new();
     let mut message_seq = 1;
     while let Some(mut output) = events_rx.recv().await {
@@ -899,7 +873,7 @@ async fn retry_closes_error_before_schedule_and_does_not_append_error_context() 
         output(assistant(StopReason::Stop, Vec::new(), None, None)),
     ]));
     let (completion, events) =
-        run_fixture_with_initial(driver.clone(), live_admitted_user(1)).await;
+        run_fixture_with(driver.clone(), bound_core(1), live_admitted_user(1)).await;
     assert_completed(completion);
     let retry = events
         .iter()
@@ -1224,7 +1198,7 @@ async fn tool_calls_execute_strictly_sequentially_and_continue_provider() {
         output(assistant(StopReason::Stop, Vec::new(), None, None)),
     ]));
     let (completion, events) =
-        run_fixture_with_initial(driver.clone(), live_admitted_user(1)).await;
+        run_fixture_with(driver.clone(), bound_core(1), live_admitted_user(1)).await;
     assert_completed(completion);
     assert_eq!(
         *driver.tool_order.lock().expect("tool order"),
@@ -4224,7 +4198,7 @@ async fn multi_tool_batch_reviewer_sees_current_call_and_prior_finalized_result(
     ]));
     let mut core = bound_core(1);
     core.set_approval(broker);
-    let (completion, _) = run_fixture_with_core(driver, core).await;
+    let (completion, _) = run_fixture_with(driver, core, admitted_user(1)).await;
     assert_completed(completion);
 
     let prompts = transport.prompts();
