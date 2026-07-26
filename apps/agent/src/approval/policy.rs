@@ -272,12 +272,11 @@ impl Policy {
             || has_unmodeled_option_payload(eff.tokens)
             || has_embedded_execution_payload(eff.tokens)
         {
-            // ssh option payloads such as ProxyCommand can execute arbitrary
-            // local commands, so they must not be downgraded to ordinary
-            // network one-shot approvals.
-            if shell::canonicalize_command_name(&shell::command_basename(command), &["ssh"])
-                .is_some_and(|family| family == "ssh")
-            {
+            // ssh-family option payloads (ProxyCommand, scp -S, sftp -D, etc.)
+            // can execute arbitrary local commands or load arbitrary configs,
+            // so they must not be downgraded to ordinary network one-shot
+            // approvals.
+            if ssh_family_forbidden_payload(eff.tokens) {
                 return PolicyDecision::Forbidden {
                     matched_rules: Vec::new(),
                     reason: "unmodeled shell wrapper or option payload".to_owned(),
@@ -1144,12 +1143,17 @@ fn has_embedded_execution_payload(tokens: &[String]) -> bool {
                     .or_else(|| lower.strip_prefix("--option="))
                     .or_else(|| lower.strip_prefix("-o"))
                     .unwrap_or(&lower);
-                if let Some((key, _)) = after_prefix.split_once('=')
-                    && matches!(
-                        key,
-                        "proxycommand" | "localcommand" | "remotecommand" | "match"
-                    )
-                {
+                // OpenSSH `-o` accepts both `key=value` and `key value` (a single
+                // quoted argument or glued token with whitespace separating the
+                // keyword from the value). Split on either delimiter.
+                let key_end = after_prefix.find(|c: char| c == '=' || c.is_ascii_whitespace());
+                let key = key_end
+                    .map(|idx| &after_prefix[..idx])
+                    .unwrap_or(after_prefix);
+                if matches!(
+                    key,
+                    "proxycommand" | "localcommand" | "remotecommand" | "match"
+                ) {
                     return true;
                 }
             }
@@ -1181,6 +1185,81 @@ fn has_embedded_execution_payload(tokens: &[String]) -> bool {
                 || option == "--rsync-path"
                 || option.contains("filter"))
     })
+}
+
+/// Detect ssh-family options that can execute arbitrary local code or load an
+/// arbitrary configuration/program. These must not be downgraded to ordinary
+/// network one-shot approvals.
+fn ssh_family_forbidden_payload(tokens: &[String]) -> bool {
+    let Some(command) = tokens.first() else {
+        return false;
+    };
+    let command = shell::command_basename(command);
+    const SSH_FAMILY: &[&str] = &["ssh", "scp", "sftp"];
+    let Some(canonical) = shell::canonicalize_command_name(&command, SSH_FAMILY) else {
+        return false;
+    };
+
+    let mut i = 1usize;
+    while i < tokens.len() {
+        let t = &tokens[i];
+
+        // `-F` / `--config` loads a config file that may define ProxyCommand.
+        if t == "-F" || t == "--config" {
+            return true;
+        }
+        if t.starts_with("-F") && t.len() > 2 {
+            return true;
+        }
+        if t.starts_with("--config=") {
+            return true;
+        }
+
+        // `scp -S <program>` substitutes an arbitrary transport program.
+        if canonical == "scp" && short_option_token_has_flag(t, "scp", 'S') {
+            return true;
+        }
+
+        // `sftp -D <program>` executes an arbitrary local SFTP server.
+        if canonical == "sftp" && short_option_token_has_flag(t, "sftp", 'D') {
+            return true;
+        }
+
+        // `-o` / `--option` with a dangerous keyword, in either `key=value`
+        // or `key value` form.
+        let option_token = if t == "-o" || t == "--option" {
+            i += 1;
+            tokens.get(i)
+        } else if (t.starts_with("-o") && t.len() > 2)
+            || t.starts_with("-o=")
+            || t.starts_with("--option=")
+        {
+            Some(t)
+        } else {
+            None
+        };
+        if let Some(option_token) = option_token {
+            let opt_lower = option_token.to_ascii_lowercase();
+            let after_prefix = opt_lower
+                .strip_prefix("-o=")
+                .or_else(|| opt_lower.strip_prefix("--option="))
+                .or_else(|| opt_lower.strip_prefix("-o"))
+                .unwrap_or(&opt_lower);
+            let key_end = after_prefix.find(|c: char| c == '=' || c.is_ascii_whitespace());
+            let key = key_end
+                .map(|idx| &after_prefix[..idx])
+                .unwrap_or(after_prefix);
+            if matches!(
+                key,
+                "proxycommand" | "localcommand" | "remotecommand" | "match"
+            ) {
+                return true;
+            }
+        }
+
+        i += 1;
+    }
+    false
 }
 
 fn is_dotgit_hooks_path(token: &str) -> bool {
@@ -1425,7 +1504,7 @@ fn token_looks_like_path(token: &str) -> bool {
 /// rsync/scp `user@host:/path` remote specs as local paths.
 fn extract_at_file_path(s: &str) -> &str {
     if let Some(idx) = s.find('@') {
-        let after = &s[idx + 1..];
+        let after = s[idx + 1..].trim_start();
         if !after.is_empty() && !after.contains(':') && token_looks_like_path(after) {
             return after;
         }
@@ -1434,11 +1513,14 @@ fn extract_at_file_path(s: &str) -> &str {
 }
 
 fn maybe_push_path(paths: &mut Vec<String>, raw: &str) {
-    let candidate = extract_at_file_path(raw);
+    let candidate = extract_at_file_path(raw).trim();
     if token_looks_like_path(candidate) {
         paths.push(candidate.to_owned());
-    } else if token_looks_like_path(raw) {
-        paths.push(raw.to_owned());
+    } else {
+        let raw_trim = raw.trim();
+        if token_looks_like_path(raw_trim) {
+            paths.push(raw_trim.to_owned());
+        }
     }
 }
 
@@ -4542,12 +4624,7 @@ mod tests {
         let cases = [
             "nc -e /workspace/malicious -l -p 1234",
             "ncat -e /workspace/malicious -l -p 1234",
-            "scp -S /workspace/malicious user@host:/",
-            "scp -o ProxyCommand='sh -c id' user@host:/",
-            "scp -oProxyCommand='sh -c id' user@host:/",
             "sftp -b /workspace/batch user@host",
-            "sftp -D /workspace/malicious user@host",
-            "sftp -D/workspace/malicious user@host",
             "lftp -e '!id' example.com",
             "psql -c '\\! id' db",
             "mongosh --eval 'sh.exit()' mongodb://example.com",
@@ -4854,8 +4931,6 @@ mod tests {
             "ncat -c 'id' example.com 80",
             "lftp -c 'rm -rf /' example.com",
             "lftp -f /workspace/script example.com",
-            "scp -F /workspace/config user@host:/",
-            "sftp -F /workspace/config user@host",
         ];
         for command in cases {
             let action = bash(command);
@@ -4894,5 +4969,67 @@ mod tests {
                 "'{command}' must be forbidden because config may define ProxyCommand"
             );
         }
+    }
+
+    #[test]
+    fn ssh_family_local_execution_options_are_forbidden() {
+        let cases = [
+            // Config files can define ProxyCommand.
+            "scp -F /workspace/config user@host:/",
+            "scp -F/workspace/config user@host:/",
+            "scp --config /workspace/config user@host:/",
+            "scp --config=/workspace/config user@host:/",
+            "sftp -F /workspace/config user@host",
+            "sftp -F/workspace/config user@host",
+            "sftp --config /workspace/config user@host",
+            "sftp --config=/workspace/config user@host",
+            // Direct program substitution / local server execution.
+            "scp -S /workspace/malicious user@host:/",
+            "scp -S/workspace/malicious user@host:/",
+            "sftp -D /workspace/malicious user@host",
+            "sftp -D/workspace/malicious user@host",
+            // -o embedded execution keywords in key=value or key value form.
+            "ssh -o ProxyCommand='sh -c id' example.com",
+            "ssh -oProxyCommand='sh -c id' example.com",
+            "ssh -o 'ProxyCommand sh -c id' example.com",
+            "ssh -o 'LocalCommand sh -c id' example.com",
+            "ssh -o 'RemoteCommand sh -c id' example.com",
+            "scp -o ProxyCommand='sh -c id' user@host:/",
+            "scp -o 'ProxyCommand sh -c id' user@host:/",
+            "sftp -o ProxyCommand='sh -c id' user@host",
+            "sftp -o 'ProxyCommand sh -c id' user@host",
+        ];
+        for command in cases {
+            let action = bash(command);
+            let p = policy();
+            let decision = p.evaluate(&action);
+            assert!(
+                decision.is_forbidden(),
+                "'{command}' must be forbidden as a local execution payload: {decision:?}"
+            );
+            let resolved = p.resolve(&action, UserDecision::ApproveOnce, &projector());
+            assert!(
+                matches!(resolved, ResolvedDecision::Rejected { .. }),
+                "'{command}' must reject ApproveOnce: {resolved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn option_values_with_leading_whitespace_classify_paths() {
+        let tokens = shell::tokenize_command("tar --file= /etc/passwd -cvf out.tar .");
+        assert_eq!(
+            bash_path_check(&tokens, Path::new("/workspace"), Path::new("/workspace")),
+            PathCheck::WorkspaceEscape,
+            "leading whitespace in --file= value must be trimmed before path classification"
+        );
+
+        // Inside-workspace values with leading whitespace must still resolve inside.
+        let tokens = shell::tokenize_command("tar --file= /workspace/archive.tar -cvf out.tar .");
+        assert_eq!(
+            bash_path_check(&tokens, Path::new("/workspace"), Path::new("/workspace")),
+            PathCheck::InsideWorkspace,
+            "leading whitespace in a workspace path must not misclassify it as an escape"
+        );
     }
 }
