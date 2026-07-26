@@ -412,6 +412,9 @@ async fn bash_env_does_not_leak_broker_socket() {
                 "type": "bash",
                 "command": "env",
                 "execution_id": "env-1",
+                "tool_call_id": "env-1-tc",
+                "command_id": "env-1-cmd",
+                "run_id": "run-1",
             }),
         ),
     )
@@ -494,6 +497,9 @@ async fn bash_cannot_reach_broker_socket_path() {
                 "type": "bash",
                 "command": "test -S ../broker-ipc/broker.sock && printf REACHABLE || printf NOT_REACHABLE",
                 "execution_id": "reach-1",
+                "tool_call_id": "reach-1-tc",
+                "command_id": "reach-1-cmd",
+                "run_id": "run-1",
             }),
         ),
     )
@@ -530,6 +536,9 @@ async fn bash_cannot_reach_broker_socket_path() {
                 "type": "bash",
                 "command": r#"awk 'BEGIN{ok=0} /broker-ipc/{ok=1; if ($0 ~ /shared|master/) {print "PROPAGATION_LEAK"; exit 1}} END{if(!ok){print "NOT_FOUND"; exit 1} print "MOUNT_PRIVATE_OK"}' /proc/self/mountinfo"#,
                 "execution_id": "mountinfo-1",
+                "tool_call_id": "mountinfo-1-tc",
+                "command_id": "mountinfo-1-cmd",
+                "run_id": "run-1",
             }),
         ),
     )
@@ -622,6 +631,9 @@ async fn bash_isolation_fails_closed_for_invalid_broker_socket() {
                 "type": "bash",
                 "command": "true",
                 "execution_id": "invalid-1",
+                "tool_call_id": "invalid-1-tc",
+                "command_id": "invalid-1-cmd",
+                "run_id": "run-1",
             }),
         ),
     )
@@ -682,6 +694,9 @@ async fn executor_in_network_namespace_cannot_reach_external_network() {
                 "type": "bash",
                 "command": "cat < /dev/tcp/8.8.8.8/53",
                 "execution_id": "net-1",
+                "tool_call_id": "net-1-tc",
+                "command_id": "net-1-cmd",
+                "run_id": "run-1",
             }),
         ),
     )
@@ -752,6 +767,9 @@ async fn executor_in_user_namespace_has_distinct_uid() {
                 "type": "bash",
                 "command": "id -u",
                 "execution_id": "uid-1",
+                "tool_call_id": "uid-1-tc",
+                "command_id": "uid-1-cmd",
+                "run_id": "run-1",
             }),
         ),
     )

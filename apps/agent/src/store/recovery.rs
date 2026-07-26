@@ -141,9 +141,10 @@ impl SuffixRecovery {
         receipt: PhysicalRecoveryReceipt,
         batch: EventBatch,
     ) -> Result<(ApplyReceiptOutcome, Vec<u64>)> {
-        writer
-            .apply_physical_recovery(lease, fence, receipt, batch)
-            .await
+        let (outcome, seqs, _receipt) = writer
+            .apply_physical_recovery(lease, fence, |_next_seq| Ok((batch, receipt)))
+            .await?;
+        Ok((outcome, seqs))
     }
 
     /// Plans and persists only the restart prefix owned by T12.

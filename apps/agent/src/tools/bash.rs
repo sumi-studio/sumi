@@ -104,6 +104,9 @@ pub struct LowTrustLocalBash<'a> {
     quota_policy: ResourceQuotaPolicy,
     process_generation: Option<ProcessGeneration>,
     execution_registry: Option<std::sync::Arc<GenerationExecutionRegistry>>,
+    tool_call_id: Option<String>,
+    command_id: Option<String>,
+    run_id: Option<String>,
     #[cfg(test)]
     cancel_stop_delay: Duration,
     #[cfg(test)]
@@ -120,6 +123,9 @@ impl<'a> LowTrustLocalBash<'a> {
             quota_policy: ResourceQuotaPolicy::default(),
             process_generation: None,
             execution_registry: None,
+            tool_call_id: None,
+            command_id: None,
+            run_id: None,
             #[cfg(test)]
             cancel_stop_delay: Duration::ZERO,
             #[cfg(test)]
@@ -148,6 +154,21 @@ impl<'a> LowTrustLocalBash<'a> {
         registry: std::sync::Arc<GenerationExecutionRegistry>,
     ) -> Self {
         self.execution_registry = Some(registry);
+        self
+    }
+
+    /// Set the durable identities needed to bind this execution to the
+    /// `tool_executions` ledger and physical recovery state.  Required when
+    /// `with_execution_registry` is used; ignored otherwise.
+    pub fn with_durable_identities(
+        mut self,
+        tool_call_id: impl Into<String>,
+        command_id: impl Into<String>,
+        run_id: impl Into<String>,
+    ) -> Self {
+        self.tool_call_id = Some(tool_call_id.into());
+        self.command_id = Some(command_id.into());
+        self.run_id = Some(run_id.into());
         self
     }
 
@@ -237,20 +258,48 @@ impl<'a> LowTrustLocalBash<'a> {
 
         let cgroup_path = applied_quota.cgroup_path().map(PathBuf::from);
 
-        let _registry_handle = self.execution_registry.as_ref().and_then(|registry| {
-            registry
-                .register(
-                    execution_id.to_owned(),
-                    execution_id.to_owned(),
-                    self.process_generation
-                        .map(|generation| generation.to_string())
-                        .unwrap_or_default(),
-                    execution_id.to_owned(),
-                    cgroup_path.clone(),
-                    vec![pid],
-                )
-                .ok()
-        });
+        let _registry_handle = match self.execution_registry.as_ref() {
+            Some(registry) => {
+                let tool_call_id = self
+                    .tool_call_id
+                    .clone()
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| {
+                        ToolError::Protocol(
+                            "tool_call_id is required when an execution registry is set".to_owned(),
+                        )
+                    })?;
+                let command_id = self
+                    .command_id
+                    .clone()
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| {
+                        ToolError::Protocol(
+                            "command_id is required when an execution registry is set".to_owned(),
+                        )
+                    })?;
+                let run_id = self
+                    .run_id
+                    .clone()
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| {
+                        ToolError::Protocol(
+                            "run_id is required when an execution registry is set".to_owned(),
+                        )
+                    })?;
+                registry
+                    .register(
+                        tool_call_id,
+                        command_id,
+                        run_id,
+                        execution_id.to_owned(),
+                        cgroup_path.clone(),
+                        vec![pid],
+                    )
+                    .ok()
+            }
+            None => None,
+        };
 
         let mut process_group = ProcessGroupGuard::new(pid, cgroup_path.clone());
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(OUTPUT_QUEUE_CAPACITY);
@@ -380,12 +429,14 @@ impl<'a> LowTrustLocalBash<'a> {
         }
 
         if !cancelled && let Some(status) = exit_status {
-            // When a cgroup is present, `AppliedQuota::classify` already
-            // inspected `memory.events`, `pids.events`, and `cpu.stat`. The only
-            // remaining signals that identify a limit without cgroup evidence
-            // are SIGXCPU and SIGXFSZ; SIGKILL must not be guessed as Memory
-            // when wall time or CPU throttle was the real stop cause.
-            resource_limit = applied_quota.classify(&status).or(resource_limit);
+            // `AppliedQuota::classify` can detect memory, CPU-time, PID, and
+            // CPU-throttle cgroup events.  The loop's OutputBytes decision is
+            // always authoritative (we killed the process because of it).
+            // WallTime is a generic watchdog, so a more specific cgroup cause
+            // such as Pids or Memory overrides it; CpuThrottle is incidental
+            // and must never overwrite OutputBytes or WallTime.
+            let cgroup_limit = applied_quota.classify(&status);
+            resource_limit = merge_resource_limit(resource_limit, cgroup_limit);
             if resource_limit.is_none() {
                 resource_limit = classify_resource_limit(
                     &self.quota_policy,
@@ -1188,6 +1239,35 @@ fn sanitize_inherited_fds(
 
 fn errno() -> libc::c_int {
     unsafe { *libc::__errno_location() }
+}
+
+fn merge_resource_limit(
+    loop_limit: Option<ResourceLimit>,
+    cgroup_limit: Option<ResourceLimit>,
+) -> Option<ResourceLimit> {
+    use ResourceLimit as R;
+    match (loop_limit.clone(), cgroup_limit.clone()) {
+        // The loop observed the output boundary and killed the process; any
+        // later cgroup evidence is incidental.
+        (Some(R::OutputBytes { .. }), _) => loop_limit,
+        // CpuThrottle caps the duty cycle; the kernel does not kill for it.
+        // If the loop already decided WallTime or OutputBytes, keep that.
+        (Some(ref wall @ R::WallTime { .. }), Some(R::CpuThrottle { .. })) => Some(wall.clone()),
+        // WallTime is a generic watchdog.  A concrete cgroup cause (memory,
+        // CPU-time budget, PID max) is more specific and should win.
+        (
+            Some(R::WallTime { .. }),
+            Some(cgroup @ (R::Memory { .. } | R::CpuTime { .. } | R::Pids { .. })),
+        ) => Some(cgroup),
+        // No loop decision; trust the cgroup classification.
+        (None, Some(cgroup)) => Some(cgroup),
+        // The loop already produced a decision and cgroup evidence does not
+        // override it; keep the loop decision.
+        (Some(loop_limit), Some(_)) => Some(loop_limit),
+        // No cgroup classification; keep whatever loop decision we have.
+        (Some(loop_limit), None) => Some(loop_limit),
+        (None, None) => None,
+    }
 }
 
 fn classify_resource_limit(
@@ -2165,5 +2245,37 @@ mod tests {
             usize::try_from(result.observed_bytes).expect("observed length"),
             "every byte measured at the pipe-reader boundary must reach the artifact"
         );
+    }
+
+    #[test]
+    fn merge_resource_limit_preserves_output_bytes_over_cpu_throttle() {
+        let output = Some(ResourceLimit::OutputBytes {
+            observed: 100,
+            limit: 100,
+        });
+        let throttle = Some(ResourceLimit::CpuThrottle { limit: 1000 });
+        assert_eq!(merge_resource_limit(output.clone(), throttle), output);
+    }
+
+    #[test]
+    fn merge_resource_limit_preserves_wall_time_over_cpu_throttle() {
+        let wall = Some(ResourceLimit::WallTime { limit_seconds: 1 });
+        let throttle = Some(ResourceLimit::CpuThrottle { limit: 1000 });
+        assert_eq!(merge_resource_limit(wall.clone(), throttle), wall);
+    }
+
+    #[test]
+    fn merge_resource_limit_prefers_concrete_cgroup_cause_over_wall_time() {
+        let wall = Some(ResourceLimit::WallTime { limit_seconds: 1 });
+        let memory = Some(ResourceLimit::Memory {
+            limit: 64 * 1024 * 1024,
+        });
+        assert_eq!(merge_resource_limit(wall, memory.clone()), memory);
+    }
+
+    #[test]
+    fn merge_resource_limit_allows_cgroup_classification_when_loop_decided_nothing() {
+        let pids = Some(ResourceLimit::Pids { limit: 64 });
+        assert_eq!(merge_resource_limit(None, pids.clone()), pids);
     }
 }

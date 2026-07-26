@@ -126,6 +126,13 @@ pub struct ToolCtx<'a> {
     /// it when retrying the same invocation and change it for a later flow.
     pub flow_id: &'a str,
     pub call_id: &'a str,
+    /// Durable conversation identity that bounds this tool execution to a
+    /// single `RunCore`/`DurableRunBinding`.  Used for physical recovery and
+    /// `tool_executions` ledger attribution.
+    pub run_id: &'a str,
+    /// Durable command identity that bounds this tool execution to the
+    /// `AdmittedCommand` that started the run.
+    pub command_id: &'a str,
     pub args: &'a ValidatedToolArguments,
     pub cancel: CancellationToken,
     /// Synchronous progress delivery. The callback runs while the internal
@@ -168,6 +175,8 @@ impl Tool for GuardedTool {
             .execute(ToolCtx {
                 flow_id: ctx.flow_id,
                 call_id: ctx.call_id,
+                run_id: ctx.run_id,
+                command_id: ctx.command_id,
                 args: ctx.args,
                 cancel: ctx.cancel,
                 on_update: Arc::new(move |value| guarded_update.emit(value)),
@@ -315,6 +324,8 @@ impl Drop for ToolSettlementGuard {
 pub struct TypedToolCtx<'a> {
     pub flow_id: &'a str,
     pub call_id: &'a str,
+    pub run_id: &'a str,
+    pub command_id: &'a str,
     pub cancel: CancellationToken,
     pub on_update: ToolUpdate,
     pub workspace: &'a WorkspacePaths,
@@ -384,6 +395,8 @@ where
                 TypedToolCtx {
                     flow_id: ctx.flow_id,
                     call_id: ctx.call_id,
+                    run_id: ctx.run_id,
+                    command_id: ctx.command_id,
                     cancel: ctx.cancel,
                     on_update: update.clone(),
                     workspace: ctx.workspace,
@@ -491,6 +504,8 @@ mod tests {
             .execute(ToolCtx {
                 flow_id: "flow-1",
                 call_id: "call-1",
+                run_id: "run-1",
+                command_id: "command-1",
                 args: &validated(json!({"value": "ok"})),
                 cancel: CancellationToken::new(),
                 on_update: Arc::new(move |value| {
@@ -548,6 +563,8 @@ mod tests {
         let mut future = Box::pin(tool.execute(ToolCtx {
             flow_id: "flow-pending",
             call_id: "call-pending",
+            run_id: "run-1",
+            command_id: "command-1",
             args: &args,
             cancel: CancellationToken::new(),
             on_update: Arc::new(move |_| {
@@ -590,6 +607,8 @@ mod tests {
         tool.execute(ToolCtx {
             flow_id: "raw-flow",
             call_id: "raw-call",
+            run_id: "run-1",
+            command_id: "command-1",
             args: &args,
             cancel: CancellationToken::new(),
             on_update: Arc::new(move |_| {
@@ -630,6 +649,8 @@ mod tests {
         let mut future = Box::pin(tool.execute(ToolCtx {
             flow_id: "raw-pending-flow",
             call_id: "raw-pending-call",
+            run_id: "run-1",
+            command_id: "command-1",
             args: &args,
             cancel: CancellationToken::new(),
             on_update: Arc::new(move |_| {

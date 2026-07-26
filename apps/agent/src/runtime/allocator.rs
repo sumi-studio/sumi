@@ -69,12 +69,7 @@ pub fn acquire_generation(state_dir: impl AsRef<Path>) -> Result<GenerationAlloc
     let state_dir = state_dir.as_ref();
     fs::create_dir_all(state_dir).context("failed to create allocator state directory")?;
 
-    let generation_path = state_dir.join(GENERATION_FILE_NAME);
-    let temp_path = state_dir.join(GENERATION_TEMP_NAME);
     let lock_path = state_dir.join(GENERATION_LOCK_NAME);
-
-    // Advisory exclusive lock on a stable inode. The generation ledger file is
-    // atomically renamed, so it cannot be the lock carrier.
     let lock_file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -82,8 +77,13 @@ pub fn acquire_generation(state_dir: impl AsRef<Path>) -> Result<GenerationAlloc
         .truncate(false)
         .open(&lock_path)
         .context("failed to open generation lock file")?;
+
+    // Lock a stable inode. The ledger itself is atomically renamed below, so
+    // locking that data file would not serialize a later opener.
     lock_exclusive(lock_file.as_raw_fd()).context("failed to lock generation ledger")?;
 
+    let generation_path = state_dir.join(GENERATION_FILE_NAME);
+    let temp_path = state_dir.join(GENERATION_TEMP_NAME);
     let file = OpenOptions::new()
         .read(true)
         .write(true)

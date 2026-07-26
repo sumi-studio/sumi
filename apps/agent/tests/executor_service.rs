@@ -439,7 +439,7 @@ async fn bash_cancel_emits_one_terminal_per_request_and_no_late_update() {
         &mut stdin,
         &request(
             "bash",
-            json!({"type":"bash","command":"printf ready; sleep 30; printf late","execution_id":"bash-1"}),
+            json!({"type":"bash","command":"printf ready; sleep 30; printf late","execution_id":"bash-1","tool_call_id":"bash-1-tc","command_id":"bash-1-cmd","run_id":"run-1"}),
         ),
     )
     .await;
@@ -496,6 +496,9 @@ async fn slow_progress_consumer_drops_overflow_but_receives_authoritative_termin
                 "type":"bash",
                 "command":"head -c 524288 /dev/zero | tr '\\0' x; printf complete > bash-slow-progress.complete",
                 "execution_id":"bash-slow-progress",
+                "tool_call_id":"bash-slow-progress-tc",
+                "command_id":"bash-slow-progress-cmd",
+                "run_id":"run-1",
             }),
         ),
     )
@@ -586,6 +589,9 @@ async fn run_bash_reap_timeout_case(matching_cancel: bool) -> [Value; 2] {
                 "type":"bash",
                 "command":"head -c 60000 /dev/zero | tr '\\0' x; sleep 30",
                 "execution_id":"bash-reap-timeout",
+                "tool_call_id":"bash-reap-timeout-tc",
+                "command_id":"bash-reap-timeout-cmd",
+                "run_id":"run-1",
             }),
         ),
     )
@@ -661,7 +667,7 @@ async fn unconsumed_executor_stdout_cannot_block_cancel_and_reap() {
         &mut stdin,
         &request(
             secret_id,
-            json!({"type":"bash","command":"head -c 8388608 /dev/zero | tr '\\0' x; sleep 30","execution_id":"bash-backpressure"}),
+            json!({"type":"bash","command":"head -c 8388608 /dev/zero | tr '\\0' x; sleep 30","execution_id":"bash-backpressure","tool_call_id":"bash-backpressure-tc","command_id":"bash-backpressure-cmd","run_id":"run-1"}),
         ),
     ).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -751,7 +757,7 @@ async fn active_bash_control_failures_cancel_and_reap_the_process_group() {
             &mut stdin,
             &request(
                 request_id,
-                json!({"type":"bash","command":"echo $$ > bash.pid; sleep 30","execution_id":"bash-control-failure"}),
+                json!({"type":"bash","command":"echo $$ > bash.pid; sleep 30","execution_id":"bash-control-failure","tool_call_id":"bash-control-failure-tc","command_id":"bash-control-failure-cmd","run_id":"run-1"}),
             ),
         )
         .await;
@@ -817,6 +823,9 @@ async fn queued_cancel_is_settled_before_simultaneous_bash_completion() {
                     "type":"bash",
                     "command":format!("echo $$ > pid-{iteration}; touch ready-{iteration}; while [ ! -e release-{iteration} ]; do :; done"),
                     "execution_id":execution_id,
+                    "tool_call_id":format!("{execution_id}-tc"),
+                    "command_id":format!("{execution_id}-cmd"),
+                    "run_id":"run-1",
                 }),
             ),
         )
@@ -920,6 +929,9 @@ async fn broker_failure_telemetry_omits_caller_execution_id() {
                 "type":"bash",
                 "command":"head -c 60000 /dev/zero | tr '\\0' x",
                 "execution_id":secret_execution_id,
+                "tool_call_id":format!("{secret_execution_id}-tc"),
+                "command_id":format!("{secret_execution_id}-cmd"),
+                "run_id":"run-1",
             }),
         ),
     )
@@ -953,7 +965,7 @@ async fn bash_archives_large_output_through_the_broker_client() {
         &mut stdin,
         &request(
             "bash-archive",
-            json!({"type":"bash","command":"head -c 60000 /dev/zero | tr '\\0' x","execution_id":"bash-archive-1"}),
+            json!({"type":"bash","command":"head -c 60000 /dev/zero | tr '\\0' x","execution_id":"bash-archive-1","tool_call_id":"bash-archive-1-tc","command_id":"bash-archive-1-cmd","run_id":"run-1"}),
         ),
     )
     .await;

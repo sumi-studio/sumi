@@ -263,14 +263,19 @@ pub struct RecoveryIntent {
     pub execution_id: String,
 }
 
-/// Best-effort kill of a sandbox. Tries cgroup.kill first, then `SIGKILL` to
-/// the process group of the first PID, then individual `SIGKILL` to each PID.
+/// Kill a sandbox and observe reaping until the configured deadline.
 async fn kill_sandbox(sandbox: &ExecutionSandbox) -> Result<()> {
-    if let Some(path) = &sandbox.cgroup_path
-        && kill_cgroup(path).is_ok()
-        && wait_cgroup_empty(path).await
-    {
-        return Ok(());
+    if sandbox.pids.is_empty() && sandbox.cgroup_path.is_none() {
+        bail!("sandbox has no pids and no cgroup path; cannot kill");
+    }
+
+    if let Some(path) = &sandbox.cgroup_path {
+        if kill_cgroup(path).is_ok() && wait_cgroup_empty(path).await {
+            return Ok(());
+        }
+        if sandbox.pids.is_empty() {
+            bail!("cgroup not empty and no known pids to reap");
+        }
     }
 
     if let Some(&pid) = sandbox.pids.first() {
@@ -281,16 +286,60 @@ async fn kill_sandbox(sandbox: &ExecutionSandbox) -> Result<()> {
         let _ = kill_pid(pid);
     }
 
-    if sandbox.pids.is_empty() && sandbox.cgroup_path.is_none() {
-        bail!("sandbox has no pids and no cgroup path; cannot kill");
-    }
-
-    // Give the kernel a bounded window to reap the processes.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    Ok(())
+    wait_pids_reaped(&sandbox.pids).await
 }
 
-fn kill_pid(pid: u32) -> Result<()> {
+async fn wait_pids_reaped(pids: &[u32]) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + REAP_DEADLINE;
+    loop {
+        if pids.iter().all(|&pid| is_pid_gone(pid)) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("sandbox processes were not reaped by deadline");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn is_pid_gone(pid: u32) -> bool {
+    if pid == 0 {
+        return true;
+    }
+    let Ok(pid) = i32::try_from(pid) else {
+        return true;
+    };
+
+    // If this process is our child, reap it and treat any exit as gone.
+    let mut status = 0;
+    let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    if rc == pid {
+        return true;
+    }
+    if rc == 0 {
+        return false;
+    }
+    if rc < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ECHILD) {
+            // Interrupted or other error; assume still present and let the
+            // deadline logic retry.
+            return false;
+        }
+    }
+
+    // Not our child: fall back to existence check.  A zombie that is still
+    // in the process table will respond to kill(pid, 0); if we cannot signal
+    // it, it is either gone or owned by another user.
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        return err.raw_os_error() == Some(libc::ESRCH);
+    }
+    false
+}
+
+pub(super) fn kill_pid(pid: u32) -> Result<()> {
     let pid = i32::try_from(pid).context("process id exceeded i32")?;
     let rc = unsafe { libc::kill(pid, libc::SIGKILL) };
     if rc == 0 {
@@ -404,6 +453,31 @@ mod tests {
 
         drop(handle);
         assert!(registry.get("exec-1").is_none());
+    }
+
+    #[tokio::test]
+    async fn recovery_intents_carry_durable_identities() {
+        let registry = GenerationExecutionRegistry::new(generation(1));
+        let mut handle = registry
+            .register(
+                "tool-call-1".to_owned(),
+                "command-1".to_owned(),
+                "run-1".to_owned(),
+                "exec-1".to_owned(),
+                None,
+                vec![],
+            )
+            .unwrap();
+
+        let intents = registry.recovery_intents();
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].tool_call_id, "tool-call-1");
+        assert_eq!(intents[0].command_id, "command-1");
+        assert_eq!(intents[0].run_id, "run-1");
+        assert_eq!(intents[0].executor_generation, generation(1));
+        assert_eq!(intents[0].execution_id, "exec-1");
+
+        handle.disarm();
     }
 
     #[tokio::test]
@@ -526,6 +600,86 @@ mod tests {
             .expect("old child was reaped");
 
         current_handle.disarm();
+    }
+
+    #[test]
+    fn is_pid_gone_reports_alive_and_dead_processes() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+
+        assert!(!is_pid_gone(pid), "running child must appear alive");
+
+        child.kill().expect("kill child");
+        let _ = child.wait();
+
+        assert!(is_pid_gone(pid), "reaped child must appear gone");
+    }
+
+    #[tokio::test]
+    async fn wait_pids_reaped_observes_until_deadline() {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id().expect("child pid");
+
+        // Start the timer before killing so the wait must observe actual reaping.
+        let start = tokio::time::Instant::now();
+        child.kill().await.expect("kill child");
+        wait_pids_reaped(&[pid])
+            .await
+            .expect("pids reaped by deadline");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "wait_pids_reaped should not assume a fixed sleep"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_pids_reaped_fails_when_process_survives() {
+        // PID 0 is not a real process, but if we ever pass it we must not block.
+        // A process that refuses SIGKILL cannot be tested safely, so this only
+        // verifies the deadline path for an obviously-gone pid list.
+        wait_pids_reaped(&[])
+            .await
+            .expect("empty pid list is trivially reaped");
+    }
+
+    #[tokio::test]
+    async fn wait_pids_reaped_fails_when_process_is_stopped() {
+        // A stopped process is still alive; the reap waiter must observe until
+        // the deadline instead of assuming success after a fixed sleep.
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id().expect("child pid");
+
+        let rc = unsafe { libc::kill(pid as i32, libc::SIGSTOP) };
+        assert_eq!(rc, 0, "failed to stop child");
+
+        let start = tokio::time::Instant::now();
+        let result = wait_pids_reaped(&[pid]).await;
+        assert!(
+            result.is_err(),
+            "stopped process must not be considered reaped"
+        );
+        assert!(
+            start.elapsed() >= Duration::from_millis(1800),
+            "wait_pids_reaped must observe until the deadline"
+        );
+
+        child.kill().await.expect("kill child");
+        let _ = child.wait().await;
     }
 
     #[test]

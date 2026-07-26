@@ -99,6 +99,8 @@ pub(crate) trait RunDriver: Send + Sync + 'static {
     async fn execute_tool_observed(
         &self,
         flow_id: &str,
+        command_id: &str,
+        run_id: &str,
         call: &ToolCall,
         cancel: CancellationToken,
         on_update: Arc<dyn Fn(Value) + Send + Sync>,
@@ -1064,10 +1066,22 @@ impl Runner {
             // Session event lane; a saturated progress lane coalesces by drop.
             let _ = updates_tx.try_send((callback_call_id.clone(), partial));
         });
+        let binding = self.core.durable_binding.as_ref().ok_or_else(|| {
+            WorkerFailure::Error("RunCore has no durable worker binding".to_owned())
+        })?;
+        let command_id = binding.command_id.clone();
+        let run_id = binding.run_id.clone();
         let driver = self.driver.clone();
         let cancel = CancellationToken::new();
         let future = CancelOnDrop::new(
-            driver.execute_tool_observed(flow_id, call, cancel.clone(), on_update),
+            driver.execute_tool_observed(
+                flow_id,
+                &command_id,
+                &run_id,
+                call,
+                cancel.clone(),
+                on_update,
+            ),
             cancel.clone(),
         );
         tokio::pin!(future);

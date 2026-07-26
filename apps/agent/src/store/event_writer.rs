@@ -1570,19 +1570,38 @@ impl EventWriter {
         self.apply_locked(batch, &mut guard).await
     }
 
-    /// Hydration entry point for a T27 physical recovery proof.  The receipt
-    /// projection must be part of the supplied batch (normally as its final
-    /// eventless write); EventWriter then commits the logical suffix, terminal
-    /// tool events/results, and T17 application ledger in one SQLite transaction.
+    /// Hydration entry point for a T27 physical recovery proof.  The caller
+    /// supplies a `build` closure that is invoked with the next durable event
+    /// sequence held under the EventWriter gate; the closure returns the logical
+    /// suffix batch and the `PhysicalRecoveryReceipt` whose bounds are derived
+    /// from that sequence.  EventWriter then commits the logical suffix,
+    /// terminal tool events/results, and T17 application ledger in one SQLite
+    /// transaction.  Because `next_seq` is allocated under the EventWriter gate,
+    /// concurrent EventWriter transactions cannot reuse or skip sequence numbers.
     #[allow(dead_code, reason = "T17 hydration caller is composed by T26")]
     pub(crate) async fn apply_physical_recovery(
         &self,
         lease: &ProcessGenerationLease,
         fence: &GenerationRecoveryFence,
-        receipt: PhysicalRecoveryReceipt,
-        mut batch: EventBatch,
-    ) -> Result<(ApplyReceiptOutcome, Vec<u64>)> {
+        build: impl FnOnce(u64) -> Result<(EventBatch, PhysicalRecoveryReceipt)>,
+    ) -> Result<(ApplyReceiptOutcome, Vec<u64>, PhysicalRecoveryReceipt)> {
+        let mut guard = self.gate.lock().await;
+        self.ensure_checkpoint(&mut guard).await?;
+        let checkpoint = guard
+            .checkpoint
+            .as_ref()
+            .expect("checkpoint initialized before physical recovery")
+            .clone();
+        let previous_event_head = checkpoint.event_head.clone();
+        let next_seq = previous_event_head
+            .as_ref()
+            .map_or(0, |head| head.last_seq)
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("durable event sequence overflow"))?;
+
+        let (mut batch, receipt) = build(next_seq)?;
         receipt.validate_for(lease, fence)?;
+
         let mut has_receipt_projection = false;
         for projection in batch.writes.iter().flat_map(|write| &write.projections) {
             if let Projection::PhysicalRecovery(existing) = projection {
@@ -1595,20 +1614,21 @@ impl EventWriter {
         if !has_receipt_projection {
             batch.writes.push(EventWrite {
                 event: None,
-                projections: vec![Projection::PhysicalRecovery(receipt)],
+                projections: vec![Projection::PhysicalRecovery(receipt.clone())],
             });
         }
+
         // Idempotency is decided inside the same SQLite transaction as the
         // application ledger write (PhysicalRecoveryApplier::apply_in_transaction).
         // Reading `already_present` outside the transaction would create a TOCTOU
         // window where two callers could both observe the receipt as new.
-        let seqs = self.apply(batch).await?;
+        let seqs = self.apply_locked(batch, &mut guard).await?;
         let outcome = if seqs.is_empty() {
             ApplyReceiptOutcome::AlreadyApplied
         } else {
             ApplyReceiptOutcome::Applied
         };
-        Ok((outcome, seqs))
+        Ok((outcome, seqs, receipt))
     }
 
     #[cfg(test)]
@@ -20508,6 +20528,7 @@ mod tests {
                 assert_eq!(intents[0].tool_call_id, tool_call_id);
                 assert_eq!(intents[0].command_id, TOOL_OWNER_COMMAND_ID);
                 assert_eq!(intents[0].run_id, run_id);
+                assert_eq!(intents[0].tool_name, "test");
             }
             HydrationOutcome::Complete(_) => panic!("running tool must keep boot fail-closed"),
         }
@@ -20789,20 +20810,13 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn t17_physical_recovery_batch(
-        store: &Store,
+    fn t17_physical_recovery_batch(
+        next_seq: u64,
         run_id: &str,
         tool_call_id: &str,
         lease: &ProcessGenerationLease,
         fence: &GenerationRecoveryFence,
     ) -> (EventBatch, PhysicalRecoveryReceipt) {
-        let head: Option<(i64, i64)> =
-            sqlx::query_as("SELECT last_seq, event_count FROM event_log_heads")
-                .fetch_optional(store.pool())
-                .await
-                .expect("read event-log head for physical recovery batch");
-        let next_seq = head.map_or(1, |(last, _)| last as u64 + 1);
-
         let mut writes = tool_finish_writes(
             tool_call_id,
             "running",
@@ -20861,8 +20875,14 @@ mod tests {
         let run_id = "run-1";
         let tool_call_id = "tool-1";
         let (lease, fence) = t17_setup_running_tool(&store, &writer, run_id, tool_call_id).await;
+        let head: Option<(i64, i64)> =
+            sqlx::query_as("SELECT last_seq, event_count FROM event_log_heads")
+                .fetch_optional(store.pool())
+                .await
+                .expect("read event-log head for abrupt failpoint child");
+        let next_seq = head.map_or(1, |(last, _)| last as u64 + 1);
         let (batch, _) =
-            t17_physical_recovery_batch(&store, run_id, tool_call_id, &lease, &fence).await;
+            t17_physical_recovery_batch(next_seq, run_id, tool_call_id, &lease, &fence);
         writer
             .apply_with_abrupt_transaction_failpoint(
                 batch,
@@ -20987,10 +21007,12 @@ mod tests {
                 let fence = GenerationRecoveryFence::new(&lease, "fence-for-test-lease")
                     .expect("test fence");
                 let writer = EventWriter::new(reopened.clone());
-                let (batch, receipt) =
-                    t17_physical_recovery_batch(&reopened, "run-1", "tool-1", &lease, &fence).await;
-                let (outcome, seqs) = writer
-                    .apply_physical_recovery(&lease, &fence, receipt, batch)
+                let (outcome, seqs, _receipt) = writer
+                    .apply_physical_recovery(&lease, &fence, |next_seq| {
+                        Ok(t17_physical_recovery_batch(
+                            next_seq, "run-1", "tool-1", &lease, &fence,
+                        ))
+                    })
                     .await
                     .expect("physical recovery converges after rollback");
                 assert_eq!(outcome, ApplyReceiptOutcome::Applied);
@@ -21041,16 +21063,16 @@ mod tests {
             let lease = receipt.lease.clone();
             let fence = receipt.fence.clone();
             let writer = EventWriter::new(reopened.clone());
-            let (outcome, seqs) = writer
-                .apply_physical_recovery(
-                    &lease,
-                    &fence,
-                    receipt,
-                    EventBatch {
-                        writes: vec![],
-                        injected_commands: Vec::new(),
-                    },
-                )
+            let (outcome, seqs, _receipt) = writer
+                .apply_physical_recovery(&lease, &fence, |_next_seq| {
+                    Ok((
+                        EventBatch {
+                            writes: vec![],
+                            injected_commands: Vec::new(),
+                        },
+                        receipt,
+                    ))
+                })
                 .await
                 .expect("bare receipt replay is idempotent");
             assert_eq!(outcome, ApplyReceiptOutcome::AlreadyApplied);

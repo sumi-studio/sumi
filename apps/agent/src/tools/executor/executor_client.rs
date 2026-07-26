@@ -837,6 +837,9 @@ mod tests {
                 ExecutorOperation::Bash {
                     command: "printf first; sleep 0.05; printf second".to_owned(),
                     execution_id: "bash-updates".to_owned(),
+                    tool_call_id: "tool-call-1".to_owned(),
+                    command_id: "command-1".to_owned(),
+                    run_id: "run-1".to_owned(),
                 },
                 CancellationToken::new(),
                 Arc::new(move |value| updates_callback.lock().unwrap().push(value)),
@@ -873,6 +876,9 @@ mod tests {
                 ExecutorOperation::Bash {
                     command: "head -c 8192 /dev/zero | tr '\\0' x; sleep 0.05".to_owned(),
                     execution_id: "bash-oversized-progress".to_owned(),
+                    tool_call_id: "tool-call-1".to_owned(),
+                    command_id: "command-1".to_owned(),
+                    run_id: "run-1".to_owned(),
                 },
                 CancellationToken::new(),
                 Arc::new(move |value| updates_callback.lock().unwrap().push(value)),
@@ -917,6 +923,9 @@ mod tests {
                 ExecutorOperation::Bash {
                     command: "printf started; sleep 30".to_owned(),
                     execution_id: "bash-cancel".to_owned(),
+                    tool_call_id: "tool-call-1".to_owned(),
+                    command_id: "command-1".to_owned(),
+                    run_id: "run-1".to_owned(),
                 },
                 cancel,
                 Arc::new(move |value| {
@@ -973,6 +982,9 @@ mod tests {
                 ExecutorOperation::Bash {
                     command: "head -c 10477568 /dev/zero | tr '\\0' x; : > quota-ready; while [ ! -e quota-release ]; do sleep 0.001; done; head -c 8192 /dev/zero | tr '\\0' x; while :; do :; done".to_owned(),
                     execution_id: "bash-cancel-at-quota".to_owned(),
+                    tool_call_id: "tool-call-1".to_owned(),
+                    command_id: "command-1".to_owned(),
+                    run_id: "run-1".to_owned(),
                 },
                 cancel,
                 Arc::new(|_| {}),
@@ -1414,6 +1426,9 @@ mod tests {
         let operation = ExecutorOperation::Bash {
             command: "true".to_owned(),
             execution_id: "bash-bounds".to_owned(),
+            tool_call_id: "tool-call-1".to_owned(),
+            command_id: "command-1".to_owned(),
+            run_id: "run-1".to_owned(),
         };
         let exact = "x".repeat(crate::tools::truncate::DEFAULT_MAX_BYTES);
         let result = crate::tools::bash::BashExecutionResult {
@@ -1828,6 +1843,9 @@ mod tests {
                 ExecutorOperation::Bash {
                     command: "sleep 30".to_owned(),
                     execution_id: "cancel-no-ack".to_owned(),
+                    tool_call_id: "tool-call-1".to_owned(),
+                    command_id: "command-1".to_owned(),
+                    run_id: "run-1".to_owned(),
                 },
                 cancel,
                 Arc::new(|_| {}),
@@ -1927,6 +1945,9 @@ mod tests {
                 ExecutorOperation::Bash {
                     command: "sleep 30".to_owned(),
                     execution_id: "cancel-false".to_owned(),
+                    tool_call_id: "tool-call-1".to_owned(),
+                    command_id: "command-1".to_owned(),
+                    run_id: "run-1".to_owned(),
                 },
                 cancel,
                 Arc::new(|_| {}),

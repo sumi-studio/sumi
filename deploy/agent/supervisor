@@ -140,7 +140,12 @@ prepare_cgroup_base() {
 
 recover_stale_generations() {
   "${SUMI_BIN}" --supervisor-recovery-scan "${SUMI_EXECUTOR_CGROUP_BASE}" "${SUMI_RPC_GENERATION}" >/dev/null \
-    || error "stale generation recovery scan failed"
+    || error "stale generation cgroup recovery scan failed"
+  # Runtime/executor/artifact-broker processes are not inside command cgroups;
+  # scan the process table for stale Sumi services with the same deployment
+  # boundary and a different generation number.
+  "${SUMI_BIN}" --supervisor-kill-stale-processes "${SUMI_RPC_GENERATION}" >/dev/null \
+    || error "stale process recovery scan failed"
 }
 
 spawn_broker() {
@@ -155,6 +160,9 @@ spawn_broker() {
         env -i \
         "SUMI_RPC_GENERATION=${generation}" \
         "SUMI_RPC_NONCE=${nonce}" \
+        "SUMI_TENANT_ID=${SUMI_TENANT_ID}" \
+        "SUMI_AGENT_ID=${SUMI_AGENT_ID}" \
+        "SUMI_CONVERSATION_ID=${SUMI_CONVERSATION_ID}" \
         "SUMI_ARTIFACT_ROOT=${SUMI_ARTIFACT_ROOT}" \
         "SUMI_ARTIFACT_BROKER_SOCKET=${SUMI_ARTIFACT_BROKER_SOCKET}" \
         "HOME=${SUMI_ARTIFACT_ROOT}" \
@@ -166,6 +174,9 @@ spawn_broker() {
         env -i \
         "SUMI_RPC_GENERATION=${generation}" \
         "SUMI_RPC_NONCE=${nonce}" \
+        "SUMI_TENANT_ID=${SUMI_TENANT_ID}" \
+        "SUMI_AGENT_ID=${SUMI_AGENT_ID}" \
+        "SUMI_CONVERSATION_ID=${SUMI_CONVERSATION_ID}" \
         "SUMI_ARTIFACT_ROOT=${SUMI_ARTIFACT_ROOT}" \
         "SUMI_ARTIFACT_BROKER_SOCKET=${SUMI_ARTIFACT_BROKER_SOCKET}" \
         "HOME=${SUMI_ARTIFACT_ROOT}" \
@@ -176,6 +187,9 @@ spawn_broker() {
       env -i \
         "SUMI_RPC_GENERATION=${generation}" \
         "SUMI_RPC_NONCE=${nonce}" \
+        "SUMI_TENANT_ID=${SUMI_TENANT_ID}" \
+        "SUMI_AGENT_ID=${SUMI_AGENT_ID}" \
+        "SUMI_CONVERSATION_ID=${SUMI_CONVERSATION_ID}" \
         "SUMI_ARTIFACT_ROOT=${SUMI_ARTIFACT_ROOT}" \
         "SUMI_ARTIFACT_BROKER_SOCKET=${SUMI_ARTIFACT_BROKER_SOCKET}" \
         "HOME=${SUMI_ARTIFACT_ROOT}" \
@@ -194,8 +208,10 @@ spawn_executor() {
         env -i \
         "SUMI_RPC_GENERATION=${generation}" \
         "SUMI_RPC_NONCE=${nonce}" \
-        "SUMI_WORKSPACE=${SUMI_WORKSPACE}" \
+        "SUMI_TENANT_ID=${SUMI_TENANT_ID}" \
+        "SUMI_AGENT_ID=${SUMI_AGENT_ID}" \
         "SUMI_CONVERSATION_ID=${conversation}" \
+        "SUMI_WORKSPACE=${SUMI_WORKSPACE}" \
         "SUMI_EXECUTOR_CGROUP_BASE=${SUMI_EXECUTOR_CGROUP_BASE}" \
         "SUMI_ARTIFACT_BROKER_SOCKET=${SUMI_ARTIFACT_BROKER_SOCKET}" \
         "SUMI_EXECUTOR_SOCKET=${SUMI_EXECUTOR_SOCKET}" \
@@ -208,8 +224,10 @@ spawn_executor() {
         env -i \
         "SUMI_RPC_GENERATION=${generation}" \
         "SUMI_RPC_NONCE=${nonce}" \
-        "SUMI_WORKSPACE=${SUMI_WORKSPACE}" \
+        "SUMI_TENANT_ID=${SUMI_TENANT_ID}" \
+        "SUMI_AGENT_ID=${SUMI_AGENT_ID}" \
         "SUMI_CONVERSATION_ID=${conversation}" \
+        "SUMI_WORKSPACE=${SUMI_WORKSPACE}" \
         "SUMI_EXECUTOR_CGROUP_BASE=${SUMI_EXECUTOR_CGROUP_BASE}" \
         "SUMI_ARTIFACT_BROKER_SOCKET=${SUMI_ARTIFACT_BROKER_SOCKET}" \
         "SUMI_EXECUTOR_SOCKET=${SUMI_EXECUTOR_SOCKET}" \
@@ -221,8 +239,10 @@ spawn_executor() {
       env -i \
         "SUMI_RPC_GENERATION=${generation}" \
         "SUMI_RPC_NONCE=${nonce}" \
-        "SUMI_WORKSPACE=${SUMI_WORKSPACE}" \
+        "SUMI_TENANT_ID=${SUMI_TENANT_ID}" \
+        "SUMI_AGENT_ID=${SUMI_AGENT_ID}" \
         "SUMI_CONVERSATION_ID=${conversation}" \
+        "SUMI_WORKSPACE=${SUMI_WORKSPACE}" \
         "SUMI_EXECUTOR_CGROUP_BASE=${SUMI_EXECUTOR_CGROUP_BASE}" \
         "SUMI_ARTIFACT_BROKER_SOCKET=${SUMI_ARTIFACT_BROKER_SOCKET}" \
         "SUMI_EXECUTOR_SOCKET=${SUMI_EXECUTOR_SOCKET}" \

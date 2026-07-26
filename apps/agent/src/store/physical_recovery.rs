@@ -42,9 +42,12 @@ pub(crate) struct PhysicalRecoveryIntent {
 /// Typed request returned by T17 hydration before T27 performs physical
 /// kill/reap.  It intentionally has no terminal sequence: that sequence is
 /// allocated only by the EventWriter transaction that applies the receipt.
+/// The `tool_name` is carried so the recovery suffix can build an accurate
+/// `ToolResultMessage` instead of synthesising a hard-coded value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PhysicalRecoveryIntentRequest {
     pub tool_call_id: String,
+    pub tool_name: String,
     pub command_id: String,
     pub run_id: String,
     pub executor_generation: ProcessGeneration,
@@ -833,6 +836,11 @@ mod tests {
             .expect("mint event key");
 
         for (seq, event_type, envelope) in [
+            (
+                9u64,
+                "tool_execution_start",
+                r#"{"type":"tool_execution_start","tool_call_id":"tool-call-1","tool_name":"bash","args":{},"state":"running"}"#,
+            ),
             (
                 first_seq,
                 "message_start",

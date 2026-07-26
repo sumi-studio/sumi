@@ -9,6 +9,7 @@ mod prompts;
 pub mod provider;
 pub mod runtime;
 mod store;
+mod t27_recovery;
 mod tools;
 
 use std::{
@@ -139,6 +140,28 @@ async fn async_main(mode: Option<String>) -> Result<()> {
                 .context("stale-generation recovery scan failed")?;
             let serialized: Vec<String> = removed.iter().map(|p| p.display().to_string()).collect();
             println!("{}", serde_json::to_string(&serialized)?);
+            return Ok(());
+        }
+        Some("--supervisor-kill-stale-processes") => {
+            let generation = env::args()
+                .nth(2)
+                .context("current generation is required as the first argument")?
+                .parse::<u64>()
+                .context("current generation must be an integer")?;
+            let tenant_id = env::var("SUMI_TENANT_ID")
+                .context("SUMI_TENANT_ID is required for stale process scan")?;
+            let agent_id = env::var("SUMI_AGENT_ID")
+                .context("SUMI_AGENT_ID is required for stale process scan")?;
+            let conversation_id = env::var("SUMI_CONVERSATION_ID")
+                .context("SUMI_CONVERSATION_ID is required for stale process scan")?;
+            let killed = runtime::supervisor::scan_and_kill_stale_processes(
+                &tenant_id,
+                &agent_id,
+                &conversation_id,
+                generation,
+            )
+            .context("stale process recovery scan failed")?;
+            println!("{}", serde_json::to_string(&killed)?);
             return Ok(());
         }
         _ => {}

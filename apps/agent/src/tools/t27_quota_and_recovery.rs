@@ -106,8 +106,9 @@ mod tests {
         }
         let workspace = temp_workspace();
         // 1% of a single CPU. The bash process will be throttled and then
-        // killed by the wall-time watchdog. Cgroup evidence (`nr_throttled`)
-        // lets us classify the result as `CpuThrottle` rather than `WallTime`.
+        // killed by the wall-time watchdog. The throttle cap is not a kill
+        // boundary (workspace.md); the actual stop cause is WallTime and must
+        // not be overwritten by incidental `nr_throttled` evidence.
         let policy = ResourceQuotaPolicy::new()
             .with_wall_time(2)
             .with_cpu_throttle_percent(1);
@@ -124,8 +125,45 @@ mod tests {
         assert!(!result.cancelled);
         assert_eq!(
             result.resource_limit,
-            Some(ResourceLimit::CpuThrottle { limit: 1_000 })
+            Some(ResourceLimit::WallTime { limit_seconds: 2 })
         );
+    }
+
+    #[tokio::test]
+    async fn output_bytes_preserved_over_cpu_throttle() {
+        if !require_cgroup_v2_release_gate() {
+            return;
+        }
+        let workspace = temp_workspace();
+        // 50% CPU throttling is enough to make `cpu.stat` report nr_throttled,
+        // but the command is dominated by pipe writes and should hit the 10 MiB
+        // output boundary first. OutputBytes must not be overwritten by the
+        // incidental CpuThrottle classification.
+        let policy = ResourceQuotaPolicy::new()
+            .with_wall_time(30)
+            .with_cpu_throttle_percent(50);
+        let result = LowTrustLocalBash::new(workspace, &NoopArtifacts)
+            .with_quota_policy(policy)
+            .execute(
+                "head -c 10485760 /dev/zero",
+                "output-vs-throttle",
+                cancel(),
+                no_update(),
+            )
+            .await
+            .expect("bash execution completed");
+
+        assert!(!result.cancelled);
+        assert!(
+            matches!(
+                result.resource_limit,
+                Some(ResourceLimit::OutputBytes { observed, limit })
+                    if limit == crate::tools::shell_capture::COMMAND_OUTPUT_LIMIT_BYTES
+                        && observed == result.observed_bytes
+            ),
+            "OutputBytes must win over incidental CpuThrottle evidence: {result:?}"
+        );
+        assert!(result.is_consistent());
     }
 
     #[tokio::test]

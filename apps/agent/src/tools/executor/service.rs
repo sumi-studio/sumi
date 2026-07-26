@@ -917,6 +917,9 @@ where
             ExecutorOperation::Bash {
                 command,
                 execution_id,
+                tool_call_id,
+                command_id,
+                run_id,
             } => {
                 lifecycle.begin_execution(&request.request_id, &execution_id)?;
                 run_bash_request(
@@ -930,6 +933,9 @@ where
                     request.request_id,
                     execution_id,
                     command,
+                    tool_call_id,
+                    command_id,
+                    run_id,
                     #[cfg(test)]
                     ExecutorTestControls {
                         cancel_stop_delay: test_controls.cancel_stop_delay,
@@ -978,6 +984,9 @@ async fn run_bash_request<R>(
     request_id: String,
     execution_id: String,
     command: String,
+    tool_call_id: String,
+    command_id: String,
+    run_id: String,
     #[cfg(test)] mut test_controls: ExecutorTestControls,
 ) -> Result<()>
 where
@@ -988,7 +997,8 @@ where
     let bash = LowTrustLocalBash::new(workspace.to_path_buf(), broker)
         .with_broker_socket(broker.socket().to_path_buf())
         .with_process_generation(identity.generation())
-        .with_execution_registry(registry);
+        .with_execution_registry(registry)
+        .with_durable_identities(tool_call_id, command_id, run_id);
     #[cfg(test)]
     let bash = bash.with_cancel_stop_delay(test_controls.cancel_stop_delay);
     let execution = bash.execute(&command, &execution_id, cancel.clone(), on_update);

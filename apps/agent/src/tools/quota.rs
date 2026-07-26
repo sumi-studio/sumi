@@ -625,24 +625,33 @@ impl QuotaBoundary for CgroupV2Boundary {
         let cpu_time = policy.cpu_time_seconds;
         let memory_fallback = policy.memory_bytes.filter(|_| !self.supports("memory"));
         let disk_bytes = policy.disk_bytes;
-        let cgroup_path_clone = cgroup_path.clone();
+
+        // Pre-allocate the NUL-terminated cgroup.procs path before fork so the
+        // pre_exec hook can migrate itself using only raw syscalls and stack
+        // buffers. The path is intentionally leaked; the child either execs or
+        // exits and the kernel reclaims the memory.
+        let mut cgroup_procs_bytes = Vec::with_capacity(
+            cgroup_path.as_os_str().as_encoded_bytes().len() + b"/cgroup.procs".len() + 1,
+        );
+        cgroup_procs_bytes.extend_from_slice(cgroup_path.as_os_str().as_encoded_bytes());
+        cgroup_procs_bytes.extend_from_slice(b"/cgroup.procs");
+        cgroup_procs_bytes.push(0);
+        let cgroup_procs_path: &'static [u8] = &*Box::leak(cgroup_procs_bytes.into_boxed_slice());
+
         unsafe {
             command.pre_exec(move || {
                 if let Some(seconds) = cpu_time {
-                    let _ = set_rlimit(libc::RLIMIT_CPU, seconds)
-                        .map_err(|error| io_error(format!("cpu_time rlimit failed: {error}")));
+                    set_rlimit(libc::RLIMIT_CPU, seconds)?;
                 }
                 if let Some(bytes) = memory_fallback {
-                    let _ = set_rlimit(libc::RLIMIT_AS, bytes)
-                        .map_err(|error| io_error(format!("memory rlimit failed: {error}")));
+                    set_rlimit(libc::RLIMIT_AS, bytes)?;
                 }
                 if let Some(bytes) = disk_bytes {
                     // Per-process max file size. This is a low-trust harness
                     // approximation of a per-command disk-byte limit.
-                    let _ = set_rlimit(libc::RLIMIT_FSIZE, bytes)
-                        .map_err(|error| io_error(format!("disk_bytes rlimit failed: {error}")));
+                    set_rlimit(libc::RLIMIT_FSIZE, bytes)?;
                 }
-                migrate_self_to_cgroup(&cgroup_path_clone)
+                migrate_self_to_cgroup(cgroup_procs_path)
             });
         }
 
@@ -665,10 +674,6 @@ impl QuotaBoundary for CgroupV2Boundary {
             }),
         })
     }
-}
-
-fn io_error(message: String) -> std::io::Error {
-    std::io::Error::other(message)
 }
 
 /// Low-trust fallback boundary that uses `setrlimit` in a `pre_exec` hook.
@@ -744,9 +749,79 @@ fn set_rlimit(resource: libc::__rlimit_resource_t, value: u64) -> std::io::Resul
     }
 }
 
-fn migrate_self_to_cgroup(path: &Path) -> std::io::Result<()> {
-    let pid = std::process::id();
-    write_cgroup_file(path.join("cgroup.procs"), format!("{pid}\n"))
+fn migrate_self_to_cgroup(path: &'static [u8]) -> std::io::Result<()> {
+    debug_assert_eq!(
+        path.last(),
+        Some(&0),
+        "cgroup.procs path must be NUL-terminated"
+    );
+
+    // Use raw syscalls in this pre_exec hook; libc wrappers such as open(2)
+    // are not async-signal-safe and must not be called between fork and exec
+    // in a multithreaded process.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat,
+            libc::AT_FDCWD,
+            path.as_ptr() as *const libc::c_char,
+            libc::O_WRONLY,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let fd = fd as libc::c_int;
+
+    let mut payload = [0u8; 32];
+    let len = write_pid_to_buffer(&mut payload, std::process::id());
+    let mut written = 0;
+    while written < len {
+        let n = unsafe {
+            libc::syscall(
+                libc::SYS_write,
+                fd,
+                payload.as_ptr().add(written) as *const libc::c_void,
+                len - written,
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            let _ = unsafe { libc::syscall(libc::SYS_close, fd) };
+            return Err(err);
+        }
+        written += n as usize;
+    }
+
+    let _ = unsafe { libc::syscall(libc::SYS_close, fd) };
+    Ok(())
+}
+
+fn write_pid_to_buffer(buf: &mut [u8; 32], pid: u32) -> usize {
+    debug_assert!(
+        buf.len() >= 12,
+        "PID buffer must fit 10 digits and a newline"
+    );
+    let mut n = pid;
+    let mut digits = [0u8; 10];
+    let mut count = 0;
+    if n == 0 {
+        digits[0] = b'0';
+        count = 1;
+    } else {
+        while n > 0 {
+            digits[count] = b'0' + (n % 10) as u8;
+            count += 1;
+            n /= 10;
+        }
+    }
+    let mut pos = 0;
+    for i in (0..count).rev() {
+        buf[pos] = digits[i];
+        pos += 1;
+    }
+    buf[pos] = b'\n';
+    pos + 1
 }
 
 fn write_cgroup_file(path: PathBuf, value: impl AsRef<[u8]>) -> std::io::Result<()> {
@@ -977,5 +1052,38 @@ mod tests {
         let policy = ResourceQuotaPolicy::new().with_disk_bytes(1024);
         let mut command = Command::new("true");
         assert!(policy.apply_to_command(&mut command, "exec-1").is_err());
+    }
+
+    #[test]
+    fn set_rlimit_rejects_invalid_resource() {
+        // An out-of-range resource is returned as an OS error; the cgroup
+        // pre_exec hook now propagates such errors with `?` instead of `let _ = ...`.
+        let invalid = 9_999 as libc::__rlimit_resource_t;
+        assert!(set_rlimit(invalid, 1).is_err());
+    }
+
+    #[test]
+    fn migrate_self_to_cgroup_returns_error_for_missing_path() {
+        // The pre_exec cgroup migration uses raw syscalls and must fail closed
+        // when the cgroup.procs path is not available instead of aborting.
+        let mut bytes = std::fs::canonicalize("/")
+            .unwrap_or_else(|_| std::path::PathBuf::from("/"))
+            .as_os_str()
+            .as_encoded_bytes()
+            .to_vec();
+        bytes.extend_from_slice(b"/sumi-test-missing-cgroup-XXXXXX/cgroup.procs\0");
+        let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        assert!(migrate_self_to_cgroup(leaked).is_err());
+    }
+
+    #[test]
+    fn write_pid_to_buffer_formats_with_newline() {
+        let mut buf = [0u8; 32];
+        let len = write_pid_to_buffer(&mut buf, 12_345);
+        assert_eq!(&buf[..len], b"12345\n");
+        let len = write_pid_to_buffer(&mut buf, 0);
+        assert_eq!(&buf[..len], b"0\n");
+        let len = write_pid_to_buffer(&mut buf, 4_294_967_295);
+        assert_eq!(&buf[..len], b"4294967295\n");
     }
 }

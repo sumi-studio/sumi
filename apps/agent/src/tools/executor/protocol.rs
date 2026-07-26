@@ -123,6 +123,9 @@ pub enum ExecutorOperation {
     Bash {
         command: String,
         execution_id: String,
+        tool_call_id: String,
+        command_id: String,
+        run_id: String,
     },
     Cancel {
         execution_id: String,
@@ -221,9 +224,20 @@ impl RpcOperationValidation for ExecutorOperation {
                 validate_workspace_input(pattern, "pattern")?;
                 validate_executor_execution_id(execution_id)
             }
-            Self::Bash { execution_id, .. } | Self::Cancel { execution_id } => {
-                validate_executor_execution_id(execution_id)
+            Self::Bash {
+                execution_id,
+                tool_call_id,
+                command_id,
+                run_id,
+                ..
+            } => {
+                validate_executor_execution_id(execution_id)?;
+                validate_rpc_id(tool_call_id, "tool_call_id")?;
+                validate_rpc_id(command_id, "command_id")?;
+                validate_rpc_id(run_id, "run_id")?;
+                Ok(())
             }
+            Self::Cancel { execution_id } => validate_executor_execution_id(execution_id),
         }
     }
 }
@@ -988,6 +1002,9 @@ mod tests {
                 ExecutorOperation::Bash {
                     command: "artifact://command | + echo 会話".to_owned(),
                     execution_id: execution_id.to_owned(),
+                    tool_call_id: "tool-call-1".to_owned(),
+                    command_id: "command-1".to_owned(),
+                    run_id: "run-1".to_owned(),
                 },
                 ExecutorOperation::Cancel {
                     execution_id: execution_id.to_owned(),

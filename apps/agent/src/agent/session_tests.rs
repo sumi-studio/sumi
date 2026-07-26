@@ -2759,6 +2759,8 @@ impl RunDriver for MultiRejectedReceiptDriver {
     async fn execute_tool_observed(
         &self,
         _flow_id: &str,
+        _command_id: &str,
+        _run_id: &str,
         _call: &ToolCall,
         _cancel: CancellationToken,
         _on_update: Arc<dyn Fn(Value) + Send + Sync>,
@@ -2883,6 +2885,8 @@ impl RunDriver for DurableToolBarrierDriver {
     async fn execute_tool_observed(
         &self,
         _flow_id: &str,
+        _command_id: &str,
+        _run_id: &str,
         call: &ToolCall,
         _cancel: CancellationToken,
         _on_update: Arc<dyn Fn(Value) + Send + Sync>,
@@ -3035,6 +3039,8 @@ impl RunDriver for IndeterminateToolDriver {
     async fn execute_tool_observed(
         &self,
         _flow_id: &str,
+        _command_id: &str,
+        _run_id: &str,
         call: &ToolCall,
         _cancel: CancellationToken,
         _on_update: Arc<dyn Fn(Value) + Send + Sync>,
@@ -3745,6 +3751,8 @@ impl RunDriver for StartFailureDriver {
     async fn execute_tool_observed(
         &self,
         _flow_id: &str,
+        _command_id: &str,
+        _run_id: &str,
         _call: &ToolCall,
         _cancel: CancellationToken,
         _on_update: Arc<dyn Fn(Value) + Send + Sync>,
@@ -3861,6 +3869,8 @@ impl RunDriver for OpaqueContextDriver {
     async fn execute_tool_observed(
         &self,
         _flow_id: &str,
+        _command_id: &str,
+        _run_id: &str,
         _call: &ToolCall,
         _cancel: CancellationToken,
         _on_update: Arc<dyn Fn(Value) + Send + Sync>,
@@ -4764,6 +4774,8 @@ impl RunDriver for SessionRetrySteerDriver {
     async fn execute_tool_observed(
         &self,
         _flow_id: &str,
+        _command_id: &str,
+        _run_id: &str,
         _call: &ToolCall,
         _cancel: CancellationToken,
         _on_update: Arc<dyn Fn(Value) + Send + Sync>,
@@ -4870,6 +4882,8 @@ impl RunDriver for SessionImmediateOverflowDriver {
     async fn execute_tool_observed(
         &self,
         _flow_id: &str,
+        _command_id: &str,
+        _run_id: &str,
         _call: &ToolCall,
         _cancel: CancellationToken,
         _on_update: Arc<dyn Fn(Value) + Send + Sync>,
@@ -6115,6 +6129,8 @@ impl RunDriver for RetryGroupDriver {
     async fn execute_tool_observed(
         &self,
         _flow_id: &str,
+        _command_id: &str,
+        _run_id: &str,
         _call: &ToolCall,
         _cancel: CancellationToken,
         _on_update: Arc<dyn Fn(Value) + Send + Sync>,
@@ -6497,6 +6513,8 @@ impl RunDriver for HardSteerKillDriver {
     async fn execute_tool_observed(
         &self,
         _flow_id: &str,
+        _command_id: &str,
+        _run_id: &str,
         _call: &ToolCall,
         _cancel: CancellationToken,
         _on_update: Arc<dyn Fn(Value) + Send + Sync>,
@@ -6591,6 +6609,8 @@ impl RunDriver for TurnEndKillDriver {
     async fn execute_tool_observed(
         &self,
         _flow_id: &str,
+        _command_id: &str,
+        _run_id: &str,
         _call: &ToolCall,
         _cancel: CancellationToken,
         _on_update: Arc<dyn Fn(Value) + Send + Sync>,
@@ -6664,6 +6684,8 @@ impl RunDriver for AbortProviderKillDriver {
     async fn execute_tool_observed(
         &self,
         _flow_id: &str,
+        _command_id: &str,
+        _run_id: &str,
         _call: &ToolCall,
         _cancel: CancellationToken,
         _on_update: Arc<dyn Fn(Value) + Send + Sync>,

@@ -167,7 +167,7 @@ impl Tool for RemoteTool {
 
     async fn execute(&self, ctx: ToolCtx<'_>) -> Result<ToolOutput, ToolError> {
         let execution_id = execution_id(ctx.flow_id, ctx.call_id);
-        let operation = self.kind.operation(ctx.args, execution_id)?;
+        let operation = self.kind.operation(&ctx, execution_id)?;
         let read_context = match &operation {
             ExecutorOperation::ReadFile {
                 path,
@@ -192,9 +192,10 @@ impl Tool for RemoteTool {
 impl RemoteToolKind {
     fn operation(
         self,
-        args: &ValidatedToolArguments,
+        ctx: &ToolCtx<'_>,
         execution_id: String,
     ) -> Result<ExecutorOperation, ToolError> {
+        let args = ctx.args;
         Ok(match self {
             Self::ReadFile => {
                 let args: ReadFileArgs = decode(args)?;
@@ -250,6 +251,9 @@ impl RemoteToolKind {
             Self::Bash => ExecutorOperation::Bash {
                 command: decode::<BashArgs>(args)?.command,
                 execution_id,
+                tool_call_id: ctx.call_id.to_owned(),
+                command_id: ctx.command_id.to_owned(),
+                run_id: ctx.run_id.to_owned(),
             },
         })
     }
@@ -811,6 +815,8 @@ mod tests {
             .execute(ToolCtx {
                 flow_id,
                 call_id,
+                run_id: "run-1",
+                command_id: "command-1",
                 args: &args,
                 cancel,
                 on_update,

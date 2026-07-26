@@ -27,7 +27,10 @@ use crate::{
         GenerationRecoveryFence, HydrationReady, HydrationReceiptIdentity, ProcessGeneration,
         ProcessGenerationLease, RpcBootNonce,
     },
-    store::{AgentScope, EnvironmentKeyProvider, HydrationOutcome, Store},
+    store::{
+        AgentScope, EnvironmentKeyProvider, EventWriter, HydrationOutcome, Store, SuffixRecovery,
+    },
+    t27_recovery,
     tools::{
         ToolRegistry, WorkspacePaths,
         executor::{ExecutorClient, remote_executor_registry, set_dumpable, wait_for_unix_socket},
@@ -206,17 +209,31 @@ pub(crate) async fn run_production_with_driver_and_broker(
         .await
         .context("failed to open durable store")?;
 
-    // T17 typed hydration. Non-empty physical recovery intents remain
-    // fail-closed until T27 receipt integration, as T26 canon says.
-    let state = match store.hydrate(&ctx.lease, &ctx.fence).await? {
-        HydrationOutcome::RecoveryRequired(intents) => {
-            bail!(
-                "durable physical recovery is required; T27 must resolve {:?} before T26 composition",
-                intents
-            );
-        }
-        HydrationOutcome::Complete(state) => state,
-    };
+    let event_writer = EventWriter::new(Arc::new(store.clone()));
+    event_writer
+        .initialize_recovery_checkpoint()
+        .await
+        .context("failed to initialize recovery checkpoint")?;
+    let pending_recovery = SuffixRecovery::recover_t12_prefix(&store, &event_writer)
+        .await
+        .context("T12 prefix recovery failed")?;
+    if !pending_recovery.is_empty() {
+        bail!(
+            "durable suffix recovery is required; T17 production hydration must resolve {:?} before T26 composition",
+            pending_recovery
+        );
+    }
+
+    let (state, runtime_receipt) =
+        hydrate_store(&store, &event_writer, &ctx.lease, &ctx.fence)
+            .await
+            .context("T17/T27 durable hydration failed")?;
+    if !state.recovery_steps.is_empty() {
+        bail!(
+            "durable suffix recovery steps remain after hydration; T17/T27 must resolve {:?} before T26 composition",
+            state.recovery_steps
+        );
+    }
 
     let registry = match tool_registry {
         Some(registry) => registry,
@@ -256,16 +273,9 @@ pub(crate) async fn run_production_with_driver_and_broker(
     .with_approval_broker(approval_broker)
     .with_hydrated_state(Some(state.clone()));
 
-    // Latch Ready only after all composition checks succeed. The receipt
-    // identity comes from the stable T17 hydration result, not a random UUID.
-    let runtime_receipt = HydrationReceiptIdentity::new(format!(
-        "{}:{}:{}:{}",
-        state.receipt.lease_id,
-        state.receipt.fence_id,
-        state.receipt.generation.as_u64(),
-        state.receipt.intent_count
-    ))
-    .context("failed to construct hydration receipt identity")?;
+    // Latch Ready only after all composition checks succeed. The identity is
+    // the stable T17 hydration receipt for a clean conversation or the durable
+    // T27 physical-recovery receipt when running tools were recovered.
     let (hydration_tx, hydration_rx) = watch::channel(HydrationReady::not_ready());
     let mut ready = HydrationReady::not_ready();
     ready
@@ -311,6 +321,42 @@ async fn build_remote_tool_registry(ctx: &BootstrapContext) -> Result<ToolRegist
         &ctx.conversation_id,
     ));
     remote_executor_registry(client).context("failed to build remote tool registry")
+}
+
+async fn hydrate_store(
+    store: &Store,
+    writer: &EventWriter,
+    lease: &ProcessGenerationLease,
+    fence: &GenerationRecoveryFence,
+) -> Result<(crate::store::HydratedRunState, HydrationReceiptIdentity)> {
+    let mut recovery_identity = None;
+    loop {
+        match store.hydrate(lease, fence).await? {
+            HydrationOutcome::RecoveryRequired(intents) => {
+                let receipt =
+                    t27_recovery::apply_physical_recovery_receipt(writer, lease, fence, intents)
+                        .await?;
+                recovery_identity = Some(
+                    HydrationReceiptIdentity::new(receipt.receipt_id)
+                        .context("failed to construct recovery hydration receipt identity")?,
+                );
+            }
+            HydrationOutcome::Complete(state) => {
+                let identity = match recovery_identity {
+                    Some(identity) => identity,
+                    None => HydrationReceiptIdentity::new(format!(
+                        "{}:{}:{}:{}",
+                        state.receipt.lease_id,
+                        state.receipt.fence_id,
+                        state.receipt.generation.as_u64(),
+                        state.receipt.intent_count
+                    ))
+                    .context("failed to construct stable hydration receipt identity")?,
+                };
+                return Ok((state, identity));
+            }
+        }
+    }
 }
 
 #[cfg(test)]

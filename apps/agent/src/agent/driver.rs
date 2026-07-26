@@ -291,6 +291,8 @@ impl RunDriver for InjectedRunDriver {
     async fn execute_tool_observed(
         &self,
         flow_id: &str,
+        command_id: &str,
+        run_id: &str,
         call: &ToolCall,
         cancel: CancellationToken,
         on_update: Arc<dyn Fn(Value) + Send + Sync>,
@@ -337,6 +339,8 @@ impl RunDriver for InjectedRunDriver {
             .execute(ToolCtx {
                 flow_id,
                 call_id: &call.id,
+                run_id,
+                command_id,
                 args: &call.arguments,
                 cancel,
                 on_update,
@@ -933,6 +937,8 @@ mod tests {
         let result = driver
             .execute_tool_observed(
                 "flow-1",
+                "command-1",
+                "run-1",
                 &call,
                 CancellationToken::new(),
                 Arc::new(move |value| sink.lock().expect("updates").push(value)),
@@ -957,6 +963,8 @@ mod tests {
             driver
                 .execute_tool_observed(
                     "flow-1",
+                    "command-1",
+                    "run-1",
                     &unknown,
                     CancellationToken::new(),
                     Arc::new(|_| {}),
@@ -1027,7 +1035,14 @@ mod tests {
                 .expect("empty args"),
         };
         let result = driver
-            .execute_tool_observed("flow-1", &call, CancellationToken::new(), Arc::new(|_| {}))
+            .execute_tool_observed(
+                "flow-1",
+                "command-1",
+                "run-1",
+                &call,
+                CancellationToken::new(),
+                Arc::new(|_| {}),
+            )
             .await
             .expect("tool result");
         assert_eq!(result.tool_call_id, "call-1");

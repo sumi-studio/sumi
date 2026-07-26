@@ -339,6 +339,29 @@ impl Store {
         .fetch_all(&self.pool)
         .await
         .context("failed to hydrate running tool executions")?;
+
+        // Tool names are not stored in `tool_executions`; they live in the
+        // redacted `tool_execution_start` envelope, which is safe to read here
+        // because it contains only non-secret message metadata.
+        let mut tool_names = HashMap::with_capacity(rows.len());
+        let start_rows = sqlx::query(
+            "SELECT envelope FROM agent_events WHERE event_type = 'tool_execution_start' ORDER BY seq",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to hydrate tool start envelopes")?;
+        for row in start_rows {
+            let envelope: String = row.try_get("envelope")?;
+            let value: serde_json::Value = serde_json::from_str(&envelope)
+                .with_context(|| "tool_execution_start envelope is not valid JSON")?;
+            if let (Some(tool_call_id), Some(tool_name)) = (
+                value.get("tool_call_id").and_then(|v| v.as_str()),
+                value.get("tool_name").and_then(|v| v.as_str()),
+            ) {
+                tool_names.insert(tool_call_id.to_owned(), tool_name.to_owned());
+            }
+        }
+
         let mut intents = Vec::with_capacity(rows.len());
         for row in rows {
             let tool_call_id: String = row.try_get("tool_call_id")?;
@@ -347,10 +370,14 @@ impl Store {
             if tool_call_id.is_empty() || command_id.is_empty() || run_id.is_empty() {
                 bail!("running tool execution identity must not be empty");
             }
+            let tool_name = tool_names.get(&tool_call_id).cloned().ok_or_else(|| {
+                anyhow!("running tool {tool_call_id} has no tool_execution_start envelope; cannot recover tool name")
+            })?;
             let generation = ProcessGeneration::from_sqlite(row.try_get("executor_generation")?)
                 .map_err(|error| anyhow!("invalid persisted executor generation: {error}"))?;
             intents.push(PhysicalRecoveryIntentRequest {
                 tool_call_id,
+                tool_name,
                 command_id,
                 run_id,
                 executor_generation: generation,

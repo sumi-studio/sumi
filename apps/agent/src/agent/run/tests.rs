@@ -163,6 +163,8 @@ impl RunDriver for FixtureDriver {
     async fn execute_tool_observed(
         &self,
         _flow_id: &str,
+        _command_id: &str,
+        _run_id: &str,
         call: &ToolCall,
         _cancel: CancellationToken,
         _on_update: Arc<dyn Fn(Value) + Send + Sync>,
@@ -2185,6 +2187,8 @@ impl RunDriver for UpdateDriver {
     async fn execute_tool_observed(
         &self,
         _flow_id: &str,
+        _command_id: &str,
+        _run_id: &str,
         call: &ToolCall,
         _cancel: CancellationToken,
         on_update: Arc<dyn Fn(Value) + Send + Sync>,
@@ -2274,6 +2278,8 @@ impl RunDriver for ReleaseDriver {
     async fn execute_tool_observed(
         &self,
         _flow_id: &str,
+        _command_id: &str,
+        _run_id: &str,
         call: &ToolCall,
         _cancel: CancellationToken,
         on_update: Arc<dyn Fn(Value) + Send + Sync>,
@@ -2526,6 +2532,8 @@ impl RunDriver for CancellingProbeDriver {
     async fn execute_tool_observed(
         &self,
         _flow_id: &str,
+        _command_id: &str,
+        _run_id: &str,
         _call: &ToolCall,
         _cancel: CancellationToken,
         _on_update: Arc<dyn Fn(Value) + Send + Sync>,
@@ -2922,6 +2930,8 @@ impl RunDriver for ControlProbeDriver {
     async fn execute_tool_observed(
         &self,
         _flow_id: &str,
+        _command_id: &str,
+        _run_id: &str,
         call: &ToolCall,
         cancel: CancellationToken,
         on_update: Arc<dyn Fn(Value) + Send + Sync>,
@@ -3189,6 +3199,8 @@ impl RunDriver for HardSteerToolDriver {
     async fn execute_tool_observed(
         &self,
         _flow_id: &str,
+        _command_id: &str,
+        _run_id: &str,
         call: &ToolCall,
         cancel: CancellationToken,
         _on_update: Arc<dyn Fn(Value) + Send + Sync>,
