@@ -33,7 +33,7 @@ fi
 : "${SUMI_ARTIFACT_ROOT:=/var/lib/sumi/artifacts}"
 : "${SUMI_EXECUTOR_SOCKET:=/run/sumi/executor.sock}"
 : "${SUMI_ARTIFACT_BROKER_SOCKET:=/run/sumi/broker.sock}"
-: "${SUMI_ISOLATION_MODE:=low-trust}"
+: "${SUMI_ISOLATION_MODE:=compose}"
 : "${SUMI_ALLOW_LOW_TRUST:=0}"
 
 SUMI_BIN="${SUMI_BIN:-sumi-agent}"
@@ -56,31 +56,16 @@ check_binary() {
 check_isolation() {
   local mode="$1"
   case "${mode}" in
-    privileged)
-      if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-        error "privileged mode requires root"
-      fi
-      for tool in setpriv unshare ip; do
-        if ! command -v "${tool}" >/dev/null 2>&1; then
-          error "privileged mode requires ${tool}"
-        fi
-      done
+    compose)
+      command -v docker >/dev/null 2>&1 || error "compose mode requires docker"
+      docker compose version >/dev/null 2>&1 || error "compose mode requires docker compose"
       ;;
-    rootless)
-      if ! command -v unshare >/dev/null 2>&1; then
-        error "rootless mode requires unshare"
-      fi
-      if ! unshare --user --net true 2>/dev/null; then
-        error "user and network namespaces are not available"
-      fi
-      # Distinct filesystem UID separation inside a rootless user namespace
-      # requires newuidmap/newgidmap and an /etc/subuid entry.  The supervisor
-      # uses them if present; if they are missing the rootless process still
-      # gets a network/user namespace but the filesystem UID is inherited, so
-      # distinct-UID separation cannot be proven.
-      if ! command -v newuidmap >/dev/null 2>&1 || ! command -v newgidmap >/dev/null 2>&1; then
-        log "WARNING: newuidmap/newgidmap not available; rootless distinct filesystem UIDs cannot be established"
-      fi
+    privileged|rootless)
+      # This process-mode prototype can create namespaces but cannot give the
+      # bash child a disjoint broker mount. Calling either mode production
+      # isolation would be false evidence, so only the Compose harness or the
+      # Cloud microVM supervisor may be used for release acceptance.
+      error "${mode} process mode does not provide the required disjoint mount/FD boundary; use compose or the Cloud microVM supervisor"
       ;;
     low-trust)
       if [[ "${SUMI_ALLOW_LOW_TRUST}" != "1" ]]; then
@@ -270,6 +255,16 @@ spawn_runtime() {
 }
 
 main() {
+  if [[ "${SUMI_ISOLATION_MODE}" == "compose" ]]; then
+    check_isolation compose
+    : "${SUMI_TENANT_ID:?SUMI_TENANT_ID is required}"
+    : "${SUMI_AGENT_ID:?SUMI_AGENT_ID is required}"
+    : "${SUMI_CONVERSATION_ID:?SUMI_CONVERSATION_ID is required}"
+    : "${SUMI_AGENT_WRAPPING_KEY:?SUMI_AGENT_WRAPPING_KEY is required}"
+    : "${SUMI_PROVIDER_API_KEY:?SUMI_PROVIDER_API_KEY is required}"
+    exec docker compose --project-directory "${SUPERVISOR_DIR}" -f "${SUPERVISOR_DIR}/compose.yaml" up --build --remove-orphans
+  fi
+
   check_binary
   check_isolation "${SUMI_ISOLATION_MODE}"
   prepare_directories

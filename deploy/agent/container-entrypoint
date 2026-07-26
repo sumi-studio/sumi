@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# T26 Compose-only entrypoint. Every service receives only its explicit
+# environment and mounts; the init role is the sole generation issuer.
+set -euo pipefail
+
+role="${1:?missing deployment role}"
+shift
+
+readonly RUNTIME_UID=10001
+readonly RUNTIME_GID=10001
+readonly EXECUTOR_UID=10002
+readonly EXECUTOR_GID=10002
+readonly BROKER_UID=10003
+readonly BROKER_GID=10003
+readonly IPC_GID=10010
+readonly RUNTIME_IPC=/run/sumi/runtime
+readonly BROKER_IPC=/run/sumi/broker
+
+require() {
+  local name="$1"
+  [[ -n "${!name:-}" ]] || {
+    printf '[sumi-entrypoint] missing required %s\n' "${name}" >&2
+    exit 64
+  }
+}
+
+load_identity() {
+  local identity_file="$1"
+  [[ -f "${identity_file}" ]] || {
+    printf '[sumi-entrypoint] generation identity is unavailable: %s\n' "${identity_file}" >&2
+    exit 65
+  }
+  # The file is generated locally by the init role, has no user-controlled
+  # input, and contains only shell export assignments emitted by the allocator.
+  # shellcheck disable=SC1090
+  source "${identity_file}"
+  require SUMI_RPC_GENERATION
+  require SUMI_RPC_NONCE
+  require SUMI_PROCESS_GENERATION_LEASE_ID
+  require SUMI_GENERATION_RECOVERY_FENCE_ID
+}
+
+case "${role}" in
+  init)
+    install -d -m 0770 -o root -g "${IPC_GID}" "${RUNTIME_IPC}" "${BROKER_IPC}"
+    install -d -m 0700 -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" /var/lib/sumi
+    install -d -m 0700 -o "${EXECUTOR_UID}" -g "${EXECUTOR_GID}" /workspace
+    install -d -m 0700 -o "${BROKER_UID}" -g "${BROKER_GID}" /var/lib/sumi-artifacts
+    # Allocate as the runtime identity so the durable generation ledger cannot
+    # be modified by either sidecar. The resulting identity is readable only
+    # by the three IPC participants, never by a workspace mount.
+    setpriv --reuid="${RUNTIME_UID}" --regid="${RUNTIME_GID}" --clear-groups -- \
+      env -i PATH=/usr/local/bin:/usr/bin:/bin SUMI_STATE_DIR=/var/lib/sumi \
+      /usr/local/bin/sumi-agent --allocate-generation > "${RUNTIME_IPC}/generation.env"
+    chown root:"${IPC_GID}" "${RUNTIME_IPC}/generation.env"
+    chmod 0640 "${RUNTIME_IPC}/generation.env"
+    cp "${RUNTIME_IPC}/generation.env" "${BROKER_IPC}/generation.env"
+    chown root:"${IPC_GID}" "${BROKER_IPC}/generation.env"
+    chmod 0640 "${BROKER_IPC}/generation.env"
+    ;;
+
+  runtime)
+    load_identity "${RUNTIME_IPC}/generation.env"
+    require SUMI_TENANT_ID
+    require SUMI_AGENT_ID
+    require SUMI_CONVERSATION_ID
+    require SUMI_AGENT_WRAPPING_KEY
+    require SUMI_PROVIDER_API_KEY
+    exec env -i \
+      PATH=/usr/local/bin:/usr/bin:/bin HOME=/var/lib/sumi LANG=C.UTF-8 \
+      SUMI_RPC_GENERATION="${SUMI_RPC_GENERATION}" \
+      SUMI_RPC_NONCE="${SUMI_RPC_NONCE}" \
+      SUMI_PROCESS_GENERATION_LEASE_ID="${SUMI_PROCESS_GENERATION_LEASE_ID}" \
+      SUMI_GENERATION_RECOVERY_FENCE_ID="${SUMI_GENERATION_RECOVERY_FENCE_ID}" \
+      SUMI_TENANT_ID="${SUMI_TENANT_ID}" SUMI_AGENT_ID="${SUMI_AGENT_ID}" \
+      SUMI_CONVERSATION_ID="${SUMI_CONVERSATION_ID}" \
+      SUMI_STATE_DIR=/var/lib/sumi SUMI_WORKSPACE=/workspace \
+      SUMI_EXECUTOR_SOCKET="${RUNTIME_IPC}/executor.sock" \
+      SUMI_AGENT_WRAPPING_KEY="${SUMI_AGENT_WRAPPING_KEY}" \
+      SUMI_AGENT_WRAPPING_KEY_ID="${SUMI_AGENT_WRAPPING_KEY_ID:-env-wrapping-key/v1}" \
+      SUMI_MODEL_PRESET="${SUMI_MODEL_PRESET:-kimi-k3}" \
+      SUMI_MODEL_API_KEY_ENV=SUMI_PROVIDER_API_KEY \
+      SUMI_PROVIDER_API_KEY="${SUMI_PROVIDER_API_KEY}" \
+      /usr/local/bin/sumi-agent
+    ;;
+
+  executor)
+    load_identity "${RUNTIME_IPC}/generation.env"
+    require SUMI_CONVERSATION_ID
+    umask 007
+    exec env -i \
+      PATH=/usr/local/bin:/usr/bin:/bin HOME=/workspace LANG=C.UTF-8 \
+      SUMI_RPC_GENERATION="${SUMI_RPC_GENERATION}" SUMI_RPC_NONCE="${SUMI_RPC_NONCE}" \
+      SUMI_CONVERSATION_ID="${SUMI_CONVERSATION_ID}" SUMI_WORKSPACE=/workspace \
+      SUMI_EXECUTOR_SOCKET="${RUNTIME_IPC}/executor.sock" \
+      SUMI_ARTIFACT_BROKER_SOCKET="${BROKER_IPC}/broker.sock" \
+      /usr/local/bin/sumi-agent --tool-executor-socket
+    ;;
+
+  broker)
+    load_identity "${BROKER_IPC}/generation.env"
+    umask 007
+    exec env -i \
+      PATH=/usr/local/bin:/usr/bin:/bin HOME=/var/lib/sumi-artifacts LANG=C.UTF-8 \
+      SUMI_RPC_GENERATION="${SUMI_RPC_GENERATION}" SUMI_RPC_NONCE="${SUMI_RPC_NONCE}" \
+      SUMI_ARTIFACT_ROOT=/var/lib/sumi-artifacts \
+      SUMI_ARTIFACT_BROKER_SOCKET="${BROKER_IPC}/broker.sock" \
+      /usr/local/bin/sumi-agent --artifact-broker
+    ;;
+
+  *)
+    printf '[sumi-entrypoint] unknown deployment role: %s\n' "${role}" >&2
+    exit 64
+    ;;
+esac

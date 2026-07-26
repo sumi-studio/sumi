@@ -1,0 +1,105 @@
+# T26 deterministic local/CI deployment boundary. The runtime never mounts
+# workspace or artifacts; executor and broker have separate UIDs, roots and
+# network namespaces. T27 owns execution cgroups, quotas and crash recovery.
+name: sumi-agent
+
+x-sidecar-hardening: &sidecar-hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+    - seccomp:./seccomp/sidecar.json
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=32m
+
+services:
+  init:
+    build:
+      context: ../..
+      dockerfile: deploy/agent/Dockerfile
+    user: "0:0"
+    command: [init]
+    read_only: true
+    cap_drop: [ALL]
+    # Init alone needs these three capabilities to set named-volume ownership
+    # and run the allocator as the runtime UID. Long-lived services get none.
+    cap_add: [CHOWN, SETUID, SETGID]
+    security_opt:
+      - no-new-privileges:true
+      - seccomp:./seccomp/sidecar.json
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    volumes:
+      - state:/var/lib/sumi
+      - workspace:/workspace
+      - artifacts:/var/lib/sumi-artifacts
+      - runtime-ipc:/run/sumi/runtime
+      - broker-ipc:/run/sumi/broker
+
+  runtime:
+    <<: *sidecar-hardening
+    build:
+      context: ../..
+      dockerfile: deploy/agent/Dockerfile
+    user: "10001:10001"
+    group_add: ["10010"]
+    command: [runtime]
+    environment:
+      SUMI_TENANT_ID: ${SUMI_TENANT_ID:?SUMI_TENANT_ID is required}
+      SUMI_AGENT_ID: ${SUMI_AGENT_ID:?SUMI_AGENT_ID is required}
+      SUMI_CONVERSATION_ID: ${SUMI_CONVERSATION_ID:?SUMI_CONVERSATION_ID is required}
+      SUMI_AGENT_WRAPPING_KEY: ${SUMI_AGENT_WRAPPING_KEY:?SUMI_AGENT_WRAPPING_KEY is required}
+      SUMI_PROVIDER_API_KEY: ${SUMI_PROVIDER_API_KEY:?SUMI_PROVIDER_API_KEY is required}
+      SUMI_MODEL_PRESET: ${SUMI_MODEL_PRESET:-kimi-k3}
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      executor:
+        condition: service_started
+    volumes:
+      - state:/var/lib/sumi
+      - runtime-ipc:/run/sumi/runtime:ro
+
+  executor:
+    <<: *sidecar-hardening
+    build:
+      context: ../..
+      dockerfile: deploy/agent/Dockerfile
+    user: "10002:10002"
+    group_add: ["10010"]
+    command: [executor]
+    network_mode: none
+    environment:
+      SUMI_CONVERSATION_ID: ${SUMI_CONVERSATION_ID:?SUMI_CONVERSATION_ID is required}
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      broker:
+        condition: service_started
+    volumes:
+      - workspace:/workspace
+      - runtime-ipc:/run/sumi/runtime
+      - broker-ipc:/run/sumi/broker:ro
+
+  broker:
+    <<: *sidecar-hardening
+    build:
+      context: ../..
+      dockerfile: deploy/agent/Dockerfile
+    user: "10003:10003"
+    group_add: ["10010"]
+    command: [broker]
+    network_mode: none
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    volumes:
+      - artifacts:/var/lib/sumi-artifacts
+      - broker-ipc:/run/sumi/broker
+
+volumes:
+  state: {}
+  workspace: {}
+  artifacts: {}
+  runtime-ipc: {}
+  broker-ipc: {}

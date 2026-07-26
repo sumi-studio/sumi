@@ -392,11 +392,22 @@ async fn bash_env_does_not_leak_broker_socket() {
         ),
     )
     .await;
-    let update = read_frame(&mut stdout).await;
-    let output = update["value"]["output"].as_str().unwrap();
+    let first = read_frame(&mut stdout).await;
+    let (output, terminal) = if first["result"].is_null() {
+        (
+            first["value"]["output"].as_str().unwrap().to_owned(),
+            read_frame(&mut stdout).await,
+        )
+    } else {
+        (
+            first["result"]["Ok"]["result"]["output"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            first,
+        )
+    };
     assert!(!output.contains("SUMI_ARTIFACT_BROKER_SOCKET"));
-
-    let terminal = read_frame(&mut stdout).await;
     assert_eq!(terminal["result"]["Ok"]["result"]["exit_code"], 0);
 
     drop(stdin);
@@ -550,7 +561,7 @@ async fn mapped_distinct_uid_separation_requires_host_subuid() {
     // root or newuidmap + /etc/subuid.
 }
 
-fn supervisor_test_env(root: &PathBuf) -> Vec<(&'static str, String)> {
+fn supervisor_test_env(root: &Path) -> Vec<(&'static str, String)> {
     vec![
         ("SUMI_BIN", env!("CARGO_BIN_EXE_sumi-agent").to_owned()),
         ("SUMI_CONFIG_FILE", "/dev/null".to_owned()),
@@ -591,6 +602,91 @@ fn supervisor_path() -> PathBuf {
         .parent()
         .unwrap()
         .join("deploy/agent/supervisor")
+}
+
+fn compose_service<'a>(source: &'a str, service: &str) -> &'a str {
+    let marker = format!("\n  {service}:\n");
+    let start = source
+        .find(&marker)
+        .unwrap_or_else(|| panic!("compose service {service} is missing"));
+    let rest = &source[start + marker.len()..];
+    let end = rest
+        .match_indices("\n  ")
+        .find_map(|(offset, _)| (rest.as_bytes().get(offset + 3) != Some(&b' ')).then_some(offset))
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
+#[test]
+fn compose_deployment_has_disjoint_mounts_identities_and_sidecar_policy() {
+    let deploy_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("deploy/agent");
+    let compose = std::fs::read_to_string(deploy_dir.join("compose.yaml")).unwrap();
+    let dockerfile = std::fs::read_to_string(deploy_dir.join("Dockerfile")).unwrap();
+    let entrypoint = std::fs::read_to_string(deploy_dir.join("container-entrypoint")).unwrap();
+    let seccomp = std::fs::read_to_string(deploy_dir.join("seccomp/sidecar.json")).unwrap();
+
+    let runtime = compose_service(&compose, "runtime");
+    let executor = compose_service(&compose, "executor");
+    let broker = compose_service(&compose, "broker");
+
+    // The runtime only sees durable state and its executor IPC endpoint. It
+    // must not receive either tenant workspace or artifact storage.
+    assert!(runtime.contains("user: \"10001:10001\""));
+    assert!(runtime.contains("state:/var/lib/sumi"));
+    assert!(runtime.contains("runtime-ipc:/run/sumi/runtime:ro"));
+    assert!(!runtime.contains("workspace:/workspace"));
+    assert!(!runtime.contains("artifacts:/var/lib/sumi-artifacts"));
+    assert!(!runtime.contains("broker-ipc:"));
+
+    // The executor receives only workspace and the two constrained IPC
+    // directories. It cannot mount durable state or the artifact volume.
+    assert!(executor.contains("user: \"10002:10002\""));
+    assert!(executor.contains("network_mode: none"));
+    assert!(executor.contains("workspace:/workspace"));
+    assert!(executor.contains("runtime-ipc:/run/sumi/runtime"));
+    assert!(executor.contains("broker-ipc:/run/sumi/broker:ro"));
+    assert!(!executor.contains("state:/var/lib/sumi"));
+    assert!(!executor.contains("artifacts:/var/lib/sumi-artifacts"));
+
+    // The broker gets no workspace/state mount and has no TCP/DNS network.
+    assert!(broker.contains("user: \"10003:10003\""));
+    assert!(broker.contains("network_mode: none"));
+    assert!(broker.contains("artifacts:/var/lib/sumi-artifacts"));
+    assert!(broker.contains("broker-ipc:/run/sumi/broker"));
+    assert!(!broker.contains("workspace:/workspace"));
+    assert!(!broker.contains("state:/var/lib/sumi"));
+    assert!(!broker.contains("runtime-ipc:"));
+
+    for service in [runtime, executor, broker] {
+        assert!(service.contains("<<: *sidecar-hardening"));
+    }
+    for required in [
+        "read_only: true",
+        "cap_drop: [ALL]",
+        "no-new-privileges:true",
+        "seccomp:./seccomp/sidecar.json",
+        "openat2",
+    ] {
+        assert!(
+            compose.contains(required) || seccomp.contains(required),
+            "deployment policy missing {required}"
+        );
+    }
+
+    assert!(dockerfile.contains("sumi-runtime"));
+    assert!(dockerfile.contains("sumi-tool"));
+    assert!(dockerfile.contains("sumi-artifact"));
+    assert!(entrypoint.contains("--allocate-generation"));
+    assert!(entrypoint.contains("SUMI_RPC_NONCE"));
+    assert!(entrypoint.contains("SUMI_PROCESS_GENERATION_LEASE_ID"));
+    assert!(entrypoint.contains("SUMI_GENERATION_RECOVERY_FENCE_ID"));
+    assert!(entrypoint.contains("env -i"));
+    let _: serde_json::Value = serde_json::from_str(&seccomp).unwrap();
 }
 
 #[tokio::test]

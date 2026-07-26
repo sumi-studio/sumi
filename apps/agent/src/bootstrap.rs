@@ -43,7 +43,6 @@ struct BootstrapContext {
     agent_id: String,
     conversation_id: String,
     state_dir: PathBuf,
-    workspace: PathBuf,
     executor_socket: PathBuf,
     wrapping_key: String,
     wrapping_key_id: String,
@@ -69,13 +68,7 @@ impl BootstrapContext {
         let conversation_id = required("SUMI_CONVERSATION_ID")?;
 
         let state_dir = required_path("SUMI_STATE_DIR")?;
-        let workspace = required_path("SUMI_WORKSPACE")?;
         let executor_socket = required_path("SUMI_EXECUTOR_SOCKET")?;
-        // These variables are consumed by the artifact-broker sidecar; the
-        // runtime validates they are present before composition so an
-        // incomplete supervisor environment is caught immediately.
-        let _ = required_path("SUMI_ARTIFACT_BROKER_SOCKET")?;
-        let _ = required_path("SUMI_ARTIFACT_ROOT")?;
 
         let wrapping_key = required("SUMI_AGENT_WRAPPING_KEY")?;
         let wrapping_key_id = env::var("SUMI_AGENT_WRAPPING_KEY_ID")
@@ -90,7 +83,6 @@ impl BootstrapContext {
             agent_id,
             conversation_id,
             state_dir,
-            workspace,
             executor_socket,
             wrapping_key,
             wrapping_key_id,
@@ -255,8 +247,14 @@ pub async fn run_production_with_driver(
         tools: registry.definitions(),
     };
 
-    let workspace =
-        WorkspacePaths::new(&ctx.workspace).context("failed to open workspace paths")?;
+    // The runtime deliberately uses an empty rootfs-local placeholder.  The
+    // production deployment never mounts the tenant workspace into this
+    // container; all real workspace access is delegated to the remote
+    // executor.  `InjectedRunDriver` still carries a `WorkspacePaths` value
+    // because that is the neutral Tool trait context, but the frozen remote
+    // registry never dereferences it.
+    let workspace = WorkspacePaths::new("/workspace")
+        .context("runtime rootfs is missing the inert workspace placeholder")?;
 
     let driver = InjectedRunDriver::with_stream_starter(
         model_spec,
@@ -336,7 +334,7 @@ fn approval_broker_available() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, path::Path};
 
     use super::*;
     use crate::tools::ToolRegistryBuilder;
@@ -363,7 +361,7 @@ mod tests {
         }
     }
 
-    fn test_env_prefix(dir: &PathBuf) -> Vec<(&'static str, String)> {
+    fn test_env_prefix(dir: &Path) -> Vec<(&'static str, String)> {
         vec![
             ("SUMI_TENANT_ID", "tenant-1".to_owned()),
             ("SUMI_AGENT_ID", "agent-1".to_owned()),
