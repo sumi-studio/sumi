@@ -934,6 +934,12 @@ fn has_embedded_execution_payload(tokens: &[String]) -> bool {
             // `-C` is case-sensitive: uppercase is the global change-directory
             // option and consumes the following directory argument.
             if tokens[i] == "-C" {
+                if tokens
+                    .get(i + 1)
+                    .is_some_and(|path| is_dotgit_hooks_path(path))
+                {
+                    return true;
+                }
                 i += 2;
                 continue;
             }
@@ -3852,6 +3858,14 @@ mod tests {
             !p2.evaluate(&cat_gitconfig).is_allow(),
             "cat .git/config must not be allowed even with a literal rule"
         );
+
+        // `git -C` consumes a directory, not a case-insensitive `-c` config
+        // assignment. That directory remains subject to internal-state policy.
+        assert!(matches!(
+            p2.evaluate(&bash("git -C .git/hooks status")),
+            PolicyDecision::NeedsApproval { ref reason, .. }
+                if reason == "shell path touches internal state"
+        ));
     }
 
     #[test]

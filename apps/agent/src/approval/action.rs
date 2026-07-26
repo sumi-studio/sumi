@@ -638,6 +638,33 @@ fn shell_credential_spans(command: &str) -> Vec<Vec<(usize, usize, &'static str)
     spans
 }
 
+/// Append a normalized shell fragment and its one-past-end byte mapping.
+///
+/// Mapping failures must remain observable to the summary path: a panic would
+/// turn malformed shell input into an availability failure instead of the
+/// fail-closed redaction marker used by the caller.
+fn append_normalized_shell_piece(
+    normalized: &mut String,
+    mapping: &mut Vec<usize>,
+    piece: &str,
+    piece_map: &[usize],
+) -> bool {
+    normalized
+        .len()
+        .checked_add(1)
+        .is_some_and(|expected| mapping.len() == expected)
+        && piece
+            .len()
+            .checked_add(1)
+            .is_some_and(|expected| piece_map.len() == expected)
+        && {
+            normalized.push_str(piece);
+            mapping.pop();
+            mapping.extend_from_slice(piece_map);
+            true
+        }
+}
+
 fn contains_shell_credential(text: &str) -> bool {
     shell_credential_spans(text)
         .iter()
@@ -726,7 +753,14 @@ impl SecretAwareActionProjector {
         let mut out = String::with_capacity(text.len());
         let mut cursor = 0usize;
         for m in self.inventory.find(normalized) {
-            if m.start >= mapping.len() || m.end >= mapping.len() {
+            // `end` is an exclusive endpoint, so a match ending exactly at
+            // normalized.len() is valid and uses the required one-past-end
+            // mapping entry. Anything beyond the normalized input is invalid.
+            if m.start > m.end
+                || m.end > normalized.len()
+                || m.start >= mapping.len()
+                || m.end >= mapping.len()
+            {
                 return "[REDACTED:shell_unverifiable]".to_owned();
             }
             let secret_start = mapping[m.start];
@@ -815,19 +849,6 @@ impl SecretAwareActionProjector {
         // tokens (e.g. unquoted `Authorization: Basic <token>`) are redacted
         // before per-token processing. Mapping matches back to original byte
         // positions preserves surrounding punctuation such as closing quotes.
-        fn append_piece(
-            normalized: &mut String,
-            mapping: &mut Vec<usize>,
-            piece: &str,
-            piece_map: &[usize],
-        ) {
-            let base = normalized.len();
-            assert_eq!(mapping.len(), base + 1);
-            normalized.push_str(piece);
-            mapping.pop();
-            mapping.extend_from_slice(piece_map);
-        }
-
         let mut normalized = String::with_capacity(command.len());
         let mut mapping: Vec<usize> = vec![0];
         let mut prev_end = 0usize;
@@ -840,14 +861,24 @@ impl SecretAwareActionProjector {
                 prev_end = end;
                 continue;
             }
-            if !normalized.is_empty() {
-                append_piece(&mut normalized, &mut mapping, " ", &[prev_end, start]);
+            if !normalized.is_empty()
+                && !append_normalized_shell_piece(
+                    &mut normalized,
+                    &mut mapping,
+                    " ",
+                    &[prev_end, start],
+                )
+            {
+                return "[REDACTED:shell_unverifiable]".to_owned();
             }
             let mut piece_map = Vec::with_capacity(span_map.len());
             for &pos in &span_map {
                 piece_map.push(start + pos);
             }
-            append_piece(&mut normalized, &mut mapping, &span_norm, &piece_map);
+            if !append_normalized_shell_piece(&mut normalized, &mut mapping, &span_norm, &piece_map)
+            {
+                return "[REDACTED:shell_unverifiable]".to_owned();
+            }
             prev_end = end;
         }
         let command = self.redact_text_with_mapping(command, &normalized, &mapping);
@@ -3102,17 +3133,24 @@ pub(crate) mod shell {
     fn git_is_network_operation(tokens: &[String]) -> bool {
         let mut i = 0usize;
         while i < tokens.len() {
-            let t_lower = tokens[i].to_ascii_lowercase();
+            let token = &tokens[i];
+            let t_lower = token.to_ascii_lowercase();
             if t_lower.starts_with('-') {
                 if matches!(
                     t_lower.as_str(),
-                    "-c" | "--config"
+                    "--config"
                         | "--config-env"
                         | "--git-dir"
                         | "--work-tree"
                         | "--exec-path"
                         | "--namespace"
                 ) {
+                    i += 2;
+                    continue;
+                }
+                // Git's short options are case-sensitive: `-C` changes the
+                // working directory, while `-c` supplies a config entry.
+                if token == "-c" || token == "-C" {
                     i += 2;
                     continue;
                 }
@@ -3135,8 +3173,8 @@ pub(crate) mod shell {
                     || t_lower.starts_with("--namespace=")
                     || t_lower.starts_with("--config=")
                     || t_lower.starts_with("--config-env=")
-                    || (t_lower.starts_with("-c") && t_lower.contains('='))
-                    || t_lower.starts_with("-C")
+                    || (token.starts_with("-c") && token.contains('='))
+                    || token.starts_with("-C")
                 {
                     i += 1;
                     continue;
@@ -3456,6 +3494,8 @@ mod tests {
             "git send-pack origin main",
             "git fetch-pack origin main",
             "git --config-env=core.pager=MY_PAGER ls-remote origin",
+            "git -C /workspace/repo push origin main",
+            "git -Crepo fetch origin",
         ] {
             assert!(
                 network_indicators_in_command(command),
@@ -4016,6 +4056,40 @@ mod tests {
             redacted.matches("https://example.com").count() == 2,
             "both hosts must remain visible: {redacted}"
         );
+    }
+
+    #[test]
+    fn shell_inventory_mapping_accepts_terminal_match_and_rejects_missing_endpoint() {
+        let secret = "sk-abcdefghijklmnop";
+        let complete_mapping: Vec<usize> = (0..=secret.len()).collect();
+        let redacted = projector().redact_text_with_mapping(secret, secret, &complete_mapping);
+        assert!(
+            !redacted.contains(secret),
+            "terminal secret match leaked: {redacted}"
+        );
+        assert!(redacted.contains("[REDACTED:api_key]"));
+
+        // The exclusive end is valid only with a one-past-end mapping entry.
+        // A truncated mapping must fail closed rather than index out of bounds.
+        let incomplete_mapping: Vec<usize> = (0..secret.len()).collect();
+        assert_eq!(
+            projector().redact_text_with_mapping(secret, secret, &incomplete_mapping),
+            "[REDACTED:shell_unverifiable]"
+        );
+    }
+
+    #[test]
+    fn malformed_normalized_piece_mapping_fails_without_panicking() {
+        let mut normalized = "a".to_owned();
+        let mut mapping = vec![0, 1];
+        assert!(!append_normalized_shell_piece(
+            &mut normalized,
+            &mut mapping,
+            "b",
+            &[1],
+        ));
+        assert_eq!(normalized, "a");
+        assert_eq!(mapping, vec![0, 1]);
     }
 
     #[test]
