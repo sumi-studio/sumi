@@ -1910,59 +1910,7 @@ fn context_message(message: &ContextMessage) -> &Message {
 }
 
 pub(super) fn public_to_message(message: PublicMessage) -> Message {
-    match message {
-        PublicMessage::User(message) => Message::User(message),
-        PublicMessage::ToolResult(message) => Message::ToolResult(message),
-        PublicMessage::Assistant(message) => {
-            Message::Assistant(crate::provider::types::AssistantMessage {
-                content: message
-                    .content
-                    .into_iter()
-                    .map(|content| match content {
-                        PublicAssistantContent::Text {
-                            text,
-                            wire_item_index,
-                        } => AssistantContent::Text {
-                            text,
-                            wire_item_index,
-                        },
-                        PublicAssistantContent::Thinking {
-                            thinking,
-                            signature_field,
-                            wire_item_index,
-                        } => AssistantContent::Thinking {
-                            thinking,
-                            signature_field,
-                            wire_item_index,
-                        },
-                        PublicAssistantContent::ToolCall {
-                            tool_call,
-                            wire_item_index,
-                        } => AssistantContent::ToolCall {
-                            tool_call,
-                            wire_item_index,
-                        },
-                        PublicAssistantContent::RejectedToolCall {
-                            rejected,
-                            wire_item_index,
-                        } => AssistantContent::RejectedToolCall {
-                            rejected,
-                            wire_item_index,
-                        },
-                    })
-                    .collect(),
-                model: message.model,
-                provider: message.provider,
-                origin: message.origin,
-                usage: message.usage,
-                stop_reason: message.stop_reason,
-                error_message: message.error_message,
-                provider_code: message.provider_code,
-                interrupted: message.interrupted,
-                timestamp: message.timestamp,
-            })
-        }
-    }
+    message.into()
 }
 
 fn assistant_error(message: &PublicMessage) -> String {

@@ -69,7 +69,7 @@ pub(crate) enum ProviderContextKind {
 }
 
 impl ProviderContextKind {
-    fn from_payload(payload: &ProviderContextPayload) -> Self {
+    pub(crate) fn from_payload(payload: &ProviderContextPayload) -> Self {
         match payload {
             ProviderContextPayload::OpenAiCompactedWindow { .. } => Self::OpenAiCompactedWindow,
             ProviderContextPayload::AnthropicCompaction { .. } => Self::AnthropicCompaction,
@@ -77,11 +77,45 @@ impl ProviderContextKind {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::EncryptedReasoning => "encrypted_reasoning",
             Self::OpenAiCompactedWindow => "open_ai_compacted_window",
             Self::AnthropicCompaction => "anthropic_compaction",
+        }
+    }
+}
+
+/// Canonical idempotency key for provider-context records.
+///
+/// Regular reasoning items use `message_id:wire_item_index:ordinal:kind`;
+/// native/dedicated compaction windows use `request_id:coverage_seq:fingerprint`.
+/// The key is stored in `provider_context.idempotency_key` and used for
+/// uniqueness and mutation-intent HMACs, while the row `id` remains a distinct
+/// stable record identifier.
+pub(crate) fn provider_context_idempotency_key(
+    request_id: &str,
+    item: &ProviderContextItem,
+) -> String {
+    match &item.payload {
+        ProviderContextPayload::EncryptedReasoning { .. } => {
+            let wire_label = item
+                .wire_item_index
+                .map_or_else(|| "_".to_owned(), |index| index.to_string());
+            format!(
+                "{}:{}:{}:{}",
+                request_id,
+                wire_label,
+                item.ordinal,
+                ProviderContextKind::from_payload(&item.payload).as_str()
+            )
+        }
+        ProviderContextPayload::OpenAiCompactedWindow { coverage, .. }
+        | ProviderContextPayload::AnthropicCompaction { coverage, .. } => {
+            format!(
+                "{}:{}:{}",
+                request_id, coverage.through_message_seq, coverage.context_fingerprint
+            )
         }
     }
 }
@@ -1403,7 +1437,10 @@ mod tests {
     use sqlx::Row;
 
     use super::*;
-    use crate::provider::types::ProviderContextAnchor;
+    use crate::provider::types::{
+        ApiProtocol, NativeCompactionCoverage, ProviderContextAnchor, ProviderContextItem,
+        ProviderContextPayload,
+    };
     use crate::store::{DataKeyPurpose, ProviderContextKeyAnchor, Store};
 
     async fn store() -> Store {
@@ -1467,7 +1504,7 @@ mod tests {
             ApiProtocol::OpenAiChatCompletions,
             "model-1",
             id,
-            format!("{id}:0:1:encrypted_reasoning"),
+            provider_context_idempotency_key(message_id, &item),
             &key,
             store.scope(),
         )
@@ -1580,7 +1617,7 @@ mod tests {
             ApiProtocol::OpenAiChatCompletions,
             "model-1",
             "pc-different",
-            "pc-different:0:2:encrypted_reasoning",
+            provider_context_idempotency_key("message-1", &different_item),
             &store
                 .provider_context_key(&ProviderContextKeyAnchor {
                     conversation_id: store.scope().conversation_id.clone(),
@@ -1950,5 +1987,117 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(remaining, 1);
+    }
+
+    #[tokio::test]
+    async fn reasoning_idempotency_key_is_message_wire_ordinal_kind() {
+        let store = store().await;
+        seed_message(&store, "message-1", 7).await.unwrap();
+
+        let a = reasoning_record(&store, "message-1", 7, "pc-a").await;
+        a.insert(store.pool()).await.unwrap();
+
+        let b = reasoning_record(&store, "message-1", 7, "pc-b").await;
+        let error = b
+            .insert(store.pool())
+            .await
+            .expect_err("same canonical reasoning idempotency key must collide");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("idempotency_key") || message.contains("UNIQUE"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_idempotency_key_is_request_coverage_fingerprint() {
+        let store = store().await;
+        seed_message(&store, "message-1", 7).await.unwrap();
+
+        let key = store
+            .provider_context_key(&ProviderContextKeyAnchor {
+                conversation_id: store.scope().conversation_id.clone(),
+                anchor_id: "message-1:7".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let mut base = ProviderContextItem {
+            origin_message: Some(ProviderContextAnchor {
+                message_id: "message-1".to_owned(),
+                message_seq: 7,
+            }),
+            wire_item_index: None,
+            ordinal: 1,
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({"summary": "a"})],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 7,
+                    context_fingerprint: "fp-a".to_owned(),
+                },
+            },
+        };
+
+        let a = EncryptedProviderContextRecord::encrypt(
+            &base,
+            "provider-instance-1",
+            ApiProtocol::OpenAiChatCompletions,
+            "model-1",
+            "pc-a",
+            provider_context_idempotency_key("message-1", &base),
+            &key,
+            store.scope(),
+        )
+        .expect("encrypt compaction a");
+        a.insert(store.pool()).await.unwrap();
+
+        // Same request/coverage/fingerprint with a different ordinal still collides
+        // on the canonical idempotency key, even though the (message_id, NULL, ordinal)
+        // tuple differs.
+        base.ordinal = 2;
+        let b = EncryptedProviderContextRecord::encrypt(
+            &base,
+            "provider-instance-1",
+            ApiProtocol::OpenAiChatCompletions,
+            "model-1",
+            "pc-b",
+            provider_context_idempotency_key("message-1", &base),
+            &key,
+            store.scope(),
+        )
+        .expect("encrypt compaction b");
+        let error = b
+            .insert(store.pool())
+            .await
+            .expect_err("same canonical compaction idempotency key must collide");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("idempotency_key") || message.contains("UNIQUE"),
+            "{message}"
+        );
+
+        // A different fingerprint produces a different canonical key and succeeds.
+        base.ordinal = 2;
+        base.payload = ProviderContextPayload::OpenAiCompactedWindow {
+            items: vec![json!({"summary": "c"})],
+            coverage: NativeCompactionCoverage {
+                through_message_seq: 7,
+                context_fingerprint: "fp-b".to_owned(),
+            },
+        };
+        let c = EncryptedProviderContextRecord::encrypt(
+            &base,
+            "provider-instance-1",
+            ApiProtocol::OpenAiChatCompletions,
+            "model-1",
+            "pc-c",
+            provider_context_idempotency_key("message-1", &base),
+            &key,
+            store.scope(),
+        )
+        .expect("encrypt compaction c");
+        c.insert(store.pool())
+            .await
+            .expect("different fingerprint must not collide");
     }
 }

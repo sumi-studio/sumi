@@ -21,6 +21,15 @@ impl MemoryLayer {
     fn as_i64(self) -> i64 {
         self as i64
     }
+
+    pub(crate) fn from_i64(value: i64) -> Option<Self> {
+        match value {
+            0 => Some(Self::L0),
+            1 => Some(Self::L1),
+            2 => Some(Self::L2),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,6 +55,19 @@ impl MemoryBatchState {
             Self::Dropped => "dropped",
         }
     }
+
+    pub(crate) fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "open" => Some(Self::Open),
+            "sealed" => Some(Self::Sealed),
+            "compacting" => Some(Self::Compacting),
+            "compact_failed" => Some(Self::CompactFailed),
+            "compacted" => Some(Self::Compacted),
+            "promoted" => Some(Self::Promoted),
+            "dropped" => Some(Self::Dropped),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,6 +83,15 @@ impl MemoryJobKind {
             Self::CompactL0 => "compact_l0",
             Self::CompactL1 => "compact_l1",
             Self::ConsolidateL2 => "consolidate_l2",
+        }
+    }
+
+    pub(crate) fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "compact_l0" => Some(Self::CompactL0),
+            "compact_l1" => Some(Self::CompactL1),
+            "consolidate_l2" => Some(Self::ConsolidateL2),
+            _ => None,
         }
     }
 }
@@ -82,6 +113,17 @@ impl MemoryJobStatus {
             Self::Completed => "completed",
             Self::Applied => "applied",
             Self::Failed => "failed",
+        }
+    }
+
+    pub(crate) fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "running" => Some(Self::Running),
+            "completed" => Some(Self::Completed),
+            "applied" => Some(Self::Applied),
+            "failed" => Some(Self::Failed),
+            _ => None,
         }
     }
 }
@@ -290,6 +332,7 @@ impl MemoryJobRecord {
     }
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct MemoryApplyCursorRecord {
     pub kind: String,
     pub next_batch_seq: i64,

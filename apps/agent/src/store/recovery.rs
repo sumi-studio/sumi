@@ -7,6 +7,7 @@ use zeroize::Zeroizing;
 
 use crate::agent::AgentEvent;
 use crate::gateway::Command;
+use crate::provider::types::{ContextMessage, ProviderContextItem};
 use crate::runtime::contracts::{GenerationRecoveryFence, ProcessGenerationLease};
 
 use super::{
@@ -15,6 +16,9 @@ use super::{
     crypto::decrypt_content,
     event_log::{EVENT_DIGEST_BYTES, EventChainEntry, extend_event_chain, verify_event_head},
     event_writer::DurableEventMetadata,
+    memory_state::{
+        MemoryApplyCursorRecord, MemoryBatchMessageRecord, MemoryBatchRecord, MemoryJobRecord,
+    },
     verify_command_payload_digest,
 };
 
@@ -72,6 +76,44 @@ pub(crate) enum RecoveryStep {
         run_id: String,
         turn_id: String,
     },
+}
+
+/// Authenticated cold-boot hydration boundary returned by T17.
+///
+/// T17 decrypts and validates persisted transcript anchors, provider context,
+/// and Store-owned memory/command/phase state, then completes the logical
+/// suffix plan. T26 consumes this typed boundary and composes the production
+/// RunCore without T17 taking ownership of T19-T21 memory, T23 ApprovalBroker,
+/// production ToolRegistry, or T26 composition.
+#[derive(Clone, Debug)]
+#[allow(
+    dead_code,
+    reason = "T17 boundary payload consumed by T26 bootstrap composition"
+)]
+pub(crate) struct HydratedRunState {
+    pub scope: super::AgentScope,
+    pub lease: ProcessGenerationLease,
+    pub fence: GenerationRecoveryFence,
+    pub receipt: super::HydrationReceiptIdentity,
+    pub messages: Vec<ContextMessage>,
+    pub provider_context: Vec<ProviderContextItem>,
+    pub memory_batches: Vec<MemoryBatchRecord>,
+    pub memory_batch_messages: Vec<MemoryBatchMessageRecord>,
+    pub memory_jobs: Vec<MemoryJobRecord>,
+    pub memory_apply_cursors: Vec<MemoryApplyCursorRecord>,
+    pub recovery_steps: Vec<RecoveryStep>,
+}
+
+/// Result of a T17 hydration attempt.
+///
+/// Non-empty physical recovery intents keep the boot fail-closed until T27
+/// supplies a valid `PhysicalRecoveryReceipt` and the logical suffix is
+/// completed in one EventWriter transaction.
+#[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum HydrationOutcome {
+    RecoveryRequired(Vec<super::PhysicalRecoveryIntentRequest>),
+    Complete(HydratedRunState),
 }
 
 #[derive(Clone, Debug)]

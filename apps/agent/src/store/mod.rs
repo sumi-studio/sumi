@@ -12,7 +12,7 @@ mod redactor;
 mod sizer;
 mod transcript;
 
-use std::{path::Path, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 #[cfg(test)]
 use std::str::FromStr;
@@ -30,6 +30,9 @@ use sqlx::{
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::provider::types::{
+    ContextMessage, Message, ProviderContextItem, ProviderContextPayload, PublicMessage,
+};
 use crate::runtime::contracts::{
     GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease,
 };
@@ -43,12 +46,13 @@ pub(crate) use self::physical_recovery::{
     ApplyReceiptOutcome, HydrationReceiptIdentity, PhysicalRecoveryApplier, PhysicalRecoveryIntent,
     PhysicalRecoveryIntentRequest, PhysicalRecoveryReceipt,
 };
-pub(crate) use self::provider_context::ProviderContextEvictionEstimate;
+pub(crate) use self::provider_context::{ProviderContextEvictionEstimate, ProviderContextKind};
+pub(crate) use self::transcript::{message_interrupted, public_message_role};
 #[cfg(test)]
 pub(crate) use crypto::{DATA_KEY_BYTES, WrappingKey};
 pub(crate) use crypto::{
     DataKeyMaterial, DataKeyPurpose, EnvironmentKeyProvider, KeyProvider, RowAad,
-    command_payload_digest, verify_command_payload_digest,
+    command_payload_digest, decrypt_content, verify_command_payload_digest,
 };
 #[allow(
     unused_imports,
@@ -61,9 +65,18 @@ pub(crate) use event_writer::{
 };
 #[allow(
     unused_imports,
+    reason = "T17 exposes the hydrated memory state boundary consumed by T19-T21"
+)]
+pub(crate) use memory_state::{
+    MemoryApplyCursorRecord, MemoryBatchMessageRecord, MemoryBatchRecord, MemoryBatchState,
+    MemoryBatchSummary, MemoryJobKind, MemoryJobRecord, MemoryJobResult, MemoryJobStatus,
+    MemoryLayer,
+};
+#[allow(
+    unused_imports,
     reason = "T12 exposes the recovery plan boundary consumed by T15"
 )]
-pub(crate) use recovery::{RecoveryStep, SuffixRecovery};
+pub(crate) use recovery::{HydratedRunState, HydrationOutcome, RecoveryStep, SuffixRecovery};
 pub(crate) use redactor::{PublicProjectionBuilder, Redactor};
 #[allow(
     unused_imports,
@@ -240,6 +253,63 @@ impl Store {
         &self.pool
     }
 
+    /// Authenticated T17 cold-boot hydration boundary.
+    ///
+    /// Validates the injected `ProcessGenerationLease`/`GenerationRecoveryFence`,
+    /// authenticates the Store scope and data keys, decrypts and validates
+    /// persisted transcript anchors, provider context, and Store-owned
+    /// memory/command/phase state, and returns either physical recovery intents
+    /// (boot remains fail-closed until T27 injects a receipt) or a complete
+    /// `HydratedRunState` with a stable `HydrationReceiptIdentity`.
+    #[allow(dead_code, reason = "T26 injects the production hydration lease/fence")]
+    pub(crate) async fn hydrate(
+        &self,
+        lease: &ProcessGenerationLease,
+        fence: &GenerationRecoveryFence,
+    ) -> Result<HydrationOutcome> {
+        self.validate_startup().await?;
+
+        lease
+            .validate_exact(fence.generation(), fence.lease_id())
+            .map_err(|error| anyhow!("invalid recovery lease/fence binding: {error}"))?;
+        fence
+            .validate_exact(lease, fence.fence_id())
+            .map_err(|error| anyhow!("invalid recovery fence binding: {error}"))?;
+
+        let intents = self.hydrate_running_intents().await?;
+        if !intents.is_empty() {
+            return Ok(HydrationOutcome::RecoveryRequired(intents));
+        }
+
+        let messages = self.hydrate_messages().await?;
+        let provider_context = self.hydrate_provider_context(&messages).await?;
+        let (memory_batches, memory_batch_messages, memory_jobs, memory_apply_cursors) =
+            self.hydrate_memory_state().await?;
+
+        let recovery_steps = SuffixRecovery::plan_full_suffix(self).await?;
+
+        let receipt = HydrationReceiptIdentity {
+            lease_id: lease.lease_id().to_owned(),
+            generation: lease.generation(),
+            fence_id: fence.fence_id().to_owned(),
+            intent_count: 0,
+        };
+
+        Ok(HydrationOutcome::Complete(HydratedRunState {
+            scope: self.scope.clone(),
+            lease: lease.clone(),
+            fence: fence.clone(),
+            receipt,
+            messages,
+            provider_context,
+            memory_batches,
+            memory_batch_messages,
+            memory_jobs,
+            memory_apply_cursors,
+            recovery_steps,
+        }))
+    }
+
     /// Hydrate only the T17 physical-recovery boundary.  T17 validates the
     /// injected lease/fence and returns immutable running-tool attestations;
     /// T27 owns the physical kill/reap and proof persistence.  A clean state
@@ -255,13 +325,13 @@ impl Store {
         Vec<PhysicalRecoveryIntentRequest>,
         Option<HydrationReceiptIdentity>,
     )> {
-        lease
-            .validate_exact(fence.generation(), fence.lease_id())
-            .map_err(|error| anyhow!("invalid recovery lease/fence binding: {error}"))?;
-        fence
-            .validate_exact(lease, fence.fence_id())
-            .map_err(|error| anyhow!("invalid recovery fence binding: {error}"))?;
+        match self.hydrate(lease, fence).await? {
+            HydrationOutcome::RecoveryRequired(intents) => Ok((intents, None)),
+            HydrationOutcome::Complete(state) => Ok((Vec::new(), Some(state.receipt))),
+        }
+    }
 
+    async fn hydrate_running_intents(&self) -> Result<Vec<PhysicalRecoveryIntentRequest>> {
         let rows = sqlx::query(
             "SELECT tool_call_id, command_id, run_id, executor_generation
              FROM tool_executions WHERE state = 'running' ORDER BY tool_call_id",
@@ -286,13 +356,379 @@ impl Store {
                 executor_generation: generation,
             });
         }
-        let receipt = intents.is_empty().then(|| HydrationReceiptIdentity {
-            lease_id: lease.lease_id().to_owned(),
-            generation: lease.generation(),
-            fence_id: fence.fence_id().to_owned(),
-            intent_count: 0,
-        });
-        Ok((intents, receipt))
+        Ok(intents)
+    }
+
+    async fn hydrate_messages(&self) -> Result<Vec<ContextMessage>> {
+        let mut key_cache: HashMap<String, Arc<DataKeyMaterial>> = HashMap::new();
+
+        let rows = sqlx::query(
+            "SELECT id, seq, role, raw_key_ref, raw_ciphertext, redaction_version, interrupted
+             FROM messages ORDER BY seq",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to hydrate transcript messages")?;
+
+        let mut messages = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.try_get("id")?;
+            let seq: i64 = row.try_get("seq")?;
+            let seq =
+                u64::try_from(seq).with_context(|| format!("message {id} seq out of u64 range"))?;
+            let stored_role: String = row.try_get("role")?;
+            let key_ref: String = row.try_get("raw_key_ref")?;
+            let redaction_version: i64 = row.try_get("redaction_version")?;
+            if redaction_version != i64::from(self.redactor.version()) {
+                bail!("message {id} uses an unsupported redaction version");
+            }
+            let interrupted: i64 = row.try_get("interrupted")?;
+            let interrupted = interrupted != 0;
+
+            let key = self.load_hydration_key(&mut key_cache, &key_ref).await?;
+            let ciphertext: Vec<u8> = row.try_get("raw_ciphertext")?;
+            let aad = self
+                .scope
+                .row_aad("messages", &id, DataKeyPurpose::Transcript);
+            let plaintext = decrypt_content(&key, &ciphertext, &aad)
+                .with_context(|| format!("failed to decrypt transcript message {id}"))?;
+            let public: PublicMessage = serde_json::from_slice(&plaintext)
+                .with_context(|| format!("transcript message {id} is not a valid PublicMessage"))?;
+
+            if public_message_role(&public) != stored_role {
+                bail!("message {id} role does not match decrypted public message");
+            }
+            if message_interrupted(&public) != interrupted {
+                bail!("message {id} interrupted flag does not match decrypted public message");
+            }
+
+            messages.push(ContextMessage::Persisted {
+                id: id.clone(),
+                seq,
+                message: Message::from(public),
+            });
+        }
+        Ok(messages)
+    }
+
+    async fn hydrate_provider_context(
+        &self,
+        messages: &[ContextMessage],
+    ) -> Result<Vec<ProviderContextItem>> {
+        let mut key_cache: HashMap<String, Arc<DataKeyMaterial>> = HashMap::new();
+
+        let rows = sqlx::query(
+            "SELECT id, message_id, message_seq, wire_item_index, item_ordinal,
+                    idempotency_key, kind, coverage_through_seq, context_fingerprint,
+                    key_ref, ciphertext
+             FROM provider_context
+             ORDER BY message_seq NULLS LAST, wire_item_index NULLS LAST, item_ordinal",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to hydrate provider context")?;
+
+        let mut provider_context = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.try_get("id")?;
+            let stored_message_id: Option<String> = row.try_get("message_id")?;
+            let stored_message_seq: Option<i64> = row.try_get("message_seq")?;
+            let stored_wire_item_index: Option<i64> = row.try_get("wire_item_index")?;
+            let stored_item_ordinal: i64 = row.try_get("item_ordinal")?;
+            let stored_idempotency_key: String = row.try_get("idempotency_key")?;
+            let stored_kind: String = row.try_get("kind")?;
+            let stored_coverage_seq: Option<i64> = row.try_get("coverage_through_seq")?;
+            let stored_fingerprint: Option<String> = row.try_get("context_fingerprint")?;
+            let key_ref: String = row.try_get("key_ref")?;
+
+            let key = self.load_hydration_key(&mut key_cache, &key_ref).await?;
+            let ciphertext: Vec<u8> = row.try_get("ciphertext")?;
+            let aad = self
+                .scope
+                .row_aad("provider_context", &id, DataKeyPurpose::ProviderContext);
+            let plaintext = decrypt_content(&key, &ciphertext, &aad)
+                .with_context(|| format!("failed to decrypt provider-context record {id}"))?;
+            let item: ProviderContextItem =
+                serde_json::from_slice(&plaintext).with_context(|| {
+                    format!("provider-context record {id} is not a valid ProviderContextItem")
+                })?;
+
+            if item.origin_message.as_ref().map(|a| a.message_id.as_str())
+                != stored_message_id.as_deref()
+            {
+                bail!("provider-context record {id} message_id does not match decrypted anchor");
+            }
+            let stored_message_seq_u64 = stored_message_seq
+                .map(|v| {
+                    u64::try_from(v).with_context(|| {
+                        format!("provider-context record {id} message_seq out of u64 range")
+                    })
+                })
+                .transpose()?;
+            if item.origin_message.as_ref().map(|a| a.message_seq) != stored_message_seq_u64 {
+                bail!("provider-context record {id} message_seq does not match decrypted anchor");
+            }
+            let stored_wire_u32 = stored_wire_item_index
+                .map(|v| {
+                    u32::try_from(v).with_context(|| {
+                        format!("provider-context record {id} wire_item_index out of u32 range")
+                    })
+                })
+                .transpose()?;
+            if item.wire_item_index != stored_wire_u32 {
+                bail!("provider-context record {id} wire_item_index does not match decrypted item");
+            }
+            let stored_ordinal_u32 = u32::try_from(stored_item_ordinal).with_context(|| {
+                format!("provider-context record {id} item_ordinal out of u32 range")
+            })?;
+            if item.ordinal != stored_ordinal_u32 {
+                bail!("provider-context record {id} item_ordinal does not match decrypted item");
+            }
+            if ProviderContextKind::from_payload(&item.payload).as_str() != stored_kind {
+                bail!("provider-context record {id} kind does not match decrypted payload");
+            }
+
+            match &item.payload {
+                ProviderContextPayload::OpenAiCompactedWindow { coverage, .. }
+                | ProviderContextPayload::AnthropicCompaction { coverage, .. } => {
+                    let expected_seq = stored_coverage_seq
+                        .map(|v| {
+                            u64::try_from(v).with_context(|| {
+                                format!(
+                                    "provider-context record {id} coverage seq out of u64 range"
+                                )
+                            })
+                        })
+                        .transpose()?;
+                    if Some(coverage.through_message_seq) != expected_seq {
+                        bail!(
+                            "provider-context record {id} coverage_through_seq does not match decrypted payload"
+                        );
+                    }
+                    if stored_fingerprint.as_deref() != Some(coverage.context_fingerprint.as_str())
+                    {
+                        bail!(
+                            "provider-context record {id} context_fingerprint does not match decrypted payload"
+                        );
+                    }
+                }
+                ProviderContextPayload::EncryptedReasoning { .. } => {
+                    if stored_coverage_seq.is_some() || stored_fingerprint.is_some() {
+                        bail!(
+                            "provider-context record {id} reasoning payload must not carry coverage metadata"
+                        );
+                    }
+                    let anchor = item.origin_message.as_ref().ok_or_else(|| {
+                        anyhow!(
+                            "provider-context record {id} encrypted reasoning is missing an anchor"
+                        )
+                    })?;
+                    let expected_idempotency_key =
+                        self::provider_context::provider_context_idempotency_key(
+                            &anchor.message_id,
+                            &item,
+                        );
+                    if stored_idempotency_key != expected_idempotency_key {
+                        bail!(
+                            "provider-context record {id} idempotency key does not match decrypted reasoning item"
+                        );
+                    }
+                }
+            }
+
+            if let Some(anchor) = &item.origin_message {
+                let anchor_found = messages.iter().any(|message| match message {
+                    ContextMessage::Persisted { id, seq, message } => {
+                        id == &anchor.message_id
+                            && *seq == anchor.message_seq
+                            && matches!(message, Message::Assistant(_))
+                    }
+                    ContextMessage::Synthetic { .. } => false,
+                });
+                if !anchor_found {
+                    bail!(
+                        "provider-context record {id} anchor {}:{} does not resolve to a persisted assistant message",
+                        anchor.message_id,
+                        anchor.message_seq
+                    );
+                }
+            }
+
+            provider_context.push(item);
+        }
+        Ok(provider_context)
+    }
+
+    async fn hydrate_memory_state(
+        &self,
+    ) -> Result<(
+        Vec<MemoryBatchRecord>,
+        Vec<MemoryBatchMessageRecord>,
+        Vec<MemoryJobRecord>,
+        Vec<MemoryApplyCursorRecord>,
+    )> {
+        let batch_rows = sqlx::query(
+            "SELECT id, layer, ord, batch_seq, version, state, est_tokens,
+                    eviction_footprint_tokens, summary_key_ref, summary_ciphertext,
+                    summary_projection, summary_redaction_version, updated_at
+             FROM memory_batches ORDER BY layer, ord",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to hydrate memory batches")?;
+
+        let mut memory_batches = Vec::with_capacity(batch_rows.len());
+        for row in batch_rows {
+            let summary = match (
+                row.try_get::<Option<String>, _>("summary_key_ref")?,
+                row.try_get::<Option<Vec<u8>>, _>("summary_ciphertext")?,
+                row.try_get::<Option<String>, _>("summary_projection")?,
+                row.try_get::<Option<i64>, _>("summary_redaction_version")?,
+            ) {
+                (Some(key_ref), Some(ciphertext), Some(projection), Some(version)) => {
+                    Some(MemoryBatchSummary {
+                        key_ref,
+                        ciphertext,
+                        projection,
+                        redaction_version: u32::try_from(version)
+                            .with_context(|| "memory batch redaction version out of u32 range")?,
+                    })
+                }
+                (None, None, None, None) => None,
+                _ => bail!("memory batch summary fields are inconsistent"),
+            };
+
+            let layer = row.try_get::<i64, _>("layer")?;
+            let layer = MemoryLayer::from_i64(layer)
+                .ok_or_else(|| anyhow!("memory batch has unknown layer {layer}"))?;
+            let state: String = row.try_get("state")?;
+            let state = MemoryBatchState::from_str(&state)
+                .ok_or_else(|| anyhow!("memory batch has unknown state {state}"))?;
+
+            memory_batches.push(MemoryBatchRecord {
+                id: row.try_get("id")?,
+                layer,
+                ord: row.try_get("ord")?,
+                batch_seq: row.try_get("batch_seq")?,
+                version: row.try_get("version")?,
+                state,
+                est_tokens: row.try_get("est_tokens")?,
+                eviction_footprint_tokens: row.try_get("eviction_footprint_tokens")?,
+                summary,
+                updated_at: row.try_get("updated_at")?,
+            });
+        }
+
+        let batch_message_rows = sqlx::query(
+            "SELECT batch_id, message_id, ord FROM memory_batch_messages ORDER BY batch_id, ord",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to hydrate memory batch messages")?;
+        let mut memory_batch_messages = Vec::with_capacity(batch_message_rows.len());
+        for row in batch_message_rows {
+            memory_batch_messages.push(MemoryBatchMessageRecord {
+                batch_id: row.try_get("batch_id")?,
+                message_id: row.try_get("message_id")?,
+                ord: row.try_get("ord")?,
+            });
+        }
+
+        let job_rows = sqlx::query(
+            "SELECT id, kind, batch_seq, source_ids, source_versions, status, attempts,
+                    result_key_ref, result_ciphertext, result_projection, result_redaction_version,
+                    created_at, updated_at
+             FROM memory_jobs ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to hydrate memory jobs")?;
+        let mut memory_jobs = Vec::with_capacity(job_rows.len());
+        for row in job_rows {
+            let result = match (
+                row.try_get::<Option<String>, _>("result_key_ref")?,
+                row.try_get::<Option<Vec<u8>>, _>("result_ciphertext")?,
+                row.try_get::<Option<String>, _>("result_projection")?,
+                row.try_get::<Option<i64>, _>("result_redaction_version")?,
+            ) {
+                (Some(key_ref), Some(ciphertext), Some(projection), Some(version)) => {
+                    Some(MemoryJobResult {
+                        key_ref,
+                        ciphertext,
+                        projection,
+                        redaction_version: u32::try_from(version).with_context(
+                            || "memory job result redaction version out of u32 range",
+                        )?,
+                    })
+                }
+                (None, None, None, None) => None,
+                _ => bail!("memory job result fields are inconsistent"),
+            };
+
+            let kind: String = row.try_get("kind")?;
+            let kind = MemoryJobKind::from_str(&kind)
+                .ok_or_else(|| anyhow!("memory job has unknown kind {kind}"))?;
+            let status: String = row.try_get("status")?;
+            let status = MemoryJobStatus::from_str(&status)
+                .ok_or_else(|| anyhow!("memory job has unknown status {status}"))?;
+            let source_ids: String = row.try_get("source_ids")?;
+            let source_ids: Vec<String> = serde_json::from_str(&source_ids)
+                .context("memory job source_ids is not valid JSON")?;
+            let source_versions: String = row.try_get("source_versions")?;
+            let source_versions: std::collections::BTreeMap<String, i64> =
+                serde_json::from_str(&source_versions)
+                    .context("memory job source_versions is not valid JSON")?;
+
+            memory_jobs.push(MemoryJobRecord {
+                id: row.try_get("id")?,
+                kind,
+                batch_seq: row.try_get("batch_seq")?,
+                source_ids,
+                source_versions,
+                status,
+                attempts: row.try_get("attempts")?,
+                result,
+                created_at: row.try_get("created_at")?,
+                updated_at: row.try_get("updated_at")?,
+            });
+        }
+
+        let cursor_rows =
+            sqlx::query("SELECT kind, next_batch_seq FROM memory_apply_cursors ORDER BY kind")
+                .fetch_all(&self.pool)
+                .await
+                .context("failed to hydrate memory apply cursors")?;
+        let mut memory_apply_cursors = Vec::with_capacity(cursor_rows.len());
+        for row in cursor_rows {
+            memory_apply_cursors.push(MemoryApplyCursorRecord {
+                kind: row.try_get("kind")?,
+                next_batch_seq: row.try_get("next_batch_seq")?,
+            });
+        }
+
+        Ok((
+            memory_batches,
+            memory_batch_messages,
+            memory_jobs,
+            memory_apply_cursors,
+        ))
+    }
+
+    async fn load_hydration_key(
+        &self,
+        cache: &mut HashMap<String, Arc<DataKeyMaterial>>,
+        key_ref: &str,
+    ) -> Result<Arc<DataKeyMaterial>> {
+        if let Some(key) = cache.get(key_ref) {
+            return Ok(key.clone());
+        }
+        let key = self
+            .data_key_by_ref(key_ref)
+            .await
+            .with_context(|| format!("failed to load hydration data key {key_ref}"))?;
+        let key = Arc::new(key);
+        cache.insert(key_ref.to_owned(), key.clone());
+        Ok(key)
     }
 
     pub(crate) fn scope(&self) -> &AgentScope {

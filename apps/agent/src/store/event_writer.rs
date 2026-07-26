@@ -46,6 +46,7 @@ use super::{
     physical_recovery::{ApplyReceiptOutcome, PhysicalRecoveryApplier, PhysicalRecoveryReceipt},
     provider_context::{
         EncryptedProviderContextRecord, ProviderContextMutation, ProviderContextMutationApplier,
+        provider_context_idempotency_key,
     },
     redactor::search_text_from_projection,
     verify_command_payload_digest,
@@ -2716,10 +2717,20 @@ impl EventWriter {
             *next += 1;
 
             let item = ProviderContextItem {
-                origin_message: Some(ProviderContextAnchor {
-                    message_id: message_id.to_owned(),
-                    message_seq,
-                }),
+                // Native compaction is a replacement window, not content at an
+                // assistant wire slot. Provider serializers reject an anchor on
+                // this form, so retain the MessageEnd transaction/key boundary
+                // without inventing a transcript anchor during persistence.
+                origin_message: match &fragment.payload {
+                    ProviderContextPayload::OpenAiCompactedWindow { .. }
+                    | ProviderContextPayload::AnthropicCompaction { .. } => None,
+                    ProviderContextPayload::EncryptedReasoning { .. } => {
+                        Some(ProviderContextAnchor {
+                            message_id: message_id.to_owned(),
+                            message_seq,
+                        })
+                    }
+                },
                 wire_item_index: fragment.wire_item_index,
                 ordinal,
                 payload: fragment.payload,
@@ -2729,13 +2740,14 @@ impl EventWriter {
                 .wire_item_index
                 .map_or_else(|| "_".to_owned(), |index| index.to_string());
             let id = format!("{message_id}:{message_seq}:{wire_label}:{ordinal}");
+            let idempotency_key = provider_context_idempotency_key(message_id, &item);
             let record = EncryptedProviderContextRecord::encrypt(
                 &item,
                 &assistant.origin.provider_instance_id,
                 assistant.origin.protocol,
                 &assistant.origin.model,
                 &id,
-                &id,
+                &idempotency_key,
                 &key,
                 self.store.scope(),
             )
@@ -3735,7 +3747,7 @@ fn test_env_abrupt_failpoint_for_prepared(
         "after_commit" => true,
         _ => return None,
     };
-    if !batch_matches_t16_failpoint(prepared, &name) {
+    if !batch_matches_failpoint(prepared, &name) {
         return None;
     }
     Some((name, after_commit, readiness.into()))
@@ -3751,14 +3763,14 @@ fn test_env_abrupt_failpoint_for_writes(
     let after_writes = env::var("SUMI_EVENT_WRITER_FAILPOINT_AFTER_WRITES").ok()?;
     let readiness = env::var("SUMI_EVENT_WRITER_FAILPOINT_READY").ok()?;
     let after_writes: usize = after_writes.parse().ok()?;
-    if !batch_matches_t16_failpoint(prepared, &name) {
+    if !batch_matches_failpoint(prepared, &name) {
         return None;
     }
     Some((name, after_writes, readiness.into()))
 }
 
 #[cfg(all(test, unix))]
-fn batch_matches_t16_failpoint(prepared: &[PreparedWrite], name: &str) -> bool {
+fn batch_matches_failpoint(prepared: &[PreparedWrite], name: &str) -> bool {
     match name {
         "hard_steer_step_zero" => prepared.iter().any(|write| {
             write.projections.iter().any(|projection| {
@@ -3911,6 +3923,16 @@ fn batch_matches_t16_failpoint(prepared: &[PreparedWrite], name: &str) -> bool {
                 })
             });
             has_empty_or_normal_turn_end && has_agent_end && has_superseded
+        }
+        "before_t17_logical_suffix_transaction" | "after_t17_logical_suffix_transaction" => {
+            prepared.iter().any(|write| {
+                write.projections.iter().any(|projection| {
+                    matches!(
+                        projection,
+                        PreparedProjection::Plain(Projection::PhysicalRecovery(_))
+                    )
+                })
+            })
         }
         _ => false,
     }
@@ -9030,15 +9052,16 @@ mod tests {
         },
         gateway::{Command, CommandEnvelope, CommandId, SensitiveCommandPayload},
         provider::types::{
-            ApiProtocol, AssistantContent, AssistantMessage, NativeCompactionCoverage,
-            ProviderContextFragment, ProviderContextPayload, ProviderEvent, ProviderOrigin,
-            ProviderOutput, PublicAssistantContent, PublicAssistantMessage, PublicMessage,
-            RejectedToolCall, StopReason, ToolArgumentError, ToolCall, ToolResultMessage, Usage,
-            UserContent, UserMessage,
+            ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, Message,
+            NativeCompactionCoverage, ProviderContextFragment, ProviderContextPayload,
+            ProviderEvent, ProviderOrigin, ProviderOutput, PublicAssistantContent,
+            PublicAssistantMessage, PublicMessage, RejectedToolCall, StopReason, ToolArgumentError,
+            ToolCall, ToolResultMessage, Usage, UserContent, UserMessage,
         },
-        runtime::contracts::ProcessGeneration,
+        runtime::contracts::{GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease},
         store::{
-            AgentScope, KeyProvider, ProviderContextEvictionEstimate, RecoveryStep, SuffixRecovery,
+            AgentScope, ApplyReceiptOutcome, HydrationOutcome, KeyProvider, PhysicalRecoveryIntent,
+            PhysicalRecoveryReceipt, ProviderContextEvictionEstimate, RecoveryStep, SuffixRecovery,
             crypto::{
                 DATA_KEY_BYTES, DataKeyMaterial, DataKeyScope, KeyWrapAad, WrappingKey,
                 decrypt_content, encrypt_content, wrap_data_key,
@@ -9052,6 +9075,15 @@ mod tests {
 
     fn test_process_generation(raw: u64) -> ProcessGeneration {
         ProcessGeneration::from_wire(raw).expect("valid test process generation")
+    }
+
+    fn test_lease(raw: u64) -> ProcessGenerationLease {
+        ProcessGenerationLease::new(test_process_generation(raw), "test-lease")
+            .expect("valid test lease")
+    }
+
+    fn test_fence(lease: &ProcessGenerationLease) -> GenerationRecoveryFence {
+        GenerationRecoveryFence::new(lease, "test-fence").expect("valid test fence")
     }
 
     #[test]
@@ -19242,10 +19274,8 @@ mod tests {
                     coverage_through_seq, context_fingerprint, eviction_tokens,
                     key_ref, ciphertext
              FROM provider_context
-             WHERE message_id = ?
              ORDER BY id",
         )
-        .bind(assistant_id)
         .fetch_all(store.pool())
         .await
         .expect("fetch provider context rows");
@@ -19293,10 +19323,20 @@ mod tests {
             Some(1)
         );
 
-        let message_seq: i64 = rows[0].get("message_seq");
+        let message_seq: i64 = reasoning_row.get("message_seq");
         assert!(
             message_seq > 0,
-            "provider context must be bound to message seq"
+            "reasoning provider context must be bound to message seq"
+        );
+        assert_eq!(
+            window_row.get::<Option<String>, _>("message_id"),
+            None,
+            "native compaction must not acquire an assistant anchor"
+        );
+        assert_eq!(
+            window_row.get::<Option<i64>, _>("message_seq"),
+            None,
+            "native compaction must not acquire an assistant sequence"
         );
 
         // Plaintext must never appear in any textual column; ciphertext is opaque.
@@ -20335,5 +20375,644 @@ mod tests {
             .await
             .expect_err("Anthropic encrypted reasoning must match a Thinking wire slot");
         assert!(error.to_string().contains("Thinking wire slot"));
+    }
+
+    #[tokio::test]
+    async fn hydrate_clean_store_returns_complete_state() {
+        let store = test_store().await;
+        let lease = test_lease(1);
+        let fence = test_fence(&lease);
+        match store.hydrate(&lease, &fence).await.unwrap() {
+            HydrationOutcome::Complete(state) => {
+                assert!(state.messages.is_empty());
+                assert!(state.provider_context.is_empty());
+                assert!(state.memory_batches.is_empty());
+                assert!(state.memory_jobs.is_empty());
+                assert!(state.recovery_steps.is_empty());
+                assert_eq!(state.receipt.intent_count, 0);
+            }
+            HydrationOutcome::RecoveryRequired(_) => {
+                panic!("clean store must not require physical recovery")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_mismatched_lease_and_fence() {
+        let store = test_store().await;
+        let lease = test_lease(1);
+        let fence = test_fence(&test_lease(2));
+        let error = store.hydrate(&lease, &fence).await;
+        assert!(error.is_err(), "mismatched lease/fence must fail hydration");
+        assert!(error.unwrap_err().to_string().contains("lease"));
+    }
+
+    #[tokio::test]
+    async fn hydrate_returns_recovery_required_for_running_tool() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let run_id = "run-1";
+        let tool_call_id = "tool-1";
+        let decision_id = "00000000-0000-4000-8000-000000000002";
+        seed_pending_approval(&store, &writer, "request-1", tool_call_id, run_id).await;
+        writer
+            .persist_inbound(&approval_command(2, decision_id, "request-1"))
+            .await
+            .expect("persist approval decision");
+        writer
+            .apply(EventBatch {
+                writes: vec![approval_resolution_write(
+                    "request-1",
+                    "approved_once",
+                    "test",
+                    Some((decision_id, 2, run_id)),
+                )],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("approve tool");
+        writer
+            .apply(EventBatch {
+                writes: vec![tool_start_write(tool_call_id, run_id)],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("start tool");
+
+        let lease = test_lease(1);
+        let fence = test_fence(&lease);
+        match store.hydrate(&lease, &fence).await.unwrap() {
+            HydrationOutcome::RecoveryRequired(intents) => {
+                assert_eq!(intents.len(), 1);
+                assert_eq!(intents[0].tool_call_id, tool_call_id);
+                assert_eq!(intents[0].command_id, TOOL_OWNER_COMMAND_ID);
+                assert_eq!(intents[0].run_id, run_id);
+            }
+            HydrationOutcome::Complete(_) => panic!("running tool must keep boot fail-closed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_message_role_mismatch() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000101";
+        let injected = classified_injection(&writer, 1, command_id, "ignored", "hello").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "hello"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("commit user message");
+
+        let message_id = user_message_id(command_id);
+        sqlx::query("UPDATE messages SET role = 'assistant' WHERE id = ?")
+            .bind(&message_id)
+            .execute(store.pool())
+            .await
+            .expect("tamper stored message role");
+
+        let lease = test_lease(1);
+        let fence = test_fence(&lease);
+        let error = store.hydrate(&lease, &fence).await;
+        assert!(error.is_err(), "role mismatch must fail hydration");
+        assert!(error.unwrap_err().to_string().contains("role"));
+    }
+
+    async fn seed_assistant_with_reasoning(
+        _store: &Arc<Store>,
+        writer: &EventWriter,
+    ) -> (String, String, String) {
+        let command_id = "00000000-0000-4000-8000-000000000102";
+        let injected = classified_injection(writer, 1, command_id, "ignored", "seed").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "seed"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("commit user message");
+
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let message = assistant_message(StopReason::Stop);
+        let message_id = "assistant-reasoning-hydrate";
+        // Persist deliberately out of wire order. Hydration must reconstruct
+        // the provider send order by `(message_seq, wire_item_index, ordinal)`
+        // and must leave native compaction unanchored.
+        let fragments = vec![
+            ProviderContextFragment {
+                wire_item_index: Some(2),
+                payload: ProviderContextPayload::EncryptedReasoning {
+                    protocol: ApiProtocol::OpenAiChatCompletions,
+                    item: json!({"encrypted_content": "opaque-later"}),
+                },
+            },
+            ProviderContextFragment {
+                wire_item_index: Some(1),
+                payload: ProviderContextPayload::EncryptedReasoning {
+                    protocol: ApiProtocol::OpenAiChatCompletions,
+                    item: json!({"encrypted_content": "opaque-earlier"}),
+                },
+            },
+            ProviderContextFragment {
+                wire_item_index: None,
+                payload: ProviderContextPayload::OpenAiCompactedWindow {
+                    items: vec![json!({"type": "compaction", "id": "cmp-hydrate"})],
+                    coverage: NativeCompactionCoverage {
+                        through_message_seq: 1,
+                        context_fingerprint: "hydrate-fingerprint".to_owned(),
+                    },
+                },
+            },
+        ];
+        let footprint = fragments
+            .iter()
+            .map(|fragment| ProviderContextEvictionEstimate::from_payload(&fragment.payload).tokens)
+            .sum();
+
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_start",
+                                message_id,
+                                &message,
+                                Some(run_id.clone()),
+                                Some(turn_id.clone()),
+                            )
+                            .expect("assistant MessageStart"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: command_id.to_owned(),
+                            run_id: run_id.clone(),
+                            expected: RunPhase::UserCommitted,
+                            next: RunPhase::AssistantStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_end",
+                                message_id,
+                                &message,
+                                Some(run_id.clone()),
+                                Some(turn_id.clone()),
+                            )
+                            .expect("assistant MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: message_id.to_owned(),
+                            role: "assistant",
+                            message,
+                            append_to_l0: true,
+                            provider_context: fragments,
+                            eviction_footprint_tokens: footprint,
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("commit assistant message with reasoning");
+        (run_id, turn_id, message_id.to_owned())
+    }
+
+    #[tokio::test]
+    async fn hydrate_round_trips_assistant_and_provider_context() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let (_, _, message_id) = seed_assistant_with_reasoning(&store, &writer).await;
+
+        let lease = test_lease(1);
+        let fence = test_fence(&lease);
+        match store.hydrate(&lease, &fence).await.unwrap() {
+            HydrationOutcome::Complete(state) => {
+                assert_eq!(state.messages.len(), 2, "user and assistant messages");
+                let assistant = state
+                    .messages
+                    .iter()
+                    .find(
+                        |m| matches!(m, ContextMessage::Persisted { id, .. } if id == &message_id),
+                    )
+                    .expect("assistant message round-trips");
+                assert!(
+                    matches!(assistant, ContextMessage::Persisted { message, .. } if matches!(message, Message::Assistant(_))),
+                    "hydrated assistant must be an Assistant message"
+                );
+                assert_eq!(state.provider_context.len(), 3);
+                assert_eq!(
+                    state
+                        .provider_context
+                        .iter()
+                        .map(|item| item.wire_item_index)
+                        .collect::<Vec<_>>(),
+                    vec![Some(1), Some(2), None],
+                    "hydration must restore wire-slot order and append the native window"
+                );
+                assert!(
+                    state.provider_context[..2].iter().all(|item| {
+                        item.origin_message
+                            .as_ref()
+                            .is_some_and(|anchor| anchor.message_id == message_id)
+                            && matches!(
+                                &item.payload,
+                                ProviderContextPayload::EncryptedReasoning { .. }
+                            )
+                    }),
+                    "reasoning must remain anchored to its persisted assistant"
+                );
+                assert!(
+                    matches!(
+                        &state.provider_context[2].payload,
+                        ProviderContextPayload::OpenAiCompactedWindow { .. }
+                    ) && state.provider_context[2].origin_message.is_none(),
+                    "native compaction must not acquire an assistant anchor"
+                );
+            }
+            HydrationOutcome::RecoveryRequired(_) => panic!("clean assistant turn must complete"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_provider_context_kind_mismatch() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        seed_assistant_with_reasoning(&store, &writer).await;
+
+        sqlx::query(
+            "UPDATE provider_context SET kind = 'open_ai_compacted_window' WHERE message_id = ?",
+        )
+        .bind("assistant-reasoning-hydrate")
+        .execute(store.pool())
+        .await
+        .expect("tamper stored provider-context kind");
+
+        let lease = test_lease(1);
+        let fence = test_fence(&lease);
+        let error = store.hydrate(&lease, &fence).await;
+        assert!(
+            error.is_err(),
+            "provider-context kind mismatch must fail hydration"
+        );
+        assert!(error.unwrap_err().to_string().contains("kind"));
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_reasoning_idempotency_key_mismatch() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        seed_assistant_with_reasoning(&store, &writer).await;
+
+        sqlx::query(
+            "UPDATE provider_context
+             SET idempotency_key = 'tampered'
+             WHERE message_id = 'assistant-reasoning-hydrate'
+               AND wire_item_index = 1",
+        )
+        .execute(store.pool())
+        .await
+        .expect("tamper provider-context idempotency key");
+
+        let lease = test_lease(1);
+        let fence = test_fence(&lease);
+        let error = store.hydrate(&lease, &fence).await;
+        assert!(error.is_err(), "idempotency mismatch must fail hydration");
+        assert!(error.unwrap_err().to_string().contains("idempotency key"));
+    }
+
+    #[cfg(unix)]
+    async fn t17_setup_running_tool(
+        store: &Arc<Store>,
+        writer: &EventWriter,
+        run_id: &str,
+        tool_call_id: &str,
+    ) -> (ProcessGenerationLease, GenerationRecoveryFence) {
+        let lease = ProcessGenerationLease::new(test_process_generation(1), "test-lease")
+            .expect("test process generation lease");
+        let fence = GenerationRecoveryFence::new(&lease, "test-fence")
+            .expect("test generation recovery fence");
+        let decision_id = "00000000-0000-4000-8000-000000000003";
+        seed_pending_approval(store, writer, "request-1", tool_call_id, run_id).await;
+        writer
+            .persist_inbound(&approval_command(2, decision_id, "request-1"))
+            .await
+            .expect("persist approval decision for physical recovery fixture");
+        writer
+            .apply(EventBatch {
+                writes: vec![approval_resolution_write(
+                    "request-1",
+                    "approved_once",
+                    "test",
+                    Some((decision_id, 2, run_id)),
+                )],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("approve tool for physical recovery fixture");
+        writer
+            .apply(EventBatch {
+                writes: vec![tool_start_write(tool_call_id, run_id)],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("start tool for physical recovery fixture");
+        (lease, fence)
+    }
+
+    #[cfg(unix)]
+    async fn t17_physical_recovery_batch(
+        store: &Store,
+        run_id: &str,
+        tool_call_id: &str,
+        lease: &ProcessGenerationLease,
+        fence: &GenerationRecoveryFence,
+    ) -> (EventBatch, PhysicalRecoveryReceipt) {
+        let head: Option<(i64, i64)> =
+            sqlx::query_as("SELECT last_seq, event_count FROM event_log_heads")
+                .fetch_optional(store.pool())
+                .await
+                .expect("read event-log head for physical recovery batch");
+        let next_seq = head.map_or(1, |(last, _)| last as u64 + 1);
+
+        let mut writes = tool_finish_writes(
+            tool_call_id,
+            "running",
+            "indeterminate",
+            Some("indeterminate"),
+            "recovered",
+            true,
+        );
+        let intent = PhysicalRecoveryIntent {
+            tool_call_id: tool_call_id.to_owned(),
+            command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+            run_id: run_id.to_owned(),
+            executor_generation: test_process_generation(1),
+            indeterminate_terminal_seq: next_seq,
+        };
+        let mut receipt = PhysicalRecoveryReceipt {
+            receipt_id: format!("receipt-{tool_call_id}"),
+            lease: lease.clone(),
+            fence: fence.clone(),
+            intents: vec![intent],
+            logical_suffix_first_seq: next_seq,
+            logical_suffix_last_seq: next_seq + 2,
+            digest: String::new(),
+        };
+        receipt.digest = receipt.canonical_digest();
+        writes.push(EventWrite {
+            event: None,
+            projections: vec![Projection::PhysicalRecovery(receipt.clone())],
+        });
+        (
+            EventBatch {
+                writes,
+                injected_commands: Vec::new(),
+            },
+            receipt,
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "subprocess entry point for T17 abrupt transaction tests"]
+    async fn t17_logical_suffix_transaction_child() {
+        let scenario = std::env::var("SUMI_T17_SCENARIO").expect("child scenario environment");
+        let boundary = std::env::var("SUMI_T17_BOUNDARY").expect("child boundary environment");
+        let database_path = std::path::PathBuf::from(
+            std::env::var("SUMI_T17_DATABASE").expect("child database environment"),
+        );
+        let readiness_path = std::path::PathBuf::from(
+            std::env::var("SUMI_T17_READY").expect("child readiness environment"),
+        );
+        let store: Arc<Store> = Store::open(&database_path, scope(), test_provider())
+            .await
+            .expect("child opens store")
+            .into();
+        let writer = EventWriter::new(store.clone());
+        let run_id = "run-1";
+        let tool_call_id = "tool-1";
+        let (lease, fence) = t17_setup_running_tool(&store, &writer, run_id, tool_call_id).await;
+        let (batch, _) =
+            t17_physical_recovery_batch(&store, run_id, tool_call_id, &lease, &fence).await;
+        writer
+            .apply_with_abrupt_transaction_failpoint(
+                batch,
+                &scenario,
+                boundary == "after_commit",
+                &readiness_path,
+            )
+            .await
+            .expect("abrupt failpoint must not return");
+        panic!("abrupt failpoint returned");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn t17_logical_suffix_transaction_is_atomic_before_and_after_commit() {
+        for boundary in ["before_commit", "after_commit"] {
+            let root = std::env::temp_dir().join(format!(
+                "sumi-t17-failpoint-{boundary}-{}",
+                uuid::Uuid::now_v7()
+            ));
+            std::fs::create_dir_all(&root).expect("create T17 failpoint root");
+            let database_path = root.join("agent.db");
+            let readiness_path = root.join("ready");
+            let scenario = format!("t17_{boundary}");
+
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("current unit test executable"),
+            )
+            .arg("--exact")
+            .arg("store::event_writer::tests::t17_logical_suffix_transaction_child")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env("SUMI_T17_SCENARIO", &scenario)
+            .env("SUMI_T17_BOUNDARY", boundary)
+            .env("SUMI_T17_DATABASE", &database_path)
+            .env("SUMI_T17_READY", &readiness_path)
+            .output()
+            .expect("run T17 abrupt transaction child");
+            assert_eq!(
+                output.status.code(),
+                Some(86),
+                "{scenario}.{boundary} child did not exit at failpoint:\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                std::fs::read_to_string(&readiness_path).expect("read readiness marker"),
+                format!("{scenario}.{boundary}\n")
+            );
+
+            let reopened: Arc<Store> = Store::open(&database_path, scope(), test_provider())
+                .await
+                .expect("reopen after T17 hard kill")
+                .into();
+            const SETUP_EVENTS: i64 = 3;
+            const RECOVERY_EVENTS: i64 = 3;
+
+            let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+                .fetch_one(reopened.pool())
+                .await
+                .expect("count events after restart");
+            let tool_state: String = sqlx::query_scalar(
+                "SELECT state FROM tool_executions WHERE tool_call_id = 'tool-1'",
+            )
+            .fetch_one(reopened.pool())
+            .await
+            .expect("tool state after restart");
+            let messages: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = 'tool-1-result'")
+                    .fetch_one(reopened.pool())
+                    .await
+                    .expect("count tool result messages");
+            let ledger_parents: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM physical_recovery_receipt_applications WHERE receipt_id = 'receipt-tool-1'"
+            )
+            .fetch_one(reopened.pool())
+            .await
+            .expect("count ledger parents");
+            let ledger_children: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM physical_recovery_receipt_intents WHERE receipt_id = 'receipt-tool-1'"
+            )
+            .fetch_one(reopened.pool())
+            .await
+            .expect("count ledger children");
+
+            let expected_applied = boundary == "after_commit";
+            assert_eq!(
+                (
+                    events,
+                    tool_state.as_str(),
+                    messages,
+                    ledger_parents,
+                    ledger_children
+                ),
+                if expected_applied {
+                    (SETUP_EVENTS + RECOVERY_EVENTS, "indeterminate", 1, 1, 1)
+                } else {
+                    (SETUP_EVENTS, "running", 0, 0, 0)
+                },
+                "{scenario}.{boundary} was not all-or-none"
+            );
+
+            let (first_seq, last_seq) = if expected_applied {
+                let row = sqlx::query(
+                    "SELECT logical_suffix_first_seq, logical_suffix_last_seq
+                     FROM physical_recovery_receipt_applications
+                     WHERE receipt_id = 'receipt-tool-1'",
+                )
+                .fetch_one(reopened.pool())
+                .await
+                .expect("read committed physical recovery suffix bounds");
+                (
+                    row.get::<i64, _>("logical_suffix_first_seq"),
+                    row.get::<i64, _>("logical_suffix_last_seq"),
+                )
+            } else {
+                // The before-commit kill rolled back the logical suffix and the
+                // application ledger. Replaying the exact same recovery batch must
+                // converge to a committed state.
+                let lease = ProcessGenerationLease::new(test_process_generation(1), "test-lease")
+                    .expect("test lease");
+                let fence = GenerationRecoveryFence::new(&lease, "test-fence").expect("test fence");
+                let writer = EventWriter::new(reopened.clone());
+                let (batch, receipt) =
+                    t17_physical_recovery_batch(&reopened, "run-1", "tool-1", &lease, &fence).await;
+                let (outcome, seqs) = writer
+                    .apply_physical_recovery(&lease, &fence, receipt, batch)
+                    .await
+                    .expect("physical recovery converges after rollback");
+                assert_eq!(outcome, ApplyReceiptOutcome::Applied);
+                assert_eq!(seqs.len(), RECOVERY_EVENTS as usize);
+
+                assert_eq!(
+                    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
+                        .fetch_one(reopened.pool())
+                        .await
+                        .expect("event count after convergence"),
+                    SETUP_EVENTS + RECOVERY_EVENTS
+                );
+
+                let row = sqlx::query(
+                    "SELECT logical_suffix_first_seq, logical_suffix_last_seq
+                     FROM physical_recovery_receipt_applications
+                     WHERE receipt_id = 'receipt-tool-1'",
+                )
+                .fetch_one(reopened.pool())
+                .await
+                .expect("read committed physical recovery suffix bounds after convergence");
+                (
+                    row.get::<i64, _>("logical_suffix_first_seq"),
+                    row.get::<i64, _>("logical_suffix_last_seq"),
+                )
+            };
+
+            // A bare receipt replay must be idempotent and must not duplicate any
+            // suffix event, ledger parent, or ledger child.
+            let intent = PhysicalRecoveryIntent {
+                tool_call_id: "tool-1".to_owned(),
+                command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                run_id: "run-1".to_owned(),
+                executor_generation: test_process_generation(1),
+                indeterminate_terminal_seq: u64::try_from(first_seq)
+                    .expect("terminal seq fits u64"),
+            };
+            let mut receipt = PhysicalRecoveryReceipt {
+                receipt_id: "receipt-tool-1".to_owned(),
+                lease: test_lease(1),
+                fence: test_fence(&test_lease(1)),
+                intents: vec![intent],
+                logical_suffix_first_seq: u64::try_from(first_seq).expect("first seq fits u64"),
+                logical_suffix_last_seq: u64::try_from(last_seq).expect("last seq fits u64"),
+                digest: String::new(),
+            };
+            receipt.digest = receipt.canonical_digest();
+            let lease = receipt.lease.clone();
+            let fence = receipt.fence.clone();
+            let writer = EventWriter::new(reopened.clone());
+            let (outcome, seqs) = writer
+                .apply_physical_recovery(
+                    &lease,
+                    &fence,
+                    receipt,
+                    EventBatch {
+                        writes: vec![],
+                        injected_commands: Vec::new(),
+                    },
+                )
+                .await
+                .expect("bare receipt replay is idempotent");
+            assert_eq!(outcome, ApplyReceiptOutcome::AlreadyApplied);
+            assert!(seqs.is_empty());
+
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_events")
+                    .fetch_one(reopened.pool())
+                    .await
+                    .expect("event count after idempotent replay"),
+                SETUP_EVENTS + RECOVERY_EVENTS,
+                "idempotent replay must not emit new events"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM physical_recovery_receipt_intents WHERE receipt_id = 'receipt-tool-1'"
+                )
+                .fetch_one(reopened.pool())
+                .await
+                .expect("ledger child count after idempotent replay"),
+                1,
+                "idempotent replay must not duplicate ledger children"
+            );
+
+            reopened.pool().close().await;
+            tokio::fs::remove_dir_all(root)
+                .await
+                .expect("remove T17 fixture");
+        }
     }
 }

@@ -32,6 +32,62 @@ pub enum PublicMessage {
     ToolResult(ToolResultMessage),
 }
 
+impl From<PublicMessage> for Message {
+    fn from(message: PublicMessage) -> Self {
+        match message {
+            PublicMessage::User(message) => Message::User(message),
+            PublicMessage::ToolResult(message) => Message::ToolResult(message),
+            PublicMessage::Assistant(assistant) => Message::Assistant(AssistantMessage {
+                content: assistant
+                    .content
+                    .into_iter()
+                    .map(|content| match content {
+                        PublicAssistantContent::Text {
+                            text,
+                            wire_item_index,
+                        } => AssistantContent::Text {
+                            text,
+                            wire_item_index,
+                        },
+                        PublicAssistantContent::Thinking {
+                            thinking,
+                            signature_field,
+                            wire_item_index,
+                        } => AssistantContent::Thinking {
+                            thinking,
+                            signature_field,
+                            wire_item_index,
+                        },
+                        PublicAssistantContent::ToolCall {
+                            tool_call,
+                            wire_item_index,
+                        } => AssistantContent::ToolCall {
+                            tool_call,
+                            wire_item_index,
+                        },
+                        PublicAssistantContent::RejectedToolCall {
+                            rejected,
+                            wire_item_index,
+                        } => AssistantContent::RejectedToolCall {
+                            rejected,
+                            wire_item_index,
+                        },
+                    })
+                    .collect(),
+                model: assistant.model,
+                provider: assistant.provider,
+                origin: assistant.origin,
+                usage: assistant.usage,
+                stop_reason: assistant.stop_reason,
+                error_message: assistant.error_message,
+                provider_code: assistant.provider_code,
+                interrupted: assistant.interrupted,
+                timestamp: assistant.timestamp,
+            }),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryLayer {

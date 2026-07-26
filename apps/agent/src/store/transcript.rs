@@ -16,7 +16,7 @@ use crate::provider::types::{PublicAssistantMessage, PublicMessage};
 use super::redactor::search_text_from_projection;
 use super::{AgentScope, DataKeyMaterial, DataKeyPurpose, PublicProjectionBuilder, Redactor};
 
-fn message_interrupted(message: &PublicMessage) -> bool {
+pub(crate) fn message_interrupted(message: &PublicMessage) -> bool {
     match message {
         PublicMessage::Assistant(PublicAssistantMessage { interrupted, .. }) => *interrupted,
         _ => false,
@@ -112,7 +112,7 @@ impl TranscriptRecord {
     }
 }
 
-fn public_message_role(message: &PublicMessage) -> &'static str {
+pub(crate) fn public_message_role(message: &PublicMessage) -> &'static str {
     match message {
         PublicMessage::User(_) => "user",
         PublicMessage::Assistant(_) => "assistant",
