@@ -1,5 +1,5 @@
 CREATE VIRTUAL TABLE messages_fts USING fts5(
-  search_text, content='messages', content_rowid='rowid'
+  search_text, content='messages', content_rowid='rowid', tokenize='trigram'
 );
 
 INSERT INTO messages_fts(rowid, search_text)

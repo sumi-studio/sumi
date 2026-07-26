@@ -322,6 +322,23 @@ mod tests {
                 .expect("fetch updated fts text");
         assert_eq!(fts_text, "updated searchable text");
 
+        sqlx::query(
+            "UPDATE messages SET search_text = '再起動後も過去の発言を検索できる' WHERE id = ?",
+        )
+        .bind("message-fts")
+        .execute(store.pool())
+        .await
+        .expect("update search text with Japanese");
+
+        let japanese_matches: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages_fts
+             WHERE messages_fts MATCH '過去の発言'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("search Japanese substring");
+        assert_eq!(japanese_matches, 1);
+
         sqlx::query("DELETE FROM messages WHERE id = ?")
             .bind("message-fts")
             .execute(store.pool())
