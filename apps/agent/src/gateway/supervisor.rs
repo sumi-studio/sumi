@@ -27,7 +27,6 @@ use zeroize::Zeroize;
 
 use crate::runtime::contracts::ProcessGeneration;
 
-use super::wire::MAX_JSON_SAFE_INTEGER;
 use super::{
     Gateway, GatewayClosed, GatewayReader, GatewayWriter, HelloError, InboundCommand,
     OutboundFrame, OversizedFrameError,
@@ -92,94 +91,119 @@ impl Drop for GatewayCredential {
 /// credential claim. All seq values are `u64` and are validated against the
 /// durable source before the epoch proceeds.
 ///
-/// The `json_safe_*` helpers enforce the T24 JSON-safe-integer boundary on the
-/// wire without narrowing the broader `ProcessGeneration`/`u64` domain used by
-/// durable state.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// The `lossless_*` helpers encode `u64`/`ProcessGeneration` as canonical
+/// decimal strings on the wire. JSON implementations (including JavaScript)
+/// cannot lose precision on a string, so the full `0..=u64::MAX` and
+/// `0..=i64::MAX` domains are preserved without narrowing the broader durable
+/// state contract.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentHello {
     pub agent_id: String,
-    #[serde(with = "json_safe_generation")]
+    #[serde(with = "lossless_generation")]
     pub generation: ProcessGeneration,
-    #[serde(with = "json_safe_u64")]
+    #[serde(with = "lossless_u64")]
     pub last_sent_event_seq: u64,
-    #[serde(with = "json_safe_u64")]
+    #[serde(with = "lossless_u64")]
     pub last_received_command_seq: u64,
-    #[serde(with = "json_safe_u64")]
+    #[serde(with = "lossless_u64")]
     pub last_applied_command_seq: u64,
 }
 
 /// API → Agent hello response.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApiHello {
-    #[serde(with = "json_safe_generation")]
+    #[serde(with = "lossless_generation")]
     pub accepted_generation: ProcessGeneration,
-    #[serde(with = "json_safe_u64")]
+    #[serde(with = "lossless_u64")]
     pub last_received_event_seq: u64,
-    #[serde(with = "json_safe_u64")]
+    #[serde(with = "lossless_u64")]
     pub next_command_seq: u64,
 }
 
-mod json_safe_generation {
-    use serde::de::Error as DeError;
-    use serde::ser::Error as SerError;
-    use serde::{Deserialize, Deserializer, Serializer};
+/// Parses a canonical decimal string: optional leading `'0'`, then one or more
+/// ASCII digits, with no sign, no leading zeros, no fractional/exponent notation,
+/// and no surrounding whitespace. Rejects empty and overflow.
+fn parse_canonical_decimal_u64(s: &str) -> Result<u64, String> {
+    if s.is_empty() {
+        return Err("empty decimal string".to_string());
+    }
+    if s == "0" {
+        return Ok(0);
+    }
+    let bytes = s.as_bytes();
+    if bytes[0] == b'0' {
+        return Err("non-canonical leading zero in decimal string".to_string());
+    }
+    if !bytes.iter().all(|b| b.is_ascii_digit()) {
+        return Err("decimal string contains a non-digit character".to_string());
+    }
+    s.parse::<u64>()
+        .map_err(|_| "decimal string exceeds u64 range".to_string())
+}
+
+mod lossless_generation {
+    use serde::de::{self, Visitor};
+    use serde::{Deserializer, Serializer};
 
     use crate::runtime::contracts::ProcessGeneration;
-
-    use super::MAX_JSON_SAFE_INTEGER;
 
     pub fn serialize<S: Serializer>(
         value: &ProcessGeneration,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        let n = value.as_u64();
-        if n > MAX_JSON_SAFE_INTEGER {
-            return Err(S::Error::custom(
-                "process generation exceeds the JSON-safe integer range",
-            ));
-        }
-        serializer.serialize_u64(n)
+        serializer.serialize_str(&value.as_u64().to_string())
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<ProcessGeneration, D::Error> {
-        let n = u64::deserialize(deserializer)?;
-        if n > MAX_JSON_SAFE_INTEGER {
-            return Err(D::Error::custom(
-                "process generation exceeds the JSON-safe integer range",
-            ));
+        struct GenerationVisitor;
+
+        impl<'de> Visitor<'de> for GenerationVisitor {
+            type Value = ProcessGeneration;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str(
+                    "a canonical decimal string representing a process generation in 0..=i64::MAX",
+                )
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<ProcessGeneration, E> {
+                let n = super::parse_canonical_decimal_u64(value).map_err(de::Error::custom)?;
+                ProcessGeneration::from_wire(n).map_err(de::Error::custom)
+            }
         }
-        ProcessGeneration::from_wire(n).map_err(|e| D::Error::custom(e.to_string()))
+
+        deserializer.deserialize_str(GenerationVisitor)
     }
 }
 
-mod json_safe_u64 {
-    use serde::de::Error as DeError;
-    use serde::ser::Error as SerError;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    use super::MAX_JSON_SAFE_INTEGER;
+mod lossless_u64 {
+    use serde::de::{self, Visitor};
+    use serde::{Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(value: &u64, serializer: S) -> Result<S::Ok, S::Error> {
-        if *value > MAX_JSON_SAFE_INTEGER {
-            return Err(S::Error::custom(
-                "sequence exceeds the JSON-safe integer range",
-            ));
-        }
-        serializer.serialize_u64(*value)
+        serializer.serialize_str(&value.to_string())
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
-        let value = u64::deserialize(deserializer)?;
-        if value > MAX_JSON_SAFE_INTEGER {
-            return Err(D::Error::custom(
-                "sequence exceeds the JSON-safe integer range",
-            ));
+        struct U64Visitor;
+
+        impl<'de> Visitor<'de> for U64Visitor {
+            type Value = u64;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a canonical decimal string representing a u64")
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<u64, E> {
+                super::parse_canonical_decimal_u64(value).map_err(de::Error::custom)
+            }
         }
-        Ok(value)
+
+        deserializer.deserialize_str(U64Visitor)
     }
 }
 
@@ -3570,119 +3594,152 @@ mod tests {
     }
 
     #[test]
-    fn hello_generation_out_of_range_rejects_on_wire() {
-        let oversized = i64::MAX as u64 + 1;
+    fn hello_dto_lossless_decimal_boundaries() {
+        // The full u64/i64 domains must round-trip as canonical decimal strings.
+        let json_safe = 9_007_199_254_740_991_u64; // 2^53 - 1, the old JS-safe cap
+        let over_json_safe = json_safe + 1;
+        let i64_max = i64::MAX as u64;
+        let over_i64 = i64_max + 1;
+        let u64_max = u64::MAX;
+        let over_u64 = "18446744073709551616"; // u64::MAX + 1
+
+        // Generation boundaries: 0, JSON-safe max, JSON-safe max + 1, i64::MAX.
+        for gen_value in [0, json_safe, over_json_safe, i64_max] {
+            let agent = AgentHello {
+                agent_id: "a".to_owned(),
+                generation: ProcessGeneration::from_wire(gen_value).unwrap(),
+                last_sent_event_seq: 0,
+                last_received_command_seq: 0,
+                last_applied_command_seq: 0,
+            };
+            let text = serde_json::to_string(&agent).expect("serialize agent hello");
+            assert!(
+                text.contains(&format!(r#""generation":"{}""#, gen_value)),
+                "generation must be a canonical decimal string on the wire: {text}"
+            );
+            let parsed: AgentHello = serde_json::from_str(&text).expect("deserialize agent hello");
+            assert_eq!(parsed.generation, agent.generation);
+        }
+
+        // Seq boundaries: 0, JSON-safe max, JSON-safe max + 1, u64::MAX.
+        for seq in [0, json_safe, over_json_safe, u64_max] {
+            let api = ApiHello {
+                accepted_generation: ProcessGeneration::from_wire(0).unwrap(),
+                last_received_event_seq: seq,
+                next_command_seq: seq,
+            };
+            let text = serde_json::to_string(&api).expect("serialize api hello");
+            let parsed: ApiHello = serde_json::from_str(&text).expect("deserialize api hello");
+            assert_eq!(parsed.last_received_event_seq, seq);
+            assert_eq!(parsed.next_command_seq, seq);
+        }
+
+        // i64::MAX and u64::MAX together in one hello.
+        let agent_i64_max = AgentHello {
+            agent_id: "a".to_owned(),
+            generation: ProcessGeneration::from_wire(i64_max).unwrap(),
+            last_sent_event_seq: u64_max,
+            last_received_command_seq: u64_max,
+            last_applied_command_seq: u64_max,
+        };
+        let text = serde_json::to_string(&agent_i64_max).expect("serialize i64::MAX");
+        assert!(text.contains(r#""generation":"9223372036854775807""#));
+        let parsed: AgentHello = serde_json::from_str(&text).expect("deserialize i64::MAX");
+        assert_eq!(parsed, agent_i64_max);
+
+        // Generation beyond i64::MAX is rejected on the wire.
+        let agent_json = format!(
+            r#"{{"agent_id":"a","generation":"{over_i64}","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}}"#
+        );
+        assert!(serde_json::from_str::<AgentHello>(&agent_json).is_err());
+
         let api_json = format!(
-            r#"{{"accepted_generation":{oversized},"last_received_event_seq":0,"next_command_seq":1}}"#
+            r#"{{"accepted_generation":"{over_i64}","last_received_event_seq":"0","next_command_seq":"1"}}"#
         );
         assert!(serde_json::from_str::<ApiHello>(&api_json).is_err());
 
-        let agent_json = format!(
-            r#"{{"agent_id":"x","generation":{oversized},"last_sent_event_seq":0,"last_received_command_seq":0,"last_applied_command_seq":0}}"#
+        // u64 overflow is rejected.
+        let agent_overflow = format!(
+            r#"{{"agent_id":"a","generation":"0","last_sent_event_seq":"{over_u64}","last_received_command_seq":"0","last_applied_command_seq":"0"}}"#
         );
-        assert!(serde_json::from_str::<AgentHello>(&agent_json).is_err());
+        assert!(serde_json::from_str::<AgentHello>(&agent_overflow).is_err());
+
+        let api_overflow = format!(
+            r#"{{"accepted_generation":"0","last_received_event_seq":"{over_u64}","next_command_seq":"1"}}"#
+        );
+        assert!(serde_json::from_str::<ApiHello>(&api_overflow).is_err());
+
+        // Old numeric encodings are no longer accepted; the wire uses strings.
+        let agent_numeric = r#"{"agent_id":"a","generation":1,"last_sent_event_seq":0,"last_received_command_seq":0,"last_applied_command_seq":0}"#;
+        assert!(serde_json::from_str::<AgentHello>(agent_numeric).is_err());
+        let api_numeric =
+            r#"{"accepted_generation":1,"last_received_event_seq":0,"next_command_seq":1}"#;
+        assert!(serde_json::from_str::<ApiHello>(api_numeric).is_err());
     }
 
     #[test]
-    fn hello_dto_json_safe_integer_boundaries() {
-        // MAX_JSON_SAFE_INTEGER is exactly representable; MAX+1 must be rejected
-        // on both inbound (deserialize) and outbound (serialize) for generation
-        // and every hello seq field.
-        let max = MAX_JSON_SAFE_INTEGER;
-        let over = max + 1;
-        let over_gen = ProcessGeneration::from_wire(over).unwrap();
+    fn hello_dto_rejects_malformed_unknown_and_trailing_data() {
+        let agent_base = r#"{"agent_id":"a","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}"#;
+        let api_base =
+            r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1"}"#;
 
-        let agent_max = AgentHello {
-            agent_id: "a".to_owned(),
-            generation: ProcessGeneration::from_wire(max).unwrap(),
-            last_sent_event_seq: max,
-            last_received_command_seq: max,
-            last_applied_command_seq: max,
-        };
-        let api_max = ApiHello {
-            accepted_generation: ProcessGeneration::from_wire(max).unwrap(),
-            last_received_event_seq: max,
-            next_command_seq: max,
-        };
+        assert!(serde_json::from_str::<AgentHello>(agent_base).is_ok());
+        assert!(serde_json::from_str::<ApiHello>(api_base).is_ok());
 
-        assert!(serde_json::to_string(&agent_max).is_ok());
-        assert!(serde_json::to_string(&api_max).is_ok());
+        // Malformed decimal strings must be rejected fail-closed.
+        for malformed in [
+            "\"01\"",
+            "\"00\"",
+            "\"+1\"",
+            "\"-1\"",
+            "\" 1\"",
+            "\"1 \"",
+            "\"1.0\"",
+            "\"1e0\"",
+            "\"0x1\"",
+            "\"not-a-generation\"",
+            "\"\"",
+        ] {
+            let agent_bad = agent_base.replace(
+                "\"generation\":\"1\"",
+                &format!("\"generation\":{malformed}"),
+            );
+            assert!(
+                serde_json::from_str::<AgentHello>(&agent_bad).is_err(),
+                "AgentHello must reject malformed generation {malformed}"
+            );
 
-        let agent_json_max = format!(
-            r#"{{"agent_id":"a","generation":{max},"last_sent_event_seq":{max},"last_received_command_seq":{max},"last_applied_command_seq":{max}}}"#
-        );
-        assert!(serde_json::from_str::<AgentHello>(&agent_json_max).is_ok());
+            let api_bad = api_base.replace(
+                "\"accepted_generation\":\"1\"",
+                &format!("\"accepted_generation\":{malformed}"),
+            );
+            assert!(
+                serde_json::from_str::<ApiHello>(&api_bad).is_err(),
+                "ApiHello must reject malformed accepted_generation {malformed}"
+            );
 
-        let api_json_max = format!(
-            r#"{{"accepted_generation":{max},"last_received_event_seq":{max},"next_command_seq":{max}}}"#
-        );
-        assert!(serde_json::from_str::<ApiHello>(&api_json_max).is_ok());
+            let agent_bad_seq = agent_base.replace(
+                "\"last_sent_event_seq\":\"0\"",
+                &format!("\"last_sent_event_seq\":{malformed}"),
+            );
+            assert!(
+                serde_json::from_str::<AgentHello>(&agent_bad_seq).is_err(),
+                "AgentHello must reject malformed seq {malformed}"
+            );
+        }
 
-        // Outbound serialization at MAX+1 must fail for every field.
-        let mut agent_over = agent_max.clone();
-        agent_over.generation = over_gen;
-        assert!(serde_json::to_string(&agent_over).is_err());
-        agent_over.generation = agent_max.generation;
-
-        agent_over.last_sent_event_seq = over;
-        assert!(serde_json::to_string(&agent_over).is_err());
-        agent_over.last_sent_event_seq = max;
-
-        agent_over.last_received_command_seq = over;
-        assert!(serde_json::to_string(&agent_over).is_err());
-        agent_over.last_received_command_seq = max;
-
-        agent_over.last_applied_command_seq = over;
-        assert!(serde_json::to_string(&agent_over).is_err());
-
-        let mut api_over = api_max.clone();
-        api_over.accepted_generation = over_gen;
-        assert!(serde_json::to_string(&api_over).is_err());
-        api_over.accepted_generation = api_max.accepted_generation;
-
-        api_over.last_received_event_seq = over;
-        assert!(serde_json::to_string(&api_over).is_err());
-        api_over.last_received_event_seq = max;
-
-        api_over.next_command_seq = over;
-        assert!(serde_json::to_string(&api_over).is_err());
-
-        // Inbound deserialization at MAX+1 must fail for every field.
-        let agent_json_over_gen = format!(
-            r#"{{"agent_id":"a","generation":{over},"last_sent_event_seq":{max},"last_received_command_seq":{max},"last_applied_command_seq":{max}}}"#
-        );
-        assert!(serde_json::from_str::<AgentHello>(&agent_json_over_gen).is_err());
-
-        let agent_json_over_seq = format!(
-            r#"{{"agent_id":"a","generation":{max},"last_sent_event_seq":{over},"last_received_command_seq":{over},"last_applied_command_seq":{over}}}"#
-        );
-        assert!(serde_json::from_str::<AgentHello>(&agent_json_over_seq).is_err());
-
-        let api_json_over_gen = format!(
-            r#"{{"accepted_generation":{over},"last_received_event_seq":{max},"next_command_seq":{max}}}"#
-        );
-        assert!(serde_json::from_str::<ApiHello>(&api_json_over_gen).is_err());
-
-        let api_json_over_seq = format!(
-            r#"{{"accepted_generation":{max},"last_received_event_seq":{over},"next_command_seq":{over}}}"#
-        );
-        assert!(serde_json::from_str::<ApiHello>(&api_json_over_seq).is_err());
-    }
-
-    #[test]
-    fn hello_dto_rejects_unknown_fields_and_trailing_data() {
         // Unknown fields continue to be rejected.
-        let agent_unknown = r#"{"agent_id":"a","generation":1,"last_sent_event_seq":0,"last_received_command_seq":0,"last_applied_command_seq":0,"extra":1}"#;
+        let agent_unknown = r#"{"agent_id":"a","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0","extra":1}"#;
         assert!(serde_json::from_str::<AgentHello>(agent_unknown).is_err());
 
-        let api_unknown = r#"{"accepted_generation":1,"last_received_event_seq":0,"next_command_seq":1,"extra":1}"#;
+        let api_unknown = r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1","extra":1}"#;
         assert!(serde_json::from_str::<ApiHello>(api_unknown).is_err());
 
         // Trailing data after a valid object must also be rejected.
-        let agent_trailing = r#"{"agent_id":"a","generation":1,"last_sent_event_seq":0,"last_received_command_seq":0,"last_applied_command_seq":0}{"extra":1}"#;
+        let agent_trailing = r#"{"agent_id":"a","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}{"extra":1}"#;
         assert!(serde_json::from_str::<AgentHello>(agent_trailing).is_err());
 
-        let api_trailing = r#"{"accepted_generation":1,"last_received_event_seq":0,"next_command_seq":1}{"extra":1}"#;
+        let api_trailing = r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1"}{"extra":1}"#;
         assert!(serde_json::from_str::<ApiHello>(api_trailing).is_err());
     }
 
@@ -5065,7 +5122,7 @@ mod tests {
 
     #[test]
     fn agent_hello_rejects_unknown_fields() {
-        let json = r#"{"agent_id":"a","generation":1,"last_sent_event_seq":0,"last_received_command_seq":0,"last_applied_command_seq":0,"extra":1}"#;
+        let json = r#"{"agent_id":"a","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0","extra":1}"#;
         assert!(
             serde_json::from_str::<AgentHello>(json).is_err(),
             "AgentHello must reject unknown fields"
@@ -5074,7 +5131,7 @@ mod tests {
 
     #[test]
     fn api_hello_rejects_unknown_fields() {
-        let json = r#"{"accepted_generation":1,"last_received_event_seq":0,"next_command_seq":1,"extra":1}"#;
+        let json = r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1","extra":1}"#;
         assert!(
             serde_json::from_str::<ApiHello>(json).is_err(),
             "ApiHello must reject unknown fields"
@@ -5083,11 +5140,11 @@ mod tests {
 
     #[test]
     fn hello_dto_deserialization_still_accepts_known_fields() {
-        let agent_json = r#"{"agent_id":"a","generation":1,"last_sent_event_seq":0,"last_received_command_seq":0,"last_applied_command_seq":0}"#;
+        let agent_json = r#"{"agent_id":"a","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}"#;
         assert!(serde_json::from_str::<AgentHello>(agent_json).is_ok());
 
         let api_json =
-            r#"{"accepted_generation":1,"last_received_event_seq":0,"next_command_seq":1}"#;
+            r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1"}"#;
         assert!(serde_json::from_str::<ApiHello>(api_json).is_ok());
     }
 
