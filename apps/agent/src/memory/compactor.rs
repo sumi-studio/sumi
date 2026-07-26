@@ -1245,12 +1245,17 @@ async fn start_attempt(store: &Store, job: &mut Job) -> Result<()> {
         .attempts
         .checked_add(1)
         .ok_or_else(|| anyhow!("attempts overflow for job {}", job.id))?;
+    // Refresh the lease at the start of each provider attempt. A single
+    // attempt can approach the header+body idle timeout budget, so the lease
+    // must cover the remaining attempts without relying on the claim time.
+    let lease_until = (Utc::now() + LEASE_DURATION).to_rfc3339();
     let result = sqlx::query(
         "UPDATE memory_jobs
-         SET attempts = ?, updated_at = ?
+         SET attempts = ?, lease_until = ?, updated_at = ?
          WHERE id = ? AND status = 'running' AND attempts = ? AND lease_until = ?",
     )
     .bind(new_attempts)
+    .bind(&lease_until)
     .bind(Utc::now().to_rfc3339())
     .bind(&job.id)
     .bind(job.attempts)
@@ -1262,6 +1267,7 @@ async fn start_attempt(store: &Store, job: &mut Job) -> Result<()> {
         bail!("start attempt CAS failed for {}", job.id);
     }
     job.attempts = new_attempts;
+    job.lease_until = Some(lease_until);
     Ok(())
 }
 
@@ -1722,7 +1728,10 @@ async fn apply_next_completed_job(store: Arc<Store>, kind: MemoryJobKind) -> Res
         };
 
         let status: String = row.try_get("status")?;
-        if status == MemoryJobStatus::Applied.as_str() {
+        if status == MemoryJobStatus::Applied.as_str() || status == MemoryJobStatus::Failed.as_str()
+        {
+            // Terminal rows (applied or permanently failed) are cursor holes.
+            // Advance past them so later completed shelves can still apply.
             let expected = next;
             next = next
                 .checked_add(1)
@@ -1740,6 +1749,12 @@ async fn apply_next_completed_job(store: Arc<Store>, kind: MemoryJobKind) -> Res
             continue;
         }
         if status != MemoryJobStatus::Completed.as_str() {
+            // Pending or running job: stop, but commit any cursor advances we
+            // already made over terminal rows.
+            if next != initial_cursor {
+                tx.commit().await?;
+                return Ok(false);
+            }
             tx.rollback().await?;
             return Ok(false);
         }
@@ -2022,8 +2037,14 @@ impl CompactWorker {
         // If the durable retry budget is already exhausted, fail the job
         // without starting another provider attempt.
         if job.attempts >= MAX_ATTEMPTS {
-            fail_job(&self.store, &job).await?;
-            return Ok(true);
+            match fail_job(&self.store, &job).await {
+                Ok(()) => return Ok(true),
+                Err(WorkerError::StaleSource { .. }) => {
+                    reset_job_to_pending(&self.store, &job).await?;
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            }
         }
 
         start_attempt(&self.store, &mut job).await?;
@@ -3855,6 +3876,435 @@ mod tests {
         assert_eq!(
             erased, 0,
             "provider context must be erased when L0 source batch is dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_budget_stale_source_releases_lease_and_skips_provider_call() {
+        let store = test_store().await;
+        let (source_id, _target_id) = insert_l0_batch(&store, &[user("hello")]).await;
+        insert_compact_l0_job(&store, "job-exhausted-stale", &source_id, 1).await;
+
+        // Exhaust the durable retry budget before the worker runs.
+        sqlx::query("UPDATE memory_jobs SET attempts = 3 WHERE id = ?")
+            .bind("job-exhausted-stale")
+            .execute(store.pool())
+            .await
+            .expect("set attempts to max");
+
+        // Simulate a concurrent update that advanced the source version.
+        sqlx::query("UPDATE memory_batches SET version = 1 WHERE id = ?")
+            .bind(&source_id)
+            .execute(store.pool())
+            .await
+            .expect("bump version");
+
+        let provider = Arc::new(FakeProvider {
+            text: Mutex::new("never called".into()),
+            ..FakeProvider::default()
+        });
+        run_worker(store.clone(), provider.clone()).await;
+
+        let job = sqlx::query("SELECT status, attempts, lease_until FROM memory_jobs WHERE id = ?")
+            .bind("job-exhausted-stale")
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch job");
+        assert_eq!(job.get::<String, _>("status"), "pending");
+        assert_eq!(job.get::<i64, _>("attempts"), 3);
+        assert!(job.get::<Option<String>, _>("lease_until").is_none());
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            0,
+            "exhausted budget must not start a provider request"
+        );
+
+        let batch = sqlx::query("SELECT state, version FROM memory_batches WHERE id = ?")
+            .bind(&source_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch batch");
+        assert_eq!(batch.get::<String, _>("state"), "compacting");
+        assert_eq!(batch.get::<i64, _>("version"), 1);
+    }
+
+    #[tokio::test]
+    async fn apply_ready_skips_failed_job_and_applies_later_completed() {
+        let store = test_store().await;
+        let (source_id_1, _target_id_1) = insert_l0_batch(&store, &[user("first")]).await;
+        let mut job1 = MemoryJobRecord::new(
+            "job-failed-1",
+            MemoryJobKind::CompactL0,
+            1,
+            vec![source_id_1.clone()],
+            BTreeMap::from([(source_id_1.clone(), 0)]),
+        );
+        job1.status = MemoryJobStatus::Failed;
+        job1.attempts = 3;
+        job1.insert(store.pool()).await.expect("insert failed job");
+
+        let (source_id_2, target_id_2) =
+            insert_l0_batch_with_seq(&store, 2, &[user("second")]).await;
+        insert_compact_l0_job(&store, "job-complete-2", &source_id_2, 2).await;
+
+        let provider = Arc::new(FakeProvider {
+            text: Mutex::new("second summary".into()),
+            ..FakeProvider::default()
+        });
+        let cancel = CancellationToken::new();
+        let worker = CompactWorker {
+            store: store.clone(),
+            spec: select_compact_model(&chat_model(), None, &[]).expect("select model"),
+            provider,
+            cancel,
+        };
+        worker.process_all_pending().await.expect("complete job 2");
+        assert_eq!(worker.apply_ready().await.expect("apply jobs"), 1);
+
+        let job1 = sqlx::query("SELECT status FROM memory_jobs WHERE id = ?")
+            .bind("job-failed-1")
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch job1");
+        assert_eq!(job1.get::<String, _>("status"), "failed");
+
+        let job2 = sqlx::query("SELECT status FROM memory_jobs WHERE id = ?")
+            .bind("job-complete-2")
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch job2");
+        assert_eq!(job2.get::<String, _>("status"), "applied");
+
+        let source2 = sqlx::query("SELECT state FROM memory_batches WHERE id = ?")
+            .bind(&source_id_2)
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch source2");
+        assert_eq!(source2.get::<String, _>("state"), "dropped");
+
+        let target2 = sqlx::query("SELECT state FROM memory_batches WHERE id = ?")
+            .bind(&target_id_2)
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch target2");
+        assert_eq!(target2.get::<String, _>("state"), "promoted");
+
+        let cursor: i64 =
+            sqlx::query_scalar("SELECT next_batch_seq FROM memory_apply_cursors WHERE kind = ?")
+                .bind(MemoryJobKind::CompactL0.as_str())
+                .fetch_one(store.pool())
+                .await
+                .expect("fetch cursor");
+        assert_eq!(cursor, 3);
+    }
+
+    #[tokio::test]
+    async fn start_attempt_refreshes_lease_and_prevents_recovery_reclaim() {
+        let store = test_store().await;
+        let (source_id, _target_id) = insert_l0_batch(&store, &[user("lease refresh")]).await;
+        insert_compact_l0_job(&store, "job-lease", &source_id, 1).await;
+
+        // Simulate a crash: job was claimed but start_attempt had not yet refreshed.
+        let expired = "2000-01-01T00:00:00Z";
+        sqlx::query(
+            "UPDATE memory_jobs SET status = 'running', attempts = 0, lease_until = ? WHERE id = ?",
+        )
+        .bind(expired)
+        .bind("job-lease")
+        .execute(store.pool())
+        .await
+        .expect("simulate running job with expired lease");
+
+        let row = sqlx::query(
+            "SELECT id, kind, batch_seq, source_ids, source_versions, status, attempts,
+                    lease_until, created_at, updated_at
+             FROM memory_jobs WHERE id = ?",
+        )
+        .bind("job-lease")
+        .fetch_one(store.pool())
+        .await
+        .expect("fetch job row");
+        let mut job = super::parse_job(&row).expect("parse job");
+
+        super::start_attempt(&store, &mut job)
+            .await
+            .expect("start attempt refreshes lease");
+
+        let job = sqlx::query("SELECT status, attempts, lease_until FROM memory_jobs WHERE id = ?")
+            .bind("job-lease")
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch job after start");
+        assert_eq!(job.get::<String, _>("status"), "running");
+        assert_eq!(job.get::<i64, _>("attempts"), 1);
+        let lease_until: String = job.get("lease_until");
+        assert!(
+            lease_until.as_str() > expired,
+            "lease must be refreshed past the original expired timestamp"
+        );
+        assert!(
+            lease_until > Utc::now().to_rfc3339(),
+            "lease must be refreshed into the future"
+        );
+
+        // Recovery must not reclaim a live attempt.
+        super::recover_expired_running_jobs(&store)
+            .await
+            .expect("recover expired jobs");
+        let job = sqlx::query("SELECT status, attempts, lease_until FROM memory_jobs WHERE id = ?")
+            .bind("job-lease")
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch job after recover");
+        assert_eq!(job.get::<String, _>("status"), "running");
+        assert_eq!(job.get::<i64, _>("attempts"), 1);
+    }
+
+    #[tokio::test]
+    async fn apply_ready_erases_openai_compacted_window_for_dropped_l0_source_batch() {
+        let store = test_store().await;
+        let assistant = PublicMessage::Assistant(PublicAssistantMessage {
+            content: Vec::new(),
+            model: "test-model".to_owned(),
+            provider: "test-provider".to_owned(),
+            origin: ProviderOrigin {
+                provider_instance_id: "test-instance".to_owned(),
+                protocol: ApiProtocol::OpenAiResponses,
+                model: "openai-responses".to_owned(),
+            },
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: timestamp(),
+        });
+        let (source_id, _target_id) = insert_l0_batch(&store, &[assistant]).await;
+        let message_id = format!("{source_id}-msg-0");
+        let message_seq = 100u64;
+
+        let key = store
+            .provider_context_key(&ProviderContextKeyAnchor {
+                conversation_id: store.scope().conversation_id.clone(),
+                anchor_id: format!("{message_id}:{message_seq}"),
+            })
+            .await
+            .expect("provider context key");
+
+        let covered_item = ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 1,
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({"type": "message", "role": "assistant", "content": []})],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: message_seq,
+                    context_fingerprint: "fp-openai-covered".to_owned(),
+                },
+            },
+        };
+        let covered = EncryptedProviderContextRecord::encrypt(
+            &covered_item,
+            "test-instance",
+            ApiProtocol::OpenAiResponses,
+            "openai-responses",
+            "pc-openai-covered",
+            provider_context_idempotency_key(&message_id, &covered_item),
+            EvictionFootprint::from_saved(1, 0, 0).expect("footprint"),
+            &key,
+            store.scope(),
+        )
+        .expect("encrypt covered");
+        covered.insert(store.pool()).await.expect("insert covered");
+
+        // Unrelated: coverage endpoint does not belong to this batch.
+        let uncovered_item = ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 1,
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({"type": "message", "role": "assistant", "content": []})],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 999,
+                    context_fingerprint: "fp-openai-uncovered".to_owned(),
+                },
+            },
+        };
+        let uncovered = EncryptedProviderContextRecord::encrypt(
+            &uncovered_item,
+            "test-instance",
+            ApiProtocol::OpenAiResponses,
+            "openai-responses",
+            "pc-openai-uncovered",
+            provider_context_idempotency_key(&message_id, &uncovered_item),
+            EvictionFootprint::from_saved(1, 0, 0).expect("footprint"),
+            &key,
+            store.scope(),
+        )
+        .expect("encrypt uncovered");
+        uncovered
+            .insert(store.pool())
+            .await
+            .expect("insert uncovered");
+
+        insert_compact_l0_job(&store, "job-erase-openai", &source_id, 1).await;
+
+        let worker = CompactWorker {
+            store: store.clone(),
+            spec: select_compact_model(&chat_model(), None, &[]).expect("select model"),
+            provider: Arc::new(FakeProvider {
+                text: Mutex::new("summary".into()),
+                ..FakeProvider::default()
+            }),
+            cancel: CancellationToken::new(),
+        };
+        worker.process_all_pending().await.expect("complete job");
+        assert_eq!(worker.apply_ready().await.expect("apply jobs"), 1);
+
+        let covered_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE id = ?")
+                .bind("pc-openai-covered")
+                .fetch_one(store.pool())
+                .await
+                .expect("count covered");
+        assert_eq!(
+            covered_count, 0,
+            "covered OpenAI compacted window must be erased"
+        );
+
+        let uncovered_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE id = ?")
+                .bind("pc-openai-uncovered")
+                .fetch_one(store.pool())
+                .await
+                .expect("count uncovered");
+        assert_eq!(
+            uncovered_count, 1,
+            "unrelated OpenAI compacted window must remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_ready_erases_anthropic_compaction_for_dropped_l0_source_batch() {
+        let store = test_store().await;
+        let assistant = PublicMessage::Assistant(PublicAssistantMessage {
+            content: Vec::new(),
+            model: "test-model".to_owned(),
+            provider: "test-provider".to_owned(),
+            origin: ProviderOrigin {
+                provider_instance_id: "test-instance".to_owned(),
+                protocol: ApiProtocol::AnthropicMessages,
+                model: "anthropic".to_owned(),
+            },
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: timestamp(),
+        });
+        let (source_id, _target_id) = insert_l0_batch(&store, &[assistant]).await;
+        let message_id = format!("{source_id}-msg-0");
+        let message_seq = 100u64;
+
+        let key = store
+            .provider_context_key(&ProviderContextKeyAnchor {
+                conversation_id: store.scope().conversation_id.clone(),
+                anchor_id: format!("{message_id}:{message_seq}"),
+            })
+            .await
+            .expect("provider context key");
+
+        let covered_item = ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 1,
+            payload: ProviderContextPayload::AnthropicCompaction {
+                block: json!({"type": "compaction", "content": "anthropic summary"}),
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: message_seq,
+                    context_fingerprint: "fp-anthropic-covered".to_owned(),
+                },
+            },
+        };
+        let covered = EncryptedProviderContextRecord::encrypt(
+            &covered_item,
+            "test-instance",
+            ApiProtocol::AnthropicMessages,
+            "anthropic",
+            "pc-anthropic-covered",
+            provider_context_idempotency_key(&message_id, &covered_item),
+            EvictionFootprint::from_saved(1, 0, 0).expect("footprint"),
+            &key,
+            store.scope(),
+        )
+        .expect("encrypt covered");
+        covered.insert(store.pool()).await.expect("insert covered");
+
+        // Unrelated: coverage endpoint does not belong to this batch.
+        let uncovered_item = ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 1,
+            payload: ProviderContextPayload::AnthropicCompaction {
+                block: json!({"type": "compaction", "content": "anthropic summary"}),
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 999,
+                    context_fingerprint: "fp-anthropic-uncovered".to_owned(),
+                },
+            },
+        };
+        let uncovered = EncryptedProviderContextRecord::encrypt(
+            &uncovered_item,
+            "test-instance",
+            ApiProtocol::AnthropicMessages,
+            "anthropic",
+            "pc-anthropic-uncovered",
+            provider_context_idempotency_key(&message_id, &uncovered_item),
+            EvictionFootprint::from_saved(1, 0, 0).expect("footprint"),
+            &key,
+            store.scope(),
+        )
+        .expect("encrypt uncovered");
+        uncovered
+            .insert(store.pool())
+            .await
+            .expect("insert uncovered");
+
+        insert_compact_l0_job(&store, "job-erase-anthropic", &source_id, 1).await;
+
+        let worker = CompactWorker {
+            store: store.clone(),
+            spec: select_compact_model(&chat_model(), None, &[]).expect("select model"),
+            provider: Arc::new(FakeProvider {
+                text: Mutex::new("summary".into()),
+                ..FakeProvider::default()
+            }),
+            cancel: CancellationToken::new(),
+        };
+        worker.process_all_pending().await.expect("complete job");
+        assert_eq!(worker.apply_ready().await.expect("apply jobs"), 1);
+
+        let covered_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE id = ?")
+                .bind("pc-anthropic-covered")
+                .fetch_one(store.pool())
+                .await
+                .expect("count covered");
+        assert_eq!(
+            covered_count, 0,
+            "covered Anthropic compaction must be erased"
+        );
+
+        let uncovered_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE id = ?")
+                .bind("pc-anthropic-uncovered")
+                .fetch_one(store.pool())
+                .await
+                .expect("count uncovered");
+        assert_eq!(
+            uncovered_count, 1,
+            "unrelated Anthropic compaction must remain"
         );
     }
 }

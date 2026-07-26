@@ -8808,6 +8808,25 @@ async fn apply_memory_batch_mutation(
         .execute(&mut **transaction)
         .await
         .context("failed to crypto-erase provider context for dropped source batch")?;
+        // Native/dedicated compaction windows are not anchored to a single
+        // message, so `message_id` is NULL. Erase those whose coverage endpoint
+        // is a message seq belonging to this batch, without touching unrelated
+        // windows whose coverage ends elsewhere.
+        sqlx::query(
+            "UPDATE provider_context
+             SET ciphertext = zeroblob(length(ciphertext))
+             WHERE message_id IS NULL
+               AND coverage_through_seq IN (
+                   SELECT seq FROM messages
+                   WHERE id IN (
+                       SELECT message_id FROM memory_batch_messages WHERE batch_id = ?
+                   )
+               )",
+        )
+        .bind(&batch.batch_id)
+        .execute(&mut **transaction)
+        .await
+        .context("failed to crypto-erase native provider context for dropped source batch")?;
         sqlx::query(
             "DELETE FROM provider_context
              WHERE message_id IN (
@@ -8818,6 +8837,20 @@ async fn apply_memory_batch_mutation(
         .execute(&mut **transaction)
         .await
         .context("failed to delete provider context for dropped source batch")?;
+        sqlx::query(
+            "DELETE FROM provider_context
+             WHERE message_id IS NULL
+               AND coverage_through_seq IN (
+                   SELECT seq FROM messages
+                   WHERE id IN (
+                       SELECT message_id FROM memory_batch_messages WHERE batch_id = ?
+                   )
+               )",
+        )
+        .bind(&batch.batch_id)
+        .execute(&mut **transaction)
+        .await
+        .context("failed to delete native provider context for dropped source batch")?;
         sqlx::query("DELETE FROM memory_batch_messages WHERE batch_id = ?")
             .bind(&batch.batch_id)
             .execute(&mut **transaction)
