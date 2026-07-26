@@ -2362,9 +2362,19 @@ impl ResponsesReceiveState {
             .ok_or_else(|| {
                 ResponsesAdapterError::InvalidEvent("response.output must be an array".into())
             })?;
-        if output.len() != self.completed_items.len()
-            || self.completed_items.len() != self.output_identities.len()
-        {
+        if self.completed_items.len() != self.output_identities.len() {
+            return Err(ResponsesAdapterError::InvalidEvent(
+                "terminal response output is missing or reordered".into(),
+            ));
+        }
+        // The ChatGPT Codex Responses endpoint sends each canonical item through
+        // output_item.done, then deliberately omits the repeated terminal copy.
+        // An empty terminal output is therefore complete only when every
+        // observed identity already has a validated item.done record.
+        if output.is_empty() {
+            return Ok(());
+        }
+        if output.len() != self.completed_items.len() {
             return Err(ResponsesAdapterError::InvalidEvent(
                 "terminal response output is missing or reordered".into(),
             ));
@@ -2856,6 +2866,9 @@ fn backfilled_reasoning_fragments(
         .ok_or_else(|| {
             ResponsesAdapterError::InvalidEvent("response.output must be an array".into())
         })?;
+    if output.is_empty() {
+        return Ok((fragments.to_vec(), 0));
+    }
     let mut encrypted = HashMap::new();
     for (index, item) in output.iter().enumerate() {
         let Some(item) = item.as_object() else {
@@ -4012,6 +4025,44 @@ mod tests {
                 "{mutation}"
             );
         }
+    }
+
+    #[test]
+    fn terminal_may_omit_repeated_output_after_all_items_are_done() {
+        let mut values = fixture_values();
+        values.last_mut().unwrap()["response"]["output"] = json!([]);
+        let mut state = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+        let mut terminal = None;
+        for value in values {
+            terminal = state
+                .push_json(&value.to_string())
+                .expect("Codex terminal omission is valid after item.done")
+                .terminal
+                .or(terminal);
+        }
+        let terminal = terminal.expect("terminal");
+        assert_eq!(terminal.reason, StopReason::ToolUse);
+        assert_eq!(terminal.provider_context.len(), 1);
+    }
+
+    #[test]
+    fn empty_terminal_output_requires_every_observed_item_to_finish() {
+        let mut values = fixture_values();
+        values[16]["type"] = json!("response.future.event");
+        values.last_mut().unwrap()["response"]["output"] = json!([]);
+        let mut state = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+        for value in &values[..values.len() - 1] {
+            state
+                .push_json(&value.to_string())
+                .expect("unknown event preserves its sequence slot");
+        }
+        assert!(
+            state
+                .push_json(&values.last().unwrap().to_string())
+                .expect_err("an empty terminal output cannot hide an unfinished item")
+                .to_string()
+                .contains("unfinished output items")
+        );
     }
 
     #[test]

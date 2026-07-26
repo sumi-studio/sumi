@@ -5269,6 +5269,18 @@ fi
         run_live_chat_tool_roundtrip("opencode-go").await;
     }
 
+    #[tokio::test]
+    #[ignore = "development-only Codex subscription Responses gate; requires the local OAuth bridge"]
+    async fn live_codex_subscription_responses_tool_roundtrip() {
+        let base_url = env::var("SUMI_CODEX_RESPONSES_BASE_URL")
+            .expect("SUMI_CODEX_RESPONSES_BASE_URL must point to the local OAuth bridge");
+        let mut spec = ModelSpec::preset("openai-responses").expect("Responses preset");
+        spec.id =
+            env::var("SUMI_CODEX_RESPONSES_MODEL").unwrap_or_else(|_| "gpt-5.6-luna".to_owned());
+        spec.base_url = base_url;
+        run_live_responses_tool_roundtrip(spec).await;
+    }
+
     #[test]
     fn live_opencode_go_release_opt_in_without_credentials_fails_before_network() {
         let output = Command::new(env::current_exe().expect("current test executable"))
@@ -5422,12 +5434,169 @@ fi
         );
     }
 
+    async fn run_live_responses_tool_roundtrip(spec: ModelSpec) {
+        let tool = ToolDefinition {
+            name: "echo_value".to_owned(),
+            description: "Return the supplied value unchanged.".to_owned(),
+            parameters: serde_json::json!({
+                "type":"object",
+                "properties":{"value":{"type":"string"}},
+                "required":["value"],
+                "additionalProperties":false
+            }),
+        };
+        let user = types::UserMessage {
+            content: vec![types::UserContent::Text {
+                text: "Call echo_value once with value responses-live-ok.".to_owned(),
+            }],
+            timestamp: Utc::now(),
+        };
+        let first_context = PromptContext {
+            system_prompt:
+                "Reason about the requested value, then use the requested tool exactly once."
+                    .to_owned(),
+            memory_blocks: vec![],
+            messages: vec![types::ContextMessage::Synthetic {
+                message: types::Message::User(user.clone()),
+            }],
+            provider_context: vec![],
+            tools: vec![tool.clone()],
+        };
+        let first_output = run_live_output(
+            spec.clone(),
+            first_context,
+            RequestOptions {
+                max_tokens: Some(4_096),
+                tool_choice: Some(serde_json::json!("required")),
+                reasoning_effort: Some("high".to_owned()),
+                ..RequestOptions::default()
+            },
+            "local-oauth-bridge".to_owned(),
+        )
+        .await;
+        let types::ProviderOutput {
+            message: first,
+            provider_context: first_fragments,
+        } = first_output;
+        assert_eq!(first.stop_reason, StopReason::ToolUse);
+        if env::var("SUMI_CODEX_REQUIRE_ENCRYPTED_REASONING").as_deref() == Ok("1") {
+            assert!(
+                !first_fragments.is_empty(),
+                "Responses live turn must preserve encrypted provider context"
+            );
+        }
+        let calls: Vec<_> = first
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                AssistantContent::ToolCall { tool_call, .. } => Some(tool_call),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "echo_value");
+        assert_eq!(
+            calls[0].arguments.as_object().get("value"),
+            Some(&serde_json::json!("responses-live-ok"))
+        );
+        eprintln!(
+            "turn1 input=user(tool=echo_value,value=responses-live-ok); output=tool_call(name={},arguments={},encrypted_context_items={})",
+            calls[0].name,
+            serde_json::Value::Object(calls[0].arguments.as_object().clone()),
+            first_fragments.len()
+        );
+
+        let tool_result = types::ToolResultMessage {
+            tool_call_id: calls[0].id.clone(),
+            tool_name: calls[0].name.clone(),
+            content: vec![types::UserContent::Text {
+                text: "responses-live-ok".to_owned(),
+            }],
+            details: serde_json::json!({}),
+            is_error: false,
+            timestamp: Utc::now(),
+        };
+        let assistant_anchor = types::ProviderContextAnchor {
+            message_id: "responses-live-assistant".to_owned(),
+            message_seq: 1,
+        };
+        let provider_context: Vec<_> = first_fragments
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, fragment)| types::ProviderContextItem {
+                origin_message: Some(assistant_anchor.clone()),
+                wire_item_index: fragment.wire_item_index,
+                ordinal: u32::try_from(ordinal).expect("provider context ordinal fits u32"),
+                payload: fragment.payload,
+            })
+            .collect();
+        let replayed_context_items = provider_context.len();
+        let second_context = PromptContext {
+            system_prompt: "After the tool result, reply with exactly responses-live-ok."
+                .to_owned(),
+            memory_blocks: vec![],
+            messages: vec![
+                types::ContextMessage::Synthetic {
+                    message: types::Message::User(user),
+                },
+                types::ContextMessage::Persisted {
+                    id: assistant_anchor.message_id,
+                    seq: assistant_anchor.message_seq,
+                    message: types::Message::Assistant(first),
+                },
+                types::ContextMessage::Synthetic {
+                    message: types::Message::ToolResult(tool_result),
+                },
+            ],
+            provider_context,
+            tools: vec![tool],
+        };
+        let second_output = run_live_output(
+            spec,
+            second_context,
+            RequestOptions {
+                max_tokens: Some(4_096),
+                reasoning_effort: Some("low".to_owned()),
+                ..RequestOptions::default()
+            },
+            "local-oauth-bridge".to_owned(),
+        )
+        .await;
+        let second = second_output.message;
+        assert_eq!(second.stop_reason, StopReason::Stop);
+        let text: String = second
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                AssistantContent::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text.trim(), "responses-live-ok");
+        eprintln!(
+            "turn2 input=tool_result(value=responses-live-ok,replayed_context_items={}); output=text({})",
+            replayed_context_items,
+            text.trim()
+        );
+    }
+
     async fn run_live_request(
         spec: ModelSpec,
         context: PromptContext,
         options: RequestOptions,
         api_key: String,
     ) -> AssistantMessage {
+        run_live_output(spec, context, options, api_key)
+            .await
+            .message
+    }
+
+    async fn run_live_output(
+        spec: ModelSpec,
+        context: PromptContext,
+        options: RequestOptions,
+        api_key: String,
+    ) -> types::ProviderOutput {
         let mut events = stream_with_api_key(
             spec,
             context,
@@ -5438,7 +5607,7 @@ fi
         tokio::time::timeout(Duration::from_secs(180), async {
             while let Some(event) = events.recv().await {
                 match event {
-                    ProviderEvent::Done { output, .. } => return output.message,
+                    ProviderEvent::Done { output, .. } => return output,
                     ProviderEvent::Error { output, .. } => {
                         panic!(
                             "live provider error {}: {}",

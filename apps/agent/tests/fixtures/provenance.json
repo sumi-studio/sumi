@@ -144,13 +144,21 @@
     },
     "responses_fixture_and_durable_round_trip": {
       "provider": "openai-responses",
-      "model": null,
+      "model": "gpt-5.6-luna",
       "required_cases": [
         "encrypted_reasoning_durable_round_trip",
         "store_false_two_turn_tool_fixture",
         "native_compaction_ordered_output"
       ],
-      "status": "fixture_and_durable_proof_required",
+      "status": "optional_live_codex_subscription_round_trip_passed_fixture_and_durable_proof_still_required",
+      "optional_live_evidence": {
+        "observed_at": "2026-07-25T23:52:55Z",
+        "endpoint_origin": "https://chatgpt.com/backend-api/codex",
+        "credential_source": "local Codex ChatGPT login (credential not stored)",
+        "result": "gpt-5.6-luna_two_turn_tool_call_and_final_text_passed",
+        "test": "provider::tests::live_codex_subscription_responses_tool_roundtrip",
+        "bridge": "scripts/dev/codex-responses-proxy.py"
+      },
       "release_blocking": true
     },
     "moonshot_direct_text_tool_reasoning": {
