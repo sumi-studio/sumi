@@ -19732,7 +19732,7 @@ mod tests {
 
         for row in &rows {
             let ordinal: i64 = row.get("item_ordinal");
-            assert!(ordinal >= 0, "item_ordinal must be non-negative");
+            assert_eq!(ordinal, 0, "item_ordinal must be zero");
         }
 
         let kinds: Vec<String> = rows

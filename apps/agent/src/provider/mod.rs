@@ -2666,7 +2666,10 @@ fi
 
     fn opencode_capture_script() -> &'static str {
         let readme = include_str!("../../tests/fixtures/README.md");
-        let (_, fenced) = readme
+        let (_, capture_section) = readme
+            .split_once("The OpenCode capture script below is retained for future qualification.")
+            .expect("README OpenCode capture section");
+        let (_, fenced) = capture_section
             .split_once("```sh\n")
             .expect("README capture shell fence");
         fenced
@@ -5238,30 +5241,31 @@ fi
     }
 
     #[tokio::test]
-    #[ignore = "live OpenCode Go gate; requires non-empty OPENCODE_GO_API_KEY"]
+    #[ignore = "post-deadline provider-qualification debt; OpenCode Go is confirmed unavailable"]
     async fn live_opencode_go_two_turn_tool_reasoning_gate() {
         run_live_chat_tool_roundtrip("opencode-go").await;
     }
 
     #[tokio::test]
-    #[ignore = "deferred T25 live Moonshot direct gate; requires non-empty MOONSHOT_API_KEY"]
+    #[ignore = "post-deadline provider-qualification debt; direct Moonshot proof deferred"]
     async fn live_kimi_k3_direct_two_turn_tool_reasoning_gate() {
         run_live_chat_tool_roundtrip("kimi-k3").await;
     }
 
     #[tokio::test]
-    #[ignore = "deferred T25 live Z.ai direct gate; requires non-empty ZAI_API_KEY"]
+    #[ignore = "post-deadline provider-qualification debt; direct Z.ai proof deferred"]
     async fn live_glm_5_2_direct_two_turn_tool_reasoning_gate() {
         run_live_chat_tool_roundtrip("glm-5.2").await;
     }
 
     #[tokio::test]
-    #[ignore = "deferred T25 live Umans direct gate; requires non-empty UMANS_API_KEY"]
+    #[ignore = "post-deadline provider-qualification debt; direct Umans proof deferred"]
     async fn live_umans_direct_two_turn_tool_reasoning_gate() {
         run_live_chat_tool_roundtrip("umans").await;
     }
 
     #[tokio::test]
+    #[ignore = "post-deadline provider-qualification debt; OpenCode Go is confirmed unavailable"]
     async fn live_opencode_go_provider_release_gate() {
         if env::var("SUMI_LIVE_TEST").as_deref() != Ok("1") {
             return;
@@ -5269,42 +5273,59 @@ fi
         run_live_chat_tool_roundtrip("opencode-go").await;
     }
 
+    /// T25 release gate: OpenAI Responses through the local development-only
+    /// Codex OAuth bridge. `SUMI_LIVE_TEST=1` selects this non-ignored gate.
+    /// Missing or empty `SUMI_CODEX_RESPONSES_BASE_URL` or
+    /// `SUMI_CODEX_RESPONSES_PROXY_SECRET` fails before any network call.
     #[tokio::test]
-    #[ignore = "development-only Codex subscription Responses gate; routes through a local bridge that mutates the request and is not a public-Responses production proof"]
-    async fn live_codex_subscription_responses_tool_roundtrip() {
-        // This test targets the ChatGPT Codex subscription endpoint through a
-        // local dev bridge. The bridge strips production fields (e.g.
-        // max_output_tokens), forces stream/store, and injects Codex OAuth
-        // credentials. It therefore validates the adapter against a
-        // non-standard endpoint, not the public OpenAI Responses contract.
-        let base_url = env::var("SUMI_CODEX_RESPONSES_BASE_URL")
-            .expect("SUMI_CODEX_RESPONSES_BASE_URL must point to the local OAuth bridge");
-        let mut spec = ModelSpec::preset("openai-responses").expect("Responses preset");
-        spec.id =
-            env::var("SUMI_CODEX_RESPONSES_MODEL").unwrap_or_else(|_| "gpt-5.6-luna".to_owned());
-        spec.base_url = base_url;
-        run_live_responses_tool_roundtrip(spec).await;
+    async fn live_codex_responses_provider_release_gate() {
+        if env::var("SUMI_LIVE_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        run_live_codex_responses_bridge().await;
     }
 
-    #[test]
-    fn live_opencode_go_release_opt_in_without_credentials_fails_before_network() {
-        let output = Command::new(env::current_exe().expect("current test executable"))
+    fn run_codex_responses_release_dispatcher(
+        base_url: Option<&str>,
+        proxy_secret: Option<&str>,
+    ) -> Output {
+        let mut command = Command::new(env::current_exe().expect("current test executable"));
+        command
             .args([
                 "--exact",
-                "provider::tests::live_opencode_go_provider_release_gate",
+                "provider::tests::live_codex_responses_provider_release_gate",
                 "--nocapture",
             ])
             .env("SUMI_LIVE_TEST", "1")
             .env_remove("SUMI_ENV_FILE")
+            .env_remove("SUMI_CODEX_RESPONSES_BASE_URL")
+            .env_remove("SUMI_CODEX_RESPONSES_PROXY_SECRET")
+            .env_remove("SUMI_CODEX_RESPONSES_MODEL")
+            .env_remove("OPENAI_API_KEY")
             .env_remove("OPENCODE_GO_API_KEY")
             .env_remove("MOONSHOT_API_KEY")
             .env_remove("ZAI_API_KEY")
-            .env_remove("UMANS_API_KEY")
+            .env_remove("UMANS_API_KEY");
+        if let Some(base_url) = base_url {
+            command.env("SUMI_CODEX_RESPONSES_BASE_URL", base_url);
+        }
+        if let Some(proxy_secret) = proxy_secret {
+            command.env("SUMI_CODEX_RESPONSES_PROXY_SECRET", proxy_secret);
+        }
+        command
             .output()
-            .expect("run isolated live release dispatcher");
+            .expect("run isolated live release dispatcher")
+    }
+
+    fn assert_codex_responses_config_failure(
+        base_url: Option<&str>,
+        proxy_secret: Option<&str>,
+        expected: &str,
+    ) {
+        let output = run_codex_responses_release_dispatcher(base_url, proxy_secret);
         assert!(
             !output.status.success(),
-            "credential-free live release opt-in must not report green"
+            "invalid live release dispatcher configuration must not report green"
         );
         let diagnostics = format!(
             "{}{}",
@@ -5312,8 +5333,64 @@ fi
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(
-            diagnostics.contains("opencode-go live gate requires OPENCODE_GO_API_KEY"),
+            diagnostics.contains(expected),
             "unexpected dispatcher failure: {diagnostics}"
+        );
+    }
+
+    #[test]
+    fn live_codex_responses_release_opt_in_without_bridge_url_fails_before_network() {
+        assert_codex_responses_config_failure(
+            None,
+            None,
+            "live Codex Responses release gate requires SUMI_CODEX_RESPONSES_BASE_URL",
+        );
+    }
+
+    #[test]
+    fn live_codex_responses_release_opt_in_with_empty_bridge_url_fails_before_network() {
+        assert_codex_responses_config_failure(
+            Some(""),
+            Some("unused-test-secret"),
+            "live Codex Responses release gate requires non-empty SUMI_CODEX_RESPONSES_BASE_URL",
+        );
+    }
+
+    #[test]
+    fn live_codex_responses_release_opt_in_without_proxy_secret_fails_before_network() {
+        assert_codex_responses_config_failure(
+            Some("http://127.0.0.1:1"),
+            None,
+            "live Codex Responses release gate requires SUMI_CODEX_RESPONSES_PROXY_SECRET",
+        );
+    }
+
+    #[test]
+    fn live_codex_responses_release_opt_in_with_empty_proxy_secret_fails_before_network() {
+        assert_codex_responses_config_failure(
+            Some("http://127.0.0.1:1"),
+            Some(""),
+            "live Codex Responses release gate requires non-empty SUMI_CODEX_RESPONSES_PROXY_SECRET",
+        );
+    }
+
+    #[test]
+    fn codex_responses_proxy_self_test_passes() {
+        let proxy = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/dev/codex-responses-proxy.py");
+        let output = Command::new("python3")
+            .arg(&proxy)
+            .arg("--self-test")
+            .output()
+            .expect("spawn proxy self-test");
+        let diagnostics = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "Codex Responses proxy self-test failed:\n{diagnostics}"
         );
     }
 
@@ -5439,7 +5516,35 @@ fi
         );
     }
 
-    async fn run_live_responses_tool_roundtrip(spec: ModelSpec) {
+    async fn run_live_codex_responses_bridge() {
+        if let Some(path) = env::var_os("SUMI_ENV_FILE") {
+            dotenvy::from_path(path).expect("load SUMI_ENV_FILE for live test");
+        }
+
+        let base_url = env::var("SUMI_CODEX_RESPONSES_BASE_URL").unwrap_or_else(|_| {
+            panic!("live Codex Responses release gate requires SUMI_CODEX_RESPONSES_BASE_URL")
+        });
+        assert!(
+            !base_url.trim().is_empty(),
+            "live Codex Responses release gate requires non-empty SUMI_CODEX_RESPONSES_BASE_URL"
+        );
+        let proxy_secret = env::var("SUMI_CODEX_RESPONSES_PROXY_SECRET").unwrap_or_else(|_| {
+            panic!("live Codex Responses release gate requires SUMI_CODEX_RESPONSES_PROXY_SECRET")
+        });
+        assert!(
+            !proxy_secret.trim().is_empty(),
+            "live Codex Responses release gate requires non-empty SUMI_CODEX_RESPONSES_PROXY_SECRET"
+        );
+
+        let mut spec = ModelSpec::preset("openai-responses").expect("Responses preset");
+        spec.id =
+            env::var("SUMI_CODEX_RESPONSES_MODEL").unwrap_or_else(|_| "gpt-5.6-luna".to_owned());
+        spec.base_url = base_url;
+        spec.api_key_env = "SUMI_CODEX_RESPONSES_PROXY_SECRET".to_owned();
+        run_live_responses_tool_roundtrip(spec, proxy_secret).await;
+    }
+
+    async fn run_live_responses_tool_roundtrip(spec: ModelSpec, api_key: String) {
         let tool = ToolDefinition {
             name: "echo_value".to_owned(),
             description: "Return the supplied value unchanged.".to_owned(),
@@ -5476,7 +5581,7 @@ fi
                 reasoning_effort: Some("high".to_owned()),
                 ..RequestOptions::default()
             },
-            "local-oauth-bridge".to_owned(),
+            api_key.clone(),
         )
         .await;
         let types::ProviderOutput {
@@ -5566,11 +5671,18 @@ fi
                 reasoning_effort: Some("low".to_owned()),
                 ..RequestOptions::default()
             },
-            "local-oauth-bridge".to_owned(),
+            api_key,
         )
         .await;
         let second = second_output.message;
         assert_eq!(second.stop_reason, StopReason::Stop);
+        assert!(
+            !second
+                .content
+                .iter()
+                .any(|content| matches!(content, AssistantContent::ToolCall { .. })),
+            "the two-turn release proof must contain exactly one tool call"
+        );
         let text: String = second
             .content
             .iter()
@@ -5579,11 +5691,14 @@ fi
                 _ => None,
             })
             .collect();
-        assert_eq!(text.trim(), "responses-live-ok");
+        let trimmed = text.trim();
+        assert!(
+            !trimmed.is_empty() && trimmed.contains("responses-live-ok"),
+            "second turn must emit non-empty expected text"
+        );
         eprintln!(
-            "turn2 input=tool_result(value=responses-live-ok,replayed_context_items={}); output=text({})",
-            replayed_context_items,
-            text.trim()
+            "turn2 input=tool_result(value=responses-live-ok,replayed_context_items={}); output=non_empty_expected_text",
+            replayed_context_items
         );
     }
 
