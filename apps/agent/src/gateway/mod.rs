@@ -348,6 +348,16 @@ impl From<anyhow::Error> for HelloError {
     }
 }
 
+/// A permanent outbound-frame size violation. The supervisor treats this as a
+/// fatal error because retrying from the same durable cursor would replay the
+/// same oversized frame forever.
+#[derive(Debug, Error, Clone, Copy)]
+#[error("outbound frame exceeds MAX_FRAME_BYTES: {actual} bytes (limit {max})")]
+pub struct OversizedFrameError {
+    pub actual: usize,
+    pub max: usize,
+}
+
 #[async_trait]
 pub trait GatewayReader: Send {
     async fn next_command(&mut self) -> Result<InboundCommand>;

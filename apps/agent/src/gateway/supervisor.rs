@@ -28,7 +28,10 @@ use zeroize::Zeroize;
 use crate::runtime::contracts::ProcessGeneration;
 
 use super::wire::MAX_JSON_SAFE_INTEGER;
-use super::{Gateway, GatewayReader, GatewayWriter, HelloError, InboundCommand, OutboundFrame};
+use super::{
+    Gateway, GatewayReader, GatewayWriter, HelloError, InboundCommand, OutboundFrame,
+    OversizedFrameError,
+};
 
 pub mod seams;
 
@@ -640,6 +643,9 @@ where
                 }
                 let reader_result = reader_result.unwrap();
                 let writer_result = writer_result.unwrap();
+                if let Some(e) = first_oversized_error(&reader_result, &writer_result) {
+                    return Err(SupervisorError::Fatal(anyhow::Error::new(e)));
+                }
                 match (reader_result, writer_result) {
                     (Ok(()), Ok(())) => Ok(()),
                     (Err(e), _) | (_, Err(e)) => Err(SupervisorError::EstablishedReconnect {
@@ -712,6 +718,10 @@ where
         let reader_result = reader_result.unwrap();
         let writer_result = writer_result.unwrap();
 
+        if let Some(e) = first_oversized_error(&reader_result, &writer_result) {
+            return Err(SupervisorError::Fatal(anyhow::Error::new(e)));
+        }
+
         match (reader_result, writer_result) {
             (Ok(()), Ok(())) => Err(SupervisorError::EstablishedReconnect {
                 reason: "reader/writer task ended".to_owned(),
@@ -749,6 +759,16 @@ where
         time::sleep(Duration::from_millis(jitter)).await;
         Ok(())
     }
+}
+
+fn first_oversized_error(
+    reader_result: &Result<()>,
+    writer_result: &Result<()>,
+) -> Option<OversizedFrameError> {
+    [reader_result.as_ref().err(), writer_result.as_ref().err()]
+        .into_iter()
+        .flatten()
+        .find_map(|e| e.downcast_ref::<OversizedFrameError>().copied())
 }
 
 async fn build_agent_hello<S: DurableSource>(
@@ -5123,6 +5143,197 @@ mod tests {
         assert!(
             !event_seqs.contains(&2),
             "stale DeliveryEpoch frame 2 must be dropped"
+        );
+    }
+
+    #[derive(Clone)]
+    struct OversizedConnector {
+        sent_hellos: Arc<Mutex<Vec<AgentHello>>>,
+    }
+
+    impl OversizedConnector {
+        fn new(sent_hellos: Arc<Mutex<Vec<AgentHello>>>) -> Self {
+            Self { sent_hellos }
+        }
+    }
+
+    #[async_trait]
+    impl GatewayConnector for OversizedConnector {
+        type Connection = OversizedGateway;
+
+        async fn connect(
+            &mut self,
+            _credential: GatewayCredential,
+        ) -> Result<Self::Connection, ConnectorError> {
+            Ok(OversizedGateway {
+                reader: MockGatewayReader {
+                    commands: VecDeque::new(),
+                    panic: false,
+                    on_empty: None,
+                },
+                sent_hellos: self.sent_hellos.clone(),
+            })
+        }
+    }
+
+    struct OversizedGateway {
+        reader: MockGatewayReader,
+        sent_hellos: Arc<Mutex<Vec<AgentHello>>>,
+    }
+
+    #[async_trait]
+    impl Gateway for OversizedGateway {
+        type Reader = MockGatewayReader;
+        type Writer = OversizedWriter;
+
+        async fn authenticate_hello(
+            &mut self,
+            hello: AgentHello,
+        ) -> std::result::Result<ApiHello, HelloError> {
+            self.sent_hellos.lock().unwrap().push(hello.clone());
+            Ok(ApiHello {
+                accepted_generation: hello.generation,
+                last_received_event_seq: 0,
+                next_command_seq: hello.last_applied_command_seq.saturating_add(1),
+            })
+        }
+
+        fn split(self) -> (Self::Reader, Self::Writer) {
+            (self.reader, OversizedWriter)
+        }
+    }
+
+    struct OversizedWriter;
+
+    #[async_trait]
+    impl GatewayWriter for OversizedWriter {
+        async fn send(&mut self, _frame: OutboundFrame) -> Result<()> {
+            Err(OversizedFrameError {
+                actual: crate::gateway::MAX_FRAME_BYTES + 1,
+                max: crate::gateway::MAX_FRAME_BYTES,
+            }
+            .into())
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_catch_up_frame_terminates_supervisor_fatal() {
+        // A durable catch-up event that the writer rejects as oversized must
+        // terminate the supervisor with the typed permanent error, not loop
+        // through reconnect epochs from the same cursor.
+        let source = MockDurableSource::new(CommandCursors::default());
+        source.push_event(event_frame(1));
+
+        let sent_hellos = Arc::new(Mutex::new(Vec::new()));
+        let connector = OversizedConnector::new(sent_hellos.clone());
+        let credentials = CountingCredentialProvider::new("token");
+        let counter = credentials.counter.clone();
+
+        let mut config = make_config();
+        config.max_reconnect_attempts = None;
+
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: ProcessGeneration::from_wire(7).unwrap(),
+            receipt_identity: "r".to_owned(),
+        });
+
+        let supervisor = ConnectionSupervisor::new(connector, credentials, source, latch, config);
+        let handle = supervisor.start();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle.join()).await;
+        assert!(
+            result.is_ok(),
+            "supervisor must terminate within bounded time"
+        );
+        let err = result
+            .unwrap()
+            .expect_err("oversized catch-up must produce a fatal error");
+        assert!(
+            err.is::<OversizedFrameError>(),
+            "error must be the typed oversized boundary: {err:?}"
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "must not fetch a fresh credential after fatal oversized frame"
+        );
+        assert_eq!(
+            sent_hellos.lock().unwrap().len(),
+            1,
+            "must not retry through connector epochs"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_writer_failure_during_catch_up_reconnects() {
+        // An ordinary send failure (not oversized) must still follow the
+        // reconnect path, replay the durable catch-up from the same cursor on
+        // a new epoch, and deliver the event.
+        let mut config = make_config();
+        config.initial_backoff = Duration::from_millis(1);
+        config.max_backoff = Duration::from_millis(5);
+
+        let sent_hellos = Arc::new(Mutex::new(Vec::new()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+
+        let mut gateway1 = MockGateway::new(VecDeque::new());
+        gateway1.writer.sent = sent.clone();
+        gateway1.writer.fail_after = Some(0);
+        gateway1.sent_hellos = sent_hellos.clone();
+
+        let mut gateway2 = MockGateway::new(VecDeque::new());
+        gateway2.writer.sent = sent.clone();
+        gateway2.sent_hellos = sent_hellos.clone();
+
+        let connector = MockConnector::new(
+            sent_hellos.clone(),
+            VecDeque::from([Ok(gateway1), Ok(gateway2)]),
+        );
+        let credentials = CountingCredentialProvider::new("token");
+        let source = ReplaySource::new(vec![event_frame(1)], CommandCursors::default());
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: ProcessGeneration::from_wire(7).unwrap(),
+            receipt_identity: "r".to_owned(),
+        });
+
+        let supervisor = ConnectionSupervisor::new(connector, credentials, source, latch, config);
+        let handle = supervisor.start();
+
+        let mut epochs = handle.epochs.clone();
+        let _epoch2 = loop {
+            if let Some(e) = *epochs.borrow() {
+                break e;
+            }
+            tokio::time::timeout(Duration::from_secs(1), epochs.changed())
+                .await
+                .unwrap()
+                .unwrap();
+        };
+
+        let mut online = handle.online.clone();
+        while !*online.borrow() {
+            online.changed().await.unwrap();
+        }
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        handle.abort();
+        assert!(handle.join().await.is_ok());
+
+        assert_eq!(
+            sent_hellos.lock().unwrap().len(),
+            2,
+            "ordinary writer failure must trigger a reconnect with a fresh hello"
+        );
+
+        let seqs: Vec<_> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|f| outbound_frame_event_seq(f).ok())
+            .collect();
+        assert!(
+            seqs.contains(&1),
+            "catch-up event must be delivered after reconnect"
         );
     }
 }

@@ -27,7 +27,7 @@ use super::supervisor::{
 use super::wire;
 use super::{
     Gateway, GatewayClosed, GatewayReader, GatewayWriter, HelloError, InboundCommand,
-    MAX_FRAME_BYTES, OutboundFrame,
+    MAX_FRAME_BYTES, OutboundFrame, OversizedFrameError,
 };
 
 /// Outbound connector for `wss://` (production). `ws://` is only allowed when
@@ -258,11 +258,11 @@ impl GatewayWriter for WsGatewayWriter {
             .map_err(|e| anyhow!("frame failed wire contract validation: {e}"))?;
         let text = serde_json::to_string(&wire).context("serialize wire frame")?;
         if text.len() > MAX_FRAME_BYTES {
-            bail!(
-                "outbound frame exceeds MAX_FRAME_BYTES: {} bytes (limit {})",
-                text.len(),
-                MAX_FRAME_BYTES
-            );
+            return Err(OversizedFrameError {
+                actual: text.len(),
+                max: MAX_FRAME_BYTES,
+            }
+            .into());
         }
         self.write
             .send(Message::Text(text))
@@ -302,7 +302,7 @@ mod tests {
     use super::super::{
         AgentHello, ApiHello, CommandDigestFactory, Envelope, Gateway, GatewayConnector,
         GatewayCredential, GatewayReader, GatewayWriter, HelloError, InboundCommand,
-        IncrementalCommandDigest, MAX_FRAME_BYTES, OutboundFrame,
+        IncrementalCommandDigest, MAX_FRAME_BYTES, OutboundFrame, OversizedFrameError,
     };
     use super::{WebSocketConnector, decode_command_bytes};
     use crate::gateway::wire::to_wire_frame;
@@ -1058,10 +1058,13 @@ mod tests {
             result.is_err(),
             "oversized frame must be rejected before sending: {result:?}"
         );
+        let err = result.unwrap_err();
         assert!(
-            result
-                .unwrap_err()
-                .to_string()
+            err.is::<OversizedFrameError>(),
+            "oversized rejection must be the typed permanent error: {err:?}"
+        );
+        assert!(
+            err.to_string()
                 .contains("outbound frame exceeds MAX_FRAME_BYTES"),
             "oversized rejection must mention the size limit"
         );
