@@ -333,6 +333,7 @@ pub struct GatewayClosed;
 /// non-recoverable claim mismatches. `Reconnect` covers transient failures.
 #[derive(Debug, Error)]
 pub enum HelloError {
+    #[allow(dead_code)]
     #[error("authentication rejected")]
     AuthRejected,
     #[allow(dead_code)]
