@@ -5,6 +5,7 @@ use std::{sync::Arc, time::Duration};
 use anyhow::{Context, Result, bail};
 use sqlx::Row;
 use tokio::{sync::mpsc, time::timeout};
+use zeroize::Zeroizing;
 
 use crate::agent::AgentEvent;
 
@@ -272,8 +273,10 @@ async fn decrypt_event(
     let aad = store
         .scope()
         .row_aad("agent_events", seq.to_string(), DataKeyPurpose::Event);
-    let plaintext = decrypt_content(&key, ciphertext, &aad)
-        .context("failed to decrypt durable event for delivery")?;
+    let plaintext = Zeroizing::new(
+        decrypt_content(&key, ciphertext, &aad)
+            .context("failed to decrypt durable event for delivery")?,
+    );
     serde_json::from_slice(&plaintext).context("durable event plaintext is not a valid AgentEvent")
 }
 
@@ -325,7 +328,9 @@ mod tests {
         ApiProtocol, ProviderOrigin, PublicAssistantContent, PublicAssistantMessage, PublicMessage,
         StopReason, Usage,
     };
+    use crate::store::DataKeyPurpose;
     use crate::store::Store;
+    use crate::store::crypto::encrypt_content;
 
     fn assistant_event(message_id: &str, text: &str) -> AgentEvent {
         AgentEvent::MessageEnd {
@@ -668,6 +673,40 @@ mod tests {
         assert!(
             pump.epoch().is_none(),
             "failed install_epoch must reset pump to Idle"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_deserialization_failure_does_not_leak_plaintext() {
+        let store = store().await;
+        let event = assistant_event("msg-1", "hello");
+        insert_test_durable_event(&store, 1, &event).await.unwrap();
+
+        let key = store
+            .conversation_key(DataKeyPurpose::Event)
+            .await
+            .expect("active event key");
+        let aad = store
+            .scope()
+            .row_aad("agent_events", "1", DataKeyPurpose::Event);
+        let secret = b"this-is-not-valid-json-and-must-not-leak";
+        let ciphertext = encrypt_content(&key, secret, &aad).expect("encrypt test plaintext");
+
+        sqlx::query("UPDATE agent_events SET raw_ciphertext = ? WHERE seq = 1")
+            .bind(ciphertext)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let (channel, _receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
+        let mut pump = DeliveryPump::new(store.clone(), channel);
+        let result = pump
+            .install_epoch(DeliveryEpoch::new("epoch-1").unwrap(), 1)
+            .await;
+        let message = result.expect_err("invalid json must fail").to_string();
+        assert!(
+            !message.contains("this-is-not-valid-json-and-must-not-leak"),
+            "decryption failure must not expose plaintext: {message}"
         );
     }
 }

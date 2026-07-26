@@ -882,77 +882,28 @@ pub struct ToolDefinition {
     pub parameters: Value,
 }
 
-/// Validate that `messages` form a valid native compaction replay suffix for `coverage`.
-/// All persisted messages must be contiguous from seq 1, with any leading synthetic
-/// messages allowed only before the first persisted message. The suffix (messages with
-/// seq > coverage) must start exactly at coverage + 1 and run contiguously to the end.
-pub fn validate_native_suffix(messages: &[ContextMessage], coverage: u64) -> Result<(), String> {
-    let mut persisted_started = false;
-    let mut previous: Option<u64> = None;
-    let mut suffix_started = false;
-    for message in messages {
-        let ContextMessage::Persisted { seq, .. } = message else {
-            if persisted_started {
-                return Err(
-                    "native suffix contains synthetic content after persisted history".into(),
-                );
-            }
-            continue;
-        };
-        persisted_started = true;
-        if *seq == 0 {
-            return Err("native replay sequence must start at seq 1, not 0".into());
-        }
-        if previous.is_none() && *seq != 1 {
-            return Err("native replay history must start at seq 1".into());
-        }
-        if previous.is_some_and(|value: u64| value.checked_add(1) != Some(*seq)) {
-            return Err(
-                "persisted native replay sequence is gapped, duplicated, or reordered".into(),
-            );
-        }
-        if *seq > coverage {
-            if !suffix_started
-                && *seq != coverage.checked_add(1).ok_or("native coverage overflow")?
-            {
-                return Err("native suffix must begin exactly at coverage + 1".into());
-            }
-            suffix_started = true;
-        } else if suffix_started {
-            return Err("covered history appears after the native suffix".into());
-        }
-        previous = Some(*seq);
-    }
-    let max_seq = previous.ok_or("native compaction requires persisted replay history")?;
-    if coverage > max_seq {
-        return Err(
-            "native compaction coverage exceeds the latest persisted message sequence".into(),
-        );
-    }
-    Ok(())
-}
-
-/// Hydration-specific validation for native compaction windows.
+/// Validate native compaction invariants for `messages`.
 ///
-/// Unlike `validate_native_suffix`, this does not require `messages` to be a
-/// contiguous 1-indexed sequence. Persisted message `seq` values are the global
-/// `agent_events.seq` assigned to each `MessageEnd`, so non-message durable
-/// events (lifecycle/tool events) create gaps. This validator only enforces:
+/// Persisted message `seq` values are the global `agent_events.seq` assigned to
+/// each `MessageEnd`, so non-message durable events create gaps. This validator
+/// enforces:
 ///
-/// 1. Persisted messages are strictly increasing (no duplicates or reordering).
-/// 2. Any synthetic messages appear only before the first persisted message.
-/// 3. `coverage` identifies one of the persisted messages. It is the global
-///    event sequence of the last transcript message replaced by the window,
-///    not an arbitrary event sequence between two messages.
+/// 1. Persisted messages are strictly increasing with positive `seq`.
+/// 2. Synthetic messages may appear only before the first persisted message.
+/// 3. If `coverage` is `Some(seq)`, that `seq` must identify one of the persisted
+///    messages — it is the global event sequence of the last transcript message
+///    replaced by the window.
 ///
-/// The covered prefix and the suffix are therefore coherent even when `seq`
-/// values are not contiguous.
-pub fn validate_native_suffix_for_hydration(
+/// Returns the maximum persisted `seq` when at least one persisted message
+/// exists and validation succeeds. Returns `None` only when `coverage` is
+/// `None` and there are no persisted messages, so callers that only need
+/// coverage can treat that as "no persisted history".
+pub fn validate_native_suffix(
     messages: &[ContextMessage],
-    coverage: u64,
-) -> Result<(), String> {
-    let mut persisted_started = false;
+    coverage: Option<u64>,
+) -> Result<Option<u64>, String> {
     let mut previous: Option<u64> = None;
+    let mut persisted_started = false;
     let mut coverage_seen = false;
     for message in messages {
         let ContextMessage::Persisted { seq, .. } = message else {
@@ -965,21 +916,34 @@ pub fn validate_native_suffix_for_hydration(
         };
         persisted_started = true;
         if *seq == 0 {
-            return Err("native replay sequence must not contain seq 0".into());
+            return Err("persisted native replay sequence must be greater than zero".into());
         }
         if previous.is_some_and(|value: u64| value >= *seq) {
             return Err(
                 "persisted native replay sequence is duplicated, reordered, or not strictly increasing".into(),
             );
         }
-        coverage_seen |= *seq == coverage;
+        if coverage.is_some_and(|value| value == *seq) {
+            coverage_seen = true;
+        }
         previous = Some(*seq);
     }
-    previous.ok_or("native compaction requires persisted replay history")?;
-    if !coverage_seen {
+    if coverage.is_some() && !coverage_seen {
         return Err("native compaction coverage does not identify a persisted message".into());
     }
-    Ok(())
+    Ok(previous)
+}
+
+/// Hydration alias for [`validate_native_suffix`].
+///
+/// This is a convenience wrapper that retains the old `coverage: u64` signature
+/// used by T17 hydration; it returns the maximum persisted `seq` on success.
+pub fn validate_native_suffix_for_hydration(
+    messages: &[ContextMessage],
+    coverage: u64,
+) -> Result<u64, String> {
+    validate_native_suffix(messages, Some(coverage))?
+        .ok_or_else(|| "native compaction requires persisted replay history".into())
 }
 
 #[cfg(test)]
@@ -1800,48 +1764,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_native_suffix_rejects_first_persisted_seq_not_one() {
-        let messages = vec![
-            ContextMessage::Persisted {
-                id: "m-2".to_owned(),
-                seq: 2,
-                message: Message::Assistant(assistant_message()),
-            },
-            ContextMessage::Persisted {
-                id: "m-3".to_owned(),
-                seq: 3,
-                message: Message::Assistant(assistant_message()),
-            },
-        ];
-        let error = validate_native_suffix(&messages, 1).expect_err("seq 2 start must fail");
-        assert!(
-            error.contains("must start at seq 1"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn validate_native_suffix_accepts_leading_synthetic_then_seq_one() {
-        let messages = vec![
-            ContextMessage::Synthetic {
-                message: Message::Assistant(assistant_message()),
-            },
-            ContextMessage::Persisted {
-                id: "m-1".to_owned(),
-                seq: 1,
-                message: Message::Assistant(assistant_message()),
-            },
-            ContextMessage::Persisted {
-                id: "m-2".to_owned(),
-                seq: 2,
-                message: Message::Assistant(assistant_message()),
-            },
-        ];
-        validate_native_suffix(&messages, 1).expect("leading synthetic + seq 1 start must pass");
-    }
-
-    #[test]
-    fn hydration_native_suffix_accepts_global_event_gaps() {
+    fn validate_native_suffix_accepts_gapped_positive_sequences() {
         let messages = vec![
             ContextMessage::Persisted {
                 id: "m-4".to_owned(),
@@ -1854,12 +1777,51 @@ mod tests {
                 message: Message::Assistant(assistant_message()),
             },
         ];
-        validate_native_suffix_for_hydration(&messages, 4)
-            .expect("non-message durable events may create gaps between messages");
+        assert_eq!(
+            validate_native_suffix(&messages, Some(4))
+                .expect("gapped coverage must identify a persisted message"),
+            Some(6)
+        );
+        assert_eq!(
+            validate_native_suffix(&messages, Some(6))
+                .expect("coverage may be the last persisted message"),
+            Some(6)
+        );
+        assert_eq!(
+            validate_native_suffix(&messages, None)
+                .expect("gapped messages without coverage should return max seq"),
+            Some(6)
+        );
     }
 
     #[test]
-    fn hydration_native_suffix_rejects_non_message_coverage_and_reordering() {
+    fn validate_native_suffix_accepts_leading_synthetic_then_positive_seq() {
+        let messages = vec![
+            ContextMessage::Synthetic {
+                message: Message::Assistant(assistant_message()),
+            },
+            ContextMessage::Persisted {
+                id: "m-2".to_owned(),
+                seq: 2,
+                message: Message::Assistant(assistant_message()),
+            },
+            ContextMessage::Persisted {
+                id: "m-5".to_owned(),
+                seq: 5,
+                message: Message::Assistant(assistant_message()),
+            },
+        ];
+        validate_native_suffix(&messages, Some(5))
+            .expect("leading synthetic + gapped persisted must pass");
+    }
+
+    #[test]
+    fn validate_native_suffix_returns_none_when_no_persisted_messages_and_no_coverage() {
+        assert_eq!(validate_native_suffix(&[], None), Ok(None));
+    }
+
+    #[test]
+    fn validate_native_suffix_rejects_invalid_order_and_missing_coverage() {
         let ordered = vec![
             ContextMessage::Persisted {
                 id: "m-4".to_owned(),
@@ -1872,16 +1834,41 @@ mod tests {
                 message: Message::Assistant(assistant_message()),
             },
         ];
-        let error = validate_native_suffix_for_hydration(&ordered, 5)
-            .expect_err("coverage must identify the last covered message");
+        let error = validate_native_suffix(&ordered, Some(5))
+            .expect_err("coverage must identify a persisted message");
         assert!(
             error.contains("does not identify a persisted message"),
             "{error}"
         );
 
         let reordered = vec![ordered[1].clone(), ordered[0].clone()];
-        let error = validate_native_suffix_for_hydration(&reordered, 4)
+        let error = validate_native_suffix(&reordered, Some(4))
             .expect_err("persisted messages must remain ordered");
         assert!(error.contains("reordered"), "{error}");
+
+        let duplicate = vec![
+            ordered[0].clone(),
+            ContextMessage::Persisted {
+                id: "m-4b".to_owned(),
+                seq: 4,
+                message: Message::Assistant(assistant_message()),
+            },
+        ];
+        assert!(validate_native_suffix(&duplicate, Some(4)).is_err());
+
+        let seq_zero = vec![ContextMessage::Persisted {
+            id: "m-0".to_owned(),
+            seq: 0,
+            message: Message::Assistant(assistant_message()),
+        }];
+        assert!(validate_native_suffix(&seq_zero, Some(0)).is_err());
+
+        let synthetic_after_persisted = vec![
+            ordered[0].clone(),
+            ContextMessage::Synthetic {
+                message: Message::Assistant(assistant_message()),
+            },
+        ];
+        assert!(validate_native_suffix(&synthetic_after_persisted, Some(4)).is_err());
     }
 }

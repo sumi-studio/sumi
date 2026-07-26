@@ -748,8 +748,12 @@ fn validate_native_replay(
             "native compaction context fingerprint mismatch".into(),
         ));
     }
-    crate::provider::types::validate_native_suffix(&context.messages, coverage.through_message_seq)
-        .map_err(AnthropicAdapterError::InvalidContext)
+    crate::provider::types::validate_native_suffix(
+        &context.messages,
+        Some(coverage.through_message_seq),
+    )
+    .map(|_| ())
+    .map_err(AnthropicAdapterError::InvalidContext)
 }
 
 fn anthropic_user_content(content: &UserContent, supports_images: bool) -> Value {
@@ -1974,40 +1978,17 @@ pub fn request_coverage(
     if !ensure_anthropic_spec(spec)?.supports_native_compact || !native_compaction {
         return Ok(None);
     }
-    let mut previous: Option<u64> = None;
-    let mut persisted_started = false;
-    for message in &context.messages {
-        let ContextMessage::Persisted { seq, .. } = message else {
-            if persisted_started {
-                return Err(AnthropicAdapterError::InvalidContext(
-                    "native compaction requires persisted messages to form a trailing suffix"
-                        .into(),
-                ));
-            }
-            continue;
-        };
-        persisted_started = true;
-        if *seq == 0 {
-            return Err(AnthropicAdapterError::InvalidContext(
-                "persisted message sequence must be greater than zero".into(),
-            ));
-        }
-        if let Some(previous) = previous
-            && previous.checked_add(1) != Some(*seq)
-        {
-            return Err(AnthropicAdapterError::InvalidContext(
-                "persisted message sequence is duplicated, nonmonotonic, or gapped".into(),
-            ));
-        }
-        previous = Some(*seq);
-    }
-    Ok(
-        previous.map(|through_message_seq| NativeCompactionCoverage {
-            through_message_seq,
-            context_fingerprint: context_fingerprint(spec, context)
-                .expect("spec was validated above"),
-        }),
-    )
+    let Some(through_message_seq) =
+        crate::provider::types::validate_native_suffix(&context.messages, None)
+            .map_err(AnthropicAdapterError::InvalidContext)?
+    else {
+        return Ok(None);
+    };
+    let context_fingerprint = context_fingerprint(spec, context).expect("spec was validated above");
+    Ok(Some(NativeCompactionCoverage {
+        through_message_seq,
+        context_fingerprint,
+    }))
 }
 
 #[cfg(test)]
@@ -2953,6 +2934,93 @@ mod tests {
     }
 
     #[test]
+    fn native_compaction_replays_gapped_persisted_suffix() {
+        let spec = spec();
+        let mut context = context(vec![
+            ContextMessage::Persisted {
+                id: "old".into(),
+                seq: 1,
+                message: Message::User(UserMessage {
+                    content: vec![UserContent::Text {
+                        text: "old-prefix".into(),
+                    }],
+                    timestamp: timestamp(),
+                }),
+            },
+            ContextMessage::Persisted {
+                id: "compacted-response".into(),
+                seq: 3,
+                message: Message::Assistant(AssistantMessage {
+                    content: vec![AssistantContent::Text {
+                        text: "assistant-suffix-marker".into(),
+                        wire_item_index: 1,
+                    }],
+                    model: spec.id.clone(),
+                    provider: spec.provider.clone(),
+                    origin: spec.origin(),
+                    usage: Usage::default(),
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                    provider_code: None,
+                    interrupted: false,
+                    timestamp: timestamp(),
+                }),
+            },
+            ContextMessage::Persisted {
+                id: "new".into(),
+                seq: 5,
+                message: Message::User(UserMessage {
+                    content: vec![UserContent::Text {
+                        text: "suffix-marker".into(),
+                    }],
+                    timestamp: timestamp(),
+                }),
+            },
+        ]);
+        let coverage = NativeCompactionCoverage {
+            through_message_seq: 1,
+            context_fingerprint: context_fingerprint(&spec, &context).unwrap(),
+        };
+        context.provider_context.push(ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
+            payload: ProviderContextPayload::AnthropicCompaction {
+                block: json!({"type":"compaction","content":"opaque-compact"}),
+                coverage: coverage.clone(),
+            },
+        });
+        let request = build_request(
+            &spec,
+            &context,
+            &RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
+        )
+        .expect("native request with gapped suffix");
+        let serialized = serde_json::to_string(&request).unwrap();
+        assert!(!serialized.contains("old-prefix"));
+        assert!(serialized.contains("assistant-suffix-marker"));
+        assert!(serialized.contains("suffix-marker"));
+        assert!(serialized.contains("opaque-compact"));
+        assert_eq!(
+            request["context_management"],
+            json!({"edits":[{"type":"compact_20260112"}]})
+        );
+        assert_eq!(request["messages"][0]["role"], "assistant");
+        assert_eq!(
+            request["messages"][0]["content"],
+            json!([
+                {"type":"compaction","content":"opaque-compact"},
+                {"type":"text","text":"assistant-suffix-marker"},
+            ])
+        );
+        assert_eq!(request["messages"][1]["role"], "user");
+    }
+
+    #[test]
     fn compaction_stop_reason_requires_one_valid_fragment_with_exact_coverage() {
         let coverage = NativeCompactionCoverage {
             through_message_seq: 1,
@@ -3508,7 +3576,7 @@ mod tests {
     }
 
     #[test]
-    fn native_coverage_requires_contiguous_trailing_persisted_suffix() {
+    fn native_coverage_accepts_gapped_trailing_persisted_suffix() {
         let spec = spec();
         let valid = context(vec![
             synthetic(Message::User(UserMessage {
@@ -3516,18 +3584,17 @@ mod tests {
                 timestamp: timestamp(),
             })),
             persisted(7),
-            persisted(8),
+            persisted(9),
         ]);
         assert_eq!(
             request_coverage(&spec, &valid, true)
                 .unwrap()
                 .expect("coverage")
                 .through_message_seq,
-            8
+            9
         );
 
         for messages in [
-            vec![persisted(7), persisted(9)],
             vec![persisted(7), persisted(7)],
             vec![persisted(0)],
             vec![persisted(8), persisted(7)],
