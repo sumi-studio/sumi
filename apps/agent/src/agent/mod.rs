@@ -1433,28 +1433,6 @@ impl<G: Gateway + 'static> Session<G> {
                     .err();
             }
         }
-        let flush_outputs = match active
-            .bridge
-            .flush_pending_approval_resolved(&self.writer)
-            .await
-        {
-            Ok(outputs) => outputs,
-            Err(error) => {
-                self.durable_core_invalidated = true;
-                return Err(error.into());
-            }
-        };
-        if deliver && delivery_failure.is_none() && !flush_outputs.is_empty() {
-            let terminal_command_ids = active.bridge.take_terminal_command_ids();
-            delivery_failure = self
-                .send_committed(
-                    flush_outputs,
-                    Some(active.bridge.command_id().to_owned()),
-                    terminal_command_ids,
-                )
-                .await
-                .err();
-        }
         Ok(delivery_failure)
     }
 

@@ -9332,8 +9332,10 @@ async fn apply_tool_mutation(
             executor_generation,
             idempotency_key,
         } => {
+            // `INSERT OR IGNORE` makes Prepare idempotent across replayed
+            // assistant recovery: the same tool_call_id may already be prepared.
             sqlx::query(
-                "INSERT INTO tool_executions(
+                "INSERT OR IGNORE INTO tool_executions(
                     tool_call_id, command_id, run_id, executor_generation, state,
                     idempotency_key, started_at, finished_at, error_code
                  ) VALUES(?, ?, ?, ?, 'prepared', ?, NULL, NULL, NULL)",
@@ -9457,8 +9459,10 @@ async fn apply_approval_mutation(
             .ok_or_else(|| {
                 anyhow!("Approval Pending requires its same-batch writer-generated request")
             })?;
+            // `INSERT OR IGNORE` makes Pending idempotent across replayed
+            // assistant recovery: the same request_id may already be pending.
             sqlx::query(
-                "INSERT INTO approval_log(
+                "INSERT OR IGNORE INTO approval_log(
                     id, tool_call_id, run_id, turn_id, state, request_projection,
                     redaction_version, created_at, decided_at
                  ) VALUES(?, ?, ?, ?, 'pending', ?, ?, ?, NULL)",
@@ -9533,7 +9537,10 @@ mod tests {
             AdmittedCommand, DurableRunBinding, ProjectedProviderEvent, ProviderEventProjector,
             ProviderTerminalKind, SteerGroup, steer_group_injection_batch,
         },
-        gateway::{Command, CommandEnvelope, CommandId, SensitiveCommandPayload},
+        gateway::{
+            ApprovalDecision, Command, CommandEnvelope, CommandId, DeferredApprovalRule,
+            SensitiveCommandPayload,
+        },
         provider::types::{
             ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, Message,
             NativeCompactionCoverage, ProviderContextFragment, ProviderContextPayload,
@@ -18323,6 +18330,84 @@ mod tests {
             .await
             .expect_err("tampered durable command must not resolve approval");
         assert!(format!("{tampered:#}").contains("HMAC"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_approval_rule_id_in_one_batch_is_rejected() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let run_id = "run-dup-rule";
+        seed_pending_approval(&store, &writer, "request-dup-1", "tool-dup-1", run_id).await;
+        seed_pending_approval(&store, &writer, "request-dup-2", "tool-dup-2", run_id).await;
+
+        let rule_value = json!({
+            "id": "rule-dup",
+            "tool": "bash",
+            "literal_prefix": ["git", "status"],
+            "effect": "allow",
+            "workspace_only": true,
+            "allowed_permissions": ["exec"],
+            "allowed_network_domains": []
+        });
+        let decision = ApprovalDecision::ApproveAlways {
+            rule: serde_json::from_value::<DeferredApprovalRule>(rule_value.clone())
+                .expect("deferred rule"),
+        };
+        writer
+            .persist_inbound(&approval_command_with_decision(
+                2,
+                "00000000-0000-4000-8000-000000000200",
+                "request-dup-1",
+                decision.clone(),
+            ))
+            .await
+            .expect("persist first approval command");
+        writer
+            .persist_inbound(&approval_command_with_decision(
+                3,
+                "00000000-0000-4000-8000-000000000201",
+                "request-dup-2",
+                decision,
+            ))
+            .await
+            .expect("persist second approval command");
+
+        let mut write1 = approval_resolution_write(
+            "request-dup-1",
+            "approved_always",
+            "user-dup",
+            Some(("00000000-0000-4000-8000-000000000200", 2, run_id)),
+        );
+        write1
+            .projections
+            .push(Projection::ApprovalRule(ApprovalRuleMutation {
+                id: "rule-dup".to_owned(),
+                tool: "bash".to_owned(),
+                pattern: rule_value.to_string(),
+            }));
+
+        let mut write2 = approval_resolution_write(
+            "request-dup-2",
+            "approved_always",
+            "user-dup",
+            Some(("00000000-0000-4000-8000-000000000201", 3, run_id)),
+        );
+        write2
+            .projections
+            .push(Projection::ApprovalRule(ApprovalRuleMutation {
+                id: "rule-dup".to_owned(),
+                tool: "bash".to_owned(),
+                pattern: rule_value.to_string(),
+            }));
+
+        let error = writer
+            .apply(EventBatch {
+                writes: vec![write1, write2],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("duplicate approval rule id in one batch must fail");
+        assert!(error.to_string().contains("duplicate approval rule insert"));
     }
 
     #[tokio::test]

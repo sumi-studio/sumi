@@ -1011,10 +1011,13 @@ mod tests {
     use std::sync::Arc;
 
     use anyhow::{Result, bail};
+    use serde_json::json;
 
     use super::*;
     use crate::{
-        gateway::{ApprovalDecision, Command, CommandEnvelope, InboundCommand},
+        gateway::{
+            ApprovalDecision, Command, CommandEnvelope, DeferredApprovalRule, InboundCommand,
+        },
         store::{
             AgentScope, DurableEvent, EventBatch, EventWrite, EventWriter, Projection,
             crypto::{DATA_KEY_BYTES, WrappingKey},
@@ -1498,6 +1501,142 @@ mod tests {
                 .expect("command row")
                 .status,
             crate::gateway::CommandAckStatus::Applied
+        );
+    }
+
+    #[tokio::test]
+    async fn t12_prefix_preserves_pending_approved_once_for_recovery() {
+        let (store, writer) = setup().await;
+        let command_id = "00000000-0000-4000-8000-000000000002";
+        writer
+            .persist_inbound(&InboundCommand::Valid(CommandEnvelope {
+                seq: 1,
+                command_id: crate::gateway::CommandId::parse(command_id).expect("command ID"),
+                command: Command::ApprovalDecision {
+                    request_id: "request-approve-once".to_owned(),
+                    decision: ApprovalDecision::ApproveOnce,
+                },
+            }))
+            .await
+            .expect("persist ApproveOnce decision before simulated restart");
+
+        // Simulate a crash where the approval decision was received but the
+        // tool was never started: approval_log is still pending and the command
+        // must not be silently applied as a no-op.
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO approval_log
+             (id, tool_call_id, run_id, turn_id, state, request_projection, redaction_version, created_at)
+             VALUES (?, ?, ?, ?, 'pending', '{}', 1, ?)",
+        )
+        .bind("request-approve-once")
+        .bind("tool-call-once")
+        .bind("run-once")
+        .bind("turn-once")
+        .bind(now)
+        .execute(store.pool())
+        .await
+        .expect("seed pending approval log");
+
+        let steps = SuffixRecovery::recover_t12_prefix(&store, &writer)
+            .await
+            .expect("plan recovery for pending approved tool");
+        assert_eq!(
+            steps.len(),
+            1,
+            "pending approval must produce a recovery step"
+        );
+        assert!(
+            matches!(steps[0], RecoveryStep::ApplyControl { command_id: ref id } if id == command_id),
+            "pending approved decision must return ApplyControl, not no-op: {steps:?}"
+        );
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM inbound_commands WHERE command_id=?")
+                .bind(command_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("command row");
+        assert_eq!(
+            status, "received",
+            "approval decision must remain received while pending"
+        );
+
+        let state: String = sqlx::query_scalar("SELECT state FROM approval_log WHERE id=?")
+            .bind("request-approve-once")
+            .fetch_one(store.pool())
+            .await
+            .expect("approval log row");
+        assert_eq!(
+            state, "pending",
+            "approval log must remain pending for recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn t12_prefix_preserves_pending_approved_always_for_recovery() {
+        let (store, writer) = setup().await;
+        let command_id = "00000000-0000-4000-8000-000000000003";
+        let rule = json!({
+            "id": "rule-fixture-always",
+            "tool": "bash",
+            "literal_prefix": ["git", "status"],
+            "effect": "allow",
+            "workspace_only": true,
+            "allowed_permissions": ["exec"],
+            "allowed_network_domains": []
+        });
+        writer
+            .persist_inbound(&InboundCommand::Valid(CommandEnvelope {
+                seq: 1,
+                command_id: crate::gateway::CommandId::parse(command_id).expect("command ID"),
+                command: Command::ApprovalDecision {
+                    request_id: "request-approve-always".to_owned(),
+                    decision: ApprovalDecision::ApproveAlways {
+                        rule: serde_json::from_value::<DeferredApprovalRule>(rule)
+                            .expect("deferred rule"),
+                    },
+                },
+            }))
+            .await
+            .expect("persist ApproveAlways decision before simulated restart");
+
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO approval_log
+             (id, tool_call_id, run_id, turn_id, state, request_projection, redaction_version, created_at)
+             VALUES (?, ?, ?, ?, 'pending', '{}', 1, ?)",
+        )
+        .bind("request-approve-always")
+        .bind("tool-call-always")
+        .bind("run-always")
+        .bind("turn-always")
+        .bind(now)
+        .execute(store.pool())
+        .await
+        .expect("seed pending approval log");
+
+        let steps = SuffixRecovery::recover_t12_prefix(&store, &writer)
+            .await
+            .expect("plan recovery for pending approved-always tool");
+        assert_eq!(
+            steps.len(),
+            1,
+            "pending approval must produce a recovery step"
+        );
+        assert!(
+            matches!(steps[0], RecoveryStep::ApplyControl { command_id: ref id } if id == command_id),
+            "pending approved-always decision must return ApplyControl, not no-op: {steps:?}"
+        );
+
+        let state: String = sqlx::query_scalar("SELECT state FROM approval_log WHERE id=?")
+            .bind("request-approve-always")
+            .fetch_one(store.pool())
+            .await
+            .expect("approval log row");
+        assert_eq!(
+            state, "pending",
+            "approval log must remain pending for recovery"
         );
     }
 

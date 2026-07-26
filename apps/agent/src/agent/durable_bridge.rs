@@ -1055,8 +1055,10 @@ impl DurableBridge {
                 if self.turn_open {
                     bail!("AgentEnd requires the current TurnEnd to be durable first");
                 }
+                if self.pending_approval_resolved.is_some() {
+                    bail!("AgentEnd cannot commit while an approved tool has not started");
+                }
                 let abort_cutoff = self.phase == RunPhase::CancelRequested;
-                let mut outputs = self.flush_pending_approval_resolved(writer).await?;
                 self.phase = RunPhase::Finished;
                 let mut projections = Vec::with_capacity(2);
                 if abort_cutoff {
@@ -1082,8 +1084,7 @@ impl DurableBridge {
                         AgentEvent::AgentEnd,
                     )
                     .await?;
-                outputs.extend(agent_end_outputs);
-                Ok((outputs, message_receipts))
+                Ok((agent_end_outputs, message_receipts))
             }
             AgentEvent::Steered {
                 mode: super::SteerMode::Hard,
@@ -1751,59 +1752,6 @@ impl DurableBridge {
         Ok((outputs, receipts))
     }
 
-    /// Commit a pending approved resolution that never received its paired
-    /// `ToolExecutionStart`. This can happen when the run ends or the worker
-    /// exits before the approved tool is started; the decision and the
-    /// command that carried it must still become durable.
-    pub(super) async fn flush_pending_approval_resolved(
-        &mut self,
-        writer: &EventWriter,
-    ) -> Result<Vec<CommittedOutput>> {
-        let Some((request_id, resolution, command)) = self.pending_approval_resolved.take() else {
-            return Ok(Vec::new());
-        };
-        let state = approval_state(&resolution);
-        let command_id = command.envelope().command_id.to_string();
-        let command_seq = command.envelope().seq;
-        let run_id = self.binding.run_id.clone();
-        self.committed_terminal_command_ids.push(command_id.clone());
-        let public_resolution = resolution.clone();
-        let mut projections = vec![
-            Projection::Approval(ApprovalMutation::Resolve {
-                request_id: request_id.clone(),
-                state,
-                actor: "user".to_owned(),
-            }),
-            Projection::CommandApplied {
-                command_id,
-                command_seq,
-                run_id: Some(run_id),
-            },
-        ];
-        if let Some(rule) = approval_rule_projection(&public_resolution)? {
-            projections.push(Projection::ApprovalRule(rule));
-        }
-        self.commit_batch(
-            writer,
-            EventBatch {
-                writes: vec![EventWrite {
-                    event: Some(DurableEvent::approval_resolved(
-                        request_id.clone(),
-                        resolution,
-                        "user".to_owned(),
-                    )?),
-                    projections,
-                }],
-                injected_commands: Vec::new(),
-            },
-            vec![AgentEvent::ApprovalResolved {
-                request_id,
-                resolution: public_resolution,
-            }],
-        )
-        .await
-    }
-
     fn transition(&mut self, expected: RunPhase, next: RunPhase) -> Result<Projection> {
         if self.phase != expected {
             bail!(
@@ -2276,7 +2224,8 @@ mod tests {
     use super::*;
 
     use crate::{
-        gateway::{Command, CommandEnvelope, CommandId, InboundCommand},
+        agent::{AdmittedCommand, events::ApprovalResolution},
+        gateway::{ApprovalDecision, Command, CommandEnvelope, CommandId, InboundCommand},
         provider::types::{
             PublicAssistantContent, PublicAssistantMessage, PublicMessage, StopReason, ToolCall,
             ToolResultMessage, UserContent, UserMessage, ValidatedToolArguments,
@@ -3707,5 +3656,50 @@ mod tests {
         assert!(!bridge.pending_steer_collecting);
         assert!(bridge.pending_steer_messages.is_empty());
         assert!(bridge.pending_steer_open_start.is_none());
+    }
+
+    #[tokio::test]
+    async fn agent_end_rejects_pending_approved_resolution_without_tool_start() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let (binding, _) = owner_in_phase(
+            &store,
+            &writer,
+            "00000000-0000-4000-8000-000000000001",
+            "run-pending",
+            "turn-1",
+            RunPhase::AssistantStarted,
+        )
+        .await;
+        let mut bridge = DurableBridge::new(binding);
+
+        let decision_command = AdmittedCommand::new(
+            CommandEnvelope {
+                seq: 2,
+                command_id: CommandId::parse("00000000-0000-4000-8000-000000000002")
+                    .expect("canonical test UUID"),
+                command: Command::ApprovalDecision {
+                    request_id: "request-1".to_owned(),
+                    decision: ApprovalDecision::ApproveOnce,
+                },
+            },
+            test_timestamp(),
+        );
+        bridge.pending_approval_resolved = Some((
+            "request-1".to_owned(),
+            ApprovalResolution::Decision(ApprovalDecision::ApproveOnce),
+            decision_command,
+        ));
+
+        let result = bridge
+            .commit(
+                &writer,
+                RunOutput::detached(bridge.binding.clone(), AgentEvent::AgentEnd, None),
+            )
+            .await;
+        assert!(
+            result.is_err_and(|e| e.to_string().contains("approved tool has not started")),
+            "AgentEnd must not commit an approved decision before ToolExecutionStart"
+        );
     }
 }

@@ -313,6 +313,9 @@ impl ApprovalBroker {
             let mut guard = self.policy.write().unwrap_or_else(|e| e.into_inner());
             if let Ok(new_policy) = guard.clone().try_with_rule(rule.clone()) {
                 *guard = new_policy;
+                if let Some(reviewer) = self.reviewer.as_ref() {
+                    reviewer.clear_allow_cache();
+                }
             } else {
                 // The candidate rule cannot be safely persisted; never claim an
                 // `ApproveAlways` decision that would not actually be durable.
@@ -597,16 +600,20 @@ fn to_events_projection(
 mod tests {
     use async_trait::async_trait;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio_util::sync::CancellationToken;
 
     use super::*;
     use crate::{
         approval::{
-            action::SecretDigestKey,
-            prompt::ReviewerPrompt,
+            action::{
+                Permission, ReviewPath, ReviewPathComponent, ReviewProjection, ReviewToken,
+                ReviewableAction, SandboxSummary, SecretDigestKey,
+            },
+            prompt::{ReviewerPrompt, TrustedEnvironment},
             reviewer::{
-                Reviewer, ReviewerModelSpec, ReviewerTransport, ReviewerTransportError,
-                ReviewerTrustSet,
+                ReviewRequest, Reviewer, ReviewerMode, ReviewerModelSpec, ReviewerTransport,
+                ReviewerTransportError, ReviewerTrustSet,
             },
         },
         gateway::ApprovalDecision as GatewayApprovalDecision,
@@ -664,6 +671,28 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct CountingTransport {
+        response: String,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ReviewerTransport for CountingTransport {
+        async fn complete(
+            &self,
+            _prompt: &ReviewerPrompt,
+            _cancel: CancellationToken,
+        ) -> Result<String, ReviewerTransportError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.response.clone())
+        }
+    }
+
+    fn allow_json() -> String {
+        r#"{"outcome":"allow","risk":"low","authorization":"low","rationale":"ok"}"#.to_owned()
+    }
+
     fn reviewer_broker(response: &str, mode: ReviewerMode) -> ApprovalBroker {
         let model = ReviewerModelSpec::new(
             "reviewer-model",
@@ -691,6 +720,70 @@ mod tests {
             false,
             trusted_env(),
         )
+    }
+
+    fn broker_with_counting_reviewer() -> (ApprovalBroker, Arc<Reviewer>, Arc<AtomicUsize>) {
+        let model = ReviewerModelSpec::new(
+            "reviewer-model",
+            "reviewer-provider",
+            "https://reviewer.example.test/v1",
+            "default",
+            "reviewer-domain",
+            "tenant-policy",
+        );
+        let trust = ReviewerTrustSet::new("reviewer-domain", Vec::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let transport = Arc::new(CountingTransport {
+            response: allow_json(),
+            calls: calls.clone(),
+        });
+        let reviewer = Arc::new(Reviewer::new(
+            model,
+            trust,
+            transport,
+            Arc::new(projector()),
+        ));
+        let broker = ApprovalBroker::new(
+            Policy::new("/workspace"),
+            projector(),
+            Some(reviewer.clone()),
+            ReviewerMode::User,
+            false,
+            trusted_env(),
+        );
+        (broker, reviewer, calls)
+    }
+
+    fn git_status_review_request(policy_hash: &str, context_version: &str) -> ReviewRequest {
+        let projection = ReviewProjection::Reviewable(ReviewableAction {
+            tool: "bash".to_owned(),
+            operation: "exec".to_owned(),
+            argv: vec![
+                ReviewToken::Literal {
+                    text: "git".to_owned(),
+                },
+                ReviewToken::Literal {
+                    text: "status".to_owned(),
+                },
+            ],
+            cwd: ReviewPath(vec![ReviewPathComponent::Literal {
+                text: "/workspace".to_owned(),
+            }]),
+            affected_paths: Vec::new(),
+            sandbox: SandboxSummary::workspace(),
+            requested_permissions: vec![Permission::Exec],
+            justification: None,
+        });
+        ReviewRequest {
+            mode: ReviewerMode::AutoReview,
+            projection,
+            transcript: Vec::new(),
+            trusted_environment: trusted_env(),
+            policy_hash: policy_hash.to_owned(),
+            context_version: context_version.to_owned(),
+            run_id: "run-1".to_owned(),
+            turn_id: Some("turn-1".to_owned()),
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -944,6 +1037,150 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn approve_always_with_duplicate_rule_id_downgrades_to_once() {
+        // Seed a policy that already contains a rule with id "rule-git-status".
+        let base_rule = ApprovalRule {
+            id: "rule-git-status".to_owned(),
+            tool: "bash".to_owned(),
+            literal_prefix: vec!["git".to_owned(), "status".to_owned()],
+            effect: crate::approval::policy::RuleEffect::Allow,
+            workspace_only: true,
+            allowed_permissions: vec![crate::approval::action::Permission::Exec],
+            allowed_network_domains: vec![],
+        };
+        let policy = Policy::new("/workspace")
+            .try_with_rule(base_rule)
+            .expect("valid base rule");
+        let mut broker = ApprovalBroker::headless(policy, projector());
+        broker.headless = false;
+
+        // A different action (git log) still requires user approval. The gateway
+        // could return an ApproveAlways decision whose rule id collides with the
+        // existing rule; the broker must downgrade to ApproveOnce.
+        let call = bash_call("git log");
+        let first = broker
+            .start_request(
+                &call,
+                &[],
+                "run-1",
+                "turn-1",
+                "v1",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("start_request");
+        let ApprovalOutcome::Pending {
+            pending: first_pending,
+        } = first
+        else {
+            panic!("expected pending");
+        };
+        let first_rule = serde_json::from_value::<crate::gateway::DeferredApprovalRule>(json!({
+            "id": "rule-git-status",
+            "tool": "bash",
+            "literal_prefix": ["git", "log"],
+            "effect": "allow",
+            "workspace_only": true,
+            "allowed_permissions": ["exec"],
+            "allowed_network_domains": []
+        }))
+        .expect("deferred rule");
+        let first_resolved = broker
+            .resolve(
+                &first_pending.request().id,
+                &GatewayApprovalDecision::ApproveAlways { rule: first_rule },
+            )
+            .expect("resolve pending");
+        assert!(
+            matches!(first_resolved, ResolvedDecision::ApproveOnce),
+            "duplicate rule id must downgrade to ApproveOnce"
+        );
+        // The policy still contains only one rule.
+        assert_eq!(
+            broker
+                .policy
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .rules()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn approve_always_clears_reviewer_allow_cache() {
+        let (mut broker, reviewer, calls) = broker_with_counting_reviewer();
+        broker.headless = false;
+
+        let call = bash_call("git status");
+        // Prime the reviewer allow cache with a decision for the current policy.
+        let policy_hash = {
+            let policy = broker
+                .policy
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            policy.hash()
+        };
+        let cache_request = git_status_review_request(&policy_hash, "v1");
+        let outcome = reviewer
+            .review(cache_request.clone(), CancellationToken::new())
+            .await;
+        assert!(matches!(outcome, ReviewOutcome::Allow(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(reviewer.allow_cache_entry_count(), 1);
+
+        // Now start a pending request in User mode and resolve it ApproveAlways.
+        let pending = broker
+            .start_request(
+                &call,
+                &[],
+                "run-1",
+                "turn-1",
+                "v1",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("start_request");
+        let ApprovalOutcome::Pending {
+            pending: pending_entry,
+        } = pending
+        else {
+            panic!("expected pending");
+        };
+        let request = pending_entry.request().clone();
+        let rule = serde_json::from_value::<crate::gateway::DeferredApprovalRule>(json!({
+            "id": "rule-git-status",
+            "tool": "bash",
+            "literal_prefix": ["git", "status"],
+            "effect": "allow",
+            "workspace_only": true,
+            "allowed_permissions": ["exec"],
+            "allowed_network_domains": []
+        }))
+        .expect("deferred rule");
+        let resolved = broker
+            .resolve(
+                &request.id,
+                &GatewayApprovalDecision::ApproveAlways { rule },
+            )
+            .expect("resolve pending");
+        assert!(matches!(resolved, ResolvedDecision::ApproveAlways(_)));
+
+        // The broker must have cleared the reviewer allow cache when it mutated
+        // the durable policy.
+        assert_eq!(reviewer.allow_cache_entry_count(), 0);
+
+        // Re-reviewing the same cached request after a policy mutation should
+        // hit the model again (cache was cleared).
+        let re_review = reviewer
+            .review(cache_request, CancellationToken::new())
+            .await;
+        assert!(matches!(re_review, ReviewOutcome::Allow(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn critical_allow_with_unknown_auth_is_denied() {
         let broker = reviewer_broker(
             r#"{"outcome":"allow","risk":"critical","authorization":"unknown","rationale":"user allowed"}"#,
@@ -1071,9 +1308,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn low_allow_with_unknown_auth_remains_allowed() {
+    async fn low_allow_with_low_auth_remains_allowed() {
         let broker = reviewer_broker(
-            r#"{"outcome":"allow","risk":"low","authorization":"unknown","rationale":"harmless"}"#,
+            r#"{"outcome":"allow","risk":"low","authorization":"low","rationale":"harmless"}"#,
             ReviewerMode::StrictAutoReview,
         );
         let outcome = broker

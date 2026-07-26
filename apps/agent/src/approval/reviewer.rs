@@ -120,6 +120,17 @@ pub enum RiskLevel {
     Critical,
 }
 
+impl RiskLevel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RiskLevel::Low => "low",
+            RiskLevel::Medium => "medium",
+            RiskLevel::High => "high",
+            RiskLevel::Critical => "critical",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UserAuthorization {
@@ -127,6 +138,26 @@ pub enum UserAuthorization {
     Low,
     Medium,
     High,
+}
+
+impl UserAuthorization {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UserAuthorization::Unknown => "unknown",
+            UserAuthorization::Low => "low",
+            UserAuthorization::Medium => "medium",
+            UserAuthorization::High => "high",
+        }
+    }
+
+    fn rank(&self) -> u8 {
+        match self {
+            UserAuthorization::Unknown => 0,
+            UserAuthorization::Low => 1,
+            UserAuthorization::Medium => 2,
+            UserAuthorization::High => 3,
+        }
+    }
 }
 
 /// Strict review response. `deny_unknown_fields` rejects extra keys, and
@@ -305,6 +336,10 @@ impl AllowCache {
             );
         }
     }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
 }
 
 impl Default for AllowCache {
@@ -403,6 +438,25 @@ impl Reviewer {
     /// called without triggering a manual/headless block.
     pub fn is_trusted(&self) -> bool {
         self.trust_set.allows(&self.model)
+    }
+
+    /// Clear the allow cache. The broker must call this whenever the durable
+    /// policy is mutated, because cached allow decisions may no longer match
+    /// the new policy_hash.
+    pub fn clear_allow_cache(&self) {
+        self.allow_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    #[cfg(test)]
+    pub fn allow_cache_entry_count(&self) -> usize {
+        self.allow_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .len()
     }
 
     pub async fn review(&self, request: ReviewRequest, cancel: CancellationToken) -> ReviewOutcome {
@@ -559,12 +613,59 @@ impl Reviewer {
             .record(outcome);
     }
 
+    /// Fail-closed guard: a reviewer may return `allow`, but the policy does
+    /// not permit an allow unless the declared risk and explicit user
+    /// authorization are sufficient. Critical risk is never allowed; High risk
+    /// requires High authorization; each lower risk requires at least the
+    /// matching authorization level; Unknown authorization is never sufficient.
+    fn guard_allow(&self, decision: AuditDecision) -> AuditDecision {
+        if decision.outcome == AuditOutcome::Deny {
+            return decision;
+        }
+        let required_rank = match decision.risk {
+            RiskLevel::Critical => {
+                return AuditDecision {
+                    outcome: AuditOutcome::Deny,
+                    risk: decision.risk,
+                    authorization: decision.authorization,
+                    rationale: format!(
+                        "reviewer returned allow with {} risk; critical risk is always denied",
+                        decision.risk.as_str()
+                    ),
+                };
+            }
+            RiskLevel::High => UserAuthorization::High.rank(),
+            RiskLevel::Medium => UserAuthorization::Medium.rank(),
+            RiskLevel::Low => UserAuthorization::Low.rank(),
+        };
+        if decision.authorization.rank() < required_rank {
+            return AuditDecision {
+                outcome: AuditOutcome::Deny,
+                risk: decision.risk,
+                authorization: decision.authorization,
+                rationale: format!(
+                    "reviewer returned allow with {} risk and {} authorization; {} authorization is required",
+                    decision.risk.as_str(),
+                    decision.authorization.as_str(),
+                    match decision.risk {
+                        RiskLevel::High => "high",
+                        RiskLevel::Medium => "medium or higher",
+                        RiskLevel::Low => "low or higher",
+                        RiskLevel::Critical => unreachable!(),
+                    }
+                ),
+            };
+        }
+        decision
+    }
+
     fn return_decision(
         &self,
         decision: AuditDecision,
         projection_hash: &str,
         request: &ReviewRequest,
     ) -> ReviewOutcome {
+        let decision = self.guard_allow(decision);
         self.record_outcome(&request.run_id, decision.outcome);
         match decision.outcome {
             AuditOutcome::Allow => {
@@ -743,6 +844,16 @@ mod tests {
         json!({"outcome": "allow", "risk": "low", "authorization": "high", "rationale": "user explicitly requested"}).to_string()
     }
 
+    fn allow_json_with(risk: &str, authorization: &str) -> String {
+        json!({
+            "outcome": "allow",
+            "risk": risk,
+            "authorization": authorization,
+            "rationale": "user explicitly requested"
+        })
+        .to_string()
+    }
+
     fn deny_json() -> String {
         json!({"outcome": "deny", "risk": "high", "authorization": "low", "rationale": "no explicit authorization"}).to_string()
     }
@@ -846,6 +957,59 @@ mod tests {
             .await;
         assert!(matches!(outcome, ReviewOutcome::Allow(_)));
         assert_eq!(fake.called_count(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn allow_with_insufficient_authorization_is_fail_closed_denied() {
+        let cases = vec![
+            ("critical", "high"),
+            ("high", "unknown"),
+            ("high", "low"),
+            ("high", "medium"),
+            ("medium", "unknown"),
+            ("medium", "low"),
+            ("low", "unknown"),
+        ];
+        for (risk, auth) in cases {
+            let fake = FakeTransport::sequence(vec![Ok(allow_json_with(risk, auth))]);
+            let reviewer = make_reviewer(fake);
+            let outcome = reviewer
+                .review(
+                    review_request(reviewable_projection()),
+                    CancellationToken::new(),
+                )
+                .await;
+            assert!(
+                matches!(outcome, ReviewOutcome::Deny(ref d) if d.rationale.contains("reviewer returned allow")),
+                "allow with risk={risk} auth={auth} must be denied; got {outcome:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn allow_with_sufficient_authorization_remains_allowed() {
+        let cases = vec![
+            ("low", "low"),
+            ("low", "medium"),
+            ("low", "high"),
+            ("medium", "medium"),
+            ("medium", "high"),
+            ("high", "high"),
+        ];
+        for (risk, auth) in cases {
+            let fake = FakeTransport::sequence(vec![Ok(allow_json_with(risk, auth))]);
+            let reviewer = make_reviewer(fake);
+            let outcome = reviewer
+                .review(
+                    review_request(reviewable_projection()),
+                    CancellationToken::new(),
+                )
+                .await;
+            assert!(
+                matches!(outcome, ReviewOutcome::Allow(_)),
+                "allow with risk={risk} auth={auth} must remain allowed"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1040,6 +1204,23 @@ mod tests {
         let outcome2 = reviewer.review(req, CancellationToken::new()).await;
         assert!(matches!(outcome2, ReviewOutcome::Allow(_)));
         assert_eq!(fake.called_count(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn clear_allow_cache_evicts_cached_allow_and_re_queries_transport() {
+        let fake = FakeTransport::sequence(vec![Ok(allow_json()), Ok(allow_json())]);
+        let reviewer = make_reviewer(fake.clone());
+        let req = review_request(reviewable_projection());
+        let outcome1 = reviewer.review(req.clone(), CancellationToken::new()).await;
+        assert!(matches!(outcome1, ReviewOutcome::Allow(_)));
+        reviewer.clear_allow_cache();
+        let outcome2 = reviewer.review(req, CancellationToken::new()).await;
+        assert!(matches!(outcome2, ReviewOutcome::Allow(_)));
+        assert_eq!(
+            fake.called_count(),
+            2,
+            "clear_allow_cache must force a new review"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

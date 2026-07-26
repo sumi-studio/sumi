@@ -144,9 +144,11 @@ pub enum RuleValidationError {
     BroadPrefix,
     #[error("rule contains secret material and cannot be persisted")]
     SecretMaterial,
+    #[error("a rule with the same id already exists")]
+    DuplicateId,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Policy {
     workspace_root: PathBuf,
     rules: Vec<ApprovalRule>,
@@ -162,6 +164,10 @@ impl Policy {
 
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
+    }
+
+    pub(crate) fn rules(&self) -> &[ApprovalRule] {
+        &self.rules
     }
 
     /// Deterministic hash of the loaded rule set and workspace root. Used as a
@@ -191,9 +197,13 @@ impl Policy {
     }
 
     /// Load `rule` after validating that its literal prefix is narrow enough
-    /// to be safely persisted. Broad or otherwise invalid rules are rejected
-    /// with a typed error rather than silently accepted.
+    /// to be safely persisted and that its `id` is unique within the policy.
+    /// Broad, secret-bearing, or duplicate rules are rejected with a typed
+    /// error rather than silently accepted.
     pub fn try_with_rule(mut self, rule: ApprovalRule) -> Result<Self, RuleValidationError> {
+        if self.rules.iter().any(|r| r.id == rule.id) {
+            return Err(RuleValidationError::DuplicateId);
+        }
         if is_broad_prefix(&rule.literal_prefix) && !is_narrow_network_rule(&rule) {
             return Err(RuleValidationError::BroadPrefix);
         }
@@ -2961,6 +2971,44 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_rule_id_is_rejected_before_durable_insert() {
+        let rule = ApprovalRule {
+            id: "git-status".to_owned(),
+            tool: "bash".to_owned(),
+            literal_prefix: vec!["git".to_owned(), "status".to_owned()],
+            effect: RuleEffect::Allow,
+            workspace_only: true,
+            allowed_permissions: vec![Permission::Exec],
+            allowed_network_domains: vec![],
+        };
+        let p = Policy::new("/workspace")
+            .try_with_rule(rule.clone())
+            .unwrap();
+        assert_eq!(
+            p.try_with_rule(rule.clone()),
+            Err(RuleValidationError::DuplicateId),
+            "duplicate rule id must be rejected before broad-prefix or secret checks"
+        );
+
+        let from_rules = Policy::from_rules(
+            "/workspace",
+            vec![
+                rule.clone(),
+                ApprovalRule {
+                    id: "git-status".to_owned(),
+                    tool: "bash".to_owned(),
+                    literal_prefix: vec!["git".to_owned(), "status".to_owned()],
+                    effect: RuleEffect::Allow,
+                    workspace_only: true,
+                    allowed_permissions: vec![Permission::Exec],
+                    allowed_network_domains: vec![],
+                },
+            ],
+        );
+        assert_eq!(from_rules, Err(RuleValidationError::DuplicateId));
+    }
+
+    #[test]
     fn adversarial_exec_wrapper_and_option_paths() {
         let p = policy();
 
@@ -3571,6 +3619,7 @@ mod tests {
             "git".to_owned(),
             "status".to_owned(),
         ];
+        rule.id = "git-status-exec-named".to_owned();
         let p = p.try_with_rule(rule).unwrap();
         assert!(p.evaluate(&bash("exec -a name git status")).is_allow());
     }
