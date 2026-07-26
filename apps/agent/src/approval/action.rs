@@ -1923,6 +1923,25 @@ pub(crate) mod shell {
         }
     }
 
+    /// Return the body of a literal `( ... )` subshell when the complete
+    /// segment is exactly that construct (optionally preceded by `!`).
+    /// Command substitutions and trailing redirects remain unverifiable.
+    pub(crate) fn literal_subshell_body(raw: &str) -> Option<&str> {
+        let mut candidate = raw.trim();
+        if let Some(rest) = candidate.strip_prefix('!') {
+            candidate = rest.trim_start();
+        }
+        if !candidate.starts_with('(') {
+            return None;
+        }
+        let end = consume_delim(candidate.as_bytes(), 0, b'(', b')')?;
+        if end + 1 != candidate.len() {
+            return None;
+        }
+        let body = candidate[1..end].trim();
+        (!body.is_empty()).then_some(body)
+    }
+
     /// Fail-closed classifier for shell constructs that a literal-prefix policy
     /// cannot prove. Returns `true` for unquoted/unescaped redirection operators
     /// (`>`, `<`), pathname/brace expansion, unmodelled grouping, tilde expansion
