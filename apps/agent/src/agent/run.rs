@@ -447,7 +447,8 @@ impl Runner {
                             .await?
                     } else {
                         self.consecutive_length_batches = 0;
-                        self.execute_calls(&assistant_message_id, &calls).await?
+                        self.execute_calls(&assistant_message_id, &message, &calls)
+                            .await?
                     };
                     if !length_guarded {
                         let mut committed = vec![(receipt, message.clone())];
@@ -1003,8 +1004,16 @@ impl Runner {
     async fn execute_calls(
         &mut self,
         assistant_message_id: &str,
+        assistant_message: &PublicMessage,
         calls: &[ToolCall],
     ) -> Result<(Vec<ToolResultMessage>, Vec<MessageCommitReceipt>), WorkerFailure> {
+        let base_epoch = self.core.mutation_epoch();
+        let mut transcript: Vec<PublicMessage> = self
+            .context
+            .iter()
+            .map(|ctx| message_to_public(context_message(ctx).clone()))
+            .collect();
+        transcript.push(assistant_message.clone());
         let mut results = Vec::with_capacity(calls.len());
         let mut receipts = Vec::with_capacity(calls.len());
         let mut cancelled = false;
@@ -1025,7 +1034,14 @@ impl Runner {
                 results.push(result);
                 continue;
             }
-            match self.evaluate_call(call).await? {
+            let context_version = base_epoch
+                .saturating_add(index as u64)
+                .saturating_add(1)
+                .to_string();
+            match self
+                .evaluate_call(call, &transcript, &context_version)
+                .await?
+            {
                 CallDisposition::Allowed => {
                     self.emit_tool_start_and_wait_committed(call).await?;
                     let result = match self
@@ -1051,14 +1067,17 @@ impl Runner {
                             "Tool execution was cancelled by a user control",
                         ),
                     };
+                    let result_message = PublicMessage::ToolResult(result.clone());
                     receipts.push(self.emit_tool_result(assistant_message_id, &result).await?);
                     results.push(result);
+                    transcript.push(result_message);
                 }
                 CallDisposition::Denied {
                     reason,
                     approval_denied,
                 } => {
                     let result = error_tool_result(call, &reason);
+                    let result_message = PublicMessage::ToolResult(result.clone());
                     receipts.push(
                         self.emit_result_message(
                             assistant_message_id,
@@ -1073,6 +1092,7 @@ impl Runner {
                         })?,
                     );
                     results.push(result);
+                    transcript.push(result_message);
                 }
                 CallDisposition::Pending { mut pending } => {
                     let request = pending.request().clone();
@@ -1136,11 +1156,13 @@ impl Runner {
                                             "Tool execution was cancelled by a user control",
                                         ),
                                     };
+                                    let result_message = PublicMessage::ToolResult(result.clone());
                                     receipts.push(
                                         self.emit_tool_result(assistant_message_id, &result)
                                             .await?,
                                     );
                                     results.push(result);
+                                    transcript.push(result_message);
                                 }
                                 crate::approval::policy::ResolvedDecision::Deny
                                 | crate::approval::policy::ResolvedDecision::Rejected { .. } => {
@@ -1151,6 +1173,7 @@ impl Runner {
                                         _ => "Approval denied".to_owned(),
                                     };
                                     let result = error_tool_result(call, &reason);
+                                    let result_message = PublicMessage::ToolResult(result.clone());
                                     receipts.push(
                                         self.emit_result_message(
                                             assistant_message_id,
@@ -1167,6 +1190,7 @@ impl Runner {
                                         })?,
                                     );
                                     results.push(result);
+                                    transcript.push(result_message);
                                 }
                             }
                         }
@@ -1178,6 +1202,7 @@ impl Runner {
                             .await?;
                             cancelled = true;
                             let result = error_tool_result(call, "Tool execution cancelled");
+                            let result_message = PublicMessage::ToolResult(result.clone());
                             receipts.push(
                                 self.emit_result_message(
                                     assistant_message_id,
@@ -1192,6 +1217,7 @@ impl Runner {
                                 })?,
                             );
                             results.push(result);
+                            transcript.push(result_message);
                         }
                     }
                     self.phase.send(WorkerPhase::Active).ok();
@@ -1220,7 +1246,12 @@ impl Runner {
         Ok((results, receipts))
     }
 
-    async fn evaluate_call(&mut self, call: &ToolCall) -> Result<CallDisposition, WorkerFailure> {
+    async fn evaluate_call(
+        &mut self,
+        call: &ToolCall,
+        transcript: &[PublicMessage],
+        context_version: &str,
+    ) -> Result<CallDisposition, WorkerFailure> {
         let Some(broker) = self.core.approval.clone() else {
             return Ok(CallDisposition::Allowed);
         };
@@ -1229,19 +1260,13 @@ impl Runner {
         })?;
         let run_id = binding.run_id.clone();
         let turn_id = binding.turn_id.clone();
-        let transcript: Vec<PublicMessage> = self
-            .context
-            .iter()
-            .map(|message| message_to_public(context_message(message).clone()))
-            .collect();
-        let context_version = self.core.mutation_epoch().to_string();
-        let review_cancel = CancellationToken::new();
+        let review_cancel = self.cancel.child_token();
         let request = broker.start_request(
             call,
-            &transcript,
+            transcript,
             &run_id,
             &turn_id,
-            &context_version,
+            context_version,
             review_cancel.clone(),
         );
         tokio::pin!(request);
@@ -1255,8 +1280,8 @@ impl Runner {
                 control = self.controls.recv() => {
                     match control {
                         Some(RunControl::SoftSteer { command, accepted, committed }) => {
-                            review_cancel.cancel();
                             if self.accept_steer_control(command, accepted, committed).await? {
+                                review_cancel.cancel();
                                 return Ok(CallDisposition::Denied {
                                     reason: "ユーザーの新しい指示により実行前に取り消された".to_owned(),
                                     approval_denied: false,
@@ -1264,9 +1289,9 @@ impl Runner {
                             }
                         }
                         Some(RunControl::Abort { accepted, committed, .. }) => {
-                            review_cancel.cancel();
                             if self.accept_abort_control(accepted, committed).await? {
                                 self.abort_requested = true;
+                                review_cancel.cancel();
                                 return Ok(CallDisposition::Denied {
                                     reason: "Tool execution was cancelled by a user control".to_owned(),
                                     approval_denied: false,

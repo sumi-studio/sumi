@@ -178,8 +178,32 @@ impl Policy {
         let mut rules: Vec<_> = self.rules.iter().collect();
         // Sort by id so physically different rule orders produce the same hash.
         rules.sort_by(|a, b| a.id.cmp(&b.id));
+
+        // Encode the workspace root using its OS-native path representation so
+        // distinct non-UTF-8 paths cannot collide after to_string_lossy.
+        #[cfg(unix)]
+        let workspace_root = {
+            use std::os::unix::ffi::OsStrExt;
+            self.workspace_root
+                .as_os_str()
+                .as_bytes()
+                .iter()
+                .copied()
+                .map(|b| json!(b))
+                .collect::<Vec<_>>()
+        };
+        #[cfg(windows)]
+        let workspace_root = {
+            use std::os::windows::ffi::OsStrExt;
+            self.workspace_root
+                .as_os_str()
+                .encode_wide()
+                .map(|w| json!(w))
+                .collect::<Vec<_>>()
+        };
+
         let canonical = json!({
-            "workspace_root": self.workspace_root.to_string_lossy(),
+            "workspace_root": workspace_root,
             "rules": rules,
         });
         let bytes = match serde_json::to_vec(&canonical) {
@@ -2994,31 +3018,65 @@ mod tests {
             allowed_permissions: vec![Permission::Exec],
             allowed_network_domains: vec![],
         };
+        let broad_duplicate = ApprovalRule {
+            id: "git-status".to_owned(),
+            tool: "bash".to_owned(),
+            literal_prefix: vec!["ls".to_owned()],
+            effect: RuleEffect::Allow,
+            workspace_only: true,
+            allowed_permissions: vec![Permission::Exec],
+            allowed_network_domains: vec![],
+        };
+        assert_eq!(
+            Policy::new("/workspace").try_with_rule(broad_duplicate.clone()),
+            Err(RuleValidationError::BroadPrefix),
+            "broad-prefix rule must fail broad-prefix validation when it is not a duplicate"
+        );
+
         let p = Policy::new("/workspace")
             .try_with_rule(rule.clone())
             .unwrap();
         assert_eq!(
-            p.try_with_rule(rule.clone()),
+            p.try_with_rule(broad_duplicate.clone()),
             Err(RuleValidationError::DuplicateId),
             "duplicate rule id must be rejected before broad-prefix or secret checks"
         );
 
-        let from_rules = Policy::from_rules(
-            "/workspace",
-            vec![
-                rule.clone(),
-                ApprovalRule {
-                    id: "git-status".to_owned(),
-                    tool: "bash".to_owned(),
-                    literal_prefix: vec!["git".to_owned(), "status".to_owned()],
-                    effect: RuleEffect::Allow,
-                    workspace_only: true,
-                    allowed_permissions: vec![Permission::Exec],
-                    allowed_network_domains: vec![],
-                },
-            ],
-        );
+        let from_rules = Policy::from_rules("/workspace", vec![rule.clone(), broad_duplicate]);
         assert_eq!(from_rules, Err(RuleValidationError::DuplicateId));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn distinct_non_utf8_workspace_roots_produce_distinct_policy_hashes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let rule = ApprovalRule {
+            id: "git-status".to_owned(),
+            tool: "bash".to_owned(),
+            literal_prefix: vec!["git".to_owned(), "status".to_owned()],
+            effect: RuleEffect::Allow,
+            workspace_only: true,
+            allowed_permissions: vec![Permission::Exec],
+            allowed_network_domains: vec![],
+        };
+
+        // 0x80 and 0x81 are both invalid UTF-8 and would map to the same
+        // replacement character under to_string_lossy, but they are distinct
+        // OS-native path representations.
+        let a = Policy::new(PathBuf::from(OsString::from_vec(vec![b'/', 0x80])))
+            .try_with_rule(rule.clone())
+            .unwrap()
+            .hash();
+        let b = Policy::new(PathBuf::from(OsString::from_vec(vec![b'/', 0x81])))
+            .try_with_rule(rule)
+            .unwrap()
+            .hash();
+        assert_ne!(
+            a, b,
+            "distinct non-UTF-8 workspace roots must not share a policy hash"
+        );
     }
 
     #[test]

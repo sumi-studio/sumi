@@ -19,7 +19,7 @@ use crate::{
         ApprovalBroker,
         action::{SandboxSummary, SecretAwareActionProjector, SecretDigestKey},
         policy::Policy,
-        prompt::{ReviewerPrompt, TrustedEnvironment},
+        prompt::{ReviewerPrompt, ReviewerRole, TrustedEnvironment},
         reviewer::{
             Reviewer, ReviewerMode, ReviewerModelSpec, ReviewerTransport, ReviewerTransportError,
             ReviewerTrustSet,
@@ -680,7 +680,7 @@ async fn abort_is_processed_while_reviewer_start_request_is_awaited() {
         arguments: serde_json::from_value(json!({"command": "git status"}))
             .expect("validated arguments"),
     };
-    let task = tokio::spawn(async move { runner.evaluate_call(&call).await });
+    let task = tokio::spawn(async move { runner.evaluate_call(&call, &[], "0").await });
     started.notified().await;
     let (accepted_tx, accepted_rx) = oneshot::channel();
     let (committed_tx, committed_rx) = oneshot::channel();
@@ -783,6 +783,30 @@ async fn run_fixture_with_initial(
     let completion = tokio::spawn(async move {
         worker
             .run(bound_core(1), initial, control_rx, events_tx)
+            .await
+    });
+    let mut events = Vec::new();
+    let mut message_seq = 1;
+    while let Some(mut output) = events_rx.recv().await {
+        resolve_message_output(&mut output, &mut message_seq);
+        if let Some(barrier) = output.commit_barrier.take() {
+            barrier.committed();
+        }
+        events.push(output.event);
+    }
+    (completion.await.expect("worker join"), events)
+}
+
+async fn run_fixture_with_core(
+    driver: Arc<FixtureDriver>,
+    core: RunCore,
+) -> (RunCompletion, Vec<AgentEvent>) {
+    let worker = SequentialRunWorker::new(driver);
+    let (_control_tx, control_rx) = mpsc::channel(8);
+    let (events_tx, mut events_rx) = mpsc::channel(256);
+    let completion = tokio::spawn(async move {
+        worker
+            .run(core, admitted_user(1), control_rx, events_tx)
             .await
     });
     let mut events = Vec::new();
@@ -4097,5 +4121,164 @@ async fn abort_during_retry_wait_reaches_turn_end_and_agent_end() {
         events.last(),
         Some(&AgentEvent::AgentEnd),
         "abort during retry wait must end with AgentEnd: {events:#?}"
+    );
+}
+
+#[derive(Clone)]
+struct RecordingReviewer {
+    prompts: Arc<Mutex<Vec<ReviewerPrompt>>>,
+}
+
+impl RecordingReviewer {
+    fn new() -> Self {
+        Self {
+            prompts: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn prompts(&self) -> Vec<ReviewerPrompt> {
+        self.prompts.lock().expect("prompts").clone()
+    }
+}
+
+#[async_trait]
+impl ReviewerTransport for RecordingReviewer {
+    async fn complete(
+        &self,
+        prompt: &ReviewerPrompt,
+        _cancel: CancellationToken,
+    ) -> Result<String, ReviewerTransportError> {
+        self.prompts.lock().expect("prompts").push(prompt.clone());
+        Ok(
+            r#"{"outcome":"allow","risk":"low","authorization":"high","rationale":"ok"}"#
+                .to_owned(),
+        )
+    }
+}
+
+fn bash_call(id: &str) -> ToolCall {
+    ToolCall {
+        id: id.to_owned(),
+        name: "bash".to_owned(),
+        arguments: serde_json::from_value::<ValidatedToolArguments>(
+            json!({"command": "git status"}),
+        )
+        .expect("valid bash args"),
+    }
+}
+
+#[tokio::test]
+async fn multi_tool_batch_reviewer_sees_current_call_and_prior_finalized_result() {
+    let transport = Arc::new(RecordingReviewer::new());
+    let reviewer_projector = Arc::new(SecretAwareActionProjector::new(
+        Redactor::v1(),
+        SecretDigestKey::fixture(),
+    ));
+    let model = ReviewerModelSpec::new(
+        "audit",
+        "fixture",
+        "https://reviewer.invalid",
+        "test",
+        "trusted",
+        "test-policy",
+    );
+    let reviewer = Arc::new(Reviewer::new(
+        model.clone(),
+        ReviewerTrustSet::new(model, vec![]),
+        transport.clone(),
+        reviewer_projector,
+    ));
+    let projector = SecretAwareActionProjector::new(Redactor::v1(), SecretDigestKey::fixture());
+    let broker = Arc::new(ApprovalBroker::new(
+        Policy::new("/workspace"),
+        projector,
+        Some(reviewer),
+        ReviewerMode::AutoReview,
+        false,
+        TrustedEnvironment {
+            workspace_root: "/workspace".to_owned(),
+            sandbox: SandboxSummary::workspace(),
+            denied_paths: Vec::new(),
+            denied_network_domains: Vec::new(),
+            repo_visibility: None,
+            git_status: None,
+        },
+    ));
+    let driver = Arc::new(FixtureDriver::new(vec![
+        output(assistant(
+            StopReason::ToolUse,
+            vec![
+                AssistantContent::ToolCall {
+                    tool_call: bash_call("first"),
+                    wire_item_index: 0,
+                },
+                AssistantContent::ToolCall {
+                    tool_call: bash_call("second"),
+                    wire_item_index: 1,
+                },
+            ],
+            None,
+            None,
+        )),
+        output(assistant(StopReason::Stop, Vec::new(), None, None)),
+    ]));
+    let mut core = bound_core(1);
+    core.set_approval(broker);
+    let (completion, _) = run_fixture_with_core(driver, core).await;
+    assert_completed(completion);
+
+    let prompts = transport.prompts();
+    assert_eq!(
+        prompts.len(),
+        2,
+        "same projection with advancing context/cache version must call reviewer twice"
+    );
+
+    fn assistant_tool_call_count(prompt: &ReviewerPrompt) -> usize {
+        prompt
+            .messages
+            .iter()
+            .filter(|m| {
+                matches!(m.role, ReviewerRole::Assistant) && m.content.contains("tool_call")
+            })
+            .count()
+    }
+    fn tool_evidence_count(prompt: &ReviewerPrompt) -> usize {
+        prompt
+            .messages
+            .iter()
+            .filter(|m| {
+                matches!(m.role, ReviewerRole::ToolEvidence) && m.content.contains("tool_result")
+            })
+            .count()
+    }
+
+    assert_eq!(
+        assistant_tool_call_count(&prompts[0]),
+        2,
+        "first review must see both tool calls from the committed assistant message"
+    );
+    assert_eq!(
+        tool_evidence_count(&prompts[0]),
+        0,
+        "first review must not see uncommitted tool results"
+    );
+    assert_eq!(
+        assistant_tool_call_count(&prompts[1]),
+        2,
+        "second review must still see the current committed assistant tool-call message"
+    );
+    assert_eq!(
+        tool_evidence_count(&prompts[1]),
+        1,
+        "second review must see the first finalized tool result"
+    );
+    assert!(
+        prompts[1].messages.iter().any(|m| {
+            matches!(m.role, ReviewerRole::ToolEvidence)
+                && m.content.contains("bash")
+                && m.content.contains("outcome=ok")
+        }),
+        "second review transcript must include the first bash tool result"
     );
 }
