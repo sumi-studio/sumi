@@ -1533,6 +1533,7 @@ impl DurableBridge {
                 if !result.is_error {
                     bail!("Approval-cancelled ToolResult must be is_error=true");
                 }
+                self.approval_prepared_tools.remove(&tool_call_id);
                 let result_value = serde_json::to_value(result)?;
                 writes.push(EventWrite {
                     event: Some(DurableEvent::tool_execution_end(
@@ -1558,6 +1559,7 @@ impl DurableBridge {
                 if !result.is_error {
                     bail!("Approval-not-started ToolResult must be is_error=true");
                 }
+                self.approval_prepared_tools.remove(&tool_call_id);
                 let result_value = serde_json::to_value(result)?;
                 writes.push(EventWrite {
                     event: Some(DurableEvent::tool_execution_end(
@@ -2233,7 +2235,10 @@ mod tests {
     use super::*;
 
     use crate::{
-        agent::{AdmittedCommand, events::ApprovalResolution},
+        agent::{
+            AdmittedCommand,
+            events::{ApprovalRequest, ApprovalResolution, ReviewProjection},
+        },
         gateway::{ApprovalDecision, Command, CommandEnvelope, CommandId, InboundCommand},
         provider::types::{
             PublicAssistantContent, PublicAssistantMessage, PublicMessage, StopReason, ToolCall,
@@ -2290,6 +2295,25 @@ mod tests {
                 seq,
                 command_id: CommandId::parse(command_id).expect("canonical test UUID"),
                 command: Command::Abort {},
+            },
+            test_timestamp(),
+        )
+    }
+
+    fn test_admitted_approval_decision(
+        seq: u64,
+        command_id: &str,
+        request_id: &str,
+        decision: ApprovalDecision,
+    ) -> AdmittedCommand {
+        AdmittedCommand::new(
+            CommandEnvelope {
+                seq,
+                command_id: CommandId::parse(command_id).expect("canonical test UUID"),
+                command: Command::ApprovalDecision {
+                    request_id: request_id.to_owned(),
+                    decision,
+                },
             },
             test_timestamp(),
         )
@@ -3722,5 +3746,423 @@ mod tests {
             .approval_prepared_tools
             .insert("tool-call-1".to_owned());
         assert_eq!(bridge.steer_stage(), SteerStage::ToolOrApproval);
+    }
+
+    async fn setup_pending_approval(
+        store: &Store,
+        writer: &EventWriter,
+        owner_id: &str,
+        run_id: &str,
+        turn_id: &str,
+        tool_call_id: &str,
+        request_id: &str,
+    ) -> (DurableBridge, DurableRunBinding, PublicMessage, ToolCall) {
+        let (binding, assistant) = owner_in_phase(
+            store,
+            writer,
+            owner_id,
+            run_id,
+            turn_id,
+            RunPhase::AssistantStarted,
+        )
+        .await;
+        let (assistant_id, assistant_base) = assistant.expect("assistant MessageStart");
+        let mut assistant = match assistant_base {
+            PublicMessage::Assistant(a) => a,
+            _ => unreachable!(),
+        };
+        let tool_call = ToolCall {
+            id: tool_call_id.to_owned(),
+            name: "bash".to_owned(),
+            arguments: serde_json::from_value::<ValidatedToolArguments>(
+                serde_json::json!({"command": "echo hello", "description": "test"}),
+            )
+            .expect("validated arguments"),
+        };
+        assistant.content = vec![PublicAssistantContent::ToolCall {
+            tool_call: tool_call.clone(),
+            wire_item_index: 0,
+        }];
+        assistant.stop_reason = StopReason::Stop;
+        let assistant_message = PublicMessage::Assistant(assistant);
+
+        let mut bridge = DurableBridge::new(binding.clone());
+        bridge.phase = RunPhase::AssistantStarted;
+        bridge.turn_open = true;
+        bridge.assistant_open = Some(assistant_id.clone());
+
+        let (assistant_barrier, _) = MessageCommitBarrier::channel();
+        bridge
+            .commit(
+                writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::MessageEnd {
+                        message_id: assistant_id.clone(),
+                        message: Box::new(assistant_message.clone()),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: Some(assistant_barrier),
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit assistant MessageEnd with tool call")
+            .resolve_message_receipts();
+
+        let request = ApprovalRequest {
+            id: request_id.to_owned(),
+            tool_call_id: tool_call.id.clone(),
+            tool_name: tool_call.name.clone(),
+            action: ReviewProjection::Reviewable(serde_json::json!({
+                "command": "echo hello",
+                "argv": ["echo", "hello"],
+            })),
+            args_summary: serde_json::json!({}),
+            reason: Some("bash requires approval".to_owned()),
+            audit: None,
+        };
+        bridge
+            .commit(
+                writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::ApprovalRequested { request },
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit ApprovalRequested");
+
+        assert!(bridge.approval_prepared_tools.contains(tool_call_id));
+        (bridge, binding, assistant_message, tool_call)
+    }
+
+    #[tokio::test]
+    async fn approval_denied_releases_prepared_tools_and_allows_agent_end() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+
+        let owner_id = "00000000-0000-4000-8000-000000000801";
+        let run_id = "run-denied-cleanup";
+        let turn_id = "turn-denied-cleanup";
+        let tool_call_id = "denied-call";
+        let request_id = "request-denied";
+
+        let (mut bridge, binding, assistant_message, tool_call) = setup_pending_approval(
+            &store,
+            &writer,
+            owner_id,
+            run_id,
+            turn_id,
+            tool_call_id,
+            request_id,
+        )
+        .await;
+
+        let decision_id = "00000000-0000-4000-8000-000000000802";
+        let decision_command =
+            test_admitted_approval_decision(2, decision_id, request_id, ApprovalDecision::Deny);
+        writer
+            .persist_inbound(&InboundCommand::Valid(decision_command.envelope().clone()))
+            .await
+            .expect("persist approval decision");
+
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::ApprovalResolved {
+                        request_id: request_id.to_owned(),
+                        resolution: ApprovalResolution::Decision(ApprovalDecision::Deny),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                    approval_command: Some(decision_command),
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit ApprovalResolved Deny");
+
+        let result = ToolResultMessage {
+            tool_call_id: tool_call.id.clone(),
+            tool_name: tool_call.name.clone(),
+            content: Vec::new(),
+            details: serde_json::json!({"error": "approval_denied"}),
+            is_error: true,
+            timestamp: test_timestamp(),
+        };
+        let result_for_turn = result.clone();
+        let result_id = "denied-result".to_owned();
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::MessageStart {
+                        message_id: result_id.clone(),
+                        message: Box::new(PublicMessage::ToolResult(result.clone())),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit tool result MessageStart");
+
+        let (result_barrier, _) = MessageCommitBarrier::channel();
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::MessageEnd {
+                        message_id: result_id,
+                        message: Box::new(PublicMessage::ToolResult(result)),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: Some(result_barrier),
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: Some(tool_call.id.clone()),
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit tool result MessageEnd")
+            .resolve_message_receipts();
+
+        assert!(
+            bridge.approval_prepared_tools.is_empty(),
+            "approval_prepared_tools must be released after denied ToolResult"
+        );
+
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::TurnEnd {
+                        message: Some(Box::new(assistant_message.clone())),
+                        tool_results: vec![result_for_turn],
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("close denied turn");
+
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding,
+                    event: AgentEvent::AgentEnd,
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("AgentEnd after denied approval");
+        assert_eq!(bridge.phase, RunPhase::Finished);
+
+        let (state, error_code, start_count) = sqlx::query_as::<_, (String, Option<String>, i64)>(
+            "SELECT state, error_code,
+                (SELECT COUNT(*) FROM agent_events WHERE event_type='tool_execution_start'
+                 AND json_extract(envelope, '$.tool_call_id')=?)
+             FROM tool_executions WHERE tool_call_id=?",
+        )
+        .bind(&tool_call.id)
+        .bind(&tool_call.id)
+        .fetch_one(store.pool())
+        .await
+        .expect("read denied tool execution");
+        assert_eq!(state, "cancelled");
+        assert_eq!(error_code.as_deref(), Some("approval_denied"));
+        assert_eq!(
+            start_count, 0,
+            "denied approval must not emit ToolExecutionStart"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_cancelled_releases_prepared_tools_and_allows_agent_end() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+
+        let owner_id = "00000000-0000-4000-8000-000000000901";
+        let run_id = "run-cancelled-cleanup";
+        let turn_id = "turn-cancelled-cleanup";
+        let tool_call_id = "cancelled-call";
+        let request_id = "request-cancelled";
+
+        let (mut bridge, binding, assistant_message, tool_call) = setup_pending_approval(
+            &store,
+            &writer,
+            owner_id,
+            run_id,
+            turn_id,
+            tool_call_id,
+            request_id,
+        )
+        .await;
+
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::ApprovalResolved {
+                        request_id: request_id.to_owned(),
+                        resolution: ApprovalResolution::Cancelled,
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit ApprovalResolved Cancelled");
+
+        let result = ToolResultMessage {
+            tool_call_id: tool_call.id.clone(),
+            tool_name: tool_call.name.clone(),
+            content: Vec::new(),
+            details: serde_json::json!({"error": "approval_cancelled"}),
+            is_error: true,
+            timestamp: test_timestamp(),
+        };
+        let result_for_turn = result.clone();
+        let result_id = "cancelled-result".to_owned();
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::MessageStart {
+                        message_id: result_id.clone(),
+                        message: Box::new(PublicMessage::ToolResult(result.clone())),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit tool result MessageStart");
+
+        let (result_barrier, _) = MessageCommitBarrier::channel();
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::MessageEnd {
+                        message_id: result_id,
+                        message: Box::new(PublicMessage::ToolResult(result)),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: Some(result_barrier),
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: Some(tool_call.id.clone()),
+                },
+            )
+            .await
+            .expect("commit tool result MessageEnd")
+            .resolve_message_receipts();
+
+        assert!(
+            bridge.approval_prepared_tools.is_empty(),
+            "approval_prepared_tools must be released after cancelled ToolResult"
+        );
+
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::TurnEnd {
+                        message: Some(Box::new(assistant_message.clone())),
+                        tool_results: vec![result_for_turn],
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("close cancelled turn");
+
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding,
+                    event: AgentEvent::AgentEnd,
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("AgentEnd after cancelled approval");
+        assert_eq!(bridge.phase, RunPhase::Finished);
+
+        let (state, error_code, start_count) = sqlx::query_as::<_, (String, Option<String>, i64)>(
+            "SELECT state, error_code,
+                (SELECT COUNT(*) FROM agent_events WHERE event_type='tool_execution_start'
+                 AND json_extract(envelope, '$.tool_call_id')=?)
+             FROM tool_executions WHERE tool_call_id=?",
+        )
+        .bind(&tool_call.id)
+        .bind(&tool_call.id)
+        .fetch_one(store.pool())
+        .await
+        .expect("read cancelled tool execution");
+        assert_eq!(state, "cancelled");
+        assert_eq!(error_code.as_deref(), Some("approval_cancelled"));
+        assert_eq!(
+            start_count, 0,
+            "cancelled approval must not emit ToolExecutionStart"
+        );
     }
 }

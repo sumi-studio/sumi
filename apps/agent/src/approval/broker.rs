@@ -20,7 +20,7 @@ use uuid::Uuid;
 use crate::{
     agent::events::{self, ApprovalRequest},
     approval::{
-        action::{CanonicalAction, SandboxSummary, SecretAwareActionProjector},
+        action::{CanonicalAction, ReviewProjection, SandboxSummary, SecretAwareActionProjector},
         policy::{
             ApprovalRule, Policy, PolicyDecision, ResolvedDecision, RuleValidationError,
             UserDecision,
@@ -491,6 +491,18 @@ impl ApprovalBroker {
         reason: &str,
         audit: Option<AuditDecision>,
     ) -> Result<ApprovalOutcome> {
+        if let ReviewProjection::InsufficientEvidence {
+            reason: projection_reason,
+        } = projection
+        {
+            return Ok(ApprovalOutcome::Denied {
+                reason: format!(
+                    "{reason}: cannot request approval because the action could not be projected: {projection_reason}"
+                ),
+                audit,
+            });
+        }
+
         let request_id = Uuid::now_v7().to_string();
         let (tx, rx) = oneshot::channel();
 
@@ -1636,5 +1648,31 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn insufficient_evidence_cannot_become_pending() {
+        let mut broker = broker();
+        broker.headless = false;
+
+        // `echo $TOKEN` contains an unquoted parameter expansion; the projector
+        // cannot produce a literal review token, so it must be denied before a
+        // pending approval can be created (and therefore before it can be approved).
+        let outcome = broker
+            .start_request(
+                &bash_call("echo $TOKEN"),
+                &[],
+                "run-1",
+                "turn-1",
+                "v1",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("start_request");
+        assert!(
+            matches!(&outcome, ApprovalOutcome::Denied { reason, .. } if reason.contains("cannot request approval")),
+            "dynamic shell must be denied before pending approval: {outcome:?}"
+        );
+        assert!(!broker.any_pending());
     }
 }
