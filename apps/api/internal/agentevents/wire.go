@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"regexp"
 )
 
@@ -371,11 +372,82 @@ func validateEnvelope(e Envelope) error {
 	return nil
 }
 
-// unmarshalStrict decodes JSON with DisallowUnknownFields enabled.
+// UnmarshalJSON decodes an Envelope and rejects an explicit JSON null in the
+// seq field, matching the contracts/agent-events.yaml rule that volatile events
+// must not have seq (even as null) and durable events require a non-null seq.
+func (e *Envelope) UnmarshalJSON(data []byte) error {
+	if err := checkDuplicateKeys(data); err != nil {
+		return fmt.Errorf("envelope json: %w", err)
+	}
+	type envelopeRaw struct {
+		Seq            json.RawMessage `json:"seq"`
+		ConversationID string          `json:"conversation_id"`
+		Event          json.RawMessage `json:"event"`
+	}
+	var raw envelopeRaw
+	if err := unmarshalStrict(data, &raw); err != nil {
+		return err
+	}
+
+	if raw.ConversationID == "" {
+		return fmt.Errorf("envelope conversation_id is required")
+	}
+	if len(raw.Event) == 0 || !json.Valid(raw.Event) {
+		return fmt.Errorf("envelope event must be valid JSON")
+	}
+	type discriminator struct {
+		Type string `json:"type"`
+	}
+	var d discriminator
+	if err := json.Unmarshal(raw.Event, &d); err != nil {
+		return fmt.Errorf("envelope event type: %w", err)
+	}
+	if d.Type == "" {
+		return fmt.Errorf("envelope event type is required")
+	}
+
+	volatile := volatileEventTypes[d.Type]
+	switch {
+	case raw.Seq == nil:
+		if !volatile {
+			return fmt.Errorf("durable event %q requires seq", d.Type)
+		}
+	case bytes.Equal(bytes.TrimSpace(raw.Seq), []byte("null")):
+		// Explicit null is not allowed for any event: volatile events must
+		// not have seq, and durable events require a real integer.
+		if volatile {
+			return fmt.Errorf("volatile event %q must not have seq", d.Type)
+		}
+		return fmt.Errorf("durable event %q requires seq", d.Type)
+	default:
+		var seq uint64
+		if err := json.Unmarshal(raw.Seq, &seq); err != nil {
+			return fmt.Errorf("envelope seq: %w", err)
+		}
+		if volatile {
+			return fmt.Errorf("volatile event %q must not have seq", d.Type)
+		}
+		e.Seq = &seq
+	}
+
+	e.ConversationID = raw.ConversationID
+	e.Event = raw.Event
+	return nil
+}
+
+// unmarshalStrict decodes one top-level JSON value with DisallowUnknownFields
+// enabled and rejects any trailing tokens or non-whitespace bytes.
 func unmarshalStrict(data []byte, v any) error {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	tok, err := dec.Token()
+	if err == nil {
+		return fmt.Errorf("trailing data after JSON value: %v", tok)
+	}
+	if !errors.Is(err, io.EOF) {
 		return err
 	}
 	return nil

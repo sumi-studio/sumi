@@ -15,6 +15,10 @@ import (
 // contracts/agent-events.yaml and §11.1.1.
 const MaxUserCommandBytes = 1024 * 1024
 
+// MaxIdempotencyKeyBytes is the largest Idempotency-Key header value that will
+// be stored in the durable log. Larger keys are rejected before seq allocation.
+const MaxIdempotencyKeyBytes = 1024
+
 var errBodyTooLarge = errors.New("request body exceeds limit")
 
 // RejectReason is a user-visible classification for a pre-sequence rejection.
@@ -111,6 +115,11 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if len(idempotencyKey) > MaxIdempotencyKeyBytes {
+		writeRejection(w, RejectOversized)
+		return
+	}
+
 	env, err := h.Appender.Append(r.Context(), conversationID, idempotencyKey, raw)
 	if err != nil {
 		// Idempotency conflicts are exposed as 409 so callers cannot

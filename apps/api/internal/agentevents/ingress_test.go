@@ -409,6 +409,53 @@ func TestUserCommandIngress_NilAppenderFailsClosed(t *testing.T) {
 	}
 }
 
+func TestUserCommandIngress_TrailingDataRejectedWithoutAllocatingSeq(t *testing.T) {
+	ingress, appender := newTestIngress(t)
+	server := httptest.NewServer(newCommandMux(ingress))
+	defer server.Close()
+
+	body := []byte(`{"type":"user_message","text":"hi","attachments":[]} trailing`)
+	resp := postAuthorized(t, server.URL+"/conversations/conv-1/commands", body)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", resp.StatusCode)
+	}
+	if appender.callCount() != 0 {
+		t.Fatalf("expected 0 append calls, got %d", appender.callCount())
+	}
+	assertRejectReason(t, resp.Body, RejectSchemaViolation)
+}
+
+func TestUserCommandIngress_OversizedIdempotencyKeyRejected(t *testing.T) {
+	ingress, appender := newTestIngress(t)
+	server := httptest.NewServer(newCommandMux(ingress))
+	defer server.Close()
+
+	body := []byte(`{"type":"user_message","text":"hi","attachments":[]}`)
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/conversations/conv-1/commands", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Idempotency-Key", strings.Repeat("x", MaxIdempotencyKeyBytes+1))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", resp.StatusCode)
+	}
+	if appender.callCount() != 0 {
+		t.Fatalf("expected 0 append calls, got %d", appender.callCount())
+	}
+	assertRejectReason(t, resp.Body, RejectOversized)
+}
+
 func assertRejectReason(t *testing.T, r io.Reader, want RejectReason) {
 	t.Helper()
 	var got struct {

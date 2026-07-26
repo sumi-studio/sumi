@@ -23,11 +23,15 @@ import (
 // verification; it does not wire the WebSocket CommandSource seam (that is
 // intentionally isolated for T17/T26).
 //
-// Each conversation has its own JSON Lines log. Seq allocation is protected
-// by a process-level mutex and command bytes are fsynced to the log before
-// success is returned. After a process restart, OpenCommandStore re-reads the
-// logs and reconstructs the per-conversation next seq and idempotency maps,
-// so server restart preserves the log and allocation continuity.
+// Each conversation has its own JSON Lines log. Seq allocation, append, sync
+// and rollback are serialized by an advisory flock on the log file so multiple
+// API processes sharing SUMI_COMMAND_LOG_DIR cannot allocate duplicate seqs,
+// interleave writes, or roll back another process's committed record. In
+// addition, a process-level mutex protects the in-memory state map. Command
+// bytes are fsynced to the log before success is returned. After any restart,
+// OpenCommandStore re-reads the logs and reconstructs the per-conversation
+// next seq and idempotency maps, so restart preserves the log and allocation
+// continuity.
 type CommandStore struct {
 	mu     sync.Mutex
 	dir    string
@@ -44,6 +48,8 @@ type fileHandle interface {
 	Sync() error
 	Truncate(size int64) error
 	Close() error
+	// Fd returns the underlying file descriptor for cross-process flock.
+	Fd() uintptr
 }
 
 type conversationState struct {
@@ -54,8 +60,28 @@ type conversationState struct {
 	bySeq       map[uint64]int
 	byCommandID map[string]int
 	byKey       map[string]int // idempotency key -> commands index
+	fileSize    int64          // end offset observed at last scan
 	poisoned    bool
 	poisonErr   error
+}
+
+// lockFile acquires an exclusive advisory flock on the log file.
+// The caller must hold CommandStore.mu.
+func lockFile(f fileHandle) error {
+	if f == nil {
+		return errors.New("no file to lock")
+	}
+	return syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
+}
+
+// unlockFile releases the advisory flock. Errors are ignored because the fd may
+// already be closed by poisonLocked, which also releases the kernel lock.
+func unlockFile(f fileHandle) error {
+	if f == nil {
+		return nil
+	}
+	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	return nil
 }
 
 // LogRecord is the on-disk representation of a command. It embeds the public
@@ -184,6 +210,15 @@ func (s *CommandStore) Append(ctx context.Context, conversationID string, idempo
 		return CommandEnvelope{}, fmt.Errorf("command log for %q is poisoned: %w", conversationID, st.poisonErr)
 	}
 
+	if err := lockFile(st.file); err != nil {
+		return CommandEnvelope{}, fmt.Errorf("lock command log for %q: %w", conversationID, err)
+	}
+	defer func() { _ = unlockFile(st.file) }()
+
+	if err := s.refreshStateLocked(st, conversationID); err != nil {
+		return CommandEnvelope{}, err
+	}
+
 	if idempotencyKey != "" {
 		if idx, ok := st.byKey[idempotencyKey]; ok {
 			existing := st.commands[idx]
@@ -206,10 +241,7 @@ func (s *CommandStore) Append(ctx context.Context, conversationID string, idempo
 		Command:   command,
 	}
 
-	offset, err := st.file.Seek(0, io.SeekEnd)
-	if err != nil {
-		return CommandEnvelope{}, fmt.Errorf("seek command log: %w", err)
-	}
+	offset := st.fileSize
 
 	record := LogRecord{CommandEnvelope: env}
 	if idempotencyKey != "" {
@@ -252,6 +284,7 @@ func (s *CommandStore) Append(ctx context.Context, conversationID string, idempo
 	if idempotencyKey != "" {
 		st.byKey[idempotencyKey] = idx
 	}
+	st.fileSize = offset + int64(len(data))
 
 	return env, nil
 }
@@ -273,6 +306,13 @@ func (s *CommandStore) NextCommandSeq(ctx context.Context, conversationID string
 	if st.poisoned {
 		return 0, fmt.Errorf("command log for %q is poisoned: %w", conversationID, st.poisonErr)
 	}
+	if err := lockFile(st.file); err != nil {
+		return 0, fmt.Errorf("lock command log for %q: %w", conversationID, err)
+	}
+	defer func() { _ = unlockFile(st.file) }()
+	if err := s.refreshStateLocked(st, conversationID); err != nil {
+		return 0, err
+	}
 	return st.nextSeq, nil
 }
 
@@ -293,6 +333,13 @@ func (s *CommandStore) FirstCommandSeq(ctx context.Context, conversationID strin
 	}
 	if st.poisoned {
 		return 0, fmt.Errorf("command log for %q is poisoned: %w", conversationID, st.poisonErr)
+	}
+	if err := lockFile(st.file); err != nil {
+		return 0, fmt.Errorf("lock command log for %q: %w", conversationID, err)
+	}
+	defer func() { _ = unlockFile(st.file) }()
+	if err := s.refreshStateLocked(st, conversationID); err != nil {
+		return 0, err
 	}
 	if len(st.commands) == 0 {
 		return 1, nil
@@ -316,6 +363,13 @@ func (s *CommandStore) CatchUp(ctx context.Context, conversationID string, fromS
 	}
 	if st.poisoned {
 		return nil, fmt.Errorf("command log for %q is poisoned: %w", conversationID, st.poisonErr)
+	}
+	if err := lockFile(st.file); err != nil {
+		return nil, fmt.Errorf("lock command log for %q: %w", conversationID, err)
+	}
+	defer func() { _ = unlockFile(st.file) }()
+	if err := s.refreshStateLocked(st, conversationID); err != nil {
+		return nil, err
 	}
 	i := sort.Search(len(st.commands), func(i int) bool { return st.commands[i].Seq >= fromSeq })
 	out := make([]CommandEnvelope, len(st.commands)-i)
@@ -346,6 +400,127 @@ func isIncompleteJSONError(err error) bool {
 		strings.Contains(msg, "unexpected EOF")
 }
 
+// scanLogLocked reads the log from the current offset and populates st. It
+// truncates an incomplete final tail and repairs a missing trailing newline.
+// The caller must hold CommandStore.mu and an exclusive flock on st.file.
+func (s *CommandStore) scanLogLocked(st *conversationState, conversationID string) error {
+	if _, err := st.file.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("seek command log for %q: %w", conversationID, err)
+	}
+
+	r := bufio.NewReader(st.file)
+	offset := int64(0)
+	for {
+		lineStart := offset
+		line, readErr := r.ReadBytes('\n')
+		if len(line) > 0 {
+			offset += int64(len(line))
+		}
+
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) == 0 {
+			if readErr == io.EOF {
+				break
+			}
+			continue
+		}
+
+		var rec LogRecord
+		if err := json.Unmarshal(trimmed, &rec); err != nil {
+			// A final record without a terminating newline that provably ends
+			// mid-value is an incomplete tail; truncate it and recover. Any
+			// other parse error on the final line, or any error on an earlier
+			// line, is a malformed complete record and must fail closed.
+			if readErr == io.EOF && isIncompleteJSONError(err) {
+				if truncErr := st.file.Truncate(lineStart); truncErr != nil {
+					return fmt.Errorf("truncate partial tail for %q: %w", conversationID, truncErr)
+				}
+				if syncErr := st.file.Sync(); syncErr != nil {
+					return fmt.Errorf("sync after truncating partial tail for %q: %w", conversationID, syncErr)
+				}
+				offset = lineStart
+				break
+			}
+			if readErr == io.EOF {
+				return fmt.Errorf("decode command log for %q: final record is malformed but complete: %w", conversationID, err)
+			}
+			return fmt.Errorf("decode command log for %q: %w", conversationID, err)
+		}
+
+		if rec.Seq == 0 && rec.CommandID == "" && len(rec.Command) == 0 {
+			return fmt.Errorf("empty command record in log for %q", conversationID)
+		}
+
+		idx := len(st.commands)
+		st.commands = append(st.commands, rec.CommandEnvelope)
+		if rec.Seq >= st.nextSeq {
+			st.nextSeq = rec.Seq + 1
+		}
+		if existing, ok := st.bySeq[rec.Seq]; ok {
+			return fmt.Errorf("duplicate seq %d in log for %q (existing %d)", rec.Seq, conversationID, existing)
+		}
+		st.bySeq[rec.Seq] = idx
+		if _, ok := st.byCommandID[rec.CommandID]; ok {
+			return fmt.Errorf("duplicate command_id %q in log for %q", rec.CommandID, conversationID)
+		}
+		st.byCommandID[rec.CommandID] = idx
+		if rec.IdempotencyKey != "" {
+			if _, ok := st.byKey[rec.IdempotencyKey]; ok {
+				return fmt.Errorf("duplicate idempotency key %q in log for %q", rec.IdempotencyKey, conversationID)
+			}
+			st.byKey[rec.IdempotencyKey] = idx
+		}
+
+		if readErr == io.EOF {
+			// A valid final record may be missing its trailing JSONL delimiter
+			// (crash between the write and the appended newline, or a file
+			// seeded by a test). Repair it now, durably, so the next append
+			// cannot concatenate records into an unparseable `}{` boundary.
+			if len(line) > 0 && line[len(line)-1] != '\n' {
+				if _, werr := st.file.Write([]byte{'\n'}); werr != nil {
+					return fmt.Errorf("repair missing trailing newline for %q: %w", conversationID, werr)
+				}
+				if syncErr := st.file.Sync(); syncErr != nil {
+					return fmt.Errorf("sync repaired trailing newline for %q: %w", conversationID, syncErr)
+				}
+				offset += 1
+			}
+			break
+		}
+		if readErr != nil {
+			return fmt.Errorf("read command log for %q: %w", conversationID, readErr)
+		}
+	}
+
+	size, err := st.file.Seek(0, io.SeekEnd)
+	if err != nil {
+		return fmt.Errorf("seek end of command log for %q: %w", conversationID, err)
+	}
+	st.fileSize = size
+	return nil
+}
+
+// refreshStateLocked resets the in-memory state for st and rescan the log from
+// disk. It skips the rescan when the file size has not changed since the last
+// observation. The caller must hold CommandStore.mu and an exclusive flock.
+func (s *CommandStore) refreshStateLocked(st *conversationState, conversationID string) error {
+	size, err := st.file.Seek(0, io.SeekEnd)
+	if err != nil {
+		return fmt.Errorf("seek command log for %q: %w", conversationID, err)
+	}
+	if size == st.fileSize {
+		return nil
+	}
+
+	st.commands = st.commands[:0]
+	st.nextSeq = 1
+	st.bySeq = make(map[uint64]int)
+	st.byCommandID = make(map[string]int)
+	st.byKey = make(map[string]int)
+	st.fileSize = 0
+	return s.scanLogLocked(st, conversationID)
+}
+
 func (s *CommandStore) loadFileLocked(conversationID, path string) (*conversationState, error) {
 	info, err := os.Lstat(path)
 	if err == nil {
@@ -373,107 +548,20 @@ func (s *CommandStore) loadFileLocked(conversationID, path string) (*conversatio
 		byKey:       make(map[string]int),
 	}
 
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
+	if err := lockFile(file); err != nil {
 		_ = file.Close()
-		return nil, fmt.Errorf("seek command log for %q: %w", conversationID, err)
+		return nil, fmt.Errorf("lock command log for %q: %w", conversationID, err)
 	}
 
-	r := bufio.NewReader(file)
-	offset := int64(0)
-	for {
-		lineStart := offset
-		line, readErr := r.ReadBytes('\n')
-		if len(line) > 0 {
-			offset += int64(len(line))
-		}
-
-		trimmed := bytes.TrimSpace(line)
-		if len(trimmed) == 0 {
-			if readErr == io.EOF {
-				break
-			}
-			continue
-		}
-
-		var rec LogRecord
-		if err := json.Unmarshal(trimmed, &rec); err != nil {
-			// A final record without a terminating newline that provably ends
-			// mid-value is an incomplete tail; truncate it and recover. Any
-			// other parse error on the final line, or any error on an earlier
-			// line, is a malformed complete record and must fail closed.
-			if readErr == io.EOF && isIncompleteJSONError(err) {
-				if truncErr := file.Truncate(lineStart); truncErr != nil {
-					_ = file.Close()
-					return nil, fmt.Errorf("truncate partial tail for %q: %w", conversationID, truncErr)
-				}
-				if syncErr := file.Sync(); syncErr != nil {
-					_ = file.Close()
-					return nil, fmt.Errorf("sync after truncating partial tail for %q: %w", conversationID, syncErr)
-				}
-				break
-			}
-			_ = file.Close()
-			if readErr == io.EOF {
-				return nil, fmt.Errorf("decode command log for %q: final record is malformed but complete: %w", conversationID, err)
-			}
-			return nil, fmt.Errorf("decode command log for %q: %w", conversationID, err)
-		}
-
-		if rec.Seq == 0 && rec.CommandID == "" && len(rec.Command) == 0 {
-			_ = file.Close()
-			return nil, fmt.Errorf("empty command record in log for %q", conversationID)
-		}
-
-		idx := len(st.commands)
-		st.commands = append(st.commands, rec.CommandEnvelope)
-		if rec.Seq >= st.nextSeq {
-			st.nextSeq = rec.Seq + 1
-		}
-		if existing, ok := st.bySeq[rec.Seq]; ok {
-			_ = file.Close()
-			return nil, fmt.Errorf("duplicate seq %d in log for %q (existing %d)", rec.Seq, conversationID, existing)
-		}
-		st.bySeq[rec.Seq] = idx
-		if _, ok := st.byCommandID[rec.CommandID]; ok {
-			_ = file.Close()
-			return nil, fmt.Errorf("duplicate command_id %q in log for %q", rec.CommandID, conversationID)
-		}
-		st.byCommandID[rec.CommandID] = idx
-		if rec.IdempotencyKey != "" {
-			if _, ok := st.byKey[rec.IdempotencyKey]; ok {
-				_ = file.Close()
-				return nil, fmt.Errorf("duplicate idempotency key %q in log for %q", rec.IdempotencyKey, conversationID)
-			}
-			st.byKey[rec.IdempotencyKey] = idx
-		}
-
-		if readErr == io.EOF {
-			// A valid final record may be missing its trailing JSONL delimiter
-			// (crash between the write and the appended newline, or a file
-			// seeded by a test). Repair it now, durably, so the next append
-			// cannot concatenate records into an unparseable `}{` boundary.
-			if len(line) > 0 && line[len(line)-1] != '\n' {
-				if _, werr := file.Write([]byte{'\n'}); werr != nil {
-					_ = file.Close()
-					return nil, fmt.Errorf("repair missing trailing newline for %q: %w", conversationID, werr)
-				}
-				if syncErr := file.Sync(); syncErr != nil {
-					_ = file.Close()
-					return nil, fmt.Errorf("sync repaired trailing newline for %q: %w", conversationID, syncErr)
-				}
-			}
-			break
-		}
-		if readErr != nil {
-			_ = file.Close()
-			return nil, fmt.Errorf("read command log for %q: %w", conversationID, readErr)
-		}
+	if err := s.scanLogLocked(st, conversationID); err != nil {
+		_ = unlockFile(file)
+		_ = file.Close()
+		return nil, err
 	}
 
-	// Move the file offset back to the end for future appends.
-	if _, err := file.Seek(0, io.SeekEnd); err != nil {
+	if err := unlockFile(file); err != nil {
 		_ = file.Close()
-		return nil, fmt.Errorf("seek end of command log for %q: %w", conversationID, err)
+		return nil, fmt.Errorf("unlock command log for %q: %w", conversationID, err)
 	}
 
 	s.states[conversationID] = st

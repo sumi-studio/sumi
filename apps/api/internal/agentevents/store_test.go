@@ -6,8 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -628,6 +631,10 @@ func (f *failingFile) Seek(offset int64, whence int) (int64, error) {
 	return f.File.Seek(offset, whence)
 }
 
+func (f *failingFile) Fd() uintptr {
+	return f.File.Fd()
+}
+
 func injectFailingFile(t *testing.T, store *CommandStore, conversationID string) *failingFile {
 	t.Helper()
 	st := store.states[conversationID]
@@ -949,5 +956,188 @@ func TestCommandStore_RepairMissingTrailingNewlineEndToEnd(t *testing.T) {
 		if err := json.Unmarshal([]byte(l), &lr); err != nil {
 			t.Fatalf("line %d is not valid JSON: %v: %q", i, err, l)
 		}
+	}
+}
+
+// TestCommandStore_MultiProcessWorker is invoked as a sub-process by the
+// multi-process tests below. It is skipped when run as a normal test.
+func TestCommandStore_MultiProcessWorker(t *testing.T) {
+	if os.Getenv("SUMI_MP_WORKER") == "" {
+		t.Skip("sub-process worker only")
+	}
+
+	dir := os.Getenv("SUMI_MP_DIR")
+	conv := os.Getenv("SUMI_MP_CONV")
+	mode := os.Getenv("SUMI_MP_MODE")
+
+	store, err := OpenCommandStore(dir)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	switch mode {
+	case "append":
+		count, err := strconv.Atoi(os.Getenv("SUMI_MP_COUNT"))
+		if err != nil {
+			t.Fatalf("invalid count: %v", err)
+		}
+		id := os.Getenv("SUMI_MP_ID")
+		for i := 0; i < count; i++ {
+			text := fmt.Sprintf("child-%s-%d", id, i)
+			cmd := json.RawMessage(fmt.Sprintf(`{"type":"user_message","text":%q,"attachments":[]}`, text))
+			env, err := store.Append(context.Background(), conv, "", cmd)
+			if err != nil {
+				t.Fatalf("append %d: %v", i, err)
+			}
+			fmt.Println(env.Seq)
+		}
+	case "rollback":
+		st := store.states[conv]
+		if st == nil {
+			t.Fatalf("no state for conversation %q", conv)
+		}
+		ff := &failingFile{File: st.file.(*os.File), failSyncOn: 1}
+		st.file = ff
+		cmd := json.RawMessage(`{"type":"user_message","text":"rollback-child","attachments":[]}`)
+		_, err := store.Append(context.Background(), conv, "", cmd)
+		if err == nil {
+			t.Fatal("expected append to fail with injected sync failure")
+		}
+	default:
+		t.Fatalf("unknown mode %q", mode)
+	}
+}
+
+func skipIfNoFlock(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("flock is not available on windows")
+	}
+}
+
+func runMPWorker(t *testing.T, dir, conv, mode, id, count string) ([]byte, error) {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestCommandStore_MultiProcessWorker$", "-test.v")
+	cmd.Env = append(
+		os.Environ(),
+		"SUMI_MP_WORKER=1",
+		"SUMI_MP_DIR="+dir,
+		"SUMI_MP_CONV="+conv,
+		"SUMI_MP_MODE="+mode,
+		"SUMI_MP_ID="+id,
+		"SUMI_MP_COUNT="+count,
+	)
+	return cmd.CombinedOutput()
+}
+
+func TestCommandStore_MultiProcessNoDuplicateSeqOrLostRecord(t *testing.T) {
+	skipIfNoFlock(t)
+
+	dir := t.TempDir()
+	conv := "conv-mp"
+	const children = 3
+	const count = 20
+
+	var wg sync.WaitGroup
+	errs := make(chan error, children)
+	for i := 0; i < children; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			out, err := runMPWorker(t, dir, conv, "append", strconv.Itoa(i), strconv.Itoa(count))
+			if err != nil {
+				errs <- fmt.Errorf("child %d failed: %w\n%s", i, err, out)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+
+	store, err := OpenCommandStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	all, err := store.CatchUp(context.Background(), conv, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := children * count
+	if len(all) != want {
+		t.Fatalf("expected %d commands, got %d", want, len(all))
+	}
+
+	seen := make(map[uint64]bool)
+	for i, env := range all {
+		if env.Seq != uint64(i+1) {
+			t.Fatalf("non-contiguous seq at index %d: got %d", i, env.Seq)
+		}
+		if seen[env.Seq] {
+			t.Fatalf("duplicate seq %d", env.Seq)
+		}
+		seen[env.Seq] = true
+		if !strings.Contains(string(env.Command), "child-") {
+			t.Fatalf("command %d missing child marker: %s", env.Seq, env.Command)
+		}
+	}
+
+	next, err := store.NextCommandSeq(context.Background(), conv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != uint64(want+1) {
+		t.Fatalf("expected next seq %d, got %d", want+1, next)
+	}
+}
+
+func TestCommandStore_MultiProcessRollbackDoesNotDestroyPeerRecord(t *testing.T) {
+	skipIfNoFlock(t)
+
+	dir := t.TempDir()
+	conv := "conv-rollback"
+
+	store, err := OpenCommandStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentCmd := json.RawMessage(`{"type":"user_message","text":"parent","attachments":[]}`)
+	env1, err := store.Append(context.Background(), conv, "", parentCmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runMPWorker(t, dir, conv, "rollback", "", "")
+	if err != nil {
+		t.Fatalf("rollback worker failed: %v\n%s", err, out)
+	}
+
+	store2, err := OpenCommandStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store2.Close()
+
+	all, err := store2.CatchUp(context.Background(), conv, env1.Seq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 1 || all[0].Seq != env1.Seq {
+		t.Fatalf("peer record destroyed by rollback: got %+v", all)
+	}
+
+	next, err := store2.NextCommandSeq(context.Background(), conv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != env1.Seq+1 {
+		t.Fatalf("expected next seq %d after rollback, got %d", env1.Seq+1, next)
 	}
 }

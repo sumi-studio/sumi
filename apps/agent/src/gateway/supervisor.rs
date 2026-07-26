@@ -510,9 +510,18 @@ async fn validate_hello<S: DurableSource>(
             agent.last_received_command_seq
         )));
     }
+    let min_next = agent.last_applied_command_seq.saturating_add(1);
+    if api.next_command_seq < min_next {
+        return Err(SupervisorError::Fatal(anyhow!(
+            "command cursor claim too low: next_command_seq {} < applied {} + 1",
+            api.next_command_seq,
+            agent.last_applied_command_seq
+        )));
+    }
     Ok(())
 }
 
+#[derive(Debug)]
 enum SupervisorError {
     AuthRejected,
     Fatal(anyhow::Error),
@@ -1609,6 +1618,45 @@ mod tests {
             elapsed >= Duration::from_millis(1),
             "nonzero delay must have nonzero jitter lower bound, elapsed {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn validate_hello_rejects_next_command_seq_below_last_applied_plus_one() {
+        let source = MockDurableSource::new(CommandCursors {
+            received: 5,
+            applied: 3,
+        });
+
+        let agent = AgentHello {
+            agent_id: "test-agent".to_owned(),
+            generation: 7,
+            last_sent_event_seq: 0,
+            last_received_command_seq: 5,
+            last_applied_command_seq: 3,
+        };
+
+        // next_command_seq == last_applied_command_seq is too low.
+        let api_too_low = ApiHello {
+            accepted_generation: 7,
+            last_received_event_seq: 0,
+            next_command_seq: 3,
+        };
+        let err = validate_hello(&source, &agent, &api_too_low).await;
+        assert!(err.is_err());
+        assert!(
+            format!("{:?}", err.unwrap_err()).contains("command cursor claim too low"),
+            "api.next_command_seq below last_applied+1 must be fatal"
+        );
+
+        // next_command_seq == last_applied_command_seq + 1 is the lower bound.
+        let api_valid = ApiHello {
+            accepted_generation: 7,
+            last_received_event_seq: 0,
+            next_command_seq: 4,
+        };
+        validate_hello(&source, &agent, &api_valid)
+            .await
+            .expect("next_command_seq at last_applied+1 is valid");
     }
 
     fn cmd_seq(cmd: &InboundCommand) -> u64 {

@@ -194,3 +194,72 @@ func sortedKeys(m map[string]any) []string {
 	}
 	return keys
 }
+
+func TestEnvelopeRejectsExplicitNullSeq(t *testing.T) {
+	for _, eventType := range []string{"message_update", "tool_execution_update", "error"} {
+		raw := []byte(fmt.Sprintf(`{"seq":null,"conversation_id":"c","event":{"type":"%s"}}`, eventType))
+		var env Envelope
+		if err := json.Unmarshal(raw, &env); err == nil {
+			t.Fatalf("expected seq:null to be rejected for volatile event %q", eventType)
+		}
+	}
+
+	// Durable events require a non-null seq; explicit null is not allowed.
+	raw := []byte(`{"seq":null,"conversation_id":"c","event":{"type":"agent_start"}}`)
+	var env Envelope
+	if err := json.Unmarshal(raw, &env); err == nil {
+		t.Fatal("expected seq:null to be rejected for durable event")
+	}
+
+	// Missing seq is fine for volatile events.
+	raw = []byte(`{"conversation_id":"c","event":{"type":"error","message":"x"}}`)
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("expected missing seq for volatile event, got %v", err)
+	}
+
+	// Missing seq is rejected for durable events.
+	raw = []byte(`{"conversation_id":"c","event":{"type":"agent_start"}}`)
+	if err := json.Unmarshal(raw, &env); err == nil {
+		t.Fatal("expected missing seq to be rejected for durable event")
+	}
+
+	// A valid integer seq is accepted for durable events.
+	raw = []byte(`{"seq":7,"conversation_id":"c","event":{"type":"agent_start"}}`)
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("expected integer seq for durable event, got %v", err)
+	}
+	if env.Seq == nil || *env.Seq != 7 {
+		t.Fatalf("expected seq 7, got %v", env.Seq)
+	}
+
+	// A seq is rejected for volatile events even when non-null.
+	raw = []byte(`{"seq":7,"conversation_id":"c","event":{"type":"error","message":"x"}}`)
+	if err := json.Unmarshal(raw, &env); err == nil {
+		t.Fatal("expected non-null seq to be rejected for volatile event")
+	}
+}
+
+func TestUnmarshalStrictRejectsTrailingData(t *testing.T) {
+	var cmd userMessageWire
+
+	if err := unmarshalStrict([]byte(`{"type":"user_message","text":"hi","attachments":[]} trailing`), &cmd); err == nil {
+		t.Fatal("expected trailing data to be rejected")
+	}
+
+	if err := unmarshalStrict([]byte(`{"type":"user_message","text":"hi","attachments":[]}`), &cmd); err != nil {
+		t.Fatalf("expected clean input to be accepted, got %v", err)
+	}
+
+	// Trailing whitespace is acceptable.
+	if err := unmarshalStrict([]byte(`{"type":"user_message","text":"hi","attachments":[]}   `+"\n"), &cmd); err != nil {
+		t.Fatalf("expected trailing whitespace to be accepted, got %v", err)
+	}
+}
+
+func TestOutboundFrameRejectsTrailingData(t *testing.T) {
+	raw := []byte(`{"frame_type":"event","envelope":{"seq":1,"conversation_id":"c","event":{"type":"agent_start"}}} trailing`)
+	var frame OutboundFrame
+	if err := json.Unmarshal(raw, &frame); err == nil {
+		t.Fatal("expected trailing data to be rejected for OutboundFrame")
+	}
+}

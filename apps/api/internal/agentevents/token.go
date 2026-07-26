@@ -46,7 +46,7 @@ func NewHMACTokenVerifier(secret []byte, audience string) (*HMACTokenVerifier, e
 
 // Verify checks the signature, expiry, audience and required claim shape of an
 // Authorization bearer token. It fail-closes on any malformed or mismatched
-// input.
+// input. The signature is verified before any claim is parsed or trusted.
 func (v *HMACTokenVerifier) Verify(ctx context.Context, token string) (TokenClaims, error) {
 	select {
 	case <-ctx.Done():
@@ -57,6 +57,14 @@ func (v *HMACTokenVerifier) Verify(ctx context.Context, token string) (TokenClai
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		return TokenClaims{}, errors.New("invalid token format")
+	}
+
+	signingInput := parts[0] + "." + parts[1]
+	mac := hmac.New(sha256.New, v.secret)
+	mac.Write([]byte(signingInput))
+	expected := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	if !hmac.Equal([]byte(expected), []byte(parts[2])) {
+		return TokenClaims{}, errors.New("invalid token signature")
 	}
 
 	headerBytes, err := decodeBase64URL(parts[0])
@@ -93,14 +101,6 @@ func (v *HMACTokenVerifier) Verify(ctx context.Context, token string) (TokenClai
 	}
 	if v.audience != "" && tc.Aud != v.audience {
 		return TokenClaims{}, fmt.Errorf("token audience mismatch: %q", tc.Aud)
-	}
-
-	signingInput := parts[0] + "." + parts[1]
-	mac := hmac.New(sha256.New, v.secret)
-	mac.Write([]byte(signingInput))
-	expected := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
-	if !hmac.Equal([]byte(expected), []byte(parts[2])) {
-		return TokenClaims{}, errors.New("invalid token signature")
 	}
 
 	return TokenClaims{
