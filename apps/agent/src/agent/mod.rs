@@ -27,9 +27,10 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
+    approval::ApprovalBroker,
     gateway::{
-        Command, CommandAckStatus, CommandEnvelope, Gateway, GatewayClosed, GatewayReader,
-        GatewayWriter, InboundCommand, OutboundFrame,
+        ApprovalDecision, Command, CommandAck, CommandAckStatus, CommandEnvelope, Gateway,
+        GatewayClosed, GatewayReader, GatewayWriter, InboundCommand, OutboundFrame,
     },
     provider::{
         overflow::OverflowSource,
@@ -44,7 +45,7 @@ use crate::{
 
 mod driver;
 mod durable_bridge;
-mod events;
+pub(crate) mod events;
 mod provider_projection;
 mod queue;
 mod run;
@@ -209,6 +210,7 @@ pub(crate) struct RunCore {
     /// Session reserves the token around `bind_hard_steer` so the provider is
     /// only cancelled after the durable step-zero commit succeeds.
     attempt_cancellation: Option<Arc<AttemptCancellation>>,
+    approval: Option<Arc<ApprovalBroker>>,
 }
 
 impl RunCore {
@@ -222,6 +224,7 @@ impl RunCore {
             durable_binding: None,
             worker_phase: None,
             attempt_cancellation: None,
+            approval: None,
         }
     }
 
@@ -235,6 +238,10 @@ impl RunCore {
 
     pub(crate) fn mark_mutated(&mut self) {
         self.mutation_epoch = self.mutation_epoch.saturating_add(1);
+    }
+
+    pub(crate) fn set_approval(&mut self, broker: Arc<ApprovalBroker>) {
+        self.approval = Some(broker);
     }
 
     pub(crate) fn queue_followup(&mut self, command: AdmittedCommand) -> Result<()> {
@@ -334,6 +341,7 @@ pub(crate) enum RunControl {
 pub(crate) enum WorkerPhase {
     #[default]
     Active,
+    Approval,
     RetryWait,
 }
 
@@ -475,6 +483,7 @@ pub(crate) struct ActiveRun {
     join: JoinHandle<()>,
     bridge: DurableBridge,
     attempt_cancellation: Arc<AttemptCancellation>,
+    approval: Option<Arc<ApprovalBroker>>,
 }
 
 impl Drop for ActiveRun {
@@ -485,7 +494,7 @@ impl Drop for ActiveRun {
 
 #[derive(Debug)]
 pub(crate) enum RunOwnership {
-    Recovered(RunCore),
+    Recovered(Box<RunCore>),
     Lost,
 }
 
@@ -639,9 +648,9 @@ impl<G: Gateway + 'static> Session<G> {
                     self.core.take();
                     RunOwnership::Lost
                 } else {
-                    self.core
-                        .take()
-                        .map_or(RunOwnership::Lost, RunOwnership::Recovered)
+                    self.core.take().map_or(RunOwnership::Lost, |core| {
+                        RunOwnership::Recovered(Box::new(core))
+                    })
                 };
                 SessionResult::Failed { failure, ownership }
             }
@@ -677,6 +686,7 @@ impl<G: Gateway + 'static> Session<G> {
                 continue;
             }
 
+            #[allow(clippy::large_enum_variant)]
             enum Selected {
                 Completion(std::result::Result<RunCompletion, oneshot::error::RecvError>),
                 Command(Result<InboundCommand>),
@@ -792,6 +802,9 @@ impl<G: Gateway + 'static> Session<G> {
             }
             if self.route_active_control(command.clone()).await? {
                 return Ok(());
+            }
+            if matches!(command.envelope().command, Command::ApprovalDecision { .. }) {
+                return self.route_active_approval_decision(command).await;
             }
             self.defer_active_command(command)?;
             return Ok(());
@@ -1015,6 +1028,60 @@ impl<G: Gateway + 'static> Session<G> {
         Ok(true)
     }
 
+    async fn route_active_approval_decision(
+        &mut self,
+        command: AdmittedCommand,
+    ) -> Result<(), SessionFailure> {
+        if matches!(
+            command.envelope().command,
+            Command::ApprovalDecision {
+                decision: ApprovalDecision::ApproveAlways { .. },
+                ..
+            }
+        ) {
+            let ack = CommandAck {
+                seq: command.envelope().seq,
+                command_id: command.envelope().command_id.to_string(),
+                status: CommandAckStatus::Rejected,
+                reject_reason: Some(
+                    "active ApproveAlways requires durable policy mutation".to_owned(),
+                ),
+            };
+            self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack }])?;
+            return Ok(());
+        }
+        let active = self
+            .active
+            .as_ref()
+            .ok_or(SessionFailure::CompletionChannelClosed)?;
+        let request_id = match &command.envelope().command {
+            Command::ApprovalDecision { request_id, .. } => request_id,
+            _ => unreachable!("caller matched ApprovalDecision"),
+        };
+        let is_pending = active
+            .approval
+            .as_ref()
+            .is_some_and(|broker| broker.has_pending(request_id));
+        if !is_pending {
+            return self.apply_idle_approval_decision(command).await;
+        }
+        let seq = command.envelope().seq;
+        let command_id = command.envelope().command_id.to_string();
+        let control = RunControl::Command(command);
+        if active.control_tx.try_send(control).is_err() {
+            let ack = CommandAck {
+                seq,
+                command_id,
+                status: CommandAckStatus::Rejected,
+                reject_reason: Some(
+                    "approval decision could not be delivered to the active worker".to_owned(),
+                ),
+            };
+            self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack }])?;
+        }
+        Ok(())
+    }
+
     fn defer_active_command(&mut self, command: AdmittedCommand) -> Result<(), SessionFailure> {
         let is_abort = matches!(command.envelope().command, Command::Abort {});
         let ordinary_count = self
@@ -1060,7 +1127,10 @@ impl<G: Gateway + 'static> Session<G> {
                     }
                 }
                 Command::Abort {} => self.route_active_abort(command.clone()).await?,
-                _ => false,
+                Command::ApprovalDecision { .. } => {
+                    self.route_active_approval_decision(command.clone()).await?;
+                    true
+                }
             };
             if !routed {
                 self.deferred_commands
@@ -1069,6 +1139,77 @@ impl<G: Gateway + 'static> Session<G> {
                 break;
             }
         }
+        Ok(())
+    }
+
+    async fn apply_idle_approval_decision(
+        &mut self,
+        command: AdmittedCommand,
+    ) -> Result<(), SessionFailure> {
+        let command_id = command.envelope().command_id.to_string();
+        let seq = command.envelope().seq;
+        if matches!(
+            command.envelope().command,
+            Command::ApprovalDecision {
+                decision: ApprovalDecision::ApproveAlways { .. },
+                ..
+            }
+        ) {
+            let ack = CommandAck {
+                seq,
+                command_id,
+                status: CommandAckStatus::Rejected,
+                reject_reason: Some(
+                    "ApproveAlways requires an active run to apply durable policy mutation"
+                        .to_owned(),
+                ),
+            };
+            self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack }])?;
+            return Ok(());
+        }
+        if let Some(broker) = self.core.as_ref().and_then(|c| c.approval.as_ref())
+            && let Command::ApprovalDecision {
+                request_id,
+                decision,
+            } = &command.envelope().command
+            && broker.has_pending(request_id)
+        {
+            // Resolve the lingering pending entry so the broker does not
+            // retain a stale waiter for a run that has already ended.
+            broker.resolve(request_id, decision);
+        }
+        let result = self
+            .writer
+            .apply(crate::store::EventBatch {
+                writes: vec![crate::store::EventWrite {
+                    event: None,
+                    projections: vec![crate::store::Projection::CommandApplied {
+                        command_id: command_id.clone(),
+                        command_seq: seq,
+                        run_id: None,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await;
+        let ack = match result {
+            Ok(_) => CommandAck {
+                seq,
+                command_id: command_id.clone(),
+                status: CommandAckStatus::Applied,
+                reject_reason: None,
+            },
+            Err(error) => {
+                tracing::error!(%error, %command_id, "approval decision could not be applied");
+                CommandAck {
+                    seq,
+                    command_id,
+                    status: CommandAckStatus::Rejected,
+                    reject_reason: Some("approval decision could not be applied".to_owned()),
+                }
+            }
+        };
+        self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack }])?;
         Ok(())
     }
 
@@ -1085,6 +1226,9 @@ impl<G: Gateway + 'static> Session<G> {
                 self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack }])?;
             }
             return Ok(());
+        }
+        if matches!(command.envelope().command, Command::ApprovalDecision { .. }) {
+            return self.apply_idle_approval_decision(command).await;
         }
         if !matches!(command.envelope().command, Command::UserMessage { .. }) {
             return Err(SessionFailure::IdleControl);
@@ -1157,6 +1301,7 @@ impl<G: Gateway + 'static> Session<G> {
         core.worker_phase = Some(phase_tx);
         let attempt_cancellation = Arc::new(AttemptCancellation::default());
         core.attempt_cancellation = Some(attempt_cancellation.clone());
+        let approval = core.approval.clone();
         let (completion_tx, completion_rx) = oneshot::channel();
         let future = catch_unwind(AssertUnwindSafe(|| {
             self.worker.run(core, initial, control_rx, events_tx)
@@ -1176,6 +1321,7 @@ impl<G: Gateway + 'static> Session<G> {
             join,
             bridge: DurableBridge::new(binding),
             attempt_cancellation,
+            approval,
         });
         Ok(())
     }
@@ -1323,6 +1469,28 @@ impl<G: Gateway + 'static> Session<G> {
                     .await
                     .err();
             }
+        }
+        let flush_outputs = match active
+            .bridge
+            .flush_pending_approval_resolved(&self.writer)
+            .await
+        {
+            Ok(outputs) => outputs,
+            Err(error) => {
+                self.durable_core_invalidated = true;
+                return Err(error.into());
+            }
+        };
+        if deliver && delivery_failure.is_none() && !flush_outputs.is_empty() {
+            let terminal_command_ids = active.bridge.take_terminal_command_ids();
+            delivery_failure = self
+                .send_committed(
+                    flush_outputs,
+                    Some(active.bridge.command_id().to_owned()),
+                    terminal_command_ids,
+                )
+                .await
+                .err();
         }
         Ok(delivery_failure)
     }

@@ -21,6 +21,7 @@ pub const BASH_TOOL_NAME: &str = "bash";
 /// Runtime-internal representation of a tool call. Not serializable, not stored,
 /// and its `Debug` implementation redacts `argv`, `cwd`, `affected_paths`, and
 /// `justification` so secret material never leaks through diagnostics.
+#[derive(Clone)]
 pub struct CanonicalAction {
     pub tool: String,
     pub operation: String,
@@ -1490,6 +1491,7 @@ struct SecretMatch<'a> {
     order: usize,
 }
 
+#[derive(Clone, Debug)]
 struct SecretPattern {
     regex: Regex,
     secret_group: usize,
@@ -1497,6 +1499,7 @@ struct SecretPattern {
     kind: &'static str,
 }
 
+#[derive(Clone, Debug)]
 struct SecretInventory {
     patterns: Vec<SecretPattern>,
 }

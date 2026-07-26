@@ -985,6 +985,13 @@ pub(crate) enum ToolExecutionMutation {
     },
 }
 
+const SKIP_ERROR_CODES: &[&str] = &[
+    "length_guard",
+    "user_steer_cancelled",
+    "approval_denied",
+    "approval_cancelled",
+];
+
 #[allow(
     dead_code,
     reason = "T12 freezes approval durability transitions before T15 broker wiring"
@@ -4682,10 +4689,8 @@ fn validate_batch_shape_with_recovery(
                     }
                     ToolExecutionMutation::Prepare { .. } => {}
                     ToolExecutionMutation::Skip { error_code, .. } => {
-                        if !matches!(*error_code, "length_guard" | "user_steer_cancelled") {
-                            bail!(
-                                "ToolExecution Skip only supports length_guard or user_steer_cancelled"
-                            );
+                        if !SKIP_ERROR_CODES.contains(error_code) {
+                            bail!("ToolExecution Skip only supports {SKIP_ERROR_CODES:?}");
                         }
                         tool_skip_mutation_ids.insert(tool_call_id.clone());
                     }
@@ -7928,10 +7933,10 @@ async fn validate_durable_lifecycle_suffix(
                     || run_id.is_empty()
                     || turn_id.is_empty()
                     || idempotency_key.is_empty()
-                    || !matches!(*error_code, "length_guard" | "user_steer_cancelled") =>
+                    || !SKIP_ERROR_CODES.contains(error_code) =>
                 {
                     bail!(
-                        "ToolExecutionSkip identity must be non-empty and use length_guard or user_steer_cancelled"
+                        "ToolExecutionSkip identity must be non-empty and use a supported error code"
                     )
                 }
                 PreparedProjection::Plain(Projection::ToolExecution(
@@ -9286,8 +9291,8 @@ async fn apply_tool_mutation(
             idempotency_key,
             error_code,
         } => {
-            if !matches!(error_code, "length_guard" | "user_steer_cancelled") {
-                bail!("ToolExecutionSkip only supports length_guard or user_steer_cancelled");
+            if !SKIP_ERROR_CODES.contains(&error_code) {
+                bail!("ToolExecutionSkip only supports {SKIP_ERROR_CODES:?}");
             }
             // user_steer_cancelled may resolve after a hard steer or Abort moved the
             // original owner out of assistant_started; length_guard remains restricted

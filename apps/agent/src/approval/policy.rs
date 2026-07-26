@@ -1,9 +1,15 @@
 //! Deterministic approval policy and `ApproveAlways` candidate validation.
 
-use std::path::{Path, PathBuf};
+use std::{
+    fmt::Write as _,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
+use uuid::Uuid;
 
 use super::action::{
     BASH_TOOL_NAME, CanonicalAction, Permission, SecretAwareActionProjector, shell,
@@ -152,6 +158,36 @@ impl Policy {
             workspace_root: workspace_root.into(),
             rules: Vec::new(),
         }
+    }
+
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
+    /// Deterministic hash of the loaded rule set and workspace root. Used as a
+    /// cache key for reviewer allow/deny caches.
+    pub fn hash(&self) -> String {
+        let mut rules: Vec<_> = self.rules.iter().collect();
+        // Sort by id so physically different rule orders produce the same hash.
+        rules.sort_by(|a, b| a.id.cmp(&b.id));
+        let canonical = json!({
+            "workspace_root": self.workspace_root.to_string_lossy(),
+            "rules": rules,
+        });
+        let bytes = match serde_json::to_vec(&canonical) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                // Fail-closed: a broken serialization must not share a cache key
+                // with a valid policy.
+                return Uuid::now_v7().to_string();
+            }
+        };
+        let digest = Sha256::digest(&bytes);
+        let mut s = String::with_capacity(digest.len() * 2);
+        for b in digest {
+            let _ = write!(s, "{b:02x}");
+        }
+        s
     }
 
     /// Load `rule` after validating that its literal prefix is narrow enough

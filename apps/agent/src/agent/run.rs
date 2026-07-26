@@ -44,6 +44,10 @@ use super::{
     RunCompletion, RunControl, RunCore, RunOutput, RunWorker, SteerMode, ToolStartCommitBarrier,
     WorkerFailure, WorkerFuture, WorkerPhase, steer,
 };
+use crate::{
+    agent::events::ApprovalRequest,
+    approval::{ApprovalOutcome, WaiterResult},
+};
 
 const LENGTH_TOOL_FAILURE: &str = "Tool call was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.";
 const LENGTH_LOOP_FAILURE: &str = "provider produced tool calls at the output token limit twice consecutively; refusing a third provider call";
@@ -175,6 +179,9 @@ struct Runner {
     provider_cancel: Option<CancellationToken>,
     hard_steer_command: Option<AdmittedCommand>,
     abort_requested: bool,
+    /// Run-wide cancellation token. Dropping the runner cancels all child
+    /// operations, including in-flight reviewer calls and tool executions.
+    cancel: CancellationToken,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -191,6 +198,25 @@ impl From<WorkerFailure> for ExecuteToolError {
     fn from(failure: WorkerFailure) -> Self {
         Self::Worker(failure)
     }
+}
+
+enum CallDisposition {
+    Allowed,
+    Denied {
+        reason: String,
+    },
+    Pending {
+        request: ApprovalRequest,
+        receiver: oneshot::Receiver<WaiterResult>,
+    },
+}
+
+enum ApprovalWaitOutcome {
+    Resolved {
+        decision: crate::approval::policy::ResolvedDecision,
+        command: Box<AdmittedCommand>,
+    },
+    Cancelled,
 }
 
 impl Runner {
@@ -221,6 +247,7 @@ impl Runner {
             provider_cancel: None,
             hard_steer_command: None,
             abort_requested: false,
+            cancel: CancellationToken::new(),
         }
     }
 
@@ -232,12 +259,12 @@ impl Runner {
         if let Err(failure) = self.recover_received_controls() {
             result = Err(failure);
         }
-        self.core.runtime_context = self.context;
+        self.core.runtime_context = std::mem::take(&mut self.context);
         self.core.mark_mutated();
         match result {
-            Ok(()) => RunCompletion::Completed(self.core),
+            Ok(()) => RunCompletion::Completed(std::mem::take(&mut self.core)),
             Err(failure) => RunCompletion::Failed {
-                core: self.core,
+                core: std::mem::take(&mut self.core),
                 failure,
             },
         }
@@ -770,7 +797,7 @@ impl Runner {
                                 _ => unreachable!("provider terminal is always MessageEnd"),
                             };
                             let receipt = self
-                                .emit_message_end(terminal_message_id, terminal_message)
+                                .emit_message_end(terminal_message_id, terminal_message, None, None)
                                 .await?;
                             if let Some(OverflowClassification::ImmediateRecovery(source)) = overflow {
                                 return Ok(AttemptOutcome::ImmediateOverflow {
@@ -840,7 +867,7 @@ impl Runner {
         })
         .await?;
         let receipt = self
-            .emit_message_end(message_id.clone(), message.clone())
+            .emit_message_end(message_id.clone(), message.clone(), None, None)
             .await?;
         Ok(AttemptOutcome::ClosedError {
             assistant_message_id: message_id,
@@ -867,7 +894,7 @@ impl Runner {
             .await?;
         }
         let receipt = self
-            .emit_message_end(message_id.to_owned(), partial.clone())
+            .emit_message_end(message_id.to_owned(), partial.clone(), None, None)
             .await?;
         let receipt = self.await_message_receipt(receipt).await?;
         // Give a queued Abort its durable authorization turn before deciding
@@ -914,7 +941,7 @@ impl Runner {
             .await?;
         }
         let receipt = self
-            .emit_message_end(message_id.to_owned(), partial.clone())
+            .emit_message_end(message_id.to_owned(), partial.clone(), None, None)
             .await?;
         Ok(AttemptOutcome::ClosedError {
             assistant_message_id: message_id.to_owned(),
@@ -939,7 +966,7 @@ impl Runner {
             .await?;
         }
         let receipt = self
-            .emit_message_end(message_id.to_owned(), message.clone())
+            .emit_message_end(message_id.to_owned(), message.clone(), None, None)
             .await?;
         Ok(AttemptOutcome::ClosedError {
             assistant_message_id: message_id.to_owned(),
@@ -967,7 +994,7 @@ impl Runner {
             };
             let result = error_tool_result(call, &message);
             let waiter = self
-                .emit_result_message(assistant_message_id, &result)
+                .emit_result_message(assistant_message_id, &result, None, None)
                 .await?;
             let receipt = self.await_message_receipt(waiter).await?;
             receipts.push(receipt);
@@ -983,55 +1010,183 @@ impl Runner {
     ) -> Result<(Vec<ToolResultMessage>, Vec<MessageCommitReceipt>), WorkerFailure> {
         let mut results = Vec::with_capacity(calls.len());
         let mut receipts = Vec::with_capacity(calls.len());
+        let mut cancelled = false;
         for (index, call) in calls.iter().enumerate() {
-            self.emit_tool_start_and_wait_committed(call).await?;
-            let result = match self
-                .execute_tool_with_updates(assistant_message_id, call)
-                .await
-            {
-                Ok(mut result) => {
-                    // The invocation identity is authoritative at this seam.
-                    result.tool_call_id.clone_from(&call.id);
-                    result.tool_name.clone_from(&call.name);
-                    result
-                }
-                Err(ExecuteToolError::Worker(failure)) => return Err(failure),
-                Err(ExecuteToolError::Tool(ToolError::RpcIndeterminate(message))) => {
-                    return Err(WorkerFailure::Error(format!(
-                        "tool RPC outcome is indeterminate: {message}"
-                    )));
-                }
-                Err(ExecuteToolError::Cancelled) => {
-                    let result =
-                        error_tool_result(call, "Tool execution was cancelled by a user control");
+            if cancelled {
+                let result = error_tool_result(call, "Tool execution cancelled");
+                receipts.push(
+                    self.emit_result_message(
+                        assistant_message_id,
+                        &result,
+                        None,
+                        Some(call.id.clone()),
+                    )
+                    .await?
+                    .await
+                    .map_err(|_| WorkerFailure::Error("tool result receipt dropped".to_owned()))?,
+                );
+                results.push(result);
+                continue;
+            }
+            match self.evaluate_call(call).await? {
+                CallDisposition::Allowed => {
+                    self.emit_tool_start_and_wait_committed(call).await?;
+                    let result = match self
+                        .execute_tool_with_updates(assistant_message_id, call)
+                        .await
+                    {
+                        Ok(mut result) => {
+                            result.tool_call_id.clone_from(&call.id);
+                            result.tool_name.clone_from(&call.name);
+                            result
+                        }
+                        Err(ExecuteToolError::Worker(failure)) => return Err(failure),
+                        Err(ExecuteToolError::Tool(ToolError::RpcIndeterminate(message))) => {
+                            return Err(WorkerFailure::Error(format!(
+                                "tool RPC outcome is indeterminate: {message}"
+                            )));
+                        }
+                        Err(ExecuteToolError::Tool(error)) => {
+                            error_tool_result(call, &format!("Tool execution failed: {error}"))
+                        }
+                        Err(ExecuteToolError::Cancelled) => error_tool_result(
+                            call,
+                            "Tool execution was cancelled by a user control",
+                        ),
+                    };
                     receipts.push(self.emit_tool_result(assistant_message_id, &result).await?);
                     results.push(result);
-                    for remaining in calls.iter().skip(index + 1) {
-                        let result = error_tool_result(
-                            remaining,
-                            "Tool execution was cancelled by a user control",
-                        );
-                        let waiter = self
-                            .emit_result_message(assistant_message_id, &result)
+                }
+                CallDisposition::Denied { reason } => {
+                    let result = error_tool_result(call, &reason);
+                    receipts.push(
+                        self.emit_result_message(
+                            assistant_message_id,
+                            &result,
+                            Some(call.id.clone()),
+                            None,
+                        )
+                        .await?
+                        .await
+                        .map_err(|_| {
+                            WorkerFailure::Error("tool result receipt dropped".to_owned())
+                        })?,
+                    );
+                    results.push(result);
+                }
+                CallDisposition::Pending { request, receiver } => {
+                    self.emit(AgentEvent::ApprovalRequested {
+                        request: request.clone(),
+                    })
+                    .await?;
+                    self.phase.send(WorkerPhase::Approval).ok();
+                    match self.wait_for_approval(request.id.clone(), receiver).await? {
+                        ApprovalWaitOutcome::Resolved { decision, command } => {
+                            self.emit_approval_resolved(
+                                request.id.clone(),
+                                &decision,
+                                Some(*command),
+                            )
                             .await?;
-                        receipts.push(self.await_message_receipt(waiter).await?);
-                        results.push(result);
+                            match decision {
+                                crate::approval::policy::ResolvedDecision::ApproveOnce
+                                | crate::approval::policy::ResolvedDecision::ApproveAlways(_) => {
+                                    self.emit_tool_start_and_wait_committed(call).await?;
+                                    let result = match self
+                                        .execute_tool_with_updates(assistant_message_id, call)
+                                        .await
+                                    {
+                                        Ok(mut result) => {
+                                            result.tool_call_id.clone_from(&call.id);
+                                            result.tool_name.clone_from(&call.name);
+                                            result
+                                        }
+                                        Err(ExecuteToolError::Worker(failure)) => {
+                                            let _ = self.phase.send(WorkerPhase::Active);
+                                            return Err(failure);
+                                        }
+                                        Err(ExecuteToolError::Tool(
+                                            ToolError::RpcIndeterminate(message),
+                                        )) => {
+                                            let _ = self.phase.send(WorkerPhase::Active);
+                                            return Err(WorkerFailure::Error(format!(
+                                                "tool RPC outcome is indeterminate: {message}"
+                                            )));
+                                        }
+                                        Err(ExecuteToolError::Tool(error)) => error_tool_result(
+                                            call,
+                                            &format!("Tool execution failed: {error}"),
+                                        ),
+                                        Err(ExecuteToolError::Cancelled) => error_tool_result(
+                                            call,
+                                            "Tool execution was cancelled by a user control",
+                                        ),
+                                    };
+                                    receipts.push(
+                                        self.emit_tool_result(assistant_message_id, &result)
+                                            .await?,
+                                    );
+                                    results.push(result);
+                                }
+                                crate::approval::policy::ResolvedDecision::Deny
+                                | crate::approval::policy::ResolvedDecision::Rejected { .. } => {
+                                    let reason = match decision {
+                                        crate::approval::policy::ResolvedDecision::Rejected {
+                                            reason,
+                                        } => reason,
+                                        _ => "Approval denied".to_owned(),
+                                    };
+                                    let result = error_tool_result(call, &reason);
+                                    receipts.push(
+                                        self.emit_result_message(
+                                            assistant_message_id,
+                                            &result,
+                                            Some(call.id.clone()),
+                                            None,
+                                        )
+                                        .await?
+                                        .await
+                                        .map_err(|_| {
+                                            WorkerFailure::Error(
+                                                "tool result receipt dropped".to_owned(),
+                                            )
+                                        })?,
+                                    );
+                                    results.push(result);
+                                }
+                            }
+                        }
+                        ApprovalWaitOutcome::Cancelled => {
+                            self.emit(AgentEvent::ApprovalResolved {
+                                request_id: request.id.clone(),
+                                resolution: crate::agent::events::ApprovalResolution::Cancelled,
+                            })
+                            .await?;
+                            cancelled = true;
+                            let result = error_tool_result(call, "Tool execution cancelled");
+                            receipts.push(
+                                self.emit_result_message(
+                                    assistant_message_id,
+                                    &result,
+                                    None,
+                                    Some(call.id.clone()),
+                                )
+                                .await?
+                                .await
+                                .map_err(|_| {
+                                    WorkerFailure::Error("tool result receipt dropped".to_owned())
+                                })?,
+                            );
+                            results.push(result);
+                        }
                     }
-                    break;
+                    self.phase.send(WorkerPhase::Active).ok();
                 }
-                Err(ExecuteToolError::Tool(error)) => {
-                    error_tool_result(call, &format!("Tool execution failed: {error}"))
-                }
-            };
-            receipts.push(self.emit_tool_result(assistant_message_id, &result).await?);
-            results.push(result);
+            }
             self.receive_control_safe_point().await?;
             if self.abort_requested || !self.in_flight_controls.is_empty() {
-                // D5: a soft steer never cancels the tool that was already
-                // running when it arrived. Once that tool has completed, the
-                // classified steer is authoritative: every not-started call in
-                // this batch is closed without ToolExecutionStart, approval,
-                // or executor side effects.
+                // A soft steer never cancels a running tool. Once it reaches
+                // this boundary, every later call is durably skipped.
                 let cancellation_message = if self.abort_requested {
                     "Tool execution was cancelled by a user control"
                 } else {
@@ -1040,7 +1195,7 @@ impl Runner {
                 for remaining in calls.iter().skip(index + 1) {
                     let result = error_tool_result(remaining, cancellation_message);
                     let waiter = self
-                        .emit_result_message(assistant_message_id, &result)
+                        .emit_result_message(assistant_message_id, &result, None, None)
                         .await?;
                     receipts.push(self.await_message_receipt(waiter).await?);
                     results.push(result);
@@ -1049,6 +1204,194 @@ impl Runner {
             }
         }
         Ok((results, receipts))
+    }
+
+    async fn evaluate_call(&self, call: &ToolCall) -> Result<CallDisposition, WorkerFailure> {
+        let Some(broker) = self.core.approval.as_ref() else {
+            return Ok(CallDisposition::Allowed);
+        };
+        let binding = self.core.durable_binding.as_ref().ok_or_else(|| {
+            WorkerFailure::Error("RunCore has no durable worker binding".to_owned())
+        })?;
+        let transcript: Vec<PublicMessage> = self
+            .context
+            .iter()
+            .map(|message| message_to_public(context_message(message).clone()))
+            .collect();
+        let context_version = self.core.mutation_epoch().to_string();
+        let outcome = broker
+            .start_request(
+                call,
+                &transcript,
+                &binding.run_id,
+                &binding.turn_id,
+                &context_version,
+                self.cancel.clone(),
+            )
+            .await
+            .map_err(|error| WorkerFailure::Error(format!("approval start failed: {error}")))?;
+        Ok(match outcome {
+            ApprovalOutcome::Allowed => CallDisposition::Allowed,
+            ApprovalOutcome::Denied { reason } => CallDisposition::Denied { reason },
+            ApprovalOutcome::Pending { request, receiver } => {
+                CallDisposition::Pending { request, receiver }
+            }
+        })
+    }
+
+    async fn wait_for_approval(
+        &mut self,
+        request_id: String,
+        mut receiver: oneshot::Receiver<WaiterResult>,
+    ) -> Result<ApprovalWaitOutcome, WorkerFailure> {
+        use crate::gateway::Command;
+        loop {
+            tokio::select! {
+                result = &mut receiver => {
+                    return match result {
+                        Ok(WaiterResult::Resolved(_)) => Err(WorkerFailure::Error(
+                            "approval resolved without an authenticated command".to_owned(),
+                        )),
+                        Ok(WaiterResult::Cancelled) | Err(_) => {
+                            Ok(ApprovalWaitOutcome::Cancelled)
+                        }
+                    };
+                }
+                control = self.controls.recv() => {
+                    match control {
+                        Some(RunControl::Command(command)) => {
+                            match &command.envelope().command {
+                                Command::ApprovalDecision { request_id: rid, decision }
+                                    if rid == &request_id =>
+                                {
+                                    if let Some(broker) = self.core.approval.as_ref() {
+                                        return Ok(match broker.resolve(rid, decision) {
+                                            Some(decision) => {
+                                                ApprovalWaitOutcome::Resolved {
+                                                    decision,
+                                                    command: Box::new(command),
+                                                }
+                                            }
+                                            None => {
+                                                self.core.queue_followup(command).map_err(|error| {
+                                                    WorkerFailure::Error(error.to_string())
+                                                })?;
+                                                ApprovalWaitOutcome::Cancelled
+                                            }
+                                        });
+                                    }
+                                    return Ok(ApprovalWaitOutcome::Cancelled);
+                                }
+                                Command::ApprovalDecision { .. } => {
+                                    self.core.queue_followup(command).map_err(|error| {
+                                        WorkerFailure::Error(error.to_string())
+                                    })?;
+                                }
+                                Command::UserMessage { .. } | Command::Abort {} => {
+                                    if let Some(broker) = self.core.approval.as_ref() {
+                                        broker.cancel_all();
+                                    }
+                                    self.core.queue_followup(command).map_err(|error| {
+                                        WorkerFailure::Error(error.to_string())
+                                    })?;
+                                    return Ok(ApprovalWaitOutcome::Cancelled);
+                                }
+                            }
+                        }
+                        Some(RunControl::RetrySteer { accepted, .. }) => {
+                            let _ = accepted.send(false);
+                        }
+                        Some(RunControl::HardSteer { accepted, .. }) => {
+                            let _ = accepted.send(false);
+                        }
+                        Some(RunControl::SoftSteer {
+                            command,
+                            accepted,
+                            committed,
+                        }) => {
+                            if let Some(broker) = self.core.approval.as_ref() {
+                                broker.cancel_all();
+                            }
+                            self.accept_steer_control(command, accepted, committed).await?;
+                            return Ok(ApprovalWaitOutcome::Cancelled);
+                        }
+                        Some(RunControl::Abort {
+                            accepted,
+                            committed,
+                            ..
+                        }) => {
+                            if let Some(broker) = self.core.approval.as_ref() {
+                                broker.cancel_all();
+                            }
+                            if self.accept_abort_control(accepted, committed).await? {
+                                self.abort_requested = true;
+                            }
+                            return Ok(ApprovalWaitOutcome::Cancelled);
+                        }
+                        None => {
+                            if let Some(broker) = self.core.approval.as_ref() {
+                                broker.cancel(&request_id);
+                            }
+                            return Ok(ApprovalWaitOutcome::Cancelled);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn emit_approval_resolved(
+        &mut self,
+        request_id: String,
+        decision: &crate::approval::ResolvedDecision,
+        command: Option<AdmittedCommand>,
+    ) -> Result<(), WorkerFailure> {
+        use crate::agent::events::ApprovalResolution;
+        use crate::approval::ResolvedDecision;
+        use crate::gateway::ApprovalDecision;
+        let resolution = match decision {
+            ResolvedDecision::ApproveOnce => {
+                ApprovalResolution::Decision(ApprovalDecision::ApproveOnce)
+            }
+            ResolvedDecision::ApproveAlways(rule) => {
+                let rule_value = serde_json::to_value(rule).map_err(|error| {
+                    WorkerFailure::Error(format!("approval rule serialization failed: {error}"))
+                })?;
+                let decision_value = serde_json::json!({
+                    "type": "approve_always",
+                    "rule": rule_value,
+                });
+                ApprovalResolution::Decision(serde_json::from_value(decision_value).map_err(
+                    |error| {
+                        WorkerFailure::Error(format!(
+                            "approval decision deserialization failed: {error}"
+                        ))
+                    },
+                )?)
+            }
+            ResolvedDecision::Deny | ResolvedDecision::Rejected { .. } => {
+                ApprovalResolution::Decision(ApprovalDecision::Deny)
+            }
+        };
+        let binding = self.core.durable_binding.clone().ok_or_else(|| {
+            WorkerFailure::Error("RunCore has no durable worker binding".to_owned())
+        })?;
+        self.events
+            .send(RunOutput {
+                binding,
+                event: AgentEvent::ApprovalResolved {
+                    request_id,
+                    resolution,
+                },
+                commit_barrier: None,
+                message_commit_barrier: None,
+                retry_wait_commit_barrier: None,
+                approval_command: command,
+                approval_not_started: None,
+                approval_cancelled: None,
+            })
+            .await
+            .map_err(|_| WorkerFailure::EventChannelClosed)
     }
 
     async fn execute_tool_with_updates(
@@ -1065,7 +1408,7 @@ impl Runner {
             let _ = updates_tx.try_send((callback_call_id.clone(), partial));
         });
         let driver = self.driver.clone();
-        let cancel = CancellationToken::new();
+        let cancel = self.cancel.child_token();
         let future = CancelOnDrop::new(
             driver.execute_tool_observed(flow_id, call, cancel.clone(), on_update),
             cancel.clone(),
@@ -1184,6 +1527,9 @@ impl Runner {
                 commit_barrier: Some(commit_barrier),
                 message_commit_barrier: None,
                 retry_wait_commit_barrier: None,
+                approval_command: None,
+                approval_not_started: None,
+                approval_cancelled: None,
             })
             .await
             .map_err(|_| WorkerFailure::EventChannelClosed)?;
@@ -1207,7 +1553,7 @@ impl Runner {
         })
         .await?;
         let receipt = self
-            .emit_result_message(assistant_message_id, result)
+            .emit_result_message(assistant_message_id, result, None, None)
             .await?;
         let receipt = self.await_message_receipt(receipt).await?;
         Ok(receipt)
@@ -1217,6 +1563,8 @@ impl Runner {
         &mut self,
         assistant_message_id: &str,
         result: &ToolResultMessage,
+        approval_not_started: Option<String>,
+        approval_cancelled: Option<String>,
     ) -> Result<oneshot::Receiver<MessageCommitReceipt>, WorkerFailure> {
         let message = PublicMessage::ToolResult(result.clone());
         let message_id = tool_result_message_id(assistant_message_id, &result.tool_call_id);
@@ -1225,7 +1573,13 @@ impl Runner {
             message: Box::new(message.clone()),
         })
         .await?;
-        self.emit_message_end(message_id, message).await
+        self.emit_message_end(
+            message_id,
+            message,
+            approval_not_started,
+            approval_cancelled,
+        )
+        .await
     }
 
     async fn emit_rejected_results(
@@ -1236,7 +1590,7 @@ impl Runner {
         let mut pending = Vec::with_capacity(results.len());
         for result in results {
             pending.push(
-                self.emit_result_message(assistant_message_id, result)
+                self.emit_result_message(assistant_message_id, result, None, None)
                     .await?,
             );
         }
@@ -1264,7 +1618,9 @@ impl Runner {
             message: Box::new(message.clone()),
         })
         .await?;
-        let receipt = self.emit_message_end(message_id, message.clone()).await?;
+        let receipt = self
+            .emit_message_end(message_id, message.clone(), None, None)
+            .await?;
         let receipt = self.await_message_receipt(receipt).await?;
         self.retain_committed(receipt, &message)?;
         Ok(())
@@ -1295,7 +1651,9 @@ impl Runner {
                 message: Box::new(message.clone()),
             })
             .await?;
-            let receipt = self.emit_message_end(message_id, message.clone()).await?;
+            let receipt = self
+                .emit_message_end(message_id, message.clone(), None, None)
+                .await?;
             pending_receipts.push(receipt);
             messages.push(message);
         }
@@ -1631,6 +1989,9 @@ impl Runner {
                 commit_barrier: None,
                 message_commit_barrier: None,
                 retry_wait_commit_barrier: None,
+                approval_command: None,
+                approval_not_started: None,
+                approval_cancelled: None,
             })
             .await
             .map_err(|_| WorkerFailure::EventChannelClosed)
@@ -1640,6 +2001,8 @@ impl Runner {
         &mut self,
         message_id: String,
         message: PublicMessage,
+        approval_not_started: Option<String>,
+        approval_cancelled: Option<String>,
     ) -> Result<oneshot::Receiver<MessageCommitReceipt>, WorkerFailure> {
         let binding = self.core.durable_binding.clone().ok_or_else(|| {
             WorkerFailure::Error("RunCore has no durable worker binding".to_owned())
@@ -1655,6 +2018,9 @@ impl Runner {
                 commit_barrier: None,
                 message_commit_barrier: Some(barrier),
                 retry_wait_commit_barrier: None,
+                approval_command: None,
+                approval_not_started,
+                approval_cancelled,
             })
             .await
             .map_err(|_| WorkerFailure::EventChannelClosed)?;
@@ -1683,6 +2049,9 @@ impl Runner {
                 commit_barrier: None,
                 message_commit_barrier: None,
                 retry_wait_commit_barrier: Some(barrier),
+                approval_command: None,
+                approval_not_started: None,
+                approval_cancelled: None,
             })
             .await
             .map_err(|_| WorkerFailure::EventChannelClosed)?;
@@ -1738,6 +2107,12 @@ impl Runner {
         })?;
         binding.turn_id = Uuid::now_v7().to_string();
         self.emit(AgentEvent::TurnStart).await
+    }
+}
+
+impl Drop for Runner {
+    fn drop(&mut self) {
+        self.cancel.cancel();
     }
 }
 
@@ -1911,6 +2286,62 @@ fn context_message(message: &ContextMessage) -> &Message {
 
 pub(super) fn public_to_message(message: PublicMessage) -> Message {
     message.into()
+}
+
+fn message_to_public(message: Message) -> PublicMessage {
+    match message {
+        Message::User(message) => PublicMessage::User(message),
+        Message::ToolResult(message) => PublicMessage::ToolResult(message),
+        Message::Assistant(message) => {
+            PublicMessage::Assistant(crate::provider::types::PublicAssistantMessage {
+                content: message
+                    .content
+                    .into_iter()
+                    .map(|content| match content {
+                        AssistantContent::Text {
+                            text,
+                            wire_item_index,
+                        } => PublicAssistantContent::Text {
+                            text,
+                            wire_item_index,
+                        },
+                        AssistantContent::Thinking {
+                            thinking,
+                            signature_field,
+                            wire_item_index,
+                        } => PublicAssistantContent::Thinking {
+                            thinking,
+                            signature_field,
+                            wire_item_index,
+                        },
+                        AssistantContent::ToolCall {
+                            tool_call,
+                            wire_item_index,
+                        } => PublicAssistantContent::ToolCall {
+                            tool_call,
+                            wire_item_index,
+                        },
+                        AssistantContent::RejectedToolCall {
+                            rejected,
+                            wire_item_index,
+                        } => PublicAssistantContent::RejectedToolCall {
+                            rejected,
+                            wire_item_index,
+                        },
+                    })
+                    .collect(),
+                model: message.model,
+                provider: message.provider,
+                origin: message.origin,
+                usage: message.usage,
+                stop_reason: message.stop_reason,
+                error_message: message.error_message,
+                provider_code: message.provider_code,
+                interrupted: message.interrupted,
+                timestamp: message.timestamp,
+            })
+        }
+    }
 }
 
 fn assistant_error(message: &PublicMessage) -> String {

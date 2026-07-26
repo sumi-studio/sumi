@@ -6,7 +6,7 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::{
-    gateway::{Command, CommandAck},
+    gateway::{ApprovalDecision, Command, CommandAck},
     provider::types::{PublicAssistantContent, PublicMessage, StopReason, ToolResultMessage},
     runtime::contracts::ProcessGeneration,
     store::{
@@ -60,6 +60,15 @@ pub(crate) struct RunOutput {
     pub commit_barrier: Option<ToolStartCommitBarrier>,
     pub message_commit_barrier: Option<MessageCommitBarrier>,
     pub retry_wait_commit_barrier: Option<RetryWaitCommitBarrier>,
+    /// For `ApprovalResolved` decisions, the authenticated `AdmittedCommand`
+    /// whose `CommandApplied` projection must accompany the resolution.
+    pub approval_command: Option<AdmittedCommand>,
+    /// Tool-call ID whose `ToolResult` should be durably skipped as
+    /// approval-denied before any matching `ToolExecutionStart`.
+    pub approval_not_started: Option<String>,
+    /// Tool-call ID whose `ToolResult` should be durably skipped as
+    /// approval-cancelled before any matching `ToolExecutionStart`.
+    pub approval_cancelled: Option<String>,
 }
 
 impl RunOutput {
@@ -85,6 +94,9 @@ impl RunOutput {
             commit_barrier,
             message_commit_barrier,
             retry_wait_commit_barrier,
+            approval_command: None,
+            approval_not_started: None,
+            approval_cancelled: None,
         }
     }
 }
@@ -224,6 +236,13 @@ pub(super) struct DurableBridge {
     /// Original owner command cut off by an active Abort; applied alongside the
     /// final AgentEnd so the owner terminates with the aborted run.
     aborted_owner: Option<(String, u64)>,
+    approval_not_started: HashSet<String>,
+    approval_cancelled: HashSet<String>,
+    approval_command: Option<AdmittedCommand>,
+    approval_request_tools: HashMap<String, String>,
+    approval_prepared_tools: HashSet<String>,
+    pending_approval_resolved: Option<(String, ApprovalResolution, AdmittedCommand)>,
+    current_tool_calls: HashSet<String>,
     committed_terminal_command_ids: Vec<String>,
 }
 
@@ -261,6 +280,13 @@ impl DurableBridge {
             pending_hard_steer_user_message_id: None,
             pending_hard_steer_message_barrier: None,
             aborted_owner: None,
+            approval_not_started: HashSet::new(),
+            approval_cancelled: HashSet::new(),
+            approval_command: None,
+            approval_request_tools: HashMap::new(),
+            approval_prepared_tools: HashSet::new(),
+            pending_approval_resolved: None,
+            current_tool_calls: HashSet::new(),
             committed_terminal_command_ids: Vec::new(),
         }
     }
@@ -511,6 +537,18 @@ impl DurableBridge {
         self.retry_wait_ready
     }
 
+    pub(super) fn take_terminal_command_ids(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.committed_terminal_command_ids)
+    }
+
+    pub(super) fn mark_approval_not_started(&mut self, tool_call_id: String) {
+        self.approval_not_started.insert(tool_call_id);
+    }
+
+    pub(super) fn set_approval_command(&mut self, command: AdmittedCommand) {
+        self.approval_command = Some(command);
+    }
+
     pub(super) async fn bind_retry_steer(
         &mut self,
         writer: &EventWriter,
@@ -598,6 +636,15 @@ impl DurableBridge {
             bail!("run output durable binding changed while the worker was active");
         }
         let steer_group_active = self.pending_steer_group.is_some();
+        if output.approval_command.is_some() {
+            self.approval_command = output.approval_command;
+        }
+        if let Some(tool_call_id) = output.approval_not_started {
+            self.approval_not_started.insert(tool_call_id);
+        }
+        if let Some(tool_call_id) = output.approval_cancelled {
+            self.approval_cancelled.insert(tool_call_id);
+        }
         let next_turn = matches!(output.event, AgentEvent::TurnStart)
             && !self.turn_open
             && self.phase != RunPhase::RunStarted
@@ -822,28 +869,112 @@ impl DurableBridge {
                 if self.assistant_open.is_some() {
                     bail!("ToolExecutionStart cannot precede assistant MessageEnd");
                 }
-                writer
-                    .apply(EventBatch {
-                        writes: vec![EventWrite {
-                            event: None,
-                            projections: vec![Projection::ToolExecution(
-                                ToolExecutionMutation::Prepare {
-                                    tool_call_id: tool_call_id.clone(),
-                                    command_id: self.binding.command_id.clone(),
-                                    run_id: self.binding.run_id.clone(),
-                                    executor_generation: self.binding.executor_generation,
-                                    idempotency_key: self
-                                        .binding
-                                        .tool_execution_idempotency_key(&tool_call_id),
-                                },
-                            )],
-                        }],
-                        injected_commands: Vec::new(),
-                    })
-                    .await?;
                 self.pending_tool_end
                     .insert(tool_call_id.clone(), (Value::Null, false));
                 self.pending_tool_calls.remove(&tool_call_id);
+                if let Some((request_id, resolution, command)) =
+                    self.pending_approval_resolved.take()
+                {
+                    let expected_tool_call_id = self
+                        .approval_request_tools
+                        .get(&request_id)
+                        .ok_or_else(|| anyhow!("pending approval has no tool_call_id binding"))?;
+                    if *expected_tool_call_id != tool_call_id {
+                        bail!("ToolExecutionStart does not match the pending approval resolution");
+                    }
+                    let state = approval_state(&resolution);
+                    let command_id = command.envelope().command_id.to_string();
+                    let command_seq = command.envelope().seq;
+                    let run_id = self.binding.run_id.clone();
+                    let public_resolution = resolution.clone();
+                    let writes = vec![
+                        EventWrite {
+                            event: Some(DurableEvent::approval_resolved(
+                                request_id.clone(),
+                                resolution,
+                                "user".to_owned(),
+                            )?),
+                            projections: vec![
+                                Projection::Approval(ApprovalMutation::Resolve {
+                                    request_id: request_id.clone(),
+                                    state,
+                                    actor: "user".to_owned(),
+                                }),
+                                Projection::CommandApplied {
+                                    command_id: command_id.clone(),
+                                    command_seq,
+                                    run_id: Some(run_id.clone()),
+                                },
+                            ],
+                        },
+                        EventWrite {
+                            event: Some(DurableEvent::tool_execution_start(
+                                tool_call_id.clone(),
+                                tool_name.clone(),
+                                args.clone(),
+                            )?),
+                            projections: vec![Projection::ToolExecution(
+                                ToolExecutionMutation::Start {
+                                    tool_call_id: tool_call_id.clone(),
+                                    run_id: run_id.clone(),
+                                },
+                            )],
+                        },
+                    ];
+                    self.approval_prepared_tools.remove(&tool_call_id);
+                    self.committed_terminal_command_ids.push(command_id);
+                    let public = vec![
+                        AgentEvent::ApprovalResolved {
+                            request_id: request_id.clone(),
+                            resolution: public_resolution,
+                        },
+                        AgentEvent::ToolExecutionStart {
+                            tool_call_id: tool_call_id.clone(),
+                            tool_name: tool_name.clone(),
+                            args: args.clone(),
+                        },
+                    ];
+                    let outputs = self
+                        .commit_batch(
+                            writer,
+                            EventBatch {
+                                writes,
+                                injected_commands: Vec::new(),
+                            },
+                            public,
+                        )
+                        .await?;
+                    return Ok(CommittedRunOutput {
+                        outputs,
+                        tool_start_barrier: output.commit_barrier,
+                        message_receipts: Vec::new(),
+                        retry_wait_commit_barrier: None,
+                        terminal_command_ids: std::mem::take(
+                            &mut self.committed_terminal_command_ids,
+                        ),
+                    });
+                }
+                if !self.approval_prepared_tools.remove(&tool_call_id) {
+                    writer
+                        .apply(EventBatch {
+                            writes: vec![EventWrite {
+                                event: None,
+                                projections: vec![Projection::ToolExecution(
+                                    ToolExecutionMutation::Prepare {
+                                        tool_call_id: tool_call_id.clone(),
+                                        command_id: self.binding.command_id.clone(),
+                                        run_id: self.binding.run_id.clone(),
+                                        executor_generation: self.binding.executor_generation,
+                                        idempotency_key: self
+                                            .binding
+                                            .tool_execution_idempotency_key(&tool_call_id),
+                                    },
+                                )],
+                            }],
+                            injected_commands: Vec::new(),
+                        })
+                        .await?;
+                }
                 self.commit_single(
                     writer,
                     DurableEvent::tool_execution_start(
@@ -931,6 +1062,7 @@ impl DurableBridge {
                     bail!("AgentEnd requires the current TurnEnd to be durable first");
                 }
                 let abort_cutoff = self.phase == RunPhase::CancelRequested;
+                let mut outputs = self.flush_pending_approval_resolved(writer).await?;
                 self.phase = RunPhase::Finished;
                 let mut projections = Vec::with_capacity(2);
                 if abort_cutoff {
@@ -948,13 +1080,16 @@ impl DurableBridge {
                         run_id: Some(self.binding.run_id.clone()),
                     });
                 }
-                self.commit_single(
-                    writer,
-                    DurableEvent::agent_end(&self.binding.run_id)?,
-                    projections,
-                    AgentEvent::AgentEnd,
-                )
-                .await
+                let (agent_end_outputs, message_receipts) = self
+                    .commit_single(
+                        writer,
+                        DurableEvent::agent_end(&self.binding.run_id)?,
+                        projections,
+                        AgentEvent::AgentEnd,
+                    )
+                    .await?;
+                outputs.extend(agent_end_outputs);
+                Ok((outputs, message_receipts))
             }
             AgentEvent::Steered {
                 mode: super::SteerMode::Hard,
@@ -984,6 +1119,9 @@ impl DurableBridge {
                 }
                 let request_id = request.id.clone();
                 let tool_call_id = request.tool_call_id.clone();
+                self.approval_request_tools
+                    .insert(request_id.clone(), tool_call_id.clone());
+                self.approval_prepared_tools.insert(tool_call_id.clone());
                 self.commit_single(
                     writer,
                     DurableEvent::approval_requested(request.clone())?,
@@ -1012,6 +1150,9 @@ impl DurableBridge {
                 request_id,
                 resolution: ApprovalResolution::Cancelled,
             } => {
+                if let Some(tool_call_id) = self.approval_request_tools.get(&request_id) {
+                    self.approval_cancelled.insert(tool_call_id.clone());
+                }
                 self.commit_single(
                     writer,
                     DurableEvent::approval_resolved(
@@ -1031,8 +1172,77 @@ impl DurableBridge {
                 )
                 .await
             }
-            AgentEvent::ApprovalResolved { .. } => {
-                bail!("user approval decisions require the later T23 ApprovalBroker")
+            AgentEvent::ApprovalResolved {
+                request_id,
+                resolution: resolution @ ApprovalResolution::Decision(..),
+            } => {
+                if self.phase != RunPhase::AssistantStarted
+                    || !self.turn_open
+                    || self.assistant_open.is_some()
+                {
+                    bail!(
+                        "ApprovalResolved Decision requires a durable assistant tool call in the active turn"
+                    );
+                }
+                let state = approval_state(&resolution);
+                if matches!(
+                    resolution,
+                    ApprovalResolution::Decision(ApprovalDecision::Deny)
+                ) && let Some(tool_call_id) = self.approval_request_tools.get(&request_id)
+                {
+                    self.approval_not_started.insert(tool_call_id.clone());
+                }
+                let command = self.approval_command.take().ok_or_else(|| {
+                    anyhow!("ApprovalResolved Decision requires a pending command")
+                })?;
+                if matches!(
+                    resolution,
+                    ApprovalResolution::Decision(
+                        ApprovalDecision::ApproveOnce | ApprovalDecision::ApproveAlways { .. }
+                    )
+                ) {
+                    self.pending_approval_resolved = Some((request_id, resolution, command));
+                    return Ok(CommittedRunOutput {
+                        outputs: Vec::new(),
+                        tool_start_barrier: None,
+                        message_receipts: Vec::new(),
+                        retry_wait_commit_barrier: None,
+                        terminal_command_ids: std::mem::take(
+                            &mut self.committed_terminal_command_ids,
+                        ),
+                    });
+                } else {
+                    let command_id = command.envelope().command_id.to_string();
+                    let command_seq = command.envelope().seq;
+                    let run_id = self.binding.run_id.clone();
+                    let projections = vec![
+                        Projection::Approval(ApprovalMutation::Resolve {
+                            request_id: request_id.clone(),
+                            state,
+                            actor: "user".to_owned(),
+                        }),
+                        Projection::CommandApplied {
+                            command_id: command_id.clone(),
+                            command_seq,
+                            run_id: Some(run_id),
+                        },
+                    ];
+                    self.committed_terminal_command_ids.push(command_id);
+                    self.commit_single(
+                        writer,
+                        DurableEvent::approval_resolved(
+                            request_id.clone(),
+                            resolution.clone(),
+                            "user".to_owned(),
+                        )?,
+                        projections,
+                        AgentEvent::ApprovalResolved {
+                            request_id,
+                            resolution,
+                        },
+                    )
+                    .await
+                }
             }
             AgentEvent::Steered { .. } | AgentEvent::MemoryMaintenance { .. } => {
                 bail!("event requires a later T15/T16/T17 durable bridge extension")
@@ -1064,8 +1274,16 @@ impl DurableBridge {
         self.assistant_open = None;
         self.length_not_started.clear();
         self.pending_tool_calls.clear();
+        self.current_tool_calls.clear();
         let mut rejected = HashSet::new();
         if let PublicMessage::Assistant(assistant) = &message {
+            self.current_tool_calls
+                .extend(assistant.content.iter().filter_map(|item| match item {
+                    PublicAssistantContent::ToolCall { tool_call, .. } => {
+                        Some(tool_call.id.clone())
+                    }
+                    _ => None,
+                }));
             let is_length = assistant.stop_reason == StopReason::Length
                 || (assistant.stop_reason == StopReason::Error
                     && assistant.provider_code.as_deref() == Some(LENGTH_LOOP_CODE));
@@ -1287,6 +1505,32 @@ impl DurableBridge {
                     idempotency_key: format!("{owner_id}/{tool_call_id}"),
                     error_code,
                 }));
+            } else if self.approval_cancelled.remove(&tool_call_id) {
+                if !result.is_error {
+                    bail!("Approval-cancelled ToolResult must be is_error=true");
+                }
+                projections.push(Projection::ToolExecution(ToolExecutionMutation::Skip {
+                    tool_call_id: tool_call_id.clone(),
+                    command_id: self.binding.command_id.clone(),
+                    run_id: self.binding.run_id.clone(),
+                    turn_id: self.binding.turn_id.clone(),
+                    executor_generation: self.binding.executor_generation,
+                    idempotency_key: self.binding.tool_execution_idempotency_key(&tool_call_id),
+                    error_code: "approval_cancelled",
+                }));
+            } else if self.approval_not_started.remove(&tool_call_id) {
+                if !result.is_error {
+                    bail!("Approval-not-started ToolResult must be is_error=true");
+                }
+                projections.push(Projection::ToolExecution(ToolExecutionMutation::Skip {
+                    tool_call_id: tool_call_id.clone(),
+                    command_id: self.binding.command_id.clone(),
+                    run_id: self.binding.run_id.clone(),
+                    turn_id: self.binding.turn_id.clone(),
+                    executor_generation: self.binding.executor_generation,
+                    idempotency_key: self.binding.tool_execution_idempotency_key(&tool_call_id),
+                    error_code: "approval_denied",
+                }));
             } else if let Some((_, _, pending_ids, _)) = self.pending_rejected_end.as_mut()
                 && pending_ids.remove(&tool_call_id)
             {
@@ -1301,7 +1545,7 @@ impl DurableBridge {
                 return self.commit_rejected_pair_batch(writer).await;
             } else {
                 bail!(
-                    "tool result has neither execution lifecycle nor Length not-started disposition"
+                    "tool result has neither execution lifecycle nor known not-started disposition"
                 );
             }
         }
@@ -1467,6 +1711,55 @@ impl DurableBridge {
             bail!("atomic batch contained an unbound MessageEnd receipt");
         }
         Ok((outputs, receipts))
+    }
+
+    /// Commit a pending approved resolution that never received its paired
+    /// `ToolExecutionStart`. This can happen when the run ends or the worker
+    /// exits before the approved tool is started; the decision and the
+    /// command that carried it must still become durable.
+    pub(super) async fn flush_pending_approval_resolved(
+        &mut self,
+        writer: &EventWriter,
+    ) -> Result<Vec<CommittedOutput>> {
+        let Some((request_id, resolution, command)) = self.pending_approval_resolved.take() else {
+            return Ok(Vec::new());
+        };
+        let state = approval_state(&resolution);
+        let command_id = command.envelope().command_id.to_string();
+        let command_seq = command.envelope().seq;
+        let run_id = self.binding.run_id.clone();
+        self.committed_terminal_command_ids.push(command_id.clone());
+        let public_resolution = resolution.clone();
+        self.commit_batch(
+            writer,
+            EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(DurableEvent::approval_resolved(
+                        request_id.clone(),
+                        resolution,
+                        "user".to_owned(),
+                    )?),
+                    projections: vec![
+                        Projection::Approval(ApprovalMutation::Resolve {
+                            request_id: request_id.clone(),
+                            state,
+                            actor: "user".to_owned(),
+                        }),
+                        Projection::CommandApplied {
+                            command_id,
+                            command_seq,
+                            run_id: Some(run_id),
+                        },
+                    ],
+                }],
+                injected_commands: Vec::new(),
+            },
+            vec![AgentEvent::ApprovalResolved {
+                request_id,
+                resolution: public_resolution,
+            }],
+        )
+        .await
     }
 
     fn transition(&mut self, expected: RunPhase, next: RunPhase) -> Result<Projection> {
@@ -1902,6 +2195,16 @@ impl DurableBridge {
     }
 }
 
+fn approval_state(resolution: &ApprovalResolution) -> &'static str {
+    use crate::gateway::ApprovalDecision;
+    match resolution {
+        ApprovalResolution::Decision(ApprovalDecision::ApproveOnce) => "approved_once",
+        ApprovalResolution::Decision(ApprovalDecision::ApproveAlways { .. }) => "approved_always",
+        ApprovalResolution::Decision(ApprovalDecision::Deny) => "denied",
+        ApprovalResolution::Cancelled => "cancelled",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2196,6 +2499,9 @@ mod tests {
             commit_barrier: None,
             message_commit_barrier: None,
             retry_wait_commit_barrier: None,
+            approval_command: None,
+            approval_not_started: None,
+            approval_cancelled: None,
         };
         assert_eq!(output.binding.executor_generation.to_wire(), 73);
         let public = serde_json::to_value(output.event).expect("serialize public event");
@@ -2312,6 +2618,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: Some(partial_barrier),
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2338,6 +2647,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: None,
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2352,6 +2664,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: None,
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2468,6 +2783,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: Some(assistant_barrier),
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2494,6 +2812,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: None,
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2512,6 +2833,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: Some(user_barrier),
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2548,6 +2872,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: None,
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2651,6 +2978,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: Some(assistant_barrier),
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2679,6 +3009,9 @@ mod tests {
                     commit_barrier: Some(tool_start_barrier),
                     message_commit_barrier: None,
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2711,6 +3044,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: None,
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2729,6 +3065,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: None,
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2747,6 +3086,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: Some(tool_result_barrier),
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2765,6 +3107,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: None,
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2779,6 +3124,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: None,
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2803,6 +3151,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: None,
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2821,6 +3172,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: Some(user_barrier),
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2907,6 +3261,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: Some(assistant_barrier),
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2948,6 +3305,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: None,
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2966,6 +3326,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: Some(result_barrier),
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2984,6 +3347,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: None,
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2998,6 +3364,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: None,
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
