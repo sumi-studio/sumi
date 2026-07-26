@@ -34,8 +34,8 @@ func (failClosedCommandSource) CatchUp(ctx context.Context, claims TokenClaims, 
 	return nil, errNotWired
 }
 
-func (failClosedCommandSource) Live(ctx context.Context, claims TokenClaims, fromSeq uint64) (<-chan CommandEnvelope, error) {
-	return nil, errNotWired
+func (failClosedCommandSource) Live(ctx context.Context, claims TokenClaims, fromSeq uint64) (<-chan CommandEnvelope, <-chan error, error) {
+	return nil, nil, errNotWired
 }
 
 func (failClosedCommandSource) ApplyAck(ctx context.Context, claims TokenClaims, ack CommandAck) error {

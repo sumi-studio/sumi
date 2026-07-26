@@ -2,10 +2,12 @@ package agentevents
 
 // DurableGateway is the production adapter for the T28 API boundary. T26
 // publishes one atomically-written state file per agent (generation + stable
-// hydration receipt identity); commands, ACKs, and agent events are persisted here rather than
-// being represented by cmd/server placeholders.
+// hydration receipt identity); commands, ACKs, and agent events are persisted
+// here rather than being represented by cmd/server placeholders.
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -23,6 +25,20 @@ type DurableGateway struct {
 	dir      string
 	commands *CommandStore
 	mu       sync.Mutex
+
+	// PollInterval bounds the polling interval used by WaitFor and Live.
+	// A zero value uses the safe default (50ms).
+	PollInterval time.Duration
+
+	tails   map[string]*conversationLogState
+	newFile func(string, int, os.FileMode) (durableFileHandle, error)
+}
+
+type conversationLogState struct {
+	eventSeq  uint64
+	eventSize int64
+	acks      map[uint64]CommandAck
+	ackSize   int64
 }
 
 type runtimeState struct {
@@ -34,6 +50,19 @@ type runtimeState struct {
 type durableEventRecord struct {
 	Seq   uint64   `json:"seq"`
 	Event Envelope `json:"event"`
+}
+
+// durableFileHandle abstracts the per-conversation log file so tests can
+// inject deterministic write/sync/truncate failures without changing
+// production call sites.
+type durableFileHandle interface {
+	io.Seeker
+	io.Reader
+	io.Writer
+	Sync() error
+	Truncate(size int64) error
+	Close() error
+	Fd() uintptr
 }
 
 func OpenDurableGateway(dir string, commands *CommandStore) (*DurableGateway, error) {
@@ -51,10 +80,31 @@ func OpenDurableGateway(dir string, commands *CommandStore) (*DurableGateway, er
 		return nil, fmt.Errorf("create gateway runtime state directory: %w", err)
 	}
 	info, err := os.Lstat(abs)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return nil, errors.New("gateway runtime state path must be a real directory")
+	if err != nil {
+		return nil, fmt.Errorf("inspect gateway runtime state directory: %w", err)
 	}
-	return &DurableGateway{dir: abs, commands: commands}, nil
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.New("gateway runtime state path must not be a symlink")
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("gateway runtime state path %q is not a directory", abs)
+	}
+	return &DurableGateway{
+		dir:          abs,
+		commands:     commands,
+		PollInterval: 50 * time.Millisecond,
+		tails:        make(map[string]*conversationLogState),
+		newFile: func(name string, flag int, perm os.FileMode) (durableFileHandle, error) {
+			return os.OpenFile(name, flag, perm)
+		},
+	}, nil
+}
+
+func (g *DurableGateway) pollInterval() time.Duration {
+	if g.PollInterval > 0 {
+		return g.PollInterval
+	}
+	return 50 * time.Millisecond
 }
 
 func (g *DurableGateway) VerifyGeneration(ctx context.Context, agentID string, generation uint64) error {
@@ -72,7 +122,7 @@ func (g *DurableGateway) VerifyGeneration(ctx context.Context, agentID string, g
 }
 
 func (g *DurableGateway) WaitFor(ctx context.Context, claims TokenClaims, generation uint64) error {
-	ticker := time.NewTicker(50 * time.Millisecond)
+	ticker := time.NewTicker(g.pollInterval())
 	defer ticker.Stop()
 	for {
 		state, err := g.state(ctx, claims.AgentID)
@@ -112,16 +162,22 @@ func (g *DurableGateway) CatchUp(ctx context.Context, claims TokenClaims, fromSe
 	return g.commands.CatchUp(ctx, claims.ConversationID, fromSeq)
 }
 
-func (g *DurableGateway) Live(ctx context.Context, claims TokenClaims, fromSeq uint64) (<-chan CommandEnvelope, error) {
+func (g *DurableGateway) Live(ctx context.Context, claims TokenClaims, fromSeq uint64) (<-chan CommandEnvelope, <-chan error, error) {
 	next := fromSeq
 	out := make(chan CommandEnvelope, 16)
+	errCh := make(chan error, 1)
 	go func() {
 		defer close(out)
-		ticker := time.NewTicker(50 * time.Millisecond)
+		defer close(errCh)
+		ticker := time.NewTicker(g.pollInterval())
 		defer ticker.Stop()
 		for {
 			commands, err := g.commands.CatchUp(ctx, claims.ConversationID, next)
 			if err != nil {
+				select {
+				case errCh <- fmt.Errorf("command catch-up: %w", err):
+				case <-ctx.Done():
+				}
 				return
 			}
 			for _, command := range commands {
@@ -139,7 +195,7 @@ func (g *DurableGateway) Live(ctx context.Context, claims TokenClaims, fromSeq u
 			}
 		}
 	}()
-	return out, nil
+	return out, errCh, nil
 }
 
 func (g *DurableGateway) ApplyAck(ctx context.Context, claims TokenClaims, ack CommandAck) error {
@@ -149,11 +205,11 @@ func (g *DurableGateway) ApplyAck(ctx context.Context, claims TokenClaims, ack C
 	if err := validateCommandAck(ack); err != nil {
 		return err
 	}
-	commands, err := g.commands.CatchUp(ctx, claims.ConversationID, ack.Seq)
+	cmd, found, err := g.commands.GetCommand(ctx, claims.ConversationID, ack.Seq)
 	if err != nil {
 		return fmt.Errorf("load acknowledged command: %w", err)
 	}
-	if len(commands) == 0 || commands[0].Seq != ack.Seq || commands[0].CommandID != ack.CommandID {
+	if !found || cmd.CommandID != ack.CommandID {
 		return fmt.Errorf(
 			"ack does not match durable command log: seq=%d command_id=%q",
 			ack.Seq,
@@ -162,7 +218,7 @@ func (g *DurableGateway) ApplyAck(ctx context.Context, claims TokenClaims, ack C
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.appendCommandAckLocked(g.ackPath(claims.ConversationID), ack)
+	return g.appendCommandAckLocked(claims.ConversationID, ack)
 }
 
 func (g *DurableGateway) Receive(ctx context.Context, claims TokenClaims, envelope Envelope) error {
@@ -178,7 +234,7 @@ func (g *DurableGateway) Receive(ctx context.Context, claims TokenClaims, envelo
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.appendDurableEventLocked(
-		g.eventPath(claims.ConversationID),
+		claims.ConversationID,
 		durableEventRecord{Seq: *envelope.Seq, Event: envelope},
 	)
 }
@@ -189,11 +245,9 @@ func (g *DurableGateway) LastReceivedEventSeq(ctx context.Context, claims TokenC
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.lastEventSeqLocked(claims.ConversationID)
-}
-
-func (g *DurableGateway) lastEventSeqLocked(conversationID string) (uint64, error) {
-	file, err := os.Open(g.eventPath(conversationID))
+	st := g.stateFor(claims.ConversationID)
+	path := g.eventPath(claims.ConversationID)
+	file, err := g.newFile(path, os.O_RDWR, 0o600)
 	if os.IsNotExist(err) {
 		return 0, nil
 	}
@@ -201,24 +255,24 @@ func (g *DurableGateway) lastEventSeqLocked(conversationID string) (uint64, erro
 		return 0, err
 	}
 	defer file.Close()
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_SH); err != nil {
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
 		return 0, fmt.Errorf("lock durable event log for read: %w", err)
 	}
-	defer func() { _ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN) }()
-	decoder := json.NewDecoder(file)
-	var last uint64
-	for {
-		var record durableEventRecord
-		if err := decoder.Decode(&record); errors.Is(err, io.EOF) {
-			return last, nil
-		} else if err != nil {
-			return 0, fmt.Errorf("decode durable event log: %w", err)
-		}
-		if record.Seq != last+1 {
-			return 0, fmt.Errorf("durable event log is non-contiguous: got %d after %d", record.Seq, last)
-		}
-		last = record.Seq
+	defer func() { _ = unlockDurableFile(file) }()
+	if err := g.refreshEventTailLocked(file, st); err != nil {
+		return 0, err
 	}
+	return st.eventSeq, nil
+}
+
+func (g *DurableGateway) stateFor(conversationID string) *conversationLogState {
+	st, ok := g.tails[conversationID]
+	if ok {
+		return st
+	}
+	st = &conversationLogState{acks: make(map[uint64]CommandAck)}
+	g.tails[conversationID] = st
+	return st
 }
 
 func (g *DurableGateway) state(ctx context.Context, agentID string) (runtimeState, error) {
@@ -251,8 +305,10 @@ func (g *DurableGateway) state(ctx context.Context, agentID string) (runtimeStat
 	return state, nil
 }
 
-func (g *DurableGateway) appendDurableEventLocked(path string, record durableEventRecord) error {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+func (g *DurableGateway) appendDurableEventLocked(conversationID string, record durableEventRecord) error {
+	st := g.stateFor(conversationID)
+	path := g.eventPath(conversationID)
+	file, err := g.newFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return err
 	}
@@ -260,40 +316,54 @@ func (g *DurableGateway) appendDurableEventLocked(path string, record durableEve
 	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
 		return fmt.Errorf("lock durable event log for append: %w", err)
 	}
-	defer func() { _ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN) }()
+	defer func() { _ = unlockDurableFile(file) }()
 
-	decoder := json.NewDecoder(file)
-	var last uint64
-	for {
-		var existing durableEventRecord
-		if err := decoder.Decode(&existing); errors.Is(err, io.EOF) {
-			break
-		} else if err != nil {
-			return fmt.Errorf("decode durable event log: %w", err)
-		}
-		if existing.Seq != last+1 {
-			return fmt.Errorf("durable event log is non-contiguous: got %d after %d", existing.Seq, last)
-		}
-		last = existing.Seq
+	if err := g.refreshEventTailLocked(file, st); err != nil {
+		return err
 	}
-	if record.Seq != last+1 {
-		return fmt.Errorf("event seq is not contiguous: got %d, want %d", record.Seq, last+1)
+	if record.Seq != st.eventSeq+1 {
+		return fmt.Errorf("event seq is not contiguous: got %d, want %d", record.Seq, st.eventSeq+1)
 	}
 	line, err := json.Marshal(record)
 	if err != nil {
 		return err
 	}
-	if _, err := file.Seek(0, io.SeekEnd); err != nil {
+	data := append(line, '\n')
+
+	preWriteOffset, err := file.Seek(0, io.SeekEnd)
+	if err != nil {
 		return err
 	}
-	if _, err := file.Write(append(line, '\n')); err != nil {
-		return err
+	written, writeErr := file.Write(data)
+	if writeErr != nil || written != len(data) {
+		var opErr error
+		if writeErr != nil {
+			opErr = fmt.Errorf("write durable event log: %w", writeErr)
+		} else {
+			opErr = fmt.Errorf("short write to durable event log: wrote %d of %d bytes", written, len(data))
+		}
+		if rbErr := rollbackDurableFile(file, preWriteOffset, opErr); rbErr != nil {
+			return rbErr
+		}
+		return opErr
 	}
-	return file.Sync()
+	if syncErr := file.Sync(); syncErr != nil {
+		opErr := fmt.Errorf("sync durable event log: %w", syncErr)
+		if rbErr := rollbackDurableFile(file, preWriteOffset, opErr); rbErr != nil {
+			return rbErr
+		}
+		return opErr
+	}
+
+	st.eventSeq = record.Seq
+	st.eventSize = preWriteOffset + int64(len(data))
+	return nil
 }
 
-func (g *DurableGateway) appendCommandAckLocked(path string, ack CommandAck) error {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+func (g *DurableGateway) appendCommandAckLocked(conversationID string, ack CommandAck) error {
+	st := g.stateFor(conversationID)
+	path := g.ackPath(conversationID)
+	file, err := g.newFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return err
 	}
@@ -301,26 +371,17 @@ func (g *DurableGateway) appendCommandAckLocked(path string, ack CommandAck) err
 	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
 		return fmt.Errorf("lock durable ack log for append: %w", err)
 	}
-	defer func() { _ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN) }()
+	defer func() { _ = unlockDurableFile(file) }()
 
-	decoder := json.NewDecoder(file)
-	var previous *CommandAck
-	for {
-		var existing CommandAck
-		if err := decoder.Decode(&existing); errors.Is(err, io.EOF) {
-			break
-		} else if err != nil {
-			return fmt.Errorf("decode durable ack log: %w", err)
-		}
-		if existing.Seq == ack.Seq || existing.CommandID == ack.CommandID {
-			if existing.Seq != ack.Seq || existing.CommandID != ack.CommandID {
-				return fmt.Errorf("durable ack log contains mismatched seq/command_id correlation")
-			}
-			existingCopy := existing
-			previous = &existingCopy
-		}
+	if err := g.refreshAckTailLocked(file, st); err != nil {
+		return err
 	}
-	if previous != nil {
+
+	previous, ok := st.acks[ack.Seq]
+	if ok {
+		if previous.Seq != ack.Seq || previous.CommandID != ack.CommandID {
+			return fmt.Errorf("durable ack log contains mismatched seq/command_id correlation")
+		}
 		if previous.Status == ack.Status && stringPointerEqual(previous.RejectReason, ack.RejectReason) {
 			return nil
 		}
@@ -341,13 +402,257 @@ func (g *DurableGateway) appendCommandAckLocked(path string, ack CommandAck) err
 	if err != nil {
 		return err
 	}
-	if _, err := file.Seek(0, io.SeekEnd); err != nil {
+	data := append(line, '\n')
+
+	preWriteOffset, err := file.Seek(0, io.SeekEnd)
+	if err != nil {
 		return err
 	}
-	if _, err := file.Write(append(line, '\n')); err != nil {
+	written, writeErr := file.Write(data)
+	if writeErr != nil || written != len(data) {
+		var opErr error
+		if writeErr != nil {
+			opErr = fmt.Errorf("write durable ack log: %w", writeErr)
+		} else {
+			opErr = fmt.Errorf("short write to durable ack log: wrote %d of %d bytes", written, len(data))
+		}
+		if rbErr := rollbackDurableFile(file, preWriteOffset, opErr); rbErr != nil {
+			return rbErr
+		}
+		return opErr
+	}
+	if syncErr := file.Sync(); syncErr != nil {
+		opErr := fmt.Errorf("sync durable ack log: %w", syncErr)
+		if rbErr := rollbackDurableFile(file, preWriteOffset, opErr); rbErr != nil {
+			return rbErr
+		}
+		return opErr
+	}
+
+	st.acks[ack.Seq] = ack
+	st.ackSize = preWriteOffset + int64(len(data))
+	return nil
+}
+
+func (g *DurableGateway) refreshEventTailLocked(file durableFileHandle, st *conversationLogState) error {
+	size, err := file.Seek(0, io.SeekEnd)
+	if err != nil {
+		return fmt.Errorf("seek durable event log: %w", err)
+	}
+	if size == st.eventSize {
+		return nil
+	}
+	if size < st.eventSize {
+		st.eventSeq = 0
+		st.eventSize = 0
+	}
+	start := st.eventSize
+	if _, err := file.Seek(start, io.SeekStart); err != nil {
+		return fmt.Errorf("seek durable event log for tail refresh: %w", err)
+	}
+
+	r := bufio.NewReader(file)
+	offset := start
+	last := st.eventSeq
+	for {
+		lineStart := offset
+		line, readErr := r.ReadBytes('\n')
+		if len(line) > 0 {
+			offset += int64(len(line))
+		}
+
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) == 0 {
+			if readErr == io.EOF {
+				break
+			}
+			if readErr != nil {
+				return fmt.Errorf("read durable event log: %w", readErr)
+			}
+			continue
+		}
+
+		var existing durableEventRecord
+		if err := json.Unmarshal(trimmed, &existing); err != nil {
+			if readErr == io.EOF && isIncompleteJSONError(err) {
+				if truncErr := file.Truncate(lineStart); truncErr != nil {
+					return fmt.Errorf("truncate partial durable event tail: %w", truncErr)
+				}
+				if syncErr := file.Sync(); syncErr != nil {
+					return fmt.Errorf("sync after truncating partial durable event tail: %w", syncErr)
+				}
+				offset = lineStart
+				break
+			}
+			if readErr == io.EOF {
+				return fmt.Errorf("decode durable event log: final record is malformed but complete: %w", err)
+			}
+			return fmt.Errorf("decode durable event log: %w", err)
+		}
+		if existing.Seq != last+1 {
+			return fmt.Errorf("durable event log is non-contiguous: got %d after %d", existing.Seq, last)
+		}
+		last = existing.Seq
+
+		if readErr == io.EOF {
+			if len(line) > 0 && line[len(line)-1] != '\n' {
+				if _, werr := file.Write([]byte{'\n'}); werr != nil {
+					return fmt.Errorf("repair missing trailing newline in durable event log: %w", werr)
+				}
+				if syncErr := file.Sync(); syncErr != nil {
+					return fmt.Errorf("sync repaired durable event log trailing newline: %w", syncErr)
+				}
+				offset += 1
+			}
+			break
+		}
+		if readErr != nil {
+			return fmt.Errorf("read durable event log: %w", readErr)
+		}
+	}
+
+	st.eventSeq = last
+	st.eventSize = offset
+	return nil
+}
+
+func (g *DurableGateway) refreshAckTailLocked(file durableFileHandle, st *conversationLogState) error {
+	size, err := file.Seek(0, io.SeekEnd)
+	if err != nil {
+		return fmt.Errorf("seek durable ack log: %w", err)
+	}
+	if size == st.ackSize {
+		return nil
+	}
+	if size < st.ackSize {
+		st.acks = make(map[uint64]CommandAck)
+		st.ackSize = 0
+	}
+	start := st.ackSize
+	if _, err := file.Seek(start, io.SeekStart); err != nil {
+		return fmt.Errorf("seek durable ack log for tail refresh: %w", err)
+	}
+
+	r := bufio.NewReader(file)
+	offset := start
+	for {
+		lineStart := offset
+		line, readErr := r.ReadBytes('\n')
+		if len(line) > 0 {
+			offset += int64(len(line))
+		}
+
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) == 0 {
+			if readErr == io.EOF {
+				break
+			}
+			if readErr != nil {
+				return fmt.Errorf("read durable ack log: %w", readErr)
+			}
+			continue
+		}
+
+		var existing CommandAck
+		if err := json.Unmarshal(trimmed, &existing); err != nil {
+			if readErr == io.EOF && isIncompleteJSONError(err) {
+				if truncErr := file.Truncate(lineStart); truncErr != nil {
+					return fmt.Errorf("truncate partial durable ack tail: %w", truncErr)
+				}
+				if syncErr := file.Sync(); syncErr != nil {
+					return fmt.Errorf("sync after truncating partial durable ack tail: %w", syncErr)
+				}
+				offset = lineStart
+				break
+			}
+			if readErr == io.EOF {
+				return fmt.Errorf("decode durable ack log: final record is malformed but complete: %w", err)
+			}
+			return fmt.Errorf("decode durable ack log: %w", err)
+		}
+		st.acks[existing.Seq] = existing
+
+		if readErr == io.EOF {
+			if len(line) > 0 && line[len(line)-1] != '\n' {
+				if _, werr := file.Write([]byte{'\n'}); werr != nil {
+					return fmt.Errorf("repair missing trailing newline in durable ack log: %w", werr)
+				}
+				if syncErr := file.Sync(); syncErr != nil {
+					return fmt.Errorf("sync repaired durable ack log trailing newline: %w", syncErr)
+				}
+				offset += 1
+			}
+			break
+		}
+		if readErr != nil {
+			return fmt.Errorf("read durable ack log: %w", readErr)
+		}
+	}
+
+	st.ackSize = offset
+	return nil
+}
+
+func (g *DurableGateway) publishRuntimeState(agentID string, state runtimeState) error {
+	raw, err := json.Marshal(state)
+	if err != nil {
 		return err
 	}
-	return file.Sync()
+	return writeFileAtomic(g.statePath(agentID), raw, 0o600)
+}
+
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temporary file for atomic write: %w", err)
+	}
+	tmpPath := tmp.Name()
+	removeTmp := true
+	defer func() {
+		if removeTmp {
+			_ = tmp.Close()
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmp.Chmod(perm); err != nil {
+		return fmt.Errorf("set temporary file permissions: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return fmt.Errorf("write temporary file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("sync temporary file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temporary file: %w", err)
+	}
+	removeTmp = false
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("publish file atomically: %w", err)
+	}
+	return nil
+}
+
+func unlockDurableFile(f durableFileHandle) error {
+	if f == nil {
+		return nil
+	}
+	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	return nil
+}
+
+func rollbackDurableFile(f durableFileHandle, offset int64, origErr error) error {
+	var truncErr, syncErr error
+	if f != nil {
+		truncErr = f.Truncate(offset)
+		syncErr = f.Sync()
+	}
+	if truncErr != nil || syncErr != nil {
+		return fmt.Errorf("append failure %v; rollback could not be confirmed (truncate=%v, sync=%v)", origErr, truncErr, syncErr)
+	}
+	return nil
 }
 
 func stringPointerEqual(left, right *string) bool {

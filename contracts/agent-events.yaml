@@ -427,7 +427,9 @@ $defs:
   AnyJSON:
     oneOf:
       - type: object
+        additionalProperties: { $ref: '#/$defs/AnyJSON' }
       - type: array
+        items: { $ref: '#/$defs/AnyJSON' }
       - type: string
       - type: integer
         minimum: -9007199254740991

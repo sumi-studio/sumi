@@ -74,8 +74,8 @@ func (f *fakeCommandSource) catchUpCount() uint64 {
 	return f.catchUpCalls
 }
 
-func (f *fakeCommandSource) Live(ctx context.Context, claims TokenClaims, fromSeq uint64) (<-chan CommandEnvelope, error) {
-	return f.live, nil
+func (f *fakeCommandSource) Live(ctx context.Context, claims TokenClaims, fromSeq uint64) (<-chan CommandEnvelope, <-chan error, error) {
+	return f.live, nil, nil
 }
 
 func (f *fakeCommandSource) ApplyAck(ctx context.Context, claims TokenClaims, ack CommandAck) error {

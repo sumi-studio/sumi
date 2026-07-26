@@ -185,9 +185,9 @@ export type StopReason = "stop" | "length" | "tool_use" | "error" | "aborted";
  */
 export type AnyJSON =
   | {
-      [k: string]: unknown;
+      [k: string]: AnyJSON;
     }
-  | unknown[]
+  | AnyJSON[]
   | string
   | number
   | boolean

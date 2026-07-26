@@ -355,6 +355,38 @@ func (s *CommandStore) FirstCommandSeq(ctx context.Context, conversationID strin
 	return st.commands[0].Seq, nil
 }
 
+// GetCommand returns a single command by exact seq. It is preferred over
+// CatchUp(seq) when the caller needs exactly one command.
+func (s *CommandStore) GetCommand(ctx context.Context, conversationID string, seq uint64) (CommandEnvelope, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return CommandEnvelope{}, false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return CommandEnvelope{}, false, errors.New("command store is closed")
+	}
+	st, err := s.ensureStateLocked(conversationID)
+	if err != nil {
+		return CommandEnvelope{}, false, err
+	}
+	if st.poisoned {
+		return CommandEnvelope{}, false, fmt.Errorf("command log for %q is poisoned: %w", conversationID, st.poisonErr)
+	}
+	if err := lockFile(st.file); err != nil {
+		return CommandEnvelope{}, false, fmt.Errorf("lock command log for %q: %w", conversationID, err)
+	}
+	defer func() { _ = unlockFile(st.file) }()
+	if err := s.refreshStateLocked(st, conversationID); err != nil {
+		return CommandEnvelope{}, false, err
+	}
+	idx, ok := st.bySeq[seq]
+	if !ok {
+		return CommandEnvelope{}, false, nil
+	}
+	return st.commands[idx], true, nil
+}
+
 // CatchUp returns commands for conversationID with seq >= fromSeq in order.
 func (s *CommandStore) CatchUp(ctx context.Context, conversationID string, fromSeq uint64) ([]CommandEnvelope, error) {
 	if err := ctx.Err(); err != nil {

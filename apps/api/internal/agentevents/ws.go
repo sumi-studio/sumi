@@ -12,8 +12,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -53,8 +55,9 @@ type CommandSource interface {
 	// Live returns commands from fromSeq onward. The source must bind this cursor
 	// before returning so an append between catch-up and subscription cannot be
 	// lost.
-	// The channel is closed when the source becomes invalid.
-	Live(ctx context.Context, claims TokenClaims, fromSeq uint64) (<-chan CommandEnvelope, error)
+	// The commands channel is closed when the source becomes invalid. The error
+	// channel carries source failures; it is closed after the commands channel.
+	Live(ctx context.Context, claims TokenClaims, fromSeq uint64) (<-chan CommandEnvelope, <-chan error, error)
 	// ApplyAck records a terminal command acknowledgement.
 	ApplyAck(ctx context.Context, claims TokenClaims, ack CommandAck) error
 }
@@ -187,8 +190,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close()
 
 	if err := s.run(ctx, conn, claims); err != nil {
-		// Close with a generic clean status. Detailed errors are logged by the
-		// caller; the agent treats any close as a reconnect signal.
+		if !errors.Is(err, context.Canceled) {
+			log.Printf("agent websocket closed: %v", err)
+		}
+		// Close with a generic clean status. The agent treats any close as a
+		// reconnect signal.
 		_ = conn.WriteControl(websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseNormalClosure, "gateway closed"),
 			s.writeDeadline())
@@ -293,25 +299,39 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 		nextSeq = cmd.Seq + 1
 	}
 
-	live, err := s.Commands.Live(ctx, claims, nextSeq)
+	live, liveErr, err := s.Commands.Live(ctx, claims, nextSeq)
 	if err != nil {
 		return fmt.Errorf("live commands: %w", err)
 	}
 
 	errCh := make(chan error, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
 
 	go func() {
+		defer wg.Done()
 		errCh <- s.readPump(ctx, conn, claims)
 		cancel()
 	}()
 
 	go func() {
-		errCh <- s.writePump(ctx, conn, live)
+		defer wg.Done()
+		errCh <- s.writePump(ctx, conn, live, liveErr)
 		cancel()
 	}()
 
 	<-ctx.Done()
-	return <-errCh
+	var pumpErrs []error
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil {
+			pumpErrs = append(pumpErrs, err)
+		}
+	}
+	wg.Wait()
+	if len(pumpErrs) > 0 {
+		return errors.Join(pumpErrs...)
+	}
+	return ctx.Err()
 }
 
 func (s *Server) readPump(ctx context.Context, conn *websocket.Conn, claims TokenClaims) error {
@@ -351,7 +371,7 @@ func (s *Server) readPump(ctx context.Context, conn *websocket.Conn, claims Toke
 	}
 }
 
-func (s *Server) writePump(ctx context.Context, conn *websocket.Conn, live <-chan CommandEnvelope) error {
+func (s *Server) writePump(ctx context.Context, conn *websocket.Conn, live <-chan CommandEnvelope, liveErr <-chan error) error {
 	if s.PingInterval <= 0 {
 		for {
 			select {
@@ -362,6 +382,10 @@ func (s *Server) writePump(ctx context.Context, conn *websocket.Conn, live <-cha
 					return errors.New("command source closed")
 				}
 				if err := s.sendCommandEnvelope(conn, cmd); err != nil {
+					return err
+				}
+			case err, ok := <-liveErr:
+				if ok && err != nil {
 					return err
 				}
 			}
@@ -379,6 +403,13 @@ func (s *Server) writePump(ctx context.Context, conn *websocket.Conn, live <-cha
 				return errors.New("command source closed")
 			}
 			if err := s.sendCommandEnvelope(conn, cmd); err != nil {
+				return err
+			}
+		case err, ok := <-liveErr:
+			if !ok {
+				return errors.New("command source closed")
+			}
+			if err != nil {
 				return err
 			}
 		case <-ticker.C:

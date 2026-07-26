@@ -146,6 +146,8 @@ pub enum WireError {
     UsageValueOutOfRange(u64),
     #[error("AnyJSON contains a number outside the JavaScript-safe range")]
     AnyJSONNumberOutOfRange,
+    #[error("integer `{0}` exceeds the JSON-safe integer range")]
+    JsonSafeIntegerOutOfRange(u64),
     #[error("seq `{0}` exceeds the JSON-safe integer range")]
     SeqOutOfRange(u64),
     #[error("user message attachments must be empty")]
@@ -1592,7 +1594,7 @@ fn wire_usage_value(value: u64) -> Result<u64, WireError> {
 
 fn wire_json_safe_integer(value: u64) -> Result<u64, WireError> {
     if value > MAX_JSON_SAFE_INTEGER {
-        return Err(WireError::SeqOutOfRange(value));
+        return Err(WireError::JsonSafeIntegerOutOfRange(value));
     }
     Ok(value)
 }
@@ -2326,6 +2328,33 @@ mod tests {
             WireUsage::try_from(internal),
             Err(WireError::UsageValueOutOfRange(_))
         ));
+    }
+
+    #[test]
+    fn json_safe_integer_fields_reject_overflow_with_correct_variant() {
+        let retry = AgentEvent::RetryScheduled {
+            attempt: 1,
+            delay_ms: MAX_JSON_SAFE_INTEGER + 1,
+            retry_at: now(),
+            error_message: "rate limited".to_owned(),
+        };
+        assert!(matches!(
+            WireAgentEvent::try_from(retry),
+            Err(WireError::JsonSafeIntegerOutOfRange(_))
+        ));
+
+        let mut inbound = json!({
+            "type": "retry_scheduled",
+            "attempt": 1,
+            "delay_ms": MAX_JSON_SAFE_INTEGER + 1,
+            "retry_at": now().to_rfc3339(),
+            "error_message": "x",
+        });
+        assert!(serde_json::from_value::<WireAgentEvent>(inbound.clone()).is_err());
+
+        inbound["delay_ms"] = 1.into();
+        inbound["attempt"] = (MAX_JSON_SAFE_INTEGER + 1).into();
+        assert!(serde_json::from_value::<WireAgentEvent>(inbound).is_err());
     }
 
     #[test]
