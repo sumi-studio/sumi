@@ -397,11 +397,11 @@ pub struct SecretRef {
 pub struct SecretDigestKey([u8; 32]);
 
 impl SecretDigestKey {
-    pub fn new(key: [u8; 32]) -> Self {
+    pub(crate) fn new(key: [u8; 32]) -> Self {
         Self(key)
     }
 
-    pub fn as_bytes(&self) -> &[u8; 32] {
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 

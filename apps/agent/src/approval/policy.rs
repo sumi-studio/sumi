@@ -261,6 +261,13 @@ impl Policy {
             PathCheck::InsideWorkspace => {}
         }
 
+        if ssh_family_forbidden_payload(eff.tokens) {
+            return PolicyDecision::Forbidden {
+                matched_rules: Vec::new(),
+                reason: "unmodeled shell wrapper or option payload".to_owned(),
+            };
+        }
+
         if eff.leading_assignments > 0 || eff.had_generic_wrapper {
             return PolicyDecision::NeedsApproval {
                 matched_rules: Vec::new(),
@@ -935,7 +942,9 @@ fn has_embedded_execution_payload(tokens: &[String]) -> bool {
         return false;
     };
     let command = shell::command_basename(command);
-    const EMBEDDED_FAMILIES: &[&str] = &["find", "git", "openssl", "rsync", "ssh", "tar"];
+    const EMBEDDED_FAMILIES: &[&str] = &[
+        "find", "git", "openssl", "rsync", "scp", "sftp", "ssh", "tar",
+    ];
     let canonical =
         shell::canonicalize_command_name(&command, EMBEDDED_FAMILIES).unwrap_or(&command);
     // External `git-<command>` programs (and `git-foo` aliases) execute
@@ -1688,6 +1697,13 @@ fn validate_action_context(action: &CanonicalAction, workspace: &Path) -> Option
         });
     }
 
+    if !action.sandbox.workspace_only || action.sandbox.network_allowed {
+        return Some(PolicyDecision::Forbidden {
+            matched_rules: Vec::new(),
+            reason: "sandbox summary is broader than the default policy".to_owned(),
+        });
+    }
+
     match path_check_all(action, workspace) {
         PathCheck::WorkspaceEscape => {
             return Some(PolicyDecision::Forbidden {
@@ -1706,13 +1722,6 @@ fn validate_action_context(action: &CanonicalAction, workspace: &Path) -> Option
                 return Some(decision);
             }
         }
-    }
-
-    if !action.sandbox.workspace_only || action.sandbox.network_allowed {
-        return Some(PolicyDecision::Forbidden {
-            matched_rules: Vec::new(),
-            reason: "sandbox summary is broader than the default policy".to_owned(),
-        });
     }
 
     None
@@ -1872,6 +1881,7 @@ fn destructure(d: PolicyDecision) -> (RuleEffect, String, Vec<String>) {
 mod tests {
     use serde_json::json;
 
+    use super::super::action::SandboxSummary;
     use super::*;
     use crate::provider::types::ValidatedToolArguments;
     use crate::store::Redactor;
@@ -5099,6 +5109,9 @@ mod tests {
             "ssh -I/workspace/malicious.so example.com",
             "sftp -S /workspace/malicious user@host",
             "sftp -S/workspace/malicious user@host",
+            // Variant names must canonicalize to their family and still be forbidden.
+            "scp-static -S /workspace/malicious user@host",
+            "sftp-1.2 -D /workspace/malicious user@host",
         ];
         for command in cases {
             let action = bash(command);
@@ -5114,5 +5127,76 @@ mod tests {
                 "'{command}' must reject ApproveOnce: {resolved:?}"
             );
         }
+    }
+
+    #[test]
+    fn generic_wrappers_cannot_downgrade_ssh_family_forbidden_payloads() {
+        let p = policy();
+        let forbidden_wrapped = [
+            "watch ssh -F config example.com",
+            "nice scp-static -S /workspace/malicious user@host",
+            "flock /tmp/lock ssh -I /workspace/malicious.so example.com",
+            "SSH_AUTH_SOCK=foo ssh -F config example.com",
+        ];
+        for command in forbidden_wrapped {
+            let decision = p.evaluate(&bash(command));
+            assert!(
+                decision.is_forbidden(),
+                "'{command}' must stay Forbidden inside a wrapper: {decision:?}"
+            );
+        }
+
+        // Other wrapper behavior is preserved (not escalated to Forbidden).
+        assert!(
+            matches!(
+                p.evaluate(&bash("nice git status")),
+                PolicyDecision::NeedsApproval { .. }
+            ),
+            "nice git status must remain a normal unmodeled wrapper"
+        );
+    }
+
+    #[test]
+    fn broader_sandbox_cannot_be_hidden_by_internal_state_path() {
+        let action = CanonicalAction {
+            tool: "read_file".to_owned(),
+            operation: "read".to_owned(),
+            argv: vec!["read_file".to_owned(), "/workspace/.git/config".to_owned()],
+            cwd: PathBuf::from("/workspace"),
+            affected_paths: vec![PathBuf::from("/workspace/.git/config")],
+            sandbox: SandboxSummary {
+                network_allowed: true,
+                workspace_only: true,
+            },
+            requested_permissions: vec![Permission::ReadWorkspace, Permission::Network],
+            justification: None,
+        };
+        assert!(
+            matches!(
+                validate_action_context(&action, Path::new("/workspace")),
+                Some(PolicyDecision::Forbidden {
+                    reason,
+                    ..
+                }) if reason == "sandbox summary is broader than the default policy"
+            ),
+            "network_allowed must take precedence over internal-state path"
+        );
+
+        let mut action = action;
+        action.sandbox = SandboxSummary {
+            network_allowed: false,
+            workspace_only: false,
+        };
+        action.requested_permissions = vec![Permission::ReadWorkspace];
+        assert!(
+            matches!(
+                validate_action_context(&action, Path::new("/workspace")),
+                Some(PolicyDecision::Forbidden {
+                    reason,
+                    ..
+                }) if reason == "sandbox summary is broader than the default policy"
+            ),
+            "workspace_only=false must take precedence over internal-state path"
+        );
     }
 }
