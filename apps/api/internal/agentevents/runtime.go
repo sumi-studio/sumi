@@ -194,6 +194,10 @@ func (g *DurableGateway) CatchUp(ctx context.Context, claims TokenClaims, fromSe
 	return g.commands.CatchUp(ctx, claims.ConversationID, fromSeq)
 }
 
+// Live polls the durable command log starting at fromSeq and streams each
+// command in order. The first poll reads from fromSeq, so a command appended
+// concurrently with this call is not lost. next advances only after a command
+// is successfully sent, and the next poll continues from that point.
 func (g *DurableGateway) Live(ctx context.Context, claims TokenClaims, fromSeq uint64) (<-chan CommandEnvelope, <-chan error, error) {
 	next := fromSeq
 	out := make(chan CommandEnvelope, 16)

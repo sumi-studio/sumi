@@ -58,6 +58,18 @@ func TestContractFixturesRoundTrip(t *testing.T) {
 				t.Fatalf("fixture %q: validate command: %v", name, err)
 			}
 			roundTripJSON(t, name, wireRaw, &env)
+		case "agent_hello":
+			var hello AgentHello
+			if err := json.Unmarshal(wireRaw, &hello); err != nil {
+				t.Fatalf("fixture %q: unmarshal AgentHello: %v", name, err)
+			}
+			roundTripJSON(t, name, wireRaw, &hello)
+		case "api_hello":
+			var hello ApiHello
+			if err := json.Unmarshal(wireRaw, &hello); err != nil {
+				t.Fatalf("fixture %q: unmarshal ApiHello: %v", name, err)
+			}
+			roundTripJSON(t, name, wireRaw, &hello)
 		case "agent_event":
 			if err := validateEvent(wireRaw); err != nil {
 				t.Fatalf("fixture %q: validate AgentEvent: %v", name, err)
@@ -269,5 +281,91 @@ func TestOutboundFrameRejectsTrailingData(t *testing.T) {
 	var frame OutboundFrame
 	if err := json.Unmarshal(raw, &frame); err == nil {
 		t.Fatal("expected trailing data to be rejected for OutboundFrame")
+	}
+}
+
+func TestAgentHelloRejectsUnknownFields(t *testing.T) {
+	raw := []byte(`{"agent_id":"agent-1","generation":7,"last_sent_event_seq":0,"last_received_command_seq":0,"last_applied_command_seq":0,"extra":true}`)
+	var hello AgentHello
+	if err := json.Unmarshal(raw, &hello); err == nil {
+		t.Fatal("expected unknown fields to be rejected for AgentHello")
+	}
+}
+
+func TestApiHelloRejectsUnknownFields(t *testing.T) {
+	raw := []byte(`{"accepted_generation":7,"last_received_event_seq":0,"next_command_seq":1,"extra":true}`)
+	var hello ApiHello
+	if err := json.Unmarshal(raw, &hello); err == nil {
+		t.Fatal("expected unknown fields to be rejected for ApiHello")
+	}
+}
+
+func TestApiHelloRejectsOutOfRangeSeq(t *testing.T) {
+	raw := []byte(fmt.Sprintf(`{"accepted_generation":7,"last_received_event_seq":%d,"next_command_seq":1}`, maxJSONSafeInteger+1))
+	var hello ApiHello
+	if err := json.Unmarshal(raw, &hello); err == nil {
+		t.Fatal("expected out-of-range seq to be rejected for ApiHello")
+	}
+}
+
+func TestAgentHelloAcceptsMaxSafeGeneration(t *testing.T) {
+	raw := []byte(fmt.Sprintf(`{"agent_id":"agent-1","generation":%d,"last_sent_event_seq":0,"last_received_command_seq":0,"last_applied_command_seq":0}`, maxJSONSafeInteger))
+	var hello AgentHello
+	if err := json.Unmarshal(raw, &hello); err != nil {
+		t.Fatalf("expected max-safe generation to be accepted: %v", err)
+	}
+	if hello.Generation != maxJSONSafeInteger {
+		t.Fatalf("expected generation %d, got %d", maxJSONSafeInteger, hello.Generation)
+	}
+}
+
+func TestAgentHelloRejectsOutOfRangeGeneration(t *testing.T) {
+	raw := []byte(fmt.Sprintf(`{"agent_id":"agent-1","generation":%d,"last_sent_event_seq":0,"last_received_command_seq":0,"last_applied_command_seq":0}`, maxJSONSafeInteger+1))
+	var hello AgentHello
+	if err := json.Unmarshal(raw, &hello); err == nil {
+		t.Fatal("expected out-of-range generation to be rejected for AgentHello")
+	}
+}
+
+func TestApiHelloAcceptsMaxSafeAcceptedGeneration(t *testing.T) {
+	raw := []byte(fmt.Sprintf(`{"accepted_generation":%d,"last_received_event_seq":0,"next_command_seq":1}`, maxJSONSafeInteger))
+	var hello ApiHello
+	if err := json.Unmarshal(raw, &hello); err != nil {
+		t.Fatalf("expected max-safe accepted_generation to be accepted: %v", err)
+	}
+	if hello.AcceptedGeneration != maxJSONSafeInteger {
+		t.Fatalf("expected accepted_generation %d, got %d", maxJSONSafeInteger, hello.AcceptedGeneration)
+	}
+}
+
+func TestApiHelloRejectsOutOfRangeAcceptedGeneration(t *testing.T) {
+	raw := []byte(fmt.Sprintf(`{"accepted_generation":%d,"last_received_event_seq":0,"next_command_seq":1}`, maxJSONSafeInteger+1))
+	var hello ApiHello
+	if err := json.Unmarshal(raw, &hello); err == nil {
+		t.Fatal("expected out-of-range accepted_generation to be rejected for ApiHello")
+	}
+}
+
+func TestAgentHelloMarshalRejectsOutOfRangeGeneration(t *testing.T) {
+	hello := AgentHello{
+		AgentID:                "agent-1",
+		Generation:             maxJSONSafeInteger + 1,
+		LastSentEventSeq:       0,
+		LastReceivedCommandSeq: 0,
+		LastAppliedCommandSeq:  0,
+	}
+	if _, err := json.Marshal(hello); err == nil {
+		t.Fatal("expected out-of-range generation to be rejected when marshaling AgentHello")
+	}
+}
+
+func TestApiHelloMarshalRejectsOutOfRangeAcceptedGeneration(t *testing.T) {
+	hello := ApiHello{
+		AcceptedGeneration:   maxJSONSafeInteger + 1,
+		LastReceivedEventSeq: 0,
+		NextCommandSeq:       1,
+	}
+	if _, err := json.Marshal(hello); err == nil {
+		t.Fatal("expected out-of-range accepted_generation to be rejected when marshaling ApiHello")
 	}
 }

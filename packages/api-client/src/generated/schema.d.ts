@@ -63,6 +63,21 @@ export interface components {
             text: string;
             attachments: unknown[];
         };
+        /** @description non-negative process generation representable exactly by JavaScript number clients */
+        ProcessGeneration: number;
+        AgentHello: {
+            /** @description agent identity from the short-lived credential claim */
+            agent_id: string;
+            generation: components["schemas"]["ProcessGeneration"];
+            last_sent_event_seq: components["schemas"]["JsonSafeInteger"];
+            last_received_command_seq: components["schemas"]["JsonSafeInteger"];
+            last_applied_command_seq: components["schemas"]["JsonSafeInteger"];
+        };
+        ApiHello: {
+            accepted_generation: components["schemas"]["ProcessGeneration"];
+            last_received_event_seq: components["schemas"]["JsonSafeInteger"];
+            next_command_seq: components["schemas"]["JsonSafeInteger"];
+        };
     };
     responses: never;
     parameters: never;

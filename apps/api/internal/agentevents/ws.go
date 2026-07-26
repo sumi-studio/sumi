@@ -54,9 +54,11 @@ type CommandSource interface {
 	HasCommands(ctx context.Context, claims TokenClaims) (bool, error)
 	// CatchUp returns commands starting from fromSeq up to the durable tail.
 	CatchUp(ctx context.Context, claims TokenClaims, fromSeq uint64) ([]CommandEnvelope, error)
-	// Live returns commands from fromSeq onward. The source must bind this cursor
-	// before returning so an append between catch-up and subscription cannot be
-	// lost.
+	// Live returns commands from fromSeq onward. The source must ensure that no
+	// command with seq >= fromSeq is dropped, either by binding a cursor before
+	// returning or by replaying from fromSeq (so an append between catch-up and
+	// the first poll is still delivered). Implementations that poll must start
+	// from fromSeq and advance next only after successfully sending each command.
 	// The commands channel is closed when the source becomes invalid. The error
 	// channel carries source failures; it is closed after the commands channel.
 	Live(ctx context.Context, claims TokenClaims, fromSeq uint64) (<-chan CommandEnvelope, <-chan error, error)

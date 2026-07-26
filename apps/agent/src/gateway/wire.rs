@@ -1663,6 +1663,7 @@ mod tests {
     use crate::agent::{
         AgentEvent, ApprovalRequest, ApprovalResolution, PublicStreamEvent, SteerMode,
     };
+    use crate::gateway::{AgentHello, ApiHello};
     use crate::provider::types::{
         ApiProtocol, ProviderOrigin, PublicAssistantContent, PublicAssistantMessage, PublicMessage,
         RejectedToolCall, StopReason, ToolArgumentError, ToolCall, ToolResultMessage, Usage,
@@ -2911,6 +2912,8 @@ mod tests {
             match kind {
                 "outbound_frame" => round_trip_value::<WireOutboundFrame>(name, &wire),
                 "command_envelope" => round_trip_value::<WireCommandEnvelope>(name, &wire),
+                "agent_hello" => round_trip_value::<AgentHello>(name, &wire),
+                "api_hello" => round_trip_value::<ApiHello>(name, &wire),
                 "agent_event" => round_trip_value::<WireAgentEvent>(name, &wire),
                 "public_message" => round_trip_value::<WirePublicMessage>(name, &wire),
                 other => panic!("unknown fixture kind '{other}' for '{name}'"),

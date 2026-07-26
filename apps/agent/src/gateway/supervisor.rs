@@ -18,7 +18,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use futures_util::future::{Either, select};
 use rand::Rng;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time;
@@ -89,8 +89,10 @@ impl Drop for GatewayCredential {
 /// credential claim. All seq values are `u64` and are validated against the
 /// durable source before the epoch proceeds.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentHello {
     pub agent_id: String,
+    #[serde(deserialize_with = "deserialize_json_safe_generation")]
     pub generation: u64,
     pub last_sent_event_seq: u64,
     pub last_received_command_seq: u64,
@@ -99,10 +101,27 @@ pub struct AgentHello {
 
 /// API → Agent hello response.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApiHello {
+    #[serde(deserialize_with = "deserialize_json_safe_generation")]
     pub accepted_generation: u64,
     pub last_received_event_seq: u64,
     pub next_command_seq: u64,
+}
+
+/// Rejects generation values that cannot round-trip through JavaScript number
+/// clients while keeping the internal `ProcessGeneration` i64 invariant separate.
+fn deserialize_json_safe_generation<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = u64::deserialize(deserializer)?;
+    if value > MAX_JSON_SAFE_INTEGER {
+        return Err(serde::de::Error::custom(
+            "generation exceeds JSON-safe integer range",
+        ));
+    }
+    Ok(value)
 }
 
 /// Cursors returned by the durable command source.
@@ -308,7 +327,12 @@ where
         let mut attempt: u32 = 0;
         loop {
             match self.connect_and_run_epoch(commands_tx.clone()).await {
-                Ok(()) => continue,
+                Ok(()) => {
+                    // A healthy epoch ended; reset the budget so future failures
+                    // are a fresh burst, not lifetime reconnects.
+                    attempt = 0;
+                    continue;
+                }
                 Err(SupervisorError::Fatal(e)) => return Err(e),
                 Err(SupervisorError::AuthRejected) => {
                     attempt = attempt.saturating_add(1);
@@ -378,6 +402,10 @@ where
         let (connection_epoch, delivery_epoch) = self.next_epoch();
         let (reader, writer) = gateway.split();
 
+        // From this point the epoch is healthy; a later disconnect resets the
+        // reconnect-attempt budget instead of consuming it.
+        let healthy = true;
+
         let token = CancellationToken::new();
         let (writer_tx, writer_rx) = mpsc::channel(config.event_buffer_size);
 
@@ -437,7 +465,7 @@ where
             }
         }
 
-        match (first, second) {
+        let outcome = match (first, second) {
             (Err(e), _) => Err(SupervisorError::Fatal(anyhow!("epoch task panicked: {e}"))),
             (_, Err(e)) => Err(SupervisorError::Fatal(anyhow!(
                 "epoch sibling task panicked: {e}"
@@ -446,6 +474,17 @@ where
             _ => Err(SupervisorError::Reconnect {
                 reason: "epoch task ended unexpectedly".to_owned(),
             }),
+        };
+
+        if healthy {
+            // A post-establishment disconnect resets the reconnect budget rather
+            // than consuming a lifetime attempt. Fatal errors remain fatal.
+            match outcome {
+                Ok(()) | Err(SupervisorError::Reconnect { .. }) => Ok(()),
+                Err(other) => Err(other),
+            }
+        } else {
+            outcome
         }
     }
 
@@ -491,6 +530,11 @@ async fn build_agent_hello<S: DurableSource>(
             .map_err(|e| SupervisorError::Reconnect {
                 reason: format!("command cursor unavailable: {e}"),
             })?;
+    if config.generation > MAX_JSON_SAFE_INTEGER {
+        return Err(SupervisorError::Fatal(anyhow!(
+            "generation exceeds JSON-safe integer range"
+        )));
+    }
     for (name, cursor) in [
         ("last_sent_event_seq", event_cursor.last_sent),
         ("last_received_command_seq", command_cursor.received),
@@ -516,6 +560,16 @@ async fn validate_hello<S: DurableSource>(
     agent: &AgentHello,
     api: &ApiHello,
 ) -> Result<(), SupervisorError> {
+    for (name, generation) in [
+        ("agent generation", agent.generation),
+        ("api accepted_generation", api.accepted_generation),
+    ] {
+        if generation > MAX_JSON_SAFE_INTEGER {
+            return Err(SupervisorError::Fatal(anyhow!(
+                "{name} exceeds JSON-safe integer range"
+            )));
+        }
+    }
     ProcessGeneration::from_wire(agent.generation)
         .and_then(|_| ProcessGeneration::from_wire(api.accepted_generation))
         .map_err(|e| SupervisorError::Fatal(anyhow!("invalid ProcessGeneration in hello: {e}")))?;
@@ -814,6 +868,7 @@ mod tests {
         Command, CommandAck, CommandAckStatus, CommandEnvelope, CommandId, CommandRejectReason,
         Envelope, Gateway, GatewayReader, GatewayWriter, InboundCommand, OutboundFrame,
     };
+    use serde_json::json;
 
     #[derive(Clone)]
     struct MockDurableSource {
@@ -1731,7 +1786,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn established_epoch_failure_preserves_reconnect_backoff() {
+    async fn established_epoch_failure_resets_reconnect_budget() {
         let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
         let gateway = MockGateway::new(VecDeque::from([
             Ok(valid_command(1, "00000000-0000-4000-8000-000000000001")),
@@ -1767,9 +1822,245 @@ mod tests {
         );
         assert!(result.unwrap().is_err());
 
-        // The reader's transport failure consumes an attempt; the following
-        // auth rejection exhausts the configured bound rather than resetting it.
-        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        // The healthy epoch reset the budget, so the first auth rejection after
+        // the EOF is attempt 1 (allowed) and the second auth rejection stops.
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn long_stable_epoch_allows_fresh_reconnect_burst_after_disconnect() {
+        let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // First gateway runs long enough to prove a stable epoch, then EOFs.
+        let first = MockGateway::new(VecDeque::from([
+            Ok(valid_command(1, "00000000-0000-4000-8000-000000000001")),
+            Ok(valid_command(2, "00000000-0000-4000-8000-000000000002")),
+            Ok(valid_command(3, "00000000-0000-4000-8000-000000000003")),
+            Err(anyhow!("reader EOF")),
+        ]));
+
+        // Second gateway reconnects successfully and then EOFs. Its first
+        // command must match the hello's next_command_seq (1) because the mock
+        // durable source does not advance between tests.
+        let second = MockGateway::new(VecDeque::from([
+            Ok(valid_command(1, "00000000-0000-4000-8000-000000000004")),
+            Err(anyhow!("reader EOF")),
+        ]));
+
+        let connector = MockConnector::new(
+            sent_hellos.clone(),
+            VecDeque::from([
+                Ok(first),
+                Err(ConnectorError::AuthRejected),
+                Ok(second),
+                Err(ConnectorError::AuthRejected),
+                Err(ConnectorError::AuthRejected),
+            ]),
+        );
+        let credentials = CountingCredentialProvider::new("token");
+        let counter = credentials.counter.clone();
+        let source = MockDurableSource::new(CommandCursors::default());
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: 7,
+            receipt_identity: "receipt-1".to_owned(),
+        });
+
+        let mut config = make_config();
+        config.max_reconnect_attempts = Some(1);
+
+        let supervisor = ConnectionSupervisor::new(connector, credentials, source, latch, config);
+        let handle = supervisor.start();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), handle.join()).await;
+        assert!(
+            result.is_ok(),
+            "supervisor should stop after exhausting bounded reconnect attempts"
+        );
+        assert!(result.unwrap().is_err());
+
+        // Budget resets after each healthy epoch. The sequence is:
+        // 1. first epoch (healthy, then EOF resets)
+        // 2. auth rejected (attempt 1, allowed)
+        // 3. second epoch (healthy, then EOF resets)
+        // 4. auth rejected (attempt 1, allowed)
+        // 5. auth rejected (attempt 2, stops)
+        assert_eq!(counter.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn build_agent_hello_rejects_seq_exceeding_json_safe_integer() {
+        let oversized = MAX_JSON_SAFE_INTEGER + 1;
+        let source = MockDurableSource::new(CommandCursors {
+            received: oversized,
+            applied: oversized,
+        });
+        let mut config = make_config();
+        config.generation = 7;
+        let err = build_agent_hello(&source, &config).await;
+        assert!(err.is_err());
+        assert!(
+            format!("{:?}", err.unwrap_err()).contains("exceeds JSON-safe integer range"),
+            "agent hello cursors above JSON-safe max must be fatal"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_hello_rejects_api_seq_exceeding_json_safe_integer() {
+        let oversized = MAX_JSON_SAFE_INTEGER + 1;
+        let source = MockDurableSource::new(CommandCursors::default());
+
+        let agent = AgentHello {
+            agent_id: "test-agent".to_owned(),
+            generation: 7,
+            last_sent_event_seq: oversized,
+            last_received_command_seq: 0,
+            last_applied_command_seq: 0,
+        };
+
+        let api = ApiHello {
+            accepted_generation: 7,
+            last_received_event_seq: oversized,
+            next_command_seq: oversized,
+        };
+        let err = validate_hello(&source, &agent, &api).await;
+        assert!(err.is_err());
+        assert!(
+            format!("{:?}", err.unwrap_err()).contains("exceeds JSON-safe integer range"),
+            "api hello seq values above JSON-safe max must be fatal"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_agent_hello_rejects_generation_exceeding_json_safe_integer() {
+        let oversized = MAX_JSON_SAFE_INTEGER + 1;
+        let source = MockDurableSource::new(CommandCursors::default());
+        let mut config = make_config();
+        config.generation = oversized;
+        let err = build_agent_hello(&source, &config).await;
+        assert!(err.is_err());
+        assert!(
+            format!("{:?}", err.unwrap_err()).contains("exceeds JSON-safe integer range"),
+            "agent hello generation above JSON-safe max must be fatal"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_hello_rejects_generation_exceeding_json_safe_integer() {
+        let oversized = MAX_JSON_SAFE_INTEGER + 1;
+        let source = MockDurableSource::new(CommandCursors::default());
+
+        let agent = AgentHello {
+            agent_id: "test-agent".to_owned(),
+            generation: oversized,
+            last_sent_event_seq: 0,
+            last_received_command_seq: 0,
+            last_applied_command_seq: 0,
+        };
+
+        let api = ApiHello {
+            accepted_generation: 7,
+            last_received_event_seq: 0,
+            next_command_seq: 1,
+        };
+        let err = validate_hello(&source, &agent, &api).await;
+        assert!(err.is_err());
+        assert!(
+            format!("{:?}", err.unwrap_err()).contains("exceeds JSON-safe integer range"),
+            "agent hello generation above JSON-safe max must be fatal"
+        );
+
+        let agent = AgentHello {
+            agent_id: "test-agent".to_owned(),
+            generation: 7,
+            last_sent_event_seq: 0,
+            last_received_command_seq: 0,
+            last_applied_command_seq: 0,
+        };
+        let api = ApiHello {
+            accepted_generation: oversized,
+            last_received_event_seq: 0,
+            next_command_seq: 1,
+        };
+        let err = validate_hello(&source, &agent, &api).await;
+        assert!(err.is_err());
+        assert!(
+            format!("{:?}", err.unwrap_err()).contains("exceeds JSON-safe integer range"),
+            "api hello accepted_generation above JSON-safe max must be fatal"
+        );
+    }
+
+    #[test]
+    fn agent_hello_accepts_max_safe_generation_and_rejects_overflow() {
+        let ok = json!({
+            "agent_id": "agent-1",
+            "generation": MAX_JSON_SAFE_INTEGER,
+            "last_sent_event_seq": 0,
+            "last_received_command_seq": 0,
+            "last_applied_command_seq": 0,
+        });
+        let hello: AgentHello =
+            serde_json::from_value(ok).expect("max-safe generation must deserialize");
+        assert_eq!(hello.generation, MAX_JSON_SAFE_INTEGER);
+
+        let overflow = json!({
+            "agent_id": "agent-1",
+            "generation": MAX_JSON_SAFE_INTEGER + 1,
+            "last_sent_event_seq": 0,
+            "last_received_command_seq": 0,
+            "last_applied_command_seq": 0,
+        });
+        assert!(
+            serde_json::from_value::<AgentHello>(overflow).is_err(),
+            "generation above JSON-safe max must be rejected at deserialization"
+        );
+    }
+
+    #[test]
+    fn api_hello_accepts_max_safe_accepted_generation_and_rejects_overflow() {
+        let ok = json!({
+            "accepted_generation": MAX_JSON_SAFE_INTEGER,
+            "last_received_event_seq": 0,
+            "next_command_seq": 1,
+        });
+        let hello: ApiHello =
+            serde_json::from_value(ok).expect("max-safe accepted_generation must deserialize");
+        assert_eq!(hello.accepted_generation, MAX_JSON_SAFE_INTEGER);
+
+        let overflow = json!({
+            "accepted_generation": MAX_JSON_SAFE_INTEGER + 1,
+            "last_received_event_seq": 0,
+            "next_command_seq": 1,
+        });
+        assert!(
+            serde_json::from_value::<ApiHello>(overflow).is_err(),
+            "accepted_generation above JSON-safe max must be rejected at deserialization"
+        );
+    }
+
+    #[test]
+    fn agent_hello_rejects_unknown_fields() {
+        let err = serde_json::from_value::<AgentHello>(json!({
+            "agent_id": "agent-1",
+            "generation": 7,
+            "last_sent_event_seq": 0,
+            "last_received_command_seq": 0,
+            "last_applied_command_seq": 0,
+            "extra_field": true
+        }))
+        .expect_err("unknown fields must fail closed");
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn api_hello_rejects_unknown_fields() {
+        let err = serde_json::from_value::<ApiHello>(json!({
+            "accepted_generation": 7,
+            "last_received_event_seq": 0,
+            "next_command_seq": 1,
+            "extra_field": true
+        }))
+        .expect_err("unknown fields must fail closed");
+        assert!(err.to_string().contains("unknown field"));
     }
 
     fn cmd_seq(cmd: &InboundCommand) -> u64 {

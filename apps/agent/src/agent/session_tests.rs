@@ -74,6 +74,7 @@ struct MockGateway {
     next_failure: Option<mpsc::Receiver<()>>,
     fail_send: Arc<AtomicBool>,
     send_failure_observed: Arc<Notify>,
+    agent_end: Arc<Notify>,
 }
 
 #[async_trait]
@@ -95,6 +96,7 @@ impl Gateway for MockGateway {
                 frames: self.frames,
                 fail_send: self.fail_send,
                 send_failure_observed: self.send_failure_observed,
+                agent_end: self.agent_end,
             },
         )
     }
@@ -127,6 +129,7 @@ struct MockGatewayWriter {
     frames: Arc<Mutex<Vec<OutboundFrame>>>,
     fail_send: Arc<AtomicBool>,
     send_failure_observed: Arc<Notify>,
+    agent_end: Arc<Notify>,
 }
 
 #[async_trait]
@@ -136,9 +139,43 @@ impl GatewayWriter for MockGatewayWriter {
             self.send_failure_observed.notify_one();
             return Err(anyhow!("fixture gateway send failure"));
         }
+        if matches!(
+            &frame,
+            OutboundFrame::Event { envelope }
+                if envelope.event.get("type") == Some(&Value::String("agent_end".to_owned()))
+        ) {
+            self.agent_end.notify_one();
+        }
         self.frames.lock().expect("frame mutex").push(frame);
         Ok(())
     }
+}
+
+#[allow(clippy::type_complexity)]
+fn gateway_with_notify() -> (
+    MockGateway,
+    mpsc::Sender<InboundCommand>,
+    Arc<Mutex<Vec<OutboundFrame>>>,
+    Arc<Notify>,
+) {
+    let (commands_tx, commands) = mpsc::channel(40);
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    let fail_send = Arc::new(AtomicBool::new(false));
+    let send_failure_observed = Arc::new(Notify::new());
+    let agent_end = Arc::new(Notify::new());
+    (
+        MockGateway {
+            commands,
+            frames: frames.clone(),
+            next_failure: None,
+            fail_send,
+            send_failure_observed: send_failure_observed.clone(),
+            agent_end: agent_end.clone(),
+        },
+        commands_tx,
+        frames,
+        agent_end,
+    )
 }
 
 fn gateway() -> (
@@ -146,21 +183,8 @@ fn gateway() -> (
     mpsc::Sender<InboundCommand>,
     Arc<Mutex<Vec<OutboundFrame>>>,
 ) {
-    let (commands_tx, commands) = mpsc::channel(40);
-    let frames = Arc::new(Mutex::new(Vec::new()));
-    let fail_send = Arc::new(AtomicBool::new(false));
-    let send_failure_observed = Arc::new(Notify::new());
-    (
-        MockGateway {
-            commands,
-            frames: frames.clone(),
-            next_failure: None,
-            fail_send,
-            send_failure_observed,
-        },
-        commands_tx,
-        frames,
-    )
+    let (gateway, commands, frames, _agent_end) = gateway_with_notify();
+    (gateway, commands, frames)
 }
 
 struct ControlledGateway {
@@ -177,6 +201,7 @@ fn controlled_gateway() -> ControlledGateway {
     let frames = Arc::new(Mutex::new(Vec::new()));
     let fail_send = Arc::new(AtomicBool::new(false));
     let send_failure_observed = Arc::new(Notify::new());
+    let agent_end = Arc::new(Notify::new());
     ControlledGateway {
         gateway: MockGateway {
             commands,
@@ -184,6 +209,7 @@ fn controlled_gateway() -> ControlledGateway {
             next_failure: Some(next_failure),
             fail_send: fail_send.clone(),
             send_failure_observed: send_failure_observed.clone(),
+            agent_end,
         },
         commands: commands_tx,
         next_failure: next_failure_tx,
@@ -6194,7 +6220,7 @@ async fn retry_wait_group_of_two_is_injected_before_next_attempt() {
         .await
         .expect("test store");
     let pool = store.pool().clone();
-    let (gateway, commands, frames) = gateway();
+    let (gateway, commands, _frames, agent_end) = gateway_with_notify();
     let driver = Arc::new(RetryGroupDriver {
         retry_wait_entered: Notify::new(),
         contexts: Mutex::new(Vec::new()),
@@ -6220,28 +6246,9 @@ async fn retry_wait_group_of_two_is_injected_before_next_attempt() {
     commands.send(user(2)).await.expect("retry steer first");
     commands.send(user(3)).await.expect("retry steer second");
 
-    let terminal_result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        loop {
-            if frames.lock().expect("frame mutex").iter().any(|frame| {
-                matches!(frame, OutboundFrame::Event { envelope }
-                    if envelope.event["type"] == "agent_end")
-            }) || task.is_finished()
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
-    if terminal_result.is_err() {
-        let kinds: Vec<String> =
-            sqlx::query_scalar("SELECT event_type FROM agent_events ORDER BY seq")
-                .fetch_all(&pool)
-                .await
-                .expect("durable kinds");
-        eprintln!("durable kinds on terminal timeout: {kinds:?}");
-    }
-    terminal_result.expect("retry group run terminal");
+    tokio::time::timeout(std::time::Duration::from_secs(3), agent_end.notified())
+        .await
+        .expect("retry group run terminal");
     drop(commands);
     completed(task.await.expect("session join"));
 
@@ -6321,7 +6328,7 @@ async fn retry_wait_group_of_three_is_injected_before_next_attempt() {
         .await
         .expect("test store");
     let pool = store.pool().clone();
-    let (gateway, commands, frames) = gateway();
+    let (gateway, commands, _frames, agent_end) = gateway_with_notify();
     let driver = Arc::new(RetryGroupDriver {
         retry_wait_entered: Notify::new(),
         contexts: Mutex::new(Vec::new()),
@@ -6348,28 +6355,9 @@ async fn retry_wait_group_of_three_is_injected_before_next_attempt() {
     commands.send(user(3)).await.expect("retry steer second");
     commands.send(user(4)).await.expect("retry steer third");
 
-    let terminal_result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        loop {
-            if frames.lock().expect("frame mutex").iter().any(|frame| {
-                matches!(frame, OutboundFrame::Event { envelope }
-                    if envelope.event["type"] == "agent_end")
-            }) || task.is_finished()
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
-    if terminal_result.is_err() {
-        let kinds: Vec<String> =
-            sqlx::query_scalar("SELECT event_type FROM agent_events ORDER BY seq")
-                .fetch_all(&pool)
-                .await
-                .expect("durable kinds");
-        eprintln!("durable kinds on terminal timeout: {kinds:?}");
-    }
-    terminal_result.expect("retry group run terminal");
+    tokio::time::timeout(std::time::Duration::from_secs(3), agent_end.notified())
+        .await
+        .expect("retry group run terminal");
     drop(commands);
     completed(task.await.expect("session join"));
 

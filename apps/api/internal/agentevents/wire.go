@@ -24,7 +24,8 @@ const maxJSONSafeInteger uint64 = 9_007_199_254_740_991
 const maxProcessGeneration uint64 = 9_223_372_036_854_775_807
 
 // AgentHello is sent by the agent immediately after the WebSocket upgrade.
-// Generation is the ProcessGeneration bound to the short-lived credential claim.
+// Generation is the ProcessGeneration bound to the short-lived credential claim,
+// validated to the JSON-safe integer range so it round-trips through JavaScript clients.
 type AgentHello struct {
 	AgentID                string `json:"agent_id"`
 	Generation             uint64 `json:"generation"`
@@ -66,8 +67,8 @@ func (h *AgentHello) UnmarshalJSON(data []byte) error {
 	if raw.LastAppliedCommandSeq == nil {
 		return fmt.Errorf("last_applied_command_seq is required")
 	}
-	if *raw.Generation > maxProcessGeneration {
-		return fmt.Errorf("generation %d exceeds ProcessGeneration range", *raw.Generation)
+	if *raw.Generation > maxJSONSafeInteger {
+		return fmt.Errorf("generation %d exceeds JSON-safe integer range", *raw.Generation)
 	}
 	for name, seq := range map[string]uint64{
 		"last_sent_event_seq":       *raw.LastSentEventSeq,
@@ -88,11 +89,76 @@ func (h *AgentHello) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// MarshalJSON validates that the outbound generation stays within the JSON-safe
+// integer range before encoding.
+func (h AgentHello) MarshalJSON() ([]byte, error) {
+	if h.Generation > maxJSONSafeInteger {
+		return nil, fmt.Errorf("generation %d exceeds JSON-safe integer range", h.Generation)
+	}
+	type noMethod AgentHello
+	return json.Marshal(noMethod(h))
+}
+
 // ApiHello is returned by the API after verifying the token and generation.
+// accepted_generation is validated to the JSON-safe integer range.
 type ApiHello struct {
 	AcceptedGeneration   uint64 `json:"accepted_generation"`
 	LastReceivedEventSeq uint64 `json:"last_received_event_seq"`
 	NextCommandSeq       uint64 `json:"next_command_seq"`
+}
+
+// UnmarshalJSON decodes an ApiHello with strict discipline: duplicate keys,
+// unknown fields, and trailing bytes are rejected, and seq values stay within
+// the JSON-safe integer range.
+func (h *ApiHello) UnmarshalJSON(data []byte) error {
+	if err := checkDuplicateKeys(data); err != nil {
+		return fmt.Errorf("api hello json: %w", err)
+	}
+	type rawHello struct {
+		AcceptedGeneration   *uint64 `json:"accepted_generation"`
+		LastReceivedEventSeq *uint64 `json:"last_received_event_seq"`
+		NextCommandSeq       *uint64 `json:"next_command_seq"`
+	}
+	var raw rawHello
+	if err := unmarshalStrict(data, &raw); err != nil {
+		return err
+	}
+	if raw.AcceptedGeneration == nil {
+		return fmt.Errorf("accepted_generation is required")
+	}
+	if raw.LastReceivedEventSeq == nil {
+		return fmt.Errorf("last_received_event_seq is required")
+	}
+	if raw.NextCommandSeq == nil {
+		return fmt.Errorf("next_command_seq is required")
+	}
+	if *raw.AcceptedGeneration > maxJSONSafeInteger {
+		return fmt.Errorf("accepted_generation %d exceeds JSON-safe integer range", *raw.AcceptedGeneration)
+	}
+	for name, seq := range map[string]uint64{
+		"last_received_event_seq": *raw.LastReceivedEventSeq,
+		"next_command_seq":        *raw.NextCommandSeq,
+	} {
+		if seq > maxJSONSafeInteger {
+			return fmt.Errorf("%s %d exceeds JSON-safe integer range", name, seq)
+		}
+	}
+	*h = ApiHello{
+		AcceptedGeneration:   *raw.AcceptedGeneration,
+		LastReceivedEventSeq: *raw.LastReceivedEventSeq,
+		NextCommandSeq:       *raw.NextCommandSeq,
+	}
+	return nil
+}
+
+// MarshalJSON validates that the outbound accepted_generation stays within the
+// JSON-safe integer range before encoding.
+func (h ApiHello) MarshalJSON() ([]byte, error) {
+	if h.AcceptedGeneration > maxJSONSafeInteger {
+		return nil, fmt.Errorf("accepted_generation %d exceeds JSON-safe integer range", h.AcceptedGeneration)
+	}
+	type noMethod ApiHello
+	return json.Marshal(noMethod(h))
 }
 
 // CommandEnvelope is a durable command sent from the API to the agent.

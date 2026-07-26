@@ -363,6 +363,13 @@ export type OutboundFrame =
       frame_type: "command_ack";
       ack: CommandAck;
     };
+/**
+ * non-negative process generation representable exactly by JavaScript number clients
+ *
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "ProcessGeneration".
+ */
+export type ProcessGeneration = number;
 
 export interface HttpsSumiDevContractsAgentEventsYaml {
   [k: string]: unknown;
@@ -526,4 +533,27 @@ export interface CommandAck {
  */
 export interface Attachment {
   [k: string]: unknown;
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "AgentHello".
+ */
+export interface AgentHello {
+  /**
+   * agent identity from the short-lived credential claim
+   */
+  agent_id: string;
+  generation: ProcessGeneration;
+  last_sent_event_seq: JsonSafeInteger;
+  last_received_command_seq: JsonSafeInteger;
+  last_applied_command_seq: JsonSafeInteger;
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "ApiHello".
+ */
+export interface ApiHello {
+  accepted_generation: ProcessGeneration;
+  last_received_event_seq: JsonSafeInteger;
+  next_command_seq: JsonSafeInteger;
 }

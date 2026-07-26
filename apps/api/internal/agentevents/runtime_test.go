@@ -498,3 +498,36 @@ func TestDurableGatewayAckRecoversFromIncompleteFinalRecord(t *testing.T) {
 		t.Fatalf("expected one complete ack line, got %q", raw)
 	}
 }
+
+func TestDurableGatewayLiveDoesNotLoseConcurrentAppend(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	claims := TokenClaims{ConversationID: "conversation-1"}
+	raw := json.RawMessage(`{"type":"abort"}`)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	live, errs, err := gateway.Live(ctx, claims, 1)
+	if err != nil {
+		t.Fatalf("live: %v", err)
+	}
+
+	// Append a command after Live has returned its channels. Because Live starts
+	// polling from fromSeq, the next tick must deliver it rather than advance
+	// past it.
+	env, err := gateway.commands.Append(ctx, claims.ConversationID, "key-1", raw)
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	select {
+	case cmd := <-live:
+		if cmd.Seq != env.Seq {
+			t.Fatalf("expected seq %d, got %d", env.Seq, cmd.Seq)
+		}
+	case err := <-errs:
+		t.Fatalf("live error: %v", err)
+	case <-ctx.Done():
+		t.Fatal("timeout waiting for live command")
+	}
+}

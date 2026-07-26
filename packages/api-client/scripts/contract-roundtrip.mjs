@@ -25,7 +25,9 @@ const schemaPath = join(
   "contracts",
   "agent-events.yaml",
 );
-assertAnyJSONNumberBounds(readFileSync(schemaPath, "utf8"));
+const schema = readFileSync(schemaPath, "utf8");
+assertAnyJSONNumberBounds(schema);
+assertProcessGenerationBounds(schema);
 
 let passed = 0;
 for (const [name, fixture] of Object.entries(fixtures)) {
@@ -50,6 +52,7 @@ for (const [name, fixture] of Object.entries(fixtures)) {
 }
 
 console.log(`contract round-trip: ${passed} fixtures passed`);
+assertProcessGenerationRuntimeBounds();
 process.exit(0);
 
 function assertAnyJSONNumberBounds(schema) {
@@ -109,5 +112,27 @@ function assertAnyJSONRuntimeBounds(value, path) {
   }
   for (const [key, child] of Object.entries(value)) {
     assertAnyJSONRuntimeBounds(child, `${path}.${key}`);
+  }
+}
+
+function assertProcessGenerationBounds(schema) {
+  const definition = schema.match(
+    /^ {2}ProcessGeneration:\n([\s\S]*?)(?=^ {2}[A-Za-z][A-Za-z0-9_]*:|(?![\s\S]))/m,
+  )?.[0];
+  if (definition === undefined) {
+    throw new Error("agent-events schema is missing the ProcessGeneration definition");
+  }
+  if (!definition.includes("maximum: 9007199254740991")) {
+    throw new Error("ProcessGeneration must be bounded to the JSON-safe integer range");
+  }
+}
+
+function assertProcessGenerationRuntimeBounds() {
+  const maxSafe = 9007199254740991;
+  if (!Number.isSafeInteger(maxSafe)) {
+    throw new Error("expected 9007199254740991 to be a safe integer");
+  }
+  if (Number.isSafeInteger(maxSafe + 1)) {
+    throw new Error("expected 9007199254740992 to be outside the safe-integer range");
   }
 }

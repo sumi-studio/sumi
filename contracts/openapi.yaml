@@ -110,3 +110,35 @@ components:
         attachments:
           type: array
           maxItems: 0
+    ProcessGeneration:
+      type: integer
+      minimum: 0
+      maximum: 9007199254740991
+      description: non-negative process generation representable exactly by JavaScript number clients
+    AgentHello:
+      type: object
+      required: [agent_id, generation, last_sent_event_seq, last_received_command_seq, last_applied_command_seq]
+      additionalProperties: false
+      properties:
+        agent_id:
+          type: string
+          description: agent identity from the short-lived credential claim
+        generation:
+          $ref: '#/components/schemas/ProcessGeneration'
+        last_sent_event_seq:
+          $ref: '#/components/schemas/JsonSafeInteger'
+        last_received_command_seq:
+          $ref: '#/components/schemas/JsonSafeInteger'
+        last_applied_command_seq:
+          $ref: '#/components/schemas/JsonSafeInteger'
+    ApiHello:
+      type: object
+      required: [accepted_generation, last_received_event_seq, next_command_seq]
+      additionalProperties: false
+      properties:
+        accepted_generation:
+          $ref: '#/components/schemas/ProcessGeneration'
+        last_received_event_seq:
+          $ref: '#/components/schemas/JsonSafeInteger'
+        next_command_seq:
+          $ref: '#/components/schemas/JsonSafeInteger'

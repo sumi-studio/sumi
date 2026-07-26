@@ -844,8 +844,11 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
     use sha2::{Digest, Sha256};
-    use tokio::io::{AsyncWriteExt, BufReader, sink};
+    use tokio::io::{AsyncRead, BufReader, ReadBuf, sink};
 
     use super::*;
     use crate::gateway::{AgentHello, Command, ConnectorError, GatewayCredential};
@@ -875,6 +878,31 @@ mod tests {
         R: AsyncBufRead + Unpin,
     {
         read_command(input, &TestDigestFactory).await
+    }
+
+    /// Simulates a peer that writes a fixed payload and then keeps the stream
+    /// open without sending more data. The reader must detect oversize before
+    /// this stream would block forever.
+    struct OpenBytes {
+        data: Vec<u8>,
+        cursor: usize,
+    }
+
+    impl AsyncRead for OpenBytes {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.cursor < self.data.len() {
+                let n = std::cmp::min(buf.remaining(), self.data.len() - self.cursor);
+                buf.put_slice(&self.data[self.cursor..self.cursor + n]);
+                self.cursor += n;
+                return Poll::Ready(Ok(()));
+            }
+            // Never close; the writer is still open and silent.
+            Poll::Pending
+        }
     }
 
     #[tokio::test]
@@ -1307,16 +1335,15 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_an_unterminated_oversized_frame_while_the_writer_is_open() {
-        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        // Use an open-ended reader so the test does not depend on a duplex
+        // buffer or scheduler timing; it only asserts that read_frame returns
+        // CommandTooLarge before it would have to wait for a newline or EOF.
         let oversized = frame_with_total_bytes(MAX_FRAME_BYTES + 1);
-        let writer_task = tokio::spawn(async move {
-            writer
-                .write_all(&oversized)
-                .await
-                .expect("write oversized frame");
-            std::future::pending::<()>().await;
-        });
-        let mut input = BufReader::new(reader);
+        let reader = OpenBytes {
+            data: oversized,
+            cursor: 0,
+        };
+        let mut input = BufReader::with_capacity(64 * 1024, reader);
 
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(1),
@@ -1325,7 +1352,6 @@ mod tests {
         .await
         .expect("oversized frame must not wait for newline or EOF")
         .expect_err("oversized input must fail");
-        writer_task.abort();
         assert_eq!(
             error.downcast_ref::<CommandTooLarge>(),
             Some(&CommandTooLarge {
