@@ -944,8 +944,16 @@ pub(crate) enum Projection {
     MemoryJobUpdate(MemoryJobUpdate),
     /// Atomic durable memory batch + job transition with source-version CAS.
     MemoryTransition(MemoryTransition),
+    ApprovalRule(ApprovalRuleMutation),
     #[cfg(test)]
     SizePadding(usize),
+}
+
+#[derive(Clone)]
+pub(crate) struct ApprovalRuleMutation {
+    pub id: String,
+    pub tool: String,
+    pub pattern: String,
 }
 
 #[allow(
@@ -5245,7 +5253,15 @@ fn validate_terminal_tool_semantics(
     }
     if !matches!(
         error_code,
-        Some("executor_failed" | "cancelled" | "indeterminate" | "invalid_result" | "internal")
+        Some(
+            "executor_failed"
+                | "cancelled"
+                | "indeterminate"
+                | "invalid_result"
+                | "internal"
+                | "approval_denied"
+                | "approval_cancelled"
+        )
     ) {
         bail!("unknown terminal tool error_code");
     }
@@ -5607,6 +5623,11 @@ fn projection_size_upper_bound(projection: &Projection) -> Result<usize> {
                     })
                     .sum::<usize>(),
             ),
+        Projection::ApprovalRule(rule) => rule
+            .id
+            .len()
+            .saturating_add(rule.tool.len())
+            .saturating_add(rule.pattern.len()),
         Projection::MessageEnd { .. } => 0,
         #[cfg(test)]
         Projection::SizePadding(bytes) => return Ok(*bytes),
@@ -6278,16 +6299,17 @@ async fn validate_tool_finish_owner(
         ),
         "prepared" => {
             let approval_cleanup = sqlx::query_scalar::<_, String>(
-                "SELECT id FROM approval_log
-                 WHERE tool_call_id = ? AND state = 'pending'",
+                "SELECT state FROM approval_log
+                 WHERE tool_call_id = ?",
             )
             .bind(tool_call_id)
             .fetch_optional(&mut **transaction)
             .await?
-            .is_some_and(|request_id| {
-                approval_resolutions
-                    .get(request_id.as_str())
-                    .is_some_and(|(resolution, _)| matches!(*resolution, "denied" | "cancelled"))
+            .is_some_and(|state| {
+                matches!(state.as_str(), "denied" | "cancelled")
+                    || approval_resolutions
+                        .values()
+                        .any(|(resolution, _)| matches!(*resolution, "denied" | "cancelled"))
             });
             if finish.state != "cancelled"
                 || !(closes_owner
@@ -6407,6 +6429,7 @@ async fn validate_required_projection_sets(
     let mut tool_starts = HashMap::new();
     let mut tool_start_positions = HashMap::new();
     let mut tool_finishes = HashMap::new();
+    let mut approval_rule_inserts = HashMap::new();
     let mut applied_controls = Vec::new();
     let mut supersedes = Vec::new();
     let mut projection_position = 0usize;
@@ -6430,6 +6453,16 @@ async fn validate_required_projection_sets(
                 })) => {
                     approval_resolutions.insert(request_id.as_str(), (*state, actor.as_str()));
                     approval_resolution_positions.insert(request_id.as_str(), projection_position);
+                }
+                PreparedProjection::Plain(Projection::ApprovalRule(rule))
+                    if approval_rule_inserts
+                        .insert(
+                            rule.id.as_str(),
+                            (rule.tool.as_str(), rule.pattern.as_str()),
+                        )
+                        .is_some() =>
+                {
+                    bail!("duplicate approval rule insert for {}", rule.id);
                 }
                 PreparedProjection::Plain(Projection::Approval(ApprovalMutation::Pending {
                     request_id,
@@ -6967,6 +7000,7 @@ async fn validate_required_projection_sets(
     }
 
     let mut consumed_approval_resolutions = HashSet::new();
+    let mut consumed_approval_rule_ids = HashSet::new();
     let mut active_abort_runs = HashSet::new();
     let mut user_owner_close_runs = HashSet::new();
     let mut user_owner_closes = Vec::new();
@@ -7080,10 +7114,29 @@ async fn validate_required_projection_sets(
                         let expected_resolution = match decision {
                             ApprovalDecision::ApproveOnce => "approved_once",
                             ApprovalDecision::Deny => "denied",
-                            ApprovalDecision::ApproveAlways { .. } => {
-                                bail!(
-                                    "active ApproveAlways requires the T22/T23 durable policy mutation path"
-                                )
+                            ApprovalDecision::ApproveAlways { rule } => {
+                                let value = serde_json::to_value(&rule)?;
+                                let rule_id = value
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .ok_or_else(|| anyhow!("ApproveAlways rule has no id"))?;
+                                let tool = value
+                                    .get("tool")
+                                    .and_then(Value::as_str)
+                                    .ok_or_else(|| anyhow!("ApproveAlways rule has no tool"))?;
+                                let pattern = serde_json::to_string(&value)?;
+                                let Some((inserted_tool, inserted_pattern)) =
+                                    approval_rule_inserts.get(rule_id)
+                                else {
+                                    bail!(
+                                        "active ApproveAlways requires its durable approval rule insert"
+                                    );
+                                };
+                                if *inserted_tool != tool || *inserted_pattern != pattern {
+                                    bail!("durable ApproveAlways rule does not match the command");
+                                }
+                                consumed_approval_rule_ids.insert(rule_id.to_owned());
+                                "approved_always"
                             }
                         };
                         let Some((resolution, actor)) =
@@ -7222,6 +7275,9 @@ async fn validate_required_projection_sets(
             }
             value => bail!("CommandApplied cannot target command kind {value}"),
         }
+    }
+    if consumed_approval_rule_ids.len() != approval_rule_inserts.len() {
+        bail!("approval rule insert requires its active ApproveAlways CommandApplied");
     }
     for (command_id, run_id) in &user_owner_closes {
         validate_owner_active_work_terminalized(
@@ -8994,6 +9050,19 @@ async fn apply_plain_projection(
         | Projection::MemoryJobUpdate(_)
         | Projection::MemoryTransition(_) => {
             bail!("memory and provider-context mutations must be prepared before apply");
+        }
+        Projection::ApprovalRule(rule) => {
+            let result = sqlx::query(
+                "INSERT INTO approval_rules(id, tool, pattern, created_at)
+                 VALUES(?, ?, ?, ?)",
+            )
+            .bind(rule.id)
+            .bind(rule.tool)
+            .bind(rule.pattern)
+            .bind(Utc::now().to_rfc3339())
+            .execute(&mut **transaction)
+            .await?;
+            require_single_cas(result.rows_affected(), "ApprovalRuleInsert")?;
         }
         #[cfg(test)]
         Projection::SizePadding(_) => {}
@@ -17807,9 +17876,18 @@ mod tests {
             .expect_err("approval can start only its pending tool");
         assert!(wrong_tool.to_string().contains("pending tool tool-2b"));
 
+        let approve_always_rule = json!({
+            "id":"rule-3",
+            "tool":"bash",
+            "literal_prefix":["git","status"],
+            "effect":"allow",
+            "workspace_only":true,
+            "allowed_permissions":["exec"],
+            "allowed_network_domains":[]
+        });
         let approve_always: ApprovalDecision = serde_json::from_value(json!({
             "type":"approve_always",
-            "rule":{"tool_name":"test","literal_prefix":["test"]}
+            "rule": approve_always_rule.clone()
         }))
         .expect("closed deferred ApproveAlways decision");
         let store = test_store().await;
@@ -17824,19 +17902,38 @@ mod tests {
             ))
             .await
             .expect("persist authenticated ApproveAlways");
-        let unsupported = writer
+        let mut resolution = approval_resolution_write(
+            "request-3",
+            "approved_always",
+            "user-3",
+            Some(("00000000-0000-4000-8000-000000000035", 2, "run-3")),
+        );
+        resolution
+            .projections
+            .push(Projection::ApprovalRule(ApprovalRuleMutation {
+                id: "rule-3".to_owned(),
+                tool: "bash".to_owned(),
+                pattern: serde_json::to_string(&approve_always_rule).expect("serialize rule"),
+            }));
+        writer
             .apply(EventBatch {
-                writes: vec![approval_resolution_write(
-                    "request-3",
-                    "approved_always",
-                    "user-3",
-                    Some(("00000000-0000-4000-8000-000000000035", 2, "run-3")),
-                )],
+                writes: vec![resolution],
                 injected_commands: Vec::new(),
             })
             .await
-            .expect_err("T12 must not invent a durable policy mutation");
-        assert!(unsupported.to_string().contains("T22/T23"));
+            .expect("ApproveAlways resolves with its durable policy mutation");
+        assert_eq!(
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT
+                    (SELECT status FROM inbound_commands
+                     WHERE command_id='00000000-0000-4000-8000-000000000035'),
+                    (SELECT tool FROM approval_rules WHERE id='rule-3')",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("durable ApproveAlways state"),
+            ("applied".to_owned(), "bash".to_owned())
+        );
 
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());

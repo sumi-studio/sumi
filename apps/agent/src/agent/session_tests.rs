@@ -1964,7 +1964,7 @@ async fn fixture_pending_and_runtime_cancellation_cross_the_durable_bridge_atomi
         .commit(
             &writer,
             RunOutput::detached(
-                binding,
+                binding.clone(),
                 AgentEvent::ApprovalResolved {
                     request_id: request.id,
                     resolution: ApprovalResolution::Cancelled,
@@ -1985,6 +1985,44 @@ async fn fixture_pending_and_runtime_cancellation_cross_the_durable_bridge_atomi
         .await
         .expect("approval cancellation transaction"),
         ("cancelled".to_owned(), 1)
+    );
+
+    let result = PublicMessage::ToolResult(ToolResultMessage {
+        tool_call_id: request.tool_call_id.clone(),
+        tool_name: request.tool_name,
+        content: vec![UserContent::Text {
+            text: "Tool execution cancelled".to_owned(),
+        }],
+        details: serde_json::json!({"error": "Tool execution cancelled"}),
+        is_error: true,
+        timestamp: Utc::now(),
+    });
+    for event in [
+        AgentEvent::MessageStart {
+            message_id: "approval-cancelled-result".to_owned(),
+            message: Box::new(result.clone()),
+        },
+        AgentEvent::MessageEnd {
+            message_id: "approval-cancelled-result".to_owned(),
+            message: Box::new(result),
+        },
+    ] {
+        bridge
+            .commit(&writer, RunOutput::detached(binding.clone(), event, None))
+            .await
+            .expect("prepared approval cleanup updates instead of reinserting");
+    }
+    assert_eq!(
+        sqlx::query_as::<_, (String, String, i64)>(
+            "SELECT state, error_code,
+                    (SELECT COUNT(*) FROM tool_executions
+                     WHERE tool_call_id='approval-tool')
+             FROM tool_executions WHERE tool_call_id='approval-tool'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("cancelled prepared tool"),
+        ("cancelled".to_owned(), "approval_cancelled".to_owned(), 1)
     );
 }
 

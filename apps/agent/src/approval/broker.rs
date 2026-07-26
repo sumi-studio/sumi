@@ -37,6 +37,7 @@ pub enum ApprovalOutcome {
     Allowed,
     Denied {
         reason: String,
+        audit: Option<AuditDecision>,
     },
     Pending {
         request: ApprovalRequest,
@@ -148,19 +149,12 @@ impl ApprovalBroker {
             Err(e) => {
                 return Ok(ApprovalOutcome::Denied {
                     reason: format!("invalid tool call: {e}"),
+                    audit: None,
                 });
             }
         };
 
         let projection = self.projector.project(&action);
-        if let crate::approval::action::ReviewProjection::InsufficientEvidence { ref reason } =
-            projection
-        {
-            return Ok(ApprovalOutcome::Denied {
-                reason: reason.clone(),
-            });
-        }
-
         let policy = self
             .policy
             .read()
@@ -169,11 +163,30 @@ impl ApprovalBroker {
         let decision = policy.evaluate(&action);
 
         match decision {
-            PolicyDecision::Forbidden { reason, .. } => Ok(ApprovalOutcome::Denied { reason }),
+            PolicyDecision::Forbidden { reason, .. } => Ok(ApprovalOutcome::Denied {
+                reason,
+                audit: None,
+            }),
             PolicyDecision::Allow { .. } => {
                 if self.mode == ReviewerMode::StrictAutoReview {
-                    self.call_reviewer(&projection, transcript, turn_id, context_version, cancel)
-                        .await
+                    let outcome = self
+                        .call_reviewer(
+                            &projection,
+                            transcript,
+                            run_id,
+                            turn_id,
+                            context_version,
+                            cancel,
+                        )
+                        .await?;
+                    self.reviewer_fallback(
+                        outcome,
+                        tool_call,
+                        &action,
+                        &projection,
+                        run_id,
+                        turn_id,
+                    )
                 } else {
                     Ok(ApprovalOutcome::Allowed)
                 }
@@ -183,12 +196,37 @@ impl ApprovalBroker {
                     if self.headless {
                         return Ok(ApprovalOutcome::Denied {
                             reason: format!("{reason} (headless User mode)"),
+                            audit: None,
                         });
                     }
-                    self.make_pending(tool_call, &action, &projection, run_id, turn_id, &reason)
+                    self.make_pending(
+                        tool_call,
+                        &action,
+                        &projection,
+                        run_id,
+                        turn_id,
+                        &reason,
+                        None,
+                    )
                 } else {
-                    self.call_reviewer(&projection, transcript, turn_id, context_version, cancel)
-                        .await
+                    let outcome = self
+                        .call_reviewer(
+                            &projection,
+                            transcript,
+                            run_id,
+                            turn_id,
+                            context_version,
+                            cancel,
+                        )
+                        .await?;
+                    self.reviewer_fallback(
+                        outcome,
+                        tool_call,
+                        &action,
+                        &projection,
+                        run_id,
+                        turn_id,
+                    )
                 }
             }
         }
@@ -311,6 +349,7 @@ impl ApprovalBroker {
             .map(|e| e.tool_call_id.clone())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn make_pending(
         &self,
         tool_call: &ToolCall,
@@ -319,6 +358,7 @@ impl ApprovalBroker {
         run_id: &str,
         turn_id: &str,
         reason: &str,
+        audit: Option<AuditDecision>,
     ) -> Result<ApprovalOutcome> {
         let request_id = Uuid::now_v7().to_string();
         let (tx, rx) = oneshot::channel();
@@ -335,7 +375,7 @@ impl ApprovalBroker {
             action: to_events_projection(projection)?,
             args_summary,
             reason: Some(reason.to_owned()),
-            audit: None,
+            audit: audit.as_ref().map(to_events_audit),
         };
 
         self.pending
@@ -356,6 +396,23 @@ impl ApprovalBroker {
             request,
             receiver: rx,
         })
+    }
+
+    fn reviewer_fallback(
+        &self,
+        outcome: ApprovalOutcome,
+        tool_call: &ToolCall,
+        action: &CanonicalAction,
+        projection: &crate::approval::action::ReviewProjection,
+        run_id: &str,
+        turn_id: &str,
+    ) -> Result<ApprovalOutcome> {
+        match outcome {
+            ApprovalOutcome::Denied { reason, audit } if !self.headless => self.make_pending(
+                tool_call, action, projection, run_id, turn_id, &reason, audit,
+            ),
+            other => Ok(other),
+        }
     }
 }
 
@@ -378,6 +435,7 @@ impl ApprovalBroker {
         &self,
         projection: &crate::approval::action::ReviewProjection,
         transcript: &[PublicMessage],
+        run_id: &str,
         turn_id: &str,
         context_version: &str,
         cancel: CancellationToken,
@@ -385,12 +443,14 @@ impl ApprovalBroker {
         let Some(reviewer) = self.reviewer.as_ref() else {
             return Ok(ApprovalOutcome::Denied {
                 reason: "no reviewer configured".to_owned(),
+                audit: Some(synthetic_audit("no reviewer configured")),
             });
         };
 
         if !reviewer.is_trusted() {
             return Ok(ApprovalOutcome::Denied {
                 reason: "reviewer trust domain is not allowed".to_owned(),
+                audit: Some(synthetic_audit("reviewer trust domain is not allowed")),
             });
         }
 
@@ -401,6 +461,7 @@ impl ApprovalBroker {
             trusted_environment: self.trusted_env.clone(),
             policy_hash: self.policy.read().unwrap_or_else(|e| e.into_inner()).hash(),
             context_version: context_version.to_owned(),
+            run_id: run_id.to_owned(),
             turn_id: Some(turn_id.to_owned()),
         };
 
@@ -409,13 +470,48 @@ impl ApprovalBroker {
                 Ok(()) => Ok(ApprovalOutcome::Allowed),
                 Err(constraint) => Ok(ApprovalOutcome::Denied {
                     reason: format!("{constraint}: {}", decision.rationale),
+                    audit: Some(decision),
                 }),
             },
             ReviewOutcome::Deny(decision) => {
                 let reason = decision.rationale.clone();
-                Ok(ApprovalOutcome::Denied { reason })
+                Ok(ApprovalOutcome::Denied {
+                    reason,
+                    audit: Some(decision),
+                })
             }
         }
+    }
+}
+
+fn synthetic_audit(reason: impl Into<String>) -> AuditDecision {
+    AuditDecision {
+        outcome: crate::approval::reviewer::AuditOutcome::Deny,
+        risk: RiskLevel::High,
+        authorization: UserAuthorization::Unknown,
+        rationale: reason.into(),
+    }
+}
+
+fn to_events_audit(decision: &AuditDecision) -> events::AuditDecision {
+    events::AuditDecision {
+        outcome: match decision.outcome {
+            crate::approval::reviewer::AuditOutcome::Allow => events::AuditOutcome::Allow,
+            crate::approval::reviewer::AuditOutcome::Deny => events::AuditOutcome::Deny,
+        },
+        risk: match decision.risk {
+            RiskLevel::Low => events::RiskLevel::Low,
+            RiskLevel::Medium => events::RiskLevel::Medium,
+            RiskLevel::High => events::RiskLevel::High,
+            RiskLevel::Critical => events::RiskLevel::Critical,
+        },
+        authorization: match decision.authorization {
+            UserAuthorization::Unknown => events::UserAuthorization::Unknown,
+            UserAuthorization::Low => events::UserAuthorization::Low,
+            UserAuthorization::Medium => events::UserAuthorization::Medium,
+            UserAuthorization::High => events::UserAuthorization::High,
+        },
+        rationale: decision.rationale.clone(),
     }
 }
 
@@ -793,9 +889,12 @@ mod tests {
             )
             .await
             .expect("start_request");
-        assert!(
-            matches!(outcome, ApprovalOutcome::Denied { reason } if reason.contains("critical risk"))
-        );
+        assert!(matches!(
+            outcome,
+            ApprovalOutcome::Pending { request, .. }
+                if request.reason.as_deref().is_some_and(|reason| reason.contains("critical risk"))
+                    && request.audit.is_some()
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -815,9 +914,12 @@ mod tests {
             )
             .await
             .expect("start_request");
-        assert!(
-            matches!(outcome, ApprovalOutcome::Denied { reason } if reason.contains("high authorization"))
-        );
+        assert!(matches!(
+            outcome,
+            ApprovalOutcome::Pending { request, .. }
+                if request.reason.as_deref().is_some_and(|reason| reason.contains("high authorization"))
+                    && request.audit.is_some()
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -838,6 +940,52 @@ mod tests {
             .await
             .expect("start_request");
         assert!(matches!(outcome, ApprovalOutcome::Allowed));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn autoreview_deny_falls_back_to_pending_only_when_interactive() {
+        let broker = reviewer_broker(
+            r#"{"outcome":"deny","risk":"high","authorization":"unknown","rationale":"manual review required"}"#,
+            ReviewerMode::AutoReview,
+        );
+        let outcome = broker
+            .start_request(
+                &bash_call("git status"),
+                &[],
+                "run-1",
+                "turn-1",
+                "v1",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("interactive review");
+        assert!(matches!(
+            outcome,
+            ApprovalOutcome::Pending { request, .. }
+                if request.audit.is_some()
+                    && request.reason.as_deref() == Some("manual review required")
+        ));
+
+        let mut headless = reviewer_broker(
+            r#"{"outcome":"deny","risk":"high","authorization":"unknown","rationale":"manual review required"}"#,
+            ReviewerMode::AutoReview,
+        );
+        headless.headless = true;
+        let outcome = headless
+            .start_request(
+                &bash_call("git status"),
+                &[],
+                "run-2",
+                "turn-1",
+                "v1",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("headless review");
+        assert!(matches!(
+            outcome,
+            ApprovalOutcome::Denied { reason, .. } if reason == "manual review required"
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]

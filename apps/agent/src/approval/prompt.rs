@@ -404,8 +404,9 @@ mod tests {
     use super::*;
     use crate::{
         approval::action::{
-            Permission, RedactedText, ReviewPath, ReviewPathComponent, ReviewToken,
-            ReviewableAction, SandboxSummary, SecretAwareActionProjector, SecretDigestKey,
+            CanonicalAction, Permission, RedactedText, ReviewPath, ReviewPathComponent,
+            ReviewToken, ReviewableAction, SandboxSummary, SecretAwareActionProjector,
+            SecretDigestKey,
         },
         provider::types::{
             ApiProtocol, AssistantMessage, ProviderOrigin, PublicAssistantMessage,
@@ -760,24 +761,23 @@ mod tests {
 
     #[test]
     fn pending_action_does_not_contain_raw_canonical_action() {
-        // The ReviewProjection already projects CanonicalAction; verify the
-        // JSON payload contains redaction markers instead of raw secret values.
-        let projection = ReviewProjection::Reviewable(ReviewableAction {
+        const RAW_SECRET: &str = "raw-token-7b6f24c6";
+        let action = CanonicalAction {
             tool: "bash".to_owned(),
             operation: "exec".to_owned(),
-            argv: vec![ReviewToken::SecretRef {
-                kind: "bearer_token".to_owned(),
-                digest: "deadbeef".to_owned(),
-            }],
-            cwd: ReviewPath(vec![]),
+            argv: vec![format!(
+                r#"curl -H "Authorization: Bearer {RAW_SECRET}" https://example.test"#
+            )],
+            cwd: PathBuf::from("/workspace"),
             affected_paths: Vec::new(),
             sandbox: SandboxSummary::workspace(),
             requested_permissions: vec![Permission::Exec, Permission::Network],
             justification: None,
-        });
+        };
+        let projection = projector().project(&action);
         let prompt = build(&[], &projection, &PromptLimits::default());
         let content = all_content(&prompt);
         assert!(content.contains("bearer_token"));
-        assert!(!content.contains("Authorization: Bearer raw-token"));
+        assert!(!content.contains(RAW_SECRET));
     }
 }

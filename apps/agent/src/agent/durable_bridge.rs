@@ -10,8 +10,8 @@ use crate::{
     provider::types::{PublicAssistantContent, PublicMessage, StopReason, ToolResultMessage},
     runtime::contracts::ProcessGeneration,
     store::{
-        ApplicationKind, ApprovalMutation, DurableEvent, EventBatch, EventWrite, EventWriter,
-        InjectedCommand, Projection, RunPhase, ToolExecutionMutation,
+        ApplicationKind, ApprovalMutation, ApprovalRuleMutation, DurableEvent, EventBatch,
+        EventWrite, EventWriter, InjectedCommand, Projection, RunPhase, ToolExecutionMutation,
     },
 };
 
@@ -887,6 +887,21 @@ impl DurableBridge {
                     let command_seq = command.envelope().seq;
                     let run_id = self.binding.run_id.clone();
                     let public_resolution = resolution.clone();
+                    let mut resolution_projections = vec![
+                        Projection::Approval(ApprovalMutation::Resolve {
+                            request_id: request_id.clone(),
+                            state,
+                            actor: "user".to_owned(),
+                        }),
+                        Projection::CommandApplied {
+                            command_id: command_id.clone(),
+                            command_seq,
+                            run_id: Some(run_id.clone()),
+                        },
+                    ];
+                    if let Some(rule) = approval_rule_projection(&public_resolution)? {
+                        resolution_projections.push(Projection::ApprovalRule(rule));
+                    }
                     let writes = vec![
                         EventWrite {
                             event: Some(DurableEvent::approval_resolved(
@@ -894,18 +909,7 @@ impl DurableBridge {
                                 resolution,
                                 "user".to_owned(),
                             )?),
-                            projections: vec![
-                                Projection::Approval(ApprovalMutation::Resolve {
-                                    request_id: request_id.clone(),
-                                    state,
-                                    actor: "user".to_owned(),
-                                }),
-                                Projection::CommandApplied {
-                                    command_id: command_id.clone(),
-                                    command_seq,
-                                    run_id: Some(run_id.clone()),
-                                },
-                            ],
+                            projections: resolution_projections,
                         },
                         EventWrite {
                             event: Some(DurableEvent::tool_execution_start(
@@ -1119,6 +1123,9 @@ impl DurableBridge {
                 }
                 let request_id = request.id.clone();
                 let tool_call_id = request.tool_call_id.clone();
+                if !self.pending_tool_calls.remove(&tool_call_id) {
+                    bail!("ApprovalRequested does not match an unprepared tool call");
+                }
                 self.approval_request_tools
                     .insert(request_id.clone(), tool_call_id.clone());
                 self.approval_prepared_tools.insert(tool_call_id.clone());
@@ -1509,28 +1516,52 @@ impl DurableBridge {
                 if !result.is_error {
                     bail!("Approval-cancelled ToolResult must be is_error=true");
                 }
-                projections.push(Projection::ToolExecution(ToolExecutionMutation::Skip {
+                let result_value = serde_json::to_value(result)?;
+                writes.push(EventWrite {
+                    event: Some(DurableEvent::tool_execution_end(
+                        tool_call_id.clone(),
+                        result_value.clone(),
+                        true,
+                        "cancelled".to_owned(),
+                        Some("approval_cancelled".to_owned()),
+                    )?),
+                    projections: vec![Projection::ToolExecution(ToolExecutionMutation::Finish {
+                        tool_call_id: tool_call_id.clone(),
+                        expected: "prepared",
+                        state: "cancelled",
+                        error_code: Some("approval_cancelled"),
+                    })],
+                });
+                public_prefix.push(AgentEvent::ToolExecutionEnd {
                     tool_call_id: tool_call_id.clone(),
-                    command_id: self.binding.command_id.clone(),
-                    run_id: self.binding.run_id.clone(),
-                    turn_id: self.binding.turn_id.clone(),
-                    executor_generation: self.binding.executor_generation,
-                    idempotency_key: self.binding.tool_execution_idempotency_key(&tool_call_id),
-                    error_code: "approval_cancelled",
-                }));
+                    result: result_value,
+                    is_error: true,
+                });
             } else if self.approval_not_started.remove(&tool_call_id) {
                 if !result.is_error {
                     bail!("Approval-not-started ToolResult must be is_error=true");
                 }
-                projections.push(Projection::ToolExecution(ToolExecutionMutation::Skip {
+                let result_value = serde_json::to_value(result)?;
+                writes.push(EventWrite {
+                    event: Some(DurableEvent::tool_execution_end(
+                        tool_call_id.clone(),
+                        result_value.clone(),
+                        true,
+                        "cancelled".to_owned(),
+                        Some("approval_denied".to_owned()),
+                    )?),
+                    projections: vec![Projection::ToolExecution(ToolExecutionMutation::Finish {
+                        tool_call_id: tool_call_id.clone(),
+                        expected: "prepared",
+                        state: "cancelled",
+                        error_code: Some("approval_denied"),
+                    })],
+                });
+                public_prefix.push(AgentEvent::ToolExecutionEnd {
                     tool_call_id: tool_call_id.clone(),
-                    command_id: self.binding.command_id.clone(),
-                    run_id: self.binding.run_id.clone(),
-                    turn_id: self.binding.turn_id.clone(),
-                    executor_generation: self.binding.executor_generation,
-                    idempotency_key: self.binding.tool_execution_idempotency_key(&tool_call_id),
-                    error_code: "approval_denied",
-                }));
+                    result: result_value,
+                    is_error: true,
+                });
             } else if let Some((_, _, pending_ids, _)) = self.pending_rejected_end.as_mut()
                 && pending_ids.remove(&tool_call_id)
             {
@@ -1730,6 +1761,21 @@ impl DurableBridge {
         let run_id = self.binding.run_id.clone();
         self.committed_terminal_command_ids.push(command_id.clone());
         let public_resolution = resolution.clone();
+        let mut projections = vec![
+            Projection::Approval(ApprovalMutation::Resolve {
+                request_id: request_id.clone(),
+                state,
+                actor: "user".to_owned(),
+            }),
+            Projection::CommandApplied {
+                command_id,
+                command_seq,
+                run_id: Some(run_id),
+            },
+        ];
+        if let Some(rule) = approval_rule_projection(&public_resolution)? {
+            projections.push(Projection::ApprovalRule(rule));
+        }
         self.commit_batch(
             writer,
             EventBatch {
@@ -1739,18 +1785,7 @@ impl DurableBridge {
                         resolution,
                         "user".to_owned(),
                     )?),
-                    projections: vec![
-                        Projection::Approval(ApprovalMutation::Resolve {
-                            request_id: request_id.clone(),
-                            state,
-                            actor: "user".to_owned(),
-                        }),
-                        Projection::CommandApplied {
-                            command_id,
-                            command_seq,
-                            run_id: Some(run_id),
-                        },
-                    ],
+                    projections,
                 }],
                 injected_commands: Vec::new(),
             },
@@ -2203,6 +2238,30 @@ fn approval_state(resolution: &ApprovalResolution) -> &'static str {
         ApprovalResolution::Decision(ApprovalDecision::Deny) => "denied",
         ApprovalResolution::Cancelled => "cancelled",
     }
+}
+
+fn approval_rule_projection(
+    resolution: &ApprovalResolution,
+) -> Result<Option<ApprovalRuleMutation>> {
+    let ApprovalResolution::Decision(ApprovalDecision::ApproveAlways { rule }) = resolution else {
+        return Ok(None);
+    };
+    let value = serde_json::to_value(rule)?;
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("ApproveAlways rule has no id"))?
+        .to_owned();
+    let tool = value
+        .get("tool")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("ApproveAlways rule has no tool"))?
+        .to_owned();
+    Ok(Some(ApprovalRuleMutation {
+        id,
+        tool,
+        pattern: serde_json::to_string(&value)?,
+    }))
 }
 
 #[cfg(test)]

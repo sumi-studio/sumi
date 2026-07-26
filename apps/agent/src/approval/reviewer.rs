@@ -154,6 +154,7 @@ pub struct ReviewRequest {
     pub trusted_environment: TrustedEnvironment,
     pub policy_hash: String,
     pub context_version: String,
+    pub run_id: String,
     pub turn_id: Option<String>,
 }
 
@@ -359,9 +360,25 @@ pub struct Reviewer {
     trust_set: ReviewerTrustSet,
     transport: Arc<dyn ReviewerTransport>,
     projector: Arc<SecretAwareActionProjector>,
-    circuit_breaker: Mutex<CircuitBreaker>,
+    circuit_breaker: Mutex<RunCircuitBreaker>,
     allow_cache: Mutex<AllowCache>,
     deny_cache: Mutex<DenyCache>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RunCircuitBreaker {
+    run_id: Option<String>,
+    breaker: CircuitBreaker,
+}
+
+impl RunCircuitBreaker {
+    fn for_run(&mut self, run_id: &str) -> &mut CircuitBreaker {
+        if self.run_id.as_deref() != Some(run_id) {
+            self.run_id = Some(run_id.to_owned());
+            self.breaker = CircuitBreaker::new();
+        }
+        &mut self.breaker
+    }
 }
 
 impl Reviewer {
@@ -376,7 +393,7 @@ impl Reviewer {
             trust_set,
             transport,
             projector,
-            circuit_breaker: Mutex::new(CircuitBreaker::new()),
+            circuit_breaker: Mutex::new(RunCircuitBreaker::default()),
             allow_cache: Mutex::new(AllowCache::new()),
             deny_cache: Mutex::new(DenyCache::new()),
         }
@@ -390,12 +407,16 @@ impl Reviewer {
 
     pub async fn review(&self, request: ReviewRequest, cancel: CancellationToken) -> ReviewOutcome {
         let projection_hash = hash_projection(&request.projection);
+        self.circuit_breaker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .for_run(&request.run_id);
 
         if request.mode == ReviewerMode::User {
             return ReviewOutcome::Deny(synthetic_deny("audit review is disabled in User mode"));
         }
         if !self.trust_set.allows(&self.model) {
-            self.record_outcome(AuditOutcome::Deny);
+            self.record_outcome(&request.run_id, AuditOutcome::Deny);
             return ReviewOutcome::Deny(synthetic_deny(
                 "reviewer model trust domain is not allowed",
             ));
@@ -404,7 +425,7 @@ impl Reviewer {
             request.projection,
             ReviewProjection::InsufficientEvidence { .. }
         ) {
-            self.record_outcome(AuditOutcome::Deny);
+            self.record_outcome(&request.run_id, AuditOutcome::Deny);
             return ReviewOutcome::Deny(synthetic_deny(
                 "insufficient evidence to review the action",
             ));
@@ -426,7 +447,12 @@ impl Reviewer {
                 .circuit_breaker
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if cb.is_open() {
+            if cb
+                .run_id
+                .as_deref()
+                .is_some_and(|run_id| run_id == request.run_id)
+                && cb.breaker.is_open()
+            {
                 return ReviewOutcome::Deny(synthetic_deny("reviewer circuit breaker is open"));
             }
         }
@@ -434,7 +460,7 @@ impl Reviewer {
         {
             let deny_cache = self.deny_cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(decision) = deny_cache.get(&projection_hash, request.turn_id.as_deref()) {
-                self.record_outcome(AuditOutcome::Deny);
+                self.record_outcome(&request.run_id, AuditOutcome::Deny);
                 return ReviewOutcome::Deny(decision.clone());
             }
         }
@@ -454,7 +480,7 @@ impl Reviewer {
             ) {
                 Ok(p) => p,
                 Err(e) => {
-                    self.record_outcome(AuditOutcome::Deny);
+                    self.record_outcome(&request.run_id, AuditOutcome::Deny);
                     return ReviewOutcome::Deny(synthetic_deny(format!(
                         "failed to build reviewer prompt: {e}"
                     )));
@@ -465,7 +491,7 @@ impl Reviewer {
             let remaining = match deadline.checked_duration_since(now) {
                 Some(d) => d,
                 None => {
-                    self.record_outcome(AuditOutcome::Deny);
+                    self.record_outcome(&request.run_id, AuditOutcome::Deny);
                     return ReviewOutcome::Deny(synthetic_deny("reviewer total timeout exceeded"));
                 }
             };
@@ -498,13 +524,13 @@ impl Reviewer {
                     continue;
                 }
                 ReviewerCall::Fatal(e) => {
-                    self.record_outcome(AuditOutcome::Deny);
+                    self.record_outcome(&request.run_id, AuditOutcome::Deny);
                     return ReviewOutcome::Deny(synthetic_deny(format!(
                         "fatal reviewer transport error: {e}"
                     )));
                 }
                 ReviewerCall::TimedOut => {
-                    self.record_outcome(AuditOutcome::Deny);
+                    self.record_outcome(&request.run_id, AuditOutcome::Deny);
                     return ReviewOutcome::Deny(synthetic_deny(
                         "reviewer call timed out after 90 seconds",
                     ));
@@ -515,7 +541,7 @@ impl Reviewer {
             }
         }
 
-        self.record_outcome(AuditOutcome::Deny);
+        self.record_outcome(&request.run_id, AuditOutcome::Deny);
         let last = retry_errors
             .last()
             .map(String::as_str)
@@ -525,10 +551,11 @@ impl Reviewer {
         )))
     }
 
-    fn record_outcome(&self, outcome: AuditOutcome) {
+    fn record_outcome(&self, run_id: &str, outcome: AuditOutcome) {
         self.circuit_breaker
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .for_run(run_id)
             .record(outcome);
     }
 
@@ -538,7 +565,7 @@ impl Reviewer {
         projection_hash: &str,
         request: &ReviewRequest,
     ) -> ReviewOutcome {
-        self.record_outcome(decision.outcome);
+        self.record_outcome(&request.run_id, decision.outcome);
         match decision.outcome {
             AuditOutcome::Allow => {
                 self.allow_cache
@@ -688,6 +715,7 @@ mod tests {
             trusted_environment: trusted_env(),
             policy_hash: "policy-hash".to_owned(),
             context_version: "v1".to_owned(),
+            run_id: "run-1".to_owned(),
             turn_id: Some("turn-1".to_owned()),
         }
     }
@@ -976,6 +1004,33 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn circuit_breaker_resets_at_run_boundary() {
+        let fake = FakeTransport::sequence(vec![
+            Ok(deny_json()),
+            Ok(deny_json()),
+            Ok(deny_json()),
+            Ok(allow_json()),
+        ]);
+        let reviewer = make_reviewer(fake.clone());
+        let mut request = review_request(reviewable_projection());
+        request.turn_id = None;
+        for _ in 0..3 {
+            assert!(matches!(
+                reviewer
+                    .review(request.clone(), CancellationToken::new())
+                    .await,
+                ReviewOutcome::Deny(_)
+            ));
+        }
+        request.run_id = "run-2".to_owned();
+        assert!(matches!(
+            reviewer.review(request, CancellationToken::new()).await,
+            ReviewOutcome::Allow(_)
+        ));
+        assert_eq!(fake.called_count(), 4);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn allow_cache_avoids_transport_on_repeat() {
         let fake = FakeTransport::sequence(vec![Ok(allow_json())]);
         let reviewer = make_reviewer(fake.clone());
@@ -985,6 +1040,25 @@ mod tests {
         let outcome2 = reviewer.review(req, CancellationToken::new()).await;
         assert!(matches!(outcome2, ReviewOutcome::Allow(_)));
         assert_eq!(fake.called_count(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn allow_cache_does_not_cross_same_run_context_mutation() {
+        let fake = FakeTransport::sequence(vec![Ok(allow_json()), Ok(allow_json())]);
+        let reviewer = make_reviewer(fake.clone());
+        let mut request = review_request(reviewable_projection());
+        assert!(matches!(
+            reviewer
+                .review(request.clone(), CancellationToken::new())
+                .await,
+            ReviewOutcome::Allow(_)
+        ));
+        request.context_version = "v2-after-steer".to_owned();
+        assert!(matches!(
+            reviewer.review(request, CancellationToken::new()).await,
+            ReviewOutcome::Allow(_)
+        ));
+        assert_eq!(fake.called_count(), 2);
     }
 
     #[tokio::test(flavor = "current_thread")]

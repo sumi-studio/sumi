@@ -15,13 +15,24 @@ use tokio_util::sync::CancellationToken;
 use super::*;
 use crate::{
     agent::{AttemptCancellation, DurableRunBinding, PublicStreamEvent},
-    gateway::{CommandEnvelope, CommandId},
+    approval::{
+        ApprovalBroker,
+        action::{SandboxSummary, SecretAwareActionProjector, SecretDigestKey},
+        policy::Policy,
+        prompt::{ReviewerPrompt, TrustedEnvironment},
+        reviewer::{
+            Reviewer, ReviewerMode, ReviewerModelSpec, ReviewerTransport, ReviewerTransportError,
+            ReviewerTrustSet,
+        },
+    },
+    gateway::{ApprovalDecision, CommandEnvelope, CommandId},
     provider::types::{
         ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, ProviderContextFragment,
         ProviderContextPayload, ProviderOrigin, ProviderOutput, PublicAssistantMessage,
         RejectedToolCall, ToolArgumentError, Usage, ValidatedToolArguments,
     },
     runtime::contracts::ProcessGeneration,
+    store::Redactor,
     tools::ToolError,
 };
 
@@ -536,6 +547,21 @@ fn admitted_abort(seq: u64) -> AdmittedCommand {
     )
 }
 
+fn admitted_approval(seq: u64, request_id: &str) -> AdmittedCommand {
+    AdmittedCommand::new(
+        CommandEnvelope {
+            seq,
+            command_id: CommandId::parse(&format!("00000000-0000-4000-8000-{seq:012}"))
+                .expect("command id"),
+            command: Command::ApprovalDecision {
+                request_id: request_id.to_owned(),
+                decision: ApprovalDecision::ApproveOnce,
+            },
+        },
+        timestamp(),
+    )
+}
+
 fn runtime_user(seq: u64) -> PublicMessage {
     PublicMessage::User(UserMessage {
         content: vec![UserContent::Text {
@@ -583,6 +609,164 @@ fn bound_core(seq: u64) -> RunCore {
     ));
     core.attempt_cancellation = Some(Arc::new(AttemptCancellation::default()));
     core
+}
+
+struct BlockingReviewer {
+    started: Arc<Notify>,
+}
+
+#[async_trait]
+impl ReviewerTransport for BlockingReviewer {
+    async fn complete(
+        &self,
+        _prompt: &ReviewerPrompt,
+        cancel: CancellationToken,
+    ) -> Result<String, ReviewerTransportError> {
+        self.started.notify_one();
+        cancel.cancelled().await;
+        Err(ReviewerTransportError::Fatal(
+            "cancelled by control".to_owned(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn abort_is_processed_while_reviewer_start_request_is_awaited() {
+    let started = Arc::new(Notify::new());
+    let projector = SecretAwareActionProjector::new(Redactor::v1(), SecretDigestKey::fixture());
+    let reviewer = Arc::new(Reviewer::new(
+        ReviewerModelSpec::new(
+            "audit",
+            "fixture",
+            "https://reviewer.invalid",
+            "test",
+            "trusted",
+            "test-policy",
+        ),
+        ReviewerTrustSet::new("trusted", vec![]),
+        Arc::new(BlockingReviewer {
+            started: started.clone(),
+        }),
+        Arc::new(SecretAwareActionProjector::new(
+            Redactor::v1(),
+            SecretDigestKey::fixture(),
+        )),
+    ));
+    let broker = Arc::new(ApprovalBroker::new(
+        Policy::new("/workspace"),
+        projector,
+        Some(reviewer),
+        ReviewerMode::AutoReview,
+        false,
+        TrustedEnvironment {
+            workspace_root: "/workspace".to_owned(),
+            sandbox: SandboxSummary::workspace(),
+            denied_paths: Vec::new(),
+            denied_network_domains: Vec::new(),
+            repo_visibility: None,
+            git_status: None,
+        },
+    ));
+    let driver = Arc::new(FixtureDriver::new(Vec::new()));
+    let mut core = bound_core(1);
+    core.set_approval(broker);
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, _events_rx) = mpsc::channel(1);
+    let mut runner = Runner::new(core, driver, control_rx, events_tx);
+    let call = ToolCall {
+        id: "call-review-wait".to_owned(),
+        name: "bash".to_owned(),
+        arguments: serde_json::from_value(json!({"command": "git status"}))
+            .expect("validated arguments"),
+    };
+    let task = tokio::spawn(async move { runner.evaluate_call(&call).await });
+    started.notified().await;
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let (committed_tx, committed_rx) = oneshot::channel();
+    control_tx
+        .send(RunControl::Abort {
+            command: admitted_abort(2),
+            accepted: accepted_tx,
+            committed: committed_rx,
+        })
+        .await
+        .expect("send abort");
+    assert!(accepted_rx.await.expect("abort acceptance"));
+    committed_tx.send(()).expect("authorize durable abort");
+    let outcome = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("abort must not wait for reviewer")
+        .expect("runner task")
+        .expect("evaluate call");
+    assert!(matches!(outcome, CallDisposition::Denied { .. }));
+}
+
+#[tokio::test]
+async fn committed_context_mutation_advances_reviewer_cache_version_within_run() {
+    let driver = Arc::new(FixtureDriver::new(Vec::new()));
+    let core = bound_core(1);
+    let (_control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, _events_rx) = mpsc::channel(1);
+    let mut runner = Runner::new(core, driver, control_rx, events_tx);
+    assert_eq!(runner.core.mutation_epoch(), 0);
+    let message = runtime_user(2);
+    runner
+        .retain_committed(
+            MessageCommitReceipt {
+                message_id: "persisted-user-2".to_owned(),
+                message_seq: 22,
+                new_turn_id: None,
+            },
+            &message,
+        )
+        .expect("retain committed steer");
+    assert_eq!(
+        runner.core.mutation_epoch(),
+        1,
+        "a same-run user/context mutation must invalidate cached reviewer allows"
+    );
+}
+
+#[tokio::test]
+async fn resolved_matching_approval_is_consumed_without_blocking_followup_queue() {
+    let projector = SecretAwareActionProjector::new(Redactor::v1(), SecretDigestKey::fixture());
+    let broker = Arc::new(ApprovalBroker::headless(
+        Policy::new("/workspace"),
+        projector,
+    ));
+    let driver = Arc::new(FixtureDriver::new(Vec::new()));
+    let mut core = bound_core(1);
+    core.set_approval(broker);
+    let (control_tx, control_rx) = mpsc::channel(2);
+    let (events_tx, _events_rx) = mpsc::channel(1);
+    let mut runner = Runner::new(core, driver, control_rx, events_tx);
+    let (_waiter_tx, waiter_rx) = oneshot::channel();
+    let send_controls = async {
+        control_tx
+            .send(RunControl::Command(admitted_approval(2, "unrelated")))
+            .await
+            .expect("send unrelated decision");
+        control_tx
+            .send(RunControl::Command(admitted_approval(
+                3,
+                "already-terminal",
+            )))
+            .await
+            .expect("send matching terminal decision");
+    };
+    let (outcome, ()) = tokio::join!(
+        runner.wait_for_approval("already-terminal".to_owned(), waiter_rx),
+        send_controls
+    );
+    assert!(matches!(
+        outcome.expect("wait outcome"),
+        ApprovalWaitOutcome::Cancelled
+    ));
+    assert_eq!(
+        pending_sequences(&mut runner.core),
+        vec![2],
+        "only the unrelated earlier decision remains in order"
+    );
 }
 
 async fn run_fixture(driver: Arc<FixtureDriver>) -> (RunCompletion, Vec<AgentEvent>) {
@@ -1897,8 +2081,8 @@ async fn immediate_overflow_recovers_twice_then_closes_without_appending_attempt
             .overflow_core_epochs
             .lock()
             .expect("overflow core epochs"),
-        vec![0, 0],
-        "planning receives immutable core state and cannot advance it"
+        vec![1, 2],
+        "each committed context boundary advances the reviewer cache version"
     );
     assert_eq!(
         events

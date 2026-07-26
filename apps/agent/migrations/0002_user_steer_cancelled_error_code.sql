@@ -17,7 +17,7 @@ CREATE TABLE tool_executions (
     error_code IS NULL
     OR error_code IN (
       'executor_failed', 'cancelled', 'indeterminate', 'invalid_result', 'internal',
-      'length_guard', 'user_steer_cancelled'
+      'length_guard', 'user_steer_cancelled', 'approval_denied', 'approval_cancelled'
     )
   ),
   CHECK (

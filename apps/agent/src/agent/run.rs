@@ -260,7 +260,6 @@ impl Runner {
             result = Err(failure);
         }
         self.core.runtime_context = std::mem::take(&mut self.context);
-        self.core.mark_mutated();
         match result {
             Ok(()) => RunCompletion::Completed(std::mem::take(&mut self.core)),
             Err(failure) => RunCompletion::Failed {
@@ -402,6 +401,7 @@ impl Runner {
                     )
                     .await?;
                     self.context = replacement;
+                    self.core.mark_mutated();
                 }
                 AttemptOutcome::Terminal {
                     assistant_message_id,
@@ -1206,33 +1206,77 @@ impl Runner {
         Ok((results, receipts))
     }
 
-    async fn evaluate_call(&self, call: &ToolCall) -> Result<CallDisposition, WorkerFailure> {
-        let Some(broker) = self.core.approval.as_ref() else {
+    async fn evaluate_call(&mut self, call: &ToolCall) -> Result<CallDisposition, WorkerFailure> {
+        let Some(broker) = self.core.approval.clone() else {
             return Ok(CallDisposition::Allowed);
         };
         let binding = self.core.durable_binding.as_ref().ok_or_else(|| {
             WorkerFailure::Error("RunCore has no durable worker binding".to_owned())
         })?;
+        let run_id = binding.run_id.clone();
+        let turn_id = binding.turn_id.clone();
         let transcript: Vec<PublicMessage> = self
             .context
             .iter()
             .map(|message| message_to_public(context_message(message).clone()))
             .collect();
         let context_version = self.core.mutation_epoch().to_string();
-        let outcome = broker
-            .start_request(
-                call,
-                &transcript,
-                &binding.run_id,
-                &binding.turn_id,
-                &context_version,
-                self.cancel.clone(),
-            )
-            .await
-            .map_err(|error| WorkerFailure::Error(format!("approval start failed: {error}")))?;
+        let review_cancel = CancellationToken::new();
+        let request = broker.start_request(
+            call,
+            &transcript,
+            &run_id,
+            &turn_id,
+            &context_version,
+            review_cancel.clone(),
+        );
+        tokio::pin!(request);
+        let outcome = loop {
+            tokio::select! {
+                outcome = &mut request => {
+                    break outcome.map_err(|error| {
+                        WorkerFailure::Error(format!("approval start failed: {error}"))
+                    })?;
+                }
+                control = self.controls.recv() => {
+                    match control {
+                        Some(RunControl::SoftSteer { command, accepted, committed }) => {
+                            review_cancel.cancel();
+                            if self.accept_steer_control(command, accepted, committed).await? {
+                                return Ok(CallDisposition::Denied {
+                                    reason: "ユーザーの新しい指示により実行前に取り消された".to_owned(),
+                                });
+                            }
+                        }
+                        Some(RunControl::Abort { accepted, committed, .. }) => {
+                            review_cancel.cancel();
+                            if self.accept_abort_control(accepted, committed).await? {
+                                self.abort_requested = true;
+                                return Ok(CallDisposition::Denied {
+                                    reason: "Tool execution was cancelled by a user control".to_owned(),
+                                });
+                            }
+                        }
+                        Some(RunControl::HardSteer { accepted, .. })
+                        | Some(RunControl::RetrySteer { accepted, .. }) => {
+                            let _ = accepted.send(false);
+                        }
+                        Some(RunControl::Command(command)) => {
+                            self.core.queue_followup(command).map_err(|error| {
+                                WorkerFailure::Error(error.to_string())
+                            })?;
+                        }
+                        None => {
+                            review_cancel.cancel();
+                            return Err(WorkerFailure::Cancelled);
+                        }
+                    }
+                }
+            }
+        };
         Ok(match outcome {
             ApprovalOutcome::Allowed => CallDisposition::Allowed,
-            ApprovalOutcome::Denied { reason } => CallDisposition::Denied { reason },
+            ApprovalOutcome::Denied { reason, .. } => CallDisposition::Denied { reason },
             ApprovalOutcome::Pending { request, receiver } => {
                 CallDisposition::Pending { request, receiver }
             }
@@ -1272,12 +1316,12 @@ impl Runner {
                                                     command: Box::new(command),
                                                 }
                                             }
-                                            None => {
-                                                self.core.queue_followup(command).map_err(|error| {
-                                                    WorkerFailure::Error(error.to_string())
-                                                })?;
-                                                ApprovalWaitOutcome::Cancelled
-                                            }
+                                            // The matching request became terminal between the
+                                            // Session's pending check and worker delivery. It is
+                                            // consumed here; treating this decision as a generic
+                                            // follow-up would leave a non-User command at the
+                                            // front of RunCore and block the next run.
+                                            None => ApprovalWaitOutcome::Cancelled,
                                         });
                                     }
                                     return Ok(ApprovalWaitOutcome::Cancelled);
@@ -2082,6 +2126,7 @@ impl Runner {
             seq: receipt.message_seq,
             message: public_to_message(message.clone()),
         });
+        self.core.mark_mutated();
         Ok(())
     }
 

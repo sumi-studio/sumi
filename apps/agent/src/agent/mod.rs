@@ -29,8 +29,8 @@ use uuid::Uuid;
 use crate::{
     approval::ApprovalBroker,
     gateway::{
-        ApprovalDecision, Command, CommandAck, CommandAckStatus, CommandEnvelope, Gateway,
-        GatewayClosed, GatewayReader, GatewayWriter, InboundCommand, OutboundFrame,
+        Command, CommandAck, CommandAckStatus, CommandEnvelope, Gateway, GatewayClosed,
+        GatewayReader, GatewayWriter, InboundCommand, OutboundFrame,
     },
     provider::{
         overflow::OverflowSource,
@@ -1032,24 +1032,6 @@ impl<G: Gateway + 'static> Session<G> {
         &mut self,
         command: AdmittedCommand,
     ) -> Result<(), SessionFailure> {
-        if matches!(
-            command.envelope().command,
-            Command::ApprovalDecision {
-                decision: ApprovalDecision::ApproveAlways { .. },
-                ..
-            }
-        ) {
-            let ack = CommandAck {
-                seq: command.envelope().seq,
-                command_id: command.envelope().command_id.to_string(),
-                status: CommandAckStatus::Rejected,
-                reject_reason: Some(
-                    "active ApproveAlways requires durable policy mutation".to_owned(),
-                ),
-            };
-            self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack }])?;
-            return Ok(());
-        }
         let active = self
             .active
             .as_ref()
@@ -1148,25 +1130,6 @@ impl<G: Gateway + 'static> Session<G> {
     ) -> Result<(), SessionFailure> {
         let command_id = command.envelope().command_id.to_string();
         let seq = command.envelope().seq;
-        if matches!(
-            command.envelope().command,
-            Command::ApprovalDecision {
-                decision: ApprovalDecision::ApproveAlways { .. },
-                ..
-            }
-        ) {
-            let ack = CommandAck {
-                seq,
-                command_id,
-                status: CommandAckStatus::Rejected,
-                reject_reason: Some(
-                    "ApproveAlways requires an active run to apply durable policy mutation"
-                        .to_owned(),
-                ),
-            };
-            self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack }])?;
-            return Ok(());
-        }
         if let Some(broker) = self.core.as_ref().and_then(|c| c.approval.as_ref())
             && let Command::ApprovalDecision {
                 request_id,

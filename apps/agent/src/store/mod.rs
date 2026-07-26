@@ -67,9 +67,10 @@ pub(crate) use crypto::{
     reason = "T12 freezes projection types consumed by T15 without duplicating EventWriter"
 )]
 pub(crate) use event_writer::{
-    ApplicationKind, ApprovalMutation, DurableEvent, EventBatch, EventWrite, EventWriter,
-    InboundAdmission, InboundReceipt, InboundReceiptOrigin, InjectedCommand, Projection,
-    RecoveryRequired, RunPhase, ToolExecutionMutation, USER_MESSAGE_ID_NAMESPACE, user_message_id,
+    ApplicationKind, ApprovalMutation, ApprovalRuleMutation, DurableEvent, EventBatch, EventWrite,
+    EventWriter, InboundAdmission, InboundReceipt, InboundReceiptOrigin, InjectedCommand,
+    Projection, RecoveryRequired, RunPhase, ToolExecutionMutation, USER_MESSAGE_ID_NAMESPACE,
+    user_message_id,
 };
 #[allow(
     unused_imports,
