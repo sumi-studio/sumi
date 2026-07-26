@@ -248,7 +248,7 @@ CREATE TABLE tool_executions (
     error_code IS NULL
     OR error_code IN (
       'executor_failed', 'cancelled', 'indeterminate', 'invalid_result', 'internal',
-      'length_guard', 'approval_denied', 'approval_cancelled'
+      'length_guard'
     )
   ),
   CHECK (
@@ -274,13 +274,6 @@ CREATE TABLE tool_executions (
     OR
     (state = 'not_started' AND error_code = 'length_guard')
   )
-);
-
-CREATE TABLE approval_rules (
-  id TEXT NOT NULL PRIMARY KEY,
-  tool TEXT NOT NULL,
-  pattern TEXT NOT NULL,
-  created_at TEXT NOT NULL
 );
 
 CREATE TABLE approval_log (

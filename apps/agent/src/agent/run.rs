@@ -204,6 +204,7 @@ enum CallDisposition {
     Allowed,
     Denied {
         reason: String,
+        approval_denied: bool,
     },
     Pending {
         request: ApprovalRequest,
@@ -1057,13 +1058,16 @@ impl Runner {
                     receipts.push(self.emit_tool_result(assistant_message_id, &result).await?);
                     results.push(result);
                 }
-                CallDisposition::Denied { reason } => {
+                CallDisposition::Denied {
+                    reason,
+                    approval_denied,
+                } => {
                     let result = error_tool_result(call, &reason);
                     receipts.push(
                         self.emit_result_message(
                             assistant_message_id,
                             &result,
-                            Some(call.id.clone()),
+                            approval_denied.then(|| call.id.clone()),
                             None,
                         )
                         .await?
@@ -1245,6 +1249,7 @@ impl Runner {
                             if self.accept_steer_control(command, accepted, committed).await? {
                                 return Ok(CallDisposition::Denied {
                                     reason: "ユーザーの新しい指示により実行前に取り消された".to_owned(),
+                                    approval_denied: false,
                                 });
                             }
                         }
@@ -1254,6 +1259,7 @@ impl Runner {
                                 self.abort_requested = true;
                                 return Ok(CallDisposition::Denied {
                                     reason: "Tool execution was cancelled by a user control".to_owned(),
+                                    approval_denied: false,
                                 });
                             }
                         }
@@ -1276,7 +1282,10 @@ impl Runner {
         };
         Ok(match outcome {
             ApprovalOutcome::Allowed => CallDisposition::Allowed,
-            ApprovalOutcome::Denied { reason, .. } => CallDisposition::Denied { reason },
+            ApprovalOutcome::Denied { reason, .. } => CallDisposition::Denied {
+                reason,
+                approval_denied: true,
+            },
             ApprovalOutcome::Pending { request, receiver } => {
                 CallDisposition::Pending { request, receiver }
             }

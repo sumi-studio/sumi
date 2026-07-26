@@ -3366,4 +3366,213 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains("stored search_text"), "{message}");
     }
+
+    #[tokio::test]
+    async fn migration_0003_creates_approval_rules_and_expands_tool_error_codes() {
+        let store = store().await;
+
+        sqlx::raw_sql(
+            "INSERT INTO approval_rules(id, tool, pattern, created_at)
+             VALUES('rule-1', 'bash', '{\"effect\":\"allow\"}', '2026-07-26T00:00:00Z')",
+        )
+        .execute(store.pool())
+        .await
+        .expect("insert approval rule on fresh schema");
+
+        for error_code in [
+            "user_steer_cancelled",
+            "approval_denied",
+            "approval_cancelled",
+        ] {
+            sqlx::query(
+                "INSERT INTO tool_executions(
+                    tool_call_id, command_id, run_id, executor_generation, state,
+                    idempotency_key, started_at, finished_at, error_code
+                 ) VALUES(?1, 'cmd-1', 'run-1', 0, 'not_started', ?2, NULL, '2026-07-26T00:00:00Z', ?3)",
+            )
+            .bind(format!("tool-{error_code}"))
+            .bind(format!("idem-{error_code}"))
+            .bind(error_code)
+            .execute(store.pool())
+            .await
+            .unwrap_or_else(|e| panic!("{error_code} not_started must be accepted: {e}"));
+        }
+
+        sqlx::query(
+            "INSERT INTO tool_executions(
+                tool_call_id, command_id, run_id, executor_generation, state,
+                idempotency_key, started_at, finished_at, error_code
+             ) VALUES('tool-cancel-denied', 'cmd-1', 'run-1', 0, 'cancelled',
+                      'idem-cancel-denied', '2026-07-26T00:00:00Z', '2026-07-26T00:00:00Z', 'approval_denied')",
+        )
+        .execute(store.pool())
+        .await
+        .expect("cancelled with approval_denied must be accepted");
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM approval_rules")
+                .fetch_one(store.pool())
+                .await
+                .expect("count approval_rules"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM tool_executions WHERE state='not_started'"
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("count not_started tools"),
+            3
+        );
+
+        let quick_check: String = sqlx::query_scalar("PRAGMA quick_check")
+            .fetch_one(store.pool())
+            .await
+            .expect("quick_check");
+        assert_eq!(quick_check, "ok");
+        assert!(
+            sqlx::query("PRAGMA foreign_key_check")
+                .fetch_optional(store.pool())
+                .await
+                .expect("foreign_key_check")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_0003_upgrades_from_0001_and_0002_without_data_loss() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open upgrade test pool");
+
+        let one = MIGRATOR
+            .migrations
+            .iter()
+            .find(|m| m.version == 1)
+            .expect("migration 0001");
+        let two = MIGRATOR
+            .migrations
+            .iter()
+            .find(|m| m.version == 2)
+            .expect("migration 0002");
+
+        sqlx::raw_sql(one.sql.as_ref())
+            .execute(&pool)
+            .await
+            .expect("apply 0001 manually");
+        sqlx::raw_sql(two.sql.as_ref())
+            .execute(&pool)
+            .await
+            .expect("apply 0002 manually");
+
+        // Seed a 0002-era skipped tool and a cancelled tool that must survive the 0003 rebuild.
+        sqlx::query(
+            "INSERT INTO tool_executions(
+                tool_call_id, command_id, run_id, executor_generation, state,
+                idempotency_key, started_at, finished_at, error_code
+             ) VALUES('tool-legacy-steer', 'cmd-1', 'run-1', 0, 'not_started',
+                      'idem-legacy-steer', NULL, '2026-07-26T00:00:00Z', 'user_steer_cancelled')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed 0002-era user_steer_cancelled row");
+        sqlx::query(
+            "INSERT INTO tool_executions(
+                tool_call_id, command_id, run_id, executor_generation, state,
+                idempotency_key, started_at, finished_at, error_code
+             ) VALUES('tool-legacy-cancel', 'cmd-1', 'run-1', 0, 'cancelled',
+                      'idem-legacy-cancel', '2026-07-26T00:00:00Z', '2026-07-26T00:00:00Z', 'cancelled')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed 0002-era cancelled row");
+
+        sqlx::raw_sql(
+            "CREATE TABLE _sqlx_migrations (
+                version BIGINT PRIMARY KEY,
+                description TEXT NOT NULL,
+                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                success BOOLEAN NOT NULL,
+                checksum BLOB NOT NULL,
+                execution_time BIGINT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create migrations tracking table");
+
+        for migration in [one, two] {
+            sqlx::query(
+                "INSERT INTO _sqlx_migrations(
+                    version, description, success, checksum, execution_time
+                 ) VALUES(?1, ?2, TRUE, ?3, 0)",
+            )
+            .bind(migration.version)
+            .bind(migration.description.as_ref())
+            .bind(&*migration.checksum)
+            .execute(&pool)
+            .await
+            .expect("record applied migration");
+        }
+
+        MIGRATOR.run(&pool).await.expect("apply 0003 upgrade");
+
+        let applied: Vec<i64> = sqlx::query_scalar(
+            "SELECT version FROM _sqlx_migrations WHERE success = TRUE ORDER BY version",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("list applied migrations");
+        assert_eq!(applied, vec![1, 2, 3]);
+
+        let table_sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='approval_rules'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("approval_rules table exists");
+        assert!(table_sql.contains("id TEXT NOT NULL PRIMARY KEY"));
+        assert!(table_sql.contains("tool TEXT NOT NULL"));
+        assert!(table_sql.contains("pattern TEXT NOT NULL"));
+        assert!(table_sql.contains("created_at TEXT NOT NULL"));
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM tool_executions")
+                .fetch_one(&pool)
+                .await
+                .expect("count legacy tool rows"),
+            2
+        );
+
+        for error_code in ["approval_denied", "approval_cancelled"] {
+            sqlx::query(
+                "INSERT INTO tool_executions(
+                    tool_call_id, command_id, run_id, executor_generation, state,
+                    idempotency_key, started_at, finished_at, error_code
+                 ) VALUES(?1, 'cmd-1', 'run-1', 0, 'not_started', ?2, NULL, '2026-07-26T00:00:00Z', ?3)",
+            )
+            .bind(format!("tool-upgrade-{error_code}"))
+            .bind(format!("idem-upgrade-{error_code}"))
+            .bind(error_code)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{error_code} not_started must be accepted after upgrade: {e}"));
+        }
+
+        let quick_check: String = sqlx::query_scalar("PRAGMA quick_check")
+            .fetch_one(&pool)
+            .await
+            .expect("quick_check");
+        assert_eq!(quick_check, "ok");
+        assert!(
+            sqlx::query("PRAGMA foreign_key_check")
+                .fetch_optional(&pool)
+                .await
+                .expect("foreign_key_check")
+                .is_none()
+        );
+    }
 }

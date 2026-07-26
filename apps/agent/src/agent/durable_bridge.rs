@@ -958,27 +958,20 @@ impl DurableBridge {
                         ),
                     });
                 }
+                let mut projections = Vec::with_capacity(2);
                 if !self.approval_prepared_tools.remove(&tool_call_id) {
-                    writer
-                        .apply(EventBatch {
-                            writes: vec![EventWrite {
-                                event: None,
-                                projections: vec![Projection::ToolExecution(
-                                    ToolExecutionMutation::Prepare {
-                                        tool_call_id: tool_call_id.clone(),
-                                        command_id: self.binding.command_id.clone(),
-                                        run_id: self.binding.run_id.clone(),
-                                        executor_generation: self.binding.executor_generation,
-                                        idempotency_key: self
-                                            .binding
-                                            .tool_execution_idempotency_key(&tool_call_id),
-                                    },
-                                )],
-                            }],
-                            injected_commands: Vec::new(),
-                        })
-                        .await?;
+                    projections.push(Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                        tool_call_id: tool_call_id.clone(),
+                        command_id: self.binding.command_id.clone(),
+                        run_id: self.binding.run_id.clone(),
+                        executor_generation: self.binding.executor_generation,
+                        idempotency_key: self.binding.tool_execution_idempotency_key(&tool_call_id),
+                    }));
                 }
+                projections.push(Projection::ToolExecution(ToolExecutionMutation::Start {
+                    tool_call_id: tool_call_id.clone(),
+                    run_id: self.binding.run_id.clone(),
+                }));
                 self.commit_single(
                     writer,
                     DurableEvent::tool_execution_start(
@@ -989,10 +982,7 @@ impl DurableBridge {
                         self.binding.run_id.clone(),
                         self.binding.executor_generation,
                     )?,
-                    vec![Projection::ToolExecution(ToolExecutionMutation::Start {
-                        tool_call_id: tool_call_id.clone(),
-                        run_id: self.binding.run_id.clone(),
-                    })],
+                    projections,
                     AgentEvent::ToolExecutionStart {
                         tool_call_id,
                         tool_name,
@@ -1463,6 +1453,23 @@ impl DurableBridge {
                     result: serde_json::to_value(result)?,
                     is_error,
                 });
+            } else if self.approval_not_started.contains(&tool_call_id)
+                && self.pending_tool_calls.contains(&tool_call_id)
+            {
+                if !result.is_error {
+                    bail!("Approval-not-started ToolResult must be is_error=true");
+                }
+                self.approval_not_started.remove(&tool_call_id);
+                self.pending_tool_calls.remove(&tool_call_id);
+                projections.push(Projection::ToolExecution(ToolExecutionMutation::Skip {
+                    tool_call_id: tool_call_id.clone(),
+                    command_id: self.binding.command_id.clone(),
+                    run_id: self.binding.run_id.clone(),
+                    turn_id: self.binding.turn_id.clone(),
+                    executor_generation: self.binding.executor_generation,
+                    idempotency_key: self.binding.tool_execution_idempotency_key(&tool_call_id),
+                    error_code: "approval_denied",
+                }));
             } else if self.pending_tool_calls.remove(&tool_call_id) {
                 if !result.is_error {
                     bail!("Cancelled ToolResult must be is_error=true");
@@ -3470,6 +3477,141 @@ mod tests {
         assert_eq!(
             owner_status.1, "finished",
             "original owner must be finished"
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_denial_is_not_swallowed_by_pending_tool_cleanup() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let owner_id = "00000000-0000-4000-8000-000000000451";
+        let run_id = "run-policy-denial";
+        let turn_id = "turn-policy-denial";
+        let (binding, assistant) = owner_in_phase(
+            &store,
+            &writer,
+            owner_id,
+            run_id,
+            turn_id,
+            RunPhase::AssistantStarted,
+        )
+        .await;
+        let (assistant_id, assistant_base) = assistant.expect("assistant MessageStart");
+        let tool_call = ToolCall {
+            id: "policy-denied-call".to_owned(),
+            name: "fixture-tool".to_owned(),
+            arguments: serde_json::from_value::<ValidatedToolArguments>(
+                serde_json::json!({"safe": true}),
+            )
+            .expect("validated arguments"),
+        };
+        let mut assistant = match assistant_base {
+            PublicMessage::Assistant(assistant) => assistant,
+            _ => unreachable!(),
+        };
+        assistant.content = vec![PublicAssistantContent::ToolCall {
+            tool_call: tool_call.clone(),
+            wire_item_index: 0,
+        }];
+        assistant.stop_reason = StopReason::Stop;
+        let assistant = PublicMessage::Assistant(assistant);
+
+        let mut bridge = DurableBridge::new(binding.clone());
+        bridge.phase = RunPhase::AssistantStarted;
+        bridge.turn_open = true;
+        bridge.assistant_open = Some(assistant_id.clone());
+        let (assistant_barrier, _) = MessageCommitBarrier::channel();
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::MessageEnd {
+                        message_id: assistant_id,
+                        message: Box::new(assistant),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: Some(assistant_barrier),
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit assistant tool call")
+            .resolve_message_receipts();
+
+        let result = ToolResultMessage {
+            tool_call_id: tool_call.id.clone(),
+            tool_name: tool_call.name,
+            content: vec![UserContent::Text {
+                text: "policy denied".to_owned(),
+            }],
+            details: serde_json::json!({"error": "approval_denied"}),
+            is_error: true,
+            timestamp: test_timestamp(),
+        };
+        let result_id = "policy-denied-result".to_owned();
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::MessageStart {
+                        message_id: result_id.clone(),
+                        message: Box::new(PublicMessage::ToolResult(result.clone())),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("buffer denied result start");
+        let (result_barrier, _) = MessageCommitBarrier::channel();
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding,
+                    event: AgentEvent::MessageEnd {
+                        message_id: result_id,
+                        message: Box::new(PublicMessage::ToolResult(result)),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: Some(result_barrier),
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: Some(tool_call.id.clone()),
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit policy denial")
+            .resolve_message_receipts();
+
+        assert_eq!(
+            sqlx::query_as::<_, (String, Option<String>, i64)>(
+                "SELECT state, error_code,
+                    (SELECT COUNT(*) FROM agent_events
+                     WHERE event_type='tool_execution_start'
+                       AND json_extract(envelope, '$.tool_call_id')=?)
+                 FROM tool_executions WHERE tool_call_id=?",
+            )
+            .bind(&tool_call.id)
+            .bind(&tool_call.id)
+            .fetch_one(store.pool())
+            .await
+            .expect("policy denial durable state"),
+            (
+                "not_started".to_owned(),
+                Some("approval_denied".to_owned()),
+                0
+            )
         );
     }
 

@@ -3458,12 +3458,16 @@ async fn rejected_running_transition_never_calls_driver_or_publishes_start() {
             .contains("fixture rejects running transition")
     );
     assert_eq!(driver.executions.load(Ordering::SeqCst), 0);
-    let state: String =
-        sqlx::query_scalar("SELECT state FROM tool_executions WHERE tool_call_id='barrier-call'")
-            .fetch_one(&pool)
-            .await
-            .expect("prepared tool row");
-    assert_eq!(state, "prepared");
+    let execution_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM tool_executions WHERE tool_call_id='barrier-call'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("tool execution row count");
+    assert_eq!(
+        execution_rows, 0,
+        "rejected atomic Prepare+Start must not leave a replay-blocking prepared row"
+    );
     assert!(frames.lock().expect("frames").iter().all(|frame| {
         !matches!(frame, OutboundFrame::Event { envelope }
             if envelope.event["type"] == "tool_execution_start")

@@ -1,6 +1,14 @@
--- Expand tool_executions error_code vocabulary so that user_steer_cancelled
--- skipped tools can persist after a hard steer or active abort.
+-- Add durable approval_rules and expand tool_executions error_code vocabulary
+-- to cover approval_denied / approval_cancelled cleanup, preserving all
+-- existing rows and constraints.
 PRAGMA foreign_keys = OFF;
+
+CREATE TABLE approval_rules (
+  id TEXT NOT NULL PRIMARY KEY,
+  tool TEXT NOT NULL,
+  pattern TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
 
 ALTER TABLE tool_executions RENAME TO tool_executions_old;
 
@@ -17,7 +25,7 @@ CREATE TABLE tool_executions (
     error_code IS NULL
     OR error_code IN (
       'executor_failed', 'cancelled', 'indeterminate', 'invalid_result', 'internal',
-      'length_guard', 'user_steer_cancelled'
+      'length_guard', 'user_steer_cancelled', 'approval_denied', 'approval_cancelled'
     )
   ),
   CHECK (
@@ -41,7 +49,9 @@ CREATE TABLE tool_executions (
     OR
     (state IN ('failed', 'cancelled', 'indeterminate') AND error_code IS NOT NULL)
     OR
-    (state = 'not_started' AND error_code IN ('length_guard', 'user_steer_cancelled'))
+    (state = 'not_started' AND error_code IN (
+      'length_guard', 'user_steer_cancelled', 'approval_denied', 'approval_cancelled'
+    ))
   )
 );
 

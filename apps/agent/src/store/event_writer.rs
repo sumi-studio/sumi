@@ -4240,6 +4240,7 @@ fn validate_batch_shape_with_recovery(
     let mut tool_result_ids = HashSet::new();
     let mut tool_result_message_ids = HashMap::new();
     let mut tool_mutation_ids = HashSet::new();
+    let mut tool_prepare_mutation_ids: HashSet<String> = HashSet::new();
     let mut tool_start_mutation_ids: HashSet<String> = HashSet::new();
     let mut tool_finish_mutation_ids: HashSet<String> = HashSet::new();
     let mut tool_skip_mutation_ids: HashSet<String> = HashSet::new();
@@ -4662,7 +4663,10 @@ fn validate_batch_shape_with_recovery(
                     | ToolExecutionMutation::Finish { tool_call_id, .. }
                     | ToolExecutionMutation::Skip { tool_call_id, .. } => tool_call_id,
                 };
-                if !tool_mutation_ids.insert(tool_call_id.as_str()) {
+                let is_atomic_start = matches!(mutation, ToolExecutionMutation::Start { .. })
+                    && tool_prepare_mutation_ids.contains(tool_call_id)
+                    && !tool_start_mutation_ids.contains(tool_call_id);
+                if !tool_mutation_ids.insert(tool_call_id.as_str()) && !is_atomic_start {
                     bail!("duplicate tool mutation for tool {tool_call_id}");
                 }
                 match mutation {
@@ -4695,7 +4699,9 @@ fn validate_batch_shape_with_recovery(
                             },
                         );
                     }
-                    ToolExecutionMutation::Prepare { .. } => {}
+                    ToolExecutionMutation::Prepare { .. } => {
+                        tool_prepare_mutation_ids.insert(tool_call_id.clone());
+                    }
                     ToolExecutionMutation::Skip { error_code, .. } => {
                         if !SKIP_ERROR_CODES.contains(error_code) {
                             bail!("ToolExecution Skip only supports {SKIP_ERROR_CODES:?}");
@@ -6298,18 +6304,23 @@ async fn validate_tool_finish_owner(
             final_phase.as_str()
         ),
         "prepared" => {
-            let approval_cleanup = sqlx::query_scalar::<_, String>(
-                "SELECT state FROM approval_log
+            let approval_cleanup = sqlx::query(
+                "SELECT id, state FROM approval_log
                  WHERE tool_call_id = ?",
             )
             .bind(tool_call_id)
             .fetch_optional(&mut **transaction)
             .await?
-            .is_some_and(|state| {
-                matches!(state.as_str(), "denied" | "cancelled")
-                    || approval_resolutions
-                        .values()
-                        .any(|(resolution, _)| matches!(*resolution, "denied" | "cancelled"))
+            .is_some_and(|row| {
+                let request_id: String = row.try_get("id").expect("approval_log id column");
+                let state: String = row.try_get("state").expect("approval_log state column");
+                match state.as_str() {
+                    "denied" | "cancelled" => true,
+                    "pending" => approval_resolutions.get(request_id.as_str()).is_some_and(
+                        |(resolution, _)| matches!(*resolution, "denied" | "cancelled"),
+                    ),
+                    _ => false,
+                }
             });
             if finish.state != "cancelled"
                 || !(closes_owner
@@ -6426,6 +6437,7 @@ async fn validate_required_projection_sets(
     let mut approval_resolution_positions = HashMap::new();
     let mut approval_pendings = Vec::new();
     let mut tool_prepares = HashMap::new();
+    let mut tool_prepare_positions = HashMap::new();
     let mut tool_starts = HashMap::new();
     let mut tool_start_positions = HashMap::new();
     let mut tool_finishes = HashMap::new();
@@ -6488,6 +6500,7 @@ async fn validate_required_projection_sets(
                         tool_call_id.as_str(),
                         (command_id.as_str(), run_id.as_str()),
                     );
+                    tool_prepare_positions.insert(tool_call_id.as_str(), projection_position);
                 }
                 PreparedProjection::Plain(Projection::ToolExecution(
                     ToolExecutionMutation::Start {
@@ -6626,9 +6639,29 @@ async fn validate_required_projection_sets(
     }
 
     for (tool_call_id, contextual_run_id) in &tool_starts {
-        let binding = load_prepared_tool_binding(transaction, tool_call_id)
-            .await?
-            .ok_or_else(|| anyhow!("ToolExecutionStart requires prepared tool {tool_call_id}"))?;
+        let binding = if let Some((command_id, prepared_run_id)) = tool_prepares.get(tool_call_id) {
+            let prepare_position = tool_prepare_positions
+                .get(tool_call_id)
+                .expect("tool prepare position was collected");
+            let start_position = tool_start_positions
+                .get(tool_call_id)
+                .expect("tool start position was collected");
+            if prepare_position >= start_position {
+                bail!(
+                    "ToolExecutionStart for {tool_call_id} requires its same-batch ToolExecutionPrepare to precede it"
+                );
+            }
+            PreparedToolBinding {
+                command_id: (*command_id).to_owned(),
+                run_id: (*prepared_run_id).to_owned(),
+            }
+        } else {
+            load_prepared_tool_binding(transaction, tool_call_id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow!("ToolExecutionStart requires prepared tool {tool_call_id}")
+                })?
+        };
         if binding.run_id != *contextual_run_id {
             bail!(
                 "ToolExecutionStart for {tool_call_id} run {contextual_run_id} does not match prepared run {}",
@@ -16640,6 +16673,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policy_allowed_prepare_and_start_are_one_retryable_transaction() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        seed_tool_owner(&store, &writer, "run-atomic-start").await;
+
+        let mut start = tool_start_write("tool-atomic-start", "run-atomic-start");
+        start.projections.insert(
+            0,
+            Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                tool_call_id: "tool-atomic-start".to_owned(),
+                command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                run_id: "run-atomic-start".to_owned(),
+                executor_generation: test_process_generation(1),
+                idempotency_key: "idem-atomic-start".to_owned(),
+            }),
+        );
+        let batch = EventBatch {
+            writes: vec![start],
+            injected_commands: Vec::new(),
+        };
+
+        let interrupted = writer
+            .apply_with_failpoint(batch.clone(), 1)
+            .await
+            .expect_err("failure after the combined write must roll back Prepare and Start");
+        assert!(
+            interrupted.to_string().contains("test failpoint"),
+            "unexpected failure: {interrupted:#}"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM tool_executions WHERE tool_call_id='tool-atomic-start'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("count rolled-back execution"),
+            0,
+            "a failed start commit must not leave a replay-blocking prepared row"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM agent_events
+                 WHERE event_type='tool_execution_start'
+                   AND json_extract(envelope, '$.tool_call_id')='tool-atomic-start'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("count rolled-back start event"),
+            0
+        );
+
+        writer
+            .apply(batch)
+            .await
+            .expect("retry after rollback must not hit a duplicate idempotency key");
+        assert_eq!(
+            sqlx::query_as::<_, (String, i64)>(
+                "SELECT
+                    (SELECT state FROM tool_executions
+                     WHERE tool_call_id='tool-atomic-start'),
+                    (SELECT COUNT(*) FROM agent_events
+                     WHERE event_type='tool_execution_start'
+                       AND json_extract(envelope, '$.tool_call_id')='tool-atomic-start')",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("coherent durable start lifecycle"),
+            ("running".to_owned(), 1)
+        );
+    }
+
+    #[tokio::test]
     async fn tool_prepare_and_start_require_ordered_canonical_assistant_message_end() {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
@@ -17242,6 +17347,216 @@ mod tests {
                 "prepared".to_owned(),
                 "assistant_started".to_owned()
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_approval_resolution_cannot_authorize_prepared_tool_cleanup() {
+        let run_id = "run-unrelated";
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        seed_tool_owner(&store, &writer, run_id).await;
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::new(&json!({
+                                "type": "approval_requested",
+                                "request": approval_request("request-1", "tool-1", "mutating"),
+                            }))
+                            .expect("approval request 1"),
+                        ),
+                        projections: vec![
+                            Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                                tool_call_id: "tool-1".to_owned(),
+                                command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                                run_id: run_id.to_owned(),
+                                executor_generation: test_process_generation(1),
+                                idempotency_key: "idem-tool-1".to_owned(),
+                            }),
+                            Projection::Approval(ApprovalMutation::Pending {
+                                request_id: "request-1".to_owned(),
+                                tool_call_id: "tool-1".to_owned(),
+                                run_id: run_id.to_owned(),
+                                turn_id: "turn-1".to_owned(),
+                            }),
+                        ],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::new(&json!({
+                                "type": "approval_requested",
+                                "request": approval_request("request-2", "tool-2", "mutating"),
+                            }))
+                            .expect("approval request 2"),
+                        ),
+                        projections: vec![
+                            Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                                tool_call_id: "tool-2".to_owned(),
+                                command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                                run_id: run_id.to_owned(),
+                                executor_generation: test_process_generation(1),
+                                idempotency_key: "idem-tool-2".to_owned(),
+                            }),
+                            Projection::Approval(ApprovalMutation::Pending {
+                                request_id: "request-2".to_owned(),
+                                tool_call_id: "tool-2".to_owned(),
+                                run_id: run_id.to_owned(),
+                                turn_id: "turn-1".to_owned(),
+                            }),
+                        ],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("seed two pending approvals with prepared tools");
+
+        writer
+            .persist_inbound(&approval_command_with_decision(
+                2,
+                "00000000-0000-4000-8000-000000000020",
+                "request-1",
+                ApprovalDecision::Deny,
+            ))
+            .await
+            .expect("persist denial command for request-1");
+
+        let bad_result = tool_result("tool-2", "unrelated denial cleanup", true);
+        let bad_error = writer
+            .apply(EventBatch {
+                writes: vec![
+                    approval_resolution_write(
+                        "request-1",
+                        "denied",
+                        "user-1",
+                        Some(("00000000-0000-4000-8000-000000000020", 2, run_id)),
+                    ),
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::new(&json!({
+                                "type": "tool_execution_end",
+                                "tool_call_id": "tool-2",
+                                "state": "cancelled",
+                                "result": bad_result.clone(),
+                                "is_error": true,
+                                "error_code": "approval_denied",
+                            }))
+                            .expect("unrelated cleanup tool end"),
+                        ),
+                        projections: vec![Projection::ToolExecution(
+                            ToolExecutionMutation::Finish {
+                                tool_call_id: "tool-2".to_owned(),
+                                expected: "prepared",
+                                state: "cancelled",
+                                error_code: Some("approval_denied"),
+                            },
+                        )],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_start", "tool-2-result", &bad_result)
+                                .expect("tool-2 result MessageStart"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_end", "tool-2-result", &bad_result)
+                                .expect("tool-2 result MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: "tool-2-result".to_owned(),
+                            role: "tool_result",
+                            message: bad_result,
+                            append_to_l0: true,
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("unrelated approval denial must not authorize tool-2 cleanup");
+        assert!(bad_error
+            .to_string()
+            .contains("prepared ToolExecutionEnd for tool-2 is permitted only for cancellation or denial cleanup"));
+
+        writer
+            .persist_inbound(&approval_command_with_decision(
+                3,
+                "00000000-0000-4000-8000-000000000021",
+                "request-2",
+                ApprovalDecision::Deny,
+            ))
+            .await
+            .expect("persist denial command for request-2");
+
+        let ok_result = tool_result("tool-2", "denied for tool-2", true);
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    approval_resolution_write(
+                        "request-2",
+                        "denied",
+                        "user-2",
+                        Some(("00000000-0000-4000-8000-000000000021", 3, run_id)),
+                    ),
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::new(&json!({
+                                "type": "tool_execution_end",
+                                "tool_call_id": "tool-2",
+                                "state": "cancelled",
+                                "result": ok_result.clone(),
+                                "is_error": true,
+                                "error_code": "approval_denied",
+                            }))
+                            .expect("exact cleanup tool end"),
+                        ),
+                        projections: vec![Projection::ToolExecution(
+                            ToolExecutionMutation::Finish {
+                                tool_call_id: "tool-2".to_owned(),
+                                expected: "prepared",
+                                state: "cancelled",
+                                error_code: Some("approval_denied"),
+                            },
+                        )],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_start", "tool-2-ok", &ok_result)
+                                .expect("tool-2 ok MessageStart"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_end", "tool-2-ok", &ok_result)
+                                .expect("tool-2 ok MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: "tool-2-ok".to_owned(),
+                            role: "tool_result",
+                            message: ok_result,
+                            append_to_l0: true,
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("exact request-2 denial may authorize tool-2 cleanup");
+        assert_eq!(
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT
+                    (SELECT state FROM approval_log WHERE id='request-2'),
+                    (SELECT state FROM tool_executions WHERE tool_call_id='tool-2')",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("exact denial cleanup state"),
+            ("denied".to_owned(), "cancelled".to_owned())
         );
     }
 
