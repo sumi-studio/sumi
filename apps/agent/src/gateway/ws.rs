@@ -8,12 +8,11 @@
 
 #![allow(dead_code)]
 
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
-use rustls::crypto::CryptoProvider;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::{
@@ -30,28 +29,6 @@ use super::{
     Gateway, GatewayClosed, GatewayReader, GatewayWriter, HelloError, InboundCommand,
     MAX_FRAME_BYTES, OutboundFrame,
 };
-
-static RUSTLS_INIT: Once = Once::new();
-
-fn init_crypto_provider() -> Result<(), ConnectorError> {
-    RUSTLS_INIT.call_once(|| {
-        if CryptoProvider::get_default().is_some() {
-            return;
-        }
-        // If another thread installs a provider between the check above and this
-        // call, install_default returns an error; the subsequent get_default() check
-        // will still see a usable provider and proceed.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    });
-
-    if CryptoProvider::get_default().is_some() {
-        Ok(())
-    } else {
-        Err(ConnectorError::Fatal(anyhow!(
-            "no rustls crypto provider is available"
-        )))
-    }
-}
 
 /// Outbound connector for `wss://` (production). `ws://` is only allowed when
 /// constructed with [`WebSocketConnector::new_insecure`], which is exposed for
@@ -106,8 +83,6 @@ impl GatewayConnector for WebSocketConnector {
         &mut self,
         credential: GatewayCredential,
     ) -> Result<Self::Connection, ConnectorError> {
-        init_crypto_provider()?;
-
         let (scheme, _rest) = self.url.split_once("://").ok_or_else(|| {
             ConnectorError::InvalidConfiguration(anyhow!("websocket url is missing a scheme"))
         })?;
@@ -311,7 +286,7 @@ mod tests {
         GatewayCredential, GatewayReader, GatewayWriter, HelloError, InboundCommand,
         IncrementalCommandDigest, MAX_FRAME_BYTES, OutboundFrame,
     };
-    use super::{CryptoProvider, WebSocketConnector, decode_command_bytes, init_crypto_provider};
+    use super::{WebSocketConnector, decode_command_bytes};
     use crate::gateway::wire::to_wire_frame;
     use crate::runtime::contracts::ProcessGeneration;
 
@@ -1076,14 +1051,26 @@ mod tests {
         let _ = server.await;
     }
 
-    #[test]
-    fn crypto_provider_initializes_without_panic() {
-        // This tests the non-panicking path and the race-tolerant behavior of
-        // init_crypto_provider. It is safe to run before/after other tests
-        // because the provider install is process-global and the function is
-        // idempotent.
-        assert!(init_crypto_provider().is_ok());
-        assert!(CryptoProvider::get_default().is_some());
-        assert!(init_crypto_provider().is_ok());
+    #[tokio::test]
+    async fn wss_connect_attempt_does_not_panic_without_server_tls() {
+        // A wss:// connect must be able to construct a rustls ClientConfig
+        // (and thus select/install a crypto provider) before the TLS handshake.
+        // The local server accepts the TCP connection and immediately closes it,
+        // so the handshake fails; the test ensures this failure is an error,
+        // not a panic due to a missing CryptoProvider.
+        let listener = TcpListener::bind(listener_addr()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
+
+        let mut connector =
+            WebSocketConnector::new(format!("wss://{addr}"), Arc::new(TestDigestFactory));
+        let result = connector.connect(GatewayCredential::new("valid")).await;
+        assert!(result.is_err(), "expected TLS/handshake error");
+
+        let _ = server.await;
     }
 }

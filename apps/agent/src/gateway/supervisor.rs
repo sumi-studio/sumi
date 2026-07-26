@@ -7,6 +7,7 @@
 
 #![allow(dead_code)]
 
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::sync::{
     Arc,
@@ -18,7 +19,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
@@ -271,9 +272,6 @@ where
     /// Test-only notification fired when `send_validated` is about to block on
     /// a full command channel.
     command_send_blocked_notify: Option<Arc<Notify>>,
-    /// Test-only notification fired when `event_forwarder` is about to block on
-    /// a full writer channel.
-    writer_send_blocked_notify: Option<Arc<Notify>>,
 }
 
 impl<C, P, S, L> ConnectionSupervisor<C, P, S, L>
@@ -304,17 +302,11 @@ where
             online: Arc::new(online_tx),
             cancel: CancellationToken::new(),
             command_send_blocked_notify: None,
-            writer_send_blocked_notify: None,
         }
     }
 
     pub(crate) fn with_command_send_blocked_notify(mut self, notify: Arc<Notify>) -> Self {
         self.command_send_blocked_notify = Some(notify);
-        self
-    }
-
-    pub(crate) fn with_writer_send_blocked_notify(mut self, notify: Arc<Notify>) -> Self {
-        self.writer_send_blocked_notify = Some(notify);
         self
     }
 
@@ -346,13 +338,11 @@ where
         let current_writer = self.current_writer.clone();
         let cancel = self.cancel.clone();
         let online_rx = self.online.subscribe();
-        let writer_send_blocked_notify = self.writer_send_blocked_notify.clone();
         let forwarder = tokio::spawn(event_forwarder(
             events_rx,
             current_writer,
             cancel,
             online_rx,
-            writer_send_blocked_notify,
         ));
 
         // run_loop owns all per-epoch cancellation and cleanup; await it so that
@@ -413,18 +403,20 @@ where
                         result = Self::backoff_sleep(&self.config, reconnect_attempt) => result?,
                     }
                 }
-                Err(SupervisorError::EstablishedReconnect { reason }) => {
-                    // A successful hello resets the auth streak, but the post-hello
-                    // failure is a reconnect like any other; do not reset the streak
-                    // merely because the hello succeeded. There is currently no
-                    // observable healthy-epoch boundary in this state machine, so a
-                    // clean (Ok, Ok) epoch end is also treated as a reconnect.
+                Err(SupervisorError::EstablishedReconnect { reason, healthy }) => {
+                    // A healthy established epoch (online reached and both half-tasks
+                    // ended cleanly) resets the reconnect budget so it bounds
+                    // consecutive failure bursts, not lifetime disconnects.
                     auth_attempt = 0;
-                    reconnect_attempt = reconnect_attempt.saturating_add(1);
-                    if let Some(max) = self.config.max_reconnect_attempts
-                        && reconnect_attempt >= max
-                    {
-                        return Err(anyhow!("max reconnect attempts exceeded: {reason}"));
+                    if healthy {
+                        reconnect_attempt = 1;
+                    } else {
+                        reconnect_attempt = reconnect_attempt.saturating_add(1);
+                        if let Some(max) = self.config.max_reconnect_attempts
+                            && reconnect_attempt >= max
+                        {
+                            return Err(anyhow!("max reconnect attempts exceeded: {reason}"));
+                        }
                     }
                     tokio::select! {
                         biased;
@@ -552,6 +544,7 @@ where
                     (Ok(()), Ok(())) => Ok(()),
                     (Err(e), _) | (_, Err(e)) => Err(SupervisorError::EstablishedReconnect {
                         reason: format!("epoch task error during cancel: {e}"),
+                        healthy: false,
                     }),
                 }
             }
@@ -559,15 +552,31 @@ where
                 epoch_token.cancel();
                 *self.current_writer.lock().unwrap() = None;
                 self.current_epoch.send_replace(None);
+                let was_online = {
+                    let rx = self.online.subscribe();
+                    *rx.borrow()
+                };
                 let _ = self.online.send(false);
-                Self::inspect_epoch_results(reader_result, writer_handle.await)
+                let writer_result = writer_handle.await;
+                let healthy = was_online
+                    && reader_result.as_ref().ok().is_some_and(|r| r.is_ok())
+                    && writer_result.as_ref().ok().is_some_and(|r| r.is_ok());
+                Self::inspect_epoch_results(reader_result, writer_result, healthy)
             }
             writer_result = &mut writer_handle => {
                 epoch_token.cancel();
                 *self.current_writer.lock().unwrap() = None;
                 self.current_epoch.send_replace(None);
+                let was_online = {
+                    let rx = self.online.subscribe();
+                    *rx.borrow()
+                };
                 let _ = self.online.send(false);
-                Self::inspect_epoch_results(reader_handle.await, writer_result)
+                let reader_result = reader_handle.await;
+                let healthy = was_online
+                    && reader_result.as_ref().ok().is_some_and(|r| r.is_ok())
+                    && writer_result.as_ref().ok().is_some_and(|r| r.is_ok());
+                Self::inspect_epoch_results(reader_result, writer_result, healthy)
             }
         };
 
@@ -585,6 +594,7 @@ where
     fn inspect_epoch_results(
         reader_result: Result<Result<()>, JoinError>,
         writer_result: Result<Result<()>, JoinError>,
+        healthy: bool,
     ) -> Result<(), SupervisorError> {
         for result in [&reader_result, &writer_result] {
             if let Err(join_err) = result {
@@ -605,9 +615,11 @@ where
         match (reader_result, writer_result) {
             (Ok(()), Ok(())) => Err(SupervisorError::EstablishedReconnect {
                 reason: "reader/writer task ended".to_owned(),
+                healthy,
             }),
             (Err(e), _) | (_, Err(e)) => Err(SupervisorError::EstablishedReconnect {
                 reason: format!("epoch task error: {e}"),
+                healthy: false,
             }),
         }
     }
@@ -704,7 +716,12 @@ async fn validate_hello<S: DurableSource>(
                 reason: format!("command cursor unavailable for hello validation: {e}"),
             })?;
     let min_next_command_seq = command_cursor.applied.saturating_add(1);
-    let max_next_command_seq = command_cursor.received.saturating_add(1);
+    let max_next_command_seq = command_cursor.received.checked_add(1).ok_or_else(|| {
+        SupervisorError::Fatal(anyhow!(
+            "command received cursor overflow: received={}",
+            command_cursor.received
+        ))
+    })?;
     if !(min_next_command_seq..=max_next_command_seq).contains(&api.next_command_seq) {
         return Err(SupervisorError::Fatal(anyhow!(
             "command cursor claim outside durable bounds: next_command_seq {} not in {}..={}; applied={}, received={}",
@@ -723,7 +740,7 @@ enum SupervisorError {
     AuthRejected,
     Fatal(anyhow::Error),
     Reconnect { reason: String },
-    EstablishedReconnect { reason: String },
+    EstablishedReconnect { reason: String, healthy: bool },
 }
 
 async fn event_forwarder(
@@ -731,7 +748,6 @@ async fn event_forwarder(
     current_writer: CurrentWriterSlot,
     cancel: CancellationToken,
     online: watch::Receiver<bool>,
-    writer_send_blocked_notify: Option<Arc<Notify>>,
 ) {
     loop {
         let result = tokio::select! {
@@ -767,11 +783,6 @@ async fn event_forwarder(
         {
             continue;
         }
-        if let Some(notify) = writer_send_blocked_notify.as_ref()
-            && sender.capacity() == 0
-        {
-            notify.notify_one();
-        }
         tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
@@ -780,6 +791,204 @@ async fn event_forwarder(
                     // Writer closed; stale frame is dropped. The supervisor will
                     // install a new epoch and catch-up from the durable source.
                 }
+            }
+        }
+    }
+}
+
+fn classify_frame(
+    frame: OutboundFrame,
+    online: bool,
+    last_received: u64,
+    outbox: &mut VecDeque<OutboundFrame>,
+    pending_events: &mut BTreeMap<u64, OutboundFrame>,
+) {
+    match frame {
+        OutboundFrame::CommandAck { .. } => outbox.push_back(frame),
+        OutboundFrame::Event { ref envelope } => match envelope.seq {
+            None if online => outbox.push_back(frame),
+            None => {
+                // Volatile/delta events before Online are stale; drop them.
+            }
+            Some(seq) if seq <= last_received => {
+                // Already delivered or already superseded by catch-up.
+            }
+            Some(seq) => {
+                pending_events.entry(seq).or_insert(frame);
+            }
+        },
+    }
+}
+
+fn prune_pending_events(pending_events: &mut BTreeMap<u64, OutboundFrame>, last_received: u64) {
+    let stale: Vec<u64> = pending_events
+        .keys()
+        .filter(|&&s| s <= last_received)
+        .cloned()
+        .collect();
+    for seq in stale {
+        pending_events.remove(&seq);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_with_interleave<W>(
+    writer: &mut W,
+    frame: OutboundFrame,
+    timeout: Duration,
+    token: &CancellationToken,
+    writer_rx: &mut mpsc::Receiver<OutboundFrame>,
+    outbox: &mut VecDeque<OutboundFrame>,
+    pending_events: &mut BTreeMap<u64, OutboundFrame>,
+    last_received: u64,
+    online: bool,
+) -> Result<()>
+where
+    W: GatewayWriter,
+{
+    let mut send_fut = std::pin::pin!(send_with_timeout(writer, frame, timeout));
+    loop {
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => return Ok(()),
+            result = &mut send_fut => return result,
+            frame = writer_rx.recv() => {
+                let Some(frame) = frame else { return Ok(()); };
+                classify_frame(frame, online, last_received, outbox, pending_events);
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drain_next<W>(
+    writer: &mut W,
+    timeout: Duration,
+    token: &CancellationToken,
+    writer_rx: &mut mpsc::Receiver<OutboundFrame>,
+    outbox: &mut VecDeque<OutboundFrame>,
+    pending_events: &mut BTreeMap<u64, OutboundFrame>,
+    last_received: &mut u64,
+    online: bool,
+) -> Result<()>
+where
+    W: GatewayWriter,
+{
+    loop {
+        prune_pending_events(pending_events, *last_received);
+        if let Some(frame) = outbox.pop_front() {
+            send_with_interleave(
+                writer,
+                frame,
+                timeout,
+                token,
+                writer_rx,
+                outbox,
+                pending_events,
+                *last_received,
+                online,
+            )
+            .await?;
+            continue;
+        }
+        // Send the smallest queued durable event that is still ahead of the
+        // watermark. Normally this is last_received + 1; if a seq is missing
+        // the next present seq is forwarded so live delivery is not stalled.
+        if online
+            && let Some(&seq) = pending_events.keys().next()
+            && seq > *last_received
+        {
+            let frame = pending_events.remove(&seq).expect("key just observed");
+            *last_received = seq;
+            send_with_interleave(
+                writer,
+                frame,
+                timeout,
+                token,
+                writer_rx,
+                outbox,
+                pending_events,
+                *last_received,
+                online,
+            )
+            .await?;
+            continue;
+        }
+        return Ok(());
+    }
+}
+
+async fn await_cursor<S>(
+    source: &S,
+    token: &CancellationToken,
+    writer_rx: &mut mpsc::Receiver<OutboundFrame>,
+    outbox: &mut VecDeque<OutboundFrame>,
+    pending_events: &mut BTreeMap<u64, OutboundFrame>,
+    last_received: u64,
+    online: bool,
+) -> Result<Option<EventCursors>>
+where
+    S: DurableSource,
+{
+    let mut fut = std::pin::pin!(source.event_cursor());
+    loop {
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => return Ok(None),
+            result = &mut fut => return result.map(Some),
+            frame = writer_rx.recv() => {
+                let Some(frame) = frame else { return Ok(None); };
+                classify_frame(frame, online, last_received, outbox, pending_events);
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn await_page<S>(
+    source: &S,
+    after_seq: u64,
+    limit: usize,
+    token: &CancellationToken,
+    writer_rx: &mut mpsc::Receiver<OutboundFrame>,
+    outbox: &mut VecDeque<OutboundFrame>,
+    pending_events: &mut BTreeMap<u64, OutboundFrame>,
+    last_received: u64,
+    online: bool,
+) -> Result<Option<Vec<OutboundFrame>>>
+where
+    S: DurableSource,
+{
+    let source = source.clone();
+    let (tx, mut rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
+        let _ = tx.send(source.events_after(after_seq, limit).await);
+    });
+    let result = loop {
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => {
+                handle.abort();
+                return Ok(None);
+            }
+            result = &mut rx => break result,
+            frame = writer_rx.recv() => {
+                let Some(frame) = frame else {
+                    handle.abort();
+                    return Ok(None);
+                };
+                classify_frame(frame, online, last_received, outbox, pending_events);
+            }
+        }
+    };
+    match result {
+        Ok(page) => page.map(Some),
+        Err(_) => {
+            // The spawned task was aborted or panicked; normal cancellation is handled above.
+            if token.is_cancelled() {
+                Ok(None)
+            } else {
+                bail!("events_after task dropped without result")
             }
         }
     }
@@ -799,97 +1008,219 @@ where
     S: DurableSource,
 {
     let mut last_received = api_hello.last_received_event_seq;
-    let mut cursor = tokio::select! {
-        biased;
-        _ = token.cancelled() => return Ok(()),
-        result = source.event_cursor() => result?,
+    let mut outbox: VecDeque<OutboundFrame> = VecDeque::new();
+    let mut pending_events: BTreeMap<u64, OutboundFrame> = BTreeMap::new();
+    let mut is_online = false;
+
+    let mut cursor = match await_cursor(
+        &source,
+        &token,
+        &mut writer_rx,
+        &mut outbox,
+        &mut pending_events,
+        last_received,
+        is_online,
+    )
+    .await?
+    {
+        Some(c) => c,
+        None => return Ok(()),
     };
 
     while last_received < cursor.last_sent {
-        let events = tokio::select! {
-            biased;
-            _ = token.cancelled() => return Ok(()),
-            result = source.events_after(last_received, config.catch_up_page_size) => result?,
+        let page = match await_page(
+            &source,
+            last_received,
+            config.catch_up_page_size,
+            &token,
+            &mut writer_rx,
+            &mut outbox,
+            &mut pending_events,
+            last_received,
+            is_online,
+        )
+        .await?
+        {
+            Some(p) => p,
+            None => return Ok(()),
         };
-        if events.is_empty() {
-            // The cursor may have raced ahead of the events_after snapshot.
-            // Re-check before treating an empty page as fatal.
-            cursor = tokio::select! {
-                biased;
-                _ = token.cancelled() => return Ok(()),
-                result = source.event_cursor() => result?,
+
+        if page.is_empty() {
+            cursor = match await_cursor(
+                &source,
+                &token,
+                &mut writer_rx,
+                &mut outbox,
+                &mut pending_events,
+                last_received,
+                is_online,
+            )
+            .await?
+            {
+                Some(c) => c,
+                None => return Ok(()),
             };
             if cursor.last_sent > last_received {
                 continue;
             }
             bail!("event source returned empty page before cursor");
         }
-        for frame in events {
+
+        for frame in page {
             let seq =
                 outbound_frame_event_seq(&frame).context("catch-up frame missing durable seq")?;
             if seq <= last_received {
                 bail!("non-monotonic catch-up event: seq {seq} after {last_received}");
             }
-            tokio::select! {
-                biased;
-                _ = token.cancelled() => return Ok(()),
-                result = send_with_timeout(&mut writer, frame, config.send_timeout) => result?,
-            }
+            send_with_interleave(
+                &mut writer,
+                frame,
+                config.send_timeout,
+                &token,
+                &mut writer_rx,
+                &mut outbox,
+                &mut pending_events,
+                last_received,
+                is_online,
+            )
+            .await?;
             last_received = seq;
+            drain_next(
+                &mut writer,
+                config.send_timeout,
+                &token,
+                &mut writer_rx,
+                &mut outbox,
+                &mut pending_events,
+                &mut last_received,
+                is_online,
+            )
+            .await?;
         }
-        // Refresh the cursor each page so commits racing catch-up are included.
-        cursor = tokio::select! {
-            biased;
-            _ = token.cancelled() => return Ok(()),
-            result = source.event_cursor() => result?,
+
+        cursor = match await_cursor(
+            &source,
+            &token,
+            &mut writer_rx,
+            &mut outbox,
+            &mut pending_events,
+            last_received,
+            is_online,
+        )
+        .await?
+        {
+            Some(c) => c,
+            None => return Ok(()),
         };
     }
 
     // Final cursor recheck right before publishing Online: catch any durable
     // commits that happened while the last page was being sent.
     loop {
-        let fresh_cursor = tokio::select! {
-            biased;
-            _ = token.cancelled() => return Ok(()),
-            result = source.event_cursor() => result?,
+        cursor = match await_cursor(
+            &source,
+            &token,
+            &mut writer_rx,
+            &mut outbox,
+            &mut pending_events,
+            last_received,
+            is_online,
+        )
+        .await?
+        {
+            Some(c) => c,
+            None => return Ok(()),
         };
-        if fresh_cursor.last_sent <= last_received {
+        if cursor.last_sent <= last_received {
             break;
         }
-        let events = tokio::select! {
-            biased;
-            _ = token.cancelled() => return Ok(()),
-            result = source.events_after(last_received, config.catch_up_page_size) => result?,
+        let page = match await_page(
+            &source,
+            last_received,
+            config.catch_up_page_size,
+            &token,
+            &mut writer_rx,
+            &mut outbox,
+            &mut pending_events,
+            last_received,
+            is_online,
+        )
+        .await?
+        {
+            Some(p) => p,
+            None => return Ok(()),
         };
-        if events.is_empty() {
-            cursor = tokio::select! {
-                biased;
-                _ = token.cancelled() => return Ok(()),
-                result = source.event_cursor() => result?,
+        if page.is_empty() {
+            cursor = match await_cursor(
+                &source,
+                &token,
+                &mut writer_rx,
+                &mut outbox,
+                &mut pending_events,
+                last_received,
+                is_online,
+            )
+            .await?
+            {
+                Some(c) => c,
+                None => return Ok(()),
             };
             if cursor.last_sent > last_received {
                 continue;
             }
             bail!("event source returned empty page before cursor");
         }
-        for frame in events {
+        for frame in page {
             let seq =
                 outbound_frame_event_seq(&frame).context("catch-up frame missing durable seq")?;
             if seq <= last_received {
                 bail!("non-monotonic catch-up event: seq {seq} after {last_received}");
             }
-            tokio::select! {
-                biased;
-                _ = token.cancelled() => return Ok(()),
-                result = send_with_timeout(&mut writer, frame, config.send_timeout) => result?,
-            }
+            send_with_interleave(
+                &mut writer,
+                frame,
+                config.send_timeout,
+                &token,
+                &mut writer_rx,
+                &mut outbox,
+                &mut pending_events,
+                last_received,
+                is_online,
+            )
+            .await?;
             last_received = seq;
+            drain_next(
+                &mut writer,
+                config.send_timeout,
+                &token,
+                &mut writer_rx,
+                &mut outbox,
+                &mut pending_events,
+                &mut last_received,
+                is_online,
+            )
+            .await?;
         }
     }
 
     // Publish Online only after reaching the durable cursor. From this point on
     // event_forwarder may deliver live frames to this writer.
+    is_online = true;
     let _ = online.send(true);
+
+    // Drain any CommandAcks that arrived during the final recheck and any durable
+    // events queued before Online in strict order.
+    drain_next(
+        &mut writer,
+        config.send_timeout,
+        &token,
+        &mut writer_rx,
+        &mut outbox,
+        &mut pending_events,
+        &mut last_received,
+        is_online,
+    )
+    .await?;
 
     loop {
         tokio::select! {
@@ -897,30 +1228,17 @@ where
             _ = token.cancelled() => return Ok(()),
             frame = writer_rx.recv() => {
                 let Some(frame) = frame else { return Ok(()); };
-
-                let event_seq = if let OutboundFrame::Event { envelope } = &frame {
-                    envelope.seq
-                } else {
-                    None
-                };
-                if let Some(seq) = event_seq
-                    && seq <= last_received
-                {
-                    // Already delivered by the durable catch-up; the live
-                    // producer raced the Online boundary.
-                    continue;
-                }
-
-                tokio::select! {
-                    biased;
-                    _ = token.cancelled() => return Ok(()),
-                    result = send_with_timeout(&mut writer, frame, config.send_timeout) => {
-                        result?;
-                        if let Some(seq) = event_seq {
-                            last_received = seq;
-                        }
-                    }
-                }
+                classify_frame(frame, is_online, last_received, &mut outbox, &mut pending_events);
+                drain_next(
+                    &mut writer,
+                    config.send_timeout,
+                    &token,
+                    &mut writer_rx,
+                    &mut outbox,
+                    &mut pending_events,
+                    &mut last_received,
+                    is_online,
+                ).await?;
             }
         }
     }
@@ -2971,6 +3289,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validate_hello_command_received_cursor_u64_max_fail_closed() {
+        // received = u64::MAX leaves no room for a legal next_command_seq
+        // (received + 1 would overflow). The validation must fail closed.
+        let cursor = CommandCursors {
+            received: u64::MAX,
+            applied: u64::MAX - 1,
+        };
+        let agent = AgentHello {
+            agent_id: "test".to_owned(),
+            generation: ProcessGeneration::from_wire(7).unwrap(),
+            last_sent_event_seq: 0,
+            last_received_command_seq: cursor.received,
+            last_applied_command_seq: cursor.applied,
+        };
+        let api = ApiHello {
+            accepted_generation: agent.generation,
+            last_received_event_seq: 0,
+            next_command_seq: u64::MAX,
+        };
+        assert!(
+            validate_hello(&MockDurableSource::new(cursor), &agent, &api)
+                .await
+                .is_err(),
+            "received cursor at u64::MAX must fail closed"
+        );
+    }
+
+    #[tokio::test]
     async fn stdio_command_survives_hydration_mid_chunk() {
         use std::io;
         use std::pin::Pin;
@@ -3266,6 +3612,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paged_catch_up_delivers_early_command_acks() {
+        // Catch-up spans multiple pages. CommandAcks and volatile events sent
+        // during catch-up must be interleaved correctly without gaps or
+        // duplicates, and durable events that arrive before Online must be held.
+        let source = MockDurableSource::new(CommandCursors::default());
+        for seq in 1..=5 {
+            source.push_event(event_frame(seq));
+        }
+
+        let mut config = make_config();
+        config.catch_up_page_size = 2;
+        config.send_timeout = Duration::from_secs(1);
+
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gateway = MockGateway {
+            reader: MockGatewayReader {
+                commands: VecDeque::new(),
+                panic: false,
+                on_empty: None,
+            },
+            writer: MockGatewayWriter {
+                fail_after: None,
+                sent: sent.clone(),
+                delay: Some(Duration::from_millis(2)),
+                block_after: None,
+                block_notify: None,
+            },
+            sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
+            hello_generation: None,
+            last_received_event_seq: 0,
+            hello_delay: None,
+            hello_error: None,
+        };
+        let connector = MockConnector::new(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            VecDeque::from([Ok(gateway)]),
+        );
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: ProcessGeneration::from_wire(7).unwrap(),
+            receipt_identity: "r".to_owned(),
+        });
+        let supervisor = ConnectionSupervisor::new(
+            connector,
+            CountingCredentialProvider::new("token"),
+            source,
+            latch,
+            config,
+        );
+        let handle = supervisor.start();
+
+        let mut epochs = handle.epochs.clone();
+        while epochs.borrow().is_none() {
+            epochs.changed().await.unwrap();
+        }
+        let epoch = epochs.borrow().unwrap();
+
+        // CommandAcks sent during paged catch-up must be delivered immediately.
+        let ack = |seq| OutboundFrame::CommandAck {
+            ack: CommandAck {
+                seq,
+                command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+                status: CommandAckStatus::Received,
+                reject_reason: None,
+            },
+        };
+        handle.events.send((epoch, ack(1))).await.unwrap();
+        handle.events.send((epoch, ack(2))).await.unwrap();
+        handle.events.send((epoch, ack(3))).await.unwrap();
+
+        // Volatile pre-online events must be dropped.
+        let volatile = OutboundFrame::Event {
+            envelope: Envelope {
+                seq: None,
+                conversation_id: "conversation-1".to_owned(),
+                event: serde_json::json!({"type": "typing"}),
+            },
+        };
+        handle.events.send((epoch, volatile)).await.unwrap();
+
+        // A durable event that is already in the durable source must not be
+        // double-sent from a pre-online live frame.
+        handle.events.send((epoch, event_frame(3))).await.unwrap();
+
+        let mut online = handle.online.clone();
+        while !*online.borrow() {
+            online.changed().await.unwrap();
+        }
+
+        handle.events.send((epoch, event_frame(6))).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        handle.abort();
+        assert!(handle.join().await.is_ok());
+
+        let sent_frames = sent.lock().unwrap();
+        let event_seqs: Vec<_> = sent_frames
+            .iter()
+            .filter_map(|f| outbound_frame_event_seq(f).ok())
+            .collect();
+        assert_eq!(
+            event_seqs,
+            vec![1, 2, 3, 4, 5, 6],
+            "paged catch-up must deliver durable events exactly once and in order"
+        );
+        assert_eq!(
+            sent_frames
+                .iter()
+                .filter(|f| matches!(f, OutboundFrame::CommandAck { .. }))
+                .count(),
+            3,
+            "all pre-online CommandAcks must be delivered"
+        );
+        assert!(
+            !sent_frames
+                .iter()
+                .any(|f| matches!(f, OutboundFrame::Event { envelope } if envelope.seq.is_none())),
+            "volatile pre-online Event must be dropped"
+        );
+    }
+
+    #[tokio::test]
     async fn writer_task_rechecks_cursor_before_publishing_online() {
         // The durable source commits event 2 while the first page is being sent,
         // then returns an empty page for the updated cursor. The writer must
@@ -3274,7 +3741,7 @@ mod tests {
             events: Arc<std::sync::Mutex<VecDeque<OutboundFrame>>>,
             first_page_started: Arc<Notify>,
             first_page_release: Arc<Notify>,
-            second_page_attempts: AtomicU64,
+            second_page_attempts: Arc<AtomicU64>,
         }
 
         impl Clone for RacingSource {
@@ -3283,7 +3750,7 @@ mod tests {
                     events: self.events.clone(),
                     first_page_started: self.first_page_started.clone(),
                     first_page_release: self.first_page_release.clone(),
-                    second_page_attempts: AtomicU64::new(0),
+                    second_page_attempts: self.second_page_attempts.clone(),
                 }
             }
         }
@@ -3349,7 +3816,7 @@ mod tests {
             events: events.clone(),
             first_page_started: first_page_started.clone(),
             first_page_release: first_page_release.clone(),
-            second_page_attempts: AtomicU64::new(0),
+            second_page_attempts: Arc::new(AtomicU64::new(0)),
         };
 
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3566,14 +4033,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn event_forwarder_cancels_blocked_writer_send() {
-        // Catch-up blocks writer_task so writer_rx is not being consumed.
-        // event_forwarder must still cancel its own sender.send when the
-        // supervisor is aborted, and the pending frame must not be forwarded.
+    async fn bounded_writer_queue_does_not_deadlock_during_catch_up() {
+        // Catch-up is held while a burst of CommandAcks and durable events fills
+        // the bounded channels. writer_task must consume writer_rx during catch-up
+        // so event_forwarder does not deadlock, and all queued frames must be
+        // delivered in order once Online is reached.
         let catch_up_notify = Arc::new(Notify::new());
         let source = DelayedCatchUpSource {
-            events: Arc::new(std::sync::Mutex::new(VecDeque::from([event_frame(1)]))),
-            notify: catch_up_notify,
+            events: Arc::new(std::sync::Mutex::new(VecDeque::from([
+                event_frame(1),
+                event_frame(2),
+            ]))),
+            notify: catch_up_notify.clone(),
             command_cursor: CommandCursors {
                 received: 0,
                 applied: 0,
@@ -3581,7 +4052,8 @@ mod tests {
         };
 
         let mut config = make_config();
-        config.event_buffer_size = 1;
+        config.event_buffer_size = 2;
+        config.send_timeout = Duration::from_secs(1);
 
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let gateway = MockGateway {
@@ -3593,7 +4065,7 @@ mod tests {
             writer: MockGatewayWriter {
                 fail_after: None,
                 sent: sent.clone(),
-                delay: None,
+                delay: Some(Duration::from_millis(2)),
                 block_after: None,
                 block_notify: None,
             },
@@ -3611,26 +4083,21 @@ mod tests {
             generation: ProcessGeneration::from_wire(7).unwrap(),
             receipt_identity: "r".to_owned(),
         });
-        let blocked = Arc::new(Notify::new());
         let supervisor = ConnectionSupervisor::new(
             connector,
             CountingCredentialProvider::new("token"),
             source,
             latch,
             config,
-        )
-        .with_writer_send_blocked_notify(blocked.clone());
+        );
         let handle = supervisor.start();
 
-        // Wait for the epoch so there is a writer installed.
         let mut epochs = handle.epochs.clone();
         while epochs.borrow().is_none() {
             epochs.changed().await.unwrap();
         }
         let epoch = epochs.borrow().unwrap();
 
-        // CommandAcks are forwarded even before Online. With event_buffer_size=1,
-        // the first fills writer_tx and the second send blocks.
         let ack = |seq| OutboundFrame::CommandAck {
             ack: CommandAck {
                 seq,
@@ -3639,26 +4106,52 @@ mod tests {
                 reject_reason: None,
             },
         };
-        handle.events.send((epoch, ack(1))).await.unwrap();
-        handle.events.send((epoch, ack(2))).await.unwrap();
 
-        tokio::time::timeout(Duration::from_secs(1), blocked.notified())
-            .await
-            .expect("event_forwarder must block on full writer channel");
+        let mut burst = Vec::new();
+        for i in 1..=5 {
+            burst.push(ack(i));
+            burst.push(event_frame(i + 2));
+        }
+
+        // This must complete without deadlock even while catch-up is blocked.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            for frame in burst {
+                handle.events.send((epoch, frame)).await.unwrap();
+            }
+        })
+        .await
+        .expect("burst send must not deadlock on a full writer queue");
+
+        // Allow catch-up to finish and reach Online.
+        catch_up_notify.notify_one();
+        let mut online = handle.online.clone();
+        while !*online.borrow() {
+            online.changed().await.unwrap();
+        }
+
+        handle.events.send((epoch, event_frame(8))).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         handle.abort();
-        let result = tokio::time::timeout(Duration::from_secs(1), handle.join()).await;
-        assert!(
-            result.is_ok(),
-            "abort must complete while event_forwarder is blocked on sender.send"
-        );
+        assert!(handle.join().await.is_ok());
 
         let sent_frames = sent.lock().unwrap();
-        assert!(
-            !sent_frames
+        let event_seqs: Vec<_> = sent_frames
+            .iter()
+            .filter_map(|f| outbound_frame_event_seq(f).ok())
+            .collect();
+        assert_eq!(
+            event_seqs,
+            vec![1, 2, 3, 4, 5, 6, 7, 8],
+            "catch-up, queued pre-online durable events, and post-online event must be in order"
+        );
+        assert_eq!(
+            sent_frames
                 .iter()
-                .any(|f| matches!(f, OutboundFrame::CommandAck { .. })),
-            "blocked CommandAck must not be forwarded to the gateway"
+                .filter(|f| matches!(f, OutboundFrame::CommandAck { .. }))
+                .count(),
+            5,
+            "all pre-online CommandAcks must be delivered"
         );
     }
 
@@ -3678,7 +4171,7 @@ mod tests {
 
         let (_online_tx, online_rx) = watch::channel(false);
         let cancel = CancellationToken::new();
-        let forwarder = tokio::spawn(event_forwarder(rx, current_writer, cancel, online_rx, None));
+        let forwarder = tokio::spawn(event_forwarder(rx, current_writer, cancel, online_rx));
 
         // Send a frame so event_forwarder tries to lock and panics.
         tx.send((DeliveryEpoch(1), event_frame(1))).await.unwrap();

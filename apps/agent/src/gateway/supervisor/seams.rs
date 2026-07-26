@@ -78,8 +78,8 @@ impl DurableSource for T17StoreAdapter {
         bail!(
             "T17 integration seam: Store::command_cursors() is not wired. \
              Contract: SELECT MAX(seq) FROM inbound_commands WHERE status IN ('received','applying') AS received; \
-             SELECT MAX(seq) FROM inbound_commands WHERE status IN ('applied','superseded','rejected') AS terminal; \
-             return CommandCursors{{ received, terminal }}."
+             SELECT MAX(seq) FROM inbound_commands WHERE status IN ('applied','superseded','rejected') AS applied; \
+             return CommandCursors{{ received, applied }}."
         )
     }
 }
