@@ -57,7 +57,7 @@ impl Redactor {
                     replacement: "Basic [REDACTED:basic_credentials]",
                 },
                 RedactionRule {
-                    pattern: Regex::new(r"(?i)https?://[^\s:@]+:[^\s@]+@[^\s]+")
+                    pattern: Regex::new(r"(?i)https?://[^\s@/]+@[^\s]+")
                         .expect("static URL credential pattern is valid"),
                     replacement: "[REDACTED:url_with_credentials]",
                 },
