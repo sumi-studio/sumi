@@ -1092,10 +1092,20 @@ impl Runner {
                                 Some(*command),
                             )
                             .await?;
+                            let committed_decision = decision.clone();
                             match decision {
                                 crate::approval::policy::ResolvedDecision::ApproveOnce
                                 | crate::approval::policy::ResolvedDecision::ApproveAlways(_) => {
                                     self.emit_tool_start_and_wait_committed(call).await?;
+                                    if let Some(broker) = self.core.approval.as_ref() {
+                                        broker.commit_resolution(&committed_decision).map_err(
+                                            |error| {
+                                                WorkerFailure::Error(format!(
+                                                    "committed approval rule activation failed: {error}"
+                                                ))
+                                            },
+                                        )?;
+                                    }
                                     let result = match self
                                         .execute_tool_with_updates(assistant_message_id, call)
                                         .await

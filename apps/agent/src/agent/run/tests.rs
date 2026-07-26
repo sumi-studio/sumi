@@ -634,16 +634,17 @@ impl ReviewerTransport for BlockingReviewer {
 async fn abort_is_processed_while_reviewer_start_request_is_awaited() {
     let started = Arc::new(Notify::new());
     let projector = SecretAwareActionProjector::new(Redactor::v1(), SecretDigestKey::fixture());
+    let reviewer_model = ReviewerModelSpec::new(
+        "audit",
+        "fixture",
+        "https://reviewer.invalid",
+        "test",
+        "trusted",
+        "test-policy",
+    );
     let reviewer = Arc::new(Reviewer::new(
-        ReviewerModelSpec::new(
-            "audit",
-            "fixture",
-            "https://reviewer.invalid",
-            "test",
-            "trusted",
-            "test-policy",
-        ),
-        ReviewerTrustSet::new("trusted", vec![]),
+        reviewer_model.clone(),
+        ReviewerTrustSet::new(reviewer_model, vec![]),
         Arc::new(BlockingReviewer {
             started: started.clone(),
         }),

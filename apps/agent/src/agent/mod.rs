@@ -807,6 +807,10 @@ impl<G: Gateway + 'static> Session<G> {
                 return Ok(());
             }
             if matches!(command.envelope().command, Command::ApprovalDecision { .. }) {
+                if !self.deferred_commands.is_empty() {
+                    self.defer_active_command(command)?;
+                    return Ok(());
+                }
                 return self.route_active_approval_decision(command).await;
             }
             self.defer_active_command(command)?;
@@ -1050,21 +1054,12 @@ impl<G: Gateway + 'static> Session<G> {
         if !is_pending {
             return self.apply_idle_approval_decision(command).await;
         }
-        let seq = command.envelope().seq;
-        let command_id = command.envelope().command_id.to_string();
         let control = RunControl::Command(command);
-        if active.control_tx.try_send(control).is_err() {
-            let ack = CommandAck {
-                seq,
-                command_id,
-                status: CommandAckStatus::Rejected,
-                reject_reason: Some(
-                    "approval decision could not be delivered to the active worker".to_owned(),
-                ),
-            };
-            self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack }])?;
-        }
-        Ok(())
+        active
+            .control_tx
+            .send(control)
+            .await
+            .map_err(|_| SessionFailure::CompletionChannelClosed)
     }
 
     fn defer_active_command(&mut self, command: AdmittedCommand) -> Result<(), SessionFailure> {
@@ -1103,6 +1098,8 @@ impl<G: Gateway + 'static> Session<G> {
     /// overtake an earlier deferred one.
     async fn reclassify_deferred(&mut self) -> Result<(), SessionFailure> {
         while let Some(command) = self.deferred_commands.pop_one() {
+            let was_user_message =
+                matches!(command.envelope().command, Command::UserMessage { .. });
             let routed = match &command.envelope().command {
                 Command::UserMessage { .. } => {
                     if self.route_retry_wait_command(&command).await? {
@@ -1121,6 +1118,16 @@ impl<G: Gateway + 'static> Session<G> {
                 self.deferred_commands
                     .push_front(command)
                     .map_err(anyhow::Error::from)?;
+                break;
+            }
+            if was_user_message
+                && self.deferred_commands.front().is_some_and(|next| {
+                    matches!(next.envelope().command, Command::ApprovalDecision { .. })
+                })
+            {
+                // The user message has just cancelled or superseded the
+                // pending action. Wait for its durable ApprovalResolved before
+                // applying a later decision as a terminal no-op.
                 break;
             }
         }
@@ -1576,13 +1583,19 @@ impl<G: Gateway + 'static> Session<G> {
                     )
             )
         });
+        let approval_boundary = outputs.iter().any(|output| {
+            matches!(
+                &output.event,
+                AgentEvent::ApprovalRequested { .. } | AgentEvent::ApprovalResolved { .. }
+            )
+        });
         let command_id = self
             .active
             .as_ref()
             .map(|active| active.bridge.command_id().to_owned());
         self.send_committed(outputs, command_id, terminal_command_ids)
             .await?;
-        if assistant_started {
+        if assistant_started || approval_boundary {
             self.reclassify_deferred().await?;
         }
         Ok(())

@@ -7813,7 +7813,7 @@ fn make_deny_reviewer() -> Arc<Reviewer> {
         "fixture-trust-domain",
         "none",
     );
-    let trust_set = ReviewerTrustSet::new("fixture-trust-domain", Vec::new());
+    let trust_set = ReviewerTrustSet::new(model.clone(), Vec::new());
     Arc::new(Reviewer::new(
         model,
         trust_set,
@@ -7949,6 +7949,115 @@ fn approval_always_decision(seq: u64, request_id: &str) -> InboundCommand {
             decision: crate::gateway::ApprovalDecision::ApproveAlways { rule },
         },
     })
+}
+
+#[tokio::test]
+async fn later_approval_decision_does_not_overtake_an_earlier_deferred_user_message() {
+    let broker = Arc::new(ApprovalBroker::new(
+        crate::approval::policy::Policy::new("/workspace"),
+        make_projector(),
+        None,
+        ReviewerMode::User,
+        false,
+        trusted_env(),
+    ));
+    let observed_control = Arc::new(Notify::new());
+    let observed_kind = Arc::new(Mutex::new(None::<&'static str>));
+    let observed_kind_worker = observed_kind.clone();
+    let observed_control_worker = observed_control.clone();
+    let (request_tx, request_rx) = oneshot::channel();
+    let request_tx = Arc::new(Mutex::new(Some(request_tx)));
+    let request_tx_worker = request_tx.clone();
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        move |core: RunCore,
+              _initial: AdmittedCommand,
+              mut controls: mpsc::Receiver<RunControl>,
+              _events: mpsc::Sender<AgentEvent>| {
+            let observed_kind = observed_kind_worker.clone();
+            let observed_control = observed_control_worker.clone();
+            let request_tx = request_tx_worker.clone();
+            async move {
+                let call = ToolCall {
+                    id: "ordering-call".to_owned(),
+                    name: "bash".to_owned(),
+                    arguments: serde_json::from_value(serde_json::json!({
+                        "command": "git status"
+                    }))
+                    .expect("validated bash arguments"),
+                };
+                let broker = core.approval.clone().expect("approval broker");
+                let outcome = broker
+                    .start_request(
+                        &call,
+                        &[],
+                        "ordering-run",
+                        "ordering-turn",
+                        "v1",
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .expect("start pending approval");
+                let ApprovalOutcome::Pending { pending } = outcome else {
+                    panic!("expected pending approval");
+                };
+                request_tx
+                    .lock()
+                    .expect("request sender")
+                    .take()
+                    .expect("single worker")
+                    .send(pending.request().id.clone())
+                    .ok();
+                if let Some(control) = controls.recv().await {
+                    *observed_kind.lock().expect("observed kind") = Some(match control {
+                        RunControl::Command(command)
+                            if matches!(
+                                command.envelope().command,
+                                Command::ApprovalDecision { .. }
+                            ) =>
+                        {
+                            "approval"
+                        }
+                        _ => "other",
+                    });
+                    observed_control.notify_one();
+                }
+                drop(pending);
+                RunCompletion::Completed(core)
+            }
+        },
+    );
+    let store = Store::session_test_store("approval-command-ordering")
+        .await
+        .expect("test store");
+    let (gateway, commands, _frames) = gateway();
+    let session = Session::start(
+        store,
+        gateway,
+        approval_core(broker),
+        worker,
+        test_executor_generation(),
+    )
+    .await
+    .expect("session startup");
+    let task = tokio::spawn(session.run());
+
+    commands.send(user(1)).await.expect("start command");
+    let request_id = request_rx.await.expect("pending request id");
+    commands.send(user(2)).await.expect("earlier user message");
+    commands
+        .send(approval_decision(3, &request_id))
+        .await
+        .expect("later approval decision");
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), observed_control.notified())
+            .await
+            .is_err(),
+        "later approval decision overtook deferred user command as {:?}",
+        *observed_kind.lock().expect("observed kind")
+    );
+    drop(commands);
+    let _ = task.await;
 }
 
 #[tokio::test]

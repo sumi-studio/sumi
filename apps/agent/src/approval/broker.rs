@@ -356,13 +356,8 @@ impl ApprovalBroker {
 
         let mut resolved = resolved;
         if let ResolvedDecision::ApproveAlways(ref rule) = resolved {
-            let mut guard = self.policy.write().unwrap_or_else(|e| e.into_inner());
-            if let Ok(new_policy) = guard.clone().try_with_rule(rule.clone()) {
-                *guard = new_policy;
-                if let Some(reviewer) = self.reviewer.as_ref() {
-                    reviewer.clear_allow_cache();
-                }
-            } else {
+            let guard = self.policy.read().unwrap_or_else(|e| e.into_inner());
+            if guard.clone().try_with_rule(rule.clone()).is_err() {
                 // The candidate rule cannot be safely persisted; never claim an
                 // `ApproveAlways` decision that would not actually be durable.
                 resolved = ResolvedDecision::ApproveOnce;
@@ -379,6 +374,24 @@ impl ApprovalBroker {
         }
 
         Some(resolved)
+    }
+
+    /// Publish a rule only after the approval resolution and matching tool
+    /// start have committed atomically. Until this point the decision is staged
+    /// and must not affect authorization of another call.
+    pub(crate) fn commit_resolution(&self, resolved: &ResolvedDecision) -> Result<()> {
+        let ResolvedDecision::ApproveAlways(rule) = resolved else {
+            return Ok(());
+        };
+        let mut guard = self.policy.write().unwrap_or_else(|e| e.into_inner());
+        *guard = guard
+            .clone()
+            .try_with_rule(rule.clone())
+            .context("activate durably committed approval rule")?;
+        if let Some(reviewer) = self.reviewer.as_ref() {
+            reviewer.clear_allow_cache();
+        }
+        Ok(())
     }
 
     /// Cancel a specific pending request and notify its waiter.
@@ -815,7 +828,7 @@ mod tests {
             "reviewer-domain",
             "tenant-policy",
         );
-        let trust = ReviewerTrustSet::new("reviewer-domain", Vec::new());
+        let trust = ReviewerTrustSet::new(model.clone(), Vec::new());
         let transport = Arc::new(StaticTransport {
             response: response.to_owned(),
         });
@@ -844,7 +857,7 @@ mod tests {
             "reviewer-domain",
             "tenant-policy",
         );
-        let trust = ReviewerTrustSet::new("reviewer-domain", Vec::new());
+        let trust = ReviewerTrustSet::new(model.clone(), Vec::new());
         let calls = Arc::new(AtomicUsize::new(0));
         let transport = Arc::new(CountingTransport {
             response: allow_json(),
@@ -911,9 +924,10 @@ mod tests {
         );
         let calls = Arc::new(AtomicUsize::new(0));
         let prompts = Arc::new(Mutex::new(Vec::new()));
+        let trust = ReviewerTrustSet::new(model.clone(), Vec::new());
         let reviewer = Arc::new(Reviewer::new(
             model,
-            ReviewerTrustSet::new("reviewer-domain", Vec::new()),
+            trust,
             Arc::new(CapturingTransport {
                 response: allow_json(),
                 calls: calls.clone(),
@@ -1113,7 +1127,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn approve_always_updates_policy_and_subsequent_call_is_allowed() {
+    async fn approve_always_only_updates_policy_after_durable_commit() {
         let mut broker = broker();
         broker.headless = false;
         let call = bash_call("ls /workspace");
@@ -1156,6 +1170,22 @@ mod tests {
                 "run-1",
                 "turn-2",
                 "v2",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("start_request");
+        assert!(matches!(outcome, ApprovalOutcome::Pending { .. }));
+
+        broker
+            .commit_resolution(&resolved)
+            .expect("activate durably committed rule");
+        let outcome = broker
+            .start_request(
+                &call,
+                &[],
+                "run-1",
+                "turn-3",
+                "v3",
                 CancellationToken::new(),
             )
             .await
@@ -1370,9 +1400,12 @@ mod tests {
             )
             .expect("resolve pending");
         assert!(matches!(resolved, ResolvedDecision::ApproveAlways(_)));
+        broker
+            .commit_resolution(&resolved)
+            .expect("activate durable rule");
 
-        // The broker must have cleared the reviewer allow cache when it mutated
-        // the durable policy.
+        // The broker clears the reviewer allow cache only when the committed
+        // rule becomes active.
         assert_eq!(reviewer.allow_cache_entry_count(), 0);
 
         // Re-reviewing the same cached request after a policy mutation should

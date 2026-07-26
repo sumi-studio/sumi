@@ -71,36 +71,72 @@ impl ReviewerModelSpec {
     }
 }
 
-/// Allowed reviewer trust domains. The reviewer model is allowed when it is in
-/// the same trust domain as the conversation provider or an explicitly allowed
-/// audit domain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReviewerTrustBinding {
+    provider: String,
+    base_url: String,
+    account_scope: String,
+    trust_domain_id: String,
+    data_processing_policy: String,
+}
+
+impl ReviewerTrustBinding {
+    fn from_model(model: &ReviewerModelSpec) -> Self {
+        Self {
+            provider: model.provider.clone(),
+            base_url: model.base_url.clone(),
+            account_scope: model.account_scope.clone(),
+            trust_domain_id: model.trust_domain_id.clone(),
+            data_processing_policy: model.data_processing_policy.clone(),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        [
+            &self.provider,
+            &self.base_url,
+            &self.account_scope,
+            &self.trust_domain_id,
+            &self.data_processing_policy,
+        ]
+        .into_iter()
+        .all(|value| !value.trim().is_empty())
+    }
+}
+
+/// Allowed reviewer trust bindings. A domain label alone is not authority:
+/// provider endpoint, account scope, and tenant data-processing policy must
+/// match a binding supplied by trusted runtime configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReviewerTrustSet {
-    conversation_domain_id: String,
-    allowed_audit_domains: Vec<String>,
+    allowed: Vec<ReviewerTrustBinding>,
 }
 
 impl ReviewerTrustSet {
     pub fn new(
-        conversation_domain_id: impl Into<String>,
-        allowed_audit_domains: Vec<String>,
+        conversation_model: ReviewerModelSpec,
+        allowed_audit_models: Vec<ReviewerModelSpec>,
     ) -> Self {
-        Self {
-            conversation_domain_id: conversation_domain_id.into(),
-            allowed_audit_domains,
-        }
+        let mut allowed = Vec::with_capacity(1 + allowed_audit_models.len());
+        allowed.push(ReviewerTrustBinding::from_model(&conversation_model));
+        allowed.extend(
+            allowed_audit_models
+                .iter()
+                .map(ReviewerTrustBinding::from_model),
+        );
+        Self { allowed }
     }
 
     pub fn allows(&self, model: &ReviewerModelSpec) -> bool {
-        if model.trust_domain_id.is_empty() {
+        if model.id.trim().is_empty() {
             return false;
         }
-        if model.trust_domain_id == self.conversation_domain_id {
-            return true;
-        }
-        self.allowed_audit_domains
-            .iter()
-            .any(|d| d == &model.trust_domain_id)
+        let binding = ReviewerTrustBinding::from_model(model);
+        binding.is_complete()
+            && self
+                .allowed
+                .iter()
+                .any(|allowed| allowed.is_complete() && allowed == &binding)
     }
 }
 
@@ -576,8 +612,11 @@ impl Reviewer {
                         continue;
                     }
                 },
-                ReviewerCall::Transient(e) => {
-                    retry_errors.push(format!("attempt {attempt}: transient error: {e}"));
+                ReviewerCall::Transient(_error) => {
+                    // Transport diagnostics may contain request URLs,
+                    // credentials, response excerpts, or attacker-controlled
+                    // text. They remain local; only schema/parse errors are
+                    // eligible for the next reviewer prompt's retry note.
                     continue;
                 }
                 ReviewerCall::Fatal(e) => {
@@ -832,23 +871,28 @@ mod tests {
         }
     }
 
-    fn make_reviewer_with_trust(
-        transport: Arc<dyn ReviewerTransport>,
-        trust: ReviewerTrustSet,
-    ) -> Reviewer {
-        let model = ReviewerModelSpec::new(
+    fn reviewer_model() -> ReviewerModelSpec {
+        ReviewerModelSpec::new(
             "reviewer-model",
             "reviewer-provider",
             "https://reviewer.example.test/v1",
             "default",
             "reviewer-domain",
             "tenant-policy",
-        );
+        )
+    }
+
+    fn make_reviewer_with_trust(
+        transport: Arc<dyn ReviewerTransport>,
+        trust: ReviewerTrustSet,
+    ) -> Reviewer {
+        let model = reviewer_model();
         Reviewer::new(model, trust, transport, Arc::new(projector()))
     }
 
     fn make_reviewer(transport: Arc<dyn ReviewerTransport>) -> Reviewer {
-        make_reviewer_with_trust(transport, ReviewerTrustSet::new("reviewer-domain", vec![]))
+        let model = reviewer_model();
+        make_reviewer_with_trust(transport, ReviewerTrustSet::new(model, vec![]))
     }
 
     fn allow_json() -> String {
@@ -1040,10 +1084,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn trust_domain_violation_does_not_call_transport() {
         let fake = FakeTransport::sequence(vec![]);
-        let reviewer = make_reviewer_with_trust(
-            fake.clone(),
-            ReviewerTrustSet::new("different-domain", vec![]),
-        );
+        let mut trusted_model = reviewer_model();
+        trusted_model.trust_domain_id = "different-domain".to_owned();
+        let reviewer =
+            make_reviewer_with_trust(fake.clone(), ReviewerTrustSet::new(trusted_model, vec![]));
         let outcome = reviewer
             .review(
                 review_request(reviewable_projection()),
@@ -1051,6 +1095,41 @@ mod tests {
             )
             .await;
         assert!(matches!(outcome, ReviewOutcome::Deny(d) if d.rationale.contains("trust domain")));
+        assert_eq!(fake.called_count(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn matching_domain_label_cannot_authorize_a_different_endpoint() {
+        let fake = FakeTransport::sequence(vec![]);
+        let trusted_model = ReviewerModelSpec::new(
+            "conversation-model",
+            "reviewer-provider",
+            "https://reviewer.example.test/v1",
+            "default",
+            "reviewer-domain",
+            "tenant-policy",
+        );
+        let untrusted_model = ReviewerModelSpec::new(
+            "reviewer-model",
+            "reviewer-provider",
+            "https://exfiltration.example.test/v1",
+            "default",
+            "reviewer-domain",
+            "tenant-policy",
+        );
+        let reviewer = Reviewer::new(
+            untrusted_model,
+            ReviewerTrustSet::new(trusted_model, vec![]),
+            fake.clone(),
+            Arc::new(projector()),
+        );
+        let outcome = reviewer
+            .review(
+                review_request(reviewable_projection()),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(outcome, ReviewOutcome::Deny(_)));
         assert_eq!(fake.called_count(), 0);
     }
 
@@ -1072,9 +1151,14 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn retries_transient_errors_and_succeeds() {
+        const TRANSPORT_SECRET: &str = "https://reviewer.invalid/?token=raw-secret";
         let fake = FakeTransport::sequence(vec![
-            Err(ReviewerTransportError::Transient("boom".to_owned())),
-            Err(ReviewerTransportError::Transient("boom".to_owned())),
+            Err(ReviewerTransportError::Transient(
+                TRANSPORT_SECRET.to_owned(),
+            )),
+            Err(ReviewerTransportError::Transient(
+                TRANSPORT_SECRET.to_owned(),
+            )),
             Ok(allow_json()),
         ]);
         let reviewer = make_reviewer(fake.clone());
@@ -1086,6 +1170,14 @@ mod tests {
             .await;
         assert!(matches!(outcome, ReviewOutcome::Allow(_)));
         assert_eq!(fake.called_count(), 3);
+        assert!(
+            fake.log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .all(|prompt| !prompt.contains(TRANSPORT_SECRET)),
+            "transport errors must remain internal and never enter a retry prompt"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
