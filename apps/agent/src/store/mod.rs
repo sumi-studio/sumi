@@ -36,7 +36,7 @@ use uuid::Uuid;
 
 use crate::provider::types::{
     ApiProtocol, ContextMessage, Message, ProviderContextItem, ProviderContextPayload,
-    PublicMessage,
+    PublicMessage, validate_native_suffix,
 };
 use crate::runtime::contracts::{
     GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease,
@@ -390,7 +390,9 @@ impl Store {
             let interrupted: i64 = row.try_get("interrupted")?;
             let interrupted = interrupted != 0;
 
-            let key = self.load_hydration_key(&mut key_cache, &key_ref).await?;
+            let key = self
+                .load_hydration_key(&mut key_cache, &key_ref, DataKeyPurpose::Transcript)
+                .await?;
             let ciphertext: Vec<u8> = row.try_get("raw_ciphertext")?;
             let aad = self
                 .scope
@@ -465,7 +467,9 @@ impl Store {
             let stored_eviction_estimator_version: i64 =
                 row.try_get("eviction_estimator_version")?;
 
-            let key = self.load_hydration_key(&mut key_cache, &key_ref).await?;
+            let key = self
+                .load_hydration_key(&mut key_cache, &key_ref, DataKeyPurpose::ProviderContext)
+                .await?;
             let ciphertext: Vec<u8> = row.try_get("ciphertext")?;
             let aad = self
                 .scope
@@ -581,24 +585,37 @@ impl Store {
                             "provider-context record {id} encrypted reasoning is missing an anchor"
                         )
                     })?;
-                    let anchor_ok =
-                        seq_to_message
-                            .get(&anchor.message_seq)
-                            .is_some_and(|message| {
-                                matches!(
-                                    message,
-                                    ContextMessage::Persisted {
-                                        id,
-                                        message: Message::Assistant(_),
-                                        ..
-                                    } if id == &anchor.message_id
-                                )
-                            });
-                    if !anchor_ok {
-                        bail!(
-                            "provider-context record {id} anchor {}:{} does not resolve to a persisted assistant message",
+                    let anchor_message = seq_to_message.get(&anchor.message_seq).ok_or_else(|| {
+                        anyhow!(
+                            "provider-context record {id} anchor {}:{} does not resolve to a persisted message",
                             anchor.message_id,
                             anchor.message_seq
+                        )
+                    })?;
+                    let (id, assistant) = match anchor_message {
+                        ContextMessage::Persisted {
+                            id,
+                            message: Message::Assistant(assistant),
+                            ..
+                        } => (id, assistant),
+                        _ => {
+                            bail!(
+                                "provider-context record {id} anchor {}:{} does not resolve to a persisted assistant message",
+                                anchor.message_id,
+                                anchor.message_seq
+                            );
+                        }
+                    };
+                    if id != &anchor.message_id {
+                        bail!(
+                            "provider-context record {id} anchor {}:{} resolves to a different message id",
+                            anchor.message_id,
+                            anchor.message_seq
+                        );
+                    }
+                    if assistant.origin != item.provider_origin {
+                        bail!(
+                            "provider-context record {id} provider_origin does not match the anchored assistant origin"
                         );
                     }
                 }
@@ -627,6 +644,9 @@ impl Store {
                             "provider-context record {id} context_fingerprint does not match decrypted payload"
                         );
                     }
+                    validate_native_suffix(messages, coverage.through_message_seq).map_err(
+                        |message| anyhow!("provider-context record {id} failed native suffix validation: {message}"),
+                    )?;
                 }
                 ProviderContextPayload::EncryptedReasoning { .. } => {
                     if stored_coverage_seq.is_some() || stored_fingerprint.is_some() {
@@ -838,14 +858,29 @@ impl Store {
         &self,
         cache: &mut HashMap<String, Arc<DataKeyMaterial>>,
         key_ref: &str,
+        expected_purpose: DataKeyPurpose,
     ) -> Result<Arc<DataKeyMaterial>> {
         if let Some(key) = cache.get(key_ref) {
+            if key.purpose != expected_purpose {
+                bail!(
+                    "hydration data key {key_ref} has purpose {}, expected {}",
+                    key.purpose.as_str(),
+                    expected_purpose.as_str()
+                );
+            }
             return Ok(key.clone());
         }
         let key = self
             .data_key_by_ref(key_ref)
             .await
             .with_context(|| format!("failed to load hydration data key {key_ref}"))?;
+        if key.purpose != expected_purpose {
+            bail!(
+                "hydration data key {key_ref} has purpose {}, expected {}",
+                key.purpose.as_str(),
+                expected_purpose.as_str()
+            );
+        }
         let key = Arc::new(key);
         cache.insert(key_ref.to_owned(), key.clone());
         Ok(key)
@@ -2220,6 +2255,74 @@ mod tests {
             error
                 .to_string()
                 .contains("approval projection uses an unsupported redaction version")
+        );
+    }
+
+    #[tokio::test]
+    async fn hydration_key_lookup_rejects_wrong_purpose() {
+        let store = store().await;
+        let transcript_key = store
+            .conversation_key(DataKeyPurpose::Transcript)
+            .await
+            .expect("mint transcript key");
+
+        let mut cache = HashMap::new();
+        let error = store
+            .load_hydration_key(
+                &mut cache,
+                &transcript_key.key_ref,
+                DataKeyPurpose::ProviderContext,
+            )
+            .await
+            .expect_err("provider-context purpose lookup for a transcript key must fail");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("has purpose") && message.contains("expected provider_context"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_context_fk_prevents_message_delete_cascade() {
+        let store = store().await;
+        let key = store
+            .conversation_key(DataKeyPurpose::Transcript)
+            .await
+            .expect("mint transcript key for provider_context row");
+
+        sqlx::query(
+            "INSERT INTO messages(
+                id, seq, role, raw_key_ref, raw_ciphertext, payload, search_text,
+                redaction_version, interrupted, created_at
+             ) VALUES('msg-fk', 1, 'user', ?, X'00', '{}', '', 1, 0, 'now')",
+        )
+        .bind(&key.key_ref)
+        .execute(store.pool())
+        .await
+        .expect("seed message");
+
+        sqlx::query(
+            "INSERT INTO provider_context(
+                id, message_id, message_seq, wire_item_index, item_ordinal,
+                idempotency_key, provider_instance_id, protocol, model, kind,
+                coverage_through_seq, context_fingerprint, key_ref, ciphertext,
+                eviction_tokens, eviction_estimator_version, created_at
+             ) VALUES('pc-fk', 'msg-fk', 1, NULL, 0, 'idem', 'inst', 'protocol',
+                     'model', 'kind', NULL, NULL, ?, X'00', 0, 1, 'now')",
+        )
+        .bind(&key.key_ref)
+        .execute(store.pool())
+        .await
+        .expect("seed provider_context row");
+
+        let error = sqlx::query("DELETE FROM messages WHERE id = 'msg-fk'")
+            .execute(store.pool())
+            .await
+            .expect_err("deleting a referenced message must fail with a foreign key constraint");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("FOREIGN KEY") || message.contains("787"),
+            "{message}"
         );
     }
 }

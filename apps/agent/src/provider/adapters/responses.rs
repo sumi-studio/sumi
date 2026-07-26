@@ -1239,49 +1239,11 @@ fn prepare_native_window(
             .map_err(|error| format!("invalid native compacted window item: {error}"))?;
         validated.push(item.clone());
     }
-    validate_native_suffix(&context.messages, coverage.through_message_seq)?;
+    crate::provider::types::validate_native_suffix(
+        &context.messages,
+        coverage.through_message_seq,
+    )?;
     Ok(Some((coverage.through_message_seq, validated)))
-}
-
-fn validate_native_suffix(messages: &[ContextMessage], coverage: u64) -> Result<(), String> {
-    let mut persisted_started = false;
-    let mut previous = None;
-    let mut suffix_started = false;
-    for message in messages {
-        let ContextMessage::Persisted { seq, .. } = message else {
-            if persisted_started {
-                return Err(
-                    "native suffix contains synthetic content after persisted history".into(),
-                );
-            }
-            continue;
-        };
-        persisted_started = true;
-        if *seq == 0 || previous.is_some_and(|value: u64| value.checked_add(1) != Some(*seq)) {
-            return Err(
-                "persisted native replay sequence is gapped, duplicated, or reordered".into(),
-            );
-        }
-        if *seq > coverage {
-            if !suffix_started
-                && *seq != coverage.checked_add(1).ok_or("native coverage overflow")?
-            {
-                return Err("native suffix must begin exactly at coverage + 1".into());
-            }
-            suffix_started = true;
-        } else if suffix_started {
-            return Err("covered history appears after the native suffix".into());
-        }
-        previous = Some(*seq);
-    }
-    let max_seq = previous
-        .ok_or_else(|| "native compacted window requires persisted replay history".to_owned())?;
-    if coverage > max_seq {
-        return Err(
-            "native compacted window coverage exceeds the latest persisted message sequence".into(),
-        );
-    }
-    Ok(())
 }
 
 fn escape_memory_text(text: &str) -> String {
@@ -4526,6 +4488,12 @@ mod tests {
                         timestamp: Utc::now(),
                     }),
                 },
+                persisted_user(1),
+                persisted_user(2),
+                persisted_user(3),
+                persisted_user(4),
+                persisted_user(5),
+                persisted_user(6),
                 persisted_user(7),
                 persisted_user(8),
                 persisted_user(9),

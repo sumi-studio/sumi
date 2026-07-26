@@ -748,62 +748,8 @@ fn validate_native_replay(
             "native compaction context fingerprint mismatch".into(),
         ));
     }
-    validate_native_suffix(&context.messages, coverage.through_message_seq)
-}
-
-fn validate_native_suffix(
-    messages: &[ContextMessage],
-    coverage: u64,
-) -> Result<(), AnthropicAdapterError> {
-    let mut persisted_started = false;
-    let mut previous = None;
-    let mut suffix_started = false;
-    for message in messages {
-        let ContextMessage::Persisted { seq, .. } = message else {
-            if persisted_started {
-                return Err(AnthropicAdapterError::InvalidContext(
-                    "native compaction suffix contains synthetic content after persisted history"
-                        .into(),
-                ));
-            }
-            continue;
-        };
-        persisted_started = true;
-        if *seq == 0 || previous.is_some_and(|value: u64| value.checked_add(1) != Some(*seq)) {
-            return Err(AnthropicAdapterError::InvalidContext(
-                "persisted native replay sequence is gapped, duplicated, or reordered".into(),
-            ));
-        }
-        if *seq > coverage {
-            if !suffix_started
-                && *seq
-                    != coverage.checked_add(1).ok_or_else(|| {
-                        AnthropicAdapterError::InvalidContext("native coverage overflow".into())
-                    })?
-            {
-                return Err(AnthropicAdapterError::InvalidContext(
-                    "native suffix must begin exactly at coverage + 1".into(),
-                ));
-            }
-            suffix_started = true;
-        } else if suffix_started {
-            return Err(AnthropicAdapterError::InvalidContext(
-                "covered history appears after the native suffix".into(),
-            ));
-        }
-        previous = Some(*seq);
-    }
-    let max_seq = previous.ok_or_else(|| {
-        AnthropicAdapterError::InvalidContext(
-            "native compaction requires persisted replay history".into(),
-        )
-    })?;
-    if coverage > max_seq {
-        return Err(AnthropicAdapterError::InvalidContext(
-            "native compaction coverage exceeds the latest persisted message sequence".into(),
-        ));
-    }
-    Ok(())
+    crate::provider::types::validate_native_suffix(&context.messages, coverage.through_message_seq)
+        .map_err(AnthropicAdapterError::InvalidContext)
 }
 
 fn anthropic_user_content(content: &UserContent, supports_images: bool) -> Value {

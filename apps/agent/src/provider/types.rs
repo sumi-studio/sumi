@@ -882,6 +882,56 @@ pub struct ToolDefinition {
     pub parameters: Value,
 }
 
+/// Validate that `messages` form a valid native compaction replay suffix for `coverage`.
+/// All persisted messages must be contiguous from seq 1, with any leading synthetic
+/// messages allowed only before the first persisted message. The suffix (messages with
+/// seq > coverage) must start exactly at coverage + 1 and run contiguously to the end.
+pub fn validate_native_suffix(messages: &[ContextMessage], coverage: u64) -> Result<(), String> {
+    let mut persisted_started = false;
+    let mut previous: Option<u64> = None;
+    let mut suffix_started = false;
+    for message in messages {
+        let ContextMessage::Persisted { seq, .. } = message else {
+            if persisted_started {
+                return Err(
+                    "native suffix contains synthetic content after persisted history".into(),
+                );
+            }
+            continue;
+        };
+        persisted_started = true;
+        if *seq == 0 {
+            return Err("native replay sequence must start at seq 1, not 0".into());
+        }
+        if previous.is_none() && *seq != 1 {
+            return Err("native replay history must start at seq 1".into());
+        }
+        if previous.is_some_and(|value: u64| value.checked_add(1) != Some(*seq)) {
+            return Err(
+                "persisted native replay sequence is gapped, duplicated, or reordered".into(),
+            );
+        }
+        if *seq > coverage {
+            if !suffix_started
+                && *seq != coverage.checked_add(1).ok_or("native coverage overflow")?
+            {
+                return Err("native suffix must begin exactly at coverage + 1".into());
+            }
+            suffix_started = true;
+        } else if suffix_started {
+            return Err("covered history appears after the native suffix".into());
+        }
+        previous = Some(*seq);
+    }
+    let max_seq = previous.ok_or("native compaction requires persisted replay history")?;
+    if coverage > max_seq {
+        return Err(
+            "native compaction coverage exceeds the latest persisted message sequence".into(),
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone;
@@ -1697,5 +1747,46 @@ mod tests {
 
         assert_eq!(usage.input, u64::MAX);
         assert_eq!(usage.total_tokens, u64::MAX);
+    }
+
+    #[test]
+    fn validate_native_suffix_rejects_first_persisted_seq_not_one() {
+        let messages = vec![
+            ContextMessage::Persisted {
+                id: "m-2".to_owned(),
+                seq: 2,
+                message: Message::Assistant(assistant_message()),
+            },
+            ContextMessage::Persisted {
+                id: "m-3".to_owned(),
+                seq: 3,
+                message: Message::Assistant(assistant_message()),
+            },
+        ];
+        let error = validate_native_suffix(&messages, 1).expect_err("seq 2 start must fail");
+        assert!(
+            error.contains("must start at seq 1"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn validate_native_suffix_accepts_leading_synthetic_then_seq_one() {
+        let messages = vec![
+            ContextMessage::Synthetic {
+                message: Message::Assistant(assistant_message()),
+            },
+            ContextMessage::Persisted {
+                id: "m-1".to_owned(),
+                seq: 1,
+                message: Message::Assistant(assistant_message()),
+            },
+            ContextMessage::Persisted {
+                id: "m-2".to_owned(),
+                seq: 2,
+                message: Message::Assistant(assistant_message()),
+            },
+        ];
+        validate_native_suffix(&messages, 1).expect("leading synthetic + seq 1 start must pass");
     }
 }

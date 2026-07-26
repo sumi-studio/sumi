@@ -443,11 +443,12 @@ fn stable_intent_bytes(full: &FullIntent) -> Vec<u8> {
 }
 
 /// Returns whether the authenticated `expected_latest_id` witness is consistent
-/// with the current replace head.  An absent witness is allowed; a present
-/// witness must match the head's latest insert id.
+/// with the current replace head.  An absent head is always consistent (there is
+/// no contradictory current insert); a present head is consistent when the
+/// witness is absent or matches the head's latest insert id.
 fn expected_latest_matches_head(full: &FullIntent, head: Option<&(i64, i64, String)>) -> bool {
     match head {
-        None => full.expected_latest_id.is_none(),
+        None => true,
         Some((_, _, head_id)) => full
             .expected_latest_id
             .as_ref()
@@ -1067,6 +1068,13 @@ impl<'a> ProviderContextMutationApplier<'a> {
                     .map(|_| ApplyOutcome::Superseded {
                         reason: "newer_replace".to_owned(),
                     });
+            }
+
+            if let Some(expected) = &full.expected_latest_id
+                && expected != &full.provider_context_id
+                && !full.invalidate_ids.contains(expected)
+            {
+                bail!("Replace expected_latest_id must be included in invalidate_ids");
             }
 
             let candidate_gen = sqlite_i64(full.config_generation, "config_generation")?;
@@ -2174,6 +2182,14 @@ mod tests {
         }
     }
 
+    fn openai_responses_origin_with_model(model: &str) -> ProviderOrigin {
+        ProviderOrigin {
+            provider_instance_id: "provider-instance-1".to_owned(),
+            protocol: ApiProtocol::OpenAiResponses,
+            model: model.to_owned(),
+        }
+    }
+
     #[tokio::test]
     async fn compaction_idempotency_key_is_request_coverage_fingerprint() {
         let store = store().await;
@@ -2562,8 +2578,8 @@ mod tests {
     #[tokio::test]
     async fn hydrate_uses_canonical_order_by_coverage_and_id() {
         let store = store().await;
-        seed_message(&store, "message-5", 5).await.unwrap();
-        seed_message(&store, "message-7", 7).await.unwrap();
+        seed_message(&store, "message-1", 1).await.unwrap();
+        seed_message(&store, "message-2", 2).await.unwrap();
 
         let key = store
             .provider_context_key(&ProviderContextKeyAnchor {
@@ -2581,7 +2597,7 @@ mod tests {
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({"summary": "a"})],
                 coverage: NativeCompactionCoverage {
-                    through_message_seq: 5,
+                    through_message_seq: 1,
                     context_fingerprint: "fp-a".to_owned(),
                 },
             },
@@ -2599,20 +2615,22 @@ mod tests {
         .expect("encrypt later compaction");
         later.insert(store.pool()).await.unwrap();
 
+        // A different model keeps this a distinct native-compaction scope so the
+        // active-native-window unique index is respected while still testing sort order.
         item.ordinal = 2;
+        item.provider_origin = openai_responses_origin_with_model("model-2");
         item.payload = ProviderContextPayload::OpenAiCompactedWindow {
             items: vec![json!({"summary": "b"})],
             coverage: NativeCompactionCoverage {
-                through_message_seq: 7,
+                through_message_seq: 2,
                 context_fingerprint: "fp-b".to_owned(),
             },
         };
-        item.provider_origin = openai_responses_origin();
         let earlier_reasoning = EncryptedProviderContextRecord::encrypt(
             &item,
             "provider-instance-1",
             ApiProtocol::OpenAiResponses,
-            "model-1",
+            "model-2",
             "pc-earlier",
             provider_context_idempotency_key("message-1", &item),
             &key,
@@ -2624,13 +2642,13 @@ mod tests {
         let origin = openai_responses_origin();
         let messages = vec![
             ContextMessage::Persisted {
-                id: "message-5".to_owned(),
-                seq: 5,
+                id: "message-1".to_owned(),
+                seq: 1,
                 message: assistant_message(origin.clone()),
             },
             ContextMessage::Persisted {
-                id: "message-7".to_owned(),
-                seq: 7,
+                id: "message-2".to_owned(),
+                seq: 2,
                 message: assistant_message(origin),
             },
         ];
@@ -2646,10 +2664,10 @@ mod tests {
             }
             _ => panic!("expected OpenAI compacted window"),
         };
-        assert_eq!(coverage_seq(&hydrated[0]), 5);
+        assert_eq!(coverage_seq(&hydrated[0]), 1);
         assert_eq!(
             coverage_seq(&hydrated[1]),
-            7,
+            2,
             "higher coverage seq must sort after lower coverage seq"
         );
     }
@@ -2657,9 +2675,10 @@ mod tests {
     #[tokio::test]
     async fn hydrate_orders_native_compaction_before_anchored_reasoning_by_coverage() {
         let store = store().await;
-        seed_message(&store, "message-7", 7).await.unwrap();
+        seed_message(&store, "message-1", 1).await.unwrap();
+        seed_message(&store, "message-2", 2).await.unwrap();
 
-        // Native compaction covering seq 5.
+        // Native compaction covering seq 1; suffix begins at seq 2.
         let compaction_key = store
             .provider_context_key(&ProviderContextKeyAnchor {
                 conversation_id: store.scope().conversation_id.clone(),
@@ -2676,8 +2695,8 @@ mod tests {
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({"summary": "compacted"})],
                 coverage: NativeCompactionCoverage {
-                    through_message_seq: 5,
-                    context_fingerprint: "fp-5".to_owned(),
+                    through_message_seq: 1,
+                    context_fingerprint: "fp-1".to_owned(),
                 },
             },
         };
@@ -2694,16 +2713,22 @@ mod tests {
         .expect("encrypt compaction");
         compaction.insert(store.pool()).await.unwrap();
 
-        // Anchored reasoning at seq 7.
-        let reasoning = reasoning_record_with(&store, "message-7", 7, "pc-reasoning", 0, 1).await;
+        // Anchored reasoning at seq 2.
+        let reasoning = reasoning_record_with(&store, "message-2", 2, "pc-reasoning", 0, 1).await;
         reasoning.insert(store.pool()).await.unwrap();
 
-        let origin = openai_responses_origin();
-        let messages = vec![ContextMessage::Persisted {
-            id: "message-7".to_owned(),
-            seq: 7,
-            message: assistant_message(origin),
-        }];
+        let messages = vec![
+            ContextMessage::Persisted {
+                id: "message-1".to_owned(),
+                seq: 1,
+                message: assistant_message(reasoning_origin()),
+            },
+            ContextMessage::Persisted {
+                id: "message-2".to_owned(),
+                seq: 2,
+                message: assistant_message(reasoning_origin()),
+            },
+        ];
 
         let hydrated = store
             .hydrate_provider_context(&messages)
@@ -3126,6 +3151,283 @@ mod tests {
         let message = format!("{error:#}");
         assert!(
             message.contains("uses unsupported eviction estimator version"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_reasoning_with_mismatched_assistant_origin() {
+        let store = store().await;
+        seed_message(&store, "message-1", 7).await.unwrap();
+
+        let record = reasoning_record(&store, "message-1", 7, "pc-1").await;
+        record.insert(store.pool()).await.unwrap();
+
+        // The reasoning record was bound to reasoning_origin(); supply an assistant
+        // message whose origin differs so P1-1 authentication is violated.
+        let mut wrong_origin = reasoning_origin();
+        wrong_origin.model = "different-model".to_owned();
+        let messages = vec![ContextMessage::Persisted {
+            id: "message-1".to_owned(),
+            seq: 7,
+            message: assistant_message(wrong_origin),
+        }];
+
+        let error = store
+            .hydrate_provider_context(&messages)
+            .await
+            .expect_err("hydration must reject reasoning with mismatched assistant origin");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("provider_origin does not match the anchored assistant origin"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_native_window_is_unique_per_origin_scope() {
+        let store = store().await;
+        seed_message(&store, "message-1", 1).await.unwrap();
+
+        let key = store
+            .provider_context_key(&ProviderContextKeyAnchor {
+                conversation_id: store.scope().conversation_id.clone(),
+                anchor_id: "native:0".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let item = ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 1,
+            provider_origin: openai_responses_origin(),
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({"summary": "first"})],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 1,
+                    context_fingerprint: "fp-1".to_owned(),
+                },
+            },
+        };
+        let first = EncryptedProviderContextRecord::encrypt(
+            &item,
+            "provider-instance-1",
+            ApiProtocol::OpenAiResponses,
+            "model-1",
+            "pc-first",
+            provider_context_idempotency_key("request-1", &item),
+            &key,
+            store.scope(),
+        )
+        .expect("encrypt first window");
+        first.insert(store.pool()).await.unwrap();
+
+        let mut second_item = item.clone();
+        second_item.payload = ProviderContextPayload::OpenAiCompactedWindow {
+            items: vec![json!({"summary": "second"})],
+            coverage: NativeCompactionCoverage {
+                through_message_seq: 1,
+                context_fingerprint: "fp-2".to_owned(),
+            },
+        };
+        let second = EncryptedProviderContextRecord::encrypt(
+            &second_item,
+            "provider-instance-1",
+            ApiProtocol::OpenAiResponses,
+            "model-1",
+            "pc-second",
+            provider_context_idempotency_key("request-2", &second_item),
+            &key,
+            store.scope(),
+        )
+        .expect("encrypt second window");
+        let error = second
+            .insert(store.pool())
+            .await
+            .expect_err("second active native window for the same origin scope must fail");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("UNIQUE")
+                || message.contains("idx_provider_context_active_native_window"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_is_idempotent_when_replace_head_row_disappeared() {
+        let store = store().await;
+        seed_message(&store, "message-1", 7).await.unwrap();
+
+        let applier = ProviderContextMutationApplier::new(&store);
+        let scope = store.scope().clone();
+
+        let a = reasoning_record(&store, "message-1", 7, "pc-a").await;
+        let intent_a = ProviderContextMutationBuilder::new(
+            store
+                .conversation_key(DataKeyPurpose::Mutation)
+                .await
+                .expect("mint mutation key"),
+            scope.clone(),
+            "replace-a".to_owned(),
+        )
+        .build_replace(None, vec![], &a, &reasoning_item("message-1", 7), 1, 1)
+        .expect("build replace-a");
+        applier.prepare(&intent_a).await.unwrap();
+        assert_eq!(
+            applier.apply("replace-a").await.unwrap(),
+            ApplyOutcome::Applied
+        );
+
+        // Simulate a crash that left the provider_context row gone but a stale
+        // expected_latest_id witness in a retry intent by deleting the head bookkeeping.
+        sqlx::query("DELETE FROM provider_context_replace_heads")
+            .execute(store.pool())
+            .await
+            .expect("delete replace head row");
+
+        let b = reasoning_record(&store, "message-1", 7, "pc-b").await;
+        let intent_b = ProviderContextMutationBuilder::new(
+            store
+                .conversation_key(DataKeyPurpose::Mutation)
+                .await
+                .expect("mint mutation key"),
+            scope,
+            "replace-b".to_owned(),
+        )
+        .build_replace(
+            Some("pc-a".to_owned()),
+            vec!["pc-a".to_owned()],
+            &b,
+            &reasoning_item("message-1", 7),
+            2,
+            2,
+        )
+        .expect("build replace-b");
+        applier.prepare(&intent_b).await.unwrap();
+        assert_eq!(
+            applier.apply("replace-b").await.unwrap(),
+            ApplyOutcome::Applied,
+            "replace with a stale expected_latest_id must apply when the head row is absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_requires_expected_latest_id_in_invalidate_ids() {
+        let store = store().await;
+        seed_message(&store, "message-1", 7).await.unwrap();
+
+        let applier = ProviderContextMutationApplier::new(&store);
+        let scope = store.scope().clone();
+
+        let a = reasoning_record(&store, "message-1", 7, "pc-a").await;
+        let intent_a = ProviderContextMutationBuilder::new(
+            store
+                .conversation_key(DataKeyPurpose::Mutation)
+                .await
+                .expect("mint mutation key"),
+            scope.clone(),
+            "replace-a".to_owned(),
+        )
+        .build_replace(None, vec![], &a, &reasoning_item("message-1", 7), 1, 1)
+        .expect("build replace-a");
+        applier.prepare(&intent_a).await.unwrap();
+        assert_eq!(
+            applier.apply("replace-a").await.unwrap(),
+            ApplyOutcome::Applied
+        );
+
+        let b = reasoning_record(&store, "message-1", 7, "pc-b").await;
+        let intent_b = ProviderContextMutationBuilder::new(
+            store
+                .conversation_key(DataKeyPurpose::Mutation)
+                .await
+                .expect("mint mutation key"),
+            scope,
+            "replace-b".to_owned(),
+        )
+        .build_replace(
+            Some("pc-a".to_owned()),
+            vec![], // missing the expected witness in invalidate_ids
+            &b,
+            &reasoning_item("message-1", 7),
+            2,
+            2,
+        )
+        .expect("build replace-b");
+        applier.prepare(&intent_b).await.unwrap();
+        let error = applier
+            .apply("replace-b")
+            .await
+            .expect_err("replace with expected_latest_id missing from invalidate_ids must fail");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("expected_latest_id must be included in invalidate_ids"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_gapped_native_compaction_suffix() {
+        let store = store().await;
+        seed_message(&store, "message-1", 1).await.unwrap();
+        seed_message(&store, "message-3", 3).await.unwrap();
+
+        let key = store
+            .provider_context_key(&ProviderContextKeyAnchor {
+                conversation_id: store.scope().conversation_id.clone(),
+                anchor_id: "native:0".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let item = ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 1,
+            provider_origin: openai_responses_origin(),
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({"summary": "compacted"})],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 1,
+                    context_fingerprint: "fp-1".to_owned(),
+                },
+            },
+        };
+        let compaction = EncryptedProviderContextRecord::encrypt(
+            &item,
+            "provider-instance-1",
+            ApiProtocol::OpenAiResponses,
+            "model-1",
+            "pc-gap",
+            provider_context_idempotency_key("request-1", &item),
+            &key,
+            store.scope(),
+        )
+        .expect("encrypt compaction");
+        compaction.insert(store.pool()).await.unwrap();
+
+        let origin = openai_responses_origin();
+        let messages = vec![
+            ContextMessage::Persisted {
+                id: "message-1".to_owned(),
+                seq: 1,
+                message: assistant_message(origin.clone()),
+            },
+            ContextMessage::Persisted {
+                id: "message-3".to_owned(),
+                seq: 3,
+                message: assistant_message(origin),
+            },
+        ];
+
+        let error = store
+            .hydrate_provider_context(&messages)
+            .await
+            .expect_err("hydration must reject gapped native compaction suffix");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("gapped, duplicated, or reordered"),
             "{message}"
         );
     }

@@ -8,7 +8,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -700,10 +700,12 @@ impl<'a> PhysicalRecoveryApplier<'a> {
         .bind(last)
         .fetch_all(&mut **transaction)
         .await?;
-        let mut starts = BTreeSet::<String>::new();
-        let mut ends = BTreeSet::<String>::new();
+        let mut starts = BTreeMap::<String, u64>::new();
+        let mut ends = BTreeMap::<String, u64>::new();
         for row in rows {
             let seq: i64 = row.try_get("seq")?;
+            let seq = u64::try_from(seq)
+                .with_context(|| format!("recovery suffix event seq {seq} is out of u64 range"))?;
             let event_type: String = row.try_get("event_type")?;
             let envelope: serde_json::Value = serde_json::from_str(row.try_get("envelope")?)?;
             match event_type.as_str() {
@@ -716,9 +718,7 @@ impl<'a> PhysicalRecoveryApplier<'a> {
                         })?;
                     if !expected_tools.contains(tool)
                         || !receipt.intents.iter().any(|intent| {
-                            intent.tool_call_id == tool
-                                && intent.indeterminate_terminal_seq
-                                    == u64::try_from(seq).unwrap_or_default()
+                            intent.tool_call_id == tool && intent.indeterminate_terminal_seq == seq
                         })
                     {
                         bail!("recovery suffix contains an unrelated tool terminal event");
@@ -740,18 +740,29 @@ impl<'a> PhysicalRecoveryApplier<'a> {
                     if !expected_tools.contains(tool) {
                         bail!("recovery suffix contains a result for an unrelated tool");
                     }
-                    if event_type == "message_start" {
-                        starts.insert(tool.to_owned());
+                    let map = if event_type == "message_start" {
+                        &mut starts
                     } else {
-                        ends.insert(tool.to_owned());
+                        &mut ends
+                    };
+                    if map.insert(tool.to_owned(), seq).is_some() {
+                        bail!("recovery suffix contains duplicate {event_type} for tool {tool}");
                     }
                 }
                 "turn_end" | "agent_end" => {}
                 _ => bail!("recovery suffix contains unrelated event type {event_type}"),
             }
         }
-        if starts.len() != expected_tools.len() || ends.len() != expected_tools.len() {
-            bail!("recovery suffix is missing a tool-result MessageStart/MessageEnd pair");
+        for tool in expected_tools {
+            let start = starts.get(tool).ok_or_else(|| {
+                anyhow::anyhow!("recovery suffix is missing a MessageStart for tool {tool}")
+            })?;
+            let end = ends.get(tool).ok_or_else(|| {
+                anyhow::anyhow!("recovery suffix is missing a MessageEnd for tool {tool}")
+            })?;
+            if start >= end {
+                bail!("recovery suffix MessageStart must precede MessageEnd for tool {tool}");
+            }
         }
         Ok(())
     }
@@ -1063,5 +1074,188 @@ mod tests {
         assert_eq!(intents.len(), 1);
         assert_eq!(intents[0].tool_call_id, tool_call_id);
         assert_eq!(intents[0].executor_generation, test_lease(1).generation());
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_message_start_for_tool() {
+        let store = test_store().await;
+        let first_seq = 10u64;
+        let last_seq = 13u64;
+        let terminal_seq = 13u64;
+
+        let key = store
+            .conversation_key(DataKeyPurpose::Event)
+            .await
+            .expect("mint event key");
+
+        for (seq, event_type, envelope) in [
+            (
+                first_seq,
+                "message_start",
+                r#"{"type":"message_start","message":{"role":"tool_result","tool_call_id":"tool-call-1"}}"#,
+            ),
+            (
+                11u64,
+                "message_start",
+                r#"{"type":"message_start","message":{"role":"tool_result","tool_call_id":"tool-call-1"}}"#,
+            ),
+            (
+                12u64,
+                "message_end",
+                r#"{"type":"message_end","message":{"role":"tool_result","tool_call_id":"tool-call-1"}}"#,
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO agent_events(
+                    seq, event_type, internal_metadata, raw_key_ref, raw_ciphertext,
+                    envelope, redaction_version, created_at
+                 ) VALUES(?, ?, '{}', ?, X'00', ?, 1, ?)",
+            )
+            .bind(sqlite_i64(seq, "seed event seq").unwrap())
+            .bind(event_type)
+            .bind(&key.key_ref)
+            .bind(envelope)
+            .bind(Utc::now().to_rfc3339())
+            .execute(store.pool())
+            .await
+            .expect("seed event row");
+        }
+        sqlx::query(
+            "INSERT INTO agent_events(
+                seq, event_type, internal_metadata, raw_key_ref, raw_ciphertext,
+                envelope, redaction_version, created_at
+             ) VALUES(?, 'tool_execution_end', ?, ?, X'00', ?, 1, ?)",
+        )
+        .bind(sqlite_i64(terminal_seq, "terminal event seq").unwrap())
+        .bind(r#"{"tool_state":"indeterminate","tool_error_code":"indeterminate"}"#)
+        .bind(&key.key_ref)
+        .bind(r#"{"type":"tool_execution_end","tool_call_id":"tool-call-1","result":{},"is_error":true}"#)
+        .bind(Utc::now().to_rfc3339())
+        .execute(store.pool())
+        .await
+        .expect("seed terminal event row");
+
+        sqlx::query(
+            "INSERT INTO tool_executions(
+                tool_call_id, command_id, run_id, executor_generation, state,
+                idempotency_key, started_at, finished_at, error_code
+             ) VALUES(?, 'command-1', 'run-1', 1, 'running', 'idem-1', ?, NULL, NULL)",
+        )
+        .bind("tool-call-1")
+        .bind(Utc::now().to_rfc3339())
+        .execute(store.pool())
+        .await
+        .expect("seed tool execution");
+
+        let lease = test_lease(1);
+        let fence = test_fence(&lease);
+        let r = receipt(
+            &lease,
+            &fence,
+            first_seq,
+            last_seq,
+            "tool-call-1",
+            terminal_seq,
+        );
+
+        let applier = PhysicalRecoveryApplier::new(&store);
+        let error = applier
+            .apply(&r)
+            .await
+            .expect_err("duplicate start must fail");
+        assert!(
+            error.to_string().contains("duplicate message_start"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_message_end_before_message_start_for_tool() {
+        let store = test_store().await;
+        let first_seq = 10u64;
+        let last_seq = 12u64;
+        let terminal_seq = 12u64;
+
+        let key = store
+            .conversation_key(DataKeyPurpose::Event)
+            .await
+            .expect("mint event key");
+
+        for (seq, event_type, envelope) in [
+            (
+                first_seq,
+                "message_end",
+                r#"{"type":"message_end","message":{"role":"tool_result","tool_call_id":"tool-call-1"}}"#,
+            ),
+            (
+                11u64,
+                "message_start",
+                r#"{"type":"message_start","message":{"role":"tool_result","tool_call_id":"tool-call-1"}}"#,
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO agent_events(
+                    seq, event_type, internal_metadata, raw_key_ref, raw_ciphertext,
+                    envelope, redaction_version, created_at
+                 ) VALUES(?, ?, '{}', ?, X'00', ?, 1, ?)",
+            )
+            .bind(sqlite_i64(seq, "seed event seq").unwrap())
+            .bind(event_type)
+            .bind(&key.key_ref)
+            .bind(envelope)
+            .bind(Utc::now().to_rfc3339())
+            .execute(store.pool())
+            .await
+            .expect("seed event row");
+        }
+        sqlx::query(
+            "INSERT INTO agent_events(
+                seq, event_type, internal_metadata, raw_key_ref, raw_ciphertext,
+                envelope, redaction_version, created_at
+             ) VALUES(?, 'tool_execution_end', ?, ?, X'00', ?, 1, ?)",
+        )
+        .bind(sqlite_i64(terminal_seq, "terminal event seq").unwrap())
+        .bind(r#"{"tool_state":"indeterminate","tool_error_code":"indeterminate"}"#)
+        .bind(&key.key_ref)
+        .bind(r#"{"type":"tool_execution_end","tool_call_id":"tool-call-1","result":{},"is_error":true}"#)
+        .bind(Utc::now().to_rfc3339())
+        .execute(store.pool())
+        .await
+        .expect("seed terminal event row");
+
+        sqlx::query(
+            "INSERT INTO tool_executions(
+                tool_call_id, command_id, run_id, executor_generation, state,
+                idempotency_key, started_at, finished_at, error_code
+             ) VALUES(?, 'command-1', 'run-1', 1, 'running', 'idem-1', ?, NULL, NULL)",
+        )
+        .bind("tool-call-1")
+        .bind(Utc::now().to_rfc3339())
+        .execute(store.pool())
+        .await
+        .expect("seed tool execution");
+
+        let lease = test_lease(1);
+        let fence = test_fence(&lease);
+        let r = receipt(
+            &lease,
+            &fence,
+            first_seq,
+            last_seq,
+            "tool-call-1",
+            terminal_seq,
+        );
+
+        let applier = PhysicalRecoveryApplier::new(&store);
+        let error = applier
+            .apply(&r)
+            .await
+            .expect_err("end before start must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("MessageStart must precede MessageEnd"),
+            "{error:#}"
+        );
     }
 }

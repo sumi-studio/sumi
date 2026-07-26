@@ -8381,12 +8381,23 @@ async fn apply_projection(
                 .await
                 .context("failed to locate memory batch for eviction footprint")?
             {
+                let delta = sqlite_i64(eviction_footprint_tokens, "eviction_footprint_tokens")?;
+                let current: i64 = sqlx::query_scalar(
+                    "SELECT eviction_footprint_tokens FROM memory_batches WHERE id = ?",
+                )
+                .bind(&batch_id)
+                .fetch_one(&mut **transaction)
+                .await
+                .context("failed to read memory batch eviction footprint")?;
+                let new = current.checked_add(delta).ok_or_else(|| {
+                    anyhow::anyhow!("memory batch eviction_footprint_tokens overflow")
+                })?;
                 sqlx::query(
                     "UPDATE memory_batches
-                     SET eviction_footprint_tokens = eviction_footprint_tokens + ?
+                     SET eviction_footprint_tokens = ?
                      WHERE id = ?",
                 )
-                .bind(i64::try_from(eviction_footprint_tokens).unwrap_or(i64::MAX))
+                .bind(new)
                 .bind(batch_id)
                 .execute(&mut **transaction)
                 .await
@@ -9058,6 +9069,7 @@ mod tests {
     use sqlx::Row;
 
     use super::*;
+    use super::{L0Disposition, PreparedProjection, apply_projection};
     use crate::{
         agent::{
             AdmittedCommand, DurableRunBinding, ProjectedProviderEvent, ProviderEventProjector,
@@ -20565,8 +20577,7 @@ mod tests {
         assistant.origin.protocol = ApiProtocol::OpenAiResponses;
         let message_id = "assistant-reasoning-hydrate";
         // Persist deliberately out of wire order. Hydration must reconstruct
-        // canonical order by `(COALESCE(message_seq, coverage_through_seq), wire_item_index, item_ordinal, id)`
-        // and must leave native compaction unanchored.
+        // canonical order by `(COALESCE(message_seq, coverage_through_seq), wire_item_index, item_ordinal, id)`.
         let fragments = vec![
             ProviderContextFragment {
                 wire_item_index: Some(2),
@@ -20580,16 +20591,6 @@ mod tests {
                 payload: ProviderContextPayload::EncryptedReasoning {
                     protocol: ApiProtocol::OpenAiResponses,
                     item: json!({"encrypted_content": "opaque-earlier"}),
-                },
-            },
-            ProviderContextFragment {
-                wire_item_index: None,
-                payload: ProviderContextPayload::OpenAiCompactedWindow {
-                    items: vec![json!({"type": "compaction", "id": "cmp-hydrate"})],
-                    coverage: NativeCompactionCoverage {
-                        through_message_seq: 1,
-                        context_fingerprint: "hydrate-fingerprint".to_owned(),
-                    },
                 },
             },
         ];
@@ -20669,25 +20670,18 @@ mod tests {
                     matches!(assistant, ContextMessage::Persisted { message, .. } if matches!(message, Message::Assistant(_))),
                     "hydrated assistant must be an Assistant message"
                 );
-                assert_eq!(state.provider_context.len(), 3);
+                assert_eq!(state.provider_context.len(), 2);
                 assert_eq!(
                     state
                         .provider_context
                         .iter()
                         .map(|item| item.wire_item_index)
                         .collect::<Vec<_>>(),
-                    vec![None, Some(1), Some(2)],
-                    "native compaction with lower coverage seq must precede anchored reasoning (coverage-prefix order)"
+                    vec![Some(1), Some(2)],
+                    "anchored reasoning must be reconstructed in canonical wire order"
                 );
                 assert!(
-                    matches!(
-                        &state.provider_context[0].payload,
-                        ProviderContextPayload::OpenAiCompactedWindow { .. }
-                    ) && state.provider_context[0].origin_message.is_none(),
-                    "native compaction must not acquire an assistant anchor"
-                );
-                assert!(
-                    state.provider_context[1..].iter().all(|item| {
+                    state.provider_context.iter().all(|item| {
                         item.origin_message
                             .as_ref()
                             .is_some_and(|anchor| anchor.message_id == message_id)
@@ -21080,5 +21074,70 @@ mod tests {
                 .await
                 .expect("remove T17 fixture");
         }
+    }
+
+    #[tokio::test]
+    async fn message_end_eviction_footprint_overflow_fails_closed() {
+        let store = test_store().await;
+        let key = store
+            .conversation_key(DataKeyPurpose::Transcript)
+            .await
+            .expect("mint transcript key");
+
+        // Disable foreign keys on a dedicated connection before starting the
+        // transaction so we can seed a memory_batch_messages row referencing a
+        // message that will only be inserted by apply_projection.
+        use sqlx::Connection as _;
+        let mut conn = store.pool().acquire().await.expect("acquire connection");
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&mut *conn)
+            .await
+            .expect("disable FK check for setup");
+        let mut transaction = conn.begin().await.expect("begin transaction");
+
+        sqlx::query(
+            "INSERT INTO memory_batches(
+                id, layer, ord, batch_seq, version, state, est_tokens,
+                eviction_footprint_tokens, summary_key_ref, summary_ciphertext,
+                summary_projection, summary_redaction_version, updated_at
+             ) VALUES(?, 0, 0, 0, 1, 'open', 0, ?, NULL, NULL, NULL, NULL, ?)",
+        )
+        .bind("batch-1")
+        .bind(i64::MAX)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *transaction)
+        .await
+        .expect("seed batch at max footprint");
+
+        sqlx::query("INSERT INTO memory_batch_messages(batch_id, message_id, ord) VALUES(?, ?, 0)")
+            .bind("batch-1")
+            .bind("msg-1")
+            .execute(&mut *transaction)
+            .await
+            .expect("seed batch membership");
+
+        let projection = PreparedProjection::MessageEnd {
+            event_seq: 1,
+            message_id: "msg-1".to_owned(),
+            role: "assistant",
+            raw_key_ref: key.key_ref.clone(),
+            raw_key_proof: vec![],
+            raw_ciphertext: vec![0],
+            payload: "{}".to_owned(),
+            search_text: "".to_owned(),
+            redaction_version: 1,
+            interrupted: false,
+            l0_disposition: L0Disposition::Append,
+            provider_context: vec![],
+            provider_context_key_ref: None,
+            provider_context_key_proof: None,
+            eviction_footprint_tokens: 1,
+        };
+
+        let error = apply_projection(&store, &mut transaction, projection, &[])
+            .await
+            .expect_err("eviction footprint overflow must fail closed");
+        assert!(error.to_string().contains("overflow"), "{error:#}");
+        transaction.rollback().await.ok();
     }
 }

@@ -115,9 +115,17 @@ CREATE TABLE provider_context (
   CHECK (eviction_estimator_version >= 1),
   CHECK (message_id IS NOT NULL OR eviction_tokens = 0),
   UNIQUE(message_id, wire_item_index, item_ordinal),
-  FOREIGN KEY(message_id, message_seq) REFERENCES messages(id, seq) ON DELETE CASCADE,
+  FOREIGN KEY(message_id, message_seq) REFERENCES messages(id, seq),
   FOREIGN KEY(key_ref) REFERENCES data_keys(key_ref)
 );
+
+-- Native compaction windows must be unique per provider origin scope.
+-- A Replace invalidates the prior window within the same transaction, so the
+-- index is respected. Anchored reasoning rows (message_id IS NOT NULL) are
+-- governed by their own (message_id, wire_item_index, item_ordinal) uniqueness.
+CREATE UNIQUE INDEX idx_provider_context_active_native_window
+ON provider_context(provider_instance_id, protocol, model, kind)
+WHERE message_id IS NULL;
 
 CREATE TABLE agent_events (
   seq INTEGER PRIMARY KEY CHECK (seq >= 0),
