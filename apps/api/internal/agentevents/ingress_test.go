@@ -22,6 +22,7 @@ type fakeCommandAppender struct {
 
 type appendCall struct {
 	ConversationID string
+	IdempotencyKey string
 	Command        json.RawMessage
 }
 
@@ -35,11 +36,11 @@ func (errorReadCloser) Close() error {
 	return nil
 }
 
-func (f *fakeCommandAppender) Append(ctx context.Context, conversationID string, command json.RawMessage) (CommandEnvelope, error) {
+func (f *fakeCommandAppender) Append(ctx context.Context, conversationID string, idempotencyKey string, command json.RawMessage) (CommandEnvelope, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.nextSeq++
-	f.calls = append(f.calls, appendCall{ConversationID: conversationID, Command: command})
+	f.calls = append(f.calls, appendCall{ConversationID: conversationID, IdempotencyKey: idempotencyKey, Command: command})
 	return CommandEnvelope{
 		Seq:       f.nextSeq,
 		CommandID: fmt.Sprintf("00000000-0000-4000-8000-%012d", f.nextSeq),

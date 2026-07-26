@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -18,14 +19,38 @@ func main() {
 		port = "8080"
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", handler.Health)
-	mux.Handle("GET /agent/ws", wsHandler())
+	mux, err := newRouter()
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	log.Printf("sumi api listening on :%s", port)
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func newRouter() (*http.ServeMux, error) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", handler.Health)
+	mux.Handle("GET /agent/ws", wsHandler())
+
+	cmdDir := os.Getenv("SUMI_COMMAND_LOG_DIR")
+	if cmdDir == "" {
+		return nil, errors.New("SUMI_COMMAND_LOG_DIR not set")
+	}
+	store, err := agentevents.OpenCommandStore(cmdDir)
+	if err != nil {
+		return nil, fmt.Errorf("open command store: %w", err)
+	}
+	ingress, err := agentevents.NewUserCommandIngress(store)
+	if err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("create command ingress: %w", err)
+	}
+	mux.Handle("POST /conversations/{conversation_id}/commands", ingress)
+
+	return mux, nil
 }
 
 // wsHandler wires a real HMAC token verifier when SUMI_AGENT_TOKEN_SECRET is

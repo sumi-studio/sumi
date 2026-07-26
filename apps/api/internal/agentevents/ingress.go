@@ -37,7 +37,11 @@ type CommandAppender interface {
 	// command_id and seq for the conversation, then returns the persisted
 	// CommandEnvelope. Append is only called for payloads that have already
 	// passed the pre-sequence size/attachment/shape checks.
-	Append(ctx context.Context, conversationID string, command json.RawMessage) (CommandEnvelope, error)
+	//
+	// If idempotencyKey is non-empty, the appender returns the existing
+	// CommandEnvelope for that key when the same command bytes are resubmitted;
+	// a different body for the same key is a conflict and returns an error.
+	Append(ctx context.Context, conversationID string, idempotencyKey string, command json.RawMessage) (CommandEnvelope, error)
 }
 
 // UserCommandIngress is the HTTP handler for web → API user command admission.
@@ -86,15 +90,24 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	env, err := h.Appender.Append(r.Context(), conversationID, raw)
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	env, err := h.Appender.Append(r.Context(), conversationID, idempotencyKey, raw)
 	if err != nil {
+		// Idempotency conflicts are exposed as 409 so callers cannot
+		// accidentally mint a second command by retrying with a mutated body.
+		if isIdempotencyConflict(err) {
+			http.Error(w, "idempotency key conflict", http.StatusConflict)
+			return
+		}
 		http.Error(w, "command append failed", http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	_ = json.NewEncoder(w).Encode(env)
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(env)
 }
 
 func readLimitedBody(r io.Reader, limit int64) ([]byte, error) {
@@ -139,6 +152,15 @@ func validateUserCommand(raw []byte) (RejectReason, error) {
 
 	return "", nil
 }
+
+func isIdempotencyConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, errIdempotencyConflict)
+}
+
+var errIdempotencyConflict = errors.New("idempotency key conflict")
 
 func writeRejection(w http.ResponseWriter, reason RejectReason) {
 	w.Header().Set("Content-Type", "application/json")
