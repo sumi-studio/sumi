@@ -21138,6 +21138,13 @@ mod tests {
             .await
             .expect_err("eviction footprint overflow must fail closed");
         assert!(error.to_string().contains("overflow"), "{error:#}");
-        transaction.rollback().await.ok();
+        transaction
+            .rollback()
+            .await
+            .expect("rollback test fixture transaction");
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&mut *conn)
+            .await
+            .expect("re-enable FK checks after fixture teardown");
     }
 }
