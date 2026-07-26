@@ -22,7 +22,10 @@ use crate::{
         action::{CanonicalAction, SandboxSummary, SecretAwareActionProjector},
         policy::{ApprovalRule, Policy, PolicyDecision, ResolvedDecision, UserDecision},
         prompt::TrustedEnvironment,
-        reviewer::{ReviewOutcome, ReviewRequest, Reviewer, ReviewerMode},
+        reviewer::{
+            AuditDecision, ReviewOutcome, ReviewRequest, Reviewer, ReviewerMode, RiskLevel,
+            UserAuthorization,
+        },
     },
     gateway::ApprovalDecision as GatewayApprovalDecision,
     provider::types::{PublicMessage, ToolCall},
@@ -354,7 +357,23 @@ impl ApprovalBroker {
             receiver: rx,
         })
     }
+}
 
+/// Check that a reviewer `Allow` response is executable under the canonical
+/// risk/authorization contract. This is the single authoritative boundary;
+/// both cached and fresh `ReviewOutcome::Allow` values must pass it before an
+/// `ApprovalOutcome::Allowed` is ever produced.
+fn reviewer_allow_is_executable(decision: &AuditDecision) -> Result<(), String> {
+    if decision.risk == RiskLevel::Critical {
+        return Err("critical risk must deny".to_owned());
+    }
+    if decision.risk == RiskLevel::High && decision.authorization != UserAuthorization::High {
+        return Err("high risk requires high authorization".to_owned());
+    }
+    Ok(())
+}
+
+impl ApprovalBroker {
     async fn call_reviewer(
         &self,
         projection: &crate::approval::action::ReviewProjection,
@@ -386,7 +405,12 @@ impl ApprovalBroker {
         };
 
         match reviewer.review(request, cancel).await {
-            ReviewOutcome::Allow(_) => Ok(ApprovalOutcome::Allowed),
+            ReviewOutcome::Allow(decision) => match reviewer_allow_is_executable(&decision) {
+                Ok(()) => Ok(ApprovalOutcome::Allowed),
+                Err(constraint) => Ok(ApprovalOutcome::Denied {
+                    reason: format!("{constraint}: {}", decision.rationale),
+                }),
+            },
             ReviewOutcome::Deny(decision) => {
                 let reason = decision.rationale.clone();
                 Ok(ApprovalOutcome::Denied { reason })
@@ -432,12 +456,21 @@ fn to_events_projection(
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
     use serde_json::json;
     use tokio_util::sync::CancellationToken;
 
     use super::*;
     use crate::{
-        approval::action::SecretDigestKey, gateway::ApprovalDecision as GatewayApprovalDecision,
+        approval::{
+            action::SecretDigestKey,
+            prompt::ReviewerPrompt,
+            reviewer::{
+                Reviewer, ReviewerModelSpec, ReviewerTransport, ReviewerTransportError,
+                ReviewerTrustSet,
+            },
+        },
+        gateway::ApprovalDecision as GatewayApprovalDecision,
         store::Redactor,
     };
 
@@ -463,6 +496,62 @@ mod tests {
 
     fn broker() -> ApprovalBroker {
         ApprovalBroker::headless(Policy::new("/workspace"), projector())
+    }
+
+    fn trusted_env() -> TrustedEnvironment {
+        TrustedEnvironment {
+            workspace_root: "/workspace".to_owned(),
+            sandbox: SandboxSummary::workspace(),
+            denied_paths: Vec::new(),
+            denied_network_domains: Vec::new(),
+            repo_visibility: None,
+            git_status: None,
+        }
+    }
+
+    #[derive(Clone)]
+    struct StaticTransport {
+        response: String,
+    }
+
+    #[async_trait]
+    impl ReviewerTransport for StaticTransport {
+        async fn complete(
+            &self,
+            _prompt: &ReviewerPrompt,
+            _cancel: CancellationToken,
+        ) -> Result<String, ReviewerTransportError> {
+            Ok(self.response.clone())
+        }
+    }
+
+    fn reviewer_broker(response: &str, mode: ReviewerMode) -> ApprovalBroker {
+        let model = ReviewerModelSpec::new(
+            "reviewer-model",
+            "reviewer-provider",
+            "https://reviewer.example.test/v1",
+            "default",
+            "reviewer-domain",
+            "tenant-policy",
+        );
+        let trust = ReviewerTrustSet::new("reviewer-domain", Vec::new());
+        let transport = Arc::new(StaticTransport {
+            response: response.to_owned(),
+        });
+        let reviewer = Arc::new(Reviewer::new(
+            model,
+            trust,
+            transport,
+            Arc::new(projector()),
+        ));
+        ApprovalBroker::new(
+            Policy::new("/workspace"),
+            projector(),
+            Some(reviewer),
+            mode,
+            false,
+            trusted_env(),
+        )
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -685,5 +774,89 @@ mod tests {
             .await
             .expect("start_request");
         assert!(matches!(outcome2, ApprovalOutcome::Pending { .. }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn critical_allow_with_unknown_auth_is_denied() {
+        let broker = reviewer_broker(
+            r#"{"outcome":"allow","risk":"critical","authorization":"unknown","rationale":"user allowed"}"#,
+            ReviewerMode::AutoReview,
+        );
+        let outcome = broker
+            .start_request(
+                &bash_call("git status"),
+                &[],
+                "run-1",
+                "turn-1",
+                "v1",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("start_request");
+        assert!(
+            matches!(outcome, ApprovalOutcome::Denied { reason } if reason.contains("critical risk"))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn high_allow_with_unknown_auth_is_denied() {
+        let broker = reviewer_broker(
+            r#"{"outcome":"allow","risk":"high","authorization":"unknown","rationale":"user allowed"}"#,
+            ReviewerMode::AutoReview,
+        );
+        let outcome = broker
+            .start_request(
+                &bash_call("git status"),
+                &[],
+                "run-1",
+                "turn-1",
+                "v1",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("start_request");
+        assert!(
+            matches!(outcome, ApprovalOutcome::Denied { reason } if reason.contains("high authorization"))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn high_allow_with_high_auth_is_allowed() {
+        let broker = reviewer_broker(
+            r#"{"outcome":"allow","risk":"high","authorization":"high","rationale":"explicit"}"#,
+            ReviewerMode::AutoReview,
+        );
+        let outcome = broker
+            .start_request(
+                &bash_call("git status"),
+                &[],
+                "run-1",
+                "turn-1",
+                "v1",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("start_request");
+        assert!(matches!(outcome, ApprovalOutcome::Allowed));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn low_allow_with_unknown_auth_remains_allowed() {
+        let broker = reviewer_broker(
+            r#"{"outcome":"allow","risk":"low","authorization":"unknown","rationale":"harmless"}"#,
+            ReviewerMode::StrictAutoReview,
+        );
+        let outcome = broker
+            .start_request(
+                &read_file_call("notes.txt"),
+                &[],
+                "run-1",
+                "turn-1",
+                "v1",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("start_request");
+        assert!(matches!(outcome, ApprovalOutcome::Allowed));
     }
 }
