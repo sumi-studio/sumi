@@ -796,17 +796,30 @@ async fn event_forwarder(
     }
 }
 
+fn take_arrival_id(counter: &mut u64) -> u64 {
+    let id = *counter;
+    *counter = counter.checked_add(1).expect("arrival id overflow");
+    id
+}
+
 fn classify_frame(
     frame: OutboundFrame,
     online: bool,
     last_received: u64,
-    outbox: &mut VecDeque<OutboundFrame>,
-    pending_events: &mut BTreeMap<u64, OutboundFrame>,
+    next_arrival_id: &mut u64,
+    outbox: &mut VecDeque<(u64, OutboundFrame)>,
+    pending_events: &mut BTreeMap<u64, (u64, OutboundFrame)>,
 ) {
     match frame {
-        OutboundFrame::CommandAck { .. } => outbox.push_back(frame),
+        OutboundFrame::CommandAck { .. } => {
+            let id = take_arrival_id(next_arrival_id);
+            outbox.push_back((id, frame));
+        }
         OutboundFrame::Event { ref envelope } => match envelope.seq {
-            None if online => outbox.push_back(frame),
+            None if online => {
+                let id = take_arrival_id(next_arrival_id);
+                outbox.push_back((id, frame));
+            }
             None => {
                 // Volatile/delta events before Online are stale; drop them.
             }
@@ -814,13 +827,17 @@ fn classify_frame(
                 // Already delivered or already superseded by catch-up.
             }
             Some(seq) => {
-                pending_events.entry(seq).or_insert(frame);
+                let id = take_arrival_id(next_arrival_id);
+                pending_events.entry(seq).or_insert_with(|| (id, frame));
             }
         },
     }
 }
 
-fn prune_pending_events(pending_events: &mut BTreeMap<u64, OutboundFrame>, last_received: u64) {
+fn prune_pending_events(
+    pending_events: &mut BTreeMap<u64, (u64, OutboundFrame)>,
+    last_received: u64,
+) {
     let stale: Vec<u64> = pending_events
         .keys()
         .filter(|&&s| s <= last_received)
@@ -838,8 +855,9 @@ async fn send_with_interleave<W>(
     timeout: Duration,
     token: &CancellationToken,
     writer_rx: &mut mpsc::Receiver<OutboundFrame>,
-    outbox: &mut VecDeque<OutboundFrame>,
-    pending_events: &mut BTreeMap<u64, OutboundFrame>,
+    next_arrival_id: &mut u64,
+    outbox: &mut VecDeque<(u64, OutboundFrame)>,
+    pending_events: &mut BTreeMap<u64, (u64, OutboundFrame)>,
     last_received: u64,
     online: bool,
 ) -> Result<()>
@@ -854,7 +872,14 @@ where
             result = &mut send_fut => return result,
             frame = writer_rx.recv() => {
                 let Some(frame) = frame else { return Ok(()); };
-                classify_frame(frame, online, last_received, outbox, pending_events);
+                classify_frame(
+                    frame,
+                    online,
+                    last_received,
+                    next_arrival_id,
+                    outbox,
+                    pending_events,
+                );
             }
         }
     }
@@ -866,8 +891,9 @@ async fn drain_next<W>(
     timeout: Duration,
     token: &CancellationToken,
     writer_rx: &mut mpsc::Receiver<OutboundFrame>,
-    outbox: &mut VecDeque<OutboundFrame>,
-    pending_events: &mut BTreeMap<u64, OutboundFrame>,
+    next_arrival_id: &mut u64,
+    outbox: &mut VecDeque<(u64, OutboundFrame)>,
+    pending_events: &mut BTreeMap<u64, (u64, OutboundFrame)>,
     last_received: &mut u64,
     online: bool,
 ) -> Result<()>
@@ -876,13 +902,58 @@ where
 {
     loop {
         prune_pending_events(pending_events, *last_received);
-        if let Some(frame) = outbox.pop_front() {
+
+        if online {
+            // Sendable durable is the smallest seq still ahead of the watermark.
+            // Preserve producer order by comparing its arrival id with the earliest
+            // ack/volatile in the outbox and sending whichever arrived first.
+            if let Some((&seq, &(id, _))) = pending_events.first_key_value() {
+                if let Some(&(out_id, _)) = outbox.front()
+                    && out_id < id
+                {
+                    let (_, frame) = outbox.pop_front().expect("front just observed");
+                    send_with_interleave(
+                        writer,
+                        frame,
+                        timeout,
+                        token,
+                        writer_rx,
+                        next_arrival_id,
+                        outbox,
+                        pending_events,
+                        *last_received,
+                        online,
+                    )
+                    .await?;
+                    continue;
+                }
+                let (_, frame) = pending_events.remove(&seq).expect("key just observed");
+                *last_received = seq;
+                send_with_interleave(
+                    writer,
+                    frame,
+                    timeout,
+                    token,
+                    writer_rx,
+                    next_arrival_id,
+                    outbox,
+                    pending_events,
+                    *last_received,
+                    online,
+                )
+                .await?;
+                continue;
+            }
+        }
+
+        if let Some((_, frame)) = outbox.pop_front() {
             send_with_interleave(
                 writer,
                 frame,
                 timeout,
                 token,
                 writer_rx,
+                next_arrival_id,
                 outbox,
                 pending_events,
                 *last_received,
@@ -891,39 +962,19 @@ where
             .await?;
             continue;
         }
-        // Send the smallest queued durable event that is still ahead of the
-        // watermark. Normally this is last_received + 1; if a seq is missing
-        // the next present seq is forwarded so live delivery is not stalled.
-        if online
-            && let Some(&seq) = pending_events.keys().next()
-            && seq > *last_received
-        {
-            let frame = pending_events.remove(&seq).expect("key just observed");
-            *last_received = seq;
-            send_with_interleave(
-                writer,
-                frame,
-                timeout,
-                token,
-                writer_rx,
-                outbox,
-                pending_events,
-                *last_received,
-                online,
-            )
-            .await?;
-            continue;
-        }
+
         return Ok(());
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn await_cursor<S>(
     source: &S,
     token: &CancellationToken,
     writer_rx: &mut mpsc::Receiver<OutboundFrame>,
-    outbox: &mut VecDeque<OutboundFrame>,
-    pending_events: &mut BTreeMap<u64, OutboundFrame>,
+    next_arrival_id: &mut u64,
+    outbox: &mut VecDeque<(u64, OutboundFrame)>,
+    pending_events: &mut BTreeMap<u64, (u64, OutboundFrame)>,
     last_received: u64,
     online: bool,
 ) -> Result<Option<EventCursors>>
@@ -938,7 +989,14 @@ where
             result = &mut fut => return result.map(Some),
             frame = writer_rx.recv() => {
                 let Some(frame) = frame else { return Ok(None); };
-                classify_frame(frame, online, last_received, outbox, pending_events);
+                classify_frame(
+                    frame,
+                    online,
+                    last_received,
+                    next_arrival_id,
+                    outbox,
+                    pending_events,
+                );
             }
         }
     }
@@ -951,8 +1009,9 @@ async fn await_page<S>(
     limit: usize,
     token: &CancellationToken,
     writer_rx: &mut mpsc::Receiver<OutboundFrame>,
-    outbox: &mut VecDeque<OutboundFrame>,
-    pending_events: &mut BTreeMap<u64, OutboundFrame>,
+    next_arrival_id: &mut u64,
+    outbox: &mut VecDeque<(u64, OutboundFrame)>,
+    pending_events: &mut BTreeMap<u64, (u64, OutboundFrame)>,
     last_received: u64,
     online: bool,
 ) -> Result<Option<Vec<OutboundFrame>>>
@@ -977,7 +1036,14 @@ where
                     handle.abort();
                     return Ok(None);
                 };
-                classify_frame(frame, online, last_received, outbox, pending_events);
+                classify_frame(
+                    frame,
+                    online,
+                    last_received,
+                    next_arrival_id,
+                    outbox,
+                    pending_events,
+                );
             }
         }
     };
@@ -1008,14 +1074,16 @@ where
     S: DurableSource,
 {
     let mut last_received = api_hello.last_received_event_seq;
-    let mut outbox: VecDeque<OutboundFrame> = VecDeque::new();
-    let mut pending_events: BTreeMap<u64, OutboundFrame> = BTreeMap::new();
+    let mut outbox: VecDeque<(u64, OutboundFrame)> = VecDeque::new();
+    let mut pending_events: BTreeMap<u64, (u64, OutboundFrame)> = BTreeMap::new();
+    let mut next_arrival_id: u64 = 0;
     let mut is_online = false;
 
     let mut cursor = match await_cursor(
         &source,
         &token,
         &mut writer_rx,
+        &mut next_arrival_id,
         &mut outbox,
         &mut pending_events,
         last_received,
@@ -1034,6 +1102,7 @@ where
             config.catch_up_page_size,
             &token,
             &mut writer_rx,
+            &mut next_arrival_id,
             &mut outbox,
             &mut pending_events,
             last_received,
@@ -1050,6 +1119,7 @@ where
                 &source,
                 &token,
                 &mut writer_rx,
+                &mut next_arrival_id,
                 &mut outbox,
                 &mut pending_events,
                 last_received,
@@ -1078,6 +1148,7 @@ where
                 config.send_timeout,
                 &token,
                 &mut writer_rx,
+                &mut next_arrival_id,
                 &mut outbox,
                 &mut pending_events,
                 last_received,
@@ -1090,6 +1161,7 @@ where
                 config.send_timeout,
                 &token,
                 &mut writer_rx,
+                &mut next_arrival_id,
                 &mut outbox,
                 &mut pending_events,
                 &mut last_received,
@@ -1102,6 +1174,7 @@ where
             &source,
             &token,
             &mut writer_rx,
+            &mut next_arrival_id,
             &mut outbox,
             &mut pending_events,
             last_received,
@@ -1121,6 +1194,7 @@ where
             &source,
             &token,
             &mut writer_rx,
+            &mut next_arrival_id,
             &mut outbox,
             &mut pending_events,
             last_received,
@@ -1140,6 +1214,7 @@ where
             config.catch_up_page_size,
             &token,
             &mut writer_rx,
+            &mut next_arrival_id,
             &mut outbox,
             &mut pending_events,
             last_received,
@@ -1155,6 +1230,7 @@ where
                 &source,
                 &token,
                 &mut writer_rx,
+                &mut next_arrival_id,
                 &mut outbox,
                 &mut pending_events,
                 last_received,
@@ -1182,6 +1258,7 @@ where
                 config.send_timeout,
                 &token,
                 &mut writer_rx,
+                &mut next_arrival_id,
                 &mut outbox,
                 &mut pending_events,
                 last_received,
@@ -1194,6 +1271,7 @@ where
                 config.send_timeout,
                 &token,
                 &mut writer_rx,
+                &mut next_arrival_id,
                 &mut outbox,
                 &mut pending_events,
                 &mut last_received,
@@ -1215,6 +1293,7 @@ where
         config.send_timeout,
         &token,
         &mut writer_rx,
+        &mut next_arrival_id,
         &mut outbox,
         &mut pending_events,
         &mut last_received,
@@ -1228,12 +1307,20 @@ where
             _ = token.cancelled() => return Ok(()),
             frame = writer_rx.recv() => {
                 let Some(frame) = frame else { return Ok(()); };
-                classify_frame(frame, is_online, last_received, &mut outbox, &mut pending_events);
+                classify_frame(
+                    frame,
+                    is_online,
+                    last_received,
+                    &mut next_arrival_id,
+                    &mut outbox,
+                    &mut pending_events,
+                );
                 drain_next(
                     &mut writer,
                     config.send_timeout,
                     &token,
                     &mut writer_rx,
+                    &mut next_arrival_id,
                     &mut outbox,
                     &mut pending_events,
                     &mut last_received,
@@ -1682,6 +1769,8 @@ mod tests {
         block_after: Option<usize>,
         /// Notified when `block_after` is reached, then waits forever.
         block_notify: Option<Arc<Notify>>,
+        /// Notified to release a blocked writer; if None, the writer blocks forever.
+        release: Option<Arc<Notify>>,
     }
 
     impl MockGatewayWriter {
@@ -1718,7 +1807,7 @@ mod tests {
             if let Some(d) = self.delay {
                 tokio::time::sleep(d).await;
             }
-            let (blocked, block_notify) = {
+            let (blocked, block_notify, release) = {
                 let mut sent = self.sent.lock().unwrap();
                 if let Some(n) = self.fail_after
                     && sent.len() >= n
@@ -1727,13 +1816,17 @@ mod tests {
                 }
                 sent.push(frame);
                 let blocked = self.block_after.map_or(false, |n| sent.len() == n);
-                (blocked, self.block_notify.clone())
+                (blocked, self.block_notify.clone(), self.release.clone())
             };
             if blocked {
                 if let Some(notify) = block_notify {
                     notify.notify_one();
                 }
-                std::future::pending::<()>().await;
+                if let Some(release) = release {
+                    release.notified().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
             }
             Ok(())
         }
@@ -1763,6 +1856,7 @@ mod tests {
                     delay: None,
                     block_after: None,
                     block_notify: None,
+                    release: None,
                 },
                 sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
                 hello_generation: None,
@@ -2049,6 +2143,7 @@ mod tests {
                 delay: None,
                 block_after: None,
                 block_notify: None,
+                release: None,
             },
             sent_hellos: sent_hellos.clone(),
             hello_generation: None,
@@ -2068,6 +2163,7 @@ mod tests {
                 delay: None,
                 block_after: None,
                 block_notify: None,
+                release: None,
             },
             sent_hellos: sent_hellos.clone(),
             hello_generation: None,
@@ -2141,6 +2237,7 @@ mod tests {
                 delay: None,
                 block_after: None,
                 block_notify: None,
+                release: None,
             },
             sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
             hello_generation: None,
@@ -2192,6 +2289,7 @@ mod tests {
                 delay: None,
                 block_after: None,
                 block_notify: None,
+                release: None,
             },
             sent_hellos: sent_hellos.clone(),
             hello_generation: None,
@@ -2211,6 +2309,7 @@ mod tests {
                 delay: None,
                 block_after: None,
                 block_notify: None,
+                release: None,
             },
             sent_hellos: sent_hellos.clone(),
             hello_generation: None,
@@ -2290,6 +2389,7 @@ mod tests {
                 delay: None,
                 block_after: None,
                 block_notify: None,
+                release: None,
             },
             sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
             hello_generation: None,
@@ -2352,6 +2452,7 @@ mod tests {
                 delay: None,
                 block_after: None,
                 block_notify: None,
+                release: None,
             },
             sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
             hello_generation: None,
@@ -2946,6 +3047,7 @@ mod tests {
                 delay: None,
                 block_after: None,
                 block_notify: None,
+                release: None,
             },
             sent_hellos: sent_hellos.clone(),
             hello_generation: None,
@@ -2985,6 +3087,7 @@ mod tests {
                 delay: None,
                 block_after: None,
                 block_notify: None,
+                release: None,
             },
             sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
             hello_generation: None,
@@ -3508,6 +3611,7 @@ mod tests {
                 delay: None,
                 block_after: None,
                 block_notify: None,
+                release: None,
             },
             sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
             hello_generation: None,
@@ -3612,6 +3716,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_volatile_does_not_overtake_preceding_durable_event() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut writer = MockGatewayWriter {
+            fail_after: None,
+            sent: sent.clone(),
+            delay: None,
+            block_after: None,
+            block_notify: None,
+            release: None,
+        };
+        let (writer_tx, mut writer_rx) = mpsc::channel(1);
+        let token = CancellationToken::new();
+        let mut next_arrival_id = 0;
+        let mut outbox = VecDeque::new();
+        let mut pending_events = BTreeMap::new();
+        let mut last_received = 0;
+
+        classify_frame(
+            event_frame(1),
+            true,
+            last_received,
+            &mut next_arrival_id,
+            &mut outbox,
+            &mut pending_events,
+        );
+        classify_frame(
+            OutboundFrame::Event {
+                envelope: Envelope {
+                    seq: None,
+                    conversation_id: "conversation-1".to_owned(),
+                    event: serde_json::json!({"type": "message_update"}),
+                },
+            },
+            true,
+            last_received,
+            &mut next_arrival_id,
+            &mut outbox,
+            &mut pending_events,
+        );
+
+        drain_next(
+            &mut writer,
+            Duration::from_secs(1),
+            &token,
+            &mut writer_rx,
+            &mut next_arrival_id,
+            &mut outbox,
+            &mut pending_events,
+            &mut last_received,
+            true,
+        )
+        .await
+        .expect("drain queued frames");
+        drop(writer_tx);
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        assert!(
+            matches!(
+                &sent[0],
+                OutboundFrame::Event { envelope } if envelope.seq == Some(1)
+            ),
+            "the preceding durable event must be sent first: {sent:?}"
+        );
+        assert!(
+            matches!(
+                &sent[1],
+                OutboundFrame::Event { envelope } if envelope.seq.is_none()
+            ),
+            "the later volatile event must remain second: {sent:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn paged_catch_up_delivers_early_command_acks() {
         // Catch-up spans multiple pages. CommandAcks and volatile events sent
         // during catch-up must be interleaved correctly without gaps or
@@ -3638,6 +3816,7 @@ mod tests {
                 delay: Some(Duration::from_millis(2)),
                 block_after: None,
                 block_notify: None,
+                release: None,
             },
             sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
             hello_generation: None,
@@ -3832,6 +4011,7 @@ mod tests {
                 delay: None,
                 block_after: None,
                 block_notify: None,
+                release: None,
             },
             sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
             hello_generation: None,
@@ -4068,6 +4248,7 @@ mod tests {
                 delay: Some(Duration::from_millis(2)),
                 block_after: None,
                 block_notify: None,
+                release: None,
             },
             sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
             hello_generation: None,

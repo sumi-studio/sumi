@@ -109,10 +109,12 @@ impl GatewayConnector for WebSocketConnector {
         let mut auth_value = Zeroizing::new(Vec::with_capacity(7 + credential.token().len()));
         auth_value.extend_from_slice(b"Bearer ");
         auth_value.extend_from_slice(credential.token().as_bytes());
-        let header = HeaderValue::from_bytes(&auth_value)
-            .map_err(|e| ConnectorError::Other(anyhow!("invalid authorization header: {e}")))?;
+        let header =
+            HeaderValue::from_bytes(&auth_value).map_err(|_| ConnectorError::AuthRejected)?;
         request.headers_mut().insert("Authorization", header);
         drop(auth_value);
+
+        ensure_rustls_crypto_provider()?;
 
         let ws_config = WebSocketConfig {
             max_message_size: Some(MAX_FRAME_BYTES),
@@ -132,6 +134,22 @@ impl GatewayConnector for WebSocketConnector {
             ))),
         }
     }
+}
+
+fn ensure_rustls_crypto_provider() -> Result<(), ConnectorError> {
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return Ok(());
+    }
+    if rustls::crypto::ring::default_provider()
+        .install_default()
+        .is_err()
+        && rustls::crypto::CryptoProvider::get_default().is_none()
+    {
+        return Err(ConnectorError::InvalidConfiguration(anyhow!(
+            "failed to install the rustls ring crypto provider"
+        )));
+    }
+    Ok(())
 }
 
 /// A freshly connected WebSocket that has not yet completed the hello exchange.
@@ -920,14 +938,14 @@ mod tests {
         let err = match result {
             Err(e) => e,
             Ok(_) => panic!("invalid Authorization bytes must be rejected"),
-        }
-        .to_string();
+        };
         assert!(
-            err.contains("invalid authorization header"),
-            "unexpected error: {err}"
+            matches!(err, super::super::ConnectorError::AuthRejected),
+            "malformed credentials must consume the authentication-attempt budget: {err:?}"
         );
+        let error_text = err.to_string();
         assert!(
-            !err.contains(secret_with_control),
+            !error_text.contains(secret_with_control),
             "error must not echo the secret"
         );
     }
