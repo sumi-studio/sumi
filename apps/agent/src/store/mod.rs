@@ -33,6 +33,7 @@ use sqlx::{
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 use crate::provider::types::{
     ApiProtocol, ContextMessage, Message, ProviderContextItem, ProviderContextPayload,
@@ -82,7 +83,7 @@ pub(crate) use memory_state::{
     reason = "T12 exposes the recovery plan boundary consumed by T15"
 )]
 pub(crate) use recovery::{HydratedRunState, HydrationOutcome, RecoveryStep, SuffixRecovery};
-pub(crate) use redactor::{PublicProjectionBuilder, Redactor};
+pub(crate) use redactor::{PublicProjectionBuilder, Redactor, search_text_from_projection};
 #[allow(
     unused_imports,
     reason = "T12 freezes the full injection sizing boundary consumed by the T15 run loop"
@@ -368,7 +369,8 @@ impl Store {
         let mut key_cache: HashMap<String, Arc<DataKeyMaterial>> = HashMap::new();
 
         let rows = sqlx::query(
-            "SELECT id, seq, role, raw_key_ref, raw_ciphertext, redaction_version, interrupted
+            "SELECT id, seq, role, raw_key_ref, raw_ciphertext, payload, search_text,
+                    redaction_version, interrupted
              FROM messages ORDER BY seq",
         )
         .fetch_all(&self.pool)
@@ -389,6 +391,8 @@ impl Store {
             }
             let interrupted: i64 = row.try_get("interrupted")?;
             let interrupted = interrupted != 0;
+            let stored_payload: String = row.try_get("payload")?;
+            let stored_search_text: String = row.try_get("search_text")?;
 
             let key = self
                 .load_hydration_key(&mut key_cache, &key_ref, DataKeyPurpose::Transcript)
@@ -397,7 +401,7 @@ impl Store {
             let aad = self
                 .scope
                 .row_aad("messages", &id, DataKeyPurpose::Transcript);
-            let plaintext = decrypt_content(&key, &ciphertext, &aad)
+            let mut plaintext = decrypt_content(&key, &ciphertext, &aad)
                 .with_context(|| format!("failed to decrypt transcript message {id}"))?;
             let public: PublicMessage = serde_json::from_slice(&plaintext)
                 .with_context(|| format!("transcript message {id} is not a valid PublicMessage"))?;
@@ -408,6 +412,22 @@ impl Store {
             if message_interrupted(&public) != interrupted {
                 bail!("message {id} interrupted flag does not match decrypted public message");
             }
+
+            let derived_payload = self
+                .redactor
+                .redact_serialized(&plaintext)
+                .with_context(|| format!("failed to re-derive payload for message {id}"))?;
+            if derived_payload != stored_payload {
+                bail!("message {id} stored payload does not match re-derived redacted projection");
+            }
+
+            let derived_search_text = search_text_from_projection(&derived_payload)
+                .with_context(|| format!("failed to re-derive search text for message {id}"))?;
+            if derived_search_text != stored_search_text {
+                bail!("message {id} stored search_text does not match re-derived search text");
+            }
+
+            plaintext.zeroize();
 
             messages.push(ContextMessage::Persisted {
                 id: id.clone(),
@@ -1572,7 +1592,9 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::types::{PublicMessage, UserContent, UserMessage};
     use crate::store::crypto::{DATA_KEY_BYTES, WrappingKey, decrypt_content, encrypt_content};
+    use crate::store::transcript::TranscriptRecord;
     use chrono::Utc;
     use serde_json::json;
 
@@ -2892,5 +2914,71 @@ mod tests {
             .expect_err("tampered memory batch must fail hydrate");
         let message = format!("{error:#}");
         assert!(message.contains("memory_batches projection"), "{message}");
+    }
+
+    async fn insert_user_message(
+        store: &Store,
+        id: &str,
+        seq: u64,
+        text: &str,
+    ) -> TranscriptRecord {
+        let key = store
+            .conversation_key(DataKeyPurpose::Transcript)
+            .await
+            .expect("mint transcript key");
+        let message = PublicMessage::User(UserMessage {
+            content: vec![UserContent::Text {
+                text: text.to_owned(),
+            }],
+            timestamp: Utc::now(),
+        });
+        let record =
+            TranscriptRecord::encrypt(&message, id, seq, &key, &store.scope, &store.redactor)
+                .expect("encrypt transcript record");
+        record
+            .insert(store.pool())
+            .await
+            .expect("insert transcript record");
+        record
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_tampered_message_payload() {
+        let store = store().await;
+        insert_user_message(&store, "msg-tamper-payload", 1, "hello world").await;
+
+        sqlx::query("UPDATE messages SET payload = ? WHERE id = ?")
+            .bind("tampered-payload")
+            .bind("msg-tamper-payload")
+            .execute(store.pool())
+            .await
+            .expect("tamper payload");
+
+        let error = store
+            .hydrate_messages()
+            .await
+            .expect_err("tampered payload must fail hydration");
+        let message = format!("{error:#}");
+        assert!(message.contains("stored payload"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_tampered_message_search_text() {
+        let store = store().await;
+        insert_user_message(&store, "msg-tamper-search", 2, "hello world").await;
+
+        sqlx::query("UPDATE messages SET search_text = ? WHERE id = ?")
+            .bind("tampered-search")
+            .bind("msg-tamper-search")
+            .execute(store.pool())
+            .await
+            .expect("tamper search text");
+
+        let error = store
+            .hydrate_messages()
+            .await
+            .expect_err("tampered search text must fail hydration");
+        let message = format!("{error:#}");
+        assert!(message.contains("stored search_text"), "{message}");
     }
 }
