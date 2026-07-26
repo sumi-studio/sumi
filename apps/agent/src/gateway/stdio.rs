@@ -17,7 +17,8 @@ use super::{
     AgentHello, ApiHello, CommandDigestFactory, CommandEnvelope, CommandId, CommandRejectReason,
     ConnectorError, Gateway, GatewayClosed, GatewayConnector, GatewayCredential, GatewayReader,
     GatewayWriter, HelloError, InboundCommand, IncrementalCommandDigest, KeyedCommandDigest,
-    MAX_FRAME_BYTES, OutboundFrame, RejectedCommandPayload, SensitiveCommandPayload,
+    MAX_FRAME_BYTES, OutboundFrame, OversizedFrameError, RejectedCommandPayload,
+    SensitiveCommandPayload,
 };
 
 const MAX_USER_COMMAND_BYTES: usize = 1024 * 1024;
@@ -196,6 +197,13 @@ async fn write_frame<W: AsyncWrite + Unpin>(output: &mut W, frame: OutboundFrame
     let wire_frame = to_wire_frame(frame).context("failed to convert gateway frame to wire DTO")?;
     let mut line =
         serde_json::to_vec(&wire_frame).context("failed to encode gateway frame JSON")?;
+    if line.len() > MAX_FRAME_BYTES {
+        return Err(OversizedFrameError {
+            actual: line.len(),
+            max: MAX_FRAME_BYTES,
+        }
+        .into());
+    }
     line.push(b'\n');
     output
         .write_all(&line)
@@ -965,6 +973,43 @@ mod tests {
             .await
             .expect_err("wire conversion must reject a volatile event with seq");
         assert!(format!("{error:#}").contains("volatile event"));
+    }
+
+    fn retry_frame_with_error_len(error_message_len: usize) -> OutboundFrame {
+        OutboundFrame::Event {
+            envelope: super::super::Envelope {
+                seq: Some(1),
+                conversation_id: "c".to_owned(),
+                event: serde_json::json!({
+                    "type": "retry_scheduled",
+                    "attempt": 1,
+                    "delay_ms": 0,
+                    "retry_at": "1970-01-01T00:00:00+00:00",
+                    "error_message": "x".repeat(error_message_len),
+                }),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_rejects_oversized_frame_before_writing() {
+        let empty = retry_frame_with_error_len(0);
+        let wire = to_wire_frame(empty).expect("convert empty fixture");
+        let base_len = serde_json::to_vec(&wire)
+            .expect("serialize empty fixture")
+            .len();
+        let oversized = retry_frame_with_error_len(MAX_FRAME_BYTES - base_len + 1);
+        let mut output = Vec::new();
+
+        let error = write_frame(&mut output, oversized)
+            .await
+            .expect_err("oversized frame must be rejected locally");
+
+        assert!(
+            error.is::<OversizedFrameError>(),
+            "oversized rejection must be typed: {error:?}"
+        );
+        assert!(output.is_empty(), "rejected frame must not be written");
     }
 
     fn frame_with_total_bytes(total_bytes: usize) -> Vec<u8> {
