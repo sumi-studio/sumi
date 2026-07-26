@@ -18,7 +18,7 @@ use serde_json::Value;
 use super::*;
 use crate::store::KeyProvider;
 use crate::{
-    gateway::{AgentHello, ApiHello, CommandAck, CommandId},
+    gateway::{AgentHello, ApiHello, CommandAck, CommandId, HelloError},
     provider::types::{
         ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, ProviderContextFragment,
         ProviderContextPayload, ProviderEvent, ProviderEventStream, ProviderOrigin, ProviderOutput,
@@ -64,7 +64,7 @@ fn test_api_hello(hello: &AgentHello) -> ApiHello {
     ApiHello {
         accepted_generation: hello.generation,
         last_received_event_seq: 0,
-        next_command_seq: hello.last_applied_command_seq.saturating_add(1),
+        next_command_seq: hello.last_terminal_command_seq.saturating_add(1),
     }
 }
 
@@ -88,7 +88,10 @@ impl Gateway for MockGateway {
     type Reader = MockGatewayReader;
     type Writer = MockGatewayWriter;
 
-    async fn authenticate_hello(&mut self, hello: AgentHello) -> Result<ApiHello> {
+    async fn authenticate_hello(
+        &mut self,
+        hello: AgentHello,
+    ) -> std::result::Result<ApiHello, HelloError> {
         Ok(test_api_hello(&hello))
     }
 
@@ -217,7 +220,10 @@ impl Gateway for FailFirstEventGateway {
     type Reader = SimpleReader;
     type Writer = FailFirstEventWriter;
 
-    async fn authenticate_hello(&mut self, hello: AgentHello) -> Result<ApiHello> {
+    async fn authenticate_hello(
+        &mut self,
+        hello: AgentHello,
+    ) -> std::result::Result<ApiHello, HelloError> {
         Ok(test_api_hello(&hello))
     }
 
@@ -278,7 +284,10 @@ impl Gateway for BlockingWriterGateway {
     type Reader = SimpleReader;
     type Writer = BlockingWriter;
 
-    async fn authenticate_hello(&mut self, hello: AgentHello) -> Result<ApiHello> {
+    async fn authenticate_hello(
+        &mut self,
+        hello: AgentHello,
+    ) -> std::result::Result<ApiHello, HelloError> {
         Ok(test_api_hello(&hello))
     }
 
@@ -327,7 +336,10 @@ impl Gateway for EofBlockingGateway {
     type Reader = EofBlockingReader;
     type Writer = EofBlockingWriter;
 
-    async fn authenticate_hello(&mut self, hello: AgentHello) -> Result<ApiHello> {
+    async fn authenticate_hello(
+        &mut self,
+        hello: AgentHello,
+    ) -> std::result::Result<ApiHello, HelloError> {
         Ok(test_api_hello(&hello))
     }
 
@@ -404,7 +416,10 @@ impl Gateway for ShutdownDrainGateway {
     type Reader = SimpleReader;
     type Writer = ShutdownDrainWriter;
 
-    async fn authenticate_hello(&mut self, hello: AgentHello) -> Result<ApiHello> {
+    async fn authenticate_hello(
+        &mut self,
+        hello: AgentHello,
+    ) -> std::result::Result<ApiHello, HelloError> {
         Ok(test_api_hello(&hello))
     }
 
@@ -1780,7 +1795,10 @@ impl Gateway for CommitCheckingGateway {
     type Reader = SimpleReader;
     type Writer = CommitCheckingWriter;
 
-    async fn authenticate_hello(&mut self, hello: AgentHello) -> Result<ApiHello> {
+    async fn authenticate_hello(
+        &mut self,
+        hello: AgentHello,
+    ) -> std::result::Result<ApiHello, HelloError> {
         Ok(test_api_hello(&hello))
     }
 

@@ -16,8 +16,8 @@ use super::wire::to_wire_frame;
 use super::{
     AgentHello, ApiHello, CommandDigestFactory, CommandEnvelope, CommandId, CommandRejectReason,
     ConnectorError, Gateway, GatewayClosed, GatewayConnector, GatewayCredential, GatewayReader,
-    GatewayWriter, InboundCommand, IncrementalCommandDigest, KeyedCommandDigest, MAX_FRAME_BYTES,
-    OutboundFrame, RejectedCommandPayload, SensitiveCommandPayload,
+    GatewayWriter, HelloError, InboundCommand, IncrementalCommandDigest, KeyedCommandDigest,
+    MAX_FRAME_BYTES, OutboundFrame, RejectedCommandPayload, SensitiveCommandPayload,
 };
 
 const MAX_USER_COMMAND_BYTES: usize = 1024 * 1024;
@@ -100,7 +100,10 @@ where
     type Reader = InjectedStdioGatewayReader<R>;
     type Writer = InjectedStdioGatewayWriter<W>;
 
-    async fn authenticate_hello(&mut self, hello: AgentHello) -> Result<ApiHello> {
+    async fn authenticate_hello(
+        &mut self,
+        hello: AgentHello,
+    ) -> std::result::Result<ApiHello, HelloError> {
         Ok(stdio_hello(&hello))
     }
 
@@ -152,7 +155,10 @@ impl Gateway for StdioGateway {
     type Reader = StdioGatewayReader;
     type Writer = StdioGatewayWriter;
 
-    async fn authenticate_hello(&mut self, hello: AgentHello) -> Result<ApiHello> {
+    async fn authenticate_hello(
+        &mut self,
+        hello: AgentHello,
+    ) -> std::result::Result<ApiHello, HelloError> {
         Ok(stdio_hello(&hello))
     }
 
@@ -200,13 +206,13 @@ async fn write_frame<W: AsyncWrite + Unpin>(output: &mut W, frame: OutboundFrame
 
 /// Compute the `ApiHello` for a stdio (single-connection, no catch-up) peer.
 /// The peer is assumed to have received all events already sent, so catch-up
-/// begins at the durable cursor. The next command starts after the last applied
+/// begins at the durable cursor. The next command starts after the last terminal
 /// durable command.
 pub(crate) fn stdio_hello(hello: &AgentHello) -> ApiHello {
     ApiHello {
         accepted_generation: hello.generation,
         last_received_event_seq: hello.last_sent_event_seq,
-        next_command_seq: hello.last_applied_command_seq.saturating_add(1),
+        next_command_seq: hello.last_terminal_command_seq.saturating_add(1),
     }
 }
 
@@ -1353,13 +1359,13 @@ mod tests {
     }
 
     #[test]
-    fn stdio_hello_returns_last_applied_plus_one_and_durable_event_cursor() {
+    fn stdio_hello_returns_last_terminal_plus_one_and_durable_event_cursor() {
         let hello = AgentHello {
             agent_id: "test-agent".to_owned(),
             generation: ProcessGeneration::from_wire(7).unwrap(),
             last_sent_event_seq: 42,
             last_received_command_seq: 10,
-            last_applied_command_seq: 9,
+            last_terminal_command_seq: 9,
         };
         let api = stdio_hello(&hello);
         assert_eq!(
