@@ -389,6 +389,7 @@ pub enum ReviewProjection {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct SecretRef {
     pub kind: String,
     pub digest: String,
@@ -397,6 +398,7 @@ pub struct SecretRef {
 /// Keyed digest for secret identity comparison without value reconstruction.
 pub struct SecretDigestKey([u8; 32]);
 
+#[allow(dead_code)]
 impl SecretDigestKey {
     pub(crate) fn new(key: [u8; 32]) -> Self {
         Self(key)
@@ -692,6 +694,7 @@ fn contains_shell_credential(text: &str) -> bool {
         .is_none_or(|spans| spans.iter().any(|token_spans| !token_spans.is_empty()))
 }
 
+#[allow(dead_code)]
 impl SecretAwareActionProjector {
     pub fn new(redactor: Redactor, key: SecretDigestKey) -> Self {
         Self {
@@ -744,6 +747,13 @@ impl SecretAwareActionProjector {
             }
             scalar => Ok(scalar.clone()),
         }
+    }
+
+    /// Redact `text` for log/diagnostic contexts. This is the same inventory
+    /// pass used for argument redaction, but exposed for one-off strings such
+    /// as approval rule literal prefixes.
+    pub(crate) fn redact_text(&self, text: &str) -> String {
+        self.redact_text_with_inventory(text)
     }
 
     fn redact_text_with_inventory(&self, text: &str) -> String {
@@ -2345,6 +2355,7 @@ pub(crate) mod shell {
         tokens
     }
 
+    #[allow(dead_code)]
     pub(crate) fn unescape_backslashes(s: &str) -> String {
         let mut out = String::with_capacity(s.len());
         let mut chars = s.chars().peekable();

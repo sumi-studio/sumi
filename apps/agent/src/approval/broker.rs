@@ -361,8 +361,13 @@ impl ApprovalBroker {
         if let ResolvedDecision::ApproveAlways(ref rule) = resolved {
             let guard = self.policy.read().unwrap_or_else(|e| e.into_inner());
             if let Err(error) = guard.clone().try_with_rule(rule.clone()) {
-                let literal_prefix = matches!(&error, RuleValidationError::BroadPrefix)
-                    .then_some(rule.literal_prefix.as_slice());
+                let literal_prefix =
+                    matches!(&error, RuleValidationError::BroadPrefix).then(|| {
+                        rule.literal_prefix
+                            .iter()
+                            .map(|token| self.projector.redact_text(token))
+                            .collect::<Vec<_>>()
+                    });
                 tracing::warn!(
                     rule_id = %rule.id,
                     tool = %rule.tool,
@@ -550,11 +555,15 @@ impl ApprovalBroker {
 /// both cached and fresh `ReviewOutcome::Allow` values must pass it before an
 /// `ApprovalOutcome::Allowed` is ever produced.
 fn reviewer_allow_is_executable(decision: &AuditDecision) -> Result<(), String> {
-    if decision.risk == RiskLevel::Critical {
+    let Some(required) = decision.risk.minimum_authorization() else {
         return Err("critical risk must deny".to_owned());
-    }
-    if decision.risk == RiskLevel::High && decision.authorization != UserAuthorization::High {
-        return Err("high risk requires high authorization".to_owned());
+    };
+    if decision.authorization.rank() < required.rank() {
+        return Err(format!(
+            "{} risk requires {} authorization",
+            decision.risk.as_str(),
+            required.as_str()
+        ));
     }
     Ok(())
 }
@@ -1574,5 +1583,58 @@ mod tests {
             .await
             .expect("start_request");
         assert!(matches!(outcome, ApprovalOutcome::Allowed));
+    }
+
+    fn test_decision(risk: RiskLevel, authorization: UserAuthorization) -> AuditDecision {
+        AuditDecision {
+            outcome: crate::approval::reviewer::AuditOutcome::Allow,
+            risk,
+            authorization,
+            rationale: "test".to_owned(),
+        }
+    }
+
+    #[test]
+    fn reviewer_allow_is_executable_enforces_risk_authorization_contract() {
+        assert!(
+            reviewer_allow_is_executable(&test_decision(RiskLevel::Low, UserAuthorization::Low))
+                .is_ok()
+        );
+        assert!(
+            reviewer_allow_is_executable(&test_decision(
+                RiskLevel::Low,
+                UserAuthorization::Unknown
+            ))
+            .is_err()
+        );
+        assert!(
+            reviewer_allow_is_executable(&test_decision(RiskLevel::Medium, UserAuthorization::Low))
+                .is_err()
+        );
+        assert!(
+            reviewer_allow_is_executable(&test_decision(
+                RiskLevel::Medium,
+                UserAuthorization::High
+            ))
+            .is_ok()
+        );
+        assert!(
+            reviewer_allow_is_executable(&test_decision(RiskLevel::High, UserAuthorization::High))
+                .is_ok()
+        );
+        assert!(
+            reviewer_allow_is_executable(&test_decision(
+                RiskLevel::High,
+                UserAuthorization::Medium
+            ))
+            .is_err()
+        );
+        assert!(
+            reviewer_allow_is_executable(&test_decision(
+                RiskLevel::Critical,
+                UserAuthorization::High
+            ))
+            .is_err()
+        );
     }
 }

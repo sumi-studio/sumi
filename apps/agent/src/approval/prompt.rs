@@ -6,8 +6,6 @@
 //! assistant Thinking, and raw CanonicalAction fields never reach the reviewer
 //! call.
 
-use std::collections::VecDeque;
-
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde_json::Value;
@@ -16,8 +14,7 @@ use crate::{
     approval::action::{ReviewProjection, SandboxSummary, SecretAwareActionProjector},
     memory::estimate::estimate_text_tokens,
     provider::types::{
-        PublicAssistantContent, PublicMessage, ToolCall, ToolResultMessage, UserContent,
-        ValidatedToolArguments,
+        PublicAssistantContent, PublicMessage, ToolCall, UserContent, ValidatedToolArguments,
     },
 };
 
@@ -60,6 +57,7 @@ impl Default for PromptLimits {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
 pub enum ReviewerRole {
     System,
     User,
@@ -140,10 +138,15 @@ pub fn build_reviewer_prompt(
     });
 
     let entries = build_transcript_entries(transcript, projector, limits)?;
+    let mut selected_total = 0u64;
     for entry in select_entries(&entries, limits) {
+        let remaining = limits.total_token_budget.saturating_sub(selected_total);
+        let max_for_entry = entry.tokens.min(remaining);
+        let content = cap_text_tokens(&entry.content, max_for_entry);
+        selected_total += estimate_text_tokens(&content).unwrap_or(max_for_entry);
         messages.push(ReviewerMessage {
             role: entry.role,
-            content: entry.content.clone(),
+            content,
         });
     }
 
@@ -342,7 +345,11 @@ fn select_entries<'a>(
     }
     if let Some(i) = last_user.filter(|i| !selected.contains(i)) {
         selected.push(i);
-        total += entries[i].tokens;
+        // The mandatory latest user entry is preserved, but its budget
+        // contribution is clamped to the remaining total so the accumulated
+        // selection never exceeds the global transcript limit.
+        let remaining = limits.total_token_budget.saturating_sub(total);
+        total += entries[i].tokens.min(remaining);
     }
 
     for i in (0..entries.len()).rev() {
@@ -420,9 +427,8 @@ mod tests {
             SecretDigestKey,
         },
         provider::types::{
-            ApiProtocol, AssistantMessage, ProviderOrigin, PublicAssistantMessage,
-            RejectedToolCall, StopReason, ToolArgumentError, ToolCall, ToolResultMessage, Usage,
-            UserMessage, ValidatedToolArguments,
+            ApiProtocol, ProviderOrigin, PublicAssistantMessage, StopReason, ToolCall,
+            ToolResultMessage, Usage, UserMessage, ValidatedToolArguments,
         },
         store::Redactor,
     };
@@ -915,6 +921,43 @@ mod tests {
         .expect("entry_for");
         let tokens = estimate_text_tokens(&entry.content).unwrap_or(0);
         assert!(tokens <= 2, "expected <= 2 tokens, got {tokens}");
+    }
+
+    #[test]
+    fn prompt_transcript_never_exceeds_total_token_budget() {
+        let action = CanonicalAction::from_tool_call(
+            PathBuf::from("/workspace"),
+            "bash",
+            &serde_json::from_value::<ValidatedToolArguments>(json!({"command": "echo x"}))
+                .expect("valid args"),
+        )
+        .expect("bash action");
+        let projection = projector().project(&action);
+        let limits = PromptLimits {
+            total_token_budget: 10,
+            tool_evidence_token_budget: 0,
+            per_entry_max_tokens: 100,
+            recent_non_user_max: 0,
+        };
+        let transcript = vec![
+            user_message(&"a".repeat(1000)),
+            user_message(&"b".repeat(1000)),
+        ];
+        let prompt = build(&transcript, &projection, &limits);
+        let transcript_tokens: u64 = prompt
+            .messages
+            .iter()
+            .filter(|m| {
+                !m.content.starts_with("Trusted environment:")
+                    && !m.content.starts_with("Pending review action:")
+            })
+            .map(|m| estimate_text_tokens(&m.content).unwrap_or(0))
+            .sum();
+        assert!(
+            transcript_tokens <= limits.total_token_budget,
+            "transcript tokens {transcript_tokens} exceed total budget {}",
+            limits.total_token_budget
+        );
     }
 
     #[test]

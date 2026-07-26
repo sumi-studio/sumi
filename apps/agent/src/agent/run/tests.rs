@@ -763,10 +763,9 @@ async fn resolved_matching_approval_is_consumed_without_blocking_followup_queue(
         outcome.expect("wait outcome"),
         ApprovalWaitOutcome::Cancelled
     ));
-    assert_eq!(
-        pending_sequences(&mut runner.core),
-        vec![2],
-        "only the unrelated earlier decision remains in order"
+    assert!(
+        pending_sequences(&mut runner.core).is_empty(),
+        "unmatched approval decisions must not be queued as follow-up controls"
     );
 }
 

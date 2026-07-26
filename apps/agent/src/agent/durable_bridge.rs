@@ -236,11 +236,37 @@ pub(super) struct DurableBridge {
     /// Original owner command cut off by an active Abort; applied alongside the
     /// final AgentEnd so the owner terminates with the aborted run.
     aborted_owner: Option<(String, u64)>,
+    /// Tool-call IDs that were approval-denied and must be durably skipped as
+    /// `approval_denied` when their `ToolResult` arrives, before any matching
+    /// `ToolExecutionStart`. Inserted by `ApprovalResolved` Deny; removed when
+    /// the skip/finish projection is committed.
     approval_not_started: HashSet<String>,
+    /// Tool-call IDs that were approval-cancelled and must be durably finished
+    /// as `approval_cancelled` when their `ToolResult` arrives. Inserted by
+    /// `ApprovalResolved` Cancelled or idle cancellation; removed when the finish
+    /// projection is committed.
     approval_cancelled: HashSet<String>,
+    /// The authenticated `ApprovalDecision` command for the currently pending
+    /// approval. Set from the worker's `RunOutput` when `ApprovalResolved` is
+    /// emitted and consumed when the Decision is committed so the matching
+    /// `CommandApplied` projection can be emitted. At most one command is kept.
     approval_command: Option<AdmittedCommand>,
+    /// Maps an active approval `request_id` to the `tool_call_id` it controls.
+    /// Inserted when `ApprovalRequested` commits; consumed by the matching
+    /// `ApprovalResolved` to locate the affected tool.
     approval_request_tools: HashMap<String, String>,
+    /// Tool-call IDs that have been prepared for approval and are waiting for
+    /// an `ApprovalResolved` before they may start execution. Inserted when
+    /// `ApprovalRequested` commits; removed when the tool starts (then it is
+    /// running) or when the approval is denied/cancelled and cleaned up.
     approval_prepared_tools: HashSet<String>,
+    /// A approved approval that has resolved but whose tool has not yet started.
+    /// Holds the `request_id`, the `ApprovalResolution`, and the authenticated
+    /// `ApprovalDecision` command. It is set by `ApprovalResolved` Decision
+    /// (ApproveOnce/ApproveAlways) and consumed by the matching
+    /// `ToolExecutionStart`, which emits the `ApprovalResolved` and
+    /// `CommandApplied` projections atomically. `AgentEnd` cannot commit while
+    /// this is non-empty.
     pending_approval_resolved: Option<(String, ApprovalResolution, AdmittedCommand)>,
     committed_terminal_command_ids: Vec<String>,
 }
@@ -303,6 +329,7 @@ impl DurableBridge {
         if !self.pending_tool_end.is_empty()
             || !self.length_not_started.is_empty()
             || !self.pending_tool_calls.is_empty()
+            || !self.approval_prepared_tools.is_empty()
         {
             return SteerStage::ToolOrApproval;
         }
@@ -3683,5 +3710,17 @@ mod tests {
             result.is_err_and(|e| e.to_string().contains("approved tool has not started")),
             "AgentEnd must not commit an approved decision before ToolExecutionStart"
         );
+    }
+
+    #[test]
+    fn steer_stage_treats_approval_prepared_tools_as_tool_or_approval() {
+        let mut bridge = DurableBridge::new(binding("00000000-0000-4000-8000-000000000001"));
+        bridge.phase = RunPhase::AssistantStarted;
+        bridge.turn_open = true;
+        bridge.assistant_open = None;
+        bridge
+            .approval_prepared_tools
+            .insert("tool-call-1".to_owned());
+        assert_eq!(bridge.steer_stage(), SteerStage::ToolOrApproval);
     }
 }

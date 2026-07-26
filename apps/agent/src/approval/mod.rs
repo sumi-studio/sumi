@@ -1,15 +1,9 @@
 //! Tool execution approval broker and deterministic policy.
 
-// T23: remove these module-wide allows once gateway/persistence integration
-// wires all action and policy exports; they currently suppress skeleton code.
-#[allow(dead_code, unused_imports)]
 pub mod action;
 pub mod broker;
-#[allow(dead_code, unused_imports)]
 pub mod policy;
-#[allow(dead_code, unused_imports)]
 pub mod prompt;
-#[allow(dead_code, unused_imports)]
 pub mod reviewer;
 
 #[allow(unused_imports)]

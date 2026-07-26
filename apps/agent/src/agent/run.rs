@@ -1343,10 +1343,16 @@ impl Runner {
                                     }
                                     return Ok(ApprovalWaitOutcome::Cancelled);
                                 }
-                                Command::ApprovalDecision { .. } => {
-                                    self.core.queue_followup(command).map_err(|error| {
-                                        WorkerFailure::Error(error.to_string())
-                                    })?;
+                                Command::ApprovalDecision { request_id: rid, decision } => {
+                                    // An approval decision for a different request must not be
+                                    // retained in pending_controls: it would sit at the front of
+                                    // RunCore and block the next run. Mirror the matched path by
+                                    // attempting to resolve the broker's pending entry; if there
+                                    // is none, the decision is a stale no-op and is discarded.
+                                    if let Some(broker) = self.core.approval.as_ref() {
+                                        let _ = broker.resolve(rid, decision);
+                                    }
+                                    continue;
                                 }
                                 Command::UserMessage { .. } | Command::Abort {} => {
                                     if let Some(broker) = self.core.approval.as_ref() {

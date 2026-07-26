@@ -15,7 +15,6 @@ use std::{
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 
@@ -51,6 +50,7 @@ pub struct ReviewerModelSpec {
     pub data_processing_policy: String,
 }
 
+#[allow(dead_code)]
 impl ReviewerModelSpec {
     pub fn new(
         id: impl Into<String>,
@@ -112,6 +112,7 @@ pub struct ReviewerTrustSet {
     allowed: Vec<ReviewerTrustBinding>,
 }
 
+#[allow(dead_code)]
 impl ReviewerTrustSet {
     pub fn new(
         conversation_model: ReviewerModelSpec,
@@ -165,6 +166,17 @@ impl RiskLevel {
             RiskLevel::Critical => "critical",
         }
     }
+
+    /// Minimum user authorization that can justify an `Allow` at this risk.
+    /// `Critical` never allows.
+    pub(crate) fn minimum_authorization(&self) -> Option<UserAuthorization> {
+        match self {
+            RiskLevel::Low => Some(UserAuthorization::Low),
+            RiskLevel::Medium => Some(UserAuthorization::Medium),
+            RiskLevel::High => Some(UserAuthorization::High),
+            RiskLevel::Critical => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,7 +198,7 @@ impl UserAuthorization {
         }
     }
 
-    fn rank(&self) -> u8 {
+    pub(crate) fn rank(&self) -> u8 {
         match self {
             UserAuthorization::Unknown => 0,
             UserAuthorization::Low => 1,
@@ -227,6 +239,7 @@ pub struct ReviewRequest {
 
 /// Transport errors returned by the injected reviewer client.
 #[derive(Clone, Debug, thiserror::Error)]
+#[allow(dead_code)]
 pub enum ReviewerTransportError {
     #[error("transient reviewer transport error: {0}")]
     Transient(String),
@@ -251,6 +264,7 @@ pub trait ReviewerTransport: Send + Sync {
 /// Circuit breaker for the audit reviewer. Opens after three consecutive
 /// denials or ten denials in the last fifty reviews within a run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum CircuitState {
     Closed,
     Open,
@@ -303,6 +317,7 @@ impl CircuitBreaker {
         }
     }
 
+    #[allow(dead_code)]
     pub fn state(&self) -> CircuitState {
         if self.open {
             CircuitState::Open
@@ -322,9 +337,15 @@ impl Default for CircuitBreaker {
     }
 }
 
+/// Maximum number of allow decisions retained across a long run. The cache is
+/// bounded so memory and replay validation time do not grow with the number of
+/// distinct projections seen in one conversation.
+const ALLOW_CACHE_CAPACITY: usize = 1024;
+
 #[derive(Clone, Debug)]
 struct AllowCache {
     entries: HashMap<CacheKey, AuditDecision>,
+    order: VecDeque<CacheKey>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -338,20 +359,30 @@ impl AllowCache {
     fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            order: VecDeque::new(),
         }
     }
 
     fn get(
-        &self,
+        &mut self,
         policy_hash: &str,
         projection_hash: &str,
         context_version: &str,
     ) -> Option<&AuditDecision> {
-        self.entries.get(&CacheKey {
+        let key = CacheKey {
             policy_hash: policy_hash.to_owned(),
             projection_hash: projection_hash.to_owned(),
             context_version: context_version.to_owned(),
-        })
+        };
+        if self.entries.contains_key(&key) {
+            if let Some(pos) = self.order.iter().position(|k| *k == key) {
+                let moved = self.order.remove(pos).expect("key present in order");
+                self.order.push_back(moved);
+            }
+            self.entries.get(&key)
+        } else {
+            None
+        }
     }
 
     fn put(
@@ -361,20 +392,31 @@ impl AllowCache {
         context_version: &str,
         decision: AuditDecision,
     ) {
-        if decision.outcome == AuditOutcome::Allow {
-            self.entries.insert(
-                CacheKey {
-                    policy_hash: policy_hash.to_owned(),
-                    projection_hash: projection_hash.to_owned(),
-                    context_version: context_version.to_owned(),
-                },
-                decision,
-            );
+        if decision.outcome != AuditOutcome::Allow {
+            return;
+        }
+        let key = CacheKey {
+            policy_hash: policy_hash.to_owned(),
+            projection_hash: projection_hash.to_owned(),
+            context_version: context_version.to_owned(),
+        };
+        let is_new = !self.entries.contains_key(&key);
+        self.entries.insert(key.clone(), decision);
+        if is_new {
+            self.order.push_back(key);
+            if self.order.len() > ALLOW_CACHE_CAPACITY {
+                let oldest = self.order.pop_front().expect("non-empty order");
+                self.entries.remove(&oldest);
+            }
+        } else if let Some(pos) = self.order.iter().position(|k| *k == key) {
+            let moved = self.order.remove(pos).expect("key present in order");
+            self.order.push_back(moved);
         }
     }
 
     fn clear(&mut self) {
         self.entries.clear();
+        self.order.clear();
     }
 }
 
@@ -453,6 +495,7 @@ impl RunCircuitBreaker {
 }
 
 impl Reviewer {
+    #[allow(dead_code)]
     pub fn new(
         model: ReviewerModelSpec,
         trust_set: ReviewerTrustSet,
@@ -522,7 +565,7 @@ impl Reviewer {
         }
 
         {
-            let allow_cache = self.allow_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let mut allow_cache = self.allow_cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(decision) = allow_cache.get(
                 &request.policy_hash,
                 &projection_hash,
@@ -663,23 +706,18 @@ impl Reviewer {
         if decision.outcome == AuditOutcome::Deny {
             return decision;
         }
-        let required_rank = match decision.risk {
-            RiskLevel::Critical => {
-                return AuditDecision {
-                    outcome: AuditOutcome::Deny,
-                    risk: decision.risk,
-                    authorization: decision.authorization,
-                    rationale: format!(
-                        "reviewer returned allow with {} risk; critical risk is always denied",
-                        decision.risk.as_str()
-                    ),
-                };
-            }
-            RiskLevel::High => UserAuthorization::High.rank(),
-            RiskLevel::Medium => UserAuthorization::Medium.rank(),
-            RiskLevel::Low => UserAuthorization::Low.rank(),
+        let Some(required) = decision.risk.minimum_authorization() else {
+            return AuditDecision {
+                outcome: AuditOutcome::Deny,
+                risk: decision.risk,
+                authorization: decision.authorization,
+                rationale: format!(
+                    "reviewer returned allow with {} risk; critical risk is always denied",
+                    decision.risk.as_str()
+                ),
+            };
         };
-        if decision.authorization.rank() < required_rank {
+        if decision.authorization.rank() < required.rank() {
             return AuditDecision {
                 outcome: AuditOutcome::Deny,
                 risk: decision.risk,
@@ -788,8 +826,7 @@ fn hex_string(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{HashMap, VecDeque},
-        fmt::Write as _,
+        collections::VecDeque,
         sync::{Arc, Mutex},
         time::Duration,
     };
@@ -805,9 +842,8 @@ mod tests {
             SandboxSummary, SecretAwareActionProjector, SecretDigestKey,
         },
         provider::types::{
-            ApiProtocol, AssistantMessage, ProviderOrigin, PublicAssistantContent,
-            PublicAssistantMessage, PublicMessage, StopReason, ToolCall, Usage, UserContent,
-            UserMessage, ValidatedToolArguments,
+            ApiProtocol, ProviderOrigin, PublicAssistantContent, PublicAssistantMessage,
+            PublicMessage, StopReason, ToolCall, Usage, UserContent, UserMessage,
         },
         store::Redactor,
     };
@@ -921,7 +957,6 @@ mod tests {
     #[derive(Clone)]
     enum FakeResponse {
         Return(Result<String, ReviewerTransportError>),
-        SleepThen(Duration, Result<String, ReviewerTransportError>),
         SleepForever,
     }
 
@@ -939,13 +974,6 @@ mod tests {
             Arc::new(Self {
                 log: Arc::new(Mutex::new(Vec::new())),
                 calls: Arc::new(Mutex::new(VecDeque::from([FakeResponse::SleepForever]))),
-            })
-        }
-
-        fn sleep_then(d: Duration, r: Result<String, ReviewerTransportError>) -> Arc<Self> {
-            Arc::new(Self {
-                log: Arc::new(Mutex::new(Vec::new())),
-                calls: Arc::new(Mutex::new(VecDeque::from([FakeResponse::SleepThen(d, r)]))),
             })
         }
 
@@ -972,13 +1000,6 @@ mod tests {
             };
             match response {
                 Some(FakeResponse::Return(r)) => r,
-                Some(FakeResponse::SleepThen(d, r)) => {
-                    tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => Err(ReviewerTransportError::Fatal("cancelled".to_owned())),
-                        _ = tokio::time::sleep(d) => r,
-                    }
-                }
                 Some(FakeResponse::SleepForever) => {
                     cancel.cancelled().await;
                     Err(ReviewerTransportError::Fatal("cancelled".to_owned()))
@@ -1572,5 +1593,30 @@ mod tests {
             !payload.contains("TOOL_RESULT_BODY_SECRET"),
             "raw action body crossed reviewer boundary"
         );
+    }
+
+    #[test]
+    fn allow_cache_bounds_entries_and_evicts_oldest() {
+        let mut cache = AllowCache::new();
+        let decision = AuditDecision {
+            outcome: AuditOutcome::Allow,
+            risk: RiskLevel::Low,
+            authorization: UserAuthorization::Low,
+            rationale: "ok".to_owned(),
+        };
+        for i in 0..ALLOW_CACHE_CAPACITY {
+            cache.put(
+                "policy",
+                &format!("projection-{i}"),
+                "ctx",
+                decision.clone(),
+            );
+        }
+        assert_eq!(cache.entries.len(), ALLOW_CACHE_CAPACITY);
+        assert!(cache.get("policy", "projection-0", "ctx").is_some());
+        cache.put("policy", "projection-new", "ctx", decision);
+        assert!(cache.get("policy", "projection-0", "ctx").is_some());
+        assert!(cache.get("policy", "projection-1", "ctx").is_none());
+        assert!(cache.get("policy", "projection-new", "ctx").is_some());
     }
 }

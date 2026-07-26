@@ -1158,7 +1158,7 @@ impl Store {
         &self,
     ) -> Result<Vec<crate::approval::policy::ApprovalRule>> {
         let rows: Vec<(String, String, String)> =
-            sqlx::query_as("SELECT id, tool, pattern FROM approval_rules ORDER BY created_at")
+            sqlx::query_as("SELECT id, tool, pattern FROM approval_rules ORDER BY created_at, id")
                 .fetch_all(&self.pool)
                 .await
                 .context("failed to load approval rules")?;
@@ -3782,5 +3782,48 @@ mod tests {
                 .expect("foreign_key_check")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn load_approval_rules_is_deterministic_when_created_at_ties() {
+        use crate::approval::action::Permission;
+        use crate::approval::policy::{ApprovalRule, RuleEffect};
+
+        let store = store().await;
+        let ts = "2026-07-26T00:00:00Z";
+        let rule_b = ApprovalRule {
+            id: "rule-b".to_owned(),
+            tool: "bash".to_owned(),
+            literal_prefix: vec!["b".to_owned()],
+            effect: RuleEffect::Allow,
+            workspace_only: true,
+            allowed_permissions: vec![Permission::Exec],
+            allowed_network_domains: vec![],
+        };
+        let rule_a = ApprovalRule {
+            id: "rule-a".to_owned(),
+            tool: "bash".to_owned(),
+            literal_prefix: vec!["a".to_owned()],
+            effect: RuleEffect::Allow,
+            workspace_only: true,
+            allowed_permissions: vec![Permission::Exec],
+            allowed_network_domains: vec![],
+        };
+        for rule in [&rule_b, &rule_a] {
+            sqlx::query(
+                "INSERT INTO approval_rules(id, tool, pattern, created_at) VALUES(?, ?, ?, ?)",
+            )
+            .bind(&rule.id)
+            .bind(&rule.tool)
+            .bind(serde_json::to_string(rule).expect("serialize rule"))
+            .bind(ts)
+            .execute(store.pool())
+            .await
+            .expect("insert rule");
+        }
+
+        let loaded = store.load_approval_rules().await.expect("load rules");
+        let ids: Vec<&str> = loaded.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["rule-a", "rule-b"]);
     }
 }

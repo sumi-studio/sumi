@@ -4663,6 +4663,10 @@ fn validate_batch_shape_with_recovery(
                     | ToolExecutionMutation::Finish { tool_call_id, .. }
                     | ToolExecutionMutation::Skip { tool_call_id, .. } => tool_call_id,
                 };
+                // `tool_prepare_mutation_ids` must contain a Prepare before a
+                // matching Start is processed; this traversal order is validated
+                // by the duplicate-mutation check below. An atomic Start that
+                // immediately follows its Prepare is allowed.
                 let is_atomic_start = matches!(mutation, ToolExecutionMutation::Start { .. })
                     && tool_prepare_mutation_ids.contains(tool_call_id)
                     && !tool_start_mutation_ids.contains(tool_call_id);
@@ -6304,16 +6308,16 @@ async fn validate_tool_finish_owner(
             final_phase.as_str()
         ),
         "prepared" => {
-            let approval_cleanup = sqlx::query(
+            let maybe_approval = sqlx::query(
                 "SELECT id, state FROM approval_log
                  WHERE tool_call_id = ?",
             )
             .bind(tool_call_id)
             .fetch_optional(&mut **transaction)
-            .await?
-            .is_some_and(|row| {
-                let request_id: String = row.try_get("id").expect("approval_log id column");
-                let state: String = row.try_get("state").expect("approval_log state column");
+            .await?;
+            let approval_cleanup = if let Some(row) = maybe_approval {
+                let request_id: String = row.try_get("id")?;
+                let state: String = row.try_get("state")?;
                 match state.as_str() {
                     "denied" | "cancelled" => true,
                     "pending" => approval_resolutions.get(request_id.as_str()).is_some_and(
@@ -6321,7 +6325,9 @@ async fn validate_tool_finish_owner(
                     ),
                     _ => false,
                 }
-            });
+            } else {
+                false
+            };
             if finish.state != "cancelled"
                 || !(closes_owner
                     || approval_cleanup
@@ -9332,10 +9338,39 @@ async fn apply_tool_mutation(
             executor_generation,
             idempotency_key,
         } => {
-            // `INSERT OR IGNORE` makes Prepare idempotent across replayed
-            // assistant recovery: the same tool_call_id may already be prepared.
+            // `INSERT OR IGNORE` is not enough: replay must accept only an
+            // exact identity match. A mismatch means a different tool_call_id
+            // collision or corrupted recovery state, so fail closed.
+            if let Some(existing) = sqlx::query(
+                "SELECT command_id, run_id, executor_generation, idempotency_key
+                 FROM tool_executions WHERE tool_call_id = ?",
+            )
+            .bind(&tool_call_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+            {
+                let existing_command_id: String = existing.try_get("command_id")?;
+                let existing_run_id: String = existing.try_get("run_id")?;
+                let existing_generation: i64 = existing.try_get("executor_generation")?;
+                let existing_idempotency: String = existing.try_get("idempotency_key")?;
+                if existing_command_id != command_id
+                    || existing_run_id != run_id
+                    || existing_generation != executor_generation.as_i64()
+                    || existing_idempotency != idempotency_key
+                {
+                    bail!(
+                        "Prepare identity mismatch for {tool_call_id}: \
+                         existing ({existing_command_id}, {existing_run_id}, \
+                         {existing_generation}, {existing_idempotency}) \
+                         does not match requested ({command_id}, {run_id}, \
+                         {generation}, {idempotency_key})",
+                        generation = executor_generation.as_i64()
+                    );
+                }
+                return Ok(());
+            }
             sqlx::query(
-                "INSERT OR IGNORE INTO tool_executions(
+                "INSERT INTO tool_executions(
                     tool_call_id, command_id, run_id, executor_generation, state,
                     idempotency_key, started_at, finished_at, error_code
                  ) VALUES(?, ?, ?, ?, 'prepared', ?, NULL, NULL, NULL)",
@@ -9459,10 +9494,35 @@ async fn apply_approval_mutation(
             .ok_or_else(|| {
                 anyhow!("Approval Pending requires its same-batch writer-generated request")
             })?;
-            // `INSERT OR IGNORE` makes Pending idempotent across replayed
-            // assistant recovery: the same request_id may already be pending.
+            // Replay must accept only an exact identity match. A mismatch
+            // means a corrupted recovery or request_id collision, so fail closed.
+            if let Some(existing) = sqlx::query(
+                "SELECT tool_call_id, run_id, turn_id, state FROM approval_log WHERE id = ?",
+            )
+            .bind(&request_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+            {
+                let existing_tool_call_id: String = existing.try_get("tool_call_id")?;
+                let existing_run_id: String = existing.try_get("run_id")?;
+                let existing_turn_id: String = existing.try_get("turn_id")?;
+                let existing_state: String = existing.try_get("state")?;
+                if existing_tool_call_id != tool_call_id
+                    || existing_run_id != run_id
+                    || existing_turn_id != turn_id
+                    || existing_state != "pending"
+                {
+                    bail!(
+                        "Approval Pending identity mismatch for {request_id}: \
+                         existing ({existing_tool_call_id}, {existing_run_id}, \
+                         {existing_turn_id}, {existing_state}) does not match \
+                         requested ({tool_call_id}, {run_id}, {turn_id}, pending)"
+                    );
+                }
+                return Ok(());
+            }
             sqlx::query(
-                "INSERT OR IGNORE INTO approval_log(
+                "INSERT INTO approval_log(
                     id, tool_call_id, run_id, turn_id, state, request_projection,
                     redaction_version, created_at, decided_at
                  ) VALUES(?, ?, ?, ?, 'pending', ?, ?, ?, NULL)",
@@ -9604,6 +9664,34 @@ mod tests {
         let _: fn(ProcessGeneration) -> ToolExecutionMutation = skip;
         let _ = prepare(ProcessGeneration::MIN);
         let _ = skip(ProcessGeneration::MAX);
+    }
+
+    #[tokio::test]
+    async fn tool_execution_prepare_rejects_identity_mismatch() {
+        let store = test_store().await;
+        let mut tx = store.pool().begin().await.expect("begin transaction");
+        sqlx::query(
+            "INSERT INTO tool_executions(
+                tool_call_id, command_id, run_id, executor_generation, state,
+                idempotency_key, started_at, finished_at, error_code
+             ) VALUES('call-1', 'cmd-a', 'run-a', 0, 'prepared', 'idem-a', NULL, NULL, NULL)",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("seed existing prepared row");
+
+        let mismatch = ToolExecutionMutation::Prepare {
+            tool_call_id: "call-1".to_owned(),
+            command_id: "cmd-b".to_owned(),
+            run_id: "run-b".to_owned(),
+            executor_generation: test_process_generation(1),
+            idempotency_key: "idem-b".to_owned(),
+        };
+        let result = apply_tool_mutation(&mut tx, mismatch).await;
+        assert!(
+            result.is_err_and(|e| e.to_string().contains("Prepare identity mismatch")),
+            "mismatched Prepare must fail closed"
+        );
     }
 
     struct TestKeyProvider {

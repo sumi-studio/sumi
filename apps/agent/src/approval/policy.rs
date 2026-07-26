@@ -108,6 +108,7 @@ pub enum PolicyDecision {
     },
 }
 
+#[allow(dead_code)]
 impl PolicyDecision {
     pub fn is_allow(&self) -> bool {
         matches!(self, Self::Allow { .. })
@@ -166,6 +167,7 @@ impl Policy {
         &self.workspace_root
     }
 
+    #[allow(dead_code)]
     pub(crate) fn rules(&self) -> &[ApprovalRule] {
         &self.rules
     }
