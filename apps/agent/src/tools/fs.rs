@@ -297,19 +297,25 @@ impl WorkspaceFs {
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
             0,
         )?;
-        match openat2(
+        let (replaced_bytes, replaced_inodes) = match openat2(
             parent_fd.as_raw_fd(),
             Path::new(name),
             libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
             0,
             RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
         ) {
-            Ok(existing) => ensure_regular_file(&existing, "write_file destination")?,
-            Err(ToolError::Io(error)) if error.raw_os_error() == Some(libc::ENOENT) => {}
+            Ok(existing) => {
+                ensure_regular_file(&existing, "write_file destination")?;
+                (File::from(existing).metadata()?.len(), 1)
+            }
+            Err(ToolError::Io(error)) if error.raw_os_error() == Some(libc::ENOENT) => (0, 0),
             Err(error) => return Err(error),
-        }
+        };
         let content_bytes = u64::try_from(content.len()).unwrap_or(u64::MAX);
-        self.check_disk_quota(content_bytes, 1)?;
+        self.check_disk_quota(
+            content_bytes.saturating_sub(replaced_bytes),
+            1u64.saturating_sub(replaced_inodes),
+        )?;
         let temporary = CString::new(format!(".sumi-{}.tmp", Uuid::now_v7()))
             .map_err(|_| ToolError::InvalidPath("temporary filename was invalid".to_owned()))?;
         let name = os_str_cstring(name)?;
@@ -346,6 +352,7 @@ impl WorkspaceFs {
                     return Err(ToolError::Io(std::io::Error::last_os_error()));
                 }
                 self.commit_disk_quota(content_bytes, 1);
+                self.rollback_disk_quota(replaced_bytes, replaced_inodes);
                 post_rename().map_err(|error| post_commit_error("write_file rename", error))?;
                 File::from(parent_fd.try_clone().map_err(|error| {
                     post_commit_error("write_file rename", ToolError::Io(error))
@@ -355,7 +362,6 @@ impl WorkspaceFs {
                 Ok(())
             })();
         if write_result.is_err() {
-            self.rollback_disk_quota(content_bytes, 1);
             unsafe {
                 libc::unlinkat(parent_fd.as_raw_fd(), temporary.as_ptr(), 0);
             }
@@ -477,7 +483,7 @@ impl WorkspaceFs {
             .map_err(|_| ToolError::InvalidPath("temporary filename was invalid".to_owned()))?;
         let name = os_str_cstring(name)?;
         let replacement_bytes = u64::try_from(replacement.len()).unwrap_or(u64::MAX);
-        self.check_disk_quota(replacement_bytes, 1)?;
+        self.check_disk_quota(replacement_bytes.saturating_sub(original_metadata.len()), 0)?;
         let raw = unsafe {
             libc::openat(
                 parent_fd.as_raw_fd(),
@@ -491,6 +497,7 @@ impl WorkspaceFs {
         }
         let mut replacement_file = File::from(unsafe { OwnedFd::from_raw_fd(raw) });
         let mut temporary_ownership = EditTemporaryOwnership::Replacement;
+        let mut replacement_accounted = false;
         let replacement_result = (|| -> Result<(), ToolError> {
             replacement_file.write_all(replacement.as_bytes())?;
             if unsafe {
@@ -520,6 +527,7 @@ impl WorkspaceFs {
                 return Err(ToolError::Io(std::io::Error::last_os_error()));
             }
             self.commit_disk_quota(replacement_bytes, 1);
+            replacement_accounted = true;
             temporary_ownership = EditTemporaryOwnership::OriginalQuarantine;
 
             before_post_write_check();
@@ -592,6 +600,8 @@ impl WorkspaceFs {
                         if unsafe { libc::unlinkat(parent_fd.as_raw_fd(), temporary.as_ptr(), 0) }
                             == 0
                         {
+                            self.rollback_disk_quota(replacement_bytes, 1);
+                            replacement_accounted = false;
                             temporary_ownership = EditTemporaryOwnership::Removed;
                         } else {
                             temporary_ownership = EditTemporaryOwnership::Unknown;
@@ -647,12 +657,10 @@ impl WorkspaceFs {
                     ToolError::Io(std::io::Error::last_os_error()),
                 ));
             }
+            self.rollback_disk_quota(original_metadata.len(), 1);
             temporary_ownership = EditTemporaryOwnership::Removed;
             Ok(())
         })();
-        if replacement_result.is_err() {
-            self.rollback_disk_quota(replacement_bytes, 1);
-        }
         if replacement_result.is_err() && temporary_ownership == EditTemporaryOwnership::Replacement
         {
             let replacement_metadata = replacement_file.metadata();
@@ -673,8 +681,10 @@ impl WorkspaceFs {
                     if replacement.dev() == temporary.dev()
                         && replacement.ino() == temporary.ino()
             ) {
-                unsafe {
-                    libc::unlinkat(parent_fd.as_raw_fd(), temporary.as_ptr(), 0);
+                let removed =
+                    unsafe { libc::unlinkat(parent_fd.as_raw_fd(), temporary.as_ptr(), 0) } == 0;
+                if removed && replacement_accounted {
+                    self.rollback_disk_quota(replacement_bytes, 1);
                 }
             }
         }

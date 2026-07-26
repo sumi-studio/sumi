@@ -2268,7 +2268,14 @@ mod tests {
                 .expect("empty arguments"),
         };
         let result = driver
-            .execute_tool_observed("flow-1", &call, CancellationToken::new(), Arc::new(|_| {}))
+            .execute_tool_observed(
+                "flow-1",
+                "command-1",
+                "run-1",
+                &call,
+                CancellationToken::new(),
+                Arc::new(|_| {}),
+            )
             .await;
         assert!(
             result.is_err(),
@@ -2306,7 +2313,14 @@ mod tests {
                 .expect("empty arguments"),
         };
         let result = driver
-            .execute_tool_observed("flow-1", &call, CancellationToken::new(), Arc::new(|_| {}))
+            .execute_tool_observed(
+                "flow-1",
+                "command-1",
+                "run-1",
+                &call,
+                CancellationToken::new(),
+                Arc::new(|_| {}),
+            )
             .await;
         assert!(result.is_ok(), "approval broker must allow the tool");
     }

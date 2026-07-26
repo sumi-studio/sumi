@@ -128,10 +128,12 @@ wait_for_socket() {
 prepare_cgroup_base() {
   local exports
   exports="$(
-    SUMI_TENANT_ID="${SUMI_TENANT_ID}" \
-    SUMI_AGENT_ID="${SUMI_AGENT_ID}" \
-    SUMI_CONVERSATION_ID="${SUMI_CONVERSATION_ID}" \
-    SUMI_RPC_GENERATION="${SUMI_RPC_GENERATION}" \
+    env -i \
+    "SUMI_TENANT_ID=${SUMI_TENANT_ID}" \
+    "SUMI_AGENT_ID=${SUMI_AGENT_ID}" \
+    "SUMI_CONVERSATION_ID=${SUMI_CONVERSATION_ID}" \
+    "SUMI_RPC_GENERATION=${SUMI_RPC_GENERATION}" \
+    "PATH=/usr/bin:/bin" \
     "${SUMI_BIN}" --supervisor-prepare-cgroup
   )" || error "cgroup base preparation failed"
   eval "${exports}"
@@ -139,12 +141,19 @@ prepare_cgroup_base() {
 }
 
 recover_stale_generations() {
-  "${SUMI_BIN}" --supervisor-recovery-scan "${SUMI_EXECUTOR_CGROUP_BASE}" "${SUMI_RPC_GENERATION}" >/dev/null \
+  env -i \
+    "PATH=/usr/bin:/bin" \
+    "${SUMI_BIN}" --supervisor-recovery-scan "${SUMI_EXECUTOR_CGROUP_BASE}" "${SUMI_RPC_GENERATION}" >/dev/null \
     || error "stale generation cgroup recovery scan failed"
   # Runtime/executor/artifact-broker processes are not inside command cgroups;
   # scan the process table for stale Sumi services with the same deployment
   # boundary and a different generation number.
-  "${SUMI_BIN}" --supervisor-kill-stale-processes "${SUMI_RPC_GENERATION}" >/dev/null \
+  env -i \
+    "SUMI_TENANT_ID=${SUMI_TENANT_ID}" \
+    "SUMI_AGENT_ID=${SUMI_AGENT_ID}" \
+    "SUMI_CONVERSATION_ID=${SUMI_CONVERSATION_ID}" \
+    "PATH=/usr/bin:/bin" \
+    "${SUMI_BIN}" --supervisor-kill-stale-processes "${SUMI_RPC_GENERATION}" >/dev/null \
     || error "stale process recovery scan failed"
 }
 

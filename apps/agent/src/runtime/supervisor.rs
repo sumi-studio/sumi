@@ -24,8 +24,11 @@ const REAP_DEADLINE: Duration = Duration::from_secs(2);
 /// Prepare a per-generation cgroup base directory under the current process
 /// cgroup. The returned path is suitable for `SUMI_EXECUTOR_CGROUP_BASE`.
 ///
-/// The base directory is named `sumi-agent-<tenant>-<agent>-<conversation>-g<generation>`
-/// so that stale siblings can be discovered by `scan_and_kill_stale`.
+/// The base directory is named
+/// `sumi-agent-<tenant>-<agent>-<conversation>-<identity-tag>-g<generation>`.
+/// The readable identities are sanitized, while the hash-derived identity tag
+/// prevents lossy sanitization collisions. The stable prefix lets
+/// `scan_and_kill_stale` discover sibling generations.
 pub fn prepare_cgroup_base(
     tenant_id: &str,
     agent_id: &str,
@@ -43,8 +46,20 @@ pub fn prepare_cgroup_base(
     }
 
     // Delegate the controllers the executor may need for command cgroups.
-    for controller in ["cpu", "memory", "pids", "io"] {
-        let _ = enable_subtree_controller(&base, controller);
+    for controller in ["cpu", "memory", "pids"] {
+        enable_subtree_controller(&base, controller).with_context(|| {
+            format!(
+                "required controller {controller} could not be delegated in {}",
+                base.display()
+            )
+        })?;
+    }
+    if let Err(error) = enable_subtree_controller(&base, "io") {
+        tracing::warn!(
+            path = %base.display(),
+            %error,
+            "optional io controller could not be delegated"
+        );
     }
 
     Ok(base)
@@ -64,6 +79,7 @@ pub fn scan_and_kill_stale(base_dir: &Path, current_generation: u64) -> Result<V
         .context("cgroup base name is missing generation suffix")?;
 
     let mut removed = Vec::new();
+    let mut failures = Vec::new();
     for entry in std::fs::read_dir(parent)
         .with_context(|| format!("failed to read cgroup parent {}", parent.display()))?
     {
@@ -96,9 +112,18 @@ pub fn scan_and_kill_stale(base_dir: &Path, current_generation: u64) -> Result<V
             );
         }
 
-        kill_and_remove_cgroup(&path)
-            .with_context(|| format!("failed to reap stale cgroup {}", path.display()))?;
-        removed.push(path);
+        match kill_and_remove_cgroup(&path) {
+            Ok(()) => removed.push(path),
+            Err(error) => failures.push(format!("{}: {error:#}", path.display())),
+        }
+    }
+
+    if !failures.is_empty() {
+        bail!(
+            "failed to reap {} stale cgroup(s) after scanning all candidates: {}",
+            failures.len(),
+            failures.join("; ")
+        );
     }
 
     Ok(removed)

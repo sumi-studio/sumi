@@ -224,10 +224,9 @@ pub(crate) async fn run_production_with_driver_and_broker(
         );
     }
 
-    let (state, runtime_receipt) =
-        hydrate_store(&store, &event_writer, &ctx.lease, &ctx.fence)
-            .await
-            .context("T17/T27 durable hydration failed")?;
+    let (state, runtime_receipt) = hydrate_store(&store, &event_writer, &ctx.lease, &ctx.fence)
+        .await
+        .context("T17/T27 durable hydration failed")?;
     if !state.recovery_steps.is_empty() {
         bail!(
             "durable suffix recovery steps remain after hydration; T17/T27 must resolve {:?} before T26 composition",

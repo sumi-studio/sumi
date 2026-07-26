@@ -213,11 +213,30 @@ impl GenerationExecutionRegistry {
             .collect();
 
         let mut reaped = Vec::with_capacity(stale.len());
+        let mut failures = Vec::new();
         for sandbox in stale {
-            if kill_sandbox(&sandbox).await.is_ok() {
-                self.mark_terminal(&sandbox.execution_id)?;
-                reaped.push(sandbox);
+            match kill_sandbox(&sandbox).await {
+                Ok(()) => {
+                    self.mark_terminal(&sandbox.execution_id)?;
+                    reaped.push(sandbox);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        execution_id = %sandbox.execution_id,
+                        generation = sandbox.generation.as_u64(),
+                        %error,
+                        "failed to kill and reap stale execution sandbox"
+                    );
+                    failures.push(format!("{}: {error:#}", sandbox.execution_id));
+                }
             }
+        }
+        if !failures.is_empty() {
+            bail!(
+                "failed to reap {} stale execution sandbox(es): {}",
+                failures.len(),
+                failures.join("; ")
+            );
         }
         Ok(reaped)
     }
@@ -227,11 +246,30 @@ impl GenerationExecutionRegistry {
     pub async fn kill_all(&self) -> Result<Vec<ExecutionSandbox>> {
         let all = self.snapshot_active();
         let mut killed = Vec::with_capacity(all.len());
+        let mut failures = Vec::new();
         for sandbox in all {
-            if kill_sandbox(&sandbox).await.is_ok() {
-                self.mark_terminal(&sandbox.execution_id)?;
-                killed.push(sandbox);
+            match kill_sandbox(&sandbox).await {
+                Ok(()) => {
+                    self.mark_terminal(&sandbox.execution_id)?;
+                    killed.push(sandbox);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        execution_id = %sandbox.execution_id,
+                        generation = sandbox.generation.as_u64(),
+                        %error,
+                        "failed to kill and reap execution sandbox during shutdown"
+                    );
+                    failures.push(format!("{}: {error:#}", sandbox.execution_id));
+                }
             }
+        }
+        if !failures.is_empty() {
+            bail!(
+                "failed to reap {} execution sandbox(es): {}",
+                failures.len(),
+                failures.join("; ")
+            );
         }
         Ok(killed)
     }
@@ -310,27 +348,10 @@ fn is_pid_gone(pid: u32) -> bool {
         return true;
     };
 
-    // If this process is our child, reap it and treat any exit as gone.
-    let mut status = 0;
-    let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-    if rc == pid {
-        return true;
-    }
-    if rc == 0 {
-        return false;
-    }
-    if rc < 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::ECHILD) {
-            // Interrupted or other error; assume still present and let the
-            // deadline logic retry.
-            return false;
-        }
-    }
-
-    // Not our child: fall back to existence check.  A zombie that is still
-    // in the process table will respond to kill(pid, 0); if we cannot signal
-    // it, it is either gone or owned by another user.
+    // Never call waitpid here. The spawning Child owns its wait status, and
+    // stealing it would make the owner's wait fail with ECHILD. A zombie still
+    // answers kill(pid, 0), so the owner must reap it before this fallback can
+    // report completion.
     let rc = unsafe { libc::kill(pid, 0) };
     if rc != 0 {
         let err = std::io::Error::last_os_error();
@@ -534,14 +555,15 @@ mod tests {
             )
             .unwrap();
 
+        let wait = tokio::spawn(async move { child.wait().await });
         registry.kill_and_reap("exec-1").await.unwrap();
 
         let snapshot = registry.get("exec-1").unwrap();
         assert!(snapshot.terminal);
 
         // The child should be gone within the reap window.
-        let waited = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
-        assert!(waited.is_ok(), "setsid child was not reaped");
+        let waited = tokio::time::timeout(Duration::from_secs(2), wait).await;
+        assert!(waited.is_ok(), "setsid child owner did not reap it");
 
         handle.disarm();
     }
@@ -588,6 +610,7 @@ mod tests {
             )
             .unwrap();
 
+        let wait = tokio::spawn(async move { old_child.wait().await });
         let reaped = registry.reap_old_generation(current).await.unwrap();
         assert_eq!(reaped.len(), 1);
         assert_eq!(reaped[0].execution_id, "old-exec");
@@ -595,9 +618,9 @@ mod tests {
         assert!(!registry.get("current-exec").unwrap().terminal);
 
         // The old child should be gone after the reap.
-        let _ = tokio::time::timeout(Duration::from_secs(2), old_child.wait())
+        let _ = tokio::time::timeout(Duration::from_secs(2), wait)
             .await
-            .expect("old child was reaped");
+            .expect("old child owner did not reap it");
 
         current_handle.disarm();
     }
@@ -650,6 +673,27 @@ mod tests {
         wait_pids_reaped(&[])
             .await
             .expect("empty pid list is trivially reaped");
+    }
+
+    #[tokio::test]
+    async fn kill_all_reports_cleanup_failure_instead_of_treating_it_as_absent() {
+        let registry = GenerationExecutionRegistry::new(generation(1));
+        registry
+            .test_insert(ExecutionSandbox {
+                generation: generation(1),
+                tool_call_id: "tool".to_owned(),
+                command_id: "command".to_owned(),
+                run_id: "run".to_owned(),
+                execution_id: "missing-boundary".to_owned(),
+                cgroup_path: None,
+                pids: vec![],
+                terminal: false,
+            })
+            .unwrap();
+
+        let error = registry.kill_all().await.unwrap_err();
+        assert!(error.to_string().contains("missing-boundary"));
+        assert!(!registry.get("missing-boundary").unwrap().terminal);
     }
 
     #[tokio::test]

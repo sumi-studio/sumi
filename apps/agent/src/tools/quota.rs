@@ -259,8 +259,16 @@ impl AppliedQuota {
     /// Best-effort removal of the per-execution cgroup directory. If processes
     /// remain, `cgroup.kill` is written and the directory is removed once it
     /// becomes empty.
-    pub fn cleanup(self) {
-        if let Some(cgroup) = self.cgroup {
+    pub fn cleanup(mut self) {
+        if let Some(cgroup) = self.cgroup.take() {
+            let _ = cgroup.destroy();
+        }
+    }
+}
+
+impl Drop for AppliedQuota {
+    fn drop(&mut self) {
+        if let Some(cgroup) = self.cgroup.take() {
             let _ = cgroup.destroy();
         }
     }
@@ -628,15 +636,15 @@ impl QuotaBoundary for CgroupV2Boundary {
 
         // Pre-allocate the NUL-terminated cgroup.procs path before fork so the
         // pre_exec hook can migrate itself using only raw syscalls and stack
-        // buffers. The path is intentionally leaked; the child either execs or
-        // exits and the kernel reclaims the memory.
+        // buffers. Ownership remains in the Command closure and is released in
+        // the parent when the Command is dropped.
         let mut cgroup_procs_bytes = Vec::with_capacity(
-            cgroup_path.as_os_str().as_encoded_bytes().len() + b"/cgroup.procs".len() + 1,
+            cgroup_path.as_os_str().as_encoded_bytes().len() + b"/cgroup.procs".len(),
         );
         cgroup_procs_bytes.extend_from_slice(cgroup_path.as_os_str().as_encoded_bytes());
         cgroup_procs_bytes.extend_from_slice(b"/cgroup.procs");
-        cgroup_procs_bytes.push(0);
-        let cgroup_procs_path: &'static [u8] = &*Box::leak(cgroup_procs_bytes.into_boxed_slice());
+        let cgroup_procs_path = std::ffi::CString::new(cgroup_procs_bytes)
+            .map_err(|_| ToolError::Protocol("cgroup path contained a NUL byte".to_owned()))?;
 
         unsafe {
             command.pre_exec(move || {
@@ -651,7 +659,7 @@ impl QuotaBoundary for CgroupV2Boundary {
                     // approximation of a per-command disk-byte limit.
                     set_rlimit(libc::RLIMIT_FSIZE, bytes)?;
                 }
-                migrate_self_to_cgroup(cgroup_procs_path)
+                migrate_self_to_cgroup(cgroup_procs_path.as_bytes_with_nul())
             });
         }
 
@@ -732,7 +740,12 @@ impl QuotaBoundary for LowTrustBoundary {
     }
 }
 
-fn set_rlimit(resource: libc::__rlimit_resource_t, value: u64) -> std::io::Result<()> {
+#[cfg(target_env = "musl")]
+type RlimitResource = libc::c_int;
+#[cfg(not(target_env = "musl"))]
+type RlimitResource = libc::__rlimit_resource_t;
+
+fn set_rlimit(resource: RlimitResource, value: u64) -> std::io::Result<()> {
     // Set the hard limit one unit above the soft limit so the kernel delivers
     // the typed signal (SIGXCPU / SIGXFSZ) at the soft limit instead of
     // SIGKILL when the process has not installed a handler.
@@ -749,7 +762,7 @@ fn set_rlimit(resource: libc::__rlimit_resource_t, value: u64) -> std::io::Resul
     }
 }
 
-fn migrate_self_to_cgroup(path: &'static [u8]) -> std::io::Result<()> {
+fn migrate_self_to_cgroup(path: &[u8]) -> std::io::Result<()> {
     debug_assert_eq!(
         path.last(),
         Some(&0),

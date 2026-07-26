@@ -240,7 +240,7 @@ mod tests {
         let result = LowTrustLocalBash::new(workspace, &NoopArtifacts)
             .with_quota_policy(policy)
             .execute(
-                "dd if=/dev/zero of=big bs=1M count=2",
+                "exec dd if=/dev/zero of=big bs=1M count=2",
                 "disk-bytes",
                 cancel(),
                 no_update(),
@@ -301,6 +301,26 @@ mod tests {
         // First file consumes the single-inode budget.
         fs.write_file(Path::new("first"), b"hello").unwrap();
         let err = fs.write_file(Path::new("second"), b"world").unwrap_err();
+        assert!(matches!(
+            err,
+            ToolError::ResourceLimit(ResourceLimit::DiskInodes { limit: 1, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn workspace_overwrite_and_edit_account_only_the_installed_file() {
+        let root = temp_workspace();
+        let quota = InMemoryDiskQuota::new(8, 1);
+        let fs = WorkspaceFs::open_with_disk_quota(&root, Some(quota)).unwrap();
+
+        fs.write_file(Path::new("only"), b"aaaa").unwrap();
+        for _ in 0..5 {
+            fs.write_file(Path::new("only"), b"bbbb").unwrap();
+            fs.edit_file(Path::new("only"), "bbbb", "aaaa").unwrap();
+        }
+
+        assert_eq!(std::fs::read(root.join("only")).unwrap(), b"aaaa");
+        let err = fs.write_file(Path::new("second"), b"x").unwrap_err();
         assert!(matches!(
             err,
             ToolError::ResourceLimit(ResourceLimit::DiskInodes { limit: 1, .. })
@@ -378,6 +398,7 @@ mod tests {
             })
             .unwrap();
 
+        let wait = tokio::spawn(async move { child.wait().await });
         let reaped = registry
             .reap_old_generation(current)
             .await
@@ -385,9 +406,9 @@ mod tests {
         assert_eq!(reaped.len(), 1);
         assert_eq!(reaped[0].execution_id, "stale-exec");
 
-        let _ = tokio::time::timeout(Duration::from_secs(2), child.wait())
+        let _ = tokio::time::timeout(Duration::from_secs(2), wait)
             .await
-            .expect("stale descendant was reaped");
+            .expect("stale descendant owner did not reap it");
     }
 
     #[tokio::test]
@@ -423,14 +444,15 @@ mod tests {
 
         // Closing the intent (here via kill_all) must mark the execution
         // terminal so it cannot be emitted or retried again.
+        let wait = tokio::spawn(async move { child.wait().await });
         let killed = registry.kill_all().await.expect("kill all");
         assert_eq!(killed.len(), 1);
         assert!(registry.get("running-exec").unwrap().terminal);
         assert!(registry.recovery_intents().is_empty());
 
-        let _ = tokio::time::timeout(Duration::from_secs(2), child.wait())
+        let _ = tokio::time::timeout(Duration::from_secs(2), wait)
             .await
-            .expect("recovered child was reaped");
+            .expect("recovered child owner did not reap it");
 
         handle.disarm();
     }
