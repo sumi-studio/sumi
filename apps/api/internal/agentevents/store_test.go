@@ -715,7 +715,7 @@ func TestCommandStore_PoisonOnWriteRollbackFailure(t *testing.T) {
 	defer store.Close()
 
 	// Seed the file so the append path seeks to end and then fails.
-	if _, err := store.Append(context.Background(), "conv-1", "", json.RawMessage(`{"type":"noop"}`)); err != nil {
+	if _, err := store.Append(context.Background(), "conv-1", "", json.RawMessage(`{"type":"abort"}`)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -723,7 +723,7 @@ func TestCommandStore_PoisonOnWriteRollbackFailure(t *testing.T) {
 	ff.failWriteOn = 1
 	ff.failTruncateOn = 1
 
-	_, err = store.Append(context.Background(), "conv-1", "", json.RawMessage(`{"type":"noop"}`))
+	_, err = store.Append(context.Background(), "conv-1", "", json.RawMessage(`{"type":"abort"}`))
 	if err == nil {
 		t.Fatal("expected append to fail")
 	}
@@ -731,7 +731,7 @@ func TestCommandStore_PoisonOnWriteRollbackFailure(t *testing.T) {
 		t.Fatalf("expected compound rollback error, got %v", err)
 	}
 
-	_, err = store.Append(context.Background(), "conv-1", "", json.RawMessage(`{"type":"noop"}`))
+	_, err = store.Append(context.Background(), "conv-1", "", json.RawMessage(`{"type":"abort"}`))
 	if err == nil || !strings.Contains(err.Error(), "poisoned") {
 		t.Fatalf("expected poisoned state error, got %v", err)
 	}
@@ -745,7 +745,7 @@ func TestCommandStore_PoisonOnSyncRollbackFailure(t *testing.T) {
 	}
 	defer store.Close()
 
-	if _, err := store.Append(context.Background(), "conv-1", "", json.RawMessage(`{"type":"noop"}`)); err != nil {
+	if _, err := store.Append(context.Background(), "conv-1", "", json.RawMessage(`{"type":"abort"}`)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -753,7 +753,7 @@ func TestCommandStore_PoisonOnSyncRollbackFailure(t *testing.T) {
 	ff.failSyncOn = 1
 	ff.failTruncateOn = 1
 
-	_, err = store.Append(context.Background(), "conv-1", "", json.RawMessage(`{"type":"noop"}`))
+	_, err = store.Append(context.Background(), "conv-1", "", json.RawMessage(`{"type":"abort"}`))
 	if err == nil {
 		t.Fatal("expected append to fail")
 	}
@@ -775,14 +775,14 @@ func TestCommandStore_NoPoisonOnRollbackSuccess(t *testing.T) {
 	}
 	defer store.Close()
 
-	if _, err := store.Append(context.Background(), "conv-1", "", json.RawMessage(`{"type":"noop"}`)); err != nil {
+	if _, err := store.Append(context.Background(), "conv-1", "", json.RawMessage(`{"type":"abort"}`)); err != nil {
 		t.Fatal(err)
 	}
 
 	ff := injectFailingFile(t, store, "conv-1")
 	ff.failSyncOn = 1
 
-	_, err = store.Append(context.Background(), "conv-1", "", json.RawMessage(`{"type":"noop"}`))
+	_, err = store.Append(context.Background(), "conv-1", "", json.RawMessage(`{"type":"abort"}`))
 	if err == nil {
 		t.Fatal("expected append to fail")
 	}
@@ -798,7 +798,7 @@ func TestCommandStore_NoPoisonOnRollbackSuccess(t *testing.T) {
 		t.Fatalf("expected next seq to remain 2 after rollback, got %d", next)
 	}
 
-	env, err := store.Append(context.Background(), "conv-1", "", json.RawMessage(`{"type":"noop"}`))
+	env, err := store.Append(context.Background(), "conv-1", "", json.RawMessage(`{"type":"abort"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1257,5 +1257,64 @@ func TestCommandStore_RejectLogWithSeqExceedingJsonSafeInteger(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "JSON-safe integer") {
 		t.Fatalf("expected JSON-safe integer error, got %v", err)
+	}
+}
+
+func TestCommandStore_ReopenRejectsInvalidPersistedCommandVocabulary(t *testing.T) {
+	for name, command := range map[string]string{
+		"null":                  `null`,
+		"non_object":            `[]`,
+		"non_string_type":       `{"type":1}`,
+		"unknown_type":          `{"type":"future_command"}`,
+		"invalid_variant_shape": `{"type":"user_message","text":"x","attachments":[{}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			line := fmt.Sprintf(
+				`{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command":%s}`+"\n",
+				command,
+			)
+			if err := os.WriteFile(commandLogPath(dir, "conv-1"), []byte(line), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			store, err := OpenCommandStore(dir)
+			if err == nil {
+				defer store.Close()
+				t.Fatalf("reopen accepted persisted %s command", name)
+			}
+			if !strings.Contains(err.Error(), "invalid persisted command") {
+				t.Fatalf("unexpected reopen error: %v", err)
+			}
+		})
+	}
+}
+
+func TestCommandStore_ReopenCatchUpAcceptsCurrentCommandVocabulary(t *testing.T) {
+	dir := t.TempDir()
+	line := `{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command":{"type":"abort"}}` + "\n"
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(commandLogPath(dir, "conv-1"), []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenCommandStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	commands, err := store.CatchUp(context.Background(), "conv-1", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(commands) != 1 {
+		t.Fatalf("unexpected recovered commands: %+v", commands)
+	}
+	commandType, err := commands[0].CommandType()
+	if err != nil || commandType != "abort" {
+		t.Fatalf("unexpected recovered commands: %+v", commands)
 	}
 }

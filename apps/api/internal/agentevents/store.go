@@ -118,9 +118,9 @@ func (r *LogRecord) UnmarshalJSON(data []byte) error {
 	if !canonicalUUIDRegexp.MatchString(*raw.CommandID) {
 		return errors.New("command_id must be a canonical UUID")
 	}
-	// The durable log predates the current public command vocabulary. Recovery
-	// must reject record-shape corruption without reinterpreting a previously
-	// accepted payload under a newer vocabulary.
+	if err := ValidateCommand(raw.Command); err != nil {
+		return fmt.Errorf("invalid persisted command: %w", err)
+	}
 	*r = LogRecord{CommandEnvelope: CommandEnvelope{
 		Seq: *raw.Seq, CommandID: *raw.CommandID, Command: raw.Command,
 	}, IdempotencyKey: raw.IdempotencyKey}
