@@ -226,7 +226,7 @@ pub struct SupervisorHandle {
     /// True once the current epoch has caught up to the durable event cursor.
     pub online: watch::Receiver<bool>,
     cancel: CancellationToken,
-    task: JoinHandle<Result<()>>,
+    task: Option<JoinHandle<Result<()>>>,
 }
 
 impl SupervisorHandle {
@@ -234,8 +234,21 @@ impl SupervisorHandle {
         self.cancel.cancel();
     }
 
-    pub async fn join(self) -> Result<()> {
-        self.task.await?
+    pub async fn join(mut self) -> Result<()> {
+        let task = self
+            .task
+            .take()
+            .context("supervisor task was already consumed")?;
+        task.await?
+    }
+}
+
+impl Drop for SupervisorHandle {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -328,7 +341,7 @@ where
             epochs: epochs_rx,
             online: online_rx,
             cancel,
-            task,
+            task: Some(task),
         }
     }
 
@@ -1047,7 +1060,7 @@ async fn send_validated(
             // seq < next_expected is a legitimate retransmission; the durable consumer
             // (EventWriter) deduplicates by command_id and re-ACKs the same canonical seq.
             if seq == next_expected {
-                Ok(next_expected + 1)
+                Ok(next_expected.saturating_add(1))
             } else {
                 Ok(next_expected)
             }
@@ -1158,6 +1171,14 @@ mod tests {
     }
 
     struct TestDigest(Sha256);
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
 
     impl crate::gateway::IncrementalCommandDigest for TestDigest {
         fn update(&mut self, data: &[u8]) {
@@ -2093,6 +2114,57 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert!(format!("{:#}", result.unwrap_err()).contains("command consumer closed"));
+    }
+
+    #[tokio::test]
+    async fn send_validated_saturates_at_maximum_command_sequence() {
+        let (mut tx, mut rx) = mpsc::channel::<InboundCommand>(1);
+        let next = send_validated(
+            valid_command(u64::MAX, "00000000-0000-4000-8000-000000000001"),
+            u64::MAX,
+            &mut tx,
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("maximum command sequence is accepted");
+        assert_eq!(next, u64::MAX);
+        assert_eq!(inbound_command_seq(&rx.recv().await.unwrap()), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn dropping_supervisor_handle_cancels_and_aborts_task() {
+        let (_commands_tx, commands) = mpsc::channel(1);
+        let (events, _events_rx) = mpsc::channel(1);
+        let (_epochs_tx, epochs) = watch::channel(None);
+        let (_online_tx, online) = watch::channel(false);
+        let cancel = CancellationToken::new();
+        let observed_cancel = cancel.clone();
+        let task_dropped = Arc::new(AtomicBool::new(false));
+        let drop_flag = DropFlag(task_dropped.clone());
+        let task = tokio::spawn(async move {
+            let _drop_flag = drop_flag;
+            std::future::pending::<Result<()>>().await
+        });
+        tokio::task::yield_now().await;
+
+        drop(SupervisorHandle {
+            commands,
+            events,
+            epochs,
+            online,
+            cancel,
+            task: Some(task),
+        });
+
+        assert!(observed_cancel.is_cancelled());
+        tokio::time::timeout(Duration::from_millis(200), async {
+            while !task_dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborted supervisor task must be dropped");
     }
 
     #[tokio::test]
