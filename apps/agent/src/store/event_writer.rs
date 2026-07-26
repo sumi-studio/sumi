@@ -18441,6 +18441,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn message_end_append_creates_l0_membership_excluded_does_not() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+
+        let command_id = "00000000-0000-4000-8000-000000000100";
+        let injected = classified_injection(&writer, 1, command_id, "ignored", "append me").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "append me"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("apply user message end with append_to_l0=true");
+
+        let membership: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_batch_messages")
+            .fetch_one(store.pool())
+            .await
+            .expect("count membership");
+        assert_eq!(
+            membership, 1,
+            "append_to_l0=true must insert explicit L0 batch membership"
+        );
+
+        let l0_batches: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memory_batches WHERE layer = 0 AND state = 'open'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("count open L0 batches");
+        assert_eq!(
+            l0_batches, 1,
+            "append_to_l0=true must create an open L0 batch"
+        );
+
+        // Retry-error assistant messages are excluded from L0: they still create
+        // a durable message row, but no memory_batch_messages membership.
+        let exclude_id = "00000000-0000-4000-8000-000000000101";
+        let exclude_run = format!("run-{command_id}");
+        let exclude_turn = format!("turn-{command_id}");
+        let exclude_message = PublicMessage::Assistant(PublicAssistantMessage {
+            content: Vec::new(),
+            model: "test-model".to_owned(),
+            provider: "test-provider".to_owned(),
+            origin: test_provider_origin(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Error,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: durable_test_timestamp(),
+        });
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_start",
+                                exclude_id,
+                                &exclude_message,
+                                Some(exclude_run.clone()),
+                                Some(exclude_turn.clone()),
+                            )
+                            .expect("MessageStart"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: command_id.to_owned(),
+                            run_id: exclude_run.clone(),
+                            expected: RunPhase::UserCommitted,
+                            next: RunPhase::AssistantStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_end",
+                                exclude_id,
+                                &exclude_message,
+                                Some(exclude_run),
+                                Some(exclude_turn),
+                            )
+                            .expect("MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: exclude_id.to_owned(),
+                            role: "assistant",
+                            message: exclude_message,
+                            append_to_l0: false,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("apply assistant retry-error message end");
+
+        let membership: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_batch_messages")
+            .fetch_one(store.pool())
+            .await
+            .expect("count membership after exclude");
+        assert_eq!(
+            membership, 1,
+            "append_to_l0=false must not add L0 batch membership"
+        );
+
+        let messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+            .fetch_one(store.pool())
+            .await
+            .expect("count messages");
+        assert_eq!(
+            messages, 2,
+            "both message ends must be persisted as messages"
+        );
+    }
+
+    #[tokio::test]
     async fn approval_projection_and_version_are_writer_generated() {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());

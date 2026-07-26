@@ -1408,13 +1408,25 @@ async fn recover_compacting_batches(store: &Store) -> Result<()> {
             let summary_key_ref: Option<String> = row.try_get("summary_key_ref")?;
             if summary_key_ref.is_none() {
                 // In-flight L1/L2 target. It is only an orphan if neither a job
-                // owns it by target batch_seq nor it is referenced as a source.
-                let target_referenced: Option<i64> =
-                    sqlx::query_scalar("SELECT 1 FROM memory_jobs WHERE batch_seq = ? LIMIT 1")
+                // owns it by target batch_seq (matching the job kind's target
+                // layer) nor it is referenced as a source.
+                let target_kinds: &[&str] = match MemoryLayer::from_i64(layer) {
+                    Some(MemoryLayer::L1) => &[MemoryJobKind::CompactL0.as_str()],
+                    Some(MemoryLayer::L2) => &[
+                        MemoryJobKind::CompactL1.as_str(),
+                        MemoryJobKind::ConsolidateL2.as_str(),
+                    ],
+                    _ => unreachable!("summary-less compacting batch must be L1 or L2"),
+                };
+                let job_kinds: Vec<String> =
+                    sqlx::query_scalar("SELECT kind FROM memory_jobs WHERE batch_seq = ?")
                         .bind(batch_seq)
-                        .fetch_optional(store.pool())
+                        .fetch_all(store.pool())
                         .await
-                        .context("check existing memory job for target batch_seq")?;
+                        .context("check existing memory jobs for target batch_seq")?;
+                let target_referenced =
+                    job_kinds.iter().any(|k| target_kinds.contains(&k.as_str()));
+
                 let source_referenced: Option<i64> = sqlx::query_scalar(
                     "SELECT 1 FROM memory_jobs
                      WHERE EXISTS (
@@ -1425,7 +1437,7 @@ async fn recover_compacting_batches(store: &Store) -> Result<()> {
                 .fetch_optional(store.pool())
                 .await
                 .context("check existing memory job for orphan target batch")?;
-                if target_referenced.is_none() && source_referenced.is_none() {
+                if !target_referenced && source_referenced.is_none() {
                     repair_orphan_compacting_target(store, &source_id, version).await?;
                 }
                 continue;
@@ -4216,5 +4228,89 @@ mod tests {
             uncovered_count, 1,
             "unrelated Anthropic compaction must remain"
         );
+    }
+
+    #[tokio::test]
+    async fn recover_repairs_orphan_l2_target_with_colliding_compact_l0_batch_seq() {
+        let store = test_store().await;
+        let source_id = Uuid::now_v7().to_string();
+        // A CompactL0 job whose target L1 happens to share batch_seq with a
+        // stray L2 target must not prevent the L2 orphan from being repaired.
+        insert_compact_l0_job(&store, "job-collide", &source_id, 5).await;
+
+        let orphan_l2 = Uuid::now_v7().to_string();
+        MemoryBatchRecord::new(
+            &orphan_l2,
+            MemoryLayer::L2,
+            0,
+            5,
+            MemoryBatchState::Compacting,
+            0,
+            0,
+        )
+        .insert(store.pool())
+        .await
+        .expect("insert orphan L2 target");
+
+        recover_compacting_batches(&store)
+            .await
+            .expect("recover compacting batches");
+
+        let state: String = sqlx::query_scalar("SELECT state FROM memory_batches WHERE id = ?")
+            .bind(&orphan_l2)
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch orphan state");
+        assert_eq!(state, "compact_failed");
+
+        let maintenance: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_events WHERE event_type = 'memory_maintenance'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("count maintenance events");
+        assert_eq!(
+            maintenance, 1,
+            "orphan repair must emit one maintenance event"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_job_states_clear_lease_until() {
+        let store = test_store().await;
+        let (source_id, _target_id) = insert_l0_batch(&store, &[user("lease check")]).await;
+        insert_compact_l0_job(&store, "job-lease", &source_id, 1).await;
+
+        let provider = Arc::new(FakeProvider {
+            text: Mutex::new("summary".into()),
+            ..FakeProvider::default()
+        });
+        run_worker(store.clone(), provider).await;
+
+        let completed: Option<String> =
+            sqlx::query_scalar("SELECT lease_until FROM memory_jobs WHERE id = ?")
+                .bind("job-lease")
+                .fetch_one(store.pool())
+                .await
+                .expect("fetch completed job");
+        assert!(completed.is_none(), "completed job must have no lease");
+
+        // Fail path also clears the lease.
+        let (source_id2, _target_id2) =
+            insert_l0_batch_with_seq(&store, 2, &[user("fail lease")]).await;
+        insert_compact_l0_job(&store, "job-fail-lease", &source_id2, 2).await;
+        let failing_provider = Arc::new(FakeProvider {
+            fail_next: AtomicUsize::new(usize::MAX),
+            ..FakeProvider::default()
+        });
+        run_worker(store.clone(), failing_provider).await;
+
+        let failed: Option<String> =
+            sqlx::query_scalar("SELECT lease_until FROM memory_jobs WHERE id = ?")
+                .bind("job-fail-lease")
+                .fetch_one(store.pool())
+                .await
+                .expect("fetch failed job");
+        assert!(failed.is_none(), "failed job must have no lease");
     }
 }
