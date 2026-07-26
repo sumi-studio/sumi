@@ -157,7 +157,7 @@ func OpenDurableGateway(dir string, commands *CommandStore) (*DurableGateway, er
 		MaxAckTail:           256,
 		tails:                make(map[string]*conversationLogState),
 		newFile: func(name string, flag int, perm os.FileMode) (durableFileHandle, error) {
-			return os.OpenFile(name, flag, perm)
+			return os.OpenFile(name, flag|syscall.O_NOFOLLOW, perm)
 		},
 	}, nil
 }

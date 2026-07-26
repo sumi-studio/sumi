@@ -202,6 +202,43 @@ func TestOutboundFrameRejectsExplicitNullRejectReason(t *testing.T) {
 	}
 }
 
+func TestOutboundFrameRejectsExplicitNullWrongBranch(t *testing.T) {
+	tests := []string{
+		`{"frame_type":"event","envelope":{"seq":1,"conversation_id":"c","event":{"type":"agent_start"}},"ack":null}`,
+		`{"frame_type":"command_ack","envelope":null,"ack":{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","status":"received"}}`,
+	}
+	for _, raw := range tests {
+		var frame OutboundFrame
+		if err := json.Unmarshal([]byte(raw), &frame); err == nil {
+			t.Fatalf("expected explicit null wrong branch to be rejected: %s", raw)
+		}
+	}
+}
+
+func TestCommandAckRejectsExplicitNullRejectReason(t *testing.T) {
+	for _, status := range []string{"received", "rejected"} {
+		raw := fmt.Sprintf(
+			`{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","status":"%s","reject_reason":null}`,
+			status,
+		)
+		var ack CommandAck
+		if err := json.Unmarshal([]byte(raw), &ack); err == nil {
+			t.Fatalf("expected standalone reject_reason:null to be rejected for status %s", status)
+		}
+	}
+}
+
+func TestValidateApprovalDecisionRequiresRequestID(t *testing.T) {
+	for _, raw := range []string{
+		`{"type":"approval_decision","decision":{"type":"approve_once"}}`,
+		`{"type":"approval_decision","request_id":"","decision":{"type":"approve_once"}}`,
+	} {
+		if err := ValidateCommand([]byte(raw)); err == nil {
+			t.Fatalf("expected missing or empty request_id to be rejected: %s", raw)
+		}
+	}
+}
+
 func sortedKeys(m map[string]any) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {

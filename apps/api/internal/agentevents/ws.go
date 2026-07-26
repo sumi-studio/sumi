@@ -302,12 +302,10 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 		return fmt.Errorf("write api hello: %w", err)
 	}
 
-	// Install the pong handler and the first post-hello read deadline before
-	// starting the read pump.
+	// Install the pong handler before catch-up. The read pump installs its
+	// initial deadline immediately before the first read so a long catch-up
+	// cannot consume the peer's entire PongWait budget.
 	if s.PongWait > 0 {
-		if err := conn.SetReadDeadline(time.Now().Add(s.PongWait)); err != nil {
-			return fmt.Errorf("set pong read deadline: %w", err)
-		}
 		conn.SetPongHandler(func(string) error {
 			if s.PongWait > 0 {
 				_ = conn.SetReadDeadline(time.Now().Add(s.PongWait))
@@ -374,6 +372,11 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 }
 
 func (s *Server) readPump(ctx context.Context, conn *websocket.Conn, claims TokenClaims) error {
+	if s.PongWait > 0 {
+		if err := conn.SetReadDeadline(time.Now().Add(s.PongWait)); err != nil {
+			return fmt.Errorf("set initial pong read deadline: %w", err)
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():

@@ -271,6 +271,9 @@ func ValidateCommand(raw json.RawMessage) error {
 		if err := unmarshalStrict(raw, &cmd); err != nil {
 			return err
 		}
+		if cmd.RequestID == "" {
+			return fmt.Errorf("approval_decision request_id is required")
+		}
 		if err := validateApprovalDecision(cmd.Decision); err != nil {
 			return err
 		}
@@ -409,21 +412,36 @@ func (o *OutboundFrame) UnmarshalJSON(data []byte) error {
 	}
 
 	type rawFrame struct {
-		FrameType string         `json:"frame_type"`
-		Envelope  *Envelope      `json:"envelope,omitempty"`
-		Ack       *rawCommandAck `json:"ack,omitempty"`
+		FrameType string          `json:"frame_type"`
+		Envelope  json.RawMessage `json:"envelope,omitempty"`
+		Ack       json.RawMessage `json:"ack,omitempty"`
 	}
 	var raw rawFrame
 	if err := unmarshalStrict(data, &raw); err != nil {
 		return err
 	}
 
-	*o = OutboundFrame{
-		FrameType: raw.FrameType,
-		Envelope:  raw.Envelope,
+	if raw.FrameType == "event" && len(raw.Ack) != 0 {
+		return fmt.Errorf("event frame must not contain ack")
 	}
-	if raw.Ack != nil {
-		ack, err := assembleCommandAck(*raw.Ack)
+	if raw.FrameType == "command_ack" && len(raw.Envelope) != 0 {
+		return fmt.Errorf("command_ack frame must not contain envelope")
+	}
+
+	*o = OutboundFrame{FrameType: raw.FrameType}
+	if len(raw.Envelope) != 0 {
+		var envelope *Envelope
+		if err := json.Unmarshal(raw.Envelope, &envelope); err != nil {
+			return err
+		}
+		o.Envelope = envelope
+	}
+	if len(raw.Ack) != 0 {
+		var rawAck rawCommandAck
+		if err := unmarshalStrict(raw.Ack, &rawAck); err != nil {
+			return err
+		}
+		ack, err := assembleCommandAck(rawAck)
 		if err != nil {
 			return err
 		}
@@ -503,29 +521,18 @@ func (ack *CommandAck) UnmarshalJSON(data []byte) error {
 	if err := checkDuplicateKeys(data); err != nil {
 		return fmt.Errorf("command ack json: %w", err)
 	}
-	type raw struct {
-		Seq          *uint64 `json:"seq"`
-		CommandID    *string `json:"command_id"`
-		Status       *string `json:"status"`
-		RejectReason *string `json:"reject_reason,omitempty"`
-	}
-	var v raw
+	var v rawCommandAck
 	if err := unmarshalStrict(data, &v); err != nil {
 		return err
 	}
-	if v.Seq == nil || v.CommandID == nil || v.Status == nil {
-		return errors.New("command ack requires seq, command_id, and status")
-	}
-	parsed := CommandAck{
-		Seq:          *v.Seq,
-		CommandID:    *v.CommandID,
-		Status:       *v.Status,
-		RejectReason: v.RejectReason,
-	}
-	if err := validateCommandAck(parsed); err != nil {
+	parsed, err := assembleCommandAck(v)
+	if err != nil {
 		return err
 	}
-	*ack = parsed
+	if err := validateCommandAck(*parsed); err != nil {
+		return err
+	}
+	*ack = *parsed
 	return nil
 }
 

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -705,6 +706,78 @@ func TestDurableGatewayAckRecoversFromIncompleteFinalRecord(t *testing.T) {
 	}
 	if lines := strings.Count(string(raw), "\n"); lines != 1 {
 		t.Fatalf("expected one complete ack line, got %q", raw)
+	}
+}
+
+func TestDurableGatewayLogsRejectSymlinkTargets(t *testing.T) {
+	tests := []struct {
+		name string
+		path func(*DurableGateway, string) string
+		run  func(*testing.T, *DurableGateway, TokenClaims) error
+	}{
+		{
+			name: "event",
+			path: func(g *DurableGateway, conversationID string) string {
+				return g.eventPath(conversationID)
+			},
+			run: func(t *testing.T, g *DurableGateway, claims TokenClaims) error {
+				t.Helper()
+				seq := uint64(1)
+				return g.Receive(context.Background(), claims, Envelope{
+					Seq:            &seq,
+					ConversationID: claims.ConversationID,
+					Event:          json.RawMessage(`{"type":"agent_start"}`),
+				})
+			},
+		},
+		{
+			name: "ack",
+			path: func(g *DurableGateway, conversationID string) string {
+				return g.ackPath(conversationID)
+			},
+			run: func(t *testing.T, g *DurableGateway, claims TokenClaims) error {
+				t.Helper()
+				command, err := g.commands.Append(
+					context.Background(),
+					claims.ConversationID,
+					"",
+					json.RawMessage(`{"type":"abort"}`),
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return g.ApplyAck(context.Background(), claims, CommandAck{
+					Seq:       command.Seq,
+					CommandID: command.CommandID,
+					Status:    "received",
+				})
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			gateway := openRuntimeGateway(t)
+			claims := TokenClaims{ConversationID: "conversation-1"}
+			target := filepath.Join(t.TempDir(), "redirected.log")
+			const original = "sentinel"
+			if err := os.WriteFile(target, []byte(original), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, test.path(gateway, claims.ConversationID)); err != nil {
+				t.Fatal(err)
+			}
+			if err := test.run(t, gateway, claims); err == nil {
+				t.Fatal("expected symlink-backed durable log to be rejected")
+			}
+			raw, err := os.ReadFile(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(raw) != original {
+				t.Fatalf("symlink target changed: %q", raw)
+			}
+		})
 	}
 }
 

@@ -39,6 +39,7 @@ type fakeCommandSource struct {
 	commands     []CommandEnvelope
 	ackSeq       uint64
 	catchUpCalls uint64
+	catchUpDelay time.Duration
 	live         chan CommandEnvelope
 }
 
@@ -77,6 +78,13 @@ func (f *fakeCommandSource) HasCommands(ctx context.Context, claims TokenClaims)
 }
 
 func (f *fakeCommandSource) CatchUp(ctx context.Context, claims TokenClaims, fromSeq uint64) ([]CommandEnvelope, error) {
+	if f.catchUpDelay > 0 {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(f.catchUpDelay):
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.catchUpCalls++
@@ -917,6 +925,53 @@ func TestWebSocketSilentPeerClosesConnection(t *testing.T) {
 	if err := conn.ReadJSON(&received); err == nil {
 		t.Fatal("expected connection to close on silent peer (no pong)")
 	}
+}
+
+func TestWebSocketCatchUpDoesNotConsumeInitialPongWait(t *testing.T) {
+	srv, _, _, commands, events, hl := newTestServer(t)
+	hl.setReady()
+	srv.PongWait = 50 * time.Millisecond
+	srv.PingInterval = time.Hour
+	commands.catchUpDelay = 100 * time.Millisecond
+
+	server := startTestServer(t, srv)
+	defer server.Close()
+	conn, _, err := dialTestWS(t, server, map[string][]string{"Authorization": {"Bearer test-token"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.WriteJSON(AgentHello{AgentID: "agent-1", Generation: 7}); err != nil {
+		t.Fatal(err)
+	}
+	var hello ApiHello
+	if err := conn.ReadJSON(&hello); err != nil {
+		t.Fatal(err)
+	}
+
+	seq := uint64(1)
+	if err := conn.WriteJSON(OutboundFrame{
+		FrameType: "event",
+		Envelope: &Envelope{
+			Seq:            &seq,
+			ConversationID: "conversation-1",
+			Event:          []byte(`{"type":"agent_start"}`),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		events.mu.Lock()
+		count := len(events.envelopes)
+		events.mu.Unlock()
+		if count == 1 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("event sent after slow catch-up was not received")
 }
 
 func TestWebSocketHelloRejectsCheckedAddOverflow(t *testing.T) {
