@@ -3,6 +3,7 @@ package agentevents
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -82,6 +83,34 @@ func TestDurableGatewayRejectsLegacyReadyBoolean(t *testing.T) {
 	}
 	if _, err := gateway.state(context.Background(), agentID); err == nil {
 		t.Fatal("legacy ready boolean must fail strict runtime-state decoding")
+	}
+}
+
+func TestDurableGatewayRuntimeStateGenerationBoundary(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	const agentID = "agent-1"
+
+	if err := gateway.publishRuntimeState(agentID, runtimeState{Generation: maxJSONSafeInteger}); err != nil {
+		t.Fatalf("publish max JSON-safe generation failed: %v", err)
+	}
+	st, err := gateway.state(context.Background(), agentID)
+	if err != nil || st.Generation != maxJSONSafeInteger {
+		t.Fatalf("max generation must be accepted in recovery: err=%v gen=%d", err, st.Generation)
+	}
+
+	if err := gateway.publishRuntimeState(agentID, runtimeState{Generation: maxJSONSafeInteger + 1}); err == nil {
+		t.Fatal("publish must reject generation max+1")
+	}
+
+	raw, err := json.Marshal(runtimeState{Generation: maxJSONSafeInteger + 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(gateway.statePath(agentID), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gateway.state(context.Background(), agentID); err == nil {
+		t.Fatal("recovery must reject generation max+1")
 	}
 }
 
@@ -394,6 +423,100 @@ func TestDurableGatewayEventRecoversFromIncompleteFinalRecord(t *testing.T) {
 	}
 	if lines := strings.Count(string(raw), "\n"); lines != 1 {
 		t.Fatalf("expected one complete line, got %q", raw)
+	}
+}
+
+func TestDurableGatewayEventLogRejectsCorruptButCompleteRecords(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	claims := TokenClaims{ConversationID: "conversation-1"}
+	seq := uint64(1)
+	event := Envelope{
+		Seq:            &seq,
+		ConversationID: claims.ConversationID,
+		Event:          json.RawMessage(`{"type":"agent_start"}`),
+	}
+	if err := gateway.Receive(context.Background(), claims, event); err != nil {
+		t.Fatal(err)
+	}
+
+	corrupt := []string{
+		`{"seq":2,"event":{"seq":2,"conversation_id":"conversation-1","event":{"type":"agent_end"}},"seq":2}\n`,
+		`{"seq":2,"event":{"seq":2,"conversation_id":"conversation-1","event":{"type":"agent_end"}},"extra":true}\n`,
+		`{"seq":9007199254740992,"event":{"seq":9007199254740992,"conversation_id":"conversation-1","event":{"type":"agent_end"}}}\n`,
+	}
+	for _, line := range corrupt {
+		if err := os.WriteFile(gateway.eventPath(claims.ConversationID), append([]byte(nil), []byte(line)...), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		seq = 2
+		event.Seq = &seq
+		event.Event = json.RawMessage(`{"type":"agent_end"}`)
+		if err := gateway.Receive(context.Background(), claims, event); err == nil {
+			t.Fatalf("corrupt event log line must be rejected: %s", line)
+		}
+	}
+}
+
+func TestDurableGatewayAckLogRejectsCorruptButCompleteRecords(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	claims := TokenClaims{ConversationID: "conversation-1"}
+	command, err := gateway.commands.Append(
+		context.Background(),
+		claims.ConversationID,
+		"",
+		json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack := CommandAck{Seq: command.Seq, CommandID: command.CommandID, Status: "received"}
+	if err := gateway.ApplyAck(context.Background(), claims, ack); err != nil {
+		t.Fatal(err)
+	}
+
+	corrupt := []string{
+		fmt.Sprintf(`{"seq":%d,"command_id":"%s","status":"applied","command_id":"%s"}`+"\n", command.Seq, command.CommandID, command.CommandID),
+		fmt.Sprintf(`{"seq":%d,"command_id":"%s","status":"applied","extra":true}`+"\n", command.Seq, command.CommandID),
+		`{"seq":9007199254740992,"command_id":"00000000-0000-4000-8000-000000000001","status":"applied"}` + "\n",
+	}
+	for _, line := range corrupt {
+		if err := os.WriteFile(gateway.ackPath(claims.ConversationID), []byte(line), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := gateway.ApplyAck(context.Background(), claims, CommandAck{Seq: command.Seq, CommandID: command.CommandID, Status: "applied"}); err == nil {
+			t.Fatalf("corrupt ack log line must be rejected: %s", line)
+		}
+	}
+}
+
+func TestDurableGatewayAckLogRejectsCorruptRecordOnFindAckLookup(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	claims := TokenClaims{ConversationID: "conversation-1"}
+	command, err := gateway.commands.Append(
+		context.Background(),
+		claims.ConversationID,
+		"",
+		json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack := CommandAck{Seq: command.Seq, CommandID: command.CommandID, Status: "received"}
+	if err := gateway.ApplyAck(context.Background(), claims, ack); err != nil {
+		t.Fatal(err)
+	}
+
+	// Evict the tail so findAckLocked must read the durable log.
+	gateway.mu.Lock()
+	gateway.tails = make(map[string]*conversationLogState)
+	gateway.mu.Unlock()
+
+	corrupt := fmt.Sprintf(`{"seq":%d,"command_id":"%s","status":"received","status":"received"}`+"\n", command.Seq, command.CommandID)
+	if err := os.WriteFile(gateway.ackPath(claims.ConversationID), []byte(corrupt), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.ApplyAck(context.Background(), claims, CommandAck{Seq: command.Seq, CommandID: command.CommandID, Status: "applied"}); err == nil {
+		t.Fatal("findAckLocked must reject corrupt ack log")
 	}
 }
 

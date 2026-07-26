@@ -140,6 +140,37 @@ func TestHMACTokenVerifierRejectsAlgNone(t *testing.T) {
 	}
 }
 
+func TestHMACTokenVerifierProcessGenerationBoundary(t *testing.T) {
+	v, err := NewHMACTokenVerifier(testSecret, "")
+	if err != nil {
+		t.Fatalf("new verifier: %v", err)
+	}
+
+	valid := signTestToken(t, testSecret, tokenClaims{
+		TenantID:       "tenant-1",
+		AgentID:        "agent-1",
+		ConversationID: "conversation-1",
+		Generation:     maxJSONSafeInteger,
+		Exp:            time.Now().Add(time.Hour).Unix(),
+		Aud:            defaultAgentAudience,
+	})
+	if _, err := v.Verify(context.Background(), valid); err != nil {
+		t.Fatalf("max JSON-safe generation must be accepted: %v", err)
+	}
+
+	invalid := signTestToken(t, testSecret, tokenClaims{
+		TenantID:       "tenant-1",
+		AgentID:        "agent-1",
+		ConversationID: "conversation-1",
+		Generation:     maxJSONSafeInteger + 1,
+		Exp:            time.Now().Add(time.Hour).Unix(),
+		Aud:            defaultAgentAudience,
+	})
+	if _, err := v.Verify(context.Background(), invalid); err == nil {
+		t.Fatal("generation max+1 must be rejected before hello emission")
+	}
+}
+
 func TestHMACTokenVerifierRejectsMissingClaims(t *testing.T) {
 	v, err := NewHMACTokenVerifier(testSecret, "")
 	if err != nil {

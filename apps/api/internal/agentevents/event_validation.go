@@ -746,6 +746,9 @@ func validateObjectNotNull(raw json.RawMessage) error {
 // A top-level validation alone would allow nested unsafe integers to lose
 // precision when they reach generated TypeScript clients.
 func validateAnyJSON(raw json.RawMessage) error {
+	if err := checkDuplicateKeys(raw); err != nil {
+		return fmt.Errorf("duplicate keys in nested JSON: %w", err)
+	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
 	var value any

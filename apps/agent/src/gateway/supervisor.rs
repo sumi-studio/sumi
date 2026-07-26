@@ -245,6 +245,28 @@ impl SupervisorHandle {
 type CurrentWriterSlot =
     Arc<std::sync::Mutex<Option<(DeliveryEpoch, mpsc::Sender<OutboundFrame>)>>>;
 
+/// AbortOnDrop ensures spawned helper tasks are cancelled if the owning future
+/// is dropped before it reaches an explicit abort/await cleanup point.
+struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T> AbortOnDrop<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self(Some(handle))
+    }
+
+    fn into_inner(mut self) -> tokio::task::JoinHandle<T> {
+        self.0.take().expect("AbortOnDrop handle present")
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
 /// Owns the connect/authenticate/hello/catch-up/reconnect loop.
 pub struct ConnectionSupervisor<C, P, S, L>
 where
@@ -312,10 +334,11 @@ where
         events_rx: mpsc::Receiver<(DeliveryEpoch, OutboundFrame)>,
     ) -> Result<()> {
         let current_writer = self.current_writer.clone();
-        let forwarder = tokio::spawn(event_forwarder(events_rx, current_writer));
+        let forwarder = AbortOnDrop::new(tokio::spawn(event_forwarder(events_rx, current_writer)));
 
         let result = self.run_loop(commands_tx).await;
 
+        let forwarder = forwarder.into_inner();
         forwarder.abort();
         let _ = forwarder.await;
         result
@@ -407,6 +430,9 @@ where
         let healthy = true;
 
         let token = CancellationToken::new();
+        let reader_token = token.child_token();
+        let writer_token = token.child_token();
+        let token_guard = token.drop_guard();
         let (writer_tx, writer_rx) = mpsc::channel(config.event_buffer_size);
 
         *self.current_writer.lock().unwrap() = Some((delivery_epoch, writer_tx));
@@ -417,7 +443,7 @@ where
             commands_tx,
             self.latch.clone(),
             api_hello.clone(),
-            token.child_token(),
+            reader_token,
         ));
 
         let writer_handle = tokio::spawn(writer_task(
@@ -426,11 +452,11 @@ where
             source,
             api_hello,
             config,
-            token.child_token(),
+            writer_token,
         ));
 
         let result = select(reader_handle, writer_handle).await;
-        token.cancel();
+        drop(token_guard);
         let (first, second) = match result {
             Either::Left((reader_result, writer_handle)) => (reader_result, writer_handle.await),
             Either::Right((writer_result, reader_handle)) => (writer_result, reader_handle.await),
@@ -687,24 +713,34 @@ where
 {
     let mut last_received = api_hello.last_received_event_seq;
     loop {
-        let cursor = source.event_cursor().await?;
-        if last_received >= cursor.last_sent {
-            break;
-        }
-        let events = source
-            .events_after(last_received, config.catch_up_page_size)
-            .await?;
-        if events.is_empty() {
-            bail!("event source returned empty page before cursor");
-        }
-        for frame in events {
-            let seq =
-                outbound_frame_event_seq(&frame).context("catch-up frame missing durable seq")?;
-            if seq <= last_received {
-                bail!("non-monotonic catch-up event: seq {seq} after {last_received}");
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => return Ok(()),
+            result = source.event_cursor() => {
+                let cursor = result?;
+                if last_received >= cursor.last_sent {
+                    break;
+                }
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => return Ok(()),
+                    result = source.events_after(last_received, config.catch_up_page_size) => {
+                        let events = result?;
+                        if events.is_empty() {
+                            bail!("event source returned empty page before cursor");
+                        }
+                        for frame in events {
+                            let seq = outbound_frame_event_seq(&frame)
+                                .context("catch-up frame missing durable seq")?;
+                            if seq <= last_received {
+                                bail!("non-monotonic catch-up event: seq {seq} after {last_received}");
+                            }
+                            last_received = seq;
+                            send_with_timeout(&mut writer, frame, config.send_timeout, &token).await?;
+                        }
+                    }
+                }
             }
-            last_received = seq;
-            send_with_timeout(&mut writer, frame, config.send_timeout, &token).await?;
         }
     }
 
@@ -983,19 +1019,39 @@ mod tests {
         }
     }
 
+    struct CountOnDrop(Arc<AtomicU64>);
+
+    impl CountOnDrop {
+        fn new(counter: Arc<AtomicU64>) -> Self {
+            Self(counter)
+        }
+    }
+
+    impl Drop for CountOnDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     struct MockGatewayReader {
         commands: VecDeque<Result<InboundCommand>>,
+        drop_count: Option<Arc<AtomicU64>>,
     }
 
     struct MockGatewayWriter {
         fail_after: Option<usize>,
         sent: Arc<std::sync::Mutex<Vec<OutboundFrame>>>,
         delay: Option<Duration>,
+        drop_count: Option<Arc<AtomicU64>>,
     }
 
     #[async_trait]
     impl GatewayReader for MockGatewayReader {
         async fn next_command(&mut self) -> Result<InboundCommand> {
+            let _guard = self
+                .drop_count
+                .as_ref()
+                .map(|c| CountOnDrop::new(c.clone()));
             match self.commands.pop_front() {
                 Some(Ok(cmd)) => Ok(cmd),
                 Some(Err(e)) => Err(e),
@@ -1007,6 +1063,10 @@ mod tests {
     #[async_trait]
     impl GatewayWriter for MockGatewayWriter {
         async fn send(&mut self, frame: OutboundFrame) -> Result<()> {
+            let _guard = self
+                .drop_count
+                .as_ref()
+                .map(|c| CountOnDrop::new(c.clone()));
             if let Some(d) = self.delay {
                 tokio::time::sleep(d).await;
             }
@@ -1033,11 +1093,15 @@ mod tests {
     impl MockGateway {
         fn new(commands: VecDeque<Result<InboundCommand>>) -> Self {
             Self {
-                reader: MockGatewayReader { commands },
+                reader: MockGatewayReader {
+                    commands,
+                    drop_count: None,
+                },
                 writer: MockGatewayWriter {
                     fail_after: None,
                     sent: Arc::new(std::sync::Mutex::new(Vec::new())),
                     delay: None,
+                    drop_count: None,
                 },
                 sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
                 hello_generation: None,
@@ -1270,11 +1334,13 @@ mod tests {
                     1,
                     "00000000-0000-4000-8000-000000000001",
                 ))]),
+                drop_count: None,
             },
             writer: MockGatewayWriter {
                 fail_after: Some(0),
                 sent: sent.clone(),
                 delay: None,
+                drop_count: None,
             },
             sent_hellos: sent_hellos.clone(),
             hello_generation: None,
@@ -1284,11 +1350,13 @@ mod tests {
         let gateway2 = MockGateway {
             reader: MockGatewayReader {
                 commands: VecDeque::new(),
+                drop_count: None,
             },
             writer: MockGatewayWriter {
                 fail_after: None,
                 sent: sent.clone(),
                 delay: None,
+                drop_count: None,
             },
             sent_hellos: sent_hellos.clone(),
             hello_generation: None,
@@ -1352,11 +1420,13 @@ mod tests {
         let gateway = MockGateway {
             reader: MockGatewayReader {
                 commands: VecDeque::new(),
+                drop_count: None,
             },
             writer: MockGatewayWriter {
                 fail_after: None,
                 sent: sent.clone(),
                 delay: None,
+                drop_count: None,
             },
             sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
             hello_generation: None,
@@ -1398,11 +1468,13 @@ mod tests {
         let gateway1 = MockGateway {
             reader: MockGatewayReader {
                 commands: VecDeque::new(),
+                drop_count: None,
             },
             writer: MockGatewayWriter {
                 fail_after: Some(0),
                 sent: sent.clone(),
                 delay: None,
+                drop_count: None,
             },
             sent_hellos: sent_hellos.clone(),
             hello_generation: None,
@@ -1412,11 +1484,13 @@ mod tests {
         let gateway2 = MockGateway {
             reader: MockGatewayReader {
                 commands: VecDeque::new(),
+                drop_count: None,
             },
             writer: MockGatewayWriter {
                 fail_after: None,
                 sent: sent.clone(),
                 delay: None,
+                drop_count: None,
             },
             sent_hellos: sent_hellos.clone(),
             hello_generation: None,
@@ -1486,11 +1560,13 @@ mod tests {
                     1,
                     "00000000-0000-4000-8000-000000000001",
                 ))]),
+                drop_count: None,
             },
             writer: MockGatewayWriter {
                 fail_after: None,
                 sent: sent.clone(),
                 delay: None,
+                drop_count: None,
             },
             sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
             hello_generation: None,
@@ -1543,11 +1619,13 @@ mod tests {
                     "00000000-0000-4000-8000-000000000001",
                     1_200_000,
                 ))]),
+                drop_count: None,
             },
             writer: MockGatewayWriter {
                 fail_after: None,
                 sent: sent.clone(),
                 delay: None,
+                drop_count: None,
             },
             sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
             hello_generation: None,
@@ -2061,6 +2139,70 @@ mod tests {
         }))
         .expect_err("unknown fields must fail closed");
         assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[tokio::test]
+    async fn abort_cancels_epoch_reader_writer_and_forwarder() {
+        let reader_drop = Arc::new(AtomicU64::new(0));
+        let writer_drop = Arc::new(AtomicU64::new(0));
+        let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let gateway = MockGateway {
+            reader: MockGatewayReader {
+                commands: VecDeque::new(),
+                drop_count: Some(reader_drop.clone()),
+            },
+            writer: MockGatewayWriter {
+                fail_after: None,
+                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+                delay: Some(Duration::from_secs(60)),
+                drop_count: Some(writer_drop.clone()),
+            },
+            sent_hellos: sent_hellos.clone(),
+            hello_generation: None,
+            last_received_event_seq: 0,
+            hello_delay: None,
+        };
+        let connector = MockConnector::new(sent_hellos, VecDeque::from([Ok(gateway)]));
+        let credentials = CountingCredentialProvider::new("token");
+        let source = MockDurableSource::new(CommandCursors::default());
+        source.push_event(event_frame(1));
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: 7,
+            receipt_identity: "receipt-1".to_owned(),
+        });
+
+        let mut config = make_config();
+        config.send_timeout = Duration::from_secs(120);
+
+        let supervisor = ConnectionSupervisor::new(connector, credentials, source, latch, config);
+        let mut handle = supervisor.start();
+
+        tokio::time::timeout(Duration::from_millis(200), handle.epochs.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        let epoch = (*handle.epochs.borrow()).unwrap();
+        let events_tx = handle.events.clone();
+
+        handle.abort();
+        let _ = handle.join().await;
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            reader_drop.load(Ordering::SeqCst) > 0,
+            "epoch reader task must be cancelled on abort"
+        );
+        assert!(
+            writer_drop.load(Ordering::SeqCst) > 0,
+            "epoch writer task must be cancelled on abort"
+        );
+
+        assert!(
+            events_tx.send((epoch, event_frame(1))).await.is_err(),
+            "event forwarder receiver must be dropped after abort"
+        );
     }
 
     fn cmd_seq(cmd: &InboundCommand) -> u64 {

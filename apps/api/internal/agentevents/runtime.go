@@ -64,6 +64,30 @@ type durableEventRecord struct {
 	Event Envelope `json:"event"`
 }
 
+// UnmarshalJSON makes durable event-log recovery fail-closed on duplicate keys,
+// unknown fields, trailing data, and sequence values outside the JSON-safe range.
+func (r *durableEventRecord) UnmarshalJSON(data []byte) error {
+	if err := checkDuplicateKeys(data); err != nil {
+		return fmt.Errorf("durable event record json: %w", err)
+	}
+	type raw struct {
+		Seq   *uint64   `json:"seq"`
+		Event *Envelope `json:"event"`
+	}
+	var v raw
+	if err := unmarshalStrict(data, &v); err != nil {
+		return err
+	}
+	if v.Seq == nil || v.Event == nil {
+		return errors.New("durable event record requires seq and event")
+	}
+	if *v.Seq > maxJSONSafeInteger {
+		return fmt.Errorf("durable event record seq %d exceeds JSON-safe integer range", *v.Seq)
+	}
+	*r = durableEventRecord{Seq: *v.Seq, Event: *v.Event}
+	return nil
+}
+
 // durableFileHandle abstracts the per-conversation log file so tests can
 // inject deterministic write/sync/truncate failures without changing
 // production call sites.
@@ -375,8 +399,8 @@ func (g *DurableGateway) state(ctx context.Context, agentID string) (runtimeStat
 	if state.HydrationReceiptIdentity != nil && *state.HydrationReceiptIdentity == "" {
 		return runtimeState{}, errors.New("hydration receipt identity must not be empty")
 	}
-	if state.Generation > maxProcessGeneration {
-		return runtimeState{}, fmt.Errorf("runtime generation %d exceeds ProcessGeneration range", state.Generation)
+	if state.Generation > maxJSONSafeInteger {
+		return runtimeState{}, fmt.Errorf("runtime generation %d exceeds JSON-safe integer range", state.Generation)
 	}
 	state.present = true
 	return state, nil
@@ -707,8 +731,8 @@ func findAckLocked(file durableFileHandle, seq uint64) (CommandAck, bool, error)
 }
 
 func (g *DurableGateway) publishRuntimeState(agentID string, state runtimeState) error {
-	if state.Generation > maxProcessGeneration {
-		return fmt.Errorf("runtime generation %d exceeds ProcessGeneration range", state.Generation)
+	if state.Generation > maxJSONSafeInteger {
+		return fmt.Errorf("runtime generation %d exceeds JSON-safe integer range", state.Generation)
 	}
 	raw, err := json.Marshal(state)
 	if err != nil {

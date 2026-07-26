@@ -194,6 +194,21 @@ func TestOutboundFrameRejectsCommandAckSeqExceedsJSONSafeInteger(t *testing.T) {
 	}
 }
 
+func TestAnyJSONRejectsDuplicateKeysInNestedPayloads(t *testing.T) {
+	cases := []string{
+		`{"type":"tool_execution_update","tool_call_id":"call-1","partial":{"text":"a","text":"b"}}`,
+		`{"type":"tool_execution_end","tool_call_id":"call-1","result":{"foo":1,"foo":2},"is_error":false}`,
+		`{"type":"tool_execution_start","tool_call_id":"call-1","tool_name":"read","args":{"path":"/a","path":"/b"}}`,
+		`{"type":"approval_resolved","request_id":"req-1","resolution":{"decision":{"type":"approve_always","rule":{"x":1,"x":2}}}}`,
+		`{"type":"tool_result","tool_call_id":"call-1","tool_name":"read","content":[],"details":{"key":"a","key":"b"},"is_error":false,"timestamp":"2026-07-25T20:00:00Z"}`,
+	}
+	for _, raw := range cases {
+		if err := validateEvent([]byte(raw)); err == nil {
+			t.Fatalf("nested duplicate keys accepted: %s", raw)
+		}
+	}
+}
+
 func TestAnyJSONRejectsUnsafeNestedIntegersButKeepsFractions(t *testing.T) {
 	valid := []string{
 		`{"type":"tool_execution_update","tool_call_id":"call-1","partial":{"low":-9007199254740991,"high":9007199254740991,"fraction":0.5,"nested":[{"also_fraction":-1.25}]}}`,

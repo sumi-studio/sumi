@@ -16,12 +16,9 @@ import (
 )
 
 // maxJSONSafeInteger is the largest integer representable exactly by JavaScript's
-// number type and by the contract's JsonSafeInteger definition.
+// number type and by the contract's JsonSafeInteger and ProcessGeneration
+// definitions.
 const maxJSONSafeInteger uint64 = 9_007_199_254_740_991
-
-// maxProcessGeneration is the largest generation that can round-trip through
-// the agent's signed SQLite representation (i64).
-const maxProcessGeneration uint64 = 9_223_372_036_854_775_807
 
 // AgentHello is sent by the agent immediately after the WebSocket upgrade.
 // Generation is the ProcessGeneration bound to the short-lived credential claim,
@@ -490,6 +487,39 @@ func (o OutboundFrame) Validate() error {
 	default:
 		return fmt.Errorf("unknown frame_type: %q", o.FrameType)
 	}
+	return nil
+}
+
+// UnmarshalJSON makes durable ack-log recovery (and any other CommandAck
+// decoding) fail-closed on duplicate keys, unknown fields, trailing data,
+// and schema/JSON-safe-integer violations.
+func (ack *CommandAck) UnmarshalJSON(data []byte) error {
+	if err := checkDuplicateKeys(data); err != nil {
+		return fmt.Errorf("command ack json: %w", err)
+	}
+	type raw struct {
+		Seq          *uint64 `json:"seq"`
+		CommandID    *string `json:"command_id"`
+		Status       *string `json:"status"`
+		RejectReason *string `json:"reject_reason,omitempty"`
+	}
+	var v raw
+	if err := unmarshalStrict(data, &v); err != nil {
+		return err
+	}
+	if v.Seq == nil || v.CommandID == nil || v.Status == nil {
+		return errors.New("command ack requires seq, command_id, and status")
+	}
+	parsed := CommandAck{
+		Seq:          *v.Seq,
+		CommandID:    *v.CommandID,
+		Status:       *v.Status,
+		RejectReason: v.RejectReason,
+	}
+	if err := validateCommandAck(parsed); err != nil {
+		return err
+	}
+	*ack = parsed
 	return nil
 }
 
