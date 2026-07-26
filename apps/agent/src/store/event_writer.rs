@@ -44,7 +44,8 @@ use super::{
         verify_event_head,
     },
     memory_state::{
-        MemoryApplyCursorRecord, MemoryBatchState, MemoryBatchSummary, MemoryJobResult,
+        MemoryApplyCursorRecord, MemoryBatchMessageRecord, MemoryBatchRecord, MemoryBatchState,
+        MemoryBatchSummary, MemoryJobResult, MemoryLayer,
     },
     physical_recovery::{ApplyReceiptOutcome, PhysicalRecoveryApplier, PhysicalRecoveryReceipt},
     provider_context::{
@@ -826,7 +827,15 @@ pub(crate) struct MemoryBatchMutation {
 )]
 #[derive(Clone)]
 pub(crate) enum MemoryJobMutation {
+    /// Claim a `pending` job without consuming an attempt. The lease is
+    /// refreshed at the start of a provider attempt via [`Start`].
     Claim {
+        job_id: String,
+        lease_until: String,
+    },
+    /// Refresh the lease and increment the durable attempt counter before a
+    /// provider call. This keeps crash-recovery from giving free retries.
+    Start {
         job_id: String,
         lease_until: String,
     },
@@ -838,6 +847,11 @@ pub(crate) enum MemoryJobMutation {
         job_id: String,
     },
     Apply {
+        job_id: String,
+    },
+    /// Return a leased `running` job to the queue without consuming another
+    /// attempt (used for cancellation or stale-source reset).
+    Release {
         job_id: String,
     },
 }
@@ -1042,7 +1056,14 @@ struct PreparedMemoryJobMutation {
     expected_status: &'static str,
     new_status: &'static str,
     attempts: i64,
-    lease_until: Option<String>,
+    /// Attempts delta applied in the SET clause (`0` for claim/complete/fail/
+    /// apply/release, `1` for start).
+    attempts_delta: i64,
+    /// Lease value that the WHERE clause must match for non-pending CAS.
+    expected_lease_until: Option<String>,
+    /// Lease value written by the SET clause (`None` clears stale leases on
+    /// terminal transitions and release).
+    new_lease_until: Option<String>,
     source_versions: Option<String>,
     result: Option<MemoryJobResult>,
 }
@@ -1064,6 +1085,14 @@ enum PreparedProjection {
         provider_context_key_ref: Option<String>,
         provider_context_key_proof: Option<Vec<u8>>,
         eviction_footprint_tokens: u64,
+        /// Record to insert when this message creates a new open L0 batch
+        /// because no open batch exists.
+        create_l0_batch: Option<MemoryBatchRecord>,
+        /// The open L0 batch this message is appended to. `None` when the
+        /// message is excluded from L0 (e.g., retry errors).
+        l0_batch_id: Option<String>,
+        /// Ordinal within `l0_batch_id` for the membership row.
+        l0_batch_message_ord: Option<i64>,
     },
     CommandInsert {
         seq: u64,
@@ -2307,6 +2336,8 @@ impl EventWriter {
         };
 
         let mut next_seq = first_seq;
+        let mut pending_l0_batch: Option<String> = None;
+        let mut pending_l0_message_ord: i64 = 0;
         let mut prepared = Vec::with_capacity(batch.writes.len());
         let mut transaction_bytes = 0usize;
         let mut event_seqs = Vec::new();
@@ -2474,6 +2505,29 @@ impl EventWriter {
                                 .and_then(|bytes| bytes.checked_add(DURABLE_ROW_OVERHEAD_BYTES))
                                 .ok_or_else(|| anyhow!("message projection byte count overflow"))?,
                         )?;
+                        let (create_l0_batch, l0_batch_id, l0_batch_message_ord) = self
+                            .prepare_l0_batch_membership(
+                                &mut pending_l0_batch,
+                                &mut pending_l0_message_ord,
+                                l0_disposition,
+                            )
+                            .await?;
+                        if let Some(record) = &create_l0_batch {
+                            charge_transaction_bytes(
+                                &mut transaction_bytes,
+                                record.id.len().saturating_add(DURABLE_ROW_OVERHEAD_BYTES),
+                            )?;
+                        }
+                        if let Some(batch_id) = &l0_batch_id {
+                            charge_transaction_bytes(
+                                &mut transaction_bytes,
+                                batch_id
+                                    .len()
+                                    .checked_add(message_id.len())
+                                    .and_then(|bytes| bytes.checked_add(DURABLE_ROW_OVERHEAD_BYTES))
+                                    .ok_or_else(|| anyhow!("L0 membership byte count overflow"))?,
+                            )?;
+                        }
                         projections.push(PreparedProjection::MessageEnd {
                             event_seq,
                             message_id,
@@ -2496,6 +2550,9 @@ impl EventWriter {
                                 .map(|(r, _)| r.clone()),
                             provider_context_key_proof: provider_context_key.map(|(_, p)| p),
                             eviction_footprint_tokens,
+                            create_l0_batch,
+                            l0_batch_id,
+                            l0_batch_message_ord,
                         });
                     }
                     Projection::CommandReceived { envelope } => {
@@ -2809,6 +2866,85 @@ impl EventWriter {
         ))
     }
 
+    /// Locate the current open L0 batch for a message that should be appended
+    /// to L0. If no open L0 batch exists, allocate a new one deterministically.
+    /// `pending_l0_batch`/`pending_l0_message_ord` carry state across multiple
+    /// MessageEnd projections prepared inside the same EventBatch so a newly
+    /// allocated batch is visible to later messages in the batch.
+    /// Returns `(record_to_create, batch_id, message_ord)` where
+    /// `record_to_create` is `Some` only when a new batch must be inserted.
+    async fn prepare_l0_batch_membership(
+        &self,
+        pending_l0_batch: &mut Option<String>,
+        pending_l0_message_ord: &mut i64,
+        disposition: L0Disposition,
+    ) -> Result<(Option<MemoryBatchRecord>, Option<String>, Option<i64>)> {
+        if !matches!(disposition, L0Disposition::Append) {
+            return Ok((None, None, None));
+        }
+
+        if let Some(batch_id) = pending_l0_batch.clone() {
+            let ord = *pending_l0_message_ord + 1;
+            *pending_l0_message_ord = ord;
+            return Ok((None, Some(batch_id), Some(ord)));
+        }
+
+        let row = sqlx::query(
+            "SELECT id FROM memory_batches
+             WHERE layer = ? AND state = 'open'
+             ORDER BY batch_seq DESC
+             LIMIT 1",
+        )
+        .bind(MemoryLayer::L0.as_i64())
+        .fetch_optional(self.store.pool())
+        .await
+        .context("failed to locate open L0 batch")?;
+
+        if let Some(row) = row {
+            let batch_id: String = row.try_get("id")?;
+            let max_ord: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(MAX(ord), 0) FROM memory_batch_messages WHERE batch_id = ?",
+            )
+            .bind(&batch_id)
+            .fetch_one(self.store.pool())
+            .await
+            .context("failed to compute L0 message ord")?;
+            *pending_l0_batch = Some(batch_id.clone());
+            *pending_l0_message_ord = max_ord + 1;
+            return Ok((None, Some(batch_id), Some(*pending_l0_message_ord)));
+        }
+
+        let next_batch_seq: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(batch_seq), 0) + 1 FROM memory_batches WHERE layer = ?",
+        )
+        .bind(MemoryLayer::L0.as_i64())
+        .fetch_one(self.store.pool())
+        .await
+        .context("failed to allocate L0 batch_seq")?;
+        let next_ord: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(ord), 0) + 1 FROM memory_batches WHERE layer = ?",
+        )
+        .bind(MemoryLayer::L0.as_i64())
+        .fetch_one(self.store.pool())
+        .await
+        .context("failed to allocate L0 ord")?;
+        let batch_id = Uuid::now_v7().to_string();
+        let record = MemoryBatchRecord::new(
+            &batch_id,
+            MemoryLayer::L0,
+            next_ord,
+            next_batch_seq,
+            MemoryBatchState::Open,
+            0,
+            0,
+        );
+
+        // Membership for the first message in a freshly-created batch is ord 1.
+        *pending_l0_batch = Some(batch_id.clone());
+        *pending_l0_message_ord = 1;
+        Ok((Some(record), Some(batch_id), Some(1)))
+    }
+
     async fn prepare_memory_job_update(
         &self,
         memory_summary_key: &mut Option<super::crypto::DataKeyMaterial>,
@@ -2819,7 +2955,12 @@ impl EventWriter {
             .context("failed to serialize memory job source versions")?;
         let mut job_mutations = Vec::with_capacity(update.job_mutations.len());
         for mutation in update.job_mutations {
-            let source_json = if matches!(mutation, MemoryJobMutation::Claim { .. }) {
+            let source_json = if matches!(
+                mutation,
+                MemoryJobMutation::Claim { .. }
+                    | MemoryJobMutation::Start { .. }
+                    | MemoryJobMutation::Release { .. }
+            ) {
                 None
             } else {
                 Some(source_versions_json.clone())
@@ -2944,7 +3085,12 @@ impl EventWriter {
             .context("failed to serialize memory transition source versions")?;
         let mut job_mutations = Vec::with_capacity(transition.job_mutations.len());
         for mutation in transition.job_mutations {
-            let source_json = if matches!(mutation, MemoryJobMutation::Claim { .. }) {
+            let source_json = if matches!(
+                mutation,
+                MemoryJobMutation::Claim { .. }
+                    | MemoryJobMutation::Start { .. }
+                    | MemoryJobMutation::Release { .. }
+            ) {
                 None
             } else {
                 Some(source_versions_json.clone())
@@ -2985,11 +3131,39 @@ impl EventWriter {
         mutation: MemoryJobMutation,
         source_versions_json: Option<String>,
     ) -> Result<PreparedMemoryJobMutation> {
-        let (job_id, expected_status, new_status, lease_until, result) = match mutation {
+        let (
+            job_id,
+            expected_status,
+            new_status,
+            attempts_delta,
+            expected_lease_until,
+            new_lease_until,
+            result,
+        ) = match mutation {
             MemoryJobMutation::Claim {
                 job_id,
                 lease_until,
-            } => (job_id, "pending", "running", Some(lease_until), None),
+            } => (
+                job_id,
+                "pending",
+                "running",
+                0,
+                None,
+                Some(lease_until),
+                None,
+            ),
+            MemoryJobMutation::Start {
+                job_id,
+                lease_until,
+            } => (
+                job_id,
+                "running",
+                "running",
+                1,
+                None,
+                Some(lease_until),
+                None,
+            ),
             MemoryJobMutation::Complete { job_id, result } => {
                 if memory_summary_key.is_none() {
                     *memory_summary_key = Some(
@@ -3002,10 +3176,25 @@ impl EventWriter {
                     .as_ref()
                     .expect("memory summary key loaded");
                 let encrypted = self.encrypt_memory_job_result(result, &job_id, key).await?;
-                (job_id, "running", "completed", None, Some(encrypted))
+                (
+                    job_id,
+                    "running",
+                    "completed",
+                    0,
+                    None,
+                    None,
+                    Some(encrypted),
+                )
             }
-            MemoryJobMutation::Fail { job_id } => (job_id, "running", "failed", None, None),
-            MemoryJobMutation::Apply { job_id } => (job_id, "completed", "applied", None, None),
+            MemoryJobMutation::Fail { job_id } => {
+                (job_id, "running", "failed", 0, None, None, None)
+            }
+            MemoryJobMutation::Apply { job_id } => {
+                (job_id, "completed", "applied", 0, None, None, None)
+            }
+            MemoryJobMutation::Release { job_id } => {
+                (job_id, "running", "pending", 0, None, None, None)
+            }
         };
 
         let row = sqlx::query("SELECT status, attempts, lease_until FROM memory_jobs WHERE id = ?")
@@ -3021,16 +3210,24 @@ impl EventWriter {
         let attempts: i64 = row.try_get("attempts")?;
         let lease_until_stored: Option<String> = row.try_get("lease_until")?;
 
+        // Terminal transitions and start must CAS on the stored lease so a
+        // concurrently-recovered job cannot be double-transitioned. The lease is
+        // always cleared on terminal transitions to prevent stale lease drift.
+        let expected_lease_until = expected_lease_until.or_else(|| lease_until_stored.clone());
+        let new_lease_until = if new_status == "running" {
+            new_lease_until
+        } else {
+            None
+        };
+
         Ok(PreparedMemoryJobMutation {
             job_id,
             expected_status,
             new_status,
             attempts,
-            lease_until: if new_status == "running" {
-                lease_until
-            } else {
-                lease_until_stored
-            },
+            attempts_delta,
+            expected_lease_until,
+            new_lease_until,
             source_versions: source_versions_json,
             result,
         })
@@ -5022,9 +5219,11 @@ fn validate_batch_shape(
 fn job_id_for_mutation(mutation: &MemoryJobMutation) -> &str {
     match mutation {
         MemoryJobMutation::Claim { job_id, .. }
+        | MemoryJobMutation::Start { job_id, .. }
         | MemoryJobMutation::Complete { job_id, .. }
         | MemoryJobMutation::Fail { job_id }
-        | MemoryJobMutation::Apply { job_id } => job_id.as_str(),
+        | MemoryJobMutation::Apply { job_id }
+        | MemoryJobMutation::Release { job_id } => job_id.as_str(),
     }
 }
 
@@ -5501,7 +5700,7 @@ fn memory_projection_size(projection: &PreparedProjection) -> usize {
                     .len()
                     .saturating_add(job.attempts as usize)
                     .saturating_add(
-                        job.lease_until
+                        job.new_lease_until
                             .as_ref()
                             .map_or(0, String::len)
                             .saturating_add(job.result.as_ref().map_or(0, |r| r.ciphertext.len())),
@@ -8393,6 +8592,9 @@ async fn apply_projection(
             l0_disposition,
             provider_context,
             eviction_footprint_tokens,
+            create_l0_batch,
+            l0_batch_id,
+            l0_batch_message_ord,
             ..
         } => {
             if !matches!(role, "user" | "assistant" | "tool_result") {
@@ -8421,6 +8623,33 @@ async fn apply_projection(
             .await
             .context("failed to apply MessageEnd projection")?;
 
+            if l0_disposition == L0Disposition::Append {
+                let batch_id = l0_batch_id.as_ref().ok_or_else(|| {
+                    anyhow!("MessageEnd Append is missing a prepared L0 batch id")
+                })?;
+                let ord = l0_batch_message_ord.ok_or_else(|| {
+                    anyhow!("MessageEnd Append is missing a prepared L0 message ord")
+                })?;
+
+                // Insert a lazily-allocated open L0 batch first, then append
+                // explicit membership in the same transaction.
+                if let Some(record) = create_l0_batch {
+                    record
+                        .insert(&mut **transaction)
+                        .await
+                        .context("failed to insert open L0 batch for MessageEnd")?;
+                }
+
+                MemoryBatchMessageRecord {
+                    batch_id: batch_id.clone(),
+                    message_id: message_id.clone(),
+                    ord,
+                }
+                .insert(&mut **transaction)
+                .await
+                .context("failed to insert L0 batch membership")?;
+            }
+
             for record in provider_context {
                 record
                     .insert(&mut **transaction)
@@ -8428,15 +8657,8 @@ async fn apply_projection(
                     .context("failed to apply provider-context record")?;
             }
 
-            if eviction_footprint_tokens > 0
-                && let Some(batch_id) = sqlx::query_scalar::<_, String>(
-                    "SELECT batch_id FROM memory_batch_messages WHERE message_id = ?",
-                )
-                .bind(&message_id)
-                .fetch_optional(&mut **transaction)
-                .await
-                .context("failed to locate memory batch for eviction footprint")?
-            {
+            if l0_disposition == L0Disposition::Append && eviction_footprint_tokens > 0 {
+                let batch_id = l0_batch_id.as_ref().expect("L0 batch id checked above");
                 sqlx::query(
                     "UPDATE memory_batches
                      SET eviction_footprint_tokens = eviction_footprint_tokens + ?
@@ -8923,14 +9145,17 @@ async fn apply_memory_job_mutation(
         };
 
     let result = if job.expected_status == "pending" {
+        // Claim: do not consume an attempt; source versions are fixed by the
+        // job creation path, so leave them untouched when not supplied.
         sqlx::query(
             "UPDATE memory_jobs
-             SET status = ?, attempts = attempts + 1, lease_until = ?,
+             SET status = ?, attempts = attempts + ?, lease_until = ?,
                  source_versions = COALESCE(?, source_versions), updated_at = ?
              WHERE id = ? AND status = ?",
         )
         .bind(job.new_status)
-        .bind(job.lease_until.as_ref())
+        .bind(job.attempts_delta)
+        .bind(job.new_lease_until.as_ref())
         .bind(job.source_versions.as_ref())
         .bind(Utc::now().to_rfc3339())
         .bind(&job.job_id)
@@ -8940,7 +9165,7 @@ async fn apply_memory_job_mutation(
     } else {
         sqlx::query(
             "UPDATE memory_jobs
-             SET status = ?, attempts = attempts, lease_until = ?,
+             SET status = ?, attempts = attempts + ?, lease_until = ?,
                  source_versions = COALESCE(?, source_versions),
                  result_key_ref = COALESCE(?, result_key_ref),
                  result_ciphertext = COALESCE(?, result_ciphertext),
@@ -8950,7 +9175,8 @@ async fn apply_memory_job_mutation(
              WHERE id = ? AND status = ? AND attempts = ? AND lease_until IS ?",
         )
         .bind(job.new_status)
-        .bind(job.lease_until.as_ref())
+        .bind(job.attempts_delta)
+        .bind(job.new_lease_until.as_ref())
         .bind(job.source_versions.as_ref())
         .bind(result_key_ref.as_ref())
         .bind(result_ciphertext.as_ref())
@@ -8960,7 +9186,7 @@ async fn apply_memory_job_mutation(
         .bind(&job.job_id)
         .bind(job.expected_status)
         .bind(job.attempts)
-        .bind(job.lease_until.as_ref())
+        .bind(job.expected_lease_until.as_ref())
         .execute(&mut **transaction)
         .await?
     };
@@ -9358,7 +9584,9 @@ mod tests {
                 expected_status: "running",
                 new_status: "failed",
                 attempts: 0,
-                lease_until: None,
+                attempts_delta: 0,
+                expected_lease_until: None,
+                new_lease_until: None,
                 source_versions: None,
                 result: None,
             },

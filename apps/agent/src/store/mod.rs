@@ -54,6 +54,7 @@ pub(crate) use self::provider_context::{
 pub(crate) use self::transcript::{message_interrupted, public_message_role};
 #[cfg(test)]
 pub(crate) use crypto::{DATA_KEY_BYTES, WrappingKey};
+#[allow(unused_imports)]
 pub(crate) use crypto::{
     DataKeyMaterial, DataKeyPurpose, EnvironmentKeyProvider, KeyProvider, RowAad,
     command_payload_digest, decrypt_content, encrypt_content, verify_command_payload_digest,

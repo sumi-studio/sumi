@@ -32,10 +32,9 @@ use crate::provider::{
 };
 use crate::store::{
     DataKeyMaterial, DataKeyPurpose, DurableEvent, EventBatch, EventWrite, EventWriter,
-    MemoryApplyCursorAdvance, MemoryBatchMutation, MemoryBatchRecord, MemoryBatchState,
-    MemoryJobKind, MemoryJobMutation, MemoryJobRecord, MemoryJobStatus, MemoryLayer,
-    MemoryTransition, Projection, PublicProjectionBuilder, Redactor, RowAad, Store,
-    decrypt_content, encrypt_content,
+    MemoryApplyCursorAdvance, MemoryApplyCursorRecord, MemoryBatchMutation, MemoryBatchRecord,
+    MemoryBatchState, MemoryJobKind, MemoryJobMutation, MemoryJobRecord, MemoryJobStatus,
+    MemoryJobUpdate, MemoryLayer, MemoryTransition, Projection, Store, decrypt_content,
 };
 
 use super::{BatchId, CompactResult, DecryptedMemorySummary, L1Entry};
@@ -659,66 +658,6 @@ struct MemorySummaryPayload {
     to: DateTime<Utc>,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct MemorySummaryProjection {
-    pub key_ref: String,
-    pub ciphertext: Vec<u8>,
-    pub job_ciphertext: Vec<u8>,
-    pub projection: String,
-    pub redaction_version: u32,
-}
-
-/// Builds an encrypted unredacted memory summary source plus its redacted
-/// projection in a single atomic step, then zeroizes the plaintext JSON.
-pub(crate) struct MemoryProjectionBuilder<'a> {
-    redactor: &'a Redactor,
-    data_key: &'a DataKeyMaterial,
-}
-
-impl<'a> MemoryProjectionBuilder<'a> {
-    pub(crate) fn new(redactor: &'a Redactor, data_key: &'a DataKeyMaterial) -> Self {
-        Self { redactor, data_key }
-    }
-
-    pub(crate) fn build(
-        &self,
-        result: &CompactResult,
-        batch_aad: &RowAad,
-        job_aad: &RowAad,
-    ) -> Result<MemorySummaryProjection> {
-        let mut payload = MemorySummaryPayload {
-            summary: result.summary.expose().to_owned(),
-            est_tokens: result.est_tokens,
-            from: result.time_range.0,
-            to: result.time_range.1,
-        };
-        let mut raw = match serde_json::to_vec(&payload) {
-            Ok(raw) => raw,
-            Err(error) => {
-                payload.summary.zeroize();
-                return Err(error).context("serialize memory summary payload");
-            }
-        };
-        let protected = PublicProjectionBuilder::new(self.redactor, self.data_key)
-            .build_serialized(&raw, batch_aad)
-            .context("build memory summary projection");
-        let job_ciphertext =
-            encrypt_content(self.data_key, &raw, job_aad).context("encrypt memory job result");
-        raw.zeroize();
-        payload.summary.zeroize();
-        let protected = protected?;
-        let job_ciphertext = job_ciphertext?;
-
-        Ok(MemorySummaryProjection {
-            key_ref: self.data_key.key_ref.clone(),
-            ciphertext: protected.ciphertext,
-            job_ciphertext,
-            projection: protected.projection,
-            redaction_version: protected.redaction_version,
-        })
-    }
-}
-
 pub(crate) fn build_compact_result(
     text: String,
     input: &CompactionInput,
@@ -1131,24 +1070,39 @@ async fn build_compaction_input(store: &Store, job: &Job) -> Result<CompactionIn
     }
 }
 
-async fn build_summary_projection(
+fn job_source_versions(job: &Job) -> Result<BTreeMap<BatchId, u64>> {
+    job.source_versions
+        .iter()
+        .map(|(id, version)| {
+            let batch_id = BatchId::parse_str(id)
+                .with_context(|| format!("invalid source batch id {id} in job"))?;
+            let version = u64::try_from(*version)
+                .with_context(|| format!("source version for {id} out of range"))?;
+            Ok((batch_id, version))
+        })
+        .collect()
+}
+
+async fn current_batch_versions(
     store: &Store,
-    result: &CompactResult,
-    target_id: &str,
-    job_id: &str,
-) -> Result<MemorySummaryProjection> {
-    let key = store
-        .conversation_key(DataKeyPurpose::MemorySummary)
-        .await
-        .context("load memory summary key")?;
-    let batch_aad =
-        store
-            .scope()
-            .row_aad("memory_batches", target_id, DataKeyPurpose::MemorySummary);
-    let job_aad = store
-        .scope()
-        .row_aad("memory_jobs", job_id, DataKeyPurpose::MemorySummary);
-    MemoryProjectionBuilder::new(store.redactor(), &key).build(result, &batch_aad, &job_aad)
+    expected: &BTreeMap<BatchId, u64>,
+) -> Result<BTreeMap<BatchId, u64>> {
+    let mut current = BTreeMap::new();
+    for batch_id in expected.keys() {
+        let row = sqlx::query("SELECT version FROM memory_batches WHERE id = ?")
+            .bind(batch_id.to_string())
+            .fetch_optional(store.pool())
+            .await
+            .with_context(|| format!("failed to load batch version for {batch_id}"))?
+            .ok_or_else(|| anyhow!("batch {batch_id} does not exist"))?;
+        let version: i64 = row.try_get("version")?;
+        current.insert(
+            *batch_id,
+            u64::try_from(version)
+                .with_context(|| format!("batch {batch_id} version out of range"))?,
+        );
+    }
+    Ok(current)
 }
 
 async fn claim_next_pending_job(store: &Store) -> Result<Option<Job>> {
@@ -1166,21 +1120,26 @@ async fn claim_next_pending_job(store: &Store) -> Result<Option<Job>> {
     let Some(row) = row else {
         return Ok(None);
     };
-    let id: String = row.try_get("id")?;
+    let job = parse_job(&row)?;
     let lease_until = (Utc::now() + LEASE_DURATION).to_rfc3339();
 
-    let updated = sqlx::query(
-        "UPDATE memory_jobs
-         SET status = 'running', lease_until = ?, updated_at = ?
-         WHERE id = ? AND status = 'pending'",
-    )
-    .bind(&lease_until)
-    .bind(Utc::now().to_rfc3339())
-    .bind(&id)
-    .execute(store.pool())
-    .await?;
+    let update = MemoryJobUpdate {
+        expected_source_versions: BTreeMap::new(),
+        job_mutations: vec![MemoryJobMutation::Claim {
+            job_id: job.id.clone(),
+            lease_until,
+        }],
+    };
+    let batch = EventBatch {
+        writes: vec![EventWrite {
+            event: None,
+            projections: vec![Projection::MemoryJobUpdate(update)],
+        }],
+        injected_commands: Vec::new(),
+    };
 
-    if updated.rows_affected() == 0 {
+    if let Err(error) = EventWriter::new(Arc::new(store.clone())).apply(batch).await {
+        tracing::debug!("claim CAS lost for {}: {error}", job.id);
         return Ok(None);
     }
 
@@ -1190,49 +1149,39 @@ async fn claim_next_pending_job(store: &Store) -> Result<Option<Job>> {
          FROM memory_jobs
          WHERE id = ?",
     )
-    .bind(&id)
+    .bind(&job.id)
     .fetch_one(store.pool())
     .await?;
 
     parse_job(&row).map(Some)
 }
 
-async fn reset_job_to_pending(store: &Store, job: &Job) -> Result<()> {
-    let result = sqlx::query(
-        "UPDATE memory_jobs
-         SET status = 'pending', lease_until = NULL, updated_at = ?
-         WHERE id = ? AND status = 'running' AND attempts = ? AND lease_until = ?",
-    )
-    .bind(Utc::now().to_rfc3339())
-    .bind(&job.id)
-    .bind(job.attempts)
-    .bind(job.lease_until.as_ref())
-    .execute(store.pool())
-    .await
-    .context("reset job to pending")?;
-    if result.rows_affected() != 1 {
-        bail!("reset job to pending CAS failed for {}", job.id);
-    }
+async fn release_or_reset_job(store: &Store, job: &Job) -> Result<()> {
+    let update = MemoryJobUpdate {
+        expected_source_versions: BTreeMap::new(),
+        job_mutations: vec![MemoryJobMutation::Release {
+            job_id: job.id.clone(),
+        }],
+    };
+    EventWriter::new(Arc::new(store.clone()))
+        .apply(EventBatch {
+            writes: vec![EventWrite {
+                event: None,
+                projections: vec![Projection::MemoryJobUpdate(update)],
+            }],
+            injected_commands: Vec::new(),
+        })
+        .await
+        .context("release/reset job to pending")?;
     Ok(())
 }
 
+async fn reset_job_to_pending(store: &Store, job: &Job) -> Result<()> {
+    release_or_reset_job(store, job).await
+}
+
 async fn release_claimed_job(store: &Store, job: &Job) -> Result<()> {
-    let result = sqlx::query(
-        "UPDATE memory_jobs
-         SET status = 'pending', lease_until = NULL, updated_at = ?
-         WHERE id = ? AND status = 'running' AND attempts = ? AND lease_until = ?",
-    )
-    .bind(Utc::now().to_rfc3339())
-    .bind(&job.id)
-    .bind(job.attempts)
-    .bind(job.lease_until.as_ref())
-    .execute(store.pool())
-    .await
-    .context("release claimed job")?;
-    if result.rows_affected() != 1 {
-        bail!("release claimed job CAS failed for {}", job.id);
-    }
-    Ok(())
+    release_or_reset_job(store, job).await
 }
 
 /// Persist the fact that this leased job is about to consume one provider
@@ -1241,42 +1190,36 @@ async fn release_claimed_job(store: &Store, job: &Job) -> Result<()> {
 /// after real provider failures while also not consuming budget for a crash
 /// that happens before the provider call is started.
 async fn start_attempt(store: &Store, job: &mut Job) -> Result<()> {
-    let new_attempts = job
-        .attempts
-        .checked_add(1)
-        .ok_or_else(|| anyhow!("attempts overflow for job {}", job.id))?;
     // Refresh the lease at the start of each provider attempt. A single
     // attempt can approach the header+body idle timeout budget, so the lease
     // must cover the remaining attempts without relying on the claim time.
     let lease_until = (Utc::now() + LEASE_DURATION).to_rfc3339();
-    let result = sqlx::query(
-        "UPDATE memory_jobs
-         SET attempts = ?, lease_until = ?, updated_at = ?
-         WHERE id = ? AND status = 'running' AND attempts = ? AND lease_until = ?",
-    )
-    .bind(new_attempts)
-    .bind(&lease_until)
-    .bind(Utc::now().to_rfc3339())
-    .bind(&job.id)
-    .bind(job.attempts)
-    .bind(job.lease_until.as_ref())
-    .execute(store.pool())
-    .await
-    .context("start job attempt")?;
-    if result.rows_affected() != 1 {
-        bail!("start attempt CAS failed for {}", job.id);
-    }
-    job.attempts = new_attempts;
+    let update = MemoryJobUpdate {
+        expected_source_versions: BTreeMap::new(),
+        job_mutations: vec![MemoryJobMutation::Start {
+            job_id: job.id.clone(),
+            lease_until: lease_until.clone(),
+        }],
+    };
+    EventWriter::new(Arc::new(store.clone()))
+        .apply(EventBatch {
+            writes: vec![EventWrite {
+                event: None,
+                projections: vec![Projection::MemoryJobUpdate(update)],
+            }],
+            injected_commands: Vec::new(),
+        })
+        .await
+        .context("start job attempt")?;
+    job.attempts = job
+        .attempts
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("attempts overflow for job {}", job.id))?;
     job.lease_until = Some(lease_until);
     Ok(())
 }
 
-async fn complete_job(
-    store: &Store,
-    job: &Job,
-    result: &CompactResult,
-    projection: &MemorySummaryProjection,
-) -> Result<(), WorkerError> {
+async fn complete_job(store: &Store, job: &Job, result: &CompactResult) -> Result<(), WorkerError> {
     let target = load_target_batch(store, job.kind, job.batch_seq)
         .await?
         .ok_or_else(|| anyhow!("target batch missing for job {}", job.id))?;
@@ -1288,106 +1231,54 @@ async fn complete_job(
         )));
     }
 
-    let mut tx = store.pool().begin().await?;
+    let mut expected_source_versions = job_source_versions(job)?;
+    let target_uuid = BatchId::parse_str(&target.id)
+        .with_context(|| format!("target batch id {} is not a UUID", target.id))?;
+    expected_source_versions.insert(target_uuid, target.version as u64);
 
-    for id in &job.source_ids {
-        let expected = job
-            .source_versions
-            .get(id)
-            .copied()
-            .ok_or_else(|| anyhow!("source version missing for {id}"))?;
-        let row = sqlx::query("SELECT version FROM memory_batches WHERE id = ?")
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?;
-        let current: i64 = row.try_get("version")?;
-        if current != expected {
-            return Err(WorkerError::StaleSource {
-                id: id.clone(),
-                expected,
-                found: current,
-            });
-        }
-    }
-
-    let target_row = sqlx::query("SELECT version, state FROM memory_batches WHERE id = ?")
-        .bind(&target.id)
-        .fetch_one(&mut *tx)
-        .await?;
-    let target_version: i64 = target_row.try_get("version")?;
-    let target_state: String = target_row.try_get("state")?;
-    if target_state != "compacting" || target_version != target.version {
+    // Pre-verify source versions so we can report StaleSource before asking
+    // EventWriter to prepare the transition.
+    let current_versions = current_batch_versions(store, &expected_source_versions).await?;
+    if current_versions != expected_source_versions {
         return Err(WorkerError::StaleSource {
             id: target.id.clone(),
             expected: target.version,
-            found: target_version,
+            found: current_versions
+                .get(&target_uuid)
+                .copied()
+                .and_then(|v| i64::try_from(v).ok())
+                .unwrap_or(-1),
         });
     }
 
-    let est_tokens = i64::try_from(result.est_tokens).context("est_tokens overflow")?;
-    let updated_batch = sqlx::query(
-        "UPDATE memory_batches
-         SET state = 'compacted', version = version + 1, summary_key_ref = ?,
-             summary_ciphertext = ?, summary_projection = ?, summary_redaction_version = ?,
-             est_tokens = ?, updated_at = ?
-         WHERE id = ? AND version = ? AND state = 'compacting'",
-    )
-    .bind(&projection.key_ref)
-    .bind(&projection.ciphertext)
-    .bind(&projection.projection)
-    .bind(i64::from(projection.redaction_version))
-    .bind(est_tokens)
-    .bind(Utc::now().to_rfc3339())
-    .bind(&target.id)
-    .bind(target_version)
-    .execute(&mut *tx)
-    .await?;
+    let transition = MemoryTransition {
+        expected_source_versions,
+        batch_mutations: vec![MemoryBatchMutation {
+            batch_id: target_uuid,
+            expected_version: target.version as u64,
+            new_state: MemoryBatchState::Compacted,
+            summary: Some(result.clone()),
+            est_tokens: result.est_tokens,
+            footprint_delta: 0,
+            delete_membership: false,
+        }],
+        job_mutations: vec![MemoryJobMutation::Complete {
+            job_id: job.id.clone(),
+            result: result.clone(),
+        }],
+        cursor_advance: None,
+    };
 
-    if updated_batch.rows_affected() != 1 {
-        let current: Option<i64> = sqlx::query("SELECT version FROM memory_batches WHERE id = ?")
-            .bind(&target.id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .map(|row| row.try_get("version"))
-            .transpose()?;
-        return Err(WorkerError::StaleSource {
-            id: target.id.clone(),
-            expected: target_version,
-            found: current.unwrap_or(-1),
-        });
-    }
-
-    let mut new_source_versions = job.source_versions.clone();
-    new_source_versions.insert(target.id.clone(), target_version + 1);
-    let source_versions_json =
-        serde_json::to_string(&new_source_versions).context("serialize source_versions")?;
-
-    let updated_job = sqlx::query(
-        "UPDATE memory_jobs
-         SET status = 'completed', result_key_ref = ?, result_ciphertext = ?,
-             result_projection = ?, result_redaction_version = ?, source_versions = ?,
-             attempts = ?, lease_until = ?, updated_at = ?
-         WHERE id = ? AND status = 'running' AND attempts = ? AND lease_until = ?",
-    )
-    .bind(&projection.key_ref)
-    .bind(&projection.job_ciphertext)
-    .bind(&projection.projection)
-    .bind(i64::from(projection.redaction_version))
-    .bind(&source_versions_json)
-    .bind(job.attempts)
-    .bind(job.lease_until.as_ref())
-    .bind(Utc::now().to_rfc3339())
-    .bind(&job.id)
-    .bind(job.attempts)
-    .bind(job.lease_until.as_ref())
-    .execute(&mut *tx)
-    .await?;
-
-    if updated_job.rows_affected() != 1 {
-        return Err(WorkerError::Store(anyhow!("job CAS failed for {}", job.id)));
-    }
-
-    tx.commit().await?;
+    EventWriter::new(Arc::new(store.clone()))
+        .apply(EventBatch {
+            writes: vec![EventWrite {
+                event: Some(DurableEvent::memory_maintenance("compact_completed")?),
+                projections: vec![Projection::MemoryTransition(transition)],
+            }],
+            injected_commands: Vec::new(),
+        })
+        .await
+        .context("complete compaction job")?;
     Ok(())
 }
 
@@ -1403,122 +1294,72 @@ async fn fail_job(store: &Store, job: &Job) -> Result<(), WorkerError> {
         )));
     }
 
-    let mut tx = store.pool().begin().await?;
+    let mut expected_source_versions = job_source_versions(job)?;
+    let target_uuid = BatchId::parse_str(&target.id)
+        .with_context(|| format!("target batch id {} is not a UUID", target.id))?;
+    expected_source_versions.insert(target_uuid, target.version as u64);
 
-    let mut new_source_versions = job.source_versions.clone();
+    let current_versions = current_batch_versions(store, &expected_source_versions).await?;
+    if current_versions != expected_source_versions {
+        return Err(WorkerError::StaleSource {
+            id: target.id.clone(),
+            expected: target.version,
+            found: current_versions
+                .get(&target_uuid)
+                .copied()
+                .and_then(|v| i64::try_from(v).ok())
+                .unwrap_or(-1),
+        });
+    }
 
+    let mut batch_mutations = Vec::with_capacity(job.source_ids.len() + 1);
     for id in &job.source_ids {
-        let expected = job
+        let batch_id = BatchId::parse_str(id)
+            .with_context(|| format!("source batch id {id} is not a UUID"))?;
+        let expected_version = job
             .source_versions
             .get(id)
             .copied()
             .ok_or_else(|| anyhow!("source version missing for {id}"))?;
-        let row = sqlx::query("SELECT version FROM memory_batches WHERE id = ?")
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?;
-        let current: i64 = row.try_get("version")?;
-        if current != expected {
-            return Err(WorkerError::StaleSource {
-                id: id.clone(),
-                expected,
-                found: current,
-            });
-        }
-
-        let updated_source = sqlx::query(
-            "UPDATE memory_batches
-             SET state = 'compact_failed', version = version + 1, updated_at = ?
-             WHERE id = ? AND version = ? AND state = 'compacting'",
-        )
-        .bind(Utc::now().to_rfc3339())
-        .bind(id)
-        .bind(expected)
-        .execute(&mut *tx)
-        .await?;
-
-        if updated_source.rows_affected() != 1 {
-            let current: Option<i64> =
-                sqlx::query("SELECT version FROM memory_batches WHERE id = ?")
-                    .bind(id)
-                    .fetch_optional(&mut *tx)
-                    .await?
-                    .map(|row| row.try_get("version"))
-                    .transpose()?;
-            return Err(WorkerError::StaleSource {
-                id: id.clone(),
-                expected,
-                found: current.unwrap_or(-1),
-            });
-        }
-
-        new_source_versions.insert(id.clone(), expected + 1);
-    }
-
-    let target_row = sqlx::query("SELECT version, state FROM memory_batches WHERE id = ?")
-        .bind(&target.id)
-        .fetch_one(&mut *tx)
-        .await?;
-    let target_version: i64 = target_row.try_get("version")?;
-    let target_state: String = target_row.try_get("state")?;
-    if target_state != "compacting" || target_version != target.version {
-        return Err(WorkerError::StaleSource {
-            id: target.id.clone(),
-            expected: target.version,
-            found: target_version,
+        batch_mutations.push(MemoryBatchMutation {
+            batch_id,
+            expected_version: expected_version as u64,
+            new_state: MemoryBatchState::CompactFailed,
+            summary: None,
+            est_tokens: 0,
+            footprint_delta: 0,
+            delete_membership: false,
         });
     }
+    batch_mutations.push(MemoryBatchMutation {
+        batch_id: target_uuid,
+        expected_version: target.version as u64,
+        new_state: MemoryBatchState::CompactFailed,
+        summary: None,
+        est_tokens: 0,
+        footprint_delta: 0,
+        delete_membership: false,
+    });
 
-    let updated_batch = sqlx::query(
-        "UPDATE memory_batches
-         SET state = 'compact_failed', version = version + 1, updated_at = ?
-         WHERE id = ? AND version = ? AND state = 'compacting'",
-    )
-    .bind(Utc::now().to_rfc3339())
-    .bind(&target.id)
-    .bind(target_version)
-    .execute(&mut *tx)
-    .await?;
+    let transition = MemoryTransition {
+        expected_source_versions,
+        batch_mutations,
+        job_mutations: vec![MemoryJobMutation::Fail {
+            job_id: job.id.clone(),
+        }],
+        cursor_advance: None,
+    };
 
-    if updated_batch.rows_affected() != 1 {
-        let current: Option<i64> = sqlx::query("SELECT version FROM memory_batches WHERE id = ?")
-            .bind(&target.id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .map(|row| row.try_get("version"))
-            .transpose()?;
-        return Err(WorkerError::StaleSource {
-            id: target.id.clone(),
-            expected: target_version,
-            found: current.unwrap_or(-1),
-        });
-    }
-
-    new_source_versions.insert(target.id.clone(), target_version + 1);
-    let source_versions_json =
-        serde_json::to_string(&new_source_versions).context("serialize source_versions")?;
-
-    let updated_job = sqlx::query(
-        "UPDATE memory_jobs
-         SET status = 'failed', source_versions = ?, attempts = ?, lease_until = ?,
-             updated_at = ?
-         WHERE id = ? AND status = 'running' AND attempts = ? AND lease_until = ?",
-    )
-    .bind(&source_versions_json)
-    .bind(job.attempts)
-    .bind(job.lease_until.as_ref())
-    .bind(Utc::now().to_rfc3339())
-    .bind(&job.id)
-    .bind(job.attempts)
-    .bind(job.lease_until.as_ref())
-    .execute(&mut *tx)
-    .await?;
-
-    if updated_job.rows_affected() != 1 {
-        return Err(WorkerError::Store(anyhow!("job CAS failed for {}", job.id)));
-    }
-
-    tx.commit().await?;
+    EventWriter::new(Arc::new(store.clone()))
+        .apply(EventBatch {
+            writes: vec![EventWrite {
+                event: Some(DurableEvent::memory_maintenance("compact_failed")?),
+                projections: vec![Projection::MemoryTransition(transition)],
+            }],
+            injected_commands: Vec::new(),
+        })
+        .await
+        .context("fail compaction job")?;
     Ok(())
 }
 
@@ -1549,6 +1390,7 @@ async fn recover_compacting_batches(store: &Store) -> Result<()> {
     for row in rows {
         let source_id: String = row.try_get("id")?;
         let layer: i64 = row.try_get("layer")?;
+        let batch_seq: i64 = row.try_get("batch_seq")?;
         let version: i64 = row.try_get("version")?;
 
         let (kind, target_layer) = match MemoryLayer::from_i64(layer) {
@@ -1565,7 +1407,27 @@ async fn recover_compacting_batches(store: &Store) -> Result<()> {
         if layer != MemoryLayer::L0.as_i64() {
             let summary_key_ref: Option<String> = row.try_get("summary_key_ref")?;
             if summary_key_ref.is_none() {
-                tracing::debug!("skipping compacting {layer} batch {source_id} without a summary");
+                // In-flight L1/L2 target. It is only an orphan if neither a job
+                // owns it by target batch_seq nor it is referenced as a source.
+                let target_referenced: Option<i64> =
+                    sqlx::query_scalar("SELECT 1 FROM memory_jobs WHERE batch_seq = ? LIMIT 1")
+                        .bind(batch_seq)
+                        .fetch_optional(store.pool())
+                        .await
+                        .context("check existing memory job for target batch_seq")?;
+                let source_referenced: Option<i64> = sqlx::query_scalar(
+                    "SELECT 1 FROM memory_jobs
+                     WHERE EXISTS (
+                         SELECT 1 FROM json_each(source_ids) WHERE json_each.value = ?
+                     ) LIMIT 1",
+                )
+                .bind(&source_id)
+                .fetch_optional(store.pool())
+                .await
+                .context("check existing memory job for orphan target batch")?;
+                if target_referenced.is_none() && source_referenced.is_none() {
+                    repair_orphan_compacting_target(store, &source_id, version).await?;
+                }
                 continue;
             }
         }
@@ -1636,135 +1498,140 @@ async fn recover_compacting_batches(store: &Store) -> Result<()> {
     Ok(())
 }
 
+async fn repair_orphan_compacting_target(
+    store: &Store,
+    target_id: &str,
+    version: i64,
+) -> Result<()> {
+    let batch_uuid = BatchId::parse_str(target_id)
+        .with_context(|| format!("orphan target batch id {target_id} is not a UUID"))?;
+    let expected_source_versions = BTreeMap::from([(batch_uuid, version as u64)]);
+
+    let transition = MemoryTransition {
+        expected_source_versions,
+        batch_mutations: vec![MemoryBatchMutation {
+            batch_id: batch_uuid,
+            expected_version: version as u64,
+            new_state: MemoryBatchState::CompactFailed,
+            summary: None,
+            est_tokens: 0,
+            footprint_delta: 0,
+            delete_membership: false,
+        }],
+        job_mutations: Vec::new(),
+        cursor_advance: None,
+    };
+
+    EventWriter::new(Arc::new(store.clone()))
+        .apply(EventBatch {
+            writes: vec![EventWrite {
+                event: Some(DurableEvent::memory_maintenance("compact_orphan_repair")?),
+                projections: vec![Projection::MemoryTransition(transition)],
+            }],
+            injected_commands: Vec::new(),
+        })
+        .await
+        .context("repair orphan compacting target")?;
+    tracing::debug!("repaired orphan compacting target {target_id}");
+    Ok(())
+}
+
 async fn recover_jobs(store: &Store) -> Result<()> {
     recover_expired_running_jobs(store).await?;
     recover_compacting_batches(store).await?;
     Ok(())
 }
 
-/// Apply completed shelves in durable sequence order. Completion is kept
-/// separate from this short transaction so provider latency never holds the
-/// memory tables. A later batch can finish first, but its `completed` row stays
-/// on the shelf until this cursor reaches it.
+/// Apply completed shelves in durable sequence order. All cursor motion is
+/// committed inside the same `MemoryTransition`/`MemoryMaintenance` transaction
+/// as the corresponding job transition, so cursor and event stream cannot drift
+/// across crash boundaries.
 async fn apply_next_completed_job(store: Arc<Store>, kind: MemoryJobKind) -> Result<bool> {
     let kind_name = kind.as_str();
-    let mut tx = store.pool().begin().await?;
 
+    // Initialize the cursor to the earliest durable job if it does not exist.
     let cursor: Option<i64> =
         sqlx::query_scalar("SELECT next_batch_seq FROM memory_apply_cursors WHERE kind = ?")
             .bind(kind_name)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(store.pool())
             .await?;
-    let mut next = match cursor {
-        Some(next) => next,
+    let initial_cursor = match cursor {
+        Some(cursor) => cursor,
         None => {
             let first: Option<i64> = sqlx::query_scalar(
                 "SELECT batch_seq FROM memory_jobs WHERE kind = ? ORDER BY batch_seq ASC LIMIT 1",
             )
             .bind(kind_name)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(store.pool())
             .await?;
             let Some(first) = first else {
-                tx.rollback().await?;
                 return Ok(false);
             };
-            sqlx::query("INSERT INTO memory_apply_cursors(kind, next_batch_seq) VALUES(?, ?)")
-                .bind(kind_name)
-                .bind(first)
-                .execute(&mut *tx)
-                .await?;
+            MemoryApplyCursorRecord {
+                kind: kind_name.to_owned(),
+                next_batch_seq: first,
+            }
+            .insert(store.pool())
+            .await
+            .context("initialize memory apply cursor")?;
             first
         }
     };
-    let initial_cursor = next;
 
-    // Applied rows are idempotent evidence from an earlier crash. Advance
-    // over them before looking for the next completed shelf.
-    loop {
-        let row = sqlx::query(
-            "SELECT id, source_ids, source_versions, status, batch_seq
-             FROM memory_jobs
-             WHERE kind = ? AND batch_seq = ?",
-        )
-        .bind(kind_name)
-        .bind(next)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some(row) = row else {
-            if next != initial_cursor {
-                tx.commit().await?;
-                return Ok(false);
-            }
-            // A cursor may have been initialized before the first reservation;
-            // bind it to the earliest durable job without skipping a job row.
-            let Some(first) = sqlx::query_scalar::<_, i64>(
-                "SELECT batch_seq FROM memory_jobs
-                 WHERE kind = ? AND batch_seq >= ? ORDER BY batch_seq ASC LIMIT 1",
-            )
-            .bind(kind_name)
-            .bind(next)
-            .fetch_optional(&mut *tx)
-            .await?
-            else {
-                tx.rollback().await?;
-                return Ok(false);
-            };
-            if first != next {
-                sqlx::query(
-                    "UPDATE memory_apply_cursors
-                     SET next_batch_seq = ?
-                     WHERE kind = ? AND next_batch_seq = ?",
-                )
-                .bind(first)
-                .bind(kind_name)
-                .bind(next)
-                .execute(&mut *tx)
-                .await?;
-                next = first;
-                continue;
-            }
-            tx.rollback().await?;
-            return Ok(false);
-        };
+    // Scan forward from the cursor to find the first completed job, passing
+    // over terminal (applied/failed) rows. If we hit a pending/running row
+    // after advancing over terminals, commit a pure cursor-advance transition
+    // for those terminal holes and stop.
+    let rows = sqlx::query(
+        "SELECT id, batch_seq, source_ids, source_versions, status
+         FROM memory_jobs
+         WHERE kind = ? AND batch_seq >= ?
+         ORDER BY batch_seq ASC",
+    )
+    .bind(kind_name)
+    .bind(initial_cursor)
+    .fetch_all(store.pool())
+    .await?;
+
+    let mut cursor = initial_cursor;
+    for row in rows {
+        let batch_seq: i64 = row.try_get("batch_seq")?;
+        if batch_seq < cursor {
+            continue;
+        }
 
         let status: String = row.try_get("status")?;
         if status == MemoryJobStatus::Applied.as_str() || status == MemoryJobStatus::Failed.as_str()
         {
-            // Terminal rows (applied or permanently failed) are cursor holes.
-            // Advance past them so later completed shelves can still apply.
-            let expected = next;
-            next = next
+            // Terminal holes are skipped here and swept up by the cursor
+            // advance bundled with the next completed job's transition.
+            cursor = batch_seq
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("memory apply cursor overflow"))?;
-            sqlx::query(
-                "UPDATE memory_apply_cursors
-                 SET next_batch_seq = ?
-                 WHERE kind = ? AND next_batch_seq = ?",
-            )
-            .bind(next)
-            .bind(kind_name)
-            .bind(expected)
-            .execute(&mut *tx)
-            .await?;
             continue;
         }
+
         if status != MemoryJobStatus::Completed.as_str() {
-            // Pending or running job: stop, but commit any cursor advances we
-            // already made over terminal rows.
-            if next != initial_cursor {
-                tx.commit().await?;
-                return Ok(false);
+            // Pending or running job blocks further application. Any terminal
+            // holes swept so far must advance the cursor in their own
+            // transition so the stream does not drift.
+            if cursor != initial_cursor {
+                advance_apply_cursor(
+                    store.clone(),
+                    kind,
+                    initial_cursor,
+                    cursor,
+                    "compact_cursor_advance",
+                )
+                .await?;
             }
-            tx.rollback().await?;
             return Ok(false);
         }
 
         let job_id: String = row.try_get("id")?;
         let source_ids_json: String = row.try_get("source_ids")?;
         let source_versions_json: String = row.try_get("source_versions")?;
-        let batch_seq: i64 = row.try_get("batch_seq")?;
 
-        tx.commit().await?;
         return apply_completed_job(
             store.clone(),
             kind,
@@ -1772,9 +1639,55 @@ async fn apply_next_completed_job(store: Arc<Store>, kind: MemoryJobKind) -> Res
             batch_seq,
             &source_ids_json,
             &source_versions_json,
+            initial_cursor,
         )
         .await;
     }
+
+    // Reached the end of the durable job list. Advance the cursor over any
+    // trailing terminal holes so they are not revisited.
+    if cursor != initial_cursor {
+        advance_apply_cursor(
+            store.clone(),
+            kind,
+            initial_cursor,
+            cursor,
+            "compact_cursor_advance",
+        )
+        .await?;
+    }
+    Ok(false)
+}
+
+async fn advance_apply_cursor(
+    store: Arc<Store>,
+    kind: MemoryJobKind,
+    expected: i64,
+    next: i64,
+    maintenance_kind: &str,
+) -> Result<()> {
+    let transition = MemoryTransition {
+        expected_source_versions: BTreeMap::new(),
+        batch_mutations: Vec::new(),
+        job_mutations: Vec::new(),
+        cursor_advance: Some(MemoryApplyCursorAdvance {
+            kind: kind.as_str().to_owned(),
+            expected: expected as u64,
+            next: next as u64,
+        }),
+    };
+
+    EventWriter::new(store)
+        .apply(EventBatch {
+            writes: vec![EventWrite {
+                event: Some(DurableEvent::memory_maintenance(maintenance_kind)?),
+                projections: vec![Projection::MemoryTransition(transition)],
+            }],
+            injected_commands: Vec::new(),
+        })
+        .await
+        .context("advance apply cursor")?;
+    Ok(())
 }
 
 async fn apply_completed_job(
@@ -1784,6 +1697,7 @@ async fn apply_completed_job(
     batch_seq: i64,
     source_ids_json: &str,
     source_versions_json: &str,
+    initial_cursor: i64,
 ) -> Result<bool> {
     let source_ids: Vec<String> =
         serde_json::from_str(source_ids_json).context("deserialize apply source_ids")?;
@@ -1884,7 +1798,7 @@ async fn apply_completed_job(
         }],
         cursor_advance: Some(MemoryApplyCursorAdvance {
             kind: kind.as_str().to_owned(),
-            expected: batch_seq as u64,
+            expected: initial_cursor as u64,
             next: next_batch_seq as u64,
         }),
     };
@@ -2056,13 +1970,8 @@ impl CompactWorker {
         {
             Ok(text) => {
                 let result = build_compact_result(text, &input)?;
-                let target = load_target_batch(&self.store, job.kind, job.batch_seq)
-                    .await?
-                    .ok_or_else(|| WorkerError::Store(anyhow!("target batch missing")))?;
-                let projection =
-                    build_summary_projection(&self.store, &result, &target.id, &job.id).await?;
 
-                match complete_job(&self.store, &job, &result, &projection).await {
+                match complete_job(&self.store, &job, &result).await {
                     Ok(()) => {}
                     Err(WorkerError::StaleSource { .. }) => {
                         reset_job_to_pending(&self.store, &job).await?;
@@ -2116,7 +2025,7 @@ mod tests {
     use crate::store::{
         DataKeyPurpose, EncryptedProviderContextRecord, MemoryBatchMessageRecord,
         MemoryBatchRecord, MemoryBatchState, MemoryBatchSummary, MemoryJobKind, MemoryJobRecord,
-        MemoryLayer, ProviderContextKeyAnchor, Store, TranscriptRecord,
+        MemoryLayer, ProviderContextKeyAnchor, Store, TranscriptRecord, encrypt_content,
         provider_context_idempotency_key,
     };
     use tokio_util::sync::CancellationToken;
@@ -3383,14 +3292,15 @@ mod tests {
         .expect("apply cursor");
         assert_eq!(cursor, 3);
 
-        // Ensure the apply produced a MemoryMaintenance event for each job.
+        // Each job now produces a MemoryMaintenance event at completion and at
+        // apply, so the durable log records two maintenance events per job.
         let maintenance_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM agent_events WHERE event_type = 'memory_maintenance'",
         )
         .fetch_one(store.pool())
         .await
         .expect("count maintenance events");
-        assert_eq!(maintenance_count, 2);
+        assert_eq!(maintenance_count, 4);
     }
 
     #[tokio::test]
