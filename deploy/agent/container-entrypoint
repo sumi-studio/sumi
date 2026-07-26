@@ -94,6 +94,7 @@ case "${role}" in
       SUMI_CONVERSATION_ID="${SUMI_CONVERSATION_ID}" SUMI_WORKSPACE=/workspace \
       SUMI_EXECUTOR_SOCKET="${RUNTIME_IPC}/executor.sock" \
       SUMI_ARTIFACT_BROKER_SOCKET="${BROKER_IPC}/broker.sock" \
+      SUMI_ENFORCE_BROKER_SOCKET_NAMESPACE_ISOLATION=1 \
       /usr/local/bin/sumi-agent --tool-executor-socket
     ;;
 

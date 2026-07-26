@@ -6,6 +6,7 @@ use std::{
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     path::{Path, PathBuf},
     pin::Pin,
+    process::Stdio,
     sync::{Arc, Mutex},
     task::{Context as TaskContext, Poll},
     time::Duration,
@@ -48,7 +49,18 @@ const EXECUTOR_TERMINAL_WRITE_DEADLINE: Duration = Duration::from_secs(2);
 // progress can never leave a partial JSON frame ahead of the terminal.
 const MAX_ATOMIC_UPDATE_FRAME_BYTES: usize = 4_096;
 const EXECUTOR_REAP_DEADLINE: Duration = Duration::from_secs(2);
+const PR_SET_DUMPABLE: libc::c_int = 4;
+
 type BashUpdateCallback = Arc<dyn Fn(Value) + Send + Sync>;
+
+fn set_dumpable(value: libc::c_int) -> std::io::Result<()> {
+    let rc = unsafe { libc::syscall(libc::SYS_prctl, PR_SET_DUMPABLE, value, 0, 0, 0) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
 
 #[cfg(test)]
 pub(super) struct ExecutorTestControls {
@@ -480,7 +492,43 @@ impl BlockingWorkRegistry {
     }
 }
 
+/// Run the namespace isolation preflight in a short-lived copy of this binary.
+/// `mode_arg` must be `--tool-executor` or `--tool-executor-socket`.
+async fn run_broker_socket_isolation_preflight(mode_arg: &str) -> Result<()> {
+    let exe = env::current_exe()
+        .context("failed to determine current executable for isolation preflight")?;
+    let output = tokio::process::Command::new(&exe)
+        .arg(mode_arg)
+        .env_clear()
+        .env("SUMI_ISOLATION_PREFLIGHT", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .context("failed to spawn namespace isolation preflight")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "namespace isolation preflight failed: {}{}",
+            output.status,
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        );
+    }
+    Ok(())
+}
+
 pub async fn run_tool_executor_mode() -> Result<()> {
+    if env::var_os("SUMI_ENFORCE_BROKER_SOCKET_NAMESPACE_ISOLATION").is_some() {
+        run_broker_socket_isolation_preflight("--tool-executor")
+            .await
+            .context("namespace isolation preflight failed")?;
+    }
+    set_dumpable(0).context("failed to set PR_SET_DUMPABLE")?;
     let identity = identity_from_env()?;
     let workspace = required_path("SUMI_WORKSPACE")?;
     let conversation_id = required_text("SUMI_CONVERSATION_ID")?;
@@ -506,6 +554,12 @@ pub async fn run_tool_executor_mode() -> Result<()> {
 /// connection gets its own `WorkspaceFs` and `ArtifactBrokerClient` so a
 /// connection cannot carry stale state into the next.
 pub async fn run_tool_executor_socket_mode() -> Result<()> {
+    if env::var_os("SUMI_ENFORCE_BROKER_SOCKET_NAMESPACE_ISOLATION").is_some() {
+        run_broker_socket_isolation_preflight("--tool-executor-socket")
+            .await
+            .context("namespace isolation preflight failed")?;
+    }
+    set_dumpable(0).context("failed to set PR_SET_DUMPABLE")?;
     let identity = identity_from_env()?;
     let workspace = required_path("SUMI_WORKSPACE")?;
     let conversation_id = required_text("SUMI_CONVERSATION_ID")?;
@@ -842,7 +896,8 @@ where
 {
     let cancel = CancellationToken::new();
     let (on_update, mut updates_rx) = bounded_bash_updates();
-    let bash = LowTrustLocalBash::new(workspace.to_path_buf(), broker);
+    let bash = LowTrustLocalBash::new(workspace.to_path_buf(), broker)
+        .with_broker_socket(broker.socket().to_path_buf());
     #[cfg(test)]
     let bash = bash.with_cancel_stop_delay(test_controls.cancel_stop_delay);
     let execution = bash.execute(&command, &execution_id, cancel.clone(), on_update);

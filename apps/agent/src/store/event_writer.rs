@@ -9095,7 +9095,7 @@ mod tests {
     }
 
     fn test_fence(lease: &ProcessGenerationLease) -> GenerationRecoveryFence {
-        GenerationRecoveryFence::new(lease, "test-fence").expect("valid test fence")
+        GenerationRecoveryFence::new(lease, "fence-for-test-lease").expect("valid test fence")
     }
 
     #[test]
@@ -20758,7 +20758,7 @@ mod tests {
     ) -> (ProcessGenerationLease, GenerationRecoveryFence) {
         let lease = ProcessGenerationLease::new(test_process_generation(1), "test-lease")
             .expect("test process generation lease");
-        let fence = GenerationRecoveryFence::new(&lease, "test-fence")
+        let fence = GenerationRecoveryFence::new(&lease, "fence-for-test-lease")
             .expect("test generation recovery fence");
         let decision_id = "00000000-0000-4000-8000-000000000003";
         seed_pending_approval(store, writer, "request-1", tool_call_id, run_id).await;
@@ -20984,7 +20984,8 @@ mod tests {
                 // converge to a committed state.
                 let lease = ProcessGenerationLease::new(test_process_generation(1), "test-lease")
                     .expect("test lease");
-                let fence = GenerationRecoveryFence::new(&lease, "test-fence").expect("test fence");
+                let fence = GenerationRecoveryFence::new(&lease, "fence-for-test-lease")
+                    .expect("test fence");
                 let writer = EventWriter::new(reopened.clone());
                 let (batch, receipt) =
                     t17_physical_recovery_batch(&reopened, "run-1", "tool-1", &lease, &fence).await;

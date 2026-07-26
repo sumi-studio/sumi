@@ -57,6 +57,7 @@ pub struct LowTrustLocalBash<'a> {
     workspace: PathBuf,
     artifact: &'a dyn ArtifactAppender,
     wall_timeout: Duration,
+    broker_socket: Option<PathBuf>,
 }
 
 impl<'a> LowTrustLocalBash<'a> {
@@ -65,7 +66,21 @@ impl<'a> LowTrustLocalBash<'a> {
             workspace,
             artifact,
             wall_timeout: DEFAULT_WALL_TIMEOUT,
+            broker_socket: None,
         }
+    }
+
+    pub fn with_broker_socket(mut self, socket: PathBuf) -> Self {
+        self.broker_socket = Some(socket);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn preflight_namespace_isolation() -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "namespace isolation is only supported on Linux",
+        ))
     }
 
     pub async fn execute(

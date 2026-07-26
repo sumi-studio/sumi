@@ -1,0 +1,69 @@
+#include <tunables/global>
+
+# SUMI agent executor: AppArmor profile for the low-trust tool executor.
+#
+# This profile is a deliberate relaxation of the default Docker apparmor
+# profile (docker-default) only where required for per-command namespace
+# isolation.  It permits the specific mount(2) calls used to hide the
+# artifact-broker Unix socket from bash children while retaining the rest of
+# docker-default's restrictions on /proc, /sys, ptrace, and mount.
+#
+# The profile must be loaded on the Docker host before `docker compose up`:
+#   sudo apparmor_parser -r /path/to/deploy/agent/apparmor/executor
+# or run deploy/agent/apparmor/load-profile as root.
+
+profile sumi-agent-executor flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  network,
+  # Permit CLONE_NEWUSER under this profile. The executor startup preflight
+  # verifies the complete user/mount/network namespace sequence before serve.
+  userns,
+  # Disallow AF_ALG (Linux kernel crypto API); see https://copy.fail/
+  deny network alg,
+  capability setuid setgid setpcap sys_admin,
+  file,
+
+  signal (receive) peer=unconfined,
+  signal (receive) peer=runc,
+  signal (send,receive) peer=sumi-agent-executor,
+
+  deny @{PROC}/* w,
+  # deny write to files not in /proc/<number>/** or /proc/sys/**
+  deny @{PROC}/{[^1-9/],[^1-9/][^0-9/],[^1-9s/][^0-9y/][^0-9s/],[^1-9/][^0-9/][^0-9/][^0-9/]*}/** w,
+  deny @{PROC}/sys/[^k]** w,
+  deny @{PROC}/sys/kernel/{?,??,[^s][^h][^m]**} w,
+  deny @{PROC}/sysrq-trigger rwklx,
+  deny @{PROC}/kcore rwklx,
+
+  # Recursive private mount propagation before the per-command bind mount.
+  mount options=(rprivate) none -> /,
+  # Per-command broker-socket mask. Source is an unpredictable ephemeral
+  # /tmp/.sumi-broker-isolation-* entry; target is the broker IPC directory
+  # or socket file.
+  mount options=(bind) /tmp/.sumi-broker-isolation-* -> /run/sumi/broker/,
+  mount options=(bind) /tmp/.sumi-broker-isolation-* -> /run/sumi/broker/broker.sock,
+  mount options=(bind) /tmp/.sumi-broker-isolation-* -> /tmp/**/broker-ipc/,
+  mount options=(bind) /tmp/.sumi-broker-isolation-* -> /tmp/**/broker-ipc/broker.sock,
+  mount options=(bind) /tmp/.sumi-broker-isolation-* -> /workspace/broker-ipc/,
+  mount options=(bind) /tmp/.sumi-broker-isolation-* -> /workspace/broker-ipc/broker.sock,
+
+  # Startup preflight uses two distinct private random paths and detaches the
+  # probe mount before removing both paths. This verifies the actual deployed
+  # user/mount/network namespace policy before the executor accepts RPC.
+  mount options=(bind) /tmp/.sumi-broker-preflight-src-* -> /tmp/.sumi-broker-preflight-tgt-*,
+  umount /tmp/.sumi-broker-preflight-tgt-*,
+
+  deny /sys/[^f]*/** wklx,
+  deny /sys/f[^s]*/** wklx,
+  deny /sys/fs/[^c]*/** wklx,
+  deny /sys/fs/c[^g]*/** wklx,
+  deny /sys/fs/cg[^r]*/** wklx,
+  deny /sys/firmware/** rwklx,
+  deny /sys/devices/virtual/powercap/** rwklx,
+  deny /sys/kernel/security/** rwklx,
+
+  # allow processes within the container to trace each other,
+  # provided all other LSM and yama setting allow it.
+  ptrace (trace,tracedby,read,readby) peer=sumi-agent-executor,
+}

@@ -24,8 +24,27 @@ use store::{
     SuffixRecovery,
 };
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let mode = env::args().nth(1);
+    if env::var_os("SUMI_ISOLATION_PREFLIGHT").is_some()
+        && matches!(
+            mode.as_deref(),
+            Some("--tool-executor") | Some("--tool-executor-socket")
+        )
+    {
+        // CLONE_NEWUSER is rejected once Tokio has started worker threads.
+        // Run this short-lived host prerequisite probe before constructing the
+        // runtime so deployed executors fail closed instead of degrading.
+        return tools::bash::preflight_namespace_isolation()
+            .context("broker-socket namespace isolation preflight failed");
+    }
+
+    tokio::runtime::Runtime::new()
+        .context("failed to construct Tokio runtime")?
+        .block_on(async_main(mode))
+}
+
+async fn async_main(mode: Option<String>) -> Result<()> {
     tracing_subscriber::fmt()
         .json()
         .with_writer(io::stderr)
@@ -35,7 +54,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    match env::args().nth(1).as_deref() {
+    match mode.as_deref() {
         Some("--tool-executor") => {
             tracing::warn!(
                 service = "tool-executor",

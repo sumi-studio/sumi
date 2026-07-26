@@ -4,7 +4,8 @@
 
 use std::{
     collections::VecDeque,
-    path::PathBuf,
+    os::unix::ffi::OsStrExt,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::{
         Arc,
@@ -93,6 +94,7 @@ impl BashExecutionResult {
 pub struct LowTrustLocalBash<'a> {
     workspace: PathBuf,
     artifact: &'a dyn ArtifactAppender,
+    broker_socket: Option<PathBuf>,
     wall_timeout: Duration,
     #[cfg(test)]
     cancel_stop_delay: Duration,
@@ -105,12 +107,18 @@ impl<'a> LowTrustLocalBash<'a> {
         Self {
             workspace,
             artifact,
+            broker_socket: None,
             wall_timeout: DEFAULT_WALL_TIMEOUT,
             #[cfg(test)]
             cancel_stop_delay: Duration::ZERO,
             #[cfg(test)]
             force_close_range_fallback: false,
         }
+    }
+
+    pub fn with_broker_socket(mut self, socket: PathBuf) -> Self {
+        self.broker_socket = Some(socket);
+        self
     }
 
     #[cfg(test)]
@@ -164,7 +172,16 @@ impl<'a> LowTrustLocalBash<'a> {
         let force_close_range_fallback = self.force_close_range_fallback;
         #[cfg(not(test))]
         let force_close_range_fallback = false;
-        configure_child_process(&mut process, inherited_fd_limit, force_close_range_fallback);
+        let enforce_broker_socket_isolation =
+            std::env::var_os("SUMI_ENFORCE_BROKER_SOCKET_NAMESPACE_ISOLATION").is_some();
+        configure_child_process(
+            &mut process,
+            inherited_fd_limit,
+            force_close_range_fallback,
+            self.broker_socket.as_deref(),
+            &self.workspace,
+            enforce_broker_socket_isolation,
+        );
 
         process.kill_on_drop(true);
         let mut child = process.spawn()?;
@@ -514,13 +531,539 @@ fn configure_child_process(
     process: &mut Command,
     inherited_fd_limit: libc::rlim_t,
     force_close_range_fallback: bool,
+    broker_socket: Option<&Path>,
+    workspace: &Path,
+    enforce_broker_socket_isolation: bool,
 ) {
+    let broker_socket = broker_socket.map(|p| p.to_path_buf());
+    let workspace = workspace.to_path_buf();
     #[allow(unsafe_code)]
     unsafe {
         process.process_group(0);
         process.pre_exec(move || {
+            if enforce_broker_socket_isolation {
+                isolate_broker_socket_path(broker_socket.as_deref(), &workspace)?;
+            }
             sanitize_inherited_fds(inherited_fd_limit, force_close_range_fallback)
         });
+    }
+}
+
+/// Fill `buf` with lowercase hex digits from getrandom(2). `buf.len()` must be
+/// even. This is async-signal-safe because it calls a single raw syscall and
+/// uses only a stack buffer.
+fn fill_random_hex(buf: &mut [u8]) -> std::io::Result<()> {
+    if !buf.len().is_multiple_of(2) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "random hex buffer length must be even",
+        ));
+    }
+
+    let mut random = [0u8; 8];
+    let mut filled = 0;
+    while filled < random.len() {
+        let n = unsafe {
+            libc::getrandom(
+                random.as_mut_ptr().add(filled) as *mut libc::c_void,
+                random.len() - filled,
+                0,
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(err);
+        }
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "getrandom returned 0 bytes",
+            ));
+        }
+        filled += n as usize;
+    }
+
+    const HEX: &[u8] = b"0123456789abcdef";
+    for (i, b) in random.iter().enumerate() {
+        buf[i * 2] = HEX[(b >> 4) as usize];
+        buf[i * 2 + 1] = HEX[(b & 0xf) as usize];
+    }
+    Ok(())
+}
+
+/// Make every inherited mount private so a shared parent mount cannot propagate
+/// a later bind mount back to the executor/host namespace.
+fn mount_private_root() -> std::io::Result<()> {
+    let root = b"/\0";
+    unsafe {
+        if libc::mount(
+            std::ptr::null(),
+            root.as_ptr() as *const libc::c_char,
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE,
+            std::ptr::null(),
+        ) != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Create an empty source directory for a bind mount. `path` must be a
+/// NUL-terminated absolute path. Fails closed if the path already exists.
+fn create_isolation_dir(path: *const libc::c_char) -> std::io::Result<()> {
+    unsafe {
+        if libc::mkdir(path, 0o700) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Create an empty source file for a bind mount. `path` must be a NUL-terminated
+/// absolute path. Fails closed if the path already exists or is a symlink.
+fn create_isolation_file(path: *const libc::c_char) -> std::io::Result<libc::c_int> {
+    let fd = unsafe {
+        libc::open(
+            path,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o666,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+/// Make the broker socket pathname unreachable from the bash child while keeping
+/// the executor's file-tool path intact. This is invoked in the child just
+/// before `execve`, so it must be async-signal-safe: no allocation, no std
+/// locks, only raw syscalls and stack buffers.
+fn isolate_broker_socket_path(
+    broker_socket: Option<&Path>,
+    workspace: &Path,
+) -> std::io::Result<()> {
+    let socket = match broker_socket {
+        Some(path) => path,
+        None => return Ok(()),
+    };
+
+    let socket_bytes = socket.as_os_str().as_bytes();
+    if socket_bytes.is_empty() || socket_bytes[0] != b'/' {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "broker socket path must be absolute",
+        ));
+    }
+
+    let mut socket_buf = [0u8; 4096];
+    if socket_bytes.len() + 1 > socket_buf.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "broker socket path too long",
+        ));
+    }
+    socket_buf[..socket_bytes.len()].copy_from_slice(socket_bytes);
+    socket_buf[socket_bytes.len()] = 0;
+
+    // If the socket file does not exist there is nothing to mask (tests use
+    // placeholder paths). Skip without entering a namespace.
+    unsafe {
+        let mut stat_buf: libc::stat = std::mem::zeroed();
+        if libc::stat(socket_buf.as_ptr() as *const libc::c_char, &mut stat_buf) != 0 {
+            return Ok(());
+        }
+    }
+
+    let parent = match socket.parent() {
+        Some(parent) => parent,
+        None => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "broker socket path has no parent directory",
+            ));
+        }
+    };
+    let parent_bytes = parent.as_os_str().as_bytes();
+    let workspace_bytes = workspace.as_os_str().as_bytes();
+    let mask_parent = parent_bytes != workspace_bytes && parent_bytes != b"/";
+
+    let target_bytes = if mask_parent {
+        parent_bytes
+    } else {
+        socket_bytes
+    };
+    let mut target_buf = [0u8; 4096];
+    if target_bytes.len() + 1 > target_buf.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "broker socket parent path too long",
+        ));
+    }
+    target_buf[..target_bytes.len()].copy_from_slice(target_bytes);
+    target_buf[target_bytes.len()] = 0;
+
+    // Capture the UID/GID in the parent namespace before unsharing, because
+    // getuid()/getgid() return the overflow user ID inside an unmapped child
+    // namespace and writing that into uid_map is rejected.
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+
+    // Build an unpredictable source path. getrandom(2) is async-signal-safe
+    // and removes the symlink race inherent in a pid-suffix path.
+    let mut source_buf = [0u8; 64];
+    let source_prefix = b"/tmp/.sumi-broker-isolation-";
+    let mut pos = 0;
+    source_buf[pos..pos + source_prefix.len()].copy_from_slice(source_prefix);
+    pos += source_prefix.len();
+    fill_random_hex(&mut source_buf[pos..pos + 16])?;
+    pos += 16;
+    source_buf[pos] = 0;
+
+    unsafe {
+        // A user namespace must be created and mapped before creating the
+        // mount/network namespaces.  Combining these flags is rejected on
+        // supported kernels because the latter need the capabilities granted
+        // by the completed user namespace.
+        if libc::unshare(libc::CLONE_NEWUSER) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        // The executor parent runs with dumpable=0 (hiding /proc/pid/environ).
+        // A child needs dumpable=1 briefly to write /proc/self/uid_map; it will
+        // be reset to 1 by the following setuid(0) and bash exec anyway.
+        const PR_SET_DUMPABLE: libc::c_int = 4;
+        if libc::syscall(libc::SYS_prctl, PR_SET_DUMPABLE, 1, 0, 0, 0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        write_id_map(b"/proc/self/uid_map\0", 0, uid)?;
+        write_setgroups_deny()?;
+        write_id_map(b"/proc/self/gid_map\0", 0, gid)?;
+
+        if libc::setgid(0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::setuid(0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        if libc::unshare(libc::CLONE_NEWNS | libc::CLONE_NEWNET) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        // Make every inherited mount private before binding, so the mask does
+        // not propagate to the executor/host namespace.
+        mount_private_root()?;
+
+        let is_dir = mask_parent;
+        let source_fd: Option<libc::c_int> = if is_dir {
+            create_isolation_dir(source_buf.as_ptr() as *const libc::c_char)?;
+            None
+        } else {
+            Some(create_isolation_file(
+                source_buf.as_ptr() as *const libc::c_char
+            )?)
+        };
+
+        if libc::mount(
+            source_buf.as_ptr() as *const libc::c_char,
+            target_buf.as_ptr() as *const libc::c_char,
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        ) != 0
+        {
+            if is_dir {
+                libc::rmdir(source_buf.as_ptr() as *const libc::c_char);
+            } else {
+                libc::unlink(source_buf.as_ptr() as *const libc::c_char);
+            }
+            if let Some(fd) = source_fd {
+                libc::close(fd);
+            }
+            return Err(std::io::Error::last_os_error());
+        }
+        if let Some(fd) = source_fd {
+            libc::close(fd);
+        }
+
+        // The bind mount now pins the source inode. Remove the source path so
+        // no host-visible per-command debris remains.
+        if is_dir {
+            if libc::rmdir(source_buf.as_ptr() as *const libc::c_char) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        } else if libc::unlink(source_buf.as_ptr() as *const libc::c_char) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        drop_all_capabilities()?;
+
+        const PR_SET_NO_NEW_PRIVS: libc::c_int = 38;
+        if libc::syscall(libc::SYS_prctl, PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
+    Ok(())
+}
+
+fn run_preflight_namespace(
+    source: *const libc::c_char,
+    target: *const libc::c_char,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+) -> std::io::Result<()> {
+    unsafe {
+        if libc::unshare(libc::CLONE_NEWUSER) != 0 {
+            let error = std::io::Error::last_os_error();
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!("preflight create user namespace: {error}"),
+            ));
+        }
+
+        const PR_SET_DUMPABLE: libc::c_int = 4;
+        if libc::syscall(libc::SYS_prctl, PR_SET_DUMPABLE, 1, 0, 0, 0) != 0 {
+            let error = std::io::Error::last_os_error();
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!("preflight set dumpable: {error}"),
+            ));
+        }
+
+        write_id_map(b"/proc/self/uid_map\0", 0, uid)
+            .map_err(|error| std::io::Error::new(error.kind(), format!("uid map: {error}")))?;
+        write_setgroups_deny().map_err(|error| {
+            std::io::Error::new(error.kind(), format!("setgroups deny: {error}"))
+        })?;
+        write_id_map(b"/proc/self/gid_map\0", 0, gid)
+            .map_err(|error| std::io::Error::new(error.kind(), format!("gid map: {error}")))?;
+
+        if libc::setgid(0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::setuid(0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        if libc::unshare(libc::CLONE_NEWNS | libc::CLONE_NEWNET) != 0 {
+            let error = std::io::Error::last_os_error();
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!("preflight create mount/network namespaces: {error}"),
+            ));
+        }
+
+        mount_private_root().map_err(|error| {
+            std::io::Error::new(error.kind(), format!("make mounts private: {error}"))
+        })?;
+
+        if libc::mount(
+            source,
+            target,
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        ) != 0
+        {
+            let error = std::io::Error::last_os_error();
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!("bind mount preflight paths: {error}"),
+            ));
+        }
+
+        // This probe must leave no mount behind: its source/target names were
+        // created in the original namespace and are removed by the caller.
+        if libc::umount2(target, libc::MNT_DETACH) != 0 {
+            let error = std::io::Error::last_os_error();
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!("unmount preflight path: {error}"),
+            ));
+        }
+    }
+
+    // The preflight child exits immediately; the bind mount is discarded with
+    // its namespace. The host source/target directories are removed by the
+    // caller.
+    Ok(())
+}
+
+/// Validate that the host allows the namespace/bind-mount dance required by
+/// `isolate_broker_socket_path`. This is intended to run in a short-lived child
+/// process; it does not return to the original namespaces.
+pub(crate) fn preflight_namespace_isolation() -> std::io::Result<()> {
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+
+    let mut source_buf = [0u8; 64];
+    let mut target_buf = [0u8; 64];
+    const SOURCE_PREFIX: &[u8] = b"/tmp/.sumi-broker-preflight-src-";
+    const TARGET_PREFIX: &[u8] = b"/tmp/.sumi-broker-preflight-tgt-";
+    debug_assert!(SOURCE_PREFIX.len() + 16 < source_buf.len());
+    debug_assert!(TARGET_PREFIX.len() + 16 < target_buf.len());
+    source_buf[..SOURCE_PREFIX.len()].copy_from_slice(SOURCE_PREFIX);
+    fill_random_hex(&mut source_buf[SOURCE_PREFIX.len()..SOURCE_PREFIX.len() + 16])?;
+    source_buf[SOURCE_PREFIX.len() + 16] = 0;
+    target_buf[..TARGET_PREFIX.len()].copy_from_slice(TARGET_PREFIX);
+    fill_random_hex(&mut target_buf[TARGET_PREFIX.len()..TARGET_PREFIX.len() + 16])?;
+    target_buf[TARGET_PREFIX.len() + 16] = 0;
+
+    unsafe {
+        create_isolation_dir(source_buf.as_ptr() as *const libc::c_char)?;
+        if let Err(error) = create_isolation_dir(target_buf.as_ptr() as *const libc::c_char) {
+            let _ = libc::rmdir(source_buf.as_ptr() as *const libc::c_char);
+            return Err(error);
+        }
+
+        let result = run_preflight_namespace(
+            source_buf.as_ptr() as *const libc::c_char,
+            target_buf.as_ptr() as *const libc::c_char,
+            uid,
+            gid,
+        );
+
+        let source_cleanup = libc::rmdir(source_buf.as_ptr() as *const libc::c_char);
+        let target_cleanup = libc::rmdir(target_buf.as_ptr() as *const libc::c_char);
+        if result.is_ok() && (source_cleanup != 0 || target_cleanup != 0) {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        result
+    }
+}
+
+fn write_decimal(buf: &mut [u8], mut n: u32) -> usize {
+    if n == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let mut digits = [0u8; 10];
+    let mut count = 0;
+    while n > 0 {
+        digits[count] = b'0' + (n % 10) as u8;
+        n /= 10;
+        count += 1;
+    }
+    for i in 0..count {
+        buf[i] = digits[count - 1 - i];
+    }
+    count
+}
+
+fn write_id_map(path: &[u8], child_id: u32, parent_id: u32) -> std::io::Result<()> {
+    unsafe {
+        let fd = libc::open(
+            path.as_ptr() as *const libc::c_char,
+            libc::O_WRONLY | libc::O_CLOEXEC,
+        );
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let mut buf = [0u8; 64];
+        let mut pos = 0;
+        pos += write_decimal(&mut buf[pos..], child_id);
+        buf[pos] = b' ';
+        pos += 1;
+        pos += write_decimal(&mut buf[pos..], parent_id);
+        buf[pos] = b' ';
+        pos += 1;
+        buf[pos] = b'1';
+        pos += 1;
+        buf[pos] = b'\n';
+        pos += 1;
+
+        let mut written = 0;
+        while written < pos {
+            let n = libc::write(
+                fd,
+                buf.as_ptr().add(written) as *const libc::c_void,
+                pos - written,
+            );
+            if n < 0 {
+                libc::close(fd);
+                return Err(std::io::Error::last_os_error());
+            }
+            written += n as usize;
+        }
+        libc::close(fd);
+        Ok(())
+    }
+}
+
+fn write_setgroups_deny() -> std::io::Result<()> {
+    const DENY: &[u8] = b"deny\n";
+    unsafe {
+        let fd = libc::open(
+            c"/proc/self/setgroups".as_ptr(),
+            libc::O_WRONLY | libc::O_CLOEXEC,
+        );
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut written = 0;
+        while written < DENY.len() {
+            let n = libc::write(
+                fd,
+                DENY.as_ptr().add(written) as *const libc::c_void,
+                DENY.len() - written,
+            );
+            if n < 0 {
+                libc::close(fd);
+                return Err(std::io::Error::last_os_error());
+            }
+            written += n as usize;
+        }
+        libc::close(fd);
+        Ok(())
+    }
+}
+
+#[repr(C)]
+struct CapUserHeader {
+    version: u32,
+    pid: i32,
+}
+
+#[repr(C)]
+struct CapUserData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+fn drop_all_capabilities() -> std::io::Result<()> {
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
+    unsafe {
+        let header = CapUserHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let data: [CapUserData; 2] = [
+            CapUserData {
+                effective: 0,
+                permitted: 0,
+                inheritable: 0,
+            },
+            CapUserData {
+                effective: 0,
+                permitted: 0,
+                inheritable: 0,
+            },
+        ];
+        if libc::syscall(libc::SYS_capset, &header, &data) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 }
 
@@ -1007,7 +1550,14 @@ mod tests {
         let inherited_fd_limit = inherited_fd_limit().expect("finite inherited FD bound");
         for force_fallback in [false, true] {
             let mut process = Command::new("/sumi-test/no-such-executable");
-            configure_child_process(&mut process, inherited_fd_limit, force_fallback);
+            configure_child_process(
+                &mut process,
+                inherited_fd_limit,
+                force_fallback,
+                None,
+                std::path::Path::new("/"),
+                false,
+            );
             let error = process
                 .spawn()
                 .expect_err("exec failure must reach the parent through Command's errpipe");

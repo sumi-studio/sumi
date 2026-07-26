@@ -71,6 +71,12 @@ services:
     network_mode: none
     environment:
       SUMI_CONVERSATION_ID: ${SUMI_CONVERSATION_ID:?SUMI_CONVERSATION_ID is required}
+    # The sumi-agent-executor AppArmor profile must be loaded on the host
+    # before `docker compose up`; run apparmor_parser -r ./apparmor/executor.
+    security_opt:
+      - no-new-privileges:true
+      - seccomp:./seccomp/sidecar.json
+      - apparmor:sumi-agent-executor
     depends_on:
       init:
         condition: service_completed_successfully

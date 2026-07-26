@@ -40,9 +40,11 @@ impl Fixture {
         let root = std::env::temp_dir().join(format!("sumi-deployment-{}-", Uuid::now_v7()));
         let workspace = root.join("workspace");
         let artifacts = root.join("artifacts");
-        let socket = root.join("broker.sock");
+        let broker_ipc = root.join("broker-ipc");
+        let socket = broker_ipc.join("broker.sock");
         tokio::fs::create_dir_all(&workspace).await.unwrap();
         tokio::fs::create_dir_all(&artifacts).await.unwrap();
+        tokio::fs::create_dir_all(&broker_ipc).await.unwrap();
 
         let broker = Command::new(env!("CARGO_BIN_EXE_sumi-agent"))
             .arg("--artifact-broker")
@@ -83,6 +85,7 @@ impl Fixture {
             .env("SUMI_WORKSPACE", &self.workspace)
             .env("SUMI_CONVERSATION_ID", CONVERSATION)
             .env("SUMI_ARTIFACT_BROKER_SOCKET", &self.socket)
+            .env("SUMI_ENFORCE_BROKER_SOCKET_NAMESPACE_ISOLATION", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -110,7 +113,7 @@ impl Fixture {
             .env("SUMI_ARTIFACT_BROKER_SOCKET", &self.socket)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap()
     }
@@ -415,6 +418,202 @@ async fn bash_env_does_not_leak_broker_socket() {
 }
 
 #[tokio::test]
+async fn bash_cannot_reach_broker_socket_path() {
+    let fixture = Fixture::new().await;
+    let mut child = fixture.executor();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    // First prove file tools still work through the executor UID.
+    send_request(
+        &mut stdin,
+        &request(
+            "write",
+            json!({
+                "type": "write_file",
+                "path": "isolation.txt",
+                "content": "workspace still reachable",
+                "execution_id": "iso-write",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        read_frame(&mut stdout).await["result"]["Ok"]["type"],
+        "written"
+    );
+
+    send_request(
+        &mut stdin,
+        &request(
+            "read",
+            json!({
+                "type": "read_file",
+                "path": "isolation.txt",
+                "offset": 0,
+                "limit": 51200,
+                "execution_id": "iso-read",
+            }),
+        ),
+    )
+    .await;
+    let read = read_frame(&mut stdout).await;
+    assert_eq!(
+        read["result"]["Ok"]["result"]["content"],
+        "workspace still reachable"
+    );
+
+    // The broker socket is hidden behind a mount namespace, so the bash child
+    // cannot see or connect to it even though the same executor UID is used.
+    send_request(
+        &mut stdin,
+        &request(
+            "reach",
+            json!({
+                "type": "bash",
+                "command": "test -S ../broker-ipc/broker.sock && printf REACHABLE || printf NOT_REACHABLE",
+                "execution_id": "reach-1",
+            }),
+        ),
+    )
+    .await;
+    let first = read_frame(&mut stdout).await;
+    let (output, terminal) = if first["result"].is_null() {
+        (
+            first["value"]["output"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            read_frame(&mut stdout).await,
+        )
+    } else {
+        (
+            first["result"]["Ok"]["result"]["output"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            first,
+        )
+    };
+    assert_eq!(output, "NOT_REACHABLE");
+    assert_eq!(terminal["result"]["Ok"]["result"]["exit_code"], 0);
+
+    // Prove the bind mount is private so the mask cannot propagate back to the
+    // executor/host namespace. A propagated mount would show 'shared' or
+    // 'master' in the broker-ipc line of /proc/self/mountinfo.
+    send_request(
+        &mut stdin,
+        &request(
+            "mountinfo",
+            json!({
+                "type": "bash",
+                "command": r#"awk 'BEGIN{ok=0} /broker-ipc/{ok=1; if ($0 ~ /shared|master/) {print "PROPAGATION_LEAK"; exit 1}} END{if(!ok){print "NOT_FOUND"; exit 1} print "MOUNT_PRIVATE_OK"}' /proc/self/mountinfo"#,
+                "execution_id": "mountinfo-1",
+            }),
+        ),
+    )
+    .await;
+    let first = read_frame(&mut stdout).await;
+    let (output, terminal) = if first["result"].is_null() {
+        (
+            first["value"]["output"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            read_frame(&mut stdout).await,
+        )
+    } else {
+        (
+            first["result"]["Ok"]["result"]["output"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            first,
+        )
+    };
+    assert_eq!(output, "MOUNT_PRIVATE_OK\n");
+    assert_eq!(terminal["result"]["Ok"]["result"]["exit_code"], 0);
+
+    drop(stdin);
+    assert!(child.wait().await.unwrap().success());
+}
+
+#[tokio::test]
+async fn executor_preflight_validates_namespace_support() {
+    // If the host cannot even unshare a user+network namespace, the preflight
+    // cannot be expected to pass. Document the blocker and pass.
+    let unshare_probe = Command::new("unshare")
+        .arg("--user")
+        .arg("--net")
+        .arg("--mount")
+        .arg("true")
+        .status()
+        .await;
+    if !unshare_probe.is_ok_and(|s| s.success()) {
+        return;
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sumi-agent"))
+        .arg("--tool-executor")
+        .env_clear()
+        .env("SUMI_ISOLATION_PREFLIGHT", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .expect("spawn isolation preflight");
+    assert!(
+        output.status.success(),
+        "namespace isolation preflight must succeed on a supported host: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn bash_isolation_fails_closed_for_invalid_broker_socket() {
+    let fixture = Fixture::new().await;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sumi-agent"))
+        .arg("--tool-executor")
+        .env_clear()
+        .env("SUMI_RPC_GENERATION", GENERATION.to_string())
+        .env("SUMI_RPC_NONCE", NONCE)
+        .env("SUMI_WORKSPACE", &fixture.workspace)
+        .env("SUMI_CONVERSATION_ID", CONVERSATION)
+        // A broker socket with no parent directory cannot be masked; the
+        // executor must fail closed instead of silently running the bash
+        // command without isolation.
+        .env("SUMI_ARTIFACT_BROKER_SOCKET", "/")
+        .env("SUMI_ENFORCE_BROKER_SOCKET_NAMESPACE_ISOLATION", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    send_request(
+        &mut stdin,
+        &request(
+            "invalid",
+            json!({
+                "type": "bash",
+                "command": "true",
+                "execution_id": "invalid-1",
+            }),
+        ),
+    )
+    .await;
+    let terminal = read_frame(&mut stdout).await;
+    assert_eq!(terminal["result"]["Err"]["code"], "io");
+
+    drop(stdin);
+    assert!(child.wait().await.unwrap().success());
+}
+
+#[tokio::test]
 async fn executor_in_network_namespace_cannot_reach_external_network() {
     let fixture = Fixture::new().await;
 
@@ -432,6 +631,7 @@ async fn executor_in_network_namespace_cannot_reach_external_network() {
     let mut child = fixture.executor_in_netns();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
 
     // Prime the executor with a workspace operation to prove it still works.
     send_request(
@@ -481,7 +681,13 @@ async fn executor_in_network_namespace_cannot_reach_external_network() {
     );
 
     drop(stdin);
-    assert!(child.wait().await.unwrap().success());
+    let status = child.wait().await.unwrap();
+    let mut err = String::new();
+    stderr.read_to_string(&mut err).await.unwrap();
+    assert!(
+        status.success(),
+        "executor exited unsuccessfully: {status} stderr: {err}"
+    );
 }
 
 #[tokio::test]
@@ -652,6 +858,7 @@ fn compose_deployment_has_disjoint_mounts_identities_and_sidecar_policy() {
     assert!(executor.contains("broker-ipc:/run/sumi/broker:ro"));
     assert!(!executor.contains("state:/var/lib/sumi"));
     assert!(!executor.contains("artifacts:/var/lib/sumi-artifacts"));
+    assert!(executor.contains("apparmor:sumi-agent-executor"));
 
     // The broker gets no workspace/state mount and has no TCP/DNS network.
     assert!(broker.contains("user: \"10003:10003\""));
@@ -685,8 +892,33 @@ fn compose_deployment_has_disjoint_mounts_identities_and_sidecar_policy() {
     assert!(entrypoint.contains("SUMI_RPC_NONCE"));
     assert!(entrypoint.contains("SUMI_PROCESS_GENERATION_LEASE_ID"));
     assert!(entrypoint.contains("SUMI_GENERATION_RECOVERY_FENCE_ID"));
+    assert!(entrypoint.contains("SUMI_ENFORCE_BROKER_SOCKET_NAMESPACE_ISOLATION"));
     assert!(entrypoint.contains("env -i"));
     let _: serde_json::Value = serde_json::from_str(&seccomp).unwrap();
+    // The deployed seccomp policy permits exactly the two namespace calls
+    // used by the fail-closed startup/pre-exec sequence, not arbitrary
+    // unshare flags inherited by bash.
+    assert!(seccomp.contains("\"value\": 268435456")); // CLONE_NEWUSER
+    assert!(seccomp.contains("\"value\": 1073872896")); // CLONE_NEWNS | CLONE_NEWNET
+
+    let apparmor_profile = deploy_dir.join("apparmor/executor");
+    assert!(
+        apparmor_profile.is_file(),
+        "sumi-agent-executor apparmor profile must be present"
+    );
+    let apparmor_load = deploy_dir.join("apparmor/load-profile");
+    assert!(
+        apparmor_load.is_file(),
+        "apparmor profile loader script must be present"
+    );
+    let apparmor = std::fs::read_to_string(apparmor_profile).unwrap();
+    assert!(apparmor.contains("userns,"));
+    assert!(apparmor.contains("mount options=(rprivate) none -> /"));
+    assert!(apparmor.contains("mount options=(bind) /tmp/.sumi-broker-isolation-*"));
+    assert!(
+        apparmor.contains("/tmp/.sumi-broker-preflight-src-* -> /tmp/.sumi-broker-preflight-tgt-*")
+    );
+    assert!(apparmor.contains("umount /tmp/.sumi-broker-preflight-tgt-*"));
 }
 
 #[tokio::test]
