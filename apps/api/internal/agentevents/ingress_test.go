@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -467,6 +468,62 @@ func TestUserCommandIngress_OversizedIdempotencyKeyRejected(t *testing.T) {
 		t.Fatalf("expected 0 append calls, got %d", appender.callCount())
 	}
 	assertRejectReason(t, resp.Body, RejectOversized)
+}
+
+func TestUserCommandIngress_ExhaustedSeqDoesNotAllocateOrPersist(t *testing.T) {
+	dir := t.TempDir()
+	conv := "conv-ingress-max"
+
+	// Seed the log with the maximum JSON-safe seq; next append should exhaust.
+	seed := LogRecord{
+		CommandEnvelope: CommandEnvelope{
+			Seq:       maxJSONSafeInteger,
+			CommandID: "00000000-0000-4000-8000-000000000000",
+			Command:   json.RawMessage(`{"type":"user_message","text":"seed","attachments":[]}`),
+		},
+	}
+	seedLine, _ := json.Marshal(seed)
+	path := commandLogPath(dir, conv)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(seedLine, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := OpenCommandStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	verifier := &fakeTokenVerifier{conversationID: conv}
+	ingress, err := NewUserCommandIngress(store, verifier)
+	if err != nil {
+		t.Fatalf("new ingress: %v", err)
+	}
+	server := httptest.NewServer(newCommandMux(ingress))
+	defer server.Close()
+
+	body := []byte(`{"type":"user_message","text":"over","attachments":[]}`)
+	resp := postAuthorized(t, server.URL+"/conversations/"+conv+"/commands", body)
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusCreated {
+		t.Fatalf("expected non-201 for exhausted seq, got %d", resp.StatusCode)
+	}
+
+	// max+1 must not be allocated, persisted, or returned.
+	if _, err := store.Append(context.Background(), conv, "", json.RawMessage(body)); !errors.Is(err, ErrSeqExhausted) {
+		t.Fatalf("expected ErrSeqExhausted on direct append, got %v", err)
+	}
+	all, err := store.CatchUp(context.Background(), conv, maxJSONSafeInteger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 1 || all[0].Seq != maxJSONSafeInteger {
+		t.Fatalf("expected only the seed record, got %+v", all)
+	}
 }
 
 func assertRejectReason(t *testing.T, r io.Reader, want RejectReason) {

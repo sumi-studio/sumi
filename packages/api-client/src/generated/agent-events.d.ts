@@ -70,22 +70,12 @@ export type AgentEvent =
   | {
       type: "tool_execution_update";
       tool_call_id: string;
-      /**
-       * any JSON value
-       */
-      partial: {
-        [k: string]: unknown;
-      };
+      partial: AnyJSON;
     }
   | {
       type: "tool_execution_end";
       tool_call_id: string;
-      /**
-       * any JSON value
-       */
-      result: {
-        [k: string]: unknown;
-      };
+      result: AnyJSON;
       is_error: boolean;
     }
   | {
@@ -188,6 +178,21 @@ export type JsonSafeInteger = number;
  */
 export type StopReason = "stop" | "length" | "tool_use" | "error" | "aborted";
 /**
+ * any JSON value
+ *
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "AnyJSON".
+ */
+export type AnyJSON =
+  | {
+      [k: string]: unknown;
+    }
+  | unknown[]
+  | string
+  | number
+  | boolean
+  | null;
+/**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "PublicStreamEvent".
  */
@@ -232,12 +237,7 @@ export type PublicStreamEvent =
   | {
       type: "tool_call_preview";
       content_index: ContentIndex;
-      /**
-       * any JSON value
-       */
-      preview: {
-        [k: string]: unknown;
-      };
+      preview: AnyJSON;
     }
   | {
       type: "tool_call_end";
@@ -276,12 +276,7 @@ export type ContentIndex = number;
  */
 export type ReviewProjection =
   | {
-      /**
-       * any JSON value
-       */
-      reviewable: {
-        [k: string]: unknown;
-      };
+      reviewable: AnyJSON;
     }
   | {
       insufficient_evidence: {
@@ -451,12 +446,7 @@ export interface ToolResultMessage {
   tool_call_id: string;
   tool_name: string;
   content: UserContent[];
-  /**
-   * any JSON value
-   */
-  details: {
-    [k: string]: unknown;
-  };
+  details: AnyJSON;
   is_error: boolean;
   timestamp: string;
 }
@@ -470,12 +460,7 @@ export interface ToolResultPayload {
   tool_call_id: string;
   tool_name: string;
   content: UserContent[];
-  /**
-   * any JSON value
-   */
-  details: {
-    [k: string]: unknown;
-  };
+  details: AnyJSON;
   is_error: boolean;
   timestamp: string;
 }
@@ -488,12 +473,7 @@ export interface ApprovalRequest {
   tool_call_id: string;
   tool_name: string;
   action: ReviewProjection;
-  /**
-   * any JSON value
-   */
-  args_summary: {
-    [k: string]: unknown;
-  };
+  args_summary: AnyJSON;
   reason?: string | null;
   audit?: AuditDecision | null;
 }

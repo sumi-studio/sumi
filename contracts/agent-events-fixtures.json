@@ -323,5 +323,91 @@
         "event": { "type": "agent_start" }
       }
     }
+  },
+  "tool_execution_update_scalar_partial": {
+    "kind": "agent_event",
+    "wire": {
+      "type": "tool_execution_update",
+      "tool_call_id": "call-1",
+      "partial": "raw stdout chunk"
+    }
+  },
+  "tool_execution_end_array_result": {
+    "kind": "agent_event",
+    "wire": {
+      "type": "tool_execution_end",
+      "tool_call_id": "call-1",
+      "result": [1, 2, 3],
+      "is_error": false
+    }
+  },
+  "message_update_tool_call_preview_null": {
+    "kind": "outbound_frame",
+    "wire": {
+      "frame_type": "event",
+      "envelope": {
+        "conversation_id": "conversation-1",
+        "event": {
+          "type": "message_update",
+          "message_id": "00000000-0000-4000-8000-000000000003",
+          "event": {
+            "type": "tool_call_preview",
+            "content_index": 0,
+            "preview": null
+          }
+        }
+      }
+    }
+  },
+  "public_message_tool_result_number_details": {
+    "kind": "public_message",
+    "wire": {
+      "role": "tool_result",
+      "tool_call_id": "call-1",
+      "tool_name": "read_file",
+      "content": [{ "type": "text", "text": "contents" }],
+      "details": 42,
+      "is_error": false,
+      "timestamp": "2026-07-25T20:00:00Z"
+    }
+  },
+  "turn_end_tool_result_boolean_details": {
+    "kind": "outbound_frame",
+    "wire": {
+      "frame_type": "event",
+      "envelope": {
+        "seq": 10,
+        "conversation_id": "conversation-1",
+        "event": {
+          "type": "turn_end",
+          "message": null,
+          "tool_results": [
+            {
+              "tool_call_id": "call-1",
+              "tool_name": "read_file",
+              "content": [{ "type": "text", "text": "contents" }],
+              "details": true,
+              "is_error": false,
+              "timestamp": "2026-07-25T20:00:00Z"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "approval_requested_scalar_and_array": {
+    "kind": "agent_event",
+    "wire": {
+      "type": "approval_requested",
+      "request": {
+        "id": "req-2",
+        "tool_call_id": "call-2",
+        "tool_name": "bash",
+        "action": { "reviewable": ["arg1", "arg2"] },
+        "args_summary": "string summary",
+        "reason": null,
+        "audit": null
+      }
+    }
   }
 }

@@ -119,14 +119,14 @@ $defs:
         properties:
           type: { const: tool_execution_update }
           tool_call_id: { type: string }
-          partial: { description: any JSON value }
+          partial: { $ref: '#/$defs/AnyJSON' }
       - type: object
         required: [type, tool_call_id, result, is_error]
         additionalProperties: false
         properties:
           type: { const: tool_execution_end }
           tool_call_id: { type: string }
-          result: { description: any JSON value }
+          result: { $ref: '#/$defs/AnyJSON' }
           is_error: { type: boolean }
       - type: object
         required: [type, request]
@@ -232,7 +232,7 @@ $defs:
         properties:
           type: { const: tool_call_preview }
           content_index: { $ref: '#/$defs/ContentIndex' }
-          preview: { description: any JSON value }
+          preview: { $ref: '#/$defs/AnyJSON' }
       - type: object
         required: [type, content_index, tool_call]
         additionalProperties: false
@@ -321,7 +321,7 @@ $defs:
       content:
         type: array
         items: { $ref: '#/$defs/UserContent' }
-      details: { description: any JSON value }
+      details: { $ref: '#/$defs/AnyJSON' }
       is_error: { type: boolean }
       timestamp: { type: string, format: date-time }
 
@@ -336,7 +336,7 @@ $defs:
       content:
         type: array
         items: { $ref: '#/$defs/UserContent' }
-      details: { description: any JSON value }
+      details: { $ref: '#/$defs/AnyJSON' }
       is_error: { type: boolean }
       timestamp: { type: string, format: date-time }
 
@@ -424,6 +424,10 @@ $defs:
     maximum: 9007199254740991
     description: non-negative integer representable exactly by JavaScript number clients
 
+  AnyJSON:
+    type: ['object', 'array', 'string', 'number', 'boolean', 'null']
+    description: any JSON value
+
   ProviderOrigin:
     type: object
     required: [provider_instance_id, protocol, model]
@@ -462,7 +466,7 @@ $defs:
       tool_call_id: { type: string }
       tool_name: { type: string }
       action: { $ref: '#/$defs/ReviewProjection' }
-      args_summary: { description: any JSON value }
+      args_summary: { $ref: '#/$defs/AnyJSON' }
       reason:
         oneOf:
           - type: string
@@ -478,7 +482,7 @@ $defs:
         required: [reviewable]
         additionalProperties: false
         properties:
-          reviewable: { description: any JSON value }
+          reviewable: { $ref: '#/$defs/AnyJSON' }
       - type: object
         required: [insufficient_evidence]
         additionalProperties: false

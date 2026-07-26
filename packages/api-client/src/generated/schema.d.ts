@@ -49,8 +49,10 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @description non-negative integer representable exactly by JavaScript number clients */
+        JsonSafeInteger: number;
         CommandEnvelope: {
-            seq: number;
+            seq: components["schemas"]["JsonSafeInteger"];
             /** Format: uuid */
             command_id: string;
             command: components["schemas"]["UserMessageCommand"];

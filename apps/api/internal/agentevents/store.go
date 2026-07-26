@@ -92,6 +92,10 @@ type LogRecord struct {
 	IdempotencyKey string `json:"idempotency_key,omitempty"`
 }
 
+// ErrSeqExhausted is returned by CommandStore.Append when the next allocated
+// sequence number would exceed the JSON-safe integer boundary exposed to clients.
+var ErrSeqExhausted = errors.New("command sequence number exhausted")
+
 // OpenCommandStore opens or creates the command log under dir.
 func OpenCommandStore(dir string) (*CommandStore, error) {
 	if dir == "" {
@@ -227,6 +231,10 @@ func (s *CommandStore) Append(ctx context.Context, conversationID string, idempo
 			}
 			return CommandEnvelope{}, fmt.Errorf("idempotency key %q reused with different command: %w", idempotencyKey, errIdempotencyConflict)
 		}
+	}
+
+	if st.nextSeq > maxJSONSafeInteger {
+		return CommandEnvelope{}, ErrSeqExhausted
 	}
 
 	commandID, err := newCommandID()
@@ -449,6 +457,9 @@ func (s *CommandStore) scanLogLocked(st *conversationState, conversationID strin
 
 		if rec.Seq == 0 && rec.CommandID == "" && len(rec.Command) == 0 {
 			return fmt.Errorf("empty command record in log for %q", conversationID)
+		}
+		if rec.Seq > maxJSONSafeInteger {
+			return fmt.Errorf("command log for %q contains seq %d exceeding JSON-safe integer range", conversationID, rec.Seq)
 		}
 
 		idx := len(st.commands)
