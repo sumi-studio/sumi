@@ -1171,7 +1171,7 @@ async fn claim_next_pending_job(store: &Store) -> Result<Option<Job>> {
 
     let updated = sqlx::query(
         "UPDATE memory_jobs
-         SET status = 'running', attempts = attempts + 1, lease_until = ?, updated_at = ?
+         SET status = 'running', lease_until = ?, updated_at = ?
          WHERE id = ? AND status = 'pending'",
     )
     .bind(&lease_until)
@@ -1219,7 +1219,7 @@ async fn reset_job_to_pending(store: &Store, job: &Job) -> Result<()> {
 async fn release_claimed_job(store: &Store, job: &Job) -> Result<()> {
     let result = sqlx::query(
         "UPDATE memory_jobs
-         SET status = 'pending', attempts = attempts - 1, lease_until = NULL, updated_at = ?
+         SET status = 'pending', lease_until = NULL, updated_at = ?
          WHERE id = ? AND status = 'running' AND attempts = ? AND lease_until = ?",
     )
     .bind(Utc::now().to_rfc3339())
@@ -1232,6 +1232,36 @@ async fn release_claimed_job(store: &Store, job: &Job) -> Result<()> {
     if result.rows_affected() != 1 {
         bail!("release claimed job CAS failed for {}", job.id);
     }
+    Ok(())
+}
+
+/// Persist the fact that this leased job is about to consume one provider
+/// attempt.  The lease (claim) itself does not count; only a durable
+/// `start_attempt` does.  This keeps crash-recovery from giving free retries
+/// after real provider failures while also not consuming budget for a crash
+/// that happens before the provider call is started.
+async fn start_attempt(store: &Store, job: &mut Job) -> Result<()> {
+    let new_attempts = job
+        .attempts
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("attempts overflow for job {}", job.id))?;
+    let result = sqlx::query(
+        "UPDATE memory_jobs
+         SET attempts = ?, updated_at = ?
+         WHERE id = ? AND status = 'running' AND attempts = ? AND lease_until = ?",
+    )
+    .bind(new_attempts)
+    .bind(Utc::now().to_rfc3339())
+    .bind(&job.id)
+    .bind(job.attempts)
+    .bind(job.lease_until.as_ref())
+    .execute(store.pool())
+    .await
+    .context("start job attempt")?;
+    if result.rows_affected() != 1 {
+        bail!("start attempt CAS failed for {}", job.id);
+    }
+    job.attempts = new_attempts;
     Ok(())
 }
 
@@ -1369,6 +1399,8 @@ async fn fail_job(store: &Store, job: &Job) -> Result<(), WorkerError> {
 
     let mut tx = store.pool().begin().await?;
 
+    let mut new_source_versions = job.source_versions.clone();
+
     for id in &job.source_ids {
         let expected = job
             .source_versions
@@ -1387,6 +1419,34 @@ async fn fail_job(store: &Store, job: &Job) -> Result<(), WorkerError> {
                 found: current,
             });
         }
+
+        let updated_source = sqlx::query(
+            "UPDATE memory_batches
+             SET state = 'compact_failed', version = version + 1, updated_at = ?
+             WHERE id = ? AND version = ? AND state = 'compacting'",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(id)
+        .bind(expected)
+        .execute(&mut *tx)
+        .await?;
+
+        if updated_source.rows_affected() != 1 {
+            let current: Option<i64> =
+                sqlx::query("SELECT version FROM memory_batches WHERE id = ?")
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .map(|row| row.try_get("version"))
+                    .transpose()?;
+            return Err(WorkerError::StaleSource {
+                id: id.clone(),
+                expected,
+                found: current.unwrap_or(-1),
+            });
+        }
+
+        new_source_versions.insert(id.clone(), expected + 1);
     }
 
     let target_row = sqlx::query("SELECT version, state FROM memory_batches WHERE id = ?")
@@ -1428,7 +1488,6 @@ async fn fail_job(store: &Store, job: &Job) -> Result<(), WorkerError> {
         });
     }
 
-    let mut new_source_versions = job.source_versions.clone();
     new_source_versions.insert(target.id.clone(), target_version + 1);
     let source_versions_json =
         serde_json::to_string(&new_source_versions).context("serialize source_versions")?;
@@ -1947,7 +2006,7 @@ impl CompactWorker {
     }
 
     async fn process_next_job(&self) -> Result<bool, WorkerError> {
-        let Some(job) = claim_next_pending_job(&self.store).await? else {
+        let Some(mut job) = claim_next_pending_job(&self.store).await? else {
             return Ok(false);
         };
 
@@ -1959,6 +2018,15 @@ impl CompactWorker {
         }
 
         let input = build_compaction_input(&self.store, &job).await?;
+
+        // If the durable retry budget is already exhausted, fail the job
+        // without starting another provider attempt.
+        if job.attempts >= MAX_ATTEMPTS {
+            fail_job(&self.store, &job).await?;
+            return Ok(true);
+        }
+
+        start_attempt(&self.store, &mut job).await?;
 
         match self
             .provider
@@ -1984,8 +2052,8 @@ impl CompactWorker {
             }
             Err(CompactError::Cancelled) => {
                 // A worker shutdown is not a compaction failure. Return the
-                // leased row to the durable queue so the next process can
-                // recover it without consuming the retry budget.
+                // leased row to the durable queue. The attempt was already
+                // started durably and therefore counts against the budget.
                 release_claimed_job(&self.store, &job).await?;
             }
             Err(error) if error.is_retryable() && job.attempts < MAX_ATTEMPTS => {
@@ -2018,14 +2086,17 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
+    use crate::memory::estimate::EvictionFootprint;
     use crate::provider::types::{
         ApiProtocol, NativeCompactionCoverage, ProviderContextAnchor, ProviderContextItem,
         ProviderContextPayload, ProviderOrigin, PublicAssistantMessage, StopReason, ToolCall,
         ToolResultMessage, Usage, UserMessage, ValidatedToolArguments,
     };
     use crate::store::{
-        DataKeyPurpose, MemoryBatchMessageRecord, MemoryBatchRecord, MemoryBatchState,
-        MemoryBatchSummary, MemoryJobKind, MemoryJobRecord, MemoryLayer, Store, TranscriptRecord,
+        DataKeyPurpose, EncryptedProviderContextRecord, MemoryBatchMessageRecord,
+        MemoryBatchRecord, MemoryBatchState, MemoryBatchSummary, MemoryJobKind, MemoryJobRecord,
+        MemoryLayer, ProviderContextKeyAnchor, Store, TranscriptRecord,
+        provider_context_idempotency_key,
     };
     use tokio_util::sync::CancellationToken;
 
@@ -3595,5 +3666,195 @@ mod tests {
         assert_eq!(row.get::<String, _>("status"), "pending");
         assert_eq!(row.get::<i64, _>("attempts"), 0);
         assert!(row.get::<Option<String>, _>("lease_until").is_none());
+    }
+
+    #[tokio::test]
+    async fn worker_crash_before_provider_attempt_does_not_consume_attempt() {
+        let store = test_store().await;
+        let (source_id, target_id) = insert_l0_batch(&store, &[user("crash before start")]).await;
+        insert_compact_l0_job(&store, "job-crash-before", &source_id, 1).await;
+
+        // Simulate a crash immediately after claim, before start_attempt.
+        sqlx::query(
+            "UPDATE memory_jobs
+             SET status = 'running', attempts = 0, lease_until = '2000-01-01T00:00:00Z'
+             WHERE id = ?",
+        )
+        .bind("job-crash-before")
+        .execute(store.pool())
+        .await
+        .expect("simulate crash after claim");
+
+        let provider = Arc::new(FakeProvider {
+            fail_next: AtomicUsize::new(3),
+            ..FakeProvider::default()
+        });
+        let worker = CompactWorker {
+            store: store.clone(),
+            spec: select_compact_model(&chat_model(), None, &[]).expect("select model"),
+            provider: provider.clone(),
+            cancel: CancellationToken::new(),
+        };
+        worker.recover().await.expect("recover crashed lease");
+        worker.process_all_pending().await.expect("process pending");
+
+        let job = sqlx::query("SELECT status, attempts FROM memory_jobs WHERE id = ?")
+            .bind("job-crash-before")
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch job");
+        assert_eq!(job.get::<String, _>("status"), "failed");
+        assert_eq!(job.get::<i64, _>("attempts"), 3);
+
+        let batch = sqlx::query("SELECT state FROM memory_batches WHERE id = ?")
+            .bind(&target_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch batch");
+        assert_eq!(batch.get::<String, _>("state"), "compact_failed");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn worker_crash_after_real_failure_does_not_give_free_retry() {
+        let store = test_store().await;
+        let (source_id, target_id) = insert_l0_batch(&store, &[user("crash after failure")]).await;
+        insert_compact_l0_job(&store, "job-crash-after", &source_id, 1).await;
+
+        // Simulate a crash after start_attempt on the final retry consumed the
+        // budget, but before fail_job could commit.
+        sqlx::query(
+            "UPDATE memory_jobs
+             SET status = 'running', attempts = 3, lease_until = '2000-01-01T00:00:00Z'
+             WHERE id = ?",
+        )
+        .bind("job-crash-after")
+        .execute(store.pool())
+        .await
+        .expect("simulate crash after failed attempt");
+
+        let provider = Arc::new(FakeProvider {
+            fail_next: AtomicUsize::new(0),
+            ..FakeProvider::default()
+        });
+        let worker = CompactWorker {
+            store: store.clone(),
+            spec: select_compact_model(&chat_model(), None, &[]).expect("select model"),
+            provider: provider.clone(),
+            cancel: CancellationToken::new(),
+        };
+        worker.recover().await.expect("recover crashed lease");
+        worker.process_all_pending().await.expect("process pending");
+
+        let job = sqlx::query("SELECT status, attempts FROM memory_jobs WHERE id = ?")
+            .bind("job-crash-after")
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch job");
+        assert_eq!(job.get::<String, _>("status"), "failed");
+        assert_eq!(job.get::<i64, _>("attempts"), 3);
+
+        let batch = sqlx::query("SELECT state FROM memory_batches WHERE id = ?")
+            .bind(&target_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch batch");
+        assert_eq!(batch.get::<String, _>("state"), "compact_failed");
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            0,
+            "must not start another provider attempt when budget is exhausted"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_ready_erases_provider_context_for_dropped_l0_source_batches() {
+        let store = test_store().await;
+        let assistant = PublicMessage::Assistant(PublicAssistantMessage {
+            content: Vec::new(),
+            model: "test-model".to_owned(),
+            provider: "test-provider".to_owned(),
+            origin: ProviderOrigin {
+                provider_instance_id: "test-instance".to_owned(),
+                protocol: ApiProtocol::OpenAiResponses,
+                model: "openai-responses".to_owned(),
+            },
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: timestamp(),
+        });
+        let (source_id, _target_id) = insert_l0_batch(&store, &[assistant]).await;
+        let message_id = format!("{source_id}-msg-0");
+        let message_seq = 100u64;
+
+        let key = store
+            .provider_context_key(&ProviderContextKeyAnchor {
+                conversation_id: store.scope().conversation_id.clone(),
+                anchor_id: format!("{message_id}:{message_seq}"),
+            })
+            .await
+            .expect("provider context key");
+        let item = ProviderContextItem {
+            origin_message: Some(ProviderContextAnchor {
+                message_id: message_id.clone(),
+                message_seq,
+            }),
+            wire_item_index: Some(0),
+            ordinal: 1,
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiResponses,
+                item: json!({
+                    "type": "reasoning",
+                    "id": "rs-1",
+                    "encrypted_content": "secret",
+                    "summary": [],
+                }),
+            },
+        };
+        let record = EncryptedProviderContextRecord::encrypt(
+            &item,
+            "test-instance",
+            ApiProtocol::OpenAiResponses,
+            "openai-responses",
+            "pc-1",
+            provider_context_idempotency_key(&message_id, &item),
+            EvictionFootprint::from_saved(1, 0, 4).expect("footprint"),
+            &key,
+            store.scope(),
+        )
+        .expect("encrypt provider context");
+        record
+            .insert(store.pool())
+            .await
+            .expect("insert provider context");
+
+        insert_compact_l0_job(&store, "job-erase", &source_id, 1).await;
+
+        let provider = Arc::new(FakeProvider {
+            text: Mutex::new("summary".into()),
+            ..FakeProvider::default()
+        });
+        let worker = CompactWorker {
+            store: store.clone(),
+            spec: select_compact_model(&chat_model(), None, &[]).expect("select model"),
+            provider,
+            cancel: CancellationToken::new(),
+        };
+        worker.process_all_pending().await.expect("complete job");
+        assert_eq!(worker.apply_ready().await.expect("apply jobs"), 1);
+
+        let erased: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE message_id = ?")
+                .bind(&message_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("count provider context");
+        assert_eq!(
+            erased, 0,
+            "provider context must be erased when L0 source batch is dropped"
+        );
     }
 }

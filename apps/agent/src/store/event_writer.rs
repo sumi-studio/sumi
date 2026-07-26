@@ -23,11 +23,14 @@ use crate::{
         ApprovalDecision, Command, CommandAck, CommandAckStatus, CommandEnvelope, CommandId,
         CommandRejectReason, InboundCommand, KeyedCommandDigest, RejectedCommandPayload,
     },
-    memory::{BatchId, CompactResult},
-    provider::types::{
-        ApiProtocol, ProviderContextAnchor, ProviderContextFragment, ProviderContextItem,
-        ProviderContextPayload, PublicAssistantContent, PublicAssistantMessage, PublicMessage,
-        StopReason, ToolResultMessage,
+    memory::{BatchId, CompactResult, estimate::eviction_footprint_for_payload},
+    provider::{
+        model::ModelSpec,
+        types::{
+            ApiProtocol, ProviderContextAnchor, ProviderContextFragment, ProviderContextItem,
+            ProviderContextPayload, PublicAssistantContent, PublicAssistantMessage, PublicMessage,
+            StopReason, ToolResultMessage,
+        },
     },
     runtime::contracts::{GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease},
 };
@@ -2725,6 +2728,9 @@ impl EventWriter {
             bail!("provider context may only accompany an assistant MessageEnd");
         };
 
+        let spec = ModelSpec::from_origin(&assistant.origin)
+            .ok_or_else(|| anyhow!("no canonical ModelSpec for provider origin"))?;
+
         let anchor_id = format!("{message_id}:{message_seq}");
         let key = self
             .store
@@ -2746,6 +2752,9 @@ impl EventWriter {
         let mut ordinal_counter: HashMap<Option<u32>, u32> = HashMap::new();
         for fragment in fragments {
             Self::validate_provider_context_fragment(&fragment, assistant)?;
+
+            let eviction_footprint = eviction_footprint_for_payload(&spec, &fragment.payload)
+                .context("failed to compute provider-context eviction footprint")?;
 
             let next = ordinal_counter.entry(fragment.wire_item_index).or_insert(1);
             let ordinal = *next;
@@ -2783,12 +2792,14 @@ impl EventWriter {
                 &assistant.origin.model,
                 &id,
                 &idempotency_key,
+                eviction_footprint,
                 &key,
                 self.store.scope(),
             )
             .context("failed to encrypt provider-context record")?;
-            eviction_footprint_tokens =
-                eviction_footprint_tokens.saturating_add(record.eviction_tokens());
+            eviction_footprint_tokens = eviction_footprint_tokens
+                .checked_add(record.eviction_tokens())
+                .ok_or_else(|| anyhow!("eviction footprint overflow"))?;
             records.push(record);
         }
         Ok((
@@ -8782,6 +8793,31 @@ async fn apply_memory_batch_mutation(
     batch: PreparedMemoryBatchMutation,
 ) -> Result<()> {
     if batch.delete_membership {
+        // Crypto-erase provider context for every message whose membership is
+        // about to be dropped. We overwrite the ciphertext BLOB with zeros
+        // before deleting the row so that the SQLite free-page bytes are not
+        // left containing the encrypted secret.
+        sqlx::query(
+            "UPDATE provider_context
+             SET ciphertext = zeroblob(length(ciphertext))
+             WHERE message_id IN (
+                 SELECT message_id FROM memory_batch_messages WHERE batch_id = ?
+             )",
+        )
+        .bind(&batch.batch_id)
+        .execute(&mut **transaction)
+        .await
+        .context("failed to crypto-erase provider context for dropped source batch")?;
+        sqlx::query(
+            "DELETE FROM provider_context
+             WHERE message_id IN (
+                 SELECT message_id FROM memory_batch_messages WHERE batch_id = ?
+             )",
+        )
+        .bind(&batch.batch_id)
+        .execute(&mut **transaction)
+        .await
+        .context("failed to delete provider context for dropped source batch")?;
         sqlx::query("DELETE FROM memory_batch_messages WHERE batch_id = ?")
             .bind(&batch.batch_id)
             .execute(&mut **transaction)
@@ -9127,7 +9163,7 @@ mod tests {
         runtime::contracts::{GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease},
         store::{
             AgentScope, ApplyReceiptOutcome, HydrationOutcome, KeyProvider, PhysicalRecoveryIntent,
-            PhysicalRecoveryReceipt, ProviderContextEvictionEstimate, RecoveryStep, SuffixRecovery,
+            PhysicalRecoveryReceipt, RecoveryStep, SuffixRecovery,
             crypto::{
                 DATA_KEY_BYTES, DataKeyMaterial, DataKeyScope, KeyWrapAad, WrappingKey,
                 decrypt_content, encrypt_content, wrap_data_key,
@@ -9150,6 +9186,21 @@ mod tests {
 
     fn test_fence(lease: &ProcessGenerationLease) -> GenerationRecoveryFence {
         GenerationRecoveryFence::new(lease, "test-fence").expect("valid test fence")
+    }
+
+    fn eviction_footprint_for_test(
+        origin: &ProviderOrigin,
+        fragments: &[ProviderContextFragment],
+    ) -> u64 {
+        let spec = ModelSpec::from_origin(origin).expect("test origin must resolve to a ModelSpec");
+        fragments
+            .iter()
+            .map(|fragment| {
+                eviction_footprint_for_payload(&spec, &fragment.payload)
+                    .expect("test payload must be footprintable")
+                    .eviction_tokens()
+            })
+            .sum()
     }
 
     #[test]
@@ -15467,7 +15518,11 @@ mod tests {
         let fragment = ProviderContextFragment {
             wire_item_index: None,
             payload: ProviderContextPayload::OpenAiCompactedWindow {
-                items: vec![json!({"summary": "opaque"})],
+                items: vec![json!({
+                    "type": "compaction",
+                    "id": "cmp-1",
+                    "encrypted_content": "opaque",
+                })],
                 coverage: NativeCompactionCoverage {
                     through_message_seq: 1,
                     context_fingerprint: "fp".to_owned(),
@@ -19252,13 +19307,22 @@ mod tests {
             wire_item_index: Some(0),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::OpenAiResponses,
-                item: json!({"text": "plain reasoning"}),
+                item: json!({
+                    "type": "reasoning",
+                    "id": "rs-1",
+                    "encrypted_content": "plain reasoning",
+                    "summary": [],
+                }),
             },
         };
         let window = ProviderContextFragment {
             wire_item_index: None,
             payload: ProviderContextPayload::OpenAiCompactedWindow {
-                items: vec![json!({"summary": "compact"})],
+                items: vec![json!({
+                    "type": "compaction",
+                    "id": "cmp-1",
+                    "encrypted_content": "compact",
+                })],
                 coverage: NativeCompactionCoverage {
                     through_message_seq: 1,
                     context_fingerprint: "fp-1".to_owned(),
@@ -19449,10 +19513,21 @@ mod tests {
                 serde_json::from_slice(&plaintext).expect("deserialize provider-context plaintext");
             match &item.payload {
                 ProviderContextPayload::EncryptedReasoning { item, .. } => {
-                    assert_eq!(item.get("text"), Some(&json!("plain reasoning")));
+                    assert_eq!(item.get("type"), Some(&json!("reasoning")));
+                    assert_eq!(
+                        item.get("encrypted_content"),
+                        Some(&json!("plain reasoning"))
+                    );
                 }
                 ProviderContextPayload::OpenAiCompactedWindow { items, .. } => {
-                    assert_eq!(items, &vec![json!({"summary": "compact"})]);
+                    assert_eq!(
+                        items,
+                        &vec![json!({
+                            "type": "compaction",
+                            "id": "cmp-1",
+                            "encrypted_content": "compact",
+                        })]
+                    );
                 }
                 _ => panic!("unexpected provider-context payload"),
             }
@@ -19771,7 +19846,6 @@ mod tests {
                 item: json!({"text": "opaque reasoning"}),
             },
         };
-        let footprint = ProviderContextEvictionEstimate::from_payload(&fragment.payload).tokens;
 
         writer
             .apply(EventBatch {
@@ -19817,7 +19891,7 @@ mod tests {
                         message: error_message,
                         append_to_l0: false,
                         provider_context: vec![fragment],
-                        eviction_footprint_tokens: footprint,
+                        eviction_footprint_tokens: 0,
                     }],
                 }],
                 injected_commands: Vec::new(),
@@ -19843,16 +19917,28 @@ mod tests {
 
         let run_id = format!("run-{command_id}");
         let turn_id = format!("turn-{command_id}");
-        let message = assistant_message(StopReason::Stop);
+        let mut message = assistant_message(StopReason::Stop);
         let message_id = "assistant-stop-with-context";
         let fragment = ProviderContextFragment {
             wire_item_index: Some(0),
             payload: ProviderContextPayload::EncryptedReasoning {
-                protocol: ApiProtocol::OpenAiChatCompletions,
-                item: json!({"text": "opaque reasoning"}),
+                protocol: ApiProtocol::OpenAiResponses,
+                item: json!({
+                    "type": "reasoning",
+                    "id": "rs-1",
+                    "encrypted_content": "opaque",
+                    "summary": [],
+                }),
             },
         };
-        let footprint = ProviderContextEvictionEstimate::from_payload(&fragment.payload).tokens;
+        let origin = match &mut message {
+            PublicMessage::Assistant(assistant) => {
+                assistant.origin.protocol = ApiProtocol::OpenAiResponses;
+                &assistant.origin
+            }
+            _ => unreachable!("fixture must be an assistant message"),
+        };
+        let footprint = eviction_footprint_for_test(origin, std::slice::from_ref(&fragment));
 
         writer
             .apply(EventBatch {
@@ -19949,10 +20035,19 @@ mod tests {
             wire_item_index: Some(99),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::OpenAiResponses,
-                item: json!({"encrypted_content": "opaque"}),
+                item: json!({
+                    "type": "reasoning",
+                    "id": "rs-1",
+                    "encrypted_content": "opaque",
+                    "summary": [],
+                }),
             },
         };
-        let footprint = ProviderContextEvictionEstimate::from_payload(&fragment.payload).tokens;
+        let origin = match &message {
+            PublicMessage::Assistant(assistant) => &assistant.origin,
+            _ => unreachable!("fixture must be an assistant message"),
+        };
+        let footprint = eviction_footprint_for_test(origin, std::slice::from_ref(&fragment));
 
         writer
             .apply(EventBatch {
@@ -20336,10 +20431,17 @@ mod tests {
             wire_item_index: Some(7),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::AnthropicMessages,
-                item: json!({"signature": "opaque-signature"}),
+                item: json!({
+                    "type": "thinking_signature",
+                    "signature": "opaque-signature",
+                }),
             },
         };
-        let footprint = ProviderContextEvictionEstimate::from_payload(&fragment.payload).tokens;
+        let origin = match &message {
+            PublicMessage::Assistant(assistant) => &assistant.origin,
+            _ => unreachable!("fixture must be an assistant message"),
+        };
+        let footprint = eviction_footprint_for_test(origin, std::slice::from_ref(&fragment));
 
         writer
             .apply(EventBatch {
@@ -20626,20 +20728,34 @@ mod tests {
                 wire_item_index: Some(2),
                 payload: ProviderContextPayload::EncryptedReasoning {
                     protocol: ApiProtocol::OpenAiResponses,
-                    item: json!({"encrypted_content": "opaque-later"}),
+                    item: json!({
+                        "type": "reasoning",
+                        "id": "rs-later",
+                        "encrypted_content": "opaque-later",
+                        "summary": [],
+                    }),
                 },
             },
             ProviderContextFragment {
                 wire_item_index: Some(1),
                 payload: ProviderContextPayload::EncryptedReasoning {
                     protocol: ApiProtocol::OpenAiResponses,
-                    item: json!({"encrypted_content": "opaque-earlier"}),
+                    item: json!({
+                        "type": "reasoning",
+                        "id": "rs-earlier",
+                        "encrypted_content": "opaque-earlier",
+                        "summary": [],
+                    }),
                 },
             },
             ProviderContextFragment {
                 wire_item_index: None,
                 payload: ProviderContextPayload::OpenAiCompactedWindow {
-                    items: vec![json!({"type": "compaction", "id": "cmp-hydrate"})],
+                    items: vec![json!({
+                        "type": "compaction",
+                        "id": "cmp-hydrate",
+                        "encrypted_content": "opaque",
+                    })],
                     coverage: NativeCompactionCoverage {
                         through_message_seq: 1,
                         context_fingerprint: "hydrate-fingerprint".to_owned(),
@@ -20647,10 +20763,7 @@ mod tests {
                 },
             },
         ];
-        let footprint = fragments
-            .iter()
-            .map(|fragment| ProviderContextEvictionEstimate::from_payload(&fragment.payload).tokens)
-            .sum();
+        let footprint = eviction_footprint_for_test(&assistant.origin, &fragments);
 
         writer
             .apply(EventBatch {

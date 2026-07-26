@@ -19,6 +19,7 @@ use sqlx::Row;
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::memory::estimate::EvictionFootprint;
 use crate::provider::types::{ApiProtocol, ProviderContextItem, ProviderContextPayload};
 
 use super::crypto::{RowAad, decrypt_content, encrypt_content};
@@ -120,42 +121,6 @@ pub(crate) fn provider_context_idempotency_key(
     }
 }
 
-/// Versioned eviction footprint for opaque provider-context payloads.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ProviderContextEvictionEstimate {
-    pub tokens: u64,
-    pub version: u32,
-}
-
-impl ProviderContextEvictionEstimate {
-    pub(crate) const V1: u32 = 1;
-
-    /// Returns the V1 estimate for a payload: opaque `EncryptedReasoning`
-    /// payloads pay `ceil(serialized_bytes / 4)` re-send tokens; native
-    /// compaction windows carry zero because they replace rather than append
-    /// to the context.
-    pub(crate) fn from_payload(payload: &ProviderContextPayload) -> Self {
-        let tokens = match payload {
-            ProviderContextPayload::EncryptedReasoning { item, .. } => {
-                let mut bytes = serde_json::to_vec(item).unwrap_or_default();
-                let tokens = (bytes.len() as u64).div_ceil(4);
-                bytes.zeroize();
-                tokens
-            }
-            _ => 0,
-        };
-        Self {
-            tokens,
-            version: Self::V1,
-        }
-    }
-
-    /// Returns the V1 estimate for a full provider-context item.
-    pub(crate) fn v1(item: &ProviderContextItem) -> Self {
-        Self::from_payload(&item.payload)
-    }
-}
-
 /// A durable `provider_context` row.  Plaintext is not retained after
 /// construction; the record exposes only the encrypted ciphertext and the
 /// metadata required for ordering, eviction accounting, and mutation intent.
@@ -241,6 +206,7 @@ impl EncryptedProviderContextRecord {
         model: impl Into<String>,
         id: impl Into<String>,
         idempotency_key: impl Into<String>,
+        eviction_footprint: EvictionFootprint,
         data_key: &DataKeyMaterial,
         scope: &AgentScope,
     ) -> Result<Self> {
@@ -264,7 +230,6 @@ impl EncryptedProviderContextRecord {
             _ => (None, None),
         };
 
-        let estimate = ProviderContextEvictionEstimate::v1(item);
         let message_id = item.origin_message.as_ref().map(|a| a.message_id.clone());
         let message_seq = item.origin_message.as_ref().map(|a| a.message_seq);
 
@@ -283,8 +248,8 @@ impl EncryptedProviderContextRecord {
             context_fingerprint,
             key_ref: data_key.key_ref.clone(),
             ciphertext,
-            eviction_tokens: estimate.tokens,
-            eviction_estimator_version: estimate.version,
+            eviction_tokens: eviction_footprint.eviction_tokens(),
+            eviction_estimator_version: eviction_footprint.estimator_version(),
             created_at: Utc::now().to_rfc3339(),
         })
     }
@@ -1437,11 +1402,16 @@ mod tests {
     use sqlx::Row;
 
     use super::*;
+    use crate::memory::estimate::EvictionFootprint;
     use crate::provider::types::{
         ApiProtocol, NativeCompactionCoverage, ProviderContextAnchor, ProviderContextItem,
         ProviderContextPayload,
     };
     use crate::store::{DataKeyPurpose, ProviderContextKeyAnchor, Store};
+
+    fn dummy_footprint() -> EvictionFootprint {
+        EvictionFootprint::from_saved(1, 0, 4).expect("valid dummy footprint")
+    }
 
     async fn store() -> Store {
         Store::session_test_store("conversation-1")
@@ -1505,6 +1475,7 @@ mod tests {
             "model-1",
             id,
             provider_context_idempotency_key(message_id, &item),
+            dummy_footprint(),
             &key,
             store.scope(),
         )
@@ -1618,6 +1589,7 @@ mod tests {
             "model-1",
             "pc-different",
             provider_context_idempotency_key("message-1", &different_item),
+            dummy_footprint(),
             &store
                 .provider_context_key(&ProviderContextKeyAnchor {
                     conversation_id: store.scope().conversation_id.clone(),
@@ -2045,6 +2017,7 @@ mod tests {
             "model-1",
             "pc-a",
             provider_context_idempotency_key("message-1", &base),
+            dummy_footprint(),
             &key,
             store.scope(),
         )
@@ -2062,6 +2035,7 @@ mod tests {
             "model-1",
             "pc-b",
             provider_context_idempotency_key("message-1", &base),
+            dummy_footprint(),
             &key,
             store.scope(),
         )
@@ -2092,6 +2066,7 @@ mod tests {
             "model-1",
             "pc-c",
             provider_context_idempotency_key("message-1", &base),
+            dummy_footprint(),
             &key,
             store.scope(),
         )

@@ -255,6 +255,18 @@ impl ModelSpec {
         }
     }
 
+    /// Resolve a canonical `ModelSpec` for a persisted provider origin. The
+    /// exact model id is tried first; if it is not a built-in preset we fall
+    /// back to a canonical preset for the protocol so that replay-probe
+    /// footprinting stays consistent with the actual wire shape.
+    pub(crate) fn from_origin(origin: &ProviderOrigin) -> Option<Self> {
+        Self::preset(&origin.model).or_else(|| match origin.protocol {
+            ApiProtocol::OpenAiResponses => Self::preset("openai-responses"),
+            ApiProtocol::AnthropicMessages => Self::preset("anthropic"),
+            ApiProtocol::OpenAiChatCompletions => Self::preset("kimi-k3"),
+        })
+    }
+
     pub fn provider_instance_id(&self) -> String {
         let endpoint = provider_instance_endpoint(&self.base_url);
         let protocol = protocol_tag(self.protocol);

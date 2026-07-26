@@ -46,7 +46,11 @@ pub(crate) use self::physical_recovery::{
     ApplyReceiptOutcome, HydrationReceiptIdentity, PhysicalRecoveryApplier, PhysicalRecoveryIntent,
     PhysicalRecoveryIntentRequest, PhysicalRecoveryReceipt,
 };
-pub(crate) use self::provider_context::{ProviderContextEvictionEstimate, ProviderContextKind};
+pub(crate) use self::provider_context::ProviderContextKind;
+#[cfg(test)]
+pub(crate) use self::provider_context::{
+    EncryptedProviderContextRecord, provider_context_idempotency_key,
+};
 pub(crate) use self::transcript::{message_interrupted, public_message_role};
 #[cfg(test)]
 pub(crate) use crypto::{DATA_KEY_BYTES, WrappingKey};

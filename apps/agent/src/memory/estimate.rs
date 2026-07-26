@@ -3,8 +3,9 @@
 use std::borrow::Borrow;
 
 use crate::provider::{
+    model::ModelSpec,
     replay_probe::{ReplayProbeResult, ReplayProbeV1},
-    types::{PublicAssistantContent, PublicMessage, Usage, UserContent},
+    types::{ProviderContextPayload, PublicAssistantContent, PublicMessage, Usage, UserContent},
 };
 use thiserror::Error;
 
@@ -296,6 +297,20 @@ pub(crate) fn native_canonical_window_footprint() -> EvictionFootprint {
         replay_wire_bytes: 0,
         eviction_tokens: 0,
     }
+}
+
+/// Compute the V1 eviction footprint for a provider-context payload using the
+/// authoritative `ReplayProbeV1` and the canonical request serializer for the
+/// given `ModelSpec`. This is the only durable footprinting entry point for
+/// opaque provider context; callers must not silently recompute with a
+/// different estimator.
+pub(crate) fn eviction_footprint_for_payload(
+    spec: &ModelSpec,
+    payload: &ProviderContextPayload,
+) -> Result<EvictionFootprint, EstimateError> {
+    let probe = ReplayProbeV1::new(spec, payload)
+        .map_err(|error| EstimateError::ReplayProbeFailure(error.to_string()))?;
+    eviction_footprint_v1(&probe)
 }
 
 /// Saved values from mixed estimator versions are additive and are never

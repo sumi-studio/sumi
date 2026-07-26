@@ -1,10 +1,15 @@
 use anyhow::{Result, bail};
 
-use crate::provider::types::{
-    AssistantContent, AssistantMessage, ProviderContextFragment, ProviderEvent,
-    PublicAssistantContent, PublicAssistantMessage, PublicMessage, StopReason, ToolResultMessage,
+use crate::memory::estimate::eviction_footprint_for_payload;
+use crate::provider::{
+    model::ModelSpec,
+    types::{
+        AssistantContent, AssistantMessage, ProviderContextFragment, ProviderEvent,
+        PublicAssistantContent, PublicAssistantMessage, PublicMessage, StopReason,
+        ToolResultMessage,
+    },
 };
-use crate::store::{DurableEvent, EventWrite, Projection, ProviderContextEvictionEstimate};
+use crate::store::{DurableEvent, EventWrite, Projection};
 
 use super::{AgentEvent, PublicStreamEvent};
 
@@ -96,11 +101,26 @@ impl ProviderTerminal {
         }
         let run_id = run_id.into();
         let turn_id = turn_id.into();
+
+        let origin = match &self.message {
+            PublicMessage::Assistant(message) => &message.origin,
+            _ => bail!("provider context may only accompany an assistant message"),
+        };
+        let spec = ModelSpec::from_origin(origin)
+            .ok_or_else(|| anyhow::anyhow!("no canonical ModelSpec for provider origin"))?;
         let eviction_footprint_tokens = self
             .provider_context
             .iter()
-            .map(|fragment| ProviderContextEvictionEstimate::from_payload(&fragment.payload).tokens)
-            .fold(0u64, |acc, tokens| acc.saturating_add(tokens));
+            .map(|fragment| {
+                eviction_footprint_for_payload(&spec, &fragment.payload)
+                    .map(|footprint| footprint.eviction_tokens())
+            })
+            .try_fold(0u64, |acc, tokens| {
+                let tokens = tokens?;
+                acc.checked_add(tokens)
+                    .ok_or_else(|| anyhow::anyhow!("eviction footprint overflow"))
+            })?;
+
         Ok(EventWrite {
             event: Some(DurableEvent::message_in_turn(
                 "message_end",
@@ -648,13 +668,20 @@ mod tests {
     fn t12_write_carries_provider_context() {
         let mut projector = started();
         let mut terminal_output = output(StopReason::Stop);
+        terminal_output.message.origin.protocol = ApiProtocol::OpenAiResponses;
+        terminal_output.message.origin.model = "openai-responses".to_owned();
         terminal_output
             .provider_context
             .push(ProviderContextFragment {
                 wire_item_index: Some(9),
                 payload: ProviderContextPayload::EncryptedReasoning {
                     protocol: ApiProtocol::OpenAiResponses,
-                    item: json!({"encrypted_content": "opaque"}),
+                    item: json!({
+                        "type": "reasoning",
+                        "id": "rs-9",
+                        "encrypted_content": "opaque",
+                        "summary": [],
+                    }),
                 },
             });
         let ProjectedProviderEvent::Terminal(terminal) = projector
