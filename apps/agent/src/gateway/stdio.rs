@@ -107,7 +107,7 @@ where
         &mut self,
         hello: AgentHello,
     ) -> std::result::Result<ApiHello, HelloError> {
-        Ok(stdio_hello(&hello))
+        stdio_hello(&hello)
     }
 
     fn split(self) -> (Self::Reader, Self::Writer) {
@@ -162,7 +162,7 @@ impl Gateway for StdioGateway {
         &mut self,
         hello: AgentHello,
     ) -> std::result::Result<ApiHello, HelloError> {
-        Ok(stdio_hello(&hello))
+        stdio_hello(&hello)
     }
 
     fn split(self) -> (Self::Reader, Self::Writer) {
@@ -211,12 +211,20 @@ async fn write_frame<W: AsyncWrite + Unpin>(output: &mut W, frame: OutboundFrame
 /// The peer is assumed to have received all events already sent, so catch-up
 /// begins at the durable cursor. The next command starts after the last applied
 /// durable command.
-pub(crate) fn stdio_hello(hello: &AgentHello) -> ApiHello {
-    ApiHello {
+pub(crate) fn stdio_hello(hello: &AgentHello) -> std::result::Result<ApiHello, HelloError> {
+    let next_command_seq = hello
+        .last_applied_command_seq
+        .checked_add(1)
+        .ok_or_else(|| {
+            HelloError::Fatal(anyhow!(
+                "last applied command sequence cannot advance beyond u64::MAX"
+            ))
+        })?;
+    Ok(ApiHello {
         accepted_generation: hello.generation,
         last_received_event_seq: hello.last_sent_event_seq,
-        next_command_seq: hello.last_applied_command_seq.saturating_add(1),
-    }
+        next_command_seq,
+    })
 }
 
 #[derive(serde::Deserialize)]
@@ -1569,13 +1577,30 @@ mod tests {
             last_received_command_seq: 10,
             last_applied_command_seq: 9,
         };
-        let api = stdio_hello(&hello);
+        let api = stdio_hello(&hello).expect("non-maximum cursor advances");
         assert_eq!(
             api.accepted_generation,
             ProcessGeneration::from_wire(7).unwrap()
         );
         assert_eq!(api.last_received_event_seq, 42);
         assert_eq!(api.next_command_seq, 10);
+    }
+
+    #[test]
+    fn stdio_hello_fails_closed_when_the_applied_cursor_cannot_advance() {
+        let hello = AgentHello {
+            agent_id: "test-agent".to_owned(),
+            generation: ProcessGeneration::from_wire(7).unwrap(),
+            last_sent_event_seq: 42,
+            last_received_command_seq: u64::MAX,
+            last_applied_command_seq: u64::MAX,
+        };
+
+        let error = stdio_hello(&hello).expect_err("u64::MAX must not replay an applied command");
+        assert!(
+            matches!(error, HelloError::Fatal(_)),
+            "cursor overflow must fail the hello exchange: {error:?}"
+        );
     }
 
     #[tokio::test]
