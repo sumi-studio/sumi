@@ -9406,7 +9406,7 @@ fn sqlite_u64(value: i64, field: &str) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{path::Path, sync::Arc};
 
     use anyhow::{Result, bail};
     use chrono::{Duration, Utc};
@@ -9544,6 +9544,13 @@ mod tests {
         Store::in_memory(scope(), test_provider())
             .await
             .expect("open test store")
+            .into()
+    }
+
+    async fn file_test_store(path: &Path) -> Arc<Store> {
+        Store::open(path, scope(), test_provider())
+            .await
+            .expect("open file-backed test store")
             .into()
     }
 
@@ -19551,7 +19558,14 @@ mod tests {
 
     #[tokio::test]
     async fn message_end_persists_encrypted_provider_context_and_eviction_tokens() {
-        let store = test_store().await;
+        let path = std::env::current_dir()
+            .expect("current package directory")
+            .join("target")
+            .join(format!(
+                "sumi-message-end-provider-context-{}.sqlite",
+                Uuid::now_v7()
+            ));
+        let store = file_test_store(&path).await;
         let writer = EventWriter::new(store.clone());
         let command_id = "00000000-0000-4000-8000-000000000073";
         let run_id = format!("run-{command_id}");
@@ -19567,6 +19581,11 @@ mod tests {
             .expect("persist user injection");
 
         let timestamp = durable_test_timestamp();
+        let provider_origin = ProviderOrigin {
+            provider_instance_id: "provider-instance-context".to_owned(),
+            protocol: ApiProtocol::OpenAiResponses,
+            model: "model-context".to_owned(),
+        };
         let message = AssistantMessage {
             content: vec![AssistantContent::Text {
                 text: "answer with reasoning".to_owned(),
@@ -19574,11 +19593,7 @@ mod tests {
             }],
             model: "model-context".to_owned(),
             provider: "provider-context".to_owned(),
-            origin: ProviderOrigin {
-                provider_instance_id: "provider-instance-context".to_owned(),
-                protocol: ApiProtocol::OpenAiResponses,
-                model: "model-context".to_owned(),
-            },
+            origin: provider_origin.clone(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
             error_message: None,
@@ -19610,6 +19625,25 @@ mod tests {
                 },
             },
         };
+        let expected_context = vec![
+            ProviderContextItem {
+                origin_message: None,
+                wire_item_index: window.wire_item_index,
+                ordinal: 1,
+                provider_origin: provider_origin.clone(),
+                payload: window.payload.clone(),
+            },
+            ProviderContextItem {
+                origin_message: Some(ProviderContextAnchor {
+                    message_id: assistant_id.to_owned(),
+                    message_seq: 0,
+                }),
+                wire_item_index: reasoning.wire_item_index,
+                ordinal: 1,
+                provider_origin,
+                payload: reasoning.payload.clone(),
+            },
+        ];
 
         let ProjectedProviderEvent::Terminal(terminal) = projector
             .project(ProviderEvent::Done {
@@ -19663,7 +19697,7 @@ mod tests {
                             DurableEvent::turn_end(
                                 run_id.clone(),
                                 turn_id.clone(),
-                                terminal_message,
+                                terminal_message.clone(),
                                 Vec::new(),
                             )
                             .expect("TurnEnd"),
@@ -19802,6 +19836,33 @@ mod tests {
                 _ => panic!("unexpected provider-context payload"),
             }
         }
+
+        let expected_origin = match &terminal_message {
+            PublicMessage::Assistant(message) => message.origin.clone(),
+            _ => panic!("terminal message must be an assistant"),
+        };
+        let message_seq = u64::try_from(message_seq).expect("positive SQLite message sequence");
+        let mut expected_context = expected_context;
+        for item in &mut expected_context {
+            if let Some(anchor) = item.origin_message.as_mut() {
+                anchor.message_seq = message_seq;
+            }
+        }
+        drop(writer);
+        store.pool().close().await;
+        drop(store);
+        let reopened = file_test_store(&path).await;
+        assert_eq!(
+            reopened
+                .load_provider_context_for_origin(&expected_origin)
+                .await
+                .expect("restore provider context after MessageEnd reopen"),
+            expected_context
+        );
+        reopened.pool().close().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
     }
 
     #[cfg(not(unix))]
