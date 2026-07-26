@@ -19,7 +19,8 @@ OAuth bridge for OpenAI Responses:
   - `SUMI_CODEX_RESPONSES_BASE_URL` — loopback bridge URL, e.g. `http://127.0.0.1:8765`
   - `SUMI_CODEX_RESPONSES_PROXY_SECRET` — shared startup secret for the bridge
   - `SUMI_CODEX_RESPONSES_MODEL` — optional, defaults to `gpt-5.6-luna`; if set, must be non-empty
-  - `SUMI_CODEX_REQUIRE_ENCRYPTED_REASONING` — optional; set to `1` to require the first turn to return non-empty encrypted provider context. When unset (the default), the gate preserves and replays whatever provider context the model actually returns, including none
+
+The gate unconditionally requires the first turn to return and preserve non-empty encrypted provider context, then replay it into the second turn.
 
 Start the bridge and export its secret:
 
@@ -49,9 +50,9 @@ SUMI_LIVE_TEST=1 cargo test --manifest-path apps/agent/Cargo.toml \
 A missing or empty `SUMI_CODEX_RESPONSES_BASE_URL` or
 `SUMI_CODEX_RESPONSES_PROXY_SECRET` fails the gate. The gate must complete a
 real `store:false` two-turn exchange: exactly one `echo_value` tool-call/result
-round-trip, preservation/replay of any returned encrypted provider context, and
-non-empty expected second-turn text. It must emit bounded evidence without
-tokens or raw secrets.
+round-trip, preservation/replay of non-empty encrypted provider context from
+the first turn into the second turn, and non-empty expected second-turn text.
+It must emit bounded evidence without tokens or raw secrets.
 
 ## Fixture and durable restart proofs (mandatory and distinct)
 
@@ -62,13 +63,16 @@ proof. The provenance ledger binds the fixture tests in
 `apps/agent/tests/fixtures/provenance.json` and the durable round-trip tests in
 `store::event_writer`.
 
-## Post-deadline provider-qualification debt
+## Post-deadline and release-blocking provider evidence
 
-OpenCode Zen Go is confirmed unavailable for the T25 deadline. It and the
-direct Moonshot, Z.ai, and Umans live/raw proofs are moved to explicit
-post-deadline provider-qualification debt. They are not completed, deleted, or
-substituted by the Responses bridge, and their ignored developer probes are
-preserved.
+OpenCode Zen Go is confirmed unavailable for the T25 deadline and is moved to
+post-deadline provider-qualification debt; the Codex OAuth bridge OpenAI
+Responses live proof replaces it for the T25 provider-release gate.
+
+Direct Moonshot, Z.ai, and Umans live/raw proofs remain release-blocking
+missing evidence for the Chat Completions provider track. They are not
+completed, deleted, or substituted by the Responses bridge, and their
+credential-gated developer probes are preserved.
 
 The OpenCode capture script below is retained for future qualification. Capture
 only after explicitly loading the `opencode-go` credential from the local
@@ -173,15 +177,16 @@ captures and the tracked fixture unchanged because `--fail-with-body` writes
 only to the trapped temporary file. Never print the config, environment,
 headers, or command trace.
 
-Moonshot direct, Z.ai direct, and Umans raw/live evidence remains explicitly
-deferred and is not replaced by the Responses bridge or by any fixture. When
-those credentials become available, capture each direct provider using its
-documented base URL, model, and credential variable. For each deferred
-direct-provider capture, tool capture uses one deterministic
-`echo_value(value: string)` tool, `tool_choice:"required"`, and a 128-token
-limit. Reasoning capture uses the preset's production thinking control and the
-prompt `Reply with exactly OK after reasoning.`. Do not infer one provider's
-dialect from another provider or gateway.
+Moonshot direct, Z.ai direct, and Umans raw/live evidence remains a
+release-blocking missing obligation for the Chat Completions provider track and
+is not replaced by the Responses bridge or by any fixture. When those
+credentials become available, capture each direct provider using its documented
+base URL, model, and credential variable. For each pending direct-provider
+capture, tool capture uses one deterministic `echo_value(value: string)` tool,
+`tool_choice:"required"`, and a 128-token limit. Reasoning capture uses the
+preset's production thinking control and the prompt
+`Reply with exactly OK after reasoning.`. Do not infer one provider's dialect
+from another provider or gateway.
 
 ## Promotion
 
@@ -222,14 +227,17 @@ The non-ignored `live_codex_responses_provider_release_gate` is the T25 release
 dispatcher. It returns without external communication unless `SUMI_LIVE_TEST=1`;
 with that opt-in it runs through the local Codex OAuth bridge and fails on a
 missing or empty `SUMI_CODEX_RESPONSES_BASE_URL` or
-`SUMI_CODEX_RESPONSES_PROXY_SECRET`. The four previously provider-specific live
-gates (`live_opencode_go_two_turn_tool_reasoning_gate`,
-`live_kimi_k3_direct_two_turn_tool_reasoning_gate`,
+`SUMI_CODEX_RESPONSES_PROXY_SECRET`. The two OpenCode Go live gates
+(`live_opencode_go_two_turn_tool_reasoning_gate` and
+`live_opencode_go_provider_release_gate`) are ignored post-debt probes; they
+are selected explicitly with `cargo test <live_gate_name> -- --ignored`.
+The direct Moonshot, Z.ai, and Umans live gates
+(`live_kimi_k3_direct_two_turn_tool_reasoning_gate`,
 `live_glm_5_2_direct_two_turn_tool_reasoning_gate`,
-`live_umans_direct_two_turn_tool_reasoning_gate`) and the old
-`live_opencode_go_provider_release_gate` are now ignored post-debt probes;
-they are selected explicitly with `cargo test <live_gate_name> -- --ignored`.
-Direct Moonshot/Z.ai/Umans evidence remains deferred; OpenCode Go is not a
-substitute for those future proofs. `SUMI_ENV_FILE` may explicitly name a
-dotenv file to load. Live tests are not substitutes for checked-in raw capture
-provenance.
+`live_umans_direct_two_turn_tool_reasoning_gate`) are ignored
+credential-gated probes for release-blocking missing Chat Completions evidence.
+Direct Moonshot/Z.ai/Umans evidence remains a release-blocking missing
+obligation for the Chat Completions provider track; the Responses bridge and
+OpenCode Go are not substitutes for those future proofs. `SUMI_ENV_FILE` may
+explicitly name a dotenv file to load. Live tests are not substitutes for
+checked-in raw capture provenance.

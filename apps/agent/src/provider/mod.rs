@@ -1923,6 +1923,25 @@ async fn finish_responses_terminal(
     cancel: &CancellationToken,
     success_terminal_committed: &SuccessTerminalCommit,
 ) {
+    if let Some(observed_model) = terminal.response_model.as_deref()
+        && observed_model != spec.id
+    {
+        finish_failure_with_context(
+            priority_terminal_tx,
+            assembler,
+            spec,
+            terminal.usage,
+            format!(
+                "provider reported model {observed_model:?}, requested model {:?}",
+                spec.id
+            ),
+            "response_model_mismatch",
+            cancel.is_cancelled(),
+            terminal.provider_context,
+        )
+        .await;
+        return;
+    }
     for event in terminal.events {
         match emit(tx, assembler, event, cancel).await {
             EmitResult::Sent => {}
@@ -1956,25 +1975,6 @@ async fn finish_responses_terminal(
                 return;
             }
         }
-    }
-    if let Some(observed_model) = terminal.response_model.as_deref()
-        && observed_model != spec.id
-    {
-        finish_failure_with_context(
-            priority_terminal_tx,
-            assembler,
-            spec,
-            terminal.usage,
-            format!(
-                "provider reported model {observed_model:?}, requested model {:?}",
-                spec.id
-            ),
-            "response_model_mismatch",
-            cancel.is_cancelled(),
-            terminal.provider_context,
-        )
-        .await;
-        return;
     }
     if terminal.reason == StopReason::Error {
         finish_failure_with_context(
@@ -4013,8 +4013,9 @@ fi
         assert_eq!(output.message.origin.model, spec.id);
         assert!(committed.is_committed());
 
-        // Mismatched observed model -> fail-closed Error, no durable success message.
-        let (tx2, _rx2) = mpsc::channel(1);
+        // Mismatched observed model -> fail-closed Error, no durable success message,
+        // and no terminal.events leak onto the normal lane.
+        let (tx2, mut rx2) = mpsc::channel(10);
         let (priority_tx2, mut priority_rx2) = mpsc::channel(1);
         let mut assembler2 = MessageAssembler::new();
         assembler2.apply(&ProviderEvent::Start).expect("Start");
@@ -4025,7 +4026,17 @@ fi
             &mut assembler2,
             &spec,
             ResponsesTerminal {
-                events: vec![],
+                events: vec![
+                    ProviderEvent::TextStart { content_index: 0 },
+                    ProviderEvent::TextDelta {
+                        content_index: 0,
+                        delta: "hello".to_owned(),
+                    },
+                    ProviderEvent::TextEnd {
+                        content_index: 0,
+                        content: "hello".to_owned(),
+                    },
+                ],
                 reason: StopReason::Stop,
                 usage: Usage::default(),
                 error_message: None,
@@ -4048,6 +4059,16 @@ fi
             Some("response_model_mismatch")
         );
         assert!(!committed2.is_committed());
+
+        drop(tx2);
+        let mut normal_lane_events = 0;
+        while rx2.recv().await.is_some() {
+            normal_lane_events += 1;
+        }
+        assert_eq!(
+            normal_lane_events, 0,
+            "model mismatch must not emit terminal events to the normal lane"
+        );
     }
 
     #[tokio::test]
@@ -5345,19 +5366,19 @@ fi
     }
 
     #[tokio::test]
-    #[ignore = "post-deadline provider-qualification debt; direct Moonshot proof deferred"]
+    #[ignore = "release-blocking missing direct-provider evidence; Moonshot proof not completed or substituted"]
     async fn live_kimi_k3_direct_two_turn_tool_reasoning_gate() {
         run_live_chat_tool_roundtrip("kimi-k3").await;
     }
 
     #[tokio::test]
-    #[ignore = "post-deadline provider-qualification debt; direct Z.ai proof deferred"]
+    #[ignore = "release-blocking missing direct-provider evidence; Z.ai proof not completed or substituted"]
     async fn live_glm_5_2_direct_two_turn_tool_reasoning_gate() {
         run_live_chat_tool_roundtrip("glm-5.2").await;
     }
 
     #[tokio::test]
-    #[ignore = "post-deadline provider-qualification debt; direct Umans proof deferred"]
+    #[ignore = "release-blocking missing direct-provider evidence; Umans proof not completed or substituted"]
     async fn live_umans_direct_two_turn_tool_reasoning_gate() {
         run_live_chat_tool_roundtrip("umans").await;
     }
@@ -5692,12 +5713,10 @@ fi
             provider_context: first_fragments,
         } = first_output;
         assert_eq!(first.stop_reason, StopReason::ToolUse);
-        if env::var("SUMI_CODEX_REQUIRE_ENCRYPTED_REASONING").as_deref() == Ok("1") {
-            assert!(
-                !first_fragments.is_empty(),
-                "Responses live turn must preserve encrypted provider context"
-            );
-        }
+        assert!(
+            !first_fragments.is_empty(),
+            "Responses live turn must preserve non-empty encrypted provider context"
+        );
         let calls: Vec<_> = first
             .content
             .iter()

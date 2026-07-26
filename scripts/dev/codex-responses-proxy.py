@@ -109,7 +109,9 @@ class ResponsesBridge(BaseHTTPRequestHandler):
         raise RuntimeError("could not allocate an exclusive capture file")
 
     def do_POST(self) -> None:
-        if self.path not in ("/responses", "/v1/responses"):
+        is_responses = self.path in ("/responses", "/v1/responses")
+        is_compact = self.path in ("/responses/compact", "/v1/responses/compact")
+        if not (is_responses or is_compact):
             self.send_error(404)
             return
 
@@ -136,8 +138,9 @@ class ResponsesBridge(BaseHTTPRequestHandler):
 
             # The subscription endpoint manages the output budget itself.
             request_body.pop("max_output_tokens", None)
-            request_body["stream"] = True
             request_body["store"] = False
+            if is_responses:
+                request_body["stream"] = True
 
             access_token, account_id = load_codex_auth(self.auth_path)
             headers = {
@@ -145,13 +148,16 @@ class ResponsesBridge(BaseHTTPRequestHandler):
                 "ChatGPT-Account-Id": account_id,
                 "originator": "codex_cli_rs",
                 "Content-Type": "application/json",
-                "Accept": "text/event-stream",
+                "Accept": "application/json" if is_compact else "text/event-stream",
                 "User-Agent": "codex-cli-rs/sumi-dev-bridge",
                 "session-id": str(uuid.uuid4()),
                 "thread-id": str(uuid.uuid4()),
             }
+            upstream_url = self.upstream_url
+            if is_compact:
+                upstream_url += "/compact"
             upstream_request = urllib.request.Request(
-                self.upstream_url,
+                upstream_url,
                 data=json.dumps(request_body, separators=(",", ":")).encode(),
                 headers=headers,
                 method="POST",
@@ -190,7 +196,13 @@ class ResponsesBridge(BaseHTTPRequestHandler):
             return
 
         self.send_response(upstream.status)
-        self.send_header("Content-Type", "text/event-stream")
+        content_type = upstream.getheader("Content-Type")
+        if not content_type:
+            content_type = "application/json" if is_compact else "text/event-stream"
+        self.send_header("Content-Type", content_type)
+        content_length = upstream.getheader("Content-Length")
+        if content_length:
+            self.send_header("Content-Length", content_length)
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
 
@@ -233,18 +245,25 @@ def _request(
     headers: dict[str, str] | None = None,
     body: bytes = b"{}",
     path: str = "/v1/responses",
+    *,
     read_first_line: bool = False,
-) -> tuple[int, bytes]:
+    return_content_type: bool = False,
+) -> tuple[int, bytes] | tuple[int, bytes, str | None]:
     conn = HTTPConnection(*server.server_address)
     all_headers = headers or {}
     conn.request("POST", path, body=body, headers=all_headers)
     response = conn.getresponse()
+    content_type = response.getheader("Content-Type")
     if read_first_line:
         first = response.readline()
         response.close()
+        if return_content_type:
+            return response.status, first, content_type
         return response.status, first
     data = response.read()
     response.close()
+    if return_content_type:
+        return response.status, data, content_type
     return response.status, data
 
 
@@ -260,6 +279,7 @@ class _SelfTestUpstream(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
     requests: ClassVar[list[dict[str, str]]] = []
     bodies: ClassVar[list[dict[str, Any]]] = []
+    paths: ClassVar[list[str]] = []
     delayed: ClassVar[bool] = False
     resume: ClassVar[threading.Event] = threading.Event()
 
@@ -271,8 +291,9 @@ class _SelfTestUpstream(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length))
         self.__class__.requests.append(dict(self.headers.items()))
         self.__class__.bodies.append(body)
+        self.__class__.paths.append(self.path)
 
-        if _SelfTestUpstream.delayed:
+        if _SelfTestUpstream.delayed and not self.path.endswith("/compact"):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
@@ -288,6 +309,37 @@ class _SelfTestUpstream(BaseHTTPRequestHandler):
                     self.wfile.flush()
                 except (ConnectionResetError, BrokenPipeError):
                     pass
+            return
+
+        if self.path.endswith("/compact"):
+            response: dict[str, Any] = {
+                "id": "resp_compact",
+                "object": "response.compaction",
+                "output": [
+                    {
+                        "id": "m1",
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "hello"}],
+                    },
+                    {"id": "cmp1", "type": "compaction", "encrypted_content": "opaque"},
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            }
+            data = json.dumps(response, separators=(",", ":")).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            try:
+                self.wfile.write(data)
+                self.wfile.flush()
+            except (ConnectionResetError, BrokenPipeError):
+                pass
             return
 
         full = b"data: first\n\ndata: second\n\n"
@@ -329,6 +381,7 @@ def _run_self_test() -> int:
         # Start a mock upstream Codex endpoint.
         _SelfTestUpstream.requests = []
         _SelfTestUpstream.bodies = []
+        _SelfTestUpstream.paths = []
         upstream_server = ThreadingHTTPServer(("127.0.0.1", 0), _SelfTestUpstream)
         upstream_thread = threading.Thread(target=upstream_server.serve_forever, daemon=True)
         upstream_thread.start()
@@ -488,6 +541,80 @@ def _run_self_test() -> int:
                 break
             time.sleep(0.01)
         check("disconnect_cleanup_file_closed", len(captures_after) == 3, f"count={len(captures_after)}")
+
+        # Compact endpoint support.
+        _SelfTestUpstream.delayed = False
+        _SelfTestUpstream.resume = threading.Event()
+        _SelfTestUpstream.requests = []
+        _SelfTestUpstream.bodies = []
+        _SelfTestUpstream.paths = []
+        compact_body = json.dumps({
+            "model": "gpt-5.6-luna",
+            "input": [{"role": "user", "content": "compact me"}],
+        }).encode()
+
+        status, body, content_type = _request(
+            proxy_server,
+            {
+                "Authorization": f"Bearer {secret}",
+                "content-type": "application/json",
+            },
+            compact_body,
+            path="/responses/compact",
+            return_content_type=True,
+        )
+        check("compact_route_accepted", status == 200, f"status={status}")
+        check(
+            "compact_response_is_json",
+            content_type == "application/json" and b'"response.compaction"' in body,
+            f"content_type={content_type!r} body={body!r}",
+        )
+        check(
+            "compact_request_shape_is_bounded",
+            len(_SelfTestUpstream.bodies) == 1
+            and _SelfTestUpstream.bodies[0].get("store") is False
+            and "stream" not in _SelfTestUpstream.bodies[0]
+            and "max_output_tokens" not in _SelfTestUpstream.bodies[0],
+        )
+        check(
+            "compact_upstream_path_has_compact_suffix",
+            _SelfTestUpstream.paths
+            and _SelfTestUpstream.paths[0].endswith("/compact"),
+            f"path={_SelfTestUpstream.paths[0]!r}",
+        )
+
+        status, body = _request(
+            proxy_server,
+            {
+                "Authorization": f"Bearer {secret}",
+                "content-type": "application/json",
+            },
+            compact_body,
+            path="/v1/responses/compact",
+        )
+        check("compact_v1_route_accepted", status == 200, f"status={status}")
+        check(
+            "compact_v1_response_is_json",
+            b'"response.compaction"' in body,
+            f"body={body!r}",
+        )
+
+        upstream_count_before_unrelated = len(_SelfTestUpstream.requests)
+        status, _ = _request(
+            proxy_server,
+            {
+                "Authorization": f"Bearer {secret}",
+                "content-type": "application/json",
+            },
+            compact_body,
+            path="/responses/compact/extra",
+        )
+        check("unrelated_compact_path_rejected", status == 404, f"status={status}")
+        check(
+            "unrelated_path_never_reaches_upstream",
+            len(_SelfTestUpstream.requests) == upstream_count_before_unrelated,
+            f"requests={len(_SelfTestUpstream.requests)}",
+        )
 
         proxy_server.shutdown()
         proxy_server.server_close()
