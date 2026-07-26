@@ -64,7 +64,7 @@ fn test_api_hello(hello: &AgentHello) -> ApiHello {
     ApiHello {
         accepted_generation: hello.generation,
         last_received_event_seq: 0,
-        next_command_seq: hello.last_terminal_command_seq.saturating_add(1),
+        next_command_seq: hello.last_applied_command_seq.saturating_add(1),
     }
 }
 

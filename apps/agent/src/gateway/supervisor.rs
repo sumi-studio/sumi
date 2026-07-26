@@ -86,10 +86,6 @@ impl Drop for GatewayCredential {
 /// Agent → API hello. `generation` is the `ProcessGeneration` bound to the
 /// credential claim. All seq values are `u64` and are validated against the
 /// durable source before the epoch proceeds.
-///
-/// `last_terminal_command_seq` is the durable terminal command cursor: the
-/// maximum seq among `applied`, `superseded`, and `rejected` statuses. The
-/// wire field name remains `last_applied_command_seq` for compatibility.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentHello {
@@ -97,8 +93,7 @@ pub struct AgentHello {
     pub generation: ProcessGeneration,
     pub last_sent_event_seq: u64,
     pub last_received_command_seq: u64,
-    #[serde(rename = "last_applied_command_seq")]
-    pub last_terminal_command_seq: u64,
+    pub last_applied_command_seq: u64,
 }
 
 /// API → Agent hello response.
@@ -111,14 +106,10 @@ pub struct ApiHello {
 }
 
 /// Cursors returned by the durable command source.
-///
-/// `terminal` is the maximum seq among terminal command statuses:
-/// `applied`, `superseded`, and `rejected`. This is the durable boundary
-/// used for hello validation and ACK cursor recovery.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CommandCursors {
     pub received: u64,
-    pub terminal: u64,
+    pub applied: u64,
 }
 
 /// Cursors returned by the durable event source.
@@ -160,6 +151,8 @@ pub trait GatewayConnector: Send + 'static {
 pub enum ConnectorError {
     #[error("authentication rejected")]
     AuthRejected,
+    #[error("invalid connector configuration: {0}")]
+    InvalidConfiguration(anyhow::Error),
     #[error("fatal: {0}")]
     Fatal(anyhow::Error),
     #[error(transparent)]
@@ -470,7 +463,7 @@ where
             result = time::timeout(config.connect_timeout, self.connector.connect(credential)) => match result {
                 Ok(Ok(g)) => g,
                 Ok(Err(ConnectorError::AuthRejected)) => return Err(SupervisorError::AuthRejected),
-                Ok(Err(ConnectorError::Fatal(e))) => return Err(SupervisorError::Fatal(e)),
+                Ok(Err(ConnectorError::Fatal(e) | ConnectorError::InvalidConfiguration(e))) => return Err(SupervisorError::Fatal(e)),
                 Ok(Err(ConnectorError::Other(e))) => return Err(SupervisorError::Reconnect {
                     reason: format!("connect failed: {e}"),
                 }),
@@ -668,7 +661,7 @@ async fn build_agent_hello<S: DurableSource>(
         generation: config.generation,
         last_sent_event_seq: event_cursor.last_sent,
         last_received_command_seq: command_cursor.received,
-        last_terminal_command_seq: command_cursor.terminal,
+        last_applied_command_seq: command_cursor.applied,
     })
 }
 
@@ -710,17 +703,15 @@ async fn validate_hello<S: DurableSource>(
             .map_err(|e| SupervisorError::Reconnect {
                 reason: format!("command cursor unavailable for hello validation: {e}"),
             })?;
-    let expected_next_command_seq = command_cursor.terminal.saturating_add(1);
-    // The API may legitimately lag behind our durable terminal cursor if a terminal
-    // ACK (Applied/Superseded/Rejected) was lost in flight; it will resend and the
-    // durable consumer deduplicates. Any cursor ahead of terminal+1 skips commands
-    // that have not yet reached a terminal status and remains fatal.
-    if api.next_command_seq > expected_next_command_seq {
+    let min_next_command_seq = command_cursor.applied.saturating_add(1);
+    let max_next_command_seq = command_cursor.received.saturating_add(1);
+    if !(min_next_command_seq..=max_next_command_seq).contains(&api.next_command_seq) {
         return Err(SupervisorError::Fatal(anyhow!(
-            "command cursor claim ahead of durable boundary: next_command_seq {} > terminal {} + 1 (expected {}); received={}",
+            "command cursor claim outside durable bounds: next_command_seq {} not in {}..={}; applied={}, received={}",
             api.next_command_seq,
-            command_cursor.terminal,
-            expected_next_command_seq,
+            min_next_command_seq,
+            max_next_command_seq,
+            command_cursor.applied,
             command_cursor.received
         )));
     }
@@ -1513,7 +1504,7 @@ mod tests {
             Ok(ApiHello {
                 accepted_generation,
                 last_received_event_seq: self.last_received_event_seq,
-                next_command_seq: hello.last_terminal_command_seq.saturating_add(1),
+                next_command_seq: hello.last_applied_command_seq.saturating_add(1),
             })
         }
 
@@ -2473,6 +2464,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connector_configuration_failure_is_fatal_without_retry() {
+        let mut config = make_config();
+        config.initial_backoff = Duration::from_millis(1);
+        let credentials = CountingCredentialProvider::new("token");
+        let counter = credentials.counter.clone();
+        let connector = MockConnector::new(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            VecDeque::from([Err(ConnectorError::InvalidConfiguration(anyhow!(
+                "missing websocket scheme"
+            )))]),
+        );
+        let source = MockDurableSource::new(CommandCursors::default());
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: ProcessGeneration::from_wire(7).unwrap(),
+            receipt_identity: "receipt-1".to_owned(),
+        });
+
+        let handle =
+            ConnectionSupervisor::new(connector, credentials, source, latch, config).start();
+        let error = tokio::time::timeout(Duration::from_secs(1), handle.join())
+            .await
+            .expect("fatal configuration must stop promptly")
+            .expect_err("invalid connector configuration must be fatal");
+        assert!(format!("{error:#}").contains("missing websocket scheme"));
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "fatal connector configuration must not retry"
+        );
+    }
+
+    #[tokio::test]
     async fn established_reconnect_failures_accumulate_and_hit_limit() {
         let mut config = make_config();
         config.max_reconnect_attempts = Some(2);
@@ -2690,11 +2713,11 @@ mod tests {
         let cursor_calls = VecDeque::from([
             CommandCursors {
                 received: 5,
-                terminal: 5,
+                applied: 5,
             },
             CommandCursors {
                 received: 10,
-                terminal: 5,
+                applied: 5,
             },
         ]);
 
@@ -2799,7 +2822,7 @@ mod tests {
                 }
                 Ok(CommandCursors {
                     received: 0,
-                    terminal: 0,
+                    applied: 0,
                 })
             }
         }
@@ -2817,7 +2840,7 @@ mod tests {
             generation: ProcessGeneration::from_wire(7).unwrap(),
             last_sent_event_seq: 0,
             last_received_command_seq: 0,
-            last_terminal_command_seq: 0,
+            last_applied_command_seq: 0,
         };
         let api = ApiHello {
             accepted_generation: agent.generation,
@@ -2855,17 +2878,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_hello_command_cursor_allows_safe_lag_and_rejects_ahead() {
+    async fn validate_hello_command_cursor_requires_applied_lower_bound_and_received_upper_bound() {
         let cursor = CommandCursors {
             received: 10,
-            terminal: 5,
+            applied: 5,
         };
         let agent = AgentHello {
             agent_id: "test".to_owned(),
             generation: ProcessGeneration::from_wire(7).unwrap(),
             last_sent_event_seq: 0,
             last_received_command_seq: cursor.received,
-            last_terminal_command_seq: cursor.terminal,
+            last_applied_command_seq: cursor.applied,
         };
 
         struct StaticSource(CommandCursors);
@@ -2891,16 +2914,18 @@ mod tests {
             }
         }
 
-        // Behind the applied cursor is allowed: the API may have lost a terminal
-        // ACK and will resend already-applied commands for deduplication.
+        // A value before applied+1 would replay an already-applied command.
         let api = ApiHello {
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 5,
         };
-        validate_hello(&StaticSource(cursor), &agent, &api)
-            .await
-            .expect("next_command_seq at applied should be allowed for retransmission");
+        assert!(
+            validate_hello(&StaticSource(cursor), &agent, &api)
+                .await
+                .is_err(),
+            "next_command_seq before applied+1 must be fatal"
+        );
 
         // Exactly applied+1 is the normal catch-up boundary and is allowed.
         let api = ApiHello {
@@ -2912,97 +2937,36 @@ mod tests {
             .await
             .unwrap();
 
-        // Just ahead of applied+1 skips an unapplied command and is fatal.
+        // Any cursor through received+1 is a valid replay/catch-up boundary.
         let api = ApiHello {
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 7,
         };
-        assert!(
-            validate_hello(&StaticSource(cursor), &agent, &api)
-                .await
-                .is_err(),
-            "next_command_seq beyond applied+1 must be fatal"
-        );
+        validate_hello(&StaticSource(cursor), &agent, &api)
+            .await
+            .expect("next_command_seq within the received range must be allowed");
 
-        // Far ahead (skips received-but-unapplied commands) is also fatal.
         let api = ApiHello {
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 11,
         };
-        assert!(
-            validate_hello(&StaticSource(cursor), &agent, &api)
-                .await
-                .is_err(),
-            "next_command_seq far beyond applied+1 must be fatal"
-        );
-    }
+        validate_hello(&StaticSource(cursor), &agent, &api)
+            .await
+            .expect("received+1 must be allowed");
 
-    #[tokio::test]
-    async fn validate_hello_uses_terminal_cursor_for_superseded_and_rejected() {
-        // If the durable state contains superseded/rejected commands at higher
-        // seqs than applied, the terminal cursor (not an applied-only cursor)
-        // must define the durable boundary. Here terminal=7 simulates commands
-        // through seq 7 reaching a terminal status while applied may lag.
-        let cursor = CommandCursors {
-            received: 10,
-            terminal: 7,
-        };
-        let agent = AgentHello {
-            agent_id: "test".to_owned(),
-            generation: ProcessGeneration::from_wire(7).unwrap(),
-            last_sent_event_seq: 0,
-            last_received_command_seq: cursor.received,
-            last_terminal_command_seq: cursor.terminal,
-        };
-
-        struct StaticSource(CommandCursors);
-        #[async_trait]
-        impl DurableSource for StaticSource {
-            async fn event_cursor(&self) -> Result<EventCursors> {
-                Ok(EventCursors { last_sent: 0 })
-            }
-            async fn events_after(
-                &self,
-                _after_seq: u64,
-                _limit: usize,
-            ) -> Result<Vec<OutboundFrame>> {
-                Ok(Vec::new())
-            }
-            async fn command_cursors(&self) -> Result<CommandCursors> {
-                Ok(self.0)
-            }
-        }
-        impl Clone for StaticSource {
-            fn clone(&self) -> Self {
-                Self(self.0)
-            }
-        }
-
-        // Lag at/below terminal is allowed (retransmit or catch-up).
-        for next in [5, 6, 7, 8] {
-            let api = ApiHello {
-                accepted_generation: agent.generation,
-                last_received_event_seq: 0,
-                next_command_seq: next,
-            };
-            validate_hello(&StaticSource(cursor), &agent, &api)
-                .await
-                .expect("next_command_seq <= terminal+1 must be allowed");
-        }
-
-        // Ahead of terminal+1 skips a terminal command and is fatal.
+        // Ahead of received+1 skips a durable command and is fatal.
         let api = ApiHello {
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
-            next_command_seq: 9,
+            next_command_seq: 12,
         };
         assert!(
             validate_hello(&StaticSource(cursor), &agent, &api)
                 .await
                 .is_err(),
-            "next_command_seq beyond terminal+1 must be fatal"
+            "next_command_seq beyond received+1 must be fatal"
         );
     }
 
@@ -3126,7 +3090,7 @@ mod tests {
         let connector = SingleConnectionConnector::new(gateway);
         let source = MockDurableSource::new(CommandCursors {
             received: 0,
-            terminal: 0,
+            applied: 0,
         });
         let mut latch_observer = latch_rx.clone();
         let latch = WatchHydrationLatch::new(latch_rx);
@@ -3181,7 +3145,7 @@ mod tests {
             notify: catch_up_notify.clone(),
             command_cursor: CommandCursors {
                 received: 0,
-                terminal: 0,
+                applied: 0,
             },
         };
 
@@ -3373,7 +3337,7 @@ mod tests {
             async fn command_cursors(&self) -> Result<CommandCursors> {
                 Ok(CommandCursors {
                     received: 0,
-                    terminal: 0,
+                    applied: 0,
                 })
             }
         }
@@ -3612,7 +3576,7 @@ mod tests {
             notify: catch_up_notify,
             command_cursor: CommandCursors {
                 received: 0,
-                terminal: 0,
+                applied: 0,
             },
         };
 

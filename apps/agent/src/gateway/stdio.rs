@@ -209,13 +209,13 @@ async fn write_frame<W: AsyncWrite + Unpin>(output: &mut W, frame: OutboundFrame
 
 /// Compute the `ApiHello` for a stdio (single-connection, no catch-up) peer.
 /// The peer is assumed to have received all events already sent, so catch-up
-/// begins at the durable cursor. The next command starts after the last terminal
+/// begins at the durable cursor. The next command starts after the last applied
 /// durable command.
 pub(crate) fn stdio_hello(hello: &AgentHello) -> ApiHello {
     ApiHello {
         accepted_generation: hello.generation,
         last_received_event_seq: hello.last_sent_event_seq,
-        next_command_seq: hello.last_terminal_command_seq.saturating_add(1),
+        next_command_seq: hello.last_applied_command_seq.saturating_add(1),
     }
 }
 
@@ -253,8 +253,7 @@ where
     R: AsyncBufRead + Unpin,
 {
     let mut frame = read_frame(input, digest_factory.start()).await?;
-    let raw: RawCommandIdentityEnvelope =
-        serde_json::from_slice(&frame.identity).map_err(InvalidCommand)?;
+    let raw = parse_outer_identity(&frame.identity).map_err(InvalidCommand)?;
     if matches!(raw.command, CommandFieldPresence::Missing) || !frame.command_found {
         return Ok(InboundCommand::Invalid {
             seq: raw.seq,
@@ -337,6 +336,11 @@ where
             payload_digest: None,
         }),
     }
+}
+
+fn parse_outer_identity(bytes: &[u8]) -> serde_json::Result<RawCommandIdentityEnvelope> {
+    let identity = parse_command_value(bytes)?;
+    serde_json::from_value(identity)
 }
 
 fn parse_command_value(bytes: &[u8]) -> serde_json::Result<serde_json::Value> {
@@ -778,7 +782,7 @@ impl EnvelopeScanner {
             return false;
         }
 
-        if serde_json::from_slice::<RawCommandIdentityEnvelope>(&self.identity)
+        if parse_outer_identity(&self.identity)
             .is_ok_and(|raw| matches!(raw.command, CommandFieldPresence::Present))
         {
             return true;
@@ -786,7 +790,7 @@ impl EnvelopeScanner {
 
         let mut candidate = Zeroizing::new(self.identity.to_vec());
         candidate.push(b'}');
-        serde_json::from_slice::<RawCommandIdentityEnvelope>(&candidate)
+        parse_outer_identity(&candidate)
             .is_ok_and(|raw| matches!(raw.command, CommandFieldPresence::Present))
     }
 
@@ -979,6 +983,18 @@ mod tests {
         frame
     }
 
+    fn oversized_frame_with_duplicate_seq(total_bytes: usize) -> Vec<u8> {
+        let prefix =
+            br#"{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command":{"type":"user_message","text":""#;
+        let suffix = br#"","attachments":[]},"seq":2}"#;
+        assert!(total_bytes >= prefix.len() + suffix.len());
+        let mut frame = Vec::with_capacity(total_bytes);
+        frame.extend_from_slice(prefix);
+        frame.resize(total_bytes - suffix.len(), b'x');
+        frame.extend_from_slice(suffix);
+        frame
+    }
+
     fn envelope(command: serde_json::Value) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
             "seq": 1,
@@ -1008,6 +1024,21 @@ mod tests {
                 command: Command::Abort {},
             })
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_outer_identity_keys() {
+        for raw in [
+            r#"{"seq":1,"seq":2,"command_id":"00000000-0000-4000-8000-000000000001","command":{"type":"abort"}}"#,
+            r#"{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command_id":"00000000-0000-4000-8000-000000000002","command":{"type":"abort"}}"#,
+            r#"{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command":{"type":"abort"},"command":{"type":"abort"}}"#,
+        ] {
+            let mut input = BufReader::with_capacity(3, raw.as_bytes());
+            assert!(
+                read_test_command(&mut input).await.is_err(),
+                "duplicate outer key must close the epoch: {raw}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1484,6 +1515,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_duplicate_identity_cannot_mix_an_early_identity_with_later_body() {
+        let mut bytes = oversized_frame_with_duplicate_seq(MAX_FRAME_BYTES + 1024);
+        bytes.push(b'\n');
+        let mut input = BufReader::with_capacity(13, bytes.as_slice());
+
+        assert!(
+            read_test_command(&mut input).await.is_err(),
+            "a duplicate discovered while draining must not become a typed rejection"
+        );
+    }
+
+    #[tokio::test]
     async fn continues_after_an_oversized_user_command() {
         let mut bytes = envelope(serde_json::json!({
             "type": "user_message",
@@ -1518,13 +1561,13 @@ mod tests {
     }
 
     #[test]
-    fn stdio_hello_returns_last_terminal_plus_one_and_durable_event_cursor() {
+    fn stdio_hello_returns_last_applied_plus_one_and_durable_event_cursor() {
         let hello = AgentHello {
             agent_id: "test-agent".to_owned(),
             generation: ProcessGeneration::from_wire(7).unwrap(),
             last_sent_event_seq: 42,
             last_received_command_seq: 10,
-            last_terminal_command_seq: 9,
+            last_applied_command_seq: 9,
         };
         let api = stdio_hello(&hello);
         assert_eq!(

@@ -108,31 +108,28 @@ impl GatewayConnector for WebSocketConnector {
     ) -> Result<Self::Connection, ConnectorError> {
         init_crypto_provider()?;
 
-        let (scheme, _rest) = self
-            .url
-            .split_once("://")
-            .ok_or_else(|| ConnectorError::Other(anyhow!("websocket url is missing a scheme")))?;
+        let (scheme, _rest) = self.url.split_once("://").ok_or_else(|| {
+            ConnectorError::InvalidConfiguration(anyhow!("websocket url is missing a scheme"))
+        })?;
         let scheme_lower = scheme.to_ascii_lowercase();
         match scheme_lower.as_str() {
             "wss" => {}
             "ws" if self.allow_insecure => {}
             "ws" => {
-                return Err(ConnectorError::Other(anyhow!(
+                return Err(ConnectorError::InvalidConfiguration(anyhow!(
                     "refusing to send bearer credential over insecure ws://"
                 )));
             }
             _ => {
-                return Err(ConnectorError::Other(anyhow!(
+                return Err(ConnectorError::InvalidConfiguration(anyhow!(
                     "unsupported websocket scheme: {scheme}"
                 )));
             }
         }
 
-        let mut request = self
-            .url
-            .as_str()
-            .into_client_request()
-            .map_err(|e| ConnectorError::Other(anyhow!("invalid websocket url: {e}")))?;
+        let mut request = self.url.as_str().into_client_request().map_err(|e| {
+            ConnectorError::InvalidConfiguration(anyhow!("invalid websocket url: {e}"))
+        })?;
 
         let mut auth_value = Zeroizing::new(Vec::with_capacity(7 + credential.token().len()));
         auth_value.extend_from_slice(b"Bearer ");
@@ -351,7 +348,7 @@ mod tests {
         let result = connector.connect(GatewayCredential::new("token")).await;
         let err = result.err().expect("connect must fail");
         assert!(
-            matches!(err, super::super::ConnectorError::Other(ref e) if e.to_string().contains("insecure ws://")),
+            matches!(err, super::super::ConnectorError::InvalidConfiguration(ref e) if e.to_string().contains("insecure ws://")),
             "unexpected error: {err:?}"
         );
     }
@@ -367,7 +364,7 @@ mod tests {
             let result = connector.connect(GatewayCredential::new("token")).await;
             let err = result.err().expect("connect must fail");
             assert!(
-                matches!(err, super::super::ConnectorError::Other(ref e) if e.to_string().contains("insecure ws://")),
+                matches!(err, super::super::ConnectorError::InvalidConfiguration(ref e) if e.to_string().contains("insecure ws://")),
                 "for {url}, unexpected error: {err:?}"
             );
         }
@@ -387,10 +384,28 @@ mod tests {
             let err = result.err().expect("connect must fail");
             let msg = err.to_string().to_ascii_lowercase();
             assert!(
+                matches!(err, super::super::ConnectorError::InvalidConfiguration(_)),
+                "for {url}, static URL failure must be fatal configuration: {err:?}"
+            );
+            assert!(
                 msg.contains(expected),
                 "for {url}, expected error containing '{expected}', got {err:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_websocket_url_as_fatal_configuration() {
+        let mut connector = WebSocketConnector::new("wss://[::1", Arc::new(TestDigestFactory));
+        let err = connector
+            .connect(GatewayCredential::new("token"))
+            .await
+            .err()
+            .expect("malformed URL must fail before connection attempts");
+        assert!(
+            matches!(err, super::super::ConnectorError::InvalidConfiguration(_)),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -411,7 +426,7 @@ mod tests {
             generation: ProcessGeneration::from_wire(7).unwrap(),
             last_sent_event_seq: 1,
             last_received_command_seq: 0,
-            last_terminal_command_seq: 1,
+            last_applied_command_seq: 1,
         }
     }
 
