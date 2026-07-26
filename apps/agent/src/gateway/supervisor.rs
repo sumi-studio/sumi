@@ -27,6 +27,7 @@ use zeroize::Zeroize;
 
 use crate::runtime::contracts::ProcessGeneration;
 
+use super::wire::MAX_JSON_SAFE_INTEGER;
 use super::{Gateway, GatewayReader, GatewayWriter, HelloError, InboundCommand, OutboundFrame};
 
 pub mod seams;
@@ -87,13 +88,21 @@ impl Drop for GatewayCredential {
 /// Agent → API hello. `generation` is the `ProcessGeneration` bound to the
 /// credential claim. All seq values are `u64` and are validated against the
 /// durable source before the epoch proceeds.
+///
+/// The `json_safe_*` helpers enforce the T24 JSON-safe-integer boundary on the
+/// wire without narrowing the broader `ProcessGeneration`/`u64` domain used by
+/// durable state.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentHello {
     pub agent_id: String,
+    #[serde(with = "json_safe_generation")]
     pub generation: ProcessGeneration,
+    #[serde(with = "json_safe_u64")]
     pub last_sent_event_seq: u64,
+    #[serde(with = "json_safe_u64")]
     pub last_received_command_seq: u64,
+    #[serde(with = "json_safe_u64")]
     pub last_applied_command_seq: u64,
 }
 
@@ -101,9 +110,74 @@ pub struct AgentHello {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApiHello {
+    #[serde(with = "json_safe_generation")]
     pub accepted_generation: ProcessGeneration,
+    #[serde(with = "json_safe_u64")]
     pub last_received_event_seq: u64,
+    #[serde(with = "json_safe_u64")]
     pub next_command_seq: u64,
+}
+
+mod json_safe_generation {
+    use serde::de::Error as DeError;
+    use serde::ser::Error as SerError;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use crate::runtime::contracts::ProcessGeneration;
+
+    use super::MAX_JSON_SAFE_INTEGER;
+
+    pub fn serialize<S: Serializer>(
+        value: &ProcessGeneration,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let n = value.as_u64();
+        if n > MAX_JSON_SAFE_INTEGER {
+            return Err(S::Error::custom(
+                "process generation exceeds the JSON-safe integer range",
+            ));
+        }
+        serializer.serialize_u64(n)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<ProcessGeneration, D::Error> {
+        let n = u64::deserialize(deserializer)?;
+        if n > MAX_JSON_SAFE_INTEGER {
+            return Err(D::Error::custom(
+                "process generation exceeds the JSON-safe integer range",
+            ));
+        }
+        ProcessGeneration::from_wire(n).map_err(|e| D::Error::custom(e.to_string()))
+    }
+}
+
+mod json_safe_u64 {
+    use serde::de::Error as DeError;
+    use serde::ser::Error as SerError;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::MAX_JSON_SAFE_INTEGER;
+
+    pub fn serialize<S: Serializer>(value: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+        if *value > MAX_JSON_SAFE_INTEGER {
+            return Err(S::Error::custom(
+                "sequence exceeds the JSON-safe integer range",
+            ));
+        }
+        serializer.serialize_u64(*value)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+        let value = u64::deserialize(deserializer)?;
+        if value > MAX_JSON_SAFE_INTEGER {
+            return Err(D::Error::custom(
+                "sequence exceeds the JSON-safe integer range",
+            ));
+        }
+        Ok(value)
+    }
 }
 
 /// Cursors returned by the durable command source.
@@ -212,10 +286,39 @@ impl Default for SupervisorConfig {
     }
 }
 
+/// Sender returned by `SupervisorHandle::events`.
+///
+/// Each frame is tagged with the `online` value observed at admission time
+/// (just before the frame is enqueued in the supervisor's event channel) so
+/// that the `event_forwarder` can drop pre-Online volatile frames using the
+/// admission boundary instead of a later, racy watch-channel observation.
+#[derive(Clone)]
+pub struct EventSender {
+    tx: mpsc::Sender<(DeliveryEpoch, bool, OutboundFrame)>,
+    online: watch::Receiver<bool>,
+}
+
+impl EventSender {
+    /// Enqueue `frame` for delivery in `epoch`. The returned future resolves
+    /// once the frame has been admitted; it preserves bounded backpressure.
+    pub async fn send(
+        &self,
+        (epoch, frame): (DeliveryEpoch, OutboundFrame),
+    ) -> Result<(), mpsc::error::SendError<(DeliveryEpoch, OutboundFrame)>> {
+        let permit = match self.tx.reserve().await {
+            Ok(p) => p,
+            Err(_) => return Err(mpsc::error::SendError((epoch, frame))),
+        };
+        let online_at_enqueue = *self.online.borrow();
+        permit.send((epoch, online_at_enqueue, frame));
+        Ok(())
+    }
+}
+
 /// Handle to a spawned `ConnectionSupervisor`.
 pub struct SupervisorHandle {
     pub commands: mpsc::Receiver<InboundCommand>,
-    pub events: mpsc::Sender<(DeliveryEpoch, OutboundFrame)>,
+    pub events: EventSender,
     pub epochs: watch::Receiver<Option<DeliveryEpoch>>,
     /// True once the current epoch has caught up to the durable event cursor.
     pub online: watch::Receiver<bool>,
@@ -322,7 +425,10 @@ where
         let task = tokio::spawn(self.run(commands_tx, events_rx));
         SupervisorHandle {
             commands: commands_rx,
-            events: events_tx,
+            events: EventSender {
+                tx: events_tx,
+                online: online_rx.clone(),
+            },
             epochs: epochs_rx,
             online: online_rx,
             cancel,
@@ -333,17 +439,11 @@ where
     pub async fn run(
         mut self,
         commands_tx: mpsc::Sender<InboundCommand>,
-        events_rx: mpsc::Receiver<(DeliveryEpoch, OutboundFrame)>,
+        events_rx: mpsc::Receiver<(DeliveryEpoch, bool, OutboundFrame)>,
     ) -> Result<()> {
         let current_writer = self.current_writer.clone();
         let cancel = self.cancel.clone();
-        let online_rx = self.online.subscribe();
-        let forwarder = tokio::spawn(event_forwarder(
-            events_rx,
-            current_writer,
-            cancel,
-            online_rx,
-        ));
+        let forwarder = tokio::spawn(event_forwarder(events_rx, current_writer, cancel));
 
         // run_loop owns all per-epoch cancellation and cleanup; await it so that
         // connect_and_run_epoch gets a chance to publish Online=false and clear
@@ -744,10 +844,9 @@ enum SupervisorError {
 }
 
 async fn event_forwarder(
-    mut event_rx: mpsc::Receiver<(DeliveryEpoch, OutboundFrame)>,
+    mut event_rx: mpsc::Receiver<(DeliveryEpoch, bool, OutboundFrame)>,
     current_writer: CurrentWriterSlot,
     cancel: CancellationToken,
-    online: watch::Receiver<bool>,
 ) {
     loop {
         let result = tokio::select! {
@@ -755,7 +854,7 @@ async fn event_forwarder(
             _ = cancel.cancelled() => break,
             result = event_rx.recv() => result,
         };
-        let Some((epoch, frame)) = result else {
+        let Some((epoch, online_at_enqueue, frame)) = result else {
             break;
         };
 
@@ -772,12 +871,15 @@ async fn event_forwarder(
         let Some(sender) = sender else {
             continue;
         };
-        // Volatile/delta Events (no seq) that arrive before the epoch has caught
-        // up are stale; drop them. Durable Events (seq present) are held in the
+        // Volatile/delta Events (no seq) are only live if they were admitted
+        // while the epoch was already Online. The boolean was captured at the
+        // event's admission/enqueue boundary, so a pre-Online volatile frame
+        // cannot become live merely because the forwarder was backpressured
+        // until after Online. Durable Events (seq present) are held in the
         // writer channel so writer_task can deduplicate them against the durable
         // cursor after Online. CommandAck frames are terminal command feedback
         // and must be delivered even while catch-up is in progress.
-        if !*online.borrow()
+        if !online_at_enqueue
             && let OutboundFrame::Event { envelope } = &frame
             && envelope.seq.is_none()
         {
@@ -1553,7 +1655,7 @@ mod tests {
 
     use anyhow::{Result, anyhow};
     use sha2::{Digest, Sha256};
-    use tokio::sync::watch;
+    use tokio::sync::{mpsc, watch};
 
     use super::*;
     use crate::gateway::stdio::SingleConnectionConnector;
@@ -2550,7 +2652,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_supervisor_handle_cancels_and_aborts_task() {
         let (_commands_tx, commands) = mpsc::channel(1);
-        let (events, _events_rx) = mpsc::channel(1);
+        let (events, _events_rx) = mpsc::channel::<(DeliveryEpoch, bool, OutboundFrame)>(1);
         let (_epochs_tx, epochs) = watch::channel(None);
         let (_online_tx, online) = watch::channel(false);
         let cancel = CancellationToken::new();
@@ -2565,7 +2667,10 @@ mod tests {
 
         drop(SupervisorHandle {
             commands,
-            events,
+            events: EventSender {
+                tx: events,
+                online: online.clone(),
+            },
             epochs,
             online,
             cancel,
@@ -2580,6 +2685,125 @@ mod tests {
         })
         .await
         .expect("aborted supervisor task must be dropped");
+    }
+
+    #[tokio::test]
+    async fn event_forwarder_admission_boundary_drops_pre_online_volatile() {
+        // Deterministic counterexample: a pre-Online volatile frame is queued
+        // behind work that blocks the forwarder. When Online flips before the
+        // forwarder unblocks, an admission-boundary rule drops the volatile; a
+        // later observation of the `online` watch would have wrongly forwarded it.
+        let epoch = DeliveryEpoch(1);
+        let (events_tx, events_rx) = mpsc::channel::<(DeliveryEpoch, bool, OutboundFrame)>(1);
+        // Pre-fill a capacity-one writer channel so the forwarder blocks on the
+        // ack until the consumer is released, simulating backpressure across the
+        // Online boundary.
+        let (writer_tx, mut writer_rx) = mpsc::channel::<OutboundFrame>(1);
+        let blocker = OutboundFrame::CommandAck {
+            ack: CommandAck {
+                seq: 0,
+                command_id: "00000000-0000-4000-8000-000000000000".to_owned(),
+                status: CommandAckStatus::Received,
+                reject_reason: None,
+            },
+        };
+        writer_tx
+            .send(blocker)
+            .await
+            .expect("writer channel should accept the blocker");
+        let current_writer: CurrentWriterSlot =
+            Arc::new(std::sync::Mutex::new(Some((epoch, writer_tx))));
+        let cancel = CancellationToken::new();
+
+        let forwarder = tokio::spawn(event_forwarder(
+            events_rx,
+            current_writer.clone(),
+            cancel.child_token(),
+        ));
+
+        let ack = OutboundFrame::CommandAck {
+            ack: CommandAck {
+                seq: 1,
+                command_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+                status: CommandAckStatus::Received,
+                reject_reason: None,
+            },
+        };
+        let volatile = OutboundFrame::Event {
+            envelope: Envelope {
+                seq: None,
+                conversation_id: "conversation-1".to_owned(),
+                event: serde_json::json!({"type": "delta"}),
+            },
+        };
+
+        // Admit both frames while Offline. The ack blocks behind the pre-filled
+        // writer channel; the volatile sits in events_rx behind the ack.
+        events_tx
+            .send((epoch, false, ack))
+            .await
+            .expect("ack should be admitted while offline");
+        events_tx
+            .send((epoch, false, volatile.clone()))
+            .await
+            .expect("volatile should be queued while offline");
+
+        // Simulate Online flipping while the forwarder is still blocked.
+        // With the old watch-channel-based rule the forwarder would read `true`
+        // when it finally dequeued the volatile and would forward it live. The
+        // admission boundary below must instead drop it.
+
+        // Release the writer by consuming the blocker, then consume the ack. The
+        // forwarder unblocks, dequeues the volatile, and must drop it because it
+        // was admitted offline.
+        let received_blocker = writer_rx.recv().await.expect("blocker must be present");
+        assert!(matches!(received_blocker, OutboundFrame::CommandAck { .. }));
+        let received_ack = writer_rx.recv().await.expect("ack must be delivered");
+        assert!(matches!(received_ack, OutboundFrame::CommandAck { .. }));
+
+        // Give the forwarder a chance to process the volatile, then close the
+        // event channel and join the forwarder so the writer_rx closes.
+        drop(events_tx);
+        tokio::time::timeout(Duration::from_millis(100), forwarder)
+            .await
+            .expect("forwarder should exit")
+            .expect("forwarder should not panic");
+
+        // Drop the current_writer slot so the remaining writer_tx clone is
+        // released and writer_rx.recv() returns None when no frame was sent.
+        drop(current_writer);
+        assert!(
+            writer_rx.recv().await.is_none(),
+            "pre-Online volatile must be dropped, not delivered after Online"
+        );
+
+        // Positive case: the same volatile frame admitted while Online is delivered.
+        let (events_tx2, events_rx2) = mpsc::channel::<(DeliveryEpoch, bool, OutboundFrame)>(1);
+        let (writer_tx2, mut writer_rx2) = mpsc::channel::<OutboundFrame>(1);
+        let current_writer2: CurrentWriterSlot =
+            Arc::new(std::sync::Mutex::new(Some((epoch, writer_tx2))));
+        let cancel2 = CancellationToken::new();
+        let forwarder2 = tokio::spawn(event_forwarder(
+            events_rx2,
+            current_writer2,
+            cancel2.child_token(),
+        ));
+
+        events_tx2
+            .send((epoch, true, volatile))
+            .await
+            .expect("volatile admitted while Online should be accepted");
+        let received = writer_rx2
+            .recv()
+            .await
+            .expect("post-Online volatile must be delivered");
+        assert!(matches!(received, OutboundFrame::Event { .. }));
+
+        drop(events_tx2);
+        tokio::time::timeout(Duration::from_millis(100), forwarder2)
+            .await
+            .expect("forwarder should exit")
+            .expect("forwarder should not panic");
     }
 
     #[tokio::test]
@@ -3214,6 +3438,109 @@ mod tests {
             r#"{{"agent_id":"x","generation":{oversized},"last_sent_event_seq":0,"last_received_command_seq":0,"last_applied_command_seq":0}}"#
         );
         assert!(serde_json::from_str::<AgentHello>(&agent_json).is_err());
+    }
+
+    #[test]
+    fn hello_dto_json_safe_integer_boundaries() {
+        // MAX_JSON_SAFE_INTEGER is exactly representable; MAX+1 must be rejected
+        // on both inbound (deserialize) and outbound (serialize) for generation
+        // and every hello seq field.
+        let max = MAX_JSON_SAFE_INTEGER;
+        let over = max + 1;
+        let over_gen = ProcessGeneration::from_wire(over).unwrap();
+
+        let agent_max = AgentHello {
+            agent_id: "a".to_owned(),
+            generation: ProcessGeneration::from_wire(max).unwrap(),
+            last_sent_event_seq: max,
+            last_received_command_seq: max,
+            last_applied_command_seq: max,
+        };
+        let api_max = ApiHello {
+            accepted_generation: ProcessGeneration::from_wire(max).unwrap(),
+            last_received_event_seq: max,
+            next_command_seq: max,
+        };
+
+        assert!(serde_json::to_string(&agent_max).is_ok());
+        assert!(serde_json::to_string(&api_max).is_ok());
+
+        let agent_json_max = format!(
+            r#"{{"agent_id":"a","generation":{max},"last_sent_event_seq":{max},"last_received_command_seq":{max},"last_applied_command_seq":{max}}}"#
+        );
+        assert!(serde_json::from_str::<AgentHello>(&agent_json_max).is_ok());
+
+        let api_json_max = format!(
+            r#"{{"accepted_generation":{max},"last_received_event_seq":{max},"next_command_seq":{max}}}"#
+        );
+        assert!(serde_json::from_str::<ApiHello>(&api_json_max).is_ok());
+
+        // Outbound serialization at MAX+1 must fail for every field.
+        let mut agent_over = agent_max.clone();
+        agent_over.generation = over_gen;
+        assert!(serde_json::to_string(&agent_over).is_err());
+        agent_over.generation = agent_max.generation;
+
+        agent_over.last_sent_event_seq = over;
+        assert!(serde_json::to_string(&agent_over).is_err());
+        agent_over.last_sent_event_seq = max;
+
+        agent_over.last_received_command_seq = over;
+        assert!(serde_json::to_string(&agent_over).is_err());
+        agent_over.last_received_command_seq = max;
+
+        agent_over.last_applied_command_seq = over;
+        assert!(serde_json::to_string(&agent_over).is_err());
+
+        let mut api_over = api_max.clone();
+        api_over.accepted_generation = over_gen;
+        assert!(serde_json::to_string(&api_over).is_err());
+        api_over.accepted_generation = api_max.accepted_generation;
+
+        api_over.last_received_event_seq = over;
+        assert!(serde_json::to_string(&api_over).is_err());
+        api_over.last_received_event_seq = max;
+
+        api_over.next_command_seq = over;
+        assert!(serde_json::to_string(&api_over).is_err());
+
+        // Inbound deserialization at MAX+1 must fail for every field.
+        let agent_json_over_gen = format!(
+            r#"{{"agent_id":"a","generation":{over},"last_sent_event_seq":{max},"last_received_command_seq":{max},"last_applied_command_seq":{max}}}"#
+        );
+        assert!(serde_json::from_str::<AgentHello>(&agent_json_over_gen).is_err());
+
+        let agent_json_over_seq = format!(
+            r#"{{"agent_id":"a","generation":{max},"last_sent_event_seq":{over},"last_received_command_seq":{over},"last_applied_command_seq":{over}}}"#
+        );
+        assert!(serde_json::from_str::<AgentHello>(&agent_json_over_seq).is_err());
+
+        let api_json_over_gen = format!(
+            r#"{{"accepted_generation":{over},"last_received_event_seq":{max},"next_command_seq":{max}}}"#
+        );
+        assert!(serde_json::from_str::<ApiHello>(&api_json_over_gen).is_err());
+
+        let api_json_over_seq = format!(
+            r#"{{"accepted_generation":{max},"last_received_event_seq":{over},"next_command_seq":{over}}}"#
+        );
+        assert!(serde_json::from_str::<ApiHello>(&api_json_over_seq).is_err());
+    }
+
+    #[test]
+    fn hello_dto_rejects_unknown_fields_and_trailing_data() {
+        // Unknown fields continue to be rejected.
+        let agent_unknown = r#"{"agent_id":"a","generation":1,"last_sent_event_seq":0,"last_received_command_seq":0,"last_applied_command_seq":0,"extra":1}"#;
+        assert!(serde_json::from_str::<AgentHello>(agent_unknown).is_err());
+
+        let api_unknown = r#"{"accepted_generation":1,"last_received_event_seq":0,"next_command_seq":1,"extra":1}"#;
+        assert!(serde_json::from_str::<ApiHello>(api_unknown).is_err());
+
+        // Trailing data after a valid object must also be rejected.
+        let agent_trailing = r#"{"agent_id":"a","generation":1,"last_sent_event_seq":0,"last_received_command_seq":0,"last_applied_command_seq":0}{"extra":1}"#;
+        assert!(serde_json::from_str::<AgentHello>(agent_trailing).is_err());
+
+        let api_trailing = r#"{"accepted_generation":1,"last_received_event_seq":0,"next_command_seq":1}{"extra":1}"#;
+        assert!(serde_json::from_str::<ApiHello>(api_trailing).is_err());
     }
 
     #[tokio::test]
@@ -4338,7 +4665,7 @@ mod tests {
 
     #[tokio::test]
     async fn event_forwarder_panic_is_propagated() {
-        let (tx, rx) = mpsc::channel::<(DeliveryEpoch, OutboundFrame)>(1);
+        let (tx, rx) = mpsc::channel::<(DeliveryEpoch, bool, OutboundFrame)>(1);
         let current_writer: CurrentWriterSlot = Arc::new(std::sync::Mutex::new(None));
 
         // Poison the writer mutex so event_forwarder panics when it locks.
@@ -4350,12 +4677,13 @@ mod tests {
         .join()
         .unwrap_err();
 
-        let (_online_tx, online_rx) = watch::channel(false);
         let cancel = CancellationToken::new();
-        let forwarder = tokio::spawn(event_forwarder(rx, current_writer, cancel, online_rx));
+        let forwarder = tokio::spawn(event_forwarder(rx, current_writer, cancel));
 
         // Send a frame so event_forwarder tries to lock and panics.
-        tx.send((DeliveryEpoch(1), event_frame(1))).await.unwrap();
+        tx.send((DeliveryEpoch(1), false, event_frame(1)))
+            .await
+            .unwrap();
 
         let result = tokio::time::timeout(Duration::from_secs(1), forwarder)
             .await
