@@ -260,6 +260,9 @@ impl SuffixRecovery {
                 ref command_ids,
             } = step
             {
+                if command_ids.is_empty() {
+                    bail!("InjectStoredGroup for {run_id}/{turn_id} produced no command_ids");
+                }
                 let key = (
                     run_id.clone(),
                     turn_id.clone(),
@@ -268,9 +271,6 @@ impl SuffixRecovery {
                 );
                 if !injected_groups.insert(key) {
                     continue;
-                }
-                if command_ids.is_empty() {
-                    bail!("InjectStoredGroup for {run_id}/{turn_id} produced no command_ids");
                 }
             }
             steps.push(step);

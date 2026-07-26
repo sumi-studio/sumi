@@ -2631,12 +2631,24 @@ impl EventWriter {
         assistant: &PublicAssistantMessage,
     ) -> Result<()> {
         match &fragment.payload {
-            ProviderContextPayload::OpenAiCompactedWindow { .. }
-            | ProviderContextPayload::AnthropicCompaction { .. } => {
+            ProviderContextPayload::OpenAiCompactedWindow { .. } => {
                 if fragment.wire_item_index.is_some() {
                     bail!(
                         "native compaction provider context must be unanchored (wire_item_index=None)"
                     );
+                }
+                if assistant.origin.protocol != ApiProtocol::OpenAiResponses {
+                    bail!("OpenAI native compaction requires an OpenAI Responses assistant origin");
+                }
+            }
+            ProviderContextPayload::AnthropicCompaction { .. } => {
+                if fragment.wire_item_index.is_some() {
+                    bail!(
+                        "native compaction provider context must be unanchored (wire_item_index=None)"
+                    );
+                }
+                if assistant.origin.protocol != ApiProtocol::AnthropicMessages {
+                    bail!("Anthropic native compaction requires an Anthropic assistant origin");
                 }
             }
             ProviderContextPayload::EncryptedReasoning { protocol, .. } => {
@@ -15392,7 +15404,11 @@ mod tests {
     async fn provider_context_key_material_replaced_after_prepare_is_rejected_in_transaction() {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
-        let message = assistant_message(StopReason::Stop);
+        let mut message = assistant_message(StopReason::Stop);
+        let PublicMessage::Assistant(assistant) = &mut message else {
+            unreachable!("assistant fixture must be an assistant message");
+        };
+        assistant.origin.protocol = ApiProtocol::OpenAiResponses;
         let message_id = "assistant-provider-context-key-race";
         let fragment = ProviderContextFragment {
             wire_item_index: None,
@@ -19161,7 +19177,7 @@ mod tests {
             provider: "provider-context".to_owned(),
             origin: ProviderOrigin {
                 provider_instance_id: "provider-instance-context".to_owned(),
-                protocol: ApiProtocol::OpenAiChatCompletions,
+                protocol: ApiProtocol::OpenAiResponses,
                 model: "model-context".to_owned(),
             },
             usage: Usage::default(),
@@ -19181,7 +19197,7 @@ mod tests {
         let reasoning = ProviderContextFragment {
             wire_item_index: Some(0),
             payload: ProviderContextPayload::EncryptedReasoning {
-                protocol: ApiProtocol::OpenAiChatCompletions,
+                protocol: ApiProtocol::OpenAiResponses,
                 item: json!({"text": "plain reasoning"}),
             },
         };
@@ -20019,6 +20035,51 @@ mod tests {
         assert!(error.to_string().contains("unanchored"));
     }
 
+    #[test]
+    fn native_compaction_requires_its_provider_protocol() {
+        let PublicMessage::Assistant(mut responses) = assistant_message(StopReason::Stop) else {
+            unreachable!("assistant fixture must be an assistant message");
+        };
+        responses.origin.protocol = ApiProtocol::OpenAiResponses;
+        let openai_window = ProviderContextFragment {
+            wire_item_index: None,
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({"type": "compaction"})],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 1,
+                    context_fingerprint: "fp-openai".to_owned(),
+                },
+            },
+        };
+        let anthropic_window = ProviderContextFragment {
+            wire_item_index: None,
+            payload: ProviderContextPayload::AnthropicCompaction {
+                block: json!({"type": "compaction"}),
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 1,
+                    context_fingerprint: "fp-anthropic".to_owned(),
+                },
+            },
+        };
+
+        assert!(
+            EventWriter::validate_provider_context_fragment(&openai_window, &responses).is_ok(),
+            "Responses native compaction must match a Responses assistant"
+        );
+        let error = EventWriter::validate_provider_context_fragment(&anthropic_window, &responses)
+            .expect_err("Anthropic native compaction must not attach to a Responses assistant");
+        assert!(error.to_string().contains("Anthropic"));
+
+        responses.origin.protocol = ApiProtocol::AnthropicMessages;
+        assert!(
+            EventWriter::validate_provider_context_fragment(&anthropic_window, &responses).is_ok(),
+            "Anthropic native compaction must match an Anthropic assistant"
+        );
+        let error = EventWriter::validate_provider_context_fragment(&openai_window, &responses)
+            .expect_err("Responses native compaction must not attach to an Anthropic assistant");
+        assert!(error.to_string().contains("OpenAI"));
+    }
+
     #[tokio::test]
     async fn message_end_rejects_encrypted_reasoning_without_wire_item_index() {
         let store = test_store().await;
@@ -20496,7 +20557,11 @@ mod tests {
 
         let run_id = format!("run-{command_id}");
         let turn_id = format!("turn-{command_id}");
-        let message = assistant_message(StopReason::Stop);
+        let mut message = assistant_message(StopReason::Stop);
+        let PublicMessage::Assistant(assistant) = &mut message else {
+            unreachable!("assistant fixture must be an assistant message");
+        };
+        assistant.origin.protocol = ApiProtocol::OpenAiResponses;
         let message_id = "assistant-reasoning-hydrate";
         // Persist deliberately out of wire order. Hydration must reconstruct
         // the provider send order by `(message_seq, wire_item_index, ordinal)`
@@ -20505,14 +20570,14 @@ mod tests {
             ProviderContextFragment {
                 wire_item_index: Some(2),
                 payload: ProviderContextPayload::EncryptedReasoning {
-                    protocol: ApiProtocol::OpenAiChatCompletions,
+                    protocol: ApiProtocol::OpenAiResponses,
                     item: json!({"encrypted_content": "opaque-later"}),
                 },
             },
             ProviderContextFragment {
                 wire_item_index: Some(1),
                 payload: ProviderContextPayload::EncryptedReasoning {
-                    protocol: ApiProtocol::OpenAiChatCompletions,
+                    protocol: ApiProtocol::OpenAiResponses,
                     item: json!({"encrypted_content": "opaque-earlier"}),
                 },
             },
