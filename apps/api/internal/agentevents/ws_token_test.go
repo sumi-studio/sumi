@@ -1,12 +1,8 @@
 package agentevents
 
 import (
-	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
-
-	"github.com/gorilla/websocket"
 )
 
 func TestWebSocketRealTokenHelloAndCatchUp(t *testing.T) {
@@ -27,12 +23,11 @@ func TestWebSocketRealTokenHelloAndCatchUp(t *testing.T) {
 	}
 	cs.pushCommand(cmd)
 
-	server := httptest.NewServer(srv)
+	server := startTestServer(t, srv)
 	defer server.Close()
 
-	wsURL := strings.Replace(server.URL, "http", "ws", 1) + "/agent/ws"
 	header := map[string][]string{"Authorization": {"Bearer " + token}}
-	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, header)
+	conn, resp, err := dialTestWS(t, server, header)
 	if err != nil {
 		t.Fatalf("dial: %v (status %d)", err, resp.StatusCode)
 	}
@@ -76,12 +71,11 @@ func TestWebSocketRealTokenExpiredIsRejected(t *testing.T) {
 	}
 	srv, _, token := newTokenVerifiedTestServer(t, claims)
 
-	server := httptest.NewServer(srv)
+	server := startTestServer(t, srv)
 	defer server.Close()
 
-	wsURL := strings.Replace(server.URL, "http", "ws", 1) + "/agent/ws"
 	header := map[string][]string{"Authorization": {"Bearer " + token}}
-	_, resp, err := websocket.DefaultDialer.Dial(wsURL, header)
+	_, resp, err := dialTestWS(t, server, header)
 	if err == nil {
 		t.Fatal("expected expired token to be rejected before upgrade")
 	}
@@ -101,12 +95,11 @@ func TestWebSocketRealTokenHelloGenerationMismatchCloses(t *testing.T) {
 	}
 	srv, _, token := newTokenVerifiedTestServer(t, claims)
 
-	server := httptest.NewServer(srv)
+	server := startTestServer(t, srv)
 	defer server.Close()
 
-	wsURL := strings.Replace(server.URL, "http", "ws", 1) + "/agent/ws"
 	header := map[string][]string{"Authorization": {"Bearer " + token}}
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+	conn, _, err := dialTestWS(t, server, header)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}

@@ -33,7 +33,7 @@ export type AgentEvent =
   | {
       type: "turn_end";
       message: null | PublicMessage;
-      tool_results: ToolResultMessage[];
+      tool_results: ToolResultPayload[];
     }
   | {
       type: "message_start";
@@ -176,6 +176,13 @@ export type ToolArgumentError =
  */
 export type ApiProtocol = "open_ai_chat_completions" | "open_ai_responses" | "anthropic_messages";
 /**
+ * non-negative integer representable exactly by JavaScript number clients
+ *
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "JsonSafeInteger".
+ */
+export type JsonSafeInteger = number;
+/**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "StopReason".
  */
@@ -187,44 +194,44 @@ export type StopReason = "stop" | "length" | "tool_use" | "error" | "aborted";
 export type PublicStreamEvent =
   | {
       type: "text_start";
-      content_index: number;
+      content_index: ContentIndex;
     }
   | {
       type: "text_delta";
-      content_index: number;
+      content_index: ContentIndex;
       delta: string;
     }
   | {
       type: "text_end";
-      content_index: number;
+      content_index: ContentIndex;
       content: string;
     }
   | {
       type: "thinking_start";
-      content_index: number;
+      content_index: ContentIndex;
     }
   | {
       type: "thinking_delta";
-      content_index: number;
+      content_index: ContentIndex;
       delta: string;
     }
   | {
       type: "thinking_end";
-      content_index: number;
+      content_index: ContentIndex;
       content: string;
     }
   | {
       type: "tool_call_start";
-      content_index: number;
+      content_index: ContentIndex;
     }
   | {
       type: "tool_call_delta";
-      content_index: number;
+      content_index: ContentIndex;
       delta: string;
     }
   | {
       type: "tool_call_preview";
-      content_index: number;
+      content_index: ContentIndex;
       /**
        * any JSON value
        */
@@ -234,28 +241,35 @@ export type PublicStreamEvent =
     }
   | {
       type: "tool_call_end";
-      content_index: number;
+      content_index: ContentIndex;
       tool_call: ToolCall;
     }
   | {
       type: "tool_call_rejected";
-      content_index: number;
+      content_index: ContentIndex;
       rejected: RejectedToolCall;
     }
   | {
       type: "reasoning_summary_start";
-      content_index: number;
+      content_index: ContentIndex;
     }
   | {
       type: "reasoning_summary_delta";
-      content_index: number;
+      content_index: ContentIndex;
       delta: string;
     }
   | {
       type: "reasoning_summary_end";
-      content_index: number;
+      content_index: ContentIndex;
       content: string;
     };
+/**
+ * non-negative index representable exactly by JavaScript number clients
+ *
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "ContentIndex".
+ */
+export type ContentIndex = number;
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "ReviewProjection".
@@ -421,12 +435,12 @@ export interface ProviderOrigin {
  * via the `definition` "Usage".
  */
 export interface Usage {
-  input: number;
-  output: number;
-  cache_read: number;
-  cache_write: number;
-  reasoning: number;
-  total_tokens: number;
+  input: JsonSafeInteger;
+  output: JsonSafeInteger;
+  cache_read: JsonSafeInteger;
+  cache_write: JsonSafeInteger;
+  reasoning: JsonSafeInteger;
+  total_tokens: JsonSafeInteger;
 }
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
@@ -434,6 +448,25 @@ export interface Usage {
  */
 export interface ToolResultMessage {
   role: "tool_result";
+  tool_call_id: string;
+  tool_name: string;
+  content: UserContent[];
+  /**
+   * any JSON value
+   */
+  details: {
+    [k: string]: unknown;
+  };
+  is_error: boolean;
+  timestamp: string;
+}
+/**
+ * tool result nested in TurnEnd; the enclosing event supplies its type
+ *
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "ToolResultPayload".
+ */
+export interface ToolResultPayload {
   tool_call_id: string;
   tool_name: string;
   content: UserContent[];

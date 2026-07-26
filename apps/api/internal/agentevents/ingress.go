@@ -116,48 +116,25 @@ func validateUserCommand(raw []byte) (RejectReason, error) {
 		return RejectSchemaViolation, errors.New("request body is not valid UTF-8")
 	}
 
-	var m map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &m); err != nil {
+	if err := checkDuplicateKeys(raw); err != nil {
 		return RejectSchemaViolation, fmt.Errorf("invalid JSON: %w", err)
 	}
 
-	allowed := map[string]bool{"type": true, "text": true, "attachments": true}
-	for k := range m {
-		if !allowed[k] {
-			return RejectSchemaViolation, fmt.Errorf("unknown field: %q", k)
+	var cmd userMessageWire
+	if err := unmarshalStrict(raw, &cmd); err != nil {
+		if errors.Is(err, errAttachmentsNotEmpty) {
+			return RejectAttachmentsNotEmpty, err
 		}
+		return RejectSchemaViolation, fmt.Errorf("invalid command shape: %w", err)
 	}
-
-	typeRaw, ok := m["type"]
-	if !ok {
-		return RejectSchemaViolation, errors.New("missing field: type")
+	if cmd.Type != "user_message" {
+		return RejectUnknownCommand, fmt.Errorf("unknown command type: %q", cmd.Type)
 	}
-	var cmdType string
-	if err := json.Unmarshal(typeRaw, &cmdType); err != nil {
-		return RejectSchemaViolation, fmt.Errorf("type is not a string: %w", err)
-	}
-	if cmdType != "user_message" {
-		return RejectUnknownCommand, fmt.Errorf("unknown command type: %q", cmdType)
-	}
-
-	textRaw, ok := m["text"]
-	if !ok {
+	if cmd.Text == nil {
 		return RejectSchemaViolation, errors.New("missing field: text")
 	}
-	if err := json.Unmarshal(textRaw, new(string)); err != nil {
-		return RejectSchemaViolation, fmt.Errorf("text is not a string: %w", err)
-	}
-
-	attachRaw, ok := m["attachments"]
-	if !ok {
+	if cmd.Attachments == nil {
 		return RejectSchemaViolation, errors.New("missing field: attachments")
-	}
-	var attachments []json.RawMessage
-	if err := json.Unmarshal(attachRaw, &attachments); err != nil {
-		return RejectSchemaViolation, fmt.Errorf("attachments is not an array: %w", err)
-	}
-	if len(attachments) > 0 {
-		return RejectAttachmentsNotEmpty, errors.New("attachments must be empty")
 	}
 
 	return "", nil

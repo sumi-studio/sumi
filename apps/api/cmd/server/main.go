@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/handler"
@@ -35,13 +36,32 @@ func wsHandler() http.Handler {
 	tv, err := tokenVerifierFromEnv()
 	if err == nil {
 		log.Print("agent WS token verification wired")
-		return agentevents.NewServerWithTokenVerifier(tv)
+		srv := agentevents.NewServerWithTokenVerifier(tv)
+		srv.AllowedOrigins = allowedOriginsFromEnv()
+		return srv
 	}
 	if !errors.Is(err, errTokenSecretMissing) {
-		log.Printf("agent WS token verifier misconfigured: %v", err)
+		log.Fatalf("agent WS token verifier misconfigured: %v", err)
 	}
 	log.Print("agent WS running fail-closed: T17/T26 production seams not wired")
-	return agentevents.NewFailClosedServer()
+	srv := agentevents.NewFailClosedServer()
+	srv.AllowedOrigins = allowedOriginsFromEnv()
+	return srv
+}
+
+func allowedOriginsFromEnv() []string {
+	raw := os.Getenv("SUMI_AGENT_WS_ALLOWED_ORIGINS")
+	if raw == "" {
+		return nil
+	}
+	var origins []string
+	for _, o := range strings.Split(raw, ",") {
+		o = strings.TrimSpace(o)
+		if o != "" {
+			origins = append(origins, o)
+		}
+	}
+	return origins
 }
 
 var errTokenSecretMissing = errors.New("SUMI_AGENT_TOKEN_SECRET not set")

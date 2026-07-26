@@ -82,23 +82,42 @@ type Server struct {
 	// context cancellation from the underlying connection.
 	HelloTimeout time.Duration
 
+	// AllowedOrigins lists the exact origins allowed to open a WebSocket.
+	// An empty list is fail-closed (no origin is accepted). Wildcards are not
+	// supported: every accepted origin must be named explicitly.
+	AllowedOrigins []string
+
 	upgrader websocket.Upgrader
 }
 
 // NewServer returns a Server with the required seams. Missing seams leave the
 // handler fail-closed.
 func NewServer(tv TokenVerifier, gv GenerationVerifier, cs CommandSource, es EventSink, hl HydrationLatch) *Server {
-	return &Server{
+	s := &Server{
 		Token:        tv,
 		Generation:   gv,
 		Commands:     cs,
 		Events:       es,
 		Latch:        hl,
 		HelloTimeout: 30 * time.Second,
-		upgrader: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool { return true },
-		},
 	}
+	s.upgrader = websocket.Upgrader{CheckOrigin: s.checkOrigin}
+	return s
+}
+
+// checkOrigin implements an explicit allow-list. The zero-value (empty list)
+// rejects every origin, including requests that omit the header.
+func (s *Server) checkOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return false
+	}
+	for _, allowed := range s.AllowedOrigins {
+		if allowed == origin {
+			return true
+		}
+	}
+	return false
 }
 
 // NewServerWithTokenVerifier returns a Server that uses the supplied real

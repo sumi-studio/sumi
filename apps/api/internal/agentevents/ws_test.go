@@ -3,6 +3,7 @@ package agentevents
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -186,11 +187,10 @@ func newTestServer(t *testing.T) (*Server, *fakeTokenVerifier, *fakeGenerationVe
 
 func TestWebSocketMissingTokenRejected(t *testing.T) {
 	srv, _, _, _, _, _ := newTestServer(t)
-	server := httptest.NewServer(srv)
+	server := startTestServer(t, srv)
 	defer server.Close()
 
-	wsURL := strings.Replace(server.URL, "http", "ws", 1) + "/agent/ws"
-	_, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	_, resp, err := dialTestWS(t, server, nil)
 	if err == nil {
 		t.Fatal("expected missing token to be rejected")
 	}
@@ -202,12 +202,11 @@ func TestWebSocketMissingTokenRejected(t *testing.T) {
 func TestWebSocketRejectedToken(t *testing.T) {
 	srv, tv, _, _, _, _ := newTestServer(t)
 	tv.reject = true
-	server := httptest.NewServer(srv)
+	server := startTestServer(t, srv)
 	defer server.Close()
 
-	wsURL := strings.Replace(server.URL, "http", "ws", 1) + "/agent/ws"
 	header := map[string][]string{"Authorization": {"Bearer bad-token"}}
-	_, resp, err := websocket.DefaultDialer.Dial(wsURL, header)
+	_, resp, err := dialTestWS(t, server, header)
 	if err == nil {
 		t.Fatal("expected rejected token")
 	}
@@ -227,12 +226,11 @@ func TestWebSocketHelloAndCommandCatchUp(t *testing.T) {
 	}
 	cs.pushCommand(cmd)
 
-	server := httptest.NewServer(srv)
+	server := startTestServer(t, srv)
 	defer server.Close()
 
-	wsURL := strings.Replace(server.URL, "http", "ws", 1) + "/agent/ws"
 	header := map[string][]string{"Authorization": {"Bearer test-token"}}
-	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, header)
+	conn, resp, err := dialTestWS(t, server, header)
 	if err != nil {
 		t.Fatalf("dial: %v (status %d)", err, resp.StatusCode)
 	}
@@ -270,12 +268,11 @@ func TestWebSocketStaleGenerationIsClosed(t *testing.T) {
 	hl.setReady()
 	gv.setLatest(99)
 
-	server := httptest.NewServer(srv)
+	server := startTestServer(t, srv)
 	defer server.Close()
 
-	wsURL := strings.Replace(server.URL, "http", "ws", 1) + "/agent/ws"
 	header := map[string][]string{"Authorization": {"Bearer test-token"}}
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+	conn, _, err := dialTestWS(t, server, header)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -307,15 +304,14 @@ func TestWebSocketReadyAfterReconnectHoldsCommands(t *testing.T) {
 	}
 	cs.pushCommand(cmd)
 
-	server := httptest.NewServer(srv)
+	server := startTestServer(t, srv)
 	defer server.Close()
 
-	wsURL := strings.Replace(server.URL, "http", "ws", 1) + "/agent/ws"
 	header := map[string][]string{"Authorization": {"Bearer test-token"}}
 
 	// First connection: NotReady, so hello succeeds up to latch wait, then
 	// blocks. Close it before latch becomes Ready.
-	conn1, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+	conn1, _, err := dialTestWS(t, server, header)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -339,7 +335,7 @@ func TestWebSocketReadyAfterReconnectHoldsCommands(t *testing.T) {
 	// Reconnect with the same generation while it is still NotReady. The new
 	// epoch must independently observe NotReady and keep its hello/command
 	// path held; it must not inherit a release from the old connection epoch.
-	conn2, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+	conn2, _, err := dialTestWS(t, server, header)
 	if err != nil {
 		t.Fatalf("dial reconnect: %v", err)
 	}
@@ -380,12 +376,11 @@ func TestWebSocketAgentSendsAckAndEvent(t *testing.T) {
 	srv, _, _, cs, es, hl := newTestServer(t)
 	hl.setReady()
 
-	server := httptest.NewServer(srv)
+	server := startTestServer(t, srv)
 	defer server.Close()
 
-	wsURL := strings.Replace(server.URL, "http", "ws", 1) + "/agent/ws"
 	header := map[string][]string{"Authorization": {"Bearer test-token"}}
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+	conn, _, err := dialTestWS(t, server, header)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -406,9 +401,11 @@ func TestWebSocketAgentSendsAckAndEvent(t *testing.T) {
 	}
 
 	// Send an event and an ack.
+	seq1 := uint64(1)
 	eventFrame := OutboundFrame{
 		FrameType: "event",
 		Envelope: &Envelope{
+			Seq:            &seq1,
 			ConversationID: "conversation-1",
 			Event:          []byte(`{"type":"agent_start"}`),
 		},
@@ -447,12 +444,11 @@ func TestWebSocketRejectsEventForAnotherConversation(t *testing.T) {
 	srv, _, _, _, es, hl := newTestServer(t)
 	hl.setReady()
 
-	server := httptest.NewServer(srv)
+	server := startTestServer(t, srv)
 	defer server.Close()
 
-	wsURL := strings.Replace(server.URL, "http", "ws", 1) + "/agent/ws"
 	header := map[string][]string{"Authorization": {"Bearer test-token"}}
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+	conn, _, err := dialTestWS(t, server, header)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -472,9 +468,11 @@ func TestWebSocketRejectsEventForAnotherConversation(t *testing.T) {
 		t.Fatalf("read api hello: %v", err)
 	}
 
+	seq1 := uint64(1)
 	if err := conn.WriteJSON(OutboundFrame{
 		FrameType: "event",
 		Envelope: &Envelope{
+			Seq:            &seq1,
 			ConversationID: "other-conversation",
 			Event:          []byte(`{"type":"agent_start"}`),
 		},
@@ -492,6 +490,66 @@ func TestWebSocketRejectsEventForAnotherConversation(t *testing.T) {
 	if len(es.envelopes) != 0 {
 		t.Fatalf("expected no event delivery on conversation mismatch, got %d", len(es.envelopes))
 	}
+}
+
+func TestWebSocketOriginPolicy(t *testing.T) {
+	srv, _, _, _, _, _ := newTestServer(t)
+	wildcardRequest := httptest.NewRequest(http.MethodGet, "http://example.test/agent/ws", nil)
+	wildcardRequest.Header.Set("Origin", "http://evil.example")
+	srv.AllowedOrigins = []string{"*"}
+	if srv.checkOrigin(wildcardRequest) {
+		t.Fatal("wildcard origin configuration must not disable origin checks")
+	}
+
+	server := startTestServer(t, srv)
+	defer server.Close()
+
+	wsURL := strings.Replace(server.URL, "http", "ws", 1) + "/agent/ws"
+	header := map[string][]string{"Authorization": {"Bearer test-token"}}
+
+	// Missing origin header is rejected.
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err == nil {
+		t.Fatal("expected missing origin to be rejected")
+	}
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", resp.StatusCode)
+	}
+
+	// Wrong origin is rejected.
+	header["Origin"] = []string{"http://evil.example"}
+	_, resp, err = websocket.DefaultDialer.Dial(wsURL, header)
+	if err == nil {
+		t.Fatal("expected mismatched origin to be rejected")
+	}
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", resp.StatusCode)
+	}
+
+	// Allowed origin upgrades.
+	header["Origin"] = []string{server.URL}
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("expected allowed origin to upgrade: %v", err)
+	}
+	conn.Close()
+}
+
+func startTestServer(t *testing.T, srv *Server) *httptest.Server {
+	t.Helper()
+	server := httptest.NewUnstartedServer(srv)
+	server.Start()
+	srv.AllowedOrigins = []string{server.URL}
+	return server
+}
+
+func dialTestWS(t *testing.T, server *httptest.Server, headers map[string][]string) (*websocket.Conn, *http.Response, error) {
+	t.Helper()
+	if headers == nil {
+		headers = make(map[string][]string)
+	}
+	headers["Origin"] = []string{server.URL}
+	return websocket.DefaultDialer.Dial(strings.Replace(server.URL, "http", "ws", 1)+"/agent/ws", headers)
 }
 
 func conn2Wait(conn *websocket.Conn, v any, timeout time.Duration) error {

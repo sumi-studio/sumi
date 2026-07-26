@@ -9,7 +9,7 @@
   "scripts": {
     "generate": "openapi-typescript ../../contracts/openapi.yaml -o src/generated/schema.d.ts && json2ts --unreachableDefinitions ../../contracts/agent-events.yaml -o src/generated/agent-events.d.ts",
     "check-types": "tsc --noEmit",
-    "test": "node scripts/contract-roundtrip.mjs"
+    "test": "node scripts/contract-roundtrip.mjs && node scripts/drift-check.mjs"
   },
   "devDependencies": {
     "@sumi/typescript-config": "workspace:*",
