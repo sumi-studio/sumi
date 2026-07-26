@@ -19,6 +19,13 @@ const fixturePath = join(
 
 const raw = readFileSync(fixturePath, "utf8");
 const fixtures = JSON.parse(raw);
+const schemaPath = join(
+  __dirname,
+  "../../..",
+  "contracts",
+  "agent-events.yaml",
+);
+assertAnyJSONNumberBounds(readFileSync(schemaPath, "utf8"));
 
 let passed = 0;
 for (const [name, fixture] of Object.entries(fixtures)) {
@@ -43,6 +50,30 @@ for (const [name, fixture] of Object.entries(fixtures)) {
 
 console.log(`contract round-trip: ${passed} fixtures passed`);
 process.exit(0);
+
+function assertAnyJSONNumberBounds(schema) {
+  const definition = schema.match(
+    /^  AnyJSON:\n([\s\S]*?)(?=^  [A-Za-z][A-Za-z0-9_]*:|(?![\s\S]))/m,
+  )?.[0];
+  if (definition === undefined) {
+    throw new Error("agent-events schema is missing the AnyJSON definition");
+  }
+
+  const min = "minimum: -9007199254740991";
+  const max = "maximum: 9007199254740991";
+  const integer = new RegExp(
+    `- type: integer\\n\\s+${min}\\n\\s+${max}`,
+  );
+  const nonIntegerNumber = new RegExp(
+    `- type: number\\n\\s+not: \\{ type: integer \\}\\n\\s+${min}\\n\\s+${max}`,
+  );
+
+  if (!integer.test(definition) || !nonIntegerNumber.test(definition)) {
+    throw new Error(
+      "AnyJSON must bound integer and non-integer number values to the JavaScript safe-integer range",
+    );
+  }
+}
 
 function normalize(value) {
   if (value === null || typeof value !== "object") {

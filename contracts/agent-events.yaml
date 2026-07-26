@@ -425,7 +425,19 @@ $defs:
     description: non-negative integer representable exactly by JavaScript number clients
 
   AnyJSON:
-    type: ['object', 'array', 'string', 'number', 'boolean', 'null']
+    oneOf:
+      - type: object
+      - type: array
+      - type: string
+      - type: integer
+        minimum: -9007199254740991
+        maximum: 9007199254740991
+      - type: number
+        not: { type: integer }
+        minimum: -9007199254740991
+        maximum: 9007199254740991
+      - type: boolean
+      - type: 'null'
     description: any JSON value
 
   ProviderOrigin:

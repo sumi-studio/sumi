@@ -371,6 +371,18 @@
       "timestamp": "2026-07-25T20:00:00Z"
     }
   },
+  "public_message_tool_result_safe_fractional_details": {
+    "kind": "public_message",
+    "wire": {
+      "role": "tool_result",
+      "tool_call_id": "call-1",
+      "tool_name": "read_file",
+      "content": [{ "type": "text", "text": "contents" }],
+      "details": -0.5,
+      "is_error": false,
+      "timestamp": "2026-07-25T20:00:00Z"
+    }
+  },
   "turn_end_tool_result_boolean_details": {
     "kind": "outbound_frame",
     "wire": {
