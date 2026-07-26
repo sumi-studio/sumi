@@ -970,6 +970,14 @@ fn prune_pending_events(
     }
 }
 
+fn internal_buffer_has_capacity(
+    writer_rx: &mpsc::Receiver<OutboundFrame>,
+    outbox: &VecDeque<(u64, OutboundFrame)>,
+    pending_events: &BTreeMap<u64, (u64, OutboundFrame)>,
+) -> bool {
+    outbox.len().saturating_add(pending_events.len()) < writer_rx.max_capacity()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn send_with_interleave<W>(
     writer: &mut W,
@@ -992,7 +1000,9 @@ where
             biased;
             _ = token.cancelled() => return Ok(()),
             result = &mut send_fut => return result,
-            frame = writer_rx.recv() => {
+            frame = writer_rx.recv(),
+                if internal_buffer_has_capacity(writer_rx, outbox, pending_events) =>
+            {
                 let Some(frame) = frame else { return Ok(()); };
                 classify_frame(
                     frame,
@@ -1109,7 +1119,9 @@ where
             biased;
             _ = token.cancelled() => return Ok(None),
             result = &mut fut => return result.map(Some),
-            frame = writer_rx.recv() => {
+            frame = writer_rx.recv(),
+                if internal_buffer_has_capacity(writer_rx, outbox, pending_events) =>
+            {
                 let Some(frame) = frame else { return Ok(None); };
                 classify_frame(
                     frame,
@@ -1153,7 +1165,9 @@ where
                 return Ok(None);
             }
             result = &mut rx => break result,
-            frame = writer_rx.recv() => {
+            frame = writer_rx.recv(),
+                if internal_buffer_has_capacity(writer_rx, outbox, pending_events) =>
+            {
                 let Some(frame) = frame else {
                     handle.abort();
                     return Ok(None);
@@ -4641,17 +4655,26 @@ mod tests {
             burst.push(event_frame(i + 2));
         }
 
-        // This must complete without deadlock even while catch-up is blocked.
-        tokio::time::timeout(Duration::from_secs(1), async {
+        let mut burst_send = tokio::spawn(async move {
             for frame in burst {
                 handle.events.send((epoch, frame)).await.unwrap();
             }
-        })
-        .await
-        .expect("burst send must not deadlock on a full writer queue");
+            handle
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut burst_send)
+                .await
+                .is_err(),
+            "the bounded internal buffer must restore producer backpressure during catch-up"
+        );
 
         // Allow catch-up to finish and reach Online.
         catch_up_notify.notify_one();
+        let handle = tokio::time::timeout(Duration::from_secs(1), burst_send)
+            .await
+            .expect("burst send must resume after catch-up drains the internal buffer")
+            .expect("burst sender must not panic");
         let mut online = handle.online.clone();
         while !*online.borrow() {
             online.changed().await.unwrap();

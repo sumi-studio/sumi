@@ -196,10 +196,11 @@ impl Gateway for WebSocketGateway {
             match msg {
                 Message::Text(s) => break s.into_bytes(),
                 Message::Binary(b) => break b,
-                // A Close before the API has sent its hello is treated as an
-                // authentication rejection so the supervisor can refresh the
-                // credential and bound the retry loop with max_auth_attempts.
-                Message::Close(_) => return Err(HelloError::AuthRejected),
+                Message::Close(close) => {
+                    return Err(HelloError::Reconnect(anyhow!(
+                        "websocket closed before hello response: {close:?}"
+                    )));
+                }
                 Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
             }
         };
@@ -803,7 +804,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticate_hello_rejects_auth_on_close_before_hello() {
+    async fn authenticate_hello_reconnects_on_close_without_status_before_hello() {
         let listener = TcpListener::bind(listener_addr()).await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -824,8 +825,8 @@ mod tests {
             .unwrap();
         let result = gateway.authenticate_hello(test_agent_hello()).await;
         assert!(
-            matches!(result, Err(HelloError::AuthRejected)),
-            "authenticate_hello must classify Close before hello as AuthRejected, got {result:?}"
+            matches!(result, Err(HelloError::Reconnect(_))),
+            "status-less Close before hello must reconnect without consuming auth attempts, got {result:?}"
         );
 
         let _ = server.await;
