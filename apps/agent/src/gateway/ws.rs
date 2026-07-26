@@ -27,8 +27,8 @@ use super::supervisor::{
 };
 use super::wire;
 use super::{
-    Gateway, GatewayClosed, GatewayReader, GatewayWriter, InboundCommand, MAX_FRAME_BYTES,
-    OutboundFrame,
+    Gateway, GatewayClosed, GatewayReader, GatewayWriter, HelloError, InboundCommand,
+    MAX_FRAME_BYTES, OutboundFrame,
 };
 
 static RUSTLS_INIT: Once = Once::new();
@@ -148,7 +148,7 @@ impl GatewayConnector for WebSocketConnector {
             ..WebSocketConfig::default()
         };
 
-        match connect_async_with_config(request, Some(ws_config), false).await {
+        match connect_async_with_config(request, Some(ws_config), true).await {
             Ok((ws, _)) => Ok(WebSocketGateway::new(ws, self.digest_factory.clone())),
             Err(tungstenite::Error::Http(response))
                 if matches!(response.status().as_u16(), 401 | 403) =>
@@ -183,7 +183,10 @@ impl Gateway for WebSocketGateway {
     type Reader = WsGatewayReader;
     type Writer = WsGatewayWriter;
 
-    async fn authenticate_hello(&mut self, hello: AgentHello) -> Result<ApiHello> {
+    async fn authenticate_hello(
+        &mut self,
+        hello: AgentHello,
+    ) -> std::result::Result<ApiHello, HelloError> {
         let hello_text = serde_json::to_string(&hello).context("serialize agent hello")?;
         self.ws
             .send(Message::Text(hello_text))
@@ -201,7 +204,10 @@ impl Gateway for WebSocketGateway {
             match msg {
                 Message::Text(s) => break s.into_bytes(),
                 Message::Binary(b) => break b,
-                Message::Close(_) => return Err(GatewayClosed.into()),
+                // A Close before the API has sent its hello is treated as an
+                // authentication rejection so the supervisor can refresh the
+                // credential and bound the retry loop with max_auth_attempts.
+                Message::Close(_) => return Err(HelloError::AuthRejected),
                 Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
             }
         };
@@ -305,8 +311,8 @@ mod tests {
 
     use super::super::{
         AgentHello, ApiHello, CommandDigestFactory, Envelope, Gateway, GatewayConnector,
-        GatewayCredential, GatewayReader, GatewayWriter, InboundCommand, IncrementalCommandDigest,
-        MAX_FRAME_BYTES, OutboundFrame,
+        GatewayCredential, GatewayReader, GatewayWriter, HelloError, InboundCommand,
+        IncrementalCommandDigest, MAX_FRAME_BYTES, OutboundFrame,
     };
     use super::{CryptoProvider, WebSocketConnector, decode_command_bytes, init_crypto_provider};
     use crate::gateway::wire::to_wire_frame;
@@ -405,7 +411,7 @@ mod tests {
             generation: ProcessGeneration::from_wire(7).unwrap(),
             last_sent_event_seq: 1,
             last_received_command_seq: 0,
-            last_applied_command_seq: 1,
+            last_terminal_command_seq: 1,
         }
     }
 
@@ -785,7 +791,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticate_hello_returns_gateway_closed_on_close_message() {
+    async fn authenticate_hello_rejects_auth_on_close_before_hello() {
         let listener = TcpListener::bind(listener_addr()).await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -805,12 +811,9 @@ mod tests {
             .await
             .unwrap();
         let result = gateway.authenticate_hello(test_agent_hello()).await;
-        assert!(result.is_err(), "authenticate_hello must fail on Close");
         assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("gateway input closed")
+            matches!(result, Err(HelloError::AuthRejected)),
+            "authenticate_hello must classify Close before hello as AuthRejected, got {result:?}"
         );
 
         let _ = server.await;

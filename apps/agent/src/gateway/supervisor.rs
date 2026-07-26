@@ -26,7 +26,7 @@ use zeroize::Zeroize;
 
 use crate::runtime::contracts::ProcessGeneration;
 
-use super::{Gateway, GatewayReader, GatewayWriter, InboundCommand, OutboundFrame};
+use super::{Gateway, GatewayReader, GatewayWriter, HelloError, InboundCommand, OutboundFrame};
 
 pub mod seams;
 
@@ -86,6 +86,10 @@ impl Drop for GatewayCredential {
 /// Agent → API hello. `generation` is the `ProcessGeneration` bound to the
 /// credential claim. All seq values are `u64` and are validated against the
 /// durable source before the epoch proceeds.
+///
+/// `last_terminal_command_seq` is the durable terminal command cursor: the
+/// maximum seq among `applied`, `superseded`, and `rejected` statuses. The
+/// wire field name remains `last_applied_command_seq` for compatibility.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentHello {
@@ -93,7 +97,8 @@ pub struct AgentHello {
     pub generation: ProcessGeneration,
     pub last_sent_event_seq: u64,
     pub last_received_command_seq: u64,
-    pub last_applied_command_seq: u64,
+    #[serde(rename = "last_applied_command_seq")]
+    pub last_terminal_command_seq: u64,
 }
 
 /// API → Agent hello response.
@@ -106,10 +111,14 @@ pub struct ApiHello {
 }
 
 /// Cursors returned by the durable command source.
+///
+/// `terminal` is the maximum seq among terminal command statuses:
+/// `applied`, `superseded`, and `rejected`. This is the durable boundary
+/// used for hello validation and ACK cursor recovery.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CommandCursors {
     pub received: u64,
-    pub applied: u64,
+    pub terminal: u64,
 }
 
 /// Cursors returned by the durable event source.
@@ -464,7 +473,9 @@ where
             _ = cancel.cancelled() => return Ok(()),
             result = time::timeout(config.hello_timeout, gateway.authenticate_hello(agent_hello.clone())) => match result {
                 Ok(Ok(h)) => h,
-                Ok(Err(e)) => return Err(SupervisorError::Reconnect {
+                Ok(Err(HelloError::AuthRejected)) => return Err(SupervisorError::AuthRejected),
+                Ok(Err(HelloError::Fatal(e))) => return Err(SupervisorError::Fatal(e)),
+                Ok(Err(HelloError::Reconnect(e))) => return Err(SupervisorError::Reconnect {
                     reason: format!("hello failed: {e}"),
                 }),
                 Err(_) => return Err(SupervisorError::Reconnect {
@@ -639,7 +650,7 @@ async fn build_agent_hello<S: DurableSource>(
         generation: config.generation,
         last_sent_event_seq: event_cursor.last_sent,
         last_received_command_seq: command_cursor.received,
-        last_applied_command_seq: command_cursor.applied,
+        last_terminal_command_seq: command_cursor.terminal,
     })
 }
 
@@ -681,16 +692,16 @@ async fn validate_hello<S: DurableSource>(
             .map_err(|e| SupervisorError::Reconnect {
                 reason: format!("command cursor unavailable for hello validation: {e}"),
             })?;
-    let expected_next_command_seq = command_cursor.applied.saturating_add(1);
-    // The API may legitimately lag behind our durable applied cursor if a terminal
+    let expected_next_command_seq = command_cursor.terminal.saturating_add(1);
+    // The API may legitimately lag behind our durable terminal cursor if a terminal
     // ACK (Applied/Superseded/Rejected) was lost in flight; it will resend and the
-    // durable consumer deduplicates. Any cursor ahead of applied+1 skips commands
-    // that have not yet been durably applied and remains fatal.
+    // durable consumer deduplicates. Any cursor ahead of terminal+1 skips commands
+    // that have not yet reached a terminal status and remains fatal.
     if api.next_command_seq > expected_next_command_seq {
         return Err(SupervisorError::Fatal(anyhow!(
-            "command cursor claim ahead of durable boundary: next_command_seq {} > applied {} + 1 (expected {}); received={}",
+            "command cursor claim ahead of durable boundary: next_command_seq {} > terminal {} + 1 (expected {}); received={}",
             api.next_command_seq,
-            command_cursor.applied,
+            command_cursor.terminal,
             expected_next_command_seq,
             command_cursor.received
         )));
@@ -1400,6 +1411,7 @@ mod tests {
         hello_generation: Option<ProcessGeneration>,
         last_received_event_seq: u64,
         hello_delay: Option<Duration>,
+        hello_error: Option<HelloError>,
     }
 
     impl MockGateway {
@@ -1421,6 +1433,7 @@ mod tests {
                 hello_generation: None,
                 last_received_event_seq: 0,
                 hello_delay: None,
+                hello_error: None,
             }
         }
 
@@ -1439,6 +1452,12 @@ mod tests {
             self
         }
 
+        #[allow(dead_code)]
+        fn with_hello_error(mut self, err: HelloError) -> Self {
+            self.hello_error = Some(err);
+            self
+        }
+
         fn with_notify_on_empty(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
             self.reader = self.reader.notify_on_empty(notify);
             self
@@ -1454,16 +1473,22 @@ mod tests {
         type Reader = MockGatewayReader;
         type Writer = MockGatewayWriter;
 
-        async fn authenticate_hello(&mut self, hello: AgentHello) -> Result<ApiHello> {
+        async fn authenticate_hello(
+            &mut self,
+            hello: AgentHello,
+        ) -> std::result::Result<ApiHello, HelloError> {
             self.sent_hellos.lock().unwrap().push(hello.clone());
             if let Some(delay) = self.hello_delay {
                 tokio::time::sleep(delay).await;
+            }
+            if let Some(err) = self.hello_error.take() {
+                return Err(err);
             }
             let accepted_generation = self.hello_generation.unwrap_or(hello.generation);
             Ok(ApiHello {
                 accepted_generation,
                 last_received_event_seq: self.last_received_event_seq,
-                next_command_seq: hello.last_applied_command_seq.saturating_add(1),
+                next_command_seq: hello.last_terminal_command_seq.saturating_add(1),
             })
         }
 
@@ -1695,6 +1720,7 @@ mod tests {
             hello_generation: None,
             last_received_event_seq: 0,
             hello_delay: None,
+            hello_error: None,
         };
         let gateway2 = MockGateway {
             reader: MockGatewayReader {
@@ -1713,6 +1739,7 @@ mod tests {
             hello_generation: None,
             last_received_event_seq: 0,
             hello_delay: None,
+            hello_error: None,
         };
 
         let connector = MockConnector::new(
@@ -1785,6 +1812,7 @@ mod tests {
             hello_generation: None,
             last_received_event_seq: 0,
             hello_delay: None,
+            hello_error: None,
         };
 
         let connector = MockConnector::new(
@@ -1835,6 +1863,7 @@ mod tests {
             hello_generation: None,
             last_received_event_seq: 0,
             hello_delay: None,
+            hello_error: None,
         };
         let gateway2 = MockGateway {
             reader: MockGatewayReader {
@@ -1853,6 +1882,7 @@ mod tests {
             hello_generation: None,
             last_received_event_seq: 0,
             hello_delay: None,
+            hello_error: None,
         };
 
         let connector = MockConnector::new(
@@ -1931,6 +1961,7 @@ mod tests {
             hello_generation: None,
             last_received_event_seq: 0,
             hello_delay: None,
+            hello_error: None,
         };
 
         let connector = MockConnector::new(
@@ -1992,6 +2023,7 @@ mod tests {
             hello_generation: None,
             last_received_event_seq: 0,
             hello_delay: None,
+            hello_error: None,
         };
 
         let connector = MockConnector::new(
@@ -2178,6 +2210,51 @@ mod tests {
         assert_eq!(
             attempts, 3,
             "auth retries must be bounded by the default max_auth_attempts"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_hello_auth_rejected_uses_max_auth_attempts() {
+        // The HTTP upgrade succeeds, but the server closes during the hello exchange.
+        // This must be classified as AuthRejected and bounded by max_auth_attempts,
+        // not treated as an unlimited reconnect loop.
+        let mut config = make_config();
+        config.max_reconnect_attempts = None;
+        config.hello_timeout = Duration::from_millis(5);
+        config.initial_backoff = Duration::from_millis(1);
+
+        let credentials = CountingCredentialProvider::new("token");
+        let counter = credentials.counter.clone();
+        let connector = MockConnector::new(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            VecDeque::from([
+                Ok(MockGateway::new(VecDeque::new()).with_hello_error(HelloError::AuthRejected)),
+                Ok(MockGateway::new(VecDeque::new()).with_hello_error(HelloError::AuthRejected)),
+                Ok(MockGateway::new(VecDeque::new()).with_hello_error(HelloError::AuthRejected)),
+                Ok(MockGateway::new(VecDeque::new()).with_hello_error(HelloError::AuthRejected)),
+                Ok(MockGateway::new(VecDeque::new()).with_hello_error(HelloError::AuthRejected)),
+            ]),
+        );
+        let source = MockDurableSource::new(CommandCursors::default());
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: ProcessGeneration::from_wire(7).unwrap(),
+            receipt_identity: "receipt-1".to_owned(),
+        });
+
+        let supervisor = ConnectionSupervisor::new(connector, credentials, source, latch, config);
+        let handle = supervisor.start();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle.join()).await;
+        assert!(
+            result.is_ok(),
+            "supervisor must stop within bounded time when post-hello auth is rejected"
+        );
+        assert!(result.unwrap().is_err());
+
+        let attempts = counter.load(Ordering::SeqCst);
+        assert_eq!(
+            attempts, 3,
+            "post-hello auth rejections must be bounded by max_auth_attempts"
         );
     }
 
@@ -2438,6 +2515,7 @@ mod tests {
             hello_generation: None,
             last_received_event_seq: 0,
             hello_delay: None,
+            hello_error: None,
         };
         let connector = MockConnector::new(sent_hellos, VecDeque::from([Ok(gateway)]));
         let credentials = CountingCredentialProvider::new("token");
@@ -2476,6 +2554,7 @@ mod tests {
             hello_generation: None,
             last_received_event_seq: 0,
             hello_delay: None,
+            hello_error: None,
         };
         let connector = MockConnector::new(
             Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -2516,11 +2595,11 @@ mod tests {
         let cursor_calls = VecDeque::from([
             CommandCursors {
                 received: 5,
-                applied: 5,
+                terminal: 5,
             },
             CommandCursors {
                 received: 10,
-                applied: 5,
+                terminal: 5,
             },
         ]);
 
@@ -2625,7 +2704,7 @@ mod tests {
                 }
                 Ok(CommandCursors {
                     received: 0,
-                    applied: 0,
+                    terminal: 0,
                 })
             }
         }
@@ -2643,7 +2722,7 @@ mod tests {
             generation: ProcessGeneration::from_wire(7).unwrap(),
             last_sent_event_seq: 0,
             last_received_command_seq: 0,
-            last_applied_command_seq: 0,
+            last_terminal_command_seq: 0,
         };
         let api = ApiHello {
             accepted_generation: agent.generation,
@@ -2684,14 +2763,14 @@ mod tests {
     async fn validate_hello_command_cursor_allows_safe_lag_and_rejects_ahead() {
         let cursor = CommandCursors {
             received: 10,
-            applied: 5,
+            terminal: 5,
         };
         let agent = AgentHello {
             agent_id: "test".to_owned(),
             generation: ProcessGeneration::from_wire(7).unwrap(),
             last_sent_event_seq: 0,
             last_received_command_seq: cursor.received,
-            last_applied_command_seq: cursor.applied,
+            last_terminal_command_seq: cursor.terminal,
         };
 
         struct StaticSource(CommandCursors);
@@ -2762,6 +2841,73 @@ mod tests {
                 .await
                 .is_err(),
             "next_command_seq far beyond applied+1 must be fatal"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_hello_uses_terminal_cursor_for_superseded_and_rejected() {
+        // If the durable state contains superseded/rejected commands at higher
+        // seqs than applied, the terminal cursor (not an applied-only cursor)
+        // must define the durable boundary. Here terminal=7 simulates commands
+        // through seq 7 reaching a terminal status while applied may lag.
+        let cursor = CommandCursors {
+            received: 10,
+            terminal: 7,
+        };
+        let agent = AgentHello {
+            agent_id: "test".to_owned(),
+            generation: ProcessGeneration::from_wire(7).unwrap(),
+            last_sent_event_seq: 0,
+            last_received_command_seq: cursor.received,
+            last_terminal_command_seq: cursor.terminal,
+        };
+
+        struct StaticSource(CommandCursors);
+        #[async_trait]
+        impl DurableSource for StaticSource {
+            async fn event_cursor(&self) -> Result<EventCursors> {
+                Ok(EventCursors { last_sent: 0 })
+            }
+            async fn events_after(
+                &self,
+                _after_seq: u64,
+                _limit: usize,
+            ) -> Result<Vec<OutboundFrame>> {
+                Ok(Vec::new())
+            }
+            async fn command_cursors(&self) -> Result<CommandCursors> {
+                Ok(self.0)
+            }
+        }
+        impl Clone for StaticSource {
+            fn clone(&self) -> Self {
+                Self(self.0)
+            }
+        }
+
+        // Lag at/below terminal is allowed (retransmit or catch-up).
+        for next in [5, 6, 7, 8] {
+            let api = ApiHello {
+                accepted_generation: agent.generation,
+                last_received_event_seq: 0,
+                next_command_seq: next,
+            };
+            validate_hello(&StaticSource(cursor), &agent, &api)
+                .await
+                .expect("next_command_seq <= terminal+1 must be allowed");
+        }
+
+        // Ahead of terminal+1 skips a terminal command and is fatal.
+        let api = ApiHello {
+            accepted_generation: agent.generation,
+            last_received_event_seq: 0,
+            next_command_seq: 9,
+        };
+        assert!(
+            validate_hello(&StaticSource(cursor), &agent, &api)
+                .await
+                .is_err(),
+            "next_command_seq beyond terminal+1 must be fatal"
         );
     }
 
@@ -2885,7 +3031,7 @@ mod tests {
         let connector = SingleConnectionConnector::new(gateway);
         let source = MockDurableSource::new(CommandCursors {
             received: 0,
-            applied: 0,
+            terminal: 0,
         });
         let mut latch_observer = latch_rx.clone();
         let latch = WatchHydrationLatch::new(latch_rx);
@@ -2940,7 +3086,7 @@ mod tests {
             notify: catch_up_notify.clone(),
             command_cursor: CommandCursors {
                 received: 0,
-                applied: 0,
+                terminal: 0,
             },
         };
 
@@ -2962,6 +3108,7 @@ mod tests {
             hello_generation: None,
             last_received_event_seq: 0,
             hello_delay: None,
+            hello_error: None,
         };
         let connector = MockConnector::new(
             Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -3131,7 +3278,7 @@ mod tests {
             async fn command_cursors(&self) -> Result<CommandCursors> {
                 Ok(CommandCursors {
                     received: 0,
-                    applied: 0,
+                    terminal: 0,
                 })
             }
         }
@@ -3164,6 +3311,7 @@ mod tests {
             hello_generation: None,
             last_received_event_seq: 0,
             hello_delay: None,
+            hello_error: None,
         };
         let connector = MockConnector::new(
             Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -3369,7 +3517,7 @@ mod tests {
             notify: catch_up_notify,
             command_cursor: CommandCursors {
                 received: 0,
-                applied: 0,
+                terminal: 0,
             },
         };
 
@@ -3394,6 +3542,7 @@ mod tests {
             hello_generation: None,
             last_received_event_seq: 0,
             hello_delay: None,
+            hello_error: None,
         };
         let connector = MockConnector::new(
             Arc::new(std::sync::Mutex::new(Vec::new())),

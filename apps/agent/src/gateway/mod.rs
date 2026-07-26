@@ -326,6 +326,28 @@ pub enum OutboundFrame {
 #[error("gateway input closed")]
 pub struct GatewayClosed;
 
+/// Errors raised during the agent/API hello exchange.
+///
+/// `AuthRejected` is reserved for authentication failures that should be retried
+/// with a fresh credential, subject to `max_auth_attempts`. `Fatal` is for
+/// non-recoverable claim mismatches. `Reconnect` covers transient failures.
+#[derive(Debug, Error)]
+pub enum HelloError {
+    #[error("authentication rejected")]
+    AuthRejected,
+    #[allow(dead_code)]
+    #[error("fatal: {0}")]
+    Fatal(#[source] anyhow::Error),
+    #[error("hello failed: {0}")]
+    Reconnect(#[source] anyhow::Error),
+}
+
+impl From<anyhow::Error> for HelloError {
+    fn from(e: anyhow::Error) -> Self {
+        HelloError::Reconnect(e)
+    }
+}
+
 #[async_trait]
 pub trait GatewayReader: Send {
     async fn next_command(&mut self) -> Result<InboundCommand>;
@@ -344,7 +366,10 @@ pub trait Gateway: Send + 'static {
     type Reader: GatewayReader + 'static;
     type Writer: GatewayWriter + 'static;
 
-    async fn authenticate_hello(&mut self, hello: AgentHello) -> Result<ApiHello>;
+    async fn authenticate_hello(
+        &mut self,
+        hello: AgentHello,
+    ) -> std::result::Result<ApiHello, HelloError>;
     fn split(self) -> (Self::Reader, Self::Writer);
 }
 
