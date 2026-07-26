@@ -2,6 +2,7 @@ package agentevents
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -39,6 +40,20 @@ type fakeCommandSource struct {
 	ackSeq       uint64
 	catchUpCalls uint64
 	live         chan CommandEnvelope
+}
+
+type failingLiveCommandSource struct {
+	*fakeCommandSource
+	err error
+}
+
+func (f *failingLiveCommandSource) Live(ctx context.Context, claims TokenClaims, fromSeq uint64) (<-chan CommandEnvelope, <-chan error, error) {
+	commands := make(chan CommandEnvelope)
+	errs := make(chan error, 1)
+	errs <- f.err
+	close(commands)
+	close(errs)
+	return commands, errs, nil
 }
 
 func newFakeCommandSource() *fakeCommandSource {
@@ -751,6 +766,75 @@ func TestNewServerConfiguresBoundedWriteTimeout(t *testing.T) {
 	srv, _, _, _, _, _ := newTestServer(t)
 	if srv.WriteTimeout <= 0 {
 		t.Fatalf("WriteTimeout = %v, want a positive bound", srv.WriteTimeout)
+	}
+}
+
+func TestWritePumpClosedErrorChannelDoesNotSpinWithoutPing(t *testing.T) {
+	srv, _, _, _, _, _ := newTestServer(t)
+	srv.PingInterval = 0
+	live := make(chan CommandEnvelope)
+	liveErr := make(chan error)
+	close(liveErr)
+
+	done := make(chan error, 1)
+	go func() { done <- srv.writePump(context.Background(), nil, live, liveErr) }()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "command source closed") {
+			t.Fatalf("expected closed source error, got %v", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("write pump spun on closed liveErr instead of exiting")
+	}
+}
+
+func TestWritePumpPreservesSourceErrorAfterCommandsClose(t *testing.T) {
+	srv, _, _, _, _, _ := newTestServer(t)
+	srv.PingInterval = 0
+	live := make(chan CommandEnvelope)
+	liveErr := make(chan error, 1)
+	close(live)
+	liveErr <- errors.New("durable source failed")
+	close(liveErr)
+	if err := srv.writePump(context.Background(), nil, live, liveErr); err == nil || !strings.Contains(err.Error(), "durable source failed") {
+		t.Fatalf("expected source error after commands close, got %v", err)
+	}
+}
+
+func TestWebSocketPumpFailureUnblocksPeerReadWithoutPongWait(t *testing.T) {
+	tv := &fakeTokenVerifier{}
+	gv := &fakeGenerationVerifier{latest: 7}
+	commands := &failingLiveCommandSource{fakeCommandSource: newFakeCommandSource(), err: errors.New("live source failed")}
+	es := &fakeEventSink{}
+	hl := newFakeHydrationLatch()
+	hl.setReady()
+	srv := NewServer(tv, gv, commands, es, hl)
+	srv.PongWait = 5 * time.Second
+	srv.PingInterval = time.Hour
+
+	server := startTestServer(t, srv)
+	defer server.Close()
+	conn, _, err := dialTestWS(t, server, map[string][]string{"Authorization": {"Bearer test-token"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.WriteJSON(AgentHello{AgentID: "agent-1", Generation: 7}); err != nil {
+		t.Fatal(err)
+	}
+	var hello ApiHello
+	if err := conn.ReadJSON(&hello); err != nil {
+		t.Fatal(err)
+	}
+
+	started := time.Now()
+	conn.SetReadDeadline(started.Add(500 * time.Millisecond))
+	var frame OutboundFrame
+	if err := conn.ReadJSON(&frame); err == nil {
+		t.Fatal("expected peer read to unblock after writer failure")
+	}
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("peer read waited %v instead of immediate pump teardown", elapsed)
 	}
 }
 

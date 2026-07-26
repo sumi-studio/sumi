@@ -29,8 +29,13 @@ type DurableGateway struct {
 	// PollInterval bounds the polling interval used by WaitFor and Live.
 	// A zero value uses the safe default (50ms).
 	PollInterval time.Duration
+	// MaxConversationTails and MaxAckTail bound process memory without changing
+	// durable replay. Zero values use conservative defaults.
+	MaxConversationTails int
+	MaxAckTail           int
 
 	tails   map[string]*conversationLogState
+	clock   uint64
 	newFile func(string, int, os.FileMode) (durableFileHandle, error)
 }
 
@@ -38,7 +43,14 @@ type conversationLogState struct {
 	eventSeq  uint64
 	eventSize int64
 	acks      map[uint64]CommandAck
+	ackOrder  []ackCacheEntry
 	ackSize   int64
+	lastUsed  uint64
+}
+
+type ackCacheEntry struct {
+	seq uint64
+	ack CommandAck
 }
 
 type runtimeState struct {
@@ -90,10 +102,12 @@ func OpenDurableGateway(dir string, commands *CommandStore) (*DurableGateway, er
 		return nil, fmt.Errorf("gateway runtime state path %q is not a directory", abs)
 	}
 	return &DurableGateway{
-		dir:          abs,
-		commands:     commands,
-		PollInterval: 50 * time.Millisecond,
-		tails:        make(map[string]*conversationLogState),
+		dir:                  abs,
+		commands:             commands,
+		PollInterval:         50 * time.Millisecond,
+		MaxConversationTails: 128,
+		MaxAckTail:           256,
+		tails:                make(map[string]*conversationLogState),
 		newFile: func(name string, flag int, perm os.FileMode) (durableFileHandle, error) {
 			return os.OpenFile(name, flag, perm)
 		},
@@ -105,6 +119,20 @@ func (g *DurableGateway) pollInterval() time.Duration {
 		return g.PollInterval
 	}
 	return 50 * time.Millisecond
+}
+
+func (g *DurableGateway) maxConversationTails() int {
+	if g.MaxConversationTails > 0 {
+		return g.MaxConversationTails
+	}
+	return 128
+}
+
+func (g *DurableGateway) maxAckTail() int {
+	if g.MaxAckTail > 0 {
+		return g.MaxAckTail
+	}
+	return 256
 }
 
 func (g *DurableGateway) VerifyGeneration(ctx context.Context, agentID string, generation uint64) error {
@@ -167,8 +195,8 @@ func (g *DurableGateway) Live(ctx context.Context, claims TokenClaims, fromSeq u
 	out := make(chan CommandEnvelope, 16)
 	errCh := make(chan error, 1)
 	go func() {
-		defer close(out)
 		defer close(errCh)
+		defer close(out)
 		ticker := time.NewTicker(g.pollInterval())
 		defer ticker.Stop()
 		for {
@@ -266,13 +294,51 @@ func (g *DurableGateway) LastReceivedEventSeq(ctx context.Context, claims TokenC
 }
 
 func (g *DurableGateway) stateFor(conversationID string) *conversationLogState {
+	g.clock++
 	st, ok := g.tails[conversationID]
 	if ok {
+		st.lastUsed = g.clock
 		return st
 	}
-	st = &conversationLogState{acks: make(map[uint64]CommandAck)}
+	st = &conversationLogState{acks: make(map[uint64]CommandAck), lastUsed: g.clock}
 	g.tails[conversationID] = st
+	g.evictInactiveTailsLocked(conversationID)
 	return st
+}
+
+func (g *DurableGateway) evictInactiveTailsLocked(activeConversationID string) {
+	for len(g.tails) > g.maxConversationTails() {
+		var evictID string
+		var oldest uint64
+		for conversationID, state := range g.tails {
+			if conversationID == activeConversationID {
+				continue
+			}
+			if evictID == "" || state.lastUsed < oldest || (state.lastUsed == oldest && conversationID < evictID) {
+				evictID, oldest = conversationID, state.lastUsed
+			}
+		}
+		if evictID == "" {
+			return
+		}
+		delete(g.tails, evictID)
+	}
+}
+
+func (g *DurableGateway) rememberAckLocked(st *conversationLogState, ack CommandAck) {
+	st.acks[ack.Seq] = ack
+	st.ackOrder = append(st.ackOrder, ackCacheEntry{seq: ack.Seq, ack: ack})
+	for len(st.acks) > g.maxAckTail() && len(st.ackOrder) > 0 {
+		oldest := st.ackOrder[0]
+		st.ackOrder = st.ackOrder[1:]
+		if current, ok := st.acks[oldest.seq]; ok && commandAckEqual(current, oldest.ack) {
+			delete(st.acks, oldest.seq)
+		}
+	}
+}
+
+func commandAckEqual(left, right CommandAck) bool {
+	return left.Seq == right.Seq && left.CommandID == right.CommandID && left.Status == right.Status && stringPointerEqual(left.RejectReason, right.RejectReason)
 }
 
 func (g *DurableGateway) state(ctx context.Context, agentID string) (runtimeState, error) {
@@ -378,6 +444,12 @@ func (g *DurableGateway) appendCommandAckLocked(conversationID string, ack Comma
 	}
 
 	previous, ok := st.acks[ack.Seq]
+	if !ok {
+		previous, ok, err = findAckLocked(file, ack.Seq)
+		if err != nil {
+			return err
+		}
+	}
 	if ok {
 		if previous.Seq != ack.Seq || previous.CommandID != ack.CommandID {
 			return fmt.Errorf("durable ack log contains mismatched seq/command_id correlation")
@@ -429,7 +501,7 @@ func (g *DurableGateway) appendCommandAckLocked(conversationID string, ack Comma
 		return opErr
 	}
 
-	st.acks[ack.Seq] = ack
+	g.rememberAckLocked(st, ack)
 	st.ackSize = preWriteOffset + int64(len(data))
 	return nil
 }
@@ -526,6 +598,7 @@ func (g *DurableGateway) refreshAckTailLocked(file durableFileHandle, st *conver
 	}
 	if size < st.ackSize {
 		st.acks = make(map[uint64]CommandAck)
+		st.ackOrder = nil
 		st.ackSize = 0
 	}
 	start := st.ackSize
@@ -570,7 +643,7 @@ func (g *DurableGateway) refreshAckTailLocked(file durableFileHandle, st *conver
 			}
 			return fmt.Errorf("decode durable ack log: %w", err)
 		}
-		st.acks[existing.Seq] = existing
+		g.rememberAckLocked(st, existing)
 
 		if readErr == io.EOF {
 			if len(line) > 0 && line[len(line)-1] != '\n' {
@@ -591,6 +664,35 @@ func (g *DurableGateway) refreshAckTailLocked(file durableFileHandle, st *conver
 
 	st.ackSize = offset
 	return nil
+}
+
+// findAckLocked reloads an evicted ACK entry from its durable log. The cache
+// may only retain a bounded tail, but terminal ACK transitions remain valid
+// regardless of conversation age or process lifetime.
+func findAckLocked(file durableFileHandle, seq uint64) (CommandAck, bool, error) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return CommandAck{}, false, fmt.Errorf("seek durable ack log for lookup: %w", err)
+	}
+	r := bufio.NewReader(file)
+	var found CommandAck
+	for {
+		line, err := r.ReadBytes('\n')
+		if len(bytes.TrimSpace(line)) > 0 {
+			var candidate CommandAck
+			if decodeErr := json.Unmarshal(bytes.TrimSpace(line), &candidate); decodeErr != nil {
+				return CommandAck{}, false, fmt.Errorf("decode durable ack log for lookup: %w", decodeErr)
+			}
+			if candidate.Seq == seq {
+				found = candidate
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			return found, found.CommandID != "", nil
+		}
+		if err != nil {
+			return CommandAck{}, false, fmt.Errorf("read durable ack log for lookup: %w", err)
+		}
+	}
 }
 
 func (g *DurableGateway) publishRuntimeState(agentID string, state runtimeState) error {
@@ -631,6 +733,14 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	if err := os.Rename(tmpPath, path); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("publish file atomically: %w", err)
+	}
+	dirFile, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open runtime-state parent directory after rename: %w", err)
+	}
+	defer dirFile.Close()
+	if err := dirFile.Sync(); err != nil {
+		return fmt.Errorf("sync runtime-state parent directory after rename: %w", err)
 	}
 	return nil
 }

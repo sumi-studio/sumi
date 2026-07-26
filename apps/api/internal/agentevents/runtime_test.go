@@ -196,6 +196,71 @@ func TestDurableGatewayCorrelatesAndDeduplicatesCommandAcks(t *testing.T) {
 	}
 }
 
+func TestDurableGatewayEvictsInactiveTailsAndReloadsDurableState(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	gateway.MaxConversationTails = 2
+	gateway.MaxAckTail = 1
+
+	for _, conversationID := range []string{"conversation-1", "conversation-2", "conversation-3"} {
+		claims := TokenClaims{ConversationID: conversationID}
+		seq := uint64(1)
+		if err := gateway.Receive(context.Background(), claims, Envelope{
+			Seq:            &seq,
+			ConversationID: conversationID,
+			Event:          json.RawMessage(`{"type":"agent_start"}`),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gateway.mu.Lock()
+	if len(gateway.tails) > gateway.MaxConversationTails {
+		gateway.mu.Unlock()
+		t.Fatalf("retained %d conversation tails, limit is %d", len(gateway.tails), gateway.MaxConversationTails)
+	}
+	gateway.mu.Unlock()
+
+	claims := TokenClaims{ConversationID: "conversation-1"}
+	last, err := gateway.LastReceivedEventSeq(context.Background(), claims)
+	if err != nil || last != 1 {
+		t.Fatalf("evicted event tail did not reload: last=%d err=%v", last, err)
+	}
+	seq := uint64(2)
+	if err := gateway.Receive(context.Background(), claims, Envelope{
+		Seq:            &seq,
+		ConversationID: claims.ConversationID,
+		Event:          json.RawMessage(`{"type":"agent_end"}`),
+	}); err != nil {
+		t.Fatalf("event append after reload: %v", err)
+	}
+
+	for i := 0; i < 2; i++ {
+		if _, err := gateway.commands.Append(context.Background(), claims.ConversationID, "", json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	commands, err := gateway.commands.CatchUp(context.Background(), claims.ConversationID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range commands {
+		if err := gateway.ApplyAck(context.Background(), claims, CommandAck{Seq: command.Seq, CommandID: command.CommandID, Status: "received"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// seq=1 is outside the one-entry cache, but its durable received ACK must
+	// still allow the one legal terminal transition.
+	first := commands[0]
+	if err := gateway.ApplyAck(context.Background(), claims, CommandAck{Seq: first.Seq, CommandID: first.CommandID, Status: "applied"}); err != nil {
+		t.Fatalf("evicted ACK did not reload for terminal transition: %v", err)
+	}
+	gateway.mu.Lock()
+	ackEntries := len(gateway.stateFor(claims.ConversationID).acks)
+	gateway.mu.Unlock()
+	if ackEntries > gateway.MaxAckTail {
+		t.Fatalf("retained %d ACK cache entries, limit is %d", ackEntries, gateway.MaxAckTail)
+	}
+}
+
 func failingOpener(ff *failingFile) func(string, int, os.FileMode) (durableFileHandle, error) {
 	return func(name string, flag int, perm os.FileMode) (durableFileHandle, error) {
 		f, err := os.OpenFile(name, flag, perm)
@@ -264,12 +329,19 @@ func TestDurableGatewayEventAppendRollsBackOnSyncFailure(t *testing.T) {
 	if err := gateway.Receive(context.Background(), claims, event); err == nil {
 		t.Fatal("expected sync failure")
 	}
+	last, err := gateway.LastReceivedEventSeq(context.Background(), claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last != 0 {
+		t.Fatalf("expected empty log after sync rollback, got seq %d", last)
+	}
 
 	gateway.newFile = realOpener()
 	if err := gateway.Receive(context.Background(), claims, event); err != nil {
 		t.Fatalf("retry after rollback failed: %v", err)
 	}
-	last, err := gateway.LastReceivedEventSeq(context.Background(), claims)
+	last, err = gateway.LastReceivedEventSeq(context.Background(), claims)
 	if err != nil {
 		t.Fatal(err)
 	}

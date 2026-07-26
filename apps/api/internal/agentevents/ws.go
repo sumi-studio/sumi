@@ -307,20 +307,31 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 	errCh := make(chan error, 2)
 	var wg sync.WaitGroup
 	wg.Add(2)
+	var stopOnce sync.Once
+	stopPumps := func() {
+		stopOnce.Do(func() {
+			cancel()
+			// Cancellation alone cannot interrupt gorilla's blocking ReadJSON.
+			// Poison both halves immediately rather than waiting for PongWait.
+			_ = conn.SetReadDeadline(time.Now())
+			_ = conn.SetWriteDeadline(time.Now())
+		})
+	}
 
 	go func() {
 		defer wg.Done()
 		errCh <- s.readPump(ctx, conn, claims)
-		cancel()
+		stopPumps()
 	}()
 
 	go func() {
 		defer wg.Done()
 		errCh <- s.writePump(ctx, conn, live, liveErr)
-		cancel()
+		stopPumps()
 	}()
 
 	<-ctx.Done()
+	stopPumps()
 	var pumpErrs []error
 	for i := 0; i < 2; i++ {
 		if err := <-errCh; err != nil {
@@ -379,13 +390,16 @@ func (s *Server) writePump(ctx context.Context, conn *websocket.Conn, live <-cha
 				return ctx.Err()
 			case cmd, ok := <-live:
 				if !ok {
-					return errors.New("command source closed")
+					return sourceCloseError(liveErr)
 				}
 				if err := s.sendCommandEnvelope(conn, cmd); err != nil {
 					return err
 				}
 			case err, ok := <-liveErr:
-				if ok && err != nil {
+				if !ok {
+					return errors.New("command source closed")
+				}
+				if err != nil {
 					return err
 				}
 			}
@@ -400,7 +414,7 @@ func (s *Server) writePump(ctx context.Context, conn *websocket.Conn, live <-cha
 			return ctx.Err()
 		case cmd, ok := <-live:
 			if !ok {
-				return errors.New("command source closed")
+				return sourceCloseError(liveErr)
 			}
 			if err := s.sendCommandEnvelope(conn, cmd); err != nil {
 				return err
@@ -418,6 +432,18 @@ func (s *Server) writePump(ctx context.Context, conn *websocket.Conn, live <-cha
 			}
 		}
 	}
+}
+
+func sourceCloseError(liveErr <-chan error) error {
+	// DurableGateway closes commands before errors. Consume the terminal error
+	// so a real source failure is not replaced by a generic closed-channel one.
+	if liveErr == nil {
+		return errors.New("command source closed")
+	}
+	if err, ok := <-liveErr; ok && err != nil {
+		return err
+	}
+	return errors.New("command source closed")
 }
 
 func (s *Server) sendCommandEnvelope(conn *websocket.Conn, cmd CommandEnvelope) error {
