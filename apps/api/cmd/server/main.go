@@ -56,6 +56,10 @@ func newRouter() (*http.ServeMux, error) {
 		return nil, fmt.Errorf("open command store: %w", err)
 	}
 	runtimeDir := os.Getenv("SUMI_AGENT_RUNTIME_STATE_DIR")
+	if runtimeDir == "" {
+		_ = store.Close()
+		return nil, errors.New("SUMI_AGENT_RUNTIME_STATE_DIR not set")
+	}
 	runtime, err := agentevents.OpenDurableGateway(runtimeDir, store)
 	if err != nil {
 		_ = store.Close()

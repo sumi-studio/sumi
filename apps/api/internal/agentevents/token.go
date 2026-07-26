@@ -63,7 +63,8 @@ func (v *HMACTokenVerifier) Verify(ctx context.Context, token string) (TokenClai
 	mac := hmac.New(sha256.New, v.secret)
 	mac.Write([]byte(signingInput))
 	expected := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
-	if !hmac.Equal([]byte(expected), []byte(parts[2])) {
+	signature := strings.TrimRight(parts[2], "=")
+	if !hmac.Equal([]byte(expected), []byte(signature)) {
 		return TokenClaims{}, errors.New("invalid token signature")
 	}
 

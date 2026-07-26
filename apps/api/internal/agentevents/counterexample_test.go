@@ -127,6 +127,8 @@ func TestAgentHelloUnmarshalJSONStrict(t *testing.T) {
 func TestEnvelopeRejectsMalformedEventBody(t *testing.T) {
 	cases := []string{
 		`{"seq":1,"conversation_id":"c","event":{"type":"message_end","message_id":"not-a-uuid","message":{"role":"user","content":[{"type":"text","text":"x"}],"timestamp":"2026-07-25T20:00:00Z"}}}`,
+		`{"seq":1,"conversation_id":"c","event":{"type":"message_end","message_id":"00000000-0000-4000-8000-000000000001","message":{"role":"user","content":[{"type":"text","text":"x"}],"timestamp":"not-a-date"}}}`,
+		`{"seq":1,"conversation_id":"c","event":{"type":"retry_scheduled","attempt":1,"delay_ms":100,"retry_at":"tomorrow","error_message":"retry"}}`,
 		`{"seq":1,"conversation_id":"c","event":{"type":"tool_execution_start","tool_call_id":"call-1","tool_name":"read_file","args":null}}`,
 		`{"seq":1,"conversation_id":"c","event":{"type":"approval_resolved","request_id":"req-1","resolution":{"decision":{"type":"approve_once","extra":1}}}}`,
 	}

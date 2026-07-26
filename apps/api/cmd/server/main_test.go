@@ -110,6 +110,15 @@ func TestNewRouter_RequiresCommandLogDir(t *testing.T) {
 	}
 }
 
+func TestNewRouter_RequiresAgentRuntimeStateDir(t *testing.T) {
+	t.Setenv("SUMI_COMMAND_LOG_DIR", t.TempDir())
+	t.Setenv("SUMI_AGENT_RUNTIME_STATE_DIR", "")
+	_, err := newRouter()
+	if err == nil || !strings.Contains(err.Error(), "SUMI_AGENT_RUNTIME_STATE_DIR") {
+		t.Fatalf("expected explicit runtime-state directory error, got %v", err)
+	}
+}
+
 func TestNewRouter_RegistersCommandRoute(t *testing.T) {
 	setTokenSecret(t)
 	t.Setenv("SUMI_COMMAND_LOG_DIR", t.TempDir())

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"time"
 )
 
 // validateEvent validates the body of an AgentEvent against the public
@@ -153,7 +154,7 @@ func validateEvent(raw json.RawMessage) error {
 		if err := validateJSONSafeInteger(obj["delay_ms"]); err != nil {
 			return fmt.Errorf("retry_scheduled.delay_ms: %w", err)
 		}
-		if err := validateString(obj["retry_at"]); err != nil {
+		if err := validateDateTime(obj["retry_at"]); err != nil {
 			return fmt.Errorf("retry_scheduled.retry_at: %w", err)
 		}
 		if err := validateString(obj["error_message"]); err != nil {
@@ -196,7 +197,7 @@ func validatePublicMessage(raw json.RawMessage) error {
 		if err := validateArray(obj["content"], validateUserContent); err != nil {
 			return fmt.Errorf("user message content: %w", err)
 		}
-		if err := validateString(obj["timestamp"]); err != nil {
+		if err := validateDateTime(obj["timestamp"]); err != nil {
 			return fmt.Errorf("user message timestamp: %w", err)
 		}
 		return nil
@@ -235,7 +236,7 @@ func validatePublicMessage(raw json.RawMessage) error {
 		if err := validateBool(obj["interrupted"]); err != nil {
 			return fmt.Errorf("assistant message interrupted: %w", err)
 		}
-		if err := validateString(obj["timestamp"]); err != nil {
+		if err := validateDateTime(obj["timestamp"]); err != nil {
 			return fmt.Errorf("assistant message timestamp: %w", err)
 		}
 		return nil
@@ -259,7 +260,7 @@ func validatePublicMessage(raw json.RawMessage) error {
 		if err := validateBool(obj["is_error"]); err != nil {
 			return fmt.Errorf("tool_result message is_error: %w", err)
 		}
-		if err := validateString(obj["timestamp"]); err != nil {
+		if err := validateDateTime(obj["timestamp"]); err != nil {
 			return fmt.Errorf("tool_result message timestamp: %w", err)
 		}
 		return nil
@@ -529,7 +530,7 @@ func validateToolResultPayload(raw json.RawMessage) error {
 	if err := validateBool(obj["is_error"]); err != nil {
 		return fmt.Errorf("tool result is_error: %w", err)
 	}
-	if err := validateString(obj["timestamp"]); err != nil {
+	if err := validateDateTime(obj["timestamp"]); err != nil {
 		return fmt.Errorf("tool result timestamp: %w", err)
 	}
 	return nil
@@ -825,6 +826,20 @@ func validateString(raw json.RawMessage) error {
 	}
 	var s string
 	return json.Unmarshal(raw, &s)
+}
+
+func validateDateTime(raw json.RawMessage) error {
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return fmt.Errorf("expected RFC3339 date-time, got null")
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return err
+	}
+	if _, err := time.Parse(time.RFC3339Nano, value); err != nil {
+		return fmt.Errorf("%q is not an RFC3339 date-time: %w", value, err)
+	}
+	return nil
 }
 
 func validateStringOrNull(raw json.RawMessage) error {

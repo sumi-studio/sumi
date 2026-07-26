@@ -212,6 +212,30 @@ func TestDecodeBase64URLAcceptsPaddedInput(t *testing.T) {
 	}
 }
 
+func TestHMACTokenVerifierAcceptsPaddedSignature(t *testing.T) {
+	v, err := NewHMACTokenVerifier(testSecret, "")
+	if err != nil {
+		t.Fatalf("new verifier: %v", err)
+	}
+	token := signTestToken(t, testSecret, tokenClaims{
+		TenantID:       "tenant-1",
+		AgentID:        "agent-1",
+		ConversationID: "conversation-1",
+		Generation:     7,
+		Exp:            time.Now().Add(time.Minute).Unix(),
+		Aud:            defaultAgentAudience,
+	})
+	parts := strings.Split(token, ".")
+	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		t.Fatalf("decode signature: %v", err)
+	}
+	parts[2] = base64.URLEncoding.EncodeToString(signature)
+	if _, err := v.Verify(context.Background(), strings.Join(parts, ".")); err != nil {
+		t.Fatalf("padded signature must verify: %v", err)
+	}
+}
+
 func TestHMACTokenVerifierSignatureCheckedBeforeClaims(t *testing.T) {
 	v, err := NewHMACTokenVerifier(testSecret, "")
 	if err != nil {

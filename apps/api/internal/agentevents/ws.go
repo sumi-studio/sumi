@@ -252,6 +252,13 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 	if err != nil {
 		return fmt.Errorf("last received event seq: %w", err)
 	}
+	if lastReceivedEventSeq > hello.LastSentEventSeq {
+		return fmt.Errorf(
+			"event cursor is ahead of agent: api received %d, agent last sent %d",
+			lastReceivedEventSeq,
+			hello.LastSentEventSeq,
+		)
+	}
 	apiHello := ApiHello{
 		AcceptedGeneration:   claims.Generation,
 		LastReceivedEventSeq: lastReceivedEventSeq,

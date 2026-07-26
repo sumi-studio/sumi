@@ -1,8 +1,8 @@
 package agentevents
 
 // DurableGateway is the production adapter for the T28 API boundary. T26
-// publishes one atomically-written state file per agent (generation + ready
-// latch); commands, ACKs, and agent events are persisted here rather than
+// publishes one atomically-written state file per agent (generation + stable
+// hydration receipt identity); commands, ACKs, and agent events are persisted here rather than
 // being represented by cmd/server placeholders.
 
 import (
@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -25,8 +26,9 @@ type DurableGateway struct {
 }
 
 type runtimeState struct {
-	Generation uint64 `json:"generation"`
-	Ready      bool   `json:"ready"`
+	Generation               uint64  `json:"generation"`
+	HydrationReceiptIdentity *string `json:"hydration_receipt_identity"`
+	present                  bool
 }
 
 type durableEventRecord struct {
@@ -60,6 +62,9 @@ func (g *DurableGateway) VerifyGeneration(ctx context.Context, agentID string, g
 	if err != nil {
 		return err
 	}
+	if !state.present {
+		return nil
+	}
 	if state.Generation != generation {
 		return fmt.Errorf("stale generation: got %d, current %d", generation, state.Generation)
 	}
@@ -74,10 +79,21 @@ func (g *DurableGateway) WaitFor(ctx context.Context, claims TokenClaims, genera
 		if err != nil {
 			return err
 		}
+		if !state.present {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-ticker.C:
+				continue
+			}
+		}
 		if state.Generation != generation {
 			return fmt.Errorf("hydration generation changed: got %d, current %d", generation, state.Generation)
 		}
-		if state.Ready {
+		if state.HydrationReceiptIdentity != nil {
+			if *state.HydrationReceiptIdentity == "" {
+				return errors.New("hydration receipt identity must not be empty")
+			}
 			return nil
 		}
 		select {
@@ -133,7 +149,20 @@ func (g *DurableGateway) ApplyAck(ctx context.Context, claims TokenClaims, ack C
 	if err := validateCommandAck(ack); err != nil {
 		return err
 	}
-	return g.appendJSONLine(g.ackPath(claims.ConversationID), ack)
+	commands, err := g.commands.CatchUp(ctx, claims.ConversationID, ack.Seq)
+	if err != nil {
+		return fmt.Errorf("load acknowledged command: %w", err)
+	}
+	if len(commands) == 0 || commands[0].Seq != ack.Seq || commands[0].CommandID != ack.CommandID {
+		return fmt.Errorf(
+			"ack does not match durable command log: seq=%d command_id=%q",
+			ack.Seq,
+			ack.CommandID,
+		)
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.appendCommandAckLocked(g.ackPath(claims.ConversationID), ack)
 }
 
 func (g *DurableGateway) Receive(ctx context.Context, claims TokenClaims, envelope Envelope) error {
@@ -148,14 +177,10 @@ func (g *DurableGateway) Receive(ctx context.Context, claims TokenClaims, envelo
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	last, err := g.lastEventSeqLocked(claims.ConversationID)
-	if err != nil {
-		return err
-	}
-	if *envelope.Seq != last+1 {
-		return fmt.Errorf("event seq is not contiguous: got %d, want %d", *envelope.Seq, last+1)
-	}
-	return g.appendJSONLineLocked(g.eventPath(claims.ConversationID), durableEventRecord{Seq: *envelope.Seq, Event: envelope})
+	return g.appendDurableEventLocked(
+		g.eventPath(claims.ConversationID),
+		durableEventRecord{Seq: *envelope.Seq, Event: envelope},
+	)
 }
 
 func (g *DurableGateway) LastReceivedEventSeq(ctx context.Context, claims TokenClaims) (uint64, error) {
@@ -176,6 +201,10 @@ func (g *DurableGateway) lastEventSeqLocked(conversationID string) (uint64, erro
 		return 0, err
 	}
 	defer file.Close()
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_SH); err != nil {
+		return 0, fmt.Errorf("lock durable event log for read: %w", err)
+	}
+	defer func() { _ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN) }()
 	decoder := json.NewDecoder(file)
 	var last uint64
 	for {
@@ -198,8 +227,14 @@ func (g *DurableGateway) state(ctx context.Context, agentID string) (runtimeStat
 	}
 	path := g.statePath(agentID)
 	info, err := os.Lstat(path)
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return runtimeState{}, errors.New("missing or invalid durable runtime state")
+	if errors.Is(err, os.ErrNotExist) {
+		return runtimeState{}, nil
+	}
+	if err != nil {
+		return runtimeState{}, fmt.Errorf("inspect durable runtime state: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return runtimeState{}, errors.New("invalid durable runtime state")
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -209,29 +244,117 @@ func (g *DurableGateway) state(ctx context.Context, agentID string) (runtimeStat
 	if err := unmarshalStrict(raw, &state); err != nil {
 		return runtimeState{}, fmt.Errorf("decode durable runtime state: %w", err)
 	}
+	if state.HydrationReceiptIdentity != nil && *state.HydrationReceiptIdentity == "" {
+		return runtimeState{}, errors.New("hydration receipt identity must not be empty")
+	}
+	state.present = true
 	return state, nil
 }
 
-func (g *DurableGateway) appendJSONLine(path string, value any) error {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.appendJSONLineLocked(path, value)
-}
-
-func (g *DurableGateway) appendJSONLineLocked(path string, value any) error {
-	line, err := json.Marshal(value)
-	if err != nil {
-		return err
-	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+func (g *DurableGateway) appendDurableEventLocked(path string, record durableEventRecord) error {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("lock durable event log for append: %w", err)
+	}
+	defer func() { _ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN) }()
+
+	decoder := json.NewDecoder(file)
+	var last uint64
+	for {
+		var existing durableEventRecord
+		if err := decoder.Decode(&existing); errors.Is(err, io.EOF) {
+			break
+		} else if err != nil {
+			return fmt.Errorf("decode durable event log: %w", err)
+		}
+		if existing.Seq != last+1 {
+			return fmt.Errorf("durable event log is non-contiguous: got %d after %d", existing.Seq, last)
+		}
+		last = existing.Seq
+	}
+	if record.Seq != last+1 {
+		return fmt.Errorf("event seq is not contiguous: got %d, want %d", record.Seq, last+1)
+	}
+	line, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Seek(0, io.SeekEnd); err != nil {
+		return err
+	}
 	if _, err := file.Write(append(line, '\n')); err != nil {
 		return err
 	}
 	return file.Sync()
+}
+
+func (g *DurableGateway) appendCommandAckLocked(path string, ack CommandAck) error {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("lock durable ack log for append: %w", err)
+	}
+	defer func() { _ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN) }()
+
+	decoder := json.NewDecoder(file)
+	var previous *CommandAck
+	for {
+		var existing CommandAck
+		if err := decoder.Decode(&existing); errors.Is(err, io.EOF) {
+			break
+		} else if err != nil {
+			return fmt.Errorf("decode durable ack log: %w", err)
+		}
+		if existing.Seq == ack.Seq || existing.CommandID == ack.CommandID {
+			if existing.Seq != ack.Seq || existing.CommandID != ack.CommandID {
+				return fmt.Errorf("durable ack log contains mismatched seq/command_id correlation")
+			}
+			existingCopy := existing
+			previous = &existingCopy
+		}
+	}
+	if previous != nil {
+		if previous.Status == ack.Status && stringPointerEqual(previous.RejectReason, ack.RejectReason) {
+			return nil
+		}
+		if previous.Status != "received" {
+			return fmt.Errorf(
+				"command ack is already terminal: seq=%d command_id=%q status=%q",
+				ack.Seq,
+				ack.CommandID,
+				previous.Status,
+			)
+		}
+		if ack.Status == "received" {
+			return fmt.Errorf("conflicting duplicate received ack")
+		}
+	}
+
+	line, err := json.Marshal(ack)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Seek(0, io.SeekEnd); err != nil {
+		return err
+	}
+	if _, err := file.Write(append(line, '\n')); err != nil {
+		return err
+	}
+	return file.Sync()
+}
+
+func stringPointerEqual(left, right *string) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }
 
 func (g *DurableGateway) statePath(agentID string) string {
