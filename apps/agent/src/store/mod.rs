@@ -707,6 +707,8 @@ impl Store {
         Vec<MemoryJobRecord>,
         Vec<MemoryApplyCursorRecord>,
     )> {
+        let mut key_cache: HashMap<String, Arc<DataKeyMaterial>> = HashMap::new();
+
         let batch_rows = sqlx::query(
             "SELECT id, layer, ord, batch_seq, version, state, est_tokens,
                     eviction_footprint_tokens, summary_key_ref, summary_ciphertext,
@@ -719,6 +721,7 @@ impl Store {
 
         let mut memory_batches = Vec::with_capacity(batch_rows.len());
         for row in batch_rows {
+            let id: String = row.try_get("id")?;
             let summary = match (
                 row.try_get::<Option<String>, _>("summary_key_ref")?,
                 row.try_get::<Option<Vec<u8>>, _>("summary_ciphertext")?,
@@ -726,12 +729,23 @@ impl Store {
                 row.try_get::<Option<i64>, _>("summary_redaction_version")?,
             ) {
                 (Some(key_ref), Some(ciphertext), Some(projection), Some(version)) => {
+                    let redaction_version = u32::try_from(version)
+                        .with_context(|| "memory batch redaction version out of u32 range")?;
+                    self.verify_memory_projection(
+                        &mut key_cache,
+                        &key_ref,
+                        &ciphertext,
+                        &projection,
+                        redaction_version,
+                        "memory_batches",
+                        &id,
+                    )
+                    .await?;
                     Some(MemoryBatchSummary {
                         key_ref,
                         ciphertext,
                         projection,
-                        redaction_version: u32::try_from(version)
-                            .with_context(|| "memory batch redaction version out of u32 range")?,
+                        redaction_version,
                     })
                 }
                 (None, None, None, None) => None,
@@ -746,7 +760,7 @@ impl Store {
                 .ok_or_else(|| anyhow!("memory batch has unknown state {state}"))?;
 
             memory_batches.push(MemoryBatchRecord {
-                id: row.try_get("id")?,
+                id,
                 layer,
                 ord: row.try_get("ord")?,
                 batch_seq: row.try_get("batch_seq")?,
@@ -785,6 +799,7 @@ impl Store {
         .context("failed to hydrate memory jobs")?;
         let mut memory_jobs = Vec::with_capacity(job_rows.len());
         for row in job_rows {
+            let id: String = row.try_get("id")?;
             let result = match (
                 row.try_get::<Option<String>, _>("result_key_ref")?,
                 row.try_get::<Option<Vec<u8>>, _>("result_ciphertext")?,
@@ -792,13 +807,23 @@ impl Store {
                 row.try_get::<Option<i64>, _>("result_redaction_version")?,
             ) {
                 (Some(key_ref), Some(ciphertext), Some(projection), Some(version)) => {
+                    let redaction_version = u32::try_from(version)
+                        .with_context(|| "memory job result redaction version out of u32 range")?;
+                    self.verify_memory_projection(
+                        &mut key_cache,
+                        &key_ref,
+                        &ciphertext,
+                        &projection,
+                        redaction_version,
+                        "memory_jobs",
+                        &id,
+                    )
+                    .await?;
                     Some(MemoryJobResult {
                         key_ref,
                         ciphertext,
                         projection,
-                        redaction_version: u32::try_from(version).with_context(
-                            || "memory job result redaction version out of u32 range",
-                        )?,
+                        redaction_version,
                     })
                 }
                 (None, None, None, None) => None,
@@ -820,7 +845,7 @@ impl Store {
                     .context("memory job source_versions is not valid JSON")?;
 
             memory_jobs.push(MemoryJobRecord {
-                id: row.try_get("id")?,
+                id,
                 kind,
                 batch_seq: row.try_get("batch_seq")?,
                 source_ids,
@@ -884,6 +909,41 @@ impl Store {
         let key = Arc::new(key);
         cache.insert(key_ref.to_owned(), key.clone());
         Ok(key)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn verify_memory_projection(
+        &self,
+        key_cache: &mut HashMap<String, Arc<DataKeyMaterial>>,
+        key_ref: &str,
+        ciphertext: &[u8],
+        projection: &str,
+        redaction_version: u32,
+        table: &str,
+        row_id: &str,
+    ) -> Result<()> {
+        let key = self
+            .load_hydration_key(key_cache, key_ref, DataKeyPurpose::MemorySummary)
+            .await
+            .with_context(|| format!("failed to load data key for {table} {row_id}"))?;
+        let aad = self
+            .scope
+            .row_aad(table, row_id, DataKeyPurpose::MemorySummary);
+        let plaintext = decrypt_content(&key, ciphertext, &aad)
+            .with_context(|| format!("failed to decrypt {table} projection for {row_id}"))?;
+        if redaction_version != self.redactor.version() {
+            bail!(
+                "{table} projection for {row_id} uses unsupported redaction version {redaction_version}"
+            );
+        }
+        let derived = self
+            .redactor
+            .redact_serialized(&plaintext)
+            .with_context(|| format!("failed to redact {table} plaintext for {row_id}"))?;
+        if derived != projection {
+            bail!("{table} projection for {row_id} does not match re-derived redacted plaintext");
+        }
+        Ok(())
     }
 
     pub(crate) fn scope(&self) -> &AgentScope {
@@ -1513,6 +1573,8 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
 mod tests {
     use super::*;
     use crate::store::crypto::{DATA_KEY_BYTES, WrappingKey, decrypt_content, encrypt_content};
+    use chrono::Utc;
+    use serde_json::json;
 
     struct TestKeyProvider {
         key: WrappingKey,
@@ -2324,5 +2386,511 @@ mod tests {
             message.contains("FOREIGN KEY") || message.contains("787"),
             "{message}"
         );
+    }
+
+    fn test_lease() -> ProcessGenerationLease {
+        ProcessGenerationLease::new(
+            ProcessGeneration::from_wire(1).expect("valid test process generation"),
+            "test-lease",
+        )
+        .expect("valid test process generation lease")
+    }
+
+    fn test_fence() -> GenerationRecoveryFence {
+        GenerationRecoveryFence::new(&test_lease(), "test-fence").expect("valid test fence")
+    }
+
+    fn test_now() -> String {
+        Utc::now().to_rfc3339()
+    }
+
+    fn test_memory_payload() -> serde_json::Value {
+        json!({
+            "summary": "Nothing of secret value here.",
+            "est_tokens": 42,
+            "from": "2024-01-01T00:00:00+00:00",
+            "to": "2024-01-02T00:00:00+00:00",
+        })
+    }
+
+    fn encrypt_memory_projection(
+        store: &Store,
+        key: &DataKeyMaterial,
+        table: &str,
+        row_id: &str,
+        payload: &serde_json::Value,
+    ) -> (Vec<u8>, String, u32) {
+        let raw = serde_json::to_vec(payload).expect("serialize memory payload");
+        let aad = store
+            .scope()
+            .row_aad(table, row_id, DataKeyPurpose::MemorySummary);
+        let ciphertext = encrypt_content(key, &raw, &aad).expect("encrypt memory payload");
+        let projection = store
+            .redactor()
+            .redact_serialized(&raw)
+            .expect("redact memory payload");
+        (ciphertext, projection, store.redactor().version())
+    }
+
+    async fn insert_memory_batch(
+        store: &Store,
+        id: &str,
+        key_ref: &str,
+        ciphertext: &[u8],
+        projection: &str,
+        redaction_version: i64,
+    ) {
+        sqlx::query(
+            "INSERT INTO memory_batches(
+                id, layer, ord, batch_seq, version, state, est_tokens,
+                eviction_footprint_tokens, summary_key_ref, summary_ciphertext,
+                summary_projection, summary_redaction_version, updated_at
+             ) VALUES(?, 0, 0, 0, 0, 'open', 10, 0, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(key_ref)
+        .bind(ciphertext)
+        .bind(projection)
+        .bind(redaction_version)
+        .bind(test_now())
+        .execute(store.pool())
+        .await
+        .expect("seed memory batch");
+    }
+
+    async fn insert_memory_job(
+        store: &Store,
+        id: &str,
+        key_ref: &str,
+        ciphertext: &[u8],
+        projection: &str,
+        redaction_version: i64,
+    ) {
+        sqlx::query(
+            "INSERT INTO memory_jobs(
+                id, kind, batch_seq, source_ids, source_versions, status, attempts,
+                result_key_ref, result_ciphertext, result_projection, result_redaction_version,
+                created_at, updated_at
+             ) VALUES(?, 'compact_l0', 0, '[]', '{}', 'completed', 0, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(key_ref)
+        .bind(ciphertext)
+        .bind(projection)
+        .bind(redaction_version)
+        .bind(test_now())
+        .bind(test_now())
+        .execute(store.pool())
+        .await
+        .expect("seed memory job");
+    }
+
+    #[tokio::test]
+    async fn memory_batch_summary_hydrates_successfully() {
+        let store = store().await;
+        let key = store
+            .conversation_key(DataKeyPurpose::MemorySummary)
+            .await
+            .expect("mint memory summary key");
+        let payload = test_memory_payload();
+        let (ciphertext, projection, version) =
+            encrypt_memory_projection(&store, &key, "memory_batches", "batch-ok", &payload);
+        insert_memory_batch(
+            &store,
+            "batch-ok",
+            &key.key_ref,
+            &ciphertext,
+            &projection,
+            i64::from(version),
+        )
+        .await;
+
+        let (batches, _messages, _jobs, _cursors) = store
+            .hydrate_memory_state()
+            .await
+            .expect("hydrate authenticated memory state");
+        assert_eq!(batches.len(), 1);
+        let summary = batches[0].summary.as_ref().expect("batch has a summary");
+        assert_eq!(summary.key_ref, key.key_ref);
+        assert_eq!(summary.projection, projection);
+        assert_eq!(summary.redaction_version, version);
+    }
+
+    #[tokio::test]
+    async fn memory_batch_summary_rejects_tampered_ciphertext() {
+        let store = store().await;
+        let key = store
+            .conversation_key(DataKeyPurpose::MemorySummary)
+            .await
+            .expect("mint memory summary key");
+        let payload = test_memory_payload();
+        let (mut ciphertext, projection, version) =
+            encrypt_memory_projection(&store, &key, "memory_batches", "batch-tamper", &payload);
+        ciphertext[0] ^= 0xff;
+        insert_memory_batch(
+            &store,
+            "batch-tamper",
+            &key.key_ref,
+            &ciphertext,
+            &projection,
+            i64::from(version),
+        )
+        .await;
+
+        let error = store
+            .hydrate_memory_state()
+            .await
+            .expect_err("tampered ciphertext must fail hydration");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("failed to decrypt memory_batches projection"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_batch_summary_rejects_wrong_key_ref() {
+        let store = store().await;
+        let memory_key = store
+            .conversation_key(DataKeyPurpose::MemorySummary)
+            .await
+            .expect("mint memory summary key");
+        let transcript_key = store
+            .conversation_key(DataKeyPurpose::Transcript)
+            .await
+            .expect("mint transcript key");
+        let payload = test_memory_payload();
+        let (ciphertext, projection, version) = encrypt_memory_projection(
+            &store,
+            &memory_key,
+            "memory_batches",
+            "batch-wrong-key",
+            &payload,
+        );
+        insert_memory_batch(
+            &store,
+            "batch-wrong-key",
+            &transcript_key.key_ref,
+            &ciphertext,
+            &projection,
+            i64::from(version),
+        )
+        .await;
+
+        let error = store
+            .hydrate_memory_state()
+            .await
+            .expect_err("wrong key reference must fail hydration");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("has purpose transcript")
+                && message.contains("expected memory_summary"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_batch_summary_rejects_mismatched_projection() {
+        let store = store().await;
+        let key = store
+            .conversation_key(DataKeyPurpose::MemorySummary)
+            .await
+            .expect("mint memory summary key");
+        let payload = test_memory_payload();
+        let (ciphertext, mut projection, version) = encrypt_memory_projection(
+            &store,
+            &key,
+            "memory_batches",
+            "batch-bad-projection",
+            &payload,
+        );
+        projection.push_str(" tampered");
+        insert_memory_batch(
+            &store,
+            "batch-bad-projection",
+            &key.key_ref,
+            &ciphertext,
+            &projection,
+            i64::from(version),
+        )
+        .await;
+
+        let error = store
+            .hydrate_memory_state()
+            .await
+            .expect_err("mismatched projection must fail hydration");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("does not match re-derived redacted plaintext"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_batch_summary_rejects_stale_redaction_version() {
+        let store = store().await;
+        let key = store
+            .conversation_key(DataKeyPurpose::MemorySummary)
+            .await
+            .expect("mint memory summary key");
+        let payload = test_memory_payload();
+        let (ciphertext, projection, _version) =
+            encrypt_memory_projection(&store, &key, "memory_batches", "batch-stale", &payload);
+        insert_memory_batch(
+            &store,
+            "batch-stale",
+            &key.key_ref,
+            &ciphertext,
+            &projection,
+            2,
+        )
+        .await;
+
+        let error = store
+            .hydrate_memory_state()
+            .await
+            .expect_err("stale redaction version must fail hydration");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("unsupported redaction version"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_job_result_hydrates_successfully() {
+        let store = store().await;
+        let key = store
+            .conversation_key(DataKeyPurpose::MemorySummary)
+            .await
+            .expect("mint memory summary key");
+        let payload = test_memory_payload();
+        let (ciphertext, projection, version) =
+            encrypt_memory_projection(&store, &key, "memory_jobs", "job-ok", &payload);
+        insert_memory_job(
+            &store,
+            "job-ok",
+            &key.key_ref,
+            &ciphertext,
+            &projection,
+            i64::from(version),
+        )
+        .await;
+
+        let (_batches, _messages, jobs, _cursors) = store
+            .hydrate_memory_state()
+            .await
+            .expect("hydrate authenticated memory state");
+        assert_eq!(jobs.len(), 1);
+        let result = jobs[0].result.as_ref().expect("job has a result");
+        assert_eq!(result.key_ref, key.key_ref);
+        assert_eq!(result.projection, projection);
+        assert_eq!(result.redaction_version, version);
+    }
+
+    #[tokio::test]
+    async fn memory_job_result_rejects_tampered_ciphertext() {
+        let store = store().await;
+        let key = store
+            .conversation_key(DataKeyPurpose::MemorySummary)
+            .await
+            .expect("mint memory summary key");
+        let payload = test_memory_payload();
+        let (mut ciphertext, projection, version) =
+            encrypt_memory_projection(&store, &key, "memory_jobs", "job-tamper", &payload);
+        ciphertext[0] ^= 0xff;
+        insert_memory_job(
+            &store,
+            "job-tamper",
+            &key.key_ref,
+            &ciphertext,
+            &projection,
+            i64::from(version),
+        )
+        .await;
+
+        let error = store
+            .hydrate_memory_state()
+            .await
+            .expect_err("tampered ciphertext must fail hydration");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("failed to decrypt memory_jobs projection"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_job_result_rejects_wrong_key_ref() {
+        let store = store().await;
+        let memory_key = store
+            .conversation_key(DataKeyPurpose::MemorySummary)
+            .await
+            .expect("mint memory summary key");
+        let transcript_key = store
+            .conversation_key(DataKeyPurpose::Transcript)
+            .await
+            .expect("mint transcript key");
+        let payload = test_memory_payload();
+        let (ciphertext, projection, version) = encrypt_memory_projection(
+            &store,
+            &memory_key,
+            "memory_jobs",
+            "job-wrong-key",
+            &payload,
+        );
+        insert_memory_job(
+            &store,
+            "job-wrong-key",
+            &transcript_key.key_ref,
+            &ciphertext,
+            &projection,
+            i64::from(version),
+        )
+        .await;
+
+        let error = store
+            .hydrate_memory_state()
+            .await
+            .expect_err("wrong key reference must fail hydration");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("has purpose transcript")
+                && message.contains("expected memory_summary"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_job_result_rejects_mismatched_projection() {
+        let store = store().await;
+        let key = store
+            .conversation_key(DataKeyPurpose::MemorySummary)
+            .await
+            .expect("mint memory summary key");
+        let payload = test_memory_payload();
+        let (ciphertext, mut projection, version) =
+            encrypt_memory_projection(&store, &key, "memory_jobs", "job-bad-projection", &payload);
+        projection.push_str(" tampered");
+        insert_memory_job(
+            &store,
+            "job-bad-projection",
+            &key.key_ref,
+            &ciphertext,
+            &projection,
+            i64::from(version),
+        )
+        .await;
+
+        let error = store
+            .hydrate_memory_state()
+            .await
+            .expect_err("mismatched projection must fail hydration");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("does not match re-derived redacted plaintext"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_job_result_rejects_stale_redaction_version() {
+        let store = store().await;
+        let key = store
+            .conversation_key(DataKeyPurpose::MemorySummary)
+            .await
+            .expect("mint memory summary key");
+        let payload = test_memory_payload();
+        let (ciphertext, projection, _version) =
+            encrypt_memory_projection(&store, &key, "memory_jobs", "job-stale", &payload);
+        insert_memory_job(
+            &store,
+            "job-stale",
+            &key.key_ref,
+            &ciphertext,
+            &projection,
+            2,
+        )
+        .await;
+
+        let error = store
+            .hydrate_memory_state()
+            .await
+            .expect_err("stale redaction version must fail hydration");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("unsupported redaction version"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_authenticates_memory_state() {
+        let store = store().await;
+        let key = store
+            .conversation_key(DataKeyPurpose::MemorySummary)
+            .await
+            .expect("mint memory summary key");
+        let payload = test_memory_payload();
+        let (ciphertext, projection, version) = encrypt_memory_projection(
+            &store,
+            &key,
+            "memory_batches",
+            "batch-integration",
+            &payload,
+        );
+        insert_memory_batch(
+            &store,
+            "batch-integration",
+            &key.key_ref,
+            &ciphertext,
+            &projection,
+            i64::from(version),
+        )
+        .await;
+
+        let outcome = store
+            .hydrate(&test_lease(), &test_fence())
+            .await
+            .expect("hydrate must authenticate and return memory state");
+        let HydrationOutcome::Complete(state) = outcome else {
+            panic!("expected complete hydration outcome");
+        };
+        assert_eq!(state.memory_batches.len(), 1);
+        assert!(state.memory_batches[0].summary.is_some());
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_tampered_memory_batch() {
+        let store = store().await;
+        let key = store
+            .conversation_key(DataKeyPurpose::MemorySummary)
+            .await
+            .expect("mint memory summary key");
+        let payload = test_memory_payload();
+        let (mut ciphertext, projection, version) = encrypt_memory_projection(
+            &store,
+            &key,
+            "memory_batches",
+            "batch-bad-integration",
+            &payload,
+        );
+        ciphertext[0] ^= 0xff;
+        insert_memory_batch(
+            &store,
+            "batch-bad-integration",
+            &key.key_ref,
+            &ciphertext,
+            &projection,
+            i64::from(version),
+        )
+        .await;
+
+        let error = store
+            .hydrate(&test_lease(), &test_fence())
+            .await
+            .expect_err("tampered memory batch must fail hydrate");
+        let message = format!("{error:#}");
+        assert!(message.contains("memory_batches projection"), "{message}");
     }
 }
