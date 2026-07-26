@@ -1,6 +1,7 @@
 package agentevents
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -228,6 +229,91 @@ func TestDurableGatewayCorrelatesAndDeduplicatesCommandAcks(t *testing.T) {
 	}
 	if lines := strings.Count(string(raw), "\n"); lines != 2 {
 		t.Fatalf("expected received+applied records without duplicates, got %d lines", lines)
+	}
+}
+
+func TestDurableGatewayReceiveRejectsConversationClaimMismatch(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	claims := TokenClaims{ConversationID: "conversation-1"}
+	seq := uint64(1)
+	err := gateway.Receive(context.Background(), claims, Envelope{
+		Seq:            &seq,
+		ConversationID: "conversation-2",
+		Event:          json.RawMessage(`{"type":"agent_start"}`),
+	})
+	if err == nil || !strings.Contains(err.Error(), "does not match token claim") {
+		t.Fatalf("expected conversation claim mismatch, got %v", err)
+	}
+	last, err := gateway.LastReceivedEventSeq(context.Background(), claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last != 0 {
+		t.Fatalf("mismatched event must not be persisted, got seq %d", last)
+	}
+}
+
+func TestDurableGatewayDetectsSameSizeEventReplacement(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	claims := TokenClaims{ConversationID: "conversation-1"}
+	seq := uint64(1)
+	if err := gateway.Receive(context.Background(), claims, Envelope{
+		Seq:            &seq,
+		ConversationID: claims.ConversationID,
+		Event:          json.RawMessage(`{"type":"agent_start"}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	path := gateway.eventPath(claims.ConversationID)
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replaced := bytes.Replace(original, []byte("agent_start"), []byte("agent_stXrt"), 1)
+	if len(replaced) != len(original) || bytes.Equal(replaced, original) {
+		t.Fatal("test replacement must change content without changing file size")
+	}
+	if err := os.WriteFile(path, replaced, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gateway.LastReceivedEventSeq(context.Background(), claims); err == nil {
+		t.Fatal("same-size corrupt event replacement must invalidate the cached tail")
+	}
+}
+
+func TestDurableGatewayDetectsSameSizeAckReplacement(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	claims := TokenClaims{ConversationID: "conversation-1"}
+	command, err := gateway.commands.Append(
+		context.Background(),
+		claims.ConversationID,
+		"",
+		json.RawMessage(`{"type":"user_message","text":"hello","attachments":[]}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	received := CommandAck{Seq: command.Seq, CommandID: command.CommandID, Status: "received"}
+	if err := gateway.ApplyAck(context.Background(), claims, received); err != nil {
+		t.Fatal(err)
+	}
+
+	path := gateway.ackPath(claims.ConversationID)
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replaced := bytes.Replace(original, []byte("received"), []byte("receivXd"), 1)
+	if len(replaced) != len(original) || bytes.Equal(replaced, original) {
+		t.Fatal("test replacement must change content without changing file size")
+	}
+	if err := os.WriteFile(path, replaced, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	applied := CommandAck{Seq: command.Seq, CommandID: command.CommandID, Status: "applied"}
+	if err := gateway.ApplyAck(context.Background(), claims, applied); err == nil {
+		t.Fatal("same-size corrupt ack replacement must invalidate the cached tail")
 	}
 }
 

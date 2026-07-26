@@ -369,3 +369,36 @@ func TestApiHelloMarshalRejectsOutOfRangeAcceptedGeneration(t *testing.T) {
 		t.Fatal("expected out-of-range accepted_generation to be rejected when marshaling ApiHello")
 	}
 }
+
+func TestApiHelloMarshalRejectsOutOfRangeLastReceivedEventSeq(t *testing.T) {
+	hello := ApiHello{
+		AcceptedGeneration:   1,
+		LastReceivedEventSeq: maxJSONSafeInteger + 1,
+		NextCommandSeq:       1,
+	}
+	if _, err := json.Marshal(hello); err == nil {
+		t.Fatal("expected out-of-range last_received_event_seq to be rejected when marshaling ApiHello")
+	}
+}
+
+func TestApiHelloMarshalRejectsOutOfRangeNextCommandSeq(t *testing.T) {
+	hello := ApiHello{
+		AcceptedGeneration:   1,
+		LastReceivedEventSeq: 0,
+		NextCommandSeq:       maxJSONSafeInteger + 1,
+	}
+	if _, err := json.Marshal(hello); err == nil {
+		t.Fatal("expected out-of-range next_command_seq to be rejected when marshaling ApiHello")
+	}
+}
+
+func TestApiHelloMarshalAcceptsMaxSafeSeqFields(t *testing.T) {
+	hello := ApiHello{
+		AcceptedGeneration:   1,
+		LastReceivedEventSeq: maxJSONSafeInteger,
+		NextCommandSeq:       maxJSONSafeInteger,
+	}
+	if _, err := json.Marshal(hello); err != nil {
+		t.Fatalf("expected max-safe seq fields to marshal: %v", err)
+	}
+}

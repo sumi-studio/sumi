@@ -170,7 +170,9 @@ impl Gateway for WebSocketGateway {
             _ => bail!("unexpected websocket message during hello"),
         };
 
-        let api_hello: ApiHello = serde_json::from_slice(&bytes).context("parse api hello")?;
+        let value =
+            super::duplicate::parse_duplicate_checked_bytes(&bytes).context("parse api hello")?;
+        let api_hello: ApiHello = serde_json::from_value(value).context("parse api hello")?;
         if api_hello.accepted_generation != hello.generation {
             bail!(
                 "generation claim mismatch: got {}, expected {}",
@@ -348,5 +350,14 @@ mod tests {
             result.is_err() && format!("{:?}", result).contains("trailing bytes"),
             "expected trailing bytes rejection, got {result:?}"
         );
+    }
+
+    #[test]
+    fn api_hello_raw_parse_rejects_duplicate_keys() {
+        // Mirrors the exact boundary in `authenticate_hello`:
+        // parse with duplicate-key checking, then deserialize to ApiHello.
+        let raw = br#"{"accepted_generation":1,"accepted_generation":2,"last_received_event_seq":0,"next_command_seq":1}"#;
+        let err = super::super::duplicate::parse_duplicate_checked_bytes(raw).unwrap_err();
+        assert!(err.to_string().contains("duplicate object key"), "{err}");
     }
 }

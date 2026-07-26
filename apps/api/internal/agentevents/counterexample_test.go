@@ -75,6 +75,32 @@ func TestIngressDuplicateKeysCounterexample(t *testing.T) {
 	}
 }
 
+func TestValidateReviewProjectionOneOfCounterexamples(t *testing.T) {
+	cases := []struct {
+		name      string
+		raw       string
+		shouldErr bool
+	}{
+		{"reviewable_null", `{"reviewable":null}`, false},
+		{"reviewable_object", `{"reviewable":{"tool_call_id":"x"}}`, false},
+		{"insufficient_evidence", `{"insufficient_evidence":{"reason":"cannot decide"}}`, false},
+		{"both_reviewable_null_and_insufficient", `{"reviewable":null,"insufficient_evidence":{"reason":"cannot decide"}}`, true},
+		{"both_reviewable_object_and_insufficient", `{"reviewable":{"x":1},"insufficient_evidence":{"reason":"cannot decide"}}`, true},
+		{"neither", `{}`, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateReviewProjection(json.RawMessage(tc.raw))
+			if tc.shouldErr && err == nil {
+				t.Fatalf("expected validateReviewProjection to reject %q", tc.raw)
+			}
+			if !tc.shouldErr && err != nil {
+				t.Fatalf("unexpected error for %q: %v", tc.raw, err)
+			}
+		})
+	}
+}
+
 func strPtr(s string) *string { return &s }
 func u64Ptr(u uint64) *uint64 { return &u }
 

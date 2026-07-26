@@ -2,10 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use serde::{
-    Deserialize, Deserializer,
-    de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor},
-};
+use serde::{Deserialize, Deserializer, de::IgnoredAny};
 use thiserror::Error;
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter, Stdin, Stdout,
@@ -337,97 +334,7 @@ where
 }
 
 fn parse_command_value(bytes: &[u8]) -> serde_json::Result<serde_json::Value> {
-    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    let value = DuplicateCheckedValue::deserialize(&mut deserializer)?.0;
-    deserializer.end()?;
-    Ok(value)
-}
-
-struct DuplicateCheckedValue(serde_json::Value);
-
-impl<'de> Deserialize<'de> for DuplicateCheckedValue {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_any(DuplicateCheckedValueVisitor)
-    }
-}
-
-struct DuplicateCheckedValueVisitor;
-
-impl<'de> Visitor<'de> for DuplicateCheckedValueVisitor {
-    type Value = DuplicateCheckedValue;
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("a JSON value without duplicate object keys")
-    }
-
-    fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E> {
-        Ok(DuplicateCheckedValue(value.into()))
-    }
-
-    fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E> {
-        Ok(DuplicateCheckedValue(value.into()))
-    }
-
-    fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E> {
-        Ok(DuplicateCheckedValue(value.into()))
-    }
-
-    fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        serde_json::Number::from_f64(value)
-            .map(serde_json::Value::Number)
-            .map(DuplicateCheckedValue)
-            .ok_or_else(|| E::custom("non-finite JSON number"))
-    }
-
-    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E> {
-        Ok(DuplicateCheckedValue(value.into()))
-    }
-
-    fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E> {
-        Ok(DuplicateCheckedValue(value.into()))
-    }
-
-    fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
-        Ok(DuplicateCheckedValue(serde_json::Value::Null))
-    }
-
-    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
-        Ok(DuplicateCheckedValue(serde_json::Value::Null))
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or_default());
-        while let Some(value) = sequence.next_element::<DuplicateCheckedValue>()? {
-            values.push(value.0);
-        }
-        Ok(DuplicateCheckedValue(serde_json::Value::Array(values)))
-    }
-
-    fn visit_map<A>(self, mut object: A) -> std::result::Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut values = serde_json::Map::with_capacity(object.size_hint().unwrap_or_default());
-        while let Some(key) = object.next_key::<String>()? {
-            if values.contains_key(&key) {
-                return Err(de::Error::custom(format_args!(
-                    "duplicate object key {key:?}"
-                )));
-            }
-            let value = object.next_value::<DuplicateCheckedValue>()?;
-            values.insert(key, value.0);
-        }
-        Ok(DuplicateCheckedValue(serde_json::Value::Object(values)))
-    }
+    super::duplicate::parse_duplicate_checked_bytes(bytes)
 }
 
 struct ReadCommandFrame {

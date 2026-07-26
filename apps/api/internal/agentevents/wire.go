@@ -148,11 +148,17 @@ func (h *ApiHello) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// MarshalJSON validates that the outbound accepted_generation stays within the
-// JSON-safe integer range before encoding.
+// MarshalJSON validates that all outbound seq values stay within the JSON-safe
+// integer range before encoding.
 func (h ApiHello) MarshalJSON() ([]byte, error) {
 	if h.AcceptedGeneration > maxJSONSafeInteger {
 		return nil, fmt.Errorf("accepted_generation %d exceeds JSON-safe integer range", h.AcceptedGeneration)
+	}
+	if h.LastReceivedEventSeq > maxJSONSafeInteger {
+		return nil, fmt.Errorf("last_received_event_seq %d exceeds JSON-safe integer range", h.LastReceivedEventSeq)
+	}
+	if h.NextCommandSeq > maxJSONSafeInteger {
+		return nil, fmt.Errorf("next_command_seq %d exceeds JSON-safe integer range", h.NextCommandSeq)
 	}
 	type noMethod ApiHello
 	return json.Marshal(noMethod(h))

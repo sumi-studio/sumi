@@ -919,6 +919,39 @@ func TestWebSocketSilentPeerClosesConnection(t *testing.T) {
 	}
 }
 
+func TestWebSocketHelloRejectsCheckedAddOverflow(t *testing.T) {
+	srv, _, _, _, _, hl := newTestServer(t)
+	hl.setReady()
+
+	server := startTestServer(t, srv)
+	defer server.Close()
+
+	conn, resp, err := dialTestWS(t, server, map[string][]string{"Authorization": {"Bearer test-token"}})
+	if err != nil {
+		t.Fatalf("dial: %v (status %d)", err, resp.StatusCode)
+	}
+	defer conn.Close()
+
+	// last_applied_command_seq at the JSON-safe maximum would require
+	// next_command_seq = max + 1. The server must fail closed and not marshal
+	// an out-of-range ApiHello.
+	if err := conn.WriteJSON(AgentHello{
+		AgentID:                "agent-1",
+		Generation:             7,
+		LastSentEventSeq:       0,
+		LastReceivedCommandSeq: 0,
+		LastAppliedCommandSeq:  maxJSONSafeInteger,
+	}); err != nil {
+		t.Fatalf("write hello: %v", err)
+	}
+
+	conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	var apiHello ApiHello
+	if err := conn.ReadJSON(&apiHello); err == nil {
+		t.Fatal("expected connection to close when next_command_seq would overflow JSON-safe range")
+	}
+}
+
 func startTestServer(t *testing.T, srv *Server) *httptest.Server {
 	t.Helper()
 	server := httptest.NewUnstartedServer(srv)

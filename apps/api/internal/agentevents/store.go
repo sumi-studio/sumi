@@ -233,6 +233,9 @@ func (s *CommandStore) Append(ctx context.Context, conversationID string, idempo
 	if err := ctx.Err(); err != nil {
 		return CommandEnvelope{}, err
 	}
+	if err := ValidateCommand(command); err != nil {
+		return CommandEnvelope{}, fmt.Errorf("validate command before append: %w", err)
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -42,15 +43,38 @@ type DurableGateway struct {
 type conversationLogState struct {
 	eventSeq  uint64
 	eventSize int64
+	eventCRC  uint32
 	acks      map[uint64]CommandAck
 	ackOrder  []ackCacheEntry
 	ackSize   int64
+	ackCRC    uint32
 	lastUsed  uint64
 }
 
 type ackCacheEntry struct {
 	seq uint64
 	ack CommandAck
+}
+
+// crc32OfFilePrefix returns the CRC-32/IEEE checksum of the first `size` bytes
+// of `file`. It re-seeks to the start and streams the prefix so it works for
+// large logs without loading them into memory.
+func crc32OfFilePrefix(file io.ReadSeeker, size int64) (uint32, error) {
+	if size <= 0 {
+		return 0, nil
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return 0, err
+	}
+	h := crc32.New(crc32.IEEETable)
+	if _, err := io.CopyN(h, file, size); err != nil {
+		return 0, err
+	}
+	return h.Sum32(), nil
+}
+
+func updateCRC(crc uint32, data []byte) uint32 {
+	return crc32.Update(crc, crc32.IEEETable, data)
 }
 
 type runtimeState struct {
@@ -288,6 +312,13 @@ func (g *DurableGateway) Receive(ctx context.Context, claims TokenClaims, envelo
 	if err := validateEnvelope(envelope); err != nil {
 		return err
 	}
+	if envelope.ConversationID != claims.ConversationID {
+		return fmt.Errorf(
+			"event conversation_id %q does not match token claim %q",
+			envelope.ConversationID,
+			claims.ConversationID,
+		)
+	}
 	if envelope.Seq == nil { // volatile frames are deliberately not part of replay.
 		return nil
 	}
@@ -458,6 +489,7 @@ func (g *DurableGateway) appendDurableEventLocked(conversationID string, record 
 
 	st.eventSeq = record.Seq
 	st.eventSize = preWriteOffset + int64(len(data))
+	st.eventCRC = updateCRC(st.eventCRC, data)
 	return nil
 }
 
@@ -538,6 +570,7 @@ func (g *DurableGateway) appendCommandAckLocked(conversationID string, ack Comma
 
 	g.rememberAckLocked(st, ack)
 	st.ackSize = preWriteOffset + int64(len(data))
+	st.ackCRC = updateCRC(st.ackCRC, data)
 	return nil
 }
 
@@ -547,12 +580,38 @@ func (g *DurableGateway) refreshEventTailLocked(file durableFileHandle, st *conv
 		return fmt.Errorf("seek durable event log: %w", err)
 	}
 	if size == st.eventSize {
-		return nil
-	}
-	if size < st.eventSize {
+		// File size is unchanged, but another process may have truncated and
+		// rewritten to the same length. Verify the cached CRC before trusting
+		// the in-memory tail state.
+		crc, err := crc32OfFilePrefix(file, size)
+		if err != nil {
+			return fmt.Errorf("checksum durable event log prefix: %w", err)
+		}
+		if crc == st.eventCRC {
+			return nil
+		}
 		st.eventSeq = 0
 		st.eventSize = 0
+		st.eventCRC = 0
+	} else if size < st.eventSize {
+		st.eventSeq = 0
+		st.eventSize = 0
+		st.eventCRC = 0
 	}
+	if st.eventSize > 0 && size > st.eventSize {
+		// Before scanning an appended tail, confirm the existing prefix has
+		// not been rewritten underneath us.
+		prefixCRC, err := crc32OfFilePrefix(file, st.eventSize)
+		if err != nil {
+			return fmt.Errorf("checksum durable event log prefix: %w", err)
+		}
+		if prefixCRC != st.eventCRC {
+			st.eventSeq = 0
+			st.eventSize = 0
+			st.eventCRC = 0
+		}
+	}
+
 	start := st.eventSize
 	if _, err := file.Seek(start, io.SeekStart); err != nil {
 		return fmt.Errorf("seek durable event log for tail refresh: %w", err)
@@ -561,11 +620,13 @@ func (g *DurableGateway) refreshEventTailLocked(file durableFileHandle, st *conv
 	r := bufio.NewReader(file)
 	offset := start
 	last := st.eventSeq
+	crc := st.eventCRC
 	for {
 		lineStart := offset
 		line, readErr := r.ReadBytes('\n')
 		if len(line) > 0 {
 			offset += int64(len(line))
+			crc = updateCRC(crc, line)
 		}
 
 		trimmed := bytes.TrimSpace(line)
@@ -588,6 +649,10 @@ func (g *DurableGateway) refreshEventTailLocked(file durableFileHandle, st *conv
 				if syncErr := file.Sync(); syncErr != nil {
 					return fmt.Errorf("sync after truncating partial durable event tail: %w", syncErr)
 				}
+				crc, err = crc32OfFilePrefix(file, lineStart)
+				if err != nil {
+					return fmt.Errorf("checksum truncated durable event log: %w", err)
+				}
 				offset = lineStart
 				break
 			}
@@ -609,6 +674,7 @@ func (g *DurableGateway) refreshEventTailLocked(file durableFileHandle, st *conv
 				if syncErr := file.Sync(); syncErr != nil {
 					return fmt.Errorf("sync repaired durable event log trailing newline: %w", syncErr)
 				}
+				crc = updateCRC(crc, []byte{'\n'})
 				offset += 1
 			}
 			break
@@ -620,6 +686,7 @@ func (g *DurableGateway) refreshEventTailLocked(file durableFileHandle, st *conv
 
 	st.eventSeq = last
 	st.eventSize = offset
+	st.eventCRC = crc
 	return nil
 }
 
@@ -629,13 +696,36 @@ func (g *DurableGateway) refreshAckTailLocked(file durableFileHandle, st *conver
 		return fmt.Errorf("seek durable ack log: %w", err)
 	}
 	if size == st.ackSize {
-		return nil
-	}
-	if size < st.ackSize {
+		crc, err := crc32OfFilePrefix(file, size)
+		if err != nil {
+			return fmt.Errorf("checksum durable ack log prefix: %w", err)
+		}
+		if crc == st.ackCRC {
+			return nil
+		}
 		st.acks = make(map[uint64]CommandAck)
 		st.ackOrder = nil
 		st.ackSize = 0
+		st.ackCRC = 0
+	} else if size < st.ackSize {
+		st.acks = make(map[uint64]CommandAck)
+		st.ackOrder = nil
+		st.ackSize = 0
+		st.ackCRC = 0
 	}
+	if st.ackSize > 0 && size > st.ackSize {
+		prefixCRC, err := crc32OfFilePrefix(file, st.ackSize)
+		if err != nil {
+			return fmt.Errorf("checksum durable ack log prefix: %w", err)
+		}
+		if prefixCRC != st.ackCRC {
+			st.acks = make(map[uint64]CommandAck)
+			st.ackOrder = nil
+			st.ackSize = 0
+			st.ackCRC = 0
+		}
+	}
+
 	start := st.ackSize
 	if _, err := file.Seek(start, io.SeekStart); err != nil {
 		return fmt.Errorf("seek durable ack log for tail refresh: %w", err)
@@ -643,11 +733,13 @@ func (g *DurableGateway) refreshAckTailLocked(file durableFileHandle, st *conver
 
 	r := bufio.NewReader(file)
 	offset := start
+	crc := st.ackCRC
 	for {
 		lineStart := offset
 		line, readErr := r.ReadBytes('\n')
 		if len(line) > 0 {
 			offset += int64(len(line))
+			crc = updateCRC(crc, line)
 		}
 
 		trimmed := bytes.TrimSpace(line)
@@ -670,6 +762,10 @@ func (g *DurableGateway) refreshAckTailLocked(file durableFileHandle, st *conver
 				if syncErr := file.Sync(); syncErr != nil {
 					return fmt.Errorf("sync after truncating partial durable ack tail: %w", syncErr)
 				}
+				crc, err = crc32OfFilePrefix(file, lineStart)
+				if err != nil {
+					return fmt.Errorf("checksum truncated durable ack log: %w", err)
+				}
 				offset = lineStart
 				break
 			}
@@ -688,6 +784,7 @@ func (g *DurableGateway) refreshAckTailLocked(file durableFileHandle, st *conver
 				if syncErr := file.Sync(); syncErr != nil {
 					return fmt.Errorf("sync repaired durable ack log trailing newline: %w", syncErr)
 				}
+				crc = updateCRC(crc, []byte{'\n'})
 				offset += 1
 			}
 			break
@@ -698,6 +795,7 @@ func (g *DurableGateway) refreshAckTailLocked(file durableFileHandle, st *conver
 	}
 
 	st.ackSize = offset
+	st.ackCRC = crc
 	return nil
 }
 

@@ -586,8 +586,12 @@ func validateReviewProjection(raw json.RawMessage) error {
 	if err := requireAndAllow(obj, nil, []string{"reviewable", "insufficient_evidence"}); err != nil {
 		return err
 	}
-	hasReviewable := obj["reviewable"] != nil && !bytes.Equal(bytes.TrimSpace(obj["reviewable"]), []byte("null"))
-	hasInsufficient := obj["insufficient_evidence"] != nil && !bytes.Equal(bytes.TrimSpace(obj["insufficient_evidence"]), []byte("null"))
+	// The schema is a oneOf: exactly one of `reviewable` or `insufficient_evidence`
+	// may be present, and each branch forbids additional properties. A key with an
+	// explicit `null` value still counts as present for `reviewable` because AnyJSON
+	// includes `null`, but the same object cannot also carry `insufficient_evidence`.
+	hasReviewable := obj["reviewable"] != nil
+	hasInsufficient := obj["insufficient_evidence"] != nil
 	if hasReviewable && hasInsufficient {
 		return fmt.Errorf("review projection must contain exactly one of reviewable or insufficient_evidence")
 	}

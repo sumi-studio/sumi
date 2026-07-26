@@ -17,7 +17,7 @@
 use chrono::{DateTime, Utc};
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
-    de::{self, IgnoredAny, SeqAccess, Visitor},
+    de::{self, DeserializeOwned, IgnoredAny, SeqAccess, Visitor},
 };
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -172,6 +172,17 @@ pub fn to_wire_frame(frame: OutboundFrame) -> Result<WireOutboundFrame, WireErro
     let value = serde_json::to_value(&wire)?;
     validate_json_safe_numbers(&value)?;
     Ok(wire)
+}
+
+/// Parse a raw JSON byte slice into a wire DTO while rejecting duplicate object
+/// keys and trailing tokens. This is the production raw boundary for `Wire*` DTOs
+/// when they are decoded directly from bytes.
+pub(crate) fn from_json_bytes<T>(bytes: &[u8]) -> Result<T, WireError>
+where
+    T: DeserializeOwned,
+{
+    let value = super::duplicate::parse_duplicate_checked_bytes(bytes).map_err(WireError::Json)?;
+    serde_json::from_value(value).map_err(WireError::Json)
 }
 
 /// Canonical lower-case hyphenated UUID used for `message_id` in message events.
@@ -2981,5 +2992,34 @@ mod tests {
             Value::Array(arr) => Value::Array(arr.into_iter().map(normalize_fixture).collect()),
             other => other,
         }
+    }
+
+    #[test]
+    fn from_json_bytes_rejects_duplicate_keys_in_wire_inputs() {
+        let command_envelope = br#"{"seq":1,"seq":2,"command_id":"00000000-0000-4000-8000-000000000001","command":{"type":"abort"}}"#;
+        let err = from_json_bytes::<WireCommandEnvelope>(command_envelope).unwrap_err();
+        assert!(err.to_string().contains("duplicate object key"), "{err}");
+
+        let command_ack = br#"{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command_id":"00000000-0000-4000-8000-000000000002","status":"received"}"#;
+        let err = from_json_bytes::<WireCommandAck>(command_ack).unwrap_err();
+        assert!(err.to_string().contains("duplicate object key"), "{err}");
+
+        let envelope = br#"{"seq":1,"conversation_id":"c","conversation_id":"d","event":{"type":"agent_start"}}"#;
+        let err = from_json_bytes::<WireEnvelope>(envelope).unwrap_err();
+        assert!(err.to_string().contains("duplicate object key"), "{err}");
+    }
+
+    #[test]
+    fn from_json_bytes_rejects_duplicate_keys_in_api_hello() {
+        let api_hello = br#"{"accepted_generation":1,"accepted_generation":2,"last_received_event_seq":0,"next_command_seq":1}"#;
+        let err = from_json_bytes::<ApiHello>(api_hello).unwrap_err();
+        assert!(err.to_string().contains("duplicate object key"), "{err}");
+    }
+
+    #[test]
+    fn from_json_bytes_rejects_trailing_tokens() {
+        let trailing = br#"{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command":{"type":"abort"}}extra"#;
+        let err = from_json_bytes::<WireCommandEnvelope>(trailing).unwrap_err();
+        assert!(err.to_string().contains("trailing"), "{err}");
     }
 }

@@ -262,10 +262,21 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 	if hello.LastReceivedCommandSeq == maxJSONSafeInteger || firstSeq > hello.LastReceivedCommandSeq+1 {
 		return fmt.Errorf("command log gap: first seq %d is beyond agent last received %d", firstSeq, hello.LastReceivedCommandSeq)
 	}
+	if firstSeq > maxJSONSafeInteger {
+		return fmt.Errorf("first command seq %d exceeds JSON-safe integer range", firstSeq)
+	}
 
+	// Use a checked increment so last_applied_command_seq at the JSON-safe
+	// maximum cannot wrap around and emit an out-of-range next_command_seq.
+	if hello.LastAppliedCommandSeq > maxJSONSafeInteger-1 {
+		return fmt.Errorf("next_command_seq would exceed JSON-safe integer range")
+	}
 	nextSeq := hello.LastAppliedCommandSeq + 1
 	if nextSeq < firstSeq {
 		nextSeq = firstSeq
+	}
+	if nextSeq > maxJSONSafeInteger {
+		return fmt.Errorf("next_command_seq %d exceeds JSON-safe integer range", nextSeq)
 	}
 
 	lastReceivedEventSeq, err := s.Events.LastReceivedEventSeq(helloCtx, claims)
@@ -278,6 +289,9 @@ func (s *Server) run(ctx context.Context, conn *websocket.Conn, claims TokenClai
 			lastReceivedEventSeq,
 			hello.LastSentEventSeq,
 		)
+	}
+	if lastReceivedEventSeq > maxJSONSafeInteger {
+		return fmt.Errorf("last_received_event_seq %d exceeds JSON-safe integer range", lastReceivedEventSeq)
 	}
 	apiHello := ApiHello{
 		AcceptedGeneration:   claims.Generation,

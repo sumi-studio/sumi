@@ -737,6 +737,44 @@ func TestCommandStore_PoisonOnWriteRollbackFailure(t *testing.T) {
 	}
 }
 
+func TestCommandStoreAppendRejectsInvalidCommandBeforeWrite(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenCommandStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if _, err := store.Append(
+		context.Background(),
+		"conv-1",
+		"",
+		json.RawMessage(`{"type":"abort","extra":true}`),
+	); err == nil {
+		t.Fatal("direct append must reject an invalid command")
+	}
+
+	env, err := store.Append(
+		context.Background(),
+		"conv-1",
+		"",
+		json.RawMessage(`{"type":"abort"}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env.Seq != 1 {
+		t.Fatalf("invalid command must not allocate sequence space, got %d", env.Seq)
+	}
+	raw, err := os.ReadFile(commandLogPath(dir, "conv-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lines := strings.Count(string(raw), "\n"); lines != 1 {
+		t.Fatalf("expected only the valid command record, got %q", raw)
+	}
+}
+
 func TestCommandStore_PoisonOnSyncRollbackFailure(t *testing.T) {
 	dir := t.TempDir()
 	store, err := OpenCommandStore(dir)
