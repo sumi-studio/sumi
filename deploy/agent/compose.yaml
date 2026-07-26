@@ -55,7 +55,7 @@ services:
       init:
         condition: service_completed_successfully
       executor:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - state:/var/lib/sumi
       - runtime-ipc:/run/sumi/runtime:ro
@@ -81,7 +81,13 @@ services:
       init:
         condition: service_completed_successfully
       broker:
-        condition: service_started
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "SUMI_READINESS_SOCKET=/run/sumi/runtime/executor.sock /usr/local/bin/sumi-agent --check-unix-socket"]
+      interval: 5s
+      timeout: 6s
+      retries: 3
+      start_period: 5s
     volumes:
       - workspace:/workspace
       - runtime-ipc:/run/sumi/runtime
@@ -96,6 +102,12 @@ services:
     group_add: ["10010"]
     command: [broker]
     network_mode: none
+    healthcheck:
+      test: ["CMD-SHELL", "SUMI_READINESS_SOCKET=/run/sumi/broker/broker.sock /usr/local/bin/sumi-agent --check-unix-socket"]
+      interval: 5s
+      timeout: 6s
+      retries: 3
+      start_period: 5s
     depends_on:
       init:
         condition: service_completed_successfully

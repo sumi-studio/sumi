@@ -12,6 +12,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
+
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde::Serialize;
@@ -49,17 +52,92 @@ const EXECUTOR_TERMINAL_WRITE_DEADLINE: Duration = Duration::from_secs(2);
 // progress can never leave a partial JSON frame ahead of the terminal.
 const MAX_ATOMIC_UPDATE_FRAME_BYTES: usize = 4_096;
 const EXECUTOR_REAP_DEADLINE: Duration = Duration::from_secs(2);
+const EXECUTOR_CONNECTION_CAPACITY: usize = 32;
+const EXECUTOR_CONNECTION_DEADLINE: Duration = Duration::from_secs(130);
+const SOCKET_READINESS_TIMEOUT: Duration = Duration::from_secs(1);
+const SOCKET_READINESS_RETRY_LIMIT: usize = 50;
+const SOCKET_READINESS_RETRY_DELAY: Duration = Duration::from_millis(100);
 const PR_SET_DUMPABLE: libc::c_int = 4;
 
 type BashUpdateCallback = Arc<dyn Fn(Value) + Send + Sync>;
 
-fn set_dumpable(value: libc::c_int) -> std::io::Result<()> {
+pub(crate) fn set_dumpable(value: libc::c_int) -> std::io::Result<()> {
     let rc = unsafe { libc::syscall(libc::SYS_prctl, PR_SET_DUMPABLE, value, 0, 0, 0) };
     if rc == 0 {
         Ok(())
     } else {
         Err(std::io::Error::last_os_error())
     }
+}
+
+/// Wait until a Unix-domain socket at `path` accepts a connection. This proves
+/// the peer is bound and listening; it fails closed if the socket is missing,
+/// stale, or does not accept within the bounded retry window.
+pub(crate) async fn wait_for_unix_socket(path: &Path, label: &str) -> Result<()> {
+    for attempt in 0..SOCKET_READINESS_RETRY_LIMIT {
+        match timeout(SOCKET_READINESS_TIMEOUT, UnixStream::connect(path)).await {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(Err(error)) => {
+                bail!(
+                    "{label} socket {} is not accepting connections: {error}",
+                    path.display()
+                );
+            }
+            Err(_) => {}
+        }
+        if attempt + 1 < SOCKET_READINESS_RETRY_LIMIT {
+            tokio::time::sleep(SOCKET_READINESS_RETRY_DELAY).await;
+        }
+    }
+    bail!("{label} socket {} did not become accepting", path.display())
+}
+
+/// Bind a Unix-domain listener, but only after proving any existing socket at
+/// `path` is stale (connection refused/invalid) rather than live. A live socket
+/// causes a fail-closed error instead of stealing the endpoint.
+async fn bind_unix_listener(path: &Path, label: &str) -> Result<UnixListener> {
+    match timeout(SOCKET_READINESS_TIMEOUT, UnixStream::connect(path)).await {
+        Ok(Ok(_)) => {
+            bail!(
+                "{label} socket {} is already in use by a live listener",
+                path.display()
+            );
+        }
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            // No stale socket; bind directly.
+        }
+        Ok(Err(error)) if error.raw_os_error() == Some(libc::ECONNREFUSED) => {
+            // A connection-refused Unix socket is a candidate stale endpoint,
+            // but never unlink a non-socket or a live/permission-denied
+            // endpoint. The lstat check keeps startup from stealing an
+            // unrelated path at the configured socket location.
+            let metadata = std::fs::symlink_metadata(path).with_context(|| {
+                format!("failed to inspect stale {label} socket {}", path.display())
+            })?;
+            if !metadata.file_type().is_socket() {
+                bail!(
+                    "{label} socket path {} is not a stale Unix socket",
+                    path.display()
+                );
+            }
+            tokio::fs::remove_file(path).await.with_context(|| {
+                format!("failed to remove stale {label} socket {}", path.display())
+            })?;
+        }
+        Ok(Err(error)) => bail!(
+            "{label} socket {} is not safely replaceable: {error}",
+            path.display()
+        ),
+        Err(_) => {
+            bail!(
+                "{label} socket {} connect timed out; refusing to steal a potentially live listener",
+                path.display()
+            );
+        }
+    }
+    UnixListener::bind(path)
+        .with_context(|| format!("failed to bind {label} socket {}", path.display()))
 }
 
 #[cfg(test)]
@@ -566,60 +644,55 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
     let broker_socket = required_path("SUMI_ARTIFACT_BROKER_SOCKET")?;
     let executor_socket = required_path("SUMI_EXECUTOR_SOCKET")?;
 
-    let _ = tokio::fs::remove_file(&executor_socket).await;
-    let listener = UnixListener::bind(&executor_socket).with_context(|| {
-        format!(
-            "failed to bind executor socket {}",
-            executor_socket.display()
-        )
-    })?;
+    wait_for_unix_socket(&broker_socket, "artifact broker")
+        .await
+        .context("broker socket is not ready")?;
+    let listener = bind_unix_listener(&executor_socket, "executor").await?;
+    let permits = Arc::new(Semaphore::new(EXECUTOR_CONNECTION_CAPACITY));
 
     loop {
         let (stream, _) = listener
             .accept()
             .await
             .context("failed to accept executor connection")?;
+        let Ok(permit) = permits.clone().try_acquire_owned() else {
+            tracing::warn!("executor connection capacity reached");
+            drop(stream);
+            continue;
+        };
         let identity = identity.clone();
         let workspace = workspace.clone();
         let broker_socket = broker_socket.clone();
         let conversation_id = conversation_id.clone();
         tokio::spawn(async move {
-            let (read, write) = stream.into_split();
-            let fs = match WorkspaceFs::open(&workspace) {
-                Ok(fs) => fs,
-                Err(error) => {
-                    tracing::error!(%error, "failed to open executor workspace for connection");
-                    return;
-                }
-            };
-            let broker =
-                ArtifactBrokerClient::new(broker_socket, identity.clone(), conversation_id);
-            if let Err(error) =
+            let _permit = permit;
+            let result = timeout(EXECUTOR_CONNECTION_DEADLINE, async {
+                let (read, write) = stream.into_split();
+                let fs = WorkspaceFs::open(&workspace)?;
+                let broker =
+                    ArtifactBrokerClient::new(broker_socket, identity.clone(), conversation_id);
                 run_executor_service(read, write, identity, workspace, fs, broker).await
-            {
-                tracing::warn!(%error, "executor socket connection closed with error");
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "executor socket connection closed with error")
+                }
+                Err(_) => tracing::warn!("executor socket connection exceeded its deadline"),
             }
         });
     }
 }
 
 pub async fn run_artifact_broker_mode() -> Result<()> {
+    set_dumpable(0).context("failed to set PR_SET_DUMPABLE")?;
     let identity = identity_from_env()?;
     let root = required_path("SUMI_ARTIFACT_ROOT")?;
     let socket = required_path("SUMI_ARTIFACT_BROKER_SOCKET")?;
 
-    // A stale socket inode from a previous run on a persistent IPC volume
-    // would otherwise cause `bind` to fail. Remove only the expected socket
-    // path; if something else is at that path the bind will surface it.
-    if socket.exists() {
-        tokio::fs::remove_file(&socket).await.with_context(|| {
-            format!("failed to remove stale broker socket {}", socket.display())
-        })?;
-    }
-
     let broker = Arc::new(ArtifactBroker::open(&root).context("failed to open artifact root")?);
-    let listener = UnixListener::bind(&socket)
-        .with_context(|| format!("failed to bind artifact broker socket {}", socket.display()))?;
+    let listener = bind_unix_listener(&socket, "artifact broker").await?;
     let lifecycle = Arc::new(Mutex::new(RpcLifecycleTracker::default()));
     let permits = Arc::new(Semaphore::new(BROKER_CONNECTION_CAPACITY));
     let blocking_work = BlockingWorkRegistry::new(BROKER_BLOCKING_WORK_CAPACITY);

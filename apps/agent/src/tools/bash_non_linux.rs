@@ -60,6 +60,16 @@ pub struct LowTrustLocalBash<'a> {
     broker_socket: Option<PathBuf>,
 }
 
+/// Hosts without Linux namespace support cannot run the broker-socket
+/// isolation preflight. This is exposed at module scope so non-Linux builds
+/// resolve `tools::bash::preflight_namespace_isolation()`.
+pub(crate) fn preflight_namespace_isolation() -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "namespace isolation is only supported on Linux",
+    ))
+}
+
 impl<'a> LowTrustLocalBash<'a> {
     pub fn new(workspace: PathBuf, artifact: &'a dyn ArtifactAppender) -> Self {
         Self {
@@ -73,14 +83,6 @@ impl<'a> LowTrustLocalBash<'a> {
     pub fn with_broker_socket(mut self, socket: PathBuf) -> Self {
         self.broker_socket = Some(socket);
         self
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn preflight_namespace_isolation() -> std::io::Result<()> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "namespace isolation is only supported on Linux",
-        ))
     }
 
     pub async fn execute(
@@ -116,6 +118,11 @@ impl<'a> LowTrustLocalBash<'a> {
         cancel: CancellationToken,
         on_update: Arc<dyn Fn(Value) + Send + Sync>,
     ) -> Result<BashExecutionResult, ToolError> {
+        if std::env::var_os("SUMI_ENFORCE_BROKER_SOCKET_NAMESPACE_ISOLATION").is_some() {
+            return Err(ToolError::Protocol(
+                "broker-socket namespace isolation is not supported on this platform".to_owned(),
+            ));
+        }
         tracing::warn!(
             target: "sumi_agent::tools",
             "starting non-Linux low-trust bash; child.kill() cannot stop escaped descendants"

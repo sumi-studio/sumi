@@ -554,10 +554,7 @@ fn configure_child_process(
 /// uses only a stack buffer.
 fn fill_random_hex(buf: &mut [u8]) -> std::io::Result<()> {
     if !buf.len().is_multiple_of(2) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "random hex buffer length must be even",
-        ));
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
     }
 
     let mut random = [0u8; 8];
@@ -578,10 +575,7 @@ fn fill_random_hex(buf: &mut [u8]) -> std::io::Result<()> {
             return Err(err);
         }
         if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "getrandom returned 0 bytes",
-            ));
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
         }
         filled += n as usize;
     }
@@ -655,38 +649,32 @@ fn isolate_broker_socket_path(
 
     let socket_bytes = socket.as_os_str().as_bytes();
     if socket_bytes.is_empty() || socket_bytes[0] != b'/' {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "broker socket path must be absolute",
-        ));
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
     }
 
     let mut socket_buf = [0u8; 4096];
     if socket_bytes.len() + 1 > socket_buf.len() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "broker socket path too long",
-        ));
+        return Err(std::io::Error::from_raw_os_error(libc::ENAMETOOLONG));
     }
     socket_buf[..socket_bytes.len()].copy_from_slice(socket_bytes);
     socket_buf[socket_bytes.len()] = 0;
 
-    // If the socket file does not exist there is nothing to mask (tests use
-    // placeholder paths). Skip without entering a namespace.
+    // Verify the socket exists and is an actual socket. Do not follow
+    // symlinks and do not fail open on a missing or rebound path.
     unsafe {
         let mut stat_buf: libc::stat = std::mem::zeroed();
-        if libc::stat(socket_buf.as_ptr() as *const libc::c_char, &mut stat_buf) != 0 {
-            return Ok(());
+        if libc::lstat(socket_buf.as_ptr() as *const libc::c_char, &mut stat_buf) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if stat_buf.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+            return Err(std::io::Error::from_raw_os_error(libc::ENOTSOCK));
         }
     }
 
     let parent = match socket.parent() {
         Some(parent) => parent,
         None => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "broker socket path has no parent directory",
-            ));
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
         }
     };
     let parent_bytes = parent.as_os_str().as_bytes();
@@ -700,10 +688,7 @@ fn isolate_broker_socket_path(
     };
     let mut target_buf = [0u8; 4096];
     if target_bytes.len() + 1 > target_buf.len() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "broker socket parent path too long",
-        ));
+        return Err(std::io::Error::from_raw_os_error(libc::ENAMETOOLONG));
     }
     target_buf[..target_bytes.len()].copy_from_slice(target_bytes);
     target_buf[target_bytes.len()] = 0;

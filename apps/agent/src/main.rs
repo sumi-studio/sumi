@@ -11,7 +11,7 @@ pub mod runtime;
 mod store;
 mod tools;
 
-use std::{env, io, sync::Arc};
+use std::{env, io, path::Path, sync::Arc};
 
 use anyhow::{Context, Result, anyhow};
 use gateway::{
@@ -93,6 +93,11 @@ async fn async_main(mode: Option<String>) -> Result<()> {
                 acquire_generation(&state_dir).context("generation allocation failed")?;
             print_shell_exports(&allocation);
             return Ok(());
+        }
+        Some("--check-unix-socket") => {
+            let socket = env::var_os("SUMI_READINESS_SOCKET")
+                .ok_or_else(|| anyhow!("SUMI_READINESS_SOCKET is required for socket readiness"))?;
+            return tools::executor::wait_for_unix_socket(Path::new(&socket), "readiness").await;
         }
         _ => {}
     }

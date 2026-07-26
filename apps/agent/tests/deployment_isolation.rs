@@ -135,6 +135,27 @@ fn request(id: &str, operation: Value) -> Value {
     })
 }
 
+fn allocate_generation(root: &Path) -> u64 {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sumi-agent"))
+        .arg("--allocate-generation")
+        .env_clear()
+        .env("SUMI_STATE_DIR", root)
+        .output()
+        .expect("allocate generation");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let exports = String::from_utf8(output.stdout).expect("utf-8 exports");
+    for line in exports.lines() {
+        if let Some(value) = line.strip_prefix("export SUMI_RPC_GENERATION=") {
+            return value.trim().parse().expect("generation is an integer");
+        }
+    }
+    panic!("SUMI_RPC_GENERATION not found in: {exports}");
+}
+
 async fn broker_rpc(socket: &Path, request: &Value) -> Option<Value> {
     let mut stream = UnixStream::connect(socket).await.unwrap();
     let mut bytes = serde_json::to_vec(request).unwrap();
@@ -593,7 +614,6 @@ async fn bash_isolation_fails_closed_for_invalid_broker_socket() {
 
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
-
     send_request(
         &mut stdin,
         &request(
@@ -692,10 +712,14 @@ async fn executor_in_network_namespace_cannot_reach_external_network() {
 
 #[tokio::test]
 async fn executor_in_user_namespace_has_distinct_uid() {
-    // A rootless user namespace maps the caller to nobody (65534) by default.
-    // This proves the process sees a UID that is not the host UID, even though
-    // full filesystem UID separation requires additional newuidmap setup.
+    // An unprivileged user namespace maps the caller to a distinct namespace
+    // UID. Root is commonly identity-mapped (0 -> 0), so this fixture cannot
+    // prove a distinct UID under root and must not fail by construction there.
     let euid = unsafe { libc::geteuid() };
+    if euid == 0 {
+        eprintln!("skipping distinct-UID namespace fixture under root identity mapping");
+        return;
+    }
     let fixture = Fixture::new().await;
     let mut child = Command::new("unshare")
         .arg("--user")
@@ -859,10 +883,12 @@ fn compose_deployment_has_disjoint_mounts_identities_and_sidecar_policy() {
     assert!(!executor.contains("state:/var/lib/sumi"));
     assert!(!executor.contains("artifacts:/var/lib/sumi-artifacts"));
     assert!(executor.contains("apparmor:sumi-agent-executor"));
+    assert!(executor.contains("SUMI_READINESS_SOCKET=/run/sumi/runtime/executor.sock"));
 
     // The broker gets no workspace/state mount and has no TCP/DNS network.
     assert!(broker.contains("user: \"10003:10003\""));
     assert!(broker.contains("network_mode: none"));
+    assert!(broker.contains("SUMI_READINESS_SOCKET=/run/sumi/broker/broker.sock"));
     assert!(broker.contains("artifacts:/var/lib/sumi-artifacts"));
     assert!(broker.contains("broker-ipc:/run/sumi/broker"));
     assert!(!broker.contains("workspace:/workspace"));
@@ -900,6 +926,9 @@ fn compose_deployment_has_disjoint_mounts_identities_and_sidecar_policy() {
     // unshare flags inherited by bash.
     assert!(seccomp.contains("\"value\": 268435456")); // CLONE_NEWUSER
     assert!(seccomp.contains("\"value\": 1073872896")); // CLONE_NEWNS | CLONE_NEWNET
+    for syscall in ["rmdir", "umask", "umount2"] {
+        assert!(seccomp.contains(&format!("\"{syscall}\"")));
+    }
 
     let apparmor_profile = deploy_dir.join("apparmor/executor");
     assert!(
@@ -953,34 +982,82 @@ async fn supervisor_fail_closed_without_low_trust_enabled() {
 }
 
 #[tokio::test]
+async fn supervisor_config_defaults_do_not_override_explicit_environment() {
+    let root = std::env::temp_dir().join(format!("sumi-supervisor-config-{}-", Uuid::now_v7()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let config = root.join("config.env");
+    tokio::fs::write(
+        &config,
+        "SUMI_ALLOW_LOW_TRUST=1\nSUMI_PROVIDER_API_KEY=config-secret\n",
+    )
+    .await
+    .unwrap();
+
+    let mut envs = supervisor_test_env(&root);
+    envs.push(("SUMI_ISOLATION_MODE", "low-trust".to_owned()));
+    envs.push(("SUMI_ALLOW_LOW_TRUST", "0".to_owned()));
+    envs.push(("SUMI_CONFIG_FILE", config.to_string_lossy().into_owned()));
+    envs.push(("SUMI_PROVIDER_API_KEY", String::new()));
+
+    let output = Command::new(supervisor_path())
+        .env_clear()
+        .envs(envs)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .expect("spawn supervisor");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("low-trust mode is disabled"),
+        "caller environment must override config defaults: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = tokio::fs::remove_dir_all(&root).await;
+}
+
+#[tokio::test]
 async fn cli_allocate_generation_is_monotonic_and_persistent() {
     let root = std::env::temp_dir().join(format!("sumi-alloc-cli-{}-", Uuid::now_v7()));
     tokio::fs::create_dir_all(&root).await.unwrap();
 
-    fn allocate(root: &PathBuf) -> u64 {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_sumi-agent"))
-            .arg("--allocate-generation")
-            .env_clear()
-            .env("SUMI_STATE_DIR", root)
-            .output()
-            .expect("allocate generation");
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let exports = String::from_utf8(output.stdout).expect("utf-8 exports");
-        for line in exports.lines() {
-            if let Some(value) = line.strip_prefix("export SUMI_RPC_GENERATION=") {
-                return value.trim().parse().expect("generation is an integer");
-            }
-        }
-        panic!("SUMI_RPC_GENERATION not found in: {exports}");
+    let first = allocate_generation(&root);
+    let second = allocate_generation(&root);
+    assert_eq!(second, first + 1);
+
+    let _ = tokio::fs::remove_dir_all(&root).await;
+}
+
+#[tokio::test]
+async fn cli_allocate_generation_is_unique_across_concurrent_processes() {
+    let root = std::env::temp_dir().join(format!("sumi-alloc-concurrent-{}-", Uuid::now_v7()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+
+    let count = 16usize;
+    let mut handles = Vec::with_capacity(count);
+    for _ in 0..count {
+        let root = root.clone();
+        handles.push(tokio::task::spawn_blocking(move || {
+            allocate_generation(&root)
+        }));
     }
 
-    let first = allocate(&root);
-    let second = allocate(&root);
-    assert_eq!(second, first + 1);
+    let mut values: Vec<u64> = Vec::with_capacity(count);
+    for handle in handles {
+        values.push(handle.await.unwrap());
+    }
+    values.sort_unstable();
+
+    let unique: std::collections::HashSet<_> = values.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        values.len(),
+        "concurrent allocations must be unique"
+    );
+    assert_eq!(values.first().copied().unwrap(), 0);
+    assert_eq!(values.last().copied().unwrap() as usize, count - 1);
 
     let _ = tokio::fs::remove_dir_all(&root).await;
 }

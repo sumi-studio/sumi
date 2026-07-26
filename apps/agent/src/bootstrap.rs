@@ -29,7 +29,8 @@ use crate::{
     },
     store::{AgentScope, EnvironmentKeyProvider, HydrationOutcome, Store},
     tools::{
-        ToolRegistry, WorkspacePaths, executor::ExecutorClient, executor::remote_executor_registry,
+        ToolRegistry, WorkspacePaths,
+        executor::{ExecutorClient, remote_executor_registry, set_dumpable, wait_for_unix_socket},
     },
 };
 
@@ -58,9 +59,6 @@ impl BootstrapContext {
         let fence_id = required("SUMI_GENERATION_RECOVERY_FENCE_ID")?;
         let fence = GenerationRecoveryFence::new(&lease, fence_id)
             .context("SUMI_GENERATION_RECOVERY_FENCE_ID is not a valid fence identity")?;
-        fence
-            .validate_exact(&lease, fence.fence_id())
-            .context("generation recovery fence does not match the process generation lease")?;
 
         let tenant_id = required("SUMI_TENANT_ID")?;
         let agent_id = required("SUMI_AGENT_ID")?;
@@ -172,6 +170,10 @@ pub(crate) async fn run_production_with_driver_and_broker(
     tool_registry: Option<ToolRegistry>,
     approval_broker: Option<Arc<dyn RuntimeApprovalBroker>>,
 ) -> Result<()> {
+    set_dumpable(0).context("failed to set PR_SET_DUMPABLE")?;
+    // Do this before reading the bootstrap identity, lease, fence, or wrapping
+    // key from the environment. Production runtime processes must never hold
+    // those secrets while dumpable.
     let ctx = BootstrapContext::from_env()?;
 
     // Load config last so missing model/system files are surfaced after the
@@ -216,17 +218,9 @@ pub(crate) async fn run_production_with_driver_and_broker(
         HydrationOutcome::Complete(state) => state,
     };
 
-    // Bind the generation recovery fence to the store scope.  This is an
-    // in-memory binding for this run because T17 owns durable fence injection.
-    // We keep the fence in the bootstrap receipts so the composition boundary
-    // is explicit.
-    ctx.fence
-        .validate_exact(&ctx.lease, ctx.fence.fence_id())
-        .context("generation recovery fence/lease binding failed")?;
-
     let registry = match tool_registry {
         Some(registry) => registry,
-        None => build_remote_tool_registry(&ctx)?,
+        None => build_remote_tool_registry(&ctx).await?,
     };
 
     let prompt = PromptContext {
@@ -273,10 +267,10 @@ pub(crate) async fn run_production_with_driver_and_broker(
     ))
     .context("failed to construct hydration receipt identity")?;
     let (hydration_tx, hydration_rx) = watch::channel(HydrationReady::not_ready());
-    let ready = HydrationReady::Ready {
-        generation: ctx.generation,
-        hydration_receipt_identity: runtime_receipt.clone(),
-    };
+    let mut ready = HydrationReady::not_ready();
+    ready
+        .latch(ctx.generation, runtime_receipt.clone())
+        .context("failed to latch hydration ready state")?;
     hydration_tx
         .send(ready)
         .context("failed to publish hydration ready state")?;
@@ -308,13 +302,8 @@ pub(crate) async fn run_production_with_driver_and_broker(
     Ok(())
 }
 
-fn build_remote_tool_registry(ctx: &BootstrapContext) -> Result<ToolRegistry> {
-    if !ctx.executor_socket.exists() {
-        bail!(
-            "SUMI_EXECUTOR_SOCKET {} does not exist; executor sidecar must be started before runtime",
-            ctx.executor_socket.display()
-        );
-    }
+async fn build_remote_tool_registry(ctx: &BootstrapContext) -> Result<ToolRegistry> {
+    wait_for_unix_socket(&ctx.executor_socket, "executor").await?;
     let identity = ctx.rpc_identity();
     let client = Arc::new(ExecutorClient::new(
         &ctx.executor_socket,
@@ -331,6 +320,11 @@ mod tests {
     use super::*;
     use crate::tools::ToolRegistryBuilder;
     use uuid::Uuid;
+
+    // Serialize the environment-mutating tests. `set_var`/`remove_var` are
+    // process-global and `unsafe` in Rust 2024; concurrent tests race on the
+    // same environment and cause observed root-gate transient failures.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     // Environment mutation is `unsafe` in Rust 2024; centralize it so tests
     // stay readable and the unsafe boundary is explicit.
@@ -407,6 +401,7 @@ mod tests {
 
     #[test]
     fn bootstrap_context_rejects_missing_identity() {
+        let _guard = ENV_LOCK.blocking_lock();
         let dir = fresh_dir();
         unsafe {
             apply_env(&test_env_prefix(&dir));
@@ -419,8 +414,9 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn bootstrap_fails_closed_with_mismatched_rpc_identity() {
+        let _guard = ENV_LOCK.lock().await;
         let dir = fresh_dir();
         unsafe {
             apply_env(&test_env_prefix(&dir));
@@ -439,8 +435,9 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn bootstrap_fails_closed_when_executor_socket_missing() {
+        let _guard = ENV_LOCK.lock().await;
         let dir = fresh_dir();
         unsafe {
             apply_env(&test_env_prefix(&dir));

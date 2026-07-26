@@ -20,11 +20,15 @@ use super::contracts::{
 };
 
 const GENERATION_FILE_NAME: &str = ".generation";
+const GENERATION_LOCK_NAME: &str = ".generation.lock";
 const GENERATION_TEMP_NAME: &str = ".generation.next";
 
 // Serialize concurrent calls within the same process.  `flock` below protects
 // against concurrent supervisor processes, but on Linux `flock` does not block
 // threads of the same process, so a process-wide mutex is required too.
+// The lock is held on a dedicated `.generation.lock` file whose inode is never
+// renamed or unlinked, so `flock` keeps its lock across the atomic rename of
+// the generation ledger.
 static PROCESS_ALLOCATOR_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A complete allocation issued to the production bootstrap boundary.
@@ -67,6 +71,18 @@ pub fn acquire_generation(state_dir: impl AsRef<Path>) -> Result<GenerationAlloc
 
     let generation_path = state_dir.join(GENERATION_FILE_NAME);
     let temp_path = state_dir.join(GENERATION_TEMP_NAME);
+    let lock_path = state_dir.join(GENERATION_LOCK_NAME);
+
+    // Advisory exclusive lock on a stable inode. The generation ledger file is
+    // atomically renamed, so it cannot be the lock carrier.
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .context("failed to open generation lock file")?;
+    lock_exclusive(lock_file.as_raw_fd()).context("failed to lock generation ledger")?;
 
     let file = OpenOptions::new()
         .read(true)
@@ -75,10 +91,6 @@ pub fn acquire_generation(state_dir: impl AsRef<Path>) -> Result<GenerationAlloc
         .truncate(false)
         .open(&generation_path)
         .context("failed to open generation ledger")?;
-
-    // Advisory exclusive lock serializes all allocator invocations for this
-    // state directory, including concurrent supervisor processes.
-    lock_exclusive(file.as_raw_fd()).context("failed to lock generation ledger")?;
 
     let ledger = read_generation(&file)?;
     let (generation, next_ledger) = match ledger {

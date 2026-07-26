@@ -43,10 +43,6 @@ profile sumi-agent-executor flags=(attach_disconnected,mediate_deleted) {
   # or socket file.
   mount options=(bind) /tmp/.sumi-broker-isolation-* -> /run/sumi/broker/,
   mount options=(bind) /tmp/.sumi-broker-isolation-* -> /run/sumi/broker/broker.sock,
-  mount options=(bind) /tmp/.sumi-broker-isolation-* -> /tmp/**/broker-ipc/,
-  mount options=(bind) /tmp/.sumi-broker-isolation-* -> /tmp/**/broker-ipc/broker.sock,
-  mount options=(bind) /tmp/.sumi-broker-isolation-* -> /workspace/broker-ipc/,
-  mount options=(bind) /tmp/.sumi-broker-isolation-* -> /workspace/broker-ipc/broker.sock,
 
   # Startup preflight uses two distinct private random paths and detaches the
   # probe mount before removing both paths. This verifies the actual deployed

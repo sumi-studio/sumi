@@ -174,7 +174,10 @@ impl ExecutorClient {
                 write_closed = true;
             }
 
-            if write_closed {
+            if write_closed
+                && original_terminal.is_some()
+                && (cancel_request_id.is_none() || cancel_terminal.is_some())
+            {
                 match timeout(self.deadlines.trailing, read_bounded_line(&mut read)).await {
                     Ok(Ok(None)) => break,
                     Ok(Ok(Some(_))) => {
@@ -209,7 +212,7 @@ impl ExecutorClient {
                         "cancel request",
                     ).await?;
                     shutdown_with_deadline(&mut write, self.deadlines.write).await?;
-                    write_closed = false;
+                    write_closed = true;
                     cancel_deadline = Some(Instant::now() + self.deadlines.cancel);
                     cancel_request_id = Some(id);
                 }

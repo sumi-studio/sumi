@@ -16,10 +16,19 @@ set -euo pipefail
 SUPERVISOR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SUMI_CONFIG_FILE="${SUMI_CONFIG_FILE:-${SUPERVISOR_DIR}/config.env}"
 if [[ -f "${SUMI_CONFIG_FILE}" ]]; then
-  # shellcheck source=/dev/null
-  set -a
-  . "${SUMI_CONFIG_FILE}"
-  set +a
+  # Load config.env values only as defaults so caller-supplied environment
+  # and secrets retain precedence. Empty values are still exported and will
+  # fail closed at required-variable checks below.
+  while IFS='=' read -r key value; do
+    [[ -z "${key}" || "${key}" =~ ^[[:space:]]*# ]] && continue
+    [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    # `-v` distinguishes an explicitly supplied empty secret from an unset
+    # variable. An empty caller value must reach the required-variable check;
+    # it must never be replaced from a local defaults file.
+    if ! [[ -v "${key}" ]]; then
+      export "${key}=${value}"
+    fi
+  done < "${SUMI_CONFIG_FILE}"
 fi
 
 : "${SUMI_RUNTIME_USER:=sumi-runtime}"
@@ -227,6 +236,10 @@ spawn_runtime() {
   )
   if [[ -n "${SUMI_MODEL_PRESET:-}" ]]; then
     runtime_env+=("SUMI_MODEL_PRESET=${SUMI_MODEL_PRESET}")
+  fi
+  if [[ -n "${SUMI_PROVIDER_API_KEY:-}" ]]; then
+    runtime_env+=("SUMI_PROVIDER_API_KEY=${SUMI_PROVIDER_API_KEY}")
+    runtime_env+=("SUMI_MODEL_API_KEY_ENV=SUMI_PROVIDER_API_KEY")
   fi
   case "${SUMI_ISOLATION_MODE}" in
     privileged)

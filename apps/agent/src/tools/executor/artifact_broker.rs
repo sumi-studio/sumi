@@ -72,8 +72,10 @@ struct BrokerState {
     artifacts: HashMap<String, ArtifactRecord>,
     // Tombstones observed by this process.  A durable ledger is T29; this set
     // makes replay of the same `DeleteConversationArtifacts` idempotent within
-    // a single broker lifetime.
-    applied_tombstones: HashSet<String>,
+    // a single broker lifetime. The map binds each tombstone_id to exactly one
+    // old_conversation_id, so a replay for that conversation is idempotent but
+    // cross-conversation reuse is rejected rather than silently accepted.
+    applied_tombstones: HashMap<String, String>,
     deleted_conversations: HashSet<String>,
 }
 
@@ -449,20 +451,31 @@ impl ArtifactBroker {
         let prefix = format!("artifact://{old_conversation_id}/");
         let mut state = self.lock_state()?;
 
-        if state.applied_tombstones.contains(tombstone_id)
-            || state.deleted_conversations.contains(old_conversation_id)
-        {
+        if let Some(recorded_conversation) = state.applied_tombstones.get(tombstone_id) {
+            if recorded_conversation != old_conversation_id {
+                return Err(ToolError::Protocol(
+                    "tombstone_id is already bound to a different conversation".to_owned(),
+                ));
+            }
             // Idempotent replay: the conversation has already been deleted by
-            // this tombstone or by an earlier one in this process.
+            // this tombstone in this broker lifetime.
             state
                 .artifacts
                 .retain(|handle, _| !handle.starts_with(&prefix));
             return Ok(ArtifactResponse::Deleted);
         }
-
-        state
-            .artifacts
-            .retain(|handle, _| !handle.starts_with(&prefix));
+        if state.deleted_conversations.contains(old_conversation_id) {
+            // A distinct tombstone for an already-deleted target is a no-op.
+            // Bind it only after the root directory has been fsync'd below.
+            fsync_fd(self.root.as_raw_fd())?;
+            state
+                .artifacts
+                .retain(|handle, _| !handle.starts_with(&prefix));
+            state
+                .applied_tombstones
+                .insert(tombstone_id.to_owned(), old_conversation_id.to_owned());
+            return Ok(ArtifactResponse::Deleted);
+        }
 
         let name = cstring(old_conversation_id)?;
         let conversation_fd = match openat2_cstr(
@@ -473,7 +486,15 @@ impl ArtifactBroker {
         ) {
             Ok(fd) => fd,
             Err(ToolError::Io(error)) if error.raw_os_error() == Some(libc::ENOENT) => {
-                state.applied_tombstones.insert(tombstone_id.to_owned());
+                // No directory to remove. Synchronize the root before
+                // recording an in-memory idempotency claim.
+                fsync_fd(self.root.as_raw_fd())?;
+                state
+                    .artifacts
+                    .retain(|handle, _| !handle.starts_with(&prefix));
+                state
+                    .applied_tombstones
+                    .insert(tombstone_id.to_owned(), old_conversation_id.to_owned());
                 state
                     .deleted_conversations
                     .insert(old_conversation_id.to_owned());
@@ -503,12 +524,18 @@ impl ArtifactBroker {
             }
         }
 
-        state.applied_tombstones.insert(tombstone_id.to_owned());
+        // Make the deletion durable before recording it in memory. If fsync
+        // fails, the in-process tombstone/deleted sets must not claim it.
+        fsync_fd(self.root.as_raw_fd())?;
+        state
+            .artifacts
+            .retain(|handle, _| !handle.starts_with(&prefix));
+        state
+            .applied_tombstones
+            .insert(tombstone_id.to_owned(), old_conversation_id.to_owned());
         state
             .deleted_conversations
             .insert(old_conversation_id.to_owned());
-
-        fsync_fd(self.root.as_raw_fd())?;
         Ok(ArtifactResponse::Deleted)
     }
 
@@ -1326,6 +1353,35 @@ mod tests {
         assert!(root.0.join("conversation-2").exists());
 
         assert_eq!(broker.execute(delete).unwrap(), ArtifactResponse::Deleted);
+    }
+
+    #[test]
+    fn delete_conversation_artifacts_rejects_cross_conversation_tombstone_reuse() {
+        let root = TestRoot::new();
+        let broker = ArtifactBroker::open(&root.0).unwrap();
+        broker.execute(begin(b"one".to_vec())).unwrap();
+        broker
+            .execute(ArtifactOperation::BeginToolOutput {
+                conversation_id: "conversation-2".to_owned(),
+                execution_id: "execution-1".to_owned(),
+                content: b"two".to_vec(),
+            })
+            .unwrap();
+
+        broker
+            .execute(ArtifactOperation::DeleteConversationArtifacts {
+                old_conversation_id: "conversation-1".to_owned(),
+                tombstone_id: "tombstone-1".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            broker.execute(ArtifactOperation::DeleteConversationArtifacts {
+                old_conversation_id: "conversation-2".to_owned(),
+                tombstone_id: "tombstone-1".to_owned(),
+            }),
+            Err(ToolError::Protocol(message)) if message.contains("different conversation")
+        ));
+        assert!(root.0.join("conversation-2").exists());
     }
 
     #[test]
