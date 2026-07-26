@@ -619,11 +619,10 @@ impl Reviewer {
                     // eligible for the next reviewer prompt's retry note.
                     continue;
                 }
-                ReviewerCall::Fatal(e) => {
+                ReviewerCall::Fatal(_error) => {
+                    tracing::warn!("reviewer transport failed fatally");
                     self.record_outcome(&request.run_id, AuditOutcome::Deny);
-                    return ReviewOutcome::Deny(synthetic_deny(format!(
-                        "fatal reviewer transport error: {e}"
-                    )));
+                    return ReviewOutcome::Deny(synthetic_deny("fatal reviewer transport failure"));
                 }
                 ReviewerCall::TimedOut => {
                     self.record_outcome(&request.run_id, AuditOutcome::Deny);
@@ -1214,8 +1213,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn fatal_error_produces_synthetic_deny_without_retry() {
+        const TRANSPORT_SECRET: &str =
+            "Authorization: Bearer reviewer-secret https://signed.example.test/?token=secret";
         let fake = FakeTransport::sequence(vec![Err(ReviewerTransportError::Fatal(
-            "bad config".to_owned(),
+            TRANSPORT_SECRET.to_owned(),
         ))]);
         let reviewer = make_reviewer(fake.clone());
         let outcome = reviewer
@@ -1224,7 +1225,12 @@ mod tests {
                 CancellationToken::new(),
             )
             .await;
-        assert!(matches!(outcome, ReviewOutcome::Deny(d) if d.rationale.contains("fatal")));
+        assert!(
+            matches!(outcome, ReviewOutcome::Deny(d)
+                if d.rationale == "fatal reviewer transport failure"
+                    && !d.rationale.contains(TRANSPORT_SECRET)),
+            "fatal transport diagnostics must not enter the public audit rationale"
+        );
         assert_eq!(fake.called_count(), 1);
     }
 

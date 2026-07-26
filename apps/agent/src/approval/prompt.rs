@@ -131,14 +131,13 @@ pub fn build_reviewer_prompt(
     let env_value =
         serde_json::to_value(trusted_environment).context("serialize trusted environment")?;
     let redacted_env = redact_value(projector, env_value)?;
-    messages.push(capped_message(
-        ReviewerRole::User,
-        format!(
+    messages.push(ReviewerMessage {
+        role: ReviewerRole::User,
+        content: format!(
             "Trusted environment:\n{}",
             serde_json::to_string_pretty(&redacted_env).context("format trusted environment")?
         ),
-        limits,
-    ));
+    });
 
     let entries = build_transcript_entries(transcript, projector, limits)?;
     for entry in select_entries(&entries, limits) {
@@ -149,11 +148,10 @@ pub fn build_reviewer_prompt(
     }
 
     let action_json = serde_json::to_string(projection).context("serialize pending action")?;
-    messages.push(capped_message(
-        ReviewerRole::User,
-        format!("Pending review action:\n{action_json}"),
-        limits,
-    ));
+    messages.push(ReviewerMessage {
+        role: ReviewerRole::User,
+        content: format!("Pending review action:\n{action_json}"),
+    });
 
     if !retry_errors.is_empty() {
         messages.push(capped_message(
@@ -345,6 +343,19 @@ fn select_entries<'a>(
     if let Some(i) = last_user.filter(|i| !selected.contains(i)) {
         selected.push(i);
         total += entries[i].tokens;
+    }
+
+    for i in (0..entries.len()).rev() {
+        let entry = &entries[i];
+        if entry.role != ReviewerRole::User || selected.contains(&i) {
+            continue;
+        }
+        let new_total = total.saturating_add(entry.tokens);
+        if new_total > limits.total_token_budget {
+            continue;
+        }
+        selected.push(i);
+        total = new_total;
     }
 
     let mut non_user_count = 0usize;
@@ -628,9 +639,9 @@ mod tests {
             transcript.push(user_message(&"x".repeat(20_000)));
         }
         let limits = PromptLimits {
-            total_token_budget: 50,
-            tool_evidence_token_budget: 10,
-            per_entry_max_tokens: 10,
+            total_token_budget: 1_000,
+            tool_evidence_token_budget: 100,
+            per_entry_max_tokens: 250,
             recent_non_user_max: 2,
         };
         let prompt = build(&transcript, &reviewable_projection(), &limits);
@@ -648,7 +659,9 @@ mod tests {
             .messages
             .iter()
             .filter(|m| {
-                m.role == ReviewerRole::User && !m.content.starts_with("Trusted environment")
+                m.role == ReviewerRole::User
+                    && !m.content.starts_with("Trusted environment")
+                    && !m.content.starts_with("Pending review action")
             })
             .map(|m| estimate_text_tokens(&m.content).unwrap_or(0))
             .sum();
@@ -717,6 +730,76 @@ mod tests {
     }
 
     #[test]
+    fn prompt_preserves_complete_oversized_pending_action() {
+        const END_SENTINEL: &str = "PENDING_ACTION_END_SENTINEL";
+        let mut projection = reviewable_projection();
+        let ReviewProjection::Reviewable(action) = &mut projection else {
+            panic!("fixture must be reviewable");
+        };
+        action.justification = Some(RedactedText(format!(
+            "{}{END_SENTINEL}",
+            "x".repeat(20_000)
+        )));
+
+        let prompt = build_reviewer_prompt(
+            None,
+            &trusted_env(),
+            &[],
+            &projection,
+            &[],
+            &projector(),
+            &PromptLimits::default(),
+        )
+        .expect("oversized pending action remains reviewable");
+        let pending = prompt
+            .messages
+            .iter()
+            .find(|message| message.content.starts_with("Pending review action"))
+            .expect("pending review action message");
+        assert!(
+            pending.content.contains(END_SENTINEL),
+            "pending action tail must not be truncated"
+        );
+        assert!(
+            estimate_text_tokens(&pending.content).expect("token estimate")
+                > PromptLimits::default().per_entry_max_tokens,
+            "fixture must exceed the transcript-only per-entry limit"
+        );
+    }
+
+    #[test]
+    fn prompt_preserves_complete_oversized_trusted_environment() {
+        const END_SENTINEL: &str = "TRUSTED_ENVIRONMENT_END_SENTINEL";
+        let mut environment = trusted_env();
+        environment.denied_paths = vec![format!("/{}{END_SENTINEL}", "x".repeat(20_000))];
+
+        let prompt = build_reviewer_prompt(
+            None,
+            &environment,
+            &[],
+            &reviewable_projection(),
+            &[],
+            &projector(),
+            &PromptLimits::default(),
+        )
+        .expect("oversized trusted environment remains reviewable");
+        let trusted = prompt
+            .messages
+            .iter()
+            .find(|message| message.content.starts_with("Trusted environment"))
+            .expect("trusted environment message");
+        assert!(
+            trusted.content.contains(END_SENTINEL),
+            "trusted environment tail must not be truncated"
+        );
+        assert!(
+            estimate_text_tokens(&trusted.content).expect("token estimate")
+                > PromptLimits::default().per_entry_max_tokens,
+            "fixture must exceed the transcript-only per-entry limit"
+        );
+    }
+
+    #[test]
     fn prompt_preserves_first_and_latest_user_messages() {
         let transcript = vec![
             user_message("first user request"),
@@ -734,6 +817,81 @@ mod tests {
         let content = all_content(&prompt);
         assert!(content.contains("first user request"));
         assert!(content.contains("latest user request"));
+    }
+
+    #[test]
+    fn prompt_prioritizes_intermediate_user_messages_over_non_user_evidence() {
+        let transcript = vec![
+            user_message("1111"),
+            user_message("22222222"),
+            assistant_message(vec![PublicAssistantContent::Text {
+                text: "aaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                wire_item_index: 0,
+            }]),
+            user_message("3333"),
+        ];
+        let limits = PromptLimits {
+            total_token_budget: 8,
+            tool_evidence_token_budget: 8,
+            per_entry_max_tokens: 2_000,
+            recent_non_user_max: 40,
+        };
+
+        let prompt = build(&transcript, &reviewable_projection(), &limits);
+        let content = all_content(&prompt);
+
+        assert!(
+            content.contains("22222222"),
+            "remaining user authorization evidence must be selected"
+        );
+        assert!(
+            !content.contains("aaaaaaaaaaaaaaaaaaaaaaaa"),
+            "non-user evidence must not displace user authorization evidence"
+        );
+    }
+
+    #[test]
+    fn prioritized_transcript_entries_remain_in_chronological_order() {
+        let transcript = vec![
+            user_message("user-one"),
+            assistant_message(vec![PublicAssistantContent::Text {
+                text: "assistant-one".to_owned(),
+                wire_item_index: 0,
+            }]),
+            user_message("user-two"),
+            assistant_message(vec![PublicAssistantContent::Text {
+                text: "assistant-two".to_owned(),
+                wire_item_index: 1,
+            }]),
+            user_message("user-three"),
+        ];
+
+        let prompt = build(
+            &transcript,
+            &reviewable_projection(),
+            &PromptLimits::default(),
+        );
+        let transcript_contents: Vec<_> = prompt
+            .messages
+            .iter()
+            .filter(|message| {
+                !message.content.starts_with("Trusted environment")
+                    && !message.content.starts_with("Pending review action")
+            })
+            .map(|message| message.content.as_str())
+            .collect();
+
+        assert_eq!(
+            transcript_contents,
+            [
+                "user-one",
+                "assistant-one",
+                "user-two",
+                "assistant-two",
+                "user-three"
+            ],
+            "selection priority must not reorder the LLM transcript"
+        );
     }
 
     #[test]
