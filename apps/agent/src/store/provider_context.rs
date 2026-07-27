@@ -1627,7 +1627,7 @@ mod tests {
                 message_seq,
             }),
             wire_item_index: Some(0),
-            ordinal: 1,
+            ordinal: 0,
             provider_origin: reasoning_origin(),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::OpenAiChatCompletions,
@@ -1642,7 +1642,7 @@ mod tests {
         message_seq: u64,
         id: &str,
     ) -> EncryptedProviderContextRecord {
-        reasoning_record_with(store, message_id, message_seq, id, 0, 1).await
+        reasoning_record_with(store, message_id, message_seq, id, 0, 0).await
     }
 
     fn reasoning_item_with(
