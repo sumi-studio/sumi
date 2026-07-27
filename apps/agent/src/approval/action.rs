@@ -703,8 +703,8 @@ impl SecretAwareActionProjector {
     /// Redact a raw tool-argument summary for the wire-visible `args_summary`
     /// field. First applies the injected versioned `Redactor` (which preserves
     /// durable-projection semantics and structured-key redaction), then the
-    /// projector's own `SecretInventory` to catch URL userinfo and generic query
-    /// secrets that the Store redactor does not yet cover.
+    /// projector's own `SecretInventory` to catch any credential forms not
+    /// already consumed by the Store redactor.
     pub fn redact_arguments(&self, args: &ValidatedToolArguments) -> anyhow::Result<JsonValue> {
         let value = JsonValue::Object(args.as_object().clone());
         let redacted = self.redactor.redact_value(&value)?;
@@ -3764,13 +3764,12 @@ mod tests {
             "userinfo password leaked: {text}"
         );
         assert!(
-            text.contains("[REDACTED:url_credential]"),
-            "url_credential placeholder missing: {text}"
+            text.contains("[REDACTED:url_with_credentials]"),
+            "credential-bearing URL placeholder missing: {text}"
         );
-        assert!(text.contains("https://deploy:"), "user part lost: {text}");
         assert!(
-            text.contains("@example.com/repo.git"),
-            "host part lost: {text}"
+            !text.contains("deploy") && !text.contains("example.com"),
+            "credential-bearing URL was only partially redacted: {text}"
         );
     }
 
@@ -3987,13 +3986,12 @@ mod tests {
             "token-only userinfo leaked: {text}"
         );
         assert!(
-            text.contains("[REDACTED:url_credential]"),
-            "url_credential placeholder missing: {text}"
+            text.contains("[REDACTED:url_with_credentials]"),
+            "credential-bearing URL placeholder missing: {text}"
         );
-        assert!(text.contains("https://"), "scheme lost: {text}");
         assert!(
-            text.contains("@github.com/repo.git"),
-            "host part lost: {text}"
+            !text.contains("github.com"),
+            "credential-bearing URL was only partially redacted: {text}"
         );
     }
 

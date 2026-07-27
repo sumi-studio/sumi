@@ -170,16 +170,17 @@ pub(in crate::provider) fn build_replay_probe_request(
     build_replay_probe_request_with_usage(fragment, Usage::default())
 }
 
-fn build_replay_probe_request_with_usage(
+fn build_replay_probe_prompt(
+    spec: &ModelSpec,
     fragment: Option<&Value>,
     usage: Usage,
-) -> Result<Value, AnthropicAdapterError> {
-    let spec =
-        ModelSpec::preset("anthropic").expect("the V1 Anthropic replay probe preset is built in");
+) -> Result<PromptContext, AnthropicAdapterError> {
+    ensure_anthropic_spec(spec)?;
     let anchor = ProviderContextAnchor {
         message_id: "replay-probe-v1-assistant".into(),
         message_seq: 2,
     };
+    let origin = spec.origin();
     let mut content = vec![AssistantContent::Thinking {
         thinking: "replay-probe-v1-sentinel".into(),
         signature_field: "thinking.signature".into(),
@@ -189,6 +190,7 @@ fn build_replay_probe_request_with_usage(
         origin_message: Some(anchor.clone()),
         wire_item_index: Some(0),
         ordinal: 0,
+        provider_origin: origin.clone(),
         payload: ProviderContextPayload::EncryptedReasoning {
             protocol: ApiProtocol::AnthropicMessages,
             item: json!({
@@ -212,13 +214,14 @@ fn build_replay_probe_request_with_usage(
             origin_message: Some(anchor),
             wire_item_index: Some(1),
             ordinal: 0,
+            provider_origin: origin.clone(),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::AnthropicMessages,
                 item: fragment.clone(),
             },
         });
     }
-    let context = PromptContext {
+    Ok(PromptContext {
         system_prompt: "replay-probe-v1".into(),
         memory_blocks: Vec::new(),
         messages: vec![
@@ -239,7 +242,7 @@ fn build_replay_probe_request_with_usage(
                     content,
                     model: spec.id.clone(),
                     provider: spec.provider.clone(),
-                    origin: spec.origin(),
+                    origin: origin.clone(),
                     usage,
                     stop_reason: StopReason::Stop,
                     error_message: None,
@@ -261,7 +264,16 @@ fn build_replay_probe_request_with_usage(
         ],
         provider_context,
         tools: Vec::new(),
-    };
+    })
+}
+
+fn build_replay_probe_request_with_usage(
+    fragment: Option<&Value>,
+    usage: Usage,
+) -> Result<Value, AnthropicAdapterError> {
+    let spec =
+        ModelSpec::preset("anthropic").expect("the V1 Anthropic replay probe preset is built in");
+    let context = build_replay_probe_prompt(&spec, fragment, usage)?;
     build_request(&spec, &context, &RequestOptions::default())
 }
 
@@ -741,62 +753,12 @@ fn validate_native_replay(
             "native compaction context fingerprint mismatch".into(),
         ));
     }
-    validate_native_suffix(&context.messages, coverage.through_message_seq)
-}
-
-fn validate_native_suffix(
-    messages: &[ContextMessage],
-    coverage: u64,
-) -> Result<(), AnthropicAdapterError> {
-    let mut persisted_started = false;
-    let mut previous = None;
-    let mut suffix_started = false;
-    for message in messages {
-        let ContextMessage::Persisted { seq, .. } = message else {
-            if persisted_started {
-                return Err(AnthropicAdapterError::InvalidContext(
-                    "native compaction suffix contains synthetic content after persisted history"
-                        .into(),
-                ));
-            }
-            continue;
-        };
-        persisted_started = true;
-        if *seq == 0 || previous.is_some_and(|value: u64| value.checked_add(1) != Some(*seq)) {
-            return Err(AnthropicAdapterError::InvalidContext(
-                "persisted native replay sequence is gapped, duplicated, or reordered".into(),
-            ));
-        }
-        if *seq > coverage {
-            if !suffix_started
-                && *seq
-                    != coverage.checked_add(1).ok_or_else(|| {
-                        AnthropicAdapterError::InvalidContext("native coverage overflow".into())
-                    })?
-            {
-                return Err(AnthropicAdapterError::InvalidContext(
-                    "native suffix must begin exactly at coverage + 1".into(),
-                ));
-            }
-            suffix_started = true;
-        } else if suffix_started {
-            return Err(AnthropicAdapterError::InvalidContext(
-                "covered history appears after the native suffix".into(),
-            ));
-        }
-        previous = Some(*seq);
-    }
-    let max_seq = previous.ok_or_else(|| {
-        AnthropicAdapterError::InvalidContext(
-            "native compaction requires persisted replay history".into(),
-        )
-    })?;
-    if coverage > max_seq {
-        return Err(AnthropicAdapterError::InvalidContext(
-            "native compaction coverage exceeds the latest persisted message sequence".into(),
-        ));
-    }
-    Ok(())
+    crate::provider::types::validate_native_suffix(
+        &context.messages,
+        Some(coverage.through_message_seq),
+    )
+    .map(|_| ())
+    .map_err(AnthropicAdapterError::InvalidContext)
 }
 
 fn anthropic_user_content(content: &UserContent, supports_images: bool) -> Value {
@@ -2021,40 +1983,17 @@ pub fn request_coverage(
     if !ensure_anthropic_spec(spec)?.supports_native_compact || !native_compaction {
         return Ok(None);
     }
-    let mut previous: Option<u64> = None;
-    let mut persisted_started = false;
-    for message in &context.messages {
-        let ContextMessage::Persisted { seq, .. } = message else {
-            if persisted_started {
-                return Err(AnthropicAdapterError::InvalidContext(
-                    "native compaction requires persisted messages to form a trailing suffix"
-                        .into(),
-                ));
-            }
-            continue;
-        };
-        persisted_started = true;
-        if *seq == 0 {
-            return Err(AnthropicAdapterError::InvalidContext(
-                "persisted message sequence must be greater than zero".into(),
-            ));
-        }
-        if let Some(previous) = previous
-            && previous.checked_add(1) != Some(*seq)
-        {
-            return Err(AnthropicAdapterError::InvalidContext(
-                "persisted message sequence is duplicated, nonmonotonic, or gapped".into(),
-            ));
-        }
-        previous = Some(*seq);
-    }
-    Ok(
-        previous.map(|through_message_seq| NativeCompactionCoverage {
-            through_message_seq,
-            context_fingerprint: context_fingerprint(spec, context)
-                .expect("spec was validated above"),
-        }),
-    )
+    let Some(through_message_seq) =
+        crate::provider::types::validate_native_suffix(&context.messages, None)
+            .map_err(AnthropicAdapterError::InvalidContext)?
+    else {
+        return Ok(None);
+    };
+    let context_fingerprint = context_fingerprint(spec, context).expect("spec was validated above");
+    Ok(Some(NativeCompactionCoverage {
+        through_message_seq,
+        context_fingerprint,
+    }))
 }
 
 #[cfg(test)]
@@ -2108,6 +2047,59 @@ mod tests {
         Utc.timestamp_millis_opt(1_700_000_000_000)
             .single()
             .expect("timestamp")
+    }
+
+    #[test]
+    fn replay_probe_context_origin_matches_assistant_origin() {
+        let preset = spec();
+        let mut custom = preset.clone();
+        custom.set_model_id("claude-custom");
+        let fragments: [(&str, Option<Value>); 3] = [
+            ("none", None),
+            (
+                "thinking_signature",
+                Some(json!({
+                    "type": "thinking_signature",
+                    "signature": "probe-sig",
+                })),
+            ),
+            (
+                "redacted_thinking",
+                Some(json!({
+                    "type": "redacted_thinking",
+                    "data": "probe-data",
+                })),
+            ),
+        ];
+        for (spec_label, spec) in [("preset", &preset), ("custom", &custom)] {
+            for (fragment_label, fragment) in &fragments {
+                let context =
+                    super::build_replay_probe_prompt(spec, fragment.as_ref(), Usage::default())
+                        .unwrap_or_else(|error| {
+                            panic!("build prompt for {spec_label}/{fragment_label}: {error}")
+                        });
+                let assistant_origin = match &context.messages[1] {
+                    ContextMessage::Persisted {
+                        message: Message::Assistant(assistant),
+                        ..
+                    } => &assistant.origin,
+                    other => panic!(
+                        "expected assistant message for {spec_label}/{fragment_label}: {other:?}"
+                    ),
+                };
+                assert_eq!(
+                    context.provider_context.len(),
+                    if fragment.is_some() { 2 } else { 1 },
+                    "provider context count for {spec_label}/{fragment_label}"
+                );
+                for (i, item) in context.provider_context.iter().enumerate() {
+                    assert_eq!(
+                        &item.provider_origin, assistant_origin,
+                        "provider_context[{i}] origin must match assistant origin for {spec_label}/{fragment_label}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -2210,6 +2202,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::AnthropicCompaction {
                 block: json!({"type":"compaction","content":"NATIVE_MARKER"}),
                 coverage,
@@ -2294,6 +2287,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({
                     "id":"cmp",
@@ -2733,6 +2727,7 @@ mod tests {
             origin_message: Some(anchor),
             wire_item_index: Some(0),
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::AnthropicMessages,
                 item: json!({"type":"thinking_signature","signature":"opaque-sig"}),
@@ -2814,6 +2809,7 @@ mod tests {
             origin_message: Some(anchor),
             wire_item_index: Some(0),
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::AnthropicMessages,
                 item: json!({"type":"thinking_signature","signature":"OPAQUE_MARKER"}),
@@ -2901,6 +2897,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::AnthropicCompaction {
                 block: json!({"type":"compaction","content":"opaque-compact"}),
                 coverage: coverage.clone(),
@@ -2995,6 +2992,93 @@ mod tests {
     }
 
     #[test]
+    fn native_compaction_replays_gapped_persisted_suffix() {
+        let spec = spec();
+        let mut context = context(vec![
+            ContextMessage::Persisted {
+                id: "old".into(),
+                seq: 1,
+                message: Message::User(UserMessage {
+                    content: vec![UserContent::Text {
+                        text: "old-prefix".into(),
+                    }],
+                    timestamp: timestamp(),
+                }),
+            },
+            ContextMessage::Persisted {
+                id: "compacted-response".into(),
+                seq: 3,
+                message: Message::Assistant(AssistantMessage {
+                    content: vec![AssistantContent::Text {
+                        text: "assistant-suffix-marker".into(),
+                        wire_item_index: 1,
+                    }],
+                    model: spec.id.clone(),
+                    provider: spec.provider.clone(),
+                    origin: spec.origin(),
+                    usage: Usage::default(),
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                    provider_code: None,
+                    interrupted: false,
+                    timestamp: timestamp(),
+                }),
+            },
+            ContextMessage::Persisted {
+                id: "new".into(),
+                seq: 5,
+                message: Message::User(UserMessage {
+                    content: vec![UserContent::Text {
+                        text: "suffix-marker".into(),
+                    }],
+                    timestamp: timestamp(),
+                }),
+            },
+        ]);
+        let coverage = NativeCompactionCoverage {
+            through_message_seq: 1,
+            context_fingerprint: context_fingerprint(&spec, &context).unwrap(),
+        };
+        context.provider_context.push(ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
+            payload: ProviderContextPayload::AnthropicCompaction {
+                block: json!({"type":"compaction","content":"opaque-compact"}),
+                coverage: coverage.clone(),
+            },
+        });
+        let request = build_request(
+            &spec,
+            &context,
+            &RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
+        )
+        .expect("native request with gapped suffix");
+        let serialized = serde_json::to_string(&request).unwrap();
+        assert!(!serialized.contains("old-prefix"));
+        assert!(serialized.contains("assistant-suffix-marker"));
+        assert!(serialized.contains("suffix-marker"));
+        assert!(serialized.contains("opaque-compact"));
+        assert_eq!(
+            request["context_management"],
+            json!({"edits":[{"type":"compact_20260112"}]})
+        );
+        assert_eq!(request["messages"][0]["role"], "assistant");
+        assert_eq!(
+            request["messages"][0]["content"],
+            json!([
+                {"type":"compaction","content":"opaque-compact"},
+                {"type":"text","text":"assistant-suffix-marker"},
+            ])
+        );
+        assert_eq!(request["messages"][1]["role"], "user");
+    }
+
+    #[test]
     fn compaction_stop_reason_requires_one_valid_fragment_with_exact_coverage() {
         let coverage = NativeCompactionCoverage {
             through_message_seq: 1,
@@ -3074,6 +3158,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::AnthropicCompaction {
                 block,
                 coverage: coverage.clone(),
@@ -3138,6 +3223,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::AnthropicCompaction {
                 block: json!({"type":"compaction","content":"opaque"}),
                 coverage,
@@ -3165,6 +3251,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::AnthropicCompaction {
                 block: json!({"type":"compaction","content":"STALE"}),
                 coverage: NativeCompactionCoverage {
@@ -3189,6 +3276,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::AnthropicCompaction {
                 block: json!({"type":"compaction","content":"GAP"}),
                 coverage: NativeCompactionCoverage {
@@ -3546,7 +3634,7 @@ mod tests {
     }
 
     #[test]
-    fn native_coverage_requires_contiguous_trailing_persisted_suffix() {
+    fn native_coverage_accepts_gapped_trailing_persisted_suffix() {
         let spec = spec();
         let valid = context(vec![
             synthetic(Message::User(UserMessage {
@@ -3554,18 +3642,17 @@ mod tests {
                 timestamp: timestamp(),
             })),
             persisted(7),
-            persisted(8),
+            persisted(9),
         ]);
         assert_eq!(
             request_coverage(&spec, &valid, true)
                 .unwrap()
                 .expect("coverage")
                 .through_message_seq,
-            8
+            9
         );
 
         for messages in [
-            vec![persisted(7), persisted(9)],
             vec![persisted(7), persisted(7)],
             vec![persisted(0)],
             vec![persisted(8), persisted(7)],

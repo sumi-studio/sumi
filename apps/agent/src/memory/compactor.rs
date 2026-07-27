@@ -102,6 +102,7 @@ pub enum CompactError {
 /// use sumi_agent_doctest::memory::compactor::CompactionInput;
 /// use sumi_agent_doctest::provider::types::{
 ///     ApiProtocol, ProviderContextAnchor, ProviderContextItem, ProviderContextPayload,
+///     ProviderOrigin,
 /// };
 ///
 /// let item = ProviderContextItem {
@@ -111,6 +112,11 @@ pub enum CompactError {
 ///     }),
 ///     wire_item_index: None,
 ///     ordinal: 0,
+///     provider_origin: ProviderOrigin {
+///         provider_instance_id: "doctest".into(),
+///         protocol: ApiProtocol::OpenAiResponses,
+///         model: "doctest".into(),
+///     },
 ///     payload: ProviderContextPayload::EncryptedReasoning {
 ///         protocol: ApiProtocol::OpenAiResponses,
 ///         item: serde_json::Value::String("secret".into()),
@@ -589,6 +595,7 @@ mod tests {
                 }),
                 wire_item_index: Some(0),
                 ordinal: 0,
+                provider_origin: ProviderContextItem::test_origin(),
                 payload: ProviderContextPayload::EncryptedReasoning {
                     protocol: ApiProtocol::OpenAiResponses,
                     item: json!({"sentinel": ENCRYPTED_REASONING_SENTINEL}),
@@ -601,6 +608,7 @@ mod tests {
                 }),
                 wire_item_index: Some(1),
                 ordinal: 0,
+                provider_origin: ProviderContextItem::test_origin(),
                 payload: ProviderContextPayload::OpenAiCompactedWindow {
                     items: vec![json!({"sentinel": OPENAI_COMPACTED_SENTINEL})],
                     coverage: NativeCompactionCoverage {
@@ -616,6 +624,7 @@ mod tests {
                 }),
                 wire_item_index: Some(2),
                 ordinal: 0,
+                provider_origin: ProviderContextItem::test_origin(),
                 payload: ProviderContextPayload::AnthropicCompaction {
                     block: json!({"sentinel": ANTHROPIC_COMPACTION_SENTINEL}),
                     coverage: NativeCompactionCoverage {

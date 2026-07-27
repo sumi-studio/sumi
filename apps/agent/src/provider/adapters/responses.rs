@@ -190,10 +190,12 @@ fn build_replay_probe_request_with_usage(
         message_id: "replay-probe-v1-assistant".into(),
         message_seq: 1,
     };
+    let origin = spec.origin();
     let mut provider_context = vec![ProviderContextItem {
         origin_message: Some(anchor.clone()),
         wire_item_index: Some(0),
         ordinal: 0,
+        provider_origin: origin.clone(),
         payload: ProviderContextPayload::EncryptedReasoning {
             protocol: ApiProtocol::OpenAiResponses,
             item: json!({
@@ -209,6 +211,7 @@ fn build_replay_probe_request_with_usage(
             origin_message: Some(anchor),
             wire_item_index: Some(1),
             ordinal: 0,
+            provider_origin: origin,
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::OpenAiResponses,
                 item: fragment.clone(),
@@ -302,38 +305,14 @@ pub(in crate::provider) fn derive_compaction_coverage(
     if !compat.supports_native_compact {
         return Err(ResponsesAdapterError::UnsupportedProtocol);
     }
-    let mut previous: Option<u64> = None;
-    let mut persisted_started = false;
-    for message in &context.messages {
-        let ContextMessage::Persisted { seq, .. } = message else {
-            if persisted_started {
-                return Err(ResponsesAdapterError::InvalidContext(
-                    "native compaction requires persisted messages to form a trailing suffix"
-                        .into(),
-                ));
-            }
-            continue;
-        };
-        persisted_started = true;
-        if *seq == 0 {
-            return Err(ResponsesAdapterError::InvalidContext(
-                "persisted message sequence must be greater than zero".into(),
-            ));
-        }
-        if let Some(previous) = previous
-            && previous.checked_add(1) != Some(*seq)
-        {
-            return Err(ResponsesAdapterError::InvalidContext(
-                "persisted message sequence is duplicated, nonmonotonic, or gapped".into(),
-            ));
-        }
-        previous = Some(*seq);
-    }
-    let through_message_seq = previous.ok_or_else(|| {
-        ResponsesAdapterError::InvalidContext(
-            "native compaction requires at least one persisted message".into(),
-        )
-    })?;
+    let through_message_seq =
+        crate::provider::types::validate_native_suffix(&context.messages, None)
+            .map_err(ResponsesAdapterError::InvalidContext)?
+            .ok_or_else(|| {
+                ResponsesAdapterError::InvalidContext(
+                    "native compaction requires at least one persisted message".into(),
+                )
+            })?;
     let context_fingerprint = context_fingerprint(spec, context)?;
     Ok(NativeCompactionCoverage {
         through_message_seq,
@@ -1236,49 +1215,12 @@ fn prepare_native_window(
             .map_err(|error| format!("invalid native compacted window item: {error}"))?;
         validated.push(item.clone());
     }
-    validate_native_suffix(&context.messages, coverage.through_message_seq)?;
+    let _ = crate::provider::types::validate_native_suffix(
+        &context.messages,
+        Some(coverage.through_message_seq),
+    )
+    .map_err(|error| error.to_string())?;
     Ok(Some((coverage.through_message_seq, validated)))
-}
-
-fn validate_native_suffix(messages: &[ContextMessage], coverage: u64) -> Result<(), String> {
-    let mut persisted_started = false;
-    let mut previous = None;
-    let mut suffix_started = false;
-    for message in messages {
-        let ContextMessage::Persisted { seq, .. } = message else {
-            if persisted_started {
-                return Err(
-                    "native suffix contains synthetic content after persisted history".into(),
-                );
-            }
-            continue;
-        };
-        persisted_started = true;
-        if *seq == 0 || previous.is_some_and(|value: u64| value.checked_add(1) != Some(*seq)) {
-            return Err(
-                "persisted native replay sequence is gapped, duplicated, or reordered".into(),
-            );
-        }
-        if *seq > coverage {
-            if !suffix_started
-                && *seq != coverage.checked_add(1).ok_or("native coverage overflow")?
-            {
-                return Err("native suffix must begin exactly at coverage + 1".into());
-            }
-            suffix_started = true;
-        } else if suffix_started {
-            return Err("covered history appears after the native suffix".into());
-        }
-        previous = Some(*seq);
-    }
-    let max_seq = previous
-        .ok_or_else(|| "native compacted window requires persisted replay history".to_owned())?;
-    if coverage > max_seq {
-        return Err(
-            "native compacted window coverage exceeds the latest persisted message sequence".into(),
-        );
-    }
-    Ok(())
 }
 
 fn escape_memory_text(text: &str) -> String {
@@ -4105,17 +4047,17 @@ mod tests {
     }
 
     #[test]
-    fn compaction_coverage_is_internal_canonical_and_requires_contiguous_persistence() {
+    fn compaction_coverage_is_internal_canonical_and_requires_strictly_increasing_persistence() {
         let spec = spec();
         let mut context = PromptContext {
             system_prompt: "system".into(),
             memory_blocks: vec![],
-            messages: vec![persisted_user(7), persisted_user(8)],
+            messages: vec![persisted_user(5), persisted_user(8), persisted_user(12)],
             provider_context: vec![],
             tools: vec![],
         };
         let coverage = derive_compaction_coverage(&spec, &context).expect("coverage");
-        assert_eq!(coverage.through_message_seq, 8);
+        assert_eq!(coverage.through_message_seq, 12);
         assert_eq!(coverage.context_fingerprint.len(), 64);
         context.messages.insert(
             0,
@@ -4130,7 +4072,7 @@ mod tests {
             derive_compaction_coverage(&spec, &context)
                 .expect("leading synthetic prefix with persisted suffix")
                 .through_message_seq,
-            8
+            12
         );
         context.messages.remove(0);
 
@@ -4160,7 +4102,7 @@ mod tests {
             }],
             vec![persisted_user(7), persisted_user(7)],
             vec![persisted_user(8), persisted_user(7)],
-            vec![persisted_user(7), persisted_user(9)],
+            vec![persisted_user(0)],
             vec![
                 persisted_user(7),
                 ContextMessage::Synthetic {
@@ -4238,6 +4180,7 @@ mod tests {
                 origin_message: Some(anchor),
                 wire_item_index: Some(0),
                 ordinal: 0,
+                provider_origin: ProviderContextItem::test_origin(),
                 payload: ProviderContextPayload::EncryptedReasoning {
                     protocol: ApiProtocol::OpenAiResponses,
                     item: json!({
@@ -4522,6 +4465,12 @@ mod tests {
                         timestamp: Utc::now(),
                     }),
                 },
+                persisted_user(1),
+                persisted_user(2),
+                persisted_user(3),
+                persisted_user(4),
+                persisted_user(5),
+                persisted_user(6),
                 persisted_user(7),
                 persisted_user(8),
                 persisted_user(9),
@@ -4535,6 +4484,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: window.clone(),
                 coverage: NativeCompactionCoverage {
@@ -4569,6 +4519,61 @@ mod tests {
     }
 
     #[test]
+    fn native_compacted_window_replays_gapped_persisted_suffix() {
+        let spec = spec();
+        let window = vec![
+            json!({"id":"m-old","type":"message","role":"user","content":[{"type":"input_text","text":"old"}]}),
+            json!({"id":"cmp","type":"compaction","encrypted_content":"opaque"}),
+            json!({"type":"function_call_output","call_id":"old-call","output":[{"type":"input_text","text":"done"}]}),
+        ];
+        let mut context = PromptContext {
+            system_prompt: "system".into(),
+            memory_blocks: vec![],
+            messages: vec![
+                persisted_user(1),
+                persisted_user(3),
+                persisted_user(5),
+                persisted_user(7),
+                persisted_user(9),
+            ],
+            provider_context: vec![],
+            tools: vec![],
+        };
+        let fingerprint = context_fingerprint(&spec, &context).unwrap();
+        context.provider_context.push(ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: window.clone(),
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 5,
+                    context_fingerprint: fingerprint,
+                },
+            },
+        });
+
+        let input = convert_input(&spec, &context, true)
+            .expect("valid native replay with global event gaps");
+        assert_eq!(input[..window.len()], window);
+        assert_eq!(input.len(), window.len() + 2);
+        assert_eq!(input[window.len()]["content"][0]["text"], "message-7");
+        assert_eq!(input[window.len() + 1]["content"][0]["text"], "message-9");
+
+        let request = build_request(
+            &spec,
+            &context,
+            &RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
+        )
+        .expect("request reuses gapped canonical replay ordering");
+        assert_eq!(request["input"], Value::Array(input));
+    }
+
+    #[test]
     fn stale_native_context_falls_back_to_durable_three_layer_view() {
         let spec = spec();
         let mut context = PromptContext {
@@ -4582,6 +4587,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({"id":"cmp","type":"compaction","encrypted_content":"opaque"})],
                 coverage: NativeCompactionCoverage {
@@ -4685,6 +4691,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({"id":"cmp","type":"compaction","encrypted_content":"NATIVE"})],
                 coverage,
@@ -4722,6 +4729,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::AnthropicCompaction {
                 block: json!({"type":"compaction","content":"FOREIGN_NATIVE"}),
                 coverage: NativeCompactionCoverage {
@@ -4910,6 +4918,7 @@ mod tests {
             }),
             wire_item_index: Some(1),
             ordinal: 1,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::OpenAiResponses,
                 item: json!({
@@ -4927,6 +4936,7 @@ mod tests {
             }),
             wire_item_index: Some(1),
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::OpenAiResponses,
                 item: json!({
@@ -5235,6 +5245,7 @@ mod tests {
                 origin_message: Some(anchor.clone()),
                 wire_item_index: Some(0),
                 ordinal: 0,
+                provider_origin: ProviderContextItem::test_origin(),
                 payload: ProviderContextPayload::EncryptedReasoning {
                     protocol: ApiProtocol::OpenAiResponses,
                     item: json!({
@@ -5283,6 +5294,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
+            provider_origin: ProviderContextItem::test_origin(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({
                     "id": "cmp",
