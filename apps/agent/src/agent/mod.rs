@@ -261,6 +261,10 @@ impl RunCore {
         Ok(())
     }
 
+    pub(crate) fn has_pending_controls(&self) -> bool {
+        !self.pending_controls.is_empty()
+    }
+
     pub(crate) fn defer_overflow_apply(&mut self, source: OverflowSource) {
         self.pending_overflow_apply.get_or_insert(source);
     }

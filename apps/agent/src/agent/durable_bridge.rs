@@ -260,14 +260,14 @@ pub(super) struct DurableBridge {
     /// `ApprovalRequested` commits; removed when the tool starts (then it is
     /// running) or when the approval is denied/cancelled and cleaned up.
     approval_prepared_tools: HashSet<String>,
-    /// A approved approval that has resolved but whose tool has not yet started.
-    /// Holds the `request_id`, the `ApprovalResolution`, and the authenticated
-    /// `ApprovalDecision` command. It is set by `ApprovalResolved` Decision
-    /// (ApproveOnce/ApproveAlways) and consumed by the matching
-    /// `ToolExecutionStart`, which emits the `ApprovalResolved` and
-    /// `CommandApplied` projections atomically. `AgentEnd` cannot commit while
-    /// this is non-empty.
-    pending_approval_resolved: Option<(String, ApprovalResolution, AdmittedCommand)>,
+    /// Approved approvals that have resolved but whose tools have not yet started.
+    /// Each tuple holds the `request_id`, the `ApprovalResolution`, and the
+    /// authenticated `ApprovalDecision` command. Entries are pushed by
+    /// `ApprovalResolved` Decision (ApproveOnce/ApproveAlways) and consumed in
+    /// order by the matching `ToolExecutionStart`, which emits the
+    /// `ApprovalResolved` and `CommandApplied` projections atomically. `AgentEnd`
+    /// cannot commit while this queue is non-empty.
+    pending_approval_resolved: Vec<(String, ApprovalResolution, AdmittedCommand)>,
     committed_terminal_command_ids: Vec<String>,
 }
 
@@ -310,7 +310,7 @@ impl DurableBridge {
             approval_command: None,
             approval_request_tools: HashMap::new(),
             approval_prepared_tools: HashSet::new(),
-            pending_approval_resolved: None,
+            pending_approval_resolved: Vec::new(),
             committed_terminal_command_ids: Vec::new(),
         }
     }
@@ -330,6 +330,7 @@ impl DurableBridge {
             || !self.length_not_started.is_empty()
             || !self.pending_tool_calls.is_empty()
             || !self.approval_prepared_tools.is_empty()
+            || !self.pending_approval_resolved.is_empty()
         {
             return SteerStage::ToolOrApproval;
         }
@@ -886,12 +887,42 @@ impl DurableBridge {
                 if self.assistant_open.is_some() {
                     bail!("ToolExecutionStart cannot precede assistant MessageEnd");
                 }
+                // If a soft/retry steer group has already been durably bound,
+                // a `Steered` event has already been durably committed, or an
+                // abort has been durably bound, any not-yet-started tool is
+                // superseded. Drop this start so the worker can emit the
+                // skipped ToolResult instead.
+                if self.pending_steer_collecting
+                    || self.pending_steer_group.is_some()
+                    || self.phase == RunPhase::CancelRequested
+                {
+                    let superseded = self.pending_approval_resolved.iter().any(|(req, _, _)| {
+                        self.approval_request_tools.get(req) == Some(&tool_call_id)
+                    }) || self.pending_tool_calls.contains(&tool_call_id);
+                    if superseded {
+                        return Ok(CommittedRunOutput {
+                            outputs: Vec::new(),
+                            tool_start_barrier: None,
+                            message_receipts: Vec::new(),
+                            retry_wait_commit_barrier: None,
+                            terminal_command_ids: std::mem::take(
+                                &mut self.committed_terminal_command_ids,
+                            ),
+                        });
+                    }
+                }
                 self.pending_tool_end
                     .insert(tool_call_id.clone(), (Value::Null, false));
                 self.pending_tool_calls.remove(&tool_call_id);
-                if let Some((request_id, resolution, command)) =
-                    self.pending_approval_resolved.take()
+                if let Some(pos) = self
+                    .pending_approval_resolved
+                    .iter()
+                    .position(|(req, _, _)| {
+                        self.approval_request_tools.get(req) == Some(&tool_call_id)
+                    })
                 {
+                    let (request_id, resolution, command) =
+                        self.pending_approval_resolved.remove(pos);
                     let expected_tool_call_id = self
                         .approval_request_tools
                         .get(&request_id)
@@ -1072,8 +1103,8 @@ impl DurableBridge {
                 if self.turn_open {
                     bail!("AgentEnd requires the current TurnEnd to be durable first");
                 }
-                if self.pending_approval_resolved.is_some() {
-                    bail!("AgentEnd cannot commit while an approved tool has not started");
+                if !self.pending_approval_resolved.is_empty() {
+                    bail!("AgentEnd cannot commit while approved tools have not started");
                 }
                 let abort_cutoff = self.phase == RunPhase::CancelRequested;
                 self.phase = RunPhase::Finished;
@@ -1165,8 +1196,19 @@ impl DurableBridge {
                 request_id,
                 resolution: ApprovalResolution::Cancelled,
             } => {
-                if let Some(tool_call_id) = self.approval_request_tools.get(&request_id) {
+                if let Some(pos) = self
+                    .pending_approval_resolved
+                    .iter()
+                    .position(|(rid, _, _)| rid == &request_id)
+                {
+                    let (request_id, _, _) = self.pending_approval_resolved.remove(pos);
+                    if let Some(tool_call_id) = self.approval_request_tools.get(&request_id) {
+                        self.approval_cancelled.insert(tool_call_id.clone());
+                        self.approval_prepared_tools.remove(tool_call_id);
+                    }
+                } else if let Some(tool_call_id) = self.approval_request_tools.get(&request_id) {
                     self.approval_cancelled.insert(tool_call_id.clone());
+                    self.approval_prepared_tools.remove(tool_call_id);
                 }
                 self.commit_single(
                     writer,
@@ -1216,7 +1258,8 @@ impl DurableBridge {
                         ApprovalDecision::ApproveOnce | ApprovalDecision::ApproveAlways { .. }
                     )
                 ) {
-                    self.pending_approval_resolved = Some((request_id, resolution, command));
+                    self.pending_approval_resolved
+                        .push((request_id, resolution, command));
                     return Ok(CommittedRunOutput {
                         outputs: Vec::new(),
                         tool_start_barrier: None,
@@ -3035,14 +3078,6 @@ mod tests {
             .expect("commit assistant MessageEnd with tool call");
         committed.resolve_message_receipts();
 
-        let steer_id = "00000000-0000-4000-8000-000000000302";
-        persist_and_pin(&store, &writer, 2, steer_id, "steer now").await;
-        let steer_command = test_admitted(2, steer_id, "steer now");
-        bridge
-            .bind_soft_steer(&writer, steer_command)
-            .await
-            .expect("bind soft steer after tool call pending");
-
         let (tool_start_barrier, _) = ToolStartCommitBarrier::channel();
         let committed = bridge
             .commit(
@@ -3068,6 +3103,14 @@ mod tests {
         if let Some(barrier) = tool_barrier {
             barrier.committed();
         }
+
+        let steer_id = "00000000-0000-4000-8000-000000000302";
+        persist_and_pin(&store, &writer, 2, steer_id, "steer now").await;
+        let steer_command = test_admitted(2, steer_id, "steer now");
+        bridge
+            .bind_soft_steer(&writer, steer_command)
+            .await
+            .expect("bind soft steer after tool call pending");
 
         let result_message = ToolResultMessage {
             tool_call_id: tool_call.id.clone(),
@@ -3718,11 +3761,11 @@ mod tests {
             },
             test_timestamp(),
         );
-        bridge.pending_approval_resolved = Some((
+        bridge.pending_approval_resolved = vec![(
             "request-1".to_owned(),
             ApprovalResolution::Decision(ApprovalDecision::ApproveOnce),
             decision_command,
-        ));
+        )];
 
         let result = bridge
             .commit(
@@ -3731,8 +3774,422 @@ mod tests {
             )
             .await;
         assert!(
-            result.is_err_and(|e| e.to_string().contains("approved tool has not started")),
+            result.is_err_and(|e| e.to_string().contains("approved tools have not started")),
             "AgentEnd must not commit an approved decision before ToolExecutionStart"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_queued_approval_resolutions_are_consumed_in_order() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let (binding, _) = owner_in_phase(
+            &store,
+            &writer,
+            "00000000-0000-4000-8000-000000000001",
+            "run-pending",
+            "turn-1",
+            RunPhase::AssistantStarted,
+        )
+        .await;
+        let mut bridge = DurableBridge::new(binding);
+        bridge.phase = RunPhase::AssistantStarted;
+        bridge.turn_open = true;
+        bridge.assistant_open = None;
+
+        let decision_command = |seq: u64, request_id: &str| {
+            AdmittedCommand::new(
+                CommandEnvelope {
+                    seq,
+                    command_id: CommandId::parse(&format!("00000000-0000-4000-8000-{seq:012}"))
+                        .expect("canonical test UUID"),
+                    command: Command::ApprovalDecision {
+                        request_id: request_id.to_owned(),
+                        decision: ApprovalDecision::ApproveOnce,
+                    },
+                },
+                test_timestamp(),
+            )
+        };
+
+        for (seq, request_id) in [(2u64, "request-1"), (3u64, "request-2")] {
+            bridge
+                .commit(
+                    &writer,
+                    RunOutput {
+                        binding: bridge.binding.clone(),
+                        event: AgentEvent::ApprovalResolved {
+                            request_id: request_id.to_owned(),
+                            resolution: ApprovalResolution::Decision(ApprovalDecision::ApproveOnce),
+                        },
+                        commit_barrier: None,
+                        message_commit_barrier: None,
+                        retry_wait_commit_barrier: None,
+                        approval_command: Some(decision_command(seq, request_id)),
+                        approval_not_started: None,
+                        approval_cancelled: None,
+                    },
+                )
+                .await
+                .expect("commit ApprovalResolved approve");
+        }
+
+        assert_eq!(bridge.pending_approval_resolved.len(), 2);
+        assert_eq!(bridge.pending_approval_resolved[0].0, "request-1");
+        assert_eq!(bridge.pending_approval_resolved[1].0, "request-2");
+
+        bridge.turn_open = false;
+        let result = bridge
+            .commit(
+                &writer,
+                RunOutput::detached(bridge.binding.clone(), AgentEvent::AgentEnd, None),
+            )
+            .await;
+        assert!(
+            result.is_err_and(|e| e.to_string().contains("approved tools have not started")),
+            "AgentEnd must not commit while approved resolutions are still queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_execution_start_dropped_when_superseded_by_soft_steer() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+
+        let (mut bridge, binding, _assistant_message, tool_call) = setup_pending_approval(
+            &store,
+            &writer,
+            "00000000-0000-4000-8000-000000000001",
+            "run-soft-steer",
+            "turn-1",
+            "tool-call-1",
+            "request-1",
+        )
+        .await;
+
+        let decision_command = AdmittedCommand::new(
+            CommandEnvelope {
+                seq: 3,
+                command_id: CommandId::parse("00000000-0000-4000-8000-000000000003")
+                    .expect("canonical test UUID"),
+                command: Command::ApprovalDecision {
+                    request_id: "request-1".to_owned(),
+                    decision: ApprovalDecision::ApproveOnce,
+                },
+            },
+            test_timestamp(),
+        );
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::ApprovalResolved {
+                        request_id: "request-1".to_owned(),
+                        resolution: ApprovalResolution::Decision(ApprovalDecision::ApproveOnce),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                    approval_command: Some(decision_command),
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit ApprovalResolved approve");
+
+        let steer_command = AdmittedCommand::new(
+            CommandEnvelope {
+                seq: 2,
+                command_id: CommandId::parse("00000000-0000-4000-8000-000000000002")
+                    .expect("canonical test UUID"),
+                command: Command::UserMessage {
+                    text: "stop".to_owned(),
+                    attachments: Vec::new(),
+                },
+            },
+            test_timestamp(),
+        );
+        let mut group = SteerGroup::new(
+            ApplicationKind::SoftSteer,
+            binding.run_id.clone(),
+            binding.turn_id.clone(),
+        )
+        .expect("create soft steer group");
+        group
+            .push(steer_command, writer.store().redactor())
+            .expect("push steer command");
+        bridge.pending_steer_group = Some(group);
+        bridge.pending_steer_collecting = true;
+
+        let (barrier, _barrier_rx) = ToolStartCommitBarrier::channel();
+        let dropped = bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::ToolExecutionStart {
+                        tool_call_id: tool_call.id.clone(),
+                        tool_name: tool_call.name.clone(),
+                        args: serde_json::to_value(&tool_call.arguments).unwrap_or_default(),
+                    },
+                    commit_barrier: Some(barrier),
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit dropped ToolExecutionStart");
+        assert!(dropped.outputs.is_empty());
+        assert_eq!(bridge.pending_approval_resolved.len(), 1);
+
+        bridge
+            .commit(
+                &writer,
+                RunOutput::detached(
+                    binding.clone(),
+                    AgentEvent::ApprovalResolved {
+                        request_id: "request-1".to_owned(),
+                        resolution: ApprovalResolution::Cancelled,
+                    },
+                    None,
+                ),
+            )
+            .await
+            .expect("commit ApprovalResolved Cancelled");
+        assert!(bridge.pending_approval_resolved.is_empty());
+        assert!(bridge.approval_cancelled.contains("tool-call-1"));
+    }
+
+    /// If a soft-steer group is durably bound before the matching
+    /// `ToolExecutionStart` is committed, the bridge must drop the start so the
+    /// durable history does not claim a started tool that was preempted.
+    #[tokio::test]
+    async fn tool_execution_start_dropped_when_soft_steer_bound_before_start() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let owner_id = "00000000-0000-4000-8000-000000000901";
+        let run_id = "run-soft-steer-bound";
+        let turn_id = "turn-1";
+
+        let (binding, assistant) = owner_in_phase(
+            &store,
+            &writer,
+            owner_id,
+            run_id,
+            turn_id,
+            RunPhase::AssistantStarted,
+        )
+        .await;
+        let (assistant_id, assistant_base) = assistant.expect("assistant MessageStart");
+        let tool_call = ToolCall {
+            id: "soft-bound-call".to_owned(),
+            name: "fixture-tool".to_owned(),
+            arguments: serde_json::from_value::<ValidatedToolArguments>(
+                serde_json::json!({"safe": true}),
+            )
+            .expect("validated arguments"),
+        };
+        let mut assistant_with_tool = match assistant_base {
+            PublicMessage::Assistant(a) => a,
+            _ => unreachable!(),
+        };
+        assistant_with_tool.content = vec![PublicAssistantContent::ToolCall {
+            tool_call: tool_call.clone(),
+            wire_item_index: 0,
+        }];
+        assistant_with_tool.stop_reason = StopReason::Stop;
+        let assistant_message = PublicMessage::Assistant(assistant_with_tool);
+
+        let mut bridge = DurableBridge::new(binding.clone());
+        bridge.phase = RunPhase::AssistantStarted;
+        bridge.turn_open = true;
+        bridge.assistant_open = Some(assistant_id.clone());
+
+        let (assistant_barrier, _) = MessageCommitBarrier::channel();
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::MessageEnd {
+                        message_id: assistant_id.clone(),
+                        message: Box::new(assistant_message.clone()),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: Some(assistant_barrier),
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit assistant MessageEnd with tool call")
+            .resolve_message_receipts();
+
+        bridge.assistant_open = None;
+        bridge.pending_tool_calls.insert(tool_call.id.clone());
+
+        let steer_id = "00000000-0000-4000-8000-000000000902";
+        persist_and_pin(&store, &writer, 2, steer_id, "steer now").await;
+        let steer_command = test_admitted(2, steer_id, "steer now");
+        bridge
+            .bind_soft_steer(&writer, steer_command)
+            .await
+            .expect("bind soft steer before tool start");
+
+        let (barrier, _) = ToolStartCommitBarrier::channel();
+        let dropped = bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::ToolExecutionStart {
+                        tool_call_id: tool_call.id.clone(),
+                        tool_name: tool_call.name.clone(),
+                        args: serde_json::json!({"safe": true}),
+                    },
+                    commit_barrier: Some(barrier),
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit dropped ToolExecutionStart");
+        assert!(dropped.outputs.is_empty(), "start must be dropped");
+
+        let start_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_events WHERE event_type='tool_execution_start'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("count tool_execution_start events");
+        assert_eq!(
+            start_count, 0,
+            "durable history must not contain a tool_execution_start when soft steer bound first"
+        );
+    }
+
+    /// Same complement as above, but for an abort bound before the
+    /// `ToolExecutionStart` is committed.
+    #[tokio::test]
+    async fn tool_execution_start_dropped_when_abort_bound_before_start() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let owner_id = "00000000-0000-4000-8000-000000000911";
+        let run_id = "run-abort-bound";
+        let turn_id = "turn-1";
+
+        let (binding, assistant) = owner_in_phase(
+            &store,
+            &writer,
+            owner_id,
+            run_id,
+            turn_id,
+            RunPhase::AssistantStarted,
+        )
+        .await;
+        let (assistant_id, assistant_base) = assistant.expect("assistant MessageStart");
+        let tool_call = ToolCall {
+            id: "abort-bound-call".to_owned(),
+            name: "fixture-tool".to_owned(),
+            arguments: serde_json::from_value::<ValidatedToolArguments>(
+                serde_json::json!({"safe": true}),
+            )
+            .expect("validated arguments"),
+        };
+        let mut assistant_with_tool = match assistant_base {
+            PublicMessage::Assistant(a) => a,
+            _ => unreachable!(),
+        };
+        assistant_with_tool.content = vec![PublicAssistantContent::ToolCall {
+            tool_call: tool_call.clone(),
+            wire_item_index: 0,
+        }];
+        assistant_with_tool.stop_reason = StopReason::Stop;
+        let assistant_message = PublicMessage::Assistant(assistant_with_tool);
+
+        let mut bridge = DurableBridge::new(binding.clone());
+        bridge.phase = RunPhase::AssistantStarted;
+        bridge.turn_open = true;
+        bridge.assistant_open = Some(assistant_id.clone());
+
+        let (assistant_barrier, _) = MessageCommitBarrier::channel();
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::MessageEnd {
+                        message_id: assistant_id.clone(),
+                        message: Box::new(assistant_message.clone()),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: Some(assistant_barrier),
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit assistant MessageEnd with tool call")
+            .resolve_message_receipts();
+
+        bridge.assistant_open = None;
+        bridge.pending_tool_calls.insert(tool_call.id.clone());
+
+        let abort_id = "00000000-0000-4000-8000-000000000912";
+        writer
+            .persist_inbound(&test_abort_command(2, abort_id))
+            .await
+            .expect("persist abort");
+        let abort_command = test_admitted_abort(2, abort_id);
+        bridge
+            .bind_abort(&writer, abort_command)
+            .await
+            .expect("bind abort before tool start");
+
+        let (barrier, _) = ToolStartCommitBarrier::channel();
+        let dropped = bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::ToolExecutionStart {
+                        tool_call_id: tool_call.id.clone(),
+                        tool_name: tool_call.name.clone(),
+                        args: serde_json::json!({"safe": true}),
+                    },
+                    commit_barrier: Some(barrier),
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit dropped ToolExecutionStart");
+        assert!(dropped.outputs.is_empty(), "start must be dropped");
+
+        let start_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_events WHERE event_type='tool_execution_start'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("count tool_execution_start events");
+        assert_eq!(
+            start_count, 0,
+            "durable history must not contain a tool_execution_start when abort bound first"
         );
     }
 

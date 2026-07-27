@@ -3535,6 +3535,256 @@ async fn soft_steer_during_tool_execution_lets_active_tool_finish() {
 }
 
 #[tokio::test]
+async fn emit_tool_start_preempts_by_controls_queued_before_commit() {
+    let driver = Arc::new(FixtureDriver::new(vec![]));
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(8);
+    let mut runner = super::Runner::new(bound_core(1), driver, control_rx, events_tx);
+
+    // Queue a soft-steer control before the worker attempts to durably commit
+    // the ToolExecutionStart. The worker must observe it, classify the new
+    // instruction, and return Preempted without emitting ToolExecutionStart.
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let (committed_tx, committed_rx) = oneshot::channel();
+    let bind_commit = tokio::spawn(async move {
+        if accepted_rx.await.is_ok() {
+            let _ = committed_tx.send(());
+        }
+    });
+    control_tx
+        .send(RunControl::SoftSteer {
+            command: admitted_user(2),
+            accepted: accepted_tx,
+            committed: committed_rx,
+        })
+        .await
+        .expect("enqueue soft steer");
+
+    let outcome = runner
+        .emit_tool_start_and_wait_committed(&call("preempted"))
+        .await
+        .expect("preempted start should not fail");
+    assert_eq!(outcome, ToolStartOutcome::Preempted);
+
+    bind_commit.await.expect("steer bind commit task");
+
+    assert!(
+        runner.in_flight_controls.len() == 1,
+        "queued soft steer must be claimed for injection"
+    );
+    assert!(
+        events_rx.try_recv().is_err(),
+        "ToolExecutionStart must not be committed when preempted"
+    );
+}
+
+/// Simulates the race where the `ToolExecutionStart` output has been sent and
+/// its `ToolStartCommitBarrier` is deliberately held, then a soft-steer control
+/// arrives and is durably authorized before the barrier completes. The worker
+/// must return `Preempted` and the start output must never be committed.
+#[tokio::test]
+async fn tool_start_barrier_held_by_soft_steer_preempts() {
+    let driver = Arc::new(FixtureDriver::new(Vec::new()));
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(8);
+    let mut runner = super::Runner::new(bound_core(1), driver, control_rx, events_tx);
+
+    // Collector receives the ToolExecutionStart and holds the barrier so the
+    // start is not durably committed until the test decides.
+    let (start_held_tx, start_held_rx) = oneshot::channel();
+    let (drop_tx, drop_rx) = oneshot::channel::<()>();
+    let collector = tokio::spawn(async move {
+        let output = events_rx.recv().await.expect("ToolExecutionStart output");
+        assert!(matches!(
+            output.event,
+            AgentEvent::ToolExecutionStart { .. }
+        ));
+        let _ = start_held_tx.send(());
+        let _ = drop_rx.await;
+    });
+
+    // Send the soft-steer control only after the start output is held.
+    let send_control = tokio::spawn(async move {
+        start_held_rx.await.expect("start held");
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let (committed_tx, committed_rx) = oneshot::channel();
+        control_tx
+            .send(RunControl::SoftSteer {
+                command: admitted_user(2),
+                accepted: accepted_tx,
+                committed: committed_rx,
+            })
+            .await
+            .expect("send soft steer");
+        assert!(accepted_rx.await.expect("accepted"));
+        committed_tx.send(()).expect("authorize soft steer");
+    });
+
+    let outcome = runner
+        .emit_tool_start_and_wait_committed(&call("held"))
+        .await
+        .expect("preempted start should not fail");
+    assert_eq!(outcome, ToolStartOutcome::Preempted);
+
+    // Allow the collector to drop the held output without resolving the start
+    // barrier.
+    drop(drop_tx);
+    collector.await.expect("collector");
+    send_control.await.expect("control sender");
+
+    assert_eq!(
+        runner.in_flight_controls.len(),
+        1,
+        "soft steer must be claimed for injection"
+    );
+    assert!(!runner.abort_requested);
+    assert!(runner.core.next_followup().is_none());
+}
+
+/// Same race as `tool_start_barrier_held_by_soft_steer_preempts`, but with an
+/// abort control. The tool must not execute and the start output must not be
+/// durably committed.
+#[tokio::test]
+async fn tool_start_barrier_held_by_abort_preempts() {
+    let driver = Arc::new(FixtureDriver::new(Vec::new()));
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(8);
+    let mut runner = super::Runner::new(bound_core(1), driver, control_rx, events_tx);
+
+    let (start_held_tx, start_held_rx) = oneshot::channel();
+    let (drop_tx, drop_rx) = oneshot::channel::<()>();
+    let collector = tokio::spawn(async move {
+        let output = events_rx.recv().await.expect("ToolExecutionStart output");
+        assert!(matches!(
+            output.event,
+            AgentEvent::ToolExecutionStart { .. }
+        ));
+        let _ = start_held_tx.send(());
+        let _ = drop_rx.await;
+    });
+
+    let send_control = tokio::spawn(async move {
+        start_held_rx.await.expect("start held");
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let (committed_tx, committed_rx) = oneshot::channel();
+        control_tx
+            .send(RunControl::Abort {
+                command: admitted_abort(2),
+                accepted: accepted_tx,
+                committed: committed_rx,
+            })
+            .await
+            .expect("send abort");
+        assert!(accepted_rx.await.expect("accepted"));
+        committed_tx.send(()).expect("authorize abort");
+    });
+
+    let outcome = runner
+        .emit_tool_start_and_wait_committed(&call("held"))
+        .await
+        .expect("preempted start should not fail");
+    assert_eq!(outcome, ToolStartOutcome::Preempted);
+
+    drop(drop_tx);
+    collector.await.expect("collector");
+    send_control.await.expect("control sender");
+
+    assert!(runner.abort_requested, "abort must be requested");
+    assert!(runner.in_flight_controls.is_empty());
+    assert!(runner.core.next_followup().is_none());
+}
+
+#[tokio::test]
+async fn dropped_soft_steer_authorization_cannot_preempt_tool_start() {
+    let driver = Arc::new(FixtureDriver::new(Vec::new()));
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(8);
+    let mut runner = super::Runner::new(bound_core(1), driver, control_rx, events_tx);
+
+    let (start_held_tx, start_held_rx) = oneshot::channel();
+    let (commit_start_tx, commit_start_rx) = oneshot::channel();
+    let collector = tokio::spawn(async move {
+        let output = events_rx.recv().await.expect("ToolExecutionStart output");
+        let barrier = output
+            .commit_barrier
+            .expect("ToolExecutionStart commit barrier");
+        start_held_tx.send(()).expect("announce held start");
+        commit_start_rx.await.expect("release held start");
+        barrier.committed();
+    });
+    let send_control = tokio::spawn(async move {
+        start_held_rx.await.expect("start held");
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let (committed_tx, committed_rx) = oneshot::channel::<()>();
+        control_tx
+            .send(RunControl::SoftSteer {
+                command: admitted_user(2),
+                accepted: accepted_tx,
+                committed: committed_rx,
+            })
+            .await
+            .expect("send soft steer");
+        assert!(accepted_rx.await.expect("accepted"));
+        drop(committed_tx);
+        commit_start_tx.send(()).expect("release held start");
+    });
+
+    let outcome = runner
+        .emit_tool_start_and_wait_committed(&call("authorization-dropped"))
+        .await
+        .expect("dropped authorization must leave the committed start authoritative");
+    assert_eq!(outcome, ToolStartOutcome::Started);
+    assert!(runner.in_flight_controls.is_empty());
+    collector.await.expect("collector");
+    send_control.await.expect("control sender");
+}
+
+#[tokio::test]
+async fn dropped_abort_authorization_cannot_cancel_committed_tool_start() {
+    let driver = Arc::new(FixtureDriver::new(Vec::new()));
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(8);
+    let mut runner = super::Runner::new(bound_core(1), driver, control_rx, events_tx);
+
+    let (start_held_tx, start_held_rx) = oneshot::channel();
+    let (commit_start_tx, commit_start_rx) = oneshot::channel();
+    let collector = tokio::spawn(async move {
+        let output = events_rx.recv().await.expect("ToolExecutionStart output");
+        let barrier = output
+            .commit_barrier
+            .expect("ToolExecutionStart commit barrier");
+        start_held_tx.send(()).expect("announce held start");
+        commit_start_rx.await.expect("release held start");
+        barrier.committed();
+    });
+    let send_control = tokio::spawn(async move {
+        start_held_rx.await.expect("start held");
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let (committed_tx, committed_rx) = oneshot::channel::<()>();
+        control_tx
+            .send(RunControl::Abort {
+                command: admitted_abort(2),
+                accepted: accepted_tx,
+                committed: committed_rx,
+            })
+            .await
+            .expect("send abort");
+        assert!(accepted_rx.await.expect("accepted"));
+        drop(committed_tx);
+        commit_start_tx.send(()).expect("release held start");
+    });
+
+    let outcome = runner
+        .emit_tool_start_and_wait_committed(&call("abort-authorization-dropped"))
+        .await
+        .expect("dropped authorization must leave the committed start authoritative");
+    assert_eq!(outcome, ToolStartOutcome::Started);
+    assert!(!runner.abort_requested);
+    collector.await.expect("collector");
+    send_control.await.expect("control sender");
+}
+
+#[tokio::test]
 async fn safe_point_abort_dropped_accept_is_no_op() {
     let driver = Arc::new(FixtureDriver::new(vec![]));
     let (control_tx, control_rx) = mpsc::channel(1);
