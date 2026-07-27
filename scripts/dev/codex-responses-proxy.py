@@ -25,13 +25,14 @@ import pathlib
 import secrets
 import socket
 import stat
+import struct
 import sys
 import tempfile
 import threading
-import time
 import urllib.error
 import urllib.request
 import uuid
+from collections.abc import Mapping
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, ClassVar
@@ -40,6 +41,19 @@ from typing import Any, ClassVar
 UPSTREAM = "https://chatgpt.com/backend-api/codex/responses"
 AUTH_HEADER = "Authorization"
 MAX_CAPTURE_NAME_ATTEMPTS = 8
+PROXY_SECRET_ENV = "SUMI_CODEX_RESPONSES_PROXY_SECRET"
+
+
+def resolve_proxy_secret(
+    cli_secret: str | None,
+    environ: Mapping[str, str] = os.environ,
+) -> tuple[str, str]:
+    environment_secret = environ.get(PROXY_SECRET_ENV)
+    if environment_secret:
+        return environment_secret, "environment"
+    if cli_secret:
+        return cli_secret, "argument"
+    return secrets.token_urlsafe(32), "generated"
 
 
 def load_codex_auth(path: pathlib.Path) -> tuple[str, str]:
@@ -64,6 +78,7 @@ class ResponsesBridge(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
     auth_path: ClassVar[pathlib.Path]
     capture_dir: ClassVar[pathlib.Path | None] = None
+    stream_cleanup_finalized: ClassVar[threading.Event | None] = None
     expected_secret: ClassVar[str] = ""
     upstream_url: ClassVar[str] = UPSTREAM
 
@@ -182,6 +197,7 @@ class ResponsesBridge(BaseHTTPRequestHandler):
             return
 
         capture = None
+        cleanup_finalized = self.stream_cleanup_finalized
         try:
             if self.capture_dir is not None:
                 capture = self._open_capture()
@@ -221,6 +237,8 @@ class ResponsesBridge(BaseHTTPRequestHandler):
                 upstream.close()
             except Exception:
                 pass
+            if cleanup_finalized is not None:
+                cleanup_finalized.set()
 
 
 def _start_server(
@@ -246,7 +264,6 @@ def _request(
     body: bytes = b"{}",
     path: str = "/v1/responses",
     *,
-    read_first_line: bool = False,
     return_content_type: bool = False,
 ) -> tuple[int, bytes] | tuple[int, bytes, str | None]:
     conn = HTTPConnection(*server.server_address)
@@ -254,12 +271,6 @@ def _request(
     conn.request("POST", path, body=body, headers=all_headers)
     response = conn.getresponse()
     content_type = response.getheader("Content-Type")
-    if read_first_line:
-        first = response.readline()
-        response.close()
-        if return_content_type:
-            return response.status, first, content_type
-        return response.status, first
     data = response.read()
     response.close()
     if return_content_type:
@@ -297,7 +308,8 @@ class _SelfTestUpstream(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
-            first = b"data: first\n"
+            first_line = b"data: first\n"
+            first = first_line + (b"x" * ((16 * 1024) - len(first_line)))
             second = b"data: second\n"
             self.wfile.write(first)
             self.wfile.flush()
@@ -366,6 +378,42 @@ def _reject_without_body(server: ThreadingHTTPServer) -> bytes:
             b"\r\n"
         )
         return connection.recv(4096)
+
+
+def _request_first_line_then_reset(
+    server: ThreadingHTTPServer,
+    headers: dict[str, str],
+    body: bytes,
+) -> tuple[int, bytes]:
+    """Read the first streamed line, then force a TCP reset."""
+    with socket.create_connection(server.server_address, timeout=1) as connection:
+        connection.settimeout(1)
+        request_headers = {
+            "Host": "127.0.0.1",
+            "Content-Length": str(len(body)),
+            "Connection": "close",
+            **headers,
+        }
+        wire_headers = "".join(f"{name}: {value}\r\n" for name, value in request_headers.items())
+        connection.sendall(
+            f"POST /v1/responses HTTP/1.0\r\n{wire_headers}\r\n".encode() + body
+        )
+        response = connection.makefile("rb", buffering=0)
+        status_line = response.readline()
+        try:
+            status = int(status_line.split()[1])
+        except (IndexError, ValueError) as error:
+            raise RuntimeError(f"invalid proxy status line: {status_line!r}") from error
+        while response.readline() not in (b"\r\n", b"\n", b""):
+            pass
+        first = response.readline()
+        response.close()
+        connection.setsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_LINGER,
+            struct.pack("ii", 1, 0),
+        )
+        return status, first
 
 
 def _run_self_test() -> int:
@@ -516,14 +564,19 @@ def _run_self_test() -> int:
         # Client disconnect before the full stream: cleanup must close the capture.
         _SelfTestUpstream.delayed = True
         _SelfTestUpstream.resume = threading.Event()
-        status, first = _request(
+        cleanup_finalized = threading.Event()
+        ResponsesBridge.stream_cleanup_finalized = cleanup_finalized
+        status, first = _request_first_line_then_reset(
             proxy_server,
             {
                 "Authorization": f"Bearer {secret}",
                 "content-type": "application/json",
             },
             b'{"max_output_tokens": 3}',
-            read_first_line=True,
+        )
+        check(
+            "disconnect_cleanup_waits_for_finalization",
+            not cleanup_finalized.is_set(),
         )
         _SelfTestUpstream.resume.set()
         check(
@@ -532,15 +585,42 @@ def _run_self_test() -> int:
             f"first={first!r}",
         )
 
-        # Poll for the proxy to finish its finally block and close the capture.
-        captures_after: list[pathlib.Path] = []
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline:
-            captures_after = sorted(capture_dir.iterdir())
-            if len(captures_after) == 3:
-                break
-            time.sleep(0.01)
-        check("disconnect_cleanup_file_closed", len(captures_after) == 3, f"count={len(captures_after)}")
+        cleanup_completed = cleanup_finalized.wait(timeout=2.0)
+        ResponsesBridge.stream_cleanup_finalized = None
+        captures_after = sorted(capture_dir.iterdir())
+        check(
+            "disconnect_cleanup_file_closed",
+            cleanup_completed and len(captures_after) == 3,
+            f"finalized={cleanup_completed} count={len(captures_after)}",
+        )
+
+        # Secret selection keeps the shared secret out of argv by default.
+        environment_secret, environment_source = resolve_proxy_secret(
+            "deprecated-argv-secret",
+            {PROXY_SECRET_ENV: "environment-secret"},
+        )
+        check(
+            "proxy_secret_environment_precedes_argv",
+            environment_secret == "environment-secret"
+            and environment_source == "environment",
+        )
+        argument_secret, argument_source = resolve_proxy_secret(
+            "deprecated-argv-secret",
+            {},
+        )
+        check(
+            "proxy_secret_argv_deprecated_fallback",
+            argument_secret == "deprecated-argv-secret" and argument_source == "argument",
+        )
+        generated_secret, generated_source = resolve_proxy_secret(None, {})
+        second_generated_secret, second_generated_source = resolve_proxy_secret(None, {})
+        check(
+            "proxy_secret_generated_when_unconfigured",
+            len(generated_secret) >= 32
+            and generated_source == "generated"
+            and second_generated_source == "generated"
+            and second_generated_secret != generated_secret,
+        )
 
         # Compact endpoint support.
         _SelfTestUpstream.delayed = False
@@ -639,7 +719,10 @@ def main() -> int:
     parser.add_argument("--capture-dir", type=pathlib.Path)
     parser.add_argument(
         "--secret",
-        help="Shared secret required by every request. Generated if not provided.",
+        help=(
+            f"Deprecated fallback for {PROXY_SECRET_ENV}. "
+            "Generated if neither source is provided."
+        ),
     )
     parser.add_argument(
         "--self-test",
@@ -651,10 +734,20 @@ def main() -> int:
     if args.self_test:
         return _run_self_test()
 
-    if args.secret:
-        secret = args.secret
-    else:
-        secret = secrets.token_urlsafe(32)
+    secret, secret_source = resolve_proxy_secret(args.secret)
+    if secret_source == "argument":
+        print(
+            f"WARNING: --secret is deprecated; set {PROXY_SECRET_ENV} instead",
+            file=sys.stderr,
+            flush=True,
+        )
+    elif secret_source == "environment" and args.secret:
+        print(
+            f"WARNING: ignoring deprecated --secret because {PROXY_SECRET_ENV} is set",
+            file=sys.stderr,
+            flush=True,
+        )
+    elif secret_source == "generated":
         print(f"PROXY_SECRET={secret}", flush=True)
 
     ResponsesBridge.auth_path = args.auth_file
