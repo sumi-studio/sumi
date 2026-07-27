@@ -1861,5 +1861,9 @@ fn panic_message(panic: Box<dyn Any + Send>) -> String {
 
 #[cfg(test)]
 mod session_tests;
+// The binary test composition root calls the real live harness through this
+// re-export. The library mirror intentionally supplies a non-live stub, so the
+// same re-export is unused only in that test target.
 #[cfg(test)]
+#[allow(unused_imports)]
 pub(crate) use session_tests::run_canonical_live_responses_roundtrip;
