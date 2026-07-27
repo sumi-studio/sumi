@@ -120,6 +120,7 @@ pub trait TombstoneRepository: Send + Sync {
     /// Idempotently create the one durable receipt for a conversation-reset
     /// command. Reusing a command id or old conversation with different
     /// identity is rejected rather than minting another tombstone.
+    #[allow(clippy::too_many_arguments)] // All authority and replay fields are explicit at this durable boundary.
     async fn request_conversation_reset(
         &self,
         tenant_id: &str,
