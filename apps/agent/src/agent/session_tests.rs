@@ -20,17 +20,22 @@ use crate::store::KeyProvider;
 use crate::{
     gateway::{CommandAck, CommandId},
     provider::types::{
-        ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, ProviderContextFragment,
-        ProviderContextPayload, ProviderEvent, ProviderEventStream, ProviderOrigin, ProviderOutput,
-        PublicAssistantContent, PublicAssistantMessage, PublicMessage, RejectedToolCall,
-        StopReason, ToolArgumentError, ToolCall, ToolResultMessage, Usage, UserContent,
-        UserMessage, ValidatedToolArguments,
+        ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, Message, PromptContext,
+        ProviderContextFragment, ProviderContextItem, ProviderContextPayload, ProviderEvent,
+        ProviderEventStream, ProviderOrigin, ProviderOutput, PublicAssistantContent,
+        PublicAssistantMessage, PublicMessage, RejectedToolCall, StopReason, ToolArgumentError,
+        ToolCall, ToolDefinition, ToolResultMessage, Usage, UserContent, UserMessage,
+        ValidatedToolArguments,
     },
+    provider::{ModelSpec, RequestOptions},
     runtime::contracts::{
         GenerationRecoveryFence, MAX_PROCESS_GENERATION, ProcessGeneration, ProcessGenerationLease,
     },
     store::{AgentScope, DATA_KEY_BYTES, HydrationOutcome, Store, WrappingKey, user_message_id},
-    tools::ToolError,
+    tools::{
+        Tool, ToolCtx, ToolError, ToolOutput, ToolRegistryBuilder, ToolRisk, WorkspacePaths,
+        text_output,
+    },
 };
 
 fn test_executor_generation() -> ProcessGeneration {
@@ -5702,6 +5707,383 @@ async fn provider_start_failures_in_two_runs_use_distinct_stable_durable_message
             .all(|message_id| Uuid::parse_str(message_id).is_ok()),
         "synthetic identities use the bounded UUIDv5 form"
     );
+}
+
+#[derive(Clone)]
+struct LiveResponsesEchoTool {
+    definition: ToolDefinition,
+}
+
+#[async_trait]
+impl Tool for LiveResponsesEchoTool {
+    fn def(&self) -> ToolDefinition {
+        self.definition.clone()
+    }
+
+    fn risk(&self) -> ToolRisk {
+        ToolRisk::ReadOnly
+    }
+
+    async fn execute(&self, ctx: ToolCtx<'_>) -> Result<ToolOutput, ToolError> {
+        if ctx.cancel.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
+        let value = ctx
+            .args
+            .as_object()
+            .get("value")
+            .and_then(Value::as_str)
+            .ok_or(ToolError::InvalidArguments)?;
+        Ok(text_output(value, serde_json::json!({"echoed": value})))
+    }
+}
+
+fn live_responses_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "echo_value".to_owned(),
+        description: "Return the supplied value unchanged.".to_owned(),
+        parameters: serde_json::json!({
+            "type":"object",
+            "properties":{"value":{"type":"string"}},
+            "required":["value"],
+            "additionalProperties":false
+        }),
+    }
+}
+
+fn live_responses_driver(
+    spec: ModelSpec,
+    tool: ToolDefinition,
+    reasoning_effort: &str,
+) -> Arc<InjectedRunDriver> {
+    let mut registry = ToolRegistryBuilder::default();
+    registry
+        .register(Arc::new(LiveResponsesEchoTool {
+            definition: tool.clone(),
+        }))
+        .expect("register live Responses echo tool");
+    let prompt = PromptContext {
+        system_prompt: concat!(
+            "Use echo_value exactly once when the user requests it. ",
+            "After its result, answer with the echoed value. ",
+            "For a later request that forbids tools, answer directly without a tool."
+        )
+        .to_owned(),
+        memory_blocks: Vec::new(),
+        messages: Vec::new(),
+        provider_context: Vec::new(),
+        tools: vec![tool],
+    };
+    Arc::new(
+        InjectedRunDriver::new(
+            spec,
+            RequestOptions {
+                max_tokens: Some(4_096),
+                reasoning_effort: Some(reasoning_effort.to_owned()),
+                ..RequestOptions::default()
+            },
+            Some(prompt),
+            Some(registry.build()),
+            Some(
+                WorkspacePaths::new(std::env::temp_dir())
+                    .expect("absolute workspace for live Responses echo tool"),
+            ),
+            Some(test_executor_generation()),
+        )
+        .expect("construct canonical live Responses driver"),
+    )
+}
+
+fn live_responses_user(seq: u64, text: &str) -> InboundCommand {
+    let command_id = format!("25000000-0000-4000-8000-{seq:012}");
+    InboundCommand::Valid(CommandEnvelope {
+        seq,
+        command_id: CommandId::parse(&command_id).expect("canonical live Responses command id"),
+        command: Command::UserMessage {
+            text: text.to_owned(),
+            attachments: Vec::new(),
+        },
+    })
+}
+
+async fn run_live_responses_session(
+    store: Store,
+    core: RunCore,
+    driver: Arc<InjectedRunDriver>,
+    seq: u64,
+    text: &str,
+) -> RunCore {
+    let (session_gateway, commands, frames) = gateway();
+    let session = Session::start(
+        store,
+        session_gateway,
+        core,
+        Arc::new(SequentialRunWorker::new(driver)),
+        test_executor_generation(),
+    )
+    .await
+    .expect("start canonical live Responses Session");
+    let task = tokio::spawn(session.run());
+    commands
+        .send(live_responses_user(seq, text))
+        .await
+        .expect("send live Responses user command");
+    tokio::time::timeout(Duration::from_secs(300), async {
+        loop {
+            if frames.lock().expect("frame mutex").iter().any(|frame| {
+                matches!(frame, OutboundFrame::CommandAck { ack }
+                    if ack.status == CommandAckStatus::Applied)
+            }) || task.is_finished()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("live Responses command did not reach its durable applied ACK");
+    drop(commands);
+    completed(task.await.expect("live Responses Session join"))
+}
+
+fn collect_encrypted_content(value: &Value, markers: &mut Vec<String>) {
+    match value {
+        Value::Object(object) => {
+            if let Some(value) = object
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                markers.push(value.to_owned());
+            }
+            for value in object.values() {
+                collect_encrypted_content(value, markers);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_encrypted_content(value, markers);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn live_opaque_markers(items: &[ProviderContextItem]) -> Vec<String> {
+    let mut markers = Vec::new();
+    for item in items {
+        match &item.payload {
+            ProviderContextPayload::EncryptedReasoning { item, .. } => {
+                collect_encrypted_content(item, &mut markers);
+            }
+            ProviderContextPayload::OpenAiCompactedWindow { items, .. } => {
+                for item in items {
+                    collect_encrypted_content(item, &mut markers);
+                }
+            }
+            ProviderContextPayload::AnthropicCompaction { block, .. } => {
+                collect_encrypted_content(block, &mut markers);
+            }
+        }
+    }
+    markers.sort();
+    markers.dedup();
+    markers
+}
+
+async fn assert_live_provider_context_private(
+    store: &Store,
+    public_messages: &[ContextMessage],
+    markers: &[String],
+) {
+    let ciphertexts: Vec<Vec<u8>> =
+        sqlx::query_scalar("SELECT ciphertext FROM provider_context ORDER BY id")
+            .fetch_all(store.pool())
+            .await
+            .expect("read encrypted live provider-context rows");
+    assert!(
+        !ciphertexts.is_empty() && ciphertexts.iter().all(|ciphertext| !ciphertext.is_empty()),
+        "live provider context must be encrypted into non-empty durable rows"
+    );
+    let public_export =
+        serde_json::to_string(public_messages).expect("serialize canonical public transcript");
+    for marker in markers {
+        let message_hits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages
+             WHERE instr(payload, ?) > 0 OR instr(search_text, ?) > 0",
+        )
+        .bind(marker)
+        .bind(marker)
+        .fetch_one(store.pool())
+        .await
+        .expect("scan live public transcript projections");
+        let event_hits: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE instr(envelope, ?) > 0")
+                .bind(marker)
+                .fetch_one(store.pool())
+                .await
+                .expect("scan live public event projections");
+        let fts_hits: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages_fts WHERE instr(search_text, ?) > 0")
+                .bind(marker)
+                .fetch_one(store.pool())
+                .await
+                .expect("scan live public transcript FTS");
+        assert_eq!(
+            message_hits + event_hits + fts_hits,
+            0,
+            "opaque live provider context leaked to a public projection"
+        );
+        assert!(
+            !public_export.contains(marker),
+            "canonical public transcript/export input leaked opaque provider context"
+        );
+        assert!(
+            ciphertexts.iter().all(|ciphertext| !ciphertext
+                .windows(marker.len())
+                .any(|part| part == marker.as_bytes())),
+            "provider-context row stored opaque plaintext instead of ciphertext"
+        );
+    }
+}
+
+pub(crate) async fn run_canonical_live_responses_roundtrip(spec: ModelSpec, api_key: String) {
+    assert!(
+        std::env::var(&spec.api_key_env).is_ok_and(|configured| configured == api_key),
+        "live proxy secret must be available to the canonical provider driver"
+    );
+    let path = std::env::current_dir()
+        .expect("agent package directory")
+        .join("target")
+        .join(format!(
+            "sumi-live-responses-restart-{}.sqlite",
+            uuid::Uuid::now_v7()
+        ));
+    let store = open_kill_restart_store(&path).await;
+    let first_pool = store.pool().clone();
+    let tool = live_responses_tool();
+    let first_core = run_live_responses_session(
+        store,
+        RunCore::new(),
+        live_responses_driver(spec.clone(), tool.clone(), "high"),
+        1,
+        "Call echo_value exactly once with value responses-live-ok, then reply with that value.",
+    )
+    .await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE role='tool_result'")
+            .fetch_one(&first_pool)
+            .await
+            .expect("durable live echo tool result"),
+        1,
+        "canonical first turn must durably execute echo_value exactly once"
+    );
+    assert!(
+        !first_core.provider_context.is_empty(),
+        "canonical first live turn must retain non-empty provider context"
+    );
+    let first_text: String = sqlx::query_scalar(
+        "SELECT payload FROM messages WHERE role='assistant' ORDER BY seq DESC LIMIT 1",
+    )
+    .fetch_one(&first_pool)
+    .await
+    .expect("first live turn durable assistant");
+    assert!(
+        first_text.contains("responses-live-ok"),
+        "canonical first live turn must end with the echoed value"
+    );
+    eprintln!(
+        "turn1 canonical_session=user(tool=echo_value,value=responses-live-ok); durable_tool_results=1; retained_context_items={}",
+        first_core.provider_context.len()
+    );
+    first_pool.close().await;
+
+    let reopened = open_kill_restart_store(&path).await;
+    let lease =
+        ProcessGenerationLease::new(test_executor_generation(), "live-responses-restart-lease")
+            .expect("live Responses restart lease");
+    let fence = GenerationRecoveryFence::new(&lease, "live-responses-restart-fence")
+        .expect("live Responses restart fence");
+    let hydrated = match reopened
+        .hydrate(&lease, &fence)
+        .await
+        .expect("authenticate and hydrate live Responses restart state")
+    {
+        HydrationOutcome::Complete(state) => state,
+        HydrationOutcome::RecoveryRequired(intents) => {
+            panic!("completed live Responses turn unexpectedly requires recovery: {intents:?}")
+        }
+    };
+    assert!(
+        !hydrated.provider_context.is_empty(),
+        "restart hydration must recover non-empty live provider context"
+    );
+    let markers = live_opaque_markers(&hydrated.provider_context);
+    assert!(
+        !markers.is_empty(),
+        "live Responses context must contain non-empty encrypted_content evidence"
+    );
+    assert_live_provider_context_private(&reopened, &hydrated.messages, &markers).await;
+    let replayed_context_items = hydrated.provider_context.len();
+    let mut restarted_core = RunCore::new();
+    restarted_core.install_hydrated_context(hydrated.messages, hydrated.provider_context);
+
+    let second_pool = reopened.pool().clone();
+    let second_core = run_live_responses_session(
+        reopened,
+        restarted_core,
+        live_responses_driver(spec, tool, "low"),
+        2,
+        "Without calling a tool, reply with exactly responses-live-restarted-ok.",
+    )
+    .await;
+    let final_text = second_core
+        .runtime_context
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            ContextMessage::Persisted {
+                message: Message::Assistant(assistant),
+                ..
+            }
+            | ContextMessage::Synthetic {
+                message: Message::Assistant(assistant),
+            } => Some(
+                assistant
+                    .content
+                    .iter()
+                    .filter_map(|content| match content {
+                        AssistantContent::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+            ),
+            _ => None,
+        })
+        .expect("second live Responses turn durable assistant");
+    assert!(
+        final_text.contains("responses-live-restarted-ok"),
+        "restarted live Responses turn must emit the expected non-empty text"
+    );
+    assert!(
+        second_core.provider_context.len() >= replayed_context_items,
+        "restarted canonical driver must retain the hydrated provider context"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE role='tool_result'")
+            .fetch_one(&second_pool)
+            .await
+            .expect("post-restart durable tool-result count"),
+        1,
+        "the restarted second user turn must not call a tool"
+    );
+    eprintln!(
+        "turn2 canonical_restart=hydrated_context_items({replayed_context_items}); output=non_empty_expected_text"
+    );
+    second_pool.close().await;
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
 }
 
 #[tokio::test]

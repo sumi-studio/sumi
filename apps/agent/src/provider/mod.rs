@@ -5398,6 +5398,17 @@ fi
     /// `SUMI_CODEX_RESPONSES_PROXY_SECRET` fails before any network call.
     #[tokio::test]
     async fn live_codex_responses_provider_release_gate() {
+        // `provider` is also compiled into the doctest-only library target,
+        // which has no agent runtime. The identically named binary-target test
+        // below is the sole release gate and owns the canonical Session.
+        if !crate::canonical_live_responses_harness_available() {
+            if env::var("SUMI_LIVE_TEST").as_deref() == Ok("1") {
+                eprintln!(
+                    "skipping duplicate doctest-library target; the sumi-agent binary target owns the live Responses release gate"
+                );
+            }
+            return;
+        }
         if env::var("SUMI_LIVE_TEST").as_deref() != Ok("1") {
             return;
         }
@@ -5459,6 +5470,9 @@ fi
 
     #[test]
     fn live_codex_responses_release_opt_in_without_bridge_url_fails_before_network() {
+        if !crate::canonical_live_responses_harness_available() {
+            return;
+        }
         assert_codex_responses_config_failure(
             None,
             None,
@@ -5468,6 +5482,9 @@ fi
 
     #[test]
     fn live_codex_responses_release_opt_in_with_empty_bridge_url_fails_before_network() {
+        if !crate::canonical_live_responses_harness_available() {
+            return;
+        }
         assert_codex_responses_config_failure(
             Some(""),
             Some("unused-test-secret"),
@@ -5477,6 +5494,9 @@ fi
 
     #[test]
     fn live_codex_responses_release_opt_in_without_proxy_secret_fails_before_network() {
+        if !crate::canonical_live_responses_harness_available() {
+            return;
+        }
         assert_codex_responses_config_failure(
             Some("http://127.0.0.1:1"),
             None,
@@ -5486,6 +5506,9 @@ fi
 
     #[test]
     fn live_codex_responses_release_opt_in_with_empty_proxy_secret_fails_before_network() {
+        if !crate::canonical_live_responses_harness_available() {
+            return;
+        }
         assert_codex_responses_config_failure(
             Some("http://127.0.0.1:1"),
             Some(""),
@@ -5669,155 +5692,8 @@ fi
     }
 
     async fn run_live_responses_tool_roundtrip(spec: ModelSpec, api_key: String) {
-        let tool = ToolDefinition {
-            name: "echo_value".to_owned(),
-            description: "Return the supplied value unchanged.".to_owned(),
-            parameters: serde_json::json!({
-                "type":"object",
-                "properties":{"value":{"type":"string"}},
-                "required":["value"],
-                "additionalProperties":false
-            }),
-        };
-        let user = types::UserMessage {
-            content: vec![types::UserContent::Text {
-                text: "Call echo_value once with value responses-live-ok.".to_owned(),
-            }],
-            timestamp: Utc::now(),
-        };
-        let first_context = PromptContext {
-            system_prompt:
-                "Reason about the requested value, then use the requested tool exactly once."
-                    .to_owned(),
-            memory_blocks: vec![],
-            messages: vec![types::ContextMessage::Synthetic {
-                message: types::Message::User(user.clone()),
-            }],
-            provider_context: vec![],
-            tools: vec![tool.clone()],
-        };
-        let first_output = run_live_output(
-            spec.clone(),
-            first_context,
-            RequestOptions {
-                max_tokens: Some(4_096),
-                tool_choice: Some(serde_json::json!("required")),
-                reasoning_effort: Some("high".to_owned()),
-                ..RequestOptions::default()
-            },
-            api_key.clone(),
-        )
-        .await;
-        let types::ProviderOutput {
-            message: first,
-            provider_context: first_fragments,
-        } = first_output;
-        assert_eq!(first.stop_reason, StopReason::ToolUse);
-        assert!(
-            !first_fragments.is_empty(),
-            "Responses live turn must preserve non-empty encrypted provider context"
-        );
-        let calls: Vec<_> = first
-            .content
-            .iter()
-            .filter_map(|content| match content {
-                AssistantContent::ToolCall { tool_call, .. } => Some(tool_call),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "echo_value");
-        assert_eq!(
-            calls[0].arguments.as_object().get("value"),
-            Some(&serde_json::json!("responses-live-ok"))
-        );
-        eprintln!(
-            "turn1 input=user(tool=echo_value,value=responses-live-ok); output=tool_call(name={},arguments={},encrypted_context_items={})",
-            calls[0].name,
-            serde_json::Value::Object(calls[0].arguments.as_object().clone()),
-            first_fragments.len()
-        );
-
-        let tool_result = types::ToolResultMessage {
-            tool_call_id: calls[0].id.clone(),
-            tool_name: calls[0].name.clone(),
-            content: vec![types::UserContent::Text {
-                text: "responses-live-ok".to_owned(),
-            }],
-            details: serde_json::json!({}),
-            is_error: false,
-            timestamp: Utc::now(),
-        };
-        let assistant_anchor = types::ProviderContextAnchor {
-            message_id: "responses-live-assistant".to_owned(),
-            message_seq: 1,
-        };
-        let provider_context = types::bind_provider_context_fragments(
-            first_fragments,
-            assistant_anchor.clone(),
-            first.origin.clone(),
-        )
-        .expect("live provider context has canonical durable ordering");
-        let replayed_context_items = provider_context.len();
-        let second_context = PromptContext {
-            system_prompt: "After the tool result, reply with exactly responses-live-ok."
-                .to_owned(),
-            memory_blocks: vec![],
-            messages: vec![
-                types::ContextMessage::Synthetic {
-                    message: types::Message::User(user),
-                },
-                types::ContextMessage::Persisted {
-                    id: assistant_anchor.message_id,
-                    seq: assistant_anchor.message_seq,
-                    message: types::Message::Assistant(first),
-                },
-                types::ContextMessage::Synthetic {
-                    message: types::Message::ToolResult(tool_result),
-                },
-            ],
-            provider_context,
-            tools: vec![tool],
-        };
-        let second_output = run_live_output(
-            spec,
-            second_context,
-            RequestOptions {
-                max_tokens: Some(4_096),
-                reasoning_effort: Some("low".to_owned()),
-                ..RequestOptions::default()
-            },
-            api_key,
-        )
-        .await;
-        let second = second_output.message;
-        assert_eq!(second.stop_reason, StopReason::Stop);
-        assert!(
-            !second
-                .content
-                .iter()
-                .any(|content| matches!(content, AssistantContent::ToolCall { .. })),
-            "second turn must not contain a tool call"
-        );
-        let text: String = second
-            .content
-            .iter()
-            .filter_map(|content| match content {
-                AssistantContent::Text { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        let trimmed = text.trim();
-        assert!(
-            !trimmed.is_empty() && trimmed.contains("responses-live-ok"),
-            "second turn must emit non-empty expected text"
-        );
-        eprintln!(
-            "turn2 input=tool_result(value=responses-live-ok,replayed_context_items={}); output=non_empty_expected_text",
-            replayed_context_items
-        );
+        crate::run_canonical_live_responses_roundtrip(spec, api_key).await;
     }
-
     async fn run_live_request(
         spec: ModelSpec,
         context: PromptContext,

@@ -1575,3 +1575,5 @@ fn panic_message(panic: Box<dyn Any + Send>) -> String {
 
 #[cfg(test)]
 mod session_tests;
+#[cfg(test)]
+pub(crate) use session_tests::run_canonical_live_responses_roundtrip;
