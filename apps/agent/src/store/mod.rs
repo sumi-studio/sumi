@@ -1202,13 +1202,13 @@ impl Store {
         .context("failed to load approval policy cache")?;
         let Some(row) = row else {
             return Ok(LoadedApprovalPolicy {
-                policy: Policy::new(workspace_root),
+                policy: Policy::unavailable_authority(workspace_root),
                 status: ApprovalPolicyCacheStatus::Missing,
             });
         };
 
         let unavailable = |reason: String| LoadedApprovalPolicy {
-            policy: Policy::new(workspace_root.clone()),
+            policy: Policy::unavailable_authority(workspace_root.clone()),
             status: ApprovalPolicyCacheStatus::Unavailable { reason },
         };
         let payload_json: String = row.try_get("payload_json")?;
@@ -3769,8 +3769,37 @@ mod tests {
 
     #[tokio::test]
     async fn approval_policy_cache_fails_closed_for_missing_expired_tampered_scope_and_stale() {
-        use crate::approval::action::Permission;
-        use crate::approval::policy::{ApprovalRule, RuleEffect};
+        use crate::approval::action::{CanonicalAction, Permission};
+        use crate::approval::policy::{ApprovalRule, PolicyDecision, RuleEffect};
+        use crate::provider::types::ValidatedToolArguments;
+
+        fn assert_unavailable_asks(policy: &crate::approval::Policy) {
+            let read_args: ValidatedToolArguments =
+                serde_json::from_value(json!({"path":"notes.txt"})).unwrap();
+            let read = CanonicalAction::from_tool_call(
+                std::path::PathBuf::from("/workspace"),
+                "read_file",
+                &read_args,
+            )
+            .unwrap();
+            assert!(
+                matches!(policy.evaluate(&read), PolicyDecision::NeedsApproval { .. }),
+                "unavailable authority must not retain the default workspace Allow"
+            );
+
+            let write_args: ValidatedToolArguments =
+                serde_json::from_value(json!({"path":"/etc/passwd","content":"x"})).unwrap();
+            let escaping_write = CanonicalAction::from_tool_call(
+                std::path::PathBuf::from("/workspace"),
+                "write_file",
+                &write_args,
+            )
+            .unwrap();
+            assert!(
+                policy.evaluate(&escaping_write).is_forbidden(),
+                "intrinsic workspace hard denies must survive unavailable authority"
+            );
+        }
 
         let store = store().await;
         let now = Utc::now();
@@ -3793,6 +3822,7 @@ mod tests {
             crate::approval::ApprovalPolicyCacheStatus::Missing
         );
         assert!(missing.policy.rules().is_empty());
+        assert_unavailable_asks(&missing.policy);
 
         let expired = signed_approval_bundle(
             1,
@@ -3857,6 +3887,7 @@ mod tests {
                 if reason.contains("expired")
         ));
         assert!(expired_after_install.policy.rules().is_empty());
+        assert_unavailable_asks(&expired_after_install.policy);
 
         let stale = store
             .load_approval_policy("/workspace", &approval_trust(), 3, now)
@@ -3868,6 +3899,7 @@ mod tests {
                 if reason.contains("stale")
         ));
         assert!(stale.policy.rules().is_empty());
+        assert_unavailable_asks(&stale.policy);
 
         sqlx::query("UPDATE approval_policy_cache SET signature=zeroblob(64) WHERE singleton=1")
             .execute(store.pool())
@@ -3883,6 +3915,7 @@ mod tests {
                 if reason.contains("signature")
         ));
         assert!(tampered.policy.rules().is_empty());
+        assert_unavailable_asks(&tampered.policy);
     }
 
     #[tokio::test]

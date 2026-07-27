@@ -14,6 +14,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -73,6 +74,7 @@ impl ReviewerModelSpec {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ReviewerTrustBinding {
+    model_id: String,
     provider: String,
     base_url: String,
     account_scope: String,
@@ -83,6 +85,7 @@ struct ReviewerTrustBinding {
 impl ReviewerTrustBinding {
     fn from_model(model: &ReviewerModelSpec) -> Self {
         Self {
+            model_id: model.id.clone(),
             provider: model.provider.clone(),
             base_url: model.base_url.clone(),
             account_scope: model.account_scope.clone(),
@@ -93,6 +96,7 @@ impl ReviewerTrustBinding {
 
     fn is_complete(&self) -> bool {
         [
+            &self.model_id,
             &self.provider,
             &self.base_url,
             &self.account_scope,
@@ -232,6 +236,7 @@ pub struct ReviewRequest {
     pub transcript: Vec<PublicMessage>,
     pub trusted_environment: TrustedEnvironment,
     pub policy_hash: String,
+    pub policy_cache_expires_at: Option<DateTime<Utc>>,
     pub context_version: String,
     pub run_id: String,
     pub turn_id: Option<String>,
@@ -368,7 +373,11 @@ impl AllowCache {
         policy_hash: &str,
         projection_hash: &str,
         context_version: &str,
+        policy_cache_expires_at: Option<DateTime<Utc>>,
     ) -> Option<&AuditDecision> {
+        if policy_cache_expires_at.is_some_and(|expires_at| Utc::now() >= expires_at) {
+            return None;
+        }
         let key = CacheKey {
             policy_hash: policy_hash.to_owned(),
             projection_hash: projection_hash.to_owned(),
@@ -600,6 +609,7 @@ impl Reviewer {
                 &request.policy_hash,
                 &projection_hash,
                 &request.context_version,
+                request.policy_cache_expires_at,
             ) {
                 let decision = decision.clone();
                 drop(allow_cache);
@@ -767,15 +777,20 @@ impl Reviewer {
         self.record_outcome(&request.run_id, decision.outcome);
         match decision.outcome {
             AuditOutcome::Allow => {
-                self.allow_cache
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .put(
-                        &request.policy_hash,
-                        projection_hash,
-                        &request.context_version,
-                        decision.clone(),
-                    );
+                if request
+                    .policy_cache_expires_at
+                    .is_none_or(|expires_at| Utc::now() < expires_at)
+                {
+                    self.allow_cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .put(
+                            &request.policy_hash,
+                            projection_hash,
+                            &request.context_version,
+                            decision.clone(),
+                        );
+                }
                 ReviewOutcome::Allow(decision)
             }
             AuditOutcome::Deny => {
@@ -920,6 +935,7 @@ mod tests {
             transcript: Vec::new(),
             trusted_environment: trusted_env(),
             policy_hash: "policy-hash".to_owned(),
+            policy_cache_expires_at: None,
             context_version: "v1".to_owned(),
             run_id: "run-1".to_owned(),
             turn_id: Some("turn-1".to_owned()),
@@ -1171,6 +1187,47 @@ mod tests {
             .await;
         assert!(matches!(outcome, ReviewOutcome::Deny(_)));
         assert_eq!(fake.called_count(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn matching_endpoint_cannot_authorize_a_different_model() {
+        let fake = FakeTransport::sequence(vec![]);
+        let trusted_model = ReviewerModelSpec::new(
+            "conversation-model",
+            "reviewer-provider",
+            "https://reviewer.example.test/v1",
+            "default",
+            "reviewer-domain",
+            "tenant-policy",
+        );
+        let untrusted_model = ReviewerModelSpec::new(
+            "different-model",
+            "reviewer-provider",
+            "https://reviewer.example.test/v1",
+            "default",
+            "reviewer-domain",
+            "tenant-policy",
+        );
+        let reviewer = Reviewer::new(
+            untrusted_model,
+            ReviewerTrustSet::new(trusted_model, vec![]),
+            fake.clone(),
+            Arc::new(projector()),
+        );
+
+        let outcome = reviewer
+            .review(
+                review_request(reviewable_projection()),
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(matches!(outcome, ReviewOutcome::Deny(_)));
+        assert_eq!(
+            fake.called_count(),
+            0,
+            "an unbound model identity must be rejected before transport"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1705,10 +1762,39 @@ mod tests {
             );
         }
         assert_eq!(cache.entries.len(), ALLOW_CACHE_CAPACITY);
-        assert!(cache.get("policy", "projection-0", "ctx").is_some());
+        assert!(cache.get("policy", "projection-0", "ctx", None).is_some());
         cache.put("policy", "projection-new", "ctx", decision);
-        assert!(cache.get("policy", "projection-0", "ctx").is_some());
-        assert!(cache.get("policy", "projection-1", "ctx").is_none());
-        assert!(cache.get("policy", "projection-new", "ctx").is_some());
+        assert!(cache.get("policy", "projection-0", "ctx", None).is_some());
+        assert!(cache.get("policy", "projection-1", "ctx", None).is_none());
+        assert!(cache.get("policy", "projection-new", "ctx", None).is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn allow_cache_does_not_cross_live_policy_expiry() {
+        let fake = FakeTransport::sequence(vec![Ok(allow_json()), Ok(allow_json())]);
+        let reviewer = make_reviewer(fake.clone());
+        let mut request = review_request(reviewable_projection());
+        request.policy_cache_expires_at = Some(Utc::now() + chrono::Duration::hours(1));
+
+        assert!(matches!(
+            reviewer
+                .review(request.clone(), CancellationToken::new())
+                .await,
+            ReviewOutcome::Allow(_)
+        ));
+        assert_eq!(fake.called_count(), 1);
+
+        // Keep the same policy hash to prove that the deadline check, rather
+        // than ordinary key churn, prevents reuse after live expiry.
+        request.policy_cache_expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
+        assert!(matches!(
+            reviewer.review(request, CancellationToken::new()).await,
+            ReviewOutcome::Allow(_)
+        ));
+        assert_eq!(
+            fake.called_count(),
+            2,
+            "the pre-expiry cached allow must not be reused"
+        );
     }
 }

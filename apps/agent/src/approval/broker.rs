@@ -12,6 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -87,6 +88,12 @@ impl TrustedEnvironmentProvider for FixedTrustedEnvironment {
     fn current(&self) -> Result<TrustedEnvironment> {
         Ok(self.0.clone())
     }
+}
+
+struct ReviewPolicySnapshot {
+    policy_hash: String,
+    cache_expires_at: Option<chrono::DateTime<Utc>>,
+    context_version: String,
 }
 
 /// The worker-side ownership of an unresolved approval request.
@@ -227,12 +234,16 @@ impl ApprovalBroker {
         context_version: &str,
         cancel: CancellationToken,
     ) -> Result<ApprovalOutcome> {
+        // One immutable policy snapshot owns action construction, evaluation,
+        // and reviewer cache identity for this request.
+        let policy = self
+            .policy
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let evaluated_at = Utc::now();
         let action = match CanonicalAction::from_tool_call(
-            self.policy
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .workspace_root()
-                .to_path_buf(),
+            policy.workspace_root().to_path_buf(),
             &tool_call.name,
             &tool_call.arguments,
         ) {
@@ -246,12 +257,12 @@ impl ApprovalBroker {
         };
 
         let projection = self.projector.project(&action);
-        let policy = self
-            .policy
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let decision = policy.evaluate(&action);
+        let decision = policy.evaluate_at(&action, evaluated_at);
+        let review_policy = ReviewPolicySnapshot {
+            policy_hash: policy.hash_at(evaluated_at),
+            cache_expires_at: policy.review_cache_expires_at(evaluated_at),
+            context_version: context_version.to_owned(),
+        };
 
         match decision {
             PolicyDecision::Forbidden { reason, .. } => Ok(ApprovalOutcome::Denied {
@@ -266,7 +277,7 @@ impl ApprovalBroker {
                             transcript,
                             run_id,
                             turn_id,
-                            context_version,
+                            &review_policy,
                             cancel,
                         )
                         .await?;
@@ -306,7 +317,7 @@ impl ApprovalBroker {
                             transcript,
                             run_id,
                             turn_id,
-                            context_version,
+                            &review_policy,
                             cancel,
                         )
                         .await?;
@@ -601,7 +612,7 @@ impl ApprovalBroker {
         transcript: &[PublicMessage],
         run_id: &str,
         turn_id: &str,
-        context_version: &str,
+        policy: &ReviewPolicySnapshot,
         cancel: CancellationToken,
     ) -> Result<ApprovalOutcome> {
         let Some(reviewer) = self.reviewer.as_ref() else {
@@ -630,7 +641,7 @@ impl ApprovalBroker {
             }
         };
         let environment_version =
-            match trusted_environment_version(context_version, &trusted_environment) {
+            match trusted_environment_version(&policy.context_version, &trusted_environment) {
                 Ok(version) => version,
                 Err(_) => {
                     return Ok(ApprovalOutcome::Denied {
@@ -646,7 +657,8 @@ impl ApprovalBroker {
             projection: projection.clone(),
             transcript: transcript.to_vec(),
             trusted_environment,
-            policy_hash: self.policy.read().unwrap_or_else(|e| e.into_inner()).hash(),
+            policy_hash: policy.policy_hash.clone(),
+            policy_cache_expires_at: policy.cache_expires_at,
             context_version: environment_version,
             run_id: run_id.to_owned(),
             turn_id: Some(turn_id.to_owned()),
@@ -978,6 +990,7 @@ mod tests {
             transcript: Vec::new(),
             trusted_environment: trusted_env(),
             policy_hash: policy_hash.to_owned(),
+            policy_cache_expires_at: None,
             context_version: context_version.to_owned(),
             run_id: "run-1".to_owned(),
             turn_id: Some("turn-1".to_owned()),

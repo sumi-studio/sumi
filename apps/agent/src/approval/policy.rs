@@ -54,6 +54,14 @@ pub struct ApprovalPolicyBundle {
 }
 
 impl ApprovalPolicyBundle {
+    /// Canonical v1 bytes signed by the control plane and verified by the
+    /// agent. The payload is the compact serde JSON representation in struct
+    /// declaration order (including UTC RFC 3339 timestamps), prefixed by the
+    /// domain separator and an unsigned big-endian payload length.
+    ///
+    /// Producers must sign these exact bytes. The agent reconstructs the same
+    /// semantic representation after loading the cache, so alternative raw JSON
+    /// whitespace or field ordering never becomes a second signing format.
     pub fn signing_bytes(&self) -> AnyResult<Vec<u8>> {
         let payload = serde_json::to_vec(self).context("serialize approval policy bundle")?;
         let mut bytes =
@@ -287,6 +295,7 @@ pub enum RuleValidationError {
 pub struct Policy {
     workspace_root: PathBuf,
     rules: Vec<ApprovalRule>,
+    authority_available: bool,
     verified_bundle_version: Option<u64>,
     verified_bundle_expires_at: Option<DateTime<Utc>>,
 }
@@ -296,6 +305,19 @@ impl Policy {
         Self {
             workspace_root: workspace_root.into(),
             rules: Vec::new(),
+            authority_available: true,
+            verified_bundle_version: None,
+            verified_bundle_expires_at: None,
+        }
+    }
+
+    /// Construct the fail-closed policy used when the control-plane authority
+    /// required by D6 is missing or cannot be verified.
+    pub(crate) fn unavailable_authority(workspace_root: impl Into<PathBuf>) -> Self {
+        Self {
+            workspace_root: workspace_root.into(),
+            rules: Vec::new(),
+            authority_available: false,
             verified_bundle_version: None,
             verified_bundle_expires_at: None,
         }
@@ -312,7 +334,12 @@ impl Policy {
 
     /// Deterministic hash of the loaded rule set and workspace root. Used as a
     /// cache key for reviewer allow/deny caches.
+    #[allow(dead_code)]
     pub fn hash(&self) -> String {
+        self.hash_at(Utc::now())
+    }
+
+    pub(crate) fn hash_at(&self, now: DateTime<Utc>) -> String {
         let mut rules: Vec<_> = self.rules.iter().collect();
         // Sort by id so physically different rule orders produce the same hash.
         rules.sort_by(|a, b| a.id.cmp(&b.id));
@@ -343,6 +370,7 @@ impl Policy {
         let canonical = json!({
             "workspace_root": workspace_root,
             "rules": rules,
+            "authority_available": self.authority_is_available_at(now),
             "verified_bundle_version": self.verified_bundle_version,
             "verified_bundle_expires_at": self.verified_bundle_expires_at,
         });
@@ -359,6 +387,19 @@ impl Policy {
         };
         let digest = Sha256::digest(&bytes);
         Self::hex_digest(&digest)
+    }
+
+    pub(crate) fn review_cache_expires_at(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.authority_is_available_at(now)
+            .then_some(self.verified_bundle_expires_at)
+            .flatten()
+    }
+
+    fn authority_is_available_at(&self, now: DateTime<Utc>) -> bool {
+        self.authority_available
+            && self
+                .verified_bundle_expires_at
+                .is_none_or(|expires_at| now < expires_at)
     }
 
     fn hex_digest(digest: &[u8]) -> String {
@@ -426,15 +467,31 @@ impl Policy {
     }
 
     pub fn evaluate(&self, action: &CanonicalAction) -> PolicyDecision {
-        if self.verified_bundle_version.is_some()
-            && self
-                .verified_bundle_expires_at
-                .is_none_or(|expires_at| Utc::now() >= expires_at)
-        {
-            // Expiry revokes only cached persistent allows. Deterministic hard
-            // denies and default Ask/Allow behavior remain available.
-            return Self::new(self.workspace_root.clone()).evaluate(action);
+        self.evaluate_at(action, Utc::now())
+    }
+
+    pub(crate) fn evaluate_at(
+        &self,
+        action: &CanonicalAction,
+        now: DateTime<Utc>,
+    ) -> PolicyDecision {
+        if !self.authority_is_available_at(now) {
+            // Missing, invalid, stale, or expired signed authority cannot use
+            // either persistent rules or default workspace fast-path allows.
+            // Re-evaluate only the intrinsic policy so hard denies survive,
+            // then turn any otherwise-Allow result into Ask.
+            return match Self::new(self.workspace_root.clone()).evaluate_available(action) {
+                PolicyDecision::Allow { matched_rules } => PolicyDecision::NeedsApproval {
+                    matched_rules,
+                    reason: "signed approval policy authority is unavailable".to_owned(),
+                },
+                decision => decision,
+            };
         }
+        self.evaluate_available(action)
+    }
+
+    fn evaluate_available(&self, action: &CanonicalAction) -> PolicyDecision {
         if action.validate().is_err() {
             return PolicyDecision::Forbidden {
                 matched_rules: Vec::new(),
@@ -691,7 +748,8 @@ impl Policy {
         candidate: ApprovalRule,
         projector: &SecretAwareActionProjector,
     ) -> ResolvedDecision {
-        if let PolicyDecision::Forbidden { reason, .. } = self.evaluate(action) {
+        let now = Utc::now();
+        if let PolicyDecision::Forbidden { reason, .. } = self.evaluate_at(action, now) {
             return ResolvedDecision::Rejected { reason };
         }
 
@@ -719,11 +777,21 @@ impl Policy {
             return ResolvedDecision::ApproveOnce;
         }
 
-        let with_candidate = match self.clone().try_with_rule(candidate.clone()) {
+        // An unavailable signed bundle must not become execution authority, but
+        // an authenticated ApproveAlways choice still needs to survive as a
+        // validated control-plane proposal. Validate that proposal against the
+        // effective rule set: current verified rules while authority is live,
+        // or the intrinsic policy alone when it is unavailable/expired.
+        let proposal_base = if self.authority_is_available_at(now) {
+            self.clone()
+        } else {
+            Self::new(self.workspace_root.clone())
+        };
+        let with_candidate = match proposal_base.try_with_rule(candidate.clone()) {
             Ok(p) => p,
             Err(_) => return ResolvedDecision::ApproveOnce,
         };
-        let decision = with_candidate.evaluate(action);
+        let decision = with_candidate.evaluate_at(action, now);
         match decision {
             PolicyDecision::Allow { .. } => ResolvedDecision::ApproveAlways(candidate),
             PolicyDecision::NeedsApproval { .. } => ResolvedDecision::ApproveOnce,
@@ -2315,6 +2383,58 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_signed_authority_turns_default_allow_into_ask_but_keeps_hard_denies() {
+        let unavailable = Policy::unavailable_authority("/workspace");
+        let read = CanonicalAction::from_tool_call(
+            PathBuf::from("/workspace"),
+            "read_file",
+            &args(json!({"path":"notes.txt"})),
+        )
+        .unwrap();
+        assert!(matches!(
+            unavailable.evaluate(&read),
+            PolicyDecision::NeedsApproval { ref reason, .. }
+                if reason.contains("authority is unavailable")
+        ));
+
+        let escaping_write = CanonicalAction::from_tool_call(
+            PathBuf::from("/workspace"),
+            "write_file",
+            &args(json!({"path":"/etc/passwd","content":"x"})),
+        )
+        .unwrap();
+        assert!(
+            unavailable.evaluate(&escaping_write).is_forbidden(),
+            "fail-closed Ask must not weaken intrinsic workspace hard denies"
+        );
+
+        let proposal = ApprovalRule {
+            id: "git-status".to_owned(),
+            tool: "bash".to_owned(),
+            literal_prefix: vec!["git".to_owned(), "status".to_owned()],
+            effect: RuleEffect::Allow,
+            workspace_only: true,
+            allowed_permissions: vec![Permission::Exec],
+            allowed_network_domains: Vec::new(),
+        };
+        assert!(matches!(
+            unavailable.resolve(
+                &bash("git status"),
+                UserDecision::ApproveAlways { rule: proposal },
+                &projector(),
+            ),
+            ResolvedDecision::ApproveAlways(_)
+        ));
+        assert!(
+            matches!(
+                unavailable.evaluate(&bash("git status")),
+                PolicyDecision::NeedsApproval { .. }
+            ),
+            "the proposal must not activate without a signed replacement bundle"
+        );
+    }
+
+    #[test]
     fn workspace_write_outside_workspace_is_forbidden() {
         let action = CanonicalAction::from_tool_call(
             PathBuf::from("/workspace"),
@@ -3288,6 +3408,43 @@ mod tests {
         assert_eq!(first, second, "policy hash must be deterministic");
         assert_eq!(first.len(), 64, "SHA-256 hex digest is 64 characters");
         assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn approval_policy_signing_bytes_have_one_canonical_v1_representation() {
+        let bundle = ApprovalPolicyBundle {
+            schema_version: APPROVAL_POLICY_BUNDLE_SCHEMA_VERSION,
+            tenant_id: "tenant-1".to_owned(),
+            agent_id: "agent-1".to_owned(),
+            version: 7,
+            issued_at: "2026-07-27T00:00:00Z".parse().unwrap(),
+            expires_at: "2026-07-28T00:00:00Z".parse().unwrap(),
+            rules: Vec::new(),
+        };
+        let canonical_payload = br#"{"schema_version":1,"tenant_id":"tenant-1","agent_id":"agent-1","version":7,"issued_at":"2026-07-27T00:00:00Z","expires_at":"2026-07-28T00:00:00Z","rules":[]}"#;
+        let mut expected = APPROVAL_POLICY_SIGNATURE_DOMAIN.to_vec();
+        expected.extend_from_slice(&(canonical_payload.len() as u64).to_be_bytes());
+        expected.extend_from_slice(canonical_payload);
+
+        assert_eq!(bundle.signing_bytes().unwrap(), expected);
+
+        let reordered: ApprovalPolicyBundle = serde_json::from_str(
+            r#"{
+                "rules": [],
+                "expires_at": "2026-07-28T00:00:00+00:00",
+                "issued_at": "2026-07-27T00:00:00+00:00",
+                "version": 7,
+                "agent_id": "agent-1",
+                "tenant_id": "tenant-1",
+                "schema_version": 1
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            reordered.signing_bytes().unwrap(),
+            expected,
+            "raw JSON ordering and equivalent UTC spelling must canonicalize identically"
+        );
     }
 
     #[test]
@@ -5907,14 +6064,14 @@ mod tests {
 
     #[test]
     fn verified_bundle_authority_expires_while_the_process_is_live() {
-        let now = Utc::now();
+        let now: DateTime<Utc> = "2026-07-27T12:00:00Z".parse().unwrap();
         let bundle = ApprovalPolicyBundle {
             schema_version: APPROVAL_POLICY_BUNDLE_SCHEMA_VERSION,
             tenant_id: "tenant-1".to_owned(),
             agent_id: "agent-1".to_owned(),
             version: 9,
-            issued_at: now - chrono::Duration::hours(2),
-            expires_at: now - chrono::Duration::hours(1),
+            issued_at: now - chrono::Duration::hours(1),
+            expires_at: now + chrono::Duration::hours(1),
             rules: vec![ApprovalRule {
                 id: "git-status".to_owned(),
                 tool: "bash".to_owned(),
@@ -5927,13 +6084,43 @@ mod tests {
         };
         let policy =
             Policy::from_verified_bundle("/workspace", &bundle).expect("valid bundle shape");
+        let read = CanonicalAction::from_tool_call(
+            PathBuf::from("/workspace"),
+            "read_file",
+            &args(json!({"path":"notes.txt"})),
+        )
+        .unwrap();
+        let escaping_write = CanonicalAction::from_tool_call(
+            PathBuf::from("/workspace"),
+            "write_file",
+            &args(json!({"path":"/etc/passwd","content":"x"})),
+        )
+        .unwrap();
+
+        assert!(policy.evaluate_at(&read, now).is_allow());
+        let pre_expiry_hash = policy.hash_at(now);
+        let after_expiry = now + chrono::Duration::hours(2);
 
         assert!(
             matches!(
-                policy.evaluate(&bash("git status")),
+                policy.evaluate_at(&bash("git status"), after_expiry),
                 PolicyDecision::NeedsApproval { .. }
             ),
             "expired signed authority must fail closed without requiring a restart"
+        );
+        assert!(matches!(
+            policy.evaluate_at(&read, after_expiry),
+            PolicyDecision::NeedsApproval { .. }
+        ));
+        assert!(
+            policy
+                .evaluate_at(&escaping_write, after_expiry)
+                .is_forbidden()
+        );
+        assert_ne!(
+            pre_expiry_hash,
+            policy.hash_at(after_expiry),
+            "reviewer cache identity must transition when live authority expires"
         );
     }
 }
