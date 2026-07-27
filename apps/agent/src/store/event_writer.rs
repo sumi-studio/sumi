@@ -946,8 +946,16 @@ pub(crate) enum Projection {
     MemoryJobUpdate(MemoryJobUpdate),
     /// Atomic durable memory batch + job transition with source-version CAS.
     MemoryTransition(MemoryTransition),
+    ApprovalRule(ApprovalRuleMutation),
     #[cfg(test)]
     SizePadding(usize),
+}
+
+#[derive(Clone)]
+pub(crate) struct ApprovalRuleMutation {
+    pub id: String,
+    pub tool: String,
+    pub pattern: String,
 }
 
 #[allow(
@@ -986,6 +994,13 @@ pub(crate) enum ToolExecutionMutation {
         error_code: &'static str,
     },
 }
+
+const SKIP_ERROR_CODES: &[&str] = &[
+    "length_guard",
+    "user_steer_cancelled",
+    "approval_denied",
+    "approval_cancelled",
+];
 
 #[allow(
     dead_code,
@@ -4212,6 +4227,7 @@ fn validate_batch_shape_with_recovery(
     let mut tool_result_ids = HashSet::new();
     let mut tool_result_message_ids = HashMap::new();
     let mut tool_mutation_ids = HashSet::new();
+    let mut tool_prepare_mutation_ids: HashSet<String> = HashSet::new();
     let mut tool_start_mutation_ids: HashSet<String> = HashSet::new();
     let mut tool_finish_mutation_ids: HashSet<String> = HashSet::new();
     let mut tool_skip_mutation_ids: HashSet<String> = HashSet::new();
@@ -4634,7 +4650,14 @@ fn validate_batch_shape_with_recovery(
                     | ToolExecutionMutation::Finish { tool_call_id, .. }
                     | ToolExecutionMutation::Skip { tool_call_id, .. } => tool_call_id,
                 };
-                if !tool_mutation_ids.insert(tool_call_id.as_str()) {
+                // `tool_prepare_mutation_ids` must contain a Prepare before a
+                // matching Start is processed; this traversal order is validated
+                // by the duplicate-mutation check below. An atomic Start that
+                // immediately follows its Prepare is allowed.
+                let is_atomic_start = matches!(mutation, ToolExecutionMutation::Start { .. })
+                    && tool_prepare_mutation_ids.contains(tool_call_id)
+                    && !tool_start_mutation_ids.contains(tool_call_id);
+                if !tool_mutation_ids.insert(tool_call_id.as_str()) && !is_atomic_start {
                     bail!("duplicate tool mutation for tool {tool_call_id}");
                 }
                 match mutation {
@@ -4667,12 +4690,12 @@ fn validate_batch_shape_with_recovery(
                             },
                         );
                     }
-                    ToolExecutionMutation::Prepare { .. } => {}
+                    ToolExecutionMutation::Prepare { .. } => {
+                        tool_prepare_mutation_ids.insert(tool_call_id.clone());
+                    }
                     ToolExecutionMutation::Skip { error_code, .. } => {
-                        if !matches!(*error_code, "length_guard" | "user_steer_cancelled") {
-                            bail!(
-                                "ToolExecution Skip only supports length_guard or user_steer_cancelled"
-                            );
+                        if !SKIP_ERROR_CODES.contains(error_code) {
+                            bail!("ToolExecution Skip only supports {SKIP_ERROR_CODES:?}");
                         }
                         tool_skip_mutation_ids.insert(tool_call_id.clone());
                     }
@@ -5227,7 +5250,15 @@ fn validate_terminal_tool_semantics(
     }
     if !matches!(
         error_code,
-        Some("executor_failed" | "cancelled" | "indeterminate" | "invalid_result" | "internal")
+        Some(
+            "executor_failed"
+                | "cancelled"
+                | "indeterminate"
+                | "invalid_result"
+                | "internal"
+                | "approval_denied"
+                | "approval_cancelled"
+        )
     ) {
         bail!("unknown terminal tool error_code");
     }
@@ -5589,6 +5620,11 @@ fn projection_size_upper_bound(projection: &Projection) -> Result<usize> {
                     })
                     .sum::<usize>(),
             ),
+        Projection::ApprovalRule(rule) => rule
+            .id
+            .len()
+            .saturating_add(rule.tool.len())
+            .saturating_add(rule.pattern.len()),
         Projection::MessageEnd { .. } => 0,
         #[cfg(test)]
         Projection::SizePadding(bytes) => return Ok(*bytes),
@@ -6259,18 +6295,26 @@ async fn validate_tool_finish_owner(
             final_phase.as_str()
         ),
         "prepared" => {
-            let approval_cleanup = sqlx::query_scalar::<_, String>(
-                "SELECT id FROM approval_log
-                 WHERE tool_call_id = ? AND state = 'pending'",
+            let maybe_approval = sqlx::query(
+                "SELECT id, state FROM approval_log
+                 WHERE tool_call_id = ?",
             )
             .bind(tool_call_id)
             .fetch_optional(&mut **transaction)
-            .await?
-            .is_some_and(|request_id| {
-                approval_resolutions
-                    .get(request_id.as_str())
-                    .is_some_and(|(resolution, _)| matches!(*resolution, "denied" | "cancelled"))
-            });
+            .await?;
+            let approval_cleanup = if let Some(row) = maybe_approval {
+                let request_id: String = row.try_get("id")?;
+                let state: String = row.try_get("state")?;
+                match state.as_str() {
+                    "denied" | "cancelled" => true,
+                    "pending" => approval_resolutions.get(request_id.as_str()).is_some_and(
+                        |(resolution, _)| matches!(*resolution, "denied" | "cancelled"),
+                    ),
+                    _ => false,
+                }
+            } else {
+                false
+            };
             if finish.state != "cancelled"
                 || !(closes_owner
                     || approval_cleanup
@@ -6386,9 +6430,11 @@ async fn validate_required_projection_sets(
     let mut approval_resolution_positions = HashMap::new();
     let mut approval_pendings = Vec::new();
     let mut tool_prepares = HashMap::new();
+    let mut tool_prepare_positions = HashMap::new();
     let mut tool_starts = HashMap::new();
     let mut tool_start_positions = HashMap::new();
     let mut tool_finishes = HashMap::new();
+    let mut approval_rule_inserts = HashMap::new();
     let mut applied_controls = Vec::new();
     let mut supersedes = Vec::new();
     let mut projection_position = 0usize;
@@ -6412,6 +6458,16 @@ async fn validate_required_projection_sets(
                 })) => {
                     approval_resolutions.insert(request_id.as_str(), (*state, actor.as_str()));
                     approval_resolution_positions.insert(request_id.as_str(), projection_position);
+                }
+                PreparedProjection::Plain(Projection::ApprovalRule(rule))
+                    if approval_rule_inserts
+                        .insert(
+                            rule.id.as_str(),
+                            (rule.tool.as_str(), rule.pattern.as_str()),
+                        )
+                        .is_some() =>
+                {
+                    bail!("duplicate approval rule insert for {}", rule.id);
                 }
                 PreparedProjection::Plain(Projection::Approval(ApprovalMutation::Pending {
                     request_id,
@@ -6437,6 +6493,7 @@ async fn validate_required_projection_sets(
                         tool_call_id.as_str(),
                         (command_id.as_str(), run_id.as_str()),
                     );
+                    tool_prepare_positions.insert(tool_call_id.as_str(), projection_position);
                 }
                 PreparedProjection::Plain(Projection::ToolExecution(
                     ToolExecutionMutation::Start {
@@ -6575,9 +6632,29 @@ async fn validate_required_projection_sets(
     }
 
     for (tool_call_id, contextual_run_id) in &tool_starts {
-        let binding = load_prepared_tool_binding(transaction, tool_call_id)
-            .await?
-            .ok_or_else(|| anyhow!("ToolExecutionStart requires prepared tool {tool_call_id}"))?;
+        let binding = if let Some((command_id, prepared_run_id)) = tool_prepares.get(tool_call_id) {
+            let prepare_position = tool_prepare_positions
+                .get(tool_call_id)
+                .expect("tool prepare position was collected");
+            let start_position = tool_start_positions
+                .get(tool_call_id)
+                .expect("tool start position was collected");
+            if prepare_position >= start_position {
+                bail!(
+                    "ToolExecutionStart for {tool_call_id} requires its same-batch ToolExecutionPrepare to precede it"
+                );
+            }
+            PreparedToolBinding {
+                command_id: (*command_id).to_owned(),
+                run_id: (*prepared_run_id).to_owned(),
+            }
+        } else {
+            load_prepared_tool_binding(transaction, tool_call_id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow!("ToolExecutionStart requires prepared tool {tool_call_id}")
+                })?
+        };
         if binding.run_id != *contextual_run_id {
             bail!(
                 "ToolExecutionStart for {tool_call_id} run {contextual_run_id} does not match prepared run {}",
@@ -6667,14 +6744,17 @@ async fn validate_required_projection_sets(
         let request_id: String = approval.try_get("id")?;
         let state: String = approval.try_get("state")?;
         let approval_run_id: String = approval.try_get("run_id")?;
-        let approved_in_batch = approval_resolutions
-            .get(request_id.as_str())
-            .is_some_and(|(resolution, _)| *resolution == "approved_once")
-            && approval_resolution_bindings.get(&request_id).is_some_and(
-                |(run_id, approved_tool)| {
-                    run_id == *contextual_run_id && approved_tool == *tool_call_id
-                },
-            );
+        let approved_in_batch =
+            approval_resolutions
+                .get(request_id.as_str())
+                .is_some_and(|(resolution, _)| {
+                    matches!(*resolution, "approved_once" | "approved_always")
+                })
+                && approval_resolution_bindings.get(&request_id).is_some_and(
+                    |(run_id, approved_tool)| {
+                        run_id == *contextual_run_id && approved_tool == *tool_call_id
+                    },
+                );
         let approved_event_before_start = durable_event_envelope_identity_position(
             prepared,
             "approval_resolved",
@@ -6696,7 +6776,7 @@ async fn validate_required_projection_sets(
                     approval_position < start_position
                 })
             && approved_event_before_start;
-        let already_approved = state == "approved_once"
+        let already_approved = matches!(state.as_str(), "approved_once" | "approved_always")
             && approval_run_id == *contextual_run_id
             && lifecycle
                 .approved_once
@@ -6949,6 +7029,7 @@ async fn validate_required_projection_sets(
     }
 
     let mut consumed_approval_resolutions = HashSet::new();
+    let mut consumed_approval_rule_ids = HashSet::new();
     let mut active_abort_runs = HashSet::new();
     let mut user_owner_close_runs = HashSet::new();
     let mut user_owner_closes = Vec::new();
@@ -7059,15 +7140,6 @@ async fn validate_required_projection_sets(
                 };
                 match *contextual_run_id {
                     Some(run_id) => {
-                        let expected_resolution = match decision {
-                            ApprovalDecision::ApproveOnce => "approved_once",
-                            ApprovalDecision::Deny => "denied",
-                            ApprovalDecision::ApproveAlways { .. } => {
-                                bail!(
-                                    "active ApproveAlways requires the T22/T23 durable policy mutation path"
-                                )
-                            }
-                        };
                         let Some((resolution, actor)) =
                             approval_resolutions.get(request_id.as_str())
                         else {
@@ -7075,11 +7147,87 @@ async fn validate_required_projection_sets(
                                 "active ApprovalDecision CommandApplied requires ApprovalResolved for {request_id}"
                             );
                         };
-                        if *resolution != expected_resolution {
-                            bail!(
-                                "ApprovalDecision {request_id} maps to {expected_resolution}, not {resolution}"
-                            );
-                        }
+                        let require_atomic_pending_tool_start = match decision {
+                            ApprovalDecision::ApproveOnce => {
+                                if *resolution != "approved_once" {
+                                    bail!(
+                                        "ApprovalDecision {request_id} maps to approved_once, not {resolution}"
+                                    );
+                                }
+                                false
+                            }
+                            ApprovalDecision::Deny => {
+                                if *resolution != "denied" {
+                                    bail!(
+                                        "ApprovalDecision {request_id} maps to denied, not {resolution}"
+                                    );
+                                }
+                                false
+                            }
+                            ApprovalDecision::ApproveAlways { rule } => match *resolution {
+                                "approved_always" => {
+                                    let mut value = serde_json::to_value(&rule)?;
+                                    let (rule_id, tool) = {
+                                        let object = value.as_object_mut().ok_or_else(|| {
+                                            anyhow!("ApproveAlways rule must be an object")
+                                        })?;
+                                        let rule_id =
+                                            object.get("id").and_then(Value::as_str).ok_or_else(
+                                                || anyhow!("ApproveAlways rule has no id"),
+                                            )?;
+                                        if rule_id.is_empty() {
+                                            object.insert(
+                                                "id".to_owned(),
+                                                Value::String(request_id.clone()),
+                                            );
+                                        }
+                                        (
+                                            object
+                                                .get("id")
+                                                .and_then(Value::as_str)
+                                                .expect("normalized ApproveAlways id")
+                                                .to_owned(),
+                                            object
+                                                .get("tool")
+                                                .and_then(Value::as_str)
+                                                .ok_or_else(|| {
+                                                    anyhow!("ApproveAlways rule has no tool")
+                                                })?
+                                                .to_owned(),
+                                        )
+                                    };
+                                    let Some((inserted_tool, inserted_pattern)) =
+                                        approval_rule_inserts.get(rule_id.as_str())
+                                    else {
+                                        bail!(
+                                            "active ApproveAlways requires its durable approval rule insert"
+                                        );
+                                    };
+                                    let inserted_value: Value = serde_json::from_str(
+                                        inserted_pattern,
+                                    )
+                                    .with_context(|| {
+                                        format!(
+                                            "parse durable ApproveAlways rule {rule_id} pattern"
+                                        )
+                                    })?;
+                                    if *inserted_tool != tool || inserted_value != value {
+                                        bail!(
+                                            "durable ApproveAlways rule does not match the command"
+                                        );
+                                    }
+                                    consumed_approval_rule_ids.insert(rule_id);
+                                    false
+                                }
+                                "approved_once" => true,
+                                "denied" => false,
+                                _ => {
+                                    bail!(
+                                        "ApproveAlways ApprovalDecision {request_id} cannot map to {resolution}"
+                                    )
+                                }
+                            },
+                        };
                         if *actor == "runtime" {
                             bail!("user ApprovalDecision cannot use the runtime resolution actor");
                         }
@@ -7095,8 +7243,16 @@ async fn validate_required_projection_sets(
                                 "ApprovalDecision {request_id} does not resolve a pending approval in run {run_id}"
                             );
                         }
-                        if expected_resolution == "denied" && !tool_starts.is_empty() {
+                        if *resolution == "denied" && !tool_starts.is_empty() {
                             bail!("denied ApprovalDecision cannot co-commit ToolExecutionStart");
+                        }
+                        if require_atomic_pending_tool_start
+                            && (tool_starts.len() != 1
+                                || !tool_starts.contains_key(tool_call_id.as_str()))
+                        {
+                            bail!(
+                                "ApproveAlways normalized to approved_once must atomically start its pending tool {tool_call_id}"
+                            );
                         }
                         if !tool_starts.is_empty()
                             && (!tool_starts.contains_key(tool_call_id.as_str())
@@ -7108,18 +7264,26 @@ async fn validate_required_projection_sets(
                         }
                         consumed_approval_resolutions.insert(request_id);
                     }
-                    None if approval_resolutions.contains_key(request_id.as_str()) => {
-                        bail!(
-                            "no-op ApprovalDecision cannot carry ApprovalResolved for {request_id}"
-                        );
-                    }
                     None => {
+                        if let Some((resolution, actor)) =
+                            approval_resolutions.get(request_id.as_str())
+                            && (*resolution != "cancelled" || *actor != "runtime")
+                        {
+                            bail!(
+                                "no-op ApprovalDecision can co-commit only its runtime cancellation for {request_id}"
+                            );
+                        }
                         let approval_state: Option<String> =
                             sqlx::query_scalar("SELECT state FROM approval_log WHERE id = ?")
                                 .bind(&request_id)
                                 .fetch_optional(&mut **transaction)
                                 .await?;
                         if approval_state.as_deref() == Some("pending")
+                            && !approval_resolutions.get(request_id.as_str()).is_some_and(
+                                |(resolution, actor)| {
+                                    *resolution == "cancelled" && *actor == "runtime"
+                                },
+                            )
                             && !has_later_abort_cutoff(
                                 transaction,
                                 &applied_controls,
@@ -7205,6 +7369,9 @@ async fn validate_required_projection_sets(
             value => bail!("CommandApplied cannot target command kind {value}"),
         }
     }
+    if consumed_approval_rule_ids.len() != approval_rule_inserts.len() {
+        bail!("approval rule insert requires its active ApproveAlways CommandApplied");
+    }
     for (command_id, run_id) in &user_owner_closes {
         validate_owner_active_work_terminalized(
             transaction,
@@ -7230,7 +7397,7 @@ async fn validate_required_projection_sets(
             bail!(
                 "ApprovalResolved for {request_id} requires its active ApprovalDecision CommandApplied"
             );
-        } else if *resolution == "approved_once" {
+        } else if matches!(*resolution, "approved_once" | "approved_always") {
             let (_, tool_call_id) = approval_resolution_bindings
                 .get(*request_id)
                 .expect("validated approval resolution binding");
@@ -7915,10 +8082,10 @@ async fn validate_durable_lifecycle_suffix(
                     || run_id.is_empty()
                     || turn_id.is_empty()
                     || idempotency_key.is_empty()
-                    || !matches!(*error_code, "length_guard" | "user_steer_cancelled") =>
+                    || !SKIP_ERROR_CODES.contains(error_code) =>
                 {
                     bail!(
-                        "ToolExecutionSkip identity must be non-empty and use length_guard or user_steer_cancelled"
+                        "ToolExecutionSkip identity must be non-empty and use a supported error code"
                     )
                 }
                 PreparedProjection::Plain(Projection::ToolExecution(
@@ -8484,7 +8651,7 @@ fn apply_lifecycle_event(
                 .and_then(|resolution| resolution.get("decision"))
                 .and_then(|decision| decision.get("type"))
                 .and_then(Value::as_str);
-            if decision == Some("approve_once") {
+            if matches!(decision, Some("approve_once" | "approve_always")) {
                 state
                     .approved_once
                     .insert(request_id.to_owned(), tool_call_id);
@@ -8977,6 +9144,37 @@ async fn apply_plain_projection(
         | Projection::MemoryTransition(_) => {
             bail!("memory and provider-context mutations must be prepared before apply");
         }
+        Projection::ApprovalRule(rule) => {
+            if let Some(existing) =
+                sqlx::query("SELECT tool, pattern FROM approval_rules WHERE id = ?")
+                    .bind(&rule.id)
+                    .fetch_optional(&mut **transaction)
+                    .await?
+            {
+                let stored_tool: String = existing.try_get("tool")?;
+                let stored_pattern: String = existing.try_get("pattern")?;
+                if stored_tool == rule.tool && stored_pattern == rule.pattern {
+                    return Ok(None);
+                }
+                bail!(
+                    "ApprovalRule identity mismatch for {}: existing ({stored_tool}, {stored_pattern}) does not match requested ({}, {})",
+                    rule.id,
+                    rule.tool,
+                    rule.pattern
+                );
+            }
+            let result = sqlx::query(
+                "INSERT INTO approval_rules(id, tool, pattern, created_at)
+                 VALUES(?, ?, ?, ?)",
+            )
+            .bind(rule.id)
+            .bind(rule.tool)
+            .bind(rule.pattern)
+            .bind(Utc::now().to_rfc3339())
+            .execute(&mut **transaction)
+            .await?;
+            require_single_cas(result.rows_affected(), "ApprovalRuleInsert")?;
+        }
         #[cfg(test)]
         Projection::SizePadding(_) => {}
     }
@@ -9209,6 +9407,39 @@ async fn apply_tool_mutation(
             executor_generation,
             idempotency_key,
         } => {
+            // `INSERT OR IGNORE` is not enough: replay must accept only an
+            // exact identity match. A mismatch means a different tool_call_id
+            // collision or corrupted recovery state, so fail closed.
+            if let Some(existing) = sqlx::query(
+                "SELECT command_id, run_id, executor_generation, idempotency_key, state
+                 FROM tool_executions WHERE tool_call_id = ?",
+            )
+            .bind(&tool_call_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+            {
+                let existing_command_id: String = existing.try_get("command_id")?;
+                let existing_run_id: String = existing.try_get("run_id")?;
+                let existing_generation: i64 = existing.try_get("executor_generation")?;
+                let existing_idempotency: String = existing.try_get("idempotency_key")?;
+                let existing_state: String = existing.try_get("state")?;
+                if existing_command_id != command_id
+                    || existing_run_id != run_id
+                    || existing_generation != executor_generation.as_i64()
+                    || existing_idempotency != idempotency_key
+                    || existing_state != "prepared"
+                {
+                    bail!(
+                        "Prepare identity mismatch for {tool_call_id}: \
+                         existing ({existing_command_id}, {existing_run_id}, \
+                         {existing_generation}, {existing_idempotency}, {existing_state}) \
+                         does not match requested ({command_id}, {run_id}, \
+                         {generation}, {idempotency_key}, prepared)",
+                        generation = executor_generation.as_i64()
+                    );
+                }
+                return Ok(());
+            }
             sqlx::query(
                 "INSERT INTO tool_executions(
                     tool_call_id, command_id, run_id, executor_generation, state,
@@ -9273,8 +9504,8 @@ async fn apply_tool_mutation(
             idempotency_key,
             error_code,
         } => {
-            if !matches!(error_code, "length_guard" | "user_steer_cancelled") {
-                bail!("ToolExecutionSkip only supports length_guard or user_steer_cancelled");
+            if !SKIP_ERROR_CODES.contains(&error_code) {
+                bail!("ToolExecutionSkip only supports {SKIP_ERROR_CODES:?}");
             }
             // user_steer_cancelled may resolve after a hard steer or Abort moved the
             // original owner out of assistant_started; length_guard remains restricted
@@ -9334,6 +9565,33 @@ async fn apply_approval_mutation(
             .ok_or_else(|| {
                 anyhow!("Approval Pending requires its same-batch writer-generated request")
             })?;
+            // Replay must accept only an exact identity match. A mismatch
+            // means a corrupted recovery or request_id collision, so fail closed.
+            if let Some(existing) = sqlx::query(
+                "SELECT tool_call_id, run_id, turn_id, state FROM approval_log WHERE id = ?",
+            )
+            .bind(&request_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+            {
+                let existing_tool_call_id: String = existing.try_get("tool_call_id")?;
+                let existing_run_id: String = existing.try_get("run_id")?;
+                let existing_turn_id: String = existing.try_get("turn_id")?;
+                let existing_state: String = existing.try_get("state")?;
+                if existing_tool_call_id != tool_call_id
+                    || existing_run_id != run_id
+                    || existing_turn_id != turn_id
+                    || existing_state != "pending"
+                {
+                    bail!(
+                        "Approval Pending identity mismatch for {request_id}: \
+                         existing ({existing_tool_call_id}, {existing_run_id}, \
+                         {existing_turn_id}, {existing_state}) does not match \
+                         requested ({tool_call_id}, {run_id}, {turn_id}, pending)"
+                    );
+                }
+                return Ok(());
+            }
             sqlx::query(
                 "INSERT INTO approval_log(
                     id, tool_call_id, run_id, turn_id, state, request_projection,
@@ -9410,7 +9668,10 @@ mod tests {
             AdmittedCommand, DurableRunBinding, ProjectedProviderEvent, ProviderEventProjector,
             ProviderTerminalKind, SteerGroup, steer_group_injection_batch,
         },
-        gateway::{Command, CommandEnvelope, CommandId, SensitiveCommandPayload},
+        gateway::{
+            ApprovalDecision, Command, CommandEnvelope, CommandId, DeferredApprovalRule,
+            SensitiveCommandPayload,
+        },
         provider::{
             ModelSpec, RequestOptions,
             adapters::responses::build_request as build_responses_request,
@@ -9479,6 +9740,103 @@ mod tests {
         let _: fn(ProcessGeneration) -> ToolExecutionMutation = skip;
         let _ = prepare(ProcessGeneration::MIN);
         let _ = skip(ProcessGeneration::MAX);
+    }
+
+    #[tokio::test]
+    async fn tool_execution_prepare_rejects_identity_mismatch() {
+        let store = test_store().await;
+        let mut tx = store.pool().begin().await.expect("begin transaction");
+        sqlx::query(
+            "INSERT INTO tool_executions(
+                tool_call_id, command_id, run_id, executor_generation, state,
+                idempotency_key, started_at, finished_at, error_code
+             ) VALUES('call-1', 'cmd-a', 'run-a', 0, 'prepared', 'idem-a', NULL, NULL, NULL)",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("seed existing prepared row");
+
+        let mismatch = ToolExecutionMutation::Prepare {
+            tool_call_id: "call-1".to_owned(),
+            command_id: "cmd-b".to_owned(),
+            run_id: "run-b".to_owned(),
+            executor_generation: test_process_generation(1),
+            idempotency_key: "idem-b".to_owned(),
+        };
+        let result = apply_tool_mutation(&mut tx, mismatch).await;
+        assert!(
+            result.is_err_and(|e| e.to_string().contains("Prepare identity mismatch")),
+            "mismatched Prepare must fail closed"
+        );
+
+        sqlx::query(
+            "UPDATE tool_executions
+             SET state='running', started_at='2026-07-27T00:00:00Z'
+             WHERE tool_call_id='call-1'",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("advance existing tool beyond prepared");
+        let stale_replay = ToolExecutionMutation::Prepare {
+            tool_call_id: "call-1".to_owned(),
+            command_id: "cmd-a".to_owned(),
+            run_id: "run-a".to_owned(),
+            executor_generation: test_process_generation(0),
+            idempotency_key: "idem-a".to_owned(),
+        };
+        let result = apply_tool_mutation(&mut tx, stale_replay).await;
+        assert!(
+            result.is_err_and(|e| e.to_string().contains("Prepare identity mismatch")),
+            "same-identity Prepare must not replay after the durable state advanced"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_rule_replay_requires_exact_identity() {
+        let store = test_store().await;
+        let mut tx = store.pool().begin().await.expect("begin transaction");
+        let rule = ApprovalRuleMutation {
+            id: "rule-replay".to_owned(),
+            tool: "bash".to_owned(),
+            pattern: r#"{"effect":"allow","literal_prefix":["git","status"]}"#.to_owned(),
+        };
+
+        apply_plain_projection(
+            &store,
+            &mut tx,
+            Projection::ApprovalRule(rule.clone()),
+            &[],
+            None,
+        )
+        .await
+        .expect("insert approval rule");
+        apply_plain_projection(
+            &store,
+            &mut tx,
+            Projection::ApprovalRule(rule.clone()),
+            &[],
+            None,
+        )
+        .await
+        .expect("exact approval rule replay is idempotent");
+
+        let mismatch = ApprovalRuleMutation {
+            pattern: r#"{"effect":"deny","literal_prefix":["git","status"]}"#.to_owned(),
+            ..rule
+        };
+        let error = apply_plain_projection(
+            &store,
+            &mut tx,
+            Projection::ApprovalRule(mismatch),
+            &[],
+            None,
+        )
+        .await
+        .expect_err("same rule id with different identity must fail closed");
+        assert!(
+            error.to_string().contains("ApprovalRule identity mismatch"),
+            "{error:#}"
+        );
     }
 
     struct TestKeyProvider {
@@ -16565,6 +16923,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policy_allowed_prepare_and_start_are_one_retryable_transaction() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        seed_tool_owner(&store, &writer, "run-atomic-start").await;
+
+        let mut start = tool_start_write("tool-atomic-start", "run-atomic-start");
+        start.projections.insert(
+            0,
+            Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                tool_call_id: "tool-atomic-start".to_owned(),
+                command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                run_id: "run-atomic-start".to_owned(),
+                executor_generation: test_process_generation(1),
+                idempotency_key: "idem-atomic-start".to_owned(),
+            }),
+        );
+        let batch = EventBatch {
+            writes: vec![start],
+            injected_commands: Vec::new(),
+        };
+
+        let interrupted = writer
+            .apply_with_failpoint(batch.clone(), 1)
+            .await
+            .expect_err("failure after the combined write must roll back Prepare and Start");
+        assert!(
+            interrupted.to_string().contains("test failpoint"),
+            "unexpected failure: {interrupted:#}"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM tool_executions WHERE tool_call_id='tool-atomic-start'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("count rolled-back execution"),
+            0,
+            "a failed start commit must not leave a replay-blocking prepared row"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM agent_events
+                 WHERE event_type='tool_execution_start'
+                   AND json_extract(envelope, '$.tool_call_id')='tool-atomic-start'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("count rolled-back start event"),
+            0
+        );
+
+        writer
+            .apply(batch)
+            .await
+            .expect("retry after rollback must not hit a duplicate idempotency key");
+        assert_eq!(
+            sqlx::query_as::<_, (String, i64)>(
+                "SELECT
+                    (SELECT state FROM tool_executions
+                     WHERE tool_call_id='tool-atomic-start'),
+                    (SELECT COUNT(*) FROM agent_events
+                     WHERE event_type='tool_execution_start'
+                       AND json_extract(envelope, '$.tool_call_id')='tool-atomic-start')",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("coherent durable start lifecycle"),
+            ("running".to_owned(), 1)
+        );
+    }
+
+    #[tokio::test]
     async fn tool_prepare_and_start_require_ordered_canonical_assistant_message_end() {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
@@ -17171,6 +17601,220 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unrelated_approval_resolution_cannot_authorize_prepared_tool_cleanup() {
+        let run_id = "run-unrelated";
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        seed_tool_owner(&store, &writer, run_id).await;
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::new(&json!({
+                                "type": "approval_requested",
+                                "request": approval_request("request-1", "tool-1", "mutating"),
+                            }))
+                            .expect("approval request 1"),
+                        ),
+                        projections: vec![
+                            Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                                tool_call_id: "tool-1".to_owned(),
+                                command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                                run_id: run_id.to_owned(),
+                                executor_generation: test_process_generation(1),
+                                idempotency_key: "idem-tool-1".to_owned(),
+                            }),
+                            Projection::Approval(ApprovalMutation::Pending {
+                                request_id: "request-1".to_owned(),
+                                tool_call_id: "tool-1".to_owned(),
+                                run_id: run_id.to_owned(),
+                                turn_id: "turn-1".to_owned(),
+                            }),
+                        ],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::new(&json!({
+                                "type": "approval_requested",
+                                "request": approval_request("request-2", "tool-2", "mutating"),
+                            }))
+                            .expect("approval request 2"),
+                        ),
+                        projections: vec![
+                            Projection::ToolExecution(ToolExecutionMutation::Prepare {
+                                tool_call_id: "tool-2".to_owned(),
+                                command_id: TOOL_OWNER_COMMAND_ID.to_owned(),
+                                run_id: run_id.to_owned(),
+                                executor_generation: test_process_generation(1),
+                                idempotency_key: "idem-tool-2".to_owned(),
+                            }),
+                            Projection::Approval(ApprovalMutation::Pending {
+                                request_id: "request-2".to_owned(),
+                                tool_call_id: "tool-2".to_owned(),
+                                run_id: run_id.to_owned(),
+                                turn_id: "turn-1".to_owned(),
+                            }),
+                        ],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("seed two pending approvals with prepared tools");
+
+        writer
+            .persist_inbound(&approval_command_with_decision(
+                2,
+                "00000000-0000-4000-8000-000000000020",
+                "request-1",
+                ApprovalDecision::Deny,
+            ))
+            .await
+            .expect("persist denial command for request-1");
+
+        let bad_result = tool_result("tool-2", "unrelated denial cleanup", true);
+        let bad_error = writer
+            .apply(EventBatch {
+                writes: vec![
+                    approval_resolution_write(
+                        "request-1",
+                        "denied",
+                        "user-1",
+                        Some(("00000000-0000-4000-8000-000000000020", 2, run_id)),
+                    ),
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::new(&json!({
+                                "type": "tool_execution_end",
+                                "tool_call_id": "tool-2",
+                                "state": "cancelled",
+                                "result": bad_result.clone(),
+                                "is_error": true,
+                                "error_code": "approval_denied",
+                            }))
+                            .expect("unrelated cleanup tool end"),
+                        ),
+                        projections: vec![Projection::ToolExecution(
+                            ToolExecutionMutation::Finish {
+                                tool_call_id: "tool-2".to_owned(),
+                                expected: "prepared",
+                                state: "cancelled",
+                                error_code: Some("approval_denied"),
+                            },
+                        )],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_start", "tool-2-result", &bad_result)
+                                .expect("tool-2 result MessageStart"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_end", "tool-2-result", &bad_result)
+                                .expect("tool-2 result MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: "tool-2-result".to_owned(),
+                            role: "tool_result",
+                            message: bad_result,
+                            append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("unrelated approval denial must not authorize tool-2 cleanup");
+        assert!(bad_error
+            .to_string()
+            .contains("prepared ToolExecutionEnd for tool-2 is permitted only for cancellation or denial cleanup"));
+
+        writer
+            .persist_inbound(&approval_command_with_decision(
+                3,
+                "00000000-0000-4000-8000-000000000021",
+                "request-2",
+                ApprovalDecision::Deny,
+            ))
+            .await
+            .expect("persist denial command for request-2");
+
+        let ok_result = tool_result("tool-2", "denied for tool-2", true);
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    approval_resolution_write(
+                        "request-2",
+                        "denied",
+                        "user-2",
+                        Some(("00000000-0000-4000-8000-000000000021", 3, run_id)),
+                    ),
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::new(&json!({
+                                "type": "tool_execution_end",
+                                "tool_call_id": "tool-2",
+                                "state": "cancelled",
+                                "result": ok_result.clone(),
+                                "is_error": true,
+                                "error_code": "approval_denied",
+                            }))
+                            .expect("exact cleanup tool end"),
+                        ),
+                        projections: vec![Projection::ToolExecution(
+                            ToolExecutionMutation::Finish {
+                                tool_call_id: "tool-2".to_owned(),
+                                expected: "prepared",
+                                state: "cancelled",
+                                error_code: Some("approval_denied"),
+                            },
+                        )],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_start", "tool-2-ok", &ok_result)
+                                .expect("tool-2 ok MessageStart"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_end", "tool-2-ok", &ok_result)
+                                .expect("tool-2 ok MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: "tool-2-ok".to_owned(),
+                            role: "tool_result",
+                            message: ok_result,
+                            append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("exact request-2 denial may authorize tool-2 cleanup");
+        assert_eq!(
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT
+                    (SELECT state FROM approval_log WHERE id='request-2'),
+                    (SELECT state FROM tool_executions WHERE tool_call_id='tool-2')",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("exact denial cleanup state"),
+            ("denied".to_owned(), "cancelled".to_owned())
+        );
+    }
+
+    #[tokio::test]
     async fn approval_and_tool_transitions_share_event_writer_transactions() {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
@@ -17430,30 +18074,32 @@ mod tests {
 
         writer
             .apply(EventBatch {
-                writes: vec![approval_resolution_write(
-                    "request-1",
-                    "cancelled",
-                    "runtime",
-                    None,
-                )],
+                writes: vec![
+                    approval_resolution_write("request-1", "cancelled", "runtime", None),
+                    EventWrite {
+                        event: None,
+                        projections: vec![Projection::CommandApplied {
+                            command_id: "00000000-0000-4000-8000-000000000020".to_owned(),
+                            command_seq: 2,
+                            run_id: None,
+                        }],
+                    },
+                ],
                 injected_commands: Vec::new(),
             })
             .await
-            .expect("terminalize approval");
-        writer
-            .apply(EventBatch {
-                writes: vec![EventWrite {
-                    event: None,
-                    projections: vec![Projection::CommandApplied {
-                        command_id: "00000000-0000-4000-8000-000000000020".to_owned(),
-                        command_seq: 2,
-                        run_id: None,
-                    }],
-                }],
-                injected_commands: Vec::new(),
-            })
+            .expect("same-batch runtime cancellation permits the terminal no-op");
+        assert_eq!(
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT
+                    (SELECT status FROM inbound_commands WHERE seq=2),
+                    (SELECT state FROM approval_log WHERE id='request-1')",
+            )
+            .fetch_one(store.pool())
             .await
-            .expect("terminal approval permits a no-op");
+            .expect("atomic cancellation and command state"),
+            ("applied".to_owned(), "cancelled".to_owned())
+        );
         assert_eq!(
             writer
                 .persist_inbound(&pending_decision)
@@ -17801,9 +18447,18 @@ mod tests {
             .expect_err("approval can start only its pending tool");
         assert!(wrong_tool.to_string().contains("pending tool tool-2b"));
 
+        let approve_always_rule = json!({
+            "id":"rule-3",
+            "tool":"bash",
+            "literal_prefix":["git","status"],
+            "effect":"allow",
+            "workspace_only":true,
+            "allowed_permissions":["exec"],
+            "allowed_network_domains":[]
+        });
         let approve_always: ApprovalDecision = serde_json::from_value(json!({
             "type":"approve_always",
-            "rule":{"tool_name":"test","literal_prefix":["test"]}
+            "rule": approve_always_rule.clone()
         }))
         .expect("closed deferred ApproveAlways decision");
         let store = test_store().await;
@@ -17818,19 +18473,38 @@ mod tests {
             ))
             .await
             .expect("persist authenticated ApproveAlways");
-        let unsupported = writer
+        let mut resolution = approval_resolution_write(
+            "request-3",
+            "approved_always",
+            "user-3",
+            Some(("00000000-0000-4000-8000-000000000035", 2, "run-3")),
+        );
+        resolution
+            .projections
+            .push(Projection::ApprovalRule(ApprovalRuleMutation {
+                id: "rule-3".to_owned(),
+                tool: "bash".to_owned(),
+                pattern: serde_json::to_string(&approve_always_rule).expect("serialize rule"),
+            }));
+        writer
             .apply(EventBatch {
-                writes: vec![approval_resolution_write(
-                    "request-3",
-                    "approved_always",
-                    "user-3",
-                    Some(("00000000-0000-4000-8000-000000000035", 2, "run-3")),
-                )],
+                writes: vec![resolution],
                 injected_commands: Vec::new(),
             })
             .await
-            .expect_err("T12 must not invent a durable policy mutation");
-        assert!(unsupported.to_string().contains("T22/T23"));
+            .expect("ApproveAlways resolves with its durable policy mutation");
+        assert_eq!(
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT
+                    (SELECT status FROM inbound_commands
+                     WHERE command_id='00000000-0000-4000-8000-000000000035'),
+                    (SELECT tool FROM approval_rules WHERE id='rule-3')",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("durable ApproveAlways state"),
+            ("applied".to_owned(), "bash".to_owned())
+        );
 
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
@@ -17902,6 +18576,293 @@ mod tests {
             .await
             .expect_err("tampered durable command must not resolve approval");
         assert!(format!("{tampered:#}").contains("HMAC"));
+    }
+
+    #[tokio::test]
+    async fn approve_always_accepts_only_broker_authorized_normalizations() {
+        fn deferred_rule(value: Value) -> ApprovalDecision {
+            ApprovalDecision::ApproveAlways {
+                rule: serde_json::from_value::<DeferredApprovalRule>(value)
+                    .expect("object deferred rule"),
+            }
+        }
+
+        let unsafe_rule = json!({
+            "id": "rule-unsafe",
+            "tool": "bash",
+            "literal_prefix": ["git"],
+            "effect": "allow",
+            "workspace_only": true,
+            "allowed_permissions": ["exec"],
+            "allowed_network_domains": []
+        });
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        seed_pending_approval(
+            &store,
+            &writer,
+            "request-normalized",
+            "tool-normalized",
+            "run-normalized",
+        )
+        .await;
+        let normalized_command = approval_command_with_decision(
+            2,
+            "00000000-0000-4000-8000-000000000210",
+            "request-normalized",
+            deferred_rule(unsafe_rule.clone()),
+        );
+        writer
+            .persist_inbound(&normalized_command)
+            .await
+            .expect("persist authenticated ApproveAlways");
+
+        let missing_start = writer
+            .apply(EventBatch {
+                writes: vec![approval_resolution_write(
+                    "request-normalized",
+                    "approved_once",
+                    "user-normalized",
+                    Some(("00000000-0000-4000-8000-000000000210", 2, "run-normalized")),
+                )],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("one-shot normalization must atomically start the pending tool");
+        assert!(
+            missing_start
+                .to_string()
+                .contains("must atomically start its pending tool")
+        );
+
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    approval_resolution_write(
+                        "request-normalized",
+                        "approved_once",
+                        "user-normalized",
+                        Some(("00000000-0000-4000-8000-000000000210", 2, "run-normalized")),
+                    ),
+                    tool_start_write("tool-normalized", "run-normalized"),
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("broker-authorized one-shot normalization");
+        assert_eq!(
+            sqlx::query_as::<_, (String, String, String, i64)>(
+                "SELECT
+                    (SELECT status FROM inbound_commands WHERE seq=2),
+                    (SELECT state FROM approval_log WHERE id='request-normalized'),
+                    (SELECT state FROM tool_executions WHERE tool_call_id='tool-normalized'),
+                    (SELECT COUNT(*) FROM approval_rules)",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("normalized durable state"),
+            (
+                "applied".to_owned(),
+                "approved_once".to_owned(),
+                "running".to_owned(),
+                0
+            )
+        );
+        let replay = writer
+            .persist_inbound(&normalized_command)
+            .await
+            .expect("replay normalized command");
+        assert_eq!(replay.seq, 2);
+        assert_eq!(replay.status, CommandAckStatus::Applied);
+
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        seed_pending_approval(
+            &store,
+            &writer,
+            "request-rejected",
+            "tool-rejected",
+            "run-rejected",
+        )
+        .await;
+        let rejected_command = approval_command_with_decision(
+            2,
+            "00000000-0000-4000-8000-000000000211",
+            "request-rejected",
+            deferred_rule(json!({"malformed": true})),
+        );
+        writer
+            .persist_inbound(&rejected_command)
+            .await
+            .expect("persist malformed authenticated ApproveAlways");
+        writer
+            .apply(EventBatch {
+                writes: vec![approval_resolution_write(
+                    "request-rejected",
+                    "denied",
+                    "user-rejected",
+                    Some(("00000000-0000-4000-8000-000000000211", 2, "run-rejected")),
+                )],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("conservative denial normalization");
+        assert_eq!(
+            sqlx::query_as::<_, (String, String, i64)>(
+                "SELECT
+                    (SELECT status FROM inbound_commands WHERE seq=2),
+                    (SELECT state FROM approval_log WHERE id='request-rejected'),
+                    (SELECT COUNT(*) FROM approval_rules)",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("denied durable state"),
+            ("applied".to_owned(), "denied".to_owned(), 0)
+        );
+        let replay = writer
+            .persist_inbound(&rejected_command)
+            .await
+            .expect("replay rejected command");
+        assert_eq!(replay.seq, 2);
+        assert_eq!(replay.status, CommandAckStatus::Applied);
+
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        seed_pending_approval(&store, &writer, "request-empty", "tool-empty", "run-empty").await;
+        let empty_id_rule = json!({
+            "id": "",
+            "tool": "bash",
+            "literal_prefix": ["git", "status"],
+            "effect": "allow",
+            "workspace_only": true,
+            "allowed_permissions": ["exec"],
+            "allowed_network_domains": []
+        });
+        writer
+            .persist_inbound(&approval_command_with_decision(
+                2,
+                "00000000-0000-4000-8000-000000000212",
+                "request-empty",
+                deferred_rule(empty_id_rule),
+            ))
+            .await
+            .expect("persist empty-id ApproveAlways");
+        let normalized_rule = json!({
+            "id": "request-empty",
+            "tool": "bash",
+            "literal_prefix": ["git", "status"],
+            "effect": "allow",
+            "workspace_only": true,
+            "allowed_permissions": ["exec"],
+            "allowed_network_domains": []
+        });
+        let mut resolution = approval_resolution_write(
+            "request-empty",
+            "approved_always",
+            "user-empty",
+            Some(("00000000-0000-4000-8000-000000000212", 2, "run-empty")),
+        );
+        resolution
+            .projections
+            .push(Projection::ApprovalRule(ApprovalRuleMutation {
+                id: "request-empty".to_owned(),
+                tool: "bash".to_owned(),
+                pattern: serde_json::to_string(&normalized_rule).expect("normalized rule"),
+            }));
+        writer
+            .apply(EventBatch {
+                writes: vec![resolution],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("empty id is normalized to the authenticated request id");
+        assert_eq!(
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT id, tool FROM approval_rules WHERE id='request-empty'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("normalized durable rule"),
+            ("request-empty".to_owned(), "bash".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_approval_rule_id_in_one_batch_is_rejected() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let run_id = "run-dup-rule";
+        seed_pending_approval(&store, &writer, "request-dup-1", "tool-dup-1", run_id).await;
+        seed_pending_approval(&store, &writer, "request-dup-2", "tool-dup-2", run_id).await;
+
+        let rule_value = json!({
+            "id": "rule-dup",
+            "tool": "bash",
+            "literal_prefix": ["git", "status"],
+            "effect": "allow",
+            "workspace_only": true,
+            "allowed_permissions": ["exec"],
+            "allowed_network_domains": []
+        });
+        let decision = ApprovalDecision::ApproveAlways {
+            rule: serde_json::from_value::<DeferredApprovalRule>(rule_value.clone())
+                .expect("deferred rule"),
+        };
+        writer
+            .persist_inbound(&approval_command_with_decision(
+                2,
+                "00000000-0000-4000-8000-000000000200",
+                "request-dup-1",
+                decision.clone(),
+            ))
+            .await
+            .expect("persist first approval command");
+        writer
+            .persist_inbound(&approval_command_with_decision(
+                3,
+                "00000000-0000-4000-8000-000000000201",
+                "request-dup-2",
+                decision,
+            ))
+            .await
+            .expect("persist second approval command");
+
+        let mut write1 = approval_resolution_write(
+            "request-dup-1",
+            "approved_always",
+            "user-dup",
+            Some(("00000000-0000-4000-8000-000000000200", 2, run_id)),
+        );
+        write1
+            .projections
+            .push(Projection::ApprovalRule(ApprovalRuleMutation {
+                id: "rule-dup".to_owned(),
+                tool: "bash".to_owned(),
+                pattern: rule_value.to_string(),
+            }));
+
+        let mut write2 = approval_resolution_write(
+            "request-dup-2",
+            "approved_always",
+            "user-dup",
+            Some(("00000000-0000-4000-8000-000000000201", 3, run_id)),
+        );
+        write2
+            .projections
+            .push(Projection::ApprovalRule(ApprovalRuleMutation {
+                id: "rule-dup".to_owned(),
+                tool: "bash".to_owned(),
+                pattern: rule_value.to_string(),
+            }));
+
+        let error = writer
+            .apply(EventBatch {
+                writes: vec![write1, write2],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("duplicate approval rule id in one batch must fail");
+        assert!(error.to_string().contains("duplicate approval rule insert"));
     }
 
     #[tokio::test]

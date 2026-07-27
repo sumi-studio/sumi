@@ -154,7 +154,7 @@ pub(crate) enum PublicStreamEvent {
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ApprovalRequest {
+pub struct ApprovalRequest {
     pub id: String,
     pub tool_call_id: String,
     pub tool_name: String,
@@ -166,14 +166,14 @@ pub(crate) struct ApprovalRequest {
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ReviewProjection {
+pub enum ReviewProjection {
     Reviewable(Value),
     InsufficientEvidence { reason: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AuditDecision {
+pub struct AuditDecision {
     pub outcome: AuditOutcome,
     pub risk: RiskLevel,
     pub authorization: UserAuthorization,
@@ -182,14 +182,14 @@ pub(crate) struct AuditDecision {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum AuditOutcome {
+pub enum AuditOutcome {
     Allow,
     Deny,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum RiskLevel {
+pub enum RiskLevel {
     Low,
     Medium,
     High,
@@ -198,7 +198,7 @@ pub(crate) enum RiskLevel {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum UserAuthorization {
+pub enum UserAuthorization {
     Unknown,
     Low,
     Medium,

@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     future::{Future, pending},
     sync::{
         Arc, Mutex,
@@ -17,6 +18,7 @@ use serde_json::Value;
 
 use super::*;
 use crate::store::KeyProvider;
+use crate::store::{PendingApprovalRecovery, Redactor};
 use crate::{
     gateway::{CommandAck, CommandId},
     provider::types::{
@@ -35,6 +37,17 @@ use crate::{
     tools::{
         Tool, ToolCtx, ToolError, ToolOutput, ToolRegistryBuilder, ToolRisk, WorkspacePaths,
         text_output,
+    },
+};
+
+use crate::approval::{
+    ApprovalBroker, ApprovalOutcome, ApprovalPolicyBundle, ApprovalPolicyTrustStore, ApprovalRule,
+    RuleEffect,
+    action::{Permission, SandboxSummary, SecretAwareActionProjector, SecretDigestKey},
+    prompt::{ReviewerPrompt, TrustedEnvironment},
+    reviewer::{
+        AuditDecision, AuditOutcome, Reviewer, ReviewerMode, ReviewerModelSpec, ReviewerTransport,
+        ReviewerTransportError, ReviewerTrustSet, RiskLevel, UserAuthorization,
     },
 };
 
@@ -507,7 +520,7 @@ fn applied_acks(frames: &Arc<Mutex<Vec<OutboundFrame>>>) -> Vec<CommandAck> {
 }
 
 async fn session(gateway: MockGateway, worker: Arc<dyn RunWorker>) -> Session<MockGateway> {
-    session_with_core(gateway, worker, RunCore::new()).await
+    session_with_core(gateway, worker, RunCore::fixture_with_unapproved_tools()).await
 }
 
 async fn session_with_core(
@@ -688,7 +701,7 @@ async fn session_rejects_worker_output_with_any_changed_durable_binding() {
         let session = Session::start(
             store,
             gateway,
-            RunCore::new(),
+            RunCore::fixture_with_unapproved_tools(),
             Arc::new(StaleBindingWorker(kind)),
             test_executor_generation(),
         )
@@ -895,7 +908,7 @@ async fn active_session_uses_durable_backpressure_before_its_bounded_fifo_can_ov
     let mut session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -980,7 +993,7 @@ async fn active_session_keeps_early_reserved_abort_and_remaining_ordinary_window
     let mut session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -1142,7 +1155,7 @@ async fn typed_worker_failures_report_recovered_ownership() {
                 }
             },
         );
-        let core = RunCore::new();
+        let core = RunCore::fixture_with_unapproved_tools();
         let ownership_id = core.ownership_id();
         let task = tokio::spawn(session_with_core(gateway, worker, core).await.run());
         commands.send(user(1)).await.expect("command");
@@ -1187,7 +1200,7 @@ async fn fixture_adapter_event_loss_drains_bounded_lane_and_returns_the_actual_c
         unreachable!()
     };
     let initial = AdmittedCommand::new(envelope, Utc::now());
-    let mut core = RunCore::new();
+    let mut core = RunCore::fixture_with_unapproved_tools();
     let ownership_id = core.ownership_id();
     core.durable_binding = Some(DurableRunBinding::idle(
         &initial,
@@ -1427,7 +1440,7 @@ async fn shutdown_drains_ready_completion_outputs_before_recovering_core_after_g
         Session::start(
             store,
             gateway,
-            RunCore::new(),
+            RunCore::fixture_with_unapproved_tools(),
             worker,
             test_executor_generation(),
         )
@@ -1473,7 +1486,7 @@ async fn event_drain_send_failure_preserves_ready_completion_core() {
     } = controlled_gateway();
     let release = Arc::new(Notify::new());
     let (started_tx, mut started_rx) = mpsc::channel(1);
-    let core = RunCore::new();
+    let core = RunCore::fixture_with_unapproved_tools();
     let ownership_id = core.ownership_id();
     let worker: Arc<dyn RunWorker> = Arc::new({
         let release = release.clone();
@@ -1567,7 +1580,7 @@ async fn completion_drain_persists_all_outputs_before_recovering_mutated_core_af
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -1711,7 +1724,7 @@ async fn t15_recovery_gate_allows_only_t12_prefix_exact_retransmission() {
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -1866,6 +1879,13 @@ async fn fixture_bridge_after_assistant(
             .await
             .expect("approval fixture store"),
     );
+    fixture_bridge_after_assistant_in_store(store, assistant).await
+}
+
+async fn fixture_bridge_after_assistant_in_store(
+    store: Arc<Store>,
+    assistant: PublicMessage,
+) -> (Arc<Store>, EventWriter, DurableBridge, DurableRunBinding) {
     let writer = EventWriter::new(store.clone());
     let inbound = user(1);
     writer
@@ -1971,7 +1991,7 @@ async fn fixture_pending_and_runtime_cancellation_cross_the_durable_bridge_atomi
         .commit(
             &writer,
             RunOutput::detached(
-                binding,
+                binding.clone(),
                 AgentEvent::ApprovalResolved {
                     request_id: request.id,
                     resolution: ApprovalResolution::Cancelled,
@@ -1992,6 +2012,265 @@ async fn fixture_pending_and_runtime_cancellation_cross_the_durable_bridge_atomi
         .await
         .expect("approval cancellation transaction"),
         ("cancelled".to_owned(), 1)
+    );
+
+    let result = PublicMessage::ToolResult(ToolResultMessage {
+        tool_call_id: request.tool_call_id.clone(),
+        tool_name: request.tool_name,
+        content: vec![UserContent::Text {
+            text: "Tool execution cancelled".to_owned(),
+        }],
+        details: serde_json::json!({"error": "Tool execution cancelled"}),
+        is_error: true,
+        timestamp: Utc::now(),
+    });
+    for event in [
+        AgentEvent::MessageStart {
+            message_id: "approval-cancelled-result".to_owned(),
+            message: Box::new(result.clone()),
+        },
+        AgentEvent::MessageEnd {
+            message_id: "approval-cancelled-result".to_owned(),
+            message: Box::new(result),
+        },
+    ] {
+        bridge
+            .commit(&writer, RunOutput::detached(binding.clone(), event, None))
+            .await
+            .expect("prepared approval cleanup updates instead of reinserting");
+    }
+    assert_eq!(
+        sqlx::query_as::<_, (String, String, i64)>(
+            "SELECT state, error_code,
+                    (SELECT COUNT(*) FROM tool_executions
+                     WHERE tool_call_id='approval-tool')
+             FROM tool_executions WHERE tool_call_id='approval-tool'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("cancelled prepared tool"),
+        ("cancelled".to_owned(), "approval_cancelled".to_owned(), 1)
+    );
+}
+
+#[tokio::test]
+async fn idle_approval_cancellation_keeps_broker_pending_until_durable_retry_commits() {
+    let (store, writer, mut bridge, binding, _) =
+        approval_fixture_bridge("idle-approval-cancellation-atomic").await;
+    let broker = Arc::new(ApprovalBroker::new(
+        crate::approval::policy::Policy::new("/workspace"),
+        SecretAwareActionProjector::new(Redactor::v1(), SecretDigestKey::fixture()),
+        None,
+        ReviewerMode::User,
+        false,
+        trusted_env(),
+    ));
+    let call = ToolCall {
+        id: "approval-tool".to_owned(),
+        name: "bash".to_owned(),
+        arguments: serde_json::from_value(serde_json::json!({"command": "git status"}))
+            .expect("validated bash arguments"),
+    };
+    let pending = match broker
+        .start_request(
+            &call,
+            &[],
+            &binding.run_id,
+            &binding.turn_id,
+            "v1",
+            CancellationToken::new(),
+        )
+        .await
+        .expect("start pending approval")
+    {
+        ApprovalOutcome::Pending { pending } => pending,
+        outcome => panic!("expected pending approval, got {outcome:?}"),
+    };
+    let request = pending.request().clone();
+    bridge
+        .commit(
+            &writer,
+            RunOutput::detached(
+                binding,
+                AgentEvent::ApprovalRequested {
+                    request: request.clone(),
+                },
+                None,
+            ),
+        )
+        .await
+        .expect("persist pending approval");
+    let pool = store.pool().clone();
+    sqlx::query(
+        "CREATE TRIGGER reject_idle_approval_cancel
+         BEFORE UPDATE OF state ON tool_executions
+         WHEN NEW.state = 'cancelled'
+         BEGIN SELECT RAISE(ABORT, 'fixture rejects idle cancellation'); END",
+    )
+    .execute(&pool)
+    .await
+    .expect("install cancellation failpoint");
+
+    drop(bridge);
+    drop(writer);
+    let store = match Arc::try_unwrap(store) {
+        Ok(store) => store,
+        Err(_) => panic!("fixture bridge must release the Store before Session starts"),
+    };
+    let (gateway, _commands, frames) = gateway();
+    let worker: Arc<dyn RunWorker> = Arc::new(SequentialRunWorker::new(
+        ApprovalTestDriver::with_tool_call(Arc::new(AtomicBool::new(false))),
+    ));
+    let mut core = RunCore::fixture_with_unapproved_tools();
+    core.set_approval(broker.clone());
+    let mut session = Session::start(store, gateway, core, worker, test_executor_generation())
+        .await
+        .expect("session startup");
+    let decision = approval_always_decision(2, &request.id);
+    session
+        .writer
+        .persist_inbound(&decision)
+        .await
+        .expect("persist approval decision");
+    let InboundCommand::Valid(envelope) = decision else {
+        unreachable!("fixture decision is valid")
+    };
+    let command = AdmittedCommand::new(envelope, Utc::now());
+
+    session
+        .apply_idle_approval_decision(command.clone())
+        .await
+        .expect_err("failed durable cancellation must force safe session replay");
+    assert!(
+        broker.has_pending(&request.id),
+        "broker must remain pending after rollback"
+    );
+    assert_eq!(
+        sqlx::query_as::<_, (String, String, i64)>(
+            "SELECT
+                (SELECT state FROM approval_log WHERE id = ?),
+                (SELECT state FROM tool_executions WHERE tool_call_id = 'approval-tool'),
+                (SELECT COUNT(*) FROM approval_rules)",
+        )
+        .bind(&request.id)
+        .fetch_one(&pool)
+        .await
+        .expect("rollback state"),
+        ("pending".to_owned(), "prepared".to_owned(), 0)
+    );
+    assert!(
+        !frames.lock().expect("frames").iter().any(|frame| matches!(
+            frame,
+            OutboundFrame::CommandAck { ack }
+                if ack.command_id == command.envelope().command_id.as_str()
+                    && matches!(
+                        ack.status,
+                        CommandAckStatus::Applied | CommandAckStatus::Rejected
+                    )
+        )),
+        "failed persistence must emit no terminal ACK"
+    );
+    drop(pending);
+}
+
+#[tokio::test]
+async fn late_approval_storage_failure_replays_through_durable_ingress_without_terminal_reject() {
+    let store = Store::session_test_store("late-approval-storage-replay")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (gateway, _commands, frames) = gateway();
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |_core: RunCore,
+         _initial: AdmittedCommand,
+         _controls: mpsc::Receiver<RunControl>,
+         _events: mpsc::Sender<AgentEvent>| async move { pending::<RunCompletion>().await },
+    );
+    let mut session = Session::start(
+        store,
+        gateway,
+        RunCore::fixture_with_unapproved_tools(),
+        worker,
+        test_executor_generation(),
+    )
+    .await
+    .expect("session startup");
+    sqlx::query(
+        "CREATE TRIGGER reject_late_approval_apply
+         BEFORE UPDATE OF status ON inbound_commands
+         WHEN OLD.seq = 1 AND NEW.status = 'applied'
+         BEGIN SELECT RAISE(ABORT, 'fixture rejects late approval apply'); END",
+    )
+    .execute(&pool)
+    .await
+    .expect("install no-op apply failpoint");
+    let command = approval_decision(1, "unknown-request");
+    let command_id = match &command {
+        InboundCommand::Valid(envelope) => envelope.command_id.to_string(),
+        _ => unreachable!("approval fixture is valid"),
+    };
+
+    session
+        .admit_and_route(command.clone())
+        .await
+        .expect_err("storage refusal must fail the production ingress path");
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM inbound_commands WHERE seq = 1")
+            .fetch_one(&pool)
+            .await
+            .expect("received command row"),
+        "received"
+    );
+    assert!(
+        !frames.lock().expect("frames").iter().any(|frame| matches!(
+            frame,
+            OutboundFrame::CommandAck { ack }
+                if ack.command_id == command_id
+                    && matches!(
+                        ack.status,
+                        CommandAckStatus::Applied | CommandAckStatus::Rejected
+                    )
+        )),
+        "failed production ingress must expose no terminal ACK"
+    );
+
+    sqlx::query("DROP TRIGGER reject_late_approval_apply")
+        .execute(&pool)
+        .await
+        .expect("remove no-op apply failpoint");
+    assert!(
+        SuffixRecovery::recover_t12_prefix(session.writer.store(), &session.writer)
+            .await
+            .expect("startup recovery applies the durable no-op")
+            .is_empty()
+    );
+    session
+        .admit_and_route(command)
+        .await
+        .expect("production ingress replays the recovered terminal ACK");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if frames.lock().expect("frames").iter().any(|frame| {
+                matches!(
+                    frame,
+                    OutboundFrame::CommandAck { ack }
+                        if ack.command_id == command_id
+                            && ack.status == CommandAckStatus::Applied
+                )
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("replayed Applied ACK");
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM inbound_commands WHERE seq = 1")
+            .fetch_one(&pool)
+            .await
+            .expect("recovered command row"),
+        "applied"
     );
 }
 
@@ -2078,7 +2357,7 @@ async fn pending_fixture_approval_is_a_fail_closed_t12_restart_suffix() {
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -2088,6 +2367,250 @@ async fn pending_fixture_approval_is_a_fail_closed_t12_restart_suffix() {
         session.recovery_steps.as_slice(),
         [RecoveryStep::ResumeAssistantFromDurableEvents { .. }]
     ));
+}
+
+#[tokio::test]
+async fn hydrated_recovery_exposes_pending_real_broker_cancellation_before_saved_steer() {
+    let mut assistant = approval_fixture_assistant("approval-tool");
+    let PublicMessage::Assistant(assistant_message) = &mut assistant else {
+        unreachable!("approval fixture assistant")
+    };
+    let PublicAssistantContent::ToolCall { tool_call, .. } = &mut assistant_message.content[0]
+    else {
+        unreachable!("approval fixture tool call")
+    };
+    tool_call.name = "bash".to_owned();
+    tool_call.arguments = serde_json::from_value(serde_json::json!({"command":"git status"}))
+        .expect("validated bash approval arguments");
+    let broker_tool_call = tool_call.clone();
+    let (store, writer, mut bridge, binding) =
+        fixture_bridge_after_assistant("durable-approval-hydration-seam", assistant).await;
+    let broker = ApprovalBroker::new(
+        crate::approval::policy::Policy::new("/workspace"),
+        make_projector(),
+        None,
+        ReviewerMode::User,
+        false,
+        trusted_env(),
+    );
+    let outcome = broker
+        .start_request(
+            &broker_tool_call,
+            &[],
+            &binding.run_id,
+            &binding.turn_id,
+            "v1",
+            CancellationToken::new(),
+        )
+        .await
+        .expect("real broker pending request");
+    let ApprovalOutcome::Pending { pending } = outcome else {
+        panic!("real broker must enter pending approval")
+    };
+    let request = pending.request().clone();
+    bridge
+        .commit(
+            &writer,
+            RunOutput::detached(
+                binding.clone(),
+                AgentEvent::ApprovalRequested {
+                    request: request.clone(),
+                },
+                None,
+            ),
+        )
+        .await
+        .expect("commit real pending approval before restart");
+
+    let steer = user(2);
+    writer
+        .persist_inbound(&steer)
+        .await
+        .expect("persist saved soft steer");
+    let InboundCommand::Valid(steer_envelope) = steer else {
+        unreachable!("soft steer fixture is valid")
+    };
+    let steer_id = steer_envelope.command_id.to_string();
+    bridge
+        .bind_soft_steer(&writer, AdmittedCommand::new(steer_envelope, Utc::now()))
+        .await
+        .expect("durably classify saved soft steer");
+    let steer_turn_id: String =
+        sqlx::query_scalar("SELECT turn_id FROM inbound_commands WHERE command_id = ?")
+            .bind(&steer_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("saved steer turn binding");
+
+    let lease = ProcessGenerationLease::new(test_executor_generation(), "approval-recovery-lease")
+        .expect("valid recovery lease");
+    let fence = GenerationRecoveryFence::new(&lease, "approval-recovery-fence")
+        .expect("valid recovery fence");
+    let hydrated = store
+        .hydrate(&lease, &fence)
+        .await
+        .expect("authenticated hydration");
+    let HydrationOutcome::Complete(hydrated) = hydrated else {
+        panic!("prepared approval requires logical-only recovery")
+    };
+    let steps = hydrated.recovery_steps;
+    assert_eq!(
+        steps,
+        vec![
+            RecoveryStep::CancelPendingApproval {
+                command_id: binding.command_id,
+                run_id: binding.run_id.clone(),
+                turn_id: binding.turn_id,
+                request_id: request.id,
+                tool_call_id: request.tool_call_id,
+            },
+            RecoveryStep::InjectStoredGroup {
+                run_id: binding.run_id,
+                turn_id: steer_turn_id,
+                application_kind: crate::store::ApplicationKind::SoftSteer,
+                command_ids: vec![steer_id],
+            },
+        ],
+        "T26 must consume the typed cancellation seam before injecting the saved group exactly once"
+    );
+    drop(pending);
+}
+
+#[tokio::test]
+async fn abort_cutoff_restart_carries_pending_approval_into_atomic_cancellation_suffix() {
+    let root = std::env::temp_dir().join(format!(
+        "sumi-approval-abort-cutoff-restart-{}",
+        uuid::Uuid::now_v7()
+    ));
+    std::fs::create_dir_all(&root).expect("create approval restart fixture root");
+    let database_path = root.join("agent.db");
+
+    let mut assistant = approval_fixture_assistant("approval-abort-tool");
+    let PublicMessage::Assistant(assistant_message) = &mut assistant else {
+        unreachable!("approval fixture assistant")
+    };
+    let PublicAssistantContent::ToolCall { tool_call, .. } = &mut assistant_message.content[0]
+    else {
+        unreachable!("approval fixture tool call")
+    };
+    tool_call.name = "bash".to_owned();
+    tool_call.arguments = serde_json::from_value(serde_json::json!({"command":"git status"}))
+        .expect("validated bash approval arguments");
+    let broker_tool_call = tool_call.clone();
+
+    let store = Arc::new(open_kill_restart_store(&database_path).await);
+    let (store, writer, mut bridge, binding) =
+        fixture_bridge_after_assistant_in_store(store, assistant).await;
+    let broker = ApprovalBroker::new(
+        crate::approval::policy::Policy::new("/workspace"),
+        make_projector(),
+        None,
+        ReviewerMode::User,
+        false,
+        trusted_env(),
+    );
+    let outcome = broker
+        .start_request(
+            &broker_tool_call,
+            &[],
+            &binding.run_id,
+            &binding.turn_id,
+            "v1",
+            CancellationToken::new(),
+        )
+        .await
+        .expect("real broker pending request");
+    let ApprovalOutcome::Pending { pending } = outcome else {
+        panic!("real broker must enter pending approval")
+    };
+    let request = pending.request().clone();
+    bridge
+        .commit(
+            &writer,
+            RunOutput::detached(
+                binding.clone(),
+                AgentEvent::ApprovalRequested {
+                    request: request.clone(),
+                },
+                None,
+            ),
+        )
+        .await
+        .expect("commit pending approval before Abort");
+
+    let abort = abort(2);
+    writer
+        .persist_inbound(&abort)
+        .await
+        .expect("persist active Abort");
+    let InboundCommand::Valid(abort_envelope) = abort else {
+        unreachable!("Abort fixture is valid")
+    };
+    bridge
+        .bind_abort(&writer, AdmittedCommand::new(abort_envelope, Utc::now()))
+        .await
+        .expect("commit active-Abort cutoff");
+
+    assert_eq!(
+        sqlx::query_as::<_, (String, String, String, String)>(
+            "SELECT
+                (SELECT run_phase FROM inbound_commands WHERE seq=1),
+                (SELECT status FROM inbound_commands WHERE seq=2),
+                (SELECT state FROM approval_log WHERE id=?),
+                (SELECT state FROM tool_executions WHERE tool_call_id=?)",
+        )
+        .bind(&request.id)
+        .bind(&request.tool_call_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("post-Abort crash boundary"),
+        (
+            "cancel_requested".to_owned(),
+            "applied".to_owned(),
+            "pending".to_owned(),
+            "prepared".to_owned(),
+        ),
+        "fixture must stop after the durable Abort cutoff and before approval cancellation output"
+    );
+
+    // Simulate the process dying at the exact boundary above. No
+    // ApprovalResolved/ToolResult is emitted before the file-backed Store is
+    // closed and reopened.
+    drop(pending);
+    drop(broker);
+    drop(bridge);
+    drop(writer);
+    store.pool().close().await;
+    drop(store);
+
+    let store = open_kill_restart_store(&database_path).await;
+    let lease = ProcessGenerationLease::new(test_executor_generation(), "abort-approval-lease")
+        .expect("valid recovery lease");
+    let fence =
+        GenerationRecoveryFence::new(&lease, "abort-approval-fence").expect("valid recovery fence");
+    let hydrated = store
+        .hydrate(&lease, &fence)
+        .await
+        .expect("authenticated restart hydration");
+    let HydrationOutcome::Complete(hydrated) = hydrated else {
+        panic!("prepared approval requires logical-only recovery")
+    };
+    assert_eq!(
+        hydrated.recovery_steps,
+        vec![RecoveryStep::ResumeCancellationFromDurableEvents {
+            command_id: binding.command_id,
+            run_id: binding.run_id,
+            turn_id: binding.turn_id,
+            pending_approval: Some(PendingApprovalRecovery {
+                request_id: request.id,
+                tool_call_id: request.tool_call_id,
+            }),
+        }],
+        "T26 must receive the typed approval identity inside the atomic Abort cancellation suffix"
+    );
+    store.pool().close().await;
+    drop(store);
+    std::fs::remove_dir_all(&root).expect("remove approval restart fixture root");
 }
 
 #[tokio::test]
@@ -2236,7 +2759,7 @@ async fn active_second_user_stays_received_then_runs_after_the_current_agent_end
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -2373,7 +2896,7 @@ async fn active_user_then_abort_is_cut_off_after_agent_end_without_starting_user
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -2444,7 +2967,7 @@ async fn active_abort_then_user_applies_abort_before_starting_later_user() {
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -2554,7 +3077,7 @@ async fn active_abort_supersedes_deferred_user_message_and_owner_applied() {
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -3115,7 +3638,7 @@ async fn sequential_worker_makes_progress_with_multiple_rejected_result_receipts
     let mut session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         Arc::new(SequentialRunWorker::new(driver.clone())),
         test_executor_generation(),
     )
@@ -3215,7 +3738,7 @@ async fn malformed_rejection_terminal_correspondence_fails_closed_without_receip
         let mut session = Session::start(
             store,
             gateway,
-            RunCore::new(),
+            RunCore::fixture_with_unapproved_tools(),
             Arc::new(SequentialRunWorker::new(driver)),
             test_executor_generation(),
         )
@@ -3265,7 +3788,7 @@ async fn tool_driver_observes_running_only_after_start_commit() {
     let mut session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         Arc::new(SequentialRunWorker::new(driver.clone())),
         test_executor_generation(),
     )
@@ -3326,7 +3849,7 @@ async fn rpc_indeterminate_after_start_fails_worker_and_leaves_durable_tool_runn
     let mut session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         Arc::new(SequentialRunWorker::new(driver.clone())),
         test_executor_generation(),
     )
@@ -3420,7 +3943,7 @@ async fn rejected_running_transition_never_calls_driver_or_publishes_start() {
     let mut session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         Arc::new(SequentialRunWorker::new(driver.clone())),
         test_executor_generation(),
     )
@@ -3439,12 +3962,16 @@ async fn rejected_running_transition_never_calls_driver_or_publishes_start() {
             .contains("fixture rejects running transition")
     );
     assert_eq!(driver.executions.load(Ordering::SeqCst), 0);
-    let state: String =
-        sqlx::query_scalar("SELECT state FROM tool_executions WHERE tool_call_id='barrier-call'")
-            .fetch_one(&pool)
-            .await
-            .expect("prepared tool row");
-    assert_eq!(state, "prepared");
+    let execution_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM tool_executions WHERE tool_call_id='barrier-call'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("tool execution row count");
+    assert_eq!(
+        execution_rows, 0,
+        "rejected atomic Prepare+Start must not leave a replay-blocking prepared row"
+    );
     assert!(frames.lock().expect("frames").iter().all(|frame| {
         !matches!(frame, OutboundFrame::Event { envelope }
             if envelope.event["type"] == "tool_execution_start")
@@ -3514,7 +4041,7 @@ async fn blocked_writer_drops_only_volatile_suffix_and_preserves_terminal_reserv
     let mut session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -3588,7 +4115,7 @@ async fn idle_gateway_eof_aborts_a_blocked_writer_without_hanging() {
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -3653,7 +4180,7 @@ async fn aborting_session_drops_blocked_writer_and_active_worker() {
             .await
             .expect("test store"),
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -3988,7 +4515,7 @@ async fn durable_bridge_commits_each_event_before_gateway_delivery_with_exact_se
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -4113,9 +4640,15 @@ async fn assert_first_length_tool_call_persists_generation(executor_generation: 
             RunCompletion::Completed(core)
         },
     );
-    let session = Session::start(store, gateway, RunCore::new(), worker, executor_generation)
-        .await
-        .expect("session");
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::fixture_with_unapproved_tools(),
+        worker,
+        executor_generation,
+    )
+    .await
+    .expect("session");
     let task = tokio::spawn(session.run());
     commands.send(user(1)).await.expect("command");
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -4259,7 +4792,7 @@ async fn consecutive_length_guard_error_is_durably_not_started_and_closes_normal
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -4478,7 +5011,7 @@ async fn mixed_valid_and_rejected_calls_commit_the_rejected_pair_before_valid_li
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -4577,7 +5110,7 @@ async fn failed_idle_injection_batch_publishes_no_partial_event_frame() {
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -4678,7 +5211,7 @@ async fn retry_error_is_excluded_and_retry_schedule_precedes_next_attempt() {
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -4963,7 +5496,7 @@ async fn session_immediate_overflow_commits_zero_delay_before_installing_replace
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         Arc::new(SequentialRunWorker::new(driver.clone())),
         test_executor_generation(),
     )
@@ -5028,7 +5561,7 @@ async fn gateway_user_during_retry_wait_is_durably_injected_before_next_attempt(
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         Arc::new(SequentialRunWorker::new(driver.clone())),
         test_executor_generation(),
     )
@@ -5227,7 +5760,7 @@ async fn delay_zero_retry_schedule_without_retry_phase_never_admits_retry_steer(
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -5385,7 +5918,7 @@ async fn retry_timer_winning_handshake_defers_command_without_loss() {
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -5578,7 +6111,7 @@ async fn retry_handshake_timeout_defers_once_and_unblocks_the_event_lane() {
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -5662,7 +6195,7 @@ async fn provider_start_failures_in_two_runs_use_distinct_stable_durable_message
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -6141,7 +6674,7 @@ async fn successful_provider_context_survives_session_restart_and_reaches_turn_t
     let session = Session::start(
         store,
         first_gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -6351,9 +6884,15 @@ async fn assert_normal_tool_lifecycle_persists_generation(executor_generation: P
             RunCompletion::Completed(core)
         },
     );
-    let session = Session::start(store, gateway, RunCore::new(), worker, executor_generation)
-        .await
-        .expect("session");
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::fixture_with_unapproved_tools(),
+        worker,
+        executor_generation,
+    )
+    .await
+    .expect("session");
     let task = tokio::spawn(session.run());
     commands.send(user(1)).await.expect("command");
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -6490,7 +7029,7 @@ async fn tool_execution_update_after_end_is_rejected_while_result_pairing_is_pen
         Session::start(
             store,
             gateway,
-            RunCore::new(),
+            RunCore::fixture_with_unapproved_tools(),
             worker,
             test_executor_generation(),
         )
@@ -6655,7 +7194,7 @@ async fn retry_wait_group_of_two_is_injected_before_next_attempt() {
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         Arc::new(SequentialRunWorker::new(driver.clone())),
         test_executor_generation(),
     )
@@ -6782,7 +7321,7 @@ async fn retry_wait_group_of_three_is_injected_before_next_attempt() {
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         Arc::new(SequentialRunWorker::new(driver.clone())),
         test_executor_generation(),
     )
@@ -7212,7 +7751,7 @@ async fn t16_hard_steer_kill_restart_child() {
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         Arc::new(SequentialRunWorker::new(driver.clone())),
         test_executor_generation(),
     )
@@ -7256,7 +7795,7 @@ async fn t16_turn_end_kill_restart_child() {
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         Arc::new(SequentialRunWorker::new(driver.clone())),
         test_executor_generation(),
     )
@@ -7295,7 +7834,7 @@ async fn t16_active_abort_provider_kill_restart_child() {
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         Arc::new(SequentialRunWorker::new(driver.clone())),
         test_executor_generation(),
     )
@@ -7827,4 +8366,1573 @@ async fn control_acceptance_selects_accepted_or_phase_change() {
     drop(accepted_tx);
     let accepted = super::await_control_acceptance(&mut phase_rx, accepted_rx).await;
     assert!(!accepted, "closed accepted channel must fail closed");
+}
+
+// ---------------------------------------------------------------------------
+// ApprovalBroker end-to-end fixtures
+// ---------------------------------------------------------------------------
+
+fn fixture_origin() -> ProviderOrigin {
+    ProviderOrigin {
+        provider_instance_id: "fixture:https://example.invalid".to_owned(),
+        protocol: ApiProtocol::OpenAiChatCompletions,
+        model: "fixture-model".to_owned(),
+    }
+}
+
+fn fixture_timestamp() -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now()
+}
+
+fn fixture_assistant_message(
+    content: Vec<AssistantContent>,
+    reason: StopReason,
+) -> AssistantMessage {
+    AssistantMessage {
+        content,
+        model: fixture_origin().model.clone(),
+        provider: "fixture".to_owned(),
+        origin: fixture_origin(),
+        usage: Usage::default(),
+        stop_reason: reason,
+        error_message: None,
+        provider_code: None,
+        interrupted: reason == StopReason::Aborted,
+        timestamp: fixture_timestamp(),
+    }
+}
+
+fn public_initial_message() -> PublicMessage {
+    PublicMessage::Assistant(PublicAssistantMessage {
+        content: Vec::new(),
+        model: fixture_origin().model.clone(),
+        provider: "fixture".to_owned(),
+        origin: fixture_origin(),
+        usage: Usage::default(),
+        stop_reason: StopReason::Stop,
+        error_message: None,
+        provider_code: None,
+        interrupted: false,
+        timestamp: fixture_timestamp(),
+    })
+}
+
+fn bash_tool_call(id: &str) -> ToolCall {
+    bash_tool_call_with_command(id, "git status")
+}
+
+fn bash_tool_call_with_command(id: &str, command: &str) -> ToolCall {
+    ToolCall {
+        id: id.to_owned(),
+        name: "bash".to_owned(),
+        arguments: serde_json::from_value::<ValidatedToolArguments>(
+            serde_json::json!({"command": command}),
+        )
+        .expect("validated bash arguments"),
+    }
+}
+
+fn provider_attempt_from_tool_call(attempt: usize, tool_call: ToolCall) -> ProviderAttempt {
+    let message = fixture_assistant_message(
+        vec![AssistantContent::ToolCall {
+            tool_call: tool_call.clone(),
+            wire_item_index: 0,
+        }],
+        StopReason::ToolUse,
+    );
+    let (tx, rx) = mpsc::channel(16);
+    tx.try_send(ProviderEvent::Start).expect("start");
+    tx.try_send(ProviderEvent::ToolCallStart { content_index: 0 })
+        .expect("tool call start");
+    tx.try_send(ProviderEvent::ToolCallEnd {
+        content_index: 0,
+        tool_call,
+    })
+    .expect("tool call end");
+    tx.try_send(ProviderEvent::Done {
+        reason: StopReason::ToolUse,
+        output: ProviderOutput {
+            message,
+            provider_context: Vec::new(),
+        },
+    })
+    .expect("done");
+    drop(tx);
+    ProviderAttempt {
+        message_id: format!("assistant-{attempt}"),
+        initial_message: public_initial_message(),
+        events: ProviderEventStream::new(rx, CancellationToken::new(), "fixture", fixture_origin()),
+    }
+}
+
+fn provider_attempt_stop(attempt: usize) -> ProviderAttempt {
+    let message = fixture_assistant_message(Vec::new(), StopReason::Stop);
+    let (tx, rx) = mpsc::channel(16);
+    tx.try_send(ProviderEvent::Start).expect("start");
+    tx.try_send(ProviderEvent::Done {
+        reason: StopReason::Stop,
+        output: ProviderOutput {
+            message,
+            provider_context: Vec::new(),
+        },
+    })
+    .expect("done");
+    drop(tx);
+    ProviderAttempt {
+        message_id: format!("assistant-{attempt}"),
+        initial_message: public_initial_message(),
+        events: ProviderEventStream::new(rx, CancellationToken::new(), "fixture", fixture_origin()),
+    }
+}
+
+#[derive(Clone)]
+enum ApprovalTestScript {
+    ToolCall(ToolCall),
+    Stop,
+}
+
+struct ApprovalTestDriver {
+    scripts: Mutex<VecDeque<ApprovalTestScript>>,
+    executed: Arc<AtomicBool>,
+    provider_attempts: AtomicUsize,
+    result_text: String,
+}
+
+impl ApprovalTestDriver {
+    fn with_tool_call(executed: Arc<AtomicBool>) -> Arc<Self> {
+        Self::with_specific_tool_call(executed, bash_tool_call("call-1"))
+    }
+
+    fn with_specific_tool_call(executed: Arc<AtomicBool>, tool_call: ToolCall) -> Arc<Self> {
+        let mut scripts = VecDeque::new();
+        scripts.push_back(ApprovalTestScript::ToolCall(tool_call));
+        scripts.push_back(ApprovalTestScript::Stop);
+        Arc::new(Self {
+            scripts: Mutex::new(scripts),
+            executed,
+            provider_attempts: AtomicUsize::new(0),
+            result_text: "ok".to_owned(),
+        })
+    }
+}
+
+struct HoldPreStartWorker {
+    inner: Arc<dyn RunWorker>,
+    tool_start_staged: Arc<Notify>,
+    tool_start_release: Option<Arc<Notify>>,
+}
+
+impl RunWorker for HoldPreStartWorker {
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+        self.inner.validate_executor_generation(generation)
+    }
+
+    fn run(
+        &self,
+        core: RunCore,
+        initial: AdmittedCommand,
+        controls: mpsc::Receiver<RunControl>,
+        events: mpsc::Sender<RunOutput>,
+    ) -> WorkerFuture {
+        let (inner_tx, mut inner_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let inner = self.inner.run(core, initial, controls, inner_tx);
+        let tool_start_staged = self.tool_start_staged.clone();
+        let tool_start_release = self.tool_start_release.clone();
+        Box::pin(async move {
+            tokio::pin!(inner);
+            loop {
+                tokio::select! {
+                    biased;
+                    completion = &mut inner => {
+                        while let Ok(output) = inner_rx.try_recv() {
+                            if events.send(output).await.is_err() {
+                                break;
+                            }
+                        }
+                        return completion;
+                    }
+                    output = inner_rx.recv() => {
+                        let Some(output) = output else {
+                            return inner.await;
+                        };
+                        if matches!(&output.event, AgentEvent::ToolExecutionStart { .. }) {
+                            tool_start_staged.notify_one();
+                            if let Some(release) = tool_start_release.as_ref() {
+                                release.notified().await;
+                                if events.send(output).await.is_err() {
+                                    return inner.await;
+                                }
+                                continue;
+                            }
+                            let preempted = tokio::select! {
+                                biased;
+                                completion = &mut inner => {
+                                    drop(output);
+                                    while let Ok(output) = inner_rx.try_recv() {
+                                        if events.send(output).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    return completion;
+                                }
+                                output = inner_rx.recv() => output,
+                            };
+                            let Some(preempted) = preempted else {
+                                return inner.await;
+                            };
+                            drop(output);
+                            if events.send(preempted).await.is_err() {
+                                return inner.await;
+                            }
+                            continue;
+                        }
+                        if events.send(output).await.is_err() {
+                            return inner.await;
+                        }
+                    }
+                }
+            }
+        })
+    }
+}
+
+#[async_trait]
+impl RunDriver for ApprovalTestDriver {
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+        validate_test_generation(generation)
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        _attempt: usize,
+        _context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        let attempt = self.provider_attempts.fetch_add(1, Ordering::SeqCst);
+        let script = self
+            .scripts
+            .lock()
+            .expect("scripts")
+            .pop_front()
+            .unwrap_or(ApprovalTestScript::Stop);
+        match script {
+            ApprovalTestScript::ToolCall(tool_call) => {
+                Ok(provider_attempt_from_tool_call(attempt, tool_call))
+            }
+            ApprovalTestScript::Stop => Ok(provider_attempt_stop(attempt)),
+        }
+    }
+
+    async fn execute_tool_observed(
+        &self,
+        _flow_id: &str,
+        call: &ToolCall,
+        _cancel: CancellationToken,
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage, ToolError> {
+        self.executed.store(true, Ordering::SeqCst);
+        Ok(ToolResultMessage {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            content: vec![UserContent::Text {
+                text: self.result_text.clone(),
+            }],
+            details: serde_json::Value::Null,
+            is_error: false,
+            timestamp: fixture_timestamp(),
+        })
+    }
+
+    fn synthetic_error(&self, message: &str) -> PublicMessage {
+        PublicMessage::Assistant(PublicAssistantMessage {
+            content: Vec::new(),
+            model: fixture_origin().model.clone(),
+            provider: "fixture".to_owned(),
+            origin: fixture_origin(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Error,
+            error_message: Some(message.to_owned()),
+            provider_code: None,
+            interrupted: false,
+            timestamp: fixture_timestamp(),
+        })
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        Ok(OverflowRecoveryOutcome::ReplacementContext(
+            active_context.to_vec(),
+        ))
+    }
+}
+
+struct DenyingReviewerTransport;
+
+#[async_trait]
+impl ReviewerTransport for DenyingReviewerTransport {
+    async fn complete(
+        &self,
+        _prompt: &ReviewerPrompt,
+        _cancel: CancellationToken,
+    ) -> Result<String, ReviewerTransportError> {
+        let decision = AuditDecision {
+            outcome: AuditOutcome::Deny,
+            risk: RiskLevel::High,
+            authorization: UserAuthorization::Unknown,
+            rationale: "fixture denial".to_owned(),
+        };
+        Ok(serde_json::to_string(&decision).unwrap())
+    }
+}
+
+fn make_projector() -> SecretAwareActionProjector {
+    SecretAwareActionProjector::new(Redactor::v1(), SecretDigestKey::fixture())
+}
+
+fn make_deny_reviewer() -> Arc<Reviewer> {
+    let model = ReviewerModelSpec::new(
+        "fixture-reviewer",
+        "fixture",
+        "https://example.invalid",
+        "test",
+        "fixture-trust-domain",
+        "none",
+    );
+    let trust_set = ReviewerTrustSet::new(model.clone(), Vec::new());
+    Arc::new(Reviewer::new(
+        model,
+        trust_set,
+        Arc::new(DenyingReviewerTransport),
+        Arc::new(make_projector()),
+    ))
+}
+
+fn trusted_env() -> TrustedEnvironment {
+    TrustedEnvironment {
+        workspace_root: "/workspace".to_owned(),
+        sandbox: SandboxSummary::workspace(),
+        denied_paths: Vec::new(),
+        denied_network_domains: Vec::new(),
+        repo_visibility: None,
+        git_status: None,
+    }
+}
+
+async fn ask_only_policy(store: &Store) -> crate::approval::Policy {
+    store
+        .load_approval_policy(
+            "/workspace",
+            &ApprovalPolicyTrustStore::default(),
+            0,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("load fail-closed approval policy")
+        .policy
+}
+
+fn approval_core(broker: Arc<ApprovalBroker>) -> RunCore {
+    let mut core = RunCore::fixture_with_unapproved_tools();
+    core.set_approval(broker);
+    core
+}
+
+async fn wait_for_agent_end(frames: &Arc<Mutex<Vec<OutboundFrame>>>) {
+    let reached_end = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if frames.lock().expect("frame mutex").iter().any(|frame| {
+                matches!(frame, OutboundFrame::Event { envelope }
+                    if envelope.event.get("type").and_then(Value::as_str) == Some("agent_end"))
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        reached_end.is_ok(),
+        "session did not reach agent_end within timeout; frames: {:#?}",
+        frames.lock().expect("frame mutex")
+    );
+    assert!(
+        frames.lock().expect("frame mutex").iter().any(|frame| {
+            matches!(frame, OutboundFrame::Event { envelope }
+                if envelope.event.get("type").and_then(Value::as_str) == Some("agent_end"))
+        }),
+        "session completed without emitting agent_end"
+    );
+}
+
+async fn wait_for_approval_request(
+    frames: &Arc<Mutex<Vec<OutboundFrame>>>,
+    task: &tokio::task::JoinHandle<SessionResult>,
+) -> String {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let request_id = frames
+                .lock()
+                .expect("frame mutex")
+                .iter()
+                .find_map(|frame| {
+                    let OutboundFrame::Event { envelope } = frame else {
+                        return None;
+                    };
+                    (envelope.event.get("type").and_then(Value::as_str)
+                        == Some("approval_requested"))
+                    .then(|| {
+                        envelope
+                            .event
+                            .get("request")?
+                            .get("id")?
+                            .as_str()
+                            .map(str::to_owned)
+                    })
+                    .flatten()
+                });
+            if let Some(request_id) = request_id {
+                break request_id;
+            }
+            if task.is_finished() {
+                panic!("session ended without approval request");
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("approval request emitted")
+}
+
+#[tokio::test]
+async fn expired_policy_grant_reenters_approval_before_stalled_tool_start() {
+    let store = Store::session_test_store("expired-policy-grant-reenters-approval")
+        .await
+        .expect("test store");
+    let now = chrono::DateTime::parse_from_rfc3339("2026-07-27T00:00:00Z")
+        .expect("fixed clock")
+        .to_utc();
+    let expires_at = now + chrono::Duration::seconds(10);
+    let policy = crate::approval::Policy::from_verified_bundle(
+        "/workspace",
+        &ApprovalPolicyBundle {
+            schema_version: crate::approval::policy::APPROVAL_POLICY_BUNDLE_SCHEMA_VERSION,
+            tenant_id: "tenant-1".to_owned(),
+            agent_id: "agent-1".to_owned(),
+            version: 7,
+            issued_at: now - chrono::Duration::seconds(10),
+            expires_at,
+            rules: vec![ApprovalRule {
+                id: "allow-git-status".to_owned(),
+                tool: "bash".to_owned(),
+                literal_prefix: vec!["git".to_owned(), "status".to_owned()],
+                effect: RuleEffect::Allow,
+                workspace_only: true,
+                allowed_permissions: vec![Permission::Exec],
+                allowed_network_domains: Vec::new(),
+            }],
+        },
+    )
+    .expect("valid signed-policy fixture");
+    let clock = Arc::new(Mutex::new(now));
+    let broker = Arc::new(
+        ApprovalBroker::new(
+            policy,
+            make_projector(),
+            None,
+            ReviewerMode::User,
+            false,
+            trusted_env(),
+        )
+        .with_clock({
+            let clock = clock.clone();
+            move || *clock.lock().expect("approval clock")
+        }),
+    );
+
+    let executed = Arc::new(AtomicBool::new(false));
+    let tool_start_staged = Arc::new(Notify::new());
+    let tool_start_release = Arc::new(Notify::new());
+    let production_worker: Arc<dyn RunWorker> = Arc::new(SequentialRunWorker::new(
+        ApprovalTestDriver::with_tool_call(executed.clone()),
+    ));
+    let worker: Arc<dyn RunWorker> = Arc::new(HoldPreStartWorker {
+        inner: production_worker,
+        tool_start_staged: tool_start_staged.clone(),
+        tool_start_release: Some(tool_start_release.clone()),
+    });
+    let (gateway, commands, frames) = gateway();
+    let session = Session::start(
+        store,
+        gateway,
+        approval_core(broker),
+        worker,
+        test_executor_generation(),
+    )
+    .await
+    .expect("session startup");
+    let task = tokio::spawn(session.run());
+
+    commands.send(user(1)).await.expect("user command");
+    tokio::time::timeout(Duration::from_secs(3), tool_start_staged.notified())
+        .await
+        .expect("policy-allowed start reached stalled pre-commit window");
+    assert!(!executed.load(Ordering::SeqCst));
+    *clock.lock().expect("approval clock") = expires_at;
+    tool_start_release.notify_one();
+
+    let request_id = wait_for_approval_request(&frames, &task).await;
+    assert!(
+        !frames.lock().expect("frame mutex").iter().any(|frame| {
+            matches!(frame, OutboundFrame::Event { envelope }
+                if envelope.event.get("type").and_then(Value::as_str)
+                    == Some("tool_execution_start"))
+        }),
+        "expired grant must not commit ToolExecutionStart"
+    );
+    assert!(
+        !executed.load(Ordering::SeqCst),
+        "expired grant must not execute or silently deny"
+    );
+
+    commands
+        .send(approval_decision(2, &request_id))
+        .await
+        .expect("approve reauthorized call");
+    tokio::time::timeout(Duration::from_secs(3), tool_start_staged.notified())
+        .await
+        .expect("user-approved start reached pre-commit window");
+    tool_start_release.notify_one();
+    wait_for_agent_end(&frames).await;
+    drop(commands);
+    match task.await.expect("session join") {
+        SessionResult::Completed(_) => {}
+        SessionResult::Failed { failure, .. } => panic!("session failed: {failure}"),
+    }
+    assert!(
+        executed.load(Ordering::SeqCst),
+        "explicit approval must execute after stale grant reauthorization"
+    );
+    let committed_starts = frames
+        .lock()
+        .expect("frame mutex")
+        .iter()
+        .filter(|frame| {
+            matches!(frame, OutboundFrame::Event { envelope }
+                if envelope.event.get("type").and_then(Value::as_str)
+                    == Some("tool_execution_start"))
+        })
+        .count();
+    assert_eq!(committed_starts, 1);
+}
+
+#[tokio::test]
+async fn session_auto_review_fail_closed_denies_bash_without_executing() {
+    let store = Store::session_test_store("session-auto-review-fail-closed")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+
+    let policy = ask_only_policy(&store).await;
+    let broker = Arc::new(ApprovalBroker::new(
+        policy,
+        make_projector(),
+        Some(make_deny_reviewer()),
+        ReviewerMode::AutoReview,
+        true,
+        trusted_env(),
+    ));
+
+    let executed = Arc::new(AtomicBool::new(false));
+    let driver = ApprovalTestDriver::with_tool_call(executed.clone());
+    let worker: Arc<dyn RunWorker> = Arc::new(SequentialRunWorker::new(driver));
+
+    let (gateway, commands, frames) = gateway();
+    let session = Session::start(
+        store,
+        gateway,
+        approval_core(broker),
+        worker,
+        test_executor_generation(),
+    )
+    .await
+    .expect("session startup");
+
+    let task = tokio::spawn(session.run());
+    commands.send(user(1)).await.expect("user command");
+    wait_for_agent_end(&frames).await;
+    drop(commands);
+    let _ = task.await;
+
+    assert!(
+        !executed.load(Ordering::SeqCst),
+        "denied bash must not execute"
+    );
+
+    let row: (String, Option<String>) = sqlx::query_as(
+        "SELECT state, error_code FROM tool_executions WHERE tool_call_id = 'call-1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("tool execution row");
+    assert_eq!(row.0, "not_started");
+    assert_eq!(row.1.as_deref(), Some("approval_denied"));
+}
+
+fn approval_decision(seq: u64, request_id: &str) -> InboundCommand {
+    InboundCommand::Valid(CommandEnvelope {
+        seq,
+        command_id: CommandId::parse(&format!("20000000-0000-4000-8000-{seq:012}"))
+            .expect("canonical command id"),
+        command: Command::ApprovalDecision {
+            request_id: request_id.to_owned(),
+            decision: crate::gateway::ApprovalDecision::ApproveOnce,
+        },
+    })
+}
+
+fn approval_always_decision(seq: u64, request_id: &str) -> InboundCommand {
+    approval_always_decision_with_rule(
+        seq,
+        request_id,
+        serde_json::json!({
+            "id": "rule-git-status",
+            "tool": "bash",
+            "literal_prefix": ["git", "status"],
+            "effect": "allow",
+            "workspace_only": true,
+            "allowed_permissions": ["exec"],
+            "allowed_network_domains": []
+        }),
+    )
+}
+
+fn approval_always_decision_with_rule(seq: u64, request_id: &str, rule: Value) -> InboundCommand {
+    let rule = serde_json::from_value::<crate::gateway::DeferredApprovalRule>(rule)
+        .expect("object deferred ApproveAlways rule");
+    InboundCommand::Valid(CommandEnvelope {
+        seq,
+        command_id: CommandId::parse(&format!("20000000-0000-4000-8000-{seq:012}"))
+            .expect("canonical command id"),
+        command: Command::ApprovalDecision {
+            request_id: request_id.to_owned(),
+            decision: crate::gateway::ApprovalDecision::ApproveAlways { rule },
+        },
+    })
+}
+
+#[tokio::test]
+async fn later_approval_decision_does_not_overtake_an_earlier_deferred_user_message() {
+    let broker = Arc::new(ApprovalBroker::new(
+        crate::approval::policy::Policy::new("/workspace"),
+        make_projector(),
+        None,
+        ReviewerMode::User,
+        false,
+        trusted_env(),
+    ));
+    let observed_control = Arc::new(Notify::new());
+    let observed_kind = Arc::new(Mutex::new(None::<&'static str>));
+    let observed_kind_worker = observed_kind.clone();
+    let observed_control_worker = observed_control.clone();
+    let (request_tx, request_rx) = oneshot::channel();
+    let request_tx = Arc::new(Mutex::new(Some(request_tx)));
+    let request_tx_worker = request_tx.clone();
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        move |core: RunCore,
+              _initial: AdmittedCommand,
+              mut controls: mpsc::Receiver<RunControl>,
+              _events: mpsc::Sender<AgentEvent>| {
+            let observed_kind = observed_kind_worker.clone();
+            let observed_control = observed_control_worker.clone();
+            let request_tx = request_tx_worker.clone();
+            async move {
+                let call = ToolCall {
+                    id: "ordering-call".to_owned(),
+                    name: "bash".to_owned(),
+                    arguments: serde_json::from_value(serde_json::json!({
+                        "command": "git status"
+                    }))
+                    .expect("validated bash arguments"),
+                };
+                let broker = core.approval.clone().expect("approval broker");
+                let outcome = broker
+                    .start_request(
+                        &call,
+                        &[],
+                        "ordering-run",
+                        "ordering-turn",
+                        "v1",
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .expect("start pending approval");
+                let ApprovalOutcome::Pending { pending } = outcome else {
+                    panic!("expected pending approval");
+                };
+                request_tx
+                    .lock()
+                    .expect("request sender")
+                    .take()
+                    .expect("single worker")
+                    .send(pending.request().id.clone())
+                    .ok();
+                if let Some(control) = controls.recv().await {
+                    *observed_kind.lock().expect("observed kind") = Some(match control {
+                        RunControl::Command(command)
+                            if matches!(
+                                command.envelope().command,
+                                Command::ApprovalDecision { .. }
+                            ) =>
+                        {
+                            "approval"
+                        }
+                        _ => "other",
+                    });
+                    observed_control.notify_one();
+                }
+                drop(pending);
+                RunCompletion::Completed(core)
+            }
+        },
+    );
+    let store = Store::session_test_store("approval-command-ordering")
+        .await
+        .expect("test store");
+    let (gateway, commands, _frames) = gateway();
+    let session = Session::start(
+        store,
+        gateway,
+        approval_core(broker),
+        worker,
+        test_executor_generation(),
+    )
+    .await
+    .expect("session startup");
+    let task = tokio::spawn(session.run());
+
+    commands.send(user(1)).await.expect("start command");
+    let request_id = request_rx.await.expect("pending request id");
+    commands.send(user(2)).await.expect("earlier user message");
+    commands
+        .send(approval_decision(3, &request_id))
+        .await
+        .expect("later approval decision");
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), observed_control.notified())
+            .await
+            .is_err(),
+        "later approval decision overtook deferred user command as {:?}",
+        *observed_kind.lock().expect("observed kind")
+    );
+    drop(commands);
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn session_user_approve_once_allows_bash_and_executes() {
+    let store = Store::session_test_store("session-user-approve-once")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+
+    let policy = ask_only_policy(&store).await;
+    let broker = Arc::new(ApprovalBroker::new(
+        policy,
+        make_projector(),
+        None,
+        ReviewerMode::User,
+        false,
+        trusted_env(),
+    ));
+
+    let executed = Arc::new(AtomicBool::new(false));
+    let driver = ApprovalTestDriver::with_tool_call(executed.clone());
+    let worker: Arc<dyn RunWorker> = Arc::new(SequentialRunWorker::new(driver));
+
+    let (gateway, commands, frames) = gateway();
+    let session = Session::start(
+        store,
+        gateway,
+        approval_core(broker),
+        worker,
+        test_executor_generation(),
+    )
+    .await
+    .expect("session startup");
+
+    let task = tokio::spawn(session.run());
+    commands.send(user(1)).await.expect("user command");
+
+    let request_id = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let maybe = frames
+                .lock()
+                .expect("frame mutex")
+                .iter()
+                .find_map(|frame| {
+                    if let OutboundFrame::Event { envelope } = frame
+                        && envelope.event.get("type").and_then(Value::as_str)
+                            == Some("approval_requested")
+                    {
+                        return envelope
+                            .event
+                            .get("request")
+                            .and_then(|r| r.get("id").and_then(Value::as_str).map(String::from));
+                    }
+                    None
+                });
+            if let Some(id) = maybe {
+                break id;
+            }
+            if task.is_finished() {
+                panic!("session ended without approval request");
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("approval request emitted");
+
+    commands
+        .send(approval_decision(2, &request_id))
+        .await
+        .expect("approve-once decision");
+
+    wait_for_agent_end(&frames).await;
+    drop(commands);
+    let _ = task.await;
+
+    assert!(
+        executed.load(Ordering::SeqCst),
+        "approved bash must execute"
+    );
+
+    let row: (String, Option<String>) = sqlx::query_as(
+        "SELECT state, error_code FROM tool_executions WHERE tool_call_id = 'call-1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("tool execution row");
+    assert_eq!(row.0, "succeeded");
+    assert!(row.1.is_none());
+
+    let state: String = sqlx::query_scalar("SELECT state FROM approval_log WHERE id = ?")
+        .bind(&request_id)
+        .fetch_one(&pool)
+        .await
+        .expect("approval log row");
+    assert_eq!(state, "approved_once");
+}
+
+#[tokio::test]
+async fn session_user_approve_always_persists_rule_and_executes() {
+    let store = Store::session_test_store("session-user-approve-always")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let policy = ask_only_policy(&store).await;
+    let broker = Arc::new(ApprovalBroker::new(
+        policy,
+        make_projector(),
+        None,
+        ReviewerMode::User,
+        false,
+        trusted_env(),
+    ));
+    let executed = Arc::new(AtomicBool::new(false));
+    let worker: Arc<dyn RunWorker> = Arc::new(SequentialRunWorker::new(
+        ApprovalTestDriver::with_tool_call(executed.clone()),
+    ));
+    let (gateway, commands, frames) = gateway();
+    let session = Session::start(
+        store,
+        gateway,
+        approval_core(broker),
+        worker,
+        test_executor_generation(),
+    )
+    .await
+    .expect("session startup");
+    let task = tokio::spawn(session.run());
+    commands.send(user(1)).await.expect("user command");
+
+    let request_id = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let request_id = frames
+                .lock()
+                .expect("frame mutex")
+                .iter()
+                .find_map(|frame| {
+                    let OutboundFrame::Event { envelope } = frame else {
+                        return None;
+                    };
+                    (envelope.event.get("type").and_then(Value::as_str)
+                        == Some("approval_requested"))
+                    .then(|| {
+                        envelope
+                            .event
+                            .get("request")?
+                            .get("id")?
+                            .as_str()
+                            .map(str::to_owned)
+                    })
+                    .flatten()
+                });
+            if let Some(request_id) = request_id {
+                break request_id;
+            }
+            if task.is_finished() {
+                panic!("session ended without approval request");
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("approval request emitted");
+    commands
+        .send(approval_always_decision(2, &request_id))
+        .await
+        .expect("approve-always decision");
+    wait_for_agent_end(&frames).await;
+    drop(commands);
+    match task.await.expect("session join") {
+        SessionResult::Completed(_) => {}
+        SessionResult::Failed { failure, .. } => panic!("approve-always session failed: {failure}"),
+    }
+
+    assert!(
+        executed.load(Ordering::SeqCst),
+        "approved bash must execute"
+    );
+    let (approval_state, execution_state, rule_count, requested, resolved): (
+        String,
+        String,
+        i64,
+        i64,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT
+           (SELECT state FROM approval_log WHERE id = ?),
+           (SELECT state FROM tool_executions WHERE tool_call_id = 'call-1'),
+           (SELECT COUNT(*) FROM approval_rules WHERE id = 'rule-git-status'),
+           (SELECT COUNT(*) FROM agent_events WHERE event_type = 'approval_requested'),
+           (SELECT COUNT(*) FROM agent_events WHERE event_type = 'approval_resolved')",
+    )
+    .bind(&request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("durable approval and execution records");
+    assert_eq!(approval_state, "approved_always");
+    assert_eq!(execution_state, "succeeded");
+    assert_eq!(rule_count, 1);
+    assert_eq!(requested, 1);
+    assert_eq!(resolved, 1);
+}
+
+#[tokio::test]
+async fn session_approve_always_normalization_matrix_is_durable_and_replayable() {
+    use crate::approval::policy::{ApprovalRule, Policy};
+
+    struct Case {
+        name: &'static str,
+        command: &'static str,
+        rule: Value,
+        policy: Policy,
+        expected_state: &'static str,
+        executes: bool,
+        persisted_rule: Option<&'static str>,
+    }
+
+    fn rule(value: Value) -> ApprovalRule {
+        serde_json::from_value(value).expect("valid fixture policy rule")
+    }
+
+    fn candidate(id: &str, prefix: &[&str], effect: &str, domains: Vec<&str>) -> Value {
+        serde_json::json!({
+            "id": id,
+            "tool": "bash",
+            "literal_prefix": prefix,
+            "effect": effect,
+            "workspace_only": true,
+            "allowed_permissions": ["exec"],
+            "allowed_network_domains": domains
+        })
+    }
+
+    let conflict_policy = Policy::new("/workspace")
+        .try_with_rule(rule(candidate(
+            "existing-needs-approval",
+            &["git", "status"],
+            "needs_approval",
+            vec![],
+        )))
+        .expect("conflict fixture policy");
+    let duplicate_policy = Policy::new("/workspace")
+        .try_with_rule(rule(candidate(
+            "duplicate-id",
+            &["git", "status"],
+            "allow",
+            vec![],
+        )))
+        .expect("duplicate fixture policy");
+    let cases = vec![
+        Case {
+            name: "session-approve-always-secret-normalization",
+            command: "printf \"Authorization: Bearer abcdef1234567890\"",
+            rule: candidate(
+                "secret-rule",
+                &["printf", "Authorization: Bearer abcdef1234567890"],
+                "allow",
+                vec![],
+            ),
+            policy: Policy::new("/workspace"),
+            expected_state: "approved_once",
+            executes: true,
+            persisted_rule: None,
+        },
+        Case {
+            name: "session-approve-always-broad-normalization",
+            command: "git status",
+            rule: candidate("broad-rule", &["git"], "allow", vec![]),
+            policy: Policy::new("/workspace"),
+            expected_state: "approved_once",
+            executes: true,
+            persisted_rule: None,
+        },
+        Case {
+            name: "session-approve-always-nonmatching-normalization",
+            command: "git status",
+            rule: candidate("nonmatching-rule", &["git", "log"], "allow", vec![]),
+            policy: Policy::new("/workspace"),
+            expected_state: "approved_once",
+            executes: true,
+            persisted_rule: None,
+        },
+        Case {
+            name: "session-approve-always-conflicting-normalization",
+            command: "git status",
+            rule: candidate("candidate-rule", &["git", "status"], "allow", vec![]),
+            policy: conflict_policy,
+            expected_state: "approved_once",
+            executes: true,
+            persisted_rule: None,
+        },
+        Case {
+            name: "session-approve-always-duplicate-normalization",
+            command: "git log",
+            rule: candidate("duplicate-id", &["git", "log"], "allow", vec![]),
+            policy: duplicate_policy,
+            expected_state: "approved_once",
+            executes: true,
+            persisted_rule: None,
+        },
+        Case {
+            name: "session-approve-always-malformed-normalization",
+            command: "git status",
+            rule: serde_json::json!({"malformed": true}),
+            policy: Policy::new("/workspace"),
+            expected_state: "denied",
+            executes: false,
+            persisted_rule: None,
+        },
+        Case {
+            name: "session-approve-always-empty-id-normalization",
+            command: "git status",
+            rule: candidate("", &["git", "status"], "allow", vec![]),
+            policy: Policy::new("/workspace"),
+            expected_state: "approved_always",
+            executes: true,
+            persisted_rule: Some("request_id"),
+        },
+    ];
+
+    for case in cases {
+        let store = Store::session_test_store(case.name)
+            .await
+            .expect("test store");
+        let pool = store.pool().clone();
+        let broker = Arc::new(ApprovalBroker::new(
+            case.policy,
+            make_projector(),
+            None,
+            ReviewerMode::User,
+            false,
+            trusted_env(),
+        ));
+        let executed = Arc::new(AtomicBool::new(false));
+        let worker: Arc<dyn RunWorker> = Arc::new(SequentialRunWorker::new(
+            ApprovalTestDriver::with_specific_tool_call(
+                executed.clone(),
+                bash_tool_call_with_command("call-1", case.command),
+            ),
+        ));
+        let (gateway, commands, frames) = gateway();
+        let session = Session::start(
+            store,
+            gateway,
+            approval_core(broker),
+            worker,
+            test_executor_generation(),
+        )
+        .await
+        .expect("session startup");
+        let task = tokio::spawn(session.run());
+        commands.send(user(1)).await.expect("user command");
+        let request_id = wait_for_approval_request(&frames, &task).await;
+        let decision = approval_always_decision_with_rule(2, &request_id, case.rule);
+        commands
+            .send(decision.clone())
+            .await
+            .expect("ApproveAlways decision");
+        wait_for_agent_end(&frames).await;
+
+        assert_eq!(
+            executed.load(Ordering::SeqCst),
+            case.executes,
+            "{} execution result",
+            case.name
+        );
+        let (approval_state, execution_state, error_code, rule_count, command_status): (
+            String,
+            String,
+            Option<String>,
+            i64,
+            String,
+        ) = sqlx::query_as(
+            "SELECT
+                (SELECT state FROM approval_log WHERE id = ?),
+                (SELECT state FROM tool_executions WHERE tool_call_id = 'call-1'),
+                (SELECT error_code FROM tool_executions WHERE tool_call_id = 'call-1'),
+                (SELECT COUNT(*) FROM approval_rules),
+                (SELECT status FROM inbound_commands WHERE seq = 2)",
+        )
+        .bind(&request_id)
+        .fetch_one(&pool)
+        .await
+        .expect("normalized durable state");
+        assert_eq!(approval_state, case.expected_state, "{}", case.name);
+        assert_eq!(command_status, "applied", "{}", case.name);
+        if case.executes {
+            assert_eq!(execution_state, "succeeded", "{}", case.name);
+            assert!(error_code.is_none(), "{}", case.name);
+        } else {
+            assert_eq!(execution_state, "cancelled", "{}", case.name);
+            assert_eq!(
+                error_code.as_deref(),
+                Some("approval_denied"),
+                "{}",
+                case.name
+            );
+        }
+        let expected_rule_count = i64::from(case.persisted_rule.is_some());
+        assert_eq!(rule_count, expected_rule_count, "{}", case.name);
+        if case.persisted_rule.is_some() {
+            let durable_rule_id: String =
+                sqlx::query_scalar("SELECT id FROM approval_rules LIMIT 1")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("normalized empty-id rule");
+            assert_eq!(durable_rule_id, request_id, "{}", case.name);
+        }
+
+        commands
+            .send(decision)
+            .await
+            .expect("replay exact ApproveAlways decision");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let exact_applied_acks = applied_acks(&frames)
+                    .into_iter()
+                    .filter(|ack| {
+                        ack.seq == 2 && ack.command_id == "20000000-0000-4000-8000-000000000002"
+                    })
+                    .count();
+                if exact_applied_acks >= 2 {
+                    break;
+                }
+                assert!(!task.is_finished(), "{} ended before replay ACK", case.name);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal replay ACK");
+        drop(commands);
+        match task.await.expect("session join") {
+            SessionResult::Completed(_) => {}
+            SessionResult::Failed { failure, .. } => {
+                panic!("{} session failed: {failure}", case.name)
+            }
+        }
+    }
+}
+
+async fn assert_pre_start_approval_control_race(store_name: &str, control: InboundCommand) {
+    let store = Store::session_test_store(store_name)
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let policy = ask_only_policy(&store).await;
+    let broker = Arc::new(ApprovalBroker::new(
+        policy,
+        make_projector(),
+        None,
+        ReviewerMode::User,
+        false,
+        trusted_env(),
+    ));
+    let executed = Arc::new(AtomicBool::new(false));
+    let tool_start_staged = Arc::new(Notify::new());
+    let production_worker: Arc<dyn RunWorker> = Arc::new(SequentialRunWorker::new(
+        ApprovalTestDriver::with_tool_call(executed.clone()),
+    ));
+    let worker: Arc<dyn RunWorker> = Arc::new(HoldPreStartWorker {
+        inner: production_worker,
+        tool_start_staged: tool_start_staged.clone(),
+        tool_start_release: None,
+    });
+    let (gateway, commands, frames) = gateway();
+    let session = Session::start(
+        store,
+        gateway,
+        approval_core(broker),
+        worker,
+        test_executor_generation(),
+    )
+    .await
+    .expect("session startup");
+    let mut task = tokio::spawn(session.run());
+
+    commands.send(user(1)).await.expect("user command");
+    let request_id = wait_for_approval_request(&frames, &task).await;
+    let decision = approval_always_decision(2, &request_id);
+    commands
+        .send(decision.clone())
+        .await
+        .expect("approve-always decision");
+    tokio::time::timeout(Duration::from_secs(3), tool_start_staged.notified())
+        .await
+        .expect("approved ToolExecutionStart reached the pre-commit race window");
+    commands.send(control).await.expect("pre-start control");
+
+    wait_for_agent_end(&frames).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM inbound_commands WHERE seq = 3")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("control status");
+            if status == "applied" {
+                break;
+            }
+            if task.is_finished() {
+                match (&mut task).await.expect("session join") {
+                    SessionResult::Completed(_) => {
+                        panic!("session completed before the winning control became terminal")
+                    }
+                    SessionResult::Failed { failure, .. } => {
+                        panic!(
+                            "session failed before the winning control became terminal: {failure:?}"
+                        )
+                    }
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("winning control became terminal");
+    assert!(
+        !executed.load(Ordering::SeqCst),
+        "a control accepted before ToolExecutionStart must prevent execution"
+    );
+
+    let durable: (
+        String,
+        String,
+        Option<String>,
+        i64,
+        i64,
+        i64,
+        String,
+        String,
+    ) = sqlx::query_as(
+        "SELECT
+                (SELECT state FROM approval_log WHERE id = ?),
+                (SELECT state FROM tool_executions WHERE tool_call_id = 'call-1'),
+                (SELECT error_code FROM tool_executions WHERE tool_call_id = 'call-1'),
+                (SELECT COUNT(*) FROM approval_rules WHERE id = 'rule-git-status'),
+                (SELECT COUNT(*) FROM agent_events
+                 WHERE event_type = 'tool_execution_start'
+                   AND json_extract(envelope, '$.tool_call_id') = 'call-1'),
+                (SELECT COUNT(*) FROM agent_events
+                 WHERE event_type = 'approval_resolved'
+                   AND json_extract(envelope, '$.request_id') = ?),
+                (SELECT status FROM inbound_commands WHERE seq = 2),
+                (SELECT status FROM inbound_commands WHERE seq = 3)",
+    )
+    .bind(&request_id)
+    .bind(&request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("atomic pre-start cancellation state");
+    assert_eq!(durable.0, "cancelled");
+    assert_eq!(durable.1, "cancelled");
+    assert_eq!(durable.2.as_deref(), Some("approval_cancelled"));
+    assert_eq!(durable.3, 0, "ApproveAlways rule must never install");
+    assert_eq!(durable.4, 0, "ToolExecutionStart must not commit");
+    assert_eq!(durable.5, 1, "approval cancellation must commit once");
+    assert_eq!(durable.6, "applied", "approval command must be terminal");
+    assert_eq!(durable.7, "applied", "winning control must be terminal");
+
+    commands
+        .send(decision)
+        .await
+        .expect("replay exact approval decision");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let applied_replays = frames
+                .lock()
+                .expect("frame mutex")
+                .iter()
+                .filter(|frame| {
+                    matches!(
+                        frame,
+                        OutboundFrame::CommandAck { ack }
+                            if ack.command_id == "20000000-0000-4000-8000-000000000002"
+                                && ack.status == CommandAckStatus::Applied
+                    )
+                })
+                .count();
+            if applied_replays >= 2 {
+                break;
+            }
+            if task.is_finished() {
+                panic!("session ended before replay ACK");
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal approval replay ACK");
+
+    assert_eq!(
+        sqlx::query_as::<_, (i64, i64)>(
+            "SELECT
+                (SELECT COUNT(*) FROM approval_rules WHERE id = 'rule-git-status'),
+                (SELECT COUNT(*) FROM agent_events
+                 WHERE event_type = 'approval_resolved'
+                   AND json_extract(envelope, '$.request_id') = ?)",
+        )
+        .bind(&request_id)
+        .fetch_one(&pool)
+        .await
+        .expect("replay remains a durable no-op"),
+        (0, 1)
+    );
+
+    drop(commands);
+    match task.await.expect("session join") {
+        SessionResult::Completed(_) => {}
+        SessionResult::Failed { failure, .. } => {
+            panic!("pre-start approval control race failed: {failure}")
+        }
+    }
+}
+
+#[tokio::test]
+async fn session_soft_steer_terminalizes_pre_start_approve_always_without_installing_rule() {
+    assert_pre_start_approval_control_race("session-pre-start-approval-soft-steer", user(3)).await;
+}
+
+#[tokio::test]
+async fn session_abort_terminalizes_pre_start_approve_always_without_installing_rule() {
+    assert_pre_start_approval_control_race("session-pre-start-approval-abort", abort(3)).await;
+}
+
+#[tokio::test]
+async fn duplicate_approval_decision_staged_race_is_terminal_after_restart() {
+    let root = std::env::temp_dir().join(format!(
+        "sumi-staged-approval-duplicate-restart-{}",
+        uuid::Uuid::now_v7()
+    ));
+    std::fs::create_dir_all(&root).expect("create duplicate approval restart fixture root");
+    let database_path = root.join("agent.db");
+    let store = open_kill_restart_store(&database_path).await;
+    let pool = store.pool().clone();
+    let policy = ask_only_policy(&store).await;
+    let broker = Arc::new(ApprovalBroker::new(
+        policy,
+        make_projector(),
+        None,
+        ReviewerMode::User,
+        false,
+        trusted_env(),
+    ));
+    let executed = Arc::new(AtomicBool::new(false));
+    let tool_start_staged = Arc::new(Notify::new());
+    let tool_start_release = Arc::new(Notify::new());
+    let production_worker: Arc<dyn RunWorker> = Arc::new(SequentialRunWorker::new(
+        ApprovalTestDriver::with_tool_call(executed.clone()),
+    ));
+    let worker: Arc<dyn RunWorker> = Arc::new(HoldPreStartWorker {
+        inner: production_worker,
+        tool_start_staged: tool_start_staged.clone(),
+        tool_start_release: Some(tool_start_release.clone()),
+    });
+    let (gateway, commands, frames) = gateway();
+    let session = Session::start(
+        store,
+        gateway,
+        approval_core(broker),
+        worker,
+        test_executor_generation(),
+    )
+    .await
+    .expect("session startup");
+    let task = tokio::spawn(session.run());
+
+    commands.send(user(1)).await.expect("user command");
+    let request_id = wait_for_approval_request(&frames, &task).await;
+    commands
+        .send(approval_decision(2, &request_id))
+        .await
+        .expect("first approval decision");
+    tokio::time::timeout(Duration::from_secs(3), tool_start_staged.notified())
+        .await
+        .expect("ToolExecutionStart reached the staged pre-commit window");
+
+    let duplicate = approval_decision(3, &request_id);
+    commands
+        .send(duplicate.clone())
+        .await
+        .expect("duplicate approval decision");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM inbound_commands WHERE seq = 3")
+                    .fetch_optional(&pool)
+                    .await
+                    .expect("duplicate command row");
+            if status.as_deref() == Some("received") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("duplicate remains ordered behind the staged resolution");
+    assert!(
+        !task.is_finished(),
+        "the duplicate decision must not fail the Session while approval_log is pending"
+    );
+
+    tool_start_release.notify_one();
+    wait_for_agent_end(&frames).await;
+
+    let durable: (String, String, String, String, i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT status FROM inbound_commands WHERE seq = 2),
+            (SELECT status FROM inbound_commands WHERE seq = 3),
+            (SELECT state FROM approval_log WHERE id = ?),
+            (SELECT state FROM tool_executions WHERE tool_call_id = 'call-1'),
+            (SELECT COUNT(*) FROM agent_events
+             WHERE event_type = 'approval_resolved'
+               AND json_extract(envelope, '$.request_id') = ?),
+            (SELECT COUNT(*) FROM agent_events
+             WHERE event_type = 'tool_execution_start'
+               AND json_extract(envelope, '$.tool_call_id') = 'call-1')",
+    )
+    .bind(&request_id)
+    .bind(&request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("staged duplicate durable state");
+    assert_eq!(durable.0, "applied");
+    assert_eq!(durable.1, "applied");
+    assert_eq!(durable.2, "approved_once");
+    assert_eq!(durable.3, "succeeded");
+    assert_eq!(durable.4, 1, "the approval resolves exactly once");
+    assert_eq!(durable.5, 1, "the tool starts exactly once");
+    assert!(executed.load(Ordering::SeqCst));
+
+    commands
+        .send(duplicate)
+        .await
+        .expect("replay terminal duplicate after the staged race");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let replay_acks = applied_acks(&frames)
+                .into_iter()
+                .filter(|ack| ack.seq == 3)
+                .count();
+            if replay_acks >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal duplicate replay ACK");
+
+    drop(commands);
+    match task.await.expect("session join") {
+        SessionResult::Completed(_) => {}
+        SessionResult::Failed { failure, .. } => {
+            panic!("staged duplicate approval race failed: {failure}")
+        }
+    }
+
+    pool.close().await;
+    let store = open_kill_restart_store(&database_path).await;
+    let lease = ProcessGenerationLease::new(
+        test_executor_generation(),
+        "duplicate-approval-restart-lease",
+    )
+    .expect("valid recovery lease");
+    let fence = GenerationRecoveryFence::new(&lease, "duplicate-approval-restart-fence")
+        .expect("valid recovery fence");
+    let hydrated = store
+        .hydrate(&lease, &fence)
+        .await
+        .expect("authenticated restart hydration");
+    let HydrationOutcome::Complete(hydrated) = hydrated else {
+        panic!("fully terminal duplicate approval state must hydrate without physical recovery")
+    };
+    assert!(
+        hydrated.recovery_steps.is_empty(),
+        "restart must not replay either approval decision or the tool: {:?}",
+        hydrated.recovery_steps
+    );
+    assert_eq!(
+        sqlx::query_as::<_, (String, String, String, String, i64, i64)>(
+            "SELECT
+                (SELECT status FROM inbound_commands WHERE seq = 2),
+                (SELECT status FROM inbound_commands WHERE seq = 3),
+                (SELECT state FROM approval_log WHERE id = ?),
+                (SELECT state FROM tool_executions WHERE tool_call_id = 'call-1'),
+                (SELECT COUNT(*) FROM agent_events
+                 WHERE event_type = 'approval_resolved'
+                   AND json_extract(envelope, '$.request_id') = ?),
+                (SELECT COUNT(*) FROM agent_events
+                 WHERE event_type = 'tool_execution_start'
+                   AND json_extract(envelope, '$.tool_call_id') = 'call-1')",
+        )
+        .bind(&request_id)
+        .bind(&request_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("restarted staged duplicate durable state"),
+        durable,
+        "restart must preserve the exact terminal command/approval/tool state"
+    );
+    store.pool().close().await;
+    drop(store);
+    std::fs::remove_dir_all(&root).expect("remove duplicate approval restart fixture root");
 }
