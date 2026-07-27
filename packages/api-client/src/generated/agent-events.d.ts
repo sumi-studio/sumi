@@ -309,12 +309,29 @@ export type OutboundFrame =
       ack: CommandAck;
     };
 /**
- * non-negative process generation representable exactly by JavaScript number clients
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "BrowserClientFrame".
+ */
+export type BrowserClientFrame = BrowserHello | BrowserCommandFrame;
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "BrowserServerFrame".
+ */
+export type BrowserServerFrame = BrowserEventFrame | BrowserCommandAcceptedFrame | BrowserCommandRejectedFrame;
+/**
+ * canonical decimal process generation in 0..=9223372036854775807; encoded as a string to preserve it losslessly in JavaScript
  *
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "ProcessGeneration".
  */
-export type ProcessGeneration = number;
+export type ProcessGeneration = string;
+/**
+ * canonical decimal u64 encoded as a string to preserve it losslessly in JavaScript
+ *
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "CanonicalDecimalU64".
+ */
+export type CanonicalDecimalU64 = string;
 
 export interface HttpsSumiDevContractsAgentEventsYaml {
   [k: string]: unknown;
@@ -644,6 +661,47 @@ export interface CommandAck {
   reject_reason?: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized";
 }
 /**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "BrowserHello".
+ */
+export interface BrowserHello {
+  type: "hello";
+  last_event_seq: JsonSafeInteger;
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "BrowserCommandFrame".
+ */
+export interface BrowserCommandFrame {
+  type: "command";
+  idempotency_key: string;
+  command: Command;
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "BrowserEventFrame".
+ */
+export interface BrowserEventFrame {
+  type: "event";
+  envelope: Envelope;
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "BrowserCommandAcceptedFrame".
+ */
+export interface BrowserCommandAcceptedFrame {
+  type: "command_accepted";
+  envelope: CommandEnvelope;
+}
+/**
+ * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
+ * via the `definition` "BrowserCommandRejectedFrame".
+ */
+export interface BrowserCommandRejectedFrame {
+  type: "command_rejected";
+  reject_reason: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized";
+}
+/**
  * placeholder for v1; no attachments are accepted yet
  *
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
@@ -662,9 +720,9 @@ export interface AgentHello {
    */
   agent_id: string;
   generation: ProcessGeneration;
-  last_sent_event_seq: JsonSafeInteger;
-  last_received_command_seq: JsonSafeInteger;
-  last_applied_command_seq: JsonSafeInteger;
+  last_sent_event_seq: CanonicalDecimalU64;
+  last_received_command_seq: CanonicalDecimalU64;
+  last_applied_command_seq: CanonicalDecimalU64;
 }
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
@@ -672,6 +730,6 @@ export interface AgentHello {
  */
 export interface ApiHello {
   accepted_generation: ProcessGeneration;
-  last_received_event_seq: JsonSafeInteger;
-  next_command_seq: JsonSafeInteger;
+  last_received_event_seq: CanonicalDecimalU64;
+  next_command_seq: CanonicalDecimalU64;
 }

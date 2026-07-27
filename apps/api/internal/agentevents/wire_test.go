@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -322,7 +323,7 @@ func TestOutboundFrameRejectsTrailingData(t *testing.T) {
 }
 
 func TestAgentHelloRejectsUnknownFields(t *testing.T) {
-	raw := []byte(`{"agent_id":"agent-1","generation":7,"last_sent_event_seq":0,"last_received_command_seq":0,"last_applied_command_seq":0,"extra":true}`)
+	raw := []byte(`{"agent_id":"agent-1","generation":"7","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0","extra":true}`)
 	var hello AgentHello
 	if err := json.Unmarshal(raw, &hello); err == nil {
 		t.Fatal("expected unknown fields to be rejected for AgentHello")
@@ -330,63 +331,51 @@ func TestAgentHelloRejectsUnknownFields(t *testing.T) {
 }
 
 func TestApiHelloRejectsUnknownFields(t *testing.T) {
-	raw := []byte(`{"accepted_generation":7,"last_received_event_seq":0,"next_command_seq":1,"extra":true}`)
+	raw := []byte(`{"accepted_generation":"7","last_received_event_seq":"0","next_command_seq":"1","extra":true}`)
 	var hello ApiHello
 	if err := json.Unmarshal(raw, &hello); err == nil {
 		t.Fatal("expected unknown fields to be rejected for ApiHello")
 	}
 }
 
-func TestApiHelloRejectsOutOfRangeSeq(t *testing.T) {
-	raw := []byte(fmt.Sprintf(`{"accepted_generation":7,"last_received_event_seq":%d,"next_command_seq":1}`, maxJSONSafeInteger+1))
-	var hello ApiHello
-	if err := json.Unmarshal(raw, &hello); err == nil {
-		t.Fatal("expected out-of-range seq to be rejected for ApiHello")
-	}
-}
-
-func TestAgentHelloAcceptsMaxSafeGeneration(t *testing.T) {
-	raw := []byte(fmt.Sprintf(`{"agent_id":"agent-1","generation":%d,"last_sent_event_seq":0,"last_received_command_seq":0,"last_applied_command_seq":0}`, maxJSONSafeInteger))
+func TestAgentHelloAcceptsFullWidthGenerationAndCursors(t *testing.T) {
+	raw := []byte(`{"agent_id":"agent-1","generation":"9223372036854775807","last_sent_event_seq":"18446744073709551615","last_received_command_seq":"18446744073709551615","last_applied_command_seq":"18446744073709551615"}`)
 	var hello AgentHello
 	if err := json.Unmarshal(raw, &hello); err != nil {
-		t.Fatalf("expected max-safe generation to be accepted: %v", err)
+		t.Fatalf("expected full-width hello to be accepted: %v", err)
 	}
-	if hello.Generation != maxJSONSafeInteger {
-		t.Fatalf("expected generation %d, got %d", maxJSONSafeInteger, hello.Generation)
-	}
-}
-
-func TestAgentHelloRejectsOutOfRangeGeneration(t *testing.T) {
-	raw := []byte(fmt.Sprintf(`{"agent_id":"agent-1","generation":%d,"last_sent_event_seq":0,"last_received_command_seq":0,"last_applied_command_seq":0}`, maxJSONSafeInteger+1))
-	var hello AgentHello
-	if err := json.Unmarshal(raw, &hello); err == nil {
-		t.Fatal("expected out-of-range generation to be rejected for AgentHello")
+	if hello.Generation != maxProcessGeneration || hello.LastSentEventSeq != ^uint64(0) {
+		t.Fatalf("unexpected decoded full-width hello: %+v", hello)
 	}
 }
 
-func TestApiHelloAcceptsMaxSafeAcceptedGeneration(t *testing.T) {
-	raw := []byte(fmt.Sprintf(`{"accepted_generation":%d,"last_received_event_seq":0,"next_command_seq":1}`, maxJSONSafeInteger))
-	var hello ApiHello
-	if err := json.Unmarshal(raw, &hello); err != nil {
-		t.Fatalf("expected max-safe accepted_generation to be accepted: %v", err)
+func TestHelloRejectsNonCanonicalDecimalAndOverflow(t *testing.T) {
+	tests := []string{
+		`{"agent_id":"agent-1","generation":"07","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}`,
+		`{"agent_id":"agent-1","generation":"+7","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}`,
+		`{"agent_id":"agent-1","generation":"7","last_sent_event_seq":"18446744073709551616","last_received_command_seq":"0","last_applied_command_seq":"0"}`,
+		`{"agent_id":"agent-1","generation":7,"last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}`,
+		`{"accepted_generation":"9223372036854775808","last_received_event_seq":"0","next_command_seq":"1"}`,
 	}
-	if hello.AcceptedGeneration != maxJSONSafeInteger {
-		t.Fatalf("expected accepted_generation %d, got %d", maxJSONSafeInteger, hello.AcceptedGeneration)
-	}
-}
-
-func TestApiHelloRejectsOutOfRangeAcceptedGeneration(t *testing.T) {
-	raw := []byte(fmt.Sprintf(`{"accepted_generation":%d,"last_received_event_seq":0,"next_command_seq":1}`, maxJSONSafeInteger+1))
-	var hello ApiHello
-	if err := json.Unmarshal(raw, &hello); err == nil {
-		t.Fatal("expected out-of-range accepted_generation to be rejected for ApiHello")
+	for _, raw := range tests {
+		var hello AgentHello
+		if strings.Contains(raw, "accepted_generation") {
+			var apiHello ApiHello
+			if err := json.Unmarshal([]byte(raw), &apiHello); err == nil {
+				t.Fatalf("accepted noncanonical or overflowing API hello: %s", raw)
+			}
+			continue
+		}
+		if err := json.Unmarshal([]byte(raw), &hello); err == nil {
+			t.Fatalf("accepted noncanonical or overflowing agent hello: %s", raw)
+		}
 	}
 }
 
 func TestAgentHelloMarshalRejectsOutOfRangeGeneration(t *testing.T) {
 	hello := AgentHello{
 		AgentID:                "agent-1",
-		Generation:             maxJSONSafeInteger + 1,
+		Generation:             maxProcessGeneration + 1,
 		LastSentEventSeq:       0,
 		LastReceivedCommandSeq: 0,
 		LastAppliedCommandSeq:  0,
@@ -398,7 +387,7 @@ func TestAgentHelloMarshalRejectsOutOfRangeGeneration(t *testing.T) {
 
 func TestApiHelloMarshalRejectsOutOfRangeAcceptedGeneration(t *testing.T) {
 	hello := ApiHello{
-		AcceptedGeneration:   maxJSONSafeInteger + 1,
+		AcceptedGeneration:   maxProcessGeneration + 1,
 		LastReceivedEventSeq: 0,
 		NextCommandSeq:       1,
 	}
@@ -407,35 +396,17 @@ func TestApiHelloMarshalRejectsOutOfRangeAcceptedGeneration(t *testing.T) {
 	}
 }
 
-func TestApiHelloMarshalRejectsOutOfRangeLastReceivedEventSeq(t *testing.T) {
+func TestHelloMarshalUsesCanonicalDecimalStrings(t *testing.T) {
 	hello := ApiHello{
-		AcceptedGeneration:   1,
-		LastReceivedEventSeq: maxJSONSafeInteger + 1,
-		NextCommandSeq:       1,
+		AcceptedGeneration:   maxProcessGeneration,
+		LastReceivedEventSeq: ^uint64(0),
+		NextCommandSeq:       ^uint64(0),
 	}
-	if _, err := json.Marshal(hello); err == nil {
-		t.Fatal("expected out-of-range last_received_event_seq to be rejected when marshaling ApiHello")
+	encoded, err := json.Marshal(hello)
+	if err != nil {
+		t.Fatalf("marshal full-width API hello: %v", err)
 	}
-}
-
-func TestApiHelloMarshalRejectsOutOfRangeNextCommandSeq(t *testing.T) {
-	hello := ApiHello{
-		AcceptedGeneration:   1,
-		LastReceivedEventSeq: 0,
-		NextCommandSeq:       maxJSONSafeInteger + 1,
-	}
-	if _, err := json.Marshal(hello); err == nil {
-		t.Fatal("expected out-of-range next_command_seq to be rejected when marshaling ApiHello")
-	}
-}
-
-func TestApiHelloMarshalAcceptsMaxSafeSeqFields(t *testing.T) {
-	hello := ApiHello{
-		AcceptedGeneration:   1,
-		LastReceivedEventSeq: maxJSONSafeInteger,
-		NextCommandSeq:       maxJSONSafeInteger,
-	}
-	if _, err := json.Marshal(hello); err != nil {
-		t.Fatalf("expected max-safe seq fields to marshal: %v", err)
+	if got, want := string(encoded), `{"accepted_generation":"9223372036854775807","last_received_event_seq":"18446744073709551615","next_command_seq":"18446744073709551615"}`; got != want {
+		t.Fatalf("hello wire mismatch\n got: %s\nwant: %s", got, want)
 	}
 }

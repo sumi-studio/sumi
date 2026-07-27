@@ -111,10 +111,15 @@ components:
           type: array
           maxItems: 0
     ProcessGeneration:
-      type: integer
-      minimum: 0
-      maximum: 9007199254740991
-      description: non-negative process generation representable exactly by JavaScript number clients
+      type: string
+      pattern: '^(0|[1-9][0-9]*)$'
+      format: canonical-process-generation
+      description: canonical decimal process generation in 0..=9223372036854775807; encoded as a string to preserve it losslessly in JavaScript
+    CanonicalDecimalU64:
+      type: string
+      pattern: '^(0|[1-9][0-9]*)$'
+      format: canonical-decimal-u64
+      description: canonical decimal u64 encoded as a string to preserve it losslessly in JavaScript
     AgentHello:
       type: object
       required: [agent_id, generation, last_sent_event_seq, last_received_command_seq, last_applied_command_seq]
@@ -126,11 +131,11 @@ components:
         generation:
           $ref: '#/components/schemas/ProcessGeneration'
         last_sent_event_seq:
-          $ref: '#/components/schemas/JsonSafeInteger'
+          $ref: '#/components/schemas/CanonicalDecimalU64'
         last_received_command_seq:
-          $ref: '#/components/schemas/JsonSafeInteger'
+          $ref: '#/components/schemas/CanonicalDecimalU64'
         last_applied_command_seq:
-          $ref: '#/components/schemas/JsonSafeInteger'
+          $ref: '#/components/schemas/CanonicalDecimalU64'
     ApiHello:
       type: object
       required: [accepted_generation, last_received_event_seq, next_command_seq]
@@ -139,6 +144,6 @@ components:
         accepted_generation:
           $ref: '#/components/schemas/ProcessGeneration'
         last_received_event_seq:
-          $ref: '#/components/schemas/JsonSafeInteger'
+          $ref: '#/components/schemas/CanonicalDecimalU64'
         next_command_seq:
-          $ref: '#/components/schemas/JsonSafeInteger'
+          $ref: '#/components/schemas/CanonicalDecimalU64'

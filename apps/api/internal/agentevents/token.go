@@ -94,8 +94,8 @@ func (v *HMACTokenVerifier) Verify(ctx context.Context, token string) (TokenClai
 	if tc.TenantID == "" || tc.AgentID == "" || tc.ConversationID == "" {
 		return TokenClaims{}, errors.New("token missing required identity claims")
 	}
-	if tc.Generation > maxJSONSafeInteger {
-		return TokenClaims{}, fmt.Errorf("token generation %d exceeds JSON-safe integer range", tc.Generation)
+	if tc.Generation > maxProcessGeneration {
+		return TokenClaims{}, fmt.Errorf("token generation %d exceeds process generation range", tc.Generation)
 	}
 	if tc.Exp == 0 {
 		return TokenClaims{}, errors.New("token missing expiry")

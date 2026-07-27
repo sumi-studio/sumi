@@ -21,6 +21,20 @@ ajv.addFormat("date-time", (s) => {
     s,
   );
 });
+ajv.addFormat("canonical-decimal-u64", (s) => {
+  return (
+    typeof s === "string" &&
+    /^(0|[1-9][0-9]*)$/.test(s) &&
+    BigInt(s) <= 18446744073709551615n
+  );
+});
+ajv.addFormat("canonical-process-generation", (s) => {
+  return (
+    typeof s === "string" &&
+    /^(0|[1-9][0-9]*)$/.test(s) &&
+    BigInt(s) <= 9223372036854775807n
+  );
+});
 
 const kindToDef = {
   outbound_frame: "OutboundFrame",
@@ -75,6 +89,35 @@ const counterexamples = [
       conversation_id: "conversation-1",
       event: { type: "error", message: "x" },
       seq: 1,
+    },
+  },
+  {
+    name: "hello rejects noncanonical decimal",
+    def: "AgentHello",
+    value: {
+      agent_id: "agent-1",
+      generation: "07",
+      last_sent_event_seq: "0",
+      last_received_command_seq: "0",
+      last_applied_command_seq: "0",
+    },
+  },
+  {
+    name: "hello rejects overflowing cursor",
+    def: "ApiHello",
+    value: {
+      accepted_generation: "7",
+      last_received_event_seq: "18446744073709551616",
+      next_command_seq: "1",
+    },
+  },
+  {
+    name: "hello rejects overflowing generation",
+    def: "ApiHello",
+    value: {
+      accepted_generation: "9223372036854775808",
+      last_received_event_seq: "0",
+      next_command_seq: "1",
     },
   },
   {

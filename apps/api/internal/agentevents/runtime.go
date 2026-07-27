@@ -35,9 +35,14 @@ type DurableGateway struct {
 	MaxConversationTails int
 	MaxAckTail           int
 
-	tails   map[string]*conversationLogState
-	clock   uint64
-	newFile func(string, int, os.FileMode) (durableFileHandle, error)
+	tails map[string]*conversationLogState
+	// browserSubscribers carry volatile frames only. Durable replay always
+	// reads the event log, so disconnecting a slow browser cannot lose durable
+	// history or grow this process without bound.
+	browserSubscribers    map[string]map[uint64]chan Envelope
+	nextBrowserSubscriber uint64
+	clock                 uint64
+	newFile               func(string, int, os.FileMode) (durableFileHandle, error)
 }
 
 type conversationLogState struct {
@@ -156,6 +161,7 @@ func OpenDurableGateway(dir string, commands *CommandStore) (*DurableGateway, er
 		MaxConversationTails: 128,
 		MaxAckTail:           256,
 		tails:                make(map[string]*conversationLogState),
+		browserSubscribers:   make(map[string]map[uint64]chan Envelope),
 		newFile: func(name string, flag int, perm os.FileMode) (durableFileHandle, error) {
 			return os.OpenFile(name, flag|syscall.O_NOFOLLOW, perm)
 		},
@@ -320,6 +326,9 @@ func (g *DurableGateway) Receive(ctx context.Context, claims TokenClaims, envelo
 		)
 	}
 	if envelope.Seq == nil { // volatile frames are deliberately not part of replay.
+		g.mu.Lock()
+		g.publishVolatileLocked(claims.ConversationID, envelope)
+		g.mu.Unlock()
 		return nil
 	}
 	g.mu.Lock()
@@ -328,6 +337,108 @@ func (g *DurableGateway) Receive(ctx context.Context, claims TokenClaims, envelo
 		claims.ConversationID,
 		durableEventRecord{Seq: *envelope.Seq, Event: envelope},
 	)
+}
+
+// EventCatchUp returns the durable event suffix after lastConsumedSeq. It
+// verifies the complete retained log on every read, so a gap or corrupt record
+// fails closed rather than being silently skipped during browser reconnect.
+func (g *DurableGateway) EventCatchUp(ctx context.Context, conversationID string, lastConsumedSeq uint64) ([]Envelope, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if lastConsumedSeq > maxJSONSafeInteger {
+		return nil, fmt.Errorf("browser event cursor %d exceeds JSON-safe integer range", lastConsumedSeq)
+	}
+	path := g.eventPath(conversationID)
+	file, err := g.newFile(path, os.O_RDONLY, 0o600)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_SH); err != nil {
+		return nil, fmt.Errorf("lock durable event log for browser replay: %w", err)
+	}
+	defer func() { _ = unlockDurableFile(file) }()
+
+	r := bufio.NewReader(file)
+	var previous uint64
+	var out []Envelope
+	for {
+		line, readErr := r.ReadBytes('\n')
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) != 0 {
+			var record durableEventRecord
+			if err := json.Unmarshal(trimmed, &record); err != nil {
+				return nil, fmt.Errorf("decode durable event log for browser replay: %w", err)
+			}
+			if record.Seq != previous+1 {
+				return nil, fmt.Errorf("durable event log is non-contiguous: got %d after %d", record.Seq, previous)
+			}
+			previous = record.Seq
+			if record.Seq > lastConsumedSeq {
+				out = append(out, record.Event)
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return nil, fmt.Errorf("read durable event log for browser replay: %w", readErr)
+		}
+	}
+	if lastConsumedSeq > previous {
+		return nil, fmt.Errorf("browser event cursor %d is ahead of durable tail %d", lastConsumedSeq, previous)
+	}
+	return out, nil
+}
+
+// SubscribeBrowserVolatile registers one bounded live-only receiver. A slow
+// consumer is disconnected rather than buffering unbounded volatile deltas.
+func (g *DurableGateway) SubscribeBrowserVolatile(conversationID string) (<-chan Envelope, func()) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.nextBrowserSubscriber++
+	id := g.nextBrowserSubscriber
+	out := make(chan Envelope, 64)
+	if g.browserSubscribers[conversationID] == nil {
+		g.browserSubscribers[conversationID] = make(map[uint64]chan Envelope)
+	}
+	g.browserSubscribers[conversationID][id] = out
+	var once sync.Once
+	return out, func() {
+		once.Do(func() {
+			g.mu.Lock()
+			defer g.mu.Unlock()
+			g.removeBrowserSubscriberLocked(conversationID, id)
+		})
+	}
+}
+
+func (g *DurableGateway) publishVolatileLocked(conversationID string, envelope Envelope) {
+	for id, subscriber := range g.browserSubscribers[conversationID] {
+		select {
+		case subscriber <- envelope:
+		default:
+			// The receiver is no longer a safe live stream. Removing and closing
+			// it makes its writer fail closed; durable replay remains available on
+			// reconnect.
+			g.removeBrowserSubscriberLocked(conversationID, id)
+		}
+	}
+}
+
+func (g *DurableGateway) removeBrowserSubscriberLocked(conversationID string, id uint64) {
+	subscribers := g.browserSubscribers[conversationID]
+	if subscriber, ok := subscribers[id]; ok {
+		delete(subscribers, id)
+		close(subscriber)
+	}
+	if len(subscribers) == 0 {
+		delete(g.browserSubscribers, conversationID)
+	}
 }
 
 func (g *DurableGateway) LastReceivedEventSeq(ctx context.Context, claims TokenClaims) (uint64, error) {
@@ -430,8 +541,8 @@ func (g *DurableGateway) state(ctx context.Context, agentID string) (runtimeStat
 	if state.HydrationReceiptIdentity != nil && *state.HydrationReceiptIdentity == "" {
 		return runtimeState{}, errors.New("hydration receipt identity must not be empty")
 	}
-	if state.Generation > maxJSONSafeInteger {
-		return runtimeState{}, fmt.Errorf("runtime generation %d exceeds JSON-safe integer range", state.Generation)
+	if state.Generation > maxProcessGeneration {
+		return runtimeState{}, fmt.Errorf("runtime generation %d exceeds process generation range", state.Generation)
 	}
 	state.present = true
 	return state, nil
@@ -829,8 +940,8 @@ func findAckLocked(file durableFileHandle, seq uint64) (CommandAck, bool, error)
 }
 
 func (g *DurableGateway) publishRuntimeState(agentID string, state runtimeState) error {
-	if state.Generation > maxJSONSafeInteger {
-		return fmt.Errorf("runtime generation %d exceeds JSON-safe integer range", state.Generation)
+	if state.Generation > maxProcessGeneration {
+		return fmt.Errorf("runtime generation %d exceeds process generation range", state.Generation)
 	}
 	raw, err := json.Marshal(state)
 	if err != nil {

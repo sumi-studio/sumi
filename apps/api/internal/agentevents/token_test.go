@@ -150,19 +150,19 @@ func TestHMACTokenVerifierProcessGenerationBoundary(t *testing.T) {
 		TenantID:       "tenant-1",
 		AgentID:        "agent-1",
 		ConversationID: "conversation-1",
-		Generation:     maxJSONSafeInteger,
+		Generation:     maxProcessGeneration,
 		Exp:            time.Now().Add(time.Hour).Unix(),
 		Aud:            defaultAgentAudience,
 	})
 	if _, err := v.Verify(context.Background(), valid); err != nil {
-		t.Fatalf("max JSON-safe generation must be accepted: %v", err)
+		t.Fatalf("max process generation must be accepted: %v", err)
 	}
 
 	invalid := signTestToken(t, testSecret, tokenClaims{
 		TenantID:       "tenant-1",
 		AgentID:        "agent-1",
 		ConversationID: "conversation-1",
-		Generation:     maxJSONSafeInteger + 1,
+		Generation:     maxProcessGeneration + 1,
 		Exp:            time.Now().Add(time.Hour).Unix(),
 		Aud:            defaultAgentAudience,
 	})

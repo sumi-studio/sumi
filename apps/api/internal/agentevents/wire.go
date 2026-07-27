@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -20,9 +21,15 @@ import (
 // definitions.
 const maxJSONSafeInteger uint64 = 9_007_199_254_740_991
 
+// maxProcessGeneration is the upper bound shared with the Rust
+// ProcessGeneration value type. Hello values are decimal strings so their
+// representation is not limited by JavaScript's number range.
+const maxProcessGeneration uint64 = 9_223_372_036_854_775_807
+
 // AgentHello is sent by the agent immediately after the WebSocket upgrade.
-// Generation is the ProcessGeneration bound to the short-lived credential claim,
-// validated to the JSON-safe integer range so it round-trips through JavaScript clients.
+// Generation and cursors use canonical decimal strings on the wire. This keeps
+// the full u64 cursor domain and i64::MAX generation domain lossless for web
+// clients while keeping the API's internal representation ergonomic.
 type AgentHello struct {
 	AgentID                string `json:"agent_id"`
 	Generation             uint64 `json:"generation"`
@@ -40,10 +47,10 @@ func (h *AgentHello) UnmarshalJSON(data []byte) error {
 	}
 	type rawHello struct {
 		AgentID                *string `json:"agent_id"`
-		Generation             *uint64 `json:"generation"`
-		LastSentEventSeq       *uint64 `json:"last_sent_event_seq"`
-		LastReceivedCommandSeq *uint64 `json:"last_received_command_seq"`
-		LastAppliedCommandSeq  *uint64 `json:"last_applied_command_seq"`
+		Generation             *string `json:"generation"`
+		LastSentEventSeq       *string `json:"last_sent_event_seq"`
+		LastReceivedCommandSeq *string `json:"last_received_command_seq"`
+		LastAppliedCommandSeq  *string `json:"last_applied_command_seq"`
 	}
 	var raw rawHello
 	if err := unmarshalStrict(data, &raw); err != nil {
@@ -64,40 +71,47 @@ func (h *AgentHello) UnmarshalJSON(data []byte) error {
 	if raw.LastAppliedCommandSeq == nil {
 		return fmt.Errorf("last_applied_command_seq is required")
 	}
-	if *raw.Generation > maxJSONSafeInteger {
-		return fmt.Errorf("generation %d exceeds JSON-safe integer range", *raw.Generation)
+	generation, err := parseCanonicalDecimal(*raw.Generation, maxProcessGeneration)
+	if err != nil {
+		return fmt.Errorf("generation: %w", err)
 	}
-	for name, seq := range map[string]uint64{
-		"last_sent_event_seq":       *raw.LastSentEventSeq,
-		"last_received_command_seq": *raw.LastReceivedCommandSeq,
-		"last_applied_command_seq":  *raw.LastAppliedCommandSeq,
-	} {
-		if seq > maxJSONSafeInteger {
-			return fmt.Errorf("%s %d exceeds JSON-safe integer range", name, seq)
-		}
+	lastSentEventSeq, err := parseCanonicalDecimal(*raw.LastSentEventSeq, ^uint64(0))
+	if err != nil {
+		return fmt.Errorf("last_sent_event_seq: %w", err)
+	}
+	lastReceivedCommandSeq, err := parseCanonicalDecimal(*raw.LastReceivedCommandSeq, ^uint64(0))
+	if err != nil {
+		return fmt.Errorf("last_received_command_seq: %w", err)
+	}
+	lastAppliedCommandSeq, err := parseCanonicalDecimal(*raw.LastAppliedCommandSeq, ^uint64(0))
+	if err != nil {
+		return fmt.Errorf("last_applied_command_seq: %w", err)
 	}
 	*h = AgentHello{
 		AgentID:                *raw.AgentID,
-		Generation:             *raw.Generation,
-		LastSentEventSeq:       *raw.LastSentEventSeq,
-		LastReceivedCommandSeq: *raw.LastReceivedCommandSeq,
-		LastAppliedCommandSeq:  *raw.LastAppliedCommandSeq,
+		Generation:             generation,
+		LastSentEventSeq:       lastSentEventSeq,
+		LastReceivedCommandSeq: lastReceivedCommandSeq,
+		LastAppliedCommandSeq:  lastAppliedCommandSeq,
 	}
 	return nil
 }
 
-// MarshalJSON validates that the outbound generation stays within the JSON-safe
-// integer range before encoding.
 func (h AgentHello) MarshalJSON() ([]byte, error) {
-	if h.Generation > maxJSONSafeInteger {
-		return nil, fmt.Errorf("generation %d exceeds JSON-safe integer range", h.Generation)
+	if h.Generation > maxProcessGeneration {
+		return nil, fmt.Errorf("generation %d exceeds process generation range", h.Generation)
 	}
-	type noMethod AgentHello
-	return json.Marshal(noMethod(h))
+	return json.Marshal(struct {
+		AgentID                string `json:"agent_id"`
+		Generation             string `json:"generation"`
+		LastSentEventSeq       string `json:"last_sent_event_seq"`
+		LastReceivedCommandSeq string `json:"last_received_command_seq"`
+		LastAppliedCommandSeq  string `json:"last_applied_command_seq"`
+	}{h.AgentID, strconv.FormatUint(h.Generation, 10), strconv.FormatUint(h.LastSentEventSeq, 10), strconv.FormatUint(h.LastReceivedCommandSeq, 10), strconv.FormatUint(h.LastAppliedCommandSeq, 10)})
 }
 
 // ApiHello is returned by the API after verifying the token and generation.
-// accepted_generation is validated to the JSON-safe integer range.
+// accepted_generation and cursor values are canonical decimal strings.
 type ApiHello struct {
 	AcceptedGeneration   uint64 `json:"accepted_generation"`
 	LastReceivedEventSeq uint64 `json:"last_received_event_seq"`
@@ -112,9 +126,9 @@ func (h *ApiHello) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("api hello json: %w", err)
 	}
 	type rawHello struct {
-		AcceptedGeneration   *uint64 `json:"accepted_generation"`
-		LastReceivedEventSeq *uint64 `json:"last_received_event_seq"`
-		NextCommandSeq       *uint64 `json:"next_command_seq"`
+		AcceptedGeneration   *string `json:"accepted_generation"`
+		LastReceivedEventSeq *string `json:"last_received_event_seq"`
+		NextCommandSeq       *string `json:"next_command_seq"`
 	}
 	var raw rawHello
 	if err := unmarshalStrict(data, &raw); err != nil {
@@ -129,39 +143,60 @@ func (h *ApiHello) UnmarshalJSON(data []byte) error {
 	if raw.NextCommandSeq == nil {
 		return fmt.Errorf("next_command_seq is required")
 	}
-	if *raw.AcceptedGeneration > maxJSONSafeInteger {
-		return fmt.Errorf("accepted_generation %d exceeds JSON-safe integer range", *raw.AcceptedGeneration)
+	acceptedGeneration, err := parseCanonicalDecimal(*raw.AcceptedGeneration, maxProcessGeneration)
+	if err != nil {
+		return fmt.Errorf("accepted_generation: %w", err)
 	}
-	for name, seq := range map[string]uint64{
-		"last_received_event_seq": *raw.LastReceivedEventSeq,
-		"next_command_seq":        *raw.NextCommandSeq,
-	} {
-		if seq > maxJSONSafeInteger {
-			return fmt.Errorf("%s %d exceeds JSON-safe integer range", name, seq)
-		}
+	lastReceivedEventSeq, err := parseCanonicalDecimal(*raw.LastReceivedEventSeq, ^uint64(0))
+	if err != nil {
+		return fmt.Errorf("last_received_event_seq: %w", err)
+	}
+	nextCommandSeq, err := parseCanonicalDecimal(*raw.NextCommandSeq, ^uint64(0))
+	if err != nil {
+		return fmt.Errorf("next_command_seq: %w", err)
 	}
 	*h = ApiHello{
-		AcceptedGeneration:   *raw.AcceptedGeneration,
-		LastReceivedEventSeq: *raw.LastReceivedEventSeq,
-		NextCommandSeq:       *raw.NextCommandSeq,
+		AcceptedGeneration:   acceptedGeneration,
+		LastReceivedEventSeq: lastReceivedEventSeq,
+		NextCommandSeq:       nextCommandSeq,
 	}
 	return nil
 }
 
-// MarshalJSON validates that all outbound seq values stay within the JSON-safe
-// integer range before encoding.
 func (h ApiHello) MarshalJSON() ([]byte, error) {
-	if h.AcceptedGeneration > maxJSONSafeInteger {
-		return nil, fmt.Errorf("accepted_generation %d exceeds JSON-safe integer range", h.AcceptedGeneration)
+	if h.AcceptedGeneration > maxProcessGeneration {
+		return nil, fmt.Errorf("accepted_generation %d exceeds process generation range", h.AcceptedGeneration)
 	}
-	if h.LastReceivedEventSeq > maxJSONSafeInteger {
-		return nil, fmt.Errorf("last_received_event_seq %d exceeds JSON-safe integer range", h.LastReceivedEventSeq)
+	return json.Marshal(struct {
+		AcceptedGeneration   string `json:"accepted_generation"`
+		LastReceivedEventSeq string `json:"last_received_event_seq"`
+		NextCommandSeq       string `json:"next_command_seq"`
+	}{strconv.FormatUint(h.AcceptedGeneration, 10), strconv.FormatUint(h.LastReceivedEventSeq, 10), strconv.FormatUint(h.NextCommandSeq, 10)})
+}
+
+// parseCanonicalDecimal accepts only the wire's lossless decimal form: 0 or a
+// nonzero ASCII digit followed by ASCII digits. It rejects JSON numbers,
+// signs, leading zeros, whitespace, exponents, fractions, and overflow.
+func parseCanonicalDecimal(value string, max uint64) (uint64, error) {
+	if value == "" {
+		return 0, errors.New("empty decimal string")
 	}
-	if h.NextCommandSeq > maxJSONSafeInteger {
-		return nil, fmt.Errorf("next_command_seq %d exceeds JSON-safe integer range", h.NextCommandSeq)
+	if value != "0" && value[0] == '0' {
+		return 0, errors.New("non-canonical leading zero")
 	}
-	type noMethod ApiHello
-	return json.Marshal(noMethod(h))
+	for _, c := range value {
+		if c < '0' || c > '9' {
+			return 0, errors.New("decimal string contains a non-digit")
+		}
+	}
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return 0, errors.New("decimal string exceeds u64 range")
+	}
+	if parsed > max {
+		return 0, fmt.Errorf("%d exceeds allowed range", parsed)
+	}
+	return parsed, nil
 }
 
 // CommandEnvelope is a durable command sent from the API to the agent.

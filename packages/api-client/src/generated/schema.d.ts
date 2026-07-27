@@ -63,20 +63,28 @@ export interface components {
             text: string;
             attachments: unknown[];
         };
-        /** @description non-negative process generation representable exactly by JavaScript number clients */
-        ProcessGeneration: number;
+        /**
+         * Format: canonical-process-generation
+         * @description canonical decimal process generation in 0..=9223372036854775807; encoded as a string to preserve it losslessly in JavaScript
+         */
+        ProcessGeneration: string;
+        /**
+         * Format: canonical-decimal-u64
+         * @description canonical decimal u64 encoded as a string to preserve it losslessly in JavaScript
+         */
+        CanonicalDecimalU64: string;
         AgentHello: {
             /** @description agent identity from the short-lived credential claim */
             agent_id: string;
             generation: components["schemas"]["ProcessGeneration"];
-            last_sent_event_seq: components["schemas"]["JsonSafeInteger"];
-            last_received_command_seq: components["schemas"]["JsonSafeInteger"];
-            last_applied_command_seq: components["schemas"]["JsonSafeInteger"];
+            last_sent_event_seq: components["schemas"]["CanonicalDecimalU64"];
+            last_received_command_seq: components["schemas"]["CanonicalDecimalU64"];
+            last_applied_command_seq: components["schemas"]["CanonicalDecimalU64"];
         };
         ApiHello: {
             accepted_generation: components["schemas"]["ProcessGeneration"];
-            last_received_event_seq: components["schemas"]["JsonSafeInteger"];
-            next_command_seq: components["schemas"]["JsonSafeInteger"];
+            last_received_event_seq: components["schemas"]["CanonicalDecimalU64"];
+            next_command_seq: components["schemas"]["CanonicalDecimalU64"];
         };
     };
     responses: never;

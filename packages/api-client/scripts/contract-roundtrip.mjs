@@ -27,7 +27,7 @@ const schemaPath = join(
 );
 const schema = readFileSync(schemaPath, "utf8");
 assertAnyJSONNumberBounds(schema);
-assertProcessGenerationBounds(schema);
+assertLosslessHelloBounds(schema);
 
 let passed = 0;
 for (const [name, fixture] of Object.entries(fixtures)) {
@@ -52,7 +52,7 @@ for (const [name, fixture] of Object.entries(fixtures)) {
 }
 
 console.log(`contract round-trip: ${passed} fixtures passed`);
-assertProcessGenerationRuntimeBounds();
+assertLosslessHelloRuntimeBounds();
 process.exit(0);
 
 function assertAnyJSONNumberBounds(schema) {
@@ -115,30 +115,32 @@ function assertAnyJSONRuntimeBounds(value, path) {
   }
 }
 
-function assertProcessGenerationBounds(schema) {
-  const definition = schema.match(
-    /^ {2}ProcessGeneration:\n([\s\S]*?)(?=^ {2}[A-Za-z][A-Za-z0-9_]*:|(?![\s\S]))/m,
-  )?.[0];
-  if (definition === undefined) {
-    throw new Error(
-      "agent-events schema is missing the ProcessGeneration definition",
-    );
-  }
-  if (!definition.includes("maximum: 9007199254740991")) {
-    throw new Error(
-      "ProcessGeneration must be bounded to the JSON-safe integer range",
-    );
+function assertLosslessHelloBounds(schema) {
+  for (const [name, format] of [
+    ["ProcessGeneration", "canonical-process-generation"],
+    ["CanonicalDecimalU64", "canonical-decimal-u64"],
+  ]) {
+    const definition = schema.match(
+      new RegExp(
+        `^ {2}${name}:\\n([\\s\\S]*?)(?=^ {2}[A-Za-z][A-Za-z0-9_]*:|(?![\\s\\S]))`,
+        "m",
+      ),
+    )?.[0];
+    if (
+      definition === undefined ||
+      !definition.includes("type: string") ||
+      !definition.includes(`format: ${format}`)
+    ) {
+      throw new Error(`${name} must be a lossless canonical decimal string`);
+    }
   }
 }
 
-function assertProcessGenerationRuntimeBounds() {
-  const maxSafe = 9007199254740991;
-  if (!Number.isSafeInteger(maxSafe)) {
-    throw new Error("expected 9007199254740991 to be a safe integer");
+function assertLosslessHelloRuntimeBounds() {
+  if (BigInt("9223372036854775807") !== 2n ** 63n - 1n) {
+    throw new Error("unexpected ProcessGeneration upper bound");
   }
-  if (Number.isSafeInteger(maxSafe + 1)) {
-    throw new Error(
-      "expected 9007199254740992 to be outside the safe-integer range",
-    );
+  if (BigInt("18446744073709551615") !== 2n ** 64n - 1n) {
+    throw new Error("unexpected u64 cursor upper bound");
   }
 }

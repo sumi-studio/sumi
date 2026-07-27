@@ -124,10 +124,10 @@ func TestValidateCommandAttachmentsRejectsAnyNonEmptyElement(t *testing.T) {
 func TestAgentHelloUnmarshalJSONStrict(t *testing.T) {
 	valid := `{
 		"agent_id":"agent-1",
-		"generation":7,
-		"last_sent_event_seq":0,
-		"last_received_command_seq":0,
-		"last_applied_command_seq":0
+		"generation":"7",
+		"last_sent_event_seq":"0",
+		"last_received_command_seq":"0",
+		"last_applied_command_seq":"0"
 	}`
 	var h AgentHello
 	if err := json.Unmarshal([]byte(valid), &h); err != nil {
@@ -139,7 +139,7 @@ func TestAgentHelloUnmarshalJSONStrict(t *testing.T) {
 		t.Fatal("agent hello accepted unknown field")
 	}
 
-	missingField := `{"agent_id":"agent-1","generation":7}`
+	missingField := `{"agent_id":"agent-1","generation":"7"}`
 	if err := json.Unmarshal([]byte(missingField), &h); err == nil {
 		t.Fatal("agent hello accepted missing fields")
 	}
@@ -149,7 +149,7 @@ func TestAgentHelloUnmarshalJSONStrict(t *testing.T) {
 		t.Fatal("agent hello accepted trailing data")
 	}
 
-	overGeneration := `{"agent_id":"agent-1","generation":9223372036854775808,"last_sent_event_seq":0,"last_received_command_seq":0,"last_applied_command_seq":0}`
+	overGeneration := `{"agent_id":"agent-1","generation":"9223372036854775808","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}`
 	if err := json.Unmarshal([]byte(overGeneration), &h); err == nil {
 		t.Fatal("agent hello accepted ProcessGeneration above i64::MAX")
 	}

@@ -92,19 +92,19 @@ func TestDurableGatewayRuntimeStateGenerationBoundary(t *testing.T) {
 	gateway := openRuntimeGateway(t)
 	const agentID = "agent-1"
 
-	if err := gateway.publishRuntimeState(agentID, runtimeState{Generation: maxJSONSafeInteger}); err != nil {
-		t.Fatalf("publish max JSON-safe generation failed: %v", err)
+	if err := gateway.publishRuntimeState(agentID, runtimeState{Generation: maxProcessGeneration}); err != nil {
+		t.Fatalf("publish max process generation failed: %v", err)
 	}
 	st, err := gateway.state(context.Background(), agentID)
-	if err != nil || st.Generation != maxJSONSafeInteger {
+	if err != nil || st.Generation != maxProcessGeneration {
 		t.Fatalf("max generation must be accepted in recovery: err=%v gen=%d", err, st.Generation)
 	}
 
-	if err := gateway.publishRuntimeState(agentID, runtimeState{Generation: maxJSONSafeInteger + 1}); err == nil {
+	if err := gateway.publishRuntimeState(agentID, runtimeState{Generation: maxProcessGeneration + 1}); err == nil {
 		t.Fatal("publish must reject generation max+1")
 	}
 
-	raw, err := json.Marshal(runtimeState{Generation: maxJSONSafeInteger + 1})
+	raw, err := json.Marshal(runtimeState{Generation: maxProcessGeneration + 1})
 	if err != nil {
 		t.Fatal(err)
 	}

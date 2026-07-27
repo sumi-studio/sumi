@@ -72,6 +72,14 @@ func newRouter() (*http.ServeMux, error) {
 		return nil, fmt.Errorf("create command ingress: %w", err)
 	}
 	mux.Handle("POST /conversations/{conversation_id}/commands", ingress)
+	browserSessions, err := browserSessionVerifierFromEnv()
+	if err != nil && !errors.Is(err, errBrowserSessionSecretMissing) {
+		_ = store.Close()
+		return nil, fmt.Errorf("browser session verifier: %w", err)
+	}
+	browser := agentevents.NewBrowserServer(browserSessions, store, runtime)
+	browser.AllowedOrigins = browserAllowedOriginsFromEnv()
+	mux.Handle("GET /conversations/{conversation_id}/ws", browser)
 
 	return mux, nil
 }
@@ -92,7 +100,15 @@ func wsHandler(tv agentevents.TokenVerifier, runtime *agentevents.DurableGateway
 }
 
 func allowedOriginsFromEnv() []string {
-	raw := os.Getenv("SUMI_AGENT_WS_ALLOWED_ORIGINS")
+	return originsFromEnv("SUMI_AGENT_WS_ALLOWED_ORIGINS")
+}
+
+func browserAllowedOriginsFromEnv() []string {
+	return originsFromEnv("SUMI_BROWSER_WS_ALLOWED_ORIGINS")
+}
+
+func originsFromEnv(name string) []string {
+	raw := os.Getenv(name)
 	if raw == "" {
 		return nil
 	}
@@ -107,6 +123,7 @@ func allowedOriginsFromEnv() []string {
 }
 
 var errTokenSecretMissing = errors.New("SUMI_AGENT_TOKEN_SECRET not set")
+var errBrowserSessionSecretMissing = errors.New("SUMI_BROWSER_SESSION_SECRET not set")
 
 func tokenVerifierFromEnv() (agentevents.TokenVerifier, error) {
 	b64 := os.Getenv("SUMI_AGENT_TOKEN_SECRET")
@@ -119,4 +136,20 @@ func tokenVerifierFromEnv() (agentevents.TokenVerifier, error) {
 	}
 	audience := os.Getenv("SUMI_AGENT_TOKEN_AUDIENCE")
 	return agentevents.NewHMACTokenVerifier(secret, audience)
+}
+
+// browserSessionVerifierFromEnv is deliberately separate from the agent token
+// verifier. Browser sessions are HttpOnly cookies scoped to users and
+// conversations; agent bearer tokens never enter this route.
+func browserSessionVerifierFromEnv() (agentevents.UserSessionVerifier, error) {
+	b64 := os.Getenv("SUMI_BROWSER_SESSION_SECRET")
+	if b64 == "" {
+		return nil, errBrowserSessionSecretMissing
+	}
+	secret, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return nil, err
+	}
+	audience := os.Getenv("SUMI_BROWSER_SESSION_AUDIENCE")
+	return agentevents.NewHMACUserSessionVerifier(secret, audience)
 }
