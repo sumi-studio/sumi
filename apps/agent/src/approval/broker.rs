@@ -20,7 +20,7 @@ use uuid::Uuid;
 use crate::{
     agent::events::{self, ApprovalRequest},
     approval::{
-        action::{CanonicalAction, ReviewProjection, SandboxSummary, SecretAwareActionProjector},
+        action::{CanonicalAction, SandboxSummary, SecretAwareActionProjector},
         policy::{
             ApprovalRule, Policy, PolicyDecision, ResolvedDecision, RuleValidationError,
             UserDecision,
@@ -397,17 +397,13 @@ impl ApprovalBroker {
     /// start have committed atomically. Until this point the decision is staged
     /// and must not affect authorization of another call.
     pub(crate) fn commit_resolution(&self, resolved: &ResolvedDecision) -> Result<()> {
-        let ResolvedDecision::ApproveAlways(rule) = resolved else {
+        let ResolvedDecision::ApproveAlways(_rule) = resolved else {
             return Ok(());
         };
-        let mut guard = self.policy.write().unwrap_or_else(|e| e.into_inner());
-        *guard = guard
-            .clone()
-            .try_with_rule(rule.clone())
-            .context("activate durably committed approval rule")?;
-        if let Some(reviewer) = self.reviewer.as_ref() {
-            reviewer.clear_allow_cache();
-        }
+        // The authenticated user choice authorizes this execution once and
+        // remains a durable proposal. Persistent authority begins only after
+        // the control plane publishes and the agent verifies a signed
+        // replacement bundle.
         Ok(())
     }
 
@@ -491,18 +487,6 @@ impl ApprovalBroker {
         reason: &str,
         audit: Option<AuditDecision>,
     ) -> Result<ApprovalOutcome> {
-        if let ReviewProjection::InsufficientEvidence {
-            reason: projection_reason,
-        } = projection
-        {
-            return Ok(ApprovalOutcome::Denied {
-                reason: format!(
-                    "{reason}: cannot request approval because the action could not be projected: {projection_reason}"
-                ),
-                audit,
-            });
-        }
-
         let request_id = Uuid::now_v7().to_string();
         let (tx, rx) = oneshot::channel();
 
@@ -1264,7 +1248,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn approve_always_only_updates_policy_after_durable_commit() {
+    async fn approve_always_proposal_does_not_activate_without_signed_bundle() {
         let mut broker = broker();
         broker.headless = false;
         let call = bash_call("ls /workspace");
@@ -1327,7 +1311,7 @@ mod tests {
             )
             .await
             .expect("start_request");
-        assert!(matches!(outcome, ApprovalOutcome::Allowed));
+        assert!(matches!(outcome, ApprovalOutcome::Pending { .. }));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1479,7 +1463,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn approve_always_clears_reviewer_allow_cache() {
+    async fn unsigned_approve_always_proposal_does_not_clear_allow_cache() {
         let (mut broker, reviewer, calls) = broker_with_counting_reviewer();
         broker.headless = false;
 
@@ -1541,17 +1525,14 @@ mod tests {
             .commit_resolution(&resolved)
             .expect("activate durable rule");
 
-        // The broker clears the reviewer allow cache only when the committed
-        // rule becomes active.
-        assert_eq!(reviewer.allow_cache_entry_count(), 0);
+        assert_eq!(reviewer.allow_cache_entry_count(), 1);
 
-        // Re-reviewing the same cached request after a policy mutation should
-        // hit the model again (cache was cleared).
+        // No signed policy mutation occurred, so the cached decision remains.
         let re_review = reviewer
             .review(cache_request, CancellationToken::new())
             .await;
         assert!(matches!(re_review, ReviewOutcome::Allow(_)));
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1755,13 +1736,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn insufficient_evidence_cannot_become_pending() {
+    async fn insufficient_evidence_falls_back_to_redacted_interactive_pending() {
         let mut broker = broker();
         broker.headless = false;
 
-        // `echo $TOKEN` contains an unquoted parameter expansion; the projector
-        // cannot produce a literal review token, so it must be denied before a
-        // pending approval can be created (and therefore before it can be approved).
+        let secret = "abcdef1234567890";
+        let outcome = broker
+            .start_request(
+                &bash_call(&format!("curl \"https://$HOST/path?token={secret}\"")),
+                &[],
+                "run-1",
+                "turn-1",
+                "v1",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("start_request");
+        let ApprovalOutcome::Pending { pending } = outcome else {
+            panic!("interactive insufficient evidence must become pending");
+        };
+        assert!(matches!(
+            pending.request().action,
+            events::ReviewProjection::InsufficientEvidence { .. }
+        ));
+        let public = serde_json::to_string(pending.request()).expect("serialize request");
+        assert!(
+            !public.contains(secret),
+            "secret leaked in approval request"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn insufficient_evidence_remains_denied_headless() {
+        let broker = broker();
         let outcome = broker
             .start_request(
                 &bash_call("echo $TOKEN"),
@@ -1773,10 +1780,7 @@ mod tests {
             )
             .await
             .expect("start_request");
-        assert!(
-            matches!(&outcome, ApprovalOutcome::Denied { reason, .. } if reason.contains("cannot request approval")),
-            "dynamic shell must be denied before pending approval: {outcome:?}"
-        );
+        assert!(matches!(outcome, ApprovalOutcome::Denied { .. }));
         assert!(!broker.any_pending());
     }
 }

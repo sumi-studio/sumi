@@ -1343,7 +1343,13 @@ impl Runner {
         context_version: &str,
     ) -> Result<CallDisposition, WorkerFailure> {
         let Some(broker) = self.core.approval.clone() else {
-            return Ok(CallDisposition::Allowed);
+            #[cfg(test)]
+            if self.core.fixture_bypass_approval {
+                return Ok(CallDisposition::Allowed);
+            }
+            return Err(WorkerFailure::Error(
+                "tool execution requires a configured ApprovalBroker".to_owned(),
+            ));
         };
         let binding = self.core.durable_binding.as_ref().ok_or_else(|| {
             WorkerFailure::Error("RunCore has no durable worker binding".to_owned())

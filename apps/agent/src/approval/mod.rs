@@ -14,8 +14,9 @@ pub use action::{
 pub use broker::{ApprovalBroker, ApprovalOutcome, WaiterResult};
 #[allow(unused_imports)]
 pub use policy::{
-    ApprovalRule, Policy, PolicyDecision, ResolvedDecision, RuleEffect, RuleValidationError,
-    UserDecision,
+    ApprovalPolicyBundle, ApprovalPolicyCacheStatus, ApprovalPolicyTrustStore, ApprovalRule,
+    LoadedApprovalPolicy, Policy, PolicyDecision, ResolvedDecision, RuleEffect,
+    RuleValidationError, SignedApprovalPolicyBundle, UserDecision,
 };
 #[allow(unused_imports)]
 pub use prompt::{PromptLimits, ReviewerMessage, ReviewerPrompt, ReviewerRole, TrustedEnvironment};

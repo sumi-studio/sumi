@@ -38,7 +38,7 @@ use crate::{
 };
 
 use crate::approval::{
-    ApprovalBroker, ApprovalOutcome,
+    ApprovalBroker, ApprovalOutcome, ApprovalPolicyTrustStore,
     action::{SandboxSummary, SecretAwareActionProjector, SecretDigestKey},
     prompt::{ReviewerPrompt, TrustedEnvironment},
     reviewer::{
@@ -516,7 +516,7 @@ fn applied_acks(frames: &Arc<Mutex<Vec<OutboundFrame>>>) -> Vec<CommandAck> {
 }
 
 async fn session(gateway: MockGateway, worker: Arc<dyn RunWorker>) -> Session<MockGateway> {
-    session_with_core(gateway, worker, RunCore::new()).await
+    session_with_core(gateway, worker, RunCore::fixture_with_unapproved_tools()).await
 }
 
 async fn session_with_core(
@@ -697,7 +697,7 @@ async fn session_rejects_worker_output_with_any_changed_durable_binding() {
         let session = Session::start(
             store,
             gateway,
-            RunCore::new(),
+            RunCore::fixture_with_unapproved_tools(),
             Arc::new(StaleBindingWorker(kind)),
             test_executor_generation(),
         )
@@ -904,7 +904,7 @@ async fn active_session_uses_durable_backpressure_before_its_bounded_fifo_can_ov
     let mut session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -989,7 +989,7 @@ async fn active_session_keeps_early_reserved_abort_and_remaining_ordinary_window
     let mut session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -1151,7 +1151,7 @@ async fn typed_worker_failures_report_recovered_ownership() {
                 }
             },
         );
-        let core = RunCore::new();
+        let core = RunCore::fixture_with_unapproved_tools();
         let ownership_id = core.ownership_id();
         let task = tokio::spawn(session_with_core(gateway, worker, core).await.run());
         commands.send(user(1)).await.expect("command");
@@ -1196,7 +1196,7 @@ async fn fixture_adapter_event_loss_drains_bounded_lane_and_returns_the_actual_c
         unreachable!()
     };
     let initial = AdmittedCommand::new(envelope, Utc::now());
-    let mut core = RunCore::new();
+    let mut core = RunCore::fixture_with_unapproved_tools();
     let ownership_id = core.ownership_id();
     core.durable_binding = Some(DurableRunBinding::idle(
         &initial,
@@ -1436,7 +1436,7 @@ async fn shutdown_drains_ready_completion_outputs_before_recovering_core_after_g
         Session::start(
             store,
             gateway,
-            RunCore::new(),
+            RunCore::fixture_with_unapproved_tools(),
             worker,
             test_executor_generation(),
         )
@@ -1482,7 +1482,7 @@ async fn event_drain_send_failure_preserves_ready_completion_core() {
     } = controlled_gateway();
     let release = Arc::new(Notify::new());
     let (started_tx, mut started_rx) = mpsc::channel(1);
-    let core = RunCore::new();
+    let core = RunCore::fixture_with_unapproved_tools();
     let ownership_id = core.ownership_id();
     let worker: Arc<dyn RunWorker> = Arc::new({
         let release = release.clone();
@@ -1576,7 +1576,7 @@ async fn completion_drain_persists_all_outputs_before_recovering_mutated_core_af
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -1720,7 +1720,7 @@ async fn t15_recovery_gate_allows_only_t12_prefix_exact_retransmission() {
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -2117,7 +2117,7 @@ async fn idle_approval_cancellation_keeps_broker_pending_until_durable_retry_com
     let worker: Arc<dyn RunWorker> = Arc::new(SequentialRunWorker::new(
         ApprovalTestDriver::with_tool_call(Arc::new(AtomicBool::new(false))),
     ));
-    let mut core = RunCore::new();
+    let mut core = RunCore::fixture_with_unapproved_tools();
     core.set_approval(broker.clone());
     let mut session = Session::start(store, gateway, core, worker, test_executor_generation())
         .await
@@ -2185,7 +2185,7 @@ async fn late_approval_storage_failure_replays_through_durable_ingress_without_t
     let mut session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -2353,7 +2353,7 @@ async fn pending_fixture_approval_is_a_fail_closed_t12_restart_suffix() {
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -2755,7 +2755,7 @@ async fn active_second_user_stays_received_then_runs_after_the_current_agent_end
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -2892,7 +2892,7 @@ async fn active_user_then_abort_is_cut_off_after_agent_end_without_starting_user
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -2963,7 +2963,7 @@ async fn active_abort_then_user_applies_abort_before_starting_later_user() {
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -3073,7 +3073,7 @@ async fn active_abort_supersedes_deferred_user_message_and_owner_applied() {
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -3622,7 +3622,7 @@ async fn sequential_worker_makes_progress_with_multiple_rejected_result_receipts
     let mut session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         Arc::new(SequentialRunWorker::new(driver.clone())),
         test_executor_generation(),
     )
@@ -3722,7 +3722,7 @@ async fn malformed_rejection_terminal_correspondence_fails_closed_without_receip
         let mut session = Session::start(
             store,
             gateway,
-            RunCore::new(),
+            RunCore::fixture_with_unapproved_tools(),
             Arc::new(SequentialRunWorker::new(driver)),
             test_executor_generation(),
         )
@@ -3772,7 +3772,7 @@ async fn tool_driver_observes_running_only_after_start_commit() {
     let mut session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         Arc::new(SequentialRunWorker::new(driver.clone())),
         test_executor_generation(),
     )
@@ -3833,7 +3833,7 @@ async fn rpc_indeterminate_after_start_fails_worker_and_leaves_durable_tool_runn
     let mut session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         Arc::new(SequentialRunWorker::new(driver.clone())),
         test_executor_generation(),
     )
@@ -3927,7 +3927,7 @@ async fn rejected_running_transition_never_calls_driver_or_publishes_start() {
     let mut session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         Arc::new(SequentialRunWorker::new(driver.clone())),
         test_executor_generation(),
     )
@@ -4025,7 +4025,7 @@ async fn blocked_writer_drops_only_volatile_suffix_and_preserves_terminal_reserv
     let mut session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -4099,7 +4099,7 @@ async fn idle_gateway_eof_aborts_a_blocked_writer_without_hanging() {
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -4164,7 +4164,7 @@ async fn aborting_session_drops_blocked_writer_and_active_worker() {
             .await
             .expect("test store"),
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -4491,7 +4491,7 @@ async fn durable_bridge_commits_each_event_before_gateway_delivery_with_exact_se
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -4616,9 +4616,15 @@ async fn assert_first_length_tool_call_persists_generation(executor_generation: 
             RunCompletion::Completed(core)
         },
     );
-    let session = Session::start(store, gateway, RunCore::new(), worker, executor_generation)
-        .await
-        .expect("session");
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::fixture_with_unapproved_tools(),
+        worker,
+        executor_generation,
+    )
+    .await
+    .expect("session");
     let task = tokio::spawn(session.run());
     commands.send(user(1)).await.expect("command");
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -4762,7 +4768,7 @@ async fn consecutive_length_guard_error_is_durably_not_started_and_closes_normal
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -4981,7 +4987,7 @@ async fn mixed_valid_and_rejected_calls_commit_the_rejected_pair_before_valid_li
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -5080,7 +5086,7 @@ async fn failed_idle_injection_batch_publishes_no_partial_event_frame() {
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -5181,7 +5187,7 @@ async fn retry_error_is_excluded_and_retry_schedule_precedes_next_attempt() {
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -5466,7 +5472,7 @@ async fn session_immediate_overflow_commits_zero_delay_before_installing_replace
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         Arc::new(SequentialRunWorker::new(driver.clone())),
         test_executor_generation(),
     )
@@ -5531,7 +5537,7 @@ async fn gateway_user_during_retry_wait_is_durably_injected_before_next_attempt(
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         Arc::new(SequentialRunWorker::new(driver.clone())),
         test_executor_generation(),
     )
@@ -5730,7 +5736,7 @@ async fn delay_zero_retry_schedule_without_retry_phase_never_admits_retry_steer(
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -5888,7 +5894,7 @@ async fn retry_timer_winning_handshake_defers_command_without_loss() {
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -6081,7 +6087,7 @@ async fn retry_handshake_timeout_defers_once_and_unblocks_the_event_lane() {
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -6165,7 +6171,7 @@ async fn provider_start_failures_in_two_runs_use_distinct_stable_durable_message
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -6224,7 +6230,7 @@ async fn opaque_context_refusal_closes_durably_before_applied_ack() {
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         worker,
         test_executor_generation(),
     )
@@ -6405,9 +6411,15 @@ async fn assert_normal_tool_lifecycle_persists_generation(executor_generation: P
             RunCompletion::Completed(core)
         },
     );
-    let session = Session::start(store, gateway, RunCore::new(), worker, executor_generation)
-        .await
-        .expect("session");
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::fixture_with_unapproved_tools(),
+        worker,
+        executor_generation,
+    )
+    .await
+    .expect("session");
     let task = tokio::spawn(session.run());
     commands.send(user(1)).await.expect("command");
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -6544,7 +6556,7 @@ async fn tool_execution_update_after_end_is_rejected_while_result_pairing_is_pen
         Session::start(
             store,
             gateway,
-            RunCore::new(),
+            RunCore::fixture_with_unapproved_tools(),
             worker,
             test_executor_generation(),
         )
@@ -6709,7 +6721,7 @@ async fn retry_wait_group_of_two_is_injected_before_next_attempt() {
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         Arc::new(SequentialRunWorker::new(driver.clone())),
         test_executor_generation(),
     )
@@ -6836,7 +6848,7 @@ async fn retry_wait_group_of_three_is_injected_before_next_attempt() {
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         Arc::new(SequentialRunWorker::new(driver.clone())),
         test_executor_generation(),
     )
@@ -7266,7 +7278,7 @@ async fn t16_hard_steer_kill_restart_child() {
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         Arc::new(SequentialRunWorker::new(driver.clone())),
         test_executor_generation(),
     )
@@ -7310,7 +7322,7 @@ async fn t16_turn_end_kill_restart_child() {
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         Arc::new(SequentialRunWorker::new(driver.clone())),
         test_executor_generation(),
     )
@@ -7349,7 +7361,7 @@ async fn t16_active_abort_provider_kill_restart_child() {
     let session = Session::start(
         store,
         gateway,
-        RunCore::new(),
+        RunCore::fixture_with_unapproved_tools(),
         Arc::new(SequentialRunWorker::new(driver.clone())),
         test_executor_generation(),
     )
@@ -8229,8 +8241,21 @@ fn trusted_env() -> TrustedEnvironment {
     }
 }
 
+async fn ask_only_policy(store: &Store) -> crate::approval::Policy {
+    store
+        .load_approval_policy(
+            "/workspace",
+            &ApprovalPolicyTrustStore::default(),
+            0,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("load fail-closed approval policy")
+        .policy
+}
+
 fn approval_core(broker: Arc<ApprovalBroker>) -> RunCore {
-    let mut core = RunCore::new();
+    let mut core = RunCore::fixture_with_unapproved_tools();
     core.set_approval(broker);
     core
 }
@@ -8308,10 +8333,7 @@ async fn session_auto_review_fail_closed_denies_bash_without_executing() {
         .expect("test store");
     let pool = store.pool().clone();
 
-    let policy = store
-        .load_approval_policy("/workspace")
-        .await
-        .expect("seed broker policy from durable rules");
+    let policy = ask_only_policy(&store).await;
     let broker = Arc::new(ApprovalBroker::new(
         policy,
         make_projector(),
@@ -8515,10 +8537,7 @@ async fn session_user_approve_once_allows_bash_and_executes() {
         .expect("test store");
     let pool = store.pool().clone();
 
-    let policy = store
-        .load_approval_policy("/workspace")
-        .await
-        .expect("seed broker policy from durable rules");
+    let policy = ask_only_policy(&store).await;
     let broker = Arc::new(ApprovalBroker::new(
         policy,
         make_projector(),
@@ -8613,10 +8632,7 @@ async fn session_user_approve_always_persists_rule_and_executes() {
         .await
         .expect("test store");
     let pool = store.pool().clone();
-    let policy = store
-        .load_approval_policy("/workspace")
-        .await
-        .expect("seed broker policy from durable rules");
+    let policy = ask_only_policy(&store).await;
     let broker = Arc::new(ApprovalBroker::new(
         policy,
         make_projector(),
@@ -8957,10 +8973,7 @@ async fn assert_pre_start_approval_control_race(store_name: &str, control: Inbou
         .await
         .expect("test store");
     let pool = store.pool().clone();
-    let policy = store
-        .load_approval_policy("/workspace")
-        .await
-        .expect("seed broker policy from durable rules");
+    let policy = ask_only_policy(&store).await;
     let broker = Arc::new(ApprovalBroker::new(
         policy,
         make_projector(),

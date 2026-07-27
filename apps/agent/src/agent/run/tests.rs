@@ -602,13 +602,41 @@ fn pending_sequences(core: &mut RunCore) -> Vec<u64> {
 
 fn bound_core(seq: u64) -> RunCore {
     let command = admitted_user(seq);
-    let mut core = RunCore::new();
+    let mut core = RunCore::fixture_with_unapproved_tools();
     core.durable_binding = Some(DurableRunBinding::idle(
         &command,
         test_executor_generation(),
     ));
     core.attempt_cancellation = Some(Arc::new(AttemptCancellation::default()));
     core
+}
+
+#[tokio::test]
+async fn tool_evaluation_without_broker_fails_closed() {
+    let command = admitted_user(1);
+    let mut core = RunCore::new();
+    core.durable_binding = Some(DurableRunBinding::idle(
+        &command,
+        test_executor_generation(),
+    ));
+    let driver = Arc::new(FixtureDriver::new(Vec::new()));
+    let (_control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, _events_rx) = mpsc::channel(1);
+    let mut runner = Runner::new(core, driver, control_rx, events_tx);
+    let call = ToolCall {
+        id: "call-no-broker".to_owned(),
+        name: "bash".to_owned(),
+        arguments: serde_json::from_value(json!({"command": "git status"}))
+            .expect("validated arguments"),
+    };
+    let error = match runner.evaluate_call(&call, &[], "0").await {
+        Err(error) => error,
+        Ok(_) => panic!("missing broker must not allow tool execution"),
+    };
+    assert!(matches!(
+        error,
+        WorkerFailure::Error(message) if message.contains("configured ApprovalBroker")
+    ));
 }
 
 struct BlockingReviewer {

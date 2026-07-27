@@ -785,7 +785,7 @@ mod tests {
         let session = Session::start(
             store,
             zero_gateway,
-            RunCore::new(),
+            RunCore::fixture_with_unapproved_tools(),
             Arc::new(SequentialRunWorker::new(driver)),
             generation(0),
         )
@@ -823,7 +823,7 @@ mod tests {
         let error = match Session::start(
             store,
             mismatch_gateway,
-            RunCore::new(),
+            RunCore::fixture_with_unapproved_tools(),
             Arc::new(SequentialRunWorker::new(driver)),
             generation(11),
         )
@@ -1277,7 +1277,7 @@ mod tests {
         let session = Session::start(
             store,
             gateway,
-            RunCore::new(),
+            RunCore::fixture_with_unapproved_tools(),
             Arc::new(SequentialRunWorker::new(driver)),
             generation(11),
         )
@@ -1461,9 +1461,15 @@ mod tests {
             .expect("driver"),
         );
         let worker = Arc::new(SequentialRunWorker::new(driver.clone()));
-        let session = Session::start(store, gateway, RunCore::new(), worker, generation(11))
-            .await
-            .expect("session");
+        let session = Session::start(
+            store,
+            gateway,
+            RunCore::fixture_with_unapproved_tools(),
+            worker,
+            generation(11),
+        )
+        .await
+        .expect("session");
         let session_task = tokio::spawn(session.run());
 
         command_write
@@ -1808,7 +1814,7 @@ mod tests {
         let session = Session::start(
             store,
             gateway,
-            RunCore::new(),
+            RunCore::fixture_with_unapproved_tools(),
             Arc::new(SequentialRunWorker::new(driver.clone())),
             generation(11),
         )
@@ -1910,7 +1916,7 @@ mod tests {
         let session = Session::start(
             store,
             gateway,
-            RunCore::new(),
+            RunCore::fixture_with_unapproved_tools(),
             Arc::new(SequentialRunWorker::new(driver)),
             generation(11),
         )
@@ -2029,7 +2035,7 @@ mod tests {
         let session = Session::start(
             store,
             gateway,
-            RunCore::new(),
+            RunCore::fixture_with_unapproved_tools(),
             Arc::new(SequentialRunWorker::new(driver)),
             generation(11),
         )

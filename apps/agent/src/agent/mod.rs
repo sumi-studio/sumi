@@ -214,6 +214,8 @@ pub(crate) struct RunCore {
     /// only cancelled after the durable step-zero commit succeeds.
     attempt_cancellation: Option<Arc<AttemptCancellation>>,
     approval: Option<Arc<ApprovalBroker>>,
+    #[cfg(test)]
+    fixture_bypass_approval: bool,
 }
 
 impl RunCore {
@@ -228,6 +230,8 @@ impl RunCore {
             worker_phase: None,
             attempt_cancellation: None,
             approval: None,
+            #[cfg(test)]
+            fixture_bypass_approval: false,
         }
     }
 
@@ -245,6 +249,13 @@ impl RunCore {
 
     pub(crate) fn set_approval(&mut self, broker: Arc<ApprovalBroker>) {
         self.approval = Some(broker);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_with_unapproved_tools() -> Self {
+        let mut core = Self::new();
+        core.fixture_bypass_approval = true;
+        core
     }
 
     pub(crate) fn queue_followup(&mut self, command: AdmittedCommand) -> Result<()> {

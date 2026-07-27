@@ -1177,19 +1177,144 @@ impl Store {
         Ok(rules)
     }
 
-    /// Reconstruct the deterministic approval policy from durable rules.
-    ///
-    /// This is the Store-to-broker read boundary: both malformed persisted
-    /// data and rules invalid under the current narrow-prefix/secret policy
-    /// reject startup rather than silently widening or dropping authority.
-    #[allow(dead_code)] // T23 Session fixtures exercise this pre-bootstrap boundary.
+    /// Load and verify the control-plane-signed D6 materialized policy cache.
+    #[allow(dead_code)] // T26 consumes this control-plane cache load seam.
     pub(crate) async fn load_approval_policy(
         &self,
         workspace_root: impl Into<std::path::PathBuf>,
-    ) -> Result<crate::approval::policy::Policy> {
-        let rules = self.load_approval_rules().await?;
-        crate::approval::policy::Policy::from_rules(workspace_root, rules)
-            .context("stored approval rules failed current-policy validation")
+        trust: &crate::approval::policy::ApprovalPolicyTrustStore,
+        minimum_version: u64,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<crate::approval::policy::LoadedApprovalPolicy> {
+        use crate::approval::policy::{
+            ApprovalPolicyBundle, ApprovalPolicyCacheStatus, LoadedApprovalPolicy, Policy,
+            SignedApprovalPolicyBundle,
+        };
+
+        let workspace_root = workspace_root.into();
+        let row = sqlx::query(
+            "SELECT tenant_id, agent_id, version, issued_at, expires_at, key_id,
+                    payload_json, signature
+             FROM approval_policy_cache WHERE singleton = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load approval policy cache")?;
+        let Some(row) = row else {
+            return Ok(LoadedApprovalPolicy {
+                policy: Policy::new(workspace_root),
+                status: ApprovalPolicyCacheStatus::Missing,
+            });
+        };
+
+        let unavailable = |reason: String| LoadedApprovalPolicy {
+            policy: Policy::new(workspace_root.clone()),
+            status: ApprovalPolicyCacheStatus::Unavailable { reason },
+        };
+        let payload_json: String = row.try_get("payload_json")?;
+        let payload: ApprovalPolicyBundle = match serde_json::from_str(&payload_json) {
+            Ok(payload) => payload,
+            Err(error) => return Ok(unavailable(format!("malformed cached payload: {error}"))),
+        };
+        let stored_version: i64 = row.try_get("version")?;
+        let denormalized_matches = stored_version >= 0
+            && u64::try_from(stored_version).ok() == Some(payload.version)
+            && row.try_get::<String, _>("tenant_id")? == payload.tenant_id
+            && row.try_get::<String, _>("agent_id")? == payload.agent_id
+            && row.try_get::<String, _>("issued_at")? == payload.issued_at.to_rfc3339()
+            && row.try_get::<String, _>("expires_at")? == payload.expires_at.to_rfc3339();
+        if !denormalized_matches {
+            return Ok(unavailable(
+                "cached approval policy metadata does not match its signed payload".to_owned(),
+            ));
+        }
+        let signed = SignedApprovalPolicyBundle {
+            key_id: row.try_get("key_id")?,
+            payload,
+            signature: row.try_get("signature")?,
+        };
+        if let Err(error) = trust.verify(
+            &signed,
+            &self.scope.tenant_id,
+            &self.scope.agent_id,
+            minimum_version,
+            now,
+        ) {
+            return Ok(unavailable(error.to_string()));
+        }
+        let policy = Policy::from_verified_bundle(workspace_root, &signed.payload)
+            .context("verified approval policy failed deterministic validation")?;
+        Ok(LoadedApprovalPolicy {
+            policy,
+            status: ApprovalPolicyCacheStatus::Verified {
+                version: signed.payload.version,
+                expires_at: signed.payload.expires_at,
+            },
+        })
+    }
+
+    #[allow(dead_code)] // T26 consumes this control-plane cache installation seam.
+    pub(crate) async fn install_approval_policy_bundle(
+        &self,
+        signed: &crate::approval::policy::SignedApprovalPolicyBundle,
+        trust: &crate::approval::policy::ApprovalPolicyTrustStore,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        trust.verify(signed, &self.scope.tenant_id, &self.scope.agent_id, 0, now)?;
+        let version = i64::try_from(signed.payload.version)
+            .context("approval policy version exceeds SQLite INTEGER")?;
+        let payload_json =
+            serde_json::to_string(&signed.payload).context("serialize approval policy cache")?;
+        let mut transaction = self.pool.begin().await?;
+        let existing =
+            sqlx::query("SELECT version, key_id, payload_json, signature FROM approval_policy_cache WHERE singleton=1")
+                .fetch_optional(&mut *transaction)
+                .await?;
+        if let Some(existing) = existing {
+            let existing_version: i64 = existing.try_get("version")?;
+            if existing_version > version {
+                bail!("approval policy bundle version rollback is forbidden");
+            }
+            if existing_version == version {
+                let exact = existing.try_get::<String, _>("key_id")? == signed.key_id
+                    && existing.try_get::<String, _>("payload_json")? == payload_json
+                    && existing.try_get::<Vec<u8>, _>("signature")? == signed.signature;
+                if exact {
+                    transaction.rollback().await?;
+                    return Ok(());
+                }
+                bail!("approval policy bundle version conflicts with cached material");
+            }
+        }
+        sqlx::query(
+            "INSERT INTO approval_policy_cache(
+                singleton, tenant_id, agent_id, version, issued_at, expires_at,
+                key_id, payload_json, signature, installed_at
+             ) VALUES(1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(singleton) DO UPDATE SET
+                tenant_id=excluded.tenant_id,
+                agent_id=excluded.agent_id,
+                version=excluded.version,
+                issued_at=excluded.issued_at,
+                expires_at=excluded.expires_at,
+                key_id=excluded.key_id,
+                payload_json=excluded.payload_json,
+                signature=excluded.signature,
+                installed_at=excluded.installed_at",
+        )
+        .bind(&signed.payload.tenant_id)
+        .bind(&signed.payload.agent_id)
+        .bind(version)
+        .bind(signed.payload.issued_at.to_rfc3339())
+        .bind(signed.payload.expires_at.to_rfc3339())
+        .bind(&signed.key_id)
+        .bind(payload_json)
+        .bind(&signed.signature)
+        .bind(now.to_rfc3339())
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     fn event_writer_state(&self) -> Arc<Mutex<event_writer::WriterState>> {
@@ -1813,7 +1938,8 @@ mod tests {
     use crate::provider::types::{PublicMessage, UserContent, UserMessage};
     use crate::store::crypto::{DATA_KEY_BYTES, WrappingKey, decrypt_content, encrypt_content};
     use crate::store::transcript::TranscriptRecord;
-    use chrono::Utc;
+    use chrono::{Duration as ChronoDuration, Utc};
+    use ed25519_dalek::{Signer, SigningKey};
     use serde_json::json;
     use sha2::Sha384;
     use tokio_util::sync::CancellationToken;
@@ -1854,6 +1980,44 @@ mod tests {
         Store::in_memory(scope(), provider())
             .await
             .expect("open in-memory store")
+    }
+
+    fn approval_signer() -> SigningKey {
+        SigningKey::from_bytes(&[0x71; 32])
+    }
+
+    fn approval_trust() -> crate::approval::ApprovalPolicyTrustStore {
+        crate::approval::ApprovalPolicyTrustStore::new([(
+            "control-plane-v1".to_owned(),
+            approval_signer().verifying_key(),
+        )])
+        .expect("fixture approval trust")
+    }
+
+    fn signed_approval_bundle(
+        version: u64,
+        rules: Vec<crate::approval::ApprovalRule>,
+        issued_at: chrono::DateTime<Utc>,
+        expires_at: chrono::DateTime<Utc>,
+    ) -> crate::approval::SignedApprovalPolicyBundle {
+        let payload = crate::approval::ApprovalPolicyBundle {
+            schema_version: crate::approval::policy::APPROVAL_POLICY_BUNDLE_SCHEMA_VERSION,
+            tenant_id: scope().tenant_id,
+            agent_id: scope().agent_id,
+            version,
+            issued_at,
+            expires_at,
+            rules,
+        };
+        let signature = approval_signer()
+            .sign(&payload.signing_bytes().expect("signing bytes"))
+            .to_bytes()
+            .to_vec();
+        crate::approval::SignedApprovalPolicyBundle {
+            key_id: "control-plane-v1".to_owned(),
+            payload,
+            signature,
+        }
     }
 
     #[tokio::test]
@@ -3487,7 +3651,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approval_rules_survive_store_reopen_and_affect_evaluation() {
+    async fn signed_approval_policy_survives_reopen_and_local_proposal_is_not_authority() {
         use crate::approval::action::{Permission, SecretAwareActionProjector, SecretDigestKey};
         use crate::approval::policy::{ApprovalRule, RuleEffect};
         use crate::approval::{ApprovalBroker, broker::ApprovalOutcome};
@@ -3509,6 +3673,17 @@ mod tests {
         let store = Store::open(&path, scope(), provider())
             .await
             .expect("open file-backed store");
+        let now = Utc::now();
+        let bundle = signed_approval_bundle(
+            7,
+            vec![rule.clone()],
+            now - ChronoDuration::minutes(1),
+            now + ChronoDuration::hours(1),
+        );
+        store
+            .install_approval_policy_bundle(&bundle, &approval_trust(), now)
+            .await
+            .expect("install signed policy");
         let pattern = serde_json::to_string(&rule).expect("serialize rule");
         sqlx::query(
             "INSERT INTO approval_rules(id, tool, pattern, created_at)
@@ -3527,12 +3702,16 @@ mod tests {
         let store = Store::open(&path, scope(), provider())
             .await
             .expect("reopen file-backed store");
-        let policy = store
-            .load_approval_policy("/workspace")
+        let loaded = store
+            .load_approval_policy("/workspace", &approval_trust(), 7, now)
             .await
             .expect("load persisted rules into policy");
+        assert!(matches!(
+            loaded.status,
+            crate::approval::ApprovalPolicyCacheStatus::Verified { version: 7, .. }
+        ));
         let projector = SecretAwareActionProjector::new(Redactor::v1(), SecretDigestKey::fixture());
-        let broker = ApprovalBroker::headless(policy, projector);
+        let broker = ApprovalBroker::headless(loaded.policy, projector);
 
         let arguments = serde_json::from_value::<ValidatedToolArguments>(
             serde_json::json!({"command": "git status"}),
@@ -3559,8 +3738,196 @@ mod tests {
             "loaded RuleEffect::Allow rule must allow matching bash command"
         );
 
+        // A locally inserted proposal not covered by the signed bundle cannot
+        // widen restart-time authority.
+        let proposal = ApprovalRule {
+            id: "proposal-npm-test".to_owned(),
+            tool: "bash".to_owned(),
+            literal_prefix: vec!["npm".to_owned(), "test".to_owned()],
+            effect: RuleEffect::Allow,
+            workspace_only: true,
+            allowed_permissions: vec![Permission::Exec],
+            allowed_network_domains: vec![],
+        };
+        sqlx::query("INSERT INTO approval_rules(id, tool, pattern, created_at) VALUES(?, ?, ?, ?)")
+            .bind(&proposal.id)
+            .bind(&proposal.tool)
+            .bind(serde_json::to_string(&proposal).unwrap())
+            .bind(now.to_rfc3339())
+            .execute(store.pool())
+            .await
+            .expect("insert uncovered local proposal");
+        let reloaded = store
+            .load_approval_policy("/workspace", &approval_trust(), 7, now)
+            .await
+            .expect("reload signed policy");
+        assert!(!reloaded.policy.rules().contains(&proposal));
+
         store.pool().close().await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn approval_policy_cache_fails_closed_for_missing_expired_tampered_scope_and_stale() {
+        use crate::approval::action::Permission;
+        use crate::approval::policy::{ApprovalRule, RuleEffect};
+
+        let store = store().await;
+        let now = Utc::now();
+        let rule = ApprovalRule {
+            id: "rule-git-status".to_owned(),
+            tool: "bash".to_owned(),
+            literal_prefix: vec!["git".to_owned(), "status".to_owned()],
+            effect: RuleEffect::Allow,
+            workspace_only: true,
+            allowed_permissions: vec![Permission::Exec],
+            allowed_network_domains: vec![],
+        };
+
+        let missing = store
+            .load_approval_policy("/workspace", &approval_trust(), 1, now)
+            .await
+            .expect("missing cache loads Ask policy");
+        assert_eq!(
+            missing.status,
+            crate::approval::ApprovalPolicyCacheStatus::Missing
+        );
+        assert!(missing.policy.rules().is_empty());
+
+        let expired = signed_approval_bundle(
+            1,
+            vec![rule.clone()],
+            now - ChronoDuration::hours(2),
+            now - ChronoDuration::hours(1),
+        );
+        assert!(
+            store
+                .install_approval_policy_bundle(&expired, &approval_trust(), now)
+                .await
+                .is_err()
+        );
+
+        let wrong_scope_payload = crate::approval::ApprovalPolicyBundle {
+            tenant_id: "other-tenant".to_owned(),
+            ..signed_approval_bundle(
+                1,
+                vec![rule.clone()],
+                now - ChronoDuration::minutes(1),
+                now + ChronoDuration::hours(1),
+            )
+            .payload
+        };
+        let wrong_scope = crate::approval::SignedApprovalPolicyBundle {
+            key_id: "control-plane-v1".to_owned(),
+            signature: approval_signer()
+                .sign(&wrong_scope_payload.signing_bytes().unwrap())
+                .to_bytes()
+                .to_vec(),
+            payload: wrong_scope_payload,
+        };
+        assert!(
+            store
+                .install_approval_policy_bundle(&wrong_scope, &approval_trust(), now)
+                .await
+                .is_err()
+        );
+
+        let valid = signed_approval_bundle(
+            2,
+            vec![rule],
+            now - ChronoDuration::minutes(1),
+            now + ChronoDuration::hours(1),
+        );
+        store
+            .install_approval_policy_bundle(&valid, &approval_trust(), now)
+            .await
+            .expect("install valid bundle");
+        let expired_after_install = store
+            .load_approval_policy(
+                "/workspace",
+                &approval_trust(),
+                2,
+                now + ChronoDuration::hours(2),
+            )
+            .await
+            .expect("expired cache loads Ask policy");
+        assert!(matches!(
+            expired_after_install.status,
+            crate::approval::ApprovalPolicyCacheStatus::Unavailable { ref reason }
+                if reason.contains("expired")
+        ));
+        assert!(expired_after_install.policy.rules().is_empty());
+
+        let stale = store
+            .load_approval_policy("/workspace", &approval_trust(), 3, now)
+            .await
+            .expect("stale cache loads Ask policy");
+        assert!(matches!(
+            stale.status,
+            crate::approval::ApprovalPolicyCacheStatus::Unavailable { ref reason }
+                if reason.contains("stale")
+        ));
+        assert!(stale.policy.rules().is_empty());
+
+        sqlx::query("UPDATE approval_policy_cache SET signature=zeroblob(64) WHERE singleton=1")
+            .execute(store.pool())
+            .await
+            .expect("tamper cached signature");
+        let tampered = store
+            .load_approval_policy("/workspace", &approval_trust(), 2, now)
+            .await
+            .expect("tampered cache loads Ask policy");
+        assert!(matches!(
+            tampered.status,
+            crate::approval::ApprovalPolicyCacheStatus::Unavailable { ref reason }
+                if reason.contains("signature")
+        ));
+        assert!(tampered.policy.rules().is_empty());
+    }
+
+    #[tokio::test]
+    async fn approval_policy_cache_replacement_is_monotonic_and_replay_idempotent() {
+        let store = store().await;
+        let now = Utc::now();
+        let v1 = signed_approval_bundle(
+            1,
+            Vec::new(),
+            now - ChronoDuration::minutes(1),
+            now + ChronoDuration::hours(1),
+        );
+        let v2 = signed_approval_bundle(
+            2,
+            Vec::new(),
+            now - ChronoDuration::minutes(1),
+            now + ChronoDuration::hours(2),
+        );
+        store
+            .install_approval_policy_bundle(&v1, &approval_trust(), now)
+            .await
+            .expect("install v1");
+        store
+            .install_approval_policy_bundle(&v1, &approval_trust(), now)
+            .await
+            .expect("exact v1 replay");
+        store
+            .install_approval_policy_bundle(&v2, &approval_trust(), now)
+            .await
+            .expect("replace with v2");
+        assert!(
+            store
+                .install_approval_policy_bundle(&v1, &approval_trust(), now)
+                .await
+                .is_err(),
+            "version rollback must fail"
+        );
+        let loaded = store
+            .load_approval_policy("/workspace", &approval_trust(), 2, now)
+            .await
+            .expect("load v2");
+        assert!(matches!(
+            loaded.status,
+            crate::approval::ApprovalPolicyCacheStatus::Verified { version: 2, .. }
+        ));
     }
 
     #[tokio::test]
@@ -3578,7 +3945,7 @@ mod tests {
         .await
         .expect("insert malformed fixture rule");
 
-        let error = match store_malformed.load_approval_policy("/workspace").await {
+        let error = match store_malformed.load_approval_rules().await {
             Err(error) => error,
             Ok(_) => panic!("malformed stored rule must fail closed"),
         };
@@ -3607,7 +3974,7 @@ mod tests {
         .await
         .expect("insert column mismatch rule");
 
-        let error = match store_mismatch.load_approval_policy("/workspace").await {
+        let error = match store_mismatch.load_approval_rules().await {
             Err(error) => error,
             Ok(_) => panic!("column/pattern mismatch must fail closed"),
         };
@@ -3638,14 +4005,14 @@ mod tests {
         .await
         .expect("insert broad fixture rule");
 
-        let error = match store_broad.load_approval_policy("/workspace").await {
-            Err(error) => error,
-            Ok(_) => panic!("broad stored rule must fail closed during policy seeding"),
-        };
+        let stored = store_broad
+            .load_approval_rules()
+            .await
+            .expect("deserialize broad proposal");
+        let error = crate::approval::Policy::from_rules("/workspace", stored)
+            .expect_err("broad stored rule must fail deterministic validation");
         assert!(
-            error
-                .downcast_ref::<RuleValidationError>()
-                .is_some_and(|error| *error == RuleValidationError::BroadPrefix),
+            error == RuleValidationError::BroadPrefix,
             "broad stored rule must fail with BroadPrefix, got {error}"
         );
     }
@@ -3731,7 +4098,7 @@ mod tests {
         MIGRATOR
             .run(&pool)
             .await
-            .expect("apply migrations 0003 through 0006");
+            .expect("apply migrations 0003 through 0007");
 
         let applied: Vec<i64> = sqlx::query_scalar(
             "SELECT version FROM _sqlx_migrations WHERE success = TRUE ORDER BY version",
@@ -3739,7 +4106,7 @@ mod tests {
         .fetch_all(&pool)
         .await
         .expect("list applied migrations");
-        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7]);
 
         let table_sql: String = sqlx::query_scalar(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='approval_rules'",
@@ -3751,6 +4118,13 @@ mod tests {
         assert!(table_sql.contains("tool TEXT NOT NULL"));
         assert!(table_sql.contains("pattern TEXT NOT NULL"));
         assert!(table_sql.contains("created_at TEXT NOT NULL"));
+        let policy_cache_sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='approval_policy_cache'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("approval_policy_cache table exists");
+        assert!(policy_cache_sql.contains("signature BLOB NOT NULL"));
 
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM tool_executions")

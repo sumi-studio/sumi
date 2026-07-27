@@ -414,6 +414,7 @@ impl AllowCache {
         }
     }
 
+    #[allow(dead_code)]
     fn clear(&mut self) {
         self.entries.clear();
         self.order.clear();
@@ -535,6 +536,7 @@ impl Reviewer {
     /// Clear the allow cache. The broker must call this whenever the durable
     /// policy is mutated, because cached allow decisions may no longer match
     /// the new policy_hash.
+    #[allow(dead_code)]
     pub fn clear_allow_cache(&self) {
         self.allow_cache
             .lock()
