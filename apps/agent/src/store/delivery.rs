@@ -154,9 +154,15 @@ impl DeliveryPump {
         if matches!(self.channel.mode, DeliveryMode::RedactionOnly) {
             return Ok(());
         }
-        self.channel
+        if let Err(err) = self
+            .channel
             .send(DeliveryFrame::Volatile { epoch, event })
             .await
+        {
+            self.state = PumpState::Idle;
+            return Err(err);
+        }
+        Ok(())
     }
 }
 
@@ -559,6 +565,35 @@ mod tests {
             "failed send must transition pump to Idle"
         );
         assert!(pump.epoch().is_none(), "failed send must clear epoch");
+    }
+
+    #[tokio::test]
+    async fn volatile_send_failure_transitions_to_idle() {
+        let store = store().await;
+        let (channel, receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
+        let mut pump = DeliveryPump::new(store, channel);
+        pump.install_epoch(DeliveryEpoch::for_test("epoch-1"));
+        drop(receiver);
+
+        let error = pump
+            .on_volatile(AgentEvent::ToolExecutionUpdate {
+                tool_call_id: "tool-1".to_owned(),
+                partial: serde_json::json!({"stdout": "partial"}),
+            })
+            .await
+            .expect_err("volatile send on a closed delivery channel must fail");
+        assert!(
+            error.to_string().contains("delivery receiver closed"),
+            "unexpected volatile delivery error: {error:#}"
+        );
+        assert!(
+            !pump.is_online(),
+            "volatile send failure must terminate the active pump epoch"
+        );
+        assert!(
+            pump.epoch().is_none(),
+            "volatile send failure must clear the active epoch"
+        );
     }
 
     #[tokio::test]

@@ -87,6 +87,7 @@ impl HydrationLatch for T17HydrationLatch {
 #[derive(Clone)]
 pub struct T17StoreAdapter {
     store: Arc<Store>,
+    mode: DeliveryMode,
     pump: Arc<tokio::sync::Mutex<DeliveryPump>>,
     delivery_rx: Arc<Mutex<Option<mpsc::Receiver<DeliveryFrame>>>>,
     #[cfg(test)]
@@ -100,10 +101,14 @@ impl fmt::Debug for T17StoreAdapter {
 }
 
 impl T17StoreAdapter {
-    pub(crate) fn new(store: Arc<Store>) -> Self {
-        let (channel, delivery_rx) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
+    /// `mode` must come from the authenticated connection authorization. It is
+    /// explicit so a projection-only connection can never silently inherit raw
+    /// decryption authority.
+    pub(crate) fn new(store: Arc<Store>, mode: DeliveryMode) -> Self {
+        let (channel, delivery_rx) = DeliveryChannelBuilder::with_mode(mode).build();
         Self {
             store: store.clone(),
+            mode,
             pump: Arc::new(tokio::sync::Mutex::new(DeliveryPump::new(store, channel))),
             delivery_rx: Arc::new(Mutex::new(Some(delivery_rx))),
             #[cfg(test)]
@@ -116,27 +121,59 @@ impl T17StoreAdapter {
             return;
         };
         let conversation_id = self.store.scope().conversation_id.clone();
+        let mode = self.mode;
         tokio::spawn(async move {
             while let Some(frame) = rx.recv().await {
-                let (epoch, seq, event) = match frame {
-                    DeliveryFrame::Durable {
-                        seq,
+                let (epoch, seq, event) = match (mode, frame) {
+                    (
+                        DeliveryMode::Raw,
+                        DeliveryFrame::Durable {
+                            seq,
+                            epoch,
+                            raw: Some(event),
+                            projection: None,
+                        },
+                    ) => (
                         epoch,
-                        raw: Some(event),
-                        projection: None,
-                    } => (epoch, Some(seq), event),
-                    DeliveryFrame::Volatile { epoch, event } => (epoch, None, event),
-                    DeliveryFrame::Durable { .. } => {
+                        Some(seq),
+                        serde_json::to_value(event).context("serialize raw T17 delivery event"),
+                    ),
+                    (
+                        DeliveryMode::RedactionOnly,
+                        DeliveryFrame::Durable {
+                            seq,
+                            epoch,
+                            raw: None,
+                            projection: Some(projection),
+                        },
+                    ) => (
+                        epoch,
+                        Some(seq),
+                        serde_json::from_str(&projection)
+                            .context("parse projected T17 delivery event"),
+                    ),
+                    (DeliveryMode::Raw, DeliveryFrame::Volatile { epoch, event }) => (
+                        epoch,
+                        None,
+                        serde_json::to_value(event)
+                            .context("serialize volatile T17 delivery event"),
+                    ),
+                    (DeliveryMode::RedactionOnly, DeliveryFrame::Volatile { .. }) => {
                         tracing::error!(
-                            "raw T17 gateway delivery received a projection-only frame"
+                            "redaction-only T17 delivery received a forbidden volatile frame"
                         );
                         break;
                     }
+                    (DeliveryMode::Raw, DeliveryFrame::Durable { .. })
+                    | (DeliveryMode::RedactionOnly, DeliveryFrame::Durable { .. }) => {
+                        tracing::error!("T17 gateway delivery frame did not match authorization");
+                        break;
+                    }
                 };
-                let event = match serde_json::to_value(event) {
+                let event = match event {
                     Ok(event) => event,
                     Err(error) => {
-                        tracing::error!(%error, "failed to serialize T17 delivery event");
+                        tracing::error!(%error, "failed to project T17 delivery event");
                         break;
                     }
                 };
@@ -158,6 +195,12 @@ impl T17StoreAdapter {
         self.pump.lock().await.on_durable_committed(seq).await
     }
 
+    /// Deliver an Online-only delta through the same pump/FIFO as durable
+    /// notifications. Redaction-only authorization suppresses it in the pump.
+    pub(crate) async fn on_volatile(&self, event: crate::agent::AgentEvent) -> Result<()> {
+        self.pump.lock().await.on_volatile(event).await
+    }
+
     #[cfg(test)]
     pub(crate) async fn active_delivery_epoch(&self) -> Option<DeliveryEpoch> {
         self.pump.lock().await.epoch().copied()
@@ -169,6 +212,37 @@ impl T17StoreAdapter {
     }
 }
 
+async fn projected_events_after(
+    store: &Store,
+    after_seq: u64,
+    limit: usize,
+) -> Result<Vec<(u64, String)>> {
+    if limit == 0 {
+        bail!("delivery event page size must be positive");
+    }
+    let rows = sqlx::query(
+        "SELECT seq, envelope
+         FROM agent_events
+         WHERE seq > ?
+         ORDER BY seq
+         LIMIT ?",
+    )
+    .bind(i64::try_from(after_seq).context("after_seq exceeds SQLite INTEGER range")?)
+    .bind(i64::try_from(limit).context("event page size exceeds SQLite INTEGER range")?)
+    .fetch_all(store.pool())
+    .await
+    .context("failed to fetch projected durable event page")?;
+
+    rows.into_iter()
+        .map(|row| {
+            let seq: i64 = row.try_get("seq")?;
+            let seq = u64::try_from(seq).context("stored event seq is negative")?;
+            let projection: String = row.try_get("envelope")?;
+            Ok((seq, projection))
+        })
+        .collect()
+}
+
 #[async_trait]
 impl DurableSource for T17StoreAdapter {
     async fn event_cursor(&self) -> Result<EventCursors> {
@@ -178,20 +252,36 @@ impl DurableSource for T17StoreAdapter {
     }
 
     async fn events_after(&self, after_seq: u64, limit: usize) -> Result<Vec<OutboundFrame>> {
-        let page: Vec<_> = raw_events_after(&self.store, after_seq, limit)
-            .await?
-            .into_iter()
-            .map(|(seq, event)| {
-                Ok(OutboundFrame::Event {
-                    envelope: Envelope {
-                        seq: Some(seq),
-                        conversation_id: self.store.scope().conversation_id.clone(),
-                        event: serde_json::to_value(event)
-                            .context("serialize durable T17 event for gateway")?,
-                    },
+        let page: Vec<_> = match self.mode {
+            DeliveryMode::Raw => raw_events_after(&self.store, after_seq, limit)
+                .await?
+                .into_iter()
+                .map(|(seq, event)| {
+                    Ok(OutboundFrame::Event {
+                        envelope: Envelope {
+                            seq: Some(seq),
+                            conversation_id: self.store.scope().conversation_id.clone(),
+                            event: serde_json::to_value(event)
+                                .context("serialize durable T17 event for gateway")?,
+                        },
+                    })
                 })
-            })
-            .collect::<Result<_>>()?;
+                .collect::<Result<_>>()?,
+            DeliveryMode::RedactionOnly => projected_events_after(&self.store, after_seq, limit)
+                .await?
+                .into_iter()
+                .map(|(seq, projection)| {
+                    Ok(OutboundFrame::Event {
+                        envelope: Envelope {
+                            seq: Some(seq),
+                            conversation_id: self.store.scope().conversation_id.clone(),
+                            event: serde_json::from_str(&projection)
+                                .context("parse projected durable T17 event for gateway")?,
+                        },
+                    })
+                })
+                .collect::<Result<_>>()?,
+        };
         #[cfg(test)]
         self.replay_page_lengths.lock().unwrap().push(page.len());
         Ok(page)

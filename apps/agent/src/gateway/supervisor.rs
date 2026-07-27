@@ -1318,24 +1318,16 @@ async fn await_page<S>(
 where
     S: DurableSource,
 {
-    let source = source.clone();
-    let (tx, mut rx) = oneshot::channel();
-    let handle = tokio::spawn(async move {
-        let _ = tx.send(source.events_after(after_seq, limit).await);
-    });
-    let result = loop {
+    let mut page = std::pin::pin!(source.events_after(after_seq, limit));
+    loop {
         tokio::select! {
             biased;
-            _ = token.cancelled() => {
-                handle.abort();
-                return Ok(None);
-            }
-            result = &mut rx => break result,
+            _ = token.cancelled() => return Ok(None),
+            result = &mut page => return result.map(Some),
             frame = writer_rx.recv(),
                 if internal_buffer_has_capacity(writer_rx, outbox, pending_events) =>
             {
                 let Some(frame) = frame else {
-                    handle.abort();
                     return Ok(None);
                 };
                 classify_frame(
@@ -1346,17 +1338,6 @@ where
                     outbox,
                     pending_events,
                 );
-            }
-        }
-    };
-    match result {
-        Ok(page) => page.map(Some),
-        Err(_) => {
-            // The spawned task was aborted or panicked; normal cancellation is handled above.
-            if token.is_cancelled() {
-                Ok(None)
-            } else {
-                bail!("events_after task dropped without result")
             }
         }
     }
@@ -1689,6 +1670,7 @@ where
     let mut ready: Option<HydrationReady> = None;
     let mut pending: Vec<InboundCommand> = Vec::with_capacity(MAX_PENDING_BEFORE_READY);
     let mut next_expected = api_hello.next_command_seq;
+    let mut terminal_after_pending = false;
 
     let result: Result<(), ReaderError> = 'task: {
         loop {
@@ -1704,8 +1686,11 @@ where
                     for cmd in pending.drain(..) {
                         next_expected = send_validated(cmd, next_expected, &mut command_tx, &token, command_send_blocked_notify.clone()).await?;
                     }
+                    if terminal_after_pending {
+                        break 'task Err(ReaderError::Terminal);
+                    }
                 }
-                result = cmd_rx.recv() => {
+                result = cmd_rx.recv(), if !terminal_after_pending => {
                     match result {
                         Some(Ok(cmd)) => {
                             if ready.is_some() {
@@ -1717,7 +1702,14 @@ where
                             }
                         }
                         Some(Err(e)) if e.is::<TerminalGatewayClosed>() => {
-                            break 'task Err(ReaderError::Terminal)
+                            if ready.is_some() || pending.is_empty() {
+                                break 'task Err(ReaderError::Terminal);
+                            }
+                            // stdin has closed, but complete commands already read
+                            // before EOF remain owned by this epoch. Keep the
+                            // hydration gate closed, then flush them before the
+                            // single-connection process exits successfully.
+                            terminal_after_pending = true;
                         }
                         Some(Err(e)) if e.is::<GatewayClosed>() => break 'task Ok(()),
                         Some(Err(e)) => break 'task Err(ReaderError::Reconnect(e)),
@@ -1872,7 +1864,7 @@ mod tests {
         OutboundFrame,
     };
     use crate::runtime::contracts::{GenerationRecoveryFence, ProcessGenerationLease};
-    use crate::store::{HydrationOutcome, Store, insert_test_durable_event};
+    use crate::store::{DeliveryMode, HydrationOutcome, Store, insert_test_durable_event};
 
     struct TestDigestFactory;
 
@@ -3260,6 +3252,54 @@ mod tests {
             .await
             .expect("stdio EOF must terminate promptly")
             .expect("stdio EOF must be a successful terminal boundary");
+    }
+
+    #[tokio::test]
+    async fn stdio_eof_waits_for_hydration_and_flushes_commands_already_read() {
+        use std::io::Cursor;
+
+        let generation = ProcessGeneration::from_wire(7).unwrap();
+        let input = br#"{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command":{"type":"abort"}}"#
+            .to_vec();
+        let gateway = InjectedStdioGateway::new(
+            tokio::io::BufReader::new(Cursor::new(input)),
+            tokio::io::sink(),
+            Arc::new(TestDigestFactory),
+        );
+        let (latch, latch_tx) = DynamicHydrationLatch::new();
+        let mut config = make_config();
+        config.generation = generation;
+        let supervisor = ConnectionSupervisor::new(
+            SingleConnectionConnector::new(gateway),
+            CountingCredentialProvider::new("token"),
+            MockDurableSource::new(CommandCursors::default()),
+            latch,
+            config,
+        );
+        let mut handle = supervisor.start();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), handle.commands.recv())
+                .await
+                .is_err(),
+            "a command read before EOF must remain held while hydration is NotReady"
+        );
+        latch_tx
+            .send(HydrationState::Ready(HydrationReady {
+                generation,
+                receipt_identity: "stdio-eof-ready".to_owned(),
+            }))
+            .unwrap();
+
+        let command = tokio::time::timeout(Duration::from_secs(1), handle.commands.recv())
+            .await
+            .expect("held stdio command must flush after hydration")
+            .expect("held stdio command must not be lost at EOF");
+        assert_eq!(inbound_command_seq(&command), 1);
+        tokio::time::timeout(Duration::from_secs(1), handle.join())
+            .await
+            .expect("stdio supervisor must terminate after flushing held input")
+            .expect("terminal stdio EOF after a flush must be successful");
     }
 
     #[tokio::test]
@@ -5537,7 +5577,23 @@ mod tests {
         }
 
         handle.events.send((epoch, event_frame(8))).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if sent
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|frame| outbound_frame_event_seq(frame).ok())
+                    .next_back()
+                    == Some(8)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bounded writer must deliver the admitted suffix before shutdown");
 
         handle.abort();
         assert!(handle.join().await.is_ok());
@@ -6047,7 +6103,7 @@ mod tests {
                 .unwrap();
         }
 
-        let adapter = seams::T17StoreAdapter::new(store.clone());
+        let adapter = seams::T17StoreAdapter::new(store.clone(), DeliveryMode::Raw);
         let (hydration_tx, hydration_rx) = watch::channel(None);
         let latch = seams::T17HydrationLatch::new(hydration_rx);
 
@@ -6151,6 +6207,118 @@ mod tests {
             adapter.active_delivery_epoch().await,
             None,
             "final supervisor shutdown must invalidate the T17 DeliveryPump epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn redaction_only_store_adapter_replays_and_delivers_projection_without_volatiles() {
+        let store = Arc::new(
+            Store::session_test_store("t17-t24-redaction-only")
+                .await
+                .unwrap(),
+        );
+        let raw_secret = "sk-abcdefghijklmnop";
+        let first_projection = insert_test_durable_event(
+            &store,
+            1,
+            &crate::agent::AgentEvent::Error {
+                message: format!("first {raw_secret}"),
+            },
+        )
+        .await
+        .unwrap();
+        let adapter = seams::T17StoreAdapter::new(store.clone(), DeliveryMode::RedactionOnly);
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut gateway = MockGateway::new(VecDeque::new());
+        gateway.writer.sent = sent.clone();
+        let connector = MockConnector::new(
+            Arc::new(Mutex::new(Vec::new())),
+            VecDeque::from([Ok(gateway)]),
+        );
+        let supervisor = ConnectionSupervisor::new(
+            connector,
+            CountingCredentialProvider::new("token"),
+            adapter.clone(),
+            StaticHydrationLatch(HydrationReady {
+                generation: ProcessGeneration::from_wire(7).unwrap(),
+                receipt_identity: "redaction-ready".to_owned(),
+            }),
+            make_config(),
+        );
+        let handle = supervisor.start();
+        let mut online = handle.online.clone();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !*online.borrow() {
+                online.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("projection-only catch-up must reach Online");
+
+        let second_projection = insert_test_durable_event(
+            &store,
+            2,
+            &crate::agent::AgentEvent::Error {
+                message: format!("second {raw_secret}"),
+            },
+        )
+        .await
+        .unwrap();
+        adapter.on_durable_committed(2).await.unwrap();
+        adapter
+            .on_volatile(crate::agent::AgentEvent::ToolExecutionUpdate {
+                tool_call_id: "tool-1".to_owned(),
+                partial: serde_json::json!({"stdout": raw_secret}),
+            })
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if sent
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|frame| outbound_frame_event_seq(frame).is_ok())
+                    .count()
+                    == 2
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("projection-only durable frames must be forwarded");
+
+        handle.abort();
+        handle.join().await.unwrap();
+
+        let expected = [first_projection, second_projection]
+            .map(|projection| serde_json::from_str::<serde_json::Value>(&projection).unwrap());
+        let frames = sent.lock().unwrap();
+        let delivered: Vec<_> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                OutboundFrame::Event { envelope } if envelope.seq.is_some() => {
+                    Some(envelope.event.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(delivered, expected);
+        assert!(
+            !serde_json::to_string(&delivered)
+                .unwrap()
+                .contains(raw_secret),
+            "projection-only adapter must never expose raw decrypted secret material"
+        );
+        assert!(
+            !frames.iter().any(
+                |frame| matches!(frame, OutboundFrame::Event { envelope } if envelope.seq.is_none())
+            ),
+            "projection-only authorization must suppress every volatile frame"
         );
     }
 
