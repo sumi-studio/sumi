@@ -10,7 +10,7 @@
 
 use std::collections::BTreeSet;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,7 @@ use crate::provider::types::{
 
 use super::crypto::{RowAad, decrypt_content, encrypt_content};
 use super::event_writer::require_single_cas;
+use super::memory_state::MemoryLayer;
 use super::{AgentScope, DataKeyMaterial, DataKeyPurpose, Store};
 
 fn sqlite_i64(value: u64, field: &str) -> Result<i64> {
@@ -1248,6 +1249,8 @@ impl<'a> ProviderContextMutationApplier<'a> {
                 .invalidate_ids(transaction, &full.invalidate_ids)
                 .await?;
 
+            let tokens = sqlite_i64(full.eviction_tokens, "provider_context.eviction_tokens")?;
+
             sqlx::query(
                 "INSERT INTO provider_context(
                     id, message_id, message_seq, wire_item_index, item_ordinal,
@@ -1278,14 +1281,17 @@ impl<'a> ProviderContextMutationApplier<'a> {
             .bind(full.context_fingerprint.as_ref())
             .bind(&full.key_ref)
             .bind(&full.ciphertext)
-            .bind(sqlite_i64(
-                full.eviction_tokens,
-                "provider_context.eviction_tokens",
-            )?)
+            .bind(tokens)
             .bind(i64::from(full.eviction_estimator_version))
             .bind(&full.created_at)
             .execute(&mut **transaction)
             .await?;
+
+            // The new row's eviction footprint must be charged to the owning
+            // open L0 batch, mirroring the MessageEnd path. Fail closed if the
+            // anchor message is not in an open L0 batch.
+            self.increment_batch_footprint(transaction, full.message_id.as_deref(), tokens)
+                .await?;
 
             sqlx::query(
                 "INSERT INTO provider_context_replace_heads(
@@ -1559,6 +1565,23 @@ impl<'a> ProviderContextMutationApplier<'a> {
                 }
             }
 
+            // Overwrite the encrypted payload before deleting the row. The
+            // SQLite free page may retain bytes, so we erase them first; the
+            // data key is still destroyed below if no remaining row references
+            // it.
+            sqlx::query(
+                "UPDATE provider_context
+                 SET ciphertext = zeroblob(length(ciphertext))
+                 WHERE id = ?",
+            )
+            .bind(id)
+            .execute(&mut **transaction)
+            .await
+            .context("failed to crypto-erase provider-context row before delete")?;
+
+            #[cfg(test)]
+            self.assert_zeroed_before_delete(transaction, id).await?;
+
             if let Some(message_id) = message_id {
                 self.decrement_batch_footprint(transaction, &message_id, tokens)
                     .await?;
@@ -1572,6 +1595,25 @@ impl<'a> ProviderContextMutationApplier<'a> {
             result.deleted_ids.insert(id.clone());
         }
         Ok(result)
+    }
+
+    #[cfg(test)]
+    async fn assert_zeroed_before_delete(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        id: &str,
+    ) -> Result<()> {
+        let ciphertext: Vec<u8> =
+            sqlx::query_scalar("SELECT ciphertext FROM provider_context WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut **transaction)
+                .await?
+                .ok_or_else(|| anyhow!("provider-context row {id} disappeared before delete"))?;
+        assert!(
+            ciphertext.iter().all(|&b| b == 0),
+            "provider-context ciphertext for {id} was not zeroed before delete"
+        );
+        Ok(())
     }
 
     async fn destroy_unreferenced_provider_context_keys(
@@ -1628,6 +1670,55 @@ impl<'a> ProviderContextMutationApplier<'a> {
         .await?;
         if row.is_none() {
             bail!("batch {batch_id} footprint underflow or missing when subtracting {tokens}");
+        }
+        Ok(())
+    }
+
+    async fn increment_batch_footprint(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        message_id: Option<&str>,
+        tokens: i64,
+    ) -> Result<()> {
+        if tokens <= 0 {
+            return Ok(());
+        }
+        let Some(message_id) = message_id else {
+            bail!(
+                "provider-context row with non-zero eviction_tokens is missing anchor message_id"
+            );
+        };
+        let row = sqlx::query(
+            "SELECT mb.id, mb.eviction_footprint_tokens
+             FROM memory_batches mb
+             JOIN memory_batch_messages mbm ON mbm.batch_id = mb.id
+             WHERE mbm.message_id = ? AND mb.layer = ? AND mb.state = 'open'",
+        )
+        .bind(message_id)
+        .bind(MemoryLayer::L0.as_i64())
+        .fetch_optional(&mut **transaction)
+        .await
+        .context("failed to locate owning open L0 batch for provider-context insert")?;
+
+        let Some(row) = row else {
+            bail!("open L0 batch not found for provider-context anchor message {message_id}");
+        };
+        let batch_id: String = row.try_get("id")?;
+        let current: i64 = row.try_get("eviction_footprint_tokens")?;
+        let new = current
+            .checked_add(tokens)
+            .ok_or_else(|| anyhow!("memory batch {batch_id} eviction_footprint_tokens overflow"))?;
+        let result = sqlx::query(
+            "UPDATE memory_batches
+             SET eviction_footprint_tokens = ?
+             WHERE id = ?",
+        )
+        .bind(new)
+        .bind(&batch_id)
+        .execute(&mut **transaction)
+        .await?;
+        if result.rows_affected() != 1 {
+            bail!("failed to increment eviction footprint for batch {batch_id}");
         }
         Ok(())
     }
@@ -1737,6 +1828,40 @@ mod tests {
         Ok(())
     }
 
+    async fn seed_message_in_open_l0_batch(
+        store: &Store,
+        message_id: &str,
+        seq: u64,
+        footprint_tokens: i64,
+    ) -> anyhow::Result<String> {
+        seed_message(store, message_id, seq).await?;
+        let batch_id = format!("l0-batch-{message_id}");
+        let batch_seq: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(batch_seq), 0) + 1 FROM memory_batches WHERE layer = ?",
+        )
+        .bind(MemoryLayer::L0.as_i64())
+        .fetch_one(store.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO memory_batches(
+                id, layer, ord, batch_seq, version, state, est_tokens,
+                eviction_footprint_tokens, updated_at
+             ) VALUES(?, ?, 1, ?, 0, 'open', 0, ?, 'now')",
+        )
+        .bind(&batch_id)
+        .bind(MemoryLayer::L0.as_i64())
+        .bind(batch_seq)
+        .bind(footprint_tokens)
+        .execute(store.pool())
+        .await?;
+        sqlx::query("INSERT INTO memory_batch_messages(batch_id, message_id, ord) VALUES(?, ?, 1)")
+            .bind(&batch_id)
+            .bind(message_id)
+            .execute(store.pool())
+            .await?;
+        Ok(batch_id)
+    }
+
     async fn seed_non_message_event(store: &Store, seq: u64) -> anyhow::Result<()> {
         let key = store
             .conversation_key(DataKeyPurpose::Event)
@@ -1825,6 +1950,68 @@ mod tests {
                 item: valid_reasoning_item(),
             },
         }
+    }
+
+    fn reasoning_item_with_content(
+        message_id: impl Into<String>,
+        message_seq: u64,
+        wire_item_index: u32,
+        ordinal: u32,
+        content: &str,
+    ) -> ProviderContextItem {
+        let origin = reasoning_origin();
+        ProviderContextItem {
+            origin_message: Some(ProviderContextAnchor {
+                message_id: message_id.into(),
+                message_seq,
+            }),
+            wire_item_index: Some(wire_item_index),
+            ordinal,
+            provider_origin: origin.clone(),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: origin.protocol,
+                item: json!({
+                    "type": "reasoning",
+                    "id": "rs-test",
+                    "encrypted_content": content,
+                    "summary": [],
+                }),
+            },
+        }
+    }
+
+    async fn reasoning_record_with_content(
+        store: &Store,
+        message_id: &str,
+        message_seq: u64,
+        id: &str,
+        wire_item_index: u32,
+        ordinal: u32,
+        content: &str,
+    ) -> EncryptedProviderContextRecord {
+        let anchor = ProviderContextKeyAnchor {
+            conversation_id: store.scope().conversation_id.clone(),
+            anchor_id: format!("{message_id}:{message_seq}"),
+        };
+        let key = store
+            .provider_context_key(&anchor)
+            .await
+            .expect("mint reasoning anchor key");
+        let item =
+            reasoning_item_with_content(message_id, message_seq, wire_item_index, ordinal, content);
+        let origin = reasoning_origin();
+        EncryptedProviderContextRecord::encrypt(
+            &item,
+            &origin.provider_instance_id,
+            origin.protocol,
+            &origin.model,
+            id,
+            provider_context_idempotency_key(message_id, &item),
+            reasoning_footprint(&item),
+            &key,
+            store.scope(),
+        )
+        .expect("encrypt reasoning record")
     }
 
     async fn reasoning_record_with(
@@ -2027,7 +2214,9 @@ mod tests {
     #[tokio::test]
     async fn replace_head_is_monotonic_and_idempotent() {
         let store = store().await;
-        seed_message(&store, "message-1", 7).await.unwrap();
+        seed_message_in_open_l0_batch(&store, "message-1", 7, 1_000_000)
+            .await
+            .unwrap();
 
         let mutation_key = store
             .conversation_key(DataKeyPurpose::Mutation)
@@ -2204,7 +2393,9 @@ mod tests {
     #[tokio::test]
     async fn replace_prepare_enforces_expected_latest_id_and_allows_cas_update() {
         let store = store().await;
-        seed_message(&store, "message-1", 7).await.unwrap();
+        seed_message_in_open_l0_batch(&store, "message-1", 7, 1_000_000)
+            .await
+            .unwrap();
 
         let mutation_key = store
             .conversation_key(DataKeyPurpose::Mutation)
@@ -2328,7 +2519,9 @@ mod tests {
     #[tokio::test]
     async fn recover_applies_prepared_provider_context_mutations() {
         let store = store().await;
-        seed_message(&store, "message-1", 7).await.unwrap();
+        seed_message_in_open_l0_batch(&store, "message-1", 7, 1_000_000)
+            .await
+            .unwrap();
 
         let record = reasoning_record(&store, "message-1", 7, "pc-1").await;
         let mutation_key = store
@@ -2608,7 +2801,9 @@ mod tests {
     #[tokio::test]
     async fn replacement_preserves_data_key_when_same_anchor_is_reinserted() {
         let store = store().await;
-        seed_message(&store, "message-1", 7).await.unwrap();
+        seed_message_in_open_l0_batch(&store, "message-1", 7, 1_000_000)
+            .await
+            .unwrap();
         let old_record = reasoning_record(&store, "message-1", 7, "pc-1").await;
         let key_ref = old_record.key_ref.clone();
         old_record.insert(store.pool()).await.unwrap();
@@ -3743,7 +3938,9 @@ mod tests {
     #[tokio::test]
     async fn replace_is_idempotent_when_replace_head_row_disappeared() {
         let store = store().await;
-        seed_message(&store, "message-1", 7).await.unwrap();
+        seed_message_in_open_l0_batch(&store, "message-1", 7, 1_000_000)
+            .await
+            .unwrap();
 
         let applier = ProviderContextMutationApplier::new(&store);
         let scope = store.scope().clone();
@@ -3801,7 +3998,9 @@ mod tests {
     #[tokio::test]
     async fn replace_requires_expected_latest_id_in_invalidate_ids() {
         let store = store().await;
-        seed_message(&store, "message-1", 7).await.unwrap();
+        seed_message_in_open_l0_batch(&store, "message-1", 7, 1_000_000)
+            .await
+            .unwrap();
 
         let applier = ProviderContextMutationApplier::new(&store);
         let scope = store.scope().clone();
@@ -4031,5 +4230,224 @@ mod tests {
             message.contains("coverage does not identify a persisted message"),
             "{message}"
         );
+    }
+
+    #[tokio::test]
+    async fn invalidate_zeroes_ciphertext_before_delete_and_preserves_shared_key() {
+        let store = store().await;
+        seed_message_in_open_l0_batch(&store, "message-1", 7, 1_000_000)
+            .await
+            .unwrap();
+
+        // Two reasoning records for the same anchor share a data key.
+        let a = reasoning_record_with(&store, "message-1", 7, "pc-a", 0, 0).await;
+        let b = reasoning_record_with(&store, "message-1", 7, "pc-b", 0, 1).await;
+        a.insert(store.pool()).await.unwrap();
+        b.insert(store.pool()).await.unwrap();
+
+        // Replace invalidates pc-a and inserts pc-c. All three share the anchor key.
+        let c = reasoning_record_with(&store, "message-1", 7, "pc-c", 0, 2).await;
+        let mutation_key = store
+            .conversation_key(DataKeyPurpose::Mutation)
+            .await
+            .expect("mint mutation key");
+        let applier = ProviderContextMutationApplier::new(&store);
+        let prepared = ProviderContextMutationBuilder::new(
+            mutation_key,
+            store.scope().clone(),
+            "mutation-1".to_owned(),
+        )
+        .build_replace(
+            None,
+            vec!["pc-a".to_owned()],
+            &c,
+            &reasoning_item_with("message-1", 7, 0, 2),
+            1,
+            1,
+        )
+        .expect("build replace");
+        applier.prepare(&prepared).await.unwrap();
+        assert_eq!(
+            applier.apply("mutation-1").await.unwrap(),
+            ApplyOutcome::Applied
+        );
+
+        // The invalidated row is gone.
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE id = ?")
+            .bind("pc-a")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "invalidated provider-context row must be deleted");
+
+        // The remaining rows are intact.
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE id IN (?, ?)")
+                .bind("pc-b")
+                .bind("pc-c")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(count, 2, "remaining rows must survive");
+
+        // The shared anchor key stays active because pc-b and pc-c still use it.
+        let state = data_key_state(&store, &a.key_ref)
+            .await
+            .expect("key exists");
+        assert_eq!(state, "active", "shared anchor key must stay active");
+
+        // The internal test seam in `invalidate_ids` asserted the row's
+        // ciphertext was overwritten with zeros before the DELETE executed.
+    }
+
+    #[tokio::test]
+    async fn replace_accounts_eviction_footprint_and_is_idempotent() {
+        let store = store().await;
+
+        // Build two reasoning items with measurably different footprints by
+        // varying the opaque encrypted content length.
+        let old_item = reasoning_item_with_content("message-1", 7, 0, 0, "short");
+        let new_item = reasoning_item_with_content(
+            "message-1",
+            7,
+            0,
+            1,
+            "this-is-a-much-longer-opaque-reasoning-payload",
+        );
+        let old_footprint = reasoning_footprint(&old_item).eviction_tokens();
+        let new_footprint = reasoning_footprint(&new_item).eviction_tokens();
+        assert!(
+            new_footprint > old_footprint,
+            "regression requires different footprints"
+        );
+
+        // Seed an open L0 batch whose footprint already includes the old record.
+        seed_message_in_open_l0_batch(
+            &store,
+            "message-1",
+            7,
+            i64::try_from(old_footprint).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let old_record = reasoning_record_from_item(&store, "pc-old", &old_item).await;
+        old_record.insert(store.pool()).await.unwrap();
+
+        let new_record = reasoning_record_from_item(&store, "pc-new", &new_item).await;
+
+        let mutation_key = store
+            .conversation_key(DataKeyPurpose::Mutation)
+            .await
+            .expect("mint mutation key");
+        let applier = ProviderContextMutationApplier::new(&store);
+
+        let prepared = ProviderContextMutationBuilder::new(
+            mutation_key,
+            store.scope().clone(),
+            "replace-1".to_owned(),
+        )
+        .build_replace(
+            None,
+            vec!["pc-old".to_owned()],
+            &new_record,
+            &new_item,
+            1,
+            1,
+        )
+        .expect("build replace-1");
+        applier.prepare(&prepared).await.unwrap();
+        assert_eq!(
+            applier.apply("replace-1").await.unwrap(),
+            ApplyOutcome::Applied
+        );
+
+        let footprint_after_apply: i64 = sqlx::query_scalar(
+            "SELECT eviction_footprint_tokens
+             FROM memory_batches
+             WHERE layer = ? AND state = 'open'",
+        )
+        .bind(MemoryLayer::L0.as_i64())
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            footprint_after_apply,
+            i64::try_from(new_footprint).unwrap(),
+            "batch footprint must reflect old-subtract/new-add exactly"
+        );
+
+        // A duplicate replace intent with the same (gen, ord, id) is already
+        // satisfied and must not re-add the footprint.
+        let mutation_key_2 = store
+            .conversation_key(DataKeyPurpose::Mutation)
+            .await
+            .expect("mint second mutation key");
+        let prepared_2 = ProviderContextMutationBuilder::new(
+            mutation_key_2,
+            store.scope().clone(),
+            "replace-2".to_owned(),
+        )
+        .build_replace(
+            None,
+            vec!["pc-old".to_owned()],
+            &new_record,
+            &new_item,
+            1,
+            1,
+        )
+        .expect("build replace-2");
+        applier.prepare(&prepared_2).await.unwrap();
+        assert_eq!(
+            applier.apply("replace-2").await.unwrap(),
+            ApplyOutcome::AlreadySatisfied
+        );
+
+        let footprint_after_retry: i64 = sqlx::query_scalar(
+            "SELECT eviction_footprint_tokens
+             FROM memory_batches
+             WHERE layer = ? AND state = 'open'",
+        )
+        .bind(MemoryLayer::L0.as_i64())
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            footprint_after_retry,
+            i64::try_from(new_footprint).unwrap(),
+            "duplicate replace must not change batch footprint"
+        );
+    }
+
+    async fn reasoning_record_from_item(
+        store: &Store,
+        id: &str,
+        item: &ProviderContextItem,
+    ) -> EncryptedProviderContextRecord {
+        let anchor = item
+            .origin_message
+            .as_ref()
+            .map(|a| ProviderContextKeyAnchor {
+                conversation_id: store.scope().conversation_id.clone(),
+                anchor_id: format!("{}:{}", a.message_id, a.message_seq),
+            })
+            .expect("reasoning item must have an anchor");
+        let key = store
+            .provider_context_key(&anchor)
+            .await
+            .expect("mint reasoning anchor key");
+        let message_id = &anchor.anchor_id[..anchor.anchor_id.find(':').unwrap()];
+        EncryptedProviderContextRecord::encrypt(
+            item,
+            &item.provider_origin.provider_instance_id,
+            item.provider_origin.protocol,
+            &item.provider_origin.model,
+            id,
+            provider_context_idempotency_key(message_id, item),
+            reasoning_footprint(item),
+            &key,
+            store.scope(),
+        )
+        .expect("encrypt reasoning record")
     }
 }
