@@ -9,9 +9,11 @@ use chrono::Utc;
 use sqlx::Row;
 
 use super::{
-    AgentScope, DataKeyPurpose, Store, TombstoneRepository, TombstoneScope, TombstoneStatus,
+    AgentScope, DataKeyPurpose, Store, Tombstone, TombstoneRepository, TombstoneScope,
+    TombstoneStatus,
 };
 use crate::gateway::Command;
+use crate::runtime::contracts::GenerationRecoveryFence;
 use crate::tools::{
     ToolError,
     executor::{ArtifactBroker, ArtifactBrokerClient, ArtifactOperation, ArtifactResponse},
@@ -100,6 +102,21 @@ pub struct LifecycleWorker {
     broker: Arc<dyn ArtifactLifecycleBroker>,
 }
 
+#[derive(Debug)]
+pub struct LifecycleCommandResult {
+    pub payload: Option<Vec<u8>>,
+    pub restart_required: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResetFailpoint {
+    None,
+    AfterCryptoErase,
+    AfterFenced,
+    AfterArtifactDelete,
+    AfterDatabaseReset,
+}
+
 impl LifecycleWorker {
     pub fn new(
         store: Arc<Store>,
@@ -114,86 +131,207 @@ impl LifecycleWorker {
         }
     }
 
-    /// Conversation reset: tombstone the old conversation, crypto-erase its
-    /// data keys, delete its row-level state, remove its artifact volume, and
-    /// re-bind the store to the new conversation id.
-    pub async fn conversation_reset(&self, new_conversation_id: &str) -> Result<()> {
-        if new_conversation_id.is_empty() {
-            bail!("new conversation id must not be empty");
-        }
+    /// Request or replay a reset. The external tombstone is the durable command
+    /// receipt; a new request blocks until a supervisor persists an exact typed
+    /// generation fence.
+    pub async fn conversation_reset(
+        &self,
+        command_id: &str,
+        command_seq: u64,
+        new_conversation_id: &str,
+    ) -> Result<bool> {
         let scope = self.store.scope();
-        let old_conversation_id = scope.conversation_id.clone();
-        if old_conversation_id == new_conversation_id {
-            bail!("new conversation id must differ from the current conversation id");
+        let command_seq = i64::try_from(command_seq)?;
+        if let Some(existing) = self
+            .tombstones
+            .find_by_command(&scope.tenant_id, &scope.agent_id, command_id)
+            .await?
+        {
+            self.validate_reset_receipt(&existing, command_id, command_seq, new_conversation_id)?;
+            if matches!(
+                existing.status,
+                TombstoneStatus::LivePurged | TombstoneStatus::BackupExpired
+            ) {
+                return Ok(false);
+            }
+            return self
+                .resume_conversation_reset_with_failpoint(&existing.id, ResetFailpoint::None)
+                .await;
         }
 
-        let purge_after = "2099-12-31T23:59:59Z";
-        let tombstone_id = self
+        let tombstone = self
             .tombstones
-            .request(
+            .request_conversation_reset(
                 &scope.tenant_id,
                 &scope.agent_id,
-                Some(&old_conversation_id),
-                TombstoneScope::Conversation,
-                purge_after,
+                &scope.conversation_id,
+                new_conversation_id,
+                command_id,
+                command_seq,
+                "2099-12-31T23:59:59Z",
             )
             .await
             .context("failed to record conversation reset tombstone")?;
-        self.tombstones
-            .advance(
-                &tombstone_id,
-                TombstoneStatus::Requested,
-                TombstoneStatus::Fenced,
-            )
+        self.resume_conversation_reset_with_failpoint(&tombstone.id, ResetFailpoint::None)
             .await
-            .context("failed to fence conversation reset tombstone")?;
+    }
 
-        self.reset_conversation_state(&scope, &old_conversation_id, new_conversation_id)
-            .await
-            .context("failed to reset conversation state")?;
-
-        let deleted = self
-            .broker
-            .delete_conversation_artifacts(&old_conversation_id, &tombstone_id)
-            .await
-            .context("failed to delete conversation artifacts")?;
-
-        self.tombstones
-            .advance(
-                &tombstone_id,
-                TombstoneStatus::Fenced,
-                TombstoneStatus::LivePurged,
-            )
-            .await
-            .context("failed to mark conversation reset live-purged")?;
-
-        self.store
-            .set_conversation_id(new_conversation_id.to_owned());
-
-        // Insert an audit record for the reset itself.
-        self.tombstones
-            .log_access(
-                "lifecycle-worker",
-                &scope.tenant_id,
-                "reset",
-                &format!("conversation:{old_conversation_id}"),
-                deleted as i64,
-            )
-            .await
-            .ok();
-
+    fn validate_reset_receipt(
+        &self,
+        tombstone: &Tombstone,
+        command_id: &str,
+        command_seq: i64,
+        new_conversation_id: &str,
+    ) -> Result<()> {
+        if tombstone.scope != TombstoneScope::Conversation
+            || tombstone.command_id.as_deref() != Some(command_id)
+            || tombstone.command_seq != Some(command_seq)
+            || tombstone.replacement_conversation_id.as_deref() != Some(new_conversation_id)
+        {
+            bail!("conversation reset command conflicts with durable tombstone receipt");
+        }
         Ok(())
     }
 
-    async fn reset_conversation_state(
+    /// Called only after the deployment supervisor has stopped/fenced the old
+    /// process generation. Recording the proof is idempotent and deliberately
+    /// does not advance the lifecycle status.
+    pub async fn record_generation_fence(
         &self,
-        scope: &AgentScope,
-        old_conversation_id: &str,
-        new_conversation_id: &str,
-    ) -> Result<()> {
-        let mut transaction = self.store.pool().begin().await?;
+        tombstone_id: &str,
+        fence: &GenerationRecoveryFence,
+    ) -> Result<Tombstone> {
+        self.tombstones
+            .record_generation_fence(
+                tombstone_id,
+                fence.generation().as_i64(),
+                fence.lease_id(),
+                fence.fence_id(),
+            )
+            .await
+            .context("failed to persist reset generation fence")
+    }
 
-        // Crypto-erase all conversation-scoped data keys.
+    /// Resume pending reset stages before startup exposes keys, commands,
+    /// transcript, search, export, provider calls, or tools.
+    pub async fn resume_pending_resets(&self) -> Result<bool> {
+        let scope = self.store.scope();
+        let tombstones = self
+            .tombstones
+            .list_for_agent(&scope.tenant_id, &scope.agent_id)
+            .await?;
+        let mut restart_required = false;
+        for tombstone in tombstones {
+            if tombstone.scope != TombstoneScope::Conversation
+                || matches!(
+                    tombstone.status,
+                    TombstoneStatus::LivePurged | TombstoneStatus::BackupExpired
+                )
+            {
+                continue;
+            }
+            if tombstone.conversation_id.as_deref() == Some(scope.conversation_id.as_str())
+                || tombstone.replacement_conversation_id.as_deref()
+                    == Some(scope.conversation_id.as_str())
+            {
+                restart_required |= self
+                    .resume_conversation_reset_with_failpoint(&tombstone.id, ResetFailpoint::None)
+                    .await?;
+            }
+        }
+        Ok(restart_required)
+    }
+
+    async fn resume_conversation_reset_with_failpoint(
+        &self,
+        tombstone_id: &str,
+        failpoint: ResetFailpoint,
+    ) -> Result<bool> {
+        let mut tombstone = self.tombstones.get(tombstone_id).await?;
+        let scope = self.store.scope();
+        if tombstone.tenant_id != scope.tenant_id
+            || tombstone.agent_id != scope.agent_id
+            || tombstone.scope != TombstoneScope::Conversation
+        {
+            bail!("conversation reset tombstone identity does not match the agent store");
+        }
+        let old_conversation_id = tombstone
+            .conversation_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("reset tombstone is missing old conversation"))?;
+        let new_conversation_id =
+            tombstone
+                .replacement_conversation_id
+                .clone()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("reset tombstone is missing replacement conversation")
+                })?;
+
+        if tombstone.status == TombstoneStatus::Requested {
+            if tombstone.fenced_generation.is_none()
+                || tombstone.generation_lease_id.is_none()
+                || tombstone.generation_fence_id.is_none()
+            {
+                bail!(
+                    "conversation reset tombstone {} blocks access until the deployment \
+                     supervisor persists a generation fence",
+                    tombstone.id
+                );
+            }
+            self.crypto_erase_conversation(&old_conversation_id).await?;
+            Self::trip_failpoint(failpoint, ResetFailpoint::AfterCryptoErase)?;
+            self.tombstones
+                .advance(
+                    &tombstone.id,
+                    TombstoneStatus::Requested,
+                    TombstoneStatus::Fenced,
+                )
+                .await?;
+            tombstone = self.tombstones.get(&tombstone.id).await?;
+        }
+
+        if tombstone.status == TombstoneStatus::Fenced {
+            Self::trip_failpoint(failpoint, ResetFailpoint::AfterFenced)?;
+            let deleted = self
+                .broker
+                .delete_conversation_artifacts(&old_conversation_id, &tombstone.id)
+                .await
+                .context("failed to delete conversation artifacts")?;
+            Self::trip_failpoint(failpoint, ResetFailpoint::AfterArtifactDelete)?;
+            self.reset_conversation_state(&scope, &new_conversation_id)
+                .await?;
+            self.store.set_conversation_id(new_conversation_id.clone());
+            Self::trip_failpoint(failpoint, ResetFailpoint::AfterDatabaseReset)?;
+            self.tombstones
+                .advance(
+                    &tombstone.id,
+                    TombstoneStatus::Fenced,
+                    TombstoneStatus::LivePurged,
+                )
+                .await?;
+            self.tombstones
+                .log_access(
+                    "lifecycle-worker",
+                    &scope.tenant_id,
+                    "reset",
+                    &format!("conversation:{old_conversation_id}"),
+                    deleted as i64,
+                )
+                .await
+                .context("failed to persist reset audit receipt")?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn trip_failpoint(actual: ResetFailpoint, expected: ResetFailpoint) -> Result<()> {
+        if actual == expected {
+            bail!("deterministic lifecycle failpoint: {expected:?}");
+        }
+        Ok(())
+    }
+
+    async fn crypto_erase_conversation(&self, old_conversation_id: &str) -> Result<()> {
         sqlx::query(
             "UPDATE data_keys
              SET state = 'destroyed', wrapped_key = NULL, wrap_nonce = NULL, destroyed_at = ?
@@ -201,27 +339,34 @@ impl LifecycleWorker {
         )
         .bind(Utc::now().to_rfc3339())
         .bind(old_conversation_id)
-        .execute(&mut *transaction)
+        .execute(self.store.pool())
         .await
         .context("failed to crypto-erase conversation data keys")?;
+        Ok(())
+    }
 
-        // Delete row-level conversation state.  Order respects FK and trigger
-        // dependencies: messages cascades to provider_context and
-        // memory_batch_messages; memory_batches then memory_jobs, then cursors.
+    async fn reset_conversation_state(
+        &self,
+        scope: &AgentScope,
+        new_conversation_id: &str,
+    ) -> Result<()> {
+        let mut transaction = self.store.pool().begin().await?;
         for table in [
-            "messages",
-            "memory_batches",
+            "physical_recovery_receipt_intents",
+            "physical_recovery_receipt_applications",
             "memory_batch_messages",
-            "memory_jobs",
-            "memory_apply_cursors",
-            "agent_events",
-            "inbound_commands",
-            "tool_executions",
-            "approval_log",
-            "event_log_heads",
             "provider_context",
             "provider_context_mutations",
             "provider_context_replace_heads",
+            "memory_jobs",
+            "memory_apply_cursors",
+            "memory_batches",
+            "approval_log",
+            "event_log_heads",
+            "messages",
+            "agent_events",
+            "tool_executions",
+            "inbound_commands",
             "kv",
         ] {
             sqlx::query(&format!("DELETE FROM {table}"))
@@ -230,17 +375,17 @@ impl LifecycleWorker {
                 .with_context(|| format!("failed to delete from {table} during reset"))?;
         }
 
-        // Re-bind the singleton scope to the new conversation id.
-        sqlx::query(
+        let updated = sqlx::query(
             "UPDATE agent_scope SET conversation_id = ? WHERE tenant_id = ? AND agent_id = ?",
         )
         .bind(new_conversation_id)
         .bind(&scope.tenant_id)
         .bind(&scope.agent_id)
         .execute(&mut *transaction)
-        .await
-        .context("failed to update agent scope conversation id")?;
-
+        .await?;
+        if updated.rows_affected() != 1 {
+            bail!("conversation reset scope update did not affect exactly one agent");
+        }
         transaction.commit().await?;
         Ok(())
     }
@@ -264,6 +409,7 @@ impl LifecycleWorker {
     /// Rotate the agent's wrapping key (e.g. after a KMS re-key) by re-wrapping
     /// every active conversation data key with the current `KeyProvider` key.
     pub async fn rotate_conversation_keys(&self) -> Result<()> {
+        self.ensure_access_allowed("key rotation").await?;
         self.store
             .rewrap_active_data_keys()
             .await
@@ -273,6 +419,7 @@ impl LifecycleWorker {
 
     /// Export redacted conversation messages as newline-delimited JSON.
     pub async fn export_conversation(&self, actor_id: &str) -> Result<Vec<u8>> {
+        self.ensure_access_allowed("export").await?;
         let scope = self.store.scope();
         let rows = sqlx::query(
             "SELECT id, seq, role, payload, search_text, created_at
@@ -347,6 +494,7 @@ impl LifecycleWorker {
 
     /// Search conversation messages with FTS5 and return redacted payloads.
     pub async fn search_conversation(&self, actor_id: &str, query: &str) -> Result<Vec<u8>> {
+        self.ensure_access_allowed("search").await?;
         let scope = self.store.scope();
         if query.is_empty() {
             bail!("search query must not be empty");
@@ -411,8 +559,21 @@ impl LifecycleWorker {
             .await
     }
 
+    pub async fn ensure_access_allowed(&self, operation: &str) -> Result<()> {
+        if let Some(tombstone) = self.blocking_tombstone().await? {
+            bail!(
+                "{operation} is blocked by deletion tombstone {} in status {}",
+                tombstone.id,
+                tombstone.status.as_str()
+            );
+        }
+        Ok(())
+    }
+
     /// Return the set of active data-key purposes for the current conversation.
     pub async fn active_conversation_purposes(&self) -> Result<HashSet<DataKeyPurpose>> {
+        self.ensure_access_allowed("conversation key access")
+            .await?;
         let scope = self.store.scope();
         let rows = sqlx::query(
             "SELECT purpose FROM data_keys
@@ -434,29 +595,48 @@ impl LifecycleWorker {
     /// Dispatch a lifecycle command that was admitted by the gateway.
     /// Returns any JSON/bytes payload that should be delivered as an outbound
     /// event (used by `export` and `search`).
-    pub async fn handle_command(&self, command: &Command) -> Result<Option<Vec<u8>>> {
+    pub async fn handle_command(
+        &self,
+        command_id: &str,
+        command_seq: u64,
+        command: &Command,
+    ) -> Result<LifecycleCommandResult> {
         match command {
             Command::ConversationReset {
                 new_conversation_id,
             } => {
-                self.conversation_reset(new_conversation_id).await?;
-                Ok(None)
+                let restart_required = self
+                    .conversation_reset(command_id, command_seq, new_conversation_id)
+                    .await?;
+                Ok(LifecycleCommandResult {
+                    payload: None,
+                    restart_required,
+                })
             }
             Command::DeleteAgent {} => {
                 self.delete_agent().await?;
-                Ok(None)
+                unreachable!("delete_agent always fails closed")
             }
             Command::Export { actor_id } => {
                 let payload = self.export_conversation(actor_id).await?;
-                Ok(Some(payload))
+                Ok(LifecycleCommandResult {
+                    payload: Some(payload),
+                    restart_required: false,
+                })
             }
             Command::Search { actor_id, query } => {
                 let payload = self.search_conversation(actor_id, query).await?;
-                Ok(Some(payload))
+                Ok(LifecycleCommandResult {
+                    payload: Some(payload),
+                    restart_required: false,
+                })
             }
             Command::RotateKeys {} => {
                 self.rotate_conversation_keys().await?;
-                Ok(None)
+                Ok(LifecycleCommandResult {
+                    payload: None,
+                    restart_required: false,
+                })
             }
             Command::UserMessage { .. } | Command::Abort {} | Command::ApprovalDecision { .. } => {
                 bail!("lifecycle worker received non-lifecycle command")
@@ -487,11 +667,12 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::runtime::contracts::{ProcessGeneration, ProcessGenerationLease};
     use crate::store::crypto::{DataKeyScope, KeyWrapAad, WRAP_ALGORITHM, wrap_data_key};
     use crate::store::{
         AgentScope, DATA_KEY_BYTES, DataKeyMaterial, DataKeyPurpose, InMemoryTombstoneRepository,
-        KeyProvider, KmsClient, KmsKeyProvider, MockKmsClient, TombstoneRepository, TombstoneScope,
-        TombstoneStatus, WrappingKey,
+        KeyProvider, KmsClient, KmsKeyProvider, MockKmsClient, SqliteTombstoneRepository,
+        TombstoneRepository, TombstoneScope, TombstoneStatus, WrappingKey,
     };
     use crate::tools::executor::{ArtifactBroker, ArtifactOperation};
     use uuid::Uuid;
@@ -512,6 +693,15 @@ mod tests {
         conversation_id: &str,
         client: Arc<MockKmsClient>,
     ) -> (Store, WrappingKey) {
+        open_test_store_for("tenant-1", "agent-1", conversation_id, client).await
+    }
+
+    async fn open_test_store_for(
+        tenant_id: &str,
+        agent_id: &str,
+        conversation_id: &str,
+        client: Arc<MockKmsClient>,
+    ) -> (Store, WrappingKey) {
         let dir = temp_test_dir();
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("agent.db");
@@ -525,8 +715,8 @@ mod tests {
         let provider = KmsKeyProvider::new(kms_client).unwrap();
         let key_provider: Arc<dyn KeyProvider> = Arc::new(provider);
         let scope = AgentScope {
-            tenant_id: "tenant-1".to_owned(),
-            agent_id: "agent-1".to_owned(),
+            tenant_id: tenant_id.to_owned(),
+            agent_id: agent_id.to_owned(),
             conversation_id: conversation_id.to_owned(),
         };
         let store = Store::open(&db_path, scope, key_provider).await.unwrap();
@@ -584,9 +774,83 @@ mod tests {
         .expect("seed workspace key");
     }
 
+    async fn seed_physical_recovery_receipt(store: &Store, suffix_seq: i64, label: &str) {
+        let event_key = store.conversation_key(DataKeyPurpose::Event).await.unwrap();
+        sqlx::query(
+            "INSERT INTO agent_events(
+                seq, event_type, internal_metadata, raw_key_ref, raw_ciphertext,
+                envelope, redaction_version, created_at
+             ) VALUES(?, 'tool_execution_end', ?, ?, X'00', ?, 1, ?)",
+        )
+        .bind(suffix_seq)
+        .bind(format!(
+            r#"{{"receipt_id":"receipt-{label}","tool_call_id":"tool-{label}"}}"#
+        ))
+        .bind(&event_key.key_ref)
+        .bind(format!(
+            r#"{{"type":"tool_execution_end","label":"{label}"}}"#
+        ))
+        .bind(Utc::now().to_rfc3339())
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO tool_executions(
+                tool_call_id, command_id, run_id, executor_generation, state,
+                idempotency_key, started_at, finished_at, error_code
+             ) VALUES(?, ?, ?, 7, 'indeterminate', ?, ?, ?, 'indeterminate')",
+        )
+        .bind(format!("tool-{label}"))
+        .bind(format!("command-{label}"))
+        .bind(format!("run-{label}"))
+        .bind(format!("idempotency-{label}"))
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO physical_recovery_receipt_applications(
+                receipt_id, receipt_digest, lease_id, fence_id, generation,
+                intent_count, logical_suffix_first_seq, logical_suffix_last_seq, applied_at
+             ) VALUES(?, ?, ?, ?, 7, 1, ?, ?, ?)",
+        )
+        .bind(format!("receipt-{label}"))
+        .bind(format!("digest-{label}"))
+        .bind(format!("lease-{label}"))
+        .bind(format!("fence-{label}"))
+        .bind(suffix_seq)
+        .bind(suffix_seq)
+        .bind(Utc::now().to_rfc3339())
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO physical_recovery_receipt_intents(
+                receipt_id, tool_call_id, command_id, run_id, executor_generation,
+                indeterminate_terminal_seq
+             ) VALUES(?, ?, ?, ?, 7, ?)",
+        )
+        .bind(format!("receipt-{label}"))
+        .bind(format!("tool-{label}"))
+        .bind(format!("command-{label}"))
+        .bind(format!("run-{label}"))
+        .bind(suffix_seq)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    }
+
     fn open_broker(root: &std::path::Path) -> crate::tools::executor::ArtifactBroker {
         std::fs::create_dir_all(root).unwrap();
         ArtifactBroker::open(root).unwrap()
+    }
+
+    fn test_generation_fence() -> GenerationRecoveryFence {
+        let lease =
+            ProcessGenerationLease::new(ProcessGeneration::from_wire(7).unwrap(), "reset-lease-7")
+                .unwrap();
+        GenerationRecoveryFence::new(&lease, "reset-fence-7").unwrap()
     }
 
     #[tokio::test]
@@ -616,7 +880,35 @@ mod tests {
             Some(artifact_root.clone()),
         );
 
-        worker.conversation_reset("conversation-new").await.unwrap();
+        let command_id = "00000000-0000-4000-8000-000000000001";
+        let error = worker
+            .conversation_reset(command_id, 1, "conversation-new")
+            .await
+            .expect_err("reset must wait for the supervisor fence");
+        assert!(error.to_string().contains("generation fence"));
+        assert!(worker.ensure_access_allowed("startup").await.is_err());
+        assert!(worker.export_conversation("actor").await.is_err());
+        assert!(worker.search_conversation("actor", "hello").await.is_err());
+        assert!(
+            worker.resume_pending_resets().await.is_err(),
+            "startup recovery must fail closed before a generation fence"
+        );
+        let tombstone = tombstones
+            .find_by_command("tenant-1", "agent-1", command_id)
+            .await
+            .unwrap()
+            .unwrap();
+        worker
+            .record_generation_fence(&tombstone.id, &test_generation_fence())
+            .await
+            .unwrap();
+        assert!(
+            worker
+                .conversation_reset(command_id, 1, "conversation-new")
+                .await
+                .unwrap(),
+            "the fenced generation must exit after live purge"
+        );
 
         assert_eq!(store.scope().conversation_id, "conversation-new");
         let purposes = worker.active_conversation_purposes().await.unwrap();
@@ -638,6 +930,210 @@ mod tests {
         assert_eq!(tombstone.scope, TombstoneScope::Conversation);
 
         assert!(!artifact_root.join("conversation-old").exists());
+    }
+
+    #[tokio::test]
+    async fn reset_failpoints_resume_one_tombstone_stage_by_stage() {
+        for failpoint in [
+            ResetFailpoint::AfterCryptoErase,
+            ResetFailpoint::AfterFenced,
+            ResetFailpoint::AfterArtifactDelete,
+            ResetFailpoint::AfterDatabaseReset,
+        ] {
+            let old = format!("conversation-old-{failpoint:?}");
+            let new = format!("conversation-new-{failpoint:?}");
+            let command_id = format!("command-{failpoint:?}");
+            let client = Arc::new(MockKmsClient::new("tenant-1", "agent-1", test_kek()));
+            let (store, _) = open_test_store(&old, client).await;
+            let store = Arc::new(store);
+            seed_message(&store, &old, 1).await;
+            let compliance_root = temp_test_dir();
+            std::fs::create_dir_all(&compliance_root).unwrap();
+            let compliance_path = compliance_root.join("control-plane.db");
+            let tombstones: Arc<dyn TombstoneRepository> = Arc::new(
+                SqliteTombstoneRepository::open(&compliance_path)
+                    .await
+                    .unwrap(),
+            );
+            let artifact_root = temp_test_dir();
+            let broker = open_broker(&artifact_root);
+            broker
+                .execute(ArtifactOperation::PutAttachment {
+                    conversation_id: old.clone(),
+                    artifact_id: "restart-proof".to_owned(),
+                    content: "must be erased".to_owned(),
+                })
+                .unwrap();
+            let broker: Arc<dyn ArtifactLifecycleBroker> =
+                Arc::new(DirectArtifactBroker::new(broker));
+            let worker =
+                LifecycleWorker::new(store.clone(), tombstones.clone(), broker.clone(), None);
+
+            worker
+                .conversation_reset(&command_id, 1, &new)
+                .await
+                .expect_err("unfenced request must stop");
+            let tombstone = tombstones
+                .find_by_command("tenant-1", "agent-1", &command_id)
+                .await
+                .unwrap()
+                .unwrap();
+            worker
+                .record_generation_fence(&tombstone.id, &test_generation_fence())
+                .await
+                .unwrap();
+            worker
+                .resume_conversation_reset_with_failpoint(&tombstone.id, failpoint)
+                .await
+                .expect_err("deterministic crash boundary must fire");
+
+            // Reopen the external compliance repository and reconstruct the
+            // worker as a process-restart counterexample.
+            drop(worker);
+            drop(tombstones);
+            let tombstones: Arc<dyn TombstoneRepository> = Arc::new(
+                SqliteTombstoneRepository::open(&compliance_path)
+                    .await
+                    .unwrap(),
+            );
+            let restarted =
+                LifecycleWorker::new(store.clone(), tombstones.clone(), broker.clone(), None);
+            assert!(
+                restarted
+                    .resume_conversation_reset_with_failpoint(&tombstone.id, ResetFailpoint::None,)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                tombstones.get(&tombstone.id).await.unwrap().status,
+                TombstoneStatus::LivePurged
+            );
+            assert_eq!(
+                tombstones
+                    .list_for_agent("tenant-1", "agent-1")
+                    .await
+                    .unwrap()
+                    .len(),
+                1,
+                "restart minted an extra tombstone at {failpoint:?}"
+            );
+            assert_eq!(store.scope().conversation_id, new);
+            assert!(!artifact_root.join(old).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_physical_receipt_is_fk_safe_and_isolated_from_second_agent() {
+        let target_client = Arc::new(MockKmsClient::new("tenant-1", "agent-1", test_kek()));
+        let second_client = Arc::new(MockKmsClient::new("tenant-2", "agent-2", test_kek()));
+        let (target, _) =
+            open_test_store_for("tenant-1", "agent-1", "conversation-target", target_client).await;
+        let (second, _) =
+            open_test_store_for("tenant-2", "agent-2", "conversation-second", second_client).await;
+        let target = Arc::new(target);
+        let second = Arc::new(second);
+        seed_physical_recovery_receipt(&target, 1, "target").await;
+        seed_physical_recovery_receipt(&second, 1, "second").await;
+        let command_key = target
+            .conversation_key(DataKeyPurpose::Command)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO inbound_commands(
+                seq, command_id, command_kind, payload_ciphertext, payload_key_ref,
+                payload_hmac, status, run_phase, received_at
+             ) VALUES(7, 'reset-with-physical-receipt', 'lifecycle', X'00', ?,
+                      zeroblob(32), 'received', 'received', ?)",
+        )
+        .bind(&command_key.key_ref)
+        .bind(Utc::now().to_rfc3339())
+        .execute(target.pool())
+        .await
+        .unwrap();
+
+        let artifact_root = temp_test_dir();
+        let broker = open_broker(&artifact_root);
+        for conversation_id in ["conversation-target", "conversation-second"] {
+            broker
+                .execute(ArtifactOperation::PutAttachment {
+                    conversation_id: conversation_id.to_owned(),
+                    artifact_id: "receipt-proof".to_owned(),
+                    content: conversation_id.to_owned(),
+                })
+                .unwrap();
+        }
+        let tombstones: Arc<dyn TombstoneRepository> = Arc::new(InMemoryTombstoneRepository::new());
+        let worker = LifecycleWorker::new(
+            target.clone(),
+            tombstones.clone(),
+            Arc::new(DirectArtifactBroker::new(broker)),
+            None,
+        );
+        let command_id = "reset-with-physical-receipt";
+        worker
+            .conversation_reset(command_id, 7, "conversation-target-new")
+            .await
+            .expect_err("unfenced reset must stop");
+        let tombstone = tombstones
+            .find_by_command("tenant-1", "agent-1", command_id)
+            .await
+            .unwrap()
+            .unwrap();
+        worker
+            .record_generation_fence(&tombstone.id, &test_generation_fence())
+            .await
+            .unwrap();
+        worker
+            .conversation_reset(command_id, 7, "conversation-target-new")
+            .await
+            .unwrap();
+        let command_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbound_commands")
+            .fetch_one(target.pool())
+            .await
+            .unwrap();
+        assert_eq!(command_rows, 0, "old encrypted command row survived reset");
+        assert!(
+            !worker
+                .conversation_reset(command_id, 7, "conversation-target-new")
+                .await
+                .unwrap(),
+            "durable tombstone receipt replay minted or re-applied reset"
+        );
+
+        for table in [
+            "physical_recovery_receipt_intents",
+            "physical_recovery_receipt_applications",
+            "agent_events",
+            "tool_executions",
+        ] {
+            let target_count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(target.pool())
+                .await
+                .unwrap();
+            let second_count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(second.pool())
+                .await
+                .unwrap();
+            assert_eq!(target_count, 0, "target {table} survived reset");
+            assert_eq!(second_count, 1, "second-agent {table} was modified");
+        }
+        assert!(!artifact_root.join("conversation-target").exists());
+        assert!(
+            artifact_root
+                .join("conversation-second")
+                .join("attachments")
+                .join("receipt-proof")
+                .exists(),
+            "second-agent artifact subtree was modified"
+        );
+        assert!(
+            tombstones
+                .list_for_agent("tenant-2", "agent-2")
+                .await
+                .unwrap()
+                .is_empty(),
+            "target reset crossed the control-plane agent identity"
+        );
     }
 
     #[tokio::test]

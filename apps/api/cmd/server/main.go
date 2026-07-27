@@ -15,7 +15,14 @@ func main() {
 		port = "8080"
 	}
 
-	tombstoneStore := store.NewTombstoneStore()
+	controlPlanePath := os.Getenv("SUMI_CONTROL_PLANE_STATE_PATH")
+	if controlPlanePath == "" {
+		controlPlanePath = "/var/lib/sumi-control-plane/tombstones.json"
+	}
+	tombstoneStore, err := store.OpenTombstoneStore(controlPlanePath)
+	if err != nil {
+		log.Fatalf("open persistent control-plane tombstones: %v", err)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handler.Health)

@@ -91,8 +91,14 @@ pub struct Tombstone {
     pub tenant_id: String,
     pub agent_id: String,
     pub conversation_id: Option<String>,
+    pub replacement_conversation_id: Option<String>,
+    pub command_id: Option<String>,
+    pub command_seq: Option<i64>,
     pub scope: TombstoneScope,
     pub status: TombstoneStatus,
+    pub fenced_generation: Option<i64>,
+    pub generation_lease_id: Option<String>,
+    pub generation_fence_id: Option<String>,
     pub requested_at: String,
     pub purge_after: String,
 }
@@ -111,16 +117,30 @@ pub struct AuditRecord {
 /// Monotonic state-machine for deletion tombstones plus audit append.
 #[async_trait]
 pub trait TombstoneRepository: Send + Sync {
-    /// Create a new tombstone in `Requested`.  `conversation_id` is required
-    /// for `Conversation` scope and must be `None` for `Agent` scope.
-    async fn request(
+    /// Idempotently create the one durable receipt for a conversation-reset
+    /// command. Reusing a command id or old conversation with different
+    /// identity is rejected rather than minting another tombstone.
+    async fn request_conversation_reset(
         &self,
         tenant_id: &str,
         agent_id: &str,
-        conversation_id: Option<&str>,
-        scope: TombstoneScope,
+        conversation_id: &str,
+        replacement_conversation_id: &str,
+        command_id: &str,
+        command_seq: i64,
         purge_after: &str,
-    ) -> Result<String>;
+    ) -> Result<Tombstone>;
+
+    /// Persist the supervisor-issued, typed generation-fence identity without
+    /// advancing the lifecycle stage. Crypto-erasure must complete before the
+    /// Requested -> Fenced CAS.
+    async fn record_generation_fence(
+        &self,
+        id: &str,
+        generation: i64,
+        lease_id: &str,
+        fence_id: &str,
+    ) -> Result<Tombstone>;
 
     /// CAS-advance a tombstone to `next`.  Same-state is an idempotent no-op.
     /// Reverse or skipped transitions fail closed.
@@ -133,6 +153,15 @@ pub trait TombstoneRepository: Send + Sync {
 
     /// Load one tombstone by id.
     async fn get(&self, id: &str) -> Result<Tombstone>;
+
+    /// Resolve durable command completion/replay from the control-plane
+    /// receipt after the original agent DB command row has been purged.
+    async fn find_by_command(
+        &self,
+        tenant_id: &str,
+        agent_id: &str,
+        command_id: &str,
+    ) -> Result<Option<Tombstone>>;
 
     /// List tombstones for one agent.
     async fn list_for_agent(&self, tenant_id: &str, agent_id: &str) -> Result<Vec<Tombstone>>;
@@ -164,14 +193,39 @@ pub trait TombstoneRepository: Send + Sync {
     ) -> Result<Vec<AuditRecord>>;
 }
 
-fn validate_scope_identity(scope: TombstoneScope, conversation_id: Option<&str>) -> Result<()> {
-    match (scope, conversation_id) {
-        (TombstoneScope::Conversation, Some(_)) | (TombstoneScope::Agent, None) => Ok(()),
-        (TombstoneScope::Conversation, None) => {
-            bail!("conversation scope requires a conversation_id")
-        }
-        (TombstoneScope::Agent, Some(_)) => bail!("agent scope must not have a conversation_id"),
+fn validate_reset_identity(
+    tenant_id: &str,
+    agent_id: &str,
+    conversation_id: &str,
+    replacement_conversation_id: &str,
+    command_id: &str,
+    command_seq: i64,
+) -> Result<()> {
+    if tenant_id.is_empty()
+        || agent_id.is_empty()
+        || conversation_id.is_empty()
+        || replacement_conversation_id.is_empty()
+        || command_id.is_empty()
+    {
+        bail!("conversation reset identity fields must not be empty");
     }
+    if conversation_id == replacement_conversation_id {
+        bail!("replacement conversation id must differ from the deleted conversation id");
+    }
+    if command_seq < 0 {
+        bail!("conversation reset command seq must be nonnegative");
+    }
+    Ok(())
+}
+
+fn validate_fence_identity(generation: i64, lease_id: &str, fence_id: &str) -> Result<()> {
+    if generation < 0 {
+        bail!("fenced generation must be nonnegative");
+    }
+    if lease_id.is_empty() || fence_id.is_empty() {
+        bail!("generation lease and fence identities must not be empty");
+    }
+    Ok(())
 }
 
 fn validate_transition(expected: TombstoneStatus, next: TombstoneStatus) -> Result<()> {
@@ -231,28 +285,91 @@ impl InMemoryTombstoneRepository {
 
 #[async_trait]
 impl TombstoneRepository for InMemoryTombstoneRepository {
-    async fn request(
+    async fn request_conversation_reset(
         &self,
         tenant_id: &str,
         agent_id: &str,
-        conversation_id: Option<&str>,
-        scope: TombstoneScope,
+        conversation_id: &str,
+        replacement_conversation_id: &str,
+        command_id: &str,
+        command_seq: i64,
         purge_after: &str,
-    ) -> Result<String> {
-        validate_scope_identity(scope, conversation_id)?;
+    ) -> Result<Tombstone> {
+        validate_reset_identity(
+            tenant_id,
+            agent_id,
+            conversation_id,
+            replacement_conversation_id,
+            command_id,
+            command_seq,
+        )?;
+        let mut tombstones = self.lock_tombstones()?;
+        if let Some(existing) = tombstones.values().find(|t| {
+            t.tenant_id == tenant_id
+                && t.agent_id == agent_id
+                && (t.command_id.as_deref() == Some(command_id)
+                    || (t.scope == TombstoneScope::Conversation
+                        && t.conversation_id.as_deref() == Some(conversation_id)))
+        }) {
+            if existing.conversation_id.as_deref() == Some(conversation_id)
+                && existing.replacement_conversation_id.as_deref()
+                    == Some(replacement_conversation_id)
+                && existing.command_id.as_deref() == Some(command_id)
+                && existing.command_seq == Some(command_seq)
+            {
+                return Ok(existing.clone());
+            }
+            bail!("conflicting conversation reset tombstone already exists");
+        }
         let id = Uuid::now_v7().to_string();
         let tombstone = Tombstone {
             id: id.clone(),
             tenant_id: tenant_id.to_owned(),
             agent_id: agent_id.to_owned(),
-            conversation_id: conversation_id.map(|s| s.to_owned()),
-            scope,
+            conversation_id: Some(conversation_id.to_owned()),
+            replacement_conversation_id: Some(replacement_conversation_id.to_owned()),
+            command_id: Some(command_id.to_owned()),
+            command_seq: Some(command_seq),
+            scope: TombstoneScope::Conversation,
             status: TombstoneStatus::Requested,
+            fenced_generation: None,
+            generation_lease_id: None,
+            generation_fence_id: None,
             requested_at: Utc::now().to_rfc3339(),
             purge_after: purge_after.to_owned(),
         };
-        self.lock_tombstones()?.insert(id.clone(), tombstone);
-        Ok(id)
+        tombstones.insert(id, tombstone.clone());
+        Ok(tombstone)
+    }
+
+    async fn record_generation_fence(
+        &self,
+        id: &str,
+        generation: i64,
+        lease_id: &str,
+        fence_id: &str,
+    ) -> Result<Tombstone> {
+        validate_fence_identity(generation, lease_id, fence_id)?;
+        let mut tombstones = self.lock_tombstones()?;
+        let tombstone = tombstones
+            .get_mut(id)
+            .ok_or_else(|| anyhow!("tombstone {id} not found"))?;
+        let existing = (
+            tombstone.fenced_generation,
+            tombstone.generation_lease_id.as_deref(),
+            tombstone.generation_fence_id.as_deref(),
+        );
+        if existing == (None, None, None) {
+            if tombstone.status != TombstoneStatus::Requested {
+                bail!("cannot attach a generation fence after reset processing began");
+            }
+            tombstone.fenced_generation = Some(generation);
+            tombstone.generation_lease_id = Some(lease_id.to_owned());
+            tombstone.generation_fence_id = Some(fence_id.to_owned());
+        } else if existing != (Some(generation), Some(lease_id), Some(fence_id)) {
+            bail!("conflicting generation fence replay for tombstone {id}");
+        }
+        Ok(tombstone.clone())
     }
 
     async fn advance(
@@ -267,10 +384,21 @@ impl TombstoneRepository for InMemoryTombstoneRepository {
             .get_mut(id)
             .ok_or_else(|| anyhow!("tombstone {id} not found"))?;
         if tombstone.status != expected {
+            if tombstone.status == next {
+                return Ok(());
+            }
             bail!(
                 "tombstone CAS mismatch for {id}: expected {expected:?}, found {:?}",
                 tombstone.status
             );
+        }
+        if expected == TombstoneStatus::Requested
+            && next == TombstoneStatus::Fenced
+            && (tombstone.fenced_generation.is_none()
+                || tombstone.generation_lease_id.is_none()
+                || tombstone.generation_fence_id.is_none())
+        {
+            bail!("cannot mark tombstone fenced without a durable generation fence");
         }
         tombstone.status = next;
         Ok(())
@@ -281,6 +409,23 @@ impl TombstoneRepository for InMemoryTombstoneRepository {
             .get(id)
             .cloned()
             .ok_or_else(|| anyhow!("tombstone {id} not found"))
+    }
+
+    async fn find_by_command(
+        &self,
+        tenant_id: &str,
+        agent_id: &str,
+        command_id: &str,
+    ) -> Result<Option<Tombstone>> {
+        Ok(self
+            .lock_tombstones()?
+            .values()
+            .find(|t| {
+                t.tenant_id == tenant_id
+                    && t.agent_id == agent_id
+                    && t.command_id.as_deref() == Some(command_id)
+            })
+            .cloned())
     }
 
     async fn list_for_agent(&self, tenant_id: &str, agent_id: &str) -> Result<Vec<Tombstone>> {
@@ -294,15 +439,17 @@ impl TombstoneRepository for InMemoryTombstoneRepository {
 
     async fn blocking_tombstone(
         &self,
-        _tenant_id: &str,
-        _agent_id: &str,
+        tenant_id: &str,
+        agent_id: &str,
         conversation_id: Option<&str>,
     ) -> Result<Option<Tombstone>> {
         let tombstones = self.lock_tombstones()?;
         Ok(tombstones
             .values()
             .filter(|t| {
-                t.status != TombstoneStatus::BackupExpired
+                t.tenant_id == tenant_id
+                    && t.agent_id == agent_id
+                    && t.status != TombstoneStatus::BackupExpired
                     && (conversation_id.is_none()
                         || t.conversation_id.as_deref() == conversation_id
                         || t.scope == TombstoneScope::Agent)
@@ -406,18 +553,49 @@ CREATE TABLE IF NOT EXISTS deletion_tombstones (
   tenant_id TEXT NOT NULL,
   agent_id TEXT NOT NULL,
   conversation_id TEXT,
+  replacement_conversation_id TEXT,
+  command_id TEXT,
+  command_seq INTEGER,
   scope TEXT NOT NULL,
   status TEXT NOT NULL,
+  fenced_generation INTEGER,
+  generation_lease_id TEXT,
+  generation_fence_id TEXT,
   requested_at TEXT NOT NULL,
   purge_after TEXT NOT NULL,
   CHECK (scope IN ('conversation', 'agent')),
   CHECK (status IN ('requested', 'fenced', 'live_purged', 'backup_expired')),
   CHECK (
-    (scope = 'conversation' AND conversation_id IS NOT NULL)
+    (scope = 'conversation'
+      AND conversation_id IS NOT NULL
+      AND replacement_conversation_id IS NOT NULL
+      AND replacement_conversation_id <> conversation_id
+      AND command_id IS NOT NULL
+      AND command_seq >= 0)
     OR
-    (scope = 'agent' AND conversation_id IS NULL)
+    (scope = 'agent'
+      AND conversation_id IS NULL
+      AND replacement_conversation_id IS NULL
+      AND command_id IS NULL
+      AND command_seq IS NULL)
+  ),
+  CHECK (
+    (fenced_generation IS NULL
+      AND generation_lease_id IS NULL
+      AND generation_fence_id IS NULL
+      AND status = 'requested')
+    OR
+    (fenced_generation >= 0
+      AND generation_lease_id IS NOT NULL
+      AND generation_fence_id IS NOT NULL)
   )
 );
+CREATE UNIQUE INDEX IF NOT EXISTS one_tombstone_per_reset_command
+ON deletion_tombstones(tenant_id, agent_id, command_id)
+WHERE command_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS one_tombstone_per_deleted_conversation
+ON deletion_tombstones(tenant_id, agent_id, conversation_id)
+WHERE scope = 'conversation';
 
 CREATE TABLE IF NOT EXISTS data_access_audit (
   id TEXT PRIMARY KEY,
@@ -432,35 +610,107 @@ CREATE TABLE IF NOT EXISTS data_access_audit (
 
 #[async_trait]
 impl TombstoneRepository for SqliteTombstoneRepository {
-    async fn request(
+    async fn request_conversation_reset(
         &self,
         tenant_id: &str,
         agent_id: &str,
-        conversation_id: Option<&str>,
-        scope: TombstoneScope,
+        conversation_id: &str,
+        replacement_conversation_id: &str,
+        command_id: &str,
+        command_seq: i64,
         purge_after: &str,
-    ) -> Result<String> {
-        validate_scope_identity(scope, conversation_id)?;
+    ) -> Result<Tombstone> {
+        validate_reset_identity(
+            tenant_id,
+            agent_id,
+            conversation_id,
+            replacement_conversation_id,
+            command_id,
+            command_seq,
+        )?;
         let id = Uuid::now_v7().to_string();
         let requested_at = Utc::now().to_rfc3339();
-        sqlx::query(
+        let inserted = sqlx::query(
             "INSERT INTO deletion_tombstones(
-                id, tenant_id, agent_id, conversation_id, scope, status,
-                requested_at, purge_after
-             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                id, tenant_id, agent_id, conversation_id, replacement_conversation_id,
+                command_id, command_seq, scope, status, requested_at, purge_after
+             ) VALUES(?, ?, ?, ?, ?, ?, ?, 'conversation', 'requested', ?, ?)
+             ON CONFLICT DO NOTHING",
         )
         .bind(&id)
         .bind(tenant_id)
         .bind(agent_id)
         .bind(conversation_id)
-        .bind(scope.as_str())
-        .bind(TombstoneStatus::Requested.as_str())
+        .bind(replacement_conversation_id)
+        .bind(command_id)
+        .bind(command_seq)
         .bind(&requested_at)
         .bind(purge_after)
         .execute(&self.pool)
         .await
         .context("failed to insert tombstone")?;
-        Ok(id)
+        if inserted.rows_affected() == 1 {
+            return self.get(&id).await;
+        }
+
+        let existing = sqlx::query(
+            "SELECT id FROM deletion_tombstones
+             WHERE tenant_id = ? AND agent_id = ?
+               AND (command_id = ? OR (scope = 'conversation' AND conversation_id = ?))
+             ORDER BY requested_at LIMIT 1",
+        )
+        .bind(tenant_id)
+        .bind(agent_id)
+        .bind(command_id)
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to resolve idempotent tombstone request")?
+        .ok_or_else(|| anyhow!("conversation reset tombstone conflict had no existing row"))?;
+        let existing_id: String = existing.try_get("id")?;
+        let existing = self.get(&existing_id).await?;
+        if existing.conversation_id.as_deref() != Some(conversation_id)
+            || existing.replacement_conversation_id.as_deref() != Some(replacement_conversation_id)
+            || existing.command_id.as_deref() != Some(command_id)
+            || existing.command_seq != Some(command_seq)
+        {
+            bail!("conflicting conversation reset tombstone already exists");
+        }
+        Ok(existing)
+    }
+
+    async fn record_generation_fence(
+        &self,
+        id: &str,
+        generation: i64,
+        lease_id: &str,
+        fence_id: &str,
+    ) -> Result<Tombstone> {
+        validate_fence_identity(generation, lease_id, fence_id)?;
+        let updated = sqlx::query(
+            "UPDATE deletion_tombstones
+             SET fenced_generation = ?, generation_lease_id = ?, generation_fence_id = ?
+             WHERE id = ? AND status = 'requested'
+               AND fenced_generation IS NULL
+               AND generation_lease_id IS NULL
+               AND generation_fence_id IS NULL",
+        )
+        .bind(generation)
+        .bind(lease_id)
+        .bind(fence_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .context("failed to record generation fence")?;
+        let tombstone = self.get(id).await?;
+        if updated.rows_affected() == 0
+            && (tombstone.fenced_generation != Some(generation)
+                || tombstone.generation_lease_id.as_deref() != Some(lease_id)
+                || tombstone.generation_fence_id.as_deref() != Some(fence_id))
+        {
+            bail!("conflicting generation fence replay for tombstone {id}");
+        }
+        Ok(tombstone)
     }
 
     async fn advance(
@@ -470,6 +720,15 @@ impl TombstoneRepository for SqliteTombstoneRepository {
         next: TombstoneStatus,
     ) -> Result<()> {
         validate_transition(expected, next)?;
+        if expected == TombstoneStatus::Requested && next == TombstoneStatus::Fenced {
+            let tombstone = self.get(id).await?;
+            if tombstone.fenced_generation.is_none()
+                || tombstone.generation_lease_id.is_none()
+                || tombstone.generation_fence_id.is_none()
+            {
+                bail!("cannot mark tombstone fenced without a durable generation fence");
+            }
+        }
         // Same-state re-application must still verify the tombstone exists.
         // A no-op UPDATE of an existing row returns rows_affected == 1; a
         // missing row returns 0 and is handled by the CAS failure path below.
@@ -505,8 +764,9 @@ impl TombstoneRepository for SqliteTombstoneRepository {
 
     async fn get(&self, id: &str) -> Result<Tombstone> {
         let row = sqlx::query(
-            "SELECT tenant_id, agent_id, conversation_id, scope, status,
-                    requested_at, purge_after
+            "SELECT tenant_id, agent_id, conversation_id, replacement_conversation_id,
+                    command_id, command_seq, scope, status, fenced_generation,
+                    generation_lease_id, generation_fence_id, requested_at, purge_after
              FROM deletion_tombstones WHERE id = ?",
         )
         .bind(id)
@@ -518,16 +778,46 @@ impl TombstoneRepository for SqliteTombstoneRepository {
             tenant_id: row.try_get("tenant_id")?,
             agent_id: row.try_get("agent_id")?,
             conversation_id: row.try_get("conversation_id")?,
+            replacement_conversation_id: row.try_get("replacement_conversation_id")?,
+            command_id: row.try_get("command_id")?,
+            command_seq: row.try_get("command_seq")?,
             scope: TombstoneScope::parse(row.try_get::<String, _>("scope")?.as_str())?,
             status: TombstoneStatus::parse(row.try_get::<String, _>("status")?.as_str())?,
+            fenced_generation: row.try_get("fenced_generation")?,
+            generation_lease_id: row.try_get("generation_lease_id")?,
+            generation_fence_id: row.try_get("generation_fence_id")?,
             requested_at: row.try_get("requested_at")?,
             purge_after: row.try_get("purge_after")?,
         })
     }
 
+    async fn find_by_command(
+        &self,
+        tenant_id: &str,
+        agent_id: &str,
+        command_id: &str,
+    ) -> Result<Option<Tombstone>> {
+        let id: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM deletion_tombstones
+             WHERE tenant_id = ? AND agent_id = ? AND command_id = ?",
+        )
+        .bind(tenant_id)
+        .bind(agent_id)
+        .bind(command_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to find tombstone by command")?;
+        match id {
+            Some(id) => self.get(&id).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
     async fn list_for_agent(&self, tenant_id: &str, agent_id: &str) -> Result<Vec<Tombstone>> {
         let rows = sqlx::query(
-            "SELECT id, conversation_id, scope, status, requested_at, purge_after
+            "SELECT id, conversation_id, replacement_conversation_id, command_id, command_seq,
+                    scope, status, fenced_generation, generation_lease_id,
+                    generation_fence_id, requested_at, purge_after
              FROM deletion_tombstones
              WHERE tenant_id = ? AND agent_id = ?
              ORDER BY requested_at",
@@ -544,8 +834,14 @@ impl TombstoneRepository for SqliteTombstoneRepository {
                     tenant_id: tenant_id.to_owned(),
                     agent_id: agent_id.to_owned(),
                     conversation_id: row.try_get("conversation_id")?,
+                    replacement_conversation_id: row.try_get("replacement_conversation_id")?,
+                    command_id: row.try_get("command_id")?,
+                    command_seq: row.try_get("command_seq")?,
                     scope: TombstoneScope::parse(row.try_get::<String, _>("scope")?.as_str())?,
                     status: TombstoneStatus::parse(row.try_get::<String, _>("status")?.as_str())?,
+                    fenced_generation: row.try_get("fenced_generation")?,
+                    generation_lease_id: row.try_get("generation_lease_id")?,
+                    generation_fence_id: row.try_get("generation_fence_id")?,
                     requested_at: row.try_get("requested_at")?,
                     purge_after: row.try_get("purge_after")?,
                 })
@@ -560,7 +856,9 @@ impl TombstoneRepository for SqliteTombstoneRepository {
         conversation_id: Option<&str>,
     ) -> Result<Option<Tombstone>> {
         let mut query = String::from(
-            "SELECT id, conversation_id, scope, status, requested_at, purge_after
+            "SELECT id, conversation_id, replacement_conversation_id, command_id, command_seq,
+                    scope, status, fenced_generation, generation_lease_id,
+                    generation_fence_id, requested_at, purge_after
              FROM deletion_tombstones
              WHERE tenant_id = ? AND agent_id = ? AND status <> 'backup_expired'",
         );
@@ -585,8 +883,14 @@ impl TombstoneRepository for SqliteTombstoneRepository {
             tenant_id: tenant_id.to_owned(),
             agent_id: agent_id.to_owned(),
             conversation_id: row.try_get("conversation_id")?,
+            replacement_conversation_id: row.try_get("replacement_conversation_id")?,
+            command_id: row.try_get("command_id")?,
+            command_seq: row.try_get("command_seq")?,
             scope: TombstoneScope::parse(row.try_get::<String, _>("scope")?.as_str())?,
             status: TombstoneStatus::parse(row.try_get::<String, _>("status")?.as_str())?,
+            fenced_generation: row.try_get("fenced_generation")?,
+            generation_lease_id: row.try_get("generation_lease_id")?,
+            generation_fence_id: row.try_get("generation_fence_id")?,
             requested_at: row.try_get("requested_at")?,
             purge_after: row.try_get("purge_after")?,
         }))
@@ -669,16 +973,19 @@ mod tests {
     #[tokio::test]
     async fn sqlite_tombstone_state_machine_enforces_order_and_idempotence() {
         let repo = SqliteTombstoneRepository::open_in_memory().await.unwrap();
-        let id = repo
-            .request(
+        let tombstone = repo
+            .request_conversation_reset(
                 "t",
                 "a",
-                Some("c1"),
-                TombstoneScope::Conversation,
+                "c1",
+                "c2",
+                "command-1",
+                1,
                 "2027-01-01T00:00:00Z",
             )
             .await
             .unwrap();
+        let id = tombstone.id;
 
         assert_eq!(
             repo.get(&id).await.unwrap().status,
@@ -690,6 +997,15 @@ mod tests {
             .await
             .unwrap();
 
+        assert!(
+            repo.advance(&id, TombstoneStatus::Requested, TombstoneStatus::Fenced)
+                .await
+                .is_err(),
+            "status cannot claim fencing before a persisted generation proof"
+        );
+        repo.record_generation_fence(&id, 7, "lease-7", "fence-7")
+            .await
+            .unwrap();
         repo.advance(&id, TombstoneStatus::Requested, TombstoneStatus::Fenced)
             .await
             .unwrap();
@@ -732,30 +1048,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_rejects_scope_identity_mismatch() {
+    async fn sqlite_rejects_reset_identity_mismatch() {
         let repo = SqliteTombstoneRepository::open_in_memory().await.unwrap();
         assert!(
-            repo.request(
+            repo.request_conversation_reset(
                 "t",
                 "a",
-                None,
-                TombstoneScope::Conversation,
-                "2027-01-01T00:00:00Z"
+                "same",
+                "same",
+                "command",
+                1,
+                "2027-01-01T00:00:00Z",
             )
             .await
             .is_err()
         );
         assert!(
-            repo.request(
+            repo.request_conversation_reset(
                 "t",
                 "a",
-                Some("c1"),
-                TombstoneScope::Agent,
-                "2027-01-01T00:00:00Z"
+                "c1",
+                "c2",
+                "command",
+                -1,
+                "2027-01-01T00:00:00Z",
             )
             .await
             .is_err()
         );
+
+        for (scope, status, conversation_id, replacement, command_id, command_seq) in [
+            (
+                "workspace",
+                "requested",
+                Some("c1"),
+                Some("c2"),
+                Some("command-unknown-scope"),
+                Some(1_i64),
+            ),
+            (
+                "conversation",
+                "unknown",
+                Some("c1"),
+                Some("c2"),
+                Some("command-unknown-status"),
+                Some(1_i64),
+            ),
+            ("agent", "requested", Some("c1"), None, None, None),
+        ] {
+            assert!(
+                sqlx::query(
+                    "INSERT INTO deletion_tombstones(
+                        id, tenant_id, agent_id, conversation_id,
+                        replacement_conversation_id, command_id, command_seq,
+                        scope, status, requested_at, purge_after
+                     ) VALUES(?, 't', 'a', ?, ?, ?, ?, ?, ?, 'now', 'later')",
+                )
+                .bind(format!("invalid-{scope}-{status}"))
+                .bind(conversation_id)
+                .bind(replacement)
+                .bind(command_id)
+                .bind(command_seq)
+                .bind(scope)
+                .bind(status)
+                .execute(&repo.pool)
+                .await
+                .is_err(),
+                "SQLite accepted invalid scope/status identity"
+            );
+        }
     }
 
     #[tokio::test]
@@ -808,14 +1169,20 @@ mod tests {
 
         let id = {
             let repo = SqliteTombstoneRepository::open(&path).await.unwrap();
-            let id = repo
-                .request(
+            let tombstone = repo
+                .request_conversation_reset(
                     "t",
                     "a",
-                    Some("c"),
-                    TombstoneScope::Conversation,
+                    "c",
+                    "c2",
+                    "command-1",
+                    1,
                     "2027-01-01T00:00:00Z",
                 )
+                .await
+                .unwrap();
+            let id = tombstone.id;
+            repo.record_generation_fence(&id, 7, "lease-7", "fence-7")
                 .await
                 .unwrap();
             repo.advance(&id, TombstoneStatus::Requested, TombstoneStatus::Fenced)

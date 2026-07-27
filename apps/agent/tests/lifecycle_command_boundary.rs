@@ -155,7 +155,7 @@ async fn lifecycle_export_and_search_return_applied_acks_and_empty_results() {
 }
 
 #[tokio::test]
-async fn conversation_reset_persists_new_scope_and_restarts_cleanly() {
+async fn conversation_reset_persists_external_receipt_and_never_acks_before_fence() {
     let dir = test_directory();
     tokio::fs::create_dir(&dir).await.unwrap();
 
@@ -166,37 +166,25 @@ async fn conversation_reset_persists_new_scope_and_restarts_cleanly() {
         "00000000-0000-4000-8000-000000000001",
         serde_json::json!({"type": "conversation_reset", "new_conversation_id": "conv-new-1"}),
     )];
-    let (frames, _stderr) = send_commands(&mut child, &commands).await;
-    let ack = find_ack(&frames, 1).expect("reset ack");
-    assert_eq!(
-        ack.get("ack").unwrap().get("status").unwrap().as_str(),
-        Some("applied")
+    let (frames, stderr, status) = send_commands_allow_failure(&mut child, &commands).await;
+    assert!(!status.success(), "unfenced reset unexpectedly succeeded");
+    assert!(
+        find_ack(&frames, 1).is_none(),
+        "unfenced reset returned an Applied receipt"
     );
-
-    // Second epoch: start with the new conversation id and export.
-    let mut child2 = agent_command(
-        &dir,
-        vec![("SUMI_CONVERSATION_ID", "conv-new-1".to_owned())],
-    )
-    .spawn()
-    .unwrap();
-    let commands2 = vec![envelope(
-        1,
-        "00000000-0000-4000-8000-000000000002",
-        serde_json::json!({"type": "export", "actor_id": "actor-1"}),
-    )];
-    let (frames2, _stderr2) = send_commands(&mut child2, &commands2).await;
-    let ack2 = find_ack(&frames2, 1).expect("export ack after reset");
-    assert_eq!(
-        ack2.get("ack").unwrap().get("status").unwrap().as_str(),
-        Some("applied")
+    assert!(stderr.contains("generation fence"));
+    assert!(
+        dir.join("sumi-control-plane")
+            .join("compliance.db")
+            .exists(),
+        "reset tombstone was not persisted outside the agent state directory"
     );
 
     tokio::fs::remove_dir_all(&dir).await.unwrap();
 }
 
 #[tokio::test]
-async fn conversation_reset_only_removes_target_conversation_artifacts() {
+async fn conversation_reset_does_not_touch_artifacts_before_generation_fence() {
     let dir = test_directory();
     tokio::fs::create_dir(&dir).await.unwrap();
 
@@ -221,16 +209,14 @@ async fn conversation_reset_only_removes_target_conversation_artifacts() {
         "00000000-0000-4000-8000-000000000001",
         serde_json::json!({"type": "conversation_reset", "new_conversation_id": "conv-new-1"}),
     )];
-    let (frames, _stderr) = send_commands(&mut child, &commands).await;
-    let ack = find_ack(&frames, 1).expect("reset ack");
-    assert_eq!(
-        ack.get("ack").unwrap().get("status").unwrap().as_str(),
-        Some("applied")
-    );
+    let (frames, stderr, status) = send_commands_allow_failure(&mut child, &commands).await;
+    assert!(!status.success(), "unfenced reset unexpectedly succeeded");
+    assert!(find_ack(&frames, 1).is_none());
+    assert!(stderr.contains("generation fence"));
 
     assert!(
-        !artifact_root.join("conv-1").exists(),
-        "target conversation artifacts were not removed"
+        artifact_root.join("conv-1").exists(),
+        "target artifacts were removed before generation fencing"
     );
     assert!(
         artifact_root

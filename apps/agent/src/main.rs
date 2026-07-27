@@ -67,6 +67,14 @@ async fn main() -> Result<()> {
     };
     let key_provider = build_key_provider()?;
     let store = Arc::new(Store::open(&config.database_path, scope, key_provider).await?);
+    let lifecycle_worker = build_lifecycle_worker(&config, store.clone()).await?;
+    if lifecycle_worker.resume_pending_resets().await? {
+        tracing::info!(
+            "conversation reset live purge completed; exiting fenced process for new generation"
+        );
+        return Ok(());
+    }
+    lifecycle_worker.ensure_access_allowed("startup").await?;
     // EventWriter never mints a key halfway through a command/event transaction.
     for purpose in [
         DataKeyPurpose::Command,
@@ -77,7 +85,6 @@ async fn main() -> Result<()> {
     }
     let event_writer = EventWriter::new(store.clone());
     event_writer.initialize_recovery_checkpoint().await?;
-    let lifecycle_worker = build_lifecycle_worker(&config, store.clone()).await?;
     let pending_recovery = SuffixRecovery::recover_t12_prefix(&store, &event_writer).await?;
     if !pending_recovery.is_empty() {
         tracing::warn!(
@@ -130,6 +137,12 @@ async fn main() -> Result<()> {
             Err(error) => return Err(error),
         };
 
+        // A control-plane tombstone may be created after startup. Re-check at
+        // every admission boundary so an already-running generation cannot
+        // ACK, call a provider/tool, search, or export after deletion intent.
+        lifecycle_worker
+            .ensure_access_allowed("command admission")
+            .await?;
         let receipt_ack = admission.receive(&event_writer, &inbound).await?;
         if receipt_ack.status != CommandAckStatus::Received {
             gateway_writer
@@ -178,15 +191,17 @@ async fn main() -> Result<()> {
             && is_lifecycle_command(&command.command)
         {
             let result = lifecycle_worker
-                .handle_command(&command.command)
+                .handle_command(command.command_id.as_str(), command.seq, &command.command)
                 .await
                 .with_context(|| {
                     format!("lifecycle command {} failed", command.command_id.as_str())
                 })?;
 
-            lifecycle_worker
-                .apply_command(command.command_id.as_str(), command.seq)
-                .await?;
+            if !result.restart_required {
+                lifecycle_worker
+                    .apply_command(command.command_id.as_str(), command.seq)
+                    .await?;
+            }
 
             gateway_writer
                 .send(OutboundFrame::CommandAck {
@@ -199,7 +214,7 @@ async fn main() -> Result<()> {
                 })
                 .await?;
 
-            if let Some(payload) = result {
+            if let Some(payload) = result.payload {
                 let event = serde_json::json!({
                     "type": "lifecycle_result",
                     "command": command.command_id.as_str(),
@@ -216,6 +231,13 @@ async fn main() -> Result<()> {
                     .await?;
             }
 
+            if result.restart_required {
+                tracing::info!(
+                    tombstone_command = %command.command_id.as_str(),
+                    "reset receipt committed; exiting fenced process for new generation"
+                );
+                break;
+            }
             continue;
         }
 
@@ -286,7 +308,38 @@ async fn build_lifecycle_worker(
     config: &config::Config,
     store: Arc<Store>,
 ) -> Result<LifecycleWorker> {
-    let compliance_path = config.database_path.with_file_name("compliance.db");
+    let agent_state_dir = config
+        .database_path
+        .parent()
+        .ok_or_else(|| anyhow!("agent database path has no state directory"))?;
+    let compliance_path = env::var_os("SUMI_CONTROL_PLANE_DB")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            agent_state_dir
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("/var/lib"))
+                .join("sumi-control-plane")
+                .join("compliance.db")
+        });
+    let compliance_path = if compliance_path.is_relative() {
+        std::env::current_dir()?.join(compliance_path)
+    } else {
+        compliance_path
+    };
+    if compliance_path.starts_with(agent_state_dir) {
+        bail!(
+            "SUMI_CONTROL_PLANE_DB must be outside the deletion-target agent state volume {}",
+            agent_state_dir.display()
+        );
+    }
+    if let Some(parent) = compliance_path.parent() {
+        tokio::fs::create_dir_all(parent).await.with_context(|| {
+            format!(
+                "failed to create control-plane state directory {}",
+                parent.display()
+            )
+        })?;
+    }
     let tombstones: Arc<dyn TombstoneRepository> = Arc::new(
         SqliteTombstoneRepository::open(&compliance_path)
             .await
