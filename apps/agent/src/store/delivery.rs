@@ -393,6 +393,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_head_survives_in_memory_pool_connection_replacement() {
+        let store = store().await;
+        insert_test_durable_event(&store, 1, &AgentEvent::AgentStart)
+            .await
+            .unwrap();
+
+        // Dropping a cancelled SQLite query can make SQLx discard its worker
+        // connection. Close the managed connection explicitly to reproduce that
+        // replacement deterministically, without depending on scheduler timing.
+        store
+            .pool()
+            .acquire()
+            .await
+            .expect("acquire managed in-memory connection")
+            .close()
+            .await
+            .expect("close managed in-memory connection");
+
+        assert_eq!(
+            current_event_head_seq(store.pool()).await.unwrap(),
+            1,
+            "replacement connections must retain the migrated schema and durable rows"
+        );
+    }
+
+    #[tokio::test]
     async fn raw_connection_receives_decrypted_durable_events() {
         let store = store().await;
         let event = assistant_event("msg-1", "hello");
