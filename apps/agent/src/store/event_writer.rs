@@ -9158,6 +9158,24 @@ async fn apply_plain_projection(
             bail!("memory and provider-context mutations must be prepared before apply");
         }
         Projection::ApprovalRule(rule) => {
+            if let Some(existing) =
+                sqlx::query("SELECT tool, pattern FROM approval_rules WHERE id = ?")
+                    .bind(&rule.id)
+                    .fetch_optional(&mut **transaction)
+                    .await?
+            {
+                let stored_tool: String = existing.try_get("tool")?;
+                let stored_pattern: String = existing.try_get("pattern")?;
+                if stored_tool == rule.tool && stored_pattern == rule.pattern {
+                    return Ok(None);
+                }
+                bail!(
+                    "ApprovalRule identity mismatch for {}: existing ({stored_tool}, {stored_pattern}) does not match requested ({}, {})",
+                    rule.id,
+                    rule.tool,
+                    rule.pattern
+                );
+            }
             let result = sqlx::query(
                 "INSERT INTO approval_rules(id, tool, pattern, created_at)
                  VALUES(?, ?, ?, ?)",
@@ -9406,7 +9424,7 @@ async fn apply_tool_mutation(
             // exact identity match. A mismatch means a different tool_call_id
             // collision or corrupted recovery state, so fail closed.
             if let Some(existing) = sqlx::query(
-                "SELECT command_id, run_id, executor_generation, idempotency_key
+                "SELECT command_id, run_id, executor_generation, idempotency_key, state
                  FROM tool_executions WHERE tool_call_id = ?",
             )
             .bind(&tool_call_id)
@@ -9417,17 +9435,19 @@ async fn apply_tool_mutation(
                 let existing_run_id: String = existing.try_get("run_id")?;
                 let existing_generation: i64 = existing.try_get("executor_generation")?;
                 let existing_idempotency: String = existing.try_get("idempotency_key")?;
+                let existing_state: String = existing.try_get("state")?;
                 if existing_command_id != command_id
                     || existing_run_id != run_id
                     || existing_generation != executor_generation.as_i64()
                     || existing_idempotency != idempotency_key
+                    || existing_state != "prepared"
                 {
                     bail!(
                         "Prepare identity mismatch for {tool_call_id}: \
                          existing ({existing_command_id}, {existing_run_id}, \
-                         {existing_generation}, {existing_idempotency}) \
+                         {existing_generation}, {existing_idempotency}, {existing_state}) \
                          does not match requested ({command_id}, {run_id}, \
-                         {generation}, {idempotency_key})",
+                         {generation}, {idempotency_key}, prepared)",
                         generation = executor_generation.as_i64()
                     );
                 }
@@ -9755,6 +9775,75 @@ mod tests {
         assert!(
             result.is_err_and(|e| e.to_string().contains("Prepare identity mismatch")),
             "mismatched Prepare must fail closed"
+        );
+
+        sqlx::query(
+            "UPDATE tool_executions
+             SET state='running', started_at='2026-07-27T00:00:00Z'
+             WHERE tool_call_id='call-1'",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("advance existing tool beyond prepared");
+        let stale_replay = ToolExecutionMutation::Prepare {
+            tool_call_id: "call-1".to_owned(),
+            command_id: "cmd-a".to_owned(),
+            run_id: "run-a".to_owned(),
+            executor_generation: test_process_generation(0),
+            idempotency_key: "idem-a".to_owned(),
+        };
+        let result = apply_tool_mutation(&mut tx, stale_replay).await;
+        assert!(
+            result.is_err_and(|e| e.to_string().contains("Prepare identity mismatch")),
+            "same-identity Prepare must not replay after the durable state advanced"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_rule_replay_requires_exact_identity() {
+        let store = test_store().await;
+        let mut tx = store.pool().begin().await.expect("begin transaction");
+        let rule = ApprovalRuleMutation {
+            id: "rule-replay".to_owned(),
+            tool: "bash".to_owned(),
+            pattern: r#"{"effect":"allow","literal_prefix":["git","status"]}"#.to_owned(),
+        };
+
+        apply_plain_projection(
+            &store,
+            &mut tx,
+            Projection::ApprovalRule(rule.clone()),
+            &[],
+            None,
+        )
+        .await
+        .expect("insert approval rule");
+        apply_plain_projection(
+            &store,
+            &mut tx,
+            Projection::ApprovalRule(rule.clone()),
+            &[],
+            None,
+        )
+        .await
+        .expect("exact approval rule replay is idempotent");
+
+        let mismatch = ApprovalRuleMutation {
+            pattern: r#"{"effect":"deny","literal_prefix":["git","status"]}"#.to_owned(),
+            ..rule
+        };
+        let error = apply_plain_projection(
+            &store,
+            &mut tx,
+            Projection::ApprovalRule(mismatch),
+            &[],
+            None,
+        )
+        .await
+        .expect_err("same rule id with different identity must fail closed");
+        assert!(
+            error.to_string().contains("ApprovalRule identity mismatch"),
+            "{error:#}"
         );
     }
 

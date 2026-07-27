@@ -3556,7 +3556,7 @@ mod tests {
             .expect("start request");
         assert!(
             matches!(outcome, ApprovalOutcome::Allowed),
-            "loaded ApproveAlways rule must allow matching bash command"
+            "loaded RuleEffect::Allow rule must allow matching bash command"
         );
 
         store.pool().close().await;
@@ -3780,6 +3780,100 @@ mod tests {
             .await
             .expect("quick_check");
         assert_eq!(quick_check, "ok");
+        assert!(
+            sqlx::query("PRAGMA foreign_key_check")
+                .fetch_optional(&pool)
+                .await
+                .expect("foreign_key_check")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_0006_preserves_nonempty_physical_recovery_attestations() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open migration boundary pool");
+        sqlx::raw_sql(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE agent_events(seq INTEGER PRIMARY KEY);
+             CREATE TABLE physical_recovery_receipt_applications(
+               receipt_id TEXT PRIMARY KEY
+             );
+             CREATE TABLE tool_executions(
+               tool_call_id TEXT NOT NULL PRIMARY KEY,
+               command_id TEXT NOT NULL,
+               run_id TEXT NOT NULL,
+               executor_generation INTEGER NOT NULL,
+               state TEXT NOT NULL,
+               idempotency_key TEXT NOT NULL UNIQUE,
+               started_at TEXT,
+               finished_at TEXT,
+               error_code TEXT
+             );
+             CREATE UNIQUE INDEX tool_executions_attestation
+             ON tool_executions(tool_call_id, command_id, run_id, executor_generation);
+             CREATE TABLE physical_recovery_receipt_intents(
+               receipt_id TEXT NOT NULL,
+               tool_call_id TEXT NOT NULL,
+               command_id TEXT NOT NULL,
+               run_id TEXT NOT NULL,
+               executor_generation INTEGER NOT NULL,
+               indeterminate_terminal_seq INTEGER NOT NULL,
+               PRIMARY KEY(receipt_id, tool_call_id),
+               UNIQUE(tool_call_id),
+               UNIQUE(indeterminate_terminal_seq),
+               FOREIGN KEY(receipt_id)
+                 REFERENCES physical_recovery_receipt_applications(receipt_id),
+               FOREIGN KEY(tool_call_id, command_id, run_id, executor_generation)
+                 REFERENCES tool_executions(
+                   tool_call_id, command_id, run_id, executor_generation
+                 ),
+               FOREIGN KEY(indeterminate_terminal_seq) REFERENCES agent_events(seq)
+             );
+             INSERT INTO agent_events(seq) VALUES(7);
+             INSERT INTO physical_recovery_receipt_applications(receipt_id)
+             VALUES('receipt-1');
+             INSERT INTO tool_executions(
+               tool_call_id, command_id, run_id, executor_generation, state,
+               idempotency_key, started_at, finished_at, error_code
+             ) VALUES(
+               'tool-1', 'command-1', 'run-1', 3, 'running',
+               'idem-1', '2026-07-27T00:00:00Z', NULL, NULL
+             );
+             INSERT INTO physical_recovery_receipt_intents(
+               receipt_id, tool_call_id, command_id, run_id, executor_generation,
+               indeterminate_terminal_seq
+             ) VALUES('receipt-1', 'tool-1', 'command-1', 'run-1', 3, 7);",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed enforced nonempty attestation graph");
+
+        let six = MIGRATOR
+            .migrations
+            .iter()
+            .find(|migration| migration.version == 6)
+            .expect("migration 0006");
+        let mut transaction = pool.begin().await.expect("begin sqlx-style migration");
+        sqlx::raw_sql(six.sql.as_ref())
+            .execute(&mut *transaction)
+            .await
+            .expect("migration preserves children with foreign keys enabled");
+        transaction.commit().await.expect("commit migration");
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM physical_recovery_receipt_intents
+                 WHERE receipt_id='receipt-1' AND tool_call_id='tool-1'"
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count preserved attestation"),
+            1
+        );
         assert!(
             sqlx::query("PRAGMA foreign_key_check")
                 .fetch_optional(&pool)
