@@ -187,45 +187,21 @@ impl ContextAssembler {
             .expect("provider context lock")
             .clone();
 
-        let mut memory_guard = self.three_layer_memory.lock().expect("memory lock");
-        if let Some(memory) = memory_guard.as_mut() {
-            let footprint =
-                provider_context_footprint_for_messages(active_context, &provider_context)?;
-            let public_est = public_estimate_for_context(active_context)?;
-            let batch = L0Batch::new(
-                active_context.to_vec(),
-                memory.allocate_l0_batch_seq(),
-                footprint,
-                public_est,
-            );
-            if memory
-                .l0()
-                .back()
-                .is_some_and(|b| b.state == BatchState::Open)
-            {
-                memory.l0_mut().pop_back();
-            }
-            memory.push_l0(batch);
-            overflow
-                .apply_l0(memory)
-                .map_err(|e| anyhow::anyhow!("L0 promotion failed: {e}"))?;
-
-            let mut result = Vec::new();
-            for batch in memory.l0().iter() {
-                result.extend(batch.messages.iter().cloned());
-            }
-            // If the open batch itself still exceeds the ordinary L0 limit, fall
-            // back to message-level dropping while still accounting for eviction
-            // footprint.  This is a bounded last resort when no compacted shelf
-            // summaries are available.
-            overflow.recover_context_with_provider_context(result, false, &provider_context)
-        } else {
-            overflow.recover_context_with_provider_context(
-                active_context.to_vec(),
-                false,
-                &provider_context,
-            )
-        }
+        // Promotion is a durable MemoryTransition: it removes batch membership,
+        // crypto-erases provider context, and advances the apply cursor in the
+        // same EventWriter transaction.  Do not synthesize a new open batch from
+        // `active_context` here.  That context already spans sealed batches; a
+        // local replacement would overlap those batches and replay them twice.
+        //
+        // The Session-owned maintainer is the only caller allowed to apply
+        // completed shelves while Idle. At this API-preflight fallback we retain
+        // only the bounded, replay-safe send-view recovery. It neither changes
+        // durable membership nor tries to imitate promotion in process memory.
+        overflow.recover_context_with_provider_context(
+            active_context.to_vec(),
+            false,
+            &provider_context,
+        )
     }
 
     /// Feed one measured prompt usage back into the calibration EMA.
@@ -1202,6 +1178,49 @@ mod tests {
                 .iter()
                 .all(|m| !matches!(m, ContextMessage::Persisted { seq: 1, .. }))
         );
+    }
+
+    #[test]
+    fn overflow_recovery_never_rebuilds_l0_from_overlapping_runtime_history() {
+        let mut memory = ThreeLayerMemory::new(
+            ConsolidatedMemory {
+                summary: crate::memory::DecryptedMemorySummary::new(String::new()),
+                est_tokens: 0,
+            },
+            TokenCalibration::default(),
+        );
+        let first = user(&"a".repeat(100_000), 1);
+        let second = user("b", 2);
+        let newest = user("c", 3);
+        let mut sealed = L0Batch::new(
+            vec![first.clone()],
+            memory.allocate_l0_batch_seq(),
+            0,
+            25_000,
+        );
+        sealed.state = BatchState::Compacted;
+        let sealed_id = sealed.id;
+        memory.push_l0(sealed);
+        let open = L0Batch::new(vec![second.clone()], memory.allocate_l0_batch_seq(), 0, 1);
+        let open_id = open.id;
+        memory.push_l0(open);
+
+        let assembler = ContextAssembler::from_prompt_with_spec(simple_prompt(), model_spec())
+            .expect("valid prompt")
+            .with_three_layer_memory(memory);
+        let recovered = assembler
+            .recover_overflow(&[first, second, newest.clone()])
+            .expect("bounded fallback recovery");
+
+        assert!(
+            recovered.contains(&newest),
+            "active user must survive fallback"
+        );
+        let memory = assembler.three_layer_memory.lock().expect("memory lock");
+        let l0 = memory.as_ref().expect("configured memory").l0();
+        assert_eq!(l0.len(), 2, "fallback must not append a full-history batch");
+        assert_eq!(l0[0].id, sealed_id);
+        assert_eq!(l0[1].id, open_id);
     }
 
     #[test]

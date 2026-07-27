@@ -107,6 +107,12 @@ pub(crate) trait RunDriver: Send + Sync + 'static {
     /// Fail closed before Session creates keys, recovery state, or a worker.
     fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()>;
 
+    /// T21 idle maintenance must return true only after its durable transition
+    /// and ContextAssembler refresh have both completed.
+    async fn apply_idle_memory_maintenance(&self, _core: &mut RunCore) -> Result<bool> {
+        Ok(false)
+    }
+
     async fn start_provider_for_command(
         &self,
         attempt: usize,
@@ -201,6 +207,13 @@ impl SequentialRunWorker {
 impl RunWorker for SequentialRunWorker {
     fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
         self.driver.validate_executor_generation(generation)
+    }
+
+    fn apply_idle_memory_maintenance<'a>(
+        &'a self,
+        core: &'a mut RunCore,
+    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+        Box::pin(async move { self.driver.apply_idle_memory_maintenance(core).await })
     }
 
     fn run(

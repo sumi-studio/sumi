@@ -302,6 +302,10 @@ impl RunCore {
         self.pending_overflow_apply
     }
 
+    pub(crate) fn clear_pending_overflow_apply(&mut self) {
+        self.pending_overflow_apply = None;
+    }
+
     pub(crate) fn install_hydrated_context(
         &mut self,
         messages: Vec<ContextMessage>,
@@ -411,6 +415,13 @@ pub(crate) enum WorkerFailure {
 
 pub(crate) trait RunWorker: Send + Sync + 'static {
     fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()>;
+
+    fn apply_idle_memory_maintenance<'a>(
+        &'a self,
+        _core: &'a mut RunCore,
+    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+        Box::pin(async { Ok(false) })
+    }
 
     fn run(
         &self,
@@ -628,6 +639,10 @@ pub(crate) struct Session<G: Gateway> {
     /// and the full control semantics without allowing a user to overtake an
     /// earlier/later control.
     deferred_commands: MessageQueue<AdmittedCommand>,
+    /// A completed shelf is durable, but its wake signal can arrive while a
+    /// worker exclusively owns `RunCore`. Retain it until the next idle
+    /// boundary; it is independent of a run-local overflow marker.
+    maintenance_ready_pending: bool,
     /// A bridge/Store refusal means the worker's returned core may be ahead of
     /// the durable transcript and must never be exposed as recovered.
     durable_core_invalidated: bool,
@@ -691,6 +706,7 @@ impl<G: Gateway + 'static> Session<G> {
             worker,
             executor_generation,
             deferred_commands: MessageQueue::bounded(PENDING_CONTROL_CAPACITY),
+            maintenance_ready_pending: false,
             durable_core_invalidated: false,
         })
     }
@@ -725,9 +741,20 @@ impl<G: Gateway + 'static> Session<G> {
         }
     }
 
+    /// T26 forwards the maintainer's durable `MaintenanceReady` wake signal
+    /// here.  The transition runs only while no worker owns the RunCore.
+    pub(crate) async fn maintenance_ready(&mut self) -> Result<(), SessionFailure> {
+        self.maintenance_ready_pending = true;
+        if self.active.is_none() {
+            self.apply_idle_memory_maintenance().await?;
+        }
+        Ok(())
+    }
+
     async fn run_until_exit(&mut self) -> Result<(), SessionFailure> {
         loop {
             if self.active.is_none() {
+                self.apply_idle_memory_maintenance().await?;
                 enum IdleSelected {
                     Command(Result<InboundCommand>),
                     Writer(std::result::Result<Result<()>, oneshot::error::RecvError>),
@@ -1363,6 +1390,7 @@ impl<G: Gateway + 'static> Session<G> {
     }
 
     async fn route_idle(&mut self, command: AdmittedCommand) -> Result<(), SessionFailure> {
+        self.apply_idle_memory_maintenance().await?;
         if matches!(command.envelope().command, Command::Abort {}) {
             let mut terminal = self
                 .writer
@@ -1507,8 +1535,34 @@ impl<G: Gateway + 'static> Session<G> {
         }
         match worker_failure {
             Some(failure) => Err(SessionFailure::Worker(failure)),
-            None => self.route_deferred_after_run().await,
+            None => {
+                self.apply_idle_memory_maintenance().await?;
+                self.route_deferred_after_run().await
+            }
         }
+    }
+
+    async fn apply_idle_memory_maintenance(&mut self) -> Result<(), SessionFailure> {
+        let Some(core) = self.core.as_mut() else {
+            return Ok(());
+        };
+        if core.pending_overflow_apply().is_none() && !self.maintenance_ready_pending {
+            return Ok(());
+        }
+        let applied = self
+            .worker
+            .apply_idle_memory_maintenance(core)
+            .await
+            .map_err(|error| SessionFailure::Worker(WorkerFailure::Error(error.to_string())))?;
+        if applied {
+            core.clear_pending_overflow_apply();
+            self.maintenance_ready_pending = false;
+            return Ok(());
+        }
+        Err(SessionFailure::Worker(WorkerFailure::Error(
+            "idle memory maintenance is pending but did not commit a refreshed transition"
+                .to_owned(),
+        )))
     }
 
     async fn route_deferred_after_run(&mut self) -> Result<(), SessionFailure> {
