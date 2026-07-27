@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Display,
     hash::Hash,
     sync::Arc,
@@ -20,16 +20,23 @@ use zeroize::{Zeroize, Zeroizing};
 #[cfg(test)]
 use crate::provider::types::ProviderContextItem;
 use crate::{
-    agent::{AgentEvent, ApprovalRequest, ApprovalResolution, SteerMode},
+    agent::{AgentEvent, ApprovalRequest, ApprovalResolution, MemoryMaintKind, SteerMode},
     gateway::{
         ApprovalDecision, Command, CommandAck, CommandAckStatus, CommandEnvelope, CommandId,
         CommandRejectReason, InboundCommand, KeyedCommandDigest, RejectedCommandPayload,
     },
-    memory::{BatchId, CompactResult},
-    provider::types::{
-        ApiProtocol, ProviderContextAnchor, ProviderContextFragment, ProviderContextPayload,
-        PublicAssistantContent, PublicAssistantMessage, PublicMessage, StopReason,
-        ToolResultMessage,
+    memory::{
+        BatchId, BatchState, CompactResult, L0Batch,
+        batch::{BoundaryContext, SealReason, seal_before_next},
+        estimate::{TokenCalibration, estimate_public_message, eviction_footprint_for_payload},
+    },
+    provider::{
+        model::ModelSpec,
+        types::{
+            ApiProtocol, ContextMessage, Message, ProviderContextAnchor, ProviderContextFragment,
+            ProviderContextPayload, PublicAssistantContent, PublicAssistantMessage, PublicMessage,
+            StopReason, ToolResultMessage,
+        },
     },
     runtime::contracts::{GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease},
 };
@@ -44,7 +51,8 @@ use super::{
     },
     memory_state::{
         MemoryApplyCursorRecord, MemoryBatchMessageRecord, MemoryBatchRecord, MemoryBatchState,
-        MemoryBatchSummary, MemoryJobResult, MemoryLayer,
+        MemoryBatchSummary, MemoryJobKind, MemoryJobRecord, MemoryJobResult, MemoryJobStatus,
+        MemoryLayer,
     },
     physical_recovery::{ApplyReceiptOutcome, PhysicalRecoveryApplier, PhysicalRecoveryReceipt},
     provider_context::{
@@ -197,6 +205,23 @@ impl DurableEvent {
                 turn_id: Some(turn_id),
                 ..DurableEventMetadata::default()
             },
+        )
+    }
+
+    #[allow(
+        dead_code,
+        reason = "T17 memory maintenance events are wired by the T20 maintainer"
+    )]
+    pub(crate) fn memory_maintenance(kind: impl Into<String>) -> Result<Self> {
+        let kind = kind.into();
+        if kind.is_empty() {
+            bail!("durable MemoryMaintenance kind must not be empty");
+        }
+        Self::from_parts(
+            AgentEvent::MemoryMaintenance {
+                kind: MemoryMaintKind::new(kind),
+            },
+            DurableEventMetadata::default(),
         )
     }
 
@@ -829,6 +854,11 @@ pub(crate) struct MemoryBatchMutation {
     pub summary: Option<CompactResult>,
     pub est_tokens: u64,
     pub footprint_delta: i64,
+    /// When true, `apply_memory_batch_mutation` deletes all
+    /// `memory_batch_messages` rows for this batch and zeroes its
+    /// `eviction_footprint_tokens`. This is used when an L0 source batch is
+    /// dropped during promotion.
+    pub delete_membership: bool,
 }
 
 #[allow(
@@ -837,19 +867,65 @@ pub(crate) struct MemoryBatchMutation {
 )]
 #[derive(Clone)]
 pub(crate) enum MemoryJobMutation {
-    Claim {
+    /// Claim a `pending` job without consuming an attempt. The lease is
+    /// refreshed at the start of a provider attempt via [`Start`].
+    Claim { job_id: String, lease_until: String },
+    /// Refresh the lease and increment the durable attempt counter before a
+    /// provider call. This keeps crash-recovery from giving free retries.
+    /// `expected_attempt` and `lease_witness` are the values observed by the
+    /// caller; EventWriter CAS rejects a row that has been reclaimed by
+    /// another worker.
+    Start {
         job_id: String,
+        expected_attempt: i64,
+        lease_witness: Option<String>,
         lease_until: String,
     },
+    /// Commit a `running` job's compacted result. `expected_attempt` and
+    /// `lease_witness` must match the durable row at the time the job was
+    /// claimed and started.
     Complete {
         job_id: String,
+        expected_attempt: i64,
+        lease_witness: Option<String>,
         result: CompactResult,
     },
+    /// Mark a `running` job as failed. `expected_attempt` and `lease_witness`
+    /// must match the durable row at the time the job was claimed and started.
     Fail {
         job_id: String,
+        expected_attempt: i64,
+        lease_witness: Option<String>,
+    },
+    /// Synchronously reclaim a `failed` job at the hard-limit fallback point.
+    /// The durable attempt counter is reset by `attempts_delta` (typically
+    /// negative) and the lease is refreshed so the job can be retried inline.
+    Reclaim {
+        job_id: String,
+        expected_attempt: i64,
+        lease_until: String,
+        attempts_delta: i64,
     },
     Apply {
         job_id: String,
+        expected_attempt: i64,
+        lease_witness: Option<String>,
+    },
+    /// Discard a completed result whose source snapshot is stale. This is a
+    /// terminal transition that advances the apply cursor without modifying
+    /// the newer source shelves.
+    Discard {
+        job_id: String,
+        expected_attempt: i64,
+        lease_witness: Option<String>,
+    },
+    /// Return a leased `running` job to the queue without consuming another
+    /// attempt (used for cancellation or stale-source reset).
+    /// `expected_attempt` and `lease_witness` must match the durable row.
+    Release {
+        job_id: String,
+        expected_attempt: i64,
+        lease_witness: Option<String>,
     },
 }
 
@@ -878,11 +954,22 @@ pub(crate) struct MemoryApplyCursorAdvance {
     dead_code,
     reason = "T17 durable memory state transitions wired by the T20 maintainer"
 )]
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct MemoryTransition {
     pub expected_source_versions: BTreeMap<BatchId, u64>,
+    /// Optional source-state witness checked inside the EventWriter transaction.
+    /// Batches named here must already exist with the expected state; they are
+    /// not mutated by the transition itself.
+    pub expected_source_states: BTreeMap<BatchId, MemoryBatchState>,
     pub batch_mutations: Vec<MemoryBatchMutation>,
     pub job_mutations: Vec<MemoryJobMutation>,
+    /// New batches to insert atomically within the same EventWriter
+    /// transaction. `batch_seq` and `ord` are assigned inside the transaction
+    /// so recovery cannot race with L0 seal allocation.
+    pub batch_inserts: Vec<MemoryBatchRecord>,
+    /// New jobs to insert atomically within the same EventWriter transaction.
+    /// Their `batch_seq` is fixed to the matching inserted target batch.
+    pub job_inserts: Vec<MemoryJobRecord>,
     pub cursor_advance: Option<MemoryApplyCursorAdvance>,
 }
 
@@ -1059,6 +1146,7 @@ struct PreparedMemoryBatchMutation {
     summary: Option<MemoryBatchSummary>,
     est_tokens: i64,
     footprint_delta: i64,
+    delete_membership: bool,
 }
 
 #[derive(Clone)]
@@ -1067,10 +1155,66 @@ struct PreparedMemoryJobMutation {
     expected_status: &'static str,
     new_status: &'static str,
     attempts: i64,
-    lease_until: Option<String>,
+    /// Attempts delta applied in the SET clause (`0` for claim/complete/fail/
+    /// apply/release, `1` for start).
+    attempts_delta: i64,
+    /// Lease value that the WHERE clause must match for non-pending CAS.
     expected_lease_until: Option<String>,
+    /// Lease value written by the SET clause (`None` clears stale leases on
+    /// terminal transitions and release).
+    new_lease_until: Option<String>,
     source_versions: Option<String>,
     result: Option<MemoryJobResult>,
+}
+
+/// Carries an L0 reservation transition that is committed atomically with the
+/// MessageEnd projection that triggers it. The source batch is sealed, an L1
+/// target batch is allocated, and a pending compaction job is inserted.
+struct L0SealTransition {
+    source_id: String,
+    source_expected_version: i64,
+    source_next_version: i64,
+    target_record: MemoryBatchRecord,
+    job_record: MemoryJobRecord,
+}
+
+/// Intermediate value produced while preparing an L0 seal. It bundles the new
+/// open L0 batch for the current message with the seal transition itself.
+struct L0SealPrep {
+    new_l0_batch_record: MemoryBatchRecord,
+    seal_transition: Box<L0SealTransition>,
+}
+
+/// Boundary state carried for an L0 batch that has pending messages prepared
+/// inside the current EventBatch but not yet durably inserted. This lets later
+/// MessageEnd projections in the same batch re-run the forced-seal and
+/// safe-boundary checks instead of blindly appending to the pending batch.
+struct PendingL0Batch {
+    id: String,
+    version: i64,
+    ord: i64,
+    est_tokens: i64,
+    eviction_footprint_tokens: i64,
+    history: Vec<ContextMessage>,
+}
+
+/// Result of loading an existing open L0 batch's messages to decide whether it
+/// must be sealed before `next`. The loaded history is returned so it can be
+/// carried as pending in-batch state.
+struct LoadedL0Boundary {
+    seal_reason: Option<SealReason>,
+    history: Vec<ContextMessage>,
+}
+
+/// In-batch sequence/ordinal allocator for memory batches. `prepare` keeps one
+/// instance per EventBatch so that multiple L0 seals/new-batch allocations in
+/// the same batch do not reuse committed sequence numbers that have not yet
+/// been inserted.
+struct L0BatchAllocator {
+    next_l0_seq: i64,
+    next_l0_ord: i64,
+    next_l1_seq: i64,
+    next_l1_ord: i64,
 }
 
 enum PreparedProjection {
@@ -1090,9 +1234,20 @@ enum PreparedProjection {
         provider_context_key_ref: Option<String>,
         provider_context_key_proof: Option<Vec<u8>>,
         eviction_footprint_tokens: u64,
+        /// Public transcript estimate for this message, used to durably update
+        /// the open L0 batch's `est_tokens`.
+        public_est: i64,
+        /// Record to insert when this message creates a new open L0 batch
+        /// because no open batch exists.
         create_l0_batch: Option<MemoryBatchRecord>,
+        /// The open L0 batch this message is appended to. `None` when the
+        /// message is excluded from L0 (e.g., retry errors).
         l0_batch_id: Option<String>,
+        /// Ordinal within `l0_batch_id` for the membership row.
         l0_batch_message_ord: Option<i64>,
+        /// If set, seal the previous open L0 batch and reserve a compaction
+        /// job before appending this message to a fresh batch.
+        seal_transition: Option<Box<L0SealTransition>>,
     },
     CommandInsert {
         seq: u64,
@@ -1121,8 +1276,11 @@ enum PreparedProjection {
     },
     MemoryTransition {
         expected_source_versions: BTreeMap<String, i64>,
+        expected_source_states: BTreeMap<String, MemoryBatchState>,
         batch_mutations: Vec<PreparedMemoryBatchMutation>,
         job_mutations: Vec<PreparedMemoryJobMutation>,
+        batch_inserts: Vec<MemoryBatchRecord>,
+        job_inserts: Vec<MemoryJobRecord>,
         cursor_advance: Option<MemoryApplyCursorAdvance>,
         memory_summary_key_ref: Option<String>,
         memory_summary_key_proof: Option<Vec<u8>>,
@@ -2378,8 +2536,8 @@ impl EventWriter {
         };
 
         let mut next_seq = first_seq;
-        let mut pending_l0_batch: Option<String> = None;
-        let mut pending_l0_message_ord = 0i64;
+        let mut pending_l0_batch: Option<PendingL0Batch> = None;
+        let mut l0_allocator: Option<L0BatchAllocator> = None;
         let mut prepared = Vec::with_capacity(batch.writes.len());
         let mut transaction_bytes = 0usize;
         let mut event_seqs = Vec::new();
@@ -2547,10 +2705,17 @@ impl EventWriter {
                                 .and_then(|bytes| bytes.checked_add(DURABLE_ROW_OVERHEAD_BYTES))
                                 .ok_or_else(|| anyhow!("message projection byte count overflow"))?,
                         )?;
-                        let (create_l0_batch, l0_batch_id, l0_batch_message_ord) = self
-                            .prepare_l0_batch_membership(
+                        let public_est_u64 = estimate_public_message(&message)
+                            .context("failed to estimate public message tokens")?;
+                        let public_est = i64::try_from(public_est_u64)
+                            .context("public est tokens overflow i64")?;
+                        let (create_l0_batch, l0_batch_id, l0_batch_message_ord, seal_transition) =
+                            self.prepare_l0_batch_membership(
                                 &mut pending_l0_batch,
-                                &mut pending_l0_message_ord,
+                                &mut l0_allocator,
+                                &message,
+                                public_est,
+                                eviction_footprint_tokens,
                                 l0_disposition,
                             )
                             .await?;
@@ -2576,6 +2741,24 @@ impl EventWriter {
                                     .ok_or_else(|| anyhow!("L0 membership byte count overflow"))?,
                             )?;
                         }
+                        if let Some(seal) = &seal_transition {
+                            charge_transaction_bytes(
+                                &mut transaction_bytes,
+                                seal.target_record
+                                    .id
+                                    .len()
+                                    .checked_add(DURABLE_ROW_OVERHEAD_BYTES)
+                                    .ok_or_else(|| anyhow!("L1 target byte count overflow"))?,
+                            )?;
+                            charge_transaction_bytes(
+                                &mut transaction_bytes,
+                                seal.job_record
+                                    .id
+                                    .len()
+                                    .checked_add(DURABLE_ROW_OVERHEAD_BYTES)
+                                    .ok_or_else(|| anyhow!("L0 job byte count overflow"))?,
+                            )?;
+                        }
                         projections.push(PreparedProjection::MessageEnd {
                             event_seq,
                             message_id,
@@ -2598,9 +2781,11 @@ impl EventWriter {
                                 .map(|(r, _)| r.clone()),
                             provider_context_key_proof: provider_context_key.map(|(_, p)| p),
                             eviction_footprint_tokens,
+                            public_est,
                             create_l0_batch,
                             l0_batch_id,
                             l0_batch_message_ord,
+                            seal_transition,
                         });
                     }
                     Projection::CommandReceived { envelope } => {
@@ -2833,6 +3018,9 @@ impl EventWriter {
             bail!("provider context may only accompany an assistant MessageEnd");
         };
 
+        let spec = ModelSpec::from_origin(&assistant.origin)
+            .ok_or_else(|| anyhow!("no canonical ModelSpec for provider origin"))?;
+
         for fragment in &fragments {
             Self::validate_provider_context_fragment(fragment, assistant)?;
         }
@@ -2865,6 +3053,8 @@ impl EventWriter {
         let mut records = Vec::with_capacity(items.len());
         let mut eviction_footprint_tokens = 0u64;
         for item in items {
+            let eviction_footprint = eviction_footprint_for_payload(&spec, &item.payload)
+                .context("failed to compute provider-context eviction footprint")?;
             let wire_label = item
                 .wire_item_index
                 .map_or_else(|| "_".to_owned(), |index| index.to_string());
@@ -2877,12 +3067,14 @@ impl EventWriter {
                 &assistant.origin.model,
                 &id,
                 &idempotency_key,
+                eviction_footprint,
                 &key,
                 self.store.scope(),
             )
             .context("failed to encrypt provider-context record")?;
-            eviction_footprint_tokens =
-                eviction_footprint_tokens.saturating_add(record.eviction_tokens());
+            eviction_footprint_tokens = eviction_footprint_tokens
+                .checked_add(record.eviction_tokens())
+                .ok_or_else(|| anyhow!("eviction footprint overflow"))?;
             records.push(record);
         }
         Ok((
@@ -2892,26 +3084,107 @@ impl EventWriter {
         ))
     }
 
+    /// Locate the current open L0 batch for a message that should be appended
+    /// to L0. If no open L0 batch exists, allocate a new one deterministically.
+    /// `pending_l0_batch` carries boundary state across multiple MessageEnd
+    /// projections prepared inside the same EventBatch so a newly allocated
+    /// batch is visible to later messages and forced-seal/safe-boundary checks
+    /// are re-run before every append. `l0_allocator` carries sequence/ordinal
+    /// values for any newly allocated memory batches in this EventBatch so
+    /// multiple allocations do not reuse numbers that have not yet durably
+    /// committed.
+    /// Returns `(record_to_create, batch_id, message_ord, seal_transition)`
+    /// where `record_to_create` is `Some` only when a new batch must be inserted
+    /// and `seal_transition` is `Some` when the previous open batch is sealed
+    /// and a compaction job is reserved.
     async fn prepare_l0_batch_membership(
         &self,
-        pending_l0_batch: &mut Option<String>,
-        pending_l0_message_ord: &mut i64,
+        pending_l0_batch: &mut Option<PendingL0Batch>,
+        l0_allocator: &mut Option<L0BatchAllocator>,
+        message: &PublicMessage,
+        public_est: i64,
+        eviction_footprint_tokens: u64,
         disposition: L0Disposition,
-    ) -> Result<(Option<MemoryBatchRecord>, Option<String>, Option<i64>)> {
+    ) -> Result<(
+        Option<MemoryBatchRecord>,
+        Option<String>,
+        Option<i64>,
+        Option<Box<L0SealTransition>>,
+    )> {
         if disposition != L0Disposition::Append {
-            return Ok((None, None, None));
+            return Ok((None, None, None, None));
         }
 
-        if let Some(batch_id) = pending_l0_batch.clone() {
-            let ord = pending_l0_message_ord
+        let next = ContextMessage::Synthetic {
+            message: Message::from(message.clone()),
+        };
+
+        if let Some(pending) = pending_l0_batch {
+            let boundary = Self::build_boundary_context(&pending.history, &next);
+            let l0_batch = L0Batch {
+                id: BatchId::parse_str(&pending.id)
+                    .with_context(|| format!("pending L0 batch id {} is not a UUID", pending.id))?,
+                batch_seq: 0,
+                messages: Vec::new(),
+                est_tokens: u64::try_from(pending.est_tokens)
+                    .with_context(|| "pending L0 est_tokens out of range for u64")?,
+                eviction_footprint_tokens: u64::try_from(pending.eviction_footprint_tokens)
+                    .with_context(|| "pending L0 eviction footprint out of range for u64")?,
+                state: BatchState::Open,
+            };
+            if seal_before_next(&l0_batch, &boundary, TokenCalibration::default()).is_some() {
+                let seal = self
+                    .prepare_l0_seal_transition(
+                        &pending.id,
+                        pending.version,
+                        public_est,
+                        l0_allocator,
+                    )
+                    .await?;
+                let new_l0_id = seal.new_l0_batch_record.id.clone();
+                *pending = PendingL0Batch {
+                    id: new_l0_id.clone(),
+                    version: 0,
+                    ord: 1,
+                    est_tokens: public_est,
+                    eviction_footprint_tokens: sqlite_i64(
+                        eviction_footprint_tokens,
+                        "eviction footprint tokens",
+                    )?,
+                    history: vec![next],
+                };
+                return Ok((
+                    Some(seal.new_l0_batch_record),
+                    Some(new_l0_id),
+                    Some(1),
+                    Some(seal.seal_transition),
+                ));
+            }
+
+            let ord = pending
+                .ord
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("L0 message ordinal overflow"))?;
-            *pending_l0_message_ord = ord;
-            return Ok((None, Some(batch_id), Some(ord)));
+            pending.ord = ord;
+            pending.est_tokens = pending
+                .est_tokens
+                .checked_add(public_est)
+                .ok_or_else(|| anyhow!("L0 batch est_tokens overflow"))?;
+            pending.eviction_footprint_tokens = pending
+                .eviction_footprint_tokens
+                .checked_add(sqlite_i64(
+                    eviction_footprint_tokens,
+                    "eviction footprint tokens",
+                )?)
+                .ok_or_else(|| anyhow!("L0 batch eviction footprint overflow"))?;
+            pending.history.push(next);
+            let batch_id = pending.id.clone();
+            return Ok((None, Some(batch_id), Some(ord), None));
         }
 
-        let open_batch_id: Option<String> = sqlx::query_scalar(
-            "SELECT id FROM memory_batches
+        let open_batch: Option<sqlx::sqlite::SqliteRow> = sqlx::query(
+            "SELECT id, batch_seq, version, est_tokens, eviction_footprint_tokens
+             FROM memory_batches
              WHERE layer = ? AND state = 'open'
              ORDER BY batch_seq DESC
              LIMIT 1",
@@ -2921,7 +3194,41 @@ impl EventWriter {
         .await
         .context("failed to locate open L0 batch")?;
 
-        if let Some(batch_id) = open_batch_id {
+        if let Some(row) = open_batch {
+            let batch_id: String = row.try_get("id")?;
+            let batch_seq: i64 = row.try_get("batch_seq")?;
+            let version: i64 = row.try_get("version")?;
+            let est_tokens: i64 = row.try_get("est_tokens")?;
+            let footprint_tokens: i64 = row.try_get("eviction_footprint_tokens")?;
+
+            let loaded = self
+                .load_l0_batch_boundary(&batch_id, batch_seq, est_tokens, footprint_tokens, message)
+                .await?;
+
+            if loaded.seal_reason.is_some() {
+                let seal = self
+                    .prepare_l0_seal_transition(&batch_id, version, public_est, l0_allocator)
+                    .await?;
+                let new_l0_id = seal.new_l0_batch_record.id.clone();
+                *pending_l0_batch = Some(PendingL0Batch {
+                    id: new_l0_id.clone(),
+                    version: 0,
+                    ord: 1,
+                    est_tokens: public_est,
+                    eviction_footprint_tokens: sqlite_i64(
+                        eviction_footprint_tokens,
+                        "eviction footprint tokens",
+                    )?,
+                    history: vec![next],
+                });
+                return Ok((
+                    Some(seal.new_l0_batch_record),
+                    Some(new_l0_id),
+                    Some(1),
+                    Some(seal.seal_transition),
+                ));
+            }
+
             let max_ord: Option<i64> =
                 sqlx::query_scalar("SELECT MAX(ord) FROM memory_batch_messages WHERE batch_id = ?")
                     .bind(&batch_id)
@@ -2932,31 +3239,38 @@ impl EventWriter {
                 .unwrap_or(0)
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("L0 message ordinal overflow"))?;
-            *pending_l0_batch = Some(batch_id.clone());
-            *pending_l0_message_ord = ord;
-            return Ok((None, Some(batch_id), Some(ord)));
+            let mut history = loaded.history;
+            history.push(next);
+            *pending_l0_batch = Some(PendingL0Batch {
+                id: batch_id.clone(),
+                version,
+                ord,
+                est_tokens: est_tokens
+                    .checked_add(public_est)
+                    .ok_or_else(|| anyhow!("L0 batch est_tokens overflow"))?,
+                eviction_footprint_tokens: footprint_tokens
+                    .checked_add(sqlite_i64(
+                        eviction_footprint_tokens,
+                        "eviction footprint tokens",
+                    )?)
+                    .ok_or_else(|| anyhow!("L0 batch eviction footprint overflow"))?,
+                history,
+            });
+            return Ok((None, Some(batch_id), Some(ord), None));
         }
 
-        let max_batch_seq: Option<i64> =
-            sqlx::query_scalar("SELECT MAX(batch_seq) FROM memory_batches WHERE layer = ?")
-                .bind(MemoryLayer::L0.as_i64())
-                .fetch_one(self.store.pool())
-                .await
-                .context("failed to read latest L0 batch sequence")?;
-        let batch_seq = max_batch_seq
-            .unwrap_or(0)
+        self.ensure_l0_allocator(l0_allocator).await?;
+        let allocator = l0_allocator
+            .as_mut()
+            .ok_or_else(|| anyhow!("L0 allocator initialization failed"))?;
+        let batch_seq = allocator.next_l0_seq;
+        allocator.next_l0_seq = batch_seq
             .checked_add(1)
-            .ok_or_else(|| anyhow!("L0 batch sequence overflow"))?;
-        let max_batch_ord: Option<i64> =
-            sqlx::query_scalar("SELECT MAX(ord) FROM memory_batches WHERE layer = ?")
-                .bind(MemoryLayer::L0.as_i64())
-                .fetch_one(self.store.pool())
-                .await
-                .context("failed to read latest L0 batch ordinal")?;
-        let batch_ord = max_batch_ord
-            .unwrap_or(0)
+            .ok_or_else(|| anyhow!("memory batch sequence overflow"))?;
+        let batch_ord = allocator.next_l0_ord;
+        allocator.next_l0_ord = batch_ord
             .checked_add(1)
-            .ok_or_else(|| anyhow!("L0 batch ordinal overflow"))?;
+            .ok_or_else(|| anyhow!("memory batch ordinal overflow"))?;
         let batch_id = Uuid::now_v7().to_string();
         let record = MemoryBatchRecord::new(
             &batch_id,
@@ -2964,13 +3278,219 @@ impl EventWriter {
             batch_ord,
             batch_seq,
             MemoryBatchState::Open,
+            public_est,
+            0,
+        );
+
+        // Membership for the first message in a freshly-created batch is ord 1.
+        *pending_l0_batch = Some(PendingL0Batch {
+            id: batch_id.clone(),
+            version: 0,
+            ord: 1,
+            est_tokens: public_est,
+            eviction_footprint_tokens: sqlite_i64(
+                eviction_footprint_tokens,
+                "eviction footprint tokens",
+            )?,
+            history: vec![next],
+        });
+        Ok((Some(record), Some(batch_id), Some(1), None))
+    }
+
+    /// Decide whether the current open L0 batch should be sealed before the
+    /// incoming message. This loads the batch's current messages from the
+    /// already-redacted `messages.payload` projection and uses the boundary
+    /// rules in `crate::memory::batch`. The loaded history is returned so it
+    /// can be carried as pending in-batch state.
+    async fn load_l0_batch_boundary(
+        &self,
+        batch_id: &str,
+        batch_seq: i64,
+        est_tokens: i64,
+        footprint_tokens: i64,
+        next_message: &PublicMessage,
+    ) -> Result<LoadedL0Boundary> {
+        let message_rows = sqlx::query(
+            "SELECT m.id, m.payload
+             FROM messages m
+             JOIN memory_batch_messages mbm ON m.id = mbm.message_id
+             WHERE mbm.batch_id = ?
+             ORDER BY mbm.ord ASC",
+        )
+        .bind(batch_id)
+        .fetch_all(self.store.pool())
+        .await
+        .context("failed to load L0 batch messages for boundary decision")?;
+
+        let mut history = Vec::with_capacity(message_rows.len());
+        for row in message_rows {
+            let message_id: String = row.try_get("id")?;
+            let payload: String = row.try_get("payload")?;
+            let public: PublicMessage = serde_json::from_str(&payload).with_context(|| {
+                format!("failed to deserialize L0 batch message {message_id} from payload")
+            })?;
+            history.push(ContextMessage::Synthetic {
+                message: Message::from(public),
+            });
+        }
+
+        let next = ContextMessage::Synthetic {
+            message: Message::from(next_message.clone()),
+        };
+        let boundary = Self::build_boundary_context(&history, &next);
+
+        let l0_batch = L0Batch {
+            id: BatchId::parse_str(batch_id)
+                .with_context(|| format!("L0 batch id {batch_id} is not a UUID"))?,
+            batch_seq: u64::try_from(batch_seq)
+                .with_context(|| "L0 batch_seq out of range for u64")?,
+            messages: Vec::new(),
+            est_tokens: u64::try_from(est_tokens)
+                .with_context(|| "L0 est_tokens out of range for u64")?,
+            eviction_footprint_tokens: u64::try_from(footprint_tokens)
+                .with_context(|| "L0 eviction footprint out of range for u64")?,
+            state: BatchState::Open,
+        };
+
+        Ok(LoadedL0Boundary {
+            seal_reason: seal_before_next(&l0_batch, &boundary, TokenCalibration::default()),
+            history,
+        })
+    }
+
+    /// Build a `BoundaryContext` from the durable history and the next message.
+    /// The `next_user_is_steering` flag is derived from whether the previous
+    /// message was an interrupted assistant.
+    fn build_boundary_context(
+        history: &[ContextMessage],
+        next: &ContextMessage,
+    ) -> BoundaryContext {
+        let last_message = history.last().map(|context| match context {
+            ContextMessage::Synthetic { message } | ContextMessage::Persisted { message, .. } => {
+                message
+            }
+        });
+        let next_user_is_steering = matches!(
+            last_message,
+            Some(Message::Assistant(assistant)) if assistant.interrupted
+        );
+        BoundaryContext::from_history(history, next, next_user_is_steering)
+    }
+
+    async fn next_memory_batch_seq(&self, layer: MemoryLayer) -> Result<i64> {
+        let max: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(batch_seq) FROM memory_batches WHERE layer = ?")
+                .bind(layer.as_i64())
+                .fetch_one(self.store.pool())
+                .await
+                .context("failed to read latest batch sequence")?;
+        max.unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("memory batch sequence overflow"))
+    }
+
+    async fn next_memory_batch_ord(&self, layer: MemoryLayer) -> Result<i64> {
+        let max: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(ord) FROM memory_batches WHERE layer = ?")
+                .bind(layer.as_i64())
+                .fetch_one(self.store.pool())
+                .await
+                .context("failed to read latest batch ordinal")?;
+        max.unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("memory batch ordinal overflow"))
+    }
+
+    /// Initialize the in-batch L0/L1 batch sequence allocator on first use.
+    async fn ensure_l0_allocator(&self, allocator: &mut Option<L0BatchAllocator>) -> Result<()> {
+        if allocator.is_some() {
+            return Ok(());
+        }
+        *allocator = Some(L0BatchAllocator {
+            next_l0_seq: self.next_memory_batch_seq(MemoryLayer::L0).await?,
+            next_l0_ord: self.next_memory_batch_ord(MemoryLayer::L0).await?,
+            next_l1_seq: self.next_memory_batch_seq(MemoryLayer::L1).await?,
+            next_l1_ord: self.next_memory_batch_ord(MemoryLayer::L1).await?,
+        });
+        Ok(())
+    }
+
+    async fn prepare_l0_seal_transition(
+        &self,
+        source_id: &str,
+        source_version: i64,
+        public_est: i64,
+        l0_allocator: &mut Option<L0BatchAllocator>,
+    ) -> Result<L0SealPrep> {
+        let source_next_version = source_version
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("memory batch version overflow"))?;
+
+        self.ensure_l0_allocator(l0_allocator).await?;
+        let allocator = l0_allocator
+            .as_mut()
+            .ok_or_else(|| anyhow!("L0 allocator initialization failed"))?;
+
+        let new_l0_seq = allocator.next_l0_seq;
+        allocator.next_l0_seq = new_l0_seq
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("memory batch sequence overflow"))?;
+        let new_l0_ord = allocator.next_l0_ord;
+        allocator.next_l0_ord = new_l0_ord
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("memory batch ordinal overflow"))?;
+        let new_l0_id = Uuid::now_v7().to_string();
+        let new_l0_batch_record = MemoryBatchRecord::new(
+            &new_l0_id,
+            MemoryLayer::L0,
+            new_l0_ord,
+            new_l0_seq,
+            MemoryBatchState::Open,
+            public_est,
+            0,
+        );
+
+        let target_seq = allocator.next_l1_seq;
+        allocator.next_l1_seq = target_seq
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("memory batch sequence overflow"))?;
+        let target_ord = allocator.next_l1_ord;
+        allocator.next_l1_ord = target_ord
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("memory batch ordinal overflow"))?;
+        let target_id = Uuid::now_v7().to_string();
+        let target_record = MemoryBatchRecord::new(
+            &target_id,
+            MemoryLayer::L1,
+            target_ord,
+            target_seq,
+            MemoryBatchState::Compacting,
             0,
             0,
         );
 
-        *pending_l0_batch = Some(batch_id.clone());
-        *pending_l0_message_ord = 1;
-        Ok((Some(record), Some(batch_id), Some(1)))
+        let job_id = Uuid::now_v7().to_string();
+        let mut source_versions = BTreeMap::new();
+        source_versions.insert(source_id.to_owned(), source_next_version);
+        source_versions.insert(target_id.clone(), 0);
+        let job_record = MemoryJobRecord::new(
+            &job_id,
+            MemoryJobKind::CompactL0,
+            target_seq,
+            vec![source_id.to_owned()],
+            source_versions,
+        );
+
+        Ok(L0SealPrep {
+            new_l0_batch_record,
+            seal_transition: Box::new(L0SealTransition {
+                source_id: source_id.to_owned(),
+                source_expected_version: source_version,
+                source_next_version,
+                target_record,
+                job_record,
+            }),
+        })
     }
 
     async fn prepare_memory_job_update(
@@ -2983,7 +3503,12 @@ impl EventWriter {
             .context("failed to serialize memory job source versions")?;
         let mut job_mutations = Vec::with_capacity(update.job_mutations.len());
         for mutation in update.job_mutations {
-            let source_json = if matches!(mutation, MemoryJobMutation::Claim { .. }) {
+            let source_json = if matches!(
+                mutation,
+                MemoryJobMutation::Claim { .. }
+                    | MemoryJobMutation::Start { .. }
+                    | MemoryJobMutation::Release { .. }
+            ) {
                 None
             } else {
                 Some(source_versions_json.clone())
@@ -3023,12 +3548,15 @@ impl EventWriter {
         let mut post_source_versions = pre_source_versions.clone();
         let mut batch_mutations = Vec::with_capacity(transition.batch_mutations.len());
         for batch in transition.batch_mutations {
-            let row = sqlx::query("SELECT version, state FROM memory_batches WHERE id = ?")
-                .bind(batch.batch_id.to_string())
-                .fetch_optional(self.store.pool())
-                .await
-                .context("failed to load memory batch for transition")?
-                .ok_or_else(|| anyhow!("memory batch {} does not exist", batch.batch_id))?;
+            let row = sqlx::query(
+                "SELECT version, state, est_tokens, eviction_footprint_tokens
+                 FROM memory_batches WHERE id = ?",
+            )
+            .bind(batch.batch_id.to_string())
+            .fetch_optional(self.store.pool())
+            .await
+            .context("failed to load memory batch for transition")?
+            .ok_or_else(|| anyhow!("memory batch {} does not exist", batch.batch_id))?;
             let old_version: i64 = row.try_get("version")?;
             let old_state_str: String = row.try_get("state")?;
             let old_state = parse_memory_batch_state(&old_state_str)?;
@@ -3041,6 +3569,9 @@ impl EventWriter {
                 );
             }
 
+            let old_est_tokens: i64 = row.try_get("est_tokens")?;
+            let old_footprint: i64 = row.try_get("eviction_footprint_tokens")?;
+
             let version_increments = batch.summary.is_some() || batch.new_state != old_state;
             let new_version = if version_increments {
                 old_version
@@ -3050,6 +3581,22 @@ impl EventWriter {
                 old_version
             };
             post_source_versions.insert(batch.batch_id.to_string(), new_version);
+
+            // State-only transitions must preserve the existing token estimate,
+            // and dropping an L0 source batch must zero its eviction footprint.
+            let has_summary = batch.summary.is_some();
+            let est_tokens = if has_summary {
+                sqlite_i64(batch.est_tokens, "batch est_tokens")?
+            } else {
+                old_est_tokens
+            };
+            let footprint_delta = if batch.delete_membership {
+                old_footprint
+                    .checked_neg()
+                    .ok_or_else(|| anyhow!("memory batch footprint overflow"))?
+            } else {
+                batch.footprint_delta
+            };
 
             let summary = if let Some(result) = batch.summary {
                 if memory_summary_key.is_none() {
@@ -3076,8 +3623,9 @@ impl EventWriter {
                 old_state,
                 new_state: batch.new_state,
                 summary,
-                est_tokens: sqlite_i64(batch.est_tokens, "batch est_tokens")?,
-                footprint_delta: batch.footprint_delta,
+                est_tokens,
+                footprint_delta,
+                delete_membership: batch.delete_membership,
             });
         }
 
@@ -3085,7 +3633,12 @@ impl EventWriter {
             .context("failed to serialize memory transition source versions")?;
         let mut job_mutations = Vec::with_capacity(transition.job_mutations.len());
         for mutation in transition.job_mutations {
-            let source_json = if matches!(mutation, MemoryJobMutation::Claim { .. }) {
+            let source_json = if matches!(
+                mutation,
+                MemoryJobMutation::Claim { .. }
+                    | MemoryJobMutation::Start { .. }
+                    | MemoryJobMutation::Release { .. }
+            ) {
                 None
             } else {
                 Some(source_versions_json.clone())
@@ -3110,10 +3663,20 @@ impl EventWriter {
             })
             .unwrap_or((None, None));
 
+        let expected_source_states: BTreeMap<String, MemoryBatchState> = transition
+            .expected_source_states
+            .iter()
+            .map(|(id, state)| Ok((id.to_string(), *state)))
+            .collect::<Result<BTreeMap<_, _>>>()
+            .context("invalid expected source state batch id")?;
+
         Ok(PreparedProjection::MemoryTransition {
             expected_source_versions: pre_source_versions,
+            expected_source_states,
             batch_mutations,
             job_mutations,
+            batch_inserts: transition.batch_inserts,
+            job_inserts: transition.job_inserts,
             cursor_advance: transition.cursor_advance,
             memory_summary_key_ref: key_ref,
             memory_summary_key_proof: key_proof,
@@ -3126,12 +3689,50 @@ impl EventWriter {
         mutation: MemoryJobMutation,
         source_versions_json: Option<String>,
     ) -> Result<PreparedMemoryJobMutation> {
-        let (job_id, expected_status, new_status, lease_until, result) = match mutation {
+        let (
+            job_id,
+            expected_status,
+            new_status,
+            attempts_delta,
+            expected_attempt,
+            expected_lease_until,
+            new_lease_until,
+            result,
+        ) = match mutation {
             MemoryJobMutation::Claim {
                 job_id,
                 lease_until,
-            } => (job_id, "pending", "running", Some(lease_until), None),
-            MemoryJobMutation::Complete { job_id, result } => {
+            } => (
+                job_id,
+                "pending",
+                "running",
+                0,
+                None,
+                None,
+                Some(lease_until),
+                None,
+            ),
+            MemoryJobMutation::Start {
+                job_id,
+                expected_attempt,
+                lease_witness,
+                lease_until,
+            } => (
+                job_id,
+                "running",
+                "running",
+                1,
+                Some(expected_attempt),
+                lease_witness,
+                Some(lease_until),
+                None,
+            ),
+            MemoryJobMutation::Complete {
+                job_id,
+                expected_attempt,
+                lease_witness,
+                result,
+            } => {
                 if memory_summary_key.is_none() {
                     *memory_summary_key = Some(
                         self.store
@@ -3143,36 +3744,108 @@ impl EventWriter {
                     .as_ref()
                     .expect("memory summary key loaded");
                 let encrypted = self.encrypt_memory_job_result(result, &job_id, key).await?;
-                (job_id, "running", "completed", None, Some(encrypted))
+                (
+                    job_id,
+                    "running",
+                    "completed",
+                    0,
+                    Some(expected_attempt),
+                    lease_witness,
+                    None,
+                    Some(encrypted),
+                )
             }
-            MemoryJobMutation::Fail { job_id } => (job_id, "running", "failed", None, None),
-            MemoryJobMutation::Apply { job_id } => (job_id, "completed", "applied", None, None),
+            MemoryJobMutation::Fail {
+                job_id,
+                expected_attempt,
+                lease_witness,
+            } => (
+                job_id,
+                "running",
+                "failed",
+                0,
+                Some(expected_attempt),
+                lease_witness,
+                None,
+                None,
+            ),
+            MemoryJobMutation::Reclaim {
+                job_id,
+                expected_attempt,
+                lease_until,
+                attempts_delta,
+            } => (
+                job_id,
+                "failed",
+                "running",
+                attempts_delta,
+                Some(expected_attempt),
+                None,
+                Some(lease_until),
+                None,
+            ),
+            MemoryJobMutation::Apply {
+                job_id,
+                expected_attempt,
+                lease_witness,
+            } => (
+                job_id,
+                "completed",
+                "applied",
+                0,
+                Some(expected_attempt),
+                lease_witness,
+                None,
+                None,
+            ),
+            MemoryJobMutation::Discard {
+                job_id,
+                expected_attempt,
+                lease_witness,
+            } => (
+                job_id,
+                "completed",
+                "failed",
+                0,
+                Some(expected_attempt),
+                lease_witness,
+                None,
+                None,
+            ),
+            MemoryJobMutation::Release {
+                job_id,
+                expected_attempt,
+                lease_witness,
+            } => (
+                job_id,
+                "running",
+                "pending",
+                0,
+                Some(expected_attempt),
+                lease_witness,
+                None,
+                None,
+            ),
         };
 
-        let row = sqlx::query("SELECT status, attempts, lease_until FROM memory_jobs WHERE id = ?")
-            .bind(&job_id)
-            .fetch_optional(self.store.pool())
-            .await
-            .context("failed to load memory job for mutation")?
-            .ok_or_else(|| anyhow!("memory job {job_id} does not exist"))?;
-        let status: String = row.try_get("status")?;
-        if status != expected_status {
-            bail!("memory job {job_id} is in status {status}, expected {expected_status}");
-        }
-        let attempts: i64 = row.try_get("attempts")?;
-        let lease_until_stored: Option<String> = row.try_get("lease_until")?;
+        // Terminal transitions, start and claim all use the witness values
+        // supplied by the caller. EventWriter's durable CAS rejects any row
+        // that has been reclaimed or advanced by another worker.
+        let attempts = expected_attempt.unwrap_or(0);
+        let new_lease_until = if new_status == "running" {
+            new_lease_until
+        } else {
+            None
+        };
 
         Ok(PreparedMemoryJobMutation {
             job_id,
             expected_status,
             new_status,
             attempts,
-            lease_until: if new_status == "running" {
-                lease_until
-            } else {
-                None
-            },
-            expected_lease_until: lease_until_stored,
+            attempts_delta,
+            expected_lease_until,
+            new_lease_until,
             source_versions: source_versions_json,
             result,
         })
@@ -5113,8 +5786,8 @@ fn validate_batch_shape_with_recovery(
         let mut memory_transition_seen = false;
         let mut memory_job_update_seen = false;
         let mut provider_context_seen = false;
-        let mut batch_ids = HashSet::new();
-        let mut job_ids = HashSet::new();
+        let mut batch_ids: HashSet<String> = HashSet::new();
+        let mut job_ids: HashSet<String> = HashSet::new();
         for projection in &write.projections {
             match projection {
                 Projection::ProviderContextMutation(_) => {
@@ -5135,7 +5808,7 @@ fn validate_batch_shape_with_recovery(
                     }
                     memory_job_update_seen = true;
                     for mutation in &update.job_mutations {
-                        if !job_ids.insert(job_id_for_mutation(mutation)) {
+                        if !job_ids.insert(job_id_for_mutation(mutation).to_owned()) {
                             bail!("duplicate job_id in MemoryJobUpdate");
                         }
                         validate_memory_job_mutation_shape(mutation)?;
@@ -5146,11 +5819,20 @@ fn validate_batch_shape_with_recovery(
                         bail!("only one terminal mutation projection is allowed per EventWrite");
                     }
                     memory_transition_seen = true;
+                    let completes_job = transition
+                        .job_mutations
+                        .iter()
+                        .any(|mutation| matches!(mutation, MemoryJobMutation::Complete { .. }));
+                    let has_compacted_summary = transition.batch_mutations.iter().any(|batch| {
+                        batch.new_state == MemoryBatchState::Compacted && batch.summary.is_some()
+                    });
                     for batch in &transition.batch_mutations {
-                        if !batch_ids.insert(batch.batch_id) {
+                        if !batch_ids.insert(batch.batch_id.to_string()) {
                             bail!("duplicate batch_id in MemoryTransition");
                         }
-                        if batch.new_state == MemoryBatchState::Compacted && batch.summary.is_none()
+                        if batch.new_state == MemoryBatchState::Compacted
+                            && batch.summary.is_none()
+                            && !(completes_job && has_compacted_summary)
                         {
                             bail!("Compacted MemoryBatchMutation requires a summary");
                         }
@@ -5165,11 +5847,58 @@ fn validate_batch_shape_with_recovery(
                             );
                         }
                     }
+                    for insert in &transition.batch_inserts {
+                        if !batch_ids.insert(insert.id.clone()) {
+                            bail!("duplicate batch_id in MemoryTransition batch_inserts");
+                        }
+                        let insert_id = BatchId::parse_str(&insert.id)
+                            .with_context(|| format!("invalid inserted batch id {}", insert.id))?;
+                        if transition.expected_source_versions.contains_key(&insert_id)
+                            || transition.expected_source_states.contains_key(&insert_id)
+                        {
+                            bail!(
+                                "inserted batch_id {} is also listed as a source witness",
+                                insert.id
+                            );
+                        }
+                        if insert.state != MemoryBatchState::Compacting {
+                            bail!("MemoryTransition batch_inserts must be in Compacting state");
+                        }
+                        if insert.version != 0 {
+                            bail!("MemoryTransition batch_inserts must have version 0");
+                        }
+                        if insert.summary.is_some() {
+                            bail!("MemoryTransition batch_inserts must not carry a summary");
+                        }
+                        if insert.est_tokens != 0 || insert.eviction_footprint_tokens != 0 {
+                            bail!("MemoryTransition batch_inserts must have zero token estimates");
+                        }
+                    }
                     for mutation in &transition.job_mutations {
-                        if !job_ids.insert(job_id_for_mutation(mutation)) {
+                        if !job_ids.insert(job_id_for_mutation(mutation).to_owned()) {
                             bail!("duplicate job_id in MemoryTransition");
                         }
                         validate_memory_job_mutation_shape(mutation)?;
+                    }
+                    for insert in &transition.job_inserts {
+                        if !job_ids.insert(insert.id.clone()) {
+                            bail!("duplicate job_id in MemoryTransition job_inserts");
+                        }
+                        if insert.status != MemoryJobStatus::Pending {
+                            bail!("MemoryTransition job_inserts must be in Pending state");
+                        }
+                        if insert.attempts != 0 {
+                            bail!("MemoryTransition job_inserts must have attempts 0");
+                        }
+                        if insert.lease_until.is_some() {
+                            bail!("MemoryTransition job_inserts must not have a lease");
+                        }
+                        if insert.result.is_some() {
+                            bail!("MemoryTransition job_inserts must not carry a result");
+                        }
+                        if insert.source_ids.is_empty() {
+                            bail!("MemoryTransition job_inserts must have at least one source");
+                        }
                     }
                     if !has_memory_maintenance && write.event.is_some() {
                         bail!(
@@ -5188,9 +5917,13 @@ fn validate_batch_shape_with_recovery(
 fn job_id_for_mutation(mutation: &MemoryJobMutation) -> &str {
     match mutation {
         MemoryJobMutation::Claim { job_id, .. }
+        | MemoryJobMutation::Start { job_id, .. }
         | MemoryJobMutation::Complete { job_id, .. }
-        | MemoryJobMutation::Fail { job_id }
-        | MemoryJobMutation::Apply { job_id } => job_id.as_str(),
+        | MemoryJobMutation::Fail { job_id, .. }
+        | MemoryJobMutation::Reclaim { job_id, .. }
+        | MemoryJobMutation::Apply { job_id, .. }
+        | MemoryJobMutation::Discard { job_id, .. }
+        | MemoryJobMutation::Release { job_id, .. } => job_id.as_str(),
     }
 }
 
@@ -5680,7 +6413,7 @@ fn memory_projection_size(projection: &PreparedProjection) -> usize {
                     .len()
                     .saturating_add(job.attempts as usize)
                     .saturating_add(
-                        job.lease_until
+                        job.new_lease_until
                             .as_ref()
                             .map_or(0, String::len)
                             .saturating_add(job.result.as_ref().map_or(0, |r| r.ciphertext.len())),
@@ -8760,11 +9493,14 @@ async fn apply_projection(
             interrupted,
             l0_disposition,
             provider_context,
+            provider_context_key_ref: _,
+            provider_context_key_proof: _,
             eviction_footprint_tokens,
+            public_est,
             create_l0_batch,
             l0_batch_id,
             l0_batch_message_ord,
-            ..
+            seal_transition,
         } => {
             if !matches!(role, "user" | "assistant" | "tool_result") {
                 bail!("invalid message role {role}");
@@ -8772,6 +9508,39 @@ async fn apply_projection(
             match l0_disposition {
                 L0Disposition::Append | L0Disposition::ExcludeRetryError => {}
             }
+
+            // Commit an L0 seal reservation atomically with the message that
+            // triggers it. The source batch is sealed, an L1 target is
+            // allocated, and a pending compaction job is inserted before the
+            // current message is appended to a fresh open L0 batch.
+            if let Some(seal) = seal_transition {
+                let seal = *seal;
+                let result = sqlx::query(
+                    "UPDATE memory_batches
+                     SET state = ?, version = ?, updated_at = ?
+                     WHERE id = ? AND version = ? AND state = ?",
+                )
+                .bind(MemoryBatchState::Compacting.as_str())
+                .bind(seal.source_next_version)
+                .bind(Utc::now().to_rfc3339())
+                .bind(&seal.source_id)
+                .bind(seal.source_expected_version)
+                .bind(MemoryBatchState::Open.as_str())
+                .execute(&mut **transaction)
+                .await
+                .context("failed to seal L0 source batch")?;
+                require_single_cas(result.rows_affected(), "L0 source seal")?;
+
+                seal.target_record
+                    .insert(&mut **transaction)
+                    .await
+                    .context("failed to insert L1 target batch for L0 seal")?;
+                seal.job_record
+                    .insert(&mut **transaction)
+                    .await
+                    .context("failed to insert L0 compaction job for L0 seal")?;
+            }
+
             sqlx::query(
                 "INSERT INTO messages(
                     id, seq, role, raw_key_ref, raw_ciphertext, payload, search_text,
@@ -8797,15 +9566,18 @@ async fn apply_projection(
                     anyhow!("MessageEnd Append is missing a prepared L0 batch id")
                 })?;
                 let ord = l0_batch_message_ord.ok_or_else(|| {
-                    anyhow!("MessageEnd Append is missing a prepared L0 message ordinal")
+                    anyhow!("MessageEnd Append is missing a prepared L0 message ord")
                 })?;
 
-                if let Some(record) = create_l0_batch {
+                // Insert a lazily-allocated open L0 batch first, then append
+                // explicit membership in the same transaction.
+                if let Some(record) = &create_l0_batch {
                     record
                         .insert(&mut **transaction)
                         .await
                         .context("failed to insert open L0 batch for MessageEnd")?;
                 }
+
                 MemoryBatchMessageRecord {
                     batch_id: batch_id.clone(),
                     message_id: message_id.clone(),
@@ -8814,6 +9586,23 @@ async fn apply_projection(
                 .insert(&mut **transaction)
                 .await
                 .context("failed to insert L0 batch membership")?;
+
+                // Add this message's public transcript estimate to the batch.
+                // Newly-created batches already carry the first message's
+                // estimate in their record, so only update existing rows.
+                if create_l0_batch.is_none() {
+                    let result = sqlx::query(
+                        "UPDATE memory_batches
+                         SET est_tokens = est_tokens + ?
+                         WHERE id = ?",
+                    )
+                    .bind(public_est)
+                    .bind(batch_id)
+                    .execute(&mut **transaction)
+                    .await
+                    .context("failed to update L0 batch est_tokens")?;
+                    require_single_cas(result.rows_affected(), "L0 est update")?;
+                }
             }
 
             for record in provider_context {
@@ -8823,41 +9612,33 @@ async fn apply_projection(
                     .context("failed to apply provider-context record")?;
             }
 
-            if eviction_footprint_tokens > 0 {
+            if l0_disposition == L0Disposition::Append && eviction_footprint_tokens > 0 {
+                let batch_id = l0_batch_id.as_ref().expect("L0 batch id checked above");
                 let delta = sqlite_i64(eviction_footprint_tokens, "eviction_footprint_tokens")?;
 
-                if let Some(batch_id) = sqlx::query_scalar::<_, String>(
-                    "SELECT batch_id FROM memory_batch_messages WHERE message_id = ?",
+                let current: i64 = sqlx::query_scalar(
+                    "SELECT eviction_footprint_tokens FROM memory_batches WHERE id = ?",
                 )
-                .bind(&message_id)
-                .fetch_optional(&mut **transaction)
+                .bind(batch_id)
+                .fetch_one(&mut **transaction)
                 .await
-                .context("failed to locate memory batch for eviction footprint")?
-                {
-                    let current: i64 = sqlx::query_scalar(
-                        "SELECT eviction_footprint_tokens FROM memory_batches WHERE id = ?",
-                    )
-                    .bind(&batch_id)
-                    .fetch_one(&mut **transaction)
-                    .await
-                    .context("failed to read memory batch eviction footprint")?;
-                    let new = current.checked_add(delta).ok_or_else(|| {
-                        anyhow::anyhow!("memory batch eviction_footprint_tokens overflow")
-                    })?;
-                    if new < 0 {
-                        bail!("memory batch eviction_footprint_tokens underflow");
-                    }
-                    sqlx::query(
-                        "UPDATE memory_batches
-                         SET eviction_footprint_tokens = ?
-                         WHERE id = ?",
-                    )
-                    .bind(new)
-                    .bind(batch_id)
-                    .execute(&mut **transaction)
-                    .await
-                    .context("failed to update memory batch eviction footprint")?;
+                .context("failed to read memory batch eviction footprint")?;
+                let new = current.checked_add(delta).ok_or_else(|| {
+                    anyhow::anyhow!("memory batch eviction_footprint_tokens overflow")
+                })?;
+                if new < 0 {
+                    bail!("memory batch eviction_footprint_tokens underflow");
                 }
+                sqlx::query(
+                    "UPDATE memory_batches
+                     SET eviction_footprint_tokens = ?
+                     WHERE id = ?",
+                )
+                .bind(new)
+                .bind(batch_id)
+                .execute(&mut **transaction)
+                .await
+                .context("failed to update memory batch eviction footprint")?;
             }
         }
         PreparedProjection::CommandInsert {
@@ -8917,16 +9698,23 @@ async fn apply_projection(
         }
         PreparedProjection::MemoryTransition {
             expected_source_versions,
+            expected_source_states,
             batch_mutations,
             job_mutations,
+            batch_inserts,
+            job_inserts,
             cursor_advance,
             ..
         } => {
             apply_memory_transition(
+                store,
                 transaction,
                 expected_source_versions,
+                expected_source_states,
                 batch_mutations,
                 job_mutations,
+                batch_inserts,
+                job_inserts,
                 cursor_advance,
             )
             .await?;
@@ -9211,6 +9999,31 @@ async fn verify_source_versions(
     Ok(())
 }
 
+async fn verify_source_states(
+    transaction: &mut Transaction<'_, Sqlite>,
+    expected: &BTreeMap<String, MemoryBatchState>,
+) -> Result<()> {
+    for (batch_id, expected_state) in expected {
+        let row = sqlx::query("SELECT state FROM memory_batches WHERE id = ?")
+            .bind(batch_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .context("failed to read source state for memory CAS")?
+            .ok_or_else(|| anyhow!("memory source batch {batch_id} does not exist"))?;
+        let state: String = row.try_get("state")?;
+        let actual = parse_memory_batch_state(&state)
+            .with_context(|| format!("memory source batch {batch_id} has unknown state {state}"))?;
+        if actual != *expected_state {
+            bail!(
+                "memory source batch {batch_id} state mismatch: expected {}, actual {}",
+                expected_state.as_str(),
+                state
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn apply_memory_job_update(
     transaction: &mut Transaction<'_, Sqlite>,
     expected_source_versions: BTreeMap<String, i64>,
@@ -9223,17 +10036,116 @@ async fn apply_memory_job_update(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "prepared projection decomposition"
+)]
 async fn apply_memory_transition(
+    store: &Store,
     transaction: &mut Transaction<'_, Sqlite>,
     expected_source_versions: BTreeMap<String, i64>,
+    expected_source_states: BTreeMap<String, MemoryBatchState>,
     batch_mutations: Vec<PreparedMemoryBatchMutation>,
     job_mutations: Vec<PreparedMemoryJobMutation>,
+    batch_inserts: Vec<MemoryBatchRecord>,
+    job_inserts: Vec<MemoryJobRecord>,
     cursor_advance: Option<MemoryApplyCursorAdvance>,
 ) -> Result<()> {
     verify_source_versions(transaction, &expected_source_versions, None).await?;
-    for batch in batch_mutations {
-        apply_memory_batch_mutation(transaction, batch).await?;
+    verify_source_states(transaction, &expected_source_states).await?;
+
+    // Allocate and insert new target batches inside the EventWriter transaction
+    // so concurrent L0 seal/recovery cannot reuse the same (layer, batch_seq).
+    let mut next_seq_by_layer: BTreeMap<i64, i64> = BTreeMap::new();
+    let mut next_ord_by_layer: BTreeMap<i64, i64> = BTreeMap::new();
+    let mut assigned_batch_seqs: BTreeMap<String, i64> = BTreeMap::new();
+    for mut batch in batch_inserts {
+        let layer = batch.layer.as_i64();
+
+        let next_seq = if let Some(seq) = next_seq_by_layer.get(&layer).copied() {
+            let next = seq
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("memory batch sequence overflow"))?;
+            next_seq_by_layer.insert(layer, next);
+            seq
+        } else {
+            let max: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(MAX(batch_seq), 0) FROM memory_batches WHERE layer = ?",
+            )
+            .bind(layer)
+            .fetch_one(&mut **transaction)
+            .await
+            .context("failed to read max batch_seq for batch insert")?;
+            let seq = max
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("memory batch sequence overflow"))?;
+            let next = seq
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("memory batch sequence overflow"))?;
+            next_seq_by_layer.insert(layer, next);
+            seq
+        };
+
+        let next_ord = if let Some(ord) = next_ord_by_layer.get(&layer).copied() {
+            let next = ord
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("memory batch ordinal overflow"))?;
+            next_ord_by_layer.insert(layer, next);
+            ord
+        } else {
+            let max: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(MAX(ord), 0) FROM memory_batches WHERE layer = ?",
+            )
+            .bind(layer)
+            .fetch_one(&mut **transaction)
+            .await
+            .context("failed to read max ord for batch insert")?;
+            let ord = max
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("memory batch ordinal overflow"))?;
+            let next = ord
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("memory batch ordinal overflow"))?;
+            next_ord_by_layer.insert(layer, next);
+            ord
+        };
+
+        batch.batch_seq = next_seq;
+        batch.ord = next_ord;
+        assigned_batch_seqs.insert(batch.id.clone(), next_seq);
+        batch
+            .insert(&mut **transaction)
+            .await
+            .context("failed to insert memory batch in transition")?;
     }
+
+    for batch in batch_mutations {
+        apply_memory_batch_mutation(transaction, batch, store).await?;
+    }
+
+    for mut job in job_inserts {
+        let target_id = job
+            .source_versions
+            .keys()
+            .find(|id| assigned_batch_seqs.contains_key(id.as_str()))
+            .cloned()
+            .ok_or_else(|| anyhow!("inserted job {} has no target batch witness", job.id))?;
+        let batch_seq = assigned_batch_seqs
+            .get(target_id.as_str())
+            .copied()
+            .ok_or_else(|| {
+                anyhow!(
+                    "inserted job {} references target batch {} not created in the same transition",
+                    job.id,
+                    target_id
+                )
+            })?;
+        job.batch_seq = batch_seq;
+        job.insert(&mut **transaction)
+            .await
+            .context("failed to insert memory job in transition")?;
+    }
+
     for job in job_mutations {
         apply_memory_job_mutation(transaction, job).await?;
     }
@@ -9257,7 +10169,165 @@ async fn apply_memory_transition(
 async fn apply_memory_batch_mutation(
     transaction: &mut Transaction<'_, Sqlite>,
     batch: PreparedMemoryBatchMutation,
+    store: &Store,
 ) -> Result<()> {
+    if batch.delete_membership {
+        // Capture the data keys that are about to become unreferenced before
+        // we overwrite/delete provider-context rows. We will destroy each key
+        // only after confirming that no remaining provider-context row still
+        // references it, so shared anchor keys (e.g. native compaction windows)
+        // are only erased once the last referencing row is gone.
+        let mut candidate_keys: HashSet<String> = HashSet::new();
+        let mut erased_provider_context_ids: BTreeSet<String> = BTreeSet::new();
+        erased_provider_context_ids.extend(
+            sqlx::query_scalar::<_, String>(
+                "SELECT id FROM provider_context
+                 WHERE message_id IN (
+                     SELECT message_id FROM memory_batch_messages WHERE batch_id = ?
+                 )",
+            )
+            .bind(&batch.batch_id)
+            .fetch_all(&mut **transaction)
+            .await
+            .context("failed to collect provider-context ids for dropped source batch")?,
+        );
+        erased_provider_context_ids.extend(
+            sqlx::query_scalar::<_, String>(
+                "SELECT id FROM provider_context
+                 WHERE message_id IS NULL
+                   AND coverage_through_seq IN (
+                       SELECT seq FROM messages
+                       WHERE id IN (
+                           SELECT message_id FROM memory_batch_messages WHERE batch_id = ?
+                       )
+                   )",
+            )
+            .bind(&batch.batch_id)
+            .fetch_all(&mut **transaction)
+            .await
+            .context("failed to collect native provider-context ids for dropped source batch")?,
+        );
+        candidate_keys.extend(
+            sqlx::query_scalar::<_, String>(
+                "SELECT DISTINCT key_ref FROM provider_context
+                 WHERE message_id IN (
+                     SELECT message_id FROM memory_batch_messages WHERE batch_id = ?
+                 )",
+            )
+            .bind(&batch.batch_id)
+            .fetch_all(&mut **transaction)
+            .await
+            .context("failed to collect provider-context key refs for dropped source batch")?,
+        );
+        candidate_keys.extend(
+            sqlx::query_scalar::<_, String>(
+                "SELECT DISTINCT key_ref FROM provider_context
+                 WHERE message_id IS NULL
+                   AND coverage_through_seq IN (
+                       SELECT seq FROM messages
+                       WHERE id IN (
+                           SELECT message_id FROM memory_batch_messages WHERE batch_id = ?
+                       )
+                   )",
+            )
+            .bind(&batch.batch_id)
+            .fetch_all(&mut **transaction)
+            .await
+            .context(
+                "failed to collect native provider-context key refs for dropped source batch",
+            )?,
+        );
+
+        // Crypto-erase provider context for every message whose membership is
+        // about to be dropped. We overwrite the ciphertext BLOB with zeros
+        // before deleting the row so that the SQLite free-page bytes are not
+        // left containing the encrypted secret.
+        sqlx::query(
+            "UPDATE provider_context
+             SET ciphertext = zeroblob(length(ciphertext))
+             WHERE message_id IN (
+                 SELECT message_id FROM memory_batch_messages WHERE batch_id = ?
+             )",
+        )
+        .bind(&batch.batch_id)
+        .execute(&mut **transaction)
+        .await
+        .context("failed to crypto-erase provider context for dropped source batch")?;
+        // Native/dedicated compaction windows are not anchored to a single
+        // message, so `message_id` is NULL. Erase those whose coverage endpoint
+        // is a message seq belonging to this batch, without touching unrelated
+        // windows whose coverage ends elsewhere.
+        sqlx::query(
+            "UPDATE provider_context
+             SET ciphertext = zeroblob(length(ciphertext))
+             WHERE message_id IS NULL
+               AND coverage_through_seq IN (
+                   SELECT seq FROM messages
+                   WHERE id IN (
+                       SELECT message_id FROM memory_batch_messages WHERE batch_id = ?
+                   )
+               )",
+        )
+        .bind(&batch.batch_id)
+        .execute(&mut **transaction)
+        .await
+        .context("failed to crypto-erase native provider context for dropped source batch")?;
+        sqlx::query(
+            "DELETE FROM provider_context
+             WHERE message_id IN (
+                 SELECT message_id FROM memory_batch_messages WHERE batch_id = ?
+             )",
+        )
+        .bind(&batch.batch_id)
+        .execute(&mut **transaction)
+        .await
+        .context("failed to delete provider context for dropped source batch")?;
+        sqlx::query(
+            "DELETE FROM provider_context
+             WHERE message_id IS NULL
+               AND coverage_through_seq IN (
+                   SELECT seq FROM messages
+                   WHERE id IN (
+                       SELECT message_id FROM memory_batch_messages WHERE batch_id = ?
+                   )
+               )",
+        )
+        .bind(&batch.batch_id)
+        .execute(&mut **transaction)
+        .await
+        .context("failed to delete native provider context for dropped source batch")?;
+        sqlx::query("DELETE FROM memory_batch_messages WHERE batch_id = ?")
+            .bind(&batch.batch_id)
+            .execute(&mut **transaction)
+            .await
+            .context("failed to delete memory batch membership")?;
+
+        let protected_key_refs = ProviderContextMutationApplier::new(store)
+            .scrub_erased_provider_context_intents(transaction, &erased_provider_context_ids)
+            .await?;
+
+        // Destroy each candidate data key whose wrapped material is no longer
+        // referenced by any provider-context row. This is done inside the same
+        // transaction as the row deletion so the key and its ciphertext are
+        // erased atomically.
+        for key_ref in candidate_keys {
+            let remaining: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE key_ref = ?")
+                    .bind(&key_ref)
+                    .fetch_one(&mut **transaction)
+                    .await
+                    .context("failed to check remaining provider-context references for key ref")?;
+            if remaining == 0 && !protected_key_refs.contains(&key_ref) {
+                store
+                    .destroy_conversation_key_ref_in_transaction(transaction, &key_ref)
+                    .await
+                    .with_context(|| {
+                        format!("failed to destroy unreferenced provider-context key {key_ref}")
+                    })?;
+            }
+        }
+    }
+
     let version_increments = batch.summary.is_some() || batch.new_state != batch.old_state;
     let new_version = if version_increments {
         batch
@@ -9342,14 +10412,17 @@ async fn apply_memory_job_mutation(
         };
 
     let result = if job.expected_status == "pending" {
+        // Claim: do not consume an attempt; source versions are fixed by the
+        // job creation path, so leave them untouched when not supplied.
         sqlx::query(
             "UPDATE memory_jobs
-             SET status = ?, attempts = attempts + 1, lease_until = ?,
+             SET status = ?, attempts = attempts + ?, lease_until = ?,
                  source_versions = COALESCE(?, source_versions), updated_at = ?
              WHERE id = ? AND status = ?",
         )
         .bind(job.new_status)
-        .bind(job.lease_until.as_ref())
+        .bind(job.attempts_delta)
+        .bind(job.new_lease_until.as_ref())
         .bind(job.source_versions.as_ref())
         .bind(Utc::now().to_rfc3339())
         .bind(&job.job_id)
@@ -9359,7 +10432,7 @@ async fn apply_memory_job_mutation(
     } else {
         sqlx::query(
             "UPDATE memory_jobs
-             SET status = ?, attempts = attempts, lease_until = ?,
+             SET status = ?, attempts = attempts + ?, lease_until = ?,
                  source_versions = COALESCE(?, source_versions),
                  result_key_ref = COALESCE(?, result_key_ref),
                  result_ciphertext = COALESCE(?, result_ciphertext),
@@ -9369,7 +10442,8 @@ async fn apply_memory_job_mutation(
              WHERE id = ? AND status = ? AND attempts = ? AND lease_until IS ?",
         )
         .bind(job.new_status)
-        .bind(job.lease_until.as_ref())
+        .bind(job.attempts_delta)
+        .bind(job.new_lease_until.as_ref())
         .bind(job.source_versions.as_ref())
         .bind(result_key_ref.as_ref())
         .bind(result_ciphertext.as_ref())
@@ -9672,6 +10746,7 @@ mod tests {
             ApprovalDecision, Command, CommandEnvelope, CommandId, DeferredApprovalRule,
             SensitiveCommandPayload,
         },
+        memory::L0_BATCH_MIN,
         provider::{
             ModelSpec, RequestOptions,
             adapters::responses::build_request as build_responses_request,
@@ -9687,7 +10762,7 @@ mod tests {
         runtime::contracts::{GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease},
         store::{
             AgentScope, ApplyReceiptOutcome, HydrationOutcome, KeyProvider, PhysicalRecoveryIntent,
-            PhysicalRecoveryReceipt, ProviderContextEvictionEstimate, RecoveryStep, SuffixRecovery,
+            PhysicalRecoveryReceipt, RecoveryStep, SuffixRecovery,
             crypto::{
                 DATA_KEY_BYTES, DataKeyMaterial, DataKeyScope, KeyWrapAad, WrappingKey,
                 decrypt_content, encrypt_content, wrap_data_key,
@@ -9710,6 +10785,21 @@ mod tests {
 
     fn test_fence(lease: &ProcessGenerationLease) -> GenerationRecoveryFence {
         GenerationRecoveryFence::new(lease, "test-fence").expect("valid test fence")
+    }
+
+    fn eviction_footprint_for_test(
+        origin: &ProviderOrigin,
+        fragments: &[ProviderContextFragment],
+    ) -> u64 {
+        let spec = ModelSpec::from_origin(origin).expect("test origin must resolve to a ModelSpec");
+        fragments
+            .iter()
+            .map(|fragment| {
+                eviction_footprint_for_payload(&spec, &fragment.payload)
+                    .expect("test payload must be footprintable")
+                    .eviction_tokens()
+            })
+            .sum()
     }
 
     #[test]
@@ -9938,8 +11028,9 @@ mod tests {
                 expected_status: "running",
                 new_status: "failed",
                 attempts: 0,
-                lease_until: None,
+                attempts_delta: 0,
                 expected_lease_until: None,
+                new_lease_until: None,
                 source_versions: None,
                 result: None,
             },
@@ -16139,7 +17230,11 @@ mod tests {
         let fragment = ProviderContextFragment {
             wire_item_index: None,
             payload: ProviderContextPayload::OpenAiCompactedWindow {
-                items: vec![json!({"summary": "opaque"})],
+                items: vec![json!({
+                    "type": "compaction",
+                    "id": "cmp-1",
+                    "encrypted_content": "opaque",
+                })],
                 coverage: NativeCompactionCoverage {
                     through_message_seq: 1,
                     context_fingerprint: "fp".to_owned(),
@@ -19400,32 +20495,550 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn message_end_append_creates_explicit_l0_membership() {
+    async fn message_end_append_creates_l0_membership_excluded_does_not() {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
+
         let command_id = "00000000-0000-4000-8000-000000000100";
         let injected = classified_injection(&writer, 1, command_id, "ignored", "append me").await;
-
         writer
             .apply(EventBatch {
                 writes: injection_writes(command_id, "ignored", "append me"),
                 injected_commands: vec![injected],
             })
             .await
-            .expect("apply appended user MessageEnd");
+            .expect("apply user message end with append_to_l0=true");
 
         let membership: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_batch_messages")
             .fetch_one(store.pool())
             .await
-            .expect("count L0 memberships");
-        let open_batches: i64 = sqlx::query_scalar(
+            .expect("count membership");
+        assert_eq!(
+            membership, 1,
+            "append_to_l0=true must insert explicit L0 batch membership"
+        );
+
+        let l0_batches: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM memory_batches WHERE layer = 0 AND state = 'open'",
         )
         .fetch_one(store.pool())
         .await
         .expect("count open L0 batches");
-        assert_eq!(membership, 1);
-        assert_eq!(open_batches, 1);
+        assert_eq!(
+            l0_batches, 1,
+            "append_to_l0=true must create an open L0 batch"
+        );
+
+        // Retry-error assistant messages are excluded from L0: they still create
+        // a durable message row, but no memory_batch_messages membership.
+        let exclude_id = "00000000-0000-4000-8000-000000000101";
+        let exclude_run = format!("run-{command_id}");
+        let exclude_turn = format!("turn-{command_id}");
+        let exclude_message = PublicMessage::Assistant(PublicAssistantMessage {
+            content: Vec::new(),
+            model: "test-model".to_owned(),
+            provider: "test-provider".to_owned(),
+            origin: test_provider_origin(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Error,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: durable_test_timestamp(),
+        });
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_start",
+                                exclude_id,
+                                &exclude_message,
+                                Some(exclude_run.clone()),
+                                Some(exclude_turn.clone()),
+                            )
+                            .expect("MessageStart"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: command_id.to_owned(),
+                            run_id: exclude_run.clone(),
+                            expected: RunPhase::UserCommitted,
+                            next: RunPhase::AssistantStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_end",
+                                exclude_id,
+                                &exclude_message,
+                                Some(exclude_run),
+                                Some(exclude_turn),
+                            )
+                            .expect("MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: exclude_id.to_owned(),
+                            role: "assistant",
+                            message: exclude_message,
+                            append_to_l0: false,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("apply assistant retry-error message end");
+
+        let membership: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_batch_messages")
+            .fetch_one(store.pool())
+            .await
+            .expect("count membership after exclude");
+        assert_eq!(
+            membership, 1,
+            "append_to_l0=false must not add L0 batch membership"
+        );
+
+        let messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+            .fetch_one(store.pool())
+            .await
+            .expect("count messages");
+        assert_eq!(
+            messages, 2,
+            "both message ends must be persisted as messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn l0_seal_at_boundary_reserves_compaction_job() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+
+        // First user message creates an open L0 batch.
+        let command_id_1 = "00000000-0000-4000-8000-000000000001";
+        let injection_1 = classified_injection(&writer, 1, command_id_1, "msg-1", "first").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id_1, "msg-1", "first"),
+                injected_commands: vec![injection_1],
+            })
+            .await
+            .expect("apply first user message");
+
+        // Bump the open batch's estimate so the next user message crosses the
+        // ordinary L0 batch boundary (L0_BATCH_MIN).
+        let (first_batch_id,): (String,) =
+            sqlx::query_as("SELECT id FROM memory_batches WHERE layer = ? AND state = 'open'")
+                .bind(crate::store::MemoryLayer::L0.as_i64())
+                .fetch_one(store.pool())
+                .await
+                .expect("load open L0 batch");
+        let bumped_est = i64::try_from(L0_BATCH_MIN + 1).expect("test est_tokens fits i64");
+        sqlx::query("UPDATE memory_batches SET est_tokens = ? WHERE id = ?")
+            .bind(bumped_est)
+            .bind(&first_batch_id)
+            .execute(store.pool())
+            .await
+            .expect("set open batch est_tokens");
+
+        // Second user message should seal the first batch, reserve an L1
+        // compaction job, and append to a fresh open L0 batch.
+        let command_id_2 = "00000000-0000-4000-8000-000000000002";
+        let injection_2 = classified_injection(&writer, 2, command_id_2, "msg-2", "second").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id_2, "msg-2", "second"),
+                injected_commands: vec![injection_2],
+            })
+            .await
+            .expect("apply second user message");
+
+        let first_state: String =
+            sqlx::query_scalar("SELECT state FROM memory_batches WHERE id = ?")
+                .bind(&first_batch_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("load first batch state");
+        assert_eq!(first_state, "compacting", "first batch must be sealed");
+
+        let first_version: i64 =
+            sqlx::query_scalar("SELECT version FROM memory_batches WHERE id = ?")
+                .bind(&first_batch_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("load first batch version");
+        assert_eq!(first_version, 1, "seal must bump source version");
+
+        let first_est_after_seal: i64 =
+            sqlx::query_scalar("SELECT est_tokens FROM memory_batches WHERE id = ?")
+                .bind(&first_batch_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("load first batch est_tokens after seal");
+        assert_eq!(
+            first_est_after_seal, bumped_est,
+            "seal must not overwrite the current est_tokens with a stale prepare-time value"
+        );
+
+        let open_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memory_batches WHERE layer = ? AND state = 'open'",
+        )
+        .bind(crate::store::MemoryLayer::L0.as_i64())
+        .fetch_one(store.pool())
+        .await
+        .expect("count open L0 batches");
+        assert_eq!(
+            open_count, 1,
+            "exactly one open L0 batch must remain for the new message"
+        );
+
+        let job_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memory_jobs WHERE kind = 'compact_l0' AND status = 'pending'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("count pending compaction jobs");
+        assert_eq!(job_count, 1, "seal must insert a pending L0 compaction job");
+    }
+
+    #[tokio::test]
+    async fn multi_message_end_in_batch_forces_seal_split() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+
+        // Open an L0 batch with a user message; later append an assistant and
+        // then a soft-steer group of two user messages that forces a seal/split.
+        let command_id = "00000000-0000-4000-8000-000000000001";
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let injection = classified_injection(&writer, 1, command_id, "msg-1", "first").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "msg-1", "first"),
+                injected_commands: vec![injection],
+            })
+            .await
+            .expect("apply first user message");
+
+        // Append an assistant message to the same turn so the owner reaches
+        // AssistantStarted; the soft-steer group will hand off from it.
+        let assistant_msg = assistant_message(StopReason::Stop);
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_start",
+                                "assistant-1",
+                                &assistant_msg,
+                                Some(run_id.clone()),
+                                Some(turn_id.clone()),
+                            )
+                            .expect("assistant MessageStart"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: command_id.to_owned(),
+                            run_id: run_id.clone(),
+                            expected: RunPhase::UserCommitted,
+                            next: RunPhase::AssistantStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_end",
+                                "assistant-1",
+                                &assistant_msg,
+                                Some(run_id.clone()),
+                                Some(turn_id.clone()),
+                            )
+                            .expect("assistant MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: "assistant-1".to_owned(),
+                            role: "assistant",
+                            message: assistant_msg.clone(),
+                            append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("append assistant message");
+
+        // Load the open batch and bump its estimate just below the ordinary
+        // L0 batch boundary so the first steer message does not seal, but the
+        // second one does after the first appends its tokens.
+        let (first_batch_id,): (String,) =
+            sqlx::query_as("SELECT id FROM memory_batches WHERE layer = ? AND state = 'open'")
+                .bind(crate::store::MemoryLayer::L0.as_i64())
+                .fetch_one(store.pool())
+                .await
+                .expect("load open L0 batch");
+        let pre_seal_est = i64::try_from(L0_BATCH_MIN - 1).expect("test est_tokens fits i64");
+        sqlx::query("UPDATE memory_batches SET est_tokens = ? WHERE id = ?")
+            .bind(pre_seal_est)
+            .bind(&first_batch_id)
+            .execute(store.pool())
+            .await
+            .expect("set open batch est_tokens");
+
+        // Inject two user messages as a soft-steer group. The first appends to
+        // the existing open batch; the second forces a normal seal/split.
+        let new_turn_id = "turn-00000000-0000-4000-8000-000000000002";
+        let steer_1_id = "00000000-0000-4000-8000-000000000002";
+        let steer_2_id = "00000000-0000-4000-8000-000000000003";
+        for (seq, steer_id, text) in [(2, steer_1_id, "a"), (3, steer_2_id, "b")] {
+            writer
+                .persist_inbound(&user_command(seq, steer_id, text))
+                .await
+                .expect("persist steer command");
+            sqlx::query("UPDATE inbound_commands SET received_at=? WHERE command_id=?")
+                .bind(durable_test_timestamp().to_rfc3339())
+                .bind(steer_id)
+                .execute(store.pool())
+                .await
+                .expect("pin steer receipt timestamp");
+            writer
+                .apply(EventBatch {
+                    writes: vec![EventWrite {
+                        event: None,
+                        projections: vec![Projection::CommandClassified {
+                            command_id: steer_id.to_owned(),
+                            application_kind: ApplicationKind::SoftSteer,
+                            run_id: run_id.clone(),
+                            turn_id: new_turn_id.to_owned(),
+                        }],
+                    }],
+                    injected_commands: Vec::new(),
+                })
+                .await
+                .expect("classify steer command");
+        }
+
+        let steer_1 = AdmittedCommand::new(
+            CommandEnvelope {
+                seq: 2,
+                command_id: CommandId::parse(steer_1_id).expect("canonical test UUID"),
+                command: Command::UserMessage {
+                    text: "a".to_owned(),
+                    attachments: Vec::new(),
+                },
+            },
+            durable_test_timestamp(),
+        );
+        let steer_2 = AdmittedCommand::new(
+            CommandEnvelope {
+                seq: 3,
+                command_id: CommandId::parse(steer_2_id).expect("canonical test UUID"),
+                command: Command::UserMessage {
+                    text: "b".to_owned(),
+                    attachments: Vec::new(),
+                },
+            },
+            durable_test_timestamp(),
+        );
+
+        let previous_owner = DurableRunBinding {
+            command_id: command_id.to_owned(),
+            command_seq: 1,
+            run_id: run_id.clone(),
+            turn_id: turn_id.clone(),
+            executor_generation: ProcessGeneration::MIN,
+        };
+
+        let mut group = SteerGroup::new(ApplicationKind::SoftSteer, run_id.clone(), new_turn_id)
+            .expect("create steer group");
+        group
+            .push(steer_1, store.redactor())
+            .expect("push first steer command");
+        group
+            .push(steer_2, store.redactor())
+            .expect("push second steer command");
+        let snapshot = group.snapshot(previous_owner, Some(assistant_msg));
+        let batch = steer_group_injection_batch(snapshot).expect("build steer group batch");
+
+        writer
+            .apply(batch)
+            .await
+            .expect("apply two user messages in one batch");
+
+        let first_state: String =
+            sqlx::query_scalar("SELECT state FROM memory_batches WHERE id = ?")
+                .bind(&first_batch_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("load first batch state");
+        assert_eq!(first_state, "compacting", "first batch must be sealed");
+
+        let membership: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT mbm.batch_id, mb.batch_seq, mbm.ord
+             FROM memory_batch_messages mbm
+             JOIN memory_batches mb ON mb.id = mbm.batch_id
+             ORDER BY mb.batch_seq, mbm.ord",
+        )
+        .fetch_all(store.pool())
+        .await
+        .expect("load membership");
+        assert_eq!(
+            membership.len(),
+            4,
+            "owner, assistant, and both steer messages must have L0 membership"
+        );
+        assert_eq!(
+            membership[0].0, first_batch_id,
+            "owner stays in the first batch"
+        );
+        assert_eq!(membership[0].2, 1, "owner is ord 1");
+
+        assert_eq!(
+            membership[1].0, first_batch_id,
+            "assistant stays in the first batch"
+        );
+        assert_eq!(membership[1].2, 2, "assistant is ord 2");
+
+        assert_eq!(
+            membership[2].0, first_batch_id,
+            "first steer message appends to the first batch"
+        );
+        assert_eq!(membership[2].2, 3, "first steer message is ord 3");
+
+        let second_batch_id = &membership[3].0;
+        assert_ne!(
+            second_batch_id, &first_batch_id,
+            "second steer message must be in a fresh batch"
+        );
+        assert!(
+            membership[3].1 > membership[0].1,
+            "second batch has the later batch_seq"
+        );
+        assert_eq!(
+            membership[3].2, 1,
+            "second steer message is ord 1 in new batch"
+        );
+    }
+    #[tokio::test]
+    async fn l0_boundary_decision_uses_payload_not_decrypt() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+
+        // Open an L0 batch with a user message.
+        let command_id_1 = "00000000-0000-4000-8000-000000000001";
+        let injection_1 = classified_injection(&writer, 1, command_id_1, "msg-1", "first").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id_1, "msg-1", "first"),
+                injected_commands: vec![injection_1],
+            })
+            .await
+            .expect("apply first user message");
+
+        // Bump the open batch so the next user message triggers a boundary
+        // decision that must load the existing message.
+        let (first_batch_id,): (String,) =
+            sqlx::query_as("SELECT id FROM memory_batches WHERE layer = ? AND state = 'open'")
+                .bind(crate::store::MemoryLayer::L0.as_i64())
+                .fetch_one(store.pool())
+                .await
+                .expect("load open L0 batch");
+        let bumped_est = i64::try_from(L0_BATCH_MIN + 1).expect("test est_tokens fits i64");
+        sqlx::query("UPDATE memory_batches SET est_tokens = ? WHERE id = ?")
+            .bind(bumped_est)
+            .bind(&first_batch_id)
+            .execute(store.pool())
+            .await
+            .expect("set open batch est_tokens");
+
+        // Corrupt the durable ciphertext of the existing user message while
+        // leaving the redacted payload intact. The old boundary decision
+        // decrypted every row and would now fail; the new decision uses payload
+        // and must succeed.
+        let (message_id,): (String,) =
+            sqlx::query_as("SELECT id FROM messages WHERE role = 'user' ORDER BY seq LIMIT 1")
+                .fetch_one(store.pool())
+                .await
+                .expect("load user message");
+        sqlx::query("UPDATE messages SET raw_ciphertext = X'000000' WHERE id = ?")
+            .bind(&message_id)
+            .execute(store.pool())
+            .await
+            .expect("corrupt user message ciphertext");
+
+        // A second user message forces the boundary decision to touch the
+        // corrupted row. If the decision still used AEAD decryption it would
+        // fail; using payload it succeeds and seals the batch.
+        let command_id_2 = "00000000-0000-4000-8000-000000000002";
+        let injection_2 = classified_injection(&writer, 2, command_id_2, "msg-2", "second").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id_2, "msg-2", "second"),
+                injected_commands: vec![injection_2],
+            })
+            .await
+            .expect("boundary decision must use payload, not decrypt corrupted ciphertext");
+
+        let first_state: String =
+            sqlx::query_scalar("SELECT state FROM memory_batches WHERE id = ?")
+                .bind(&first_batch_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("load first batch state");
+        assert_eq!(
+            first_state, "compacting",
+            "boundary decision must complete and seal the batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn l0_seal_version_overflow_is_rejected() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+
+        let command_id_1 = "00000000-0000-4000-8000-000000000001";
+        let injection_1 = classified_injection(&writer, 1, command_id_1, "msg-1", "first").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id_1, "msg-1", "first"),
+                injected_commands: vec![injection_1],
+            })
+            .await
+            .expect("apply first user message");
+
+        let (first_batch_id,): (String,) =
+            sqlx::query_as("SELECT id FROM memory_batches WHERE layer = ? AND state = 'open'")
+                .bind(crate::store::MemoryLayer::L0.as_i64())
+                .fetch_one(store.pool())
+                .await
+                .expect("load open L0 batch");
+        let bumped_est = i64::try_from(L0_BATCH_MIN + 1).expect("test est_tokens fits i64");
+        sqlx::query("UPDATE memory_batches SET version = ?, est_tokens = ? WHERE id = ?")
+            .bind(i64::MAX)
+            .bind(bumped_est)
+            .bind(&first_batch_id)
+            .execute(store.pool())
+            .await
+            .expect("set open batch to max version");
+
+        let command_id_2 = "00000000-0000-4000-8000-000000000002";
+        let injection_2 = classified_injection(&writer, 2, command_id_2, "msg-2", "second").await;
+        let error = writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id_2, "msg-2", "second"),
+                injected_commands: vec![injection_2],
+            })
+            .await
+            .expect_err("seal must reject version overflow");
+        assert!(
+            format!("{error:#}").contains("version overflow"),
+            "expected version overflow error, got {error:#}"
+        );
     }
 
     #[tokio::test]
@@ -20579,7 +22192,11 @@ mod tests {
         let window = ProviderContextFragment {
             wire_item_index: None,
             payload: ProviderContextPayload::OpenAiCompactedWindow {
-                items: vec![json!({"summary": "compact"})],
+                items: vec![json!({
+                    "type": "compaction",
+                    "id": "cmp-1",
+                    "encrypted_content": "compact",
+                })],
                 coverage: NativeCompactionCoverage {
                     through_message_seq: coverage_seq,
                     context_fingerprint: "fp-1".to_owned(),
@@ -20795,7 +22412,14 @@ mod tests {
                     );
                 }
                 ProviderContextPayload::OpenAiCompactedWindow { items, .. } => {
-                    assert_eq!(items, &vec![json!({"summary": "compact"})]);
+                    assert_eq!(
+                        items,
+                        &vec![json!({
+                            "type": "compaction",
+                            "id": "cmp-1",
+                            "encrypted_content": "compact",
+                        })]
+                    );
                 }
                 _ => panic!("unexpected provider-context payload"),
             }
@@ -20935,7 +22559,9 @@ mod tests {
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::OpenAiResponses,
                 item: json!({
-                    "text": reasoning_marker,
+                    "id": "rs-leak",
+                    "type": "reasoning",
+                    "summary": [],
                     "encrypted_content": reasoning_marker,
                 }),
             },
@@ -20944,7 +22570,8 @@ mod tests {
             wire_item_index: None,
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({
-                    "summary": compact_marker,
+                    "type": "compaction",
+                    "id": "cmp-leak",
                     "encrypted_content": compact_marker,
                 })],
                 coverage: NativeCompactionCoverage {
@@ -21343,9 +22970,11 @@ mod tests {
                         summary: None,
                         est_tokens: 0,
                         footprint_delta: 0,
+                        delete_membership: false,
                     }],
                     job_mutations: Vec::new(),
                     cursor_advance: None,
+                    ..Default::default()
                 })],
             }],
             injected_commands: Vec::new(),
@@ -21396,7 +23025,6 @@ mod tests {
                 item: json!({"text": "opaque reasoning"}),
             },
         };
-        let footprint = ProviderContextEvictionEstimate::from_payload(&fragment.payload).tokens;
 
         writer
             .apply(EventBatch {
@@ -21442,7 +23070,7 @@ mod tests {
                         message: error_message,
                         append_to_l0: false,
                         provider_context: vec![fragment],
-                        eviction_footprint_tokens: footprint,
+                        eviction_footprint_tokens: 0,
                     }],
                 }],
                 injected_commands: Vec::new(),
@@ -21468,16 +23096,28 @@ mod tests {
 
         let run_id = format!("run-{command_id}");
         let turn_id = format!("turn-{command_id}");
-        let message = assistant_message(StopReason::Stop);
+        let mut message = assistant_message(StopReason::Stop);
         let message_id = "assistant-stop-with-context";
         let fragment = ProviderContextFragment {
             wire_item_index: Some(0),
             payload: ProviderContextPayload::EncryptedReasoning {
-                protocol: ApiProtocol::OpenAiChatCompletions,
-                item: json!({"text": "opaque reasoning"}),
+                protocol: ApiProtocol::OpenAiResponses,
+                item: json!({
+                    "type": "reasoning",
+                    "id": "rs-1",
+                    "encrypted_content": "opaque",
+                    "summary": [],
+                }),
             },
         };
-        let footprint = ProviderContextEvictionEstimate::from_payload(&fragment.payload).tokens;
+        let origin = match &mut message {
+            PublicMessage::Assistant(assistant) => {
+                assistant.origin.protocol = ApiProtocol::OpenAiResponses;
+                &assistant.origin
+            }
+            _ => unreachable!("fixture must be an assistant message"),
+        };
+        let footprint = eviction_footprint_for_test(origin, std::slice::from_ref(&fragment));
 
         writer
             .apply(EventBatch {
@@ -21574,10 +23214,19 @@ mod tests {
             wire_item_index: Some(99),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::OpenAiResponses,
-                item: json!({"encrypted_content": "opaque"}),
+                item: json!({
+                    "type": "reasoning",
+                    "id": "rs-1",
+                    "encrypted_content": "opaque",
+                    "summary": [],
+                }),
             },
         };
-        let footprint = ProviderContextEvictionEstimate::from_payload(&fragment.payload).tokens;
+        let origin = match &message {
+            PublicMessage::Assistant(assistant) => &assistant.origin,
+            _ => unreachable!("fixture must be an assistant message"),
+        };
+        let footprint = eviction_footprint_for_test(origin, std::slice::from_ref(&fragment));
 
         writer
             .apply(EventBatch {
@@ -21961,10 +23610,17 @@ mod tests {
             wire_item_index: Some(7),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::AnthropicMessages,
-                item: json!({"signature": "opaque-signature"}),
+                item: json!({
+                    "type": "thinking_signature",
+                    "signature": "opaque-signature",
+                }),
             },
         };
-        let footprint = ProviderContextEvictionEstimate::from_payload(&fragment.payload).tokens;
+        let origin = match &message {
+            PublicMessage::Assistant(assistant) => &assistant.origin,
+            _ => unreachable!("fixture must be an assistant message"),
+        };
+        let footprint = eviction_footprint_for_test(origin, std::slice::from_ref(&fragment));
 
         writer
             .apply(EventBatch {
@@ -22298,21 +23954,28 @@ mod tests {
                 wire_item_index: Some(2),
                 payload: ProviderContextPayload::EncryptedReasoning {
                     protocol: ApiProtocol::OpenAiResponses,
-                    item: json!({"encrypted_content": "opaque-later"}),
+                    item: json!({
+                        "type": "reasoning",
+                        "id": "rs-later",
+                        "encrypted_content": "opaque-later",
+                        "summary": [],
+                    }),
                 },
             },
             ProviderContextFragment {
                 wire_item_index: Some(1),
                 payload: ProviderContextPayload::EncryptedReasoning {
                     protocol: ApiProtocol::OpenAiResponses,
-                    item: json!({"encrypted_content": "opaque-earlier"}),
+                    item: json!({
+                        "type": "reasoning",
+                        "id": "rs-earlier",
+                        "encrypted_content": "opaque-earlier",
+                        "summary": [],
+                    }),
                 },
             },
         ];
-        let footprint = fragments
-            .iter()
-            .map(|fragment| ProviderContextEvictionEstimate::from_payload(&fragment.payload).tokens)
-            .sum();
+        let footprint = eviction_footprint_for_test(&assistant.origin, &fragments);
 
         writer
             .apply(EventBatch {
@@ -22884,9 +24547,11 @@ mod tests {
             provider_context_key_ref: None,
             provider_context_key_proof: None,
             eviction_footprint_tokens: 1,
+            public_est: 0,
             create_l0_batch: None,
             l0_batch_id: Some("batch-1".to_owned()),
             l0_batch_message_ord: Some(1),
+            seal_transition: None,
         };
 
         let error = apply_projection(&store, &mut transaction, projection, &[], None)
@@ -22924,7 +24589,8 @@ mod tests {
                 expected_status: "running",
                 new_status: "failed",
                 attempts: 1,
-                lease_until: None,
+                attempts_delta: 0,
+                new_lease_until: None,
                 expected_lease_until: Some(lease.clone()),
                 source_versions: None,
                 result: None,
@@ -22955,7 +24621,8 @@ mod tests {
                 expected_status: "failed",
                 new_status: "applied",
                 attempts: 1,
-                lease_until: None,
+                attempts_delta: 0,
+                new_lease_until: None,
                 expected_lease_until: Some(lease),
                 source_versions: None,
                 result: None,
@@ -22997,7 +24664,9 @@ mod tests {
                 summary: None,
                 est_tokens: 0,
                 footprint_delta: 1,
+                delete_membership: false,
             },
+            &store,
         )
         .await
         .expect_err("overflow must fail closed");
@@ -23026,7 +24695,9 @@ mod tests {
                 summary: None,
                 est_tokens: 0,
                 footprint_delta: -1,
+                delete_membership: false,
             },
+            &store,
         )
         .await
         .expect("decrement to zero must succeed");
@@ -23048,7 +24719,9 @@ mod tests {
                 summary: None,
                 est_tokens: 0,
                 footprint_delta: -1,
+                delete_membership: false,
             },
+            &store,
         )
         .await
         .expect_err("underflow must fail closed");
@@ -23095,6 +24768,8 @@ mod tests {
             provider_context_key_ref: None,
             provider_context_key_proof: None,
             eviction_footprint_tokens: 42,
+            public_est: 0,
+            seal_transition: None,
         };
         apply_projection(&store, &mut transaction, projection, &[], None)
             .await

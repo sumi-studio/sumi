@@ -32,6 +32,11 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use crate::memory::estimate::{
+    EVICTION_ESTIMATOR_VERSION_REPLAY_PROBE_V1, EVICTION_ESTIMATOR_VERSION_SERIALIZED_BYTES,
+    eviction_footprint_for_payload, legacy_serialized_bytes_eviction_footprint,
+};
+use crate::provider::model::ModelSpec;
 use crate::provider::types::{
     ApiProtocol, ContextMessage, Message, ProviderContextItem, ProviderContextPayload,
     PublicMessage, validate_native_suffix_for_hydration,
@@ -55,15 +60,20 @@ pub(crate) use self::physical_recovery::{
     ApplyReceiptOutcome, HydrationReceiptIdentity, PhysicalRecoveryApplier, PhysicalRecoveryIntent,
     PhysicalRecoveryIntentRequest, PhysicalRecoveryReceipt,
 };
+#[cfg(test)]
+pub(crate) use self::provider_context::EncryptedProviderContextRecord;
+pub(crate) use self::provider_context::{ProviderContextKind, provider_context_idempotency_key};
+#[cfg(test)]
 pub(crate) use self::provider_context::{
-    ProviderContextEvictionEstimate, ProviderContextKind, provider_context_idempotency_key,
+    ProviderContextMutationApplier, ProviderContextMutationBuilder,
 };
 pub(crate) use self::transcript::{message_interrupted, public_message_role};
 #[cfg(test)]
 pub(crate) use crypto::{DATA_KEY_BYTES, WrappingKey};
+#[allow(unused_imports)]
 pub(crate) use crypto::{
     DataKeyMaterial, DataKeyPurpose, EnvironmentKeyProvider, KeyProvider, RowAad,
-    command_payload_digest, decrypt_content, verify_command_payload_digest,
+    command_payload_digest, decrypt_content, encrypt_content, verify_command_payload_digest,
 };
 #[allow(
     unused_imports,
@@ -72,8 +82,9 @@ pub(crate) use crypto::{
 pub(crate) use event_writer::{
     ApplicationKind, ApprovalMutation, ApprovalRuleMutation, DurableEvent, EventBatch, EventWrite,
     EventWriter, InboundAdmission, InboundReceipt, InboundReceiptOrigin, InjectedCommand,
-    Projection, RecoveryRequired, RunPhase, ToolExecutionMutation, USER_MESSAGE_ID_NAMESPACE,
-    user_message_id,
+    MemoryApplyCursorAdvance, MemoryBatchMutation, MemoryJobMutation, MemoryJobUpdate,
+    MemoryTransition, Projection, RecoveryRequired, RunPhase, ToolExecutionMutation,
+    USER_MESSAGE_ID_NAMESPACE, user_message_id,
 };
 #[allow(
     unused_imports,
@@ -100,6 +111,8 @@ pub(crate) use sizer::{
     BatchBounds, CommandSizeInput, DURABLE_ROW_OVERHEAD_BYTES, EventBatchSizer,
     InjectionApplication, InjectionBatchSizeInput, InjectionCommandSizeInput,
 };
+#[cfg(test)]
+pub(crate) use transcript::TranscriptRecord;
 
 /// Number of rows fetched per page during cold-boot hydration.  Pages are
 /// processed and dropped before the next page is requested, so decrypted
@@ -844,17 +857,35 @@ impl Store {
                         "provider-context record {id} eviction_estimator_version out of u32 range"
                     )
                 })?;
-                if stored_eviction_version != ProviderContextEvictionEstimate::V1 {
-                    bail!(
-                        "provider-context record {id} uses unsupported eviction estimator version {stored_eviction_version}"
-                    );
-                }
+                let expected_eviction = match stored_eviction_version {
+                    EVICTION_ESTIMATOR_VERSION_SERIALIZED_BYTES => {
+                        legacy_serialized_bytes_eviction_footprint(&item.payload).with_context(
+                            || {
+                                format!(
+                                    "provider-context record {id} failed legacy footprint computation"
+                                )
+                            },
+                        )?
+                    }
+                    EVICTION_ESTIMATOR_VERSION_REPLAY_PROBE_V1 => {
+                        let spec = ModelSpec::from_origin(&item.provider_origin).ok_or_else(|| {
+                            anyhow!(
+                                "provider-context record {id} has no known model spec for its origin"
+                            )
+                        })?;
+                        eviction_footprint_for_payload(&spec, &item.payload)?
+                    }
+                    _ => {
+                        bail!(
+                            "provider-context record {id} uses unsupported eviction estimator version {stored_eviction_version}"
+                        );
+                    }
+                };
                 let stored_eviction_tokens_u64 = u64::try_from(stored_eviction_tokens)
                     .with_context(|| {
                         format!("provider-context record {id} eviction_tokens out of u64 range")
                     })?;
-                let expected_eviction = ProviderContextEvictionEstimate::v1(&item);
-                if stored_eviction_tokens_u64 != expected_eviction.tokens {
+                if stored_eviction_tokens_u64 != expected_eviction.eviction_tokens() {
                     bail!(
                         "provider-context record {id} eviction_tokens do not match the decrypted payload"
                     );
@@ -982,7 +1013,7 @@ impl Store {
         offset = 0;
         loop {
             let job_rows = sqlx::query(
-                "SELECT id, kind, batch_seq, source_ids, source_versions, status, attempts,
+                "SELECT id, kind, batch_seq, source_ids, source_versions, status, lease_until, attempts,
                     result_key_ref, result_ciphertext, result_projection, result_redaction_version,
                     created_at, updated_at
              FROM memory_jobs ORDER BY id LIMIT ? OFFSET ?",
@@ -1050,6 +1081,7 @@ impl Store {
                     source_ids,
                     source_versions,
                     status,
+                    lease_until: row.try_get("lease_until")?,
                     attempts: row.try_get("attempts")?,
                     result,
                     created_at: row.try_get("created_at")?,

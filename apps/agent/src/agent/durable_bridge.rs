@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -8,15 +8,18 @@ use uuid::Uuid;
 use crate::{
     approval::{ExecutableGrant, GrantLease, GrantRevalidation},
     gateway::{ApprovalDecision, Command, CommandAck},
-    provider::types::{
-        ProviderContextFragment, PublicAssistantContent, PublicMessage, StopReason,
-        ToolResultMessage,
+    memory::estimate::eviction_footprint_for_payload,
+    provider::{
+        model::ModelSpec,
+        types::{
+            ProviderContextFragment, PublicAssistantContent, PublicMessage, StopReason,
+            ToolResultMessage,
+        },
     },
     runtime::contracts::ProcessGeneration,
     store::{
         ApplicationKind, ApprovalMutation, ApprovalRuleMutation, DurableEvent, EventBatch,
-        EventWrite, EventWriter, InjectedCommand, Projection, ProviderContextEvictionEstimate,
-        RunPhase, ToolExecutionMutation,
+        EventWrite, EventWriter, InjectedCommand, Projection, RunPhase, ToolExecutionMutation,
     },
 };
 
@@ -402,6 +405,26 @@ impl DurableBridge {
 
     pub(super) fn command_id(&self) -> &str {
         &self.binding.command_id
+    }
+
+    fn provider_context_footprint(
+        message: &PublicMessage,
+        provider_context: &[ProviderContextFragment],
+    ) -> Result<u64> {
+        let PublicMessage::Assistant(assistant) = message else {
+            bail!("provider context may only accompany an assistant message");
+        };
+        let spec = ModelSpec::from_origin(&assistant.origin)
+            .ok_or_else(|| anyhow!("no canonical ModelSpec for provider origin"))?;
+        let mut total = 0u64;
+        for fragment in provider_context {
+            let footprint = eviction_footprint_for_payload(&spec, &fragment.payload)
+                .context("failed to compute provider-context eviction footprint")?;
+            total = total
+                .checked_add(footprint.eviction_tokens())
+                .ok_or_else(|| anyhow!("eviction footprint overflow"))?;
+        }
+        Ok(total)
     }
 
     pub(super) fn steer_stage(&self) -> SteerStage {
@@ -1533,13 +1556,10 @@ impl DurableBridge {
                         role: "assistant",
                         message: message.clone(),
                         append_to_l0,
-                        eviction_footprint_tokens: provider_context
-                            .iter()
-                            .map(|fragment| {
-                                ProviderContextEvictionEstimate::from_payload(&fragment.payload)
-                                    .tokens
-                            })
-                            .fold(0u64, |total, tokens| total.saturating_add(tokens)),
+                        eviction_footprint_tokens: Self::provider_context_footprint(
+                            &message,
+                            &provider_context,
+                        )?,
                         provider_context,
                     }],
                 }],
@@ -1891,12 +1911,10 @@ impl DurableBridge {
                 role: "assistant",
                 message: assistant.clone(),
                 append_to_l0,
-                eviction_footprint_tokens: provider_context
-                    .iter()
-                    .map(|fragment| {
-                        ProviderContextEvictionEstimate::from_payload(&fragment.payload).tokens
-                    })
-                    .fold(0u64, |total, tokens| total.saturating_add(tokens)),
+                eviction_footprint_tokens: Self::provider_context_footprint(
+                    &assistant,
+                    &provider_context,
+                )?,
                 provider_context,
             }],
         }];
