@@ -73,6 +73,15 @@ struct PhysicalRecoveryContext<'a> {
     receipt: &'a PhysicalRecoveryReceipt,
 }
 
+/// Outcome of applying an `EventBatch`.  The `receipt_outcome` is only
+/// `Some` when the batch contains a `PhysicalRecovery` projection, whose
+/// `Applied`/`AlreadyApplied` result is determined inside the SQLite
+/// transaction by `PhysicalRecoveryApplier::apply_in_transaction`.
+struct ApplyBatchOutcome {
+    seqs: Vec<u64>,
+    receipt_outcome: Option<ApplyReceiptOutcome>,
+}
+
 #[derive(Clone)]
 pub(crate) struct DurableEvent {
     value: AgentEvent,
@@ -1027,6 +1036,7 @@ struct PreparedMemoryJobMutation {
     new_status: &'static str,
     attempts: i64,
     lease_until: Option<String>,
+    expected_lease_until: Option<String>,
     source_versions: Option<String>,
     result: Option<MemoryJobResult>,
 }
@@ -1622,15 +1632,13 @@ impl EventWriter {
             fence,
             receipt: &receipt,
         };
-        let seqs = self
+        let outcome = self
             .apply_locked_with_failpoint(batch, None, None, None, Some(context), &mut guard)
             .await?;
-        let outcome = if seqs.is_empty() {
-            ApplyReceiptOutcome::AlreadyApplied
-        } else {
-            ApplyReceiptOutcome::Applied
-        };
-        Ok((outcome, seqs))
+        let receipt_outcome = outcome.receipt_outcome.ok_or_else(|| {
+            anyhow!("physical recovery projection did not produce an ApplyReceiptOutcome")
+        })?;
+        Ok((receipt_outcome, outcome.seqs))
     }
 
     #[cfg(test)]
@@ -1649,6 +1657,7 @@ impl EventWriter {
             &mut guard,
         )
         .await
+        .map(|outcome| outcome.seqs)
     }
 
     #[cfg(all(test, unix))]
@@ -1670,6 +1679,7 @@ impl EventWriter {
             &mut guard,
         )
         .await
+        .map(|outcome| outcome.seqs)
     }
 
     #[cfg(test)]
@@ -1681,6 +1691,7 @@ impl EventWriter {
         let mut guard = self.gate.lock().await;
         self.apply_locked_with_failpoint(batch, None, None, Some(key_ref), None, &mut guard)
             .await
+            .map(|outcome| outcome.seqs)
     }
 
     pub(crate) async fn apply_idle_abort_cutoff(
@@ -2011,6 +2022,7 @@ impl EventWriter {
     ) -> Result<Vec<u64>> {
         self.apply_locked_with_failpoint(batch, None, None, None, physical_recovery, state)
             .await
+            .map(|outcome| outcome.seqs)
     }
 
     async fn apply_locked_with_failpoint(
@@ -2021,7 +2033,7 @@ impl EventWriter {
         destroy_after_prepare: Option<&str>,
         physical_recovery: Option<PhysicalRecoveryContext<'_>>,
         state: &mut WriterState,
-    ) -> Result<Vec<u64>> {
+    ) -> Result<ApplyBatchOutcome> {
         self.ensure_checkpoint(state).await?;
         preflight_materialization_bounds(self.store.redactor(), &batch)?;
         let expected_injections = validate_batch_shape_with_recovery(
@@ -2135,6 +2147,7 @@ impl EventWriter {
 
         let mut applied_writes = 0usize;
         let mut updated_event_head = previous_event_head.clone();
+        let mut receipt_outcome = None;
         for write in prepared {
             if let Some(event) = write.event {
                 let (previous_digest, previous_count, head_key_ref) =
@@ -2208,7 +2221,7 @@ impl EventWriter {
                 });
             }
             for projection in write.projections {
-                apply_projection(
+                let outcome = apply_projection(
                     self.store.as_ref(),
                     &mut transaction,
                     projection,
@@ -2216,6 +2229,12 @@ impl EventWriter {
                     physical_recovery.as_ref(),
                 )
                 .await?;
+                if let Some(outcome) = outcome {
+                    if receipt_outcome.is_some() {
+                        bail!("multiple physical recovery outcomes in one EventBatch");
+                    }
+                    receipt_outcome = Some(outcome);
+                }
             }
             applied_writes = applied_writes.saturating_add(1);
             if fail_after_writes == Some(applied_writes) {
@@ -2260,7 +2279,10 @@ impl EventWriter {
         if let Some((name, true, readiness_path)) = effective_abrupt_failpoint {
             abrupt_transaction_exit(name, "after_commit", readiness_path);
         }
-        Ok(event_seqs)
+        Ok(ApplyBatchOutcome {
+            seqs: event_seqs,
+            receipt_outcome,
+        })
     }
 
     async fn prepare_batch(
@@ -3131,8 +3153,9 @@ impl EventWriter {
             lease_until: if new_status == "running" {
                 lease_until
             } else {
-                lease_until_stored
+                None
             },
+            expected_lease_until: lease_until_stored,
             source_versions: source_versions_json,
             result,
         })
@@ -8496,7 +8519,7 @@ async fn apply_projection(
     projection: PreparedProjection,
     batch_event_seqs: &[u64],
     physical_recovery: Option<&PhysicalRecoveryContext<'_>>,
-) -> Result<()> {
+) -> Result<Option<ApplyReceiptOutcome>> {
     match projection {
         PreparedProjection::MessageEnd {
             event_seq,
@@ -8574,36 +8597,41 @@ async fn apply_projection(
                     .context("failed to apply provider-context record")?;
             }
 
-            if eviction_footprint_tokens > 0
-                && let Some(batch_id) = sqlx::query_scalar::<_, String>(
+            if eviction_footprint_tokens > 0 {
+                let delta = sqlite_i64(eviction_footprint_tokens, "eviction_footprint_tokens")?;
+
+                if let Some(batch_id) = sqlx::query_scalar::<_, String>(
                     "SELECT batch_id FROM memory_batch_messages WHERE message_id = ?",
                 )
                 .bind(&message_id)
                 .fetch_optional(&mut **transaction)
                 .await
                 .context("failed to locate memory batch for eviction footprint")?
-            {
-                let delta = sqlite_i64(eviction_footprint_tokens, "eviction_footprint_tokens")?;
-                let current: i64 = sqlx::query_scalar(
-                    "SELECT eviction_footprint_tokens FROM memory_batches WHERE id = ?",
-                )
-                .bind(&batch_id)
-                .fetch_one(&mut **transaction)
-                .await
-                .context("failed to read memory batch eviction footprint")?;
-                let new = current.checked_add(delta).ok_or_else(|| {
-                    anyhow::anyhow!("memory batch eviction_footprint_tokens overflow")
-                })?;
-                sqlx::query(
-                    "UPDATE memory_batches
-                     SET eviction_footprint_tokens = ?
-                     WHERE id = ?",
-                )
-                .bind(new)
-                .bind(batch_id)
-                .execute(&mut **transaction)
-                .await
-                .context("failed to update memory batch eviction footprint")?;
+                {
+                    let current: i64 = sqlx::query_scalar(
+                        "SELECT eviction_footprint_tokens FROM memory_batches WHERE id = ?",
+                    )
+                    .bind(&batch_id)
+                    .fetch_one(&mut **transaction)
+                    .await
+                    .context("failed to read memory batch eviction footprint")?;
+                    let new = current.checked_add(delta).ok_or_else(|| {
+                        anyhow::anyhow!("memory batch eviction_footprint_tokens overflow")
+                    })?;
+                    if new < 0 {
+                        bail!("memory batch eviction_footprint_tokens underflow");
+                    }
+                    sqlx::query(
+                        "UPDATE memory_batches
+                         SET eviction_footprint_tokens = ?
+                         WHERE id = ?",
+                    )
+                    .bind(new)
+                    .bind(batch_id)
+                    .execute(&mut **transaction)
+                    .await
+                    .context("failed to update memory batch eviction footprint")?;
+                }
             }
         }
         PreparedProjection::CommandInsert {
@@ -8678,17 +8706,17 @@ async fn apply_projection(
             .await?;
         }
         PreparedProjection::Plain(projection) => {
-            apply_plain_projection(
+            return apply_plain_projection(
                 store,
                 transaction,
                 projection,
                 batch_event_seqs,
                 physical_recovery,
             )
-            .await?;
+            .await;
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 async fn apply_plain_projection(
@@ -8697,7 +8725,7 @@ async fn apply_plain_projection(
     projection: Projection,
     batch_event_seqs: &[u64],
     physical_recovery: Option<&PhysicalRecoveryContext<'_>>,
-) -> Result<()> {
+) -> Result<Option<ApplyReceiptOutcome>> {
     match projection {
         Projection::MessageEnd { .. } => unreachable!("MessageEnd is prepared separately"),
         Projection::CommandReceived { .. } | Projection::CommandRejected { .. } => {
@@ -8874,7 +8902,7 @@ async fn apply_plain_projection(
                 bail!("PhysicalRecovery projection disagrees with the bound recovery receipt");
             }
             receipt.validate_for(ctx.lease, ctx.fence)?;
-            PhysicalRecoveryApplier::new(store)
+            let outcome = PhysicalRecoveryApplier::new(store)
                 .apply_in_transaction(
                     transaction,
                     &receipt,
@@ -8883,6 +8911,7 @@ async fn apply_plain_projection(
                     ctx.fence,
                 )
                 .await?;
+            return Ok(Some(outcome));
         }
         Projection::ProviderContextMutation(_)
         | Projection::MemoryJobUpdate(_)
@@ -8892,7 +8921,7 @@ async fn apply_plain_projection(
         #[cfg(test)]
         Projection::SizePadding(_) => {}
     }
-    Ok(())
+    Ok(None)
 }
 
 async fn verify_source_versions(
@@ -8992,10 +9021,29 @@ async fn apply_memory_batch_mutation(
         None => (None, None, None, None),
     };
 
+    let row = sqlx::query(
+        "SELECT eviction_footprint_tokens
+         FROM memory_batches
+         WHERE id = ? AND version = ? AND state = ?",
+    )
+    .bind(&batch.batch_id)
+    .bind(batch.expected_version)
+    .bind(batch.old_state.as_str())
+    .fetch_optional(&mut **transaction)
+    .await
+    .context("failed to read memory batch for mutation")?
+    .ok_or_else(|| anyhow!("memory batch CAS failed or batch missing"))?;
+    let current_footprint: i64 = row.try_get("eviction_footprint_tokens")?;
+    let new_footprint = current_footprint
+        .checked_add(batch.footprint_delta)
+        .ok_or_else(|| anyhow!("memory batch eviction_footprint_tokens overflow"))?;
+    if new_footprint < 0 {
+        bail!("memory batch eviction_footprint_tokens underflow");
+    }
+
     let result = sqlx::query(
         "UPDATE memory_batches
-         SET state = ?, version = ?, est_tokens = ?,
-             eviction_footprint_tokens = eviction_footprint_tokens + ?,
+         SET state = ?, version = ?, est_tokens = ?, eviction_footprint_tokens = ?,
              summary_key_ref = COALESCE(?, summary_key_ref),
              summary_ciphertext = COALESCE(?, summary_ciphertext),
              summary_projection = COALESCE(?, summary_projection),
@@ -9006,7 +9054,7 @@ async fn apply_memory_batch_mutation(
     .bind(batch.new_state.as_str())
     .bind(new_version)
     .bind(batch.est_tokens)
-    .bind(batch.footprint_delta)
+    .bind(new_footprint)
     .bind(key_ref.as_ref())
     .bind(ciphertext.as_ref())
     .bind(projection.as_ref())
@@ -9074,7 +9122,7 @@ async fn apply_memory_job_mutation(
         .bind(&job.job_id)
         .bind(job.expected_status)
         .bind(job.attempts)
-        .bind(job.lease_until.as_ref())
+        .bind(job.expected_lease_until.as_ref())
         .execute(&mut **transaction)
         .await?
     };
@@ -9294,7 +9342,10 @@ mod tests {
     use sqlx::Row;
 
     use super::*;
-    use super::{L0Disposition, PreparedProjection, apply_projection};
+    use super::{
+        L0Disposition, PreparedMemoryBatchMutation, PreparedMemoryJobMutation, PreparedProjection,
+        apply_memory_batch_mutation, apply_memory_job_mutation, apply_projection,
+    };
     use crate::{
         agent::{
             AdmittedCommand, DurableRunBinding, ProjectedProviderEvent, ProviderEventProjector,
@@ -9459,6 +9510,7 @@ mod tests {
                 new_status: "failed",
                 attempts: 0,
                 lease_until: None,
+                expected_lease_until: None,
                 source_versions: None,
                 result: None,
             },
@@ -21437,5 +21489,234 @@ mod tests {
             .rollback()
             .await
             .expect("rollback test fixture transaction");
+    }
+
+    #[tokio::test]
+    async fn memory_job_terminal_clears_lease_until() {
+        let store = test_store().await;
+        let lease = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO memory_jobs(
+                id, kind, batch_seq, source_ids, source_versions, status, lease_until,
+                attempts, created_at, updated_at
+             ) VALUES('lease-job', 'compact', 1, '[]', '{}', 'running', ?, 1, ?, ?)",
+        )
+        .bind(&lease)
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(store.pool())
+        .await
+        .expect("insert running job with lease");
+
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
+        apply_memory_job_mutation(
+            &mut transaction,
+            PreparedMemoryJobMutation {
+                job_id: "lease-job".to_owned(),
+                expected_status: "running",
+                new_status: "failed",
+                attempts: 1,
+                lease_until: None,
+                expected_lease_until: Some(lease.clone()),
+                source_versions: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("terminal transition must clear lease");
+        transaction.commit().await.expect("commit");
+
+        let row = sqlx::query("SELECT status, lease_until FROM memory_jobs WHERE id = ?")
+            .bind("lease-job")
+            .fetch_one(store.pool())
+            .await
+            .expect("load job");
+        assert_eq!(row.try_get::<String, _>("status").unwrap(), "failed");
+        assert!(
+            row.try_get::<Option<String>, _>("lease_until")
+                .unwrap()
+                .is_none(),
+            "terminal job must have NULL lease_until"
+        );
+
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
+        let error = apply_memory_job_mutation(
+            &mut transaction,
+            PreparedMemoryJobMutation {
+                job_id: "lease-job".to_owned(),
+                expected_status: "failed",
+                new_status: "applied",
+                attempts: 1,
+                lease_until: None,
+                expected_lease_until: Some(lease),
+                source_versions: None,
+                result: None,
+            },
+        )
+        .await
+        .expect_err("stale lease CAS must fail");
+        assert!(
+            error.to_string().contains("CAS expected one row"),
+            "{error:#}"
+        );
+        transaction.rollback().await.expect("rollback");
+    }
+
+    #[tokio::test]
+    async fn memory_batch_mutation_rejects_footprint_overflow_and_underflow() {
+        let store = test_store().await;
+
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
+        sqlx::query(
+            "INSERT INTO memory_batches(
+                id, layer, ord, batch_seq, version, state, est_tokens,
+                eviction_footprint_tokens, updated_at
+             ) VALUES('overflow-batch', 0, 0, 0, 1, 'open', 0, ?, ?)",
+        )
+        .bind(i64::MAX)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *transaction)
+        .await
+        .expect("seed batch at max footprint");
+
+        let error = apply_memory_batch_mutation(
+            &mut transaction,
+            PreparedMemoryBatchMutation {
+                batch_id: "overflow-batch".to_owned(),
+                expected_version: 1,
+                old_state: MemoryBatchState::Open,
+                new_state: MemoryBatchState::Open,
+                summary: None,
+                est_tokens: 0,
+                footprint_delta: 1,
+            },
+        )
+        .await
+        .expect_err("overflow must fail closed");
+        assert!(error.to_string().contains("overflow"), "{error:#}");
+        transaction.rollback().await.expect("rollback");
+
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
+        sqlx::query(
+            "INSERT INTO memory_batches(
+                id, layer, ord, batch_seq, version, state, est_tokens,
+                eviction_footprint_tokens, updated_at
+             ) VALUES('underflow-batch', 0, 0, 0, 1, 'open', 0, 1, ?)",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *transaction)
+        .await
+        .expect("seed batch with small footprint");
+
+        apply_memory_batch_mutation(
+            &mut transaction,
+            PreparedMemoryBatchMutation {
+                batch_id: "underflow-batch".to_owned(),
+                expected_version: 1,
+                old_state: MemoryBatchState::Open,
+                new_state: MemoryBatchState::Open,
+                summary: None,
+                est_tokens: 0,
+                footprint_delta: -1,
+            },
+        )
+        .await
+        .expect("decrement to zero must succeed");
+        let footprint: i64 =
+            sqlx::query_scalar("SELECT eviction_footprint_tokens FROM memory_batches WHERE id = ?")
+                .bind("underflow-batch")
+                .fetch_one(&mut *transaction)
+                .await
+                .expect("read footprint");
+        assert_eq!(footprint, 0);
+
+        let error = apply_memory_batch_mutation(
+            &mut transaction,
+            PreparedMemoryBatchMutation {
+                batch_id: "underflow-batch".to_owned(),
+                expected_version: 1,
+                old_state: MemoryBatchState::Open,
+                new_state: MemoryBatchState::Open,
+                summary: None,
+                est_tokens: 0,
+                footprint_delta: -1,
+            },
+        )
+        .await
+        .expect_err("underflow must fail closed");
+        assert!(error.to_string().contains("underflow"), "{error:#}");
+        transaction.rollback().await.expect("rollback");
+    }
+
+    #[tokio::test]
+    async fn message_end_creates_l0_membership_and_attributes_footprint() {
+        let store = test_store().await;
+        let key = store
+            .conversation_key(DataKeyPurpose::Transcript)
+            .await
+            .expect("mint transcript key");
+
+        sqlx::query(
+            "INSERT INTO memory_batches(
+                id, layer, ord, batch_seq, version, state, est_tokens,
+                eviction_footprint_tokens, updated_at
+             ) VALUES('l0-batch', 0, 0, 0, 1, 'open', 0, 0, ?)",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .execute(store.pool())
+        .await
+        .expect("seed open L0 batch");
+
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
+        let projection = PreparedProjection::MessageEnd {
+            event_seq: 1,
+            message_id: "msg-l0".to_owned(),
+            role: "assistant",
+            raw_key_ref: key.key_ref.clone(),
+            raw_key_proof: vec![],
+            raw_ciphertext: vec![0],
+            payload: "{}".to_owned(),
+            search_text: "".to_owned(),
+            redaction_version: 1,
+            interrupted: false,
+            l0_disposition: L0Disposition::Append,
+            create_l0_batch: None,
+            l0_batch_id: Some("l0-batch".to_owned()),
+            l0_batch_message_ord: Some(0),
+            provider_context: vec![],
+            provider_context_key_ref: None,
+            provider_context_key_proof: None,
+            eviction_footprint_tokens: 42,
+        };
+        apply_projection(&store, &mut transaction, projection, &[], None)
+            .await
+            .expect("attribute footprint to open L0 batch");
+        transaction.commit().await.expect("commit");
+
+        let membership =
+            sqlx::query("SELECT batch_id FROM memory_batch_messages WHERE message_id = ?")
+                .bind("msg-l0")
+                .fetch_optional(store.pool())
+                .await
+                .expect("load membership");
+        assert!(
+            membership.is_some(),
+            "message must be linked to an L0 batch"
+        );
+        assert_eq!(
+            membership
+                .unwrap()
+                .try_get::<String, _>("batch_id")
+                .unwrap(),
+            "l0-batch"
+        );
+
+        let footprint: i64 =
+            sqlx::query_scalar("SELECT eviction_footprint_tokens FROM memory_batches WHERE id = ?")
+                .bind("l0-batch")
+                .fetch_one(store.pool())
+                .await
+                .expect("read batch footprint");
+        assert_eq!(footprint, 42);
     }
 }
