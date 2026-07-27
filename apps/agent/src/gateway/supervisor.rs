@@ -833,6 +833,18 @@ where
                 *self.current_writer.lock().unwrap() = None;
                 self.current_epoch.send_replace(None);
                 let _ = self.online.send(false);
+
+                // `install_delivery_epoch` may have installed the opaque epoch
+                // before discovering a later setup error. Always run the
+                // matching cleanup once so a failed attempt cannot wedge the
+                // next reconnect behind a stale T17 mapping. Preserve the
+                // install failure and surface cleanup failure as fatal.
+                if let Err(cleanup_error) = source.invalidate_delivery_epoch(delivery_epoch).await {
+                    return Err(SupervisorError::Fatal(anyhow!(
+                        "{reason}; failed to invalidate T17 delivery epoch {} after install failure: {cleanup_error:#}",
+                        delivery_epoch.as_u64()
+                    )));
+                }
                 return Err(SupervisorError::EstablishedReconnect {
                     reason,
                     healthy: false,
@@ -2802,6 +2814,125 @@ mod tests {
         assert_eq!(invalidations.load(Ordering::SeqCst), 1);
         assert_eq!(connect_attempts.load(Ordering::SeqCst), 1);
         assert_eq!(sent_hellos.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn install_failure_invalidates_partial_epoch_before_reconnect() {
+        #[derive(Clone)]
+        struct PartialInstallSource {
+            installs: Arc<AtomicU64>,
+            invalidations: Arc<AtomicU64>,
+            active: Arc<AtomicBool>,
+            first_invalidated: Arc<Notify>,
+            release_first_invalidation: Arc<Notify>,
+        }
+
+        #[async_trait]
+        impl DurableSource for PartialInstallSource {
+            async fn event_cursor(&self) -> Result<EventCursors> {
+                Ok(EventCursors::default())
+            }
+
+            async fn events_after(
+                &self,
+                _after_seq: u64,
+                _limit: usize,
+            ) -> Result<Vec<OutboundFrame>> {
+                Ok(Vec::new())
+            }
+
+            async fn command_cursors(&self) -> Result<CommandCursors> {
+                Ok(CommandCursors::default())
+            }
+
+            async fn install_delivery_epoch(
+                &self,
+                _epoch: DeliveryEpoch,
+                _catch_up_from_seq: u64,
+                _sink: EventSender,
+                _cancel: CancellationToken,
+            ) -> Result<Option<DeliveryEpochRuntime>> {
+                let attempt = self.installs.fetch_add(1, Ordering::SeqCst);
+                assert!(
+                    !self.active.swap(true, Ordering::SeqCst),
+                    "a stale partial mapping would wedge the next install"
+                );
+                if attempt == 0 {
+                    bail!("synthetic partial install failure")
+                }
+                Ok(None)
+            }
+
+            async fn invalidate_delivery_epoch(&self, _epoch: DeliveryEpoch) -> Result<()> {
+                let invalidation = self.invalidations.fetch_add(1, Ordering::SeqCst) + 1;
+                assert!(
+                    self.active.swap(false, Ordering::SeqCst),
+                    "each installed epoch must be invalidated exactly once"
+                );
+                if invalidation == 1 {
+                    self.first_invalidated.notify_one();
+                    self.release_first_invalidation.notified().await;
+                }
+                Ok(())
+            }
+        }
+
+        let source = PartialInstallSource {
+            installs: Arc::new(AtomicU64::new(0)),
+            invalidations: Arc::new(AtomicU64::new(0)),
+            active: Arc::new(AtomicBool::new(false)),
+            first_invalidated: Arc::new(Notify::new()),
+            release_first_invalidation: Arc::new(Notify::new()),
+        };
+        let installs = source.installs.clone();
+        let invalidations = source.invalidations.clone();
+        let active = source.active.clone();
+        let first_invalidated = source.first_invalidated.clone();
+        let release_first_invalidation = source.release_first_invalidation.clone();
+        let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let supervisor = ConnectionSupervisor::new(
+            MockConnector::new(
+                sent_hellos,
+                VecDeque::from([
+                    Ok(MockGateway::new(VecDeque::new())),
+                    Ok(MockGateway::new(VecDeque::new())),
+                ]),
+            ),
+            CountingCredentialProvider::new("token"),
+            source,
+            StaticHydrationLatch(HydrationReady {
+                generation: ProcessGeneration::from_wire(7).unwrap(),
+                receipt_identity: "receipt-1".to_owned(),
+            }),
+            make_config(),
+        );
+        let handle = supervisor.start();
+        let epochs = handle.epochs.clone();
+
+        tokio::time::timeout(Duration::from_secs(1), first_invalidated.notified())
+            .await
+            .expect("install failure must invoke invalidation before reconnect");
+        assert!(
+            epochs.borrow().is_none(),
+            "failed epoch must clear the supervisor's current mapping before cleanup returns"
+        );
+        release_first_invalidation.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while installs.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("partial install cleanup must permit the next epoch");
+
+        assert_eq!(invalidations.load(Ordering::SeqCst), 1);
+        assert!(active.load(Ordering::SeqCst));
+
+        handle.abort();
+        handle.join().await.unwrap();
+        assert_eq!(invalidations.load(Ordering::SeqCst), 2);
+        assert!(!active.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

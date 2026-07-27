@@ -265,6 +265,9 @@ impl DeliveryPump {
             // A replacement epoch may have been installed while the bounded
             // durable send was waiting. Only the epoch that initiated the send
             // may transition itself to Idle or notify its failure supervisor.
+            // A late failure from an invalidated epoch is stale transport
+            // noise, not an EventWriter failure: drop it after proving that
+            // this epoch no longer owns the slot.
             if matches!(
                 &*state,
                 PumpState::CatchingUp { epoch: current, .. }
@@ -275,8 +278,9 @@ impl DeliveryPump {
                 if let Some(failure_tx) = failure_tx {
                     let _ = failure_tx.send(format!("durable delivery failed: {err:#}"));
                 }
+                return Err(err);
             }
-            return Err(err);
+            return Ok(());
         }
         Ok(())
     }
@@ -859,7 +863,7 @@ mod tests {
         pump.install_epoch(epoch_2);
         drop(receiver);
 
-        assert!(durable.await.unwrap().is_err());
+        assert!(durable.await.unwrap().is_ok());
         assert_eq!(pump.epoch(), Some(epoch_2));
         assert!(
             pump.is_online(),
