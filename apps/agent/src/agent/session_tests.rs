@@ -548,6 +548,41 @@ fn applied_acks(frames: &Arc<Mutex<Vec<OutboundFrame>>>) -> Vec<CommandAck> {
         .collect()
 }
 
+async fn close_mock_gateway_after_idle_boundary(
+    commands: mpsc::Sender<InboundCommand>,
+    frames: &Arc<Mutex<Vec<OutboundFrame>>>,
+    task: &tokio::task::JoinHandle<SessionResult>,
+    sentinel_seq: u64,
+) {
+    let sentinel = abort(sentinel_seq);
+    let sentinel_command_id = match &sentinel {
+        InboundCommand::Valid(envelope) => envelope.command_id.to_string(),
+        InboundCommand::Invalid { .. } => unreachable!("abort helper produces a valid command"),
+    };
+    commands
+        .send(sentinel)
+        .await
+        .expect("idle-boundary sentinel");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if applied_acks(frames)
+                .iter()
+                .any(|ack| ack.command_id == sentinel_command_id)
+            {
+                break;
+            }
+            assert!(
+                !task.is_finished(),
+                "session exited before applying idle-boundary sentinel"
+            );
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("idle-boundary sentinel applied");
+    drop(commands);
+}
+
 async fn session(gateway: MockGateway, worker: Arc<dyn RunWorker>) -> Session<MockGateway> {
     session_with_core(gateway, worker, RunCore::new()).await
 }
@@ -6276,7 +6311,7 @@ async fn retry_wait_group_of_two_is_injected_before_next_attempt() {
         eprintln!("durable kinds on terminal timeout: {kinds:?}");
     }
     terminal_result.expect("retry group run terminal");
-    drop(commands);
+    close_mock_gateway_after_idle_boundary(commands, &frames, &task, 4).await;
     completed(task.await.expect("session join"));
 
     let kinds: Vec<String> = sqlx::query_scalar("SELECT event_type FROM agent_events ORDER BY seq")
@@ -6404,7 +6439,7 @@ async fn retry_wait_group_of_three_is_injected_before_next_attempt() {
         eprintln!("durable kinds on terminal timeout: {kinds:?}");
     }
     terminal_result.expect("retry group run terminal");
-    drop(commands);
+    close_mock_gateway_after_idle_boundary(commands, &frames, &task, 5).await;
     completed(task.await.expect("session join"));
 
     let kinds: Vec<String> = sqlx::query_scalar("SELECT event_type FROM agent_events ORDER BY seq")
