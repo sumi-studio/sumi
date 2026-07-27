@@ -103,6 +103,8 @@ pub(super) struct DurableEventMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) tool_error_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) executor_generation: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) approval_actor: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub(super) empty_turn: bool,
@@ -299,6 +301,9 @@ impl DurableEvent {
         tool_call_id: String,
         tool_name: String,
         args: Value,
+        command_id: String,
+        run_id: String,
+        executor_generation: ProcessGeneration,
     ) -> Result<Self> {
         Self::from_parts(
             AgentEvent::ToolExecutionStart {
@@ -307,7 +312,10 @@ impl DurableEvent {
                 args,
             },
             DurableEventMetadata {
+                command_id: Some(command_id),
+                run_id: Some(run_id),
                 tool_state: Some("running".to_owned()),
+                executor_generation: Some(executor_generation.as_i64()),
                 ..DurableEventMetadata::default()
             },
         )
@@ -417,6 +425,11 @@ fn normalize_test_event(mut raw: Value) -> Result<(AgentEvent, DurableEventMetad
             None | Some(Value::Null) => Ok(None),
             Some(value) => serde_json::from_value::<String>(value).map(Some),
         };
+    let take_i64 =
+        |object: &mut serde_json::Map<String, Value>, field: &str| match object.remove(field) {
+            None | Some(Value::Null) => Ok(None),
+            Some(value) => serde_json::from_value::<i64>(value).map(Some),
+        };
     let mut metadata = DurableEventMetadata::default();
     match event_type.as_str() {
         "agent_start" | "agent_end" => {
@@ -436,9 +449,11 @@ fn normalize_test_event(mut raw: Value) -> Result<(AgentEvent, DurableEventMetad
             metadata.turn_id = take_string(object, "turn_id")?;
         }
         "tool_execution_start" => {
+            metadata.command_id = take_string(object, "command_id")?;
             metadata.run_id = take_string(object, "run_id")?;
             metadata.turn_id = take_string(object, "turn_id")?;
             metadata.tool_state = take_string(object, "state")?;
+            metadata.executor_generation = take_i64(object, "executor_generation")?;
         }
         "tool_execution_end" => {
             metadata.run_id = take_string(object, "run_id")?;
@@ -7581,16 +7596,74 @@ async fn load_authenticated_event(
     })
 }
 
+pub(super) async fn authenticate_running_tool_intent(
+    store: &Store,
+    transaction: &mut Transaction<'_, Sqlite>,
+    tool_call_id: &str,
+    command_id: &str,
+    run_id: &str,
+    executor_generation: ProcessGeneration,
+) -> Result<()> {
+    let sequences: Vec<i64> = sqlx::query_scalar(
+        "SELECT seq FROM agent_events
+         WHERE event_type = 'tool_execution_start'
+           AND json_extract(envelope, '$.tool_call_id') = ?
+         ORDER BY seq",
+    )
+    .bind(tool_call_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .context("failed to locate durable ToolExecutionStart evidence")?;
+    if sequences.len() != 1 {
+        bail!(
+            "running tool execution {tool_call_id} requires exactly one durable ToolExecutionStart"
+        );
+    }
+    let event = load_authenticated_event(store, transaction, sequences[0]).await?;
+    if event.kind != "tool_execution_start"
+        || event.envelope.get("tool_call_id").and_then(Value::as_str) != Some(tool_call_id)
+        || event.metadata.command_id.as_deref() != Some(command_id)
+        || event.metadata.run_id.as_deref() != Some(run_id)
+        || event.metadata.tool_state.as_deref() != Some("running")
+        || event.metadata.executor_generation != Some(executor_generation.as_i64())
+    {
+        bail!(
+            "running tool execution {tool_call_id} disagrees with authenticated ToolExecutionStart evidence"
+        );
+    }
+
+    Ok(())
+}
+
 async fn reconstruct_authenticated_checkpoint(store: &Store) -> Result<LifecycleCheckpoint> {
     let mut transaction = store.pool().begin().await?;
-    let event_head = load_verified_event_head_in_transaction(store, &mut transaction).await?;
+    let checkpoint =
+        reconstruct_authenticated_checkpoint_in_transaction(store, &mut transaction).await?;
+    transaction.commit().await?;
+    Ok(checkpoint)
+}
+
+pub(super) async fn authenticate_event_log_snapshot(
+    store: &Store,
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<()> {
+    reconstruct_authenticated_checkpoint_in_transaction(store, transaction)
+        .await
+        .map(drop)
+}
+
+async fn reconstruct_authenticated_checkpoint_in_transaction(
+    store: &Store,
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<LifecycleCheckpoint> {
+    let event_head = load_verified_event_head_in_transaction(store, transaction).await?;
     let mut lifecycle = DurableLifecycleState::default();
     lifecycle.live_runs.extend(
         sqlx::query_scalar::<_, String>(
             "SELECT DISTINCT run_id FROM inbound_commands
              WHERE run_id IS NOT NULL AND status = 'applying' AND run_phase <> 'finished'",
         )
-        .fetch_all(&mut *transaction)
+        .fetch_all(&mut **transaction)
         .await?,
     );
     for row in sqlx::query(
@@ -7599,7 +7672,7 @@ async fn reconstruct_authenticated_checkpoint(store: &Store) -> Result<Lifecycle
            AND run_phase IN ('user_started','user_committed','assistant_started',
                              'hard_steer_requested','cancel_requested')",
     )
-    .fetch_all(&mut *transaction)
+    .fetch_all(&mut **transaction)
     .await?
     {
         let run_id: String = row.try_get("run_id")?;
@@ -7618,7 +7691,7 @@ async fn reconstruct_authenticated_checkpoint(store: &Store) -> Result<Lifecycle
             sqlx::query_scalar("SELECT seq FROM agent_events WHERE seq > ? ORDER BY seq LIMIT ?")
                 .bind(after_seq)
                 .bind(EVENT_CHAIN_VERIFICATION_PAGE_ROWS)
-                .fetch_all(&mut *transaction)
+                .fetch_all(&mut **transaction)
                 .await
                 .context("failed to page durable event history during startup recovery")?;
         if page.is_empty() {
@@ -7632,7 +7705,7 @@ async fn reconstruct_authenticated_checkpoint(store: &Store) -> Result<Lifecycle
                     "durable event chain is not contiguous: expected {expected_seq}, found {seq}"
                 );
             }
-            let event = load_authenticated_event(store, &mut transaction, physical_seq).await?;
+            let event = load_authenticated_event(store, transaction, physical_seq).await?;
             chain_digest = extend_event_chain(
                 &chain_digest,
                 EventChainEntry {
@@ -7670,7 +7743,6 @@ async fn reconstruct_authenticated_checkpoint(store: &Store) -> Result<Lifecycle
                 && head.chain_digest == chain_digest => {}
         Some(_) => bail!("durable event history does not match authenticated head"),
     }
-    transaction.commit().await?;
     Ok(LifecycleCheckpoint {
         event_head,
         lifecycle,
@@ -9696,6 +9768,9 @@ mod tests {
                     "tool_call_id":tool_call_id,
                     "tool_name":"test",
                     "args":{},
+                    "command_id":TOOL_OWNER_COMMAND_ID,
+                    "run_id":run_id,
+                    "executor_generation":1,
                     "state":"running"
                 }))
                 .expect("typed tool start"),
@@ -12745,13 +12820,13 @@ mod tests {
     async fn plaintext_secret_never_appears_in_event_or_message_projections() {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
-        let secret = "sk-abcdefghijklmnop";
+        let secret = format!("sk-abcdefghijklmnop github_pat_{}", "x".repeat(82));
         let injection = classified_injection(
             &writer,
             1,
             "00000000-0000-4000-8000-000000000030",
             "message-secret",
-            secret,
+            &secret,
         )
         .await;
         writer
@@ -12759,7 +12834,7 @@ mod tests {
                 writes: injection_writes(
                     "00000000-0000-4000-8000-000000000030",
                     "message-secret",
-                    secret,
+                    &secret,
                 ),
                 injected_commands: vec![injection],
             })
@@ -12775,7 +12850,11 @@ mod tests {
         .expect("read projections");
         for column in ["envelope", "payload", "search_text"] {
             let value: String = row.get(column);
-            assert!(!value.contains(secret), "{column} leaked plaintext secret");
+            assert!(!value.contains(&secret), "{column} leaked plaintext secret");
+            assert!(
+                !value.contains("github_pat_"),
+                "{column} leaked GitHub token prefix"
+            );
         }
     }
 
@@ -20820,7 +20899,7 @@ mod tests {
             .await
             .expect("start tool");
 
-        let lease = test_lease(1);
+        let lease = test_lease(2);
         let fence = test_fence(&lease);
         match store.hydrate(&lease, &fence).await.unwrap() {
             HydrationOutcome::RecoveryRequired(intents) => {
@@ -20828,9 +20907,57 @@ mod tests {
                 assert_eq!(intents[0].tool_call_id, tool_call_id);
                 assert_eq!(intents[0].command_id, TOOL_OWNER_COMMAND_ID);
                 assert_eq!(intents[0].run_id, run_id);
+                assert_eq!(intents[0].executor_generation, test_process_generation(1));
             }
             HydrationOutcome::Complete(_) => panic!("running tool must keep boot fail-closed"),
         }
+
+        sqlx::query(
+            "UPDATE tool_executions SET executor_generation = executor_generation + 1
+             WHERE tool_call_id = ?",
+        )
+        .bind(tool_call_id)
+        .execute(store.pool())
+        .await
+        .expect("tamper running projection attestation");
+        let error = store
+            .hydrate(&lease, &fence)
+            .await
+            .expect_err("tampered running projection must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("authenticated ToolExecutionStart")
+        );
+
+        sqlx::query(
+            "UPDATE tool_executions SET executor_generation = executor_generation - 1
+             WHERE tool_call_id = ?",
+        )
+        .bind(tool_call_id)
+        .execute(store.pool())
+        .await
+        .expect("restore running projection attestation");
+        sqlx::query(
+            "DELETE FROM agent_events
+             WHERE event_type = 'tool_execution_start'
+               AND json_extract(envelope, '$.tool_call_id') = ?",
+        )
+        .bind(tool_call_id)
+        .execute(store.pool())
+        .await
+        .expect("remove durable start evidence");
+        let error = store
+            .hydrate(&lease, &fence)
+            .await
+            .expect_err("orphan running projection must fail closed");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("durable event history")
+                || rendered.contains("durable event chain")
+                || rendered.contains("exactly one durable"),
+            "{rendered}"
+        );
     }
 
     #[tokio::test]

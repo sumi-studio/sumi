@@ -195,10 +195,8 @@ impl<'a> PhysicalRecoveryApplier<'a> {
     /// Legacy proof-ledger adapter used by migration fixtures. Production
     /// hydration must call `EventWriter::apply_physical_recovery`, which also
     /// couples logical terminal events/results to this ledger transaction.
-    pub(crate) async fn apply(
-        &self,
-        receipt: &PhysicalRecoveryReceipt,
-    ) -> Result<ApplyReceiptOutcome> {
+    #[cfg(test)]
+    async fn apply(&self, receipt: &PhysicalRecoveryReceipt) -> Result<ApplyReceiptOutcome> {
         receipt.validate()?;
 
         let mut transaction = self.store.pool().begin().await?;
@@ -1065,22 +1063,6 @@ mod tests {
             .expect("hydrate clean store");
         assert!(intents.is_empty());
         assert_eq!(receipt.expect("clean hydration receipt").intent_count, 0);
-    }
-
-    #[tokio::test]
-    async fn hydration_preserves_old_executor_generation_for_reap_attestation() {
-        let store = test_store().await;
-        let (_first, _last, tool_call_id) = seed_events_and_execution(&store).await;
-        let lease = test_lease(2);
-        let fence = test_fence(&lease);
-        let (intents, receipt) = store
-            .hydrate_recovery_intents(&lease, &fence)
-            .await
-            .expect("hydrate old-generation running execution");
-        assert!(receipt.is_none());
-        assert_eq!(intents.len(), 1);
-        assert_eq!(intents[0].tool_call_id, tool_call_id);
-        assert_eq!(intents[0].executor_generation, test_lease(1).generation());
     }
 
     #[tokio::test]

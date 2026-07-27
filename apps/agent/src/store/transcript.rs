@@ -131,6 +131,9 @@ pub(crate) async fn search_message_ids(
     if query.is_empty() {
         bail!("transcript search query must not be empty");
     }
+    if query.chars().any(char::is_control) {
+        bail!("transcript search query must not contain control characters");
+    }
 
     if query.chars().count() < 3 {
         let escaped = query
@@ -290,10 +293,11 @@ mod tests {
 
     #[tokio::test]
     async fn transcript_search_text_is_redacted_before_storage() {
+        let fine_grained = format!("github_pat_{}", "x".repeat(82));
         let mut message = message_fixture();
         if let PublicMessage::Assistant(assistant) = &mut message {
             assistant.content = vec![PublicAssistantContent::Text {
-                text: "use sk-abcdefghijklmnop".to_owned(),
+                text: format!("use sk-abcdefghijklmnop and {fine_grained}"),
                 wire_item_index: 0,
             }];
         }
@@ -314,7 +318,9 @@ mod tests {
             .await
             .expect("fetch search text");
         assert!(!search.contains("sk-abcdefghijklmnop"));
+        assert!(!search.contains(&fine_grained));
         assert!(search.contains("[REDACTED:api_key]"));
+        assert!(search.contains("[REDACTED:github_token]"));
     }
 
     #[tokio::test]
@@ -393,6 +399,13 @@ mod tests {
                 .expect("search Japanese trigram substring"),
             vec!["message-fts"]
         );
+
+        for query in ["\0", "a\0", "ab\0"] {
+            let error = search_message_ids(store.pool(), query)
+                .await
+                .expect_err("control characters must fail closed");
+            assert!(error.to_string().contains("control"));
+        }
 
         sqlx::query("DELETE FROM messages WHERE id = ?")
             .bind("message-fts")

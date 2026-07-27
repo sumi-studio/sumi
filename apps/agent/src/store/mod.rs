@@ -300,6 +300,7 @@ impl Store {
             .await
             .context("failed to begin hydration snapshot transaction")?;
 
+        event_writer::authenticate_event_log_snapshot(self, &mut transaction).await?;
         let intents = self.hydrate_running_intents(&mut transaction).await?;
         if !intents.is_empty() {
             transaction
@@ -400,6 +401,15 @@ impl Store {
                     row.try_get("executor_generation")?,
                 )
                 .map_err(|error| anyhow!("invalid persisted executor generation: {error}"))?;
+                event_writer::authenticate_running_tool_intent(
+                    self,
+                    transaction,
+                    &tool_call_id,
+                    &command_id,
+                    &run_id,
+                    generation,
+                )
+                .await?;
                 intents.push(PhysicalRecoveryIntentRequest {
                     tool_call_id,
                     command_id,
