@@ -113,6 +113,9 @@ func (r *durableEventRecord) UnmarshalJSON(data []byte) error {
 	if *v.Seq > maxJSONSafeInteger {
 		return fmt.Errorf("durable event record seq %d exceeds JSON-safe integer range", *v.Seq)
 	}
+	if err := validateEnvelope(*v.Event); err != nil {
+		return fmt.Errorf("durable event record event: %w", err)
+	}
 	*r = durableEventRecord{Seq: *v.Seq, Event: *v.Event}
 	return nil
 }
@@ -376,6 +379,12 @@ func (g *DurableGateway) EventCatchUp(ctx context.Context, conversationID string
 			}
 			if record.Seq != previous+1 {
 				return nil, fmt.Errorf("durable event log is non-contiguous: got %d after %d", record.Seq, previous)
+			}
+			if record.Event.Seq == nil || *record.Event.Seq != record.Seq {
+				return nil, fmt.Errorf("durable event record seq mismatch: outer %d, inner %v", record.Seq, record.Event.Seq)
+			}
+			if record.Event.ConversationID != conversationID {
+				return nil, fmt.Errorf("durable event record conversation mismatch: got %q, want %q", record.Event.ConversationID, conversationID)
 			}
 			previous = record.Seq
 			if record.Seq > lastConsumedSeq {

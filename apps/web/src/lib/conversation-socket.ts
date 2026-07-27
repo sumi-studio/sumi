@@ -10,6 +10,16 @@ export type ConnectionState = "connecting" | "open" | "closed";
 type Listener = (frame: BrowserServerFrame) => void;
 type StateListener = (state: ConnectionState) => void;
 
+const InitialReconnectDelay = 500;
+const MaxReconnectDelay = 30000;
+
+function reconnectDelay(attempt: number): number {
+  const exponential = InitialReconnectDelay * 2 ** attempt;
+  const capped = Math.min(exponential, MaxReconnectDelay);
+  const jitter = Math.random() * 200;
+  return Math.min(capped + jitter, MaxReconnectDelay);
+}
+
 // One screen owns one always-on browser WebSocket. Authentication is the
 // HttpOnly session cookie attached by the browser; no agent credential is ever
 // accepted or stored here.
@@ -17,6 +27,7 @@ export class ConversationSocket {
   private readonly conversationID: string;
   private socket?: WebSocket;
   private retry?: number;
+  private reconnectAttempt = 0;
   private lastEventSeq = 0;
   private readonly listeners = new Set<Listener>();
   private readonly stateListeners = new Set<StateListener>();
@@ -26,8 +37,25 @@ export class ConversationSocket {
   }
 
   connect() {
+    if (this.socket) {
+      const { readyState } = this.socket;
+      if (
+        readyState === WebSocket.CONNECTING ||
+        readyState === WebSocket.OPEN
+      ) {
+        return;
+      }
+      if (readyState === WebSocket.CLOSING) {
+        // onclose will schedule the reconnect when the socket is clean.
+        return;
+      }
+      // CLOSED: drop the stale reference and reconnect below.
+      this.socket = undefined;
+    }
+
     this.clearRetry();
     this.setState("connecting");
+
     const base = import.meta.env.VITE_API_BASE_URL ?? window.location.origin;
     const url = new URL(
       `/conversations/${encodeURIComponent(this.conversationID)}/ws`,
@@ -36,9 +64,15 @@ export class ConversationSocket {
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     const socket = new WebSocket(url);
     this.socket = socket;
+
     socket.onopen = () => {
+      this.reconnectAttempt = 0;
       this.setState("open");
       this.send({ type: "hello", last_event_seq: this.lastEventSeq });
+    };
+    socket.onerror = () => {
+      // Browsers always follow an error with an onclose; the close path owns
+      // state cleanup and reconnect scheduling.
     };
     socket.onmessage = (message) => {
       const frame = JSON.parse(String(message.data)) as BrowserServerFrame;
@@ -49,12 +83,16 @@ export class ConversationSocket {
     };
     socket.onclose = () => {
       if (this.socket !== socket) return;
+      this.socket = undefined;
       this.setState("closed");
-      this.retry = window.setTimeout(() => this.connect(), 500);
+      this.scheduleReconnect();
     };
   }
 
   sendCommand(command: Command, idempotencyKey = crypto.randomUUID()) {
+    if (this.socket?.readyState !== WebSocket.OPEN) {
+      return;
+    }
     this.send({ type: "command", idempotency_key: idempotencyKey, command });
   }
 
@@ -70,8 +108,9 @@ export class ConversationSocket {
 
   close() {
     this.clearRetry();
-    this.socket?.close();
+    const socket = this.socket;
     this.socket = undefined;
+    socket?.close();
   }
 
   private send(frame: BrowserClientFrame) {
@@ -79,6 +118,12 @@ export class ConversationSocket {
       throw new Error("conversation websocket is not connected");
     }
     this.socket.send(JSON.stringify(frame));
+  }
+
+  private scheduleReconnect() {
+    if (this.retry !== undefined) return;
+    const delay = reconnectDelay(this.reconnectAttempt++);
+    this.retry = window.setTimeout(() => this.connect(), delay);
   }
 
   private setState(state: ConnectionState) {

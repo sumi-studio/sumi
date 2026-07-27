@@ -58,7 +58,7 @@ func TestOutboundFrameValidateCounterexamples(t *testing.T) {
 
 func TestIngressDuplicateKeysCounterexample(t *testing.T) {
 	appender := &fakeCommandAppender{}
-	ingress, err := NewUserCommandIngress(appender, &fakeTokenVerifier{conversationID: "conv-1"})
+	ingress, err := NewUserCommandIngress(appender, &fakeSessionVerifier{conversationID: "conv-1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +68,7 @@ func TestIngressDuplicateKeysCounterexample(t *testing.T) {
 	defer server.Close()
 
 	body := []byte(`{"type":"user_message","type":"user_message","text":"x","text":"hi","attachments":[]}`)
-	resp := postAuthorized(t, server.URL+"/conversations/conv-1/commands", body)
+	resp := postWithSessionCookie(t, server.URL+"/conversations/conv-1/commands", body, "conv-1")
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusCreated {
 		t.Fatalf("ingress accepted body with duplicate keys (status %d)", resp.StatusCode)

@@ -44,9 +44,11 @@ func newRouter() (*http.ServeMux, error) {
 	if err != nil && !errors.Is(err, errTokenSecretMissing) {
 		return nil, fmt.Errorf("agent token verifier: %w", err)
 	}
+	sv, err := browserSessionVerifierFromEnv()
+	if err != nil && !errors.Is(err, errBrowserSessionSecretMissing) {
+		return nil, fmt.Errorf("browser session verifier: %w", err)
+	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", handler.Health)
 	cmdDir := os.Getenv("SUMI_COMMAND_LOG_DIR")
 	if cmdDir == "" {
 		return nil, errors.New("SUMI_COMMAND_LOG_DIR not set")
@@ -65,38 +67,10 @@ func newRouter() (*http.ServeMux, error) {
 		_ = store.Close()
 		return nil, fmt.Errorf("open agent runtime gateway: %w", err)
 	}
-	mux.Handle("GET /agent/ws", wsHandler(tv, runtime))
-	ingress, err := agentevents.NewUserCommandIngress(store, tv)
-	if err != nil {
-		_ = store.Close()
-		return nil, fmt.Errorf("create command ingress: %w", err)
-	}
-	mux.Handle("POST /conversations/{conversation_id}/commands", ingress)
-	browserSessions, err := browserSessionVerifierFromEnv()
-	if err != nil && !errors.Is(err, errBrowserSessionSecretMissing) {
-		_ = store.Close()
-		return nil, fmt.Errorf("browser session verifier: %w", err)
-	}
-	browser := agentevents.NewBrowserServer(browserSessions, store, runtime)
-	browser.AllowedOrigins = browserAllowedOriginsFromEnv()
-	mux.Handle("GET /conversations/{conversation_id}/ws", browser)
 
+	mux, _, _ := agentevents.NewProductionMux(store, runtime, tv, sv, allowedOriginsFromEnv(), browserAllowedOriginsFromEnv())
+	mux.HandleFunc("GET /health", handler.Health)
 	return mux, nil
-}
-
-// wsHandler assembles the production token, generation, durable command/event,
-// and hydration adapters. A missing token verifier remains fail-closed, but a
-// configured production route never substitutes placeholder T17/T26 seams.
-func wsHandler(tv agentevents.TokenVerifier, runtime *agentevents.DurableGateway) http.Handler {
-	if tv == nil || runtime == nil {
-		srv := agentevents.NewFailClosedServer()
-		srv.AllowedOrigins = allowedOriginsFromEnv()
-		return srv
-	}
-	log.Print("agent WS token, generation, durable command/event, and hydration wiring ready")
-	srv := agentevents.NewServer(tv, runtime, runtime, runtime, runtime)
-	srv.AllowedOrigins = allowedOriginsFromEnv()
-	return srv
 }
 
 func allowedOriginsFromEnv() []string {

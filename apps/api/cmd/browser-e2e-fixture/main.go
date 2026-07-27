@@ -42,12 +42,13 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	browser := agentevents.NewBrowserServer(browserSessions, store, gateway)
-	browser.AllowedOrigins = []string{"http://127.0.0.1:4173"}
+
+	// Use the same production router as cmd/server so the E2E journey exercises
+	// production wiring. We do not expose the agent WebSocket boundary in this
+	// fixture; nil TokenVerifier makes it fail-closed.
+	mux, browser, _ := agentevents.NewProductionMux(store, gateway, nil, browserSessions, nil, []string{"http://127.0.0.1:4173"})
 
 	fixture := newFixture(store, gateway)
-	mux := http.NewServeMux()
-	mux.Handle("GET /conversations/{conversation_id}/ws", browser)
 	mux.HandleFunc("GET /__e2e__/session", func(w http.ResponseWriter, r *http.Request) {
 		http.SetCookie(w, &http.Cookie{Name: agentevents.BrowserSessionCookie, Value: signSession(), Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode})
 		w.WriteHeader(http.StatusNoContent)

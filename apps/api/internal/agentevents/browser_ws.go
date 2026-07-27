@@ -24,6 +24,8 @@ type BrowserServer struct {
 	AllowedOrigins []string
 	HelloTimeout   time.Duration
 	WriteTimeout   time.Duration
+	PongWait       time.Duration
+	PingInterval   time.Duration
 	MaxReadLimit   int64
 
 	upgrader      websocket.Upgrader
@@ -167,7 +169,39 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 	if err != nil {
 		return err
 	}
-	_ = conn.SetReadDeadline(time.Time{})
+
+	// Install pong handler before first read and schedule the initial
+	// keepalive deadline. Pongs from the browser reset the deadline for the
+	// next PongWait interval.
+	if s.pongWait() > 0 {
+		conn.SetPongHandler(func(string) error {
+			_ = conn.SetReadDeadline(time.Now().Add(s.pongWait()))
+			return nil
+		})
+		if err := conn.SetReadDeadline(time.Now().Add(s.pongWait())); err != nil {
+			return err
+		}
+	}
+
+	// Send periodic pings so the browser does not time out. The browser
+	// WebSocket implementation answers control pings automatically with pongs.
+	if s.pingInterval() > 0 {
+		ticker := time.NewTicker(s.pingInterval())
+		defer ticker.Stop()
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(s.writeTimeout())); err != nil {
+						cancel()
+						return
+					}
+				}
+			}
+		}()
+	}
 
 	volatile, unsubscribe := s.Events.SubscribeBrowserVolatile(claims.ConversationID)
 	defer unsubscribe()
@@ -241,6 +275,11 @@ func (s *BrowserServer) browserReadPump(ctx context.Context, conn *websocket.Con
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
 			return err
+		}
+		if s.pongWait() > 0 {
+			if err := conn.SetReadDeadline(time.Now().Add(s.pongWait())); err != nil {
+				return err
+			}
 		}
 		frame, err := decodeBrowserCommand(raw)
 		if err != nil {
@@ -328,4 +367,18 @@ func (s *BrowserServer) writeTimeout() time.Duration {
 		return s.WriteTimeout
 	}
 	return 10 * time.Second
+}
+
+func (s *BrowserServer) pongWait() time.Duration {
+	if s.PongWait > 0 {
+		return s.PongWait
+	}
+	return 60 * time.Second
+}
+
+func (s *BrowserServer) pingInterval() time.Duration {
+	if s.PingInterval > 0 {
+		return s.PingInterval
+	}
+	return 54 * time.Second
 }

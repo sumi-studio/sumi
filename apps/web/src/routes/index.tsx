@@ -23,11 +23,12 @@ function Home() {
   const [input, setInput] = useState("");
   const [feed, setFeed] = useState<FeedItem[]>([]);
   const streamingText = useRef("");
+  const streamingMessageID = useRef<string | undefined>(undefined);
 
   useEffect(() => {
     const offState = socket.onState(setState);
     const offFrame = socket.onFrame((frame) =>
-      applyFrame(frame, streamingText, setFeed),
+      applyFrame(frame, streamingText, streamingMessageID, setFeed),
     );
     socket.connect();
     return () => {
@@ -68,7 +69,7 @@ function Home() {
           <p className="text-zinc-500">会話を開始してください。</p>
         )}
         {feed.map((item) => (
-          <FeedItemView item={item} socket={socket} key={item.id} />
+          <FeedItemView item={item} socket={socket} state={state} key={item.id} />
         ))}
       </section>
       <form
@@ -97,7 +98,8 @@ function Home() {
         </button>
         {streamingText.current && (
           <button
-            className="rounded-lg border px-3"
+            className="rounded-lg border px-3 disabled:opacity-40"
+            disabled={state !== "open"}
             type="button"
             onClick={() => socket.sendCommand({ type: "abort" })}
           >
@@ -112,10 +114,14 @@ function Home() {
 function FeedItemView({
   item,
   socket,
+  state,
 }: {
   item: FeedItem;
   socket: ConversationSocket;
+  state: ConnectionState;
 }) {
+  const disabled = state !== "open";
+
   if (item.kind === "approval" && item.requestID) {
     const requestID = item.requestID;
     return (
@@ -125,7 +131,8 @@ function FeedItemView({
         <div className="flex gap-2">
           <button
             type="button"
-            className="rounded bg-zinc-900 px-3 py-1 text-white"
+            className="rounded bg-zinc-900 px-3 py-1 text-white disabled:opacity-40"
+            disabled={disabled}
             onClick={() =>
               socket.sendCommand({
                 type: "approval_decision",
@@ -138,7 +145,8 @@ function FeedItemView({
           </button>
           <button
             type="button"
-            className="rounded border px-3 py-1"
+            className="rounded border px-3 py-1 disabled:opacity-40"
+            disabled={disabled}
             onClick={() =>
               socket.sendCommand({
                 type: "approval_decision",
@@ -173,6 +181,7 @@ function FeedItemView({
 function applyFrame(
   frame: BrowserServerFrame,
   streamingText: React.MutableRefObject<string>,
+  streamingMessageID: React.MutableRefObject<string | undefined>,
   setFeed: React.Dispatch<React.SetStateAction<FeedItem[]>>,
 ) {
   if (frame.type === "command_rejected") {
@@ -186,14 +195,24 @@ function applyFrame(
     ]);
     return;
   }
+  if (frame.type === "command_accepted") {
+    // The UI already renders user messages optimistically; the server is
+    // acknowledging durable append. No further action is required.
+    return;
+  }
   if (frame.type !== "event") return;
   const event = frame.envelope.event as unknown as Record<string, unknown>;
   const type = eventType(frame.envelope);
   if (type === "message_update") {
+    const messageID = String(event.message_id);
     const stream = event.event as { type?: string; delta?: string };
     if (stream.type === "text_delta" && typeof stream.delta === "string") {
+      if (streamingMessageID.current !== messageID) {
+        streamingText.current = "";
+        streamingMessageID.current = messageID;
+      }
       streamingText.current += stream.delta;
-      const id = `stream-${String(event.message_id)}`;
+      const id = `stream-${messageID}`;
       setFeed((items) => [
         ...items.filter((item) => item.id !== id),
         { id, kind: "assistant", text: streamingText.current },
@@ -215,6 +234,7 @@ function applyFrame(
         { id: `message-${String(event.message_id)}`, kind: "assistant", text },
       ]);
     streamingText.current = "";
+    streamingMessageID.current = undefined;
   }
   if (type === "tool_execution_start" || type === "tool_execution_end") {
     const label =

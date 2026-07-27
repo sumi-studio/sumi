@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -265,6 +266,70 @@ func TestHMACTokenVerifierAcceptsPaddedSignature(t *testing.T) {
 	if _, err := v.Verify(context.Background(), strings.Join(parts, ".")); err != nil {
 		t.Fatalf("padded signature must verify: %v", err)
 	}
+}
+
+func TestHMACTokenVerifierRejectsDuplicateKeys(t *testing.T) {
+	v, err := NewHMACTokenVerifier(testSecret, "")
+	if err != nil {
+		t.Fatalf("new verifier: %v", err)
+	}
+
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","alg":"HS256","typ":"JWT"}`))
+	claims := base64.RawURLEncoding.EncodeToString(mustJSON(t, tokenClaims{
+		TenantID:       "tenant-1",
+		AgentID:        "agent-1",
+		ConversationID: "conversation-1",
+		Generation:     7,
+		Exp:            time.Now().Add(time.Hour).Unix(),
+		Aud:            defaultAgentAudience,
+	}))
+	token := signTokenWithParts(t, testSecret, header, claims)
+	if _, err := v.Verify(context.Background(), token); err == nil {
+		t.Fatal("expected duplicate keys in header to be rejected")
+	}
+
+	header = base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
+	claims = base64.RawURLEncoding.EncodeToString([]byte(`{"tenant_id":"tenant-1","tenant_id":"tenant-1","agent_id":"agent-1","conversation_id":"conversation-1","generation":7,"exp":` + fmt.Sprintf("%d", time.Now().Add(time.Hour).Unix()) + `,"aud":"` + defaultAgentAudience + `"}`))
+	token = signTokenWithParts(t, testSecret, header, claims)
+	if _, err := v.Verify(context.Background(), token); err == nil {
+		t.Fatal("expected duplicate keys in claims to be rejected")
+	}
+}
+
+func TestHMACTokenVerifierRejectsUnknownFieldsAndWrongTyp(t *testing.T) {
+	v, err := NewHMACTokenVerifier(testSecret, "")
+	if err != nil {
+		t.Fatalf("new verifier: %v", err)
+	}
+
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT","extra":"field"}`))
+	claims := base64.RawURLEncoding.EncodeToString(mustJSON(t, tokenClaims{
+		TenantID:       "tenant-1",
+		AgentID:        "agent-1",
+		ConversationID: "conversation-1",
+		Generation:     7,
+		Exp:            time.Now().Add(time.Hour).Unix(),
+		Aud:            defaultAgentAudience,
+	}))
+	token := signTokenWithParts(t, testSecret, header, claims)
+	if _, err := v.Verify(context.Background(), token); err == nil {
+		t.Fatal("expected unknown header field to be rejected")
+	}
+
+	header = base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"token"}`))
+	token = signTokenWithParts(t, testSecret, header, claims)
+	if _, err := v.Verify(context.Background(), token); err == nil {
+		t.Fatal("expected wrong typ to be rejected")
+	}
+}
+
+func signTokenWithParts(t *testing.T, secret []byte, header, claims string) string {
+	t.Helper()
+	signingInput := header + "." + claims
+	mac := hmac.New(sha256.New, secret)
+	mac.Write([]byte(signingInput))
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	return signingInput + "." + sig
 }
 
 func TestHMACTokenVerifierSignatureCheckedBeforeClaims(t *testing.T) {

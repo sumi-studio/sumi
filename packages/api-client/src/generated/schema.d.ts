@@ -32,11 +32,13 @@ export interface paths {
         put?: never;
         /**
          * Create a user command in a conversation
-         * @description Admits a user_message command from the web client. The request is
-         *     validated for UTF-8 JSON shape, empty attachments, and a 1 MiB wire-size
-         *     limit before any command_id or seq is allocated. Rejections are returned
-         *     as typed 4xx responses with no command_id/seq, so they cannot create a
-         *     sequence gap in the durable command log.
+         * @description Admits a user_message command from the web client. The caller is
+         *     authenticated by the signed HttpOnly `sumi_session` browser cookie; agent
+         *     bearer tokens are not accepted. The request is validated for UTF-8 JSON
+         *     shape, empty attachments, and a 1 MiB wire-size limit before any
+         *     command_id or seq is allocated. Rejections are returned as typed 4xx
+         *     responses with no command_id/seq, so they cannot create a sequence gap
+         *     in the durable command log.
          */
         post: operations["createUserCommand"];
         delete?: never;

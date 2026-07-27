@@ -5,7 +5,6 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -72,23 +71,32 @@ func (v *HMACTokenVerifier) Verify(ctx context.Context, token string) (TokenClai
 	if err != nil {
 		return TokenClaims{}, fmt.Errorf("decode token header: %w", err)
 	}
+	if err := checkDuplicateKeys(headerBytes); err != nil {
+		return TokenClaims{}, fmt.Errorf("parse token header: %w", err)
+	}
 	var header struct {
 		Alg string `json:"alg"`
 		Typ string `json:"typ"`
 	}
-	if err := json.Unmarshal(headerBytes, &header); err != nil {
+	if err := unmarshalStrict(headerBytes, &header); err != nil {
 		return TokenClaims{}, fmt.Errorf("parse token header: %w", err)
 	}
 	if header.Alg != "HS256" {
 		return TokenClaims{}, fmt.Errorf("unexpected token alg: %q", header.Alg)
+	}
+	if header.Typ != "JWT" {
+		return TokenClaims{}, fmt.Errorf("unexpected token typ: %q", header.Typ)
 	}
 
 	claimsBytes, err := decodeBase64URL(parts[1])
 	if err != nil {
 		return TokenClaims{}, fmt.Errorf("decode token claims: %w", err)
 	}
+	if err := checkDuplicateKeys(claimsBytes); err != nil {
+		return TokenClaims{}, fmt.Errorf("parse token claims: %w", err)
+	}
 	var tc tokenClaims
-	if err := json.Unmarshal(claimsBytes, &tc); err != nil {
+	if err := unmarshalStrict(claimsBytes, &tc); err != nil {
 		return TokenClaims{}, fmt.Errorf("parse token claims: %w", err)
 	}
 	if tc.TenantID == "" || tc.AgentID == "" || tc.ConversationID == "" {

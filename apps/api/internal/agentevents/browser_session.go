@@ -13,8 +13,15 @@ import (
 
 const (
 	defaultBrowserAudience = "sumi:web:conversation"
-	BrowserSessionCookie   = "sumi_session"
+	// BrowserSessionCookie is the name of the signed HttpOnly session cookie
+	// used by browser routes.
+	BrowserSessionCookie = "sumi_session"
 )
+
+// DefaultBrowserAudience returns the default audience for browser session
+// cookies. It is exposed so production wiring and tests can agree on the value
+// without hardcoding it in multiple packages.
+func DefaultBrowserAudience() string { return defaultBrowserAudience }
 
 // UserSessionClaims are deliberately separate from agent TokenClaims. A
 // browser can act only as its user in one conversation; it never learns an
@@ -75,16 +82,25 @@ func (v *HMACUserSessionVerifier) VerifySession(ctx context.Context, signedCooki
 	if err != nil {
 		return UserSessionClaims{}, fmt.Errorf("decode browser session header: %w", err)
 	}
+	if err := checkDuplicateKeys(headerBytes); err != nil {
+		return UserSessionClaims{}, fmt.Errorf("browser session header: %w", err)
+	}
 	var header struct {
 		Alg string `json:"alg"`
 		Typ string `json:"typ"`
 	}
-	if err := unmarshalStrict(headerBytes, &header); err != nil || header.Alg != "HS256" || header.Typ != "JWT" {
+	if err := unmarshalStrict(headerBytes, &header); err != nil {
+		return UserSessionClaims{}, fmt.Errorf("invalid browser session header: %w", err)
+	}
+	if header.Alg != "HS256" || header.Typ != "JWT" {
 		return UserSessionClaims{}, errors.New("invalid browser session header")
 	}
 	claimsBytes, err := decodeBase64URL(parts[1])
 	if err != nil {
 		return UserSessionClaims{}, fmt.Errorf("decode browser session claims: %w", err)
+	}
+	if err := checkDuplicateKeys(claimsBytes); err != nil {
+		return UserSessionClaims{}, fmt.Errorf("browser session claims: %w", err)
 	}
 	var claims userSessionWireClaims
 	if err := unmarshalStrict(claimsBytes, &claims); err != nil {

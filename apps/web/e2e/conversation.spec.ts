@@ -18,28 +18,42 @@ test("real Chrome chat journey uses the browser websocket boundary", async ({
     const composer = page.getByLabel("メッセージ");
     await composer.fill("initial user_message");
     await page.getByRole("button", { name: "送信" }).click();
-    await expect(page.getByText("streamed assistant")).toBeVisible();
-    await expect(page.getByText("Tool started: read_file")).toBeVisible();
-    await expect(page.getByText("Tool finished: call-1")).toBeVisible();
+    await expect(
+      page.getByText("streamed assistant", { exact: true }),
+    ).toBeVisible();
+    await expect(
+      page.getByText("Tool started: read_file", { exact: true }),
+    ).toBeVisible();
+    await expect(
+      page.getByText("Tool finished: call-1", { exact: true }),
+    ).toBeVisible();
 
     await composer.fill("second message is a steer");
     await page.getByRole("button", { name: "Steer" }).click();
-    await expect(page.getByText("Steered (hard)")).toBeVisible();
-    await expect(page.getByText("🔐 承認が必要です")).toBeVisible();
+    await expect(
+      page.getByText("Steered (hard)", { exact: true }),
+    ).toBeVisible();
+    await expect(
+      page.getByText("🔐 承認が必要です", { exact: true }),
+    ).toBeVisible();
     await page.getByRole("button", { name: "今回のみ" }).click();
-    await expect(page.getByText("abortable stream")).toBeVisible();
+    await expect(
+      page.getByText("abortable stream", { exact: true }),
+    ).toBeVisible();
 
     await page.getByRole("button", { name: "停止" }).click();
     expect(
       (await fetch(`${fixture.url}/__e2e__/disconnect`, { method: "POST" }))
         .status,
     ).toBe(204);
-    await expect(page.getByText("closed")).toBeVisible();
+    await expect(page.getByText("closed", { exact: true })).toBeVisible();
     const terminal = await fetch(`${fixture.url}/__e2e__/emit-terminal`, {
       method: "POST",
     });
     expect(terminal.status).toBe(204);
-    await expect(page.getByText("Terminal replay")).toHaveCount(1);
+    await expect(
+      page.getByText("Terminal replay", { exact: true }),
+    ).toHaveCount(1);
   } finally {
     stop(vite);
     stop(fixture.process);

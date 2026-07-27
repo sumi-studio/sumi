@@ -813,3 +813,79 @@ func TestDurableGatewayLiveDoesNotLoseConcurrentAppend(t *testing.T) {
 		t.Fatal("timeout waiting for live command")
 	}
 }
+
+func TestDurableGatewayEventCatchUpRejectsCorruptRecords(t *testing.T) {
+	conversationID := "conversation-1"
+
+	cases := []struct {
+		name     string
+		contents []byte
+		wantErr  string
+	}{
+		{
+			name:     "outer/inner seq mismatch",
+			contents: []byte(`{"seq":1,"event":{"seq":2,"conversation_id":"conversation-1","event":{"type":"agent_start"}}}` + "\n"),
+			wantErr:  "seq mismatch",
+		},
+		{
+			name:     "conversation mismatch",
+			contents: []byte(`{"seq":1,"event":{"seq":1,"conversation_id":"conversation-2","event":{"type":"agent_start"}}}` + "\n"),
+			wantErr:  "conversation mismatch",
+		},
+		{
+			name:     "volatile event with seq",
+			contents: []byte(`{"seq":1,"event":{"seq":1,"conversation_id":"conversation-1","event":{"type":"message_update"}}}` + "\n"),
+			wantErr:  "volatile event",
+		},
+		{
+			name:     "durable event missing inner seq",
+			contents: []byte(`{"seq":1,"event":{"conversation_id":"conversation-1","event":{"type":"agent_start"}}}` + "\n"),
+			wantErr:  "requires seq",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := openRuntimeGateway(t)
+			if err := os.WriteFile(g.eventPath(conversationID), tc.contents, 0o600); err != nil {
+				t.Fatalf("write corrupt log: %v", err)
+			}
+			_, err := g.EventCatchUp(context.Background(), conversationID, 0)
+			if err == nil {
+				t.Fatal("expected corrupt event log to be rejected")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected error containing %q, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestDurableGatewayEventCatchUpAcceptsValidRecords(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	conversationID := "conversation-1"
+	claims := TokenClaims{ConversationID: conversationID}
+
+	seq := uint64(1)
+	if err := gateway.Receive(context.Background(), claims, Envelope{
+		Seq:            &seq,
+		ConversationID: conversationID,
+		Event:          json.RawMessage(`{"type":"agent_start"}`),
+	}); err != nil {
+		t.Fatalf("receive event: %v", err)
+	}
+
+	caught, err := gateway.EventCatchUp(context.Background(), conversationID, 0)
+	if err != nil {
+		t.Fatalf("catch-up: %v", err)
+	}
+	if len(caught) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(caught))
+	}
+	if caught[0].ConversationID != conversationID {
+		t.Fatalf("expected conversation %q, got %q", conversationID, caught[0].ConversationID)
+	}
+	if caught[0].Seq == nil || *caught[0].Seq != 1 {
+		t.Fatalf("expected seq 1, got %v", caught[0].Seq)
+	}
+}

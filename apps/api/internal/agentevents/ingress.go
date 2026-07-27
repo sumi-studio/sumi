@@ -49,25 +49,26 @@ type CommandAppender interface {
 }
 
 // UserCommandIngress is the HTTP handler for web → API user command admission.
-// It authenticates the caller, authorizes the conversation, then rejects
-// oversized payloads, non-empty attachments, and malformed commands before
-// calling CommandAppender.Append. Rejected requests never allocate a command_id
-// or seq and cannot poison later commands.
+// It authenticates the caller via the signed HttpOnly browser session cookie,
+// authorizes the conversation, then rejects oversized payloads, non-empty
+// attachments, and malformed commands before calling CommandAppender.Append.
+// Rejected requests never allocate a command_id or seq and cannot poison later
+// commands.
 type UserCommandIngress struct {
 	Appender CommandAppender
-	Verifier TokenVerifier
+	Sessions UserSessionVerifier
 	MaxBytes int64
 }
 
 // NewUserCommandIngress returns an ingress handler wired to the given appender.
 // It fail-closes: a nil appender returns an error so cmd/server cannot expose
-// the route with an unbacked log. A nil Verifier causes every request to be
-// rejected with 401 until a production TokenVerifier is wired.
-func NewUserCommandIngress(appender CommandAppender, verifier TokenVerifier) (*UserCommandIngress, error) {
+// the route with an unbacked log. A nil Sessions verifier causes every request
+// to be rejected with 401 until a production UserSessionVerifier is wired.
+func NewUserCommandIngress(appender CommandAppender, sessions UserSessionVerifier) (*UserCommandIngress, error) {
 	if appender == nil {
 		return nil, errors.New("CommandAppender is required")
 	}
-	return &UserCommandIngress{Appender: appender, Verifier: verifier, MaxBytes: MaxUserCommandBytes}, nil
+	return &UserCommandIngress{Appender: appender, Sessions: sessions, MaxBytes: MaxUserCommandBytes}, nil
 }
 
 func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -82,15 +83,15 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, ok := bearerToken(r.Header.Get("Authorization"))
-	if !ok || h.Verifier == nil {
-		http.Error(w, "missing authorization", http.StatusUnauthorized)
+	cookie, err := r.Cookie(BrowserSessionCookie)
+	if err != nil || h.Sessions == nil {
+		http.Error(w, "missing session", http.StatusUnauthorized)
 		return
 	}
 
-	claims, err := h.Verifier.Verify(r.Context(), token)
+	claims, err := h.Sessions.VerifySession(r.Context(), cookie.Value)
 	if err != nil {
-		http.Error(w, "invalid authorization", http.StatusUnauthorized)
+		http.Error(w, "invalid session", http.StatusUnauthorized)
 		return
 	}
 

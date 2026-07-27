@@ -13,7 +13,13 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 )
+
+var testIngressSecret = []byte("test-ingress-session-secret-32!")
 
 type fakeCommandAppender struct {
 	mu      sync.Mutex
@@ -32,6 +38,12 @@ type fakeTokenVerifier struct {
 	conversationID string
 	reject         bool
 	err            error
+}
+
+func (f *fakeTokenVerifier) setReject(reject bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reject = reject
 }
 
 func (f *fakeTokenVerifier) Verify(ctx context.Context, token string) (TokenClaims, error) {
@@ -59,10 +71,58 @@ func (f *fakeTokenVerifier) Verify(ctx context.Context, token string) (TokenClai
 	}, nil
 }
 
-func (f *fakeTokenVerifier) setReject(reject bool) {
+type fakeSessionVerifier struct {
+	mu             sync.Mutex
+	conversationID string
+	reject         bool
+	err            error
+}
+
+func (f *fakeSessionVerifier) VerifySession(ctx context.Context, cookie string) (UserSessionClaims, error) {
+	f.mu.Lock()
+	reject := f.reject
+	err := f.err
+	conversationID := f.conversationID
+	f.mu.Unlock()
+
+	if reject {
+		return UserSessionClaims{}, fmt.Errorf("rejected")
+	}
+	if err != nil {
+		return UserSessionClaims{}, err
+	}
+	conv := conversationID
+	if conv == "" {
+		conv = "conversation-1"
+	}
+	return UserSessionClaims{
+		TenantID:       "tenant-1",
+		UserID:         "user-1",
+		ConversationID: conv,
+	}, nil
+}
+
+func (f *fakeSessionVerifier) setReject(reject bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.reject = reject
+}
+
+func signTestIngressSession(conversationID string) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
+	claims, _ := json.Marshal(map[string]any{
+		"tenant_id":       "tenant-1",
+		"user_id":         "user-1",
+		"conversation_id": conversationID,
+		"exp":             1893456000,
+		"aud":             defaultBrowserAudience,
+	})
+	claimsPart := base64.RawURLEncoding.EncodeToString(claims)
+	signingInput := header + "." + claimsPart
+	mac := hmac.New(sha256.New, testIngressSecret)
+	mac.Write([]byte(signingInput))
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	return signingInput + "." + sig
 }
 
 type errorReadCloser struct{}
@@ -96,7 +156,7 @@ func (f *fakeCommandAppender) callCount() int {
 func newTestIngress(t *testing.T) (*UserCommandIngress, *fakeCommandAppender) {
 	t.Helper()
 	appender := &fakeCommandAppender{}
-	verifier := &fakeTokenVerifier{conversationID: "conv-1"}
+	verifier := &fakeSessionVerifier{conversationID: "conv-1"}
 	ingress, err := NewUserCommandIngress(appender, verifier)
 	if err != nil {
 		t.Fatalf("new ingress: %v", err)
@@ -104,14 +164,29 @@ func newTestIngress(t *testing.T) (*UserCommandIngress, *fakeCommandAppender) {
 	return ingress, appender
 }
 
-func postAuthorized(t *testing.T, url string, body []byte) *http.Response {
+func postWithSessionCookie(t *testing.T, url string, body []byte, conversationID string) *http.Response {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer test-token")
+	req.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: signTestIngressSession(conversationID)})
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	return resp
+}
+
+func postWithAuthorization(t *testing.T, url string, body []byte) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer agent-token")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("post: %v", err)
@@ -131,7 +206,7 @@ func TestUserCommandIngress_ValidRequestAllocatesSeq(t *testing.T) {
 	defer server.Close()
 
 	body := []byte(`{"type":"user_message","text":"hi","attachments":[]}`)
-	resp := postAuthorized(t, server.URL+"/conversations/conv-1/commands", body)
+	resp := postWithSessionCookie(t, server.URL+"/conversations/conv-1/commands", body, "conv-1")
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusCreated {
@@ -166,7 +241,7 @@ func TestUserCommandIngress_OversizedRejectedWithoutAllocatingSeq(t *testing.T) 
 		t.Fatalf("test fixture not oversized: %d bytes", len(body))
 	}
 
-	resp := postAuthorized(t, server.URL+"/conversations/conv-1/commands", body)
+	resp := postWithSessionCookie(t, server.URL+"/conversations/conv-1/commands", body, "conv-1")
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusBadRequest {
@@ -179,7 +254,7 @@ func TestUserCommandIngress_OversizedRejectedWithoutAllocatingSeq(t *testing.T) 
 
 	// A subsequent valid request must receive the first contiguous sequence.
 	valid := []byte(`{"type":"user_message","text":"hi","attachments":[]}`)
-	resp2 := postAuthorized(t, server.URL+"/conversations/conv-1/commands", valid)
+	resp2 := postWithSessionCookie(t, server.URL+"/conversations/conv-1/commands", valid, "conv-1")
 	defer resp2.Body.Close()
 	if resp2.StatusCode != http.StatusCreated {
 		t.Fatalf("expected 201 after reject, got %d", resp2.StatusCode)
@@ -202,7 +277,7 @@ func TestUserCommandIngress_NonEmptyAttachmentsRejected(t *testing.T) {
 	defer server.Close()
 
 	body := []byte(`{"type":"user_message","text":"hi","attachments":[{"name":"x"}]}`)
-	resp := postAuthorized(t, server.URL+"/conversations/conv-1/commands", body)
+	resp := postWithSessionCookie(t, server.URL+"/conversations/conv-1/commands", body, "conv-1")
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusBadRequest {
@@ -214,7 +289,7 @@ func TestUserCommandIngress_NonEmptyAttachmentsRejected(t *testing.T) {
 	assertRejectReason(t, resp.Body, RejectAttachmentsNotEmpty)
 
 	valid := []byte(`{"type":"user_message","text":"hi","attachments":[]}`)
-	resp2 := postAuthorized(t, server.URL+"/conversations/conv-1/commands", valid)
+	resp2 := postWithSessionCookie(t, server.URL+"/conversations/conv-1/commands", valid, "conv-1")
 	defer resp2.Body.Close()
 	var env CommandEnvelope
 	if err := json.NewDecoder(resp2.Body).Decode(&env); err != nil {
@@ -264,7 +339,7 @@ func TestUserCommandIngress_MalformedAndUnknownRejected(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			resp := postAuthorized(t, server.URL+"/conversations/conv-1/commands", []byte(tc.body))
+			resp := postWithSessionCookie(t, server.URL+"/conversations/conv-1/commands", []byte(tc.body), "conv-1")
 			defer resp.Body.Close()
 			if resp.StatusCode != http.StatusBadRequest {
 				t.Fatalf("expected 400, got %d", resp.StatusCode)
@@ -287,7 +362,7 @@ func TestUserCommandIngress_InvalidUTF8RejectedWithoutAllocatingSeq(t *testing.T
 		0xff,
 	)
 	body = append(body, []byte(`","attachments":[]}`)...)
-	resp := postAuthorized(t, server.URL+"/conversations/conv-1/commands", body)
+	resp := postWithSessionCookie(t, server.URL+"/conversations/conv-1/commands", body, "conv-1")
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusBadRequest {
@@ -307,7 +382,7 @@ func TestUserCommandIngress_BodyReadFailureIsNotMisclassifiedAsOversized(t *test
 		nil,
 	)
 	req.SetPathValue("conversation_id", "conv-1")
-	req.Header.Set("Authorization", "Bearer test-token")
+	req.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: signTestIngressSession("conv-1")})
 	req.Body = errorReadCloser{}
 	recorder := httptest.NewRecorder()
 
@@ -329,7 +404,7 @@ func TestUserCommandIngress_MultipleValidRequestsAreContiguous(t *testing.T) {
 
 	for i := 1; i <= 3; i++ {
 		body := []byte(fmt.Sprintf(`{"type":"user_message","text":"msg %d","attachments":[]}`, i))
-		resp := postAuthorized(t, server.URL+"/conversations/conv-1/commands", body)
+		resp := postWithSessionCookie(t, server.URL+"/conversations/conv-1/commands", body, "conv-1")
 		if resp.StatusCode != http.StatusCreated {
 			t.Fatalf("expected 201 for request %d, got %d", i, resp.StatusCode)
 		}
@@ -347,7 +422,7 @@ func TestUserCommandIngress_MultipleValidRequestsAreContiguous(t *testing.T) {
 	}
 }
 
-func TestUserCommandIngress_RequiresAuthorization(t *testing.T) {
+func TestUserCommandIngress_RequiresSessionCookie(t *testing.T) {
 	appender := &fakeCommandAppender{}
 	ingress, err := NewUserCommandIngress(appender, nil)
 	if err != nil {
@@ -359,19 +434,19 @@ func TestUserCommandIngress_RequiresAuthorization(t *testing.T) {
 	defer server.Close()
 
 	body := []byte(`{"type":"user_message","text":"hi","attachments":[]}`)
-	resp := postAuthorized(t, server.URL+"/conversations/conv-1/commands", body)
+	resp := postWithAuthorization(t, server.URL+"/conversations/conv-1/commands", body)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("expected 401 for unconfigured verifier, got %d", resp.StatusCode)
+		t.Fatalf("expected 401 for missing session cookie, got %d", resp.StatusCode)
 	}
 	if appender.callCount() != 0 {
 		t.Fatalf("expected 0 append calls, got %d", appender.callCount())
 	}
 }
 
-func TestUserCommandIngress_RejectsInvalidAndWrongConversationToken(t *testing.T) {
+func TestUserCommandIngress_AgentBearerTokenCannotInjectUserCommand(t *testing.T) {
 	appender := &fakeCommandAppender{}
-	verifier := &fakeTokenVerifier{conversationID: "other-conversation"}
+	verifier := &fakeSessionVerifier{conversationID: "conv-1"}
 	ingress, err := NewUserCommandIngress(appender, verifier)
 	if err != nil {
 		t.Fatal(err)
@@ -382,16 +457,30 @@ func TestUserCommandIngress_RejectsInvalidAndWrongConversationToken(t *testing.T
 	defer server.Close()
 
 	body := []byte(`{"type":"user_message","text":"hi","attachments":[]}`)
-	req, err := http.NewRequest(http.MethodPost, server.URL+"/conversations/conv-1/commands", bytes.NewReader(body))
+	resp := postWithAuthorization(t, server.URL+"/conversations/conv-1/commands", body)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for agent bearer token, got %d", resp.StatusCode)
+	}
+	if appender.callCount() != 0 {
+		t.Fatalf("expected 0 append calls, got %d", appender.callCount())
+	}
+}
+
+func TestUserCommandIngress_RejectsInvalidAndWrongConversationSession(t *testing.T) {
+	appender := &fakeCommandAppender{}
+	verifier := &fakeSessionVerifier{conversationID: "other-conversation"}
+	ingress, err := NewUserCommandIngress(appender, verifier)
 	if err != nil {
 		t.Fatal(err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer test-token")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
+	mux := http.NewServeMux()
+	mux.Handle("POST /conversations/{conversation_id}/commands", ingress)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	body := []byte(`{"type":"user_message","text":"hi","attachments":[]}`)
+	resp := postWithSessionCookie(t, server.URL+"/conversations/conv-1/commands", body, "conv-1")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("expected 403 for wrong conversation, got %d", resp.StatusCode)
@@ -401,19 +490,10 @@ func TestUserCommandIngress_RejectsInvalidAndWrongConversationToken(t *testing.T
 	}
 
 	verifier.setReject(true)
-	req2, err := http.NewRequest(http.MethodPost, server.URL+"/conversations/conv-1/commands", bytes.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req2.Header.Set("Content-Type", "application/json")
-	req2.Header.Set("Authorization", "Bearer test-token")
-	resp2, err := http.DefaultClient.Do(req2)
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp2 := postWithSessionCookie(t, server.URL+"/conversations/conv-1/commands", body, "conv-1")
 	defer resp2.Body.Close()
 	if resp2.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("expected 401 for rejected token, got %d", resp2.StatusCode)
+		t.Fatalf("expected 401 for rejected session, got %d", resp2.StatusCode)
 	}
 }
 
@@ -429,7 +509,7 @@ func TestUserCommandIngress_TrailingDataRejectedWithoutAllocatingSeq(t *testing.
 	defer server.Close()
 
 	body := []byte(`{"type":"user_message","text":"hi","attachments":[]} trailing`)
-	resp := postAuthorized(t, server.URL+"/conversations/conv-1/commands", body)
+	resp := postWithSessionCookie(t, server.URL+"/conversations/conv-1/commands", body, "conv-1")
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusBadRequest {
@@ -452,7 +532,7 @@ func TestUserCommandIngress_OversizedIdempotencyKeyRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer test-token")
+	req.AddCookie(&http.Cookie{Name: BrowserSessionCookie, Value: signTestIngressSession("conv-1")})
 	req.Header.Set("Idempotency-Key", strings.Repeat("x", MaxIdempotencyKeyBytes+1))
 
 	resp, err := http.DefaultClient.Do(req)
