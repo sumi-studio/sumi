@@ -292,9 +292,6 @@ pub fn build_compact_request(
         "input".into(),
         Value::Array(convert_input(spec, context, true)?),
     );
-    if compat.supports_store {
-        request.insert("store".into(), json!(false));
-    }
     Ok(Value::Object(request))
 }
 
@@ -2526,9 +2523,11 @@ impl ResponsesReceiveState {
                 .as_deref()
                 .is_some_and(|known| known != model)
         {
-            return Err(ResponsesAdapterError::InvalidEvent(
-                "response identity changed during stream".into(),
-            ));
+            tracing::debug!(
+                observed_model = model,
+                prior_model = ?self.response_model,
+                "provider reported a different model string during stream; retaining first observed"
+            );
         }
         let new_id = self.response_id.is_none();
         let new_model = self.response_model.is_none().then_some(model).flatten();
@@ -4201,7 +4200,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_request_disables_provider_storage_when_supported() {
+    fn compact_request_omits_provider_storage_field() {
         let body = build_compact_request(
             &spec(),
             &PromptContext {
@@ -4213,7 +4212,10 @@ mod tests {
             },
         )
         .expect("compact request");
-        assert_eq!(body["store"], false);
+        assert!(
+            body.get("store").is_none(),
+            "compact responses must not include store"
+        );
     }
 
     #[test]
@@ -5753,13 +5755,16 @@ mod tests {
             )
             .expect("later response event establishes model");
         assert_eq!(state.response_model.as_deref(), Some("gpt-5.6"));
-        assert!(state
+        // A dated/resolved/variant model string reported later in the stream must not
+        // invalidate an otherwise valid response; the first observed model is retained
+        // for telemetry.
+        state
             .push_json(
                 r#"{"type":"response.in_progress","sequence_number":2,"response":{"id":"resp","model":"other","status":"in_progress","created_at":1}}"#,
             )
-            .is_err());
+            .expect("later model variant is accepted");
         assert_eq!(state.response_model.as_deref(), Some("gpt-5.6"));
-        assert_eq!(state.next_sequence_number, 2);
+        assert_eq!(state.next_sequence_number, 3);
 
         let mut missing = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
         let error = missing

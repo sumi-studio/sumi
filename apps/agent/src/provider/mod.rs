@@ -1926,21 +1926,11 @@ async fn finish_responses_terminal(
     if let Some(observed_model) = terminal.response_model.as_deref()
         && observed_model != spec.id
     {
-        finish_failure_with_context(
-            priority_terminal_tx,
-            assembler,
-            spec,
-            terminal.usage,
-            format!(
-                "provider reported model {observed_model:?}, requested model {:?}",
-                spec.id
-            ),
-            "response_model_mismatch",
-            cancel.is_cancelled(),
-            terminal.provider_context,
-        )
-        .await;
-        return;
+        tracing::debug!(
+            observed_model,
+            canonical_model = spec.id,
+            "provider reported a different model string; using canonical spec model"
+        );
     }
     for event in terminal.events {
         match emit(tx, assembler, event, cancel).await {
@@ -2016,14 +2006,9 @@ async fn finish_responses_terminal(
             Err(_) => return,
         }
     };
-    let mut origin = spec.origin();
-    origin.model = terminal
-        .response_model
-        .clone()
-        .unwrap_or_else(|| spec.id.clone());
     let metadata = TerminalMetadata {
         provider: spec.provider.clone(),
-        origin,
+        origin: spec.origin(),
         usage: terminal.usage.clone(),
         stop_reason: terminal.reason,
         error_message: terminal.error_message,
@@ -3978,11 +3963,11 @@ fi
     }
 
     #[tokio::test]
-    async fn responses_terminal_uses_observed_model_and_rejects_mismatch() {
+    async fn responses_terminal_uses_canonical_origin_despite_observed_model() {
         let spec = ModelSpec::preset("openai-responses").expect("preset");
         let cancel = CancellationToken::new();
 
-        // Matching observed model -> success and origin model is the observed value.
+        // Matching observed model -> success and origin model is the canonical spec value.
         let (tx, mut rx) = mpsc::channel(1);
         let (priority_tx, _priority_rx) = mpsc::channel(1);
         let mut assembler = MessageAssembler::new();
@@ -4011,10 +3996,11 @@ fi
         };
         assert_eq!(output.message.model, spec.id);
         assert_eq!(output.message.origin.model, spec.id);
+        assert_eq!(output.message.origin, spec.origin());
         assert!(committed.is_committed());
 
-        // Mismatched observed model -> fail-closed Error, no durable success message,
-        // and no terminal.events leak onto the normal lane.
+        // Mismatched observed model -> still a normal success terminal, with canonical
+        // origin/model preserved and terminal events still delivered on the normal lane.
         let (tx2, mut rx2) = mpsc::channel(10);
         let (priority_tx2, mut priority_rx2) = mpsc::channel(1);
         let mut assembler2 = MessageAssembler::new();
@@ -4048,26 +4034,35 @@ fi
             &committed2,
         )
         .await;
-        let ProviderEvent::Error { reason, output } = priority_rx2.recv().await.expect("terminal")
-        else {
-            panic!("expected Error terminal")
-        };
-        assert_eq!(reason, StopReason::Error);
-        assert_eq!(output.message.stop_reason, StopReason::Error);
-        assert_eq!(
-            output.message.provider_code.as_deref(),
-            Some("response_model_mismatch")
-        );
-        assert!(!committed2.is_committed());
+        let mut output = None;
+        let mut _normal_lane_events = 0;
+        while let Some(event) = rx2.recv().await {
+            _normal_lane_events += 1;
+            if let ProviderEvent::Done {
+                output: done_output,
+                ..
+            } = event
+            {
+                output = Some(done_output);
+                break;
+            }
+        }
+        let output = output.expect("expected Done terminal");
+        assert_eq!(output.message.model, spec.id);
+        assert_eq!(output.message.origin.model, spec.id);
+        assert_eq!(output.message.origin, spec.origin());
+        assert_eq!(output.message.content.len(), 1);
+        assert!(committed2.is_committed());
+        assert!(priority_rx2.try_recv().is_err());
 
         drop(tx2);
-        let mut normal_lane_events = 0;
+        let mut remaining_events = 0;
         while rx2.recv().await.is_some() {
-            normal_lane_events += 1;
+            remaining_events += 1;
         }
         assert_eq!(
-            normal_lane_events, 0,
-            "model mismatch must not emit terminal events to the normal lane"
+            remaining_events, 0,
+            "all terminal events were already delivered on the normal lane"
         );
     }
 

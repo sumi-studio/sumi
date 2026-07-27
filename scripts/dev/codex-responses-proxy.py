@@ -153,8 +153,11 @@ class ResponsesBridge(BaseHTTPRequestHandler):
 
             # The subscription endpoint manages the output budget itself.
             request_body.pop("max_output_tokens", None)
-            request_body["store"] = False
+            # Compact responses must not include the store field; ordinary
+            # Responses requests explicitly disable it.
+            request_body.pop("store", None)
             if is_responses:
+                request_body["store"] = False
                 request_body["stream"] = True
 
             access_token, account_id = load_codex_auth(self.auth_path)
@@ -652,7 +655,7 @@ def _run_self_test() -> int:
         check(
             "compact_request_shape_is_bounded",
             len(_SelfTestUpstream.bodies) == 1
-            and _SelfTestUpstream.bodies[0].get("store") is False
+            and "store" not in _SelfTestUpstream.bodies[0]
             and "stream" not in _SelfTestUpstream.bodies[0]
             and "max_output_tokens" not in _SelfTestUpstream.bodies[0],
         )
