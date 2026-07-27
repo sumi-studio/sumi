@@ -66,6 +66,17 @@ pub(crate) enum RecoveryStep {
         run_id: String,
         turn_id: String,
     },
+    /// T23/T26 restart seam for an assistant turn that crashed while a real
+    /// ApprovalBroker request was durably pending. T26 must consume this before
+    /// resuming the assistant: atomically close the approval/prepared tool as
+    /// Cancelled, then continue any separately planned stored steer group.
+    CancelPendingApproval {
+        command_id: String,
+        run_id: String,
+        turn_id: String,
+        request_id: String,
+        tool_call_id: String,
+    },
     ResumeHardSteerFromDurableEvents {
         command_id: String,
         run_id: String,
@@ -252,7 +263,23 @@ impl SuffixRecovery {
         let mut steps = Vec::with_capacity(commands.len());
         let mut injected_groups = HashSet::new();
         for command in &commands {
-            let step = plan_one_command(store, command, &events).await?;
+            let mut step = plan_one_command(store, command, &events).await?;
+            if let RecoveryStep::ResumeAssistantFromDurableEvents {
+                command_id,
+                run_id,
+                turn_id,
+            } = &step
+                && let Some((request_id, tool_call_id)) =
+                    pending_approval_for_recovery(store, run_id, turn_id).await?
+            {
+                step = RecoveryStep::CancelPendingApproval {
+                    command_id: command_id.clone(),
+                    run_id: run_id.clone(),
+                    turn_id: turn_id.clone(),
+                    request_id,
+                    tool_call_id,
+                };
+            }
             if let RecoveryStep::InjectStoredGroup {
                 ref run_id,
                 ref turn_id,
@@ -311,6 +338,42 @@ impl SuffixRecovery {
         }
         Ok(vec![plan_one_command(store, &command, &events).await?])
     }
+}
+
+async fn pending_approval_for_recovery(
+    store: &Store,
+    run_id: &str,
+    turn_id: &str,
+) -> Result<Option<(String, String)>> {
+    let rows = sqlx::query(
+        "SELECT a.id, a.tool_call_id, t.state
+         FROM approval_log a
+         JOIN tool_executions t ON t.tool_call_id = a.tool_call_id
+         WHERE a.run_id = ? AND a.turn_id = ? AND a.state = 'pending'
+         ORDER BY a.created_at, a.id",
+    )
+    .bind(run_id)
+    .bind(turn_id)
+    .fetch_all(store.pool())
+    .await
+    .context("failed to inspect pending approval recovery state")?;
+    if rows.len() > 1 {
+        bail!(
+            "run {run_id}/{turn_id} has multiple pending approvals despite sequential one-at-a-time execution"
+        );
+    }
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let request_id: String = row.try_get("id")?;
+    let tool_call_id: String = row.try_get("tool_call_id")?;
+    let tool_state: String = row.try_get("state")?;
+    if tool_state != "prepared" {
+        bail!(
+            "pending approval {request_id} recovery requires prepared tool {tool_call_id}, found {tool_state}"
+        );
+    }
+    Ok(Some((request_id, tool_call_id)))
 }
 
 async fn plan_one_command(

@@ -27,8 +27,12 @@ use crate::{
         StopReason, ToolArgumentError, ToolCall, ToolResultMessage, Usage, UserContent,
         UserMessage, ValidatedToolArguments,
     },
-    runtime::contracts::{MAX_PROCESS_GENERATION, ProcessGeneration},
-    store::{AgentScope, DATA_KEY_BYTES, Redactor, Store, WrappingKey, user_message_id},
+    runtime::contracts::{
+        GenerationRecoveryFence, MAX_PROCESS_GENERATION, ProcessGeneration, ProcessGenerationLease,
+    },
+    store::{
+        AgentScope, DATA_KEY_BYTES, HydrationOutcome, Redactor, Store, WrappingKey, user_message_id,
+    },
     tools::ToolError,
 };
 
@@ -2351,6 +2355,113 @@ async fn pending_fixture_approval_is_a_fail_closed_t12_restart_suffix() {
         session.recovery_steps.as_slice(),
         [RecoveryStep::ResumeAssistantFromDurableEvents { .. }]
     ));
+}
+
+#[tokio::test]
+async fn hydrated_recovery_exposes_pending_real_broker_cancellation_before_saved_steer() {
+    let mut assistant = approval_fixture_assistant("approval-tool");
+    let PublicMessage::Assistant(assistant_message) = &mut assistant else {
+        unreachable!("approval fixture assistant")
+    };
+    let PublicAssistantContent::ToolCall { tool_call, .. } = &mut assistant_message.content[0]
+    else {
+        unreachable!("approval fixture tool call")
+    };
+    tool_call.name = "bash".to_owned();
+    tool_call.arguments = serde_json::from_value(serde_json::json!({"command":"git status"}))
+        .expect("validated bash approval arguments");
+    let broker_tool_call = tool_call.clone();
+    let (store, writer, mut bridge, binding) =
+        fixture_bridge_after_assistant("durable-approval-hydration-seam", assistant).await;
+    let broker = ApprovalBroker::new(
+        crate::approval::policy::Policy::new("/workspace"),
+        make_projector(),
+        None,
+        ReviewerMode::User,
+        false,
+        trusted_env(),
+    );
+    let outcome = broker
+        .start_request(
+            &broker_tool_call,
+            &[],
+            &binding.run_id,
+            &binding.turn_id,
+            "v1",
+            CancellationToken::new(),
+        )
+        .await
+        .expect("real broker pending request");
+    let ApprovalOutcome::Pending { pending } = outcome else {
+        panic!("real broker must enter pending approval")
+    };
+    let request = pending.request().clone();
+    bridge
+        .commit(
+            &writer,
+            RunOutput::detached(
+                binding.clone(),
+                AgentEvent::ApprovalRequested {
+                    request: request.clone(),
+                },
+                None,
+            ),
+        )
+        .await
+        .expect("commit real pending approval before restart");
+
+    let steer = user(2);
+    writer
+        .persist_inbound(&steer)
+        .await
+        .expect("persist saved soft steer");
+    let InboundCommand::Valid(steer_envelope) = steer else {
+        unreachable!("soft steer fixture is valid")
+    };
+    let steer_id = steer_envelope.command_id.to_string();
+    bridge
+        .bind_soft_steer(&writer, AdmittedCommand::new(steer_envelope, Utc::now()))
+        .await
+        .expect("durably classify saved soft steer");
+    let steer_turn_id: String =
+        sqlx::query_scalar("SELECT turn_id FROM inbound_commands WHERE command_id = ?")
+            .bind(&steer_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("saved steer turn binding");
+
+    let lease = ProcessGenerationLease::new(test_executor_generation(), "approval-recovery-lease")
+        .expect("valid recovery lease");
+    let fence = GenerationRecoveryFence::new(&lease, "approval-recovery-fence")
+        .expect("valid recovery fence");
+    let hydrated = store
+        .hydrate(&lease, &fence)
+        .await
+        .expect("authenticated hydration");
+    let HydrationOutcome::Complete(hydrated) = hydrated else {
+        panic!("prepared approval requires logical-only recovery")
+    };
+    let steps = hydrated.recovery_steps;
+    assert_eq!(
+        steps,
+        vec![
+            RecoveryStep::CancelPendingApproval {
+                command_id: binding.command_id,
+                run_id: binding.run_id.clone(),
+                turn_id: binding.turn_id,
+                request_id: request.id,
+                tool_call_id: request.tool_call_id,
+            },
+            RecoveryStep::InjectStoredGroup {
+                run_id: binding.run_id,
+                turn_id: steer_turn_id,
+                application_kind: crate::store::ApplicationKind::SoftSteer,
+                command_ids: vec![steer_id],
+            },
+        ],
+        "T26 must consume the typed cancellation seam before injecting the saved group exactly once"
+    );
+    drop(pending);
 }
 
 #[tokio::test]

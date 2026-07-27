@@ -2614,6 +2614,130 @@ async fn accept_steer_control_releases_claim_when_durable_authorization_drops() 
     assert!(accepted_rx.await.expect("accepted must still be sent"));
 }
 
+async fn approval_wait_preserves_pending_across_failed_control_authorization(abort: bool) {
+    let broker = Arc::new(ApprovalBroker::new(
+        Policy::new("/workspace"),
+        SecretAwareActionProjector::new(Redactor::v1(), SecretDigestKey::fixture()),
+        None,
+        ReviewerMode::User,
+        false,
+        TrustedEnvironment {
+            workspace_root: "/workspace".to_owned(),
+            sandbox: SandboxSummary::workspace(),
+            denied_paths: Vec::new(),
+            denied_network_domains: Vec::new(),
+            repo_visibility: None,
+            git_status: None,
+        },
+    ));
+    let call = ToolCall {
+        id: "approval-authorization-failure".to_owned(),
+        name: "bash".to_owned(),
+        arguments: serde_json::from_value(json!({"command": "git status"}))
+            .expect("validated arguments"),
+    };
+    let outcome = broker
+        .start_request(
+            &call,
+            &[],
+            "approval-run",
+            "approval-turn",
+            "v1",
+            CancellationToken::new(),
+        )
+        .await
+        .expect("start pending approval");
+    let ApprovalOutcome::Pending { mut pending } = outcome else {
+        panic!("fixture must enter pending approval");
+    };
+    let request_id = pending.request().id.clone();
+    let waiter_request_id = request_id.clone();
+
+    let driver = Arc::new(FixtureDriver::new(Vec::new()));
+    let mut core = bound_core(1);
+    core.set_approval(broker.clone());
+    let (control_tx, control_rx) = mpsc::channel(2);
+    let (events_tx, _events_rx) = mpsc::channel(1);
+    let mut runner = Runner::new(core, driver, control_rx, events_tx);
+    let waiter = tokio::spawn(async move {
+        runner
+            .wait_for_approval(waiter_request_id, pending.receiver_mut())
+            .await
+    });
+
+    let send_control = |seq, accepted, committed| {
+        if abort {
+            RunControl::Abort {
+                command: admitted_abort(seq),
+                accepted,
+                committed,
+            }
+        } else {
+            RunControl::SoftSteer {
+                command: admitted_user(seq),
+                accepted,
+                committed,
+            }
+        }
+    };
+
+    // Dropping the authorization sender models the Session's EventWriter
+    // transaction failing before it can publish commit authorization.
+    let (first_accepted_tx, first_accepted_rx) = oneshot::channel();
+    let (first_committed_tx, first_committed_rx) = oneshot::channel::<()>();
+    control_tx
+        .send(send_control(2, first_accepted_tx, first_committed_rx))
+        .await
+        .expect("send first control");
+    assert!(
+        first_accepted_rx
+            .await
+            .expect("worker accepts first control")
+    );
+    drop(first_committed_tx);
+
+    // A second control being accepted proves the waiter processed the failed
+    // authorization and remained live rather than returning Cancelled.
+    let (second_accepted_tx, second_accepted_rx) = oneshot::channel();
+    let (second_committed_tx, second_committed_rx) = oneshot::channel();
+    control_tx
+        .send(send_control(3, second_accepted_tx, second_committed_rx))
+        .await
+        .expect("send retry control");
+    assert!(
+        second_accepted_rx
+            .await
+            .expect("approval wait must remain live after failed authorization")
+    );
+    assert!(
+        broker.has_pending(&request_id),
+        "failed durability authorization must preserve the exact broker Pending entry"
+    );
+
+    second_committed_tx
+        .send(())
+        .expect("authorize retry control");
+    let outcome = waiter
+        .await
+        .expect("approval waiter task")
+        .expect("approval wait");
+    assert!(matches!(outcome, ApprovalWaitOutcome::Cancelled));
+    assert!(
+        !broker.any_pending(),
+        "durably authorized control must cancel the pending approval"
+    );
+}
+
+#[tokio::test]
+async fn approval_wait_preserves_pending_when_soft_steer_event_writer_commit_fails() {
+    approval_wait_preserves_pending_across_failed_control_authorization(false).await;
+}
+
+#[tokio::test]
+async fn approval_wait_preserves_pending_when_abort_event_writer_commit_fails() {
+    approval_wait_preserves_pending_across_failed_control_authorization(true).await;
+}
+
 // The following drivers and tests cover the timeout/dropped-acceptance path
 // described in the RunControl handshake audit. They ensure HardSteer and Abort
 // are not applied when the Session `accepted` receiver has already been dropped.

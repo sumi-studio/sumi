@@ -1491,24 +1491,28 @@ impl Runner {
                             accepted,
                             committed,
                         }) => {
-                            if let Some(broker) = self.core.approval.as_ref() {
-                                broker.cancel_all();
+                            if self
+                                .accept_steer_control(command, accepted, committed)
+                                .await?
+                            {
+                                if let Some(broker) = self.core.approval.as_ref() {
+                                    broker.cancel(&request_id);
+                                }
+                                return Ok(ApprovalWaitOutcome::Cancelled);
                             }
-                            self.accept_steer_control(command, accepted, committed).await?;
-                            return Ok(ApprovalWaitOutcome::Cancelled);
                         }
                         Some(RunControl::Abort {
                             accepted,
                             committed,
                             ..
                         }) => {
-                            if let Some(broker) = self.core.approval.as_ref() {
-                                broker.cancel_all();
-                            }
                             if self.accept_abort_control(accepted, committed).await? {
                                 self.abort_requested = true;
+                                if let Some(broker) = self.core.approval.as_ref() {
+                                    broker.cancel(&request_id);
+                                }
+                                return Ok(ApprovalWaitOutcome::Cancelled);
                             }
-                            return Ok(ApprovalWaitOutcome::Cancelled);
                         }
                         None => {
                             if let Some(broker) = self.core.approval.as_ref() {
