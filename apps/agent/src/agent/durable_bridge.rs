@@ -6,7 +6,7 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::{
-    approval::{ExecutableGrant, GrantRevalidation},
+    approval::{ExecutableGrant, GrantLease, GrantRevalidation},
     gateway::{ApprovalDecision, Command, CommandAck},
     provider::types::{PublicAssistantContent, PublicMessage, StopReason, ToolResultMessage},
     runtime::contracts::ProcessGeneration,
@@ -160,17 +160,21 @@ impl ToolStartCommitBarrier {
         )
     }
 
-    fn revalidate_grant(
+    async fn revalidate_grant(
         &self,
         tool_call_id: &str,
         tool_name: &str,
         args: &Value,
         run_id: &str,
         turn_id: &str,
-    ) -> Result<GrantRevalidation> {
+    ) -> Result<(GrantRevalidation, GrantLease<'_>)> {
         match self.grant.as_ref() {
-            Some(grant) => grant.revalidate(tool_call_id, tool_name, args, run_id, turn_id),
-            None => Ok(GrantRevalidation::Valid),
+            Some(grant) => {
+                grant
+                    .authorize(tool_call_id, tool_name, args, run_id, turn_id)
+                    .await
+            }
+            None => Ok((GrantRevalidation::Valid, GrantLease::empty())),
         }
     }
 
@@ -965,7 +969,7 @@ impl DurableBridge {
                         });
                     }
                 }
-                let grant_status = output
+                let (grant_status, grant_lease) = output
                     .commit_barrier
                     .as_ref()
                     .expect("ToolExecutionStart barrier checked")
@@ -975,8 +979,10 @@ impl DurableBridge {
                         &args,
                         &self.binding.run_id,
                         &self.binding.turn_id,
-                    )?;
+                    )
+                    .await?;
                 if grant_status == GrantRevalidation::Reauthorize {
+                    drop(grant_lease);
                     output
                         .commit_barrier
                         .take()
@@ -1080,6 +1086,7 @@ impl DurableBridge {
                             public,
                         )
                         .await?;
+                    drop(grant_lease);
                     return Ok(CommittedRunOutput {
                         outputs,
                         tool_start_barrier: output.commit_barrier,
@@ -1104,24 +1111,27 @@ impl DurableBridge {
                     tool_call_id: tool_call_id.clone(),
                     run_id: self.binding.run_id.clone(),
                 }));
-                self.commit_single(
-                    writer,
-                    DurableEvent::tool_execution_start(
-                        tool_call_id.clone(),
-                        tool_name.clone(),
-                        args.clone(),
-                        self.binding.command_id.clone(),
-                        self.binding.run_id.clone(),
-                        self.binding.executor_generation,
-                    )?,
-                    projections,
-                    AgentEvent::ToolExecutionStart {
-                        tool_call_id,
-                        tool_name,
-                        args,
-                    },
-                )
-                .await
+                let committed = self
+                    .commit_single(
+                        writer,
+                        DurableEvent::tool_execution_start(
+                            tool_call_id.clone(),
+                            tool_name.clone(),
+                            args.clone(),
+                            self.binding.command_id.clone(),
+                            self.binding.run_id.clone(),
+                            self.binding.executor_generation,
+                        )?,
+                        projections,
+                        AgentEvent::ToolExecutionStart {
+                            tool_call_id,
+                            tool_name,
+                            args,
+                        },
+                    )
+                    .await?;
+                drop(grant_lease);
+                Ok(committed)
             }
             AgentEvent::RetryScheduled {
                 attempt,

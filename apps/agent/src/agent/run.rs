@@ -1486,7 +1486,7 @@ impl Runner {
                                     if rid == &request_id =>
                                 {
                                     if let Some(broker) = self.core.approval.as_ref() {
-                                        return Ok(match broker.resolve(rid, decision) {
+                                        return Ok(match broker.resolve(rid, decision).await {
                                             Some(decision) => {
                                                 ApprovalWaitOutcome::Resolved {
                                                     decision,
@@ -1510,7 +1510,7 @@ impl Runner {
                                     // attempting to resolve the broker's pending entry; if there
                                     // is none, the decision is a stale no-op and is discarded.
                                     if let Some(broker) = self.core.approval.as_ref() {
-                                        let _ = broker.resolve(rid, decision);
+                                        let _ = broker.resolve(rid, decision).await;
                                     }
                                     continue;
                                 }

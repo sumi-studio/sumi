@@ -8,14 +8,14 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
-use tokio::sync::oneshot;
+use tokio::sync::{RwLock, RwLockReadGuard, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -90,14 +90,14 @@ pub(crate) enum GrantRevalidation {
 }
 
 impl ExecutableGrant {
-    pub(crate) fn revalidate(
+    pub(crate) async fn authorize(
         &self,
         tool_call_id: &str,
         tool_name: &str,
         arguments: &Value,
         run_id: &str,
         turn_id: &str,
-    ) -> Result<GrantRevalidation> {
+    ) -> Result<(GrantRevalidation, GrantLease<'_>)> {
         let arguments_hash: [u8; 32] =
             Sha256::digest(serde_json::to_vec(arguments).context("serialize tool arguments")?)
                 .into();
@@ -111,13 +111,46 @@ impl ExecutableGrant {
         );
 
         let now = (self.clock)();
-        let policy = self.policy.read().unwrap_or_else(|e| e.into_inner());
+        let policy = self.policy.read().await;
         if self.valid_until.is_some_and(|deadline| now >= deadline)
             || policy.hash_at(now) != self.policy_hash
         {
-            return Ok(GrantRevalidation::Reauthorize);
+            return Ok((GrantRevalidation::Reauthorize, GrantLease::empty()));
         }
-        Ok(GrantRevalidation::Valid)
+        Ok((
+            GrantRevalidation::Valid,
+            GrantLease {
+                _policy: Some(policy),
+            },
+        ))
+    }
+
+    #[cfg(test)]
+    async fn revalidate(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments: &Value,
+        run_id: &str,
+        turn_id: &str,
+    ) -> Result<GrantRevalidation> {
+        Ok(self
+            .authorize(tool_call_id, tool_name, arguments, run_id, turn_id)
+            .await?
+            .0)
+    }
+}
+
+/// A read lease over the verified policy. Holding this lease through the
+/// EventWriter transaction linearizes policy replacement with tool start: a
+/// replacement waits for the durable start to commit before becoming visible.
+pub(crate) struct GrantLease<'a> {
+    _policy: Option<RwLockReadGuard<'a, Policy>>,
+}
+
+impl<'a> GrantLease<'a> {
+    pub(crate) fn empty() -> Self {
+        Self { _policy: None }
     }
 }
 
@@ -165,6 +198,7 @@ impl TrustedEnvironmentProvider for FixedTrustedEnvironment {
 struct ReviewPolicySnapshot {
     policy_hash: String,
     cache_expires_at: Option<chrono::DateTime<Utc>>,
+    grant_expires_at: Option<chrono::DateTime<Utc>>,
     context_version: String,
     run_id: String,
     turn_id: String,
@@ -291,11 +325,15 @@ impl ApprovalBroker {
     ///
     /// Existing executable grants observe the same `RwLock`, so the durable
     /// start boundary detects a replacement instead of trusting its snapshot.
-    pub(crate) fn replace_policy(&self, policy: Policy) -> Result<()> {
+    pub(crate) async fn replace_policy(&self, policy: Policy) -> Result<()> {
         // Hold the write lock through validation and installation so concurrent
         // replacements cannot both validate against the same stale authority
         // version and then install a rollback out of order.
-        let mut current = self.policy.write().unwrap_or_else(|e| e.into_inner());
+        anyhow::ensure!(
+            policy.authority_binding().is_some(),
+            "replacement policy must carry verified approval authority"
+        );
+        let mut current = self.policy.write().await;
         anyhow::ensure!(
             policy.workspace_root() == current.workspace_root(),
             "replacement policy changed workspace root"
@@ -318,7 +356,8 @@ impl ApprovalBroker {
             (Some(_), None) => {
                 anyhow::bail!("replacement policy dropped verified approval authority scope");
             }
-            (None, _) => {}
+            (None, Some(_)) => {}
+            (None, None) => unreachable!("replacement authority checked above"),
         }
         *current = policy;
         if let Some(reviewer) = self.reviewer.as_ref() {
@@ -361,11 +400,7 @@ impl ApprovalBroker {
     ) -> Result<ApprovalOutcome> {
         // One immutable policy snapshot owns action construction, evaluation,
         // and reviewer cache identity for this request.
-        let policy = self
-            .policy
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let policy = self.policy.read().await.clone();
         let evaluated_at = (self.clock)();
         let action = match CanonicalAction::from_tool_call(
             policy.workspace_root().to_path_buf(),
@@ -383,9 +418,17 @@ impl ApprovalBroker {
 
         let projection = self.projector.project(&action);
         let decision = policy.evaluate_at(&action, evaluated_at);
+        let verified_cache_expiry = policy.review_cache_expires_at(evaluated_at);
         let review_policy = ReviewPolicySnapshot {
             policy_hash: policy.hash_at(evaluated_at),
-            cache_expires_at: policy.review_cache_expires_at(evaluated_at),
+            // An unsigned or unavailable policy must never seed or hit the
+            // shared reviewer allow cache. A past expiry is the existing
+            // cache contract's fail-closed disable switch; grant expiry is
+            // kept separate so an explicit reviewer decision remains a
+            // one-shot authorization under the current policy.
+            cache_expires_at: verified_cache_expiry
+                .or_else(|| Some(evaluated_at - chrono::Duration::seconds(1))),
+            grant_expires_at: verified_cache_expiry,
             context_version: context_version.to_owned(),
             run_id: run_id.to_owned(),
             turn_id: turn_id.to_owned(),
@@ -463,7 +506,7 @@ impl ApprovalBroker {
                 policy: self.policy.clone(),
                 clock: self.clock.clone(),
                 policy_hash: policy.policy_hash.clone(),
-                valid_until: policy.cache_expires_at,
+                valid_until: policy.grant_expires_at,
                 tool_call_id: tool_call.id.clone(),
                 tool_name: tool_call.name.clone(),
                 arguments_hash,
@@ -477,14 +520,15 @@ impl ApprovalBroker {
     /// the in-memory policy for safe `ApproveAlways` rules, and notify the
     /// waiting worker. Returns `None` when the `request_id` is not pending
     /// (terminal/unknown no-op).
-    pub fn resolve(
+    pub async fn resolve(
         &self,
         request_id: &str,
         decision: &GatewayApprovalDecision,
     ) -> Option<ResolvedDecision> {
-        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = pending.remove(request_id)?;
-        drop(pending);
+        let entry = {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            pending.remove(request_id)?
+        };
         self.resolving
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -505,17 +549,13 @@ impl ApprovalBroker {
         };
 
         let resolved = {
-            let policy = self
-                .policy
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
+            let policy = self.policy.read().await.clone();
             policy.resolve(&entry.action, user_decision, &self.projector)
         };
 
         let mut resolved = resolved;
         if let ResolvedDecision::ApproveAlways(ref rule) = resolved {
-            let guard = self.policy.read().unwrap_or_else(|e| e.into_inner());
+            let guard = self.policy.read().await;
             if let Err(error) = guard.clone().try_with_rule(rule.clone()) {
                 let literal_prefix =
                     matches!(&error, RuleValidationError::BroadPrefix).then(|| {
@@ -1103,6 +1143,37 @@ mod tests {
         (broker, reviewer, calls)
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsigned_authority_never_seeds_or_hits_reviewer_allow_cache() {
+        let (mut broker, reviewer, calls) = broker_with_counting_reviewer();
+        broker.mode = ReviewerMode::AutoReview;
+        let call = bash_call("git status");
+
+        for turn_id in ["turn-1", "turn-2"] {
+            assert!(matches!(
+                broker
+                    .start_request(
+                        &call,
+                        &[],
+                        "run-1",
+                        turn_id,
+                        "context-1",
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .expect("review without verified authority"),
+                ApprovalOutcome::Allowed { .. }
+            ));
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            reviewer.allow_cache_entry_count(),
+            0,
+            "unsigned authority must not seed a shared allow cache"
+        );
+    }
+
     fn git_status_review_request(policy_hash: &str, context_version: &str) -> ReviewRequest {
         let projection = ReviewProjection::Reviewable(ReviewableAction {
             tool: "bash".to_owned(),
@@ -1326,7 +1397,21 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn executable_grant_observes_live_policy_replacement() {
-        let broker = broker();
+        let now = Utc::now();
+        let authority = |version: u64, rules: Vec<ApprovalRule>| ApprovalPolicyBundle {
+            schema_version: APPROVAL_POLICY_BUNDLE_SCHEMA_VERSION,
+            tenant_id: "tenant-1".to_owned(),
+            agent_id: "agent-1".to_owned(),
+            version,
+            issued_at: now - chrono::Duration::minutes(1),
+            expires_at: now + chrono::Duration::hours(1),
+            rules,
+        };
+        let broker = ApprovalBroker::headless(
+            Policy::from_verified_bundle("/workspace", &authority(1, Vec::new()))
+                .expect("initial verified policy"),
+            projector(),
+        );
         let call = read_file_call("notes.txt");
         let ApprovalOutcome::Allowed { grant } = broker
             .start_request(
@@ -1342,19 +1427,25 @@ mod tests {
         else {
             panic!("workspace read should initially allow");
         };
-        let replacement = Policy::new("/workspace")
-            .try_with_rule(ApprovalRule {
-                id: "replacement-identity".to_owned(),
-                tool: "bash".to_owned(),
-                literal_prefix: vec!["git".to_owned(), "status".to_owned()],
-                effect: crate::approval::RuleEffect::NeedsApproval,
-                workspace_only: true,
-                allowed_permissions: vec![Permission::Exec],
-                allowed_network_domains: Vec::new(),
-            })
-            .expect("valid replacement policy");
+        let replacement = Policy::from_verified_bundle(
+            "/workspace",
+            &authority(
+                2,
+                vec![ApprovalRule {
+                    id: "replacement-identity".to_owned(),
+                    tool: "bash".to_owned(),
+                    literal_prefix: vec!["git".to_owned(), "status".to_owned()],
+                    effect: crate::approval::RuleEffect::NeedsApproval,
+                    workspace_only: true,
+                    allowed_permissions: vec![Permission::Exec],
+                    allowed_network_domains: Vec::new(),
+                }],
+            ),
+        )
+        .expect("valid replacement policy");
         broker
             .replace_policy(replacement)
+            .await
             .expect("replace live policy");
 
         assert_eq!(
@@ -1366,14 +1457,78 @@ mod tests {
                     "run-1",
                     "turn-1",
                 )
+                .await
                 .expect("grant revalidation"),
             GrantRevalidation::Reauthorize,
             "a live policy replacement must invalidate an already-issued grant"
         );
     }
 
-    #[test]
-    fn replacement_rejects_a_different_verified_authority_scope() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn policy_replacement_waits_for_grant_start_authorization_lease() {
+        let now = Utc::now();
+        let bundle = |version: u64| ApprovalPolicyBundle {
+            schema_version: APPROVAL_POLICY_BUNDLE_SCHEMA_VERSION,
+            tenant_id: "tenant-1".to_owned(),
+            agent_id: "agent-1".to_owned(),
+            version,
+            issued_at: now - chrono::Duration::minutes(1),
+            expires_at: now + chrono::Duration::hours(1),
+            rules: Vec::new(),
+        };
+        let broker = ApprovalBroker::headless(
+            Policy::from_verified_bundle("/workspace", &bundle(1))
+                .expect("initial verified policy"),
+            projector(),
+        );
+        let call = read_file_call("notes.txt");
+        let ApprovalOutcome::Allowed { grant } = broker
+            .start_request(
+                &call,
+                &[],
+                "run-1",
+                "turn-1",
+                "v1",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("initial allow")
+        else {
+            panic!("workspace read should initially allow");
+        };
+        let (status, lease) = grant
+            .authorize(
+                &call.id,
+                &call.name,
+                &Value::Object(call.arguments.as_object().clone()),
+                "run-1",
+                "turn-1",
+            )
+            .await
+            .expect("start authorization");
+        assert_eq!(status, GrantRevalidation::Valid);
+
+        let replacement = Policy::from_verified_bundle("/workspace", &bundle(2))
+            .expect("replacement verified policy");
+        let replacement_task = tokio::spawn({
+            let broker = broker.clone();
+            async move { broker.replace_policy(replacement).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !replacement_task.is_finished(),
+            "policy replacement must wait while a tool-start authorization lease is held"
+        );
+
+        drop(lease);
+        replacement_task
+            .await
+            .expect("replacement task join")
+            .expect("replacement after durable authorization");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replacement_rejects_a_different_verified_authority_scope() {
         let now = Utc::now();
         let bundle = |tenant_id: &str, agent_id: &str, version: u64| ApprovalPolicyBundle {
             schema_version: APPROVAL_POLICY_BUNDLE_SCHEMA_VERSION,
@@ -1394,8 +1549,20 @@ mod tests {
                 .expect("replacement verified policy");
         let broker = ApprovalBroker::headless(current, projector());
 
+        let unsigned = Policy::new("/workspace");
+        let unsigned_error = broker
+            .replace_policy(unsigned)
+            .await
+            .expect_err("unsigned replacement must fail closed");
+        assert!(
+            unsigned_error
+                .to_string()
+                .contains("verified approval authority")
+        );
+
         broker
             .replace_policy(same_scope)
+            .await
             .expect("same-scope policy replacement must remain allowed");
 
         let rollback =
@@ -1403,6 +1570,7 @@ mod tests {
                 .expect("rollback policy");
         let rollback_error = broker
             .replace_policy(rollback)
+            .await
             .expect_err("authority bundle rollback must fail closed");
         assert!(rollback_error.to_string().contains("strictly newer"));
 
@@ -1420,11 +1588,13 @@ mod tests {
             .expect("same-version conflicting policy");
         let conflict_error = broker
             .replace_policy(conflicting)
+            .await
             .expect_err("same-version conflicting authority bundle must fail closed");
         assert!(conflict_error.to_string().contains("strictly newer"));
 
         let error = broker
             .replace_policy(replacement)
+            .await
             .expect_err("cross-authority replacement must fail closed");
         assert!(error.to_string().contains("authority scope"));
     }
@@ -1491,6 +1661,7 @@ mod tests {
 
         let resolved = broker
             .resolve(&request.id, &GatewayApprovalDecision::ApproveOnce)
+            .await
             .expect("resolve pending");
         assert!(matches!(resolved, ResolvedDecision::ApproveOnce));
         assert!(!broker.any_pending());
@@ -1569,6 +1740,7 @@ mod tests {
                 &request.id,
                 &GatewayApprovalDecision::ApproveAlways { rule },
             )
+            .await
             .expect("resolve pending");
         assert!(matches!(resolved, ResolvedDecision::ApproveAlways(_)));
         let outcome = broker
@@ -1607,6 +1779,7 @@ mod tests {
         assert!(
             broker
                 .resolve("no-such-id", &GatewayApprovalDecision::ApproveOnce)
+                .await
                 .is_none()
         );
     }
@@ -1662,7 +1835,9 @@ mod tests {
         };
         let request = pending.request();
 
-        let _ = broker.resolve(&request.id, &GatewayApprovalDecision::ApproveOnce);
+        let _ = broker
+            .resolve(&request.id, &GatewayApprovalDecision::ApproveOnce)
+            .await;
         // A second identical bash call must still require approval.
         let outcome2 = broker
             .start_request(
@@ -1732,21 +1907,14 @@ mod tests {
                 &first_pending.request().id,
                 &GatewayApprovalDecision::ApproveAlways { rule: first_rule },
             )
+            .await
             .expect("resolve pending");
         assert!(
             matches!(first_resolved, ResolvedDecision::ApproveOnce),
             "duplicate rule id must downgrade to ApproveOnce"
         );
         // The policy still contains only one rule.
-        assert_eq!(
-            broker
-                .policy
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .rules()
-                .len(),
-            1
-        );
+        assert_eq!(broker.policy.read().await.rules().len(), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1757,11 +1925,7 @@ mod tests {
         let call = bash_call("git status");
         // Prime the reviewer allow cache with a decision for the current policy.
         let policy_hash = {
-            let policy = broker
-                .policy
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
+            let policy = broker.policy.read().await.clone();
             policy.hash()
         };
         let cache_request = git_status_review_request(&policy_hash, "v1");
@@ -1806,6 +1970,7 @@ mod tests {
                 &request.id,
                 &GatewayApprovalDecision::ApproveAlways { rule },
             )
+            .await
             .expect("resolve pending");
         assert!(matches!(resolved, ResolvedDecision::ApproveAlways(_)));
         broker
