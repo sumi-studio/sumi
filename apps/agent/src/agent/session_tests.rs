@@ -6420,6 +6420,131 @@ fn live_responses_driver(
     )
 }
 
+fn live_responses_approval_broker() -> Arc<ApprovalBroker> {
+    let workspace_root = std::env::temp_dir();
+    let policy = crate::approval::Policy::new(&workspace_root)
+        .try_with_rule(ApprovalRule {
+            id: "live-responses-echo-value".to_owned(),
+            tool: "echo_value".to_owned(),
+            literal_prefix: vec!["echo_value".to_owned(), "responses-live-ok".to_owned()],
+            effect: RuleEffect::Allow,
+            workspace_only: true,
+            allowed_permissions: vec![Permission::ReadWorkspace],
+            allowed_network_domains: Vec::new(),
+        })
+        .expect("valid bounded live Responses approval rule");
+    Arc::new(ApprovalBroker::headless(
+        policy,
+        SecretAwareActionProjector::new(Redactor::v1(), SecretDigestKey::fixture()),
+    ))
+}
+
+#[tokio::test]
+async fn live_responses_approval_broker_constructs_bounded_policy() {
+    let broker = live_responses_approval_broker();
+    let call = |id: &str, value: &str| ToolCall {
+        id: id.to_owned(),
+        name: "echo_value".to_owned(),
+        arguments: serde_json::from_value(serde_json::json!({"value": value}))
+            .expect("valid echo_value arguments"),
+    };
+    assert!(matches!(
+        broker
+            .start_request(
+                &call("allowed", "responses-live-ok"),
+                &[],
+                "live-approval-test",
+                "turn-1",
+                "context-1",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("bounded allowed prefix"),
+        ApprovalOutcome::Allowed { .. }
+    ));
+    assert!(matches!(
+        broker
+            .start_request(
+                &call("modified", "responses-live-no"),
+                &[],
+                "live-approval-test",
+                "turn-2",
+                "context-1",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("modified prefix denial"),
+        ApprovalOutcome::Denied { .. }
+    ));
+    for (id, value) in [
+        ("dot-prefix", "./responses-live-ok"),
+        ("trailing-slash", "responses-live-ok/"),
+    ] {
+        assert!(matches!(
+            broker
+                .start_request(
+                    &call(id, value),
+                    &[],
+                    "live-approval-test",
+                    "turn-2",
+                    "context-1",
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("normalized literal variant denial"),
+            ApprovalOutcome::Denied { .. }
+        ));
+    }
+    let unknown = ToolCall {
+        id: "unknown".to_owned(),
+        name: "unknown_tool".to_owned(),
+        arguments: serde_json::from_value(serde_json::json!({})).expect("valid object"),
+    };
+    assert!(matches!(
+        broker
+            .start_request(
+                &unknown,
+                &[],
+                "live-approval-test",
+                "turn-3",
+                "context-1",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("unknown tool denial"),
+        ApprovalOutcome::Denied { .. }
+    ));
+    let permission_policy = crate::approval::Policy::new(std::env::temp_dir())
+        .try_with_rule(ApprovalRule {
+            id: "live-responses-wrong-permission".to_owned(),
+            tool: "echo_value".to_owned(),
+            literal_prefix: vec!["echo_value".to_owned(), "responses-live-ok".to_owned()],
+            effect: RuleEffect::Allow,
+            workspace_only: true,
+            allowed_permissions: vec![Permission::WriteWorkspace],
+            allowed_network_domains: Vec::new(),
+        })
+        .expect("valid permission-mismatch rule");
+    let permission_broker = ApprovalBroker::headless(
+        permission_policy,
+        SecretAwareActionProjector::new(Redactor::v1(), SecretDigestKey::fixture()),
+    );
+    assert!(matches!(
+        permission_broker
+            .start_request(
+                &call("permission", "responses-live-ok"),
+                &[],
+                "live-approval-test",
+                "turn-4",
+                "context-1",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("permission violation denial"),
+        ApprovalOutcome::Denied { .. }
+    ));
+}
+
 fn live_responses_user(seq: u64, text: &str) -> InboundCommand {
     let command_id = format!("25000000-0000-4000-8000-{seq:012}");
     InboundCommand::Valid(CommandEnvelope {
@@ -6620,7 +6745,11 @@ pub(crate) async fn run_canonical_live_responses_roundtrip(spec: ModelSpec, api_
     let tool = live_responses_tool();
     let first_core = run_live_responses_session(
         store,
-        RunCore::new(),
+        {
+            let mut core = RunCore::new();
+            core.set_approval(live_responses_approval_broker());
+            core
+        },
         live_responses_driver(
             spec.clone(),
             tool.clone(),
@@ -6688,6 +6817,7 @@ pub(crate) async fn run_canonical_live_responses_roundtrip(spec: ModelSpec, api_
     assert_live_provider_context_private(&reopened, &hydrated.messages, &markers).await;
     let replayed_context_items = hydrated.provider_context.len();
     let mut restarted_core = RunCore::new();
+    restarted_core.set_approval(live_responses_approval_broker());
     restarted_core.install_hydrated_context(hydrated.messages, hydrated.provider_context);
 
     let second_pool = reopened.pool().clone();
