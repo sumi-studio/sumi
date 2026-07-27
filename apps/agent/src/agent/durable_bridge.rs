@@ -964,6 +964,9 @@ impl DurableBridge {
                                 tool_call_id.clone(),
                                 tool_name.clone(),
                                 args.clone(),
+                                self.binding.command_id.clone(),
+                                run_id.clone(),
+                                self.binding.executor_generation,
                             )?),
                             projections: vec![Projection::ToolExecution(
                                 ToolExecutionMutation::Start {
