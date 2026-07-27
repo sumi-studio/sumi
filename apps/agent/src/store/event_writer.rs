@@ -51,7 +51,8 @@ use super::{
     },
     memory_state::{
         MemoryApplyCursorRecord, MemoryBatchMessageRecord, MemoryBatchRecord, MemoryBatchState,
-        MemoryBatchSummary, MemoryJobKind, MemoryJobRecord, MemoryJobResult, MemoryLayer,
+        MemoryBatchSummary, MemoryJobKind, MemoryJobRecord, MemoryJobResult, MemoryJobStatus,
+        MemoryLayer,
     },
     physical_recovery::{ApplyReceiptOutcome, PhysicalRecoveryApplier, PhysicalRecoveryReceipt},
     provider_context::{
@@ -953,11 +954,22 @@ pub(crate) struct MemoryApplyCursorAdvance {
     dead_code,
     reason = "T17 durable memory state transitions wired by the T20 maintainer"
 )]
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct MemoryTransition {
     pub expected_source_versions: BTreeMap<BatchId, u64>,
+    /// Optional source-state witness checked inside the EventWriter transaction.
+    /// Batches named here must already exist with the expected state; they are
+    /// not mutated by the transition itself.
+    pub expected_source_states: BTreeMap<BatchId, MemoryBatchState>,
     pub batch_mutations: Vec<MemoryBatchMutation>,
     pub job_mutations: Vec<MemoryJobMutation>,
+    /// New batches to insert atomically within the same EventWriter
+    /// transaction. `batch_seq` and `ord` are assigned inside the transaction
+    /// so recovery cannot race with L0 seal allocation.
+    pub batch_inserts: Vec<MemoryBatchRecord>,
+    /// New jobs to insert atomically within the same EventWriter transaction.
+    /// Their `batch_seq` is fixed to the matching inserted target batch.
+    pub job_inserts: Vec<MemoryJobRecord>,
     pub cursor_advance: Option<MemoryApplyCursorAdvance>,
 }
 
@@ -1264,8 +1276,11 @@ enum PreparedProjection {
     },
     MemoryTransition {
         expected_source_versions: BTreeMap<String, i64>,
+        expected_source_states: BTreeMap<String, MemoryBatchState>,
         batch_mutations: Vec<PreparedMemoryBatchMutation>,
         job_mutations: Vec<PreparedMemoryJobMutation>,
+        batch_inserts: Vec<MemoryBatchRecord>,
+        job_inserts: Vec<MemoryJobRecord>,
         cursor_advance: Option<MemoryApplyCursorAdvance>,
         memory_summary_key_ref: Option<String>,
         memory_summary_key_proof: Option<Vec<u8>>,
@@ -3648,10 +3663,20 @@ impl EventWriter {
             })
             .unwrap_or((None, None));
 
+        let expected_source_states: BTreeMap<String, MemoryBatchState> = transition
+            .expected_source_states
+            .iter()
+            .map(|(id, state)| Ok((id.to_string(), *state)))
+            .collect::<Result<BTreeMap<_, _>>>()
+            .context("invalid expected source state batch id")?;
+
         Ok(PreparedProjection::MemoryTransition {
             expected_source_versions: pre_source_versions,
+            expected_source_states,
             batch_mutations,
             job_mutations,
+            batch_inserts: transition.batch_inserts,
+            job_inserts: transition.job_inserts,
             cursor_advance: transition.cursor_advance,
             memory_summary_key_ref: key_ref,
             memory_summary_key_proof: key_proof,
@@ -5761,8 +5786,8 @@ fn validate_batch_shape_with_recovery(
         let mut memory_transition_seen = false;
         let mut memory_job_update_seen = false;
         let mut provider_context_seen = false;
-        let mut batch_ids = HashSet::new();
-        let mut job_ids = HashSet::new();
+        let mut batch_ids: HashSet<String> = HashSet::new();
+        let mut job_ids: HashSet<String> = HashSet::new();
         for projection in &write.projections {
             match projection {
                 Projection::ProviderContextMutation(_) => {
@@ -5783,7 +5808,7 @@ fn validate_batch_shape_with_recovery(
                     }
                     memory_job_update_seen = true;
                     for mutation in &update.job_mutations {
-                        if !job_ids.insert(job_id_for_mutation(mutation)) {
+                        if !job_ids.insert(job_id_for_mutation(mutation).to_owned()) {
                             bail!("duplicate job_id in MemoryJobUpdate");
                         }
                         validate_memory_job_mutation_shape(mutation)?;
@@ -5802,7 +5827,7 @@ fn validate_batch_shape_with_recovery(
                         batch.new_state == MemoryBatchState::Compacted && batch.summary.is_some()
                     });
                     for batch in &transition.batch_mutations {
-                        if !batch_ids.insert(batch.batch_id) {
+                        if !batch_ids.insert(batch.batch_id.to_string()) {
                             bail!("duplicate batch_id in MemoryTransition");
                         }
                         if batch.new_state == MemoryBatchState::Compacted
@@ -5822,11 +5847,58 @@ fn validate_batch_shape_with_recovery(
                             );
                         }
                     }
+                    for insert in &transition.batch_inserts {
+                        if !batch_ids.insert(insert.id.clone()) {
+                            bail!("duplicate batch_id in MemoryTransition batch_inserts");
+                        }
+                        let insert_id = BatchId::parse_str(&insert.id)
+                            .with_context(|| format!("invalid inserted batch id {}", insert.id))?;
+                        if transition.expected_source_versions.contains_key(&insert_id)
+                            || transition.expected_source_states.contains_key(&insert_id)
+                        {
+                            bail!(
+                                "inserted batch_id {} is also listed as a source witness",
+                                insert.id
+                            );
+                        }
+                        if insert.state != MemoryBatchState::Compacting {
+                            bail!("MemoryTransition batch_inserts must be in Compacting state");
+                        }
+                        if insert.version != 0 {
+                            bail!("MemoryTransition batch_inserts must have version 0");
+                        }
+                        if insert.summary.is_some() {
+                            bail!("MemoryTransition batch_inserts must not carry a summary");
+                        }
+                        if insert.est_tokens != 0 || insert.eviction_footprint_tokens != 0 {
+                            bail!("MemoryTransition batch_inserts must have zero token estimates");
+                        }
+                    }
                     for mutation in &transition.job_mutations {
-                        if !job_ids.insert(job_id_for_mutation(mutation)) {
+                        if !job_ids.insert(job_id_for_mutation(mutation).to_owned()) {
                             bail!("duplicate job_id in MemoryTransition");
                         }
                         validate_memory_job_mutation_shape(mutation)?;
+                    }
+                    for insert in &transition.job_inserts {
+                        if !job_ids.insert(insert.id.clone()) {
+                            bail!("duplicate job_id in MemoryTransition job_inserts");
+                        }
+                        if insert.status != MemoryJobStatus::Pending {
+                            bail!("MemoryTransition job_inserts must be in Pending state");
+                        }
+                        if insert.attempts != 0 {
+                            bail!("MemoryTransition job_inserts must have attempts 0");
+                        }
+                        if insert.lease_until.is_some() {
+                            bail!("MemoryTransition job_inserts must not have a lease");
+                        }
+                        if insert.result.is_some() {
+                            bail!("MemoryTransition job_inserts must not carry a result");
+                        }
+                        if insert.source_ids.is_empty() {
+                            bail!("MemoryTransition job_inserts must have at least one source");
+                        }
                     }
                     if !has_memory_maintenance && write.event.is_some() {
                         bail!(
@@ -9626,8 +9698,11 @@ async fn apply_projection(
         }
         PreparedProjection::MemoryTransition {
             expected_source_versions,
+            expected_source_states,
             batch_mutations,
             job_mutations,
+            batch_inserts,
+            job_inserts,
             cursor_advance,
             ..
         } => {
@@ -9635,8 +9710,11 @@ async fn apply_projection(
                 store,
                 transaction,
                 expected_source_versions,
+                expected_source_states,
                 batch_mutations,
                 job_mutations,
+                batch_inserts,
+                job_inserts,
                 cursor_advance,
             )
             .await?;
@@ -9921,6 +9999,31 @@ async fn verify_source_versions(
     Ok(())
 }
 
+async fn verify_source_states(
+    transaction: &mut Transaction<'_, Sqlite>,
+    expected: &BTreeMap<String, MemoryBatchState>,
+) -> Result<()> {
+    for (batch_id, expected_state) in expected {
+        let row = sqlx::query("SELECT state FROM memory_batches WHERE id = ?")
+            .bind(batch_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .context("failed to read source state for memory CAS")?
+            .ok_or_else(|| anyhow!("memory source batch {batch_id} does not exist"))?;
+        let state: String = row.try_get("state")?;
+        let actual = parse_memory_batch_state(&state)
+            .with_context(|| format!("memory source batch {batch_id} has unknown state {state}"))?;
+        if actual != *expected_state {
+            bail!(
+                "memory source batch {batch_id} state mismatch: expected {}, actual {}",
+                expected_state.as_str(),
+                state
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn apply_memory_job_update(
     transaction: &mut Transaction<'_, Sqlite>,
     expected_source_versions: BTreeMap<String, i64>,
@@ -9933,18 +10036,116 @@ async fn apply_memory_job_update(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "prepared projection decomposition"
+)]
 async fn apply_memory_transition(
     store: &Store,
     transaction: &mut Transaction<'_, Sqlite>,
     expected_source_versions: BTreeMap<String, i64>,
+    expected_source_states: BTreeMap<String, MemoryBatchState>,
     batch_mutations: Vec<PreparedMemoryBatchMutation>,
     job_mutations: Vec<PreparedMemoryJobMutation>,
+    batch_inserts: Vec<MemoryBatchRecord>,
+    job_inserts: Vec<MemoryJobRecord>,
     cursor_advance: Option<MemoryApplyCursorAdvance>,
 ) -> Result<()> {
     verify_source_versions(transaction, &expected_source_versions, None).await?;
+    verify_source_states(transaction, &expected_source_states).await?;
+
+    // Allocate and insert new target batches inside the EventWriter transaction
+    // so concurrent L0 seal/recovery cannot reuse the same (layer, batch_seq).
+    let mut next_seq_by_layer: BTreeMap<i64, i64> = BTreeMap::new();
+    let mut next_ord_by_layer: BTreeMap<i64, i64> = BTreeMap::new();
+    let mut assigned_batch_seqs: BTreeMap<String, i64> = BTreeMap::new();
+    for mut batch in batch_inserts {
+        let layer = batch.layer.as_i64();
+
+        let next_seq = if let Some(seq) = next_seq_by_layer.get(&layer).copied() {
+            let next = seq
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("memory batch sequence overflow"))?;
+            next_seq_by_layer.insert(layer, next);
+            seq
+        } else {
+            let max: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(MAX(batch_seq), 0) FROM memory_batches WHERE layer = ?",
+            )
+            .bind(layer)
+            .fetch_one(&mut **transaction)
+            .await
+            .context("failed to read max batch_seq for batch insert")?;
+            let seq = max
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("memory batch sequence overflow"))?;
+            let next = seq
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("memory batch sequence overflow"))?;
+            next_seq_by_layer.insert(layer, next);
+            seq
+        };
+
+        let next_ord = if let Some(ord) = next_ord_by_layer.get(&layer).copied() {
+            let next = ord
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("memory batch ordinal overflow"))?;
+            next_ord_by_layer.insert(layer, next);
+            ord
+        } else {
+            let max: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(MAX(ord), 0) FROM memory_batches WHERE layer = ?",
+            )
+            .bind(layer)
+            .fetch_one(&mut **transaction)
+            .await
+            .context("failed to read max ord for batch insert")?;
+            let ord = max
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("memory batch ordinal overflow"))?;
+            let next = ord
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("memory batch ordinal overflow"))?;
+            next_ord_by_layer.insert(layer, next);
+            ord
+        };
+
+        batch.batch_seq = next_seq;
+        batch.ord = next_ord;
+        assigned_batch_seqs.insert(batch.id.clone(), next_seq);
+        batch
+            .insert(&mut **transaction)
+            .await
+            .context("failed to insert memory batch in transition")?;
+    }
+
     for batch in batch_mutations {
         apply_memory_batch_mutation(transaction, batch, store).await?;
     }
+
+    for mut job in job_inserts {
+        let target_id = job
+            .source_versions
+            .keys()
+            .find(|id| assigned_batch_seqs.contains_key(id.as_str()))
+            .cloned()
+            .ok_or_else(|| anyhow!("inserted job {} has no target batch witness", job.id))?;
+        let batch_seq = assigned_batch_seqs
+            .get(target_id.as_str())
+            .copied()
+            .ok_or_else(|| {
+                anyhow!(
+                    "inserted job {} references target batch {} not created in the same transition",
+                    job.id,
+                    target_id
+                )
+            })?;
+        job.batch_seq = batch_seq;
+        job.insert(&mut **transaction)
+            .await
+            .context("failed to insert memory job in transition")?;
+    }
+
     for job in job_mutations {
         apply_memory_job_mutation(transaction, job).await?;
     }
@@ -22773,6 +22974,7 @@ mod tests {
                     }],
                     job_mutations: Vec::new(),
                     cursor_advance: None,
+                    ..Default::default()
                 })],
             }],
             injected_commands: Vec::new(),

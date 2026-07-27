@@ -1285,6 +1285,7 @@ async fn supersede_stale_job(
             lease_witness: job.lease_until.clone(),
         }],
         cursor_advance: None,
+        ..Default::default()
     };
 
     EventWriter::new(Arc::new(store.clone()))
@@ -1374,6 +1375,7 @@ async fn complete_job(store: &Store, job: &Job, result: &CompactResult) -> Resul
             result: result.clone(),
         }],
         cursor_advance: None,
+        ..Default::default()
     };
 
     EventWriter::new(Arc::new(store.clone()))
@@ -1452,6 +1454,7 @@ async fn fail_job(store: &Store, job: &Job) -> Result<(), WorkerError> {
             lease_witness: job.lease_until.clone(),
         }],
         cursor_advance: None,
+        ..Default::default()
     };
 
     EventWriter::new(Arc::new(store.clone()))
@@ -1563,51 +1566,59 @@ async fn recover_compacting_batches(store: &Store) -> Result<()> {
             continue;
         }
 
-        let mut tx = store.pool().begin().await?;
-
-        let next_batch_seq: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(batch_seq), 0) + 1 FROM memory_batches WHERE layer = ?",
-        )
-        .bind(target_layer.as_i64())
-        .fetch_one(&mut *tx)
-        .await
-        .context("compute recovered target batch_seq")?;
-        let next_ord: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(ord), 0) + 1 FROM memory_batches WHERE layer = ?",
-        )
-        .bind(target_layer.as_i64())
-        .fetch_one(&mut *tx)
-        .await
-        .context("compute recovered target ord")?;
+        // Recover the source through the EventWriter single-writer transaction
+        // so the target batch_seq/ord allocation cannot race with concurrent L0
+        // seal preparation.
+        let source_uuid = BatchId::parse_str(&source_id)
+            .with_context(|| format!("source batch id {source_id} is not a UUID"))?;
+        let mut expected_source_versions = BTreeMap::new();
+        expected_source_versions.insert(source_uuid, version as u64);
+        let mut expected_source_states = BTreeMap::new();
+        expected_source_states.insert(source_uuid, MemoryBatchState::Compacting);
 
         let target_id = Uuid::now_v7().to_string();
-        let target = MemoryBatchRecord::new(
+        let target_record = MemoryBatchRecord::new(
             &target_id,
             target_layer,
-            next_ord,
-            next_batch_seq,
+            0,
+            0,
             MemoryBatchState::Compacting,
             0,
             0,
         );
-        target
-            .insert(&mut *tx)
-            .await
-            .context("insert recovered target batch")?;
 
-        let source_versions = BTreeMap::from([(source_id.clone(), version)]);
-        let job = MemoryJobRecord::new(
+        let mut source_versions = BTreeMap::new();
+        source_versions.insert(source_id.clone(), version);
+        source_versions.insert(target_id.clone(), 0);
+        let job_record = MemoryJobRecord::new(
             Uuid::now_v7().to_string(),
             kind,
-            next_batch_seq,
+            0,
             vec![source_id.clone()],
             source_versions,
         );
-        job.insert(&mut *tx)
-            .await
-            .context("insert recovered compaction job")?;
 
-        tx.commit().await?;
+        let transition = MemoryTransition {
+            expected_source_versions,
+            expected_source_states,
+            batch_mutations: Vec::new(),
+            job_mutations: Vec::new(),
+            batch_inserts: vec![target_record],
+            job_inserts: vec![job_record],
+            cursor_advance: None,
+        };
+
+        EventWriter::new(Arc::new(store.clone()))
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(DurableEvent::memory_maintenance("compact_recovered")?),
+                    projections: vec![Projection::MemoryTransition(transition)],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .context("recover compacting batch")?;
+
         tracing::debug!("reinserted compacting {layer} batch {source_id} as {kind:?} job");
     }
 
@@ -1636,6 +1647,7 @@ async fn repair_orphan_compacting_target(
         }],
         job_mutations: Vec::new(),
         cursor_advance: None,
+        ..Default::default()
     };
 
     EventWriter::new(Arc::new(store.clone()))
@@ -1821,6 +1833,7 @@ async fn advance_apply_cursor(
             expected: expected as u64,
             next: next as u64,
         }),
+        ..Default::default()
     };
 
     EventWriter::new(store)
@@ -1884,6 +1897,7 @@ async fn discard_stale_completed_job(
             expected: initial_cursor as u64,
             next: next_batch_seq as u64,
         }),
+        ..Default::default()
     };
     EventWriter::new(store)
         .apply(EventBatch {
@@ -2023,6 +2037,7 @@ async fn apply_completed_job(
             expected: initial_cursor as u64,
             next: next_batch_seq as u64,
         }),
+        ..Default::default()
     };
 
     let batch = EventBatch {
@@ -2174,6 +2189,7 @@ impl CompactWorker {
                 attempts_delta,
             }],
             cursor_advance: None,
+            ..Default::default()
         };
         EventWriter::new(self.store.clone())
             .apply(EventBatch {
@@ -3560,6 +3576,87 @@ mod tests {
         .await
         .expect("fetch target batch");
         assert_eq!(target_state, "compacted");
+    }
+
+    #[tokio::test]
+    async fn concurrent_recovery_and_l1_insert_are_serialized() {
+        let store = test_store().await;
+
+        // Simulate a crash where the L0 source is compacting but neither the
+        // target nor the job row was written.
+        let source_id = Uuid::now_v7().to_string();
+        let source = MemoryBatchRecord::new(
+            &source_id,
+            MemoryLayer::L0,
+            0,
+            1,
+            MemoryBatchState::Compacting,
+            100,
+            0,
+        );
+        source
+            .insert(store.pool())
+            .await
+            .expect("insert source batch");
+
+        // Spawn recovery and a concurrent EventWriter transition that inserts
+        // an unrelated L1 batch. Under the old raw-transaction recovery, both
+        // could read the same MAX(batch_seq) before either inserted, producing
+        // a duplicate (layer, batch_seq). The new implementation routes
+        // recovery through EventWriter.apply and allocates seq/ord inside the
+        // single-writer transaction.
+        let recover_store = store.clone();
+        let insert_store = store.clone();
+        let recover = tokio::spawn(async move { recover_compacting_batches(&recover_store).await });
+        let insert = tokio::spawn(async move {
+            let target_id = Uuid::now_v7().to_string();
+            let target = MemoryBatchRecord::new(
+                &target_id,
+                MemoryLayer::L1,
+                0,
+                0,
+                MemoryBatchState::Compacting,
+                0,
+                0,
+            );
+            let transition = MemoryTransition {
+                batch_inserts: vec![target],
+                ..Default::default()
+            };
+            EventWriter::new(insert_store)
+                .apply(EventBatch {
+                    writes: vec![EventWrite {
+                        event: Some(DurableEvent::memory_maintenance("concurrent_l1_insert")?),
+                        projections: vec![Projection::MemoryTransition(transition)],
+                    }],
+                    injected_commands: Vec::new(),
+                })
+                .await
+        });
+
+        let (recover_result, insert_result) = tokio::join!(recover, insert);
+        recover_result
+            .expect("recover task panicked")
+            .expect("recover failed");
+        insert_result
+            .expect("insert task panicked")
+            .expect("insert failed");
+
+        let l1_seqs: Vec<i64> = sqlx::query_scalar(
+            "SELECT batch_seq FROM memory_batches WHERE layer = 1 AND state = 'compacting' ORDER BY batch_seq",
+        )
+        .fetch_all(store.pool())
+        .await
+        .expect("fetch l1 seqs");
+        assert_eq!(
+            l1_seqs.len(),
+            2,
+            "recovery and concurrent L1 insert must each create an L1 target"
+        );
+        assert_ne!(
+            l1_seqs[0], l1_seqs[1],
+            "concurrent L1 inserts must not reuse batch_seq"
+        );
     }
 
     #[tokio::test]
@@ -5142,5 +5239,67 @@ mod tests {
                 .await
                 .expect("fetch failed job");
         assert!(failed.is_none(), "failed job must have no lease");
+    }
+
+    #[tokio::test]
+    async fn compacted_source_version_mismatch_is_unreachable() {
+        let store = test_store().await;
+
+        // A source batch reaches Compacted only through a Complete transition
+        // (Compacting -> Compacted with a summary). The EventWriter validator
+        // rejects Compacted -> Compacted without a summary, so the only way to
+        // bump a Compacted batch's version while preserving Compacted is to
+        // re-apply a summary. No production path re-summarizes a source batch.
+        // Therefore, when apply_completed_job sees a Compacted source, its
+        // version must equal the one recorded in the Completed job, and the
+        // discard branch for a Compacted source with version mismatch is
+        // unreachable under existing CAS invariants.
+        let source_id = Uuid::now_v7().to_string();
+        MemoryBatchRecord::new(
+            &source_id,
+            MemoryLayer::L0,
+            0,
+            1,
+            MemoryBatchState::Compacted,
+            100,
+            0,
+        )
+        .insert(store.pool())
+        .await
+        .expect("insert source batch");
+
+        let source_uuid = BatchId::parse_str(&source_id).expect("source id is a valid batch UUID");
+        let transition = MemoryTransition {
+            expected_source_versions: BTreeMap::from([(source_uuid, 0)]),
+            expected_source_states: BTreeMap::from([(source_uuid, MemoryBatchState::Compacted)]),
+            batch_mutations: vec![MemoryBatchMutation {
+                batch_id: source_uuid,
+                expected_version: 0,
+                new_state: MemoryBatchState::Compacted,
+                summary: None,
+                est_tokens: 0,
+                footprint_delta: 0,
+                delete_membership: false,
+            }],
+            ..Default::default()
+        };
+        let error = EventWriter::new(store.clone())
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::memory_maintenance("test_compacted_noop").expect("event"),
+                    ),
+                    projections: vec![Projection::MemoryTransition(transition)],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("Compacted -> Compacted without summary must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("Compacted MemoryBatchMutation requires a summary"),
+            "unexpected error: {error:#}"
+        );
     }
 }
