@@ -28,6 +28,14 @@ const PENDING_COMMAND_MAX_BYTES: usize = 4 * 1024 * 1024;
 const RECOVERY_GROUP_MAX_COMMANDS: usize = 16;
 const RECOVERY_GROUP_MAX_BYTES: usize = 1024 * 1024;
 
+/// Typed identity for one durably pending approval whose prepared tool must be
+/// closed during logical suffix recovery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingApprovalRecovery {
+    pub request_id: String,
+    pub tool_call_id: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RecoveryStep {
     Reclassify {
@@ -86,6 +94,14 @@ pub(crate) enum RecoveryStep {
         command_id: String,
         run_id: String,
         turn_id: String,
+        /// Present when Abort already committed `cancel_requested` but the
+        /// worker crashed before emitting the approval cancellation/result.
+        ///
+        /// T26 must consume this as one cancellation suffix transaction:
+        /// `ApprovalResolved(Cancelled)`, the prepared tool terminal/result,
+        /// and the Abort owner close must all commit together. This packet does
+        /// not claim that the T26 consumer exists.
+        pending_approval: Option<PendingApprovalRecovery>,
     },
 }
 
@@ -264,21 +280,40 @@ impl SuffixRecovery {
         let mut injected_groups = HashSet::new();
         for command in &commands {
             let mut step = plan_one_command(store, command, &events).await?;
-            if let RecoveryStep::ResumeAssistantFromDurableEvents {
-                command_id,
-                run_id,
-                turn_id,
-            } = &step
-                && let Some((request_id, tool_call_id)) =
-                    pending_approval_for_recovery(store, run_id, turn_id).await?
-            {
-                step = RecoveryStep::CancelPendingApproval {
-                    command_id: command_id.clone(),
-                    run_id: run_id.clone(),
-                    turn_id: turn_id.clone(),
-                    request_id,
-                    tool_call_id,
-                };
+            match &step {
+                RecoveryStep::ResumeAssistantFromDurableEvents {
+                    command_id,
+                    run_id,
+                    turn_id,
+                } => {
+                    if let Some(pending) =
+                        pending_approval_for_recovery(store, run_id, turn_id).await?
+                    {
+                        step = RecoveryStep::CancelPendingApproval {
+                            command_id: command_id.clone(),
+                            run_id: run_id.clone(),
+                            turn_id: turn_id.clone(),
+                            request_id: pending.request_id,
+                            tool_call_id: pending.tool_call_id,
+                        };
+                    }
+                }
+                RecoveryStep::ResumeCancellationFromDurableEvents {
+                    command_id,
+                    run_id,
+                    turn_id,
+                    ..
+                } => {
+                    let pending_approval =
+                        pending_approval_for_recovery(store, run_id, turn_id).await?;
+                    step = RecoveryStep::ResumeCancellationFromDurableEvents {
+                        command_id: command_id.clone(),
+                        run_id: run_id.clone(),
+                        turn_id: turn_id.clone(),
+                        pending_approval,
+                    };
+                }
+                _ => {}
             }
             if let RecoveryStep::InjectStoredGroup {
                 ref run_id,
@@ -344,7 +379,7 @@ async fn pending_approval_for_recovery(
     store: &Store,
     run_id: &str,
     turn_id: &str,
-) -> Result<Option<(String, String)>> {
+) -> Result<Option<PendingApprovalRecovery>> {
     let rows = sqlx::query(
         "SELECT a.id, a.tool_call_id, t.state
          FROM approval_log a
@@ -373,7 +408,10 @@ async fn pending_approval_for_recovery(
             "pending approval {request_id} recovery requires prepared tool {tool_call_id}, found {tool_state}"
         );
     }
-    Ok(Some((request_id, tool_call_id)))
+    Ok(Some(PendingApprovalRecovery {
+        request_id,
+        tool_call_id,
+    }))
 }
 
 async fn plan_one_command(
@@ -470,6 +508,7 @@ async fn plan_one_command(
             command_id: command.command_id.clone(),
             run_id: required(command.run_id.as_deref(), "run_id", command)?.to_owned(),
             turn_id: required(command.turn_id.as_deref(), "turn_id", command)?.to_owned(),
+            pending_approval: None,
         }),
         RunPhase::Finished => {
             bail!(

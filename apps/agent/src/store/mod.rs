@@ -85,7 +85,9 @@ pub(crate) use memory_state::{
     unused_imports,
     reason = "T12 exposes the recovery plan boundary consumed by T15"
 )]
-pub(crate) use recovery::{HydratedRunState, HydrationOutcome, RecoveryStep, SuffixRecovery};
+pub(crate) use recovery::{
+    HydratedRunState, HydrationOutcome, PendingApprovalRecovery, RecoveryStep, SuffixRecovery,
+};
 pub(crate) use redactor::{PublicProjectionBuilder, Redactor, search_text_from_projection};
 #[allow(
     unused_imports,

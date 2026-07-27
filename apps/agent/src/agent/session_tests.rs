@@ -31,7 +31,8 @@ use crate::{
         GenerationRecoveryFence, MAX_PROCESS_GENERATION, ProcessGeneration, ProcessGenerationLease,
     },
     store::{
-        AgentScope, DATA_KEY_BYTES, HydrationOutcome, Redactor, Store, WrappingKey, user_message_id,
+        AgentScope, DATA_KEY_BYTES, HydrationOutcome, PendingApprovalRecovery, Redactor, Store,
+        WrappingKey, user_message_id,
     },
     tools::ToolError,
 };
@@ -1874,6 +1875,13 @@ async fn fixture_bridge_after_assistant(
             .await
             .expect("approval fixture store"),
     );
+    fixture_bridge_after_assistant_in_store(store, assistant).await
+}
+
+async fn fixture_bridge_after_assistant_in_store(
+    store: Arc<Store>,
+    assistant: PublicMessage,
+) -> (Arc<Store>, EventWriter, DurableBridge, DurableRunBinding) {
     let writer = EventWriter::new(store.clone());
     let inbound = user(1);
     writer
@@ -2462,6 +2470,143 @@ async fn hydrated_recovery_exposes_pending_real_broker_cancellation_before_saved
         "T26 must consume the typed cancellation seam before injecting the saved group exactly once"
     );
     drop(pending);
+}
+
+#[tokio::test]
+async fn abort_cutoff_restart_carries_pending_approval_into_atomic_cancellation_suffix() {
+    let root = std::env::temp_dir().join(format!(
+        "sumi-approval-abort-cutoff-restart-{}",
+        uuid::Uuid::now_v7()
+    ));
+    std::fs::create_dir_all(&root).expect("create approval restart fixture root");
+    let database_path = root.join("agent.db");
+
+    let mut assistant = approval_fixture_assistant("approval-abort-tool");
+    let PublicMessage::Assistant(assistant_message) = &mut assistant else {
+        unreachable!("approval fixture assistant")
+    };
+    let PublicAssistantContent::ToolCall { tool_call, .. } = &mut assistant_message.content[0]
+    else {
+        unreachable!("approval fixture tool call")
+    };
+    tool_call.name = "bash".to_owned();
+    tool_call.arguments = serde_json::from_value(serde_json::json!({"command":"git status"}))
+        .expect("validated bash approval arguments");
+    let broker_tool_call = tool_call.clone();
+
+    let store = Arc::new(open_kill_restart_store(&database_path).await);
+    let (store, writer, mut bridge, binding) =
+        fixture_bridge_after_assistant_in_store(store, assistant).await;
+    let broker = ApprovalBroker::new(
+        crate::approval::policy::Policy::new("/workspace"),
+        make_projector(),
+        None,
+        ReviewerMode::User,
+        false,
+        trusted_env(),
+    );
+    let outcome = broker
+        .start_request(
+            &broker_tool_call,
+            &[],
+            &binding.run_id,
+            &binding.turn_id,
+            "v1",
+            CancellationToken::new(),
+        )
+        .await
+        .expect("real broker pending request");
+    let ApprovalOutcome::Pending { pending } = outcome else {
+        panic!("real broker must enter pending approval")
+    };
+    let request = pending.request().clone();
+    bridge
+        .commit(
+            &writer,
+            RunOutput::detached(
+                binding.clone(),
+                AgentEvent::ApprovalRequested {
+                    request: request.clone(),
+                },
+                None,
+            ),
+        )
+        .await
+        .expect("commit pending approval before Abort");
+
+    let abort = abort(2);
+    writer
+        .persist_inbound(&abort)
+        .await
+        .expect("persist active Abort");
+    let InboundCommand::Valid(abort_envelope) = abort else {
+        unreachable!("Abort fixture is valid")
+    };
+    bridge
+        .bind_abort(&writer, AdmittedCommand::new(abort_envelope, Utc::now()))
+        .await
+        .expect("commit active-Abort cutoff");
+
+    assert_eq!(
+        sqlx::query_as::<_, (String, String, String, String)>(
+            "SELECT
+                (SELECT run_phase FROM inbound_commands WHERE seq=1),
+                (SELECT status FROM inbound_commands WHERE seq=2),
+                (SELECT state FROM approval_log WHERE id=?),
+                (SELECT state FROM tool_executions WHERE tool_call_id=?)",
+        )
+        .bind(&request.id)
+        .bind(&request.tool_call_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("post-Abort crash boundary"),
+        (
+            "cancel_requested".to_owned(),
+            "applied".to_owned(),
+            "pending".to_owned(),
+            "prepared".to_owned(),
+        ),
+        "fixture must stop after the durable Abort cutoff and before approval cancellation output"
+    );
+
+    // Simulate the process dying at the exact boundary above. No
+    // ApprovalResolved/ToolResult is emitted before the file-backed Store is
+    // closed and reopened.
+    drop(pending);
+    drop(broker);
+    drop(bridge);
+    drop(writer);
+    store.pool().close().await;
+    drop(store);
+
+    let store = open_kill_restart_store(&database_path).await;
+    let lease = ProcessGenerationLease::new(test_executor_generation(), "abort-approval-lease")
+        .expect("valid recovery lease");
+    let fence =
+        GenerationRecoveryFence::new(&lease, "abort-approval-fence").expect("valid recovery fence");
+    let hydrated = store
+        .hydrate(&lease, &fence)
+        .await
+        .expect("authenticated restart hydration");
+    let HydrationOutcome::Complete(hydrated) = hydrated else {
+        panic!("prepared approval requires logical-only recovery")
+    };
+    assert_eq!(
+        hydrated.recovery_steps,
+        vec![RecoveryStep::ResumeCancellationFromDurableEvents {
+            command_id: binding.command_id,
+            run_id: binding.run_id,
+            turn_id: binding.turn_id,
+            pending_approval: Some(PendingApprovalRecovery {
+                request_id: request.id,
+                tool_call_id: request.tool_call_id,
+            }),
+        }],
+        "T26 must receive the typed approval identity inside the atomic Abort cancellation suffix"
+    );
+    store.pool().close().await;
+    drop(store);
+    std::fs::remove_dir_all(&root).expect("remove approval restart fixture root");
 }
 
 #[tokio::test]
