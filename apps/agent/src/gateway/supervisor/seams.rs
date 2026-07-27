@@ -77,8 +77,10 @@ impl DurableSource for T17StoreAdapter {
     async fn command_cursors(&self) -> Result<CommandCursors> {
         bail!(
             "T17 integration seam: Store::command_cursors() is not wired. \
-             Contract: SELECT MAX(seq) FROM inbound_commands WHERE status IN ('received','applying') AS received; \
-             SELECT MAX(seq) FROM inbound_commands WHERE status IN ('applied','superseded','rejected') AS applied; \
+             Contract: SELECT MAX(seq) FROM inbound_commands AS received over every status, \
+             and verify that rows form the complete persisted prefix 1..=received; \
+             derive applied as the largest contiguous prefix whose rows all have status \
+             IN ('applied','superseded','rejected'), not merely MAX(seq) over terminal rows; \
              return CommandCursors{{ received, applied }}."
         )
     }

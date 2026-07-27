@@ -853,21 +853,21 @@ async fn validate_hello<S: DurableSource>(
             .map_err(|e| SupervisorError::Reconnect {
                 reason: format!("command cursor unavailable for hello validation: {e}"),
             })?;
-    // The peer's claim must be compatible with the AgentHello snapshot we sent,
-    // not with a newer local applied cursor that may have advanced during the
-    // round-trip. Retransmissions of already-applied commands are safe.
-    let min_next_command_seq = agent.last_applied_command_seq.saturating_add(1);
+    // The API may not have durably recorded a terminal ACK that the agent
+    // already committed. In that case it must restart replay at that locally
+    // terminal command so the durable consumer can return the saved
+    // Applied/Superseded/Rejected ACK. Only zero (command seq starts at one) or
+    // a claim beyond the complete received prefix is impossible.
     let max_next_command_seq = command_cursor.received.checked_add(1).ok_or_else(|| {
         SupervisorError::Fatal(anyhow!(
             "command received cursor overflow: received={}",
             command_cursor.received
         ))
     })?;
-    if !(min_next_command_seq..=max_next_command_seq).contains(&api.next_command_seq) {
+    if api.next_command_seq == 0 || api.next_command_seq > max_next_command_seq {
         return Err(SupervisorError::Fatal(anyhow!(
-            "command cursor claim outside durable bounds: next_command_seq {} not in {}..={}; agent_applied={}, received={}",
+            "command cursor claim outside durable bounds: next_command_seq {} not in 1..={}; agent_applied={}, received={}",
             api.next_command_seq,
-            min_next_command_seq,
             max_next_command_seq,
             agent.last_applied_command_seq,
             command_cursor.received
@@ -1093,6 +1093,12 @@ where
                     .await?;
                     continue;
                 }
+                let expected = last_received
+                    .checked_add(1)
+                    .context("durable event sequence exhausted")?;
+                if seq != expected {
+                    bail!("durable live event gap: expected {expected}, got {seq}");
+                }
                 let (_, frame) = pending_events.remove(&seq).expect("key just observed");
                 *last_received = seq;
                 send_with_interleave(
@@ -1309,8 +1315,11 @@ where
         for frame in page {
             let seq =
                 outbound_frame_event_seq(&frame).context("catch-up frame missing durable seq")?;
-            if seq <= last_received {
-                bail!("non-monotonic catch-up event: seq {seq} after {last_received}");
+            let expected = last_received
+                .checked_add(1)
+                .context("durable event sequence exhausted during catch-up")?;
+            if seq != expected {
+                bail!("durable catch-up event gap: expected {expected}, got {seq}");
             }
             send_with_interleave(
                 &mut writer,
@@ -1419,8 +1428,11 @@ where
         for frame in page {
             let seq =
                 outbound_frame_event_seq(&frame).context("catch-up frame missing durable seq")?;
-            if seq <= last_received {
-                bail!("non-monotonic catch-up event: seq {seq} after {last_received}");
+            let expected = last_received
+                .checked_add(1)
+                .context("durable event sequence exhausted during final catch-up")?;
+            if seq != expected {
+                bail!("durable catch-up event gap: expected {expected}, got {seq}");
             }
             send_with_interleave(
                 &mut writer,
@@ -2511,7 +2523,7 @@ mod tests {
         let epoch1 = (*handle.epochs.borrow()).unwrap();
 
         // Drop a stale-epoch frame; it must not be sent after reconnect.
-        handle.events.send((epoch1, event_frame(1))).await.unwrap();
+        handle.events.send((epoch1, event_frame(99))).await.unwrap();
 
         // Wait for the second epoch to be installed.
         let mut epochs = handle.epochs.clone();
@@ -2528,7 +2540,7 @@ mod tests {
         };
 
         // Send a frame with the new epoch.
-        handle.events.send((epoch2, event_frame(2))).await.unwrap();
+        handle.events.send((epoch2, event_frame(1))).await.unwrap();
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         handle.abort();
@@ -2536,7 +2548,7 @@ mod tests {
 
         let sent = sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
-        assert_eq!(outbound_frame_event_seq(&sent[0]).unwrap(), 2);
+        assert_eq!(outbound_frame_event_seq(&sent[0]).unwrap(), 1);
     }
 
     #[tokio::test]
@@ -3576,15 +3588,25 @@ mod tests {
             .await
             .expect("original legal resend point must be accepted");
 
-        // A claim below the original applied+1 is still impossible.
+        // The API may start at an already-applied command when its terminal ACK
+        // was lost; the durable consumer will re-ACK it without reapplying it.
         let api = ApiHello {
             accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
             last_received_event_seq: 0,
             next_command_seq: 5,
         };
+        validate_hello(&source, &agent, &api)
+            .await
+            .expect("locally terminal command must remain replayable");
+
+        let api = ApiHello {
+            accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
+            last_received_event_seq: 0,
+            next_command_seq: 0,
+        };
         assert!(
             validate_hello(&source, &agent, &api).await.is_err(),
-            "claim before the original applied cursor must fail closed"
+            "command sequence zero is not a valid replay boundary"
         );
     }
 
@@ -3821,7 +3843,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_hello_command_cursor_requires_applied_lower_bound_and_received_upper_bound() {
+    async fn validate_hello_command_cursor_requires_nonzero_and_received_upper_bound() {
         let cursor = CommandCursors {
             received: 10,
             applied: 5,
@@ -3857,18 +3879,16 @@ mod tests {
             }
         }
 
-        // A value before applied+1 would replay an already-applied command.
+        // A locally terminal command remains a valid replay point when the API
+        // did not durably record its terminal ACK.
         let api = ApiHello {
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 5,
         };
-        assert!(
-            validate_hello(&StaticSource(cursor), &agent, &api)
-                .await
-                .is_err(),
-            "next_command_seq before applied+1 must be fatal"
-        );
+        validate_hello(&StaticSource(cursor), &agent, &api)
+            .await
+            .expect("terminal ACK recovery must allow replay at seq 5");
 
         // Exactly applied+1 is the normal catch-up boundary and is allowed.
         let api = ApiHello {
@@ -3911,6 +3931,169 @@ mod tests {
                 .is_err(),
             "next_command_seq beyond received+1 must be fatal"
         );
+
+        let api = ApiHello {
+            accepted_generation: agent.generation,
+            last_received_event_seq: 0,
+            next_command_seq: 0,
+        };
+        assert!(
+            validate_hello(&StaticSource(cursor), &agent, &api)
+                .await
+                .is_err(),
+            "command seq zero must be fatal"
+        );
+    }
+
+    #[tokio::test]
+    async fn lost_terminal_ack_replays_applied_superseded_and_rejected_commands() {
+        struct TerminalReplayGateway {
+            reader: MockGatewayReader,
+            writer: MockGatewayWriter,
+            terminal_seq: u64,
+        }
+
+        #[async_trait]
+        impl Gateway for TerminalReplayGateway {
+            type Reader = MockGatewayReader;
+            type Writer = MockGatewayWriter;
+
+            async fn authenticate_hello(
+                &mut self,
+                hello: AgentHello,
+            ) -> std::result::Result<ApiHello, HelloError> {
+                Ok(ApiHello {
+                    accepted_generation: hello.generation,
+                    last_received_event_seq: 0,
+                    next_command_seq: self.terminal_seq,
+                })
+            }
+
+            fn split(self) -> (Self::Reader, Self::Writer) {
+                (self.reader, self.writer)
+            }
+        }
+
+        let terminal_seq = 5;
+        let cases = [
+            (
+                CommandAckStatus::Applied,
+                None,
+                valid_command(terminal_seq, "00000000-0000-4000-8000-000000000005"),
+            ),
+            (
+                CommandAckStatus::Superseded,
+                None,
+                valid_command(terminal_seq, "00000000-0000-4000-8000-000000000006"),
+            ),
+            (
+                CommandAckStatus::Rejected,
+                Some("oversized".to_owned()),
+                rejected_oversized_command(
+                    terminal_seq,
+                    "00000000-0000-4000-8000-000000000007",
+                    1024 * 1024 + 1,
+                ),
+            ),
+        ];
+
+        for (terminal_status, reject_reason, command) in cases {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let gateway = TerminalReplayGateway {
+                reader: MockGatewayReader {
+                    commands: VecDeque::from([Ok(command)]),
+                    panic: false,
+                    on_empty: None,
+                },
+                writer: MockGatewayWriter {
+                    fail_after: None,
+                    sent: sent.clone(),
+                    delay: None,
+                    block_after: None,
+                    block_notify: None,
+                    release: None,
+                },
+                terminal_seq,
+            };
+            let source = MockDurableSource::new(CommandCursors {
+                received: terminal_seq,
+                applied: terminal_seq,
+            });
+            let supervisor = ConnectionSupervisor::new(
+                SingleConnectionConnector::new(gateway),
+                CountingCredentialProvider::new("token"),
+                source,
+                StaticHydrationLatch(HydrationReady {
+                    generation: ProcessGeneration::from_wire(7).unwrap(),
+                    receipt_identity: format!("{terminal_status:?}-receipt"),
+                }),
+                make_config(),
+            );
+            let mut handle = supervisor.start();
+
+            let replay = tokio::time::timeout(Duration::from_secs(1), handle.commands.recv())
+                .await
+                .expect("terminal replay must not stall")
+                .expect("terminal replay must be forwarded to durable dedupe");
+            assert_eq!(
+                inbound_command_seq(&replay),
+                terminal_seq,
+                "{terminal_status:?} replay must preserve its canonical seq"
+            );
+            let command_id = match replay {
+                InboundCommand::Valid(envelope) => envelope.command_id.to_string(),
+                InboundCommand::Invalid { command_id, .. } => command_id.to_string(),
+            };
+
+            let epoch = loop {
+                if let Some(epoch) = *handle.epochs.borrow() {
+                    break epoch;
+                }
+                handle
+                    .epochs
+                    .changed()
+                    .await
+                    .expect("epoch watch must stay open");
+            };
+            handle
+                .events
+                .send((
+                    epoch,
+                    OutboundFrame::CommandAck {
+                        ack: CommandAck {
+                            seq: terminal_seq,
+                            command_id,
+                            status: terminal_status,
+                            reject_reason,
+                        },
+                    },
+                ))
+                .await
+                .expect("saved terminal ACK must enter the epoch");
+
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if sent.lock().unwrap().iter().any(|frame| {
+                        matches!(
+                            frame,
+                            OutboundFrame::CommandAck { ack }
+                                if ack.seq == terminal_seq && ack.status == terminal_status
+                        )
+                    }) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("saved terminal ACK must be delivered after replay");
+
+            handle.abort();
+            handle
+                .join()
+                .await
+                .expect("terminal replay epoch must close cleanly");
+        }
     }
 
     #[tokio::test]
@@ -4308,6 +4491,55 @@ mod tests {
                 OutboundFrame::Event { envelope } if envelope.seq.is_none()
             ),
             "the later volatile event must remain second: {sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_durable_gap_fails_without_sending_or_advancing() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut writer = MockGatewayWriter {
+            fail_after: None,
+            sent: sent.clone(),
+            delay: None,
+            block_after: None,
+            block_notify: None,
+            release: None,
+        };
+        let (_writer_tx, mut writer_rx) = mpsc::channel(1);
+        let token = CancellationToken::new();
+        let mut next_arrival_id = 0;
+        let mut outbox = VecDeque::new();
+        let mut pending_events = BTreeMap::new();
+        let mut last_received = 0;
+
+        classify_frame(
+            event_frame(2),
+            true,
+            last_received,
+            &mut next_arrival_id,
+            &mut outbox,
+            &mut pending_events,
+        );
+
+        let error = drain_next(
+            &mut writer,
+            Duration::from_secs(1),
+            &token,
+            &mut writer_rx,
+            &mut next_arrival_id,
+            &mut outbox,
+            &mut pending_events,
+            &mut last_received,
+            true,
+        )
+        .await
+        .expect_err("a live durable event must not skip seq 1");
+
+        assert!(format!("{error:#}").contains("expected 1, got 2"));
+        assert_eq!(last_received, 0, "gap must not advance the watermark");
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "out-of-order durable event must not reach the transport"
         );
     }
 
@@ -5184,6 +5416,61 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn catch_up_gap_fails_before_online_without_advancing_past_the_gap() {
+        let source = ReplaySource::new(
+            vec![event_frame(1), event_frame(3)],
+            CommandCursors::default(),
+        );
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let writer = MockGatewayWriter {
+            fail_after: None,
+            sent: sent.clone(),
+            delay: None,
+            block_after: None,
+            block_notify: None,
+            release: None,
+        };
+        let (writer_tx, writer_rx) = mpsc::channel(4);
+        let (online, online_rx) = watch::channel(false);
+        let token = CancellationToken::new();
+        let api_hello = ApiHello {
+            accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
+            last_received_event_seq: 0,
+            next_command_seq: 1,
+        };
+
+        let error = writer_task(
+            writer,
+            writer_rx,
+            source,
+            api_hello,
+            make_config(),
+            Arc::new(online),
+            token,
+        )
+        .await
+        .expect_err("catch-up must fail closed on missing seq 2");
+        drop(writer_tx);
+
+        assert!(format!("{error:#}").contains("expected 2, got 3"));
+        assert!(
+            !*online_rx.borrow(),
+            "a gapped catch-up must never publish Online"
+        );
+        let seqs: Vec<_> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|frame| outbound_frame_event_seq(frame).ok())
+            .collect();
+        assert_eq!(
+            seqs,
+            vec![1],
+            "catch-up must stop at the last contiguous seq"
+        );
+    }
+
     /// A durable source that blocks a configurable `event_cursor` call so a test
     /// can inject a live durable event between the final cursor read and Online.
     #[derive(Clone)]
@@ -5497,9 +5784,9 @@ mod tests {
         assert_eq!(cmd_seq(&cmd), 1);
 
         // A frame tagged with the old DeliveryEpoch must be dropped.
-        handle.events.send((epoch1, event_frame(2))).await.unwrap();
-        // A frame tagged with the new DeliveryEpoch must be delivered.
-        handle.events.send((epoch2, event_frame(3))).await.unwrap();
+        handle.events.send((epoch1, event_frame(99))).await.unwrap();
+        // The exact next durable frame tagged with the new DeliveryEpoch must be delivered.
+        handle.events.send((epoch2, event_frame(2))).await.unwrap();
 
         let mut online = handle.online.clone();
         while !*online.borrow() {
@@ -5535,12 +5822,12 @@ mod tests {
             "durable catch-up must replay event 1 after restart"
         );
         assert!(
-            event_seqs.contains(&3),
-            "live event 3 must be delivered on the new epoch"
+            event_seqs.contains(&2),
+            "live event 2 must be delivered on the new epoch"
         );
         assert!(
-            !event_seqs.contains(&2),
-            "stale DeliveryEpoch frame 2 must be dropped"
+            !event_seqs.contains(&99),
+            "stale DeliveryEpoch frame 99 must be dropped"
         );
     }
 
