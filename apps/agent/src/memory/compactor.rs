@@ -1708,9 +1708,10 @@ async fn apply_next_completed_job(store: Arc<Store>, kind: MemoryJobKind) -> Res
     };
 
     // Scan forward from the cursor to find the first completed job, passing
-    // over terminal (applied/failed) rows. If we hit a pending/running row
-    // after advancing over terminals, commit a pure cursor-advance transition
-    // for those terminal holes and stop.
+    // over applied rows. If we hit a failed job, the FIFO boundary must hold;
+    // any applied holes before it are advanced and we stop. If we hit a
+    // pending/running row after advancing over applied holes, commit a pure
+    // cursor-advance transition for those applied holes and stop.
     let rows = sqlx::query(
         "SELECT id, kind, batch_seq, source_ids, source_versions, status, attempts,
                 lease_until, created_at, updated_at
@@ -1731,11 +1732,8 @@ async fn apply_next_completed_job(store: Arc<Store>, kind: MemoryJobKind) -> Res
             continue;
         }
 
-        if matches!(
-            job.status,
-            MemoryJobStatus::Applied | MemoryJobStatus::Failed
-        ) {
-            // Terminal holes are skipped here and swept up by the cursor
+        if job.status == MemoryJobStatus::Applied {
+            // Applied holes are skipped here and swept up by the cursor
             // advance bundled with the next completed job's transition.
             cursor = batch_seq
                 .checked_add(1)
@@ -1743,8 +1741,29 @@ async fn apply_next_completed_job(store: Arc<Store>, kind: MemoryJobKind) -> Res
             continue;
         }
 
+        if job.status == MemoryJobStatus::Failed {
+            // A failed job holds the FIFO boundary: later jobs cannot be
+            // applied until the failed job is reclaimed or explicitly
+            // discarded. Advance any leading applied holes now.
+            if cursor != initial_cursor {
+                advance_apply_cursor(
+                    store.clone(),
+                    kind,
+                    initial_cursor,
+                    cursor,
+                    "compact_cursor_advance",
+                )
+                .await?;
+            }
+            return Ok(if cursor != initial_cursor {
+                ApplyProgress::CursorAdvanced
+            } else {
+                ApplyProgress::None
+            });
+        }
+
         if job.status != MemoryJobStatus::Completed {
-            // Pending or running job blocks further application. Any terminal
+            // Pending or running job blocks further application. Any applied
             // holes swept so far must advance the cursor in their own
             // transition so the stream does not drift.
             if cursor != initial_cursor {
@@ -2076,6 +2095,131 @@ impl CompactWorker {
         Ok(())
     }
 
+    /// Synchronously reclaim a failed job at the hard-limit fallback point.
+    /// The source and target snapshots are returned to `Compacting` using the
+    /// post-failure versions recorded on the job, the attempt counter is reset,
+    /// and the provider is invoked inline. The job is completed if the retry
+    /// succeeds or returned to `Failed` if it fails again.
+    pub(crate) async fn reclaim_failed(&self, job_id: &str) -> Result<()> {
+        let row = sqlx::query(
+            "SELECT id, kind, batch_seq, source_ids, source_versions, status, attempts,
+                    lease_until, created_at, updated_at
+             FROM memory_jobs WHERE id = ?",
+        )
+        .bind(job_id)
+        .fetch_one(self.store.pool())
+        .await?;
+        let mut job = parse_job(&row)?;
+        if job.status != MemoryJobStatus::Failed {
+            bail!("job {job_id} is not failed, cannot reclaim");
+        }
+
+        let target = load_target_batch(&self.store, job.kind, job.batch_seq)
+            .await?
+            .ok_or_else(|| anyhow!("target batch missing for job {job_id}"))?;
+        if target.state != MemoryBatchState::CompactFailed {
+            bail!("target batch {} is not compact_failed", target.id);
+        }
+
+        let mut expected_source_versions = job_source_versions(&job)?;
+        let target_uuid = BatchId::parse_str(&target.id)
+            .with_context(|| format!("target batch id {} is not a UUID", target.id))?;
+        expected_source_versions.insert(target_uuid, target.version as u64);
+
+        let current_versions =
+            current_batch_versions(&self.store, &expected_source_versions).await?;
+        if current_versions != expected_source_versions {
+            bail!("source versions changed since failure for job {job_id}");
+        }
+
+        let mut batch_mutations = Vec::with_capacity(job.source_ids.len() + 1);
+        for source_id in &job.source_ids {
+            let expected_version =
+                job.source_versions.get(source_id).copied().ok_or_else(|| {
+                    anyhow!("source version missing for {source_id} in job {job_id}")
+                })?;
+            let source_uuid = BatchId::parse_str(source_id)
+                .with_context(|| format!("source batch id {source_id} is not a UUID"))?;
+            batch_mutations.push(MemoryBatchMutation {
+                batch_id: source_uuid,
+                expected_version: expected_version as u64,
+                new_state: MemoryBatchState::Compacting,
+                summary: None,
+                est_tokens: 0,
+                footprint_delta: 0,
+                delete_membership: false,
+            });
+        }
+        batch_mutations.push(MemoryBatchMutation {
+            batch_id: target_uuid,
+            expected_version: target.version as u64,
+            new_state: MemoryBatchState::Compacting,
+            summary: None,
+            est_tokens: 0,
+            footprint_delta: 0,
+            delete_membership: false,
+        });
+
+        let new_attempts = 1_i64;
+        let attempts_delta = new_attempts - job.attempts;
+        let lease_until = (Utc::now() + LEASE_DURATION).to_rfc3339();
+
+        let transition = MemoryTransition {
+            expected_source_versions,
+            batch_mutations,
+            job_mutations: vec![MemoryJobMutation::Reclaim {
+                job_id: job.id.clone(),
+                expected_attempt: job.attempts,
+                lease_until: lease_until.clone(),
+                attempts_delta,
+            }],
+            cursor_advance: None,
+        };
+        EventWriter::new(self.store.clone())
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(DurableEvent::memory_maintenance("compact_reclaim")?),
+                    projections: vec![Projection::MemoryTransition(transition)],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .context("reclaim failed compaction job")?;
+
+        // Re-read the job in its post-reclaim running state.
+        let row = sqlx::query(
+            "SELECT id, kind, batch_seq, source_ids, source_versions, status, attempts,
+                    lease_until, created_at, updated_at
+             FROM memory_jobs WHERE id = ?",
+        )
+        .bind(job_id)
+        .fetch_one(self.store.pool())
+        .await?;
+        job = parse_job(&row)?;
+        if job.status != MemoryJobStatus::Running {
+            bail!("reclaim did not transition job {job_id} to running");
+        }
+
+        let input = build_compaction_input(&self.store, &job).await?;
+        if self.cancel.is_cancelled() {
+            return Err(anyhow!("compact cancelled"));
+        }
+        match self
+            .provider
+            .summarize(&self.spec, &input, self.cancel.clone())
+            .await
+        {
+            Ok(text) => {
+                let result = build_compact_result(text, &input)?;
+                complete_job(&self.store, &job, &result).await?;
+            }
+            Err(_) => {
+                fail_job(&self.store, &job).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Apply all contiguous completed shelves for each job kind. This is
     /// intentionally an explicit maintenance operation; compaction workers
     /// only produce encrypted shelves and never block the conversation path.
@@ -2105,10 +2249,11 @@ impl CompactWorker {
     async fn maintenance_cycle(&self) -> Result<()> {
         // Recovery is deliberately part of every live maintenance cycle, not
         // only startup. Any post-claim error can therefore converge after its
-        // lease expires without requiring a process restart.
+        // lease expires without requiring a process restart. Completed shelves
+        // are left as `MaintenanceReady`; capacity-aware T21 maintenance owns
+        // the separate `apply_ready` step.
         recover_expired_running_jobs(&self.store).await?;
         self.process_all_pending().await?;
-        self.apply_ready().await?;
         Ok(())
     }
 
@@ -3472,31 +3617,56 @@ mod tests {
             }),
             cancel: CancellationToken::new(),
         };
+
+        // `maintenance_cycle` processes the recovered job but does not apply
+        // completed shelves; that is the T21 capacity-aware maintenance step.
         worker
             .maintenance_cycle()
             .await
             .expect("run live maintenance");
-
         let job: (String, i64, Option<String>) =
             sqlx::query_as("SELECT status, attempts, lease_until FROM memory_jobs WHERE id = ?")
                 .bind("job-live-expired")
                 .fetch_one(store.pool())
                 .await
-                .expect("load recovered job");
+                .expect("load processed job");
+        assert_eq!(job, ("completed".to_owned(), 1, None));
+        let source_state: String =
+            sqlx::query_scalar("SELECT state FROM memory_batches WHERE id = ?")
+                .bind(&source_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("load processed source");
+        assert_eq!(source_state, "compacted");
+        let target_state: String =
+            sqlx::query_scalar("SELECT state FROM memory_batches WHERE id = ?")
+                .bind(&target_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("load processed target");
+        assert_eq!(target_state, "compacted");
+
+        assert_eq!(worker.apply_ready().await.expect("apply jobs"), 1);
+        let job: (String, i64, Option<String>) =
+            sqlx::query_as("SELECT status, attempts, lease_until FROM memory_jobs WHERE id = ?")
+                .bind("job-live-expired")
+                .fetch_one(store.pool())
+                .await
+                .expect("load applied job");
         assert_eq!(job, ("applied".to_owned(), 1, None));
         let source_state: String =
             sqlx::query_scalar("SELECT state FROM memory_batches WHERE id = ?")
                 .bind(&source_id)
                 .fetch_one(store.pool())
                 .await
-                .expect("load recovered source");
+                .expect("load applied source");
         assert_eq!(source_state, "dropped");
         let target_state: String =
             sqlx::query_scalar("SELECT state FROM memory_batches WHERE id = ?")
                 .bind(&target_id)
                 .fetch_one(store.pool())
                 .await
-                .expect("load recovered target");
+                .expect("load applied target");
         assert_eq!(target_state, "promoted");
     }
 
@@ -4367,51 +4537,89 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_ready_skips_failed_job_and_applies_later_completed() {
+    async fn apply_ready_holds_failed_job_boundary_until_reclaimed() {
         let store = test_store().await;
-        let (source_id_1, _target_id_1) = insert_l0_batch(&store, &[user("first")]).await;
-        let mut job1 = MemoryJobRecord::new(
-            "job-failed-1",
-            MemoryJobKind::CompactL0,
-            1,
-            vec![source_id_1.clone()],
-            BTreeMap::from([(source_id_1.clone(), 0)]),
-        );
-        job1.status = MemoryJobStatus::Failed;
-        job1.attempts = 3;
-        job1.insert(store.pool()).await.expect("insert failed job");
-
+        let (source_id_1, target_id_1) = insert_l0_batch(&store, &[user("first")]).await;
         let (source_id_2, target_id_2) =
             insert_l0_batch_with_seq(&store, 2, &[user("second")]).await;
+        insert_compact_l0_job(&store, "job-failed-1", &source_id_1, 1).await;
         insert_compact_l0_job(&store, "job-complete-2", &source_id_2, 2).await;
 
+        // The first job fails its durable retry budget; the second completes.
         let provider = Arc::new(FakeProvider {
-            text: Mutex::new("second summary".into()),
+            text: Mutex::new("summary".into()),
+            fail_next: AtomicUsize::new(3),
             ..FakeProvider::default()
         });
-        let cancel = CancellationToken::new();
         let worker = CompactWorker {
             store: store.clone(),
             spec: select_compact_model(&chat_model(), None, &[]).expect("select model"),
-            provider,
-            cancel,
+            provider: provider.clone(),
+            cancel: CancellationToken::new(),
         };
-        worker.process_all_pending().await.expect("complete job 2");
-        assert_eq!(worker.apply_ready().await.expect("apply jobs"), 1);
+        worker.process_all_pending().await.expect("process jobs");
 
-        let job1 = sqlx::query("SELECT status FROM memory_jobs WHERE id = ?")
+        // The failed job must hold the FIFO boundary: apply_ready cannot
+        // skip it and apply the later completed job.
+        assert_eq!(worker.apply_ready().await.expect("apply ready"), 0);
+
+        let job1 = sqlx::query("SELECT status, attempts FROM memory_jobs WHERE id = ?")
             .bind("job-failed-1")
             .fetch_one(store.pool())
             .await
             .expect("fetch job1");
         assert_eq!(job1.get::<String, _>("status"), "failed");
+        assert_eq!(job1.get::<i64, _>("attempts"), 3);
 
         let job2 = sqlx::query("SELECT status FROM memory_jobs WHERE id = ?")
             .bind("job-complete-2")
             .fetch_one(store.pool())
             .await
             .expect("fetch job2");
-        assert_eq!(job2.get::<String, _>("status"), "applied");
+        assert_eq!(job2.get::<String, _>("status"), "completed");
+
+        let source1 = sqlx::query("SELECT state FROM memory_batches WHERE id = ?")
+            .bind(&source_id_1)
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch source1");
+        assert_eq!(source1.get::<String, _>("state"), "compact_failed");
+
+        let target1 = sqlx::query("SELECT state FROM memory_batches WHERE id = ?")
+            .bind(&target_id_1)
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch target1");
+        assert_eq!(target1.get::<String, _>("state"), "compact_failed");
+
+        // Reclaim the failed job and complete it inline. The next apply_ready
+        // then applies both completed jobs contiguously.
+        worker
+            .reclaim_failed("job-failed-1")
+            .await
+            .expect("reclaim failed job");
+        assert_eq!(worker.apply_ready().await.expect("apply jobs"), 2);
+
+        let job1 = sqlx::query("SELECT status FROM memory_jobs WHERE id = ?")
+            .bind("job-failed-1")
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch job1 after reclaim");
+        assert_eq!(job1.get::<String, _>("status"), "applied");
+
+        let source1 = sqlx::query("SELECT state FROM memory_batches WHERE id = ?")
+            .bind(&source_id_1)
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch source1 after reclaim");
+        assert_eq!(source1.get::<String, _>("state"), "dropped");
+
+        let target1 = sqlx::query("SELECT state FROM memory_batches WHERE id = ?")
+            .bind(&target_id_1)
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch target1 after reclaim");
+        assert_eq!(target1.get::<String, _>("state"), "promoted");
 
         let source2 = sqlx::query("SELECT state FROM memory_batches WHERE id = ?")
             .bind(&source_id_2)
@@ -4434,6 +4642,9 @@ mod tests {
                 .await
                 .expect("fetch cursor");
         assert_eq!(cursor, 3);
+
+        // Three failures for job1, one success for job2, one success for reclaim.
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 5);
     }
 
     #[tokio::test]
