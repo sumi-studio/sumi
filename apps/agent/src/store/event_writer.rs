@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Display,
     hash::Hash,
     sync::Arc,
@@ -891,6 +891,14 @@ pub(crate) enum MemoryJobMutation {
         lease_witness: Option<String>,
     },
     Apply {
+        job_id: String,
+        expected_attempt: i64,
+        lease_witness: Option<String>,
+    },
+    /// Discard a completed result whose source snapshot is stale. This is a
+    /// terminal transition that advances the apply cursor without modifying
+    /// the newer source shelves.
+    Discard {
         job_id: String,
         expected_attempt: i64,
         lease_witness: Option<String>,
@@ -3333,6 +3341,20 @@ impl EventWriter {
                 None,
                 None,
             ),
+            MemoryJobMutation::Discard {
+                job_id,
+                expected_attempt,
+                lease_witness,
+            } => (
+                job_id,
+                "completed",
+                "failed",
+                0,
+                Some(expected_attempt),
+                lease_witness,
+                None,
+                None,
+            ),
             MemoryJobMutation::Release {
                 job_id,
                 expected_attempt,
@@ -5332,11 +5354,20 @@ fn validate_batch_shape_with_recovery(
                         bail!("only one terminal mutation projection is allowed per EventWrite");
                     }
                     memory_transition_seen = true;
+                    let completes_job = transition
+                        .job_mutations
+                        .iter()
+                        .any(|mutation| matches!(mutation, MemoryJobMutation::Complete { .. }));
+                    let has_compacted_summary = transition.batch_mutations.iter().any(|batch| {
+                        batch.new_state == MemoryBatchState::Compacted && batch.summary.is_some()
+                    });
                     for batch in &transition.batch_mutations {
                         if !batch_ids.insert(batch.batch_id) {
                             bail!("duplicate batch_id in MemoryTransition");
                         }
-                        if batch.new_state == MemoryBatchState::Compacted && batch.summary.is_none()
+                        if batch.new_state == MemoryBatchState::Compacted
+                            && batch.summary.is_none()
+                            && !(completes_job && has_compacted_summary)
                         {
                             bail!("Compacted MemoryBatchMutation requires a summary");
                         }
@@ -5378,6 +5409,7 @@ fn job_id_for_mutation(mutation: &MemoryJobMutation) -> &str {
         | MemoryJobMutation::Complete { job_id, .. }
         | MemoryJobMutation::Fail { job_id, .. }
         | MemoryJobMutation::Apply { job_id, .. }
+        | MemoryJobMutation::Discard { job_id, .. }
         | MemoryJobMutation::Release { job_id, .. } => job_id.as_str(),
     }
 }
@@ -9276,6 +9308,35 @@ async fn apply_memory_batch_mutation(
         // references it, so shared anchor keys (e.g. native compaction windows)
         // are only erased once the last referencing row is gone.
         let mut candidate_keys: HashSet<String> = HashSet::new();
+        let mut erased_provider_context_ids: BTreeSet<String> = BTreeSet::new();
+        erased_provider_context_ids.extend(
+            sqlx::query_scalar::<_, String>(
+                "SELECT id FROM provider_context
+                 WHERE message_id IN (
+                     SELECT message_id FROM memory_batch_messages WHERE batch_id = ?
+                 )",
+            )
+            .bind(&batch.batch_id)
+            .fetch_all(&mut **transaction)
+            .await
+            .context("failed to collect provider-context ids for dropped source batch")?,
+        );
+        erased_provider_context_ids.extend(
+            sqlx::query_scalar::<_, String>(
+                "SELECT id FROM provider_context
+                 WHERE message_id IS NULL
+                   AND coverage_through_seq IN (
+                       SELECT seq FROM messages
+                       WHERE id IN (
+                           SELECT message_id FROM memory_batch_messages WHERE batch_id = ?
+                       )
+                   )",
+            )
+            .bind(&batch.batch_id)
+            .fetch_all(&mut **transaction)
+            .await
+            .context("failed to collect native provider-context ids for dropped source batch")?,
+        );
         candidate_keys.extend(
             sqlx::query_scalar::<_, String>(
                 "SELECT DISTINCT key_ref FROM provider_context
@@ -9371,6 +9432,10 @@ async fn apply_memory_batch_mutation(
             .await
             .context("failed to delete memory batch membership")?;
 
+        let protected_key_refs = ProviderContextMutationApplier::new(store)
+            .scrub_erased_provider_context_intents(transaction, &erased_provider_context_ids)
+            .await?;
+
         // Destroy each candidate data key whose wrapped material is no longer
         // referenced by any provider-context row. This is done inside the same
         // transaction as the row deletion so the key and its ciphertext are
@@ -9382,7 +9447,7 @@ async fn apply_memory_batch_mutation(
                     .fetch_one(&mut **transaction)
                     .await
                     .context("failed to check remaining provider-context references for key ref")?;
-            if remaining == 0 {
+            if remaining == 0 && !protected_key_refs.contains(&key_ref) {
                 store
                     .destroy_conversation_key_ref_in_transaction(transaction, &key_ref)
                     .await

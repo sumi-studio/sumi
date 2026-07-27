@@ -743,6 +743,131 @@ impl<'a> ProviderContextMutationApplier<'a> {
         Ok(full)
     }
 
+    /// Remove durable replay copies for provider-context rows erased by a
+    /// memory transition. Prepared replacements for an erased row are first
+    /// terminalized so recovery cannot recreate the deleted plaintext.
+    ///
+    /// Returns provider-context key refs still required by other prepared
+    /// replacement intents. Callers must preserve those keys even when no
+    /// active provider-context row currently references them.
+    pub(in crate::store) async fn scrub_erased_provider_context_intents(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        erased_ids: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>> {
+        if erased_ids.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+
+        let rows = sqlx::query(
+            "SELECT mutation_id, state, intent_key_ref, intent_ciphertext, intent_hmac
+             FROM provider_context_mutations
+             WHERE intent_key_ref IN (
+                 SELECT key_ref FROM data_keys
+                 WHERE scope = 'conversation' AND conversation_id = ? AND state = 'active'
+             )
+             ORDER BY mutation_id",
+        )
+        .bind(&self.store.scope().conversation_id)
+        .fetch_all(&mut **transaction)
+        .await
+        .context("failed to load provider-context intents for crypto-erasure")?;
+
+        let mut protected_key_refs = BTreeSet::new();
+        for row in rows {
+            let mutation_id: String = row.try_get("mutation_id")?;
+            let state: String = row.try_get("state")?;
+            let intent_key_ref: String = row.try_get("intent_key_ref")?;
+            let intent_ciphertext: Vec<u8> = row.try_get("intent_ciphertext")?;
+            let stored_hmac: Vec<u8> = row.try_get("intent_hmac")?;
+            let mutation_key = self
+                .store
+                .data_key_by_ref_in_transaction(transaction, &intent_key_ref)
+                .await
+                .with_context(|| {
+                    format!("failed to load mutation key while scrubbing {mutation_id}")
+                })?;
+            let aad = self.store.scope().row_aad(
+                "provider_context_mutations",
+                &mutation_id,
+                DataKeyPurpose::Mutation,
+            );
+            let intent_key =
+                hkdf_intent_hmac_key(&mutation_key, &self.store.scope().conversation_id);
+            let mut full = self.decrypt_full_intent(
+                &mutation_key,
+                &intent_ciphertext,
+                &aad,
+                &intent_key,
+                &stored_hmac,
+                "stored",
+            )?;
+
+            if !full.is_replace() {
+                continue;
+            }
+            if !erased_ids.contains(&full.provider_context_id) {
+                if state == "prepared" && !full.key_ref.is_empty() {
+                    protected_key_refs.insert(full.key_ref);
+                }
+                continue;
+            }
+
+            if state == "prepared" {
+                let result = sqlx::query(
+                    "UPDATE provider_context_mutations
+                     SET state = 'applied', finished_at = ?, terminal_reason = 'already_satisfied'
+                     WHERE mutation_id = ? AND state = 'prepared'",
+                )
+                .bind(Utc::now().to_rfc3339())
+                .bind(&mutation_id)
+                .execute(&mut **transaction)
+                .await
+                .context("failed to terminalize erased provider-context intent")?;
+                require_single_cas(
+                    result.rows_affected(),
+                    "ProviderContextMutationEraseTerminalize",
+                )?;
+            }
+
+            // The encrypted insert is non-semantic and may be removed without
+            // changing intent_hmac. Overwrite the old envelope first so SQLite
+            // does not retain a replayable ciphertext in the live page.
+            sqlx::query(
+                "UPDATE provider_context_mutations
+                 SET intent_ciphertext = zeroblob(length(intent_ciphertext))
+                 WHERE mutation_id = ?",
+            )
+            .bind(&mutation_id)
+            .execute(&mut **transaction)
+            .await
+            .context("failed to zero erased provider-context mutation intent")?;
+
+            full.key_ref.clear();
+            full.ciphertext.zeroize();
+            full.ciphertext.clear();
+            let mut full_json = Zeroizing::new(
+                serde_json::to_vec(&full)
+                    .context("failed to serialize scrubbed provider-context mutation intent")?,
+            );
+            let scrubbed_ciphertext = encrypt_content(&mutation_key, &full_json, &aad)?;
+            full_json.zeroize();
+            let result = sqlx::query(
+                "UPDATE provider_context_mutations
+                 SET intent_ciphertext = ?
+                 WHERE mutation_id = ?",
+            )
+            .bind(scrubbed_ciphertext)
+            .bind(&mutation_id)
+            .execute(&mut **transaction)
+            .await
+            .context("failed to persist scrubbed provider-context mutation intent")?;
+            require_single_cas(result.rows_affected(), "ProviderContextMutationEraseScrub")?;
+        }
+
+        Ok(protected_key_refs)
+    }
+
     pub(crate) async fn prepare(&self, prepared: &PreparedProviderContextMutation) -> Result<()> {
         if prepared.mutation_id.is_empty() {
             bail!("mutation_id must not be empty");
@@ -1291,6 +1416,46 @@ impl<'a> ProviderContextMutationApplier<'a> {
             }
             None => bail!("mutation {mutation_id} not found after apply"),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn inspect_stored_insert(
+        &self,
+        mutation_id: &str,
+    ) -> Result<(String, Option<String>, String, usize)> {
+        let mut transaction = self.store.pool().begin().await?;
+        let row = sqlx::query(
+            "SELECT state, terminal_reason, intent_key_ref, intent_ciphertext, intent_hmac
+             FROM provider_context_mutations WHERE mutation_id = ?",
+        )
+        .bind(mutation_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        let state: String = row.try_get("state")?;
+        let terminal_reason: Option<String> = row.try_get("terminal_reason")?;
+        let intent_key_ref: String = row.try_get("intent_key_ref")?;
+        let intent_ciphertext: Vec<u8> = row.try_get("intent_ciphertext")?;
+        let stored_hmac: Vec<u8> = row.try_get("intent_hmac")?;
+        let mutation_key = self
+            .store
+            .data_key_by_ref_in_transaction(&mut transaction, &intent_key_ref)
+            .await?;
+        let aad = self.store.scope().row_aad(
+            "provider_context_mutations",
+            mutation_id,
+            DataKeyPurpose::Mutation,
+        );
+        let intent_key = hkdf_intent_hmac_key(&mutation_key, &self.store.scope().conversation_id);
+        let full = self.decrypt_full_intent(
+            &mutation_key,
+            &intent_ciphertext,
+            &aad,
+            &intent_key,
+            &stored_hmac,
+            "inspected",
+        )?;
+        transaction.commit().await?;
+        Ok((state, terminal_reason, full.key_ref, full.ciphertext.len()))
     }
 
     fn replace_scope_key(&self, full: &FullIntent, intent_key: &[u8]) -> String {

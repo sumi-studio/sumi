@@ -60,6 +60,10 @@ pub(crate) use self::physical_recovery::{
 #[cfg(test)]
 pub(crate) use self::provider_context::EncryptedProviderContextRecord;
 pub(crate) use self::provider_context::{ProviderContextKind, provider_context_idempotency_key};
+#[cfg(test)]
+pub(crate) use self::provider_context::{
+    ProviderContextMutationApplier, ProviderContextMutationBuilder,
+};
 pub(crate) use self::transcript::{message_interrupted, public_message_role};
 #[cfg(test)]
 pub(crate) use crypto::{DATA_KEY_BYTES, WrappingKey};
