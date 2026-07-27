@@ -8046,6 +8046,7 @@ impl ApprovalTestDriver {
 struct HoldPreStartWorker {
     inner: Arc<dyn RunWorker>,
     tool_start_staged: Arc<Notify>,
+    tool_start_release: Option<Arc<Notify>>,
 }
 
 impl RunWorker for HoldPreStartWorker {
@@ -8063,6 +8064,7 @@ impl RunWorker for HoldPreStartWorker {
         let (inner_tx, mut inner_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let inner = self.inner.run(core, initial, controls, inner_tx);
         let tool_start_staged = self.tool_start_staged.clone();
+        let tool_start_release = self.tool_start_release.clone();
         Box::pin(async move {
             tokio::pin!(inner);
             loop {
@@ -8082,6 +8084,13 @@ impl RunWorker for HoldPreStartWorker {
                         };
                         if matches!(&output.event, AgentEvent::ToolExecutionStart { .. }) {
                             tool_start_staged.notify_one();
+                            if let Some(release) = tool_start_release.as_ref() {
+                                release.notified().await;
+                                if events.send(output).await.is_err() {
+                                    return inner.await;
+                                }
+                                continue;
+                            }
                             let preempted = tokio::select! {
                                 biased;
                                 completion = &mut inner => {
@@ -8990,6 +8999,7 @@ async fn assert_pre_start_approval_control_race(store_name: &str, control: Inbou
     let worker: Arc<dyn RunWorker> = Arc::new(HoldPreStartWorker {
         inner: production_worker,
         tool_start_staged: tool_start_staged.clone(),
+        tool_start_release: None,
     });
     let (gateway, commands, frames) = gateway();
     let session = Session::start(
@@ -9149,4 +9159,185 @@ async fn session_soft_steer_terminalizes_pre_start_approve_always_without_instal
 #[tokio::test]
 async fn session_abort_terminalizes_pre_start_approve_always_without_installing_rule() {
     assert_pre_start_approval_control_race("session-pre-start-approval-abort", abort(3)).await;
+}
+
+#[tokio::test]
+async fn duplicate_approval_decision_staged_race_is_terminal_after_restart() {
+    let root = std::env::temp_dir().join(format!(
+        "sumi-staged-approval-duplicate-restart-{}",
+        uuid::Uuid::now_v7()
+    ));
+    std::fs::create_dir_all(&root).expect("create duplicate approval restart fixture root");
+    let database_path = root.join("agent.db");
+    let store = open_kill_restart_store(&database_path).await;
+    let pool = store.pool().clone();
+    let policy = ask_only_policy(&store).await;
+    let broker = Arc::new(ApprovalBroker::new(
+        policy,
+        make_projector(),
+        None,
+        ReviewerMode::User,
+        false,
+        trusted_env(),
+    ));
+    let executed = Arc::new(AtomicBool::new(false));
+    let tool_start_staged = Arc::new(Notify::new());
+    let tool_start_release = Arc::new(Notify::new());
+    let production_worker: Arc<dyn RunWorker> = Arc::new(SequentialRunWorker::new(
+        ApprovalTestDriver::with_tool_call(executed.clone()),
+    ));
+    let worker: Arc<dyn RunWorker> = Arc::new(HoldPreStartWorker {
+        inner: production_worker,
+        tool_start_staged: tool_start_staged.clone(),
+        tool_start_release: Some(tool_start_release.clone()),
+    });
+    let (gateway, commands, frames) = gateway();
+    let session = Session::start(
+        store,
+        gateway,
+        approval_core(broker),
+        worker,
+        test_executor_generation(),
+    )
+    .await
+    .expect("session startup");
+    let task = tokio::spawn(session.run());
+
+    commands.send(user(1)).await.expect("user command");
+    let request_id = wait_for_approval_request(&frames, &task).await;
+    commands
+        .send(approval_decision(2, &request_id))
+        .await
+        .expect("first approval decision");
+    tokio::time::timeout(Duration::from_secs(3), tool_start_staged.notified())
+        .await
+        .expect("ToolExecutionStart reached the staged pre-commit window");
+
+    let duplicate = approval_decision(3, &request_id);
+    commands
+        .send(duplicate.clone())
+        .await
+        .expect("duplicate approval decision");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM inbound_commands WHERE seq = 3")
+                    .fetch_optional(&pool)
+                    .await
+                    .expect("duplicate command row");
+            if status.as_deref() == Some("received") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("duplicate remains ordered behind the staged resolution");
+    assert!(
+        !task.is_finished(),
+        "the duplicate decision must not fail the Session while approval_log is pending"
+    );
+
+    tool_start_release.notify_one();
+    wait_for_agent_end(&frames).await;
+
+    let durable: (String, String, String, String, i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT status FROM inbound_commands WHERE seq = 2),
+            (SELECT status FROM inbound_commands WHERE seq = 3),
+            (SELECT state FROM approval_log WHERE id = ?),
+            (SELECT state FROM tool_executions WHERE tool_call_id = 'call-1'),
+            (SELECT COUNT(*) FROM agent_events
+             WHERE event_type = 'approval_resolved'
+               AND json_extract(envelope, '$.request_id') = ?),
+            (SELECT COUNT(*) FROM agent_events
+             WHERE event_type = 'tool_execution_start'
+               AND json_extract(envelope, '$.tool_call_id') = 'call-1')",
+    )
+    .bind(&request_id)
+    .bind(&request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("staged duplicate durable state");
+    assert_eq!(durable.0, "applied");
+    assert_eq!(durable.1, "applied");
+    assert_eq!(durable.2, "approved_once");
+    assert_eq!(durable.3, "succeeded");
+    assert_eq!(durable.4, 1, "the approval resolves exactly once");
+    assert_eq!(durable.5, 1, "the tool starts exactly once");
+    assert!(executed.load(Ordering::SeqCst));
+
+    commands
+        .send(duplicate)
+        .await
+        .expect("replay terminal duplicate after the staged race");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let replay_acks = applied_acks(&frames)
+                .into_iter()
+                .filter(|ack| ack.seq == 3)
+                .count();
+            if replay_acks >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal duplicate replay ACK");
+
+    drop(commands);
+    match task.await.expect("session join") {
+        SessionResult::Completed(_) => {}
+        SessionResult::Failed { failure, .. } => {
+            panic!("staged duplicate approval race failed: {failure}")
+        }
+    }
+
+    pool.close().await;
+    let store = open_kill_restart_store(&database_path).await;
+    let lease = ProcessGenerationLease::new(
+        test_executor_generation(),
+        "duplicate-approval-restart-lease",
+    )
+    .expect("valid recovery lease");
+    let fence = GenerationRecoveryFence::new(&lease, "duplicate-approval-restart-fence")
+        .expect("valid recovery fence");
+    let hydrated = store
+        .hydrate(&lease, &fence)
+        .await
+        .expect("authenticated restart hydration");
+    let HydrationOutcome::Complete(hydrated) = hydrated else {
+        panic!("fully terminal duplicate approval state must hydrate without physical recovery")
+    };
+    assert!(
+        hydrated.recovery_steps.is_empty(),
+        "restart must not replay either approval decision or the tool: {:?}",
+        hydrated.recovery_steps
+    );
+    assert_eq!(
+        sqlx::query_as::<_, (String, String, String, String, i64, i64)>(
+            "SELECT
+                (SELECT status FROM inbound_commands WHERE seq = 2),
+                (SELECT status FROM inbound_commands WHERE seq = 3),
+                (SELECT state FROM approval_log WHERE id = ?),
+                (SELECT state FROM tool_executions WHERE tool_call_id = 'call-1'),
+                (SELECT COUNT(*) FROM agent_events
+                 WHERE event_type = 'approval_resolved'
+                   AND json_extract(envelope, '$.request_id') = ?),
+                (SELECT COUNT(*) FROM agent_events
+                 WHERE event_type = 'tool_execution_start'
+                   AND json_extract(envelope, '$.tool_call_id') = 'call-1')",
+        )
+        .bind(&request_id)
+        .bind(&request_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("restarted staged duplicate durable state"),
+        durable,
+        "restart must preserve the exact terminal command/approval/tool state"
+    );
+    store.pool().close().await;
+    drop(store);
+    std::fs::remove_dir_all(&root).expect("remove duplicate approval restart fixture root");
 }

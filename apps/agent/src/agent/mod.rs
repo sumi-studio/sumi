@@ -6,6 +6,7 @@
 
 use std::{
     any::Any,
+    collections::HashSet,
     future::Future,
     marker::PhantomData,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -502,11 +503,30 @@ pub(crate) struct ActiveRun {
     bridge: DurableBridge,
     attempt_cancellation: Arc<AttemptCancellation>,
     approval: Option<Arc<ApprovalBroker>>,
+    resolving_approvals: HashSet<String>,
 }
 
 impl Drop for ActiveRun {
     fn drop(&mut self) {
         self.join.abort();
+    }
+}
+
+impl ActiveRun {
+    fn finish_committed_approval_resolutions(&mut self, outputs: &[CommittedOutput]) {
+        let committed: Vec<_> = outputs
+            .iter()
+            .filter_map(|output| match &output.event {
+                AgentEvent::ApprovalResolved { request_id, .. } => Some(request_id.clone()),
+                _ => None,
+            })
+            .collect();
+        for request_id in committed {
+            self.resolving_approvals.remove(&request_id);
+            if let Some(broker) = self.approval.as_ref() {
+                broker.finish_resolution(&request_id);
+            }
+        }
     }
 }
 
@@ -826,7 +846,10 @@ impl<G: Gateway + 'static> Session<G> {
                     self.defer_active_command(command)?;
                     return Ok(());
                 }
-                return self.route_active_approval_decision(command).await;
+                if !self.route_active_approval_decision(command.clone()).await? {
+                    self.defer_active_command(command)?;
+                }
+                return Ok(());
             }
             self.defer_active_command(command)?;
             return Ok(());
@@ -1053,7 +1076,7 @@ impl<G: Gateway + 'static> Session<G> {
     async fn route_active_approval_decision(
         &mut self,
         command: AdmittedCommand,
-    ) -> Result<(), SessionFailure> {
+    ) -> Result<bool, SessionFailure> {
         let active = self
             .active
             .as_ref()
@@ -1062,19 +1085,37 @@ impl<G: Gateway + 'static> Session<G> {
             Command::ApprovalDecision { request_id, .. } => request_id,
             _ => unreachable!("caller matched ApprovalDecision"),
         };
+        if active.resolving_approvals.contains(request_id)
+            || active
+                .approval
+                .as_ref()
+                .is_some_and(|broker| broker.is_resolving(request_id))
+        {
+            return Ok(false);
+        }
         let is_pending = active
             .approval
             .as_ref()
             .is_some_and(|broker| broker.has_pending(request_id));
         if !is_pending {
-            return self.apply_idle_approval_decision(command).await;
+            self.apply_idle_approval_decision(command).await?;
+            return Ok(true);
         }
+        let request_id = request_id.clone();
         let control = RunControl::Command(command);
-        active
+        self.active
+            .as_mut()
+            .expect("active approval route retains its run")
+            .resolving_approvals
+            .insert(request_id);
+        self.active
+            .as_ref()
+            .expect("active approval route retains its run")
             .control_tx
             .send(control)
             .await
-            .map_err(|_| SessionFailure::CompletionChannelClosed)
+            .map_err(|_| SessionFailure::CompletionChannelClosed)?;
+        Ok(true)
     }
 
     fn defer_active_command(&mut self, command: AdmittedCommand) -> Result<(), SessionFailure> {
@@ -1125,8 +1166,7 @@ impl<G: Gateway + 'static> Session<G> {
                 }
                 Command::Abort {} => self.route_active_abort(command.clone()).await?,
                 Command::ApprovalDecision { .. } => {
-                    self.route_active_approval_decision(command.clone()).await?;
-                    true
+                    self.route_active_approval_decision(command.clone()).await?
                 }
             };
             if !routed {
@@ -1401,6 +1441,7 @@ impl<G: Gateway + 'static> Session<G> {
             bridge: DurableBridge::new(binding),
             attempt_cancellation,
             approval,
+            resolving_approvals: HashSet::new(),
         });
         Ok(())
     }
@@ -1538,6 +1579,7 @@ impl<G: Gateway + 'static> Session<G> {
             if let Some(barrier) = retry_wait_commit_barrier {
                 barrier.committed();
             }
+            active.finish_committed_approval_resolutions(&outputs);
             if deliver && delivery_failure.is_none() {
                 delivery_failure = self
                     .send_committed(
@@ -1576,6 +1618,10 @@ impl<G: Gateway + 'static> Session<G> {
         if let Some(barrier) = retry_wait_commit_barrier {
             barrier.committed();
         }
+        self.active
+            .as_mut()
+            .expect("committed event retains active run")
+            .finish_committed_approval_resolutions(&outputs);
         let assistant_started = outputs.iter().any(|output| {
             matches!(
                 &output.event,

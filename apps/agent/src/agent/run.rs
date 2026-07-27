@@ -1157,13 +1157,16 @@ impl Runner {
                                     match self.emit_tool_start_and_wait_committed(call).await? {
                                         ToolStartOutcome::Started => {
                                             if let Some(broker) = self.core.approval.as_ref() {
-                                                broker.commit_resolution(&committed_decision).map_err(
-                                                    |error| {
+                                                broker
+                                                    .commit_resolution(
+                                                        &request.id,
+                                                        &committed_decision,
+                                                    )
+                                                    .map_err(|error| {
                                                         WorkerFailure::Error(format!(
                                                             "committed approval rule activation failed: {error}"
                                                         ))
-                                                    },
-                                                )?;
+                                                    })?;
                                             }
                                             let result = match self
                                                 .execute_tool_with_updates(

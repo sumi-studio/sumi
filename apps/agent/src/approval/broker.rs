@@ -7,7 +7,7 @@
 //! `oneshot` wait per pending request.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex, RwLock},
 };
 
@@ -141,6 +141,7 @@ pub struct ApprovalBroker {
     headless: bool,
     trusted_environment: Arc<dyn TrustedEnvironmentProvider>,
     pending: Arc<Mutex<HashMap<String, PendingEntry>>>,
+    resolving: Arc<Mutex<HashSet<String>>>,
 }
 
 impl std::fmt::Debug for ApprovalBroker {
@@ -190,6 +191,7 @@ impl ApprovalBroker {
             headless,
             trusted_environment,
             pending: Arc::new(Mutex::new(HashMap::new())),
+            resolving: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -333,6 +335,10 @@ impl ApprovalBroker {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         let entry = pending.remove(request_id)?;
         drop(pending);
+        self.resolving
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(request_id.to_owned());
 
         let user_decision = match user_decision_from_gateway(request_id, decision) {
             Ok(d) => d,
@@ -396,15 +402,39 @@ impl ApprovalBroker {
     /// Publish a rule only after the approval resolution and matching tool
     /// start have committed atomically. Until this point the decision is staged
     /// and must not affect authorization of another call.
-    pub(crate) fn commit_resolution(&self, resolved: &ResolvedDecision) -> Result<()> {
+    pub(crate) fn commit_resolution(
+        &self,
+        request_id: &str,
+        resolved: &ResolvedDecision,
+    ) -> Result<()> {
         let ResolvedDecision::ApproveAlways(_rule) = resolved else {
+            self.finish_resolution(request_id);
             return Ok(());
         };
         // The authenticated user choice authorizes this execution once and
         // remains a durable proposal. Persistent authority begins only after
         // the control plane publishes and the agent verifies a signed
         // replacement bundle.
+        self.finish_resolution(request_id);
         Ok(())
+    }
+
+    /// True while an authenticated decision owns the request but its durable
+    /// resolution boundary has not yet completed.
+    pub fn is_resolving(&self, request_id: &str) -> bool {
+        self.resolving
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(request_id)
+    }
+
+    /// Release resolving ownership only after the matching durable resolution
+    /// (and, for approvals, ToolExecutionStart) has committed.
+    pub fn finish_resolution(&self, request_id: &str) {
+        self.resolving
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(request_id);
     }
 
     /// Cancel a specific pending request and notify its waiter.
@@ -1298,7 +1328,7 @@ mod tests {
         assert!(matches!(outcome, ApprovalOutcome::Pending { .. }));
 
         broker
-            .commit_resolution(&resolved)
+            .commit_resolution(&request.id, &resolved)
             .expect("activate durably committed rule");
         let outcome = broker
             .start_request(
@@ -1522,7 +1552,7 @@ mod tests {
             .expect("resolve pending");
         assert!(matches!(resolved, ResolvedDecision::ApproveAlways(_)));
         broker
-            .commit_resolution(&resolved)
+            .commit_resolution(&request.id, &resolved)
             .expect("activate durable rule");
 
         assert_eq!(reviewer.allow_cache_entry_count(), 1);

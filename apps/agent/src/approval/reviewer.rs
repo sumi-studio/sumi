@@ -580,20 +580,6 @@ impl Reviewer {
         }
 
         {
-            let mut allow_cache = self.allow_cache.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(decision) = allow_cache.get(
-                &request.policy_hash,
-                &projection_hash,
-                &request.context_version,
-            ) {
-                let decision = decision.clone();
-                drop(allow_cache);
-                self.record_outcome(&request.run_id, AuditOutcome::Allow);
-                return ReviewOutcome::Allow(decision);
-            }
-        }
-
-        {
             let cb = self
                 .circuit_breaker
                 .lock()
@@ -605,6 +591,20 @@ impl Reviewer {
                 && cb.breaker.is_open()
             {
                 return ReviewOutcome::Deny(synthetic_deny("reviewer circuit breaker is open"));
+            }
+        }
+
+        {
+            let mut allow_cache = self.allow_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(decision) = allow_cache.get(
+                &request.policy_hash,
+                &projection_hash,
+                &request.context_version,
+            ) {
+                let decision = decision.clone();
+                drop(allow_cache);
+                self.record_outcome(&request.run_id, AuditOutcome::Allow);
+                return ReviewOutcome::Allow(decision);
             }
         }
 
@@ -1315,6 +1315,53 @@ mod tests {
             matches!(outcome, ReviewOutcome::Deny(d) if d.rationale.contains("circuit breaker"))
         );
         assert_eq!(fake.called_count(), 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn open_circuit_breaker_blocks_a_warm_cached_allow() {
+        let fake = FakeTransport::sequence(vec![
+            Ok(allow_json()),
+            Ok(deny_json()),
+            Ok(deny_json()),
+            Ok(deny_json()),
+        ]);
+        let reviewer = make_reviewer(fake.clone());
+        let allow_request = review_request(reviewable_projection());
+
+        assert!(matches!(
+            reviewer
+                .review(allow_request.clone(), CancellationToken::new())
+                .await,
+            ReviewOutcome::Allow(_)
+        ));
+
+        for command in ["log", "diff", "show"] {
+            let mut deny_request = review_request(git_projection(command));
+            deny_request.turn_id = None;
+            assert!(matches!(
+                reviewer
+                    .review(deny_request, CancellationToken::new())
+                    .await,
+                ReviewOutcome::Deny(_)
+            ));
+        }
+
+        let cached_retry = reviewer
+            .review(allow_request, CancellationToken::new())
+            .await;
+        assert!(
+            matches!(
+                cached_retry,
+                ReviewOutcome::Deny(ref decision)
+                    if decision.rationale.contains("circuit breaker")
+            ),
+            "an open same-run breaker must bypass warm allows: {cached_retry:?}"
+        );
+        assert_eq!(
+            fake.called_count(),
+            4,
+            "the cached retry must neither execute nor call the reviewer"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
