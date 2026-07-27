@@ -11,6 +11,11 @@ use super::{
 
 pub(crate) const REPLAY_PROBE_VERSION: u32 = 1;
 
+/// Persisted estimator version for the `ReplayProbeV1` contract. It is kept
+/// distinct from the contract version because the legacy serialized-bytes/4
+/// estimator also used version 1.
+pub(crate) const REPLAY_PROBE_EVICTION_ESTIMATOR_VERSION: u32 = 2;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ReplayProbeKind {
     ResponsesEncryptedReasoning,
@@ -474,7 +479,7 @@ mod tests {
         ];
         json!({
             "contract":"ReplayProbeV1",
-            "eviction_estimator_version":REPLAY_PROBE_VERSION,
+            "eviction_estimator_version":REPLAY_PROBE_EVICTION_ESTIMATOR_VERSION,
             "cases":cases,
         })
     }

@@ -8,9 +8,18 @@ use crate::provider::{
     types::{ProviderContextPayload, PublicAssistantContent, PublicMessage, Usage, UserContent},
 };
 use thiserror::Error;
+use zeroize::Zeroizing;
 
-/// The estimator version is coupled to the provider-owned probe contract.
-pub const EVICTION_ESTIMATOR_VERSION_V1: u32 = crate::provider::replay_probe::REPLAY_PROBE_VERSION;
+/// Legacy estimator that used the serialized plaintext byte length divided
+/// by four with ceiling. This predates the provider-specific `ReplayProbeV1`
+/// contract and is only accepted for backward-compatible hydration.
+pub const EVICTION_ESTIMATOR_VERSION_SERIALIZED_BYTES: u32 = 1;
+
+/// The estimator version for the `ReplayProbeV1` wire-byte accounting
+/// contract. It is intentionally distinct from `SERIALIZED_BYTES` so the two
+/// formulas cannot be silently reinterpreted.
+pub const EVICTION_ESTIMATOR_VERSION_REPLAY_PROBE_V1: u32 =
+    crate::provider::replay_probe::REPLAY_PROBE_EVICTION_ESTIMATOR_VERSION;
 
 const NO_TOOL_OUTPUT_PLACEHOLDER: &str = "(no tool output)";
 const TOOL_RESULT_IMAGE_PLACEHOLDER: &str = "(see attached image)";
@@ -283,7 +292,7 @@ pub(crate) fn eviction_footprint_v1(
         .map_err(|error| EstimateError::ReplayProbeFailure(error.to_string()))?
     {
         ReplayProbeResult::SerializedDelta { replay_wire_bytes } => Ok(EvictionFootprint {
-            estimator_version: EVICTION_ESTIMATOR_VERSION_V1,
+            estimator_version: EVICTION_ESTIMATOR_VERSION_REPLAY_PROBE_V1,
             replay_wire_bytes,
             eviction_tokens: replay_wire_bytes.div_ceil(4),
         }),
@@ -293,9 +302,39 @@ pub(crate) fn eviction_footprint_v1(
 
 pub(crate) fn native_canonical_window_footprint() -> EvictionFootprint {
     EvictionFootprint {
-        estimator_version: EVICTION_ESTIMATOR_VERSION_V1,
+        estimator_version: EVICTION_ESTIMATOR_VERSION_REPLAY_PROBE_V1,
         replay_wire_bytes: 0,
         eviction_tokens: 0,
+    }
+}
+
+/// Compute the exact legacy serialized-payload/4 eviction footprint used by
+/// current main before the `ReplayProbeV1` estimator. Legacy encrypted
+/// reasoning measured only its opaque JSON item, not the surrounding
+/// `ProviderContextItem`; native windows were a typed zero.
+pub(crate) fn legacy_serialized_bytes_eviction_footprint(
+    payload: &ProviderContextPayload,
+) -> Result<EvictionFootprint, EstimateError> {
+    match payload {
+        ProviderContextPayload::EncryptedReasoning { item, .. } => {
+            let serialized = Zeroizing::new(
+                serde_json::to_vec(item)
+                    .map_err(|error| EstimateError::SerializerFailure(error.to_string()))?,
+            );
+            let replay_wire_bytes =
+                u64::try_from(serialized.len()).map_err(|_| EstimateError::ArithmeticOverflow)?;
+            Ok(EvictionFootprint {
+                estimator_version: EVICTION_ESTIMATOR_VERSION_SERIALIZED_BYTES,
+                replay_wire_bytes,
+                eviction_tokens: replay_wire_bytes.div_ceil(4),
+            })
+        }
+        ProviderContextPayload::OpenAiCompactedWindow { .. }
+        | ProviderContextPayload::AnthropicCompaction { .. } => Ok(EvictionFootprint {
+            estimator_version: EVICTION_ESTIMATOR_VERSION_SERIALIZED_BYTES,
+            replay_wire_bytes: 0,
+            eviction_tokens: 0,
+        }),
     }
 }
 
@@ -418,6 +457,50 @@ mod tests {
     }
 
     #[test]
+    fn legacy_v1_reproduces_current_main_payload_only_accounting() {
+        let signature = ProviderContextPayload::EncryptedReasoning {
+            protocol: ApiProtocol::AnthropicMessages,
+            item: json!({
+                "type": "thinking_signature",
+                "signature": "quote:\" backslash:\\ newline:\n 日本語 YWJjZA==",
+            }),
+        };
+        let legacy =
+            legacy_serialized_bytes_eviction_footprint(&signature).expect("legacy footprint");
+        assert_eq!(
+            legacy.estimator_version(),
+            EVICTION_ESTIMATOR_VERSION_SERIALIZED_BYTES
+        );
+        assert_eq!(legacy.replay_wire_bytes(), 95);
+        assert_eq!(legacy.eviction_tokens(), 24);
+
+        let replay = eviction_footprint_for_payload(
+            &ModelSpec::preset("anthropic").expect("preset"),
+            &signature,
+        )
+        .expect("replay-probe footprint");
+        assert_eq!(
+            replay.estimator_version(),
+            EVICTION_ESTIMATOR_VERSION_REPLAY_PROBE_V1
+        );
+        assert_eq!(replay.replay_wire_bytes(), 124);
+        assert_eq!(replay.eviction_tokens(), 31);
+
+        let native = legacy_serialized_bytes_eviction_footprint(
+            &ProviderContextPayload::AnthropicCompaction {
+                block: json!({"type": "compaction", "content": "summary"}),
+                coverage: crate::provider::types::NativeCompactionCoverage {
+                    through_message_seq: 1,
+                    context_fingerprint: "legacy-native".to_owned(),
+                },
+            },
+        )
+        .expect("legacy native zero");
+        assert_eq!(native.replay_wire_bytes(), 0);
+        assert_eq!(native.eviction_tokens(), 0);
+    }
+
+    #[test]
     fn malformed_or_overflowing_inputs_fail_closed() {
         assert_eq!(
             EvictionFootprint::from_saved(0, 0, 0),
@@ -461,7 +544,7 @@ mod tests {
         assert_eq!(contract["contract"], "ReplayProbeV1");
         assert_eq!(
             contract["eviction_estimator_version"],
-            EVICTION_ESTIMATOR_VERSION_V1
+            EVICTION_ESTIMATOR_VERSION_REPLAY_PROBE_V1
         );
         let supported_kinds = HashSet::from([
             "encrypted_reasoning",

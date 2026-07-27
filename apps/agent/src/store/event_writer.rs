@@ -862,30 +862,46 @@ pub(crate) struct MemoryBatchMutation {
 pub(crate) enum MemoryJobMutation {
     /// Claim a `pending` job without consuming an attempt. The lease is
     /// refreshed at the start of a provider attempt via [`Start`].
-    Claim {
-        job_id: String,
-        lease_until: String,
-    },
+    Claim { job_id: String, lease_until: String },
     /// Refresh the lease and increment the durable attempt counter before a
     /// provider call. This keeps crash-recovery from giving free retries.
+    /// `expected_attempt` and `lease_witness` are the values observed by the
+    /// caller; EventWriter CAS rejects a row that has been reclaimed by
+    /// another worker.
     Start {
         job_id: String,
+        expected_attempt: i64,
+        lease_witness: Option<String>,
         lease_until: String,
     },
+    /// Commit a `running` job's compacted result. `expected_attempt` and
+    /// `lease_witness` must match the durable row at the time the job was
+    /// claimed and started.
     Complete {
         job_id: String,
+        expected_attempt: i64,
+        lease_witness: Option<String>,
         result: CompactResult,
     },
+    /// Mark a `running` job as failed. `expected_attempt` and `lease_witness`
+    /// must match the durable row at the time the job was claimed and started.
     Fail {
         job_id: String,
+        expected_attempt: i64,
+        lease_witness: Option<String>,
     },
     Apply {
         job_id: String,
+        expected_attempt: i64,
+        lease_witness: Option<String>,
     },
     /// Return a leased `running` job to the queue without consuming another
     /// attempt (used for cancellation or stale-source reset).
+    /// `expected_attempt` and `lease_witness` must match the durable row.
     Release {
         job_id: String,
+        expected_attempt: i64,
+        lease_witness: Option<String>,
     },
 }
 
@@ -3228,6 +3244,7 @@ impl EventWriter {
             expected_status,
             new_status,
             attempts_delta,
+            expected_attempt,
             expected_lease_until,
             new_lease_until,
             result,
@@ -3241,22 +3258,31 @@ impl EventWriter {
                 "running",
                 0,
                 None,
+                None,
                 Some(lease_until),
                 None,
             ),
             MemoryJobMutation::Start {
                 job_id,
+                expected_attempt,
+                lease_witness,
                 lease_until,
             } => (
                 job_id,
                 "running",
                 "running",
                 1,
-                None,
+                Some(expected_attempt),
+                lease_witness,
                 Some(lease_until),
                 None,
             ),
-            MemoryJobMutation::Complete { job_id, result } => {
+            MemoryJobMutation::Complete {
+                job_id,
+                expected_attempt,
+                lease_witness,
+                result,
+            } => {
                 if memory_summary_key.is_none() {
                     *memory_summary_key = Some(
                         self.store
@@ -3273,39 +3299,60 @@ impl EventWriter {
                     "running",
                     "completed",
                     0,
-                    None,
+                    Some(expected_attempt),
+                    lease_witness,
                     None,
                     Some(encrypted),
                 )
             }
-            MemoryJobMutation::Fail { job_id } => {
-                (job_id, "running", "failed", 0, None, None, None)
-            }
-            MemoryJobMutation::Apply { job_id } => {
-                (job_id, "completed", "applied", 0, None, None, None)
-            }
-            MemoryJobMutation::Release { job_id } => {
-                (job_id, "running", "pending", 0, None, None, None)
-            }
+            MemoryJobMutation::Fail {
+                job_id,
+                expected_attempt,
+                lease_witness,
+            } => (
+                job_id,
+                "running",
+                "failed",
+                0,
+                Some(expected_attempt),
+                lease_witness,
+                None,
+                None,
+            ),
+            MemoryJobMutation::Apply {
+                job_id,
+                expected_attempt,
+                lease_witness,
+            } => (
+                job_id,
+                "completed",
+                "applied",
+                0,
+                Some(expected_attempt),
+                lease_witness,
+                None,
+                None,
+            ),
+            MemoryJobMutation::Release {
+                job_id,
+                expected_attempt,
+                lease_witness,
+            } => (
+                job_id,
+                "running",
+                "pending",
+                0,
+                Some(expected_attempt),
+                lease_witness,
+                None,
+                None,
+            ),
         };
 
-        let row = sqlx::query("SELECT status, attempts, lease_until FROM memory_jobs WHERE id = ?")
-            .bind(&job_id)
-            .fetch_optional(self.store.pool())
-            .await
-            .context("failed to load memory job for mutation")?
-            .ok_or_else(|| anyhow!("memory job {job_id} does not exist"))?;
-        let status: String = row.try_get("status")?;
-        if status != expected_status {
-            bail!("memory job {job_id} is in status {status}, expected {expected_status}");
-        }
-        let attempts: i64 = row.try_get("attempts")?;
-        let lease_until_stored: Option<String> = row.try_get("lease_until")?;
-
-        // Terminal transitions and start must CAS on the stored lease so a
-        // concurrently-recovered job cannot be double-transitioned. The lease is
-        // always cleared on terminal transitions to prevent stale lease drift.
-        let expected_lease_until = expected_lease_until.or_else(|| lease_until_stored.clone());
+        // Terminal transitions, start and claim all use the witness values
+        // supplied by the caller. EventWriter's durable CAS rejects any row
+        // that has been reclaimed or advanced by another worker.
+        let attempts = expected_attempt.unwrap_or(0);
         let new_lease_until = if new_status == "running" {
             new_lease_until
         } else {
@@ -5329,9 +5376,9 @@ fn job_id_for_mutation(mutation: &MemoryJobMutation) -> &str {
         MemoryJobMutation::Claim { job_id, .. }
         | MemoryJobMutation::Start { job_id, .. }
         | MemoryJobMutation::Complete { job_id, .. }
-        | MemoryJobMutation::Fail { job_id }
-        | MemoryJobMutation::Apply { job_id }
-        | MemoryJobMutation::Release { job_id } => job_id.as_str(),
+        | MemoryJobMutation::Fail { job_id, .. }
+        | MemoryJobMutation::Apply { job_id, .. }
+        | MemoryJobMutation::Release { job_id, .. } => job_id.as_str(),
     }
 }
 
@@ -8915,6 +8962,7 @@ async fn apply_projection(
             ..
         } => {
             apply_memory_transition(
+                store,
                 transaction,
                 expected_source_versions,
                 batch_mutations,
@@ -9185,6 +9233,7 @@ async fn apply_memory_job_update(
 }
 
 async fn apply_memory_transition(
+    store: &Store,
     transaction: &mut Transaction<'_, Sqlite>,
     expected_source_versions: BTreeMap<String, i64>,
     batch_mutations: Vec<PreparedMemoryBatchMutation>,
@@ -9193,7 +9242,7 @@ async fn apply_memory_transition(
 ) -> Result<()> {
     verify_source_versions(transaction, &expected_source_versions, None).await?;
     for batch in batch_mutations {
-        apply_memory_batch_mutation(transaction, batch).await?;
+        apply_memory_batch_mutation(transaction, batch, store).await?;
     }
     for job in job_mutations {
         apply_memory_job_mutation(transaction, job).await?;
@@ -9218,8 +9267,46 @@ async fn apply_memory_transition(
 async fn apply_memory_batch_mutation(
     transaction: &mut Transaction<'_, Sqlite>,
     batch: PreparedMemoryBatchMutation,
+    store: &Store,
 ) -> Result<()> {
     if batch.delete_membership {
+        // Capture the data keys that are about to become unreferenced before
+        // we overwrite/delete provider-context rows. We will destroy each key
+        // only after confirming that no remaining provider-context row still
+        // references it, so shared anchor keys (e.g. native compaction windows)
+        // are only erased once the last referencing row is gone.
+        let mut candidate_keys: HashSet<String> = HashSet::new();
+        candidate_keys.extend(
+            sqlx::query_scalar::<_, String>(
+                "SELECT DISTINCT key_ref FROM provider_context
+                 WHERE message_id IN (
+                     SELECT message_id FROM memory_batch_messages WHERE batch_id = ?
+                 )",
+            )
+            .bind(&batch.batch_id)
+            .fetch_all(&mut **transaction)
+            .await
+            .context("failed to collect provider-context key refs for dropped source batch")?,
+        );
+        candidate_keys.extend(
+            sqlx::query_scalar::<_, String>(
+                "SELECT DISTINCT key_ref FROM provider_context
+                 WHERE message_id IS NULL
+                   AND coverage_through_seq IN (
+                       SELECT seq FROM messages
+                       WHERE id IN (
+                           SELECT message_id FROM memory_batch_messages WHERE batch_id = ?
+                       )
+                   )",
+            )
+            .bind(&batch.batch_id)
+            .fetch_all(&mut **transaction)
+            .await
+            .context(
+                "failed to collect native provider-context key refs for dropped source batch",
+            )?,
+        );
+
         // Crypto-erase provider context for every message whose membership is
         // about to be dropped. We overwrite the ciphertext BLOB with zeros
         // before deleting the row so that the SQLite free-page bytes are not
@@ -9283,6 +9370,27 @@ async fn apply_memory_batch_mutation(
             .execute(&mut **transaction)
             .await
             .context("failed to delete memory batch membership")?;
+
+        // Destroy each candidate data key whose wrapped material is no longer
+        // referenced by any provider-context row. This is done inside the same
+        // transaction as the row deletion so the key and its ciphertext are
+        // erased atomically.
+        for key_ref in candidate_keys {
+            let remaining: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM provider_context WHERE key_ref = ?")
+                    .bind(&key_ref)
+                    .fetch_one(&mut **transaction)
+                    .await
+                    .context("failed to check remaining provider-context references for key ref")?;
+            if remaining == 0 {
+                store
+                    .destroy_conversation_key_ref_in_transaction(transaction, &key_ref)
+                    .await
+                    .with_context(|| {
+                        format!("failed to destroy unreferenced provider-context key {key_ref}")
+                    })?;
+            }
+        }
     }
 
     let version_increments = batch.summary.is_some() || batch.new_state != batch.old_state;
@@ -22100,6 +22208,7 @@ mod tests {
                 footprint_delta: 1,
                 delete_membership: false,
             },
+            &store,
         )
         .await
         .expect_err("overflow must fail closed");
@@ -22130,6 +22239,7 @@ mod tests {
                 footprint_delta: -1,
                 delete_membership: false,
             },
+            &store,
         )
         .await
         .expect("decrement to zero must succeed");
@@ -22153,6 +22263,7 @@ mod tests {
                 footprint_delta: -1,
                 delete_membership: false,
             },
+            &store,
         )
         .await
         .expect_err("underflow must fail closed");

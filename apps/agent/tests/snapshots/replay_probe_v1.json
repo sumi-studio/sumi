@@ -1,6 +1,6 @@
 {
   "contract": "ReplayProbeV1",
-  "eviction_estimator_version": 1,
+  "eviction_estimator_version": 2,
   "cases": [
     {
       "protocol": "open_ai_responses",

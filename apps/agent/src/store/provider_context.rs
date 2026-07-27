@@ -1529,7 +1529,10 @@ mod tests {
     use sqlx::Row;
 
     use super::*;
-    use crate::memory::estimate::{EvictionFootprint, eviction_footprint_for_payload};
+    use crate::memory::estimate::{
+        EvictionFootprint, eviction_footprint_for_payload,
+        legacy_serialized_bytes_eviction_footprint, native_canonical_window_footprint,
+    };
     use crate::provider::model::ModelSpec;
     use crate::provider::types::{
         ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, Message,
@@ -1539,7 +1542,9 @@ mod tests {
     use crate::store::{DataKeyPurpose, ProviderContextKeyAnchor, Store};
 
     fn dummy_footprint() -> EvictionFootprint {
-        EvictionFootprint::from_saved(1, 0, 0).expect("valid dummy footprint")
+        // Native compaction windows and many mutation/invalidation tests do not
+        // need a real reasoning footprint; the canonical zero footprint is enough.
+        native_canonical_window_footprint()
     }
 
     async fn store() -> Store {
@@ -3265,6 +3270,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hydrate_accepts_current_main_legacy_v1_anthropic_reasoning() {
+        let store = store().await;
+        seed_message(&store, "message-legacy", 7).await.unwrap();
+
+        let origin = ProviderOrigin {
+            provider_instance_id: "legacy-provider-instance".to_owned(),
+            protocol: ApiProtocol::AnthropicMessages,
+            model: "anthropic".to_owned(),
+        };
+        let item = ProviderContextItem {
+            origin_message: Some(ProviderContextAnchor {
+                message_id: "message-legacy".to_owned(),
+                message_seq: 7,
+            }),
+            wire_item_index: Some(0),
+            ordinal: 1,
+            provider_origin: origin.clone(),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::AnthropicMessages,
+                item: json!({
+                    "type": "thinking_signature",
+                    "signature": "quote:\" backslash:\\ newline:\n 日本語 YWJjZA==",
+                }),
+            },
+        };
+        let footprint = legacy_serialized_bytes_eviction_footprint(&item.payload)
+            .expect("current-main V1 footprint");
+        assert_eq!(footprint.eviction_tokens(), 24);
+        let key = store
+            .provider_context_key(&ProviderContextKeyAnchor {
+                conversation_id: store.scope().conversation_id.clone(),
+                anchor_id: "message-legacy:7".to_owned(),
+            })
+            .await
+            .expect("provider-context key");
+        EncryptedProviderContextRecord::encrypt(
+            &item,
+            &origin.provider_instance_id,
+            origin.protocol,
+            &origin.model,
+            "pc-legacy-v1",
+            provider_context_idempotency_key("message-legacy", &item),
+            footprint,
+            &key,
+            store.scope(),
+        )
+        .expect("encrypt legacy record")
+        .insert(store.pool())
+        .await
+        .expect("insert legacy record");
+
+        let messages = vec![ContextMessage::Persisted {
+            id: "message-legacy".to_owned(),
+            seq: 7,
+            message: assistant_message(origin),
+        }];
+        let hydrated = {
+            let mut transaction = store.pool().begin().await.expect("begin hydration");
+            store
+                .hydrate_provider_context(&messages, &mut transaction)
+                .await
+                .expect("legacy V1 record remains hydratable")
+        };
+        assert_eq!(hydrated, vec![item]);
+    }
+
+    #[tokio::test]
     async fn hydrate_rejects_unsupported_eviction_estimator_version() {
         let store = store().await;
         seed_message(&store, "message-1", 7).await.unwrap();
@@ -3273,7 +3345,7 @@ mod tests {
         record.insert(store.pool()).await.unwrap();
 
         sqlx::query("UPDATE provider_context SET eviction_estimator_version = ? WHERE id = ?")
-            .bind(2i64)
+            .bind(99i64)
             .bind("pc-1")
             .execute(store.pool())
             .await

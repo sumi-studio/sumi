@@ -35,7 +35,10 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::memory::estimate::eviction_footprint_for_payload;
+use crate::memory::estimate::{
+    EVICTION_ESTIMATOR_VERSION_REPLAY_PROBE_V1, EVICTION_ESTIMATOR_VERSION_SERIALIZED_BYTES,
+    eviction_footprint_for_payload, legacy_serialized_bytes_eviction_footprint,
+};
 use crate::provider::model::ModelSpec;
 use crate::provider::types::{
     ApiProtocol, ContextMessage, Message, ProviderContextItem, ProviderContextPayload,
@@ -827,15 +830,30 @@ impl Store {
                         "provider-context record {id} eviction_estimator_version out of u32 range"
                     )
                 })?;
-                let spec = ModelSpec::from_origin(&item.provider_origin).ok_or_else(|| {
-                    anyhow!("provider-context record {id} has no known model spec for its origin")
-                })?;
-                let expected_eviction = eviction_footprint_for_payload(&spec, &item.payload)?;
-                if stored_eviction_version != expected_eviction.estimator_version() {
-                    bail!(
-                        "provider-context record {id} uses unsupported eviction estimator version {stored_eviction_version}"
-                    );
-                }
+                let expected_eviction = match stored_eviction_version {
+                    EVICTION_ESTIMATOR_VERSION_SERIALIZED_BYTES => {
+                        legacy_serialized_bytes_eviction_footprint(&item.payload).with_context(
+                            || {
+                                format!(
+                                    "provider-context record {id} failed legacy footprint computation"
+                                )
+                            },
+                        )?
+                    }
+                    EVICTION_ESTIMATOR_VERSION_REPLAY_PROBE_V1 => {
+                        let spec = ModelSpec::from_origin(&item.provider_origin).ok_or_else(|| {
+                            anyhow!(
+                                "provider-context record {id} has no known model spec for its origin"
+                            )
+                        })?;
+                        eviction_footprint_for_payload(&spec, &item.payload)?
+                    }
+                    _ => {
+                        bail!(
+                            "provider-context record {id} uses unsupported eviction estimator version {stored_eviction_version}"
+                        );
+                    }
+                };
                 let stored_eviction_tokens_u64 = u64::try_from(stored_eviction_tokens)
                     .with_context(|| {
                         format!("provider-context record {id} eviction_tokens out of u64 range")
