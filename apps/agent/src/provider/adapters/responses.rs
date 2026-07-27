@@ -1023,7 +1023,22 @@ fn convert_input(
                     // at the exact provider origin. Cross-origin state is omitted from the
                     // send view alongside raw Thinking, while public transcript content
                     // remains replayable.
-                    for item in items.into_iter().filter(|_| same_origin) {
+                    for item in items {
+                        if item.provider_origin != assistant.origin {
+                            return Err(ResponsesAdapterError::InvalidContext(
+                                "encrypted reasoning provider_origin does not match its anchored assistant origin"
+                                    .into(),
+                            ));
+                        }
+                        if !same_origin {
+                            continue;
+                        }
+                        if item.provider_origin != spec.origin() {
+                            return Err(ResponsesAdapterError::InvalidContext(
+                                "encrypted reasoning provider_origin does not match the selected Responses origin"
+                                    .into(),
+                            ));
+                        }
                         let wire = item.wire_item_index.ok_or_else(|| {
                             ResponsesAdapterError::InvalidContext(
                                 "encrypted reasoning is missing wire_item_index".into(),
@@ -1193,6 +1208,12 @@ fn prepare_native_window(
             )
         })
         .expect("compacted entry came from provider_context");
+    if native_item.provider_origin != spec.origin() {
+        return Err(
+            "native compacted window provider_origin does not match the selected Responses origin"
+                .into(),
+        );
+    }
     if native_item.origin_message.is_some() || native_item.wire_item_index.is_some() {
         return Err("native compacted window has reasoning placement metadata".into());
     }
@@ -4234,7 +4255,7 @@ mod tests {
                 origin_message: Some(anchor),
                 wire_item_index: Some(0),
                 ordinal: 0,
-                provider_origin: ProviderContextItem::test_origin(),
+                provider_origin: source.origin(),
                 payload: ProviderContextPayload::EncryptedReasoning {
                     protocol: ApiProtocol::OpenAiResponses,
                     item: json!({
@@ -4253,6 +4274,17 @@ mod tests {
         assert!(!wire.contains("RAW_THINKING_MARKER"));
         assert!(!wire.contains("OPAQUE_MARKER"));
 
+        let mut tampered_item_origin = context.clone();
+        tampered_item_origin.provider_context[0].provider_origin = target.origin();
+        let error = build_request(&target, &tampered_item_origin, &RequestOptions::default())
+            .expect_err("provider context must remain bound to its anchored assistant");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its anchored assistant origin"),
+            "{error}"
+        );
+
         let mut same_origin = context;
         if let Message::Assistant(assistant) = match &mut same_origin.messages[0] {
             ContextMessage::Persisted { message, .. } => message,
@@ -4262,6 +4294,7 @@ mod tests {
             assistant.model.clone_from(&target.id);
             assistant.provider.clone_from(&target.provider);
         }
+        same_origin.provider_context[0].provider_origin = target.origin();
         same_origin.provider_context[0].payload = ProviderContextPayload::EncryptedReasoning {
             protocol: ApiProtocol::AnthropicMessages,
             item: json!({"malformed":"SAME_ORIGIN_MARKER"}),
@@ -4538,7 +4571,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
-            provider_origin: ProviderContextItem::test_origin(),
+            provider_origin: spec.origin(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: window.clone(),
                 coverage: NativeCompactionCoverage {
@@ -4598,7 +4631,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
-            provider_origin: ProviderContextItem::test_origin(),
+            provider_origin: spec.origin(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: window.clone(),
                 coverage: NativeCompactionCoverage {
@@ -4641,7 +4674,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
-            provider_origin: ProviderContextItem::test_origin(),
+            provider_origin: spec.origin(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({"id":"cmp","type":"compaction","encrypted_content":"opaque"})],
                 coverage: NativeCompactionCoverage {
@@ -4745,7 +4778,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
-            provider_origin: ProviderContextItem::test_origin(),
+            provider_origin: spec.origin(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({"id":"cmp","type":"compaction","encrypted_content":"NATIVE"})],
                 coverage,
@@ -4783,7 +4816,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
-            provider_origin: ProviderContextItem::test_origin(),
+            provider_origin: spec.origin(),
             payload: ProviderContextPayload::AnthropicCompaction {
                 block: json!({"type":"compaction","content":"FOREIGN_NATIVE"}),
                 coverage: NativeCompactionCoverage {
@@ -4803,6 +4836,51 @@ mod tests {
         .expect("foreign native state falls back");
         assert!(!request.to_string().contains("FOREIGN_NATIVE"));
         assert!(request.to_string().contains("message-1"));
+    }
+
+    #[test]
+    fn forged_matching_fingerprint_cannot_cross_native_provider_origin() {
+        let spec = spec();
+        let mut context = PromptContext {
+            system_prompt: "system".into(),
+            memory_blocks: vec![],
+            messages: vec![persisted_user(1), persisted_user(2)],
+            provider_context: vec![],
+            tools: vec![],
+        };
+        let mut foreign_origin = spec.origin();
+        foreign_origin.provider_instance_id.push_str("-foreign");
+        context.provider_context.push(ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 0,
+            provider_origin: foreign_origin,
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({
+                    "id":"cmp",
+                    "type":"compaction",
+                    "encrypted_content":"FOREIGN_NATIVE_MARKER",
+                })],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 1,
+                    context_fingerprint: context_fingerprint(&spec, &context).unwrap(),
+                },
+            },
+        });
+
+        let request = build_request(
+            &spec,
+            &context,
+            &RequestOptions {
+                native_compaction: true,
+                ..RequestOptions::default()
+            },
+        )
+        .expect("foreign native context falls back to the durable transcript");
+        let wire = request.to_string();
+        assert!(!wire.contains("FOREIGN_NATIVE_MARKER"));
+        assert!(wire.contains("message-1"));
+        assert!(wire.contains("message-2"));
     }
 
     #[test]
@@ -4972,7 +5050,7 @@ mod tests {
             }),
             wire_item_index: Some(1),
             ordinal: 1,
-            provider_origin: ProviderContextItem::test_origin(),
+            provider_origin: spec.origin(),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::OpenAiResponses,
                 item: json!({
@@ -4990,7 +5068,7 @@ mod tests {
             }),
             wire_item_index: Some(1),
             ordinal: 0,
-            provider_origin: ProviderContextItem::test_origin(),
+            provider_origin: spec.origin(),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::OpenAiResponses,
                 item: json!({
@@ -5299,7 +5377,7 @@ mod tests {
                 origin_message: Some(anchor.clone()),
                 wire_item_index: Some(0),
                 ordinal: 0,
-                provider_origin: ProviderContextItem::test_origin(),
+                provider_origin: spec.origin(),
                 payload: ProviderContextPayload::EncryptedReasoning {
                     protocol: ApiProtocol::OpenAiResponses,
                     item: json!({
@@ -5348,7 +5426,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 0,
-            provider_origin: ProviderContextItem::test_origin(),
+            provider_origin: spec.origin(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({
                     "id": "cmp",

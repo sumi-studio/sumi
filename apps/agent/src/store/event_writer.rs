@@ -9424,12 +9424,17 @@ mod tests {
             ProviderTerminalKind, SteerGroup, steer_group_injection_batch,
         },
         gateway::{Command, CommandEnvelope, CommandId, SensitiveCommandPayload},
-        provider::types::{
-            ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, Message,
-            NativeCompactionCoverage, ProviderContextFragment, ProviderContextPayload,
-            ProviderEvent, ProviderOrigin, ProviderOutput, PublicAssistantContent,
-            PublicAssistantMessage, PublicMessage, RejectedToolCall, StopReason, ToolArgumentError,
-            ToolCall, ToolResultMessage, Usage, UserContent, UserMessage,
+        provider::{
+            ModelSpec, RequestOptions,
+            adapters::responses::build_request as build_responses_request,
+            types::{
+                ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, Message,
+                NativeCompactionCoverage, PromptContext, ProviderContextFragment,
+                ProviderContextPayload, ProviderEvent, ProviderOrigin, ProviderOutput,
+                PublicAssistantContent, PublicAssistantMessage, PublicMessage, RejectedToolCall,
+                StopReason, ToolArgumentError, ToolCall, ToolResultMessage, Usage, UserContent,
+                UserMessage,
+            },
         },
         runtime::contracts::{GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease},
         store::{
@@ -19580,20 +19585,16 @@ mod tests {
             .await
             .expect("persist user injection");
 
+        let spec = ModelSpec::preset("openai-responses").expect("Responses preset");
         let timestamp = durable_test_timestamp();
-        let provider_origin = ProviderOrigin {
-            provider_instance_id: "provider-instance-context".to_owned(),
-            protocol: ApiProtocol::OpenAiResponses,
-            model: "model-context".to_owned(),
-        };
         let message = AssistantMessage {
             content: vec![AssistantContent::Text {
                 text: "answer with reasoning".to_owned(),
                 wire_item_index: 0,
             }],
-            model: "model-context".to_owned(),
-            provider: "provider-context".to_owned(),
-            origin: provider_origin.clone(),
+            model: spec.id.clone(),
+            provider: spec.provider.clone(),
+            origin: spec.origin(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
             error_message: None,
@@ -19608,11 +19609,23 @@ mod tests {
             ProjectedProviderEvent::Started
         ));
 
+        let coverage_seq: i64 =
+            sqlx::query_scalar("SELECT seq FROM messages WHERE role = 'user' ORDER BY seq DESC")
+                .fetch_one(store.pool())
+                .await
+                .expect("load durable user message coverage");
+        let coverage_seq =
+            u64::try_from(coverage_seq).expect("durable user message coverage is positive");
         let reasoning = ProviderContextFragment {
-            wire_item_index: Some(0),
+            wire_item_index: Some(1),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::OpenAiResponses,
-                item: json!({"text": "plain reasoning"}),
+                item: json!({
+                    "id": "rs-durable-context",
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": "opaque-durable-reasoning",
+                }),
             },
         };
         let window = ProviderContextFragment {
@@ -19620,7 +19633,7 @@ mod tests {
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({"summary": "compact"})],
                 coverage: NativeCompactionCoverage {
-                    through_message_seq: 1,
+                    through_message_seq: coverage_seq,
                     context_fingerprint: "fp-1".to_owned(),
                 },
             },
@@ -19630,7 +19643,7 @@ mod tests {
                 origin_message: None,
                 wire_item_index: window.wire_item_index,
                 ordinal: 0,
-                provider_origin: provider_origin.clone(),
+                provider_origin: spec.origin(),
                 payload: window.payload.clone(),
             },
             ProviderContextItem {
@@ -19640,7 +19653,7 @@ mod tests {
                 }),
                 wire_item_index: reasoning.wire_item_index,
                 ordinal: 0,
-                provider_origin,
+                provider_origin: spec.origin(),
                 payload: reasoning.payload.clone(),
             },
         ];
@@ -19769,7 +19782,7 @@ mod tests {
         );
         assert_eq!(
             window_row.get::<Option<i64>, _>("coverage_through_seq"),
-            Some(1)
+            Some(i64::try_from(coverage_seq).expect("coverage fits SQLite INTEGER"))
         );
 
         let message_seq: i64 = reasoning_row.get("message_seq");
@@ -19802,7 +19815,7 @@ mod tests {
                 leak_check.push_str(&value);
             }
         }
-        for secret in ["plain reasoning", "compact"] {
+        for secret in ["opaque-durable-reasoning", "compact"] {
             assert!(
                 !leak_check.contains(secret),
                 "provider_context textual columns leaked plaintext: {secret}"
@@ -19828,7 +19841,10 @@ mod tests {
                 serde_json::from_slice(&plaintext).expect("deserialize provider-context plaintext");
             match &item.payload {
                 ProviderContextPayload::EncryptedReasoning { item, .. } => {
-                    assert_eq!(item.get("text"), Some(&json!("plain reasoning")));
+                    assert_eq!(
+                        item.get("encrypted_content"),
+                        Some(&json!("opaque-durable-reasoning"))
+                    );
                 }
                 ProviderContextPayload::OpenAiCompactedWindow { items, .. } => {
                     assert_eq!(items, &vec![json!({"summary": "compact"})]);
@@ -19837,10 +19853,6 @@ mod tests {
             }
         }
 
-        let expected_origin = match &terminal_message {
-            PublicMessage::Assistant(message) => message.origin.clone(),
-            _ => panic!("terminal message must be an assistant"),
-        };
         let message_seq = u64::try_from(message_seq).expect("positive SQLite message sequence");
         let mut expected_context = expected_context;
         for item in &mut expected_context {
@@ -19852,12 +19864,63 @@ mod tests {
         store.pool().close().await;
         drop(store);
         let reopened = file_test_store(&path).await;
-        assert_eq!(
-            reopened
-                .load_provider_context_for_origin(&expected_origin)
-                .await
-                .expect("restore provider context after MessageEnd reopen"),
-            expected_context
+        let lease = test_lease(1);
+        let fence = test_fence(&lease);
+        let hydrated = match reopened
+            .hydrate(&lease, &fence)
+            .await
+            .expect("canonical cold-boot hydration after MessageEnd reopen")
+        {
+            HydrationOutcome::Complete(state) => state,
+            HydrationOutcome::RecoveryRequired(_) => {
+                panic!("completed assistant turn must not require physical recovery")
+            }
+        };
+        assert_eq!(hydrated.provider_context, expected_context);
+
+        let mut second_turn_messages = hydrated.messages.clone();
+        second_turn_messages.push(ContextMessage::Synthetic {
+            message: Message::User(UserMessage {
+                content: vec![UserContent::Text {
+                    text: "continue after restart".to_owned(),
+                }],
+                timestamp: durable_test_timestamp(),
+            }),
+        });
+        let second_turn = build_responses_request(
+            &spec,
+            &PromptContext {
+                system_prompt: "continue the durable conversation".to_owned(),
+                memory_blocks: Vec::new(),
+                messages: second_turn_messages,
+                provider_context: hydrated.provider_context,
+                tools: Vec::new(),
+            },
+            &RequestOptions::default(),
+        )
+        .expect("build second-turn Responses request from canonical HydratedRunState");
+        let second_turn_wire = second_turn.to_string();
+        assert_eq!(second_turn["store"], false);
+        assert!(second_turn_wire.contains("opaque-durable-reasoning"));
+        assert!(second_turn_wire.contains("continue after restart"));
+
+        sqlx::query(
+            "UPDATE provider_context
+             SET provider_instance_id = 'tampered-provider-origin'
+             WHERE kind = 'encrypted_reasoning'",
+        )
+        .execute(reopened.pool())
+        .await
+        .expect("tamper stored provider origin after successful restart proof");
+        let error = reopened
+            .hydrate(&lease, &fence)
+            .await
+            .expect_err("canonical hydration must reject tampered provider origin metadata");
+        assert!(
+            error
+                .to_string()
+                .contains("stored provider origin does not match authenticated plaintext origin"),
+            "{error:#}"
         );
         reopened.pool().close().await;
         let _ = std::fs::remove_file(&path);
