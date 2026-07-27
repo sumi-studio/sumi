@@ -69,7 +69,12 @@ function Home() {
           <p className="text-zinc-500">会話を開始してください。</p>
         )}
         {feed.map((item) => (
-          <FeedItemView item={item} socket={socket} state={state} key={item.id} />
+          <FeedItemView
+            item={item}
+            socket={socket}
+            state={state}
+            key={item.id}
+          />
         ))}
       </section>
       <form
