@@ -23,6 +23,7 @@ use tokio_tungstenite::tungstenite::{
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config, tungstenite};
 use zeroize::Zeroizing;
 
+use super::stdio::MAX_IDENTIFIED_OVERSIZED_FRAME_BYTES;
 use super::supervisor::{
     AgentHello, ApiHello, ConnectorError, GatewayConnector, GatewayCredential,
 };
@@ -119,8 +120,11 @@ impl GatewayConnector for WebSocketConnector {
         ensure_rustls_crypto_provider()?;
 
         let ws_config = WebSocketConfig {
-            max_message_size: Some(MAX_FRAME_BYTES),
-            max_frame_size: Some(MAX_FRAME_BYTES),
+            // Permit the bounded oversize window required to parse a readable
+            // command identity and emit its terminal Rejected ACK. Outbound
+            // frames remain capped at MAX_FRAME_BYTES in WsGatewayWriter.
+            max_message_size: Some(MAX_IDENTIFIED_OVERSIZED_FRAME_BYTES),
+            max_frame_size: Some(MAX_IDENTIFIED_OVERSIZED_FRAME_BYTES),
             ..WebSocketConfig::default()
         };
 
@@ -318,6 +322,7 @@ mod tests {
     use tokio::time::timeout;
     use tokio_tungstenite::{accept_async, accept_hdr_async};
 
+    use super::super::stdio::MAX_IDENTIFIED_OVERSIZED_FRAME_BYTES;
     use super::super::{
         AgentHello, ApiHello, Command, CommandDigestFactory, CommandEnvelope,
         DeliveryAuthorization, Envelope, Gateway, GatewayConnector, GatewayCredential,
@@ -457,6 +462,45 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn websocket_bounded_oversize_decoder_reaches_terminal_rejection() {
+        let mut bytes = br#"{"seq":42,"command_id":"00000000-0000-4000-8000-000000000042","command":{"type":"user_message","text":"""#.to_vec();
+        bytes.extend(std::iter::repeat_n(b'x', MAX_FRAME_BYTES));
+        bytes.extend_from_slice(br#"","attachments":[]}}"#);
+        assert!(bytes.len() > MAX_FRAME_BYTES);
+        assert!(bytes.len() <= MAX_IDENTIFIED_OVERSIZED_FRAME_BYTES);
+
+        let result = decode_command_bytes(bytes, &TestDigestFactory).await;
+        assert!(matches!(
+            result.expect("bounded readable oversize must decode"),
+            InboundCommand::Invalid {
+                seq: 42,
+                reason: super::super::CommandRejectReason::Oversized { .. },
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn websocket_oversize_beyond_identity_window_fails_closed() {
+        let mut bytes = br#"{"seq":43,"command_id":"00000000-0000-4000-8000-000000000043","command":{"type":"user_message","text":"""#.to_vec();
+        bytes.extend(std::iter::repeat_n(b'x', MAX_FRAME_BYTES));
+        bytes.extend_from_slice(br#"","attachments":[]}}"#);
+        bytes.extend(std::iter::repeat_n(
+            b' ',
+            MAX_IDENTIFIED_OVERSIZED_FRAME_BYTES + 1 - bytes.len(),
+        ));
+        assert!(bytes.len() > MAX_IDENTIFIED_OVERSIZED_FRAME_BYTES);
+
+        let error = decode_command_bytes(bytes, &TestDigestFactory)
+            .await
+            .expect_err("input beyond bounded identity window must fail closed");
+        assert!(
+            error.to_string().contains("exceeded") || error.to_string().contains("limit"),
+            "unexpected bounded-oversize error: {error:#}"
+        );
     }
 
     // M5 gate 10: real local mock WebSocket server integration tests.
@@ -916,7 +960,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reader_rejects_message_exceeding_max_frame_bytes() {
+    async fn reader_rejects_bounded_oversize_without_hanging() {
         let listener = TcpListener::bind(listener_addr()).await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -927,15 +971,14 @@ mod tests {
             read_agent_hello(&mut ws).await;
             send_api_hello(&mut ws, test_api_hello()).await;
 
-            // Tell the client the oversized frame is about to be sent, then send
-            // it. The send may block once the client stops reading after the
-            // capacity error, so the test aborts the server task rather than
-            // waiting for the send to complete.
+            // Send a bounded oversize payload; the reader must remain bounded.
             let _ = ready_tx.send(());
-            let oversized = vec![0u8; MAX_FRAME_BYTES + 1];
-            let _ = ws
-                .send(tokio_tungstenite::tungstenite::Message::Binary(oversized))
-                .await;
+            let mut oversized = br#"{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","command":{"type":"user_message","text":"""#.to_vec();
+            oversized.extend(std::iter::repeat_n(b'x', MAX_FRAME_BYTES));
+            oversized.extend_from_slice(br#"","attachments":[]}}"#);
+            ws.send(tokio_tungstenite::tungstenite::Message::Binary(oversized))
+                .await
+                .unwrap();
         });
 
         let mut connector =
@@ -953,14 +996,53 @@ mod tests {
             result.is_ok(),
             "reader must not hang waiting for oversized message"
         );
-        let result = result.unwrap();
-        assert!(
-            result.is_err(),
-            "reader must reject oversized websocket message: {result:?}"
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("Message too long"), "unexpected error: {err}");
+        assert!(matches!(
+            result
+                .unwrap()
+                .expect("bounded readable oversize must decode"),
+            InboundCommand::Invalid {
+                seq: 1,
+                reason: super::super::CommandRejectReason::Oversized { .. },
+                ..
+            }
+        ));
 
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn reader_rejects_message_above_bounded_identity_window() {
+        let listener = TcpListener::bind(listener_addr()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            read_agent_hello(&mut ws).await;
+            send_api_hello(&mut ws, test_api_hello()).await;
+            let oversized = vec![b'x'; MAX_IDENTIFIED_OVERSIZED_FRAME_BYTES + 1];
+            let _ = ws
+                .send(tokio_tungstenite::tungstenite::Message::Binary(oversized))
+                .await;
+        });
+
+        let mut connector =
+            WebSocketConnector::new_insecure(format!("ws://{addr}"), Arc::new(TestDigestFactory));
+        let mut gateway = connector.connect(test_credential("valid")).await.unwrap();
+        gateway
+            .authenticate_hello(test_agent_hello())
+            .await
+            .unwrap();
+        let (mut reader, _writer) = gateway.split();
+        let result = timeout(Duration::from_secs(2), reader.next_command())
+            .await
+            .expect("reader must fail without hanging")
+            .expect_err("message above bounded window must fail closed");
+        assert!(
+            result.to_string().contains("Message too long"),
+            "unexpected transport error: {result}"
+        );
         server.abort();
         let _ = server.await;
     }

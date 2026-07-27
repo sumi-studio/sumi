@@ -27,7 +27,8 @@ const MAX_ENVELOPE_METADATA_BYTES: usize = 64 * 1024;
 const MAX_ENVELOPE_KEY_BYTES: usize = 256;
 /// A readable envelope may be terminal-rejected after crossing the transport
 /// limit, but its line must still end within this bounded drain window.
-const MAX_IDENTIFIED_OVERSIZED_FRAME_BYTES: usize = MAX_FRAME_BYTES + MAX_ENVELOPE_METADATA_BYTES;
+pub(crate) const MAX_IDENTIFIED_OVERSIZED_FRAME_BYTES: usize =
+    MAX_FRAME_BYTES + MAX_ENVELOPE_METADATA_BYTES;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 #[error("command was {actual} bytes and exceeded the {limit} byte limit")]
@@ -827,8 +828,12 @@ impl EnvelopeScanner {
     }
 
     fn finish(mut self) -> Result<ReadCommandFrame> {
-        if !self.is_done() {
-            self.invalidate()?;
+        if !self.is_done() && parse_outer_identity(&self.identity).is_err() {
+            if self.has_readable_outer_identity() {
+                self.push_identity(b'}')?;
+            } else {
+                self.invalidate()?;
+            }
         }
         Ok(ReadCommandFrame {
             identity: self.identity,
@@ -938,8 +943,7 @@ where
         line_bytes
     };
     if content_bytes > MAX_IDENTIFIED_OVERSIZED_FRAME_BYTES
-        || (content_bytes > MAX_FRAME_BYTES
-            && (readable_identity_at_transport_limit != Some(true) || !scanner.is_done()))
+        || (content_bytes > MAX_FRAME_BYTES && readable_identity_at_transport_limit != Some(true))
     {
         return Err(CommandTooLarge {
             limit: MAX_FRAME_BYTES,
