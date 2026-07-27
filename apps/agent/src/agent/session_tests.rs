@@ -18,7 +18,7 @@ use serde_json::Value;
 use super::*;
 use crate::store::KeyProvider;
 use crate::{
-    gateway::{AgentHello, ApiHello, CommandAck, CommandId, DeliveryAuthorization, HelloError},
+    gateway::{AgentHello, ApiHello, CommandAck, CommandId, HelloError},
     provider::types::{
         ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, ProviderContextFragment,
         ProviderContextPayload, ProviderEvent, ProviderEventStream, ProviderOrigin, ProviderOutput,
@@ -65,7 +65,6 @@ fn test_api_hello(hello: &AgentHello) -> ApiHello {
         accepted_generation: hello.generation,
         last_received_event_seq: 0,
         next_command_seq: hello.last_applied_command_seq.saturating_add(1),
-        delivery_authorization: DeliveryAuthorization::Raw,
     }
 }
 

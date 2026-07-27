@@ -151,7 +151,6 @@ pub struct ApiHello {
     pub last_received_event_seq: u64,
     #[serde(with = "lossless_u64")]
     pub next_command_seq: u64,
-    pub delivery_authorization: DeliveryAuthorization,
 }
 
 /// Parses a canonical decimal string: either exactly `'0'` or a nonzero ASCII
@@ -772,12 +771,6 @@ where
             biased;
             _ = cancel.cancelled() => return Ok(()),
             result = validate_hello(&source, &agent_hello, &api_hello) => result?,
-        }
-        if api_hello.delivery_authorization != delivery_authorization {
-            return Err(SupervisorError::Fatal(anyhow!(
-                "delivery authorization mismatch: credential={delivery_authorization:?}, api={:?}",
-                api_hello.delivery_authorization
-            )));
         }
         let source = source
             .bind_delivery_authorization(delivery_authorization)
@@ -1835,8 +1828,11 @@ where
     const MAX_PENDING_BEFORE_READY: usize = 16;
 
     // Run command reception in its own task so hydration completion never cancels
-    // an in-flight read across transport chunk boundaries.
-    let (cmd_tx, mut cmd_rx) = mpsc::channel(MAX_PENDING_BEFORE_READY);
+    // an in-flight read across transport chunk boundaries. The channel is sized
+    // to a single slot so the supervisor can enforce the hold limit strictly:
+    // at most MAX_PENDING_BEFORE_READY commands may be buffered in `pending`, and
+    // one additional in-flight command is the deterministic fail-closed signal.
+    let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
     let cmd_token = token.child_token();
     let command_reader = tokio::spawn(async move {
         let mut reader = reader;
@@ -1889,12 +1885,17 @@ where
                 }
                 result = cmd_rx.recv(),
                     if !terminal_after_pending
-                        && (ready.is_some() || pending.len() < MAX_PENDING_BEFORE_READY) =>
+                        && (ready.is_some() || pending.len() <= MAX_PENDING_BEFORE_READY) =>
                 {
                     match result {
                         Some(Ok(cmd)) => {
                             if ready.is_some() {
                                 next_expected = send_validated(cmd, next_expected, &mut command_tx, &token, command_send_blocked_notify.clone()).await?;
+                            } else if pending.len() >= MAX_PENDING_BEFORE_READY {
+                                break 'task Err(ReaderError::Fatal(anyhow!(
+                                    "hydration hold limit exceeded: {} commands received before Ready",
+                                    pending.len()
+                                )));
                             } else {
                                 pending.push(cmd);
                             }
@@ -2346,7 +2347,6 @@ mod tests {
         last_received_event_seq: u64,
         hello_delay: Option<Duration>,
         hello_error: Option<HelloError>,
-        delivery_authorization: DeliveryAuthorization,
     }
 
     impl MockGateway {
@@ -2370,7 +2370,6 @@ mod tests {
                 last_received_event_seq: 0,
                 hello_delay: None,
                 hello_error: None,
-                delivery_authorization: DeliveryAuthorization::Raw,
             }
         }
 
@@ -2391,14 +2390,6 @@ mod tests {
 
         fn with_hello_error(mut self, err: HelloError) -> Self {
             self.hello_error = Some(err);
-            self
-        }
-
-        fn with_delivery_authorization(
-            mut self,
-            delivery_authorization: DeliveryAuthorization,
-        ) -> Self {
-            self.delivery_authorization = delivery_authorization;
             self
         }
 
@@ -2433,7 +2424,6 @@ mod tests {
                 accepted_generation,
                 last_received_event_seq: self.last_received_event_seq,
                 next_command_seq: hello.last_applied_command_seq.saturating_add(1),
-                delivery_authorization: self.delivery_authorization,
             })
         }
 
@@ -2472,7 +2462,6 @@ mod tests {
                 accepted_generation: hello.generation,
                 last_received_event_seq: 0,
                 next_command_seq: self.next_command_seq,
-                delivery_authorization: DeliveryAuthorization::Raw,
             })
         }
 
@@ -2646,32 +2635,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delivery_authorization_mismatch_is_fatal_before_source_binding() {
+    async fn gateway_credential_delivery_authorization_binds_source() {
         #[derive(Clone)]
         struct BindingSource {
-            binds: Arc<AtomicU64>,
+            bound: Arc<std::sync::Mutex<Option<DeliveryAuthorization>>>,
+            events: Vec<OutboundFrame>,
         }
 
         #[async_trait]
         impl DurableSource for BindingSource {
             fn bind_delivery_authorization(
                 &self,
-                _authorization: DeliveryAuthorization,
+                authorization: DeliveryAuthorization,
             ) -> Result<Self> {
-                self.binds.fetch_add(1, Ordering::SeqCst);
+                *self.bound.lock().unwrap() = Some(authorization);
                 Ok(self.clone())
             }
 
             async fn event_cursor(&self) -> Result<EventCursors> {
-                Ok(EventCursors::default())
+                Ok(EventCursors {
+                    last_sent: self.events.len() as u64,
+                })
             }
 
             async fn events_after(
                 &self,
-                _after_seq: u64,
+                after_seq: u64,
                 _limit: usize,
             ) -> Result<Vec<OutboundFrame>> {
-                panic!("authorization mismatch must fail before durable replay")
+                Ok(self
+                    .events
+                    .iter()
+                    .filter(|f| outbound_frame_event_seq(f).unwrap_or(0) > after_seq)
+                    .cloned()
+                    .collect())
             }
 
             async fn command_cursors(&self) -> Result<CommandCursors> {
@@ -2679,36 +2676,49 @@ mod tests {
             }
         }
 
-        let binds = Arc::new(AtomicU64::new(0));
-        let gateway = MockGateway::new(VecDeque::new())
-            .with_delivery_authorization(DeliveryAuthorization::RedactionOnly);
-        let connector = MockConnector::new(
-            Arc::new(std::sync::Mutex::new(Vec::new())),
-            VecDeque::from([Ok(gateway)]),
-        );
-        let supervisor = ConnectionSupervisor::new(
-            connector,
-            CountingCredentialProvider::new("token"),
-            BindingSource {
-                binds: binds.clone(),
-            },
-            StaticHydrationLatch(HydrationReady {
-                generation: ProcessGeneration::from_wire(7).unwrap(),
-                receipt_identity: "receipt-1".to_owned(),
-            }),
-            make_config(),
-        );
+        for authorization in [
+            DeliveryAuthorization::Raw,
+            DeliveryAuthorization::RedactionOnly,
+        ] {
+            let bound = Arc::new(std::sync::Mutex::new(None));
+            let source = BindingSource {
+                bound: bound.clone(),
+                events: Vec::new(),
+            };
+            let gateway = MockGateway::new(VecDeque::new());
+            let connector = MockConnector::new(
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+                VecDeque::from([Ok(gateway)]),
+            );
+            let supervisor = ConnectionSupervisor::new(
+                connector,
+                CountingCredentialProvider::new("token").with_delivery_authorization(authorization),
+                source,
+                StaticHydrationLatch(HydrationReady {
+                    generation: ProcessGeneration::from_wire(7).unwrap(),
+                    receipt_identity: "credential-auth-binding".to_owned(),
+                }),
+                make_config(),
+            );
 
-        let error = supervisor.start().join().await.unwrap_err();
-        assert!(
-            format!("{error:#}").contains("delivery authorization mismatch"),
-            "unexpected error: {error:#}"
-        );
-        assert_eq!(
-            binds.load(Ordering::SeqCst),
-            0,
-            "mismatched authorization must fail before raw-capable source binding"
-        );
+            let handle = supervisor.start();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while bound.lock().unwrap().is_none() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("bind_delivery_authorization must be called");
+
+            assert_eq!(
+                *bound.lock().unwrap(),
+                Some(authorization),
+                "credential delivery authorization must bind to durable source"
+            );
+
+            handle.abort();
+            assert!(handle.join().await.is_ok());
+        }
     }
 
     #[tokio::test]
@@ -2996,7 +3006,6 @@ mod tests {
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
-            delivery_authorization: DeliveryAuthorization::Raw,
         };
         let gateway2 = MockGateway {
             reader: MockGatewayReader {
@@ -3017,7 +3026,6 @@ mod tests {
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
-            delivery_authorization: DeliveryAuthorization::Raw,
         };
 
         let connector = MockConnector::new(
@@ -3092,7 +3100,6 @@ mod tests {
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
-            delivery_authorization: DeliveryAuthorization::Raw,
         };
 
         let connector = MockConnector::new(
@@ -3145,7 +3152,6 @@ mod tests {
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
-            delivery_authorization: DeliveryAuthorization::Raw,
         };
         let gateway2 = MockGateway {
             reader: MockGatewayReader {
@@ -3166,7 +3172,6 @@ mod tests {
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
-            delivery_authorization: DeliveryAuthorization::Raw,
         };
 
         let connector = MockConnector::new(
@@ -3247,7 +3252,6 @@ mod tests {
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
-            delivery_authorization: DeliveryAuthorization::Raw,
         };
 
         let connector = MockConnector::new(
@@ -3311,7 +3315,6 @@ mod tests {
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
-            delivery_authorization: DeliveryAuthorization::Raw,
         };
 
         let connector = MockConnector::new(
@@ -4062,7 +4065,6 @@ mod tests {
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
-            delivery_authorization: DeliveryAuthorization::Raw,
         };
         let connector = MockConnector::new(sent_hellos, VecDeque::from([Ok(gateway)]));
         let credentials = CountingCredentialProvider::new("token");
@@ -4103,7 +4105,6 @@ mod tests {
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
-            delivery_authorization: DeliveryAuthorization::Raw,
         };
         let connector = MockConnector::new(
             Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -4204,7 +4205,6 @@ mod tests {
             accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
             last_received_event_seq: 0,
             next_command_seq: 6,
-            delivery_authorization: DeliveryAuthorization::Raw,
         };
 
         // The first legal resend point is applied + 1, not received + 1.
@@ -4289,7 +4289,6 @@ mod tests {
             accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
             last_received_event_seq: 0,
             next_command_seq: 6,
-            delivery_authorization: DeliveryAuthorization::Raw,
         };
         validate_hello(&source, &agent, &api)
             .await
@@ -4301,7 +4300,6 @@ mod tests {
             accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
             last_received_event_seq: 0,
             next_command_seq: 5,
-            delivery_authorization: DeliveryAuthorization::Raw,
         };
         validate_hello(&source, &agent, &api)
             .await
@@ -4311,7 +4309,6 @@ mod tests {
             accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
             last_received_event_seq: 0,
             next_command_seq: 0,
-            delivery_authorization: DeliveryAuthorization::Raw,
         };
         assert!(
             validate_hello(&source, &agent, &api).await.is_err(),
@@ -4353,7 +4350,6 @@ mod tests {
                 accepted_generation: ProcessGeneration::from_wire(0).unwrap(),
                 last_received_event_seq: seq,
                 next_command_seq: seq,
-                delivery_authorization: DeliveryAuthorization::Raw,
             };
             let text = serde_json::to_string(&api).expect("serialize api hello");
             let parsed: ApiHello = serde_json::from_str(&text).expect("deserialize api hello");
@@ -4381,7 +4377,7 @@ mod tests {
         assert!(serde_json::from_str::<AgentHello>(&agent_json).is_err());
 
         let api_json = format!(
-            r#"{{"accepted_generation":"{over_i64}","last_received_event_seq":"0","next_command_seq":"1","delivery_authorization":"raw"}}"#
+            r#"{{"accepted_generation":"{over_i64}","last_received_event_seq":"0","next_command_seq":"1"}}"#
         );
         assert!(serde_json::from_str::<ApiHello>(&api_json).is_err());
 
@@ -4392,21 +4388,23 @@ mod tests {
         assert!(serde_json::from_str::<AgentHello>(&agent_overflow).is_err());
 
         let api_overflow = format!(
-            r#"{{"accepted_generation":"0","last_received_event_seq":"{over_u64}","next_command_seq":"1","delivery_authorization":"raw"}}"#
+            r#"{{"accepted_generation":"0","last_received_event_seq":"{over_u64}","next_command_seq":"1"}}"#
         );
         assert!(serde_json::from_str::<ApiHello>(&api_overflow).is_err());
 
         // Old numeric encodings are no longer accepted; the wire uses strings.
         let agent_numeric = r#"{"agent_id":"a","generation":1,"last_sent_event_seq":0,"last_received_command_seq":0,"last_applied_command_seq":0}"#;
         assert!(serde_json::from_str::<AgentHello>(agent_numeric).is_err());
-        let api_numeric = r#"{"accepted_generation":1,"last_received_event_seq":0,"next_command_seq":1,"delivery_authorization":"raw"}"#;
+        let api_numeric =
+            r#"{"accepted_generation":1,"last_received_event_seq":0,"next_command_seq":1}"#;
         assert!(serde_json::from_str::<ApiHello>(api_numeric).is_err());
     }
 
     #[test]
     fn hello_dto_rejects_malformed_unknown_and_trailing_data() {
         let agent_base = r#"{"agent_id":"a","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}"#;
-        let api_base = r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1","delivery_authorization":"raw"}"#;
+        let api_base =
+            r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1"}"#;
 
         assert!(serde_json::from_str::<AgentHello>(agent_base).is_ok());
         assert!(serde_json::from_str::<ApiHello>(api_base).is_ok());
@@ -4457,14 +4455,14 @@ mod tests {
         let agent_unknown = r#"{"agent_id":"a","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0","extra":1}"#;
         assert!(serde_json::from_str::<AgentHello>(agent_unknown).is_err());
 
-        let api_unknown = r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1","delivery_authorization":"raw","extra":1}"#;
+        let api_unknown = r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1","extra":1}"#;
         assert!(serde_json::from_str::<ApiHello>(api_unknown).is_err());
 
         // Trailing data after a valid object must also be rejected.
         let agent_trailing = r#"{"agent_id":"a","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}{"extra":1}"#;
         assert!(serde_json::from_str::<AgentHello>(agent_trailing).is_err());
 
-        let api_trailing = r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1","delivery_authorization":"raw"}{"extra":1}"#;
+        let api_trailing = r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1"}{"extra":1}"#;
         assert!(serde_json::from_str::<ApiHello>(api_trailing).is_err());
     }
 
@@ -4519,7 +4517,6 @@ mod tests {
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 1,
-            delivery_authorization: DeliveryAuthorization::Raw,
         };
 
         let result = validate_hello(
@@ -4594,7 +4591,6 @@ mod tests {
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 5,
-            delivery_authorization: DeliveryAuthorization::Raw,
         };
         validate_hello(&StaticSource(cursor), &agent, &api)
             .await
@@ -4605,7 +4601,6 @@ mod tests {
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 6,
-            delivery_authorization: DeliveryAuthorization::Raw,
         };
         validate_hello(&StaticSource(cursor), &agent, &api)
             .await
@@ -4616,7 +4611,6 @@ mod tests {
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 7,
-            delivery_authorization: DeliveryAuthorization::Raw,
         };
         assert!(
             validate_hello(&StaticSource(cursor), &agent, &api)
@@ -4628,7 +4622,6 @@ mod tests {
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 11,
-            delivery_authorization: DeliveryAuthorization::Raw,
         };
         assert!(
             validate_hello(&StaticSource(cursor), &agent, &api)
@@ -4641,7 +4634,6 @@ mod tests {
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 12,
-            delivery_authorization: DeliveryAuthorization::Raw,
         };
         assert!(
             validate_hello(&StaticSource(cursor), &agent, &api)
@@ -4654,7 +4646,6 @@ mod tests {
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 0,
-            delivery_authorization: DeliveryAuthorization::Raw,
         };
         assert!(
             validate_hello(&StaticSource(cursor), &agent, &api)
@@ -4711,7 +4702,6 @@ mod tests {
                     accepted_generation: hello.generation,
                     last_received_event_seq: 0,
                     next_command_seq: self.terminal_seq,
-                    delivery_authorization: DeliveryAuthorization::Raw,
                 })
             }
 
@@ -4860,7 +4850,6 @@ mod tests {
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: u64::MAX,
-            delivery_authorization: DeliveryAuthorization::Raw,
         };
         let error = validate_hello(&MockDurableSource::new(cursor), &agent, &api)
             .await
@@ -5110,7 +5099,6 @@ mod tests {
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
-            delivery_authorization: DeliveryAuthorization::Raw,
         };
         let connector = MockConnector::new(
             Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -5365,7 +5353,6 @@ mod tests {
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
-            delivery_authorization: DeliveryAuthorization::Raw,
         };
         let connector = MockConnector::new(
             Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -5551,7 +5538,6 @@ mod tests {
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
-            delivery_authorization: DeliveryAuthorization::Raw,
         };
         let connector = MockConnector::new(
             Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -5665,10 +5651,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hydration_hold_limit_backpressures_then_drains_arbitrary_burst() {
+    async fn hydration_hold_buffers_exact_limit_before_ready_then_drains() {
         let generation = ProcessGeneration::from_wire(7).unwrap();
         let (latch, latch_tx) = DynamicHydrationLatch::new();
-        let commands: VecDeque<_> = (1..=64)
+        let commands: VecDeque<_> = (1..=16)
             .map(|seq| {
                 Ok(valid_command(
                     seq,
@@ -5679,11 +5665,15 @@ mod tests {
         let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
         let gateway = MockGateway::new(commands);
         let connector = MockConnector::new(sent_hellos.clone(), VecDeque::from([Ok(gateway)]));
-        let credentials = CountingCredentialProvider::new("token");
         let source = MockDurableSource::new(CommandCursors::default());
 
-        let supervisor =
-            ConnectionSupervisor::new(connector, credentials, source, latch, make_config());
+        let supervisor = ConnectionSupervisor::new(
+            connector,
+            CountingCredentialProvider::new("token"),
+            source,
+            latch,
+            make_config(),
+        );
         let mut handle = supervisor.start();
 
         assert!(
@@ -5695,28 +5685,70 @@ mod tests {
         latch_tx
             .send(HydrationState::Ready(HydrationReady {
                 generation,
-                receipt_identity: "burst-ready".to_owned(),
+                receipt_identity: "limit-ready".to_owned(),
             }))
             .unwrap();
 
-        for expected in 1..=64 {
+        for expected in 1..=16 {
             let command = tokio::time::timeout(Duration::from_secs(1), handle.commands.recv())
                 .await
-                .expect("delayed hydration burst must drain")
+                .expect("exact-limit hydration burst must drain in order")
                 .expect("command channel must remain open");
             assert_eq!(cmd_seq(&command), expected);
         }
-        assert!(
-            !handle.task.as_ref().expect("supervisor task").is_finished(),
-            "a valid replay burst must not terminate the supervisor"
-        );
         assert_eq!(
             sent_hellos.lock().unwrap().len(),
             1,
-            "backpressure must not manufacture a reconnect"
+            "exact-limit hold must not manufacture a reconnect"
         );
         handle.abort();
         handle.join().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hydration_hold_fails_closed_on_limit_plus_one() {
+        let (latch, _latch_tx) = DynamicHydrationLatch::new();
+        let commands: VecDeque<_> = (1..=17)
+            .map(|seq| {
+                Ok(valid_command(
+                    seq,
+                    &format!("00000000-0000-4000-8000-{:012x}", seq),
+                ))
+            })
+            .collect();
+        let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gateway = MockGateway::new(commands);
+        let connector = MockConnector::new(sent_hellos.clone(), VecDeque::from([Ok(gateway)]));
+        let source = MockDurableSource::new(CommandCursors::default());
+
+        let supervisor = ConnectionSupervisor::new(
+            connector,
+            CountingCredentialProvider::new("token"),
+            source,
+            latch,
+            make_config(),
+        );
+        let mut handle = supervisor.start();
+
+        assert!(
+            handle.commands.try_recv().is_err(),
+            "limit+1 command must not be exposed before Ready"
+        );
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle.join())
+            .await
+            .expect("supervisor must fail closed within bounded time");
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("hydration hold limit exceeded"),
+            "expected hold-overflow error, got {err:#}"
+        );
+
+        assert_eq!(
+            sent_hellos.lock().unwrap().len(),
+            1,
+            "hold overflow must not retry as a new connection"
+        );
     }
 
     #[tokio::test]
@@ -6016,7 +6048,6 @@ mod tests {
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
-            delivery_authorization: DeliveryAuthorization::Raw,
         };
         let connector = MockConnector::new(
             Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -6168,7 +6199,7 @@ mod tests {
 
     #[test]
     fn api_hello_rejects_unknown_fields() {
-        let json = r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1","delivery_authorization":"raw","extra":1}"#;
+        let json = r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1","extra":1}"#;
         assert!(
             serde_json::from_str::<ApiHello>(json).is_err(),
             "ApiHello must reject unknown fields"
@@ -6180,7 +6211,8 @@ mod tests {
         let agent_json = r#"{"agent_id":"a","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}"#;
         assert!(serde_json::from_str::<AgentHello>(agent_json).is_ok());
 
-        let api_json = r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1","delivery_authorization":"raw"}"#;
+        let api_json =
+            r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1"}"#;
         assert!(serde_json::from_str::<ApiHello>(api_json).is_ok());
     }
 
@@ -6293,7 +6325,6 @@ mod tests {
             accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
             last_received_event_seq: 0,
             next_command_seq: 1,
-            delivery_authorization: DeliveryAuthorization::Raw,
         };
         let (delivery_ready_tx, delivery_ready_rx) = oneshot::channel();
         delivery_ready_tx.send(Ok(())).unwrap();
@@ -6387,7 +6418,6 @@ mod tests {
             accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
             last_received_event_seq: 0,
             next_command_seq: 1,
-            delivery_authorization: DeliveryAuthorization::Raw,
         };
         let (delivery_ready_tx, delivery_ready_rx) = oneshot::channel();
         delivery_ready_tx.send(Ok(())).unwrap();
@@ -6944,8 +6974,7 @@ mod tests {
         let adapter = seams::T17StoreAdapter::new(store.clone());
 
         let sent = Arc::new(Mutex::new(Vec::new()));
-        let mut gateway = MockGateway::new(VecDeque::new())
-            .with_delivery_authorization(DeliveryAuthorization::RedactionOnly);
+        let mut gateway = MockGateway::new(VecDeque::new());
         gateway.writer.sent = sent.clone();
         let connector = MockConnector::new(
             Arc::new(Mutex::new(Vec::new())),
@@ -7048,10 +7077,7 @@ mod tests {
         let adapter = seams::T17StoreAdapter::new(store.clone());
         let sent_hellos = Arc::new(Mutex::new(Vec::new()));
         let responses = (0..5)
-            .map(|_| {
-                Ok(MockGateway::new(VecDeque::new())
-                    .with_delivery_authorization(DeliveryAuthorization::RedactionOnly))
-            })
+            .map(|_| Ok(MockGateway::new(VecDeque::new())))
             .collect();
         let connector = MockConnector::new(sent_hellos.clone(), responses);
         let mut config = make_config();
@@ -7260,7 +7286,6 @@ mod tests {
                 accepted_generation: hello.generation,
                 last_received_event_seq: 0,
                 next_command_seq: hello.last_applied_command_seq.saturating_add(1),
-                delivery_authorization: DeliveryAuthorization::Raw,
             })
         }
 

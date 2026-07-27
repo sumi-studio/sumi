@@ -476,7 +476,6 @@ mod tests {
             accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
             last_received_event_seq: 1,
             next_command_seq: 2,
-            delivery_authorization: DeliveryAuthorization::Raw,
         }
     }
 

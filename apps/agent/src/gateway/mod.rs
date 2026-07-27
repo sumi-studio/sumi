@@ -25,10 +25,9 @@ use zeroize::Zeroize;
 )]
 pub(crate) use stdio::{InjectedStdioGateway, read_command};
 
-pub use supervisor::{
-    AgentHello, ApiHello, ConnectorError, DeliveryAuthorization, GatewayConnector,
-    GatewayCredential,
-};
+#[allow(unused_imports)]
+pub use supervisor::DeliveryAuthorization;
+pub use supervisor::{AgentHello, ApiHello, ConnectorError, GatewayConnector, GatewayCredential};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]

@@ -115,7 +115,7 @@ struct PendingDurable<'a> {
 
 impl Drop for PendingDurable<'_> {
     fn drop(&mut self) {
-        let mut state = self.pump.state.lock().unwrap();
+        let mut state = self.pump.lock_state();
         match &mut *state {
             PumpState::CatchingUp {
                 epoch,
@@ -146,21 +146,27 @@ impl DeliveryPump {
         }
     }
 
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, PumpState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     pub(crate) fn epoch(&self) -> Option<DeliveryEpoch> {
-        match &*self.state.lock().unwrap() {
+        match &*self.lock_state() {
             PumpState::Idle => None,
             PumpState::CatchingUp { epoch, .. } | PumpState::Online { epoch, .. } => Some(*epoch),
         }
     }
 
     pub(crate) fn is_online(&self) -> bool {
-        matches!(*self.state.lock().unwrap(), PumpState::Online { .. })
+        matches!(*self.lock_state(), PumpState::Online { .. })
     }
 
     /// Install the live-delivery epoch. Initial durable replay is owned by the
     /// supervisor writer, which reads bounded pages from `DurableSource`.
     pub(crate) fn install_epoch(&self, epoch: DeliveryEpoch) {
-        *self.state.lock().unwrap() = PumpState::Online {
+        *self.lock_state() = PumpState::Online {
             epoch,
             failure_tx: None,
             pending_durable: 0,
@@ -172,7 +178,7 @@ impl DeliveryPump {
         epoch: DeliveryEpoch,
         failure_tx: mpsc::UnboundedSender<String>,
     ) {
-        *self.state.lock().unwrap() = PumpState::CatchingUp {
+        *self.lock_state() = PumpState::CatchingUp {
             epoch,
             failure_tx: Some(failure_tx),
             pending_durable: 0,
@@ -184,7 +190,7 @@ impl DeliveryPump {
     /// admissible during catch-up so the replay cursor can converge, but all
     /// volatile frames are dropped until this barrier is crossed.
     pub(crate) fn mark_online(&self, epoch: DeliveryEpoch) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock_state();
         match &mut *state {
             PumpState::CatchingUp {
                 epoch: current,
@@ -210,7 +216,7 @@ impl DeliveryPump {
     }
 
     pub(crate) fn invalidate_epoch(&self, epoch: DeliveryEpoch) -> bool {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock_state();
         if !matches!(
             &*state,
             PumpState::CatchingUp { epoch: current, .. }
@@ -227,7 +233,7 @@ impl DeliveryPump {
         // Preserve the EventWriter's post-commit durable FIFO while keeping the
         // shared adapter selection/state lock out of the bounded channel await.
         let admission_epoch = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.lock_state();
             match &mut *state {
                 PumpState::CatchingUp {
                     epoch,
@@ -250,7 +256,7 @@ impl DeliveryPump {
             epoch: admission_epoch,
         };
         let _serial = self.durable_serial.lock().await;
-        let (epoch, failure_tx) = match &*self.state.lock().unwrap() {
+        let (epoch, failure_tx) = match &*self.lock_state() {
             PumpState::Idle => return Ok(()),
             PumpState::CatchingUp {
                 epoch, failure_tx, ..
@@ -261,7 +267,7 @@ impl DeliveryPump {
             PumpState::CatchingUp { .. } | PumpState::Online { .. } => return Ok(()),
         };
         if let Err(err) = send_event_range(&self.store, &self.channel, &epoch, seq, seq).await {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.lock_state();
             // A replacement epoch may have been installed while the bounded
             // durable send was waiting. Only the epoch that initiated the send
             // may transition itself to Idle or notify its failure supervisor.
@@ -289,7 +295,7 @@ impl DeliveryPump {
         if let Some(kind) = event.durable_kind() {
             bail!("volatile delivery rejected durable event of kind {kind}");
         }
-        let (epoch, failure_tx) = match &*self.state.lock().unwrap() {
+        let (epoch, failure_tx) = match &*self.lock_state() {
             PumpState::Online {
                 epoch,
                 failure_tx,
@@ -308,7 +314,7 @@ impl DeliveryPump {
         {
             Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                let mut state = self.state.lock().unwrap();
+                let mut state = self.lock_state();
                 if matches!(&*state, PumpState::Online { epoch: current, .. } if *current == epoch)
                 {
                     *state = PumpState::Idle;
