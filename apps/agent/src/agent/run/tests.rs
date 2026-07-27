@@ -3713,7 +3713,7 @@ async fn emit_tool_start_preempts_by_controls_queued_before_commit() {
         .expect("enqueue soft steer");
 
     let outcome = runner
-        .emit_tool_start_and_wait_committed(&call("preempted"))
+        .emit_tool_start_and_wait_committed(&call("preempted"), None)
         .await
         .expect("preempted start should not fail");
     assert_eq!(outcome, ToolStartOutcome::Preempted);
@@ -3773,7 +3773,7 @@ async fn tool_start_barrier_held_by_soft_steer_preempts() {
     });
 
     let outcome = runner
-        .emit_tool_start_and_wait_committed(&call("held"))
+        .emit_tool_start_and_wait_committed(&call("held"), None)
         .await
         .expect("preempted start should not fail");
     assert_eq!(outcome, ToolStartOutcome::Preempted);
@@ -3832,7 +3832,7 @@ async fn tool_start_barrier_held_by_abort_preempts() {
     });
 
     let outcome = runner
-        .emit_tool_start_and_wait_committed(&call("held"))
+        .emit_tool_start_and_wait_committed(&call("held"), None)
         .await
         .expect("preempted start should not fail");
     assert_eq!(outcome, ToolStartOutcome::Preempted);
@@ -3882,7 +3882,7 @@ async fn dropped_soft_steer_authorization_cannot_preempt_tool_start() {
     });
 
     let outcome = runner
-        .emit_tool_start_and_wait_committed(&call("authorization-dropped"))
+        .emit_tool_start_and_wait_committed(&call("authorization-dropped"), None)
         .await
         .expect("dropped authorization must leave the committed start authoritative");
     assert_eq!(outcome, ToolStartOutcome::Started);
@@ -3927,7 +3927,7 @@ async fn dropped_abort_authorization_cannot_cancel_committed_tool_start() {
     });
 
     let outcome = runner
-        .emit_tool_start_and_wait_committed(&call("abort-authorization-dropped"))
+        .emit_tool_start_and_wait_committed(&call("abort-authorization-dropped"), None)
         .await
         .expect("dropped authorization must leave the committed start authoritative");
     assert_eq!(outcome, ToolStartOutcome::Started);

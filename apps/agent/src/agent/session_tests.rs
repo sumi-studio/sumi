@@ -38,8 +38,9 @@ use crate::{
 };
 
 use crate::approval::{
-    ApprovalBroker, ApprovalOutcome, ApprovalPolicyTrustStore,
-    action::{SandboxSummary, SecretAwareActionProjector, SecretDigestKey},
+    ApprovalBroker, ApprovalOutcome, ApprovalPolicyBundle, ApprovalPolicyTrustStore, ApprovalRule,
+    RuleEffect,
+    action::{Permission, SandboxSummary, SecretAwareActionProjector, SecretDigestKey},
     prompt::{ReviewerPrompt, TrustedEnvironment},
     reviewer::{
         AuditDecision, AuditOutcome, Reviewer, ReviewerMode, ReviewerModelSpec, ReviewerTransport,
@@ -8333,6 +8334,128 @@ async fn wait_for_approval_request(
     })
     .await
     .expect("approval request emitted")
+}
+
+#[tokio::test]
+async fn expired_policy_grant_reenters_approval_before_stalled_tool_start() {
+    let store = Store::session_test_store("expired-policy-grant-reenters-approval")
+        .await
+        .expect("test store");
+    let now = chrono::DateTime::parse_from_rfc3339("2026-07-27T00:00:00Z")
+        .expect("fixed clock")
+        .to_utc();
+    let expires_at = now + chrono::Duration::seconds(10);
+    let policy = crate::approval::Policy::from_verified_bundle(
+        "/workspace",
+        &ApprovalPolicyBundle {
+            schema_version: crate::approval::policy::APPROVAL_POLICY_BUNDLE_SCHEMA_VERSION,
+            tenant_id: "tenant-1".to_owned(),
+            agent_id: "agent-1".to_owned(),
+            version: 7,
+            issued_at: now - chrono::Duration::seconds(10),
+            expires_at,
+            rules: vec![ApprovalRule {
+                id: "allow-git-status".to_owned(),
+                tool: "bash".to_owned(),
+                literal_prefix: vec!["git".to_owned(), "status".to_owned()],
+                effect: RuleEffect::Allow,
+                workspace_only: true,
+                allowed_permissions: vec![Permission::Exec],
+                allowed_network_domains: Vec::new(),
+            }],
+        },
+    )
+    .expect("valid signed-policy fixture");
+    let clock = Arc::new(Mutex::new(now));
+    let broker = Arc::new(
+        ApprovalBroker::new(
+            policy,
+            make_projector(),
+            None,
+            ReviewerMode::User,
+            false,
+            trusted_env(),
+        )
+        .with_clock({
+            let clock = clock.clone();
+            move || *clock.lock().expect("approval clock")
+        }),
+    );
+
+    let executed = Arc::new(AtomicBool::new(false));
+    let tool_start_staged = Arc::new(Notify::new());
+    let tool_start_release = Arc::new(Notify::new());
+    let production_worker: Arc<dyn RunWorker> = Arc::new(SequentialRunWorker::new(
+        ApprovalTestDriver::with_tool_call(executed.clone()),
+    ));
+    let worker: Arc<dyn RunWorker> = Arc::new(HoldPreStartWorker {
+        inner: production_worker,
+        tool_start_staged: tool_start_staged.clone(),
+        tool_start_release: Some(tool_start_release.clone()),
+    });
+    let (gateway, commands, frames) = gateway();
+    let session = Session::start(
+        store,
+        gateway,
+        approval_core(broker),
+        worker,
+        test_executor_generation(),
+    )
+    .await
+    .expect("session startup");
+    let task = tokio::spawn(session.run());
+
+    commands.send(user(1)).await.expect("user command");
+    tokio::time::timeout(Duration::from_secs(3), tool_start_staged.notified())
+        .await
+        .expect("policy-allowed start reached stalled pre-commit window");
+    assert!(!executed.load(Ordering::SeqCst));
+    *clock.lock().expect("approval clock") = expires_at;
+    tool_start_release.notify_one();
+
+    let request_id = wait_for_approval_request(&frames, &task).await;
+    assert!(
+        !frames.lock().expect("frame mutex").iter().any(|frame| {
+            matches!(frame, OutboundFrame::Event { envelope }
+                if envelope.event.get("type").and_then(Value::as_str)
+                    == Some("tool_execution_start"))
+        }),
+        "expired grant must not commit ToolExecutionStart"
+    );
+    assert!(
+        !executed.load(Ordering::SeqCst),
+        "expired grant must not execute or silently deny"
+    );
+
+    commands
+        .send(approval_decision(2, &request_id))
+        .await
+        .expect("approve reauthorized call");
+    tokio::time::timeout(Duration::from_secs(3), tool_start_staged.notified())
+        .await
+        .expect("user-approved start reached pre-commit window");
+    tool_start_release.notify_one();
+    wait_for_agent_end(&frames).await;
+    drop(commands);
+    match task.await.expect("session join") {
+        SessionResult::Completed(_) => {}
+        SessionResult::Failed { failure, .. } => panic!("session failed: {failure}"),
+    }
+    assert!(
+        executed.load(Ordering::SeqCst),
+        "explicit approval must execute after stale grant reauthorization"
+    );
+    let committed_starts = frames
+        .lock()
+        .expect("frame mutex")
+        .iter()
+        .filter(|frame| {
+            matches!(frame, OutboundFrame::Event { envelope }
+                if envelope.event.get("type").and_then(Value::as_str)
+                    == Some("tool_execution_start"))
+        })
+        .count();
+    assert_eq!(committed_starts, 1);
 }
 
 #[tokio::test]

@@ -12,6 +12,7 @@ pub use action::{
     ReviewToken, ReviewableAction, SandboxSummary, SecretAwareActionProjector, SecretDigestKey,
 };
 pub use broker::{ApprovalBroker, ApprovalOutcome, WaiterResult};
+pub(crate) use broker::{ExecutableGrant, GrantRevalidation};
 #[allow(unused_imports)]
 pub use policy::{
     ApprovalPolicyBundle, ApprovalPolicyCacheStatus, ApprovalPolicyTrustStore, ApprovalRule,

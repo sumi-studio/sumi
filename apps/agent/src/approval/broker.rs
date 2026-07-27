@@ -12,7 +12,8 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -39,7 +40,9 @@ use crate::{
 /// Result of asking the broker whether a tool may start.
 #[derive(Debug)]
 pub enum ApprovalOutcome {
-    Allowed,
+    Allowed {
+        grant: ExecutableGrant,
+    },
     Denied {
         reason: String,
         audit: Option<AuditDecision>,
@@ -47,6 +50,75 @@ pub enum ApprovalOutcome {
     Pending {
         pending: PendingApproval,
     },
+}
+
+type ApprovalClock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
+
+/// Opaque, single-call authority to attempt a durable tool start.
+///
+/// The durable bridge revalidates this value immediately before committing
+/// `ToolExecutionStart`. Its fields stay private so callers cannot mint or
+/// widen authority by editing policy identity, deadline, or call bindings.
+#[derive(Clone)]
+pub(crate) struct ExecutableGrant {
+    policy: Arc<RwLock<Policy>>,
+    clock: ApprovalClock,
+    policy_hash: String,
+    valid_until: Option<DateTime<Utc>>,
+    tool_call_id: String,
+    tool_name: String,
+    arguments_hash: [u8; 32],
+    run_id: String,
+    turn_id: String,
+}
+
+impl std::fmt::Debug for ExecutableGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecutableGrant")
+            .field("tool_call_id", &self.tool_call_id)
+            .field("run_id", &self.run_id)
+            .field("turn_id", &self.turn_id)
+            .field("valid_until", &self.valid_until)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GrantRevalidation {
+    Valid,
+    Reauthorize,
+}
+
+impl ExecutableGrant {
+    pub(crate) fn revalidate(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments: &Value,
+        run_id: &str,
+        turn_id: &str,
+    ) -> Result<GrantRevalidation> {
+        let arguments_hash: [u8; 32] =
+            Sha256::digest(serde_json::to_vec(arguments).context("serialize tool arguments")?)
+                .into();
+        anyhow::ensure!(
+            self.tool_call_id == tool_call_id
+                && self.tool_name == tool_name
+                && self.arguments_hash == arguments_hash
+                && self.run_id == run_id
+                && self.turn_id == turn_id,
+            "executable grant does not match ToolExecutionStart"
+        );
+
+        let now = (self.clock)();
+        let policy = self.policy.read().unwrap_or_else(|e| e.into_inner());
+        if self.valid_until.is_some_and(|deadline| now >= deadline)
+            || policy.hash_at(now) != self.policy_hash
+        {
+            return Ok(GrantRevalidation::Reauthorize);
+        }
+        Ok(GrantRevalidation::Valid)
+    }
 }
 
 /// Message delivered to a pending approval waiter.
@@ -94,6 +166,8 @@ struct ReviewPolicySnapshot {
     policy_hash: String,
     cache_expires_at: Option<chrono::DateTime<Utc>>,
     context_version: String,
+    run_id: String,
+    turn_id: String,
 }
 
 /// The worker-side ownership of an unresolved approval request.
@@ -142,6 +216,7 @@ impl Drop for PendingApproval {
 #[derive(Clone)]
 pub struct ApprovalBroker {
     policy: Arc<RwLock<Policy>>,
+    clock: ApprovalClock,
     projector: Arc<SecretAwareActionProjector>,
     reviewer: Option<Arc<Reviewer>>,
     mode: ReviewerMode,
@@ -192,6 +267,7 @@ impl ApprovalBroker {
     ) -> Self {
         Self {
             policy: Arc::new(RwLock::new(policy)),
+            clock: Arc::new(Utc::now),
             projector: Arc::new(projector),
             reviewer,
             mode,
@@ -200,6 +276,37 @@ impl ApprovalBroker {
             pending: Arc::new(Mutex::new(HashMap::new())),
             resolving: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_clock(
+        mut self,
+        clock: impl Fn() -> DateTime<Utc> + Send + Sync + 'static,
+    ) -> Self {
+        self.clock = Arc::new(clock);
+        self
+    }
+
+    /// Replace the live policy authority and invalidate reviewer allows.
+    ///
+    /// Existing executable grants observe the same `RwLock`, so the durable
+    /// start boundary detects a replacement instead of trusting its snapshot.
+    pub(crate) fn replace_policy(&self, policy: Policy) -> Result<()> {
+        let workspace_root = self
+            .policy
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .workspace_root()
+            .to_path_buf();
+        anyhow::ensure!(
+            policy.workspace_root() == workspace_root,
+            "replacement policy changed workspace root"
+        );
+        *self.policy.write().unwrap_or_else(|e| e.into_inner()) = policy;
+        if let Some(reviewer) = self.reviewer.as_ref() {
+            reviewer.clear_allow_cache();
+        }
+        Ok(())
     }
 
     /// Build a headless broker with no reviewer: `NeedsApproval` actions are
@@ -241,7 +348,7 @@ impl ApprovalBroker {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let evaluated_at = Utc::now();
+        let evaluated_at = (self.clock)();
         let action = match CanonicalAction::from_tool_call(
             policy.workspace_root().to_path_buf(),
             &tool_call.name,
@@ -262,6 +369,8 @@ impl ApprovalBroker {
             policy_hash: policy.hash_at(evaluated_at),
             cache_expires_at: policy.review_cache_expires_at(evaluated_at),
             context_version: context_version.to_owned(),
+            run_id: run_id.to_owned(),
+            turn_id: turn_id.to_owned(),
         };
 
         match decision {
@@ -272,14 +381,7 @@ impl ApprovalBroker {
             PolicyDecision::Allow { .. } => {
                 if self.mode == ReviewerMode::StrictAutoReview {
                     let outcome = self
-                        .call_reviewer(
-                            &projection,
-                            transcript,
-                            run_id,
-                            turn_id,
-                            &review_policy,
-                            cancel,
-                        )
+                        .call_reviewer(tool_call, &projection, transcript, &review_policy, cancel)
                         .await?;
                     self.reviewer_fallback(
                         outcome,
@@ -290,7 +392,7 @@ impl ApprovalBroker {
                         turn_id,
                     )
                 } else {
-                    Ok(ApprovalOutcome::Allowed)
+                    self.allow(tool_call, run_id, turn_id, &review_policy)
                 }
             }
             PolicyDecision::NeedsApproval { reason, .. } => {
@@ -312,14 +414,7 @@ impl ApprovalBroker {
                     )
                 } else {
                     let outcome = self
-                        .call_reviewer(
-                            &projection,
-                            transcript,
-                            run_id,
-                            turn_id,
-                            &review_policy,
-                            cancel,
-                        )
+                        .call_reviewer(tool_call, &projection, transcript, &review_policy, cancel)
                         .await?;
                     self.reviewer_fallback(
                         outcome,
@@ -332,6 +427,32 @@ impl ApprovalBroker {
                 }
             }
         }
+    }
+
+    fn allow(
+        &self,
+        tool_call: &ToolCall,
+        run_id: &str,
+        turn_id: &str,
+        policy: &ReviewPolicySnapshot,
+    ) -> Result<ApprovalOutcome> {
+        let arguments = Value::Object(tool_call.arguments.as_object().clone());
+        let arguments_hash: [u8; 32] =
+            Sha256::digest(serde_json::to_vec(&arguments).context("serialize tool arguments")?)
+                .into();
+        Ok(ApprovalOutcome::Allowed {
+            grant: ExecutableGrant {
+                policy: self.policy.clone(),
+                clock: self.clock.clone(),
+                policy_hash: policy.policy_hash.clone(),
+                valid_until: policy.cache_expires_at,
+                tool_call_id: tool_call.id.clone(),
+                tool_name: tool_call.name.clone(),
+                arguments_hash,
+                run_id: run_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+            },
+        })
     }
 
     /// Convert an external `ApprovalDecision` into a `ResolvedDecision`, update
@@ -608,10 +729,9 @@ fn reviewer_allow_is_executable(decision: &AuditDecision) -> Result<(), String> 
 impl ApprovalBroker {
     async fn call_reviewer(
         &self,
+        tool_call: &ToolCall,
         projection: &crate::approval::action::ReviewProjection,
         transcript: &[PublicMessage],
-        run_id: &str,
-        turn_id: &str,
         policy: &ReviewPolicySnapshot,
         cancel: CancellationToken,
     ) -> Result<ApprovalOutcome> {
@@ -660,13 +780,13 @@ impl ApprovalBroker {
             policy_hash: policy.policy_hash.clone(),
             policy_cache_expires_at: policy.cache_expires_at,
             context_version: environment_version,
-            run_id: run_id.to_owned(),
-            turn_id: Some(turn_id.to_owned()),
+            run_id: policy.run_id.clone(),
+            turn_id: Some(policy.turn_id.clone()),
         };
 
         match reviewer.review(request, cancel).await {
             ReviewOutcome::Allow(decision) => match reviewer_allow_is_executable(&decision) {
-                Ok(()) => Ok(ApprovalOutcome::Allowed),
+                Ok(()) => self.allow(tool_call, &policy.run_id, &policy.turn_id, policy),
                 Err(constraint) => Ok(ApprovalOutcome::Denied {
                     reason: format!("{constraint}: {}", decision.rationale),
                     audit: Some(decision),
@@ -1045,7 +1165,7 @@ mod tests {
                 )
                 .await
                 .expect("first review"),
-            ApprovalOutcome::Allowed
+            ApprovalOutcome::Allowed { .. }
         ));
         environment
             .lock()
@@ -1063,7 +1183,7 @@ mod tests {
                 )
                 .await
                 .expect("review after repo change"),
-            ApprovalOutcome::Allowed
+            ApprovalOutcome::Allowed { .. }
         ));
 
         assert_eq!(
@@ -1182,7 +1302,55 @@ mod tests {
             )
             .await
             .expect("start_request");
-        assert!(matches!(outcome, ApprovalOutcome::Allowed));
+        assert!(matches!(outcome, ApprovalOutcome::Allowed { .. }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn executable_grant_observes_live_policy_replacement() {
+        let broker = broker();
+        let call = read_file_call("notes.txt");
+        let ApprovalOutcome::Allowed { grant } = broker
+            .start_request(
+                &call,
+                &[],
+                "run-1",
+                "turn-1",
+                "v1",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("initial allow")
+        else {
+            panic!("workspace read should initially allow");
+        };
+        let replacement = Policy::new("/workspace")
+            .try_with_rule(ApprovalRule {
+                id: "replacement-identity".to_owned(),
+                tool: "bash".to_owned(),
+                literal_prefix: vec!["git".to_owned(), "status".to_owned()],
+                effect: crate::approval::RuleEffect::NeedsApproval,
+                workspace_only: true,
+                allowed_permissions: vec![Permission::Exec],
+                allowed_network_domains: Vec::new(),
+            })
+            .expect("valid replacement policy");
+        broker
+            .replace_policy(replacement)
+            .expect("replace live policy");
+
+        assert_eq!(
+            grant
+                .revalidate(
+                    &call.id,
+                    &call.name,
+                    &Value::Object(call.arguments.as_object().clone()),
+                    "run-1",
+                    "turn-1",
+                )
+                .expect("grant revalidation"),
+            GrantRevalidation::Reauthorize,
+            "a live policy replacement must invalidate an already-issued grant"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1655,7 +1823,7 @@ mod tests {
             )
             .await
             .expect("start_request");
-        assert!(matches!(outcome, ApprovalOutcome::Allowed));
+        assert!(matches!(outcome, ApprovalOutcome::Allowed { .. }));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1722,7 +1890,7 @@ mod tests {
             )
             .await
             .expect("start_request");
-        assert!(matches!(outcome, ApprovalOutcome::Allowed));
+        assert!(matches!(outcome, ApprovalOutcome::Allowed { .. }));
     }
 
     fn test_decision(risk: RiskLevel, authorization: UserAuthorization) -> AuditDecision {

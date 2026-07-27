@@ -3734,7 +3734,7 @@ mod tests {
             .await
             .expect("start request");
         assert!(
-            matches!(outcome, ApprovalOutcome::Allowed),
+            matches!(outcome, ApprovalOutcome::Allowed { .. }),
             "loaded RuleEffect::Allow rule must allow matching bash command"
         );
 

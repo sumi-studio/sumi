@@ -59,7 +59,7 @@ pub(crate) use durable_bridge::DurableRunBinding;
 
 use durable_bridge::{
     CommittedOutput, DurableBridge, MessageCommitBarrier, MessageCommitReceipt,
-    RetryWaitCommitBarrier, RunOutput, ToolStartCommitBarrier,
+    RetryWaitCommitBarrier, RunOutput, ToolStartCommitBarrier, ToolStartCommitResult,
 };
 use queue::MessageQueue;
 

@@ -42,9 +42,9 @@ use super::{
     AdmittedCommand, AgentEvent, DurableRunBinding, MessageCommitBarrier, MessageCommitReceipt,
     ProjectedProviderEvent, ProviderEventProjector, ProviderTerminalKind, RetryWaitCommitBarrier,
     RunCompletion, RunControl, RunCore, RunOutput, RunWorker, SteerMode, ToolStartCommitBarrier,
-    WorkerFailure, WorkerFuture, WorkerPhase, steer,
+    ToolStartCommitResult, WorkerFailure, WorkerFuture, WorkerPhase, steer,
 };
-use crate::approval::{ApprovalOutcome, WaiterResult};
+use crate::approval::{ApprovalOutcome, ExecutableGrant, WaiterResult};
 
 const LENGTH_TOOL_FAILURE: &str = "Tool call was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.";
 const LENGTH_LOOP_FAILURE: &str = "provider produced tool calls at the output token limit twice consecutively; refusing a third provider call";
@@ -78,6 +78,9 @@ pub(crate) enum ToolStartOutcome {
     /// A control arrived before the tool could durably start; the start must not
     /// be committed and the current call should be skipped.
     Preempted,
+    /// The signed-policy authority changed or expired before durable start.
+    /// The same call must pass through the broker again.
+    Reauthorize,
 }
 
 /// One provider attempt. The initial public message supplies stable model and
@@ -208,7 +211,9 @@ impl From<WorkerFailure> for ExecuteToolError {
 }
 
 enum CallDisposition {
-    Allowed,
+    Allowed {
+        grant: Option<ExecutableGrant>,
+    },
     Denied {
         reason: String,
         approval_denied: bool,
@@ -1045,57 +1050,64 @@ impl Runner {
                 .saturating_add(index as u64)
                 .saturating_add(1)
                 .to_string();
-            match self
-                .evaluate_call(call, &transcript, &context_version)
-                .await?
-            {
-                CallDisposition::Allowed => {
-                    match self.emit_tool_start_and_wait_committed(call).await? {
-                        ToolStartOutcome::Started => {
-                            let result = match self
-                                .execute_tool_with_updates(assistant_message_id, call)
-                                .await
-                            {
-                                Ok(mut result) => {
-                                    result.tool_call_id.clone_from(&call.id);
-                                    result.tool_name.clone_from(&call.name);
-                                    result
-                                }
-                                Err(ExecuteToolError::Worker(failure)) => return Err(failure),
-                                Err(ExecuteToolError::Tool(ToolError::RpcIndeterminate(
-                                    message,
-                                ))) => {
-                                    return Err(WorkerFailure::Error(format!(
-                                        "tool RPC outcome is indeterminate: {message}"
-                                    )));
-                                }
-                                Err(ExecuteToolError::Tool(error)) => error_tool_result(
-                                    call,
-                                    &format!("Tool execution failed: {error}"),
-                                ),
-                                Err(ExecuteToolError::Cancelled) => error_tool_result(
-                                    call,
-                                    "Tool execution was cancelled by a user control",
-                                ),
-                            };
-                            let result_message = PublicMessage::ToolResult(result.clone());
-                            receipts
-                                .push(self.emit_tool_result(assistant_message_id, &result).await?);
-                            results.push(result);
-                            transcript.push(result_message);
-                        }
-                        ToolStartOutcome::Preempted => {
-                            let reason = if self.abort_requested {
-                                "Tool execution was cancelled by a user control".to_owned()
-                            } else if !self.in_flight_controls.is_empty() {
-                                "ユーザーの新しい指示により実行前に取り消された".to_owned()
-                            } else {
-                                "Tool execution was cancelled by a user control".to_owned()
-                            };
-                            let result = error_tool_result(call, &reason);
-                            let result_message = PublicMessage::ToolResult(result.clone());
-                            receipts.push(
-                                self.emit_result_message(assistant_message_id, &result, None, None)
+            'authorize: loop {
+                match self
+                    .evaluate_call(call, &transcript, &context_version)
+                    .await?
+                {
+                    CallDisposition::Allowed { grant } => {
+                        match self.emit_tool_start_and_wait_committed(call, grant).await? {
+                            ToolStartOutcome::Started => {
+                                let result = match self
+                                    .execute_tool_with_updates(assistant_message_id, call)
+                                    .await
+                                {
+                                    Ok(mut result) => {
+                                        result.tool_call_id.clone_from(&call.id);
+                                        result.tool_name.clone_from(&call.name);
+                                        result
+                                    }
+                                    Err(ExecuteToolError::Worker(failure)) => return Err(failure),
+                                    Err(ExecuteToolError::Tool(ToolError::RpcIndeterminate(
+                                        message,
+                                    ))) => {
+                                        return Err(WorkerFailure::Error(format!(
+                                            "tool RPC outcome is indeterminate: {message}"
+                                        )));
+                                    }
+                                    Err(ExecuteToolError::Tool(error)) => error_tool_result(
+                                        call,
+                                        &format!("Tool execution failed: {error}"),
+                                    ),
+                                    Err(ExecuteToolError::Cancelled) => error_tool_result(
+                                        call,
+                                        "Tool execution was cancelled by a user control",
+                                    ),
+                                };
+                                let result_message = PublicMessage::ToolResult(result.clone());
+                                receipts.push(
+                                    self.emit_tool_result(assistant_message_id, &result).await?,
+                                );
+                                results.push(result);
+                                transcript.push(result_message);
+                            }
+                            ToolStartOutcome::Preempted => {
+                                let reason = if self.abort_requested {
+                                    "Tool execution was cancelled by a user control".to_owned()
+                                } else if !self.in_flight_controls.is_empty() {
+                                    "ユーザーの新しい指示により実行前に取り消された".to_owned()
+                                } else {
+                                    "Tool execution was cancelled by a user control".to_owned()
+                                };
+                                let result = error_tool_result(call, &reason);
+                                let result_message = PublicMessage::ToolResult(result.clone());
+                                receipts.push(
+                                    self.emit_result_message(
+                                        assistant_message_id,
+                                        &result,
+                                        None,
+                                        None,
+                                    )
                                     .await?
                                     .await
                                     .map_err(|_| {
@@ -1103,61 +1115,65 @@ impl Runner {
                                             "tool result receipt dropped".to_owned(),
                                         )
                                     })?,
-                            );
-                            results.push(result);
-                            transcript.push(result_message);
-                            cancel_reason = Some(reason);
+                                );
+                                results.push(result);
+                                transcript.push(result_message);
+                                cancel_reason = Some(reason);
+                            }
+                            ToolStartOutcome::Reauthorize => continue 'authorize,
                         }
                     }
-                }
-                CallDisposition::Denied {
-                    reason,
-                    approval_denied,
-                } => {
-                    let result = error_tool_result(call, &reason);
-                    let result_message = PublicMessage::ToolResult(result.clone());
-                    receipts.push(
-                        self.emit_result_message(
-                            assistant_message_id,
-                            &result,
-                            approval_denied.then(|| call.id.clone()),
-                            None,
-                        )
-                        .await?
-                        .await
-                        .map_err(|_| {
-                            WorkerFailure::Error("tool result receipt dropped".to_owned())
-                        })?,
-                    );
-                    results.push(result);
-                    transcript.push(result_message);
-                }
-                CallDisposition::Pending { mut pending } => {
-                    let request = pending.request().clone();
-                    self.emit(AgentEvent::ApprovalRequested {
-                        request: request.clone(),
-                    })
-                    .await?;
-                    self.phase.send(WorkerPhase::Approval).ok();
-                    match self
-                        .wait_for_approval(request.id.clone(), pending.receiver_mut())
-                        .await?
-                    {
-                        ApprovalWaitOutcome::Resolved { decision, command } => {
-                            self.emit_approval_resolved(
-                                request.id.clone(),
-                                &decision,
-                                Some(*command),
+                    CallDisposition::Denied {
+                        reason,
+                        approval_denied,
+                    } => {
+                        let result = error_tool_result(call, &reason);
+                        let result_message = PublicMessage::ToolResult(result.clone());
+                        receipts.push(
+                            self.emit_result_message(
+                                assistant_message_id,
+                                &result,
+                                approval_denied.then(|| call.id.clone()),
+                                None,
                             )
-                            .await?;
-                            let committed_decision = decision.clone();
-                            match decision {
-                                crate::approval::policy::ResolvedDecision::ApproveOnce
-                                | crate::approval::policy::ResolvedDecision::ApproveAlways(_) => {
-                                    match self.emit_tool_start_and_wait_committed(call).await? {
-                                        ToolStartOutcome::Started => {
-                                            if let Some(broker) = self.core.approval.as_ref() {
-                                                broker
+                            .await?
+                            .await
+                            .map_err(|_| {
+                                WorkerFailure::Error("tool result receipt dropped".to_owned())
+                            })?,
+                        );
+                        results.push(result);
+                        transcript.push(result_message);
+                    }
+                    CallDisposition::Pending { mut pending } => {
+                        let request = pending.request().clone();
+                        self.emit(AgentEvent::ApprovalRequested {
+                            request: request.clone(),
+                        })
+                        .await?;
+                        self.phase.send(WorkerPhase::Approval).ok();
+                        match self
+                            .wait_for_approval(request.id.clone(), pending.receiver_mut())
+                            .await?
+                        {
+                            ApprovalWaitOutcome::Resolved { decision, command } => {
+                                self.emit_approval_resolved(
+                                    request.id.clone(),
+                                    &decision,
+                                    Some(*command),
+                                )
+                                .await?;
+                                let committed_decision = decision.clone();
+                                match decision {
+                                    crate::approval::policy::ResolvedDecision::ApproveOnce
+                                    | crate::approval::policy::ResolvedDecision::ApproveAlways(_) => {
+                                        match self
+                                            .emit_tool_start_and_wait_committed(call, None)
+                                            .await?
+                                        {
+                                            ToolStartOutcome::Started => {
+                                                if let Some(broker) = self.core.approval.as_ref() {
+                                                    broker
                                                     .commit_resolution(
                                                         &request.id,
                                                         &committed_decision,
@@ -1167,154 +1183,174 @@ impl Runner {
                                                             "committed approval rule activation failed: {error}"
                                                         ))
                                                     })?;
+                                                }
+                                                let result = match self
+                                                    .execute_tool_with_updates(
+                                                        assistant_message_id,
+                                                        call,
+                                                    )
+                                                    .await
+                                                {
+                                                    Ok(mut result) => {
+                                                        result.tool_call_id.clone_from(&call.id);
+                                                        result.tool_name.clone_from(&call.name);
+                                                        result
+                                                    }
+                                                    Err(ExecuteToolError::Worker(failure)) => {
+                                                        let _ =
+                                                            self.phase.send(WorkerPhase::Active);
+                                                        return Err(failure);
+                                                    }
+                                                    Err(ExecuteToolError::Tool(
+                                                        ToolError::RpcIndeterminate(message),
+                                                    )) => {
+                                                        let _ =
+                                                            self.phase.send(WorkerPhase::Active);
+                                                        return Err(WorkerFailure::Error(format!(
+                                                            "tool RPC outcome is indeterminate: {message}"
+                                                        )));
+                                                    }
+                                                    Err(ExecuteToolError::Tool(error)) => {
+                                                        error_tool_result(
+                                                            call,
+                                                            &format!(
+                                                                "Tool execution failed: {error}"
+                                                            ),
+                                                        )
+                                                    }
+                                                    Err(ExecuteToolError::Cancelled) => {
+                                                        error_tool_result(
+                                                            call,
+                                                            "Tool execution was cancelled by a user control",
+                                                        )
+                                                    }
+                                                };
+                                                let result_message =
+                                                    PublicMessage::ToolResult(result.clone());
+                                                receipts.push(
+                                                    self.emit_tool_result(
+                                                        assistant_message_id,
+                                                        &result,
+                                                    )
+                                                    .await?,
+                                                );
+                                                results.push(result);
+                                                transcript.push(result_message);
                                             }
-                                            let result = match self
-                                                .execute_tool_with_updates(
-                                                    assistant_message_id,
-                                                    call,
-                                                )
-                                                .await
-                                            {
-                                                Ok(mut result) => {
-                                                    result.tool_call_id.clone_from(&call.id);
-                                                    result.tool_name.clone_from(&call.name);
-                                                    result
-                                                }
-                                                Err(ExecuteToolError::Worker(failure)) => {
-                                                    let _ = self.phase.send(WorkerPhase::Active);
-                                                    return Err(failure);
-                                                }
-                                                Err(ExecuteToolError::Tool(
-                                                    ToolError::RpcIndeterminate(message),
-                                                )) => {
-                                                    let _ = self.phase.send(WorkerPhase::Active);
-                                                    return Err(WorkerFailure::Error(format!(
-                                                        "tool RPC outcome is indeterminate: {message}"
-                                                    )));
-                                                }
-                                                Err(ExecuteToolError::Tool(error)) => {
-                                                    error_tool_result(
-                                                        call,
-                                                        &format!("Tool execution failed: {error}"),
-                                                    )
-                                                }
-                                                Err(ExecuteToolError::Cancelled) => {
-                                                    error_tool_result(
-                                                        call,
-                                                        "Tool execution was cancelled by a user control",
-                                                    )
-                                                }
-                                            };
-                                            let result_message =
-                                                PublicMessage::ToolResult(result.clone());
-                                            receipts.push(
-                                                self.emit_tool_result(
-                                                    assistant_message_id,
-                                                    &result,
-                                                )
-                                                .await?,
-                                            );
-                                            results.push(result);
-                                            transcript.push(result_message);
-                                        }
-                                        ToolStartOutcome::Preempted => {
-                                            self.emit(AgentEvent::ApprovalResolved {
+                                            ToolStartOutcome::Preempted => {
+                                                self.emit(AgentEvent::ApprovalResolved {
                                                 request_id: request.id.clone(),
                                                 resolution: crate::agent::events::ApprovalResolution::Cancelled,
                                             })
                                             .await?;
-                                            let reason = if self.abort_requested {
-                                                "Tool execution was cancelled by a user control"
-                                                    .to_owned()
-                                            } else if !self.in_flight_controls.is_empty() {
-                                                "ユーザーの新しい指示により実行前に取り消された"
-                                                    .to_owned()
-                                            } else {
-                                                "Tool execution was cancelled by a user control"
-                                                    .to_owned()
-                                            };
-                                            let result = error_tool_result(call, &reason);
-                                            let result_message =
-                                                PublicMessage::ToolResult(result.clone());
-                                            receipts.push(
-                                                self.emit_result_message(
-                                                    assistant_message_id,
-                                                    &result,
-                                                    None,
-                                                    Some(call.id.clone()),
-                                                )
-                                                .await?
-                                                .await
-                                                .map_err(|_| {
-                                                    WorkerFailure::Error(
-                                                        "tool result receipt dropped".to_owned(),
+                                                let reason = if self.abort_requested {
+                                                    "Tool execution was cancelled by a user control"
+                                                        .to_owned()
+                                                } else if !self.in_flight_controls.is_empty() {
+                                                    "ユーザーの新しい指示により実行前に取り消された"
+                                                        .to_owned()
+                                                } else {
+                                                    "Tool execution was cancelled by a user control"
+                                                        .to_owned()
+                                                };
+                                                let result = error_tool_result(call, &reason);
+                                                let result_message =
+                                                    PublicMessage::ToolResult(result.clone());
+                                                receipts.push(
+                                                    self.emit_result_message(
+                                                        assistant_message_id,
+                                                        &result,
+                                                        None,
+                                                        Some(call.id.clone()),
                                                     )
-                                                })?,
-                                            );
-                                            results.push(result);
-                                            transcript.push(result_message);
-                                            cancel_reason = Some(reason);
+                                                    .await?
+                                                    .await
+                                                    .map_err(|_| {
+                                                        WorkerFailure::Error(
+                                                            "tool result receipt dropped"
+                                                                .to_owned(),
+                                                        )
+                                                    })?,
+                                                );
+                                                results.push(result);
+                                                transcript.push(result_message);
+                                                cancel_reason = Some(reason);
+                                            }
+                                            ToolStartOutcome::Reauthorize => {
+                                                return Err(WorkerFailure::Error(
+                                                "user-approved ToolExecutionStart unexpectedly requested signed-policy reauthorization"
+                                                    .to_owned(),
+                                            ));
+                                            }
                                         }
                                     }
-                                }
-                                crate::approval::policy::ResolvedDecision::Deny
-                                | crate::approval::policy::ResolvedDecision::Rejected { .. } => {
-                                    let reason = match decision {
+                                    crate::approval::policy::ResolvedDecision::Deny
+                                    | crate::approval::policy::ResolvedDecision::Rejected {
+                                        ..
+                                    } => {
+                                        let reason = match decision {
                                         crate::approval::policy::ResolvedDecision::Rejected {
                                             reason,
                                         } => reason,
                                         _ => "Approval denied".to_owned(),
                                     };
-                                    let result = error_tool_result(call, &reason);
-                                    let result_message = PublicMessage::ToolResult(result.clone());
-                                    receipts.push(
-                                        self.emit_result_message(
-                                            assistant_message_id,
-                                            &result,
-                                            Some(call.id.clone()),
-                                            None,
-                                        )
-                                        .await?
-                                        .await
-                                        .map_err(|_| {
-                                            WorkerFailure::Error(
-                                                "tool result receipt dropped".to_owned(),
+                                        let result = error_tool_result(call, &reason);
+                                        let result_message =
+                                            PublicMessage::ToolResult(result.clone());
+                                        receipts.push(
+                                            self.emit_result_message(
+                                                assistant_message_id,
+                                                &result,
+                                                Some(call.id.clone()),
+                                                None,
                                             )
-                                        })?,
-                                    );
-                                    results.push(result);
-                                    transcript.push(result_message);
+                                            .await?
+                                            .await
+                                            .map_err(
+                                                |_| {
+                                                    WorkerFailure::Error(
+                                                        "tool result receipt dropped".to_owned(),
+                                                    )
+                                                },
+                                            )?,
+                                        );
+                                        results.push(result);
+                                        transcript.push(result_message);
+                                    }
                                 }
                             }
+                            ApprovalWaitOutcome::Cancelled => {
+                                self.emit(AgentEvent::ApprovalResolved {
+                                    request_id: request.id.clone(),
+                                    resolution: crate::agent::events::ApprovalResolution::Cancelled,
+                                })
+                                .await?;
+                                cancel_reason = Some("Tool execution cancelled".to_owned());
+                                let result = error_tool_result(call, "Tool execution cancelled");
+                                let result_message = PublicMessage::ToolResult(result.clone());
+                                receipts.push(
+                                    self.emit_result_message(
+                                        assistant_message_id,
+                                        &result,
+                                        None,
+                                        Some(call.id.clone()),
+                                    )
+                                    .await?
+                                    .await
+                                    .map_err(|_| {
+                                        WorkerFailure::Error(
+                                            "tool result receipt dropped".to_owned(),
+                                        )
+                                    })?,
+                                );
+                                results.push(result);
+                                transcript.push(result_message);
+                            }
                         }
-                        ApprovalWaitOutcome::Cancelled => {
-                            self.emit(AgentEvent::ApprovalResolved {
-                                request_id: request.id.clone(),
-                                resolution: crate::agent::events::ApprovalResolution::Cancelled,
-                            })
-                            .await?;
-                            cancel_reason = Some("Tool execution cancelled".to_owned());
-                            let result = error_tool_result(call, "Tool execution cancelled");
-                            let result_message = PublicMessage::ToolResult(result.clone());
-                            receipts.push(
-                                self.emit_result_message(
-                                    assistant_message_id,
-                                    &result,
-                                    None,
-                                    Some(call.id.clone()),
-                                )
-                                .await?
-                                .await
-                                .map_err(|_| {
-                                    WorkerFailure::Error("tool result receipt dropped".to_owned())
-                                })?,
-                            );
-                            results.push(result);
-                            transcript.push(result_message);
-                        }
+                        self.phase.send(WorkerPhase::Active).ok();
                     }
-                    self.phase.send(WorkerPhase::Active).ok();
                 }
+                break 'authorize;
             }
             self.receive_control_safe_point().await?;
             if self.abort_requested || !self.in_flight_controls.is_empty() {
@@ -1348,7 +1384,7 @@ impl Runner {
         let Some(broker) = self.core.approval.clone() else {
             #[cfg(test)]
             if self.core.fixture_bypass_approval {
-                return Ok(CallDisposition::Allowed);
+                return Ok(CallDisposition::Allowed { grant: None });
             }
             return Err(WorkerFailure::Error(
                 "tool execution requires a configured ApprovalBroker".to_owned(),
@@ -1415,7 +1451,7 @@ impl Runner {
             }
         };
         Ok(match outcome {
-            ApprovalOutcome::Allowed => CallDisposition::Allowed,
+            ApprovalOutcome::Allowed { grant } => CallDisposition::Allowed { grant: Some(grant) },
             ApprovalOutcome::Denied { reason, .. } => CallDisposition::Denied {
                 reason,
                 approval_denied: true,
@@ -1709,6 +1745,7 @@ impl Runner {
     async fn emit_tool_start_and_wait_committed(
         &mut self,
         call: &ToolCall,
+        grant: Option<ExecutableGrant>,
     ) -> Result<ToolStartOutcome, WorkerFailure> {
         // Observe any controls that arrived before we durably start the tool.
         self.receive_control_safe_point().await?;
@@ -1722,7 +1759,10 @@ impl Runner {
         let binding = self.core.durable_binding.clone().ok_or_else(|| {
             WorkerFailure::Error("RunCore has no durable worker binding".to_owned())
         })?;
-        let (commit_barrier, mut committed) = ToolStartCommitBarrier::channel();
+        let (commit_barrier, mut committed) = match grant {
+            Some(grant) => ToolStartCommitBarrier::channel_with_grant(grant),
+            None => ToolStartCommitBarrier::channel(),
+        };
         self.events
             .send(RunOutput {
                 binding,
@@ -1744,10 +1784,13 @@ impl Runner {
         tokio::select! {
             biased;
             result = &mut committed => {
-                result.map_err(|_| {
+                let result = result.map_err(|_| {
                     WorkerFailure::Error("ToolExecutionStart durability commit failed".to_owned())
                 })?;
-                Ok(ToolStartOutcome::Started)
+                Ok(match result {
+                    ToolStartCommitResult::Committed => ToolStartOutcome::Started,
+                    ToolStartCommitResult::Reauthorize => ToolStartOutcome::Reauthorize,
+                })
             }
             control = self.controls.recv() => {
                 let Some(control) = control else {
@@ -1755,6 +1798,7 @@ impl Runner {
                 };
                 match self.apply_pre_start_control(control, &mut committed).await? {
                     ToolStartOutcome::Started => Ok(ToolStartOutcome::Started),
+                    ToolStartOutcome::Reauthorize => Ok(ToolStartOutcome::Reauthorize),
                     ToolStartOutcome::Preempted => {
                         // Drain any additional controls that arrived while we were
                         // authorizing the first one.
@@ -1984,7 +2028,7 @@ impl Runner {
     async fn apply_pre_start_control(
         &mut self,
         control: RunControl,
-        committed: &mut oneshot::Receiver<()>,
+        committed: &mut oneshot::Receiver<ToolStartCommitResult>,
     ) -> Result<ToolStartOutcome, WorkerFailure> {
         match control {
             RunControl::Command(command) => {
@@ -2023,9 +2067,20 @@ impl Runner {
                 tokio::select! {
                     biased;
                     result = &mut *committed => {
-                        result.map_err(|_| {
+                        let result = result.map_err(|_| {
                             WorkerFailure::Error("ToolExecutionStart durability commit failed".to_owned())
                         })?;
+                        if result == ToolStartCommitResult::Reauthorize {
+                            if (&mut control_committed).await.is_ok() {
+                                return Ok(ToolStartOutcome::Preempted);
+                            }
+                            let released = self
+                                .in_flight_controls
+                                .pop()
+                                .expect("pre-start steer remains claimed until authorization");
+                            debug_assert_eq!(released.envelope().command_id, command_id);
+                            return Ok(ToolStartOutcome::Reauthorize);
+                        }
                         if (&mut control_committed).await.is_err() {
                             let released = self
                                 .in_flight_controls
@@ -2050,12 +2105,17 @@ impl Runner {
                                 released.envelope().command_id,
                                 command_id
                             );
-                            (&mut *committed).await.map_err(|_| {
+                            let result = (&mut *committed).await.map_err(|_| {
                                 WorkerFailure::Error(
                                     "ToolExecutionStart durability commit failed".to_owned(),
                                 )
                             })?;
-                            Ok(ToolStartOutcome::Started)
+                            Ok(match result {
+                                ToolStartCommitResult::Committed => ToolStartOutcome::Started,
+                                ToolStartCommitResult::Reauthorize => {
+                                    ToolStartOutcome::Reauthorize
+                                }
+                            })
                         }
                     }
                 }
@@ -2073,9 +2133,16 @@ impl Runner {
                 tokio::select! {
                     biased;
                     result = &mut *committed => {
-                        result.map_err(|_| {
+                        let result = result.map_err(|_| {
                             WorkerFailure::Error("ToolExecutionStart durability commit failed".to_owned())
                         })?;
+                        if result == ToolStartCommitResult::Reauthorize {
+                            if (&mut control_committed).await.is_ok() {
+                                self.abort_requested = true;
+                                return Ok(ToolStartOutcome::Preempted);
+                            }
+                            return Ok(ToolStartOutcome::Reauthorize);
+                        }
                         if (&mut control_committed).await.is_ok() {
                             self.abort_requested = true;
                         }
@@ -2087,12 +2154,17 @@ impl Runner {
                             self.abort_requested = true;
                             Ok(ToolStartOutcome::Preempted)
                         } else {
-                            (&mut *committed).await.map_err(|_| {
+                            let result = (&mut *committed).await.map_err(|_| {
                                 WorkerFailure::Error(
                                     "ToolExecutionStart durability commit failed".to_owned(),
                                 )
                             })?;
-                            Ok(ToolStartOutcome::Started)
+                            Ok(match result {
+                                ToolStartCommitResult::Committed => ToolStartOutcome::Started,
+                                ToolStartCommitResult::Reauthorize => {
+                                    ToolStartOutcome::Reauthorize
+                                }
+                            })
                         }
                     }
                 }

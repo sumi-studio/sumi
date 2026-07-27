@@ -6,6 +6,7 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::{
+    approval::{ExecutableGrant, GrantRevalidation},
     gateway::{ApprovalDecision, Command, CommandAck},
     provider::types::{PublicAssistantContent, PublicMessage, StopReason, ToolResultMessage},
     runtime::contracts::ProcessGeneration,
@@ -123,16 +124,62 @@ impl MessageCommitBarrier {
     }
 }
 
-pub(crate) struct ToolStartCommitBarrier(oneshot::Sender<()>);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolStartCommitResult {
+    Committed,
+    Reauthorize,
+}
+
+pub(crate) struct ToolStartCommitBarrier {
+    sender: oneshot::Sender<ToolStartCommitResult>,
+    grant: Option<ExecutableGrant>,
+}
 
 impl ToolStartCommitBarrier {
-    pub(crate) fn channel() -> (Self, oneshot::Receiver<()>) {
+    pub(crate) fn channel() -> (Self, oneshot::Receiver<ToolStartCommitResult>) {
         let (sender, receiver) = oneshot::channel();
-        (Self(sender), receiver)
+        (
+            Self {
+                sender,
+                grant: None,
+            },
+            receiver,
+        )
+    }
+
+    pub(crate) fn channel_with_grant(
+        grant: ExecutableGrant,
+    ) -> (Self, oneshot::Receiver<ToolStartCommitResult>) {
+        let (sender, receiver) = oneshot::channel();
+        (
+            Self {
+                sender,
+                grant: Some(grant),
+            },
+            receiver,
+        )
+    }
+
+    fn revalidate_grant(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        args: &Value,
+        run_id: &str,
+        turn_id: &str,
+    ) -> Result<GrantRevalidation> {
+        match self.grant.as_ref() {
+            Some(grant) => grant.revalidate(tool_call_id, tool_name, args, run_id, turn_id),
+            None => Ok(GrantRevalidation::Valid),
+        }
     }
 
     pub(super) fn committed(self) {
-        let _ = self.0.send(());
+        let _ = self.sender.send(ToolStartCommitResult::Committed);
+    }
+
+    fn reauthorize(self) {
+        let _ = self.sender.send(ToolStartCommitResult::Reauthorize);
     }
 }
 
@@ -638,7 +685,7 @@ impl DurableBridge {
     pub(super) async fn commit(
         &mut self,
         writer: &EventWriter,
-        output: RunOutput,
+        mut output: RunOutput,
     ) -> Result<CommittedRunOutput> {
         let has_barrier = output.commit_barrier.is_some();
         let is_tool_start = matches!(output.event, AgentEvent::ToolExecutionStart { .. });
@@ -917,6 +964,33 @@ impl DurableBridge {
                             ),
                         });
                     }
+                }
+                let grant_status = output
+                    .commit_barrier
+                    .as_ref()
+                    .expect("ToolExecutionStart barrier checked")
+                    .revalidate_grant(
+                        &tool_call_id,
+                        &tool_name,
+                        &args,
+                        &self.binding.run_id,
+                        &self.binding.turn_id,
+                    )?;
+                if grant_status == GrantRevalidation::Reauthorize {
+                    output
+                        .commit_barrier
+                        .take()
+                        .expect("ToolExecutionStart barrier checked")
+                        .reauthorize();
+                    return Ok(CommittedRunOutput {
+                        outputs: Vec::new(),
+                        tool_start_barrier: None,
+                        message_receipts: Vec::new(),
+                        retry_wait_commit_barrier: None,
+                        terminal_command_ids: std::mem::take(
+                            &mut self.committed_terminal_command_ids,
+                        ),
+                    });
                 }
                 self.pending_tool_end
                     .insert(tool_call_id.clone(), (Value::Null, false));
