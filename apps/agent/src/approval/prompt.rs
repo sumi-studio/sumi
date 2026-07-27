@@ -231,8 +231,8 @@ fn build_transcript_entries(
                             let summary = tool_call_summary(tool_call, projector)?;
                             entries.push(entry_for(
                                 summary,
-                                ReviewerRole::Assistant,
-                                false,
+                                ReviewerRole::ToolEvidence,
+                                true,
                                 limits,
                             )?);
                         }
@@ -243,8 +243,8 @@ fn build_transcript_entries(
                             );
                             entries.push(entry_for(
                                 summary,
-                                ReviewerRole::Assistant,
-                                false,
+                                ReviewerRole::ToolEvidence,
+                                true,
                                 limits,
                             )?);
                         }
@@ -427,8 +427,9 @@ mod tests {
             SecretDigestKey,
         },
         provider::types::{
-            ApiProtocol, ProviderOrigin, PublicAssistantMessage, StopReason, ToolCall,
-            ToolResultMessage, Usage, UserMessage, ValidatedToolArguments,
+            ApiProtocol, ProviderOrigin, PublicAssistantMessage, RejectedToolCall, StopReason,
+            ToolArgumentError, ToolCall, ToolResultMessage, Usage, UserMessage,
+            ValidatedToolArguments,
         },
         store::Redactor,
     };
@@ -521,6 +522,17 @@ mod tests {
                 arguments: args,
             },
             wire_item_index: 0,
+        }
+    }
+
+    fn rejected_tool_call(name: &str) -> PublicAssistantContent {
+        PublicAssistantContent::RejectedToolCall {
+            rejected: RejectedToolCall {
+                id: "rejected-call-1".to_owned(),
+                name: name.to_owned(),
+                error: ToolArgumentError::SchemaViolation,
+            },
+            wire_item_index: 1,
         }
     }
 
@@ -672,6 +684,88 @@ mod tests {
             .map(|m| estimate_text_tokens(&m.content).unwrap_or(0))
             .sum();
         assert!(transcript_tokens <= limits.total_token_budget);
+    }
+
+    #[test]
+    fn zero_tool_evidence_budget_excludes_tool_calls_and_rejected_tool_calls() {
+        let transcript = vec![
+            user_message("inspect the workspace"),
+            assistant_message(vec![
+                PublicAssistantContent::Text {
+                    text: "general assistant context remains".to_owned(),
+                    wire_item_index: 0,
+                },
+                bash_tool_call("echo tool-call-evidence"),
+                rejected_tool_call("rejected-evidence"),
+            ]),
+        ];
+        let limits = PromptLimits {
+            total_token_budget: 1_000,
+            tool_evidence_token_budget: 0,
+            per_entry_max_tokens: 1_000,
+            recent_non_user_max: 40,
+        };
+
+        let prompt = build(&transcript, &reviewable_projection(), &limits);
+        let content = all_content(&prompt);
+        assert!(content.contains("general assistant context remains"));
+        assert!(!content.contains("tool-call-evidence"));
+        assert!(!content.contains("rejected-evidence"));
+        assert!(
+            prompt
+                .messages
+                .iter()
+                .all(|message| message.role != ReviewerRole::ToolEvidence),
+            "zero tool-evidence budget must exclude every tool-evidence variant"
+        );
+    }
+
+    #[test]
+    fn small_tool_evidence_budget_is_shared_by_tool_calls_and_rejected_tool_calls() {
+        let rejected_summary = format!(
+            "rejected_tool_call {}: {:?}",
+            "rejected-evidence",
+            ToolArgumentError::SchemaViolation
+        );
+        let evidence_budget =
+            estimate_text_tokens(&rejected_summary).expect("rejected summary estimate");
+        let transcript = vec![
+            user_message("inspect the workspace"),
+            assistant_message(vec![
+                PublicAssistantContent::Text {
+                    text: "general assistant context remains".to_owned(),
+                    wire_item_index: 0,
+                },
+                bash_tool_call("echo tool-call-evidence"),
+                rejected_tool_call("rejected-evidence"),
+            ]),
+        ];
+        let limits = PromptLimits {
+            total_token_budget: 1_000,
+            tool_evidence_token_budget: evidence_budget,
+            per_entry_max_tokens: 1_000,
+            recent_non_user_max: 40,
+        };
+
+        let prompt = build(&transcript, &reviewable_projection(), &limits);
+        let content = all_content(&prompt);
+        let tool_evidence_tokens: u64 = prompt
+            .messages
+            .iter()
+            .filter(|message| message.role == ReviewerRole::ToolEvidence)
+            .map(|message| estimate_text_tokens(&message.content).unwrap_or(u64::MAX))
+            .sum();
+        assert!(content.contains("general assistant context remains"));
+        assert!(content.contains("rejected-evidence"));
+        assert!(
+            !content.contains("tool-call-evidence"),
+            "the earlier tool call must not consume the general transcript budget after the shared tool-evidence budget is exhausted"
+        );
+        assert!(
+            tool_evidence_tokens <= limits.tool_evidence_token_budget,
+            "tool evidence used {tool_evidence_tokens} tokens with budget {}",
+            limits.tool_evidence_token_budget
+        );
     }
 
     #[test]

@@ -4582,12 +4582,12 @@ async fn multi_tool_batch_reviewer_sees_current_call_and_prior_finalized_result(
         "same projection with advancing context/cache version must call reviewer twice"
     );
 
-    fn assistant_tool_call_count(prompt: &ReviewerPrompt) -> usize {
+    fn tool_call_evidence_count(prompt: &ReviewerPrompt) -> usize {
         prompt
             .messages
             .iter()
             .filter(|m| {
-                matches!(m.role, ReviewerRole::Assistant) && m.content.contains("tool_call")
+                matches!(m.role, ReviewerRole::ToolEvidence) && m.content.contains("tool_call")
             })
             .count()
     }
@@ -4602,7 +4602,7 @@ async fn multi_tool_batch_reviewer_sees_current_call_and_prior_finalized_result(
     }
 
     assert_eq!(
-        assistant_tool_call_count(&prompts[0]),
+        tool_call_evidence_count(&prompts[0]),
         2,
         "first review must see both tool calls from the committed assistant message"
     );
@@ -4612,7 +4612,7 @@ async fn multi_tool_batch_reviewer_sees_current_call_and_prior_finalized_result(
         "first review must not see uncommitted tool results"
     );
     assert_eq!(
-        assistant_tool_call_count(&prompts[1]),
+        tool_call_evidence_count(&prompts[1]),
         2,
         "second review must still see the current committed assistant tool-call message"
     );
