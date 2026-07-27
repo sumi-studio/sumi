@@ -460,9 +460,11 @@ impl SupervisorHandle {
 impl Drop for SupervisorHandle {
     fn drop(&mut self) {
         self.cancel.cancel();
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
+        // Dropping a JoinHandle detaches the task. Keep the cancelled
+        // supervisor alive long enough to join both connection halves and
+        // invalidate the installed T17 delivery epoch. Aborting this task here
+        // would cancel the cleanup future and leave the dead epoch mapped.
+        self.task.take();
     }
 }
 
@@ -859,28 +861,29 @@ where
             }
         };
 
-        if let Some(runtime) = delivery_runtime {
+        let delivery_join_error = if let Some(runtime) = delivery_runtime {
             match runtime.join().await {
-                Ok(()) => {}
-                Err(join_err) if join_err.is_panic() => {
-                    return Err(SupervisorError::Fatal(anyhow!(
-                        "delivery epoch task panicked: {join_err}"
-                    )));
-                }
-                Err(join_err) if !join_err.is_cancelled() => {
-                    return Err(SupervisorError::Fatal(anyhow!(
-                        "delivery epoch task join error: {join_err}"
-                    )));
-                }
-                Err(_) => {}
+                Ok(()) => None,
+                Err(join_err) if join_err.is_panic() => Some(SupervisorError::Fatal(anyhow!(
+                    "delivery epoch task panicked: {join_err}"
+                ))),
+                Err(join_err) if !join_err.is_cancelled() => Some(SupervisorError::Fatal(anyhow!(
+                    "delivery epoch task join error: {join_err}"
+                ))),
+                Err(_) => None,
             }
-        }
+        } else {
+            None
+        };
 
         if let Err(error) = source.invalidate_delivery_epoch(delivery_epoch).await {
             return Err(SupervisorError::Fatal(error.context(format!(
                 "failed to invalidate T17 delivery epoch {}",
                 delivery_epoch.as_u64()
             ))));
+        }
+        if let Some(error) = delivery_join_error {
+            return Err(error);
         }
 
         if let Err(SupervisorError::EstablishedReconnect { .. }) = &result {
@@ -1989,14 +1992,6 @@ mod tests {
     }
 
     struct TestDigest(Sha256);
-
-    struct DropFlag(Arc<AtomicBool>);
-
-    impl Drop for DropFlag {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::SeqCst);
-        }
-    }
 
     impl crate::gateway::IncrementalCommandDigest for TestDigest {
         fn update(&mut self, data: &[u8]) {
@@ -3113,44 +3108,6 @@ mod tests {
         .expect_err("maximum command sequence must exhaust the cursor");
         assert!(error.is::<DurableReplayInvariantError>());
         assert_eq!(inbound_command_seq(&rx.recv().await.unwrap()), u64::MAX);
-    }
-
-    #[tokio::test]
-    async fn dropping_supervisor_handle_cancels_and_aborts_task() {
-        let (_commands_tx, commands) = mpsc::channel(1);
-        let (events, _events_rx) = mpsc::channel::<(DeliveryEpoch, bool, OutboundFrame)>(1);
-        let (_epochs_tx, epochs) = watch::channel(None);
-        let (_online_tx, online) = watch::channel(false);
-        let cancel = CancellationToken::new();
-        let observed_cancel = cancel.clone();
-        let task_dropped = Arc::new(AtomicBool::new(false));
-        let drop_flag = DropFlag(task_dropped.clone());
-        let task = tokio::spawn(async move {
-            let _drop_flag = drop_flag;
-            std::future::pending::<Result<()>>().await
-        });
-        tokio::task::yield_now().await;
-
-        drop(SupervisorHandle {
-            commands,
-            events: EventSender {
-                tx: events,
-                online: online.clone(),
-            },
-            epochs,
-            online,
-            cancel,
-            task: Some(task),
-        });
-
-        assert!(observed_cancel.is_cancelled());
-        tokio::time::timeout(Duration::from_millis(200), async {
-            while !task_dropped.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("aborted supervisor task must be dropped");
     }
 
     #[tokio::test]
@@ -6412,6 +6369,11 @@ mod tests {
             Some(epoch2),
             "old T17 DeliveryPump epoch must be invalidated before replacement"
         );
+        assert_eq!(
+            adapter.delivery_epoch_lifecycle_counts(),
+            (2, 1),
+            "replacement must install once after invalidating the old epoch once"
+        );
 
         assert!(
             tokio::time::timeout(Duration::from_millis(50), handle.commands.recv())
@@ -6466,6 +6428,69 @@ mod tests {
             None,
             "final supervisor shutdown must invalidate the T17 DeliveryPump epoch"
         );
+        assert_eq!(
+            adapter.delivery_epoch_lifecycle_counts(),
+            (2, 2),
+            "each Store-backed epoch must be installed and invalidated exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_active_handle_finishes_t17_epoch_cleanup_with_or_without_prior_abort() {
+        async fn assert_cleanup(abort_before_drop: bool) {
+            let store_name = if abort_before_drop {
+                "t17-t24-abort-without-join-cleanup"
+            } else {
+                "t17-t24-handle-drop-cleanup"
+            };
+            let store = Arc::new(Store::session_test_store(store_name).await.unwrap());
+            let adapter = seams::T17StoreAdapter::new(store);
+            let connector = MockConnector::new(
+                Arc::new(Mutex::new(Vec::new())),
+                VecDeque::from([Ok(MockGateway::new(VecDeque::new()))]),
+            );
+            let supervisor = ConnectionSupervisor::new(
+                connector,
+                CountingCredentialProvider::new("token"),
+                adapter.clone(),
+                StaticHydrationLatch(HydrationReady {
+                    generation: ProcessGeneration::from_wire(7).unwrap(),
+                    receipt_identity: "handle-drop-ready".to_owned(),
+                }),
+                make_config(),
+            );
+            let handle = supervisor.start();
+
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while adapter.active_delivery_epoch().await.is_none() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("real T17 delivery epoch must be installed before handle drop");
+            assert_eq!(adapter.delivery_epoch_lifecycle_counts(), (1, 0));
+
+            if abort_before_drop {
+                handle.abort();
+            }
+            drop(handle);
+
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while adapter.active_delivery_epoch().await.is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("detached supervisor cleanup must invalidate the dropped handle's epoch");
+            assert_eq!(
+                adapter.delivery_epoch_lifecycle_counts(),
+                (1, 1),
+                "handle drop must install and invalidate the real T17 epoch exactly once"
+            );
+        }
+
+        assert_cleanup(false).await;
+        assert_cleanup(true).await;
     }
 
     #[tokio::test]

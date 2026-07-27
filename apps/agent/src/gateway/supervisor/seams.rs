@@ -1,6 +1,8 @@
 //! Store/runtime adapters for the T17 and T26 integration boundaries.
 
 use std::fmt;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -93,6 +95,10 @@ pub struct T17StoreAdapter {
     pump: Arc<tokio::sync::Mutex<Option<DeliveryPump>>>,
     #[cfg(test)]
     replay_page_lengths: Arc<Mutex<Vec<usize>>>,
+    #[cfg(test)]
+    delivery_epoch_installs: Arc<AtomicU64>,
+    #[cfg(test)]
+    delivery_epoch_invalidations: Arc<AtomicU64>,
 }
 
 impl fmt::Debug for T17StoreAdapter {
@@ -111,6 +117,10 @@ impl T17StoreAdapter {
             pump: Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(test)]
             replay_page_lengths: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            delivery_epoch_installs: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            delivery_epoch_invalidations: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -249,6 +259,14 @@ impl T17StoreAdapter {
     pub(crate) fn replay_page_lengths(&self) -> Vec<usize> {
         self.replay_page_lengths.lock().unwrap().clone()
     }
+
+    #[cfg(test)]
+    pub(crate) fn delivery_epoch_lifecycle_counts(&self) -> (u64, u64) {
+        (
+            self.delivery_epoch_installs.load(Ordering::SeqCst),
+            self.delivery_epoch_invalidations.load(Ordering::SeqCst),
+        )
+    }
 }
 
 async fn projected_events_after(
@@ -380,6 +398,8 @@ impl DurableSource for T17StoreAdapter {
         sink: EventSender,
         cancel: CancellationToken,
     ) -> Result<Option<DeliveryEpochRuntime>> {
+        #[cfg(test)]
+        self.delivery_epoch_installs.fetch_add(1, Ordering::SeqCst);
         let authorization = self
             .authorization
             .context("delivery epoch installed before authenticated authorization was bound")?;
@@ -404,6 +424,9 @@ impl DurableSource for T17StoreAdapter {
     }
 
     async fn invalidate_delivery_epoch(&self, epoch: DeliveryEpoch) -> Result<()> {
+        #[cfg(test)]
+        self.delivery_epoch_invalidations
+            .fetch_add(1, Ordering::SeqCst);
         let mut slot = self.pump.lock().await;
         let Some(pump) = slot.as_mut() else {
             return Ok(());
