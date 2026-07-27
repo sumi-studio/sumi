@@ -1,18 +1,9 @@
--- Add durable approval_rules and expand tool_executions error_code vocabulary
--- to cover approval_denied / approval_cancelled cleanup, preserving all
--- existing rows and constraints.
+-- Migration 0005 creates durable approval_rules. Migration 0006 expands the
+-- tool_executions error_code vocabulary for approval_denied /
+-- approval_cancelled cleanup while preserving all existing rows and constraints.
 PRAGMA foreign_keys = OFF;
 
-CREATE TABLE approval_rules (
-  id TEXT NOT NULL PRIMARY KEY,
-  tool TEXT NOT NULL,
-  pattern TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
-
-ALTER TABLE tool_executions RENAME TO tool_executions_old;
-
-CREATE TABLE tool_executions (
+CREATE TABLE new_tool_executions (
   tool_call_id TEXT NOT NULL PRIMARY KEY,
   command_id TEXT NOT NULL,
   run_id TEXT NOT NULL,
@@ -55,14 +46,17 @@ CREATE TABLE tool_executions (
   )
 );
 
-INSERT INTO tool_executions(
+INSERT INTO new_tool_executions(
   tool_call_id, command_id, run_id, executor_generation, state,
   idempotency_key, started_at, finished_at, error_code
 ) SELECT
   tool_call_id, command_id, run_id, executor_generation, state,
   idempotency_key, started_at, finished_at, error_code
-FROM tool_executions_old;
+FROM tool_executions;
 
-DROP TABLE tool_executions_old;
+DROP TABLE tool_executions;
+ALTER TABLE new_tool_executions RENAME TO tool_executions;
+CREATE UNIQUE INDEX tool_executions_attestation
+ON tool_executions(tool_call_id, command_id, run_id, executor_generation);
 
 PRAGMA foreign_keys = ON;

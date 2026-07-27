@@ -617,7 +617,7 @@ mod tests {
             "url credential leaked"
         );
         assert!(
-            content.contains("url_credential"),
+            content.contains("url_with_credentials"),
             "url credential not marked"
         );
     }

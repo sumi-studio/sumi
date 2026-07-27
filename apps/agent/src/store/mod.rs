@@ -3412,7 +3412,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_0003_creates_approval_rules_and_expands_tool_error_codes() {
+    async fn migration_0006_creates_approval_rules_and_expands_tool_error_codes() {
         let store = store().await;
 
         sqlx::raw_sql(
@@ -3649,7 +3649,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_0003_upgrades_from_0001_and_0002_without_data_loss() {
+    async fn migration_0006_upgrades_from_0001_and_0002_without_data_loss() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -3726,7 +3726,10 @@ mod tests {
             .expect("record applied migration");
         }
 
-        MIGRATOR.run(&pool).await.expect("apply 0003 upgrade");
+        MIGRATOR
+            .run(&pool)
+            .await
+            .expect("apply migrations 0003 through 0006");
 
         let applied: Vec<i64> = sqlx::query_scalar(
             "SELECT version FROM _sqlx_migrations WHERE success = TRUE ORDER BY version",
@@ -3734,7 +3737,7 @@ mod tests {
         .fetch_all(&pool)
         .await
         .expect("list applied migrations");
-        assert_eq!(applied, vec![1, 2, 3]);
+        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6]);
 
         let table_sql: String = sqlx::query_scalar(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='approval_rules'",

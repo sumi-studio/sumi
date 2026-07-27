@@ -1216,6 +1216,8 @@ impl<G: Gateway + 'static> Session<G> {
                     role: "tool_result",
                     message: tool_result,
                     append_to_l0: true,
+                    provider_context: Vec::new(),
+                    eviction_footprint_tokens: 0,
                 }],
             });
             writes.push(EventWrite {
