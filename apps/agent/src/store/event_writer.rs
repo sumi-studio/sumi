@@ -41,7 +41,8 @@ use super::{
         verify_event_head,
     },
     memory_state::{
-        MemoryApplyCursorRecord, MemoryBatchState, MemoryBatchSummary, MemoryJobResult,
+        MemoryApplyCursorRecord, MemoryBatchMessageRecord, MemoryBatchRecord, MemoryBatchState,
+        MemoryBatchSummary, MemoryJobResult, MemoryLayer,
     },
     physical_recovery::{ApplyReceiptOutcome, PhysicalRecoveryApplier, PhysicalRecoveryReceipt},
     provider_context::{
@@ -1047,6 +1048,9 @@ enum PreparedProjection {
         provider_context_key_ref: Option<String>,
         provider_context_key_proof: Option<Vec<u8>>,
         eviction_footprint_tokens: u64,
+        create_l0_batch: Option<MemoryBatchRecord>,
+        l0_batch_id: Option<String>,
+        l0_batch_message_ord: Option<i64>,
     },
     CommandInsert {
         seq: u64,
@@ -2320,6 +2324,8 @@ impl EventWriter {
         };
 
         let mut next_seq = first_seq;
+        let mut pending_l0_batch: Option<String> = None;
+        let mut pending_l0_message_ord = 0i64;
         let mut prepared = Vec::with_capacity(batch.writes.len());
         let mut transaction_bytes = 0usize;
         let mut event_seqs = Vec::new();
@@ -2487,6 +2493,35 @@ impl EventWriter {
                                 .and_then(|bytes| bytes.checked_add(DURABLE_ROW_OVERHEAD_BYTES))
                                 .ok_or_else(|| anyhow!("message projection byte count overflow"))?,
                         )?;
+                        let (create_l0_batch, l0_batch_id, l0_batch_message_ord) = self
+                            .prepare_l0_batch_membership(
+                                &mut pending_l0_batch,
+                                &mut pending_l0_message_ord,
+                                l0_disposition,
+                            )
+                            .await?;
+                        if let Some(record) = &create_l0_batch {
+                            charge_transaction_bytes(
+                                &mut transaction_bytes,
+                                record
+                                    .id
+                                    .len()
+                                    .checked_add(DURABLE_ROW_OVERHEAD_BYTES)
+                                    .ok_or_else(|| {
+                                        anyhow!("L0 batch record byte count overflow")
+                                    })?,
+                            )?;
+                        }
+                        if let Some(batch_id) = &l0_batch_id {
+                            charge_transaction_bytes(
+                                &mut transaction_bytes,
+                                batch_id
+                                    .len()
+                                    .checked_add(message_id.len())
+                                    .and_then(|bytes| bytes.checked_add(DURABLE_ROW_OVERHEAD_BYTES))
+                                    .ok_or_else(|| anyhow!("L0 membership byte count overflow"))?,
+                            )?;
+                        }
                         projections.push(PreparedProjection::MessageEnd {
                             event_seq,
                             message_id,
@@ -2509,6 +2544,9 @@ impl EventWriter {
                                 .map(|(r, _)| r.clone()),
                             provider_context_key_proof: provider_context_key.map(|(_, p)| p),
                             eviction_footprint_tokens,
+                            create_l0_batch,
+                            l0_batch_id,
+                            l0_batch_message_ord,
                         });
                     }
                     Projection::CommandReceived { envelope } => {
@@ -2813,6 +2851,87 @@ impl EventWriter {
             eviction_footprint_tokens,
             Some((key_ref, key_proof)),
         ))
+    }
+
+    async fn prepare_l0_batch_membership(
+        &self,
+        pending_l0_batch: &mut Option<String>,
+        pending_l0_message_ord: &mut i64,
+        disposition: L0Disposition,
+    ) -> Result<(Option<MemoryBatchRecord>, Option<String>, Option<i64>)> {
+        if disposition != L0Disposition::Append {
+            return Ok((None, None, None));
+        }
+
+        if let Some(batch_id) = pending_l0_batch.clone() {
+            let ord = pending_l0_message_ord
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("L0 message ordinal overflow"))?;
+            *pending_l0_message_ord = ord;
+            return Ok((None, Some(batch_id), Some(ord)));
+        }
+
+        let open_batch_id: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM memory_batches
+             WHERE layer = ? AND state = 'open'
+             ORDER BY batch_seq DESC
+             LIMIT 1",
+        )
+        .bind(MemoryLayer::L0.as_i64())
+        .fetch_optional(self.store.pool())
+        .await
+        .context("failed to locate open L0 batch")?;
+
+        if let Some(batch_id) = open_batch_id {
+            let max_ord: Option<i64> =
+                sqlx::query_scalar("SELECT MAX(ord) FROM memory_batch_messages WHERE batch_id = ?")
+                    .bind(&batch_id)
+                    .fetch_one(self.store.pool())
+                    .await
+                    .context("failed to compute L0 message ordinal")?;
+            let ord = max_ord
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("L0 message ordinal overflow"))?;
+            *pending_l0_batch = Some(batch_id.clone());
+            *pending_l0_message_ord = ord;
+            return Ok((None, Some(batch_id), Some(ord)));
+        }
+
+        let max_batch_seq: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(batch_seq) FROM memory_batches WHERE layer = ?")
+                .bind(MemoryLayer::L0.as_i64())
+                .fetch_one(self.store.pool())
+                .await
+                .context("failed to read latest L0 batch sequence")?;
+        let batch_seq = max_batch_seq
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("L0 batch sequence overflow"))?;
+        let max_batch_ord: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(ord) FROM memory_batches WHERE layer = ?")
+                .bind(MemoryLayer::L0.as_i64())
+                .fetch_one(self.store.pool())
+                .await
+                .context("failed to read latest L0 batch ordinal")?;
+        let batch_ord = max_batch_ord
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("L0 batch ordinal overflow"))?;
+        let batch_id = Uuid::now_v7().to_string();
+        let record = MemoryBatchRecord::new(
+            &batch_id,
+            MemoryLayer::L0,
+            batch_ord,
+            batch_seq,
+            MemoryBatchState::Open,
+            0,
+            0,
+        );
+
+        *pending_l0_batch = Some(batch_id.clone());
+        *pending_l0_message_ord = 1;
+        Ok((Some(record), Some(batch_id), Some(1)))
     }
 
     async fn prepare_memory_job_update(
@@ -8393,6 +8512,9 @@ async fn apply_projection(
             l0_disposition,
             provider_context,
             eviction_footprint_tokens,
+            create_l0_batch,
+            l0_batch_id,
+            l0_batch_message_ord,
             ..
         } => {
             if !matches!(role, "user" | "assistant" | "tool_result") {
@@ -8420,6 +8542,30 @@ async fn apply_projection(
             .execute(&mut **transaction)
             .await
             .context("failed to apply MessageEnd projection")?;
+
+            if l0_disposition == L0Disposition::Append {
+                let batch_id = l0_batch_id.as_ref().ok_or_else(|| {
+                    anyhow!("MessageEnd Append is missing a prepared L0 batch id")
+                })?;
+                let ord = l0_batch_message_ord.ok_or_else(|| {
+                    anyhow!("MessageEnd Append is missing a prepared L0 message ordinal")
+                })?;
+
+                if let Some(record) = create_l0_batch {
+                    record
+                        .insert(&mut **transaction)
+                        .await
+                        .context("failed to insert open L0 batch for MessageEnd")?;
+                }
+                MemoryBatchMessageRecord {
+                    batch_id: batch_id.clone(),
+                    message_id: message_id.clone(),
+                    ord,
+                }
+                .insert(&mut **transaction)
+                .await
+                .context("failed to insert L0 batch membership")?;
+            }
 
             for record in provider_context {
                 record
@@ -18163,6 +18309,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn message_end_append_creates_explicit_l0_membership() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000100";
+        let injected = classified_injection(&writer, 1, command_id, "ignored", "append me").await;
+
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "append me"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("apply appended user MessageEnd");
+
+        let membership: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_batch_messages")
+            .fetch_one(store.pool())
+            .await
+            .expect("count L0 memberships");
+        let open_batches: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memory_batches WHERE layer = 0 AND state = 'open'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("count open L0 batches");
+        assert_eq!(membership, 1);
+        assert_eq!(open_batches, 1);
+    }
+
+    #[tokio::test]
     async fn approval_projection_and_version_are_writer_generated() {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
@@ -21215,15 +21390,8 @@ mod tests {
             .await
             .expect("mint transcript key");
 
-        // Disable foreign keys on a dedicated connection before starting the
-        // transaction so we can seed a memory_batch_messages row referencing a
-        // message that will only be inserted by apply_projection.
         use sqlx::Connection as _;
         let mut conn = store.pool().acquire().await.expect("acquire connection");
-        sqlx::query("PRAGMA foreign_keys = OFF")
-            .execute(&mut *conn)
-            .await
-            .expect("disable FK check for setup");
         let mut transaction = conn.begin().await.expect("begin transaction");
 
         sqlx::query(
@@ -21239,13 +21407,6 @@ mod tests {
         .execute(&mut *transaction)
         .await
         .expect("seed batch at max footprint");
-
-        sqlx::query("INSERT INTO memory_batch_messages(batch_id, message_id, ord) VALUES(?, ?, 0)")
-            .bind("batch-1")
-            .bind("msg-1")
-            .execute(&mut *transaction)
-            .await
-            .expect("seed batch membership");
 
         let projection = PreparedProjection::MessageEnd {
             event_seq: 1,
@@ -21263,6 +21424,9 @@ mod tests {
             provider_context_key_ref: None,
             provider_context_key_proof: None,
             eviction_footprint_tokens: 1,
+            create_l0_batch: None,
+            l0_batch_id: Some("batch-1".to_owned()),
+            l0_batch_message_ord: Some(1),
         };
 
         let error = apply_projection(&store, &mut transaction, projection, &[], None)
@@ -21273,9 +21437,5 @@ mod tests {
             .rollback()
             .await
             .expect("rollback test fixture transaction");
-        sqlx::query("PRAGMA foreign_keys = ON")
-            .execute(&mut *conn)
-            .await
-            .expect("re-enable FK checks after fixture teardown");
     }
 }

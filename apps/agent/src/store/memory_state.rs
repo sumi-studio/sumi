@@ -18,7 +18,7 @@ pub(crate) enum MemoryLayer {
 }
 
 impl MemoryLayer {
-    fn as_i64(self) -> i64 {
+    pub(crate) fn as_i64(self) -> i64 {
         self as i64
     }
 
