@@ -1224,7 +1224,63 @@ impl TombstoneRepository for SqliteTombstoneRepository {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        net::TcpListener,
+        path::PathBuf,
+        process::{Child, Command},
+        time::Duration,
+    };
+
     use super::*;
+
+    struct GoApiProcess {
+        child: Child,
+        state_path: PathBuf,
+    }
+
+    impl Drop for GoApiProcess {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_file(&self.state_path);
+        }
+    }
+
+    async fn start_go_control_plane() -> (GoApiProcess, String) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let state =
+            std::env::temp_dir().join(format!("sumi-go-control-plane-{}.json", Uuid::now_v7()));
+        let child = Command::new("go")
+            .args(["run", "./cmd/server"])
+            .current_dir(root.join("apps/api"))
+            .env("PORT", port.to_string())
+            .env("SUMI_CONTROL_PLANE_STATE_PATH", &state)
+            .env("SUMI_CONTROL_PLANE_TENANT_ID", "tenant-a")
+            .env("SUMI_CONTROL_PLANE_AGENT_ID", "agent-a")
+            .env("SUMI_CONTROL_PLANE_RUNTIME_TOKEN", "runtime-token")
+            .spawn()
+            .expect("spawn Go control-plane server");
+        let process = GoApiProcess {
+            child,
+            state_path: state,
+        };
+        let base = format!("http://127.0.0.1:{port}/");
+        for _ in 0..100 {
+            if reqwest::get(format!("{base}health")).await.is_ok() {
+                return (process, base);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("Go control-plane server did not become ready");
+    }
 
     #[tokio::test]
     async fn sqlite_tombstone_state_machine_enforces_order_and_idempotence() {
@@ -1454,5 +1510,102 @@ mod tests {
         let repo = SqliteTombstoneRepository::open(&path).await.unwrap();
         let tombstone = repo.get(&id).await.unwrap();
         assert_eq!(tombstone.status, TombstoneStatus::LivePurged);
+    }
+
+    #[tokio::test]
+    async fn rust_http_repository_round_trips_against_go_authenticated_authority() {
+        let (_server, base) = start_go_control_plane().await;
+        let identity = ControlPlaneIdentity::new("tenant-a", "agent-a").unwrap();
+        let repository = HttpTombstoneRepository::new_for_test(
+            &base,
+            "runtime-token".to_owned(),
+            identity.clone(),
+        )
+        .unwrap();
+        let tombstone = repository
+            .request_conversation_reset(
+                "tenant-a",
+                "agent-a",
+                "old-conversation",
+                "new-conversation",
+                "command-1",
+                1,
+                "2030-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            repository
+                .find_by_command("tenant-a", "agent-a", "command-1")
+                .await
+                .unwrap(),
+            Some(tombstone.clone())
+        );
+        assert_eq!(repository.get(&tombstone.id).await.unwrap(), tombstone);
+
+        let wrong_bearer = HttpTombstoneRepository::new_for_test(
+            &base,
+            "wrong-token".to_owned(),
+            identity.clone(),
+        )
+        .unwrap();
+        assert!(
+            wrong_bearer
+                .list_for_agent("tenant-a", "agent-a")
+                .await
+                .is_err()
+        );
+        assert!(
+            repository
+                .list_for_agent("tenant-b", "agent-a")
+                .await
+                .is_err()
+        );
+
+        let raw = reqwest::Client::new();
+        let endpoint = format!("{base}internal/agent/tombstones");
+        let request = serde_json::json!({
+            "tenant_id": "tenant-b", "agent_id": "agent-b", "conversation_id": "old-b",
+            "replacement_conversation_id": "new-b", "command_id": "command-b", "command_seq": 1,
+            "scope": "conversation", "purge_after": "2030-01-01T00:00:00Z"
+        });
+        assert_eq!(
+            raw.post(&endpoint)
+                .bearer_auth("runtime-token")
+                .header("X-Sumi-Internal-Principal", "other-principal")
+                .json(&request)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            raw.post(&endpoint)
+                .bearer_auth("runtime-token")
+                .header("X-Sumi-Internal-Principal", "agent-runtime")
+                .json(&request)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let deletion = serde_json::json!({
+            "tenant_id": "tenant-a", "agent_id": "agent-a", "conversation_id": "",
+            "replacement_conversation_id": "", "command_id": "", "command_seq": null,
+            "scope": "agent", "purge_after": "2030-01-01T00:00:00Z"
+        });
+        assert_eq!(
+            raw.post(&endpoint)
+                .bearer_auth("runtime-token")
+                .header("X-Sumi-Internal-Principal", "agent-runtime")
+                .json(&deletion)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
     }
 }
