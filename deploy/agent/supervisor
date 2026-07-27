@@ -45,6 +45,9 @@ fi
 : "${SUMI_ARTIFACT_BROKER_SOCKET:=/run/sumi/broker.sock}"
 : "${SUMI_ISOLATION_MODE:=compose}"
 : "${SUMI_ALLOW_LOW_TRUST:=0}"
+: "${SUMI_T27_RECOVERY_REQUEST_DIR:=${SUMI_AGENT_RUNTIME_STATE_DIR}/t27-recovery-requests}"
+: "${SUMI_T27_SUPERVISOR_PROOF_DIR:=/var/lib/sumi-supervisor-proofs}"
+: "${SUMI_T27_HEARTBEAT_TIMEOUT_MS:=5000}"
 
 SUMI_BIN="${SUMI_BIN:-sumi-agent}"
 
@@ -105,12 +108,15 @@ allocate_identity() {
 }
 
 prepare_directories() {
-  mkdir -p "${SUMI_WORKSPACE}" "${SUMI_ARTIFACT_ROOT}" "$(dirname "${SUMI_EXECUTOR_SOCKET}")" "$(dirname "${SUMI_ARTIFACT_BROKER_SOCKET}")"
+  mkdir -p "${SUMI_WORKSPACE}" "${SUMI_ARTIFACT_ROOT}" "$(dirname "${SUMI_EXECUTOR_SOCKET}")" "$(dirname "${SUMI_ARTIFACT_BROKER_SOCKET}")" "${SUMI_T27_RECOVERY_REQUEST_DIR}" "${SUMI_T27_SUPERVISOR_PROOF_DIR}"
   rm -f "${SUMI_EXECUTOR_SOCKET}" "${SUMI_ARTIFACT_BROKER_SOCKET}"
   mkdir -p "${SUMI_STATE_DIR}" "${SUMI_AGENT_RUNTIME_STATE_DIR}"
   chmod 700 "${SUMI_STATE_DIR}" "${SUMI_AGENT_RUNTIME_STATE_DIR}" "${SUMI_WORKSPACE}" "${SUMI_ARTIFACT_ROOT}"
+  chmod 750 "${SUMI_T27_SUPERVISOR_PROOF_DIR}"
+  chmod 700 "${SUMI_T27_RECOVERY_REQUEST_DIR}"
   if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-    chown "${SUMI_RUNTIME_USER}:${SUMI_RUNTIME_GROUP}" "${SUMI_STATE_DIR}" "${SUMI_AGENT_RUNTIME_STATE_DIR}" "${SUMI_WORKSPACE}"
+    chown "${SUMI_RUNTIME_USER}:${SUMI_RUNTIME_GROUP}" "${SUMI_STATE_DIR}" "${SUMI_AGENT_RUNTIME_STATE_DIR}" "${SUMI_WORKSPACE}" "${SUMI_T27_RECOVERY_REQUEST_DIR}"
+    chown root:"${SUMI_RUNTIME_GROUP}" "${SUMI_T27_SUPERVISOR_PROOF_DIR}"
     chown "${SUMI_BROKER_USER}:${SUMI_BROKER_GROUP}" "${SUMI_ARTIFACT_ROOT}"
   fi
 }
@@ -126,7 +132,7 @@ wait_for_socket() {
   error "${label} did not bind ${socket}"
 }
 
-prepare_cgroup_base() {
+prepare_cgroup_bases() {
   local exports
   exports="$(
     env -i \
@@ -139,6 +145,62 @@ prepare_cgroup_base() {
   )" || error "cgroup base preparation failed"
   eval "${exports}"
   : "${SUMI_EXECUTOR_CGROUP_BASE:?cgroup preparation did not set SUMI_EXECUTOR_CGROUP_BASE}"
+  : "${SUMI_SERVICE_CGROUP_BASE:?cgroup preparation did not set SUMI_SERVICE_CGROUP_BASE}"
+}
+
+launch_in_service_cgroup() {
+  # The supervisor deliberately stays in its host cgroup. Only child roles
+  # enter the generation service leaf, so cgroup.kill cannot kill the process
+  # that must observe reap completion and allocate the next generation.
+  (
+    echo "${BASHPID}" > "${SUMI_SERVICE_CGROUP_BASE}/cgroup.procs" \
+      || exit 66
+    exec "$@"
+  ) &
+  LAST_CHILD_PID=$!
+}
+
+reap_current_generation() {
+  env -i \
+    "SUMI_TENANT_ID=${SUMI_TENANT_ID}" "SUMI_AGENT_ID=${SUMI_AGENT_ID}" "SUMI_CONVERSATION_ID=${SUMI_CONVERSATION_ID}" \
+    "SUMI_RPC_GENERATION=${SUMI_RPC_GENERATION}" "SUMI_PROCESS_GENERATION_LEASE_ID=${SUMI_PROCESS_GENERATION_LEASE_ID}" \
+    "SUMI_GENERATION_RECOVERY_FENCE_ID=${SUMI_GENERATION_RECOVERY_FENCE_ID}" PATH=/usr/bin:/bin \
+    "${SUMI_BIN}" --supervisor-reap-generation "${SUMI_EXECUTOR_CGROUP_BASE}" "${SUMI_SERVICE_CGROUP_BASE}" "${SUMI_T27_SUPERVISOR_PROOF_DIR}" \
+    || error "failed to kill/reap generation ${SUMI_RPC_GENERATION}"
+  for pid in "${RUNTIME_PID:-}" "${EXECUTOR_PID:-}" "${BROKER_PID:-}"; do
+    [[ -z "${pid}" ]] || wait "${pid}" 2>/dev/null || true
+  done
+}
+
+fulfill_recovery_requests() {
+  local request
+  shopt -s nullglob
+  for request in "${SUMI_T27_RECOVERY_REQUEST_DIR}"/*.t27request; do
+    env -i \
+      "SUMI_TENANT_ID=${SUMI_TENANT_ID}" "SUMI_AGENT_ID=${SUMI_AGENT_ID}" "SUMI_CONVERSATION_ID=${SUMI_CONVERSATION_ID}" \
+      "SUMI_RPC_GENERATION=${SUMI_RPC_GENERATION}" "SUMI_PROCESS_GENERATION_LEASE_ID=${SUMI_PROCESS_GENERATION_LEASE_ID}" \
+      "SUMI_GENERATION_RECOVERY_FENCE_ID=${SUMI_GENERATION_RECOVERY_FENCE_ID}" PATH=/usr/bin:/bin \
+      "${SUMI_BIN}" --supervisor-fulfill-recovery "${request}" "${SUMI_T27_SUPERVISOR_PROOF_DIR}" \
+      || error "failed to fulfill recovery request ${request}"
+    rm -f -- "${request}"
+  done
+  shopt -u nullglob
+}
+
+heartbeat_is_fresh() {
+  env -i PATH=/usr/bin:/bin \
+    "${SUMI_BIN}" --supervisor-heartbeat-check \
+      "${SUMI_AGENT_RUNTIME_STATE_DIR}" "${SUMI_AGENT_ID}" \
+      "${SUMI_RPC_GENERATION}" "${SUMI_PROCESS_GENERATION_LEASE_ID}" \
+      "${SUMI_GENERATION_RECOVERY_FENCE_ID}" "${SUMI_T27_HEARTBEAT_TIMEOUT_MS}"
+}
+
+wait_for_heartbeat() {
+  for _ in $(seq 1 50); do
+    heartbeat_is_fresh && return 0
+    sleep 0.1
+  done
+  return 1
 }
 
 recover_stale_generations() {
@@ -146,16 +208,13 @@ recover_stale_generations() {
     "PATH=/usr/bin:/bin" \
     "${SUMI_BIN}" --supervisor-recovery-scan "${SUMI_EXECUTOR_CGROUP_BASE}" "${SUMI_RPC_GENERATION}" >/dev/null \
     || error "stale generation cgroup recovery scan failed"
-  # Runtime/executor/artifact-broker processes are not inside command cgroups;
-  # scan the process table for stale Sumi services with the same deployment
-  # boundary and a different generation number.
+  # Services for a generation live in a separate leaf cgroup. Reap any stale
+  # service cgroup for a previous generation before spawning the new
+  # runtime/executor/broker pair.
   env -i \
-    "SUMI_TENANT_ID=${SUMI_TENANT_ID}" \
-    "SUMI_AGENT_ID=${SUMI_AGENT_ID}" \
-    "SUMI_CONVERSATION_ID=${SUMI_CONVERSATION_ID}" \
     "PATH=/usr/bin:/bin" \
-    "${SUMI_BIN}" --supervisor-kill-stale-processes "${SUMI_RPC_GENERATION}" >/dev/null \
-    || error "stale process recovery scan failed"
+    "${SUMI_BIN}" --supervisor-kill-stale-processes "${SUMI_SERVICE_CGROUP_BASE}" "${SUMI_RPC_GENERATION}" >/dev/null \
+    || error "stale service recovery scan failed"
 }
 
 spawn_broker() {
@@ -194,7 +253,7 @@ spawn_broker() {
         "${SUMI_BIN}" --artifact-broker &
       ;;
     low-trust)
-      env -i \
+      launch_in_service_cgroup env -i \
         "SUMI_RPC_GENERATION=${generation}" \
         "SUMI_RPC_NONCE=${nonce}" \
         "SUMI_TENANT_ID=${SUMI_TENANT_ID}" \
@@ -204,7 +263,8 @@ spawn_broker() {
         "SUMI_ARTIFACT_BROKER_SOCKET=${SUMI_ARTIFACT_BROKER_SOCKET}" \
         "HOME=${SUMI_ARTIFACT_ROOT}" \
         "PATH=/usr/bin:/bin" \
-        "${SUMI_BIN}" --artifact-broker &
+        "${SUMI_BIN}" --artifact-broker
+      BROKER_PID="${LAST_CHILD_PID}"
       ;;
   esac
 }
@@ -223,6 +283,7 @@ spawn_executor() {
         "SUMI_CONVERSATION_ID=${conversation}" \
         "SUMI_WORKSPACE=${SUMI_WORKSPACE}" \
         "SUMI_EXECUTOR_CGROUP_BASE=${SUMI_EXECUTOR_CGROUP_BASE}" \
+        "SUMI_SERVICE_CGROUP_BASE=${SUMI_SERVICE_CGROUP_BASE}" \
         "SUMI_ARTIFACT_BROKER_SOCKET=${SUMI_ARTIFACT_BROKER_SOCKET}" \
         "SUMI_EXECUTOR_SOCKET=${SUMI_EXECUTOR_SOCKET}" \
         "HOME=${SUMI_WORKSPACE}" \
@@ -239,6 +300,7 @@ spawn_executor() {
         "SUMI_CONVERSATION_ID=${conversation}" \
         "SUMI_WORKSPACE=${SUMI_WORKSPACE}" \
         "SUMI_EXECUTOR_CGROUP_BASE=${SUMI_EXECUTOR_CGROUP_BASE}" \
+        "SUMI_SERVICE_CGROUP_BASE=${SUMI_SERVICE_CGROUP_BASE}" \
         "SUMI_ARTIFACT_BROKER_SOCKET=${SUMI_ARTIFACT_BROKER_SOCKET}" \
         "SUMI_EXECUTOR_SOCKET=${SUMI_EXECUTOR_SOCKET}" \
         "HOME=${SUMI_WORKSPACE}" \
@@ -246,7 +308,7 @@ spawn_executor() {
         "${SUMI_BIN}" --tool-executor-socket &
       ;;
     low-trust)
-      env -i \
+      launch_in_service_cgroup env -i \
         "SUMI_RPC_GENERATION=${generation}" \
         "SUMI_RPC_NONCE=${nonce}" \
         "SUMI_TENANT_ID=${SUMI_TENANT_ID}" \
@@ -254,11 +316,13 @@ spawn_executor() {
         "SUMI_CONVERSATION_ID=${conversation}" \
         "SUMI_WORKSPACE=${SUMI_WORKSPACE}" \
         "SUMI_EXECUTOR_CGROUP_BASE=${SUMI_EXECUTOR_CGROUP_BASE}" \
+        "SUMI_SERVICE_CGROUP_BASE=${SUMI_SERVICE_CGROUP_BASE}" \
         "SUMI_ARTIFACT_BROKER_SOCKET=${SUMI_ARTIFACT_BROKER_SOCKET}" \
         "SUMI_EXECUTOR_SOCKET=${SUMI_EXECUTOR_SOCKET}" \
         "HOME=${SUMI_WORKSPACE}" \
         "PATH=/usr/bin:/bin" \
-        "${SUMI_BIN}" --tool-executor-socket &
+        "${SUMI_BIN}" --tool-executor-socket
+      EXECUTOR_PID="${LAST_CHILD_PID}"
       ;;
   esac
 }
@@ -282,6 +346,9 @@ spawn_runtime() {
     "SUMI_ARTIFACT_BROKER_SOCKET=${SUMI_ARTIFACT_BROKER_SOCKET}"
     "SUMI_EXECUTOR_SOCKET=${SUMI_EXECUTOR_SOCKET}"
     "SUMI_EXECUTOR_CGROUP_BASE=${SUMI_EXECUTOR_CGROUP_BASE}"
+    "SUMI_SERVICE_CGROUP_BASE=${SUMI_SERVICE_CGROUP_BASE}"
+    "SUMI_T27_RECOVERY_REQUEST_DIR=${SUMI_T27_RECOVERY_REQUEST_DIR}"
+    "SUMI_T27_SUPERVISOR_PROOF_DIR=${SUMI_T27_SUPERVISOR_PROOF_DIR}"
     "SUMI_AGENT_WRAPPING_KEY=${SUMI_AGENT_WRAPPING_KEY}"
     "SUMI_AGENT_WRAPPING_KEY_ID=${SUMI_AGENT_WRAPPING_KEY_ID:-env-wrapping-key/v1}"
     "HOME=${SUMI_STATE_DIR}"
@@ -314,10 +381,99 @@ spawn_runtime() {
         "${SUMI_BIN}" &
       ;;
     low-trust)
-      env -i "${runtime_env[@]}" \
-        "${SUMI_BIN}" &
+      launch_in_service_cgroup env -i "${runtime_env[@]}" \
+        "${SUMI_BIN}"
+      RUNTIME_PID="${LAST_CHILD_PID}"
       ;;
   esac
+}
+
+compose_cmd() {
+  docker compose --project-directory "${SUPERVISOR_DIR}" -f "${SUPERVISOR_DIR}/compose.yaml" "$@"
+}
+
+compose_load_generation() {
+  local exports
+  exports="$(compose_cmd run --rm --no-deps --entrypoint /bin/cat init /run/sumi/runtime/generation.env)" || error "failed to read Compose generation identity"
+  eval "${exports}"
+  : "${SUMI_RPC_GENERATION:?Compose init did not issue a generation}"
+  : "${SUMI_PROCESS_GENERATION_LEASE_ID:?Compose init did not issue a lease}"
+  : "${SUMI_GENERATION_RECOVERY_FENCE_ID:?Compose init did not issue a fence}"
+  exports="$(compose_cmd run --rm --no-deps --entrypoint /bin/cat init /run/sumi/runtime/cgroup.env)" || error "failed to read Compose cgroup boundary"
+  eval "${exports}"
+  : "${SUMI_EXECUTOR_CGROUP_BASE:?Compose init did not prepare executor cgroup}"
+  : "${SUMI_SERVICE_CGROUP_BASE:?Compose init did not prepare service cgroup}"
+}
+
+compose_reap_current_generation() {
+  # This helper is launched by the host Docker CLI with the host cgroup
+  # namespace and the supervisor-proof volume. Runtime/executor containers
+  # never receive authority to write the proof directory.
+  compose_cmd run --rm --no-deps \
+    -e "SUMI_RPC_GENERATION=${SUMI_RPC_GENERATION}" \
+    -e "SUMI_PROCESS_GENERATION_LEASE_ID=${SUMI_PROCESS_GENERATION_LEASE_ID}" \
+    -e "SUMI_GENERATION_RECOVERY_FENCE_ID=${SUMI_GENERATION_RECOVERY_FENCE_ID}" \
+    --entrypoint /usr/local/bin/sumi-agent init \
+    --supervisor-reap-generation "${SUMI_EXECUTOR_CGROUP_BASE}" "${SUMI_SERVICE_CGROUP_BASE}" /run/sumi/supervisor-proofs \
+    || error "Compose host helper failed to reap generation ${SUMI_RPC_GENERATION}"
+}
+
+compose_fulfill_recovery_requests() {
+  local request
+  local requests
+  requests="$(compose_cmd run --rm --no-deps --entrypoint /bin/sh init -c 'for f in /run/sumi/recovery-requests/*.t27request; do [ -e "$f" ] && printf "%s\\n" "$f"; done')" || error "failed to list Compose recovery requests"
+  while IFS= read -r request; do
+    [[ -z "${request}" ]] && continue
+    compose_cmd run --rm --no-deps \
+      -e "SUMI_RPC_GENERATION=${SUMI_RPC_GENERATION}" \
+      -e "SUMI_PROCESS_GENERATION_LEASE_ID=${SUMI_PROCESS_GENERATION_LEASE_ID}" \
+      -e "SUMI_GENERATION_RECOVERY_FENCE_ID=${SUMI_GENERATION_RECOVERY_FENCE_ID}" \
+      --entrypoint /usr/local/bin/sumi-agent init \
+      --supervisor-fulfill-recovery "${request}" /run/sumi/supervisor-proofs \
+      || error "failed to fulfill Compose recovery request ${request}"
+    compose_cmd run --rm --no-deps --entrypoint /bin/rm init -f -- "${request}" || error "failed to remove fulfilled recovery request"
+  done <<< "${requests}"
+}
+
+compose_heartbeat_is_fresh() {
+  compose_cmd exec -T runtime /usr/local/bin/sumi-agent --supervisor-heartbeat-check \
+    /var/lib/sumi-runtime-state "${SUMI_AGENT_ID}" "${SUMI_RPC_GENERATION}" \
+    "${SUMI_PROCESS_GENERATION_LEASE_ID}" "${SUMI_GENERATION_RECOVERY_FENCE_ID}" \
+    "${SUMI_T27_HEARTBEAT_TIMEOUT_MS}" >/dev/null 2>&1
+}
+
+compose_runtime_running() {
+  local id
+  id="$(compose_cmd ps -q runtime)"
+  [[ -n "${id}" ]] && [[ "$(docker inspect -f '{{.State.Running}}' "${id}")" == true ]]
+}
+
+run_compose_supervisor() {
+  while true; do
+    # Init is an explicit phase on every generation; do not let Compose's
+    # one-shot dependency cache turn `up` into a generation reuse shortcut.
+    compose_cmd rm -sf runtime executor broker init >/dev/null 2>&1 || true
+    compose_cmd up --build -d init || error "Compose init failed to start"
+    compose_cmd wait init || error "Compose init failed"
+    compose_load_generation
+    log "Compose deployment generation=${SUMI_RPC_GENERATION} executor_cgroup=${SUMI_EXECUTOR_CGROUP_BASE} service_cgroup=${SUMI_SERVICE_CGROUP_BASE}"
+    compose_cmd up -d broker executor runtime || error "Compose sidecars failed to start"
+    local initial=0
+    while compose_runtime_running; do
+      if compose_heartbeat_is_fresh; then
+        initial=1
+      elif [[ "${initial}" == 1 ]]; then
+        log "Compose runtime heartbeat is stale or fenced; reaping generation ${SUMI_RPC_GENERATION}"
+        break
+      fi
+      compose_fulfill_recovery_requests
+      sleep 0.1
+    done
+    compose_fulfill_recovery_requests
+    compose_reap_current_generation
+    # Destroy old containers and IPC endpoints before a new allocator lease.
+    compose_cmd rm -sf runtime executor broker init >/dev/null 2>&1 || true
+  done
 }
 
 main() {
@@ -328,33 +484,51 @@ main() {
     : "${SUMI_CONVERSATION_ID:?SUMI_CONVERSATION_ID is required}"
     : "${SUMI_AGENT_WRAPPING_KEY:?SUMI_AGENT_WRAPPING_KEY is required}"
     : "${SUMI_PROVIDER_API_KEY:?SUMI_PROVIDER_API_KEY is required}"
-    exec docker compose --project-directory "${SUPERVISOR_DIR}" -f "${SUPERVISOR_DIR}/compose.yaml" up --build --remove-orphans
+    run_compose_supervisor
+    return
   fi
 
   check_binary
   check_isolation "${SUMI_ISOLATION_MODE}"
   prepare_directories
 
-  allocate_identity
-  prepare_cgroup_base
-  recover_stale_generations
-
-  log "deployment generation=${SUMI_RPC_GENERATION} mode=${SUMI_ISOLATION_MODE} cgroup=${SUMI_EXECUTOR_CGROUP_BASE}"
-
   : "${SUMI_TENANT_ID:?SUMI_TENANT_ID is required}"
   : "${SUMI_AGENT_ID:?SUMI_AGENT_ID is required}"
   : "${SUMI_CONVERSATION_ID:?SUMI_CONVERSATION_ID is required}"
   : "${SUMI_AGENT_WRAPPING_KEY:?SUMI_AGENT_WRAPPING_KEY is required}"
 
-  spawn_broker "${SUMI_RPC_GENERATION}" "${SUMI_RPC_NONCE}"
-  wait_for_socket "${SUMI_ARTIFACT_BROKER_SOCKET}" "artifact broker"
+  # Exactly one generation is live per loop iteration. The host supervisor
+  # polls recovery requests while the runtime is alive; when it dies, it first
+  # kills/reaps the service and executor cgroups, records host proof, then
+  # allocates one new generation.
+  while true; do
+    allocate_identity
+    prepare_cgroup_bases
+    recover_stale_generations
+    log "deployment generation=${SUMI_RPC_GENERATION} mode=${SUMI_ISOLATION_MODE} executor_cgroup=${SUMI_EXECUTOR_CGROUP_BASE} service_cgroup=${SUMI_SERVICE_CGROUP_BASE}"
 
-  spawn_executor "${SUMI_RPC_GENERATION}" "${SUMI_RPC_NONCE}" "${SUMI_CONVERSATION_ID}"
-  wait_for_socket "${SUMI_EXECUTOR_SOCKET}" "tool executor"
+    spawn_broker "${SUMI_RPC_GENERATION}" "${SUMI_RPC_NONCE}"
+    wait_for_socket "${SUMI_ARTIFACT_BROKER_SOCKET}" "artifact broker"
+    spawn_executor "${SUMI_RPC_GENERATION}" "${SUMI_RPC_NONCE}" "${SUMI_CONVERSATION_ID}"
+    wait_for_socket "${SUMI_EXECUTOR_SOCKET}" "tool executor"
+    spawn_runtime "${SUMI_RPC_GENERATION}" "${SUMI_RPC_NONCE}" "${SUMI_CONVERSATION_ID}"
 
-  spawn_runtime "${SUMI_RPC_GENERATION}" "${SUMI_RPC_NONCE}" "${SUMI_CONVERSATION_ID}"
+    wait_for_heartbeat || log "runtime never published an initial heartbeat; reaping generation ${SUMI_RPC_GENERATION}"
 
-  wait
+    while kill -0 "${RUNTIME_PID}" 2>/dev/null; do
+      fulfill_recovery_requests
+      if ! heartbeat_is_fresh; then
+        log "runtime heartbeat is missing, stale, or fenced; reaping generation ${SUMI_RPC_GENERATION}"
+        break
+      fi
+      sleep 0.05
+    done
+    wait "${RUNTIME_PID}" 2>/dev/null || true
+    log "runtime generation ${SUMI_RPC_GENERATION} exited; reaping before restart"
+    reap_current_generation
+  done
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

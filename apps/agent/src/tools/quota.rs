@@ -102,6 +102,18 @@ impl ResourceQuotaPolicy {
         Self::default()
     }
 
+    /// The production contract.  Unlike `Default`, this deliberately asks for
+    /// disk and inode enforcement.  A deployment which has not installed a
+    /// real filesystem/project-quota backend will therefore refuse to spawn a
+    /// command rather than silently granting an unbounded workspace.
+    pub fn production() -> Self {
+        Self {
+            disk_bytes: Some(2 * 1024 * 1024 * 1024),
+            disk_inodes: Some(200_000),
+            ..Self::default()
+        }
+    }
+
     pub fn with_wall_time(mut self, seconds: u64) -> Self {
         self.wall_time = Duration::from_secs(seconds);
         self

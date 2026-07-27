@@ -39,6 +39,7 @@ use crate::tools::{
     ToolError,
     bash::{BashExecutionResult, LowTrustLocalBash},
     fs::WorkspaceFs,
+    quota::ResourceQuotaPolicy,
 };
 
 const UPDATE_CHANNEL_CAPACITY: usize = 32;
@@ -54,12 +55,47 @@ const MAX_ATOMIC_UPDATE_FRAME_BYTES: usize = 4_096;
 const EXECUTOR_REAP_DEADLINE: Duration = Duration::from_secs(2);
 const EXECUTOR_CONNECTION_CAPACITY: usize = 32;
 const EXECUTOR_CONNECTION_DEADLINE: Duration = Duration::from_secs(130);
+const EXECUTOR_COMMAND_CAPACITY: usize = 4;
+const EXECUTOR_COMMAND_ADMISSION_DEADLINE: Duration = Duration::from_secs(30);
 const SOCKET_READINESS_TIMEOUT: Duration = Duration::from_secs(1);
 const SOCKET_READINESS_RETRY_LIMIT: usize = 50;
 const SOCKET_READINESS_RETRY_DELAY: Duration = Duration::from_millis(100);
 const PR_SET_DUMPABLE: libc::c_int = 4;
 
 type BashUpdateCallback = Arc<dyn Fn(Value) + Send + Sync>;
+
+/// One generation-wide FIFO command gate.  It is intentionally created once
+/// by the socket listener, rather than once per client connection, so four is
+/// an aggregate cap and not a per-connection hint.
+#[derive(Clone)]
+struct GenerationCommandAdmission {
+    permits: Arc<Semaphore>,
+    deadline: Duration,
+}
+
+impl GenerationCommandAdmission {
+    fn new() -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(EXECUTOR_COMMAND_CAPACITY)),
+            deadline: EXECUTOR_COMMAND_ADMISSION_DEADLINE,
+        }
+    }
+
+    async fn reserve(&self) -> Result<tokio::sync::OwnedSemaphorePermit, ToolError> {
+        timeout(self.deadline, self.permits.clone().acquire_owned())
+            .await
+            .map_err(|_| ToolError::ResourceLimit(crate::tools::ResourceLimit::Concurrency))?
+            .map_err(|_| ToolError::ResourceLimit(crate::tools::ResourceLimit::Concurrency))
+    }
+
+    #[cfg(test)]
+    fn with_deadline(deadline: Duration) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(EXECUTOR_COMMAND_CAPACITY)),
+            deadline,
+        }
+    }
+}
 
 pub(crate) fn set_dumpable(value: libc::c_int) -> std::io::Result<()> {
     let rc = unsafe { libc::syscall(libc::SYS_prctl, PR_SET_DUMPABLE, value, 0, 0, 0) };
@@ -615,6 +651,7 @@ pub async fn run_tool_executor_mode() -> Result<()> {
     let broker = ArtifactBrokerClient::new(broker_socket, identity.clone(), conversation_id);
     let stdin = nonblocking_stdin().context("failed to take ownership of executor stdin")?;
     let stdout = nonblocking_stdout().context("failed to take ownership of executor stdout")?;
+    let registry = GenerationExecutionRegistry::new(identity.generation());
     run_executor_service_with_writer(
         stdin,
         ExecutorWriter::start_atomic_progress(stdout),
@@ -622,6 +659,8 @@ pub async fn run_tool_executor_mode() -> Result<()> {
         workspace,
         fs,
         broker,
+        registry,
+        GenerationCommandAdmission::new(),
         #[cfg(test)]
         ExecutorTestControls::default(),
     )
@@ -649,6 +688,8 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
         .context("broker socket is not ready")?;
     let listener = bind_unix_listener(&executor_socket, "executor").await?;
     let permits = Arc::new(Semaphore::new(EXECUTOR_CONNECTION_CAPACITY));
+    let registry = GenerationExecutionRegistry::new(identity.generation());
+    let admission = GenerationCommandAdmission::new();
 
     loop {
         let (stream, _) = listener
@@ -664,6 +705,8 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
         let workspace = workspace.clone();
         let broker_socket = broker_socket.clone();
         let conversation_id = conversation_id.clone();
+        let registry = registry.clone();
+        let admission = admission.clone();
         tokio::spawn(async move {
             let _permit = permit;
             let result = timeout(EXECUTOR_CONNECTION_DEADLINE, async {
@@ -671,7 +714,10 @@ pub async fn run_tool_executor_socket_mode() -> Result<()> {
                 let fs = WorkspaceFs::open(&workspace)?;
                 let broker =
                     ArtifactBrokerClient::new(broker_socket, identity.clone(), conversation_id);
-                run_executor_service(read, write, identity, workspace, fs, broker).await
+                run_executor_service_with_registry(
+                    read, write, identity, workspace, fs, broker, registry, admission,
+                )
+                .await
             })
             .await;
             match result {
@@ -815,6 +861,34 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let registry = GenerationExecutionRegistry::new(identity.generation());
+    run_executor_service_with_registry(
+        read,
+        write,
+        identity,
+        workspace,
+        fs,
+        broker,
+        registry,
+        GenerationCommandAdmission::new(),
+    )
+    .await
+}
+
+async fn run_executor_service_with_registry<R, W>(
+    read: R,
+    write: W,
+    identity: RpcIdentity,
+    workspace: PathBuf,
+    fs: WorkspaceFs,
+    broker: ArtifactBrokerClient,
+    registry: Arc<GenerationExecutionRegistry>,
+    admission: GenerationCommandAdmission,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     run_executor_service_with_writer(
         read,
         ExecutorWriter::start(write),
@@ -822,6 +896,8 @@ where
         workspace,
         fs,
         broker,
+        registry,
+        admission,
         #[cfg(test)]
         ExecutorTestControls::default(),
     )
@@ -842,6 +918,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let registry = GenerationExecutionRegistry::new(identity.generation());
     run_executor_service_with_writer(
         read,
         ExecutorWriter::start(write),
@@ -849,6 +926,8 @@ where
         workspace,
         fs,
         broker,
+        registry,
+        GenerationCommandAdmission::new(),
         test_controls,
     )
     .await
@@ -861,12 +940,13 @@ async fn run_executor_service_with_writer<R>(
     workspace: PathBuf,
     fs: WorkspaceFs,
     broker: ArtifactBrokerClient,
+    registry: Arc<GenerationExecutionRegistry>,
+    admission: GenerationCommandAdmission,
     #[cfg(test)] test_controls: ExecutorTestControls,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
 {
-    let registry = GenerationExecutionRegistry::new(identity.generation());
     let result = run_executor_loop(
         read,
         &writer,
@@ -875,6 +955,7 @@ where
         fs,
         broker,
         registry,
+        admission,
         #[cfg(test)]
         test_controls,
     )
@@ -893,6 +974,7 @@ async fn run_executor_loop<R>(
     fs: WorkspaceFs,
     broker: ArtifactBrokerClient,
     registry: Arc<GenerationExecutionRegistry>,
+    admission: GenerationCommandAdmission,
     #[cfg(test)] mut test_controls: ExecutorTestControls,
 ) -> Result<()>
 where
@@ -930,6 +1012,7 @@ where
                     &broker,
                     &mut lifecycle,
                     registry.clone(),
+                    admission.clone(),
                     request.request_id,
                     execution_id,
                     command,
@@ -981,6 +1064,7 @@ async fn run_bash_request<R>(
     broker: &ArtifactBrokerClient,
     lifecycle: &mut RpcLifecycleTracker,
     registry: Arc<GenerationExecutionRegistry>,
+    admission: GenerationCommandAdmission,
     request_id: String,
     execution_id: String,
     command: String,
@@ -992,12 +1076,16 @@ async fn run_bash_request<R>(
 where
     R: AsyncBufRead + Unpin,
 {
+    // Acquiring before the command cgroup is created makes the four slots a
+    // true cgroup/process cap. Tokio's semaphore queues acquirers FIFO.
+    let _command_slot = admission.reserve().await?;
     let cancel = CancellationToken::new();
     let (on_update, mut updates_rx) = bounded_bash_updates();
     let bash = LowTrustLocalBash::new(workspace.to_path_buf(), broker)
         .with_broker_socket(broker.socket().to_path_buf())
         .with_process_generation(identity.generation())
         .with_execution_registry(registry)
+        .with_quota_policy(executor_quota_policy())
         .with_durable_identities(tool_call_id, command_id, run_id);
     #[cfg(test)]
     let bash = bash.with_cancel_stop_delay(test_controls.cancel_stop_delay);
@@ -1248,6 +1336,18 @@ where
                 .await?;
             Ok(())
         }
+    }
+}
+
+fn executor_quota_policy() -> ResourceQuotaPolicy {
+    // Unit/integration fixtures use an in-memory workspace and deliberately
+    // exercise lower-level quota backends. Production must request the disk
+    // and inode contract, which fails closed until a real host backend is
+    // supplied rather than treating a memory shim as deployment evidence.
+    if cfg!(debug_assertions) {
+        ResourceQuotaPolicy::default()
+    } else {
+        ResourceQuotaPolicy::production()
     }
 }
 
@@ -2325,5 +2425,22 @@ mod tests {
             .expect("released blocking-work permit")
             .unwrap();
         drop((second, replacement));
+    }
+
+    #[tokio::test]
+    async fn generation_command_admission_is_four_slot_and_times_out() {
+        let admission = GenerationCommandAdmission::with_deadline(Duration::from_millis(10));
+        let one = admission.reserve().await.unwrap();
+        let two = admission.reserve().await.unwrap();
+        let three = admission.reserve().await.unwrap();
+        let four = admission.reserve().await.unwrap();
+        assert!(matches!(
+            admission.reserve().await,
+            Err(ToolError::ResourceLimit(
+                crate::tools::ResourceLimit::Concurrency
+            ))
+        ));
+        drop((one, two, three, four));
+        assert!(admission.reserve().await.is_ok());
     }
 }

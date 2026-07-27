@@ -23,7 +23,10 @@ use gateway::{
     CommandAckStatus, Envelope, Gateway, GatewayClosed, GatewayReader, GatewayWriter,
     InboundCommand, InvalidCommand, OutboundFrame, StdioGateway,
 };
-use runtime::allocator::{acquire_generation, print_shell_exports};
+use runtime::{
+    allocator::{acquire_generation, print_shell_exports},
+    contracts::{GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease},
+};
 use store::{
     AgentScope, DataKeyPurpose, EnvironmentKeyProvider, EventWriter, InboundAdmission, Store,
     SuffixRecovery,
@@ -112,6 +115,43 @@ async fn async_main(mode: Option<String>) -> Result<()> {
                 .ok_or_else(|| anyhow!("SUMI_READINESS_SOCKET is required for socket readiness"))?;
             return tools::executor::wait_for_unix_socket(Path::new(&socket), "readiness").await;
         }
+        Some("--supervisor-heartbeat-check") => {
+            let state_dir = PathBuf::from(
+                env::args()
+                    .nth(2)
+                    .context("runtime state directory is required")?,
+            );
+            let agent_id = env::args().nth(3).context("agent id is required")?;
+            let generation = ProcessGeneration::from_wire(
+                env::args()
+                    .nth(4)
+                    .context("generation is required")?
+                    .parse()
+                    .context("generation must be an integer")?,
+            )?;
+            let lease = ProcessGenerationLease::new(
+                generation,
+                env::args().nth(5).context("lease id is required")?,
+            )?;
+            let fence = GenerationRecoveryFence::new(
+                &lease,
+                env::args().nth(6).context("fence id is required")?,
+            )?;
+            let max_age_ms: u64 = env::args()
+                .nth(7)
+                .context("heartbeat max age milliseconds is required")?
+                .parse()
+                .context("heartbeat max age must be an integer")?;
+            runtime::publisher::RuntimeHeartbeatPublisher::validate_fresh(
+                state_dir,
+                &agent_id,
+                generation,
+                &lease,
+                &fence,
+                std::time::Duration::from_millis(max_age_ms),
+            )?;
+            return Ok(());
+        }
         Some("--supervisor-prepare-cgroup") => {
             let tenant_id = env::var("SUMI_TENANT_ID")
                 .context("SUMI_TENANT_ID is required for cgroup preparation")?;
@@ -123,14 +163,29 @@ async fn async_main(mode: Option<String>) -> Result<()> {
                 .context("SUMI_RPC_GENERATION is required for cgroup preparation")?
                 .parse::<u64>()
                 .context("SUMI_RPC_GENERATION must be an integer")?;
-            let base = runtime::supervisor::prepare_cgroup_base(
+            let executor_base = runtime::supervisor::prepare_cgroup_base(
                 &tenant_id,
                 &agent_id,
                 &conversation_id,
                 generation,
             )
-            .context("failed to prepare supervisor cgroup base")?;
-            println!("export SUMI_EXECUTOR_CGROUP_BASE={}", base.display());
+            .context("failed to prepare executor cgroup base")?;
+            let service_base = runtime::supervisor::prepare_service_cgroup_base(
+                &tenant_id,
+                &agent_id,
+                &conversation_id,
+                generation,
+            )
+            .context("failed to prepare service cgroup base")?;
+            println!(
+                "export SUMI_EXECUTOR_CGROUP_BASE={}",
+                executor_base.display()
+            );
+            println!("export SUMI_SERVICE_CGROUP_BASE={}", service_base.display());
+            let parent = executor_base
+                .parent()
+                .context("executor cgroup base has no parent; cannot derive SUMI_CGROUP_PARENT")?;
+            println!("export SUMI_CGROUP_PARENT={}", parent.display());
             return Ok(());
         }
         Some("--supervisor-recovery-scan") => {
@@ -151,25 +206,72 @@ async fn async_main(mode: Option<String>) -> Result<()> {
             return Ok(());
         }
         Some("--supervisor-kill-stale-processes") => {
+            let base = PathBuf::from(
+                env::args()
+                    .nth(2)
+                    .context("cgroup base path is required as the first argument")?,
+            );
             let generation = env::args()
-                .nth(2)
-                .context("current generation is required as the first argument")?
+                .nth(3)
+                .context("current generation is required as the second argument")?
                 .parse::<u64>()
                 .context("current generation must be an integer")?;
-            let tenant_id = env::var("SUMI_TENANT_ID")
-                .context("SUMI_TENANT_ID is required for stale process scan")?;
-            let agent_id = env::var("SUMI_AGENT_ID")
-                .context("SUMI_AGENT_ID is required for stale process scan")?;
-            let conversation_id = env::var("SUMI_CONVERSATION_ID")
-                .context("SUMI_CONVERSATION_ID is required for stale process scan")?;
-            let killed = runtime::supervisor::scan_and_kill_stale_processes(
+            let removed = runtime::supervisor::scan_and_kill_stale_services(&base, generation)
+                .context("stale service recovery scan failed")?;
+            let serialized: Vec<String> = removed.iter().map(|p| p.display().to_string()).collect();
+            println!("{}", serde_json::to_string(&serialized)?);
+            return Ok(());
+        }
+        Some("--supervisor-reap-generation") => {
+            let executor = PathBuf::from(
+                env::args()
+                    .nth(2)
+                    .context("executor cgroup path is required")?,
+            );
+            let service = PathBuf::from(
+                env::args()
+                    .nth(3)
+                    .context("service cgroup path is required")?,
+            );
+            let proof_dir = PathBuf::from(
+                env::args()
+                    .nth(4)
+                    .context("host proof directory is required")?,
+            );
+            let (tenant_id, agent_id, conversation_id, lease, fence) = supervisor_identity()?;
+            t27_recovery::supervisor_reap_generation(
+                &proof_dir,
                 &tenant_id,
                 &agent_id,
                 &conversation_id,
-                generation,
-            )
-            .context("stale process recovery scan failed")?;
-            println!("{}", serde_json::to_string(&killed)?);
+                &lease,
+                &fence,
+                &executor,
+                &service,
+            )?;
+            return Ok(());
+        }
+        Some("--supervisor-fulfill-recovery") => {
+            let request = PathBuf::from(
+                env::args()
+                    .nth(2)
+                    .context("runtime recovery request path is required")?,
+            );
+            let proof_dir = PathBuf::from(
+                env::args()
+                    .nth(3)
+                    .context("host proof directory is required")?,
+            );
+            let (tenant_id, agent_id, conversation_id, lease, fence) = supervisor_identity()?;
+            t27_recovery::supervisor_fulfill_recovery_request(
+                &request,
+                &proof_dir,
+                &tenant_id,
+                &agent_id,
+                &conversation_id,
+                &lease,
+                &fence,
+            )?;
             return Ok(());
         }
         _ => {}
@@ -187,6 +289,36 @@ async fn async_main(mode: Option<String>) -> Result<()> {
         "production identity (SUMI_RPC_GENERATION and SUMI_RPC_NONCE) is required; \
          use --low-trust only for test/development"
     ))
+}
+
+fn supervisor_identity() -> Result<(
+    String,
+    String,
+    String,
+    ProcessGenerationLease,
+    GenerationRecoveryFence,
+)> {
+    let tenant_id = env::var("SUMI_TENANT_ID").context("SUMI_TENANT_ID is required")?;
+    let agent_id = env::var("SUMI_AGENT_ID").context("SUMI_AGENT_ID is required")?;
+    let conversation_id =
+        env::var("SUMI_CONVERSATION_ID").context("SUMI_CONVERSATION_ID is required")?;
+    let generation = env::var("SUMI_RPC_GENERATION")
+        .context("SUMI_RPC_GENERATION is required")?
+        .parse::<u64>()
+        .context("SUMI_RPC_GENERATION must be an integer")?;
+    let lease = ProcessGenerationLease::new(
+        ProcessGeneration::from_wire(generation).context("invalid supervisor generation")?,
+        env::var("SUMI_PROCESS_GENERATION_LEASE_ID")
+            .context("SUMI_PROCESS_GENERATION_LEASE_ID is required")?,
+    )
+    .context("invalid supervisor generation lease")?;
+    let fence = GenerationRecoveryFence::new(
+        &lease,
+        env::var("SUMI_GENERATION_RECOVERY_FENCE_ID")
+            .context("SUMI_GENERATION_RECOVERY_FENCE_ID is required")?,
+    )
+    .context("invalid supervisor generation fence")?;
+    Ok((tenant_id, agent_id, conversation_id, lease, fence))
 }
 
 async fn run_low_trust_admission() -> Result<()> {

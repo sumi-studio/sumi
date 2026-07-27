@@ -18,19 +18,22 @@ use std::{
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::contracts::{HydrationReceiptIdentity, ProcessGeneration};
+use super::contracts::{
+    GenerationRecoveryFence, HydrationReceiptIdentity, ProcessGeneration, ProcessGenerationLease,
+};
 
 const RUNTIME_STATE_FILE_PREFIX: &str = "runtime-";
 const RUNTIME_STATE_FILE_SUFFIX: &str = ".json";
 const RUNTIME_LOCK_SUFFIX: &str = ".lock";
 const RUNTIME_TEMP_SUFFIX: &str = ".tmp";
+const HEARTBEAT_FILE_PREFIX: &str = "heartbeat-";
 const RUNTIME_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const RUNTIME_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -56,6 +59,151 @@ pub struct RuntimeStatePublisher {
     state_dir: PathBuf,
     file_id: String,
     generation: ProcessGeneration,
+}
+
+/// Separate liveness record for the host supervisor.  This is deliberately
+/// not part of T28's strict `RuntimeState` schema: it proves only that the
+/// runtime continues to make generation/lease/fence-bound progress.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeHeartbeat {
+    pub generation: u64,
+    pub lease_id: String,
+    pub fence_id: String,
+    pub updated_unix_ms: u64,
+}
+
+pub struct RuntimeHeartbeatPublisher {
+    state_dir: PathBuf,
+    file_id: String,
+    generation: ProcessGeneration,
+    lease: ProcessGenerationLease,
+    fence: GenerationRecoveryFence,
+}
+
+impl RuntimeHeartbeatPublisher {
+    pub fn new(
+        state_dir: impl AsRef<Path>,
+        agent_id: impl Into<String>,
+        generation: ProcessGeneration,
+        lease: ProcessGenerationLease,
+        fence: GenerationRecoveryFence,
+    ) -> Result<Self> {
+        let state_dir = prepare_runtime_state_dir(state_dir.as_ref())?;
+        let agent_id = agent_id.into();
+        if agent_id.is_empty() {
+            bail!("runtime heartbeat requires a non-empty agent_id");
+        }
+        Ok(Self {
+            state_dir,
+            file_id: base64url_encode(agent_id.as_bytes()),
+            generation,
+            lease,
+            fence,
+        })
+    }
+
+    pub fn file_path(&self) -> PathBuf {
+        self.state_dir.join(format!(
+            "{HEARTBEAT_FILE_PREFIX}{}{RUNTIME_STATE_FILE_SUFFIX}",
+            self.file_id
+        ))
+    }
+    fn lock_path(&self) -> PathBuf {
+        self.state_dir.join(format!(
+            "{HEARTBEAT_FILE_PREFIX}{}{RUNTIME_LOCK_SUFFIX}",
+            self.file_id
+        ))
+    }
+    fn temp_path(&self) -> PathBuf {
+        self.state_dir.join(format!(
+            "{HEARTBEAT_FILE_PREFIX}{}.{}{RUNTIME_TEMP_SUFFIX}",
+            self.file_id,
+            Uuid::now_v7()
+        ))
+    }
+    pub fn pulse(&self) -> Result<()> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system time predates epoch")?
+            .as_millis() as u64;
+        self.pulse_at(now)
+    }
+    pub fn pulse_at(&self, updated_unix_ms: u64) -> Result<()> {
+        let next = RuntimeHeartbeat {
+            generation: self.generation.as_u64(),
+            lease_id: self.lease.lease_id().to_owned(),
+            fence_id: self.fence.fence_id().to_owned(),
+            updated_unix_ms,
+        };
+        let payload = serde_json::to_vec(&next).context("failed to serialize runtime heartbeat")?;
+        let temp = self.temp_path();
+        write_temp_file(&temp, &payload)?;
+        let lock = open_lock_file(&self.lock_path())?;
+        lock_exclusive(lock.as_raw_fd()).context("failed to lock runtime heartbeat")?;
+        let result = (|| -> Result<()> {
+            if let Some(current) = read_heartbeat(&self.file_path())? {
+                if current.generation > next.generation {
+                    bail!(
+                        "stale heartbeat generation {} cannot overwrite {}",
+                        next.generation,
+                        current.generation
+                    );
+                }
+                if current.generation == next.generation
+                    && (current.lease_id != next.lease_id || current.fence_id != next.fence_id)
+                {
+                    bail!("heartbeat lease/fence does not match current generation");
+                }
+            }
+            fs::rename(&temp, self.file_path()).context("failed to commit runtime heartbeat")?;
+            sync_dir(&self.state_dir).context("failed to fsync runtime heartbeat directory")
+        })();
+        let _ = fs::remove_file(temp);
+        result
+    }
+    pub fn validate_fresh(
+        state_dir: impl AsRef<Path>,
+        agent_id: &str,
+        generation: ProcessGeneration,
+        lease: &ProcessGenerationLease,
+        fence: &GenerationRecoveryFence,
+        max_age: Duration,
+    ) -> Result<()> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system time predates epoch")?
+            .as_millis() as u64;
+        Self::validate_fresh_at(state_dir, agent_id, generation, lease, fence, max_age, now)
+    }
+    pub fn validate_fresh_at(
+        state_dir: impl AsRef<Path>,
+        agent_id: &str,
+        generation: ProcessGeneration,
+        lease: &ProcessGenerationLease,
+        fence: &GenerationRecoveryFence,
+        max_age: Duration,
+        now_unix_ms: u64,
+    ) -> Result<()> {
+        let dir = prepare_runtime_state_dir(state_dir.as_ref())?;
+        let path = dir.join(format!(
+            "{HEARTBEAT_FILE_PREFIX}{}{RUNTIME_STATE_FILE_SUFFIX}",
+            base64url_encode(agent_id.as_bytes())
+        ));
+        let heartbeat = read_heartbeat(&path)?.context("runtime heartbeat is absent")?;
+        if heartbeat.generation != generation.as_u64()
+            || heartbeat.lease_id != lease.lease_id()
+            || heartbeat.fence_id != fence.fence_id()
+        {
+            bail!("runtime heartbeat identity does not match active generation/lease/fence");
+        }
+        if heartbeat.updated_unix_ms > now_unix_ms
+            || now_unix_ms - heartbeat.updated_unix_ms > max_age.as_millis() as u64
+        {
+            bail!("runtime heartbeat is stale");
+        }
+        Ok(())
+    }
 }
 
 impl RuntimeStatePublisher {
@@ -389,6 +537,28 @@ fn read_current_state(path: &Path) -> Result<Option<RuntimeState>> {
     Ok(Some(state))
 }
 
+fn read_heartbeat(path: &Path) -> Result<Option<RuntimeHeartbeat>> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to stat runtime heartbeat {}", path.display()));
+        }
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        bail!(
+            "runtime heartbeat must be a regular non-symlink file: {}",
+            path.display()
+        );
+    }
+    let mut contents = String::new();
+    File::open(path)?.read_to_string(&mut contents)?;
+    serde_json::from_str(contents.trim())
+        .with_context(|| format!("runtime heartbeat {} contains invalid JSON", path.display()))
+        .map(Some)
+}
+
 fn lock_exclusive(fd: std::os::fd::RawFd) -> Result<()> {
     lock_exclusive_with_timeout(fd, RUNTIME_LOCK_TIMEOUT)
 }
@@ -666,6 +836,60 @@ mod tests {
         let dir = temp_dir();
         let result = RuntimeStatePublisher::new(&dir, "", ProcessGeneration::from_wire(1).unwrap());
         assert!(result.is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn heartbeat_rejects_stale_or_mismatched_generation_fence() {
+        let dir = temp_dir();
+        let generation = ProcessGeneration::from_wire(7).unwrap();
+        let lease = ProcessGenerationLease::new(generation, "lease-7").unwrap();
+        let fence = GenerationRecoveryFence::new(&lease, "fence-for-lease-7").unwrap();
+        let heartbeat = RuntimeHeartbeatPublisher::new(
+            &dir,
+            "agent-1",
+            generation,
+            lease.clone(),
+            fence.clone(),
+        )
+        .unwrap();
+        heartbeat.pulse_at(1_000).unwrap();
+        RuntimeHeartbeatPublisher::validate_fresh_at(
+            &dir,
+            "agent-1",
+            generation,
+            &lease,
+            &fence,
+            Duration::from_millis(100),
+            1_100,
+        )
+        .unwrap();
+        assert!(
+            RuntimeHeartbeatPublisher::validate_fresh_at(
+                &dir,
+                "agent-1",
+                generation,
+                &lease,
+                &fence,
+                Duration::from_millis(99),
+                1_100
+            )
+            .is_err()
+        );
+        let wrong_lease = ProcessGenerationLease::new(generation, "lease-8").unwrap();
+        let wrong_fence = GenerationRecoveryFence::new(&wrong_lease, "fence-for-lease-8").unwrap();
+        assert!(
+            RuntimeHeartbeatPublisher::validate_fresh_at(
+                &dir,
+                "agent-1",
+                generation,
+                &wrong_lease,
+                &wrong_fence,
+                Duration::from_secs(1),
+                1_001
+            )
+            .is_err()
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

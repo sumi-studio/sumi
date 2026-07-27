@@ -24,11 +24,19 @@ services:
     # Init alone needs these three capabilities to set named-volume ownership
     # and run the allocator as the runtime UID. Long-lived services get none.
     cap_add: [CHOWN, SETUID, SETGID]
+    # The init role prepares the generation-scoped cgroup boundary; it must
+    # operate in the host cgroup namespace so the runtime/executor/broker can
+    # be placed into the cgroups it creates.
+    cgroup: host
     security_opt:
       - no-new-privileges:true
       - seccomp:./seccomp/sidecar.json
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=32m
+    environment:
+      SUMI_TENANT_ID: ${SUMI_TENANT_ID:?SUMI_TENANT_ID is required}
+      SUMI_AGENT_ID: ${SUMI_AGENT_ID:?SUMI_AGENT_ID is required}
+      SUMI_CONVERSATION_ID: ${SUMI_CONVERSATION_ID:?SUMI_CONVERSATION_ID is required}
     volumes:
       - state:/var/lib/sumi
       - runtime-state:/var/lib/sumi-runtime-state
@@ -36,6 +44,8 @@ services:
       - artifacts:/var/lib/sumi-artifacts
       - runtime-ipc:/run/sumi/runtime
       - broker-ipc:/run/sumi/broker
+      - recovery-requests:/run/sumi/recovery-requests
+      - supervisor-proofs:/run/sumi/supervisor-proofs
 
   runtime:
     <<: *sidecar-hardening
@@ -45,6 +55,9 @@ services:
     user: "10001:10001"
     group_add: ["10010"]
     command: [runtime]
+    # The runtime migrates into the generation-scoped service cgroup and uses
+    # the executor cgroup base for T27 recovery; it needs the host namespace.
+    cgroup: host
     environment:
       SUMI_TENANT_ID: ${SUMI_TENANT_ID:?SUMI_TENANT_ID is required}
       SUMI_AGENT_ID: ${SUMI_AGENT_ID:?SUMI_AGENT_ID is required}
@@ -62,6 +75,8 @@ services:
       - state:/var/lib/sumi
       - runtime-state:/var/lib/sumi-runtime-state
       - runtime-ipc:/run/sumi/runtime:ro
+      - recovery-requests:/run/sumi/recovery-requests
+      - supervisor-proofs:/run/sumi/supervisor-proofs:ro
 
   executor:
     <<: *sidecar-hardening
@@ -71,8 +86,13 @@ services:
     user: "10002:10002"
     group_add: ["10010"]
     command: [executor]
+    # The executor migrates into the generation-scoped service cgroup and places
+    # each command into a sub-cgroup of the executor cgroup base.
+    cgroup: host
     network_mode: none
     environment:
+      SUMI_TENANT_ID: ${SUMI_TENANT_ID:?SUMI_TENANT_ID is required}
+      SUMI_AGENT_ID: ${SUMI_AGENT_ID:?SUMI_AGENT_ID is required}
       SUMI_CONVERSATION_ID: ${SUMI_CONVERSATION_ID:?SUMI_CONVERSATION_ID is required}
     # The sumi-agent-executor AppArmor profile must be loaded on the host
     # before `docker compose up`; run apparmor_parser -r ./apparmor/executor.
@@ -104,6 +124,9 @@ services:
     user: "10003:10003"
     group_add: ["10010"]
     command: [broker]
+    # The broker migrates into the generation-scoped service cgroup for
+    # consistency with the runtime/executor isolation boundary.
+    cgroup: host
     network_mode: none
     healthcheck:
       test: ["CMD-SHELL", "SUMI_READINESS_SOCKET=/run/sumi/broker/broker.sock /usr/local/bin/sumi-agent --check-unix-socket"]
@@ -125,3 +148,5 @@ volumes:
   artifacts: {}
   runtime-ipc: {}
   broker-ipc: {}
+  recovery-requests: {}
+  supervisor-proofs: {}

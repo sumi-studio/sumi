@@ -28,7 +28,7 @@ use crate::{
             GenerationRecoveryFence, HydrationReady, HydrationReceiptIdentity, ProcessGeneration,
             ProcessGenerationLease, RpcBootNonce,
         },
-        publisher::RuntimeStatePublisher,
+        publisher::{RuntimeHeartbeatPublisher, RuntimeStatePublisher},
     },
     store::{
         AgentScope, EnvironmentKeyProvider, EventWriter, HydrationOutcome, Store, SuffixRecovery,
@@ -52,6 +52,8 @@ struct BootstrapContext {
     state_dir: PathBuf,
     runtime_state_dir: PathBuf,
     executor_socket: PathBuf,
+    t27_recovery_request_dir: PathBuf,
+    t27_supervisor_proof_dir: PathBuf,
     wrapping_key_id: String,
 }
 
@@ -74,6 +76,8 @@ impl BootstrapContext {
         let state_dir = required_path("SUMI_STATE_DIR")?;
         let runtime_state_dir = required_path("SUMI_AGENT_RUNTIME_STATE_DIR")?;
         let executor_socket = required_path("SUMI_EXECUTOR_SOCKET")?;
+        let t27_recovery_request_dir = required_path("SUMI_T27_RECOVERY_REQUEST_DIR")?;
+        let t27_supervisor_proof_dir = required_path("SUMI_T27_SUPERVISOR_PROOF_DIR")?;
 
         let wrapping_key_id = env::var("SUMI_AGENT_WRAPPING_KEY_ID")
             .unwrap_or_else(|_| "env-wrapping-key/v1".to_owned());
@@ -94,6 +98,8 @@ impl BootstrapContext {
             state_dir,
             runtime_state_dir,
             executor_socket,
+            t27_recovery_request_dir,
+            t27_supervisor_proof_dir,
             wrapping_key_id,
         })
     }
@@ -194,6 +200,28 @@ pub(crate) async fn run_production_with_driver_and_broker(
     runtime_state_publisher
         .publish_not_ready()
         .context("failed to publish initial not-ready runtime state")?;
+    // T27 liveness is a separate, lease/fence-bound record.  It intentionally
+    // does not extend the strict T28 RuntimeState schema.
+    let heartbeat = RuntimeHeartbeatPublisher::new(
+        &ctx.runtime_state_dir,
+        &ctx.agent_id,
+        ctx.generation,
+        ctx.lease.clone(),
+        ctx.fence.clone(),
+    )?;
+    heartbeat
+        .pulse()
+        .context("failed to publish initial runtime heartbeat")?;
+    let _heartbeat_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            if let Err(error) = heartbeat.pulse() {
+                tracing::error!(%error, "runtime heartbeat pulse failed");
+                break;
+            }
+        }
+    });
 
     // Load config last so missing model/system files are surfaced after the
     // identity boundary is validated.
@@ -240,9 +268,10 @@ pub(crate) async fn run_production_with_driver_and_broker(
         );
     }
 
-    let (state, runtime_receipt) = hydrate_store(&store, &event_writer, &ctx.lease, &ctx.fence)
-        .await
-        .context("T17/T27 durable hydration failed")?;
+    let (state, runtime_receipt) =
+        hydrate_store(&store, &event_writer, &ctx.lease, &ctx.fence, &ctx)
+            .await
+            .context("T17/T27 durable hydration failed")?;
     if !state.recovery_steps.is_empty() {
         bail!(
             "durable suffix recovery steps remain after hydration; T17/T27 must resolve {:?} before T26 composition",
@@ -365,14 +394,24 @@ async fn hydrate_store(
     writer: &EventWriter,
     lease: &ProcessGenerationLease,
     fence: &GenerationRecoveryFence,
+    ctx: &BootstrapContext,
 ) -> Result<(crate::store::HydratedRunState, HydrationReceiptIdentity)> {
     let mut recovery_identity = None;
     loop {
         match store.hydrate(lease, fence).await? {
             HydrationOutcome::RecoveryRequired(intents) => {
-                let receipt =
-                    t27_recovery::apply_physical_recovery_receipt(writer, lease, fence, intents)
-                        .await?;
+                let receipt = t27_recovery::consume_physical_recovery(
+                    writer,
+                    lease,
+                    fence,
+                    intents,
+                    &ctx.tenant_id,
+                    &ctx.agent_id,
+                    &ctx.conversation_id,
+                    &ctx.t27_recovery_request_dir,
+                    &ctx.t27_supervisor_proof_dir,
+                )
+                .await?;
                 recovery_identity = Some(
                     HydrationReceiptIdentity::new(receipt.receipt_id)
                         .context("failed to construct recovery hydration receipt identity")?,
@@ -455,6 +494,20 @@ mod tests {
             (
                 "SUMI_ARTIFACT_BROKER_SOCKET",
                 dir.join("broker.sock").to_string_lossy().into_owned(),
+            ),
+            (
+                "SUMI_T27_RECOVERY_REQUEST_DIR",
+                dir.join("t27")
+                    .join("requests")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            (
+                "SUMI_T27_SUPERVISOR_PROOF_DIR",
+                dir.join("t27")
+                    .join("supervisor-proofs")
+                    .to_string_lossy()
+                    .into_owned(),
             ),
             (
                 "SUMI_ARTIFACT_ROOT",

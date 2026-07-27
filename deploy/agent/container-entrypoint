@@ -15,6 +15,8 @@ readonly BROKER_GID=10003
 readonly IPC_GID=10010
 readonly RUNTIME_IPC=/run/sumi/runtime
 readonly BROKER_IPC=/run/sumi/broker
+readonly RECOVERY_REQUESTS=/run/sumi/recovery-requests
+readonly SUPERVISOR_PROOFS=/run/sumi/supervisor-proofs
 
 require() {
   local name="$1"
@@ -40,9 +42,26 @@ load_identity() {
   require SUMI_GENERATION_RECOVERY_FENCE_ID
 }
 
+load_cgroup_env() {
+  local cgroup_file="$1"
+  [[ -f "${cgroup_file}" ]] || {
+    printf '[sumi-entrypoint] cgroup boundary is unavailable: %s\n' "${cgroup_file}" >&2
+    exit 65
+  }
+  # shellcheck disable=SC1090
+  source "${cgroup_file}"
+  require SUMI_EXECUTOR_CGROUP_BASE
+  require SUMI_SERVICE_CGROUP_BASE
+  require SUMI_CGROUP_PARENT
+}
+
 case "${role}" in
   init)
     install -d -m 02770 -o root -g "${IPC_GID}" "${RUNTIME_IPC}" "${BROKER_IPC}"
+    install -d -m 0700 -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" "${RECOVERY_REQUESTS}"
+    # This volume is owned by the host supervisor. Runtime receives it
+    # read-only and therefore cannot substitute a local JSON marker for proof.
+    install -d -m 0750 -o root -g "${IPC_GID}" "${SUPERVISOR_PROOFS}"
     install -d -m 0700 -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" /var/lib/sumi
     install -d -m 0700 -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" /var/lib/sumi-runtime-state
     install -d -m 0700 -o "${EXECUTOR_UID}" -g "${EXECUTOR_GID}" /workspace
@@ -58,15 +77,52 @@ case "${role}" in
     cp "${RUNTIME_IPC}/generation.env" "${BROKER_IPC}/generation.env"
     chown root:"${IPC_GID}" "${BROKER_IPC}/generation.env"
     chmod 0640 "${BROKER_IPC}/generation.env"
+
+    # Prepare the generation-scoped cgroup boundary for the runtime, executor
+    # and broker. This must happen as root in the host cgroup namespace before
+    # the long-lived services start.
+    # shellcheck disable=SC1090
+    source "${RUNTIME_IPC}/generation.env"
+    require SUMI_TENANT_ID
+    require SUMI_AGENT_ID
+    require SUMI_CONVERSATION_ID
+    require SUMI_RPC_GENERATION
+    env -i PATH=/usr/local/bin:/usr/bin:/bin \
+      SUMI_TENANT_ID="${SUMI_TENANT_ID}" \
+      SUMI_AGENT_ID="${SUMI_AGENT_ID}" \
+      SUMI_CONVERSATION_ID="${SUMI_CONVERSATION_ID}" \
+      SUMI_RPC_GENERATION="${SUMI_RPC_GENERATION}" \
+      /usr/local/bin/sumi-agent --supervisor-prepare-cgroup > "${RUNTIME_IPC}/cgroup.env"
+    chown root:"${IPC_GID}" "${RUNTIME_IPC}/cgroup.env"
+    chmod 0640 "${RUNTIME_IPC}/cgroup.env"
+
+    # The sidecars run as distinct UIDs but share the IPC_GID, so the executor
+    # command-cgroup directory must be group-writable and the service cgroup's
+    # cgroup.procs must be group-writable for self-migration.
+    # shellcheck disable=SC1090
+    source "${RUNTIME_IPC}/cgroup.env"
+    chown -R root:"${IPC_GID}" "${SUMI_EXECUTOR_CGROUP_BASE}" "${SUMI_SERVICE_CGROUP_BASE}" 2>/dev/null || true
+    chmod 2770 "${SUMI_EXECUTOR_CGROUP_BASE}" 2>/dev/null || true
+    chmod g+w "${SUMI_SERVICE_CGROUP_BASE}/cgroup.procs" 2>/dev/null || true
+    cp "${RUNTIME_IPC}/cgroup.env" "${BROKER_IPC}/cgroup.env"
+    chown root:"${IPC_GID}" "${BROKER_IPC}/cgroup.env"
+    chmod 0640 "${BROKER_IPC}/cgroup.env"
     ;;
 
   runtime)
     load_identity "${RUNTIME_IPC}/generation.env"
+    load_cgroup_env "${RUNTIME_IPC}/cgroup.env"
     require SUMI_TENANT_ID
     require SUMI_AGENT_ID
     require SUMI_CONVERSATION_ID
     require SUMI_AGENT_WRAPPING_KEY
     require SUMI_PROVIDER_API_KEY
+    # Enter the generation-scoped service cgroup so the runtime is isolated
+    # from command execution cgroups and from other generations.
+    echo $$ > "${SUMI_SERVICE_CGROUP_BASE}/cgroup.procs" || {
+      printf '[sumi-entrypoint] failed to migrate runtime to service cgroup\n' >&2
+      exit 66
+    }
     exec env -i \
       PATH=/usr/local/bin:/usr/bin:/bin HOME=/var/lib/sumi LANG=C.UTF-8 \
       SUMI_RPC_GENERATION="${SUMI_RPC_GENERATION}" \
@@ -78,6 +134,10 @@ case "${role}" in
       SUMI_STATE_DIR=/var/lib/sumi SUMI_WORKSPACE=/workspace \
       SUMI_AGENT_RUNTIME_STATE_DIR=/var/lib/sumi-runtime-state \
       SUMI_EXECUTOR_SOCKET="${RUNTIME_IPC}/executor.sock" \
+      SUMI_EXECUTOR_CGROUP_BASE="${SUMI_EXECUTOR_CGROUP_BASE}" \
+      SUMI_SERVICE_CGROUP_BASE="${SUMI_SERVICE_CGROUP_BASE}" \
+      SUMI_T27_RECOVERY_REQUEST_DIR="${RECOVERY_REQUESTS}" \
+      SUMI_T27_SUPERVISOR_PROOF_DIR="${SUPERVISOR_PROOFS}" \
       SUMI_AGENT_WRAPPING_KEY="${SUMI_AGENT_WRAPPING_KEY}" \
       SUMI_AGENT_WRAPPING_KEY_ID="${SUMI_AGENT_WRAPPING_KEY_ID:-env-wrapping-key/v1}" \
       SUMI_MODEL_PRESET="${SUMI_MODEL_PRESET:-kimi-k3}" \
@@ -88,26 +148,47 @@ case "${role}" in
 
   executor)
     load_identity "${RUNTIME_IPC}/generation.env"
+    load_cgroup_env "${RUNTIME_IPC}/cgroup.env"
     require SUMI_CONVERSATION_ID
     umask 007
+    # Enter the generation-scoped service cgroup so the executor is isolated
+    # from command execution cgroups and from other generations.
+    echo $$ > "${SUMI_SERVICE_CGROUP_BASE}/cgroup.procs" || {
+      printf '[sumi-entrypoint] failed to migrate executor to service cgroup\n' >&2
+      exit 66
+    }
     exec env -i \
       PATH=/usr/local/bin:/usr/bin:/bin HOME=/workspace LANG=C.UTF-8 \
       SUMI_RPC_GENERATION="${SUMI_RPC_GENERATION}" SUMI_RPC_NONCE="${SUMI_RPC_NONCE}" \
+      SUMI_TENANT_ID="${SUMI_TENANT_ID}" SUMI_AGENT_ID="${SUMI_AGENT_ID}" \
       SUMI_CONVERSATION_ID="${SUMI_CONVERSATION_ID}" SUMI_WORKSPACE=/workspace \
       SUMI_EXECUTOR_SOCKET="${RUNTIME_IPC}/executor.sock" \
       SUMI_ARTIFACT_BROKER_SOCKET="${BROKER_IPC}/broker.sock" \
+      SUMI_EXECUTOR_CGROUP_BASE="${SUMI_EXECUTOR_CGROUP_BASE}" \
+      SUMI_SERVICE_CGROUP_BASE="${SUMI_SERVICE_CGROUP_BASE}" \
       SUMI_ENFORCE_BROKER_SOCKET_NAMESPACE_ISOLATION=1 \
       /usr/local/bin/sumi-agent --tool-executor-socket
     ;;
 
   broker)
     load_identity "${BROKER_IPC}/generation.env"
+    load_cgroup_env "${BROKER_IPC}/cgroup.env"
     umask 007
+    # Enter the generation-scoped service cgroup so the broker is isolated
+    # from command execution cgroups and from other generations.
+    echo $$ > "${SUMI_SERVICE_CGROUP_BASE}/cgroup.procs" || {
+      printf '[sumi-entrypoint] failed to migrate broker to service cgroup\n' >&2
+      exit 66
+    }
     exec env -i \
       PATH=/usr/local/bin:/usr/bin:/bin HOME=/var/lib/sumi-artifacts LANG=C.UTF-8 \
       SUMI_RPC_GENERATION="${SUMI_RPC_GENERATION}" SUMI_RPC_NONCE="${SUMI_RPC_NONCE}" \
+      SUMI_TENANT_ID="${SUMI_TENANT_ID}" SUMI_AGENT_ID="${SUMI_AGENT_ID}" \
+      SUMI_CONVERSATION_ID="${SUMI_CONVERSATION_ID}" \
       SUMI_ARTIFACT_ROOT=/var/lib/sumi-artifacts \
       SUMI_ARTIFACT_BROKER_SOCKET="${BROKER_IPC}/broker.sock" \
+      SUMI_EXECUTOR_CGROUP_BASE="${SUMI_EXECUTOR_CGROUP_BASE}" \
+      SUMI_SERVICE_CGROUP_BASE="${SUMI_SERVICE_CGROUP_BASE}" \
       /usr/local/bin/sumi-agent --artifact-broker
     ;;
 
