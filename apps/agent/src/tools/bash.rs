@@ -184,7 +184,10 @@ impl<'a> LowTrustLocalBash<'a> {
         );
 
         process.kill_on_drop(true);
-        let mut child = process.spawn()?;
+        let mut child = process.spawn().map_err(|error| {
+            tracing::warn!(%error, "failed to spawn constrained bash child");
+            ToolError::Io(error)
+        })?;
         drop(process);
         let pid = child.id().ok_or_else(|| {
             ToolError::Protocol("spawned bash did not expose a process id".to_owned())

@@ -272,8 +272,9 @@ pub(crate) async fn run_production_with_driver_and_broker(
     .with_approval_broker(approval_broker)
     .with_hydrated_state(Some(state.clone()));
 
-    // Latch Ready only after all composition checks succeed. The receipt
-    // identity comes from the stable T17 hydration result, not a random UUID.
+    // Construct the prospective Ready value, but keep both the in-process gate
+    // and durable state NotReady until every fallible Session/Gateway startup
+    // step and the remaining production dependency check have succeeded.
     let runtime_receipt = HydrationReceiptIdentity::new(format!(
         "{}:{}:{}:{}",
         state.receipt.lease_id,
@@ -287,19 +288,6 @@ pub(crate) async fn run_production_with_driver_and_broker(
     ready
         .latch(ctx.generation, runtime_receipt.clone())
         .context("failed to latch hydration ready state")?;
-    runtime_state_publisher
-        .publish_ready(&runtime_receipt)
-        .context("failed to publish ready runtime state")?;
-    hydration_tx
-        .send(ready)
-        .context("failed to publish hydration ready state")?;
-    tracing::info!(
-        generation = ctx.generation.as_u64(),
-        lease_id = ctx.lease.lease_id(),
-        fence_id = ctx.fence.fence_id(),
-        hydration_receipt_identity = %runtime_receipt.as_str(),
-        "production hydration ready latched"
-    );
 
     let core = RunCore::new()
         .with_runtime_context(state.messages)
@@ -313,12 +301,44 @@ pub(crate) async fn run_production_with_driver_and_broker(
         .context("failed to build command digest factory")?;
     let gateway = StdioGateway::new(command_digest_factory);
 
-    let session = Session::start(store, gateway, core, worker, ctx.generation)
+    let mut session = Session::prepare(store, gateway, core, worker, ctx.generation)
         .await
-        .context("failed to start production session")?;
+        .context("failed to install production command gate and session")?;
+
+    // This branch does not yet contain the T21/T23/T24 production composition.
+    // Keep the durable state explicitly NotReady until those dependencies are
+    // integrated; the local stdio/fail-closed placeholders are not release
+    // substitutes and must never publish production readiness.
+    ensure_production_dependencies_integrated()?;
+
+    // Install and validate the in-process command gate first. Session::run has
+    // not started, so no command can be admitted. Durable Ready is the final
+    // fallible startup operation; a publication failure drops the prepared
+    // Session while the prior NotReady file remains authoritative.
+    hydration_tx.send_replace(ready);
+    session
+        .await_hydration_ready()
+        .await
+        .context("failed to open installed hydration command gate")?;
+    runtime_state_publisher
+        .publish_ready(&runtime_receipt)
+        .context("failed to publish ready runtime state")?;
+    tracing::info!(
+        generation = ctx.generation.as_u64(),
+        lease_id = ctx.lease.lease_id(),
+        fence_id = ctx.fence.fence_id(),
+        hydration_receipt_identity = %runtime_receipt.as_str(),
+        "production hydration ready latched"
+    );
 
     session.run().await;
     Ok(())
+}
+
+fn ensure_production_dependencies_integrated() -> Result<()> {
+    bail!(
+        "production composition remains NotReady until T21 memory, T23 approval, and T24 Gateway dependencies are integrated"
+    )
 }
 
 async fn build_remote_tool_registry(ctx: &BootstrapContext) -> Result<ToolRegistry> {
@@ -407,6 +427,17 @@ mod tests {
         std::env::temp_dir().join(format!("sumi-bootstrap-{}", Uuid::now_v7()))
     }
 
+    fn assert_durable_not_ready(dir: &Path, generation: ProcessGeneration) {
+        let publisher =
+            RuntimeStatePublisher::new(dir, "agent-1", generation).expect("state publisher");
+        let state: crate::runtime::publisher::RuntimeState = serde_json::from_str(
+            &fs::read_to_string(publisher.file_path()).expect("runtime state"),
+        )
+        .expect("runtime state JSON");
+        assert_eq!(state.generation, generation.as_u64());
+        assert_eq!(state.hydration_receipt_identity, None);
+    }
+
     #[test]
     fn hydration_ready_latches_exactly_once_and_rejects_rollover_without_invalidation() {
         let mut ready = HydrationReady::not_ready();
@@ -420,6 +451,21 @@ mod tests {
         assert!(ready.latch(gen2, id2.clone()).is_err());
         ready.invalidate();
         assert!(ready.latch(gen2, id2).is_ok());
+    }
+
+    #[test]
+    fn missing_production_dependencies_leave_durable_state_not_ready() {
+        let dir = fresh_dir();
+        let generation = ProcessGeneration::from_wire(7).unwrap();
+        let publisher = RuntimeStatePublisher::new(&dir, "agent-1", generation).expect("publisher");
+        publisher.publish_not_ready().expect("initial NotReady");
+
+        let error = ensure_production_dependencies_integrated()
+            .expect_err("incomplete production composition must fail closed");
+        assert!(error.to_string().contains("T21 memory"));
+
+        assert_durable_not_ready(&dir, generation);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -451,6 +497,10 @@ mod tests {
 
         let result = run_production_with_driver(inert_starter(), Some(empty_registry())).await;
         assert!(result.is_err(), "mismatched lease/fence must fail closed");
+        assert!(
+            !dir.join("runtime-state").exists(),
+            "invalid bootstrap identity must fail before publishing runtime state"
+        );
 
         unsafe {
             clear_env(&test_env_prefix(&dir));
@@ -474,6 +524,10 @@ mod tests {
         assert!(
             result.is_err(),
             "missing executor socket must fail closed before session start"
+        );
+        assert_durable_not_ready(
+            &dir.join("runtime-state"),
+            ProcessGeneration::from_wire(1).unwrap(),
         );
 
         unsafe {

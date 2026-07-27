@@ -35,6 +35,20 @@ struct Fixture {
     broker: Child,
 }
 
+struct DockerContainerGuard {
+    name: String,
+}
+
+impl Drop for DockerContainerGuard {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", &self.name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 impl Fixture {
     async fn new() -> Self {
         let root = std::env::temp_dir().join(format!("sumi-deployment-{}-", Uuid::now_v7()));
@@ -436,6 +450,156 @@ async fn bash_env_does_not_leak_broker_socket() {
 
     drop(stdin);
     assert!(child.wait().await.unwrap().success());
+}
+
+#[tokio::test]
+async fn production_seccomp_profile_allows_executor_bash_close_range() {
+    let docker = Command::new("docker")
+        .arg("info")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+    if !docker.is_ok_and(|status| status.success()) {
+        eprintln!("docker daemon unavailable; seccomp-constrained bash fixture not executed");
+        return;
+    }
+
+    let fixture = Fixture::new().await;
+    let executor_socket = fixture.root.join("executor.sock");
+    let container_executor_socket = Path::new("/fixture/executor.sock");
+    let container_broker_socket = Path::new("/fixture/broker-ipc/broker.sock");
+    let container_workspace = Path::new("/fixture/workspace");
+    let container_name = format!("sumi-seccomp-{}", Uuid::now_v7());
+    let _container_guard = DockerContainerGuard {
+        name: container_name.clone(),
+    };
+    let deploy_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("deploy/agent");
+    let seccomp = deploy_dir.join("seccomp/sidecar.json");
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_sumi-agent"));
+
+    let mut executor = Command::new("docker")
+        .arg("run")
+        .arg("--rm")
+        .arg("--name")
+        .arg(&container_name)
+        .arg("--network")
+        .arg("none")
+        .arg("--security-opt")
+        .arg(format!("seccomp={}", seccomp.display()))
+        .arg("--user")
+        .arg(format!("{}:{}", unsafe { libc::geteuid() }, unsafe {
+            libc::getegid()
+        }))
+        .arg("--volume")
+        .arg(format!("{}:/sumi-agent:ro", binary.display()))
+        .arg("--volume")
+        .arg(format!("{}:/fixture", fixture.root.display()))
+        .arg("--env")
+        .arg(format!("SUMI_RPC_GENERATION={GENERATION}"))
+        .arg("--env")
+        .arg(format!("SUMI_RPC_NONCE={NONCE}"))
+        .arg("--env")
+        .arg(format!("SUMI_CONVERSATION_ID={CONVERSATION}"))
+        .arg("--env")
+        .arg(format!("SUMI_WORKSPACE={}", container_workspace.display()))
+        .arg("--env")
+        .arg(format!(
+            "SUMI_ARTIFACT_BROKER_SOCKET={}",
+            container_broker_socket.display()
+        ))
+        .arg("--env")
+        .arg(format!(
+            "SUMI_EXECUTOR_SOCKET={}",
+            container_executor_socket.display()
+        ))
+        // The test binary is built on the host and needs the host-generation
+        // glibc ABI. Ubuntu 24.04 supplies glibc 2.39 while still exercising the
+        // exact production seccomp JSON through Docker/runc.
+        .arg("ubuntu:24.04")
+        .arg("/sumi-agent")
+        .arg("--tool-executor-socket")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start seccomp-constrained executor container");
+
+    let ready = timeout(Duration::from_secs(15), async {
+        loop {
+            if UnixStream::connect(&executor_socket).await.is_ok() {
+                break;
+            }
+            if let Some(status) = executor.try_wait().expect("poll executor") {
+                let mut stderr = String::new();
+                if let Some(mut pipe) = executor.stderr.take() {
+                    pipe.read_to_string(&mut stderr)
+                        .await
+                        .expect("read executor stderr");
+                }
+                panic!("seccomp-constrained executor exited before binding: {status}: {stderr}");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    if ready.is_err() {
+        panic!("seccomp-constrained executor did not bind");
+    }
+
+    let mut stream = UnixStream::connect(&executor_socket)
+        .await
+        .expect("connect constrained executor");
+    let mut request_bytes = serde_json::to_vec(&request(
+        "seccomp-bash",
+        json!({
+            "type": "bash",
+            "command": "printf SECCOMP_CLOSE_RANGE_OK",
+            "execution_id": "seccomp-bash-1",
+        }),
+    ))
+    .unwrap();
+    request_bytes.push(b'\n');
+    stream.write_all(&request_bytes).await.unwrap();
+    let mut frames = BufReader::new(stream).lines();
+    let mut terminal = None;
+    let mut streamed_output = String::new();
+    while let Some(line) = timeout(Duration::from_secs(10), frames.next_line())
+        .await
+        .expect("executor frame timeout")
+        .expect("executor frame read")
+    {
+        let frame: Value = serde_json::from_str(&line).expect("executor JSON frame");
+        if !frame["result"].is_null() {
+            terminal = Some(frame);
+            break;
+        }
+        if let Some(output) = frame["value"]["output"].as_str() {
+            streamed_output.push_str(output);
+        }
+    }
+    let terminal = terminal.expect("executor terminal frame");
+    let terminal_output = terminal["result"]["Ok"]["result"]["output"]
+        .as_str()
+        .unwrap_or_default();
+    let observed_output = if terminal_output.is_empty() {
+        streamed_output.as_str()
+    } else {
+        terminal_output
+    };
+    assert_eq!(
+        observed_output, "SECCOMP_CLOSE_RANGE_OK",
+        "unexpected constrained bash terminal: {terminal}"
+    );
+    assert_eq!(terminal["result"]["Ok"]["result"]["exit_code"], 0);
+
+    drop(_container_guard);
+    let _ = executor.wait().await;
 }
 
 #[tokio::test]
