@@ -4059,12 +4059,19 @@ mod tests {
         .expect("encrypt covered");
         covered.insert(store.pool()).await.expect("insert covered");
 
-        // Unrelated: coverage endpoint does not belong to this batch.
+        // Unrelated: coverage endpoint does not belong to this batch and lives in a
+        // different provider scope, so it is not the same active native window as the
+        // covered record.
+        let unrelated_origin = ProviderOrigin {
+            provider_instance_id: "test-instance-unrelated".to_owned(),
+            protocol: ApiProtocol::OpenAiResponses,
+            model: "openai-responses-unrelated".to_owned(),
+        };
         let uncovered_item = ProviderContextItem {
             origin_message: None,
             wire_item_index: None,
             ordinal: 1,
-            provider_origin: assistant_origin(&assistant),
+            provider_origin: unrelated_origin.clone(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({"type": "message", "role": "assistant", "content": []})],
                 coverage: NativeCompactionCoverage {
@@ -4075,9 +4082,9 @@ mod tests {
         };
         let uncovered = EncryptedProviderContextRecord::encrypt(
             &uncovered_item,
-            "test-instance",
+            "test-instance-unrelated",
             ApiProtocol::OpenAiResponses,
-            "openai-responses",
+            "openai-responses-unrelated",
             "pc-openai-uncovered",
             provider_context_idempotency_key(&message_id, &uncovered_item),
             EvictionFootprint::from_saved(1, 0, 0).expect("footprint"),
@@ -4186,12 +4193,19 @@ mod tests {
         .expect("encrypt covered");
         covered.insert(store.pool()).await.expect("insert covered");
 
-        // Unrelated: coverage endpoint does not belong to this batch.
+        // Unrelated: coverage endpoint does not belong to this batch and lives in a
+        // different provider scope, so it is not the same active native window as the
+        // covered record.
+        let unrelated_origin = ProviderOrigin {
+            provider_instance_id: "test-instance-unrelated".to_owned(),
+            protocol: ApiProtocol::AnthropicMessages,
+            model: "anthropic-unrelated".to_owned(),
+        };
         let uncovered_item = ProviderContextItem {
             origin_message: None,
             wire_item_index: None,
             ordinal: 1,
-            provider_origin: assistant_origin(&assistant),
+            provider_origin: unrelated_origin.clone(),
             payload: ProviderContextPayload::AnthropicCompaction {
                 block: json!({"type": "compaction", "content": "anthropic summary"}),
                 coverage: NativeCompactionCoverage {
@@ -4202,9 +4216,9 @@ mod tests {
         };
         let uncovered = EncryptedProviderContextRecord::encrypt(
             &uncovered_item,
-            "test-instance",
+            "test-instance-unrelated",
             ApiProtocol::AnthropicMessages,
-            "anthropic",
+            "anthropic-unrelated",
             "pc-anthropic-uncovered",
             provider_context_idempotency_key(&message_id, &uncovered_item),
             EvictionFootprint::from_saved(1, 0, 0).expect("footprint"),

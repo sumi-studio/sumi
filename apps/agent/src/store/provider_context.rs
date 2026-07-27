@@ -1529,7 +1529,8 @@ mod tests {
     use sqlx::Row;
 
     use super::*;
-    use crate::memory::estimate::EvictionFootprint;
+    use crate::memory::estimate::{EvictionFootprint, eviction_footprint_for_payload};
+    use crate::provider::model::ModelSpec;
     use crate::provider::types::{
         ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, Message,
         NativeCompactionCoverage, ProviderContextAnchor, ProviderContextItem,
@@ -1587,12 +1588,29 @@ mod tests {
     fn reasoning_origin() -> ProviderOrigin {
         ProviderOrigin {
             provider_instance_id: "provider-instance-1".to_owned(),
-            protocol: ApiProtocol::OpenAiChatCompletions,
+            protocol: ApiProtocol::OpenAiResponses,
             model: "model-1".to_owned(),
         }
     }
 
+    fn valid_reasoning_item() -> serde_json::Value {
+        json!({
+            "type": "reasoning",
+            "id": "rs-test",
+            "encrypted_content": "opaque-reasoning",
+            "summary": [],
+        })
+    }
+
+    fn reasoning_footprint(item: &ProviderContextItem) -> EvictionFootprint {
+        let spec = ModelSpec::from_origin(&item.provider_origin)
+            .expect("test origin must resolve to a ModelSpec");
+        eviction_footprint_for_payload(&spec, &item.payload)
+            .expect("test reasoning payload must be footprintable")
+    }
+
     fn reasoning_item(message_id: impl Into<String>, message_seq: u64) -> ProviderContextItem {
+        let origin = reasoning_origin();
         ProviderContextItem {
             origin_message: Some(ProviderContextAnchor {
                 message_id: message_id.into(),
@@ -1600,10 +1618,10 @@ mod tests {
             }),
             wire_item_index: Some(0),
             ordinal: 1,
-            provider_origin: reasoning_origin(),
+            provider_origin: origin.clone(),
             payload: ProviderContextPayload::EncryptedReasoning {
-                protocol: ApiProtocol::OpenAiChatCompletions,
-                item: json!({"text": "opaque reasoning"}),
+                protocol: origin.protocol,
+                item: valid_reasoning_item(),
             },
         }
     }
@@ -1623,6 +1641,7 @@ mod tests {
         wire_item_index: u32,
         ordinal: u32,
     ) -> ProviderContextItem {
+        let origin = reasoning_origin();
         ProviderContextItem {
             origin_message: Some(ProviderContextAnchor {
                 message_id: message_id.into(),
@@ -1630,10 +1649,10 @@ mod tests {
             }),
             wire_item_index: Some(wire_item_index),
             ordinal,
-            provider_origin: reasoning_origin(),
+            provider_origin: origin.clone(),
             payload: ProviderContextPayload::EncryptedReasoning {
-                protocol: ApiProtocol::OpenAiChatCompletions,
-                item: json!({"text": "opaque reasoning"}),
+                protocol: origin.protocol,
+                item: valid_reasoning_item(),
             },
         }
     }
@@ -1655,14 +1674,15 @@ mod tests {
             .await
             .expect("mint reasoning anchor key");
         let item = reasoning_item_with(message_id, message_seq, wire_item_index, ordinal);
+        let origin = reasoning_origin();
         EncryptedProviderContextRecord::encrypt(
             &item,
-            "provider-instance-1",
-            ApiProtocol::OpenAiChatCompletions,
-            "model-1",
+            &origin.provider_instance_id,
+            origin.protocol,
+            &origin.model,
             id,
             provider_context_idempotency_key(message_id, &item),
-            dummy_footprint(),
+            reasoning_footprint(&item),
             &key,
             store.scope(),
         )
@@ -1795,11 +1815,12 @@ mod tests {
         // A different plaintext under the same mutation_id is a conflicting intent.
         let mut different_item = reasoning_item("message-1", 7);
         different_item.ordinal = 2;
+        let different_origin = reasoning_origin();
         let different_record = EncryptedProviderContextRecord::encrypt(
             &different_item,
-            "provider-instance-1",
-            ApiProtocol::OpenAiChatCompletions,
-            "model-1",
+            &different_origin.provider_instance_id,
+            different_origin.protocol,
+            &different_origin.model,
             "pc-different",
             provider_context_idempotency_key("message-1", &different_item),
             dummy_footprint(),
@@ -2236,7 +2257,11 @@ mod tests {
                 }
             } else {
                 ProviderContextPayload::OpenAiCompactedWindow {
-                    items: vec![json!({"summary": "compacted"})],
+                    items: vec![json!({
+                        "type": "compaction",
+                        "id": "native-cmp",
+                        "encrypted_content": "opaque",
+                    })],
                     coverage,
                 }
             },
@@ -2688,7 +2713,11 @@ mod tests {
             ordinal: 1,
             provider_origin: openai_responses_origin(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
-                items: vec![json!({"summary": "a"})],
+                items: vec![json!({
+                    "type": "compaction",
+                    "id": "cmp-a",
+                    "encrypted_content": "opaque-a",
+                })],
                 coverage: NativeCompactionCoverage {
                     through_message_seq: 1,
                     context_fingerprint: "fp-a".to_owned(),
@@ -2717,7 +2746,11 @@ mod tests {
         item.ordinal = 2;
         item.provider_origin = openai_responses_origin_with_model("model-2");
         item.payload = ProviderContextPayload::OpenAiCompactedWindow {
-            items: vec![json!({"summary": "b"})],
+            items: vec![json!({
+                "type": "compaction",
+                "id": "cmp-b",
+                "encrypted_content": "opaque-b",
+            })],
             coverage: NativeCompactionCoverage {
                 through_message_seq: 2,
                 context_fingerprint: "fp-b".to_owned(),
@@ -2794,7 +2827,11 @@ mod tests {
             ordinal: 1,
             provider_origin: openai_responses_origin(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
-                items: vec![json!({"summary": "compacted"})],
+                items: vec![json!({
+                    "type": "compaction",
+                    "id": "compaction-1",
+                    "encrypted_content": "opaque",
+                })],
                 coverage: NativeCompactionCoverage {
                     through_message_seq: 1,
                     context_fingerprint: "fp-1".to_owned(),
@@ -3085,24 +3122,14 @@ mod tests {
             .await
             .unwrap();
 
-        let item = ProviderContextItem {
-            origin_message: Some(ProviderContextAnchor {
-                message_id: "message-1".to_owned(),
-                message_seq: 7,
-            }),
-            wire_item_index: None,
-            ordinal: 1,
-            provider_origin: reasoning_origin(),
-            payload: ProviderContextPayload::EncryptedReasoning {
-                protocol: ApiProtocol::OpenAiChatCompletions,
-                item: json!({"text": "opaque reasoning"}),
-            },
-        };
+        let mut item = reasoning_item("message-1", 7);
+        item.wire_item_index = None;
+        let origin = reasoning_origin();
         let record = EncryptedProviderContextRecord::encrypt(
             &item,
-            "provider-instance-1",
-            ApiProtocol::OpenAiChatCompletions,
-            "model-1",
+            &origin.provider_instance_id,
+            origin.protocol,
+            &origin.model,
             "pc-tamper-reasoning-wire",
             provider_context_idempotency_key("message-1", &item),
             dummy_footprint(),
@@ -3144,21 +3171,14 @@ mod tests {
             .await
             .unwrap();
 
-        let item = ProviderContextItem {
-            origin_message: None,
-            wire_item_index: Some(0),
-            ordinal: 1,
-            provider_origin: reasoning_origin(),
-            payload: ProviderContextPayload::EncryptedReasoning {
-                protocol: ApiProtocol::OpenAiChatCompletions,
-                item: json!({"text": "opaque reasoning"}),
-            },
-        };
+        let mut item = reasoning_item("message-1", 7);
+        item.origin_message = None;
+        let origin = reasoning_origin();
         let record = EncryptedProviderContextRecord::encrypt(
             &item,
-            "provider-instance-1",
-            ApiProtocol::OpenAiChatCompletions,
-            "model-1",
+            &origin.provider_instance_id,
+            origin.protocol,
+            &origin.model,
             "pc-tamper-reasoning-origin",
             provider_context_idempotency_key("message-1", &item),
             dummy_footprint(),
@@ -3686,7 +3706,11 @@ mod tests {
             ordinal: 1,
             provider_origin: openai_responses_origin(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
-                items: vec![json!({"summary": "compacted"})],
+                items: vec![json!({
+                    "type": "compaction",
+                    "id": "cmp-out-of-range",
+                    "encrypted_content": "opaque",
+                })],
                 coverage: NativeCompactionCoverage {
                     through_message_seq: 5,
                     context_fingerprint: "fp-1".to_owned(),

@@ -21410,20 +21410,6 @@ mod tests {
                     }),
                 },
             },
-            ProviderContextFragment {
-                wire_item_index: None,
-                payload: ProviderContextPayload::OpenAiCompactedWindow {
-                    items: vec![json!({
-                        "type": "compaction",
-                        "id": "cmp-hydrate",
-                        "encrypted_content": "opaque",
-                    })],
-                    coverage: NativeCompactionCoverage {
-                        through_message_seq: 1,
-                        context_fingerprint: "hydrate-fingerprint".to_owned(),
-                    },
-                },
-            },
         ];
         let footprint = eviction_footprint_for_test(&assistant.origin, &fragments);
 
