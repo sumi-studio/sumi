@@ -20,7 +20,7 @@ use super::*;
 use crate::store::KeyProvider;
 use crate::store::{PendingApprovalRecovery, Redactor};
 use crate::{
-    gateway::{CommandAck, CommandId},
+    gateway::{AgentHello, ApiHello, CommandAck, CommandId, HelloError},
     provider::types::{
         ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, Message, PromptContext,
         ProviderContextFragment, ProviderContextItem, ProviderContextPayload, ProviderEvent,
@@ -80,6 +80,14 @@ fn synthetic_runtime_context(messages: Vec<PublicMessage>) -> Vec<ContextMessage
         .collect()
 }
 
+fn test_api_hello(hello: &AgentHello) -> ApiHello {
+    ApiHello {
+        accepted_generation: hello.generation,
+        last_received_event_seq: 0,
+        next_command_seq: hello.last_applied_command_seq.saturating_add(1),
+    }
+}
+
 struct MockGateway {
     commands: mpsc::Receiver<InboundCommand>,
     frames: Arc<Mutex<Vec<OutboundFrame>>>,
@@ -95,9 +103,17 @@ impl MockGateway {
     }
 }
 
+#[async_trait]
 impl Gateway for MockGateway {
     type Reader = MockGatewayReader;
     type Writer = MockGatewayWriter;
+
+    async fn authenticate_hello(
+        &mut self,
+        hello: AgentHello,
+    ) -> std::result::Result<ApiHello, HelloError> {
+        Ok(test_api_hello(&hello))
+    }
 
     fn split(self) -> (Self::Reader, Self::Writer) {
         (
@@ -219,9 +235,17 @@ struct FailFirstEventGateway {
     attempted: Arc<Notify>,
 }
 
+#[async_trait]
 impl Gateway for FailFirstEventGateway {
     type Reader = SimpleReader;
     type Writer = FailFirstEventWriter;
+
+    async fn authenticate_hello(
+        &mut self,
+        hello: AgentHello,
+    ) -> std::result::Result<ApiHello, HelloError> {
+        Ok(test_api_hello(&hello))
+    }
 
     fn split(self) -> (Self::Reader, Self::Writer) {
         (
@@ -275,9 +299,17 @@ struct BlockingWriterGateway {
     release: Arc<Notify>,
 }
 
+#[async_trait]
 impl Gateway for BlockingWriterGateway {
     type Reader = SimpleReader;
     type Writer = BlockingWriter;
+
+    async fn authenticate_hello(
+        &mut self,
+        hello: AgentHello,
+    ) -> std::result::Result<ApiHello, HelloError> {
+        Ok(test_api_hello(&hello))
+    }
 
     fn split(self) -> (Self::Reader, Self::Writer) {
         (
@@ -319,9 +351,17 @@ struct EofBlockingGateway {
     writer_dropped: Arc<Notify>,
 }
 
+#[async_trait]
 impl Gateway for EofBlockingGateway {
     type Reader = EofBlockingReader;
     type Writer = EofBlockingWriter;
+
+    async fn authenticate_hello(
+        &mut self,
+        hello: AgentHello,
+    ) -> std::result::Result<ApiHello, HelloError> {
+        Ok(test_api_hello(&hello))
+    }
 
     fn split(self) -> (Self::Reader, Self::Writer) {
         (
@@ -391,9 +431,17 @@ impl GatewayWriter for EofBlockingWriter {
     }
 }
 
+#[async_trait]
 impl Gateway for ShutdownDrainGateway {
     type Reader = SimpleReader;
     type Writer = ShutdownDrainWriter;
+
+    async fn authenticate_hello(
+        &mut self,
+        hello: AgentHello,
+    ) -> std::result::Result<ApiHello, HelloError> {
+        Ok(test_api_hello(&hello))
+    }
 
     fn split(self) -> (Self::Reader, Self::Writer) {
         (
@@ -517,6 +565,41 @@ fn applied_acks(frames: &Arc<Mutex<Vec<OutboundFrame>>>) -> Vec<CommandAck> {
             _ => None,
         })
         .collect()
+}
+
+async fn close_mock_gateway_after_idle_boundary(
+    commands: mpsc::Sender<InboundCommand>,
+    frames: &Arc<Mutex<Vec<OutboundFrame>>>,
+    task: &tokio::task::JoinHandle<SessionResult>,
+    sentinel_seq: u64,
+) {
+    let sentinel = abort(sentinel_seq);
+    let sentinel_command_id = match &sentinel {
+        InboundCommand::Valid(envelope) => envelope.command_id.to_string(),
+        InboundCommand::Invalid { .. } => unreachable!("abort helper produces a valid command"),
+    };
+    commands
+        .send(sentinel)
+        .await
+        .expect("idle-boundary sentinel");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if applied_acks(frames)
+                .iter()
+                .any(|ack| ack.command_id == sentinel_command_id)
+            {
+                break;
+            }
+            assert!(
+                !task.is_finished(),
+                "session exited before applying idle-boundary sentinel"
+            );
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("idle-boundary sentinel applied");
+    drop(commands);
 }
 
 async fn session(gateway: MockGateway, worker: Arc<dyn RunWorker>) -> Session<MockGateway> {
@@ -1762,9 +1845,17 @@ struct CommitCheckingGateway {
     observed: Arc<Mutex<Vec<(u64, String)>>>,
 }
 
+#[async_trait]
 impl Gateway for CommitCheckingGateway {
     type Reader = SimpleReader;
     type Writer = CommitCheckingWriter;
+
+    async fn authenticate_hello(
+        &mut self,
+        hello: AgentHello,
+    ) -> std::result::Result<ApiHello, HelloError> {
+        Ok(test_api_hello(&hello))
+    }
 
     fn split(self) -> (Self::Reader, Self::Writer) {
         (
@@ -7234,7 +7325,7 @@ async fn retry_wait_group_of_two_is_injected_before_next_attempt() {
         eprintln!("durable kinds on terminal timeout: {kinds:?}");
     }
     terminal_result.expect("retry group run terminal");
-    drop(commands);
+    close_mock_gateway_after_idle_boundary(commands, &frames, &task, 4).await;
     completed(task.await.expect("session join"));
 
     let kinds: Vec<String> = sqlx::query_scalar("SELECT event_type FROM agent_events ORDER BY seq")
@@ -7362,7 +7453,7 @@ async fn retry_wait_group_of_three_is_injected_before_next_attempt() {
         eprintln!("durable kinds on terminal timeout: {kinds:?}");
     }
     terminal_result.expect("retry group run terminal");
-    drop(commands);
+    close_mock_gateway_after_idle_boundary(commands, &frames, &task, 5).await;
     completed(task.await.expect("session join"));
 
     let kinds: Vec<String> = sqlx::query_scalar("SELECT event_type FROM agent_events ORDER BY seq")

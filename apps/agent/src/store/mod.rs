@@ -18,9 +18,6 @@ use std::{
     sync::Arc,
 };
 
-#[cfg(test)]
-use std::str::FromStr;
-
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
@@ -46,6 +43,12 @@ use crate::runtime::contracts::{
 use self::crypto::{
     ConversationCommandDigestFactory, DataKeyScope, KeyWrapAad, WRAP_ALGORITHM, unwrap_data_key,
     wrap_data_key,
+};
+#[cfg(test)]
+pub(crate) use self::delivery::insert_test_durable_event;
+pub(crate) use self::delivery::{
+    DeliveryChannelBuilder, DeliveryFrame, DeliveryMode, DeliveryPump, current_event_head_seq,
+    raw_events_after,
 };
 #[allow(unused_imports)]
 pub(crate) use self::physical_recovery::{
@@ -156,6 +159,8 @@ pub(crate) struct Store {
     key_provider: Arc<dyn KeyProvider>,
     redactor: Redactor,
     event_writer_state: Arc<Mutex<event_writer::WriterState>>,
+    #[cfg(test)]
+    _in_memory_anchor: Option<Arc<Mutex<sqlx::SqliteConnection>>>,
 }
 
 impl Store {
@@ -183,14 +188,28 @@ impl Store {
 
     #[cfg(test)]
     async fn in_memory(scope: AgentScope, key_provider: Arc<dyn KeyProvider>) -> Result<Self> {
-        let options = SqliteConnectOptions::from_str("sqlite::memory:")?
+        // SQLx closes a SQLite worker connection when an in-flight query is
+        // cancelled. A single-connection anonymous in-memory pool then opens a
+        // fresh, empty database, losing the migrated schema. Keep one connection
+        // permanently outside the managed pool so cancellation-driven connection
+        // replacement observes the same named shared-memory database.
+        let database_name = format!("sumi-test-{}", Uuid::now_v7());
+        let options = SqliteConnectOptions::new()
+            .filename(format!("file:{database_name}?mode=memory&cache=shared"))
+            .in_memory(true)
+            .shared_cache(true)
             .foreign_keys(true)
             .journal_mode(SqliteJournalMode::Memory);
+        let anchor = <sqlx::SqliteConnection as sqlx::Connection>::connect_with(&options)
+            .await
+            .context("failed to open in-memory database anchor")?;
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(options)
             .await?;
-        Self::finish_open(pool, scope, key_provider).await
+        let mut store = Self::finish_open(pool, scope, key_provider).await?;
+        store._in_memory_anchor = Some(Arc::new(Mutex::new(anchor)));
+        Ok(store)
     }
 
     #[cfg(test)]
@@ -256,6 +275,8 @@ impl Store {
             key_provider,
             redactor: Redactor::v1(),
             event_writer_state: Arc::new(Mutex::new(event_writer::WriterState::default())),
+            #[cfg(test)]
+            _in_memory_anchor: None,
         });
         store.validate_startup().await?;
         event_writer::EventWriter::new(store.clone())
