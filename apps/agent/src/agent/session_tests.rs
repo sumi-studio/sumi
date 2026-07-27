@@ -6385,6 +6385,25 @@ async fn live_responses_approval_broker_constructs_bounded_policy() {
             .expect("modified prefix denial"),
         ApprovalOutcome::Denied { .. }
     ));
+    for (id, value) in [
+        ("dot-prefix", "./responses-live-ok"),
+        ("trailing-slash", "responses-live-ok/"),
+    ] {
+        assert!(matches!(
+            broker
+                .start_request(
+                    &call(id, value),
+                    &[],
+                    "live-approval-test",
+                    "turn-2",
+                    "context-1",
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("normalized literal variant denial"),
+            ApprovalOutcome::Denied { .. }
+        ));
+    }
     let unknown = ToolCall {
         id: "unknown".to_owned(),
         name: "unknown_tool".to_owned(),

@@ -150,7 +150,11 @@ impl CanonicalAction {
                         "echo_value requires exactly one value argument",
                     ));
                 }
-                let value = get_path_arg(map, tool_name, "value")?;
+                // `value` is an opaque test literal, not a filesystem path.
+                // Preserving it byte-for-byte keeps the live-gate policy's
+                // literal prefix exact instead of accepting path-normalized
+                // variants such as `./responses-live-ok`.
+                let value = get_string(map, tool_name, "value")?;
                 Self {
                     tool: tool_name.to_owned(),
                     operation: "read".to_owned(),
