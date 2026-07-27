@@ -110,7 +110,9 @@ pub(crate) trait RunDriver: Send + Sync + 'static {
     /// T21 idle maintenance must return true only after its durable transition
     /// and ContextAssembler refresh have both completed.
     async fn apply_idle_memory_maintenance(&self, _core: &mut RunCore) -> Result<bool> {
-        Ok(false)
+        Err(anyhow::anyhow!(
+            "idle memory maintenance is not wired to the authoritative Store/EventWriter path"
+        ))
     }
 
     async fn start_provider_for_command(
