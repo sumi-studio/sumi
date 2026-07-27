@@ -7677,11 +7677,15 @@ fn public_initial_message() -> PublicMessage {
 }
 
 fn bash_tool_call(id: &str) -> ToolCall {
+    bash_tool_call_with_command(id, "git status")
+}
+
+fn bash_tool_call_with_command(id: &str, command: &str) -> ToolCall {
     ToolCall {
         id: id.to_owned(),
         name: "bash".to_owned(),
         arguments: serde_json::from_value::<ValidatedToolArguments>(
-            serde_json::json!({"command": "git status"}),
+            serde_json::json!({"command": command}),
         )
         .expect("validated bash arguments"),
     }
@@ -7755,8 +7759,12 @@ struct ApprovalTestDriver {
 
 impl ApprovalTestDriver {
     fn with_tool_call(executed: Arc<AtomicBool>) -> Arc<Self> {
+        Self::with_specific_tool_call(executed, bash_tool_call("call-1"))
+    }
+
+    fn with_specific_tool_call(executed: Arc<AtomicBool>, tool_call: ToolCall) -> Arc<Self> {
         let mut scripts = VecDeque::new();
-        scripts.push_back(ApprovalTestScript::ToolCall(bash_tool_call("call-1")));
+        scripts.push_back(ApprovalTestScript::ToolCall(tool_call));
         scripts.push_back(ApprovalTestScript::Stop);
         Arc::new(Self {
             scripts: Mutex::new(scripts),
@@ -8106,16 +8114,24 @@ fn approval_decision(seq: u64, request_id: &str) -> InboundCommand {
 }
 
 fn approval_always_decision(seq: u64, request_id: &str) -> InboundCommand {
-    let rule = serde_json::from_value::<crate::gateway::DeferredApprovalRule>(serde_json::json!({
-        "id": "rule-git-status",
-        "tool": "bash",
-        "literal_prefix": ["git", "status"],
-        "effect": "allow",
-        "workspace_only": true,
-        "allowed_permissions": ["exec"],
-        "allowed_network_domains": []
-    }))
-    .expect("valid narrow ApproveAlways rule");
+    approval_always_decision_with_rule(
+        seq,
+        request_id,
+        serde_json::json!({
+            "id": "rule-git-status",
+            "tool": "bash",
+            "literal_prefix": ["git", "status"],
+            "effect": "allow",
+            "workspace_only": true,
+            "allowed_permissions": ["exec"],
+            "allowed_network_domains": []
+        }),
+    )
+}
+
+fn approval_always_decision_with_rule(seq: u64, request_id: &str, rule: Value) -> InboundCommand {
+    let rule = serde_json::from_value::<crate::gateway::DeferredApprovalRule>(rule)
+        .expect("object deferred ApproveAlways rule");
     InboundCommand::Valid(CommandEnvelope {
         seq,
         command_id: CommandId::parse(&format!("20000000-0000-4000-8000-{seq:012}"))
@@ -8441,6 +8457,243 @@ async fn session_user_approve_always_persists_rule_and_executes() {
     assert_eq!(rule_count, 1);
     assert_eq!(requested, 1);
     assert_eq!(resolved, 1);
+}
+
+#[tokio::test]
+async fn session_approve_always_normalization_matrix_is_durable_and_replayable() {
+    use crate::approval::policy::{ApprovalRule, Policy};
+
+    struct Case {
+        name: &'static str,
+        command: &'static str,
+        rule: Value,
+        policy: Policy,
+        expected_state: &'static str,
+        executes: bool,
+        persisted_rule: Option<&'static str>,
+    }
+
+    fn rule(value: Value) -> ApprovalRule {
+        serde_json::from_value(value).expect("valid fixture policy rule")
+    }
+
+    fn candidate(id: &str, prefix: &[&str], effect: &str, domains: Vec<&str>) -> Value {
+        serde_json::json!({
+            "id": id,
+            "tool": "bash",
+            "literal_prefix": prefix,
+            "effect": effect,
+            "workspace_only": true,
+            "allowed_permissions": ["exec"],
+            "allowed_network_domains": domains
+        })
+    }
+
+    let conflict_policy = Policy::new("/workspace")
+        .try_with_rule(rule(candidate(
+            "existing-needs-approval",
+            &["git", "status"],
+            "needs_approval",
+            vec![],
+        )))
+        .expect("conflict fixture policy");
+    let duplicate_policy = Policy::new("/workspace")
+        .try_with_rule(rule(candidate(
+            "duplicate-id",
+            &["git", "status"],
+            "allow",
+            vec![],
+        )))
+        .expect("duplicate fixture policy");
+    let cases = vec![
+        Case {
+            name: "session-approve-always-secret-normalization",
+            command: "printf \"Authorization: Bearer abcdef1234567890\"",
+            rule: candidate(
+                "secret-rule",
+                &["printf", "Authorization: Bearer abcdef1234567890"],
+                "allow",
+                vec![],
+            ),
+            policy: Policy::new("/workspace"),
+            expected_state: "approved_once",
+            executes: true,
+            persisted_rule: None,
+        },
+        Case {
+            name: "session-approve-always-broad-normalization",
+            command: "git status",
+            rule: candidate("broad-rule", &["git"], "allow", vec![]),
+            policy: Policy::new("/workspace"),
+            expected_state: "approved_once",
+            executes: true,
+            persisted_rule: None,
+        },
+        Case {
+            name: "session-approve-always-nonmatching-normalization",
+            command: "git status",
+            rule: candidate("nonmatching-rule", &["git", "log"], "allow", vec![]),
+            policy: Policy::new("/workspace"),
+            expected_state: "approved_once",
+            executes: true,
+            persisted_rule: None,
+        },
+        Case {
+            name: "session-approve-always-conflicting-normalization",
+            command: "git status",
+            rule: candidate("candidate-rule", &["git", "status"], "allow", vec![]),
+            policy: conflict_policy,
+            expected_state: "approved_once",
+            executes: true,
+            persisted_rule: None,
+        },
+        Case {
+            name: "session-approve-always-duplicate-normalization",
+            command: "git log",
+            rule: candidate("duplicate-id", &["git", "log"], "allow", vec![]),
+            policy: duplicate_policy,
+            expected_state: "approved_once",
+            executes: true,
+            persisted_rule: None,
+        },
+        Case {
+            name: "session-approve-always-malformed-normalization",
+            command: "git status",
+            rule: serde_json::json!({"malformed": true}),
+            policy: Policy::new("/workspace"),
+            expected_state: "denied",
+            executes: false,
+            persisted_rule: None,
+        },
+        Case {
+            name: "session-approve-always-empty-id-normalization",
+            command: "git status",
+            rule: candidate("", &["git", "status"], "allow", vec![]),
+            policy: Policy::new("/workspace"),
+            expected_state: "approved_always",
+            executes: true,
+            persisted_rule: Some("request_id"),
+        },
+    ];
+
+    for case in cases {
+        let store = Store::session_test_store(case.name)
+            .await
+            .expect("test store");
+        let pool = store.pool().clone();
+        let broker = Arc::new(ApprovalBroker::new(
+            case.policy,
+            make_projector(),
+            None,
+            ReviewerMode::User,
+            false,
+            trusted_env(),
+        ));
+        let executed = Arc::new(AtomicBool::new(false));
+        let worker: Arc<dyn RunWorker> = Arc::new(SequentialRunWorker::new(
+            ApprovalTestDriver::with_specific_tool_call(
+                executed.clone(),
+                bash_tool_call_with_command("call-1", case.command),
+            ),
+        ));
+        let (gateway, commands, frames) = gateway();
+        let session = Session::start(
+            store,
+            gateway,
+            approval_core(broker),
+            worker,
+            test_executor_generation(),
+        )
+        .await
+        .expect("session startup");
+        let task = tokio::spawn(session.run());
+        commands.send(user(1)).await.expect("user command");
+        let request_id = wait_for_approval_request(&frames, &task).await;
+        let decision = approval_always_decision_with_rule(2, &request_id, case.rule);
+        commands
+            .send(decision.clone())
+            .await
+            .expect("ApproveAlways decision");
+        wait_for_agent_end(&frames).await;
+
+        assert_eq!(
+            executed.load(Ordering::SeqCst),
+            case.executes,
+            "{} execution result",
+            case.name
+        );
+        let (approval_state, execution_state, error_code, rule_count, command_status): (
+            String,
+            String,
+            Option<String>,
+            i64,
+            String,
+        ) = sqlx::query_as(
+            "SELECT
+                (SELECT state FROM approval_log WHERE id = ?),
+                (SELECT state FROM tool_executions WHERE tool_call_id = 'call-1'),
+                (SELECT error_code FROM tool_executions WHERE tool_call_id = 'call-1'),
+                (SELECT COUNT(*) FROM approval_rules),
+                (SELECT status FROM inbound_commands WHERE seq = 2)",
+        )
+        .bind(&request_id)
+        .fetch_one(&pool)
+        .await
+        .expect("normalized durable state");
+        assert_eq!(approval_state, case.expected_state, "{}", case.name);
+        assert_eq!(command_status, "applied", "{}", case.name);
+        if case.executes {
+            assert_eq!(execution_state, "succeeded", "{}", case.name);
+            assert!(error_code.is_none(), "{}", case.name);
+        } else {
+            assert_eq!(execution_state, "cancelled", "{}", case.name);
+            assert_eq!(
+                error_code.as_deref(),
+                Some("approval_denied"),
+                "{}",
+                case.name
+            );
+        }
+        let expected_rule_count = i64::from(case.persisted_rule.is_some());
+        assert_eq!(rule_count, expected_rule_count, "{}", case.name);
+        if case.persisted_rule.is_some() {
+            let durable_rule_id: String =
+                sqlx::query_scalar("SELECT id FROM approval_rules LIMIT 1")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("normalized empty-id rule");
+            assert_eq!(durable_rule_id, request_id, "{}", case.name);
+        }
+
+        commands
+            .send(decision)
+            .await
+            .expect("replay exact ApproveAlways decision");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let exact_applied_acks = applied_acks(&frames)
+                    .into_iter()
+                    .filter(|ack| {
+                        ack.seq == 2 && ack.command_id == "20000000-0000-4000-8000-000000000002"
+                    })
+                    .count();
+                if exact_applied_acks >= 2 {
+                    break;
+                }
+                assert!(!task.is_finished(), "{} ended before replay ACK", case.name);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal replay ACK");
+        drop(commands);
+        match task.await.expect("session join") {
+            SessionResult::Completed(_) => {}
+            SessionResult::Failed { failure, .. } => {
+                panic!("{} session failed: {failure}", case.name)
+            }
+        }
+    }
 }
 
 async fn assert_pre_start_approval_control_race(store_name: &str, control: InboundCommand) {

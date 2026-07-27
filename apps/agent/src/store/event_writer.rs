@@ -7153,34 +7153,6 @@ async fn validate_required_projection_sets(
                 };
                 match *contextual_run_id {
                     Some(run_id) => {
-                        let expected_resolution = match decision {
-                            ApprovalDecision::ApproveOnce => "approved_once",
-                            ApprovalDecision::Deny => "denied",
-                            ApprovalDecision::ApproveAlways { rule } => {
-                                let value = serde_json::to_value(&rule)?;
-                                let rule_id = value
-                                    .get("id")
-                                    .and_then(Value::as_str)
-                                    .ok_or_else(|| anyhow!("ApproveAlways rule has no id"))?;
-                                let tool = value
-                                    .get("tool")
-                                    .and_then(Value::as_str)
-                                    .ok_or_else(|| anyhow!("ApproveAlways rule has no tool"))?;
-                                let pattern = serde_json::to_string(&value)?;
-                                let Some((inserted_tool, inserted_pattern)) =
-                                    approval_rule_inserts.get(rule_id)
-                                else {
-                                    bail!(
-                                        "active ApproveAlways requires its durable approval rule insert"
-                                    );
-                                };
-                                if *inserted_tool != tool || *inserted_pattern != pattern {
-                                    bail!("durable ApproveAlways rule does not match the command");
-                                }
-                                consumed_approval_rule_ids.insert(rule_id.to_owned());
-                                "approved_always"
-                            }
-                        };
                         let Some((resolution, actor)) =
                             approval_resolutions.get(request_id.as_str())
                         else {
@@ -7188,11 +7160,87 @@ async fn validate_required_projection_sets(
                                 "active ApprovalDecision CommandApplied requires ApprovalResolved for {request_id}"
                             );
                         };
-                        if *resolution != expected_resolution {
-                            bail!(
-                                "ApprovalDecision {request_id} maps to {expected_resolution}, not {resolution}"
-                            );
-                        }
+                        let require_atomic_pending_tool_start = match decision {
+                            ApprovalDecision::ApproveOnce => {
+                                if *resolution != "approved_once" {
+                                    bail!(
+                                        "ApprovalDecision {request_id} maps to approved_once, not {resolution}"
+                                    );
+                                }
+                                false
+                            }
+                            ApprovalDecision::Deny => {
+                                if *resolution != "denied" {
+                                    bail!(
+                                        "ApprovalDecision {request_id} maps to denied, not {resolution}"
+                                    );
+                                }
+                                false
+                            }
+                            ApprovalDecision::ApproveAlways { rule } => match *resolution {
+                                "approved_always" => {
+                                    let mut value = serde_json::to_value(&rule)?;
+                                    let (rule_id, tool) = {
+                                        let object = value.as_object_mut().ok_or_else(|| {
+                                            anyhow!("ApproveAlways rule must be an object")
+                                        })?;
+                                        let rule_id =
+                                            object.get("id").and_then(Value::as_str).ok_or_else(
+                                                || anyhow!("ApproveAlways rule has no id"),
+                                            )?;
+                                        if rule_id.is_empty() {
+                                            object.insert(
+                                                "id".to_owned(),
+                                                Value::String(request_id.clone()),
+                                            );
+                                        }
+                                        (
+                                            object
+                                                .get("id")
+                                                .and_then(Value::as_str)
+                                                .expect("normalized ApproveAlways id")
+                                                .to_owned(),
+                                            object
+                                                .get("tool")
+                                                .and_then(Value::as_str)
+                                                .ok_or_else(|| {
+                                                    anyhow!("ApproveAlways rule has no tool")
+                                                })?
+                                                .to_owned(),
+                                        )
+                                    };
+                                    let Some((inserted_tool, inserted_pattern)) =
+                                        approval_rule_inserts.get(rule_id.as_str())
+                                    else {
+                                        bail!(
+                                            "active ApproveAlways requires its durable approval rule insert"
+                                        );
+                                    };
+                                    let inserted_value: Value = serde_json::from_str(
+                                        inserted_pattern,
+                                    )
+                                    .with_context(|| {
+                                        format!(
+                                            "parse durable ApproveAlways rule {rule_id} pattern"
+                                        )
+                                    })?;
+                                    if *inserted_tool != tool || inserted_value != value {
+                                        bail!(
+                                            "durable ApproveAlways rule does not match the command"
+                                        );
+                                    }
+                                    consumed_approval_rule_ids.insert(rule_id);
+                                    false
+                                }
+                                "approved_once" => true,
+                                "denied" => false,
+                                _ => {
+                                    bail!(
+                                        "ApproveAlways ApprovalDecision {request_id} cannot map to {resolution}"
+                                    )
+                                }
+                            },
+                        };
                         if *actor == "runtime" {
                             bail!("user ApprovalDecision cannot use the runtime resolution actor");
                         }
@@ -7208,8 +7256,16 @@ async fn validate_required_projection_sets(
                                 "ApprovalDecision {request_id} does not resolve a pending approval in run {run_id}"
                             );
                         }
-                        if expected_resolution == "denied" && !tool_starts.is_empty() {
+                        if *resolution == "denied" && !tool_starts.is_empty() {
                             bail!("denied ApprovalDecision cannot co-commit ToolExecutionStart");
+                        }
+                        if require_atomic_pending_tool_start
+                            && (tool_starts.len() != 1
+                                || !tool_starts.contains_key(tool_call_id.as_str()))
+                        {
+                            bail!(
+                                "ApproveAlways normalized to approved_once must atomically start its pending tool {tool_call_id}"
+                            );
                         }
                         if !tool_starts.is_empty()
                             && (!tool_starts.contains_key(tool_call_id.as_str())
@@ -18432,6 +18488,215 @@ mod tests {
             .await
             .expect_err("tampered durable command must not resolve approval");
         assert!(format!("{tampered:#}").contains("HMAC"));
+    }
+
+    #[tokio::test]
+    async fn approve_always_accepts_only_broker_authorized_normalizations() {
+        fn deferred_rule(value: Value) -> ApprovalDecision {
+            ApprovalDecision::ApproveAlways {
+                rule: serde_json::from_value::<DeferredApprovalRule>(value)
+                    .expect("object deferred rule"),
+            }
+        }
+
+        let unsafe_rule = json!({
+            "id": "rule-unsafe",
+            "tool": "bash",
+            "literal_prefix": ["git"],
+            "effect": "allow",
+            "workspace_only": true,
+            "allowed_permissions": ["exec"],
+            "allowed_network_domains": []
+        });
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        seed_pending_approval(
+            &store,
+            &writer,
+            "request-normalized",
+            "tool-normalized",
+            "run-normalized",
+        )
+        .await;
+        let normalized_command = approval_command_with_decision(
+            2,
+            "00000000-0000-4000-8000-000000000210",
+            "request-normalized",
+            deferred_rule(unsafe_rule.clone()),
+        );
+        writer
+            .persist_inbound(&normalized_command)
+            .await
+            .expect("persist authenticated ApproveAlways");
+
+        let missing_start = writer
+            .apply(EventBatch {
+                writes: vec![approval_resolution_write(
+                    "request-normalized",
+                    "approved_once",
+                    "user-normalized",
+                    Some(("00000000-0000-4000-8000-000000000210", 2, "run-normalized")),
+                )],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("one-shot normalization must atomically start the pending tool");
+        assert!(
+            missing_start
+                .to_string()
+                .contains("must atomically start its pending tool")
+        );
+
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    approval_resolution_write(
+                        "request-normalized",
+                        "approved_once",
+                        "user-normalized",
+                        Some(("00000000-0000-4000-8000-000000000210", 2, "run-normalized")),
+                    ),
+                    tool_start_write("tool-normalized", "run-normalized"),
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("broker-authorized one-shot normalization");
+        assert_eq!(
+            sqlx::query_as::<_, (String, String, String, i64)>(
+                "SELECT
+                    (SELECT status FROM inbound_commands WHERE seq=2),
+                    (SELECT state FROM approval_log WHERE id='request-normalized'),
+                    (SELECT state FROM tool_executions WHERE tool_call_id='tool-normalized'),
+                    (SELECT COUNT(*) FROM approval_rules)",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("normalized durable state"),
+            (
+                "applied".to_owned(),
+                "approved_once".to_owned(),
+                "running".to_owned(),
+                0
+            )
+        );
+        let replay = writer
+            .persist_inbound(&normalized_command)
+            .await
+            .expect("replay normalized command");
+        assert_eq!(replay.seq, 2);
+        assert_eq!(replay.status, CommandAckStatus::Applied);
+
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        seed_pending_approval(
+            &store,
+            &writer,
+            "request-rejected",
+            "tool-rejected",
+            "run-rejected",
+        )
+        .await;
+        let rejected_command = approval_command_with_decision(
+            2,
+            "00000000-0000-4000-8000-000000000211",
+            "request-rejected",
+            deferred_rule(json!({"malformed": true})),
+        );
+        writer
+            .persist_inbound(&rejected_command)
+            .await
+            .expect("persist malformed authenticated ApproveAlways");
+        writer
+            .apply(EventBatch {
+                writes: vec![approval_resolution_write(
+                    "request-rejected",
+                    "denied",
+                    "user-rejected",
+                    Some(("00000000-0000-4000-8000-000000000211", 2, "run-rejected")),
+                )],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("conservative denial normalization");
+        assert_eq!(
+            sqlx::query_as::<_, (String, String, i64)>(
+                "SELECT
+                    (SELECT status FROM inbound_commands WHERE seq=2),
+                    (SELECT state FROM approval_log WHERE id='request-rejected'),
+                    (SELECT COUNT(*) FROM approval_rules)",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("denied durable state"),
+            ("applied".to_owned(), "denied".to_owned(), 0)
+        );
+        let replay = writer
+            .persist_inbound(&rejected_command)
+            .await
+            .expect("replay rejected command");
+        assert_eq!(replay.seq, 2);
+        assert_eq!(replay.status, CommandAckStatus::Applied);
+
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        seed_pending_approval(&store, &writer, "request-empty", "tool-empty", "run-empty").await;
+        let empty_id_rule = json!({
+            "id": "",
+            "tool": "bash",
+            "literal_prefix": ["git", "status"],
+            "effect": "allow",
+            "workspace_only": true,
+            "allowed_permissions": ["exec"],
+            "allowed_network_domains": []
+        });
+        writer
+            .persist_inbound(&approval_command_with_decision(
+                2,
+                "00000000-0000-4000-8000-000000000212",
+                "request-empty",
+                deferred_rule(empty_id_rule),
+            ))
+            .await
+            .expect("persist empty-id ApproveAlways");
+        let normalized_rule = json!({
+            "id": "request-empty",
+            "tool": "bash",
+            "literal_prefix": ["git", "status"],
+            "effect": "allow",
+            "workspace_only": true,
+            "allowed_permissions": ["exec"],
+            "allowed_network_domains": []
+        });
+        let mut resolution = approval_resolution_write(
+            "request-empty",
+            "approved_always",
+            "user-empty",
+            Some(("00000000-0000-4000-8000-000000000212", 2, "run-empty")),
+        );
+        resolution
+            .projections
+            .push(Projection::ApprovalRule(ApprovalRuleMutation {
+                id: "request-empty".to_owned(),
+                tool: "bash".to_owned(),
+                pattern: serde_json::to_string(&normalized_rule).expect("normalized rule"),
+            }));
+        writer
+            .apply(EventBatch {
+                writes: vec![resolution],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("empty id is normalized to the authenticated request id");
+        assert_eq!(
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT id, tool FROM approval_rules WHERE id='request-empty'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("normalized durable rule"),
+            ("request-empty".to_owned(), "bash".to_owned())
+        );
     }
 
     #[tokio::test]
