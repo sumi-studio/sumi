@@ -775,7 +775,7 @@ Chat Completions JSON への変換は、**[事実]** 以下すべて `pi:ai/src/
 4. **`requires_reasoning_content_on_assistant`**: 再送する assistant メッセージに reasoning_content が無ければ `""` を補う(:1038-1044)
 5. **tool_calls**: `{id, type:"function", function:{name, arguments: JSON文字列}}`。引数は必ず `serde_json::to_string` で直列化
 6. **tool ロール**: `{"role":"tool","content":text,"tool_call_id":...}`。テキストが空で画像のみなら `"(see attached image)"`、両方空なら `"(no tool output)"` のプレースホルダ(:1073-1075)
-7. **ツール結果内の画像**: tool メッセージには載らないため、直後に user メッセージ `"Attached image(s) from tool result:"` + image_url ブロックとして追送(:1109-1127)。※ Kimi K3 は image/video 入力可 **[事実]**(公式 K3 quickstart 2026-07 確認。直API挙動詳細はT25ライブfixtureで固定)、GLM-5.2 text のみ **[事実]**(モデルメタ)。非対応モデルにはプレースホルダテキストに差替(`transform-messages.ts` の画像差替処理)
+7. **ツール結果内の画像**: tool メッセージには載らないため、直後に user メッセージ `"Attached image(s) from tool result:"` + image_url ブロックとして追送(:1109-1127)。※ Kimi K3 は image/video 入力可 **[事実]**(公式 K3 quickstart 2026-07 確認。直API挙動詳細は公式形状に基づくprovenance付きfixtureで固定し、direct Moonshot probeは任意の開発証拠とする)、GLM-5.2 text のみ **[事実]**(モデルメタ)。非対応モデルにはプレースホルダテキストに差替(`transform-messages.ts` の画像差替処理)
 8. **空 assistant のスキップ**: content も tool_calls も無い assistant メッセージは送らない(aborted 応答の残骸対策、:1045-1056)
 9. **tools が空でも履歴にツールコールがあるなら `"tools": []` を送る**(プロキシ互換、:625-628)。※ Sumi はツール凍結原則なので通常発生しないが移植しておく
 10. **サニタイズ**: 送信テキスト全部に不対サロゲート除去を適用。Rust の `String` は常に正しい UTF-8 なので pi の `sanitizeSurrogates` 相当は**受信側**(ツール出力のバイト列→String 変換時の `from_utf8_lossy`)で保証する。加えて `serde_json` は文字列中の生制御文字を正しくエスケープするため pi の repairJson 送信側問題は起きない **[推測、M1で確認]**
@@ -2517,7 +2517,7 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
   3. `store=false` のライブ2ターン+tool 1往復を GPT-5.6 系で完走し、再起動後も durable transcript + provider context から継続できる
 - Anthropic Messages ゲート:
   1. named SSE の `message_start/content_block_*/message_delta/message_stop`、ping、stream error、`input_json_delta` を fixture で正規化できる
-  2. assistant `tool_use` → user `tool_result` の1往復、top-level system、連続 user turn の結合を fixture と live test で確認する
+  2. assistant `tool_use` → user `tool_result` の1往復、top-level system、連続 user turn の結合を fixture で確認する。Anthropic live実行は任意の開発証拠であり、Cloud release gateには使わない
   3. native compaction 対応 provider では `provider_native` mode で compaction block 1個 + coverage 後の suffix だけを暗号化往復し、同じ prefix の `MemoryBlock`/L0/reasoning と重複しない。非対応の互換 provider と fingerprint 不一致時は `sumi_three_layer` へ戻る
   4. thinking 有効の tool loop で `thinking.signature` と `redacted_thinking.data` を含む直近 assistant content block 列を完全・同順で round-trip する。欠落・改変 fixture が API 相当の400として失敗し、`tool_choice=any/named` と turn途中のthinking mode変更を組立時に拒否する
   5. `cache_creation_input_tokens > 0` の usage fixture で `input + cache_read + cache_write` が prompt 全体と一致し、サイレント溢れ判定・校正 EMA・キャッシュヒット率の三経路が cache_write を落とさない
