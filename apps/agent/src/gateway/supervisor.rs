@@ -324,6 +324,12 @@ pub trait DurableSource: Clone + Send + Sync + 'static {
     /// catch-up and its final cursor recheck. Implementations that own a
     /// DeliveryPump use this as the admission barrier; other sources may treat
     /// the transition as a no-op.
+    ///
+    /// This operation is transactional at the trait boundary: `Ok(())` means
+    /// the epoch is open, while `Err` guarantees that the source has not
+    /// admitted any volatile frame for that epoch. An implementation must not
+    /// open delivery and then report failure; the supervisor intentionally
+    /// keeps its public Online watch false until this method succeeds.
     async fn mark_delivery_online(&self, _epoch: DeliveryEpoch) -> Result<()> {
         Ok(())
     }
@@ -460,10 +466,11 @@ impl Default for SupervisorConfig {
 
 /// Sender returned by `SupervisorHandle::events`.
 ///
-/// Each frame is tagged with the `online` value observed at admission time
-/// (just before the frame is enqueued in the supervisor's event channel) so
-/// that the `event_forwarder` can drop pre-Online volatile frames using the
-/// admission boundary instead of a later, racy watch-channel observation.
+/// Direct frames are tagged with the public `online` value observed at
+/// admission time. Volatile frames emitted by the DeliveryPump instead carry
+/// the pump's authoritative epoch-Online admission. The `event_forwarder` can
+/// therefore drop pre-Online volatile frames without reclassifying them from a
+/// later, racy watch-channel observation.
 #[derive(Clone)]
 pub struct EventSender {
     tx: mpsc::Sender<(DeliveryEpoch, bool, OutboundFrame)>,
@@ -477,11 +484,39 @@ impl EventSender {
         &self,
         (epoch, frame): (DeliveryEpoch, OutboundFrame),
     ) -> Result<(), mpsc::error::SendError<(DeliveryEpoch, OutboundFrame)>> {
+        self.send_with_admission(epoch, frame, None).await
+    }
+
+    /// Enqueue a frame emitted by the current DeliveryPump.
+    ///
+    /// A volatile frame can only leave the pump after `mark_online` has
+    /// accepted the matching epoch, so that pump admission is authoritative
+    /// even during the short interval before the supervisor publishes its
+    /// public Online watch. Durable frames do not use the volatile admission
+    /// bit.
+    pub(super) async fn send_from_delivery_pump(
+        &self,
+        (epoch, frame): (DeliveryEpoch, OutboundFrame),
+    ) -> Result<(), mpsc::error::SendError<(DeliveryEpoch, OutboundFrame)>> {
+        let pump_admitted_online = matches!(
+            &frame,
+            OutboundFrame::Event { envelope } if envelope.seq.is_none()
+        );
+        self.send_with_admission(epoch, frame, Some(pump_admitted_online))
+            .await
+    }
+
+    async fn send_with_admission(
+        &self,
+        epoch: DeliveryEpoch,
+        frame: OutboundFrame,
+        admitted_online: Option<bool>,
+    ) -> Result<(), mpsc::error::SendError<(DeliveryEpoch, OutboundFrame)>> {
         let permit = match self.tx.reserve().await {
             Ok(p) => p,
             Err(_) => return Err(mpsc::error::SendError((epoch, frame))),
         };
-        let online_at_enqueue = *self.online.borrow();
+        let online_at_enqueue = admitted_online.unwrap_or_else(|| *self.online.borrow());
         permit.send((epoch, online_at_enqueue, frame));
         Ok(())
     }
@@ -1239,14 +1274,15 @@ async fn event_forwarder(
         let Some(sender) = sender else {
             continue;
         };
-        // Volatile/delta Events (no seq) are only live if they were admitted
-        // while the epoch was already Online. The boolean was captured at the
-        // event's admission/enqueue boundary, so a pre-Online volatile frame
-        // cannot become live merely because the forwarder was backpressured
-        // until after Online. Durable Events (seq present) are held in the
-        // writer channel so writer_task can deduplicate them against the durable
-        // cursor after Online. CommandAck frames are terminal command feedback
-        // and must be delivered even while catch-up is in progress.
+        // Volatile/delta Events (no seq) are only live if their producer's
+        // authoritative admission boundary was already Online: the public
+        // watch for direct frames, or the DeliveryPump epoch state for
+        // pump-originated frames. A pre-Online volatile cannot become live
+        // merely because the forwarder was backpressured until after Online.
+        // Durable Events (seq present) are held in the writer channel so
+        // writer_task can deduplicate them against the durable cursor after
+        // Online. CommandAck frames are terminal command feedback and must be
+        // delivered even while catch-up is in progress.
         if !online_at_enqueue
             && let OutboundFrame::Event { envelope } = &frame
             && envelope.seq.is_none()
@@ -1748,8 +1784,12 @@ where
         }
     }
 
-    // Publish Online only after reaching the durable cursor. From this point on
-    // event_forwarder may deliver live frames to this writer.
+    // Open the DeliveryPump volatile barrier only after reaching the durable
+    // cursor. Pump-originated volatile frames carry the pump's authoritative
+    // Online admission through EventSender, so the first accepted frame can
+    // wait in the bounded writer channel without depending on this public
+    // watch. Publish the watch only after the barrier succeeds; direct
+    // SupervisorHandle producers therefore cannot observe a false Online.
     source
         .mark_delivery_online(delivery_epoch)
         .await
@@ -2052,9 +2092,10 @@ mod tests {
 
     use anyhow::{Result, anyhow};
     use sha2::{Digest, Sha256};
-    use tokio::sync::{mpsc, watch};
+    use tokio::sync::{Notify, mpsc, watch};
 
     use super::*;
+    use crate::agent::{AgentEvent, PublicStreamEvent};
     use crate::gateway::stdio::{InjectedStdioGateway, SingleConnectionConnector};
     use crate::gateway::wire::to_wire_frame;
     use crate::gateway::{
@@ -5194,6 +5235,329 @@ mod tests {
         handle.abort();
         let _ = handle.join().await;
         assert!(!*online.borrow());
+    }
+
+    /// A durable source that owns a real DeliveryPump and exposes explicit
+    /// barriers at the catch-up and Online boundary so the test can exercise
+    /// the exact interleaving between `mark_delivery_online` and the
+    /// supervisor's `online` watch.
+    #[derive(Clone)]
+    struct BoundaryRaceSource {
+        store: Arc<Store>,
+        pump: Arc<std::sync::Mutex<Option<DeliveryPump>>>,
+        catch_up_entered: Arc<Notify>,
+        catch_up_release: Arc<Notify>,
+        mark_online_entered: Arc<Notify>,
+        mark_online_release: Arc<Notify>,
+        post_mark_online: Arc<Notify>,
+        boundary_release: Arc<Notify>,
+    }
+
+    impl BoundaryRaceSource {
+        fn new(store: Arc<Store>) -> Self {
+            Self {
+                store,
+                pump: Arc::new(std::sync::Mutex::new(None)),
+                catch_up_entered: Arc::new(Notify::new()),
+                catch_up_release: Arc::new(Notify::new()),
+                mark_online_entered: Arc::new(Notify::new()),
+                mark_online_release: Arc::new(Notify::new()),
+                post_mark_online: Arc::new(Notify::new()),
+                boundary_release: Arc::new(Notify::new()),
+            }
+        }
+
+        fn pump(&self) -> DeliveryPump {
+            self.pump.lock().unwrap().clone().expect("pump installed")
+        }
+    }
+
+    #[async_trait]
+    impl DurableSource for BoundaryRaceSource {
+        async fn event_cursor(&self) -> Result<EventCursors> {
+            Ok(EventCursors { last_sent: 1 })
+        }
+
+        async fn events_after(&self, after_seq: u64, _limit: usize) -> Result<Vec<OutboundFrame>> {
+            if after_seq == 0 {
+                self.catch_up_entered.notify_one();
+                self.catch_up_release.notified().await;
+                Ok(vec![event_frame(1)])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+
+        async fn command_cursors(&self) -> Result<CommandCursors> {
+            Ok(CommandCursors::default())
+        }
+
+        async fn install_delivery_epoch(
+            &self,
+            epoch: DeliveryEpoch,
+            _catch_up_from_seq: u64,
+            sink: EventSender,
+            cancel: CancellationToken,
+        ) -> Result<Option<DeliveryEpochRuntime>> {
+            let (channel, mut delivery_rx) =
+                DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
+            let (failure_tx, failure_rx) = mpsc::unbounded_channel();
+            let pump = DeliveryPump::new(self.store.clone(), channel);
+            pump.install_supervised_epoch(epoch, failure_tx.clone());
+            *self.pump.lock().unwrap() = Some(pump);
+
+            let conversation_id = "conversation-1".to_owned();
+            let task = tokio::spawn(async move {
+                loop {
+                    let frame = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => break,
+                        frame = delivery_rx.recv() => match frame {
+                            Some(frame) => frame,
+                            None => break,
+                        }
+                    };
+                    let (epoch, seq, event) = match frame {
+                        DeliveryFrame::Durable { .. } => continue,
+                        DeliveryFrame::Volatile { epoch, event } => {
+                            let event = match serde_json::to_value(event) {
+                                Ok(event) => event,
+                                Err(error) => {
+                                    let _ = failure_tx.send(format!(
+                                        "failed to serialize volatile event: {error}"
+                                    ));
+                                    break;
+                                }
+                            };
+                            (epoch, None, event)
+                        }
+                    };
+                    let outbound = OutboundFrame::Event {
+                        envelope: Envelope {
+                            seq,
+                            conversation_id: conversation_id.clone(),
+                            event,
+                        },
+                    };
+                    let send = sink.send_from_delivery_pump((epoch, outbound));
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => break,
+                        result = send => {
+                            if result.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+            Ok(Some(DeliveryEpochRuntime::new(failure_rx, task)))
+        }
+
+        async fn mark_delivery_online(&self, epoch: DeliveryEpoch) -> Result<()> {
+            self.mark_online_entered.notify_one();
+            self.mark_online_release.notified().await;
+            let pump = self
+                .pump
+                .lock()
+                .unwrap()
+                .clone()
+                .context("BoundaryRaceSource pump missing")?;
+            pump.mark_online(epoch)?;
+            self.post_mark_online.notify_one();
+            self.boundary_release.notified().await;
+            Ok(())
+        }
+
+        async fn invalidate_delivery_epoch(&self, epoch: DeliveryEpoch) -> Result<()> {
+            if let Some(pump) = self.pump.lock().unwrap().clone() {
+                let _ = pump.invalidate_epoch(epoch);
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn first_boundary_volatile_is_forwarded_without_early_public_online() {
+        let store = Arc::new(
+            Store::session_test_store("boundary-race")
+                .await
+                .expect("open test store"),
+        );
+        let source = BoundaryRaceSource::new(store);
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gateway = MockGateway {
+            reader: MockGatewayReader {
+                commands: VecDeque::new(),
+                panic: false,
+                on_empty: None,
+            },
+            writer: MockGatewayWriter {
+                fail_after: None,
+                sent: sent.clone(),
+                delay: None,
+                block_after: None,
+                block_notify: None,
+                release: None,
+            },
+            sent_hellos: Arc::new(std::sync::Mutex::new(Vec::new())),
+            hello_generation: None,
+            last_received_event_seq: 0,
+            hello_delay: None,
+            hello_error: None,
+        };
+        let connector = MockConnector::new(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            VecDeque::from([Ok(gateway)]),
+        );
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: ProcessGeneration::from_wire(7).unwrap(),
+            receipt_identity: "r".to_owned(),
+        });
+        let supervisor = ConnectionSupervisor::new(
+            connector,
+            CountingCredentialProvider::new("token"),
+            source.clone(),
+            latch,
+            make_config(),
+        );
+        let handle = supervisor.start();
+
+        // Wait for the epoch to be established and catch-up to block.
+        let mut epochs = handle.epochs.clone();
+        while epochs.borrow().is_none() {
+            epochs.changed().await.unwrap();
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), source.catch_up_entered.notified())
+            .await
+            .expect("writer must enter catch-up");
+
+        // A volatile sent while the pump is still CatchingUp must be dropped.
+        source
+            .pump()
+            .on_volatile(AgentEvent::MessageUpdate {
+                message_id: "pre-online".to_owned(),
+                event: PublicStreamEvent::TextDelta {
+                    content_index: 0,
+                    delta: "drop".to_owned(),
+                },
+            })
+            .await
+            .unwrap();
+
+        // Release catch-up so the writer reaches the Online boundary.
+        source.catch_up_release.notify_one();
+
+        // Wait for mark_delivery_online to be entered. The public Online watch
+        // must remain false until the DeliveryPump barrier succeeds, so direct
+        // SupervisorHandle producers cannot observe a false Online.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            source.mark_online_entered.notified(),
+        )
+        .await
+        .expect("writer must enter mark_delivery_online");
+        assert!(
+            !*handle.online.borrow(),
+            "online watch must remain false before DeliveryPump mark_online completes"
+        );
+
+        // The pump is still CatchingUp here, so this volatile must be dropped.
+        source
+            .pump()
+            .on_volatile(AgentEvent::MessageUpdate {
+                message_id: "during-mark-online".to_owned(),
+                event: PublicStreamEvent::TextDelta {
+                    content_index: 0,
+                    delta: "drop".to_owned(),
+                },
+            })
+            .await
+            .unwrap();
+
+        // Release mark_online. The pump transitions to Online, but the source
+        // holds the return so the test can inject the first accepted volatile
+        // before writer_task publishes its public Online watch.
+        source.mark_online_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), source.post_mark_online.notified())
+            .await
+            .expect("pump must be marked online");
+        assert!(
+            !*handle.online.borrow(),
+            "public Online must not be visible until the pump barrier returns successfully"
+        );
+
+        // This is the first volatile accepted by the pump immediately at the
+        // catch-up -> Online boundary. Its pump admission is authoritative even
+        // though the public watch is intentionally still false.
+        source
+            .pump()
+            .on_volatile(AgentEvent::MessageUpdate {
+                message_id: "boundary".to_owned(),
+                event: PublicStreamEvent::TextDelta {
+                    content_index: 0,
+                    delta: "forward".to_owned(),
+                },
+            })
+            .await
+            .unwrap();
+
+        // Let writer_task complete the Online transition.
+        source.boundary_release.notify_one();
+
+        // Wait for the supervisor to publish Online.
+        let mut online = handle.online.clone();
+        while !*online.borrow() {
+            online.changed().await.unwrap();
+        }
+
+        // Wait for the boundary volatile to reach the writer.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let found = {
+                    let sent_frames = sent.lock().unwrap();
+                    sent_frames.iter().any(|f| {
+                        matches!(
+                            f,
+                            OutboundFrame::Event { envelope }
+                            if envelope.seq.is_none()
+                                && envelope.event.get("message_id")
+                                    .and_then(|v| v.as_str()) == Some("boundary")
+                        )
+                    })
+                };
+                if found {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("boundary volatile must be forwarded");
+
+        {
+            let sent_frames = sent.lock().unwrap();
+            let seqs: Vec<_> = sent_frames
+                .iter()
+                .filter_map(|f| outbound_frame_event_seq(f).ok())
+                .collect();
+            assert_eq!(seqs, vec![1], "catch-up durable must be delivered first");
+            let volatiles: Vec<_> = sent_frames
+                .iter()
+                .filter(
+                    |f| matches!(f, OutboundFrame::Event { envelope } if envelope.seq.is_none()),
+                )
+                .collect();
+            assert_eq!(
+                volatiles.len(),
+                1,
+                "exactly one volatile (the boundary volatile) must be delivered"
+            );
+        }
+
+        handle.abort();
+        let _ = handle.join().await;
     }
 
     #[tokio::test]

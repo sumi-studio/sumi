@@ -211,7 +211,7 @@ impl T17StoreAdapter {
                         event,
                     },
                 };
-                let send = sink.send((epoch, outbound));
+                let send = sink.send_from_delivery_pump((epoch, outbound));
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => break,
