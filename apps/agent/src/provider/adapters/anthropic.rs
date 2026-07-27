@@ -384,6 +384,8 @@ fn convert_messages(
     native_compaction: bool,
 ) -> Result<Vec<Value>, AnthropicAdapterError> {
     let compat = ensure_anthropic_spec(spec)?;
+    crate::provider::types::validate_provider_context_ordinals(&context.provider_context)
+        .map_err(AnthropicAdapterError::InvalidContext)?;
     let mut messages = Vec::<Value>::new();
     for memory in &context.memory_blocks {
         let layer = match memory.layer {

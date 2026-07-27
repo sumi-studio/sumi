@@ -17,6 +17,8 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
+#[cfg(test)]
+use crate::provider::types::ProviderContextItem;
 use crate::{
     agent::{AgentEvent, ApprovalRequest, ApprovalResolution, SteerMode},
     gateway::{
@@ -25,9 +27,9 @@ use crate::{
     },
     memory::{BatchId, CompactResult},
     provider::types::{
-        ApiProtocol, ProviderContextAnchor, ProviderContextFragment, ProviderContextItem,
-        ProviderContextPayload, PublicAssistantContent, PublicAssistantMessage, PublicMessage,
-        StopReason, ToolResultMessage,
+        ApiProtocol, ProviderContextAnchor, ProviderContextFragment, ProviderContextPayload,
+        PublicAssistantContent, PublicAssistantMessage, PublicMessage, StopReason,
+        ToolResultMessage,
     },
     runtime::contracts::{GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease},
 };
@@ -2816,6 +2818,19 @@ impl EventWriter {
             bail!("provider context may only accompany an assistant MessageEnd");
         };
 
+        for fragment in &fragments {
+            Self::validate_provider_context_fragment(fragment, assistant)?;
+        }
+        let items = crate::provider::types::bind_provider_context_fragments(
+            fragments,
+            ProviderContextAnchor {
+                message_id: message_id.to_owned(),
+                message_seq,
+            },
+            assistant.origin.clone(),
+        )
+        .map_err(anyhow::Error::msg)?;
+
         let anchor_id = format!("{message_id}:{message_seq}");
         let key = self
             .store
@@ -2832,41 +2847,13 @@ impl EventWriter {
             PREPARED_KEY_MATERIAL_PROOF,
         );
 
-        let mut records = Vec::with_capacity(fragments.len());
+        let mut records = Vec::with_capacity(items.len());
         let mut eviction_footprint_tokens = 0u64;
-        let mut ordinal_counter: HashMap<Option<u32>, u32> = HashMap::new();
-        for fragment in fragments {
-            Self::validate_provider_context_fragment(&fragment, assistant)?;
-
-            let next = ordinal_counter.entry(fragment.wire_item_index).or_insert(0);
-            let ordinal = *next;
-            *next += 1;
-
-            let item = ProviderContextItem {
-                // Native compaction is a replacement window, not content at an
-                // assistant wire slot. Provider serializers reject an anchor on
-                // this form, so retain the MessageEnd transaction/key boundary
-                // without inventing a transcript anchor during persistence.
-                origin_message: match &fragment.payload {
-                    ProviderContextPayload::OpenAiCompactedWindow { .. }
-                    | ProviderContextPayload::AnthropicCompaction { .. } => None,
-                    ProviderContextPayload::EncryptedReasoning { .. } => {
-                        Some(ProviderContextAnchor {
-                            message_id: message_id.to_owned(),
-                            message_seq,
-                        })
-                    }
-                },
-                wire_item_index: fragment.wire_item_index,
-                ordinal,
-                provider_origin: assistant.origin.clone(),
-                payload: fragment.payload,
-            };
-
-            let wire_label = fragment
+        for item in items {
+            let wire_label = item
                 .wire_item_index
                 .map_or_else(|| "_".to_owned(), |index| index.to_string());
-            let id = format!("{message_id}:{message_seq}:{wire_label}:{ordinal}");
+            let id = format!("{message_id}:{message_seq}:{wire_label}:{}", item.ordinal);
             let idempotency_key = provider_context_idempotency_key(message_id, &item);
             let record = EncryptedProviderContextRecord::encrypt(
                 &item,

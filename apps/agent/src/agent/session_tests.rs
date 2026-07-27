@@ -26,8 +26,10 @@ use crate::{
         StopReason, ToolArgumentError, ToolCall, ToolResultMessage, Usage, UserContent,
         UserMessage, ValidatedToolArguments,
     },
-    runtime::contracts::{MAX_PROCESS_GENERATION, ProcessGeneration},
-    store::{AgentScope, DATA_KEY_BYTES, Store, WrappingKey, user_message_id},
+    runtime::contracts::{
+        GenerationRecoveryFence, MAX_PROCESS_GENERATION, ProcessGeneration, ProcessGenerationLease,
+    },
+    store::{AgentScope, DATA_KEY_BYTES, HydrationOutcome, Store, WrappingKey, user_message_id},
     tools::ToolError,
 };
 
@@ -2627,7 +2629,19 @@ async fn active_abort_supersedes_deferred_user_message_and_owner_applied() {
     assert_eq!(run_count.load(Ordering::SeqCst), 1);
 }
 
-struct OpaqueContextDriver;
+struct OpaqueContextDriver {
+    attempts: AtomicUsize,
+    replay_observed: AtomicBool,
+}
+
+impl OpaqueContextDriver {
+    fn new() -> Self {
+        Self {
+            attempts: AtomicUsize::new(0),
+            replay_observed: AtomicBool::new(false),
+        }
+    }
+}
 
 struct MultiRejectedReceiptDriver {
     observed_contexts: Mutex<Vec<Vec<ContextMessage>>>,
@@ -3800,23 +3814,16 @@ impl RunDriver for OpaqueContextDriver {
         _command_received_at: Option<std::time::Instant>,
         _cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
+        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
         let origin = ProviderOrigin {
             provider_instance_id: "opaque-fixture".to_owned(),
             protocol: ApiProtocol::OpenAiResponses,
             model: "bridge-model".to_owned(),
         };
-        let rejected = RejectedToolCall {
-            id: "opaque-rejected-call".to_owned(),
-            name: "opaque-tool".to_owned(),
-            error: ToolArgumentError::InvalidJson,
-        };
         let message = AssistantMessage {
-            content: vec![AssistantContent::RejectedToolCall {
-                rejected: rejected.clone(),
-                wire_item_index: 0,
-            }],
+            content: Vec::new(),
             model: origin.model.clone(),
-            provider: "fixture".to_owned(),
+            provider: "opaque-fixture".to_owned(),
             origin: origin.clone(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
@@ -3825,26 +3832,8 @@ impl RunDriver for OpaqueContextDriver {
             interrupted: false,
             timestamp: Utc::now(),
         };
-        let synthetic_result = ToolResultMessage {
-            tool_call_id: rejected.id.clone(),
-            tool_name: rejected.name.clone(),
-            content: vec![UserContent::Text {
-                text: "Tool arguments were rejected.".to_owned(),
-            }],
-            details: serde_json::json!({"category":"invalid_json"}),
-            is_error: true,
-            timestamp: Utc::now(),
-        };
-        let (tx, rx) = mpsc::channel(4);
+        let (tx, rx) = mpsc::channel(2);
         tx.try_send(ProviderEvent::Start).expect("provider start");
-        tx.try_send(ProviderEvent::ToolCallStart { content_index: 0 })
-            .expect("rejected tool start");
-        tx.try_send(ProviderEvent::ToolCallRejected {
-            content_index: 0,
-            rejected,
-            synthetic_result,
-        })
-        .expect("rejected tool terminal");
         tx.try_send(ProviderEvent::Done {
             reason: StopReason::Stop,
             output: ProviderOutput {
@@ -3853,7 +3842,12 @@ impl RunDriver for OpaqueContextDriver {
                     wire_item_index: Some(0),
                     payload: ProviderContextPayload::EncryptedReasoning {
                         protocol: ApiProtocol::OpenAiResponses,
-                        item: serde_json::json!({"encrypted_content":"must-not-persist"}),
+                        item: serde_json::json!({
+                            "id": format!("reasoning-{attempt}"),
+                            "type": "reasoning",
+                            "summary": [],
+                            "encrypted_content": format!("must-persist-{attempt}"),
+                        }),
                     },
                 }],
             },
@@ -3861,8 +3855,19 @@ impl RunDriver for OpaqueContextDriver {
         .expect("provider terminal");
         drop(tx);
         Ok(ProviderAttempt {
-            message_id: "opaque-refusal".to_owned(),
-            initial_message: bridge_assistant(StopReason::Stop),
+            message_id: format!("opaque-durable-{attempt}"),
+            initial_message: PublicMessage::Assistant(PublicAssistantMessage {
+                content: Vec::new(),
+                model: origin.model.clone(),
+                provider: "opaque-fixture".to_owned(),
+                origin: origin.clone(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                provider_code: None,
+                interrupted: false,
+                timestamp: Utc::now(),
+            }),
             events: ProviderEventStream::new(
                 rx,
                 CancellationToken::new(),
@@ -3870,6 +3875,23 @@ impl RunDriver for OpaqueContextDriver {
                 origin,
             ),
         })
+    }
+
+    async fn start_provider_with_context(
+        &self,
+        attempt: usize,
+        context: &[ContextMessage],
+        provider_context: &[crate::provider::types::ProviderContextItem],
+        command_received_at: Option<std::time::Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        if !provider_context.is_empty() {
+            crate::provider::types::validate_provider_context_ordinals(provider_context)
+                .map_err(anyhow::Error::msg)?;
+            self.replay_observed.store(true, Ordering::SeqCst);
+        }
+        self.start_provider_for_command(attempt, context, command_received_at, cancel)
+            .await
     }
 
     async fn execute_tool_observed(
@@ -5683,17 +5705,22 @@ async fn provider_start_failures_in_two_runs_use_distinct_stable_durable_message
 }
 
 #[tokio::test]
-async fn opaque_context_refusal_closes_durably_before_applied_ack() {
-    let store = Store::session_test_store("durable-opaque-refusal-session")
-        .await
-        .expect("test store");
+async fn successful_provider_context_survives_session_restart_and_reaches_turn_two() {
+    let path = std::env::current_dir()
+        .expect("package directory")
+        .join("target")
+        .join(format!(
+            "sumi-provider-context-session-{}.sqlite",
+            Uuid::now_v7()
+        ));
+    let store = open_kill_restart_store(&path).await;
     let pool = store.pool().clone();
-    let (gateway, commands, frames) = gateway();
-    let worker: Arc<dyn RunWorker> =
-        Arc::new(SequentialRunWorker::new(Arc::new(OpaqueContextDriver)));
+    let (first_gateway, commands, frames) = gateway();
+    let driver = Arc::new(OpaqueContextDriver::new());
+    let worker: Arc<dyn RunWorker> = Arc::new(SequentialRunWorker::new(driver.clone()));
     let session = Session::start(
         store,
-        gateway,
+        first_gateway,
         RunCore::new(),
         worker,
         test_executor_generation(),
@@ -5701,7 +5728,7 @@ async fn opaque_context_refusal_closes_durably_before_applied_ack() {
     .await
     .expect("session");
     let task = tokio::spawn(session.run());
-    commands.send(user(1)).await.expect("command");
+    commands.send(user(1)).await.expect("first command");
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             if frames.lock().expect("frame mutex").iter().any(|frame| {
@@ -5715,38 +5742,23 @@ async fn opaque_context_refusal_closes_durably_before_applied_ack() {
         }
     })
     .await
-    .expect("applied ACK");
+    .expect("first applied ACK");
     drop(commands);
     let core = completed(task.await.expect("session join"));
-    // EventWriter rejects a persisted Error assistant when append_to_l0=true;
-    // the durable row asserted below plus this send-context exclusion proves
-    // the bridge supplied append_to_l0=false at the real Store boundary.
-    assert_eq!(core.runtime_context.len(), 1);
-    assert!(matches!(
-        core.runtime_context.first(),
-        Some(ContextMessage::Persisted {
-            message: crate::provider::types::Message::User(_),
-            ..
-        })
-    ));
-
-    let kinds: Vec<String> = sqlx::query_scalar(
-        "SELECT event_type FROM agent_events WHERE event_type IN ('message_start','message_end','turn_end','agent_end') ORDER BY seq",
-    )
-    .fetch_all(&pool)
-    .await
-    .expect("closed durable lifecycle");
     assert_eq!(
-        &kinds[kinds.len() - 4..],
-        ["message_start", "message_end", "turn_end", "agent_end"]
+        core.runtime_context.len(),
+        2,
+        "frames: {:?}",
+        frames.lock().expect("frame mutex")
     );
-    let error_stop: String = sqlx::query_scalar(
-        "SELECT json_extract(payload, '$.stop_reason') FROM messages WHERE id='opaque-refusal'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("error projection");
-    assert_eq!(error_stop, "error");
+    assert_eq!(core.provider_context.len(), 1);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM provider_context")
+            .fetch_one(&pool)
+            .await
+            .expect("durable provider context"),
+        1
+    );
     let opaque_leaks: i64 = sqlx::query_scalar(
         "SELECT (SELECT COUNT(*) FROM messages WHERE payload LIKE '%encrypted_content%') + (SELECT COUNT(*) FROM agent_events WHERE envelope LIKE '%encrypted_content%')",
     )
@@ -5754,33 +5766,77 @@ async fn opaque_context_refusal_closes_durably_before_applied_ack() {
     .await
     .expect("opaque leak check");
     assert_eq!(opaque_leaks, 0);
-    let rejected_leaks: i64 = sqlx::query_scalar(
-        "SELECT (SELECT COUNT(*) FROM messages WHERE id='opaque-rejected-call') + (SELECT COUNT(*) FROM messages WHERE json_extract(payload, '$.tool_call_id')='opaque-rejected-call') + (SELECT COUNT(*) FROM agent_events WHERE envelope LIKE '%opaque-rejected-call%')",
+    assert!(!driver.replay_observed.load(Ordering::SeqCst));
+
+    pool.close().await;
+    let reopened = open_kill_restart_store(&path).await;
+    let lease =
+        ProcessGenerationLease::new(test_executor_generation(), "provider-context-session-lease")
+            .expect("lease");
+    let fence =
+        GenerationRecoveryFence::new(&lease, "provider-context-session-fence").expect("fence");
+    let hydrated = match reopened
+        .hydrate(&lease, &fence)
+        .await
+        .expect("canonical restart hydration")
+    {
+        HydrationOutcome::Complete(state) => state,
+        HydrationOutcome::RecoveryRequired(_) => panic!("completed turn requires no recovery"),
+    };
+    assert_eq!(hydrated.provider_context.len(), 1);
+    let mut restarted_core = RunCore::new();
+    restarted_core.install_hydrated_context(hydrated.messages, hydrated.provider_context);
+
+    let second_pool = reopened.pool().clone();
+    let (second_gateway, second_commands, second_frames) = gateway();
+    let second = Session::start(
+        reopened,
+        second_gateway,
+        restarted_core,
+        Arc::new(SequentialRunWorker::new(driver.clone())),
+        test_executor_generation(),
     )
-    .fetch_one(&pool)
     .await
-    .expect("rejected pair leak check");
-    assert_eq!(rejected_leaks, 0);
-    assert!(!frames.lock().expect("frame mutex").iter().any(|frame| {
-        matches!(frame, OutboundFrame::Event { envelope }
-            if envelope.event.to_string().contains("\"tool_call_id\":\"opaque-rejected-call\""))
-    }));
-    let frames = frames.lock().expect("frame mutex");
-    let agent_end = frames
-        .iter()
-        .position(|frame| {
-            matches!(frame, OutboundFrame::Event { envelope }
-            if envelope.event["type"] == "agent_end")
-        })
-        .expect("AgentEnd frame");
-    let applied = frames
-        .iter()
-        .position(|frame| {
-            matches!(frame, OutboundFrame::CommandAck { ack }
-            if ack.status == CommandAckStatus::Applied)
-        })
-        .expect("Applied ACK");
-    assert!(agent_end < applied);
+    .expect("restarted session");
+    let second_task = tokio::spawn(second.run());
+    second_commands
+        .send(user(2))
+        .await
+        .expect("second-turn command");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if second_frames
+                .lock()
+                .expect("frame mutex")
+                .iter()
+                .any(|frame| {
+                    matches!(frame, OutboundFrame::CommandAck { ack }
+                    if ack.status == CommandAckStatus::Applied)
+                })
+                || second_task.is_finished()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("second-turn applied ACK");
+    drop(second_commands);
+    let second_core = completed(second_task.await.expect("restarted session join"));
+    assert!(driver.replay_observed.load(Ordering::SeqCst));
+    assert_eq!(second_core.provider_context.len(), 2);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM provider_context")
+            .fetch_one(&second_pool)
+            .await
+            .expect("both provider contexts durable"),
+        2
+    );
+    second_pool.close().await;
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
 }
 
 async fn assert_normal_tool_lifecycle_persists_generation(executor_generation: ProcessGeneration) {

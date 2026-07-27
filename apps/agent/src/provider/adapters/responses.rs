@@ -863,6 +863,8 @@ fn convert_input(
     native_compaction: bool,
 ) -> Result<Vec<Value>, ResponsesAdapterError> {
     let compat = ensure_responses_spec(spec)?;
+    crate::provider::types::validate_provider_context_ordinals(&context.provider_context)
+        .map_err(ResponsesAdapterError::InvalidContext)?;
     let replay_encrypted_reasoning = spec.reasoning && compat.supports_encrypted_reasoning;
     let mut output = Vec::new();
     let has_foreign_native = context.provider_context.iter().any(|item| {
@@ -2222,6 +2224,11 @@ impl ResponsesReceiveState {
         let snapshot = self.snapshot();
         let result = (|| -> Result<ResponsesPush, ResponsesAdapterError> {
             self.observe_response_identity(object)?;
+            if self.response_model.is_none() {
+                return Err(ResponsesAdapterError::InvalidEvent(
+                    "terminal response must include or follow a non-empty response.model".into(),
+                ));
+            }
             if self
                 .slots
                 .values()
@@ -4684,8 +4691,11 @@ mod tests {
             },
         };
         context.provider_context = vec![native.clone(), native.clone()];
-        let fallback = convert_input(&spec, &context, true).expect("duplicate fallback");
-        assert!(!Value::Array(fallback).to_string().contains("opaque"));
+        assert!(matches!(
+            convert_input(&spec, &context, true),
+            Err(ResponsesAdapterError::InvalidContext(message))
+                if message.contains("must be unique and contiguous from zero")
+        ));
 
         context.provider_context = vec![native.clone()];
         context
@@ -5089,7 +5099,7 @@ mod tests {
         assert!(matches!(
             build_request(&spec, &context, &RequestOptions::default()),
             Err(ResponsesAdapterError::InvalidContext(message))
-                if message.contains("duplicate encrypted reasoning placement")
+                if message.contains("must be unique and contiguous from zero")
         ));
 
         context.provider_context[1].ordinal = 0;
@@ -5097,14 +5107,14 @@ mod tests {
         assert!(matches!(
             build_request(&spec, &context, &RequestOptions::default()),
             Err(ResponsesAdapterError::InvalidContext(message))
-                if message.contains("missing wire_item_index")
+                if message.contains("missing a wire_item_index")
         ));
         context.provider_context[1].wire_item_index = Some(1);
         context.provider_context[1].origin_message = None;
         assert!(matches!(
             build_request(&spec, &context, &RequestOptions::default()),
             Err(ResponsesAdapterError::InvalidContext(message))
-                if message.contains("missing an origin anchor")
+                if message.contains("missing an origin message")
         ));
     }
 
@@ -5750,6 +5760,17 @@ mod tests {
             .is_err());
         assert_eq!(state.response_model.as_deref(), Some("gpt-5.6"));
         assert_eq!(state.next_sequence_number, 2);
+
+        let mut missing = ResponsesReceiveState::with_budget(schemas(), ResponseBudget::default());
+        let error = missing
+            .push_json(
+                r#"{"type":"response.completed","sequence_number":0,"response":{"id":"resp","status":"completed","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}"#,
+            )
+            .expect_err("successful terminal cannot omit model identity");
+        assert!(error.to_string().contains("response.model"), "{error}");
+        assert!(missing.response_id.is_none());
+        assert!(missing.response_model.is_none());
+        assert_eq!(missing.next_sequence_number, 0);
     }
 
     #[test]

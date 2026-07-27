@@ -212,30 +212,20 @@ impl InjectedRunDriver {
             timestamp: Utc::now(),
         })
     }
-}
 
-#[async_trait]
-impl RunDriver for InjectedRunDriver {
-    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
-        if generation != self.executor_generation {
-            bail!(
-                "injected driver executor generation {} does not match Session generation {generation}",
-                self.executor_generation
-            );
-        }
-        Ok(())
-    }
-
-    async fn start_provider_for_command(
+    fn start_provider_attempt(
         &self,
-        _attempt: usize,
         context: &[ContextMessage],
+        provider_context: Option<&[crate::provider::types::ProviderContextItem]>,
         command_received_at: Option<Instant>,
         cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
         let mut prompt = self.prompt.clone();
-        // Derive the send view immediately before the provider call.  The
-        // runner's retained runtime_context anchors must not be mutated.
+        if let Some(provider_context) = provider_context {
+            prompt.provider_context = provider_context.to_vec();
+        }
+        // Derive the send view immediately before the provider call. The
+        // runner's retained durable anchors must not be mutated.
         prompt.messages = transform::transform(context, &self.spec.origin());
         // Re-check at use time: the frozen registry remains the authority.
         if prompt.tools != self.registry.definitions() {
@@ -265,6 +255,40 @@ impl RunDriver for InjectedRunDriver {
             initial_message: self.initial_message(),
             events,
         })
+    }
+}
+
+#[async_trait]
+impl RunDriver for InjectedRunDriver {
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+        if generation != self.executor_generation {
+            bail!(
+                "injected driver executor generation {} does not match Session generation {generation}",
+                self.executor_generation
+            );
+        }
+        Ok(())
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        _attempt: usize,
+        context: &[ContextMessage],
+        command_received_at: Option<Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.start_provider_attempt(context, None, command_received_at, cancel)
+    }
+
+    async fn start_provider_with_context(
+        &self,
+        _attempt: usize,
+        context: &[ContextMessage],
+        provider_context: &[crate::provider::types::ProviderContextItem],
+        command_received_at: Option<Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.start_provider_attempt(context, Some(provider_context), command_received_at, cancel)
     }
 
     async fn execute_tool_observed(

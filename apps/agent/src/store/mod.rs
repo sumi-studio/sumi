@@ -840,6 +840,9 @@ impl Store {
             }
             offset += HYDRATION_PAGE_SIZE;
         }
+        crate::provider::types::validate_provider_context_ordinals(&provider_context).map_err(
+            |message| anyhow!("hydrated provider-context ordering is invalid: {message}"),
+        )?;
         Ok(provider_context)
     }
 

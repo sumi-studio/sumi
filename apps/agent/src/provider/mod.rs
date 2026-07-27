@@ -5752,18 +5752,12 @@ fi
             message_id: "responses-live-assistant".to_owned(),
             message_seq: 1,
         };
-        let provider_origin = spec.origin();
-        let provider_context: Vec<_> = first_fragments
-            .into_iter()
-            .enumerate()
-            .map(|(ordinal, fragment)| types::ProviderContextItem {
-                origin_message: Some(assistant_anchor.clone()),
-                wire_item_index: fragment.wire_item_index,
-                ordinal: u32::try_from(ordinal).expect("provider context ordinal fits u32"),
-                provider_origin: provider_origin.clone(),
-                payload: fragment.payload,
-            })
-            .collect();
+        let provider_context = types::bind_provider_context_fragments(
+            first_fragments,
+            assistant_anchor.clone(),
+            first.origin.clone(),
+        )
+        .expect("live provider context has canonical durable ordering");
         let replayed_context_items = provider_context.len();
         let second_context = PromptContext {
             system_prompt: "After the tool result, reply with exactly responses-live-ok."
