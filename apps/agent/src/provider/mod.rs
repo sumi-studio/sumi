@@ -5684,7 +5684,12 @@ fi
             Ok(_) => panic!(
                 "live Codex Responses release gate requires a non-empty SUMI_CODEX_RESPONSES_MODEL when set"
             ),
-            Err(_) => "gpt-5.6-luna".to_owned(),
+            // The release gate must exercise encrypted reasoning provider context.
+            // gpt-5.6-luna is the cost-optimized tier and adaptively emits zero
+            // reasoning tokens for simple tool-use turns, so the canonical first
+            // turn produces no provider context. gpt-5.6-sol is the frontier
+            // reasoning model and reliably emits reasoning items here.
+            Err(_) => "gpt-5.6-sol".to_owned(),
         };
         spec.base_url = base_url;
         spec.api_key_env = "SUMI_CODEX_RESPONSES_PROXY_SECRET".to_owned();

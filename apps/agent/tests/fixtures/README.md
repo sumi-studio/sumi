@@ -18,7 +18,7 @@ OAuth bridge for OpenAI Responses:
 - required environment:
   - `SUMI_CODEX_RESPONSES_BASE_URL` — loopback bridge URL, e.g. `http://127.0.0.1:8765`
   - `SUMI_CODEX_RESPONSES_PROXY_SECRET` — shared startup secret for the bridge
-  - `SUMI_CODEX_RESPONSES_MODEL` — optional, defaults to `gpt-5.6-luna`; if set, must be non-empty
+  - `SUMI_CODEX_RESPONSES_MODEL` — optional, defaults to `gpt-5.6-sol`; if set, must be non-empty. The release gate uses Sol because its first canonical tool-use turn must yield encrypted reasoning context for the required preservation/replay proof.
 
 The gate unconditionally requires the first turn to return and preserve non-empty encrypted provider context, then replay it into the second turn.
 

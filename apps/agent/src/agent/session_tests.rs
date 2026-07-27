@@ -5755,6 +5755,7 @@ fn live_responses_driver(
     spec: ModelSpec,
     tool: ToolDefinition,
     reasoning_effort: &str,
+    tool_choice: Option<Value>,
 ) -> Arc<InjectedRunDriver> {
     let mut registry = ToolRegistryBuilder::default();
     registry
@@ -5780,6 +5781,7 @@ fn live_responses_driver(
             RequestOptions {
                 max_tokens: Some(4_096),
                 reasoning_effort: Some(reasoning_effort.to_owned()),
+                tool_choice,
                 ..RequestOptions::default()
             },
             Some(prompt),
@@ -5813,22 +5815,31 @@ async fn run_live_responses_session(
     seq: u64,
     text: &str,
 ) -> RunCore {
+    let phase = format!("run_live_responses_session(seq={seq})");
+    eprintln!("[{phase}] starting session");
     let (session_gateway, commands, frames) = gateway();
-    let session = Session::start(
-        store,
-        session_gateway,
-        core,
-        Arc::new(SequentialRunWorker::new(driver)),
-        test_executor_generation(),
+    let session = tokio::time::timeout(
+        Duration::from_secs(30),
+        Session::start(
+            store,
+            session_gateway,
+            core,
+            Arc::new(SequentialRunWorker::new(driver)),
+            test_executor_generation(),
+        ),
     )
     .await
+    .unwrap_or_else(|_| panic!("[{phase}] Session::start timed out (phase: session_start)"))
     .expect("start canonical live Responses Session");
+    eprintln!("[{phase}] session started; spawning run task");
     let task = tokio::spawn(session.run());
+    eprintln!("[{phase}] sending user command");
     commands
         .send(live_responses_user(seq, text))
         .await
         .expect("send live Responses user command");
-    tokio::time::timeout(Duration::from_secs(300), async {
+    eprintln!("[{phase}] waiting for durable Applied ACK");
+    tokio::time::timeout(Duration::from_secs(120), async {
         loop {
             if frames.lock().expect("frame mutex").iter().any(|frame| {
                 matches!(frame, OutboundFrame::CommandAck { ack }
@@ -5841,9 +5852,26 @@ async fn run_live_responses_session(
         }
     })
     .await
-    .expect("live Responses command did not reach its durable applied ACK");
+    .unwrap_or_else(|_| {
+        panic!("[{phase}] timed out waiting for durable Applied ACK (phase: applied_ack)")
+    });
+    eprintln!("[{phase}] Applied ACK received; dropping commands and awaiting session completion");
     drop(commands);
-    completed(task.await.expect("live Responses Session join"))
+    let core = tokio::time::timeout(Duration::from_secs(120), task)
+        .await
+        .unwrap_or_else(|_| {
+            panic!("[{phase}] timed out awaiting session task join (phase: session_join)")
+        })
+        .expect("live Responses Session join");
+    match core {
+        SessionResult::Completed(core) => {
+            eprintln!("[{phase}] session completed cleanly");
+            core
+        }
+        SessionResult::Failed { failure, ownership } => {
+            panic!("[{phase}] session failed: {failure:?} with {ownership:?}")
+        }
+    }
 }
 
 fn collect_encrypted_content(value: &Value, markers: &mut Vec<String>) {
@@ -5948,6 +5976,10 @@ async fn assert_live_provider_context_private(
 }
 
 pub(crate) async fn run_canonical_live_responses_roundtrip(spec: ModelSpec, api_key: String) {
+    eprintln!(
+        "run_canonical_live_responses_roundtrip: starting turn 1 with spec.id={}",
+        spec.id
+    );
     assert!(
         std::env::var(&spec.api_key_env).is_ok_and(|configured| configured == api_key),
         "live proxy secret must be available to the canonical provider driver"
@@ -5965,9 +5997,15 @@ pub(crate) async fn run_canonical_live_responses_roundtrip(spec: ModelSpec, api_
     let first_core = run_live_responses_session(
         store,
         RunCore::new(),
-        live_responses_driver(spec.clone(), tool.clone(), "high"),
+        live_responses_driver(
+            spec.clone(),
+            tool.clone(),
+            "high",
+            Some(serde_json::json!("required")),
+        ),
         1,
-        "Call echo_value exactly once with value responses-live-ok, then reply with that value.",
+        "Before calling echo_value, reason about the value responses-live-ok. \
+         Then call echo_value exactly once with value responses-live-ok, and finally reply with that value.",
     )
     .await;
     assert_eq!(
@@ -6032,7 +6070,7 @@ pub(crate) async fn run_canonical_live_responses_roundtrip(spec: ModelSpec, api_
     let second_core = run_live_responses_session(
         reopened,
         restarted_core,
-        live_responses_driver(spec, tool, "low"),
+        live_responses_driver(spec, tool, "low", Some(serde_json::json!("none"))),
         2,
         "Without calling a tool, reply with exactly responses-live-restarted-ok.",
     )
