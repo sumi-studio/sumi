@@ -2220,6 +2220,7 @@ impl CompactWorker {
         if self.cancel.is_cancelled() {
             return Err(anyhow!("compact cancelled"));
         }
+        start_attempt(&self.store, &mut job).await?;
         match self
             .provider
             .summarize(&self.spec, &input, self.cancel.clone())
@@ -2367,7 +2368,7 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::memory::estimate::EvictionFootprint;
+    use crate::memory::estimate::{EvictionFootprint, legacy_serialized_bytes_eviction_footprint};
     use crate::provider::types::{
         ApiProtocol, NativeCompactionCoverage, ProviderContextAnchor, ProviderContextItem,
         ProviderContextPayload, ProviderOrigin, PublicAssistantMessage, StopReason, ToolCall,
@@ -4483,7 +4484,7 @@ mod tests {
             "openai-responses",
             "pc-1",
             provider_context_idempotency_key(&message_id, &item),
-            EvictionFootprint::from_saved(1, 0, 4).expect("footprint"),
+            legacy_serialized_bytes_eviction_footprint(&item.payload).expect("legacy footprint"),
             &key,
             store.scope(),
         )
@@ -4697,12 +4698,17 @@ mod tests {
             .expect("reclaim failed job");
         assert_eq!(worker.apply_ready().await.expect("apply jobs"), 2);
 
-        let job1 = sqlx::query("SELECT status FROM memory_jobs WHERE id = ?")
+        let job1 = sqlx::query("SELECT status, attempts FROM memory_jobs WHERE id = ?")
             .bind("job-failed-1")
             .fetch_one(store.pool())
             .await
             .expect("fetch job1 after reclaim");
         assert_eq!(job1.get::<String, _>("status"), "applied");
+        assert_eq!(
+            job1.get::<i64, _>("attempts"),
+            2,
+            "the reclaimed provider call must consume a durable attempt"
+        );
 
         let source1 = sqlx::query("SELECT state FROM memory_batches WHERE id = ?")
             .bind(&source_id_1)
