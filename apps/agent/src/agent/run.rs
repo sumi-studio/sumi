@@ -5,7 +5,7 @@
 //! has been transferred together with the unique [`RunCore`].
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -28,9 +28,9 @@ use crate::{
         overflow::{OverflowClassification, OverflowSource, classify_context_overflow},
         retry::{is_retryable, retry_delay, sleep_or_cancel},
         types::{
-            AssistantContent, ContextMessage, Message, ProviderEvent, ProviderEventStream,
-            PublicAssistantContent, PublicMessage, StopReason, ToolCall, ToolResultMessage,
-            UserContent, UserMessage,
+            AssistantContent, ContextMessage, Message, ProviderContextFragment,
+            ProviderContextItem, ProviderEvent, ProviderEventStream, PublicAssistantContent,
+            PublicMessage, StopReason, ToolCall, ToolResultMessage, UserContent, UserMessage,
         },
     },
     runtime::contracts::ProcessGeneration,
@@ -110,6 +110,23 @@ pub(crate) trait RunDriver: Send + Sync + 'static {
         cancel: CancellationToken,
     ) -> Result<ProviderAttempt>;
 
+    async fn start_provider_with_context(
+        &self,
+        attempt: usize,
+        context: &[ContextMessage],
+        provider_context: &[ProviderContextItem],
+        command_received_at: Option<std::time::Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        if !provider_context.is_empty() {
+            return Err(anyhow!(
+                "run driver does not support durable provider-context replay"
+            ));
+        }
+        self.start_provider_for_command(attempt, context, command_received_at, cancel)
+            .await
+    }
+
     async fn execute_tool_observed(
         &self,
         flow_id: &str,
@@ -180,6 +197,14 @@ struct Runner {
     events: mpsc::Sender<RunOutput>,
     phase: watch::Sender<WorkerPhase>,
     context: Vec<ContextMessage>,
+    provider_context: Vec<ProviderContextItem>,
+    pending_provider_context: HashMap<
+        String,
+        (
+            crate::provider::types::ProviderOrigin,
+            Vec<ProviderContextFragment>,
+        ),
+    >,
     attempt_sequence: usize,
     ordinary_retries: usize,
     overflow_recoveries: u8,
@@ -243,6 +268,7 @@ impl Runner {
             .take()
             .unwrap_or_else(|| watch::channel(WorkerPhase::Active).0);
         let context = std::mem::take(&mut core.runtime_context);
+        let provider_context = std::mem::take(&mut core.provider_context);
         Self {
             core,
             driver,
@@ -250,6 +276,8 @@ impl Runner {
             events,
             phase,
             context,
+            provider_context,
+            pending_provider_context: HashMap::new(),
             attempt_sequence: 0,
             ordinary_retries: 0,
             overflow_recoveries: 0,
@@ -272,6 +300,8 @@ impl Runner {
             result = Err(failure);
         }
         self.core.runtime_context = std::mem::take(&mut self.context);
+        self.core.provider_context = std::mem::take(&mut self.provider_context);
+        self.core.mark_mutated();
         match result {
             Ok(()) => RunCompletion::Completed(std::mem::take(&mut self.core)),
             Err(failure) => RunCompletion::Failed {
@@ -587,9 +617,10 @@ impl Runner {
         // Retries and tool continuations keep their own TTFT observation, but
         // must not fold provider/backoff/tool time into agent internal p95.
         let command_received_at = self.pending_command_received_at.take();
-        let start = self.driver.start_provider_for_command(
+        let start = self.driver.start_provider_with_context(
             self.attempt_sequence,
             &self.context,
+            &self.provider_context,
             command_received_at,
             cancel.clone(),
         );
@@ -713,13 +744,16 @@ impl Runner {
                             rejected_results.push(synthetic_result);
                         }
                         ProjectedProviderEvent::Terminal(terminal) => {
-                            if !terminal.provider_context().is_empty() {
+                            let provider_context = terminal.provider_context().to_vec();
+                            if terminal.kind() == ProviderTerminalKind::Error
+                                && !provider_context.is_empty()
+                            {
                                 rejected_results.clear();
                                 return self
                                     .close_broken_attempt(
                                         &attempt.message_id,
                                         message_started,
-                                        "provider terminal context requires the T17 durable hand-off; refusing to persist opaque context"
+                                        "error provider terminal cannot retain opaque provider context"
                                             .to_owned(),
                                     )
                                     .await;
@@ -809,8 +843,41 @@ impl Runner {
                                 }
                                 _ => unreachable!("provider terminal is always MessageEnd"),
                             };
+                            let durable_provider_context = if matches!(
+                                overflow,
+                                Some(OverflowClassification::ImmediateRecovery(_))
+                            ) || length_guarded
+                            {
+                                Vec::new()
+                            } else {
+                                provider_context
+                            };
+                            if !durable_provider_context.is_empty() {
+                                let PublicMessage::Assistant(assistant) = &terminal_message else {
+                                    return Err(WorkerFailure::Error(
+                                        "provider context requires an assistant terminal".to_owned(),
+                                    ));
+                                };
+                                if self
+                                    .pending_provider_context
+                                    .insert(
+                                        terminal_message_id.clone(),
+                                        (assistant.origin.clone(), durable_provider_context.clone()),
+                                    )
+                                    .is_some()
+                                {
+                                    return Err(WorkerFailure::Error(
+                                        "duplicate pending provider-context message identity"
+                                            .to_owned(),
+                                    ));
+                                }
+                            }
                             let receipt = self
-                                .emit_message_end(terminal_message_id, terminal_message, None, None)
+                                .emit_provider_message_end(
+                                    terminal_message_id,
+                                    terminal_message,
+                                    durable_provider_context,
+                                )
                                 .await?;
                             if let Some(OverflowClassification::ImmediateRecovery(source)) = overflow {
                                 return Ok(AttemptOutcome::ImmediateOverflow {
@@ -2430,10 +2497,45 @@ impl Runner {
         approval_not_started: Option<String>,
         approval_cancelled: Option<String>,
     ) -> Result<oneshot::Receiver<MessageCommitReceipt>, WorkerFailure> {
+        self.emit_message_end_with_provider_context(
+            message_id,
+            message,
+            Vec::new(),
+            approval_not_started,
+            approval_cancelled,
+        )
+        .await
+    }
+
+    async fn emit_provider_message_end(
+        &mut self,
+        message_id: String,
+        message: PublicMessage,
+        provider_context: Vec<crate::provider::types::ProviderContextFragment>,
+    ) -> Result<oneshot::Receiver<MessageCommitReceipt>, WorkerFailure> {
+        self.emit_message_end_with_provider_context(
+            message_id,
+            message,
+            provider_context,
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn emit_message_end_with_provider_context(
+        &mut self,
+        message_id: String,
+        message: PublicMessage,
+        provider_context: Vec<crate::provider::types::ProviderContextFragment>,
+        approval_not_started: Option<String>,
+        approval_cancelled: Option<String>,
+    ) -> Result<oneshot::Receiver<MessageCommitReceipt>, WorkerFailure> {
         let binding = self.core.durable_binding.clone().ok_or_else(|| {
             WorkerFailure::Error("RunCore has no durable worker binding".to_owned())
         })?;
-        let (barrier, receipt) = MessageCommitBarrier::channel();
+        let (barrier, receipt) =
+            MessageCommitBarrier::channel_with_provider_context(provider_context);
         self.events
             .send(RunOutput {
                 binding,
@@ -2502,6 +2604,21 @@ impl Runner {
     ) -> Result<(), WorkerFailure> {
         if stop_reason(message) == Some(StopReason::Error) {
             return Ok(());
+        }
+        if let Some((origin, fragments)) = self.pending_provider_context.remove(&receipt.message_id)
+        {
+            let items = crate::provider::types::bind_provider_context_fragments(
+                fragments,
+                crate::provider::types::ProviderContextAnchor {
+                    message_id: receipt.message_id.clone(),
+                    message_seq: receipt.message_seq,
+                },
+                origin,
+            )
+            .map_err(WorkerFailure::Error)?;
+            self.provider_context.extend(items);
+            crate::provider::types::validate_provider_context_ordinals(&self.provider_context)
+                .map_err(WorkerFailure::Error)?;
         }
         self.context.push(ContextMessage::Persisted {
             id: receipt.message_id,

@@ -1923,6 +1923,15 @@ async fn finish_responses_terminal(
     cancel: &CancellationToken,
     success_terminal_committed: &SuccessTerminalCommit,
 ) {
+    if let Some(observed_model) = terminal.response_model.as_deref()
+        && observed_model != spec.id
+    {
+        tracing::debug!(
+            observed_model,
+            canonical_model = spec.id,
+            "provider reported a different model string; using canonical spec model"
+        );
+    }
     for event in terminal.events {
         match emit(tx, assembler, event, cancel).await {
             EmitResult::Sent => {}
@@ -2666,7 +2675,10 @@ fi
 
     fn opencode_capture_script() -> &'static str {
         let readme = include_str!("../../tests/fixtures/README.md");
-        let (_, fenced) = readme
+        let (_, capture_section) = readme
+            .split_once("The OpenCode capture script below is retained for future qualification.")
+            .expect("README OpenCode capture section");
+        let (_, fenced) = capture_section
             .split_once("```sh\n")
             .expect("README capture shell fence");
         fenced
@@ -3862,6 +3874,7 @@ fi
                 usage: Usage::default(),
                 error_message: Some("late error".into()),
                 provider_code: Some("late_error".into()),
+                response_model: None,
                 provider_context: vec![],
             },
             &cancel,
@@ -3947,6 +3960,110 @@ fi
             Some("normalized_event_contract_violation")
         );
         assert!(!committed.is_committed());
+    }
+
+    #[tokio::test]
+    async fn responses_terminal_uses_canonical_origin_despite_observed_model() {
+        let spec = ModelSpec::preset("openai-responses").expect("preset");
+        let cancel = CancellationToken::new();
+
+        // Matching observed model -> success and origin model is the canonical spec value.
+        let (tx, mut rx) = mpsc::channel(1);
+        let (priority_tx, _priority_rx) = mpsc::channel(1);
+        let mut assembler = MessageAssembler::new();
+        assembler.apply(&ProviderEvent::Start).expect("Start");
+        let committed = SuccessTerminalCommit::new();
+        finish_responses_terminal(
+            &tx,
+            &priority_tx,
+            &mut assembler,
+            &spec,
+            ResponsesTerminal {
+                events: vec![],
+                reason: StopReason::Stop,
+                usage: Usage::default(),
+                error_message: None,
+                provider_code: Some("stop".to_owned()),
+                response_model: Some(spec.id.clone()),
+                provider_context: vec![],
+            },
+            &cancel,
+            &committed,
+        )
+        .await;
+        let ProviderEvent::Done { output, .. } = rx.recv().await.expect("terminal") else {
+            panic!("expected Done terminal")
+        };
+        assert_eq!(output.message.model, spec.id);
+        assert_eq!(output.message.origin.model, spec.id);
+        assert_eq!(output.message.origin, spec.origin());
+        assert!(committed.is_committed());
+
+        // Mismatched observed model -> still a normal success terminal, with canonical
+        // origin/model preserved and terminal events still delivered on the normal lane.
+        let (tx2, mut rx2) = mpsc::channel(10);
+        let (priority_tx2, mut priority_rx2) = mpsc::channel(1);
+        let mut assembler2 = MessageAssembler::new();
+        assembler2.apply(&ProviderEvent::Start).expect("Start");
+        let committed2 = SuccessTerminalCommit::new();
+        finish_responses_terminal(
+            &tx2,
+            &priority_tx2,
+            &mut assembler2,
+            &spec,
+            ResponsesTerminal {
+                events: vec![
+                    ProviderEvent::TextStart { content_index: 0 },
+                    ProviderEvent::TextDelta {
+                        content_index: 0,
+                        delta: "hello".to_owned(),
+                    },
+                    ProviderEvent::TextEnd {
+                        content_index: 0,
+                        content: "hello".to_owned(),
+                    },
+                ],
+                reason: StopReason::Stop,
+                usage: Usage::default(),
+                error_message: None,
+                provider_code: Some("stop".to_owned()),
+                response_model: Some("other-model".to_owned()),
+                provider_context: vec![],
+            },
+            &cancel,
+            &committed2,
+        )
+        .await;
+        let mut output = None;
+        let mut _normal_lane_events = 0;
+        while let Some(event) = rx2.recv().await {
+            _normal_lane_events += 1;
+            if let ProviderEvent::Done {
+                output: done_output,
+                ..
+            } = event
+            {
+                output = Some(done_output);
+                break;
+            }
+        }
+        let output = output.expect("expected Done terminal");
+        assert_eq!(output.message.model, spec.id);
+        assert_eq!(output.message.origin.model, spec.id);
+        assert_eq!(output.message.origin, spec.origin());
+        assert_eq!(output.message.content.len(), 1);
+        assert!(committed2.is_committed());
+        assert!(priority_rx2.try_recv().is_err());
+
+        drop(tx2);
+        let mut remaining_events = 0;
+        while rx2.recv().await.is_some() {
+            remaining_events += 1;
+        }
+        assert_eq!(
+            remaining_events, 0,
+            "all terminal events were already delivered on the normal lane"
+        );
     }
 
     #[tokio::test]
@@ -5238,58 +5355,102 @@ fi
     }
 
     #[tokio::test]
-    #[ignore = "live OpenCode Go gate; requires non-empty OPENCODE_GO_API_KEY"]
+    #[ignore = "post-deadline provider-qualification debt; OpenCode Go is confirmed unavailable"]
     async fn live_opencode_go_two_turn_tool_reasoning_gate() {
         run_live_chat_tool_roundtrip("opencode-go").await;
     }
 
     #[tokio::test]
-    #[ignore = "T25 live Moonshot direct gate; requires non-empty MOONSHOT_API_KEY"]
+    #[ignore = "release-blocking missing direct-provider evidence; Moonshot proof not completed or substituted"]
     async fn live_kimi_k3_direct_two_turn_tool_reasoning_gate() {
         run_live_chat_tool_roundtrip("kimi-k3").await;
     }
 
     #[tokio::test]
-    #[ignore = "T25 live Z.ai direct gate; requires non-empty ZAI_API_KEY"]
+    #[ignore = "release-blocking missing direct-provider evidence; Z.ai proof not completed or substituted"]
     async fn live_glm_5_2_direct_two_turn_tool_reasoning_gate() {
         run_live_chat_tool_roundtrip("glm-5.2").await;
     }
 
     #[tokio::test]
-    #[ignore = "T25 live Umans direct gate; requires non-empty UMANS_API_KEY"]
+    #[ignore = "release-blocking missing direct-provider evidence; Umans proof not completed or substituted"]
     async fn live_umans_direct_two_turn_tool_reasoning_gate() {
         run_live_chat_tool_roundtrip("umans").await;
     }
 
     #[tokio::test]
-    async fn live_direct_provider_release_gate() {
+    #[ignore = "post-deadline provider-qualification debt; OpenCode Go is confirmed unavailable"]
+    async fn live_opencode_go_provider_release_gate() {
         if env::var("SUMI_LIVE_TEST").as_deref() != Ok("1") {
             return;
         }
-
-        for preset in ["kimi-k3", "glm-5.2", "umans"] {
-            run_live_chat_tool_roundtrip(preset).await;
-        }
+        run_live_chat_tool_roundtrip("opencode-go").await;
     }
 
-    #[test]
-    fn live_release_opt_in_without_credentials_fails_before_network() {
-        let output = Command::new(env::current_exe().expect("current test executable"))
+    /// T25 release gate: OpenAI Responses through the local development-only
+    /// Codex OAuth bridge. `SUMI_LIVE_TEST=1` selects this non-ignored gate.
+    /// Missing or empty `SUMI_CODEX_RESPONSES_BASE_URL` or
+    /// `SUMI_CODEX_RESPONSES_PROXY_SECRET` fails before any network call.
+    #[tokio::test]
+    async fn live_codex_responses_provider_release_gate() {
+        // `provider` is also compiled into the doctest-only library target,
+        // which has no agent runtime. The identically named binary-target test
+        // below is the sole release gate and owns the canonical Session.
+        if !crate::canonical_live_responses_harness_available() {
+            if env::var("SUMI_LIVE_TEST").as_deref() == Ok("1") {
+                eprintln!(
+                    "skipping duplicate doctest-library target; the sumi-agent binary target owns the live Responses release gate"
+                );
+            }
+            return;
+        }
+        if env::var("SUMI_LIVE_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        run_live_codex_responses_bridge().await;
+    }
+
+    fn run_codex_responses_release_dispatcher(
+        base_url: Option<&str>,
+        proxy_secret: Option<&str>,
+    ) -> Output {
+        let mut command = Command::new(env::current_exe().expect("current test executable"));
+        command
             .args([
                 "--exact",
-                "provider::tests::live_direct_provider_release_gate",
+                "provider::tests::live_codex_responses_provider_release_gate",
                 "--nocapture",
             ])
             .env("SUMI_LIVE_TEST", "1")
             .env_remove("SUMI_ENV_FILE")
+            .env_remove("SUMI_CODEX_RESPONSES_BASE_URL")
+            .env_remove("SUMI_CODEX_RESPONSES_PROXY_SECRET")
+            .env_remove("SUMI_CODEX_RESPONSES_MODEL")
+            .env_remove("OPENAI_API_KEY")
+            .env_remove("OPENCODE_GO_API_KEY")
             .env_remove("MOONSHOT_API_KEY")
             .env_remove("ZAI_API_KEY")
-            .env_remove("UMANS_API_KEY")
+            .env_remove("UMANS_API_KEY");
+        if let Some(base_url) = base_url {
+            command.env("SUMI_CODEX_RESPONSES_BASE_URL", base_url);
+        }
+        if let Some(proxy_secret) = proxy_secret {
+            command.env("SUMI_CODEX_RESPONSES_PROXY_SECRET", proxy_secret);
+        }
+        command
             .output()
-            .expect("run isolated live release dispatcher");
+            .expect("run isolated live release dispatcher")
+    }
+
+    fn assert_codex_responses_config_failure(
+        base_url: Option<&str>,
+        proxy_secret: Option<&str>,
+        expected: &str,
+    ) {
+        let output = run_codex_responses_release_dispatcher(base_url, proxy_secret);
         assert!(
             !output.status.success(),
-            "credential-free live release opt-in must not report green"
+            "invalid live release dispatcher configuration must not report green"
         );
         let diagnostics = format!(
             "{}{}",
@@ -5297,8 +5458,76 @@ fi
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(
-            diagnostics.contains("kimi-k3 live gate requires MOONSHOT_API_KEY"),
+            diagnostics.contains(expected),
             "unexpected dispatcher failure: {diagnostics}"
+        );
+    }
+
+    #[test]
+    fn live_codex_responses_release_opt_in_without_bridge_url_fails_before_network() {
+        if !crate::canonical_live_responses_harness_available() {
+            return;
+        }
+        assert_codex_responses_config_failure(
+            None,
+            None,
+            "live Codex Responses release gate requires SUMI_CODEX_RESPONSES_BASE_URL",
+        );
+    }
+
+    #[test]
+    fn live_codex_responses_release_opt_in_with_empty_bridge_url_fails_before_network() {
+        if !crate::canonical_live_responses_harness_available() {
+            return;
+        }
+        assert_codex_responses_config_failure(
+            Some(""),
+            Some("unused-test-secret"),
+            "live Codex Responses release gate requires non-empty SUMI_CODEX_RESPONSES_BASE_URL",
+        );
+    }
+
+    #[test]
+    fn live_codex_responses_release_opt_in_without_proxy_secret_fails_before_network() {
+        if !crate::canonical_live_responses_harness_available() {
+            return;
+        }
+        assert_codex_responses_config_failure(
+            Some("http://127.0.0.1:1"),
+            None,
+            "live Codex Responses release gate requires SUMI_CODEX_RESPONSES_PROXY_SECRET",
+        );
+    }
+
+    #[test]
+    fn live_codex_responses_release_opt_in_with_empty_proxy_secret_fails_before_network() {
+        if !crate::canonical_live_responses_harness_available() {
+            return;
+        }
+        assert_codex_responses_config_failure(
+            Some("http://127.0.0.1:1"),
+            Some(""),
+            "live Codex Responses release gate requires non-empty SUMI_CODEX_RESPONSES_PROXY_SECRET",
+        );
+    }
+
+    #[test]
+    fn codex_responses_proxy_self_test_passes() {
+        let proxy = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/dev/codex-responses-proxy.py");
+        let output = Command::new("python3")
+            .arg(&proxy)
+            .arg("--self-test")
+            .output()
+            .expect("spawn proxy self-test");
+        let diagnostics = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "Codex Responses proxy self-test failed:\n{diagnostics}"
         );
     }
 
@@ -5424,12 +5653,64 @@ fi
         );
     }
 
+    async fn run_live_codex_responses_bridge() {
+        if let Some(path) = env::var_os("SUMI_ENV_FILE") {
+            dotenvy::from_path(path).expect("load SUMI_ENV_FILE for live test");
+        }
+
+        let base_url = env::var("SUMI_CODEX_RESPONSES_BASE_URL").unwrap_or_else(|_| {
+            panic!("live Codex Responses release gate requires SUMI_CODEX_RESPONSES_BASE_URL")
+        });
+        assert!(
+            !base_url.trim().is_empty(),
+            "live Codex Responses release gate requires non-empty SUMI_CODEX_RESPONSES_BASE_URL"
+        );
+        let proxy_secret = env::var("SUMI_CODEX_RESPONSES_PROXY_SECRET").unwrap_or_else(|_| {
+            panic!("live Codex Responses release gate requires SUMI_CODEX_RESPONSES_PROXY_SECRET")
+        });
+        assert!(
+            !proxy_secret.trim().is_empty(),
+            "live Codex Responses release gate requires non-empty SUMI_CODEX_RESPONSES_PROXY_SECRET"
+        );
+
+        let mut spec = ModelSpec::preset("openai-responses").expect("Responses preset");
+        spec.id = match env::var("SUMI_CODEX_RESPONSES_MODEL") {
+            Ok(model) if !model.trim().is_empty() => model,
+            Ok(_) => panic!(
+                "live Codex Responses release gate requires a non-empty SUMI_CODEX_RESPONSES_MODEL when set"
+            ),
+            // The release gate must exercise encrypted reasoning provider context.
+            // gpt-5.6-luna is the cost-optimized tier and adaptively emits zero
+            // reasoning tokens for simple tool-use turns, so the canonical first
+            // turn produces no provider context. gpt-5.6-sol is the frontier
+            // reasoning model and reliably emits reasoning items here.
+            Err(_) => "gpt-5.6-sol".to_owned(),
+        };
+        spec.base_url = base_url;
+        spec.api_key_env = "SUMI_CODEX_RESPONSES_PROXY_SECRET".to_owned();
+        run_live_responses_tool_roundtrip(spec, proxy_secret).await;
+    }
+
+    async fn run_live_responses_tool_roundtrip(spec: ModelSpec, api_key: String) {
+        crate::run_canonical_live_responses_roundtrip(spec, api_key).await;
+    }
     async fn run_live_request(
         spec: ModelSpec,
         context: PromptContext,
         options: RequestOptions,
         api_key: String,
     ) -> AssistantMessage {
+        run_live_output(spec, context, options, api_key)
+            .await
+            .message
+    }
+
+    async fn run_live_output(
+        spec: ModelSpec,
+        context: PromptContext,
+        options: RequestOptions,
+        api_key: String,
+    ) -> types::ProviderOutput {
         let mut events = stream_with_api_key(
             spec,
             context,
@@ -5440,7 +5721,7 @@ fi
         tokio::time::timeout(Duration::from_secs(180), async {
             while let Some(event) = events.recv().await {
                 match event {
-                    ProviderEvent::Done { output, .. } => return output.message,
+                    ProviderEvent::Done { output, .. } => return output,
                     ProviderEvent::Error { output, .. } => {
                         panic!(
                             "live provider error {}: {}",

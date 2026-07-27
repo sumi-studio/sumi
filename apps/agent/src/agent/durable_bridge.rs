@@ -8,11 +8,15 @@ use uuid::Uuid;
 use crate::{
     approval::{ExecutableGrant, GrantLease, GrantRevalidation},
     gateway::{ApprovalDecision, Command, CommandAck},
-    provider::types::{PublicAssistantContent, PublicMessage, StopReason, ToolResultMessage},
+    provider::types::{
+        ProviderContextFragment, PublicAssistantContent, PublicMessage, StopReason,
+        ToolResultMessage,
+    },
     runtime::contracts::ProcessGeneration,
     store::{
         ApplicationKind, ApprovalMutation, ApprovalRuleMutation, DurableEvent, EventBatch,
-        EventWrite, EventWriter, InjectedCommand, Projection, RunPhase, ToolExecutionMutation,
+        EventWrite, EventWriter, InjectedCommand, Projection, ProviderContextEvictionEstimate,
+        RunPhase, ToolExecutionMutation,
     },
 };
 
@@ -111,16 +115,35 @@ pub(crate) struct MessageCommitReceipt {
     pub new_turn_id: Option<String>,
 }
 
-pub(crate) struct MessageCommitBarrier(oneshot::Sender<MessageCommitReceipt>);
+pub(crate) struct MessageCommitBarrier {
+    sender: oneshot::Sender<MessageCommitReceipt>,
+    provider_context: Vec<ProviderContextFragment>,
+}
 
 impl MessageCommitBarrier {
     pub(crate) fn channel() -> (Self, oneshot::Receiver<MessageCommitReceipt>) {
+        Self::channel_with_provider_context(Vec::new())
+    }
+
+    pub(crate) fn channel_with_provider_context(
+        provider_context: Vec<ProviderContextFragment>,
+    ) -> (Self, oneshot::Receiver<MessageCommitReceipt>) {
         let (sender, receiver) = oneshot::channel();
-        (Self(sender), receiver)
+        (
+            Self {
+                sender,
+                provider_context,
+            },
+            receiver,
+        )
+    }
+
+    fn provider_context(&self) -> &[ProviderContextFragment] {
+        &self.provider_context
     }
 
     pub(crate) fn resolve(self, receipt: MessageCommitReceipt) {
-        let _ = self.0.send(receipt);
+        let _ = self.sender.send(receipt);
     }
 }
 
@@ -1437,6 +1460,7 @@ impl DurableBridge {
         Vec<CommittedOutput>,
         Vec<(MessageCommitBarrier, MessageCommitReceipt)>,
     )> {
+        let provider_context = barrier.provider_context().to_vec();
         if self.assistant_open.as_deref() != Some(message_id.as_str()) {
             bail!("assistant MessageEnd does not close its exact durable MessageStart");
         }
@@ -1467,6 +1491,9 @@ impl DurableBridge {
             &message,
             PublicMessage::Assistant(assistant) if assistant.stop_reason == StopReason::Error
         );
+        if !append_to_l0 && !provider_context.is_empty() {
+            bail!("L0-excluded assistant MessageEnd cannot carry provider context");
+        }
         if self.pending_hard_steer.is_some()
             && matches!(
                 &message,
@@ -1501,8 +1528,14 @@ impl DurableBridge {
                         role: "assistant",
                         message: message.clone(),
                         append_to_l0,
-                        provider_context: Vec::new(),
-                        eviction_footprint_tokens: 0,
+                        eviction_footprint_tokens: provider_context
+                            .iter()
+                            .map(|fragment| {
+                                ProviderContextEvictionEstimate::from_payload(&fragment.payload)
+                                    .tokens
+                            })
+                            .fold(0u64, |total, tokens| total.saturating_add(tokens)),
+                        provider_context,
                     }],
                 }],
                 injected_commands: Vec::new(),
@@ -1836,6 +1869,10 @@ impl DurableBridge {
             &assistant,
             PublicMessage::Assistant(value) if value.stop_reason == StopReason::Error
         );
+        let provider_context = assistant_barrier.provider_context().to_vec();
+        if !append_to_l0 && !provider_context.is_empty() {
+            bail!("L0-excluded rejected assistant cannot carry provider context");
+        }
         let mut writes = vec![EventWrite {
             event: Some(DurableEvent::message_in_turn(
                 "message_end",
@@ -1849,8 +1886,13 @@ impl DurableBridge {
                 role: "assistant",
                 message: assistant.clone(),
                 append_to_l0,
-                provider_context: Vec::new(),
-                eviction_footprint_tokens: 0,
+                eviction_footprint_tokens: provider_context
+                    .iter()
+                    .map(|fragment| {
+                        ProviderContextEvictionEstimate::from_payload(&fragment.payload).tokens
+                    })
+                    .fold(0u64, |total, tokens| total.saturating_add(tokens)),
+                provider_context,
             }],
         }];
         let mut receipt_requests = vec![(assistant_id.clone(), assistant_barrier)];

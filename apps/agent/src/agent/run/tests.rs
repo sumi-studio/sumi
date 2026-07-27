@@ -924,7 +924,7 @@ async fn retry_closes_error_before_schedule_and_does_not_append_error_context() 
 }
 
 #[tokio::test]
-async fn nonempty_provider_context_fails_closed_instead_of_being_dropped() {
+async fn nonempty_provider_context_flows_to_the_durable_message_barrier() {
     let message = assistant(StopReason::Stop, Vec::new(), None, None);
     let events = vec![
         ProviderEvent::Start,
@@ -958,11 +958,7 @@ async fn nonempty_provider_context_fails_closed_instead_of_being_dropped() {
     assert!(matches!(
         end,
         PublicMessage::Assistant(assistant)
-            if assistant.stop_reason == StopReason::Error
-                && assistant.error_message.as_deref().is_some_and(|message| {
-                    message.contains("T17 durable hand-off")
-                        && message.contains("refusing to persist opaque context")
-                })
+            if assistant.stop_reason == StopReason::Stop
     ));
     assert!(matches!(
         emitted[emitted.len() - 2],

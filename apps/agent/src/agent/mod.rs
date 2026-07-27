@@ -36,7 +36,10 @@ use crate::{
     },
     provider::{
         overflow::OverflowSource,
-        types::{ContextMessage, PublicMessage, StopReason, ToolResultMessage, UserContent},
+        types::{
+            ContextMessage, ProviderContextItem, PublicMessage, StopReason, ToolResultMessage,
+            UserContent,
+        },
     },
     runtime::contracts::ProcessGeneration,
     store::{
@@ -208,6 +211,7 @@ pub(crate) struct RunCore {
     /// production; keeping this injected representation in `RunCore` prevents
     /// a second Session run from silently losing the first run.
     runtime_context: Vec<ContextMessage>,
+    provider_context: Vec<ProviderContextItem>,
     durable_binding: Option<DurableRunBinding>,
     worker_phase: Option<watch::Sender<WorkerPhase>>,
     /// Shared cancellation registry for the one live provider attempt. The
@@ -227,6 +231,7 @@ impl RunCore {
             pending_controls: MessageQueue::bounded(PENDING_CONTROL_CAPACITY),
             pending_overflow_apply: None,
             runtime_context: Vec::new(),
+            provider_context: Vec::new(),
             durable_binding: None,
             worker_phase: None,
             attempt_cancellation: None,
@@ -283,6 +288,16 @@ impl RunCore {
 
     pub(crate) fn pending_overflow_apply(&self) -> Option<OverflowSource> {
         self.pending_overflow_apply
+    }
+
+    pub(crate) fn install_hydrated_context(
+        &mut self,
+        messages: Vec<ContextMessage>,
+        provider_context: Vec<ProviderContextItem>,
+    ) {
+        self.runtime_context = messages;
+        self.provider_context = provider_context;
+        self.mark_mutated();
     }
 }
 
@@ -531,6 +546,9 @@ impl ActiveRun {
 }
 
 #[derive(Debug)]
+// RunCore owns the durable replay state and is moved through this enum only at
+// worker completion; boxing it would add an allocation to every run.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum RunOwnership {
     Recovered(Box<RunCore>),
     Lost,
@@ -1843,3 +1861,5 @@ fn panic_message(panic: Box<dyn Any + Send>) -> String {
 
 #[cfg(test)]
 mod session_tests;
+#[cfg(test)]
+pub(crate) use session_tests::run_canonical_live_responses_roundtrip;

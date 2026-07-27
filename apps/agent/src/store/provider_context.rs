@@ -1627,7 +1627,7 @@ mod tests {
                 message_seq,
             }),
             wire_item_index: Some(0),
-            ordinal: 1,
+            ordinal: 0,
             provider_origin: reasoning_origin(),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::OpenAiChatCompletions,
@@ -1642,7 +1642,7 @@ mod tests {
         message_seq: u64,
         id: &str,
     ) -> EncryptedProviderContextRecord {
-        reasoning_record_with(store, message_id, message_seq, id, 0, 1).await
+        reasoning_record_with(store, message_id, message_seq, id, 0, 0).await
     }
 
     fn reasoning_item_with(
@@ -2253,7 +2253,7 @@ mod tests {
         ProviderContextItem {
             origin_message: None,
             wire_item_index: None,
-            ordinal: 1,
+            ordinal: 0,
             provider_origin,
             payload: if anthropic {
                 ProviderContextPayload::AnthropicCompaction {
@@ -2655,6 +2655,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hydrate_rejects_provider_context_ordinal_gap_after_row_loss() {
+        let store = store().await;
+        seed_message(&store, "message-1", 7).await.unwrap();
+        reasoning_record_with(&store, "message-1", 7, "pc-0", 0, 0)
+            .await
+            .insert(store.pool())
+            .await
+            .unwrap();
+        reasoning_record_with(&store, "message-1", 7, "pc-1", 0, 1)
+            .await
+            .insert(store.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM provider_context WHERE id = 'pc-0'")
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let messages = vec![ContextMessage::Persisted {
+            id: "message-1".to_owned(),
+            seq: 7,
+            message: assistant_message(reasoning_origin()),
+        }];
+        let mut transaction = store.pool().begin().await.unwrap();
+        let error = store
+            .hydrate_provider_context(&messages, &mut transaction)
+            .await
+            .expect_err("missing ordinal zero must fail canonical hydration");
+        assert!(
+            error
+                .to_string()
+                .contains("must be unique and contiguous from zero"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
     async fn hydrate_rejects_stored_provider_origin_mismatch() {
         let store = store().await;
         seed_message(&store, "message-1", 7).await.unwrap();
@@ -2707,7 +2744,7 @@ mod tests {
         let mut item = ProviderContextItem {
             origin_message: None,
             wire_item_index: None,
-            ordinal: 1,
+            ordinal: 0,
             provider_origin: openai_responses_origin(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({"summary": "a"})],
@@ -2725,8 +2762,8 @@ mod tests {
             "provider-instance-1",
             ApiProtocol::OpenAiResponses,
             "model-1",
-            "message-1:1:_:1",
-            provider_context_idempotency_key("message-1", &item),
+            "request-a:1:_:0",
+            provider_context_idempotency_key("request-a", &item),
             &key,
             store.scope(),
         )
@@ -2735,7 +2772,7 @@ mod tests {
 
         // A different model keeps this a distinct native-compaction scope so the
         // active-native-window unique index is respected while still testing sort order.
-        item.ordinal = 2;
+        item.ordinal = 0;
         item.provider_origin = openai_responses_origin_with_model("model-2");
         item.payload = ProviderContextPayload::OpenAiCompactedWindow {
             items: vec![json!({"summary": "b"})],
@@ -2749,8 +2786,8 @@ mod tests {
             "provider-instance-1",
             ApiProtocol::OpenAiResponses,
             "model-2",
-            "message-1:1:_:2",
-            provider_context_idempotency_key("message-1", &item),
+            "request-b:1:_:0",
+            provider_context_idempotency_key("request-b", &item),
             &key,
             store.scope(),
         )
@@ -2811,7 +2848,7 @@ mod tests {
         let compaction_item = ProviderContextItem {
             origin_message: None,
             wire_item_index: None,
-            ordinal: 1,
+            ordinal: 0,
             provider_origin: openai_responses_origin(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({"summary": "compacted"})],
@@ -2826,7 +2863,7 @@ mod tests {
             "provider-instance-1",
             ApiProtocol::OpenAiResponses,
             "model-1",
-            "request-1:2:_:1",
+            "request-1:2:_:0",
             provider_context_idempotency_key("request-1", &compaction_item),
             &compaction_key,
             store.scope(),
@@ -2835,7 +2872,7 @@ mod tests {
         compaction.insert(store.pool()).await.unwrap();
 
         // Anchored reasoning at seq 2.
-        let reasoning = reasoning_record_with(&store, "message-2", 2, "pc-reasoning", 0, 1).await;
+        let reasoning = reasoning_record_with(&store, "message-2", 2, "pc-reasoning", 0, 0).await;
         reasoning.insert(store.pool()).await.unwrap();
 
         let messages = vec![
