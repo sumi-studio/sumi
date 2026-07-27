@@ -31,6 +31,7 @@ use store::{
 
 fn main() -> Result<()> {
     let mode = env::args().nth(1);
+    harden_process_entry(mode.as_deref())?;
     if env::var_os("SUMI_ISOLATION_PREFLIGHT").is_some()
         && matches!(
             mode.as_deref(),
@@ -47,6 +48,13 @@ fn main() -> Result<()> {
     tokio::runtime::Runtime::new()
         .context("failed to construct Tokio runtime")?
         .block_on(async_main(mode))
+}
+
+fn harden_process_entry(_mode: Option<&str>) -> Result<()> {
+    // Every production role receives secret-bearing environment variables at
+    // exec time. Disable ptrace/core-dump access before Tokio, tracing, the
+    // namespace preflight, or any environment parsing can extend that exposure.
+    tools::executor::set_dumpable(0).context("failed to set PR_SET_DUMPABLE at process entry")
 }
 
 async fn async_main(mode: Option<String>) -> Result<()> {
@@ -308,4 +316,29 @@ async fn run_low_trust_admission() -> Result<()> {
 
     tracing::info!("sumi-agent stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod process_entry_tests {
+    use super::*;
+
+    const PR_GET_DUMPABLE: libc::c_int = 3;
+
+    fn dumpable() -> libc::c_int {
+        unsafe { libc::prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) }
+    }
+
+    #[test]
+    fn every_secret_bearing_role_disables_dumpability_before_async_startup() {
+        for mode in [
+            None,
+            Some("--tool-executor"),
+            Some("--tool-executor-socket"),
+            Some("--artifact-broker"),
+        ] {
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) }, 0);
+            harden_process_entry(mode).expect("entry hardening");
+            assert_eq!(dumpable(), 0, "mode {mode:?} remained dumpable");
+        }
+    }
 }

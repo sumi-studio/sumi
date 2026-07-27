@@ -44,6 +44,7 @@ case "${role}" in
   init)
     install -d -m 02770 -o root -g "${IPC_GID}" "${RUNTIME_IPC}" "${BROKER_IPC}"
     install -d -m 0700 -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" /var/lib/sumi
+    install -d -m 0700 -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" /var/lib/sumi-runtime-state
     install -d -m 0700 -o "${EXECUTOR_UID}" -g "${EXECUTOR_GID}" /workspace
     install -d -m 0700 -o "${BROKER_UID}" -g "${BROKER_GID}" /var/lib/sumi-artifacts
     # Allocate as the runtime identity so the durable generation ledger cannot
@@ -75,6 +76,7 @@ case "${role}" in
       SUMI_TENANT_ID="${SUMI_TENANT_ID}" SUMI_AGENT_ID="${SUMI_AGENT_ID}" \
       SUMI_CONVERSATION_ID="${SUMI_CONVERSATION_ID}" \
       SUMI_STATE_DIR=/var/lib/sumi SUMI_WORKSPACE=/workspace \
+      SUMI_AGENT_RUNTIME_STATE_DIR=/var/lib/sumi-runtime-state \
       SUMI_EXECUTOR_SOCKET="${RUNTIME_IPC}/executor.sock" \
       SUMI_AGENT_WRAPPING_KEY="${SUMI_AGENT_WRAPPING_KEY}" \
       SUMI_AGENT_WRAPPING_KEY_ID="${SUMI_AGENT_WRAPPING_KEY_ID:-env-wrapping-key/v1}" \

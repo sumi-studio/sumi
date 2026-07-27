@@ -100,6 +100,9 @@ const RETRY_STEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(250);
 /// This is not provider retry backoff; it only prevents one stalled local task
 /// from blocking the Session event lane indefinitely.
 const STEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(250);
+/// Bounds the generation-bound hydration latch so a lost publisher cannot
+/// leave Session startup pending forever.
+const HYDRATION_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// API admission permits 32 ordinary commands plus one reserved Abort.
 const PENDING_ORDINARY_CONTROL_CAPACITY: usize = 32;
 const PENDING_CONTROL_CAPACITY: usize = PENDING_ORDINARY_CONTROL_CAPACITY + 1;
@@ -580,6 +583,7 @@ pub(crate) struct Session<G: Gateway> {
     writer: EventWriter,
     admission: InboundAdmission,
     recovery_steps: Vec<RecoveryStep>,
+    hydration: Option<watch::Receiver<HydrationReady>>,
     core: Option<RunCore>,
     active: Option<ActiveRun>,
     worker: Arc<dyn RunWorker>,
@@ -604,30 +608,25 @@ impl<G: Gateway + 'static> Session<G> {
         worker: Arc<dyn RunWorker>,
         executor_generation: ProcessGeneration,
     ) -> Result<Self> {
+        let mut session = Self::prepare(store, gateway, core, worker, executor_generation).await?;
+        session.await_hydration_ready().await?;
+        Ok(session)
+    }
+
+    /// Install every fallible Store, command-gate, and Gateway component while
+    /// hydration is still NotReady. Production bootstrap uses this boundary so
+    /// durable Ready cannot be published before the Session is actually built.
+    pub(crate) async fn prepare(
+        store: Store,
+        gateway: G,
+        core: RunCore,
+        worker: Arc<dyn RunWorker>,
+        executor_generation: ProcessGeneration,
+    ) -> Result<Self> {
         worker.validate_executor_generation(executor_generation)?;
 
-        // Wait for the generation-bound hydration latch before loading keys or
-        // admitting any command. A stale-generation Ready is fail-closed; a
-        // dropped sender before Ready is also fail-closed.
         let mut core = core;
-        if let Some(mut hydration) = core.hydration.take() {
-            loop {
-                let state = hydration.borrow_and_update().clone();
-                if let Some(ready_generation) = state.generation() {
-                    if ready_generation != executor_generation {
-                        return Err(anyhow::anyhow!(
-                            "hydration ready latched for generation {ready_generation}, expected {executor_generation}"
-                        ));
-                    }
-                    break;
-                }
-                if hydration.changed().await.is_err() {
-                    return Err(anyhow::anyhow!(
-                        "hydration ready signal closed before becoming ready"
-                    ));
-                }
-            }
-        }
+        let hydration = core.hydration.take();
 
         let conversation_id = store.scope().conversation_id.clone();
         let store = Arc::new(store);
@@ -640,11 +639,9 @@ impl<G: Gateway + 'static> Session<G> {
         }
         let writer = EventWriter::new(store.clone());
         writer.initialize_recovery_checkpoint().await?;
-        let recovery_steps = core.recovery_steps.take().unwrap_or_default();
-        let recovery_steps = if recovery_steps.is_empty() {
-            SuffixRecovery::recover_t12_prefix(&store, &writer).await?
-        } else {
-            recovery_steps
+        let recovery_steps = match core.recovery_steps.take() {
+            Some(steps) => steps,
+            None => SuffixRecovery::recover_t12_prefix(&store, &writer).await?,
         };
         let admission = InboundAdmission::after_t12_recovery(!recovery_steps.is_empty());
         let (gateway_reader, gateway_writer) = gateway.split();
@@ -678,6 +675,7 @@ impl<G: Gateway + 'static> Session<G> {
             writer,
             admission,
             recovery_steps,
+            hydration,
             core: Some(core),
             active: None,
             worker,
@@ -685,6 +683,35 @@ impl<G: Gateway + 'static> Session<G> {
             deferred_commands: MessageQueue::bounded(PENDING_CONTROL_CAPACITY),
             durable_core_invalidated: false,
         })
+    }
+
+    /// Complete the in-process command gate after the Session has been
+    /// installed. No command reader is polled until this returns successfully.
+    pub(crate) async fn await_hydration_ready(&mut self) -> Result<()> {
+        if let Some(mut hydration) = self.hydration.take() {
+            tokio::time::timeout(HYDRATION_READY_TIMEOUT, async {
+                loop {
+                    let state = hydration.borrow_and_update().clone();
+                    if let Some(ready_generation) = state.generation() {
+                        if ready_generation != self.executor_generation {
+                            return Err(anyhow::anyhow!(
+                                "hydration ready latched for generation {ready_generation}, expected {}",
+                                self.executor_generation
+                            ));
+                        }
+                        return Ok(());
+                    }
+                    if hydration.changed().await.is_err() {
+                        return Err(anyhow::anyhow!(
+                            "hydration ready signal closed before becoming ready"
+                        ));
+                    }
+                }
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for hydration ready"))??;
+        }
+        Ok(())
     }
 
     pub(crate) async fn run(mut self) -> SessionResult {

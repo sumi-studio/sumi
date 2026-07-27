@@ -38,6 +38,7 @@ fi
 : "${SUMI_BROKER_USER:=sumi-artifact}"
 : "${SUMI_BROKER_GROUP:=sumi-artifact}"
 : "${SUMI_STATE_DIR:=/var/lib/sumi}"
+: "${SUMI_AGENT_RUNTIME_STATE_DIR:=/var/lib/sumi-runtime-state}"
 : "${SUMI_WORKSPACE:=/var/lib/sumi/workspace}"
 : "${SUMI_ARTIFACT_ROOT:=/var/lib/sumi/artifacts}"
 : "${SUMI_EXECUTOR_SOCKET:=/run/sumi/executor.sock}"
@@ -106,10 +107,10 @@ allocate_identity() {
 prepare_directories() {
   mkdir -p "${SUMI_WORKSPACE}" "${SUMI_ARTIFACT_ROOT}" "$(dirname "${SUMI_EXECUTOR_SOCKET}")" "$(dirname "${SUMI_ARTIFACT_BROKER_SOCKET}")"
   rm -f "${SUMI_EXECUTOR_SOCKET}" "${SUMI_ARTIFACT_BROKER_SOCKET}"
-  mkdir -p "${SUMI_STATE_DIR}"
-  chmod 700 "${SUMI_STATE_DIR}" "${SUMI_WORKSPACE}" "${SUMI_ARTIFACT_ROOT}"
+  mkdir -p "${SUMI_STATE_DIR}" "${SUMI_AGENT_RUNTIME_STATE_DIR}"
+  chmod 700 "${SUMI_STATE_DIR}" "${SUMI_AGENT_RUNTIME_STATE_DIR}" "${SUMI_WORKSPACE}" "${SUMI_ARTIFACT_ROOT}"
   if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-    chown "${SUMI_RUNTIME_USER}:${SUMI_RUNTIME_GROUP}" "${SUMI_STATE_DIR}" "${SUMI_WORKSPACE}"
+    chown "${SUMI_RUNTIME_USER}:${SUMI_RUNTIME_GROUP}" "${SUMI_STATE_DIR}" "${SUMI_AGENT_RUNTIME_STATE_DIR}" "${SUMI_WORKSPACE}"
     chown "${SUMI_BROKER_USER}:${SUMI_BROKER_GROUP}" "${SUMI_ARTIFACT_ROOT}"
   fi
 }
@@ -275,6 +276,7 @@ spawn_runtime() {
     "SUMI_AGENT_ID=${SUMI_AGENT_ID}"
     "SUMI_CONVERSATION_ID=${conversation}"
     "SUMI_STATE_DIR=${SUMI_STATE_DIR}"
+    "SUMI_AGENT_RUNTIME_STATE_DIR=${SUMI_AGENT_RUNTIME_STATE_DIR}"
     "SUMI_WORKSPACE=${SUMI_WORKSPACE}"
     "SUMI_ARTIFACT_ROOT=${SUMI_ARTIFACT_ROOT}"
     "SUMI_ARTIFACT_BROKER_SOCKET=${SUMI_ARTIFACT_BROKER_SOCKET}"
