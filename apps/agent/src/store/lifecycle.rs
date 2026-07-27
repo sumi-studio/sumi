@@ -450,6 +450,31 @@ impl LifecycleWorker {
             lines.push(serde_json::to_string(&record)?);
         }
 
+        // Compact summaries are exported only through their materialized,
+        // redacted projection.  The encrypted summary ciphertext is never
+        // selected here, and completed memory jobs remain an internal audit /
+        // recovery record rather than a second copy of the same summary.
+        let summaries = sqlx::query(
+            "SELECT id, batch_seq, summary_projection, summary_redaction_version
+             FROM memory_batches
+             WHERE summary_projection IS NOT NULL
+             ORDER BY batch_seq, id",
+        )
+        .fetch_all(self.store.pool())
+        .await
+        .context("failed to read materialized memory summaries for export")?;
+        for row in summaries {
+            let projection: String = row.try_get("summary_projection")?;
+            let redacted_projection = self.store.redactor().redact_text(&projection);
+            lines.push(serde_json::to_string(&serde_json::json!({
+                "type": "memory_summary",
+                "id": row.try_get::<String, _>("id")?,
+                "seq": row.try_get::<i64, _>("batch_seq")?,
+                "projection": redacted_projection,
+                "redaction_version": row.try_get::<i64, _>("summary_redaction_version")?,
+            }))?);
+        }
+
         self.tombstones
             .log_access(
                 actor_id,
@@ -666,13 +691,28 @@ impl LifecycleWorker {
 mod tests {
     use std::sync::Arc;
 
+    use super::super::delivery::{
+        DeliveryChannelBuilder, DeliveryEpoch, DeliveryFrame, DeliveryMode, DeliveryPump,
+    };
     use super::*;
+    use crate::agent::{ProjectedProviderEvent, ProviderEventProjector};
+    use crate::gateway::{Command, CommandEnvelope, CommandId, InboundCommand};
+    use crate::memory::compactor::MemoryProjectionBuilder;
+    use crate::memory::{CompactResult, DecryptedMemorySummary};
+    use crate::provider::assembler::{MessageAssembler, TerminalMetadata};
+    use crate::provider::types::{
+        ApiProtocol, ProviderEvent, ProviderOrigin, ProviderOutput, PublicAssistantMessage,
+        PublicMessage, StopReason, ToolCall, Usage, UserContent, UserMessage,
+    };
     use crate::runtime::contracts::{ProcessGeneration, ProcessGenerationLease};
     use crate::store::crypto::{DataKeyScope, KeyWrapAad, WRAP_ALGORITHM, wrap_data_key};
+    use crate::store::memory_state::MemoryBatchSummary;
     use crate::store::{
-        AgentScope, DATA_KEY_BYTES, DataKeyMaterial, DataKeyPurpose, InMemoryTombstoneRepository,
-        KeyProvider, KmsClient, KmsKeyProvider, MockKmsClient, SqliteTombstoneRepository,
-        TombstoneRepository, TombstoneScope, TombstoneStatus, WrappingKey,
+        AgentScope, ApplicationKind, DATA_KEY_BYTES, DataKeyMaterial, DataKeyPurpose, DurableEvent,
+        EventBatch, EventWrite, EventWriter, InMemoryTombstoneRepository, InjectedCommand,
+        KeyProvider, KmsClient, KmsKeyProvider, MockKmsClient, Projection, RunPhase,
+        SqliteTombstoneRepository, TombstoneRepository, TombstoneScope, TombstoneStatus,
+        WrappingKey, user_message_id,
     };
     use crate::tools::executor::{ArtifactBroker, ArtifactOperation};
     use uuid::Uuid;
@@ -743,6 +783,298 @@ mod tests {
         .execute(store.pool())
         .await
         .expect("seed message");
+    }
+
+    const T29_COMMAND_ID: &str = "00000000-0000-4000-8000-000000000029";
+    const T29_SECRET: &str = "sk-1234567890abcdef";
+
+    /// Assemble secret-bearing stream deltas, then persist their terminal
+    /// assistant message through the same EventWriter lifecycle used by a run.
+    /// The returned sequence is the authoritative MessageEnd event to replay.
+    async fn commit_t29_delta_fixture(store: Arc<Store>) -> (u64, Vec<crate::agent::AgentEvent>) {
+        let writer = EventWriter::new(store.clone());
+        let command_id = CommandId::parse(T29_COMMAND_ID).expect("canonical fixture command id");
+        writer
+            .persist_inbound(&InboundCommand::Valid(CommandEnvelope {
+                seq: 1,
+                command_id: command_id.clone(),
+                command: Command::UserMessage {
+                    text: "assemble the response".to_owned(),
+                    attachments: Vec::new(),
+                },
+            }))
+            .await
+            .expect("persist fixture command");
+        let received_at: String =
+            sqlx::query_scalar("SELECT received_at FROM inbound_commands WHERE command_id = ?")
+                .bind(T29_COMMAND_ID)
+                .fetch_one(store.pool())
+                .await
+                .expect("read real command receipt timestamp");
+        let timestamp = chrono::DateTime::parse_from_rfc3339(&received_at)
+            .expect("valid durable receipt timestamp")
+            .with_timezone(&Utc);
+        let run_id = format!("run-{T29_COMMAND_ID}");
+        let turn_id = format!("turn-{T29_COMMAND_ID}");
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![Projection::CommandClassified {
+                        command_id: T29_COMMAND_ID.to_owned(),
+                        application_kind: ApplicationKind::IdleRun,
+                        run_id: run_id.clone(),
+                        turn_id: turn_id.clone(),
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("classify fixture command");
+
+        let user_message_id = user_message_id(&command_id);
+        let user = PublicMessage::User(UserMessage {
+            content: vec![UserContent::Text {
+                text: "assemble the response".to_owned(),
+            }],
+            timestamp,
+        });
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(DurableEvent::agent_start(run_id.clone()).unwrap()),
+                        projections: vec![Projection::RunPhase {
+                            command_id: T29_COMMAND_ID.to_owned(),
+                            run_id: run_id.clone(),
+                            expected: RunPhase::Classified,
+                            next: RunPhase::RunStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::turn_start(run_id.clone(), turn_id.clone()).unwrap(),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: T29_COMMAND_ID.to_owned(),
+                            run_id: run_id.clone(),
+                            expected: RunPhase::RunStarted,
+                            next: RunPhase::TurnStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_start", &user_message_id, &user)
+                                .unwrap(),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: T29_COMMAND_ID.to_owned(),
+                            run_id: run_id.clone(),
+                            expected: RunPhase::TurnStarted,
+                            next: RunPhase::UserStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_end", &user_message_id, &user).unwrap(),
+                        ),
+                        projections: vec![
+                            Projection::MessageEnd {
+                                message_id: user_message_id,
+                                role: "user",
+                                message: user,
+                                append_to_l0: true,
+                                provider_context: Vec::new(),
+                                eviction_footprint_tokens: 0,
+                            },
+                            Projection::RunPhase {
+                                command_id: T29_COMMAND_ID.to_owned(),
+                                run_id: run_id.clone(),
+                                expected: RunPhase::UserStarted,
+                                next: RunPhase::UserCommitted,
+                            },
+                        ],
+                    },
+                ],
+                injected_commands: vec![InjectedCommand::new(1, command_id)],
+            })
+            .await
+            .expect("commit fixture user lifecycle");
+
+        let assistant_id = "assistant-t29-secret";
+        let origin = ProviderOrigin {
+            provider_instance_id: "provider-t29".to_owned(),
+            protocol: ApiProtocol::OpenAiResponses,
+            model: "test-model".to_owned(),
+        };
+        let initial = PublicMessage::Assistant(PublicAssistantMessage {
+            content: Vec::new(),
+            model: origin.model.clone(),
+            provider: "test-provider".to_owned(),
+            origin: origin.clone(),
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp,
+        });
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            assistant_id,
+                            &initial,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .unwrap(),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: T29_COMMAND_ID.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("open fixture assistant lifecycle");
+
+        fn feed(
+            assembler: &mut MessageAssembler,
+            projector: &mut ProviderEventProjector,
+            volatile_updates: &mut Vec<crate::agent::AgentEvent>,
+            event: ProviderEvent,
+        ) {
+            assembler.apply(&event).expect("assemble provider event");
+            if let ProjectedProviderEvent::Update(update) =
+                projector.project(event).expect("project provider event")
+            {
+                volatile_updates.push(update);
+            }
+        }
+
+        let mut assembler = MessageAssembler::new();
+        let mut projector = ProviderEventProjector::new(assistant_id).unwrap();
+        let mut volatile_updates = Vec::new();
+        feed(
+            &mut assembler,
+            &mut projector,
+            &mut volatile_updates,
+            ProviderEvent::Start,
+        );
+        feed(
+            &mut assembler,
+            &mut projector,
+            &mut volatile_updates,
+            ProviderEvent::TextStart { content_index: 0 },
+        );
+        feed(
+            &mut assembler,
+            &mut projector,
+            &mut volatile_updates,
+            ProviderEvent::TextDelta {
+                content_index: 0,
+                delta: "assistant text sk-12345678".to_owned(),
+            },
+        );
+        feed(
+            &mut assembler,
+            &mut projector,
+            &mut volatile_updates,
+            ProviderEvent::TextDelta {
+                content_index: 0,
+                delta: "90abcdef".to_owned(),
+            },
+        );
+        feed(
+            &mut assembler,
+            &mut projector,
+            &mut volatile_updates,
+            ProviderEvent::TextEnd {
+                content_index: 0,
+                content: format!("assistant text {T29_SECRET}"),
+            },
+        );
+        feed(
+            &mut assembler,
+            &mut projector,
+            &mut volatile_updates,
+            ProviderEvent::ToolCallStart { content_index: 1 },
+        );
+        feed(
+            &mut assembler,
+            &mut projector,
+            &mut volatile_updates,
+            ProviderEvent::ToolCallDelta {
+                content_index: 1,
+                delta: r#"{\"api_key\":\"sk-12345678"#.to_owned(),
+            },
+        );
+        feed(
+            &mut assembler,
+            &mut projector,
+            &mut volatile_updates,
+            ProviderEvent::ToolCallDelta {
+                content_index: 1,
+                delta: "90abcdef\"}".to_owned(),
+            },
+        );
+        feed(
+            &mut assembler,
+            &mut projector,
+            &mut volatile_updates,
+            ProviderEvent::ToolCallEnd {
+                content_index: 1,
+                tool_call: ToolCall {
+                    id: "call-t29".to_owned(),
+                    name: "test_tool".to_owned(),
+                    arguments: serde_json::from_value(serde_json::json!({"api_key": T29_SECRET}))
+                        .expect("object-shaped tool arguments"),
+                },
+            },
+        );
+        let output = ProviderOutput {
+            message: assembler
+                .finish(TerminalMetadata {
+                    provider: "test-provider".to_owned(),
+                    origin,
+                    usage: Usage::default(),
+                    stop_reason: StopReason::ToolUse,
+                    error_message: None,
+                    provider_code: None,
+                    interrupted: false,
+                    timestamp,
+                })
+                .expect("assemble terminal message"),
+            provider_context: Vec::new(),
+        };
+        let ProjectedProviderEvent::Terminal(terminal) = projector
+            .project(ProviderEvent::Done {
+                reason: StopReason::ToolUse,
+                output,
+            })
+            .expect("project terminal message")
+        else {
+            panic!("provider terminal must project to MessageEnd");
+        };
+        let sequences = writer
+            .apply(EventBatch {
+                writes: vec![
+                    terminal
+                        .into_t12_write(run_id, turn_id, true)
+                        .expect("build terminal EventWriter write"),
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("commit assembled assistant MessageEnd");
+        assert_eq!(sequences.len(), 1, "fixture commits one terminal event");
+        (sequences[0], volatile_updates)
     }
 
     async fn seed_workspace_key(store: &Store, wrapping_key: &WrappingKey) {
@@ -1259,7 +1591,7 @@ mod tests {
         let client = Arc::new(MockKmsClient::new("tenant-1", "agent-1", test_kek()));
         let (store, _) = open_test_store("conversation-export", client.clone()).await;
         let store = Arc::new(store);
-        seed_message(&store, "conversation-export", 1).await;
+        let (terminal_seq, volatile_updates) = commit_t29_delta_fixture(store.clone()).await;
 
         let tombstones: Arc<dyn TombstoneRepository> = Arc::new(InMemoryTombstoneRepository::new());
         let worker = LifecycleWorker::new(
@@ -1269,39 +1601,124 @@ mod tests {
             None,
         );
 
-        // Insert a message that contains a secret token.
-        sqlx::query(
-            "INSERT INTO messages(
-                id, seq, role, raw_key_ref, raw_ciphertext, payload, search_text,
-                redaction_version, interrupted, created_at
-             ) VALUES('msg-secret', 2, 'user', ?, X'00', ?, ?, 1, 0, ?)",
-        )
-        .bind(
-            store
-                .conversation_key(DataKeyPurpose::Transcript)
+        // Redaction-only catch-up replays the committed MessageEnd projection,
+        // never the raw event or any volatile stream delta.
+        let (channel, mut delivery_rx) =
+            DeliveryChannelBuilder::with_mode(DeliveryMode::RedactionOnly).build();
+        let mut pump = DeliveryPump::new(store.clone(), channel);
+        pump.install_epoch(DeliveryEpoch::new("t29-redaction").unwrap(), terminal_seq)
+            .await
+            .expect("install redaction-only fixture epoch");
+        assert!(
+            volatile_updates.len() >= 6,
+            "fixture must project text and tool deltas"
+        );
+        for update in volatile_updates {
+            pump.on_volatile(update)
                 .await
-                .unwrap()
-                .key_ref
-                .clone(),
+                .expect("redaction-only volatile is suppressed");
+        }
+        let Some(DeliveryFrame::Durable {
+            seq,
+            raw: None,
+            projection: Some(projection),
+        }) = delivery_rx.recv().await
+        else {
+            panic!("redaction-only catch-up must yield the terminal durable projection");
+        };
+        assert_eq!(seq, terminal_seq);
+        assert!(projection.contains("[REDACTED:api_key]"));
+        assert!(!projection.contains(T29_SECRET));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), delivery_rx.recv())
+                .await
+                .is_err(),
+            "redaction-only pump must not emit a volatile delta"
+        );
+        let indexed: Vec<String> = sqlx::query_scalar("SELECT search_text FROM messages_fts")
+            .fetch_all(store.pool())
+            .await
+            .expect("read committed FTS projections");
+        assert!(
+            indexed.iter().all(|text| !text.contains(T29_SECRET)),
+            "FTS must be derived from the redacted committed projection"
+        );
+
+        let summary_key = store
+            .conversation_key(DataKeyPurpose::MemorySummary)
+            .await
+            .unwrap();
+        let batch_id = "batch-export-secret";
+        let result = CompactResult {
+            summary: DecryptedMemorySummary::new(format!(
+                "Compact result contains {T29_SECRET} and keep-me"
+            )),
+            est_tokens: 8,
+            time_range: (Utc::now(), Utc::now()),
+        };
+        let projection = MemoryProjectionBuilder::new(store.redactor(), &summary_key)
+            .build(
+                &result,
+                &store
+                    .scope()
+                    .row_aad("memory_batches", batch_id, DataKeyPurpose::MemorySummary),
+                &store.scope().row_aad(
+                    "memory_jobs",
+                    "job-export-secret",
+                    DataKeyPurpose::MemorySummary,
+                ),
+            )
+            .unwrap();
+        let mut batch = crate::store::MemoryBatchRecord::new(
+            batch_id,
+            crate::store::MemoryLayer::L1,
+            0,
+            3,
+            crate::store::MemoryBatchState::Compacted,
+            8,
+            8,
+        );
+        batch.summary = Some(MemoryBatchSummary {
+            key_ref: projection.key_ref,
+            ciphertext: projection.ciphertext,
+            projection: projection.projection,
+            redaction_version: projection.redaction_version,
+        });
+        batch.insert(store.pool()).await.unwrap();
+        let stored = sqlx::query(
+            "SELECT summary_ciphertext, summary_projection FROM memory_batches WHERE id = ?",
         )
-        .bind(r#"{"text":"token is sk-1234567890abcdef"}"#)
-        .bind("token is sk-1234567890abcdef")
-        .bind(Utc::now().to_rfc3339())
-        .execute(store.pool())
+        .bind(batch_id)
+        .fetch_one(store.pool())
         .await
         .unwrap();
+        let stored_projection: String = stored.try_get("summary_projection").unwrap();
+        assert!(!stored_projection.contains(T29_SECRET));
+        assert!(stored_projection.contains("[REDACTED:api_key]"));
+        let plaintext = crate::store::decrypt_content(
+            &summary_key,
+            &stored.try_get::<Vec<u8>, _>("summary_ciphertext").unwrap(),
+            &store
+                .scope()
+                .row_aad("memory_batches", batch_id, DataKeyPurpose::MemorySummary),
+        )
+        .unwrap();
+        assert!(String::from_utf8_lossy(&plaintext).contains(T29_SECRET));
 
         let exported = worker.export_conversation("actor-1").await.unwrap();
         let text = String::from_utf8(exported).unwrap();
         assert!(text.contains("[REDACTED:api_key]"));
-        assert!(!text.contains("sk-1234567890abcdef"));
+        assert!(!text.contains(T29_SECRET));
+        assert!(text.contains("memory_summary"));
+        assert!(text.contains("keep-me"));
 
         let search = worker
-            .search_conversation("actor-1", "token")
+            .search_conversation("actor-1", T29_SECRET)
             .await
             .unwrap();
         let search_text = String::from_utf8(search).unwrap();
         assert!(search_text.contains("[REDACTED:api_key]"));
+        assert!(!search_text.contains(T29_SECRET));
 
         let audit = tombstones
             .list_audit("tenant-1", Some("actor-1"), None)
