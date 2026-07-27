@@ -13,8 +13,8 @@ use crate::provider::{
     types::{
         ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, MemoryLayer, Message,
         NativeCompactionCoverage, PromptContext, ProviderContextAnchor, ProviderContextFragment,
-        ProviderContextItem, ProviderContextPayload, ProviderEvent, ProviderOrigin, StopReason,
-        ToolDefinition, Usage, UserContent, UserMessage,
+        ProviderContextItem, ProviderContextPayload, ProviderEvent, StopReason, ToolDefinition,
+        Usage, UserContent, UserMessage,
     },
 };
 
@@ -170,21 +170,17 @@ pub(in crate::provider) fn build_replay_probe_request(
     build_replay_probe_request_with_usage(fragment, Usage::default())
 }
 
-fn build_replay_probe_request_with_usage(
+fn build_replay_probe_prompt(
+    spec: &ModelSpec,
     fragment: Option<&Value>,
     usage: Usage,
-) -> Result<Value, AnthropicAdapterError> {
-    let spec =
-        ModelSpec::preset("anthropic").expect("the V1 Anthropic replay probe preset is built in");
+) -> Result<PromptContext, AnthropicAdapterError> {
+    ensure_anthropic_spec(spec)?;
     let anchor = ProviderContextAnchor {
         message_id: "replay-probe-v1-assistant".into(),
         message_seq: 2,
     };
-    let origin = ProviderOrigin {
-        provider_instance_id: "anthropic".into(),
-        protocol: ApiProtocol::AnthropicMessages,
-        model: "claude".into(),
-    };
+    let origin = spec.origin();
     let mut content = vec![AssistantContent::Thinking {
         thinking: "replay-probe-v1-sentinel".into(),
         signature_field: "thinking.signature".into(),
@@ -218,14 +214,14 @@ fn build_replay_probe_request_with_usage(
             origin_message: Some(anchor),
             wire_item_index: Some(1),
             ordinal: 0,
-            provider_origin: origin,
+            provider_origin: origin.clone(),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::AnthropicMessages,
                 item: fragment.clone(),
             },
         });
     }
-    let context = PromptContext {
+    Ok(PromptContext {
         system_prompt: "replay-probe-v1".into(),
         memory_blocks: Vec::new(),
         messages: vec![
@@ -246,7 +242,7 @@ fn build_replay_probe_request_with_usage(
                     content,
                     model: spec.id.clone(),
                     provider: spec.provider.clone(),
-                    origin: spec.origin(),
+                    origin: origin.clone(),
                     usage,
                     stop_reason: StopReason::Stop,
                     error_message: None,
@@ -268,7 +264,16 @@ fn build_replay_probe_request_with_usage(
         ],
         provider_context,
         tools: Vec::new(),
-    };
+    })
+}
+
+fn build_replay_probe_request_with_usage(
+    fragment: Option<&Value>,
+    usage: Usage,
+) -> Result<Value, AnthropicAdapterError> {
+    let spec =
+        ModelSpec::preset("anthropic").expect("the V1 Anthropic replay probe preset is built in");
+    let context = build_replay_probe_prompt(&spec, fragment, usage)?;
     build_request(&spec, &context, &RequestOptions::default())
 }
 
@@ -2042,6 +2047,59 @@ mod tests {
         Utc.timestamp_millis_opt(1_700_000_000_000)
             .single()
             .expect("timestamp")
+    }
+
+    #[test]
+    fn replay_probe_context_origin_matches_assistant_origin() {
+        let preset = spec();
+        let mut custom = preset.clone();
+        custom.set_model_id("claude-custom");
+        let fragments: [(&str, Option<Value>); 3] = [
+            ("none", None),
+            (
+                "thinking_signature",
+                Some(json!({
+                    "type": "thinking_signature",
+                    "signature": "probe-sig",
+                })),
+            ),
+            (
+                "redacted_thinking",
+                Some(json!({
+                    "type": "redacted_thinking",
+                    "data": "probe-data",
+                })),
+            ),
+        ];
+        for (spec_label, spec) in [("preset", &preset), ("custom", &custom)] {
+            for (fragment_label, fragment) in &fragments {
+                let context =
+                    super::build_replay_probe_prompt(spec, fragment.as_ref(), Usage::default())
+                        .unwrap_or_else(|error| {
+                            panic!("build prompt for {spec_label}/{fragment_label}: {error}")
+                        });
+                let assistant_origin = match &context.messages[1] {
+                    ContextMessage::Persisted {
+                        message: Message::Assistant(assistant),
+                        ..
+                    } => &assistant.origin,
+                    other => panic!(
+                        "expected assistant message for {spec_label}/{fragment_label}: {other:?}"
+                    ),
+                };
+                assert_eq!(
+                    context.provider_context.len(),
+                    if fragment.is_some() { 2 } else { 1 },
+                    "provider context count for {spec_label}/{fragment_label}"
+                );
+                for (i, item) in context.provider_context.iter().enumerate() {
+                    assert_eq!(
+                        &item.provider_origin, assistant_origin,
+                        "provider_context[{i}] origin must match assistant origin for {spec_label}/{fragment_label}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
