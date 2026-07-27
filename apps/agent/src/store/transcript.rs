@@ -120,6 +120,48 @@ pub(crate) fn public_message_role(message: &PublicMessage) -> &'static str {
     }
 }
 
+/// Search the redacted transcript projection without exposing encrypted raw
+/// content. FTS5's trigram tokenizer cannot match queries shorter than three
+/// Unicode scalar values, so those queries use a correctness-preserving LIKE
+/// fallback over the same redacted column.
+pub(crate) async fn search_message_ids(
+    pool: &sqlx::SqlitePool,
+    query: &str,
+) -> Result<Vec<String>> {
+    if query.is_empty() {
+        bail!("transcript search query must not be empty");
+    }
+
+    if query.chars().count() < 3 {
+        let escaped = query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        return sqlx::query_scalar(
+            "SELECT id FROM messages
+             WHERE search_text LIKE ? ESCAPE '\\'
+             ORDER BY seq",
+        )
+        .bind(format!("%{escaped}%"))
+        .fetch_all(pool)
+        .await
+        .context("failed to search short transcript query");
+    }
+
+    let phrase = format!("\"{}\"", query.replace('"', "\"\""));
+    sqlx::query_scalar(
+        "SELECT messages.id
+         FROM messages_fts
+         JOIN messages ON messages.rowid = messages_fts.rowid
+         WHERE messages_fts MATCH ?
+         ORDER BY messages.seq",
+    )
+    .bind(phrase)
+    .fetch_all(pool)
+    .await
+    .context("failed to search transcript FTS")
+}
+
 #[cfg(test)]
 mod tests {
     use sqlx::Row;
@@ -338,6 +380,19 @@ mod tests {
         .await
         .expect("search Japanese substring");
         assert_eq!(japanese_matches, 1);
+
+        assert_eq!(
+            search_message_ids(store.pool(), "過去")
+                .await
+                .expect("search two-character Japanese substring"),
+            vec!["message-fts"]
+        );
+        assert_eq!(
+            search_message_ids(store.pool(), "過去の発言")
+                .await
+                .expect("search Japanese trigram substring"),
+            vec!["message-fts"]
+        );
 
         sqlx::query("DELETE FROM messages WHERE id = ?")
             .bind("message-fts")
