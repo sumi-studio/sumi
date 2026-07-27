@@ -444,6 +444,17 @@ impl DurableSource for T17StoreAdapter {
         *slot = None;
         Ok(())
     }
+
+    async fn mark_delivery_online(&self, epoch: DeliveryEpoch) -> Result<()> {
+        let pump = self
+            .pump
+            .lock()
+            .await
+            .as_ref()
+            .cloned()
+            .context("delivery online barrier has no active pump")?;
+        pump.mark_online(epoch)
+    }
 }
 
 /// Placeholder credential provider for T26's workload-identity integration.

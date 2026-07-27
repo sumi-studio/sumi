@@ -88,9 +88,15 @@ impl DeliveryChannelBuilder {
 
 enum PumpState {
     Idle,
+    CatchingUp {
+        epoch: DeliveryEpoch,
+        failure_tx: Option<mpsc::UnboundedSender<String>>,
+        pending_durable: usize,
+    },
     Online {
         epoch: DeliveryEpoch,
         failure_tx: Option<mpsc::UnboundedSender<String>>,
+        pending_durable: usize,
     },
 }
 
@@ -100,6 +106,34 @@ pub(crate) struct DeliveryPump {
     channel: DeliveryChannel,
     state: Arc<std::sync::Mutex<PumpState>>,
     durable_serial: Arc<tokio::sync::Mutex<()>>,
+}
+
+struct PendingDurable<'a> {
+    pump: &'a DeliveryPump,
+    epoch: DeliveryEpoch,
+}
+
+impl Drop for PendingDurable<'_> {
+    fn drop(&mut self) {
+        let mut state = self.pump.state.lock().unwrap();
+        match &mut *state {
+            PumpState::CatchingUp {
+                epoch,
+                pending_durable,
+                ..
+            } if *epoch == self.epoch => {
+                *pending_durable = pending_durable.saturating_sub(1);
+            }
+            PumpState::Online {
+                epoch,
+                pending_durable,
+                ..
+            } if *epoch == self.epoch => {
+                *pending_durable = pending_durable.saturating_sub(1);
+            }
+            PumpState::Idle | PumpState::CatchingUp { .. } | PumpState::Online { .. } => {}
+        }
+    }
 }
 
 impl DeliveryPump {
@@ -115,7 +149,7 @@ impl DeliveryPump {
     pub(crate) fn epoch(&self) -> Option<DeliveryEpoch> {
         match &*self.state.lock().unwrap() {
             PumpState::Idle => None,
-            PumpState::Online { epoch, .. } => Some(*epoch),
+            PumpState::CatchingUp { epoch, .. } | PumpState::Online { epoch, .. } => Some(*epoch),
         }
     }
 
@@ -129,6 +163,7 @@ impl DeliveryPump {
         *self.state.lock().unwrap() = PumpState::Online {
             epoch,
             failure_tx: None,
+            pending_durable: 0,
         };
     }
 
@@ -137,15 +172,51 @@ impl DeliveryPump {
         epoch: DeliveryEpoch,
         failure_tx: mpsc::UnboundedSender<String>,
     ) {
-        *self.state.lock().unwrap() = PumpState::Online {
+        *self.state.lock().unwrap() = PumpState::CatchingUp {
             epoch,
             failure_tx: Some(failure_tx),
+            pending_durable: 0,
         };
+    }
+
+    /// Open volatile admission only after the supervisor has completed its
+    /// durable catch-up and final cursor check. Durable callbacks remain
+    /// admissible during catch-up so the replay cursor can converge, but all
+    /// volatile frames are dropped until this barrier is crossed.
+    pub(crate) fn mark_online(&self, epoch: DeliveryEpoch) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        match &mut *state {
+            PumpState::CatchingUp {
+                epoch: current,
+                failure_tx,
+                pending_durable,
+            } if *current == epoch => {
+                *state = PumpState::Online {
+                    epoch,
+                    failure_tx: failure_tx.clone(),
+                    pending_durable: *pending_durable,
+                };
+                Ok(())
+            }
+            PumpState::Online { epoch: current, .. } if *current == epoch => Ok(()),
+            PumpState::Idle => bail!("delivery epoch {} is not active", epoch.as_u64()),
+            PumpState::CatchingUp { epoch: current, .. }
+            | PumpState::Online { epoch: current, .. } => bail!(
+                "delivery epoch barrier mismatch: expected {}, current {}",
+                epoch.as_u64(),
+                current.as_u64()
+            ),
+        }
     }
 
     pub(crate) fn invalidate_epoch(&self, epoch: DeliveryEpoch) -> bool {
         let mut state = self.state.lock().unwrap();
-        if !matches!(&*state, PumpState::Online { epoch: current, .. } if *current == epoch) {
+        if !matches!(
+            &*state,
+            PumpState::CatchingUp { epoch: current, .. }
+                | PumpState::Online { epoch: current, .. }
+                if *current == epoch
+        ) {
             return false;
         }
         *state = PumpState::Idle;
@@ -155,17 +226,51 @@ impl DeliveryPump {
     pub(crate) async fn on_durable_committed(&self, seq: u64) -> Result<()> {
         // Preserve the EventWriter's post-commit durable FIFO while keeping the
         // shared adapter selection/state lock out of the bounded channel await.
+        let admission_epoch = {
+            let mut state = self.state.lock().unwrap();
+            match &mut *state {
+                PumpState::CatchingUp {
+                    epoch,
+                    pending_durable,
+                    ..
+                }
+                | PumpState::Online {
+                    epoch,
+                    pending_durable,
+                    ..
+                } => {
+                    *pending_durable = pending_durable.saturating_add(1);
+                    *epoch
+                }
+                PumpState::Idle => return Ok(()),
+            }
+        };
+        let _pending = PendingDurable {
+            pump: self,
+            epoch: admission_epoch,
+        };
         let _serial = self.durable_serial.lock().await;
         let (epoch, failure_tx) = match &*self.state.lock().unwrap() {
             PumpState::Idle => return Ok(()),
-            PumpState::Online { epoch, failure_tx } => (*epoch, failure_tx.clone()),
+            PumpState::CatchingUp {
+                epoch, failure_tx, ..
+            }
+            | PumpState::Online {
+                epoch, failure_tx, ..
+            } if *epoch == admission_epoch => (*epoch, failure_tx.clone()),
+            PumpState::CatchingUp { .. } | PumpState::Online { .. } => return Ok(()),
         };
         if let Err(err) = send_event_range(&self.store, &self.channel, &epoch, seq, seq).await {
             let mut state = self.state.lock().unwrap();
             // A replacement epoch may have been installed while the bounded
             // durable send was waiting. Only the epoch that initiated the send
             // may transition itself to Idle or notify its failure supervisor.
-            if matches!(&*state, PumpState::Online { epoch: current, .. } if *current == epoch) {
+            if matches!(
+                &*state,
+                PumpState::CatchingUp { epoch: current, .. }
+                    | PumpState::Online { epoch: current, .. }
+                    if *current == epoch
+            ) {
                 *state = PumpState::Idle;
                 if let Some(failure_tx) = failure_tx {
                     let _ = failure_tx.send(format!("durable delivery failed: {err:#}"));
@@ -181,7 +286,12 @@ impl DeliveryPump {
             bail!("volatile delivery rejected durable event of kind {kind}");
         }
         let (epoch, failure_tx) = match &*self.state.lock().unwrap() {
-            PumpState::Online { epoch, failure_tx } => (*epoch, failure_tx.clone()),
+            PumpState::Online {
+                epoch,
+                failure_tx,
+                pending_durable,
+            } if *pending_durable == 0 => (*epoch, failure_tx.clone()),
+            PumpState::Online { .. } | PumpState::CatchingUp { .. } => return Ok(()),
             PumpState::Idle => return Ok(()),
         };
         if matches!(self.channel.mode, DeliveryMode::RedactionOnly) {
@@ -623,6 +733,100 @@ mod tests {
         assert!(matches!(
             receiver.recv().await,
             Some(DeliveryFrame::Durable { seq: 2, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn supervised_epoch_drops_volatiles_until_online_barrier() {
+        let store = store().await;
+        let (channel, mut receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
+        let (failure_tx, _failure_rx) = mpsc::unbounded_channel();
+        let pump = DeliveryPump::new(store, channel);
+        let epoch = DeliveryEpoch::for_test("catching-up");
+        pump.install_supervised_epoch(epoch, failure_tx);
+
+        pump.on_volatile(AgentEvent::MessageUpdate {
+            message_id: "pre-online".to_owned(),
+            event: PublicStreamEvent::TextDelta {
+                content_index: 0,
+                delta: "must-drop".to_owned(),
+            },
+        })
+        .await
+        .unwrap();
+        assert!(!pump.is_online());
+        assert!(
+            timeout(Duration::from_millis(50), receiver.recv())
+                .await
+                .is_err()
+        );
+
+        pump.mark_online(epoch).unwrap();
+        pump.on_volatile(AgentEvent::MessageUpdate {
+            message_id: "online".to_owned(),
+            event: PublicStreamEvent::TextDelta {
+                content_index: 0,
+                delta: "deliver".to_owned(),
+            },
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            receiver.recv().await,
+            Some(DeliveryFrame::Volatile {
+                event: AgentEvent::MessageUpdate { message_id, .. },
+                ..
+            }) if message_id == "online"
+        ));
+    }
+
+    #[tokio::test]
+    async fn volatile_drops_promptly_while_earlier_durable_admission_is_pending() {
+        let store = store().await;
+        insert_test_durable_event(&store, 1, &assistant_event("msg-1", "a"))
+            .await
+            .unwrap();
+        let (channel, mut receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw)
+            .capacity(2)
+            .build();
+        let pump = DeliveryPump::new(store, channel);
+        let epoch = DeliveryEpoch::for_test("durable-barrier");
+        pump.install_epoch(epoch);
+
+        // Hold the durable serializer after admission. The durable callback has
+        // already reserved the ordering barrier, but has not prepared/sent its
+        // frame yet; a volatile callback must still return without overtaking it.
+        let serial = pump.durable_serial.lock().await;
+        let durable = {
+            let pump = pump.clone();
+            tokio::spawn(async move { pump.on_durable_committed(1).await })
+        };
+        tokio::task::yield_now().await;
+
+        timeout(
+            Duration::from_millis(100),
+            pump.on_volatile(AgentEvent::MessageUpdate {
+                message_id: "msg-1".to_owned(),
+                event: PublicStreamEvent::TextDelta {
+                    content_index: 0,
+                    delta: "must-drop".to_owned(),
+                },
+            }),
+        )
+        .await
+        .expect("volatile delivery must not wait on durable preparation")
+        .unwrap();
+        assert!(
+            timeout(Duration::from_millis(50), receiver.recv())
+                .await
+                .is_err()
+        );
+
+        drop(serial);
+        durable.await.unwrap().unwrap();
+        assert!(matches!(
+            receiver.recv().await,
+            Some(DeliveryFrame::Durable { seq: 1, .. })
         ));
     }
 

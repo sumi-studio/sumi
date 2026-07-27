@@ -320,6 +320,14 @@ pub trait DurableSource: Clone + Send + Sync + 'static {
     async fn invalidate_delivery_epoch(&self, _epoch: DeliveryEpoch) -> Result<()> {
         Ok(())
     }
+
+    /// Open volatile delivery only after the writer has completed durable
+    /// catch-up and its final cursor recheck. Implementations that own a
+    /// DeliveryPump use this as the admission barrier; other sources may treat
+    /// the transition as a no-op.
+    async fn mark_delivery_online(&self, _epoch: DeliveryEpoch) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub struct DeliveryEpochRuntime {
@@ -791,6 +799,7 @@ where
             writer_rx,
             writer_source,
             api_hello.clone(),
+            delivery_epoch,
             config.clone(),
             online,
             epoch_token.child_token(),
@@ -1520,6 +1529,7 @@ async fn writer_task<W, S>(
     mut writer_rx: mpsc::Receiver<OutboundFrame>,
     source: S,
     api_hello: ApiHello,
+    delivery_epoch: DeliveryEpoch,
     config: SupervisorConfig,
     online: Arc<watch::Sender<bool>>,
     token: CancellationToken,
@@ -1735,6 +1745,10 @@ where
 
     // Publish Online only after reaching the durable cursor. From this point on
     // event_forwarder may deliver live frames to this writer.
+    source
+        .mark_delivery_online(delivery_epoch)
+        .await
+        .context("failed to open delivery online barrier")?;
     is_online = true;
     let _ = online.send(true);
 
@@ -2036,7 +2050,10 @@ mod tests {
         OutboundFrame,
     };
     use crate::runtime::contracts::{GenerationRecoveryFence, ProcessGenerationLease};
-    use crate::store::{HydrationOutcome, Store, insert_test_durable_event};
+    use crate::store::{
+        DeliveryChannelBuilder, DeliveryFrame, DeliveryMode, DeliveryPump, HydrationOutcome, Store,
+        insert_test_durable_event,
+    };
 
     struct TestDigestFactory;
 
@@ -6077,6 +6094,146 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct BarrierDeliverySource {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        pump: DeliveryPump,
+        epoch: DeliveryEpoch,
+    }
+
+    #[async_trait]
+    impl DurableSource for BarrierDeliverySource {
+        async fn event_cursor(&self) -> Result<EventCursors> {
+            Ok(EventCursors { last_sent: 1 })
+        }
+
+        async fn events_after(&self, _after_seq: u64, _limit: usize) -> Result<Vec<OutboundFrame>> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(vec![event_frame(1)])
+        }
+
+        async fn command_cursors(&self) -> Result<CommandCursors> {
+            Ok(CommandCursors::default())
+        }
+
+        async fn mark_delivery_online(&self, epoch: DeliveryEpoch) -> Result<()> {
+            assert_eq!(epoch, self.epoch);
+            self.pump.mark_online(epoch)
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_catch_up_drops_volatile_until_writer_opens_online_barrier() {
+        let (channel, mut delivery_rx) =
+            DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
+        let (failure_tx, _failure_rx) = mpsc::unbounded_channel();
+        let pump = DeliveryPump::new(
+            Arc::new(
+                Store::session_test_store("blocked-catch-up-pump")
+                    .await
+                    .unwrap(),
+            ),
+            channel,
+        );
+        let epoch = DeliveryEpoch::for_test("blocked-catch-up");
+        pump.install_supervised_epoch(epoch, failure_tx);
+        let source = BarrierDeliverySource {
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            pump: pump.clone(),
+            epoch,
+        };
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let writer = MockGatewayWriter {
+            fail_after: None,
+            sent: sent.clone(),
+            delay: None,
+            block_after: None,
+            block_notify: None,
+            release: None,
+        };
+        let (writer_tx, writer_rx) = mpsc::channel(4);
+        let (online, mut online_rx) = watch::channel(false);
+        let token = CancellationToken::new();
+        let api_hello = ApiHello {
+            accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
+            last_received_event_seq: 0,
+            next_command_seq: 1,
+            delivery_authorization: DeliveryAuthorization::Raw,
+        };
+        let (delivery_ready_tx, delivery_ready_rx) = oneshot::channel();
+        delivery_ready_tx.send(Ok(())).unwrap();
+
+        let task = tokio::spawn(writer_task(
+            writer,
+            writer_rx,
+            source.clone(),
+            api_hello,
+            epoch,
+            make_config(),
+            Arc::new(online),
+            token.clone(),
+            delivery_ready_rx,
+        ));
+        tokio::time::timeout(Duration::from_secs(1), source.entered.notified())
+            .await
+            .expect("writer must be blocked in catch-up");
+
+        pump.on_volatile(crate::agent::AgentEvent::MessageUpdate {
+            message_id: "pre-online".to_owned(),
+            event: crate::agent::PublicStreamEvent::TextDelta {
+                content_index: 0,
+                delta: "must-drop".to_owned(),
+            },
+        })
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), delivery_rx.recv())
+                .await
+                .is_err()
+        );
+
+        source.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !*online_rx.borrow() {
+                online_rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("writer must open the online barrier after durable replay");
+        pump.on_volatile(crate::agent::AgentEvent::MessageUpdate {
+            message_id: "online".to_owned(),
+            event: crate::agent::PublicStreamEvent::TextDelta {
+                content_index: 0,
+                delta: "deliver".to_owned(),
+            },
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            delivery_rx.recv().await,
+            Some(DeliveryFrame::Volatile {
+                event: crate::agent::AgentEvent::MessageUpdate { message_id, .. },
+                ..
+            }) if message_id == "online"
+        ));
+        assert!(
+            sent.lock()
+                .unwrap()
+                .iter()
+                .any(|frame| outbound_frame_event_seq(frame).is_ok_and(|seq| seq == 1)),
+            "durable replay must be sent before online volatile admission"
+        );
+
+        token.cancel();
+        drop(writer_tx);
+        assert!(task.await.unwrap().is_ok());
+    }
+
     #[tokio::test]
     async fn catch_up_gap_fails_before_online_without_advancing_past_the_gap() {
         let source = ReplaySource::new(
@@ -6109,6 +6266,7 @@ mod tests {
             writer_rx,
             source,
             api_hello,
+            DeliveryEpoch::for_test("writer-task-gap"),
             make_config(),
             Arc::new(online),
             token,
