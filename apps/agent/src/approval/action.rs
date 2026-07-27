@@ -140,6 +140,32 @@ impl CanonicalAction {
                     justification: None,
                 }
             }
+            // The canonical live Responses gate uses a deterministic test-only
+            // read-only tool. Keep this mapping out of production builds while
+            // still routing the gate through the real ApprovalBroker path.
+            #[cfg(test)]
+            "echo_value" => {
+                if map.len() != 1 || !map.contains_key("value") {
+                    return Err(ActionError::InvalidAction(
+                        "echo_value requires exactly one value argument",
+                    ));
+                }
+                // `value` is an opaque test literal, not a filesystem path.
+                // Preserving it byte-for-byte keeps the live-gate policy's
+                // literal prefix exact instead of accepting path-normalized
+                // variants such as `./responses-live-ok`.
+                let value = get_string(map, tool_name, "value")?;
+                Self {
+                    tool: tool_name.to_owned(),
+                    operation: "read".to_owned(),
+                    argv: vec![tool_name.to_owned(), value.clone()],
+                    cwd: workspace_root.clone(),
+                    affected_paths: vec![PathBuf::from(value)],
+                    sandbox: SandboxSummary::workspace(),
+                    requested_permissions: vec![Permission::ReadWorkspace],
+                    justification: None,
+                }
+            }
             _ => return Err(ActionError::UnknownTool(tool_name.to_owned())),
         };
         action.cwd = workspace_root;
@@ -157,6 +183,8 @@ impl CanonicalAction {
     pub fn validate(&self) -> Result<(), ActionError> {
         let expected_operation = match self.tool.as_str() {
             "read_file" | "list_dir" | "glob" | "grep" => "read",
+            #[cfg(test)]
+            "echo_value" => "read",
             "write_file" => "write",
             "edit_file" => "edit",
             "delete" => "delete",
@@ -169,6 +197,8 @@ impl CanonicalAction {
 
         let expected_permission = match self.tool.as_str() {
             "read_file" | "list_dir" | "glob" | "grep" => Permission::ReadWorkspace,
+            #[cfg(test)]
+            "echo_value" => Permission::ReadWorkspace,
             "write_file" => Permission::WriteWorkspace,
             "edit_file" => Permission::EditWorkspace,
             "delete" => Permission::DeleteWorkspace,
@@ -3427,6 +3457,56 @@ mod tests {
         assert_eq!(action.tool, "read_file");
         assert_eq!(action.operation, "read");
         assert_eq!(action.argv, vec!["read_file", "notes.txt"]);
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn test_only_echo_value_canonicalization_is_narrow_and_unknown_remains_denied() {
+        let args = serde_json::from_value::<ValidatedToolArguments>(json!({
+            "value": "responses-live-ok"
+        }))
+        .unwrap();
+        let action =
+            CanonicalAction::from_tool_call(PathBuf::from("/workspace"), "echo_value", &args)
+                .expect("exact echo_value shape");
+        assert_eq!(action.operation, "read");
+        assert_eq!(
+            action.requested_permissions,
+            vec![Permission::ReadWorkspace]
+        );
+        assert_eq!(action.tool, "echo_value");
+        assert_eq!(action.argv, vec!["echo_value", "responses-live-ok"]);
+        assert_eq!(
+            action.affected_paths,
+            vec![PathBuf::from("responses-live-ok")]
+        );
+        assert_eq!(action.cwd, PathBuf::from("/workspace"));
+        assert_eq!(action.sandbox, SandboxSummary::workspace());
+
+        let malformed = serde_json::from_value::<ValidatedToolArguments>(json!({
+            "value": "responses-live-ok",
+            "extra": true
+        }))
+        .unwrap();
+        assert!(
+            CanonicalAction::from_tool_call(PathBuf::from("/workspace"), "echo_value", &malformed,)
+                .is_err()
+        );
+        for value in [serde_json::json!({}), serde_json::json!({"value": 7})] {
+            let invalid = serde_json::from_value::<ValidatedToolArguments>(value).unwrap();
+            assert!(
+                CanonicalAction::from_tool_call(
+                    PathBuf::from("/workspace"),
+                    "echo_value",
+                    &invalid,
+                )
+                .is_err()
+            );
+        }
+        assert!(matches!(
+            CanonicalAction::from_tool_call(PathBuf::from("/workspace"), "unknown", &args),
+            Err(ActionError::UnknownTool(_))
+        ));
     }
 
     #[test]
