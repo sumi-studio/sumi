@@ -103,9 +103,11 @@ overflow、transportの各境界から再検証した。レビュー指摘への
     装わない。OpenCode Zen Goは2026-07-20のcurl raw captureをsanitization前SHA-256付きで
     固定し、`reasoning_content`、usage/costの配置、`[DONE]`後cost trailerを保持する。
     `[DONE]`をcanonical terminalとし、後続trailerはfixtureには残すが正規化eventにはしない。
-    Moonshot直API、Z.ai直API、Umansのraw captureと2ターンlive証拠はcredential不在であり、
-    任意の開発証拠として扱う。T25のCloud release live profileはResponses-onlyとし、
-    Chat Completions / Responses / Anthropicの3 protocol対応はfixture/contract gateで維持する。
+    Moonshot直API、Z.ai直API、Umansのraw captureと2ターンlive証拠はcredential不在のため
+    未取得である。将来取得した場合だけ、capture時刻・endpoint・sanitization前SHA-256を
+    伴うprovenance付きの任意な開発証拠として保存する。T25のCloud release live profileは
+    Responses-onlyとし、Chat Completions / Responses / Anthropicの3 protocol対応は
+    fixture/contract gateで維持する。
 
 ## 根拠
 

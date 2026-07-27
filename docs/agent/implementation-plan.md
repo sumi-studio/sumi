@@ -2502,12 +2502,11 @@ web への転送方針(api の責務、参考): `PublicStreamEvent` の Text/Too
 ### M1: 共通 provider core + Chat Completions
 
 - `provider/` の共通 core と `adapters/chat_completions.rs`: 第4章+移植リスト #1〜17。types → transport → assembler → adapter → retry/overflow の順
-- テスト: (a) **SSE フィクスチャ再生**: fixtureごとに`sanitized_live_curl_capture`か`synthetic_contract_fixture`かをprovenanceで明示し、axumモックサーバで再生して**全正規化イベント列と最終メッセージ**をスナップショットアサートする。syntheticを実API採取済みと表現しない。OpenCode Zen Goはcurl raw captureのsanitization前SHA-256、capture時刻・endpoint・command・sanitization操作を記録し、`reasoning_content`、usage/cost配置、`[DONE]`後cost trailerを保存する。既存Kimi text/tool/reasoning、GLM tool/provider固有finish reasonは公式形状に基づくsynthetic fixtureとして残す。(b) partial_json の pi テスト移植。(c) `SUMI_LIVE_TEST=1` でのResponses-onlyライブ疎通。他providerのlive captureは任意な開発証拠とし、T25 Cloud releaseの必須条件へ引き継がない
+- テスト: (a) **SSE フィクスチャ再生**: fixtureごとに`sanitized_live_curl_capture`か`synthetic_contract_fixture`かをprovenanceで明示し、axumモックサーバで再生して**全正規化イベント列と最終メッセージ**をスナップショットアサートする。syntheticを実API採取済みと表現しない。OpenCode Zen Goはcurl raw captureのsanitization前SHA-256、capture時刻・endpoint・command・sanitization操作を記録し、`reasoning_content`、usage/cost配置、`[DONE]`後cost trailerを保存する。既存Kimi text/tool/reasoning、GLM tool/provider固有finish reasonは公式形状に基づくsynthetic fixtureとして残す。(b) partial_json の pi テスト移植。他providerのlive captureは任意な開発証拠とし、T25 Cloud releaseの必須条件へ引き継がない
 - **ゲート**:
   1. `cargo test --manifest-path apps/agent/Cargo.toml` 全緑(フィクスチャ再生で: ツールコール引数の逐次previewと生bufferのstrict終端を分離し、repairならpreview可能だがstrictでは失敗するJSONを確定ToolCallにしない、reasoning 分離、usage 取得、標準finish_reasonに加えて Z.ai の `sensitive` / `network_error` / `model_context_window_exceeded` を含む provider 固有パターン)
-  2. ライブ: T25のResponses-only release profileでツールコール1往復、encrypted reasoning付き2ターン、kill/restart後の継続、native compactionを完走する。Chat Completions / Anthropicを含む3 protocolの対応はfixture/contract gateで維持するが、他providerのdirect live証拠をCloud release blockerにしない
-  3. TTFT 計測基盤: T8で`HTTP リクエスト送出 → 最初の公開 delta(Thinking または Text)`と上位span接続口を実装する。`user_message command 受信 → HTTP リクエスト送出`の接続、stdio REPL表示、**agent 内部オーバーヘッド p95 < 30ms**判定は実AgentLoopを持つT15で完成する(モデル側 TTFB は記録のみ)。T8だけの暫定loopは作らない
-  4. abort: 生成中に CancellationToken 発火 → 1s 以内に Aborted イベントで正常形クローズ。通常event channelが飽和したfixtureでもpriority terminalがbacklogを追い越し、それまでのpartial contentと既受信usageを保持し、終端後のdelta/二重terminalをfuseする
+  2. TTFT 計測基盤: T8で`HTTP リクエスト送出 → 最初の公開 delta(Thinking または Text)`と上位span接続口を実装する。`user_message command 受信 → HTTP リクエスト送出`の接続、stdio REPL表示、**agent 内部オーバーヘッド p95 < 30ms**判定は実AgentLoopを持つT15で完成する(モデル側 TTFB は記録のみ)。T8だけの暫定loopは作らない
+  3. abort: 生成中に CancellationToken 発火 → 1s 以内に Aborted イベントで正常形クローズ。通常event channelが飽和したfixtureでもpriority terminalがbacklogを追い越し、それまでのpartial contentと既受信usageを保持し、終端後のdelta/二重terminalをfuseする
 
 ### M1P: Responses + Anthropic Messages adapters (M1後に並行、release必須)
 
