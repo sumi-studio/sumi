@@ -39,8 +39,8 @@ use self::crypto::{
 };
 #[allow(unused_imports)]
 pub use compliance::{
-    AuditRecord, InMemoryTombstoneRepository, SqliteTombstoneRepository, Tombstone,
-    TombstoneRepository, TombstoneScope, TombstoneStatus,
+    AuditRecord, ControlPlaneIdentity, HttpTombstoneRepository, InMemoryTombstoneRepository,
+    SqliteTombstoneRepository, Tombstone, TombstoneRepository, TombstoneScope, TombstoneStatus,
 };
 #[cfg(test)]
 pub(crate) use crypto::DATA_KEY_BYTES;
@@ -60,7 +60,9 @@ pub(crate) use event_writer::{
 };
 pub use kms::{HttpKmsClient, KmsClient, KmsKeyProvider, MockKmsClient};
 #[allow(unused_imports)]
-pub use lifecycle::{ArtifactLifecycleBroker, DirectArtifactBroker, LifecycleWorker};
+pub use lifecycle::{
+    ArtifactLifecycleBroker, ConversationExport, DirectArtifactBroker, LifecycleWorker,
+};
 #[cfg(test)]
 pub(crate) use memory_state::{MemoryBatchMessageRecord, MemoryBatchRecord, MemoryJobRecord};
 pub(crate) use memory_state::{MemoryBatchState, MemoryJobKind, MemoryJobStatus, MemoryLayer};

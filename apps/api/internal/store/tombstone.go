@@ -241,6 +241,17 @@ func (s *TombstoneStore) ListForAgent(tenantID, agentID string) []*Tombstone {
 	return out
 }
 
+func (s *TombstoneStore) FindByCommand(tenantID, agentID, commandID string) (*Tombstone, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, t := range s.tombstones {
+		if t.TenantID == tenantID && t.AgentID == agentID && t.CommandID == commandID {
+			return cloneTombstone(t), nil
+		}
+	}
+	return nil, fmt.Errorf("tombstone command %q not found", commandID)
+}
+
 func (s *TombstoneStore) persistLocked() error {
 	payload, err := json.Marshal(persistedTombstones{Version: 1, Tombstones: s.tombstones})
 	if err != nil {

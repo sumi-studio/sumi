@@ -208,7 +208,9 @@ pub struct HttpKmsClient {
     api_token: String,
     tenant_id: String,
     agent_id: String,
-    current_key_id: Option<String>,
+    // Retained in the constructor for compatibility with local fixtures only;
+    // Cloud current-key selection always asks the control plane below.
+    _configured_key_id: Option<String>,
     allow_http: bool,
 }
 
@@ -219,7 +221,7 @@ impl fmt::Debug for HttpKmsClient {
             .field("base_url", &self.base_url)
             .field("tenant_id", &self.tenant_id)
             .field("agent_id", &self.agent_id)
-            .field("current_key_id", &self.current_key_id)
+            .field("current_key_id", &"control-plane resolved")
             .field("allow_http", &self.allow_http)
             .field("api_token", &"[REDACTED]")
             .finish_non_exhaustive()
@@ -281,7 +283,7 @@ impl HttpKmsClient {
             api_token,
             tenant_id,
             agent_id,
-            current_key_id,
+            _configured_key_id: current_key_id,
             allow_http,
         })
     }
@@ -304,9 +306,6 @@ impl HttpKmsClient {
 #[async_trait]
 impl KmsClient for HttpKmsClient {
     async fn current_key_id(&self) -> Result<String> {
-        if let Some(id) = self.current_key_id.as_ref() {
-            return Ok(id.clone());
-        }
         let url = self
             .base_url
             .join(&format!("v1/agents/{}/current-key", self.agent_id))
@@ -563,16 +562,16 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn http_kms_static_current_key_id_skips_fetch() {
+        async fn http_kms_ignores_static_key_hint_and_observes_remote_rotation() {
             let state = Arc::new(KmsState {
-                current: Mutex::new("unused".to_owned()),
-                keys: Mutex::new(HashMap::from([(
-                    "agent-key-v2".to_owned(),
-                    [0x55; DATA_KEY_BYTES],
-                )])),
+                current: Mutex::new("agent-key-v1".to_owned()),
+                keys: Mutex::new(HashMap::from([
+                    ("agent-key-v1".to_owned(), [0x54; DATA_KEY_BYTES]),
+                    ("agent-key-v2".to_owned(), [0x55; DATA_KEY_BYTES]),
+                ])),
                 disabled: Mutex::new(HashSet::new()),
             });
-            let base_url = start_server(state).await;
+            let base_url = start_server(state.clone()).await;
             let client = HttpKmsClient::new(
                 &base_url,
                 "test-token".to_owned(),
@@ -583,8 +582,16 @@ mod tests {
             )
             .unwrap();
 
-            let key = client.current_key_id().await.unwrap();
-            assert_eq!(key, "agent-key-v2");
+            let provider = KmsKeyProvider::new(Arc::new(client)).unwrap();
+            assert_eq!(
+                provider.current_key().await.unwrap().key_id(),
+                "agent-key-v1"
+            );
+            *state.current.lock().unwrap() = "agent-key-v2".to_owned();
+            assert_eq!(
+                provider.current_key().await.unwrap().key_id(),
+                "agent-key-v2"
+            );
         }
 
         #[tokio::test]

@@ -29,6 +29,21 @@ pub trait ArtifactLifecycleBroker: Send + Sync {
         conversation_id: &str,
         tombstone_id: &str,
     ) -> Result<u64, ToolError>;
+
+    /// Authorized archive export is a distinct supervisor/broker boundary;
+    /// lifecycle code never walks the artifact volume directly. Implementors
+    /// must bind the archive to the authenticated conversation and export
+    /// receipt. The direct broker intentionally has no production archive
+    /// implementation.
+    async fn export_conversation_artifacts(
+        &self,
+        _conversation_id: &str,
+        _export_id: &str,
+    ) -> Result<Vec<u8>, ToolError> {
+        Err(ToolError::Protocol(
+            "artifact archive export requires an authenticated supervisor broker".to_owned(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -106,6 +121,14 @@ pub struct LifecycleWorker {
 pub struct LifecycleCommandResult {
     pub payload: Option<Vec<u8>>,
     pub restart_required: bool,
+}
+
+/// A caller can package the transcript and opaque, authorized artifact archive
+/// without granting the agent process direct artifact-volume access.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationExport {
+    pub transcript_jsonl: Vec<u8>,
+    pub artifact_archive: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -222,12 +245,7 @@ impl LifecycleWorker {
             .await?;
         let mut restart_required = false;
         for tombstone in tombstones {
-            if tombstone.scope != TombstoneScope::Conversation
-                || matches!(
-                    tombstone.status,
-                    TombstoneStatus::LivePurged | TombstoneStatus::BackupExpired
-                )
-            {
+            if tombstone.scope != TombstoneScope::Conversation {
                 continue;
             }
             if tombstone.conversation_id.as_deref() == Some(scope.conversation_id.as_str())
@@ -320,6 +338,30 @@ impl LifecycleWorker {
                 .await
                 .context("failed to persist reset audit receipt")?;
             return Ok(true);
+        }
+        // A backup may contain an old agent DB/artifact subtree after the
+        // authority has already advanced to a terminal-looking state.  Those
+        // labels describe retention progress, never permission to expose the
+        // restored old conversation. Re-apply the destructive suffix before
+        // allowing the replacement conversation to boot.
+        if matches!(
+            tombstone.status,
+            TombstoneStatus::LivePurged | TombstoneStatus::BackupExpired
+        ) {
+            if scope.conversation_id == old_conversation_id {
+                self.crypto_erase_conversation(&old_conversation_id).await?;
+                self.broker
+                    .delete_conversation_artifacts(&old_conversation_id, &tombstone.id)
+                    .await
+                    .context("failed to reapply restored artifact tombstone")?;
+                self.reset_conversation_state(&scope, &new_conversation_id)
+                    .await?;
+                self.store.set_conversation_id(new_conversation_id);
+                return Ok(true);
+            }
+            if scope.conversation_id != new_conversation_id {
+                bail!("tombstone replacement conversation does not match restored agent DB scope");
+            }
         }
         Ok(false)
     }
@@ -487,6 +529,27 @@ impl LifecycleWorker {
             .context("failed to append export audit record")?;
 
         Ok(lines.join("\n").into_bytes())
+    }
+
+    pub async fn export_conversation_with_artifacts(
+        &self,
+        actor_id: &str,
+        export_id: &str,
+    ) -> Result<ConversationExport> {
+        if export_id.is_empty() {
+            bail!("artifact export id must not be empty");
+        }
+        let transcript_jsonl = self.export_conversation(actor_id).await?;
+        let conversation_id = self.store.scope().conversation_id;
+        let artifact_archive = self
+            .broker
+            .export_conversation_artifacts(&conversation_id, export_id)
+            .await
+            .context("failed to obtain authorized artifact archive")?;
+        Ok(ConversationExport {
+            transcript_jsonl,
+            artifact_archive,
+        })
     }
 
     /// Escape a redacted or user-supplied query so it is treated as a literal
@@ -1466,6 +1529,87 @@ mod tests {
                 .is_empty(),
             "target reset crossed the control-plane agent identity"
         );
+    }
+
+    #[tokio::test]
+    async fn restored_terminal_tombstone_reapplies_old_conversation_cleanup() {
+        for expire_backup in [false, true] {
+            let client = Arc::new(MockKmsClient::new("tenant-1", "agent-1", test_kek()));
+            let (store, _) = open_test_store("restore-old", client).await;
+            let store = Arc::new(store);
+            let tombstones: Arc<dyn TombstoneRepository> =
+                Arc::new(InMemoryTombstoneRepository::new());
+            let root = temp_test_dir();
+            let broker = open_broker(&root);
+            let worker = LifecycleWorker::new(
+                store.clone(),
+                tombstones.clone(),
+                Arc::new(DirectArtifactBroker::new(broker)),
+                None,
+            );
+            worker
+                .conversation_reset("restore-command", 1, "restore-new")
+                .await
+                .unwrap_err();
+            let tombstone = tombstones
+                .find_by_command("tenant-1", "agent-1", "restore-command")
+                .await
+                .unwrap()
+                .unwrap();
+            worker
+                .record_generation_fence(&tombstone.id, &test_generation_fence())
+                .await
+                .unwrap();
+            worker
+                .conversation_reset("restore-command", 1, "restore-new")
+                .await
+                .unwrap();
+            if expire_backup {
+                tombstones
+                    .advance(
+                        &tombstone.id,
+                        TombstoneStatus::LivePurged,
+                        TombstoneStatus::BackupExpired,
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            // Restore a stale old DB/artifact subtree after the live purge.
+            sqlx::query("UPDATE agent_scope SET conversation_id = 'restore-old'")
+                .execute(store.pool())
+                .await
+                .unwrap();
+            store.set_conversation_id("restore-old".to_owned());
+            seed_message(&store, "restore-old", 99).await;
+            let broker = open_broker(&root);
+            broker
+                .execute(ArtifactOperation::PutAttachment {
+                    conversation_id: "restore-old".to_owned(),
+                    artifact_id: "stale".to_owned(),
+                    content: "stale".to_owned(),
+                })
+                .unwrap();
+            broker
+                .execute(ArtifactOperation::PutAttachment {
+                    conversation_id: "other-agent".to_owned(),
+                    artifact_id: "keep".to_owned(),
+                    content: "keep".to_owned(),
+                })
+                .unwrap();
+
+            assert!(worker.resume_pending_resets().await.unwrap());
+            assert_eq!(store.scope().conversation_id, "restore-new");
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages")
+                    .fetch_one(store.pool())
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert!(!root.join("restore-old").exists());
+            assert!(root.join("other-agent").exists());
+        }
     }
 
     #[tokio::test]

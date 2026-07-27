@@ -15,6 +15,8 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use chrono::Utc;
+use reqwest::{StatusCode, Url};
+use serde::{Deserialize, Serialize};
 
 use sqlx::{
     Row, SqlitePool,
@@ -24,7 +26,8 @@ use sqlx::{
 use std::str::FromStr;
 use uuid::Uuid;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TombstoneScope {
     Conversation,
     Agent,
@@ -47,7 +50,8 @@ impl TombstoneScope {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TombstoneStatus {
     Requested,
     Fenced,
@@ -85,7 +89,7 @@ impl TombstoneStatus {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tombstone {
     pub id: String,
     pub tenant_id: String,
@@ -101,6 +105,112 @@ pub struct Tombstone {
     pub generation_fence_id: Option<String>,
     pub requested_at: String,
     pub purge_after: String,
+}
+
+/// Identity embedded in the short-lived control-plane credential.  The agent
+/// client checks it before every request; the server independently binds the
+/// bearer credential to the same tenant/agent, so request JSON cannot select a
+/// different tenant or agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ControlPlaneIdentity {
+    pub tenant_id: String,
+    pub agent_id: String,
+}
+
+impl ControlPlaneIdentity {
+    pub fn new(tenant_id: impl Into<String>, agent_id: impl Into<String>) -> Result<Self> {
+        let identity = Self {
+            tenant_id: tenant_id.into(),
+            agent_id: agent_id.into(),
+        };
+        if identity.tenant_id.is_empty() || identity.agent_id.is_empty() {
+            bail!("control-plane tenant and agent identity must not be empty");
+        }
+        Ok(identity)
+    }
+}
+
+/// Authenticated control-plane implementation.  This is intentionally not a
+/// local cache: a restore or lifecycle request must see the authority that
+/// survives deletion of the agent volume.
+pub struct HttpTombstoneRepository {
+    client: reqwest::Client,
+    base_url: Url,
+    bearer_token: String,
+    identity: ControlPlaneIdentity,
+}
+
+impl HttpTombstoneRepository {
+    pub fn new(
+        base_url: &str,
+        bearer_token: String,
+        identity: ControlPlaneIdentity,
+    ) -> Result<Self> {
+        if bearer_token.is_empty() {
+            bail!("control-plane bearer token must not be empty");
+        }
+        let base_url = Url::parse(base_url).context("invalid control-plane URL")?;
+        if base_url.scheme() != "https" {
+            bail!("control-plane URL must use https");
+        }
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()?,
+            base_url,
+            bearer_token,
+            identity,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn new_for_test(
+        base_url: &str,
+        bearer_token: String,
+        identity: ControlPlaneIdentity,
+    ) -> Result<Self> {
+        let base_url = Url::parse(base_url).context("invalid test control-plane URL")?;
+        Ok(Self {
+            client: reqwest::Client::new(),
+            base_url,
+            bearer_token,
+            identity,
+        })
+    }
+
+    fn require_identity(&self, tenant_id: &str, agent_id: &str) -> Result<()> {
+        if tenant_id != self.identity.tenant_id || agent_id != self.identity.agent_id {
+            bail!("control-plane request identity differs from authenticated runtime identity");
+        }
+        Ok(())
+    }
+
+    fn url(&self, path: &str) -> Result<Url> {
+        self.base_url.join(path).context("build control-plane URL")
+    }
+
+    async fn response<T: serde::de::DeserializeOwned>(
+        &self,
+        response: reqwest::Response,
+    ) -> Result<T> {
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            bail!("control-plane tombstone request failed: HTTP {status}: {text}");
+        }
+        response
+            .json()
+            .await
+            .context("invalid control-plane tombstone response")
+    }
+
+    fn request(&self, method: reqwest::Method, path: &str) -> Result<reqwest::RequestBuilder> {
+        Ok(self
+            .client
+            .request(method, self.url(path)?)
+            .bearer_auth(&self.bearer_token)
+            .header("X-Sumi-Internal-Principal", "agent-runtime"))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -192,6 +302,152 @@ pub trait TombstoneRepository: Send + Sync {
         actor_id: Option<&str>,
         action: Option<&str>,
     ) -> Result<Vec<AuditRecord>>;
+}
+
+#[async_trait]
+impl TombstoneRepository for HttpTombstoneRepository {
+    async fn request_conversation_reset(
+        &self,
+        tenant_id: &str,
+        agent_id: &str,
+        conversation_id: &str,
+        replacement_conversation_id: &str,
+        command_id: &str,
+        command_seq: i64,
+        purge_after: &str,
+    ) -> Result<Tombstone> {
+        self.require_identity(tenant_id, agent_id)?;
+        let purge_after = chrono::DateTime::parse_from_rfc3339(purge_after)
+            .context("control-plane tombstone purge_after must be RFC3339")?;
+        let response = self
+            .request(reqwest::Method::POST, "internal/agent/tombstones")?
+            .json(&serde_json::json!({
+                "tenant_id": tenant_id, "agent_id": agent_id,
+                "conversation_id": conversation_id,
+                "replacement_conversation_id": replacement_conversation_id,
+                "command_id": command_id, "command_seq": command_seq,
+                "scope": TombstoneScope::Conversation,
+                "purge_after": purge_after,
+            }))
+            .send()
+            .await
+            .context("send reset tombstone request")?;
+        self.response(response).await
+    }
+
+    async fn record_generation_fence(
+        &self,
+        id: &str,
+        generation: i64,
+        lease_id: &str,
+        fence_id: &str,
+    ) -> Result<Tombstone> {
+        let response = self.request(reqwest::Method::POST, &format!("internal/agent/tombstones/{id}/generation-fence"))?
+            .json(&serde_json::json!({"generation": generation, "lease_id": lease_id, "fence_id": fence_id}))
+            .send().await.context("send generation fence")?;
+        self.response(response).await
+    }
+
+    async fn advance(
+        &self,
+        id: &str,
+        expected: TombstoneStatus,
+        next: TombstoneStatus,
+    ) -> Result<()> {
+        let response = self
+            .request(
+                reqwest::Method::POST,
+                &format!("internal/agent/tombstones/{id}/advance"),
+            )?
+            .json(&serde_json::json!({"from": expected, "to": next}))
+            .send()
+            .await
+            .context("advance tombstone")?;
+        if response.status() == StatusCode::NO_CONTENT {
+            return Ok(());
+        }
+        let _: Tombstone = self.response(response).await?;
+        Ok(())
+    }
+
+    async fn get(&self, id: &str) -> Result<Tombstone> {
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                &format!("internal/agent/tombstones/{id}"),
+            )?
+            .send()
+            .await
+            .context("read tombstone")?;
+        self.response(response).await
+    }
+
+    async fn find_by_command(
+        &self,
+        tenant_id: &str,
+        agent_id: &str,
+        command_id: &str,
+    ) -> Result<Option<Tombstone>> {
+        self.require_identity(tenant_id, agent_id)?;
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                &format!("internal/agent/tombstones/by-command/{command_id}"),
+            )?
+            .send()
+            .await
+            .context("find tombstone by command")?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        self.response(response).await.map(Some)
+    }
+
+    async fn list_for_agent(&self, tenant_id: &str, agent_id: &str) -> Result<Vec<Tombstone>> {
+        self.require_identity(tenant_id, agent_id)?;
+        let response = self
+            .request(reqwest::Method::GET, "internal/agent/tombstones")?
+            .send()
+            .await
+            .context("list tombstones")?;
+        self.response(response).await
+    }
+
+    async fn blocking_tombstone(
+        &self,
+        tenant_id: &str,
+        agent_id: &str,
+        conversation_id: Option<&str>,
+    ) -> Result<Option<Tombstone>> {
+        self.require_identity(tenant_id, agent_id)?;
+        let tombstones = self.list_for_agent(tenant_id, agent_id).await?;
+        Ok(tombstones.into_iter().find(|t| {
+            t.scope == TombstoneScope::Agent
+                || conversation_id.is_some_and(|id| t.conversation_id.as_deref() == Some(id))
+        }))
+    }
+
+    async fn log_access(
+        &self,
+        _actor_id: &str,
+        _tenant_id: &str,
+        _action: &str,
+        _scope: &str,
+        _result_count: i64,
+    ) -> Result<()> {
+        bail!(
+            "control-plane access-audit endpoint is not wired; fail closed rather than recording audit locally"
+        )
+    }
+
+    async fn list_audit(
+        &self,
+        _tenant_id: &str,
+        _actor_id: Option<&str>,
+        _action: Option<&str>,
+    ) -> Result<Vec<AuditRecord>> {
+        bail!("control-plane access-audit endpoint is not wired")
+    }
 }
 
 fn validate_reset_identity(
@@ -450,7 +706,6 @@ impl TombstoneRepository for InMemoryTombstoneRepository {
             .filter(|t| {
                 t.tenant_id == tenant_id
                     && t.agent_id == agent_id
-                    && t.status != TombstoneStatus::BackupExpired
                     && (conversation_id.is_none()
                         || t.conversation_id.as_deref() == conversation_id
                         || t.scope == TombstoneScope::Agent)
@@ -861,7 +1116,7 @@ impl TombstoneRepository for SqliteTombstoneRepository {
                     scope, status, fenced_generation, generation_lease_id,
                     generation_fence_id, requested_at, purge_after
              FROM deletion_tombstones
-             WHERE tenant_id = ? AND agent_id = ? AND status <> 'backup_expired'",
+             WHERE tenant_id = ? AND agent_id = ?",
         );
         if conversation_id.is_some() {
             query.push_str(" AND (conversation_id = ? OR scope = 'agent') ORDER BY status LIMIT 1");
