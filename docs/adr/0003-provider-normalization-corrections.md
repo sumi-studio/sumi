@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-07-20
+- Amended: 2026-07-27 (Cloud release live profileをResponses-onlyへ変更)
 - Amends: [実装計画](../agent/implementation-plan.md) §3.1〜§4.5、§7.8、§13 M1
 
 ## コンテキスト
@@ -102,8 +103,9 @@ overflow、transportの各境界から再検証した。レビュー指摘への
     装わない。OpenCode Zen Goは2026-07-20のcurl raw captureをsanitization前SHA-256付きで
     固定し、`reasoning_content`、usage/costの配置、`[DONE]`後cost trailerを保持する。
     `[DONE]`をcanonical terminalとし、後続trailerはfixtureには残すが正規化eventにはしない。
-    Moonshot直API、Z.ai直API、Umansのraw captureと2ターンlive証拠はcredential不在のため
-    未完了であり、T25 provider releaseのrelease-blocking gateへ明示的に移管する。
+    Moonshot直API、Z.ai直API、Umansのraw captureと2ターンlive証拠はcredential不在であり、
+    任意の開発証拠として扱う。T25のCloud release live profileはResponses-onlyとし、
+    Chat Completions / Responses / Anthropicの3 protocol対応はfixture/contract gateで維持する。
 
 ## 根拠
 
@@ -167,5 +169,7 @@ overflow、transportの各境界から再検証した。レビュー指摘への
 fixture結合テストを同じPRで更新する。wire/persistence型の追加はpre-release中に
 必須化し、由来不明の旧thinkingを安全と仮定するdefaultは設けない。response budgetは
 config検証、transport、全adapter、assemblerへ同じrequest token予算から渡すため、T9/T10も
-この境界を再利用する。T25はprovider context durable round-tripに加え、Moonshot/Z.ai/Umans
-直APIのraw capture provenanceとlive 2-turnを満たすまで完了扱いにしない。
+この境界を再利用する。T25はprovider context durable round-tripに加え、Responses経路で
+tool 1往復、encrypted reasoning、kill/restart後の2ターン継続、native compactionを同じ
+release profileで実証するまで完了扱いにしない。他providerのdirect live証拠はこのgateの
+代替にも追加必須条件にもならない。
