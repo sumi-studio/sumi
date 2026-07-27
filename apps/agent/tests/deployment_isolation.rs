@@ -871,10 +871,16 @@ async fn executor_in_network_namespace_cannot_reach_external_network() {
         ),
     )
     .await;
-    let update = read_frame(&mut stdout).await;
-    let mut output = update["value"]["output"].as_str().unwrap().to_owned();
-
-    let terminal = read_frame(&mut stdout).await;
+    let mut output = String::new();
+    let terminal = loop {
+        let frame = read_frame(&mut stdout).await;
+        if !frame["result"].is_null() {
+            break frame;
+        }
+        if let Some(chunk) = frame["value"]["output"].as_str() {
+            output.push_str(chunk);
+        }
+    };
     let result = &terminal["result"]["Ok"]["result"];
     if let Some(tail) = result["output"].as_str() {
         output.push_str(tail);
