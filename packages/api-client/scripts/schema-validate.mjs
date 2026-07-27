@@ -43,6 +43,11 @@ const kindToDef = {
   api_hello: "ApiHello",
   agent_event: "AgentEvent",
   public_message: "PublicMessage",
+  browser_hello: "BrowserHello",
+  browser_command_frame: "BrowserCommandFrame",
+  browser_event_frame: "BrowserEventFrame",
+  browser_command_accepted: "BrowserCommandAcceptedFrame",
+  browser_command_rejected: "BrowserCommandRejectedFrame",
 };
 
 const validators = new Map();

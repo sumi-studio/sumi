@@ -693,7 +693,7 @@ $defs:
         enum: [received, applied, superseded, rejected]
       reject_reason:
         type: string
-        enum: [unknown_command, schema_violation, attachments_not_empty, oversized]
+        enum: [unknown_command, schema_violation, attachments_not_empty, oversized, not_allowed]
     if:
       properties:
         status: { const: rejected }
@@ -766,7 +766,7 @@ $defs:
       type: { const: command_rejected }
       reject_reason:
         type: string
-        enum: [unknown_command, schema_violation, attachments_not_empty, oversized]
+        enum: [unknown_command, schema_violation, attachments_not_empty, oversized, not_allowed]
 
   BrowserServerFrame:
     oneOf:

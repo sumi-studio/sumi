@@ -658,7 +658,7 @@ export interface CommandAck {
   seq: JsonSafeInteger;
   command_id: string;
   status: "received" | "applied" | "superseded" | "rejected";
-  reject_reason?: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized";
+  reject_reason?: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed";
 }
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
@@ -699,7 +699,7 @@ export interface BrowserCommandAcceptedFrame {
  */
 export interface BrowserCommandRejectedFrame {
   type: "command_rejected";
-  reject_reason: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized";
+  reject_reason: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed";
 }
 /**
  * placeholder for v1; no attachments are accepted yet

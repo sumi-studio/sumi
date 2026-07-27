@@ -46,7 +46,10 @@ func main() {
 	// Use the same production router as cmd/server so the E2E journey exercises
 	// production wiring. We do not expose the agent WebSocket boundary in this
 	// fixture; nil TokenVerifier makes it fail-closed.
-	mux, browser, _ := agentevents.NewProductionMux(store, gateway, nil, browserSessions, nil, []string{"http://127.0.0.1:4173"})
+	mux, browser, _, err := agentevents.NewProductionMux(store, gateway, nil, browserSessions, nil, []string{"http://127.0.0.1:4173"})
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	fixture := newFixture(store, gateway)
 	mux.HandleFunc("GET /__e2e__/session", func(w http.ResponseWriter, r *http.Request) {
@@ -121,6 +124,7 @@ func (f *fixture) react(kind string) {
 		f.durable(`{"type":"approval_requested","request":{"id":"request-1","tool_call_id":"call-1","tool_name":"read_file","action":{"reviewable":"read fixture"},"args_summary":"read fixture"}}`)
 	case kind == "approval_decision" && f.stage == 2:
 		f.stage = 3
+		f.durable(`{"type":"message_start","message_id":"00000000-0000-4000-8000-000000000002","message":{"role":"assistant","content":[],"model":"fixture","provider":"fixture","origin":{"provider_instance_id":"fixture","protocol":"open_ai_responses","model":"fixture"},"usage":{"input":0,"output":0,"cache_read":0,"cache_write":0,"reasoning":0,"total_tokens":0},"stop_reason":"stop","error_message":null,"provider_code":null,"interrupted":false,"timestamp":"2026-07-28T00:00:00Z"}}`)
 		f.volatile(`{"type":"message_update","message_id":"00000000-0000-4000-8000-000000000002","event":{"type":"text_delta","content_index":0,"delta":"abortable stream"}}`)
 	case kind == "abort" && f.stage == 3:
 		f.stage = 4

@@ -430,7 +430,7 @@ type OutboundFrame struct {
 
 var (
 	commandAckStatuses  = map[string]bool{"received": true, "applied": true, "superseded": true, "rejected": true}
-	rejectReasons       = map[string]bool{"unknown_command": true, "schema_violation": true, "attachments_not_empty": true, "oversized": true}
+	rejectReasons       = map[string]bool{"unknown_command": true, "schema_violation": true, "attachments_not_empty": true, "oversized": true, "not_allowed": true}
 	volatileEventTypes  = map[string]bool{"message_update": true, "tool_execution_update": true, "error": true}
 	canonicalUUIDRegexp = regexp.MustCompile("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 

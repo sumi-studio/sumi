@@ -42,7 +42,9 @@ function Home() {
     const text = input.trim();
     if (!text) return;
     const command: Command = { type: "user_message", text, attachments: [] };
-    socket.sendCommand(command);
+    if (!socket.sendCommand(command)) {
+      return;
+    }
     setFeed((items) => [
       ...items,
       {

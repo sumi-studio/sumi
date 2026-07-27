@@ -488,5 +488,77 @@
       "last_received_event_seq": "0",
       "next_command_seq": "1"
     }
+  },
+  "browser_hello": {
+    "kind": "browser_hello",
+    "wire": {
+      "type": "hello",
+      "last_event_seq": 0
+    }
+  },
+  "browser_command_frame_user_message": {
+    "kind": "browser_command_frame",
+    "wire": {
+      "type": "command",
+      "idempotency_key": "00000000-0000-4000-8000-000000000001",
+      "command": {
+        "type": "user_message",
+        "text": "hello",
+        "attachments": []
+      }
+    }
+  },
+  "browser_command_frame_abort": {
+    "kind": "browser_command_frame",
+    "wire": {
+      "type": "command",
+      "idempotency_key": "00000000-0000-4000-8000-000000000002",
+      "command": { "type": "abort" }
+    }
+  },
+  "browser_command_frame_approval": {
+    "kind": "browser_command_frame",
+    "wire": {
+      "type": "command",
+      "idempotency_key": "00000000-0000-4000-8000-000000000003",
+      "command": {
+        "type": "approval_decision",
+        "request_id": "00000000-0000-4000-8000-000000000004",
+        "decision": { "type": "approve_once" }
+      }
+    }
+  },
+  "browser_event_frame": {
+    "kind": "browser_event_frame",
+    "wire": {
+      "type": "event",
+      "envelope": {
+        "seq": 1,
+        "conversation_id": "conversation-1",
+        "event": { "type": "agent_start" }
+      }
+    }
+  },
+  "browser_command_accepted": {
+    "kind": "browser_command_accepted",
+    "wire": {
+      "type": "command_accepted",
+      "envelope": {
+        "seq": 1,
+        "command_id": "00000000-0000-4000-8000-000000000001",
+        "command": {
+          "type": "user_message",
+          "text": "hello",
+          "attachments": []
+        }
+      }
+    }
+  },
+  "browser_command_rejected": {
+    "kind": "browser_command_rejected",
+    "wire": {
+      "type": "command_rejected",
+      "reject_reason": "unknown_command"
+    }
   }
 }

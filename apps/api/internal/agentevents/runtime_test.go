@@ -27,6 +27,21 @@ func openRuntimeGateway(t *testing.T) *DurableGateway {
 	return gateway
 }
 
+func openGatewayAt(t *testing.T, storeDir, runtimeDir string) (*CommandStore, *DurableGateway, error) {
+	t.Helper()
+	store, err := OpenCommandStore(storeDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	gateway, err := OpenDurableGateway(runtimeDir, store)
+	if err != nil {
+		_ = store.Close()
+		return nil, nil, err
+	}
+	gateway.PollInterval = 5 * time.Millisecond
+	return store, gateway, nil
+}
+
 func TestDurableGatewayMissingStateFailsGenerationVerificationUntilPublished(t *testing.T) {
 	gateway := openRuntimeGateway(t)
 	const agentID = "agent-1"
@@ -887,5 +902,175 @@ func TestDurableGatewayEventCatchUpAcceptsValidRecords(t *testing.T) {
 	}
 	if caught[0].Seq == nil || *caught[0].Seq != 1 {
 		t.Fatalf("expected seq 1, got %v", caught[0].Seq)
+	}
+}
+
+func TestDurableGatewayAppendRejectsInnerOuterSeqMismatch(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	const conversationID = "conversation-1"
+	inner := uint64(2)
+	err := gateway.appendDurableEventLocked(conversationID, durableEventRecord{
+		Seq: 1,
+		Event: Envelope{
+			Seq:            &inner,
+			ConversationID: conversationID,
+			Event:          json.RawMessage(`{"type":"agent_start"}`),
+		},
+	})
+	if err == nil {
+		t.Fatal("expected inner/outer seq mismatch to be rejected")
+	}
+	if !strings.Contains(err.Error(), "seq mismatch") {
+		t.Fatalf("expected seq mismatch error, got %v", err)
+	}
+
+	err = gateway.appendDurableEventLocked(conversationID, durableEventRecord{
+		Seq: 1,
+		Event: Envelope{
+			Seq:            nil,
+			ConversationID: conversationID,
+			Event:          json.RawMessage(`{"type":"agent_start"}`),
+		},
+	})
+	if err == nil {
+		t.Fatal("expected missing inner seq to be rejected")
+	}
+	if !strings.Contains(err.Error(), "seq mismatch") {
+		t.Fatalf("expected seq mismatch error, got %v", err)
+	}
+}
+
+func TestDurableGatewayReconstructsCommandGuardStateAcrossRestart(t *testing.T) {
+	tmp := t.TempDir()
+	storeDir := filepath.Join(tmp, "commands")
+	runtimeDir := filepath.Join(tmp, "runtime")
+
+	store, gateway, err := openGatewayAt(t, storeDir, runtimeDir)
+	if err != nil {
+		t.Fatalf("open first gateway: %v", err)
+	}
+
+	const conversationID = "conversation-1"
+	claims := TokenClaims{TenantID: "tenant-1", AgentID: "agent-1", ConversationID: conversationID, Generation: 1}
+
+	seq := uint64(1)
+	if err := gateway.Receive(context.Background(), claims, Envelope{
+		Seq:            &seq,
+		ConversationID: conversationID,
+		Event:          json.RawMessage(`{"type":"message_start","message_id":"00000000-0000-4000-8000-000000000001","message":{"role":"user","content":[{"type":"text","text":"ok"}],"timestamp":"2026-07-28T00:00:00Z"}}`),
+	}); err != nil {
+		t.Fatalf("receive message_start: %v", err)
+	}
+
+	seq = 2
+	if err := gateway.Receive(context.Background(), claims, Envelope{
+		Seq:            &seq,
+		ConversationID: conversationID,
+		Event:          json.RawMessage(`{"type":"approval_requested","request":{"id":"request-1","tool_call_id":"call-1","tool_name":"read_file","action":{"reviewable":"read"},"args_summary":"read"}}`),
+	}); err != nil {
+		t.Fatalf("receive approval_requested: %v", err)
+	}
+
+	seq = 3
+	if err := gateway.Receive(context.Background(), claims, Envelope{
+		Seq:            &seq,
+		ConversationID: conversationID,
+		Event:          json.RawMessage(`{"type":"approval_requested","request":{"id":"request-2","tool_call_id":"call-2","tool_name":"read_file","action":{"reviewable":"read"},"args_summary":"read"}}`),
+	}); err != nil {
+		t.Fatalf("receive second approval_requested: %v", err)
+	}
+
+	seq = 4
+	if err := gateway.Receive(context.Background(), claims, Envelope{
+		Seq:            &seq,
+		ConversationID: conversationID,
+		Event:          json.RawMessage(`{"type":"approval_resolved","request_id":"request-2","resolution":{"decision":{"type":"approve_once"}}}`),
+	}); err != nil {
+		t.Fatalf("receive approval_resolved: %v", err)
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("close command store: %v", err)
+	}
+
+	store, gateway, err = openGatewayAt(t, storeDir, runtimeDir)
+	if err != nil {
+		t.Fatalf("reopen gateway: %v", err)
+	}
+	defer store.Close()
+
+	// Before reconstruction the guard state must appear empty. This is safe
+	// only because EnsureConversationStateRebuilt is invoked before command
+	// admission in the browser WebSocket path.
+	if gateway.IsAssistantTurnInFlight(conversationID) {
+		t.Fatal("expected no in-flight turn before state rebuild")
+	}
+	if gateway.IsApprovalPending(conversationID, "request-1") {
+		t.Fatal("expected no pending approvals before state rebuild")
+	}
+
+	if err := gateway.EnsureConversationStateRebuilt(context.Background(), conversationID); err != nil {
+		t.Fatalf("rebuild conversation state: %v", err)
+	}
+
+	if !gateway.IsAssistantTurnInFlight(conversationID) {
+		t.Fatal("expected in-flight turn after state rebuild")
+	}
+	if !gateway.IsApprovalPending(conversationID, "request-1") {
+		t.Fatal("expected request-1 to be pending after state rebuild")
+	}
+	if gateway.IsApprovalPending(conversationID, "request-2") {
+		t.Fatal("expected resolved request-2 not to be pending")
+	}
+	if gateway.IsApprovalPending(conversationID, "request-unknown") {
+		t.Fatal("expected unknown request not to be pending")
+	}
+}
+
+func TestDurableGatewayReconstructionFailsClosedOnCorruptState(t *testing.T) {
+	tmp := t.TempDir()
+	storeDir := filepath.Join(tmp, "commands")
+	runtimeDir := filepath.Join(tmp, "runtime")
+
+	store, gateway, err := openGatewayAt(t, storeDir, runtimeDir)
+	if err != nil {
+		t.Fatalf("open gateway: %v", err)
+	}
+
+	const conversationID = "conversation-1"
+	// A non-contiguous durable event log must fail reconstruction rather than
+	// defaulting to an empty "no turn / no approval" state.
+	if err := os.WriteFile(
+		gateway.eventPath(conversationID),
+		[]byte(`{"seq":2,"event":{"seq":2,"conversation_id":"conversation-1","event":{"type":"agent_start"}}}`+"\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write corrupt event log: %v", err)
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("close command store: %v", err)
+	}
+
+	store, gateway, err = openGatewayAt(t, storeDir, runtimeDir)
+	if err != nil {
+		t.Fatalf("reopen gateway: %v", err)
+	}
+	defer store.Close()
+
+	if err := gateway.EnsureConversationStateRebuilt(context.Background(), conversationID); err == nil {
+		t.Fatal("expected corrupt durable state to fail reconstruction")
+	} else if !strings.Contains(err.Error(), "non-contiguous") {
+		t.Fatalf("expected non-contiguous error, got %v", err)
+	}
+
+	// The guard must remain closed after failed reconstruction; it must not
+	// silently default to an empty state that would admit abort or
+	// approval_decision commands.
+	if gateway.IsAssistantTurnInFlight(conversationID) {
+		t.Fatal("expected in-flight flag to remain false after failed reconstruction")
+	}
+	if gateway.IsApprovalPending(conversationID, "request-1") {
+		t.Fatal("expected pending approvals to remain empty after failed reconstruction")
 	}
 }

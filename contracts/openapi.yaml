@@ -15,6 +15,7 @@ paths:
               schema:
                 type: object
                 required: [status]
+                additionalProperties: false
                 properties:
                   status:
                     type: string
@@ -37,6 +38,8 @@ paths:
           required: true
           schema:
             type: string
+      security:
+        - sumiSession: []
       requestBody:
         required: true
         content:
@@ -80,38 +83,87 @@ paths:
                       - schema_violation
                       - attachments_not_empty
                       - oversized
+        "401":
+          description: Missing or invalid browser session cookie
+  /conversations/{conversation_id}/ws:
+    get:
+      operationId: browserWebSocket
+      summary: Browser-facing WebSocket
+      description: |
+        Upgrades to a WebSocket for browser clients. After the handshake the
+        client sends `BrowserClientFrame` messages and the server pushes
+        `BrowserServerFrame` messages. The caller is authenticated by the signed
+        HttpOnly `sumi_session` browser cookie.
+      parameters:
+        - name: conversation_id
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - sumiSession: []
+      requestBody:
+        description: The first WebSocket frame (BrowserHello)
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BrowserClientFrame"
+      responses:
+        "101":
+          description: WebSocket upgrade
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BrowserServerFrame"
+        "401":
+          description: Missing or invalid browser session cookie
+        "403":
+          description: Origin not allowed
+  /agent/ws:
+    get:
+      operationId: agentWebSocket
+      summary: Agent-facing WebSocket
+      description: |
+        Upgrades to a WebSocket for agent workers. After the handshake the agent
+        sends `AgentHello` followed by `OutboundFrame` messages, and the server
+        replies with `ApiHello` followed by `CommandEnvelope` messages. The
+        caller is authenticated by a short-lived `Authorization: Bearer` token.
+      security:
+        - bearerAuth: []
+      requestBody:
+        description: The first WebSocket frame (AgentHello)
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AgentHello"
+      responses:
+        "101":
+          description: WebSocket upgrade
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiHello"
+        "401":
+          description: Missing or invalid agent token
+        "403":
+          description: Origin not allowed
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Short-lived HMAC-SHA256 agent token.
+    sumiSession:
+      type: apiKey
+      in: cookie
+      name: sumi_session
+      description: Signed HttpOnly browser session cookie.
   schemas:
     JsonSafeInteger:
       type: integer
       minimum: 0
       maximum: 9007199254740991
       description: non-negative integer representable exactly by JavaScript number clients
-    CommandEnvelope:
-      type: object
-      required: [seq, command_id, command]
-      additionalProperties: false
-      properties:
-        seq:
-          $ref: "#/components/schemas/JsonSafeInteger"
-        command_id:
-          type: string
-          format: uuid
-        command:
-          $ref: "#/components/schemas/UserMessageCommand"
-    UserMessageCommand:
-      type: object
-      required: [type, text, attachments]
-      additionalProperties: false
-      properties:
-        type:
-          type: string
-          enum: [user_message]
-        text:
-          type: string
-        attachments:
-          type: array
-          maxItems: 0
     ProcessGeneration:
       type: string
       pattern: '^(0|[1-9][0-9]*)$'
@@ -122,30 +174,15 @@ components:
       pattern: '^(0|[1-9][0-9]*)$'
       format: canonical-decimal-u64
       description: canonical decimal u64 encoded as a string to preserve it losslessly in JavaScript
+    CommandEnvelope:
+      $ref: "./agent-events.yaml#/$defs/CommandEnvelope"
     AgentHello:
-      type: object
-      required: [agent_id, generation, last_sent_event_seq, last_received_command_seq, last_applied_command_seq]
-      additionalProperties: false
-      properties:
-        agent_id:
-          type: string
-          description: agent identity from the short-lived credential claim
-        generation:
-          $ref: '#/components/schemas/ProcessGeneration'
-        last_sent_event_seq:
-          $ref: '#/components/schemas/CanonicalDecimalU64'
-        last_received_command_seq:
-          $ref: '#/components/schemas/CanonicalDecimalU64'
-        last_applied_command_seq:
-          $ref: '#/components/schemas/CanonicalDecimalU64'
+      $ref: "./agent-events.yaml#/$defs/AgentHello"
     ApiHello:
-      type: object
-      required: [accepted_generation, last_received_event_seq, next_command_seq]
-      additionalProperties: false
-      properties:
-        accepted_generation:
-          $ref: '#/components/schemas/ProcessGeneration'
-        last_received_event_seq:
-          $ref: '#/components/schemas/CanonicalDecimalU64'
-        next_command_seq:
-          $ref: '#/components/schemas/CanonicalDecimalU64'
+      $ref: "./agent-events.yaml#/$defs/ApiHello"
+    OutboundFrame:
+      $ref: "./agent-events.yaml#/$defs/OutboundFrame"
+    BrowserClientFrame:
+      $ref: "./agent-events.yaml#/$defs/BrowserClientFrame"
+    BrowserServerFrame:
+      $ref: "./agent-events.yaml#/$defs/BrowserServerFrame"

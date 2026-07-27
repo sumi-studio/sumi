@@ -89,11 +89,12 @@ export class ConversationSocket {
     };
   }
 
-  sendCommand(command: Command, idempotencyKey = crypto.randomUUID()) {
+  sendCommand(command: Command, idempotencyKey = crypto.randomUUID()): boolean {
     if (this.socket?.readyState !== WebSocket.OPEN) {
-      return;
+      return false;
     }
     this.send({ type: "command", idempotency_key: idempotencyKey, command });
+    return true;
   }
 
   onFrame(listener: Listener) {

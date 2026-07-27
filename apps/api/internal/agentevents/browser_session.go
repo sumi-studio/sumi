@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
-	"encoding/base64"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"strings"
@@ -67,6 +67,11 @@ func (v *HMACUserSessionVerifier) VerifySession(ctx context.Context, signedCooki
 		return UserSessionClaims{}, ctx.Err()
 	default:
 	}
+
+	if len(signedCookie) > maxSignedTokenBytes {
+		return UserSessionClaims{}, errors.New("browser session exceeds maximum allowed size")
+	}
+
 	parts := strings.Split(signedCookie, ".")
 	if len(parts) != 3 {
 		return UserSessionClaims{}, errors.New("invalid browser session format")
@@ -74,8 +79,12 @@ func (v *HMACUserSessionVerifier) VerifySession(ctx context.Context, signedCooki
 	signingInput := parts[0] + "." + parts[1]
 	mac := hmac.New(sha256.New, v.secret)
 	_, _ = mac.Write([]byte(signingInput))
-	expected := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
-	if !hmac.Equal([]byte(expected), []byte(strings.TrimRight(parts[2], "="))) {
+	expected := mac.Sum(nil)
+	signature, err := decodeBase64URL(parts[2])
+	if err != nil || len(signature) != len(expected) {
+		return UserSessionClaims{}, errors.New("invalid browser session signature")
+	}
+	if subtle.ConstantTimeCompare(expected, signature) != 1 {
 		return UserSessionClaims{}, errors.New("invalid browser session signature")
 	}
 	headerBytes, err := decodeBase64URL(parts[0])

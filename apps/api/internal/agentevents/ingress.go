@@ -30,6 +30,7 @@ const (
 	RejectSchemaViolation     RejectReason = "schema_violation"
 	RejectAttachmentsNotEmpty RejectReason = "attachments_not_empty"
 	RejectOversized           RejectReason = "oversized"
+	RejectNotAllowed          RejectReason = "not_allowed"
 )
 
 // CommandAppender is the durable command log entry point owned by the T28 API
@@ -60,13 +61,15 @@ type UserCommandIngress struct {
 	MaxBytes int64
 }
 
+var errCommandAppenderRequired = errors.New("CommandAppender is required")
+
 // NewUserCommandIngress returns an ingress handler wired to the given appender.
 // It fail-closes: a nil appender returns an error so cmd/server cannot expose
 // the route with an unbacked log. A nil Sessions verifier causes every request
 // to be rejected with 401 until a production UserSessionVerifier is wired.
 func NewUserCommandIngress(appender CommandAppender, sessions UserSessionVerifier) (*UserCommandIngress, error) {
 	if appender == nil {
-		return nil, errors.New("CommandAppender is required")
+		return nil, errCommandAppenderRequired
 	}
 	return &UserCommandIngress{Appender: appender, Sessions: sessions, MaxBytes: MaxUserCommandBytes}, nil
 }

@@ -372,6 +372,7 @@ pub enum WireRejectReason {
     SchemaViolation,
     AttachmentsNotEmpty,
     Oversized,
+    NotAllowed,
 }
 
 fn parse_reject_reason(reason: &str) -> Result<WireRejectReason, WireError> {
@@ -380,6 +381,7 @@ fn parse_reject_reason(reason: &str) -> Result<WireRejectReason, WireError> {
         "schema_violation" => Ok(WireRejectReason::SchemaViolation),
         "attachments_not_empty" => Ok(WireRejectReason::AttachmentsNotEmpty),
         "oversized" => Ok(WireRejectReason::Oversized),
+        "not_allowed" => Ok(WireRejectReason::NotAllowed),
         _ => Err(WireError::InvalidRejectReason {
             reason: reason.to_owned(),
         }),
@@ -2977,6 +2979,16 @@ mod tests {
                 "api_hello" => round_trip_value::<ApiHello>(name, &wire),
                 "agent_event" => round_trip_value::<WireAgentEvent>(name, &wire),
                 "public_message" => round_trip_value::<WirePublicMessage>(name, &wire),
+                // These frames terminate at the API/browser boundary and are
+                // validated by the Go gateway and generated TypeScript client.
+                // The Rust agent never sends or receives them, so naming each
+                // browser-only kind here keeps the shared fixture registry
+                // exhaustive without inventing an unused Rust wire surface.
+                "browser_hello"
+                | "browser_command_frame"
+                | "browser_event_frame"
+                | "browser_command_accepted"
+                | "browser_command_rejected" => continue,
                 other => panic!("unknown fixture kind '{other}' for '{name}'"),
             }
             passed += 1;

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 )
 
 const defaultAgentAudience = "sumi:agent:events"
+const maxSignedTokenBytes = 8 * 1024
 
 // HMACTokenVerifier validates short-lived agent tokens signed with HMAC-SHA256.
 // It is a T28 production wiring point for the API-side token verification seam.
@@ -53,6 +55,10 @@ func (v *HMACTokenVerifier) Verify(ctx context.Context, token string) (TokenClai
 	default:
 	}
 
+	if len(token) > maxSignedTokenBytes {
+		return TokenClaims{}, errors.New("token exceeds maximum allowed size")
+	}
+
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		return TokenClaims{}, errors.New("invalid token format")
@@ -60,10 +66,13 @@ func (v *HMACTokenVerifier) Verify(ctx context.Context, token string) (TokenClai
 
 	signingInput := parts[0] + "." + parts[1]
 	mac := hmac.New(sha256.New, v.secret)
-	mac.Write([]byte(signingInput))
-	expected := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
-	signature := strings.TrimRight(parts[2], "=")
-	if !hmac.Equal([]byte(expected), []byte(signature)) {
+	_, _ = mac.Write([]byte(signingInput))
+	expected := mac.Sum(nil)
+	signature, err := decodeBase64URL(parts[2])
+	if err != nil || len(signature) != len(expected) {
+		return TokenClaims{}, errors.New("invalid token signature")
+	}
+	if subtle.ConstantTimeCompare(expected, signature) != 1 {
 		return TokenClaims{}, errors.New("invalid token signature")
 	}
 

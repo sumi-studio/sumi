@@ -68,7 +68,11 @@ func newRouter() (*http.ServeMux, error) {
 		return nil, fmt.Errorf("open agent runtime gateway: %w", err)
 	}
 
-	mux, _, _ := agentevents.NewProductionMux(store, runtime, tv, sv, allowedOriginsFromEnv(), browserAllowedOriginsFromEnv())
+	mux, _, _, err := agentevents.NewProductionMux(store, runtime, tv, sv, allowedOriginsFromEnv(), browserAllowedOriginsFromEnv())
+	if err != nil {
+		_ = store.Close()
+		return nil, err
+	}
 	mux.HandleFunc("GET /health", handler.Health)
 	return mux, nil
 }

@@ -59,6 +59,11 @@ type browserCommandRejectedFrame struct {
 	RejectReason RejectReason `json:"reject_reason"`
 }
 
+type browserCommandHead struct {
+	Type      string `json:"type"`
+	RequestID string `json:"request_id"`
+}
+
 func NewBrowserServer(sessions UserSessionVerifier, appender CommandAppender, events *DurableGateway) *BrowserServer {
 	s := &BrowserServer{
 		Sessions:     sessions,
@@ -71,6 +76,23 @@ func NewBrowserServer(sessions UserSessionVerifier, appender CommandAppender, ev
 	s.upgrader = websocket.Upgrader{CheckOrigin: s.checkOrigin}
 	s.connections = make(map[*websocket.Conn]struct{})
 	return s
+}
+
+func (s *BrowserServer) checkCommandState(conversationID string, head browserCommandHead) (RejectReason, bool) {
+	if s.Events == nil {
+		return "", false
+	}
+	switch head.Type {
+	case "abort":
+		if !s.Events.IsAssistantTurnInFlight(conversationID) {
+			return RejectNotAllowed, true
+		}
+	case "approval_decision":
+		if !s.Events.IsApprovalPending(conversationID, head.RequestID) {
+			return RejectNotAllowed, true
+		}
+	}
+	return "", false
 }
 
 func (s *BrowserServer) checkOrigin(r *http.Request) bool {
@@ -168,6 +190,10 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 	hello, err := decodeBrowserHello(raw)
 	if err != nil {
 		return err
+	}
+
+	if err := s.Events.EnsureConversationStateRebuilt(ctx, claims.ConversationID); err != nil {
+		return fmt.Errorf("rebuild conversation state: %w", err)
 	}
 
 	// Install pong handler before first read and schedule the initial
@@ -294,6 +320,19 @@ func (s *BrowserServer) browserReadPump(ctx context.Context, conn *websocket.Con
 		}
 		if len(frame.IdempotencyKey) > MaxIdempotencyKeyBytes {
 			if err := write(browserCommandRejectedFrame{Type: "command_rejected", RejectReason: RejectOversized}); err != nil {
+				return err
+			}
+			continue
+		}
+		var head browserCommandHead
+		if err := json.Unmarshal(frame.Command, &head); err != nil {
+			if err := write(browserCommandRejectedFrame{Type: "command_rejected", RejectReason: RejectSchemaViolation}); err != nil {
+				return err
+			}
+			continue
+		}
+		if reason, reject := s.checkCommandState(claims.ConversationID, head); reject {
+			if err := write(browserCommandRejectedFrame{Type: "command_rejected", RejectReason: reason}); err != nil {
 				return err
 			}
 			continue

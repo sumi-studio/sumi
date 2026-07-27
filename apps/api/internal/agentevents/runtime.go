@@ -43,6 +43,15 @@ type DurableGateway struct {
 	nextBrowserSubscriber uint64
 	clock                 uint64
 	newFile               func(string, int, os.FileMode) (durableFileHandle, error)
+
+	// stateMu protects in-flight and pending-approval state derived from
+	// durable events. Readers also take mu first so they cannot observe the
+	// interval after an event is durably appended but before its derived state
+	// is updated.
+	stateMu          sync.RWMutex
+	stateRebuilt     map[string]bool
+	inFlight         map[string]bool
+	pendingApprovals map[string]map[string]bool
 }
 
 type conversationLogState struct {
@@ -165,6 +174,9 @@ func OpenDurableGateway(dir string, commands *CommandStore) (*DurableGateway, er
 		MaxAckTail:           256,
 		tails:                make(map[string]*conversationLogState),
 		browserSubscribers:   make(map[string]map[uint64]chan Envelope),
+		stateRebuilt:         make(map[string]bool),
+		inFlight:             make(map[string]bool),
+		pendingApprovals:     make(map[string]map[string]bool),
 		newFile: func(name string, flag int, perm os.FileMode) (durableFileHandle, error) {
 			return os.OpenFile(name, flag|syscall.O_NOFOLLOW, perm)
 		},
@@ -336,10 +348,14 @@ func (g *DurableGateway) Receive(ctx context.Context, claims TokenClaims, envelo
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.appendDurableEventLocked(
+	if err := g.appendDurableEventLocked(
 		claims.ConversationID,
 		durableEventRecord{Seq: *envelope.Seq, Event: envelope},
-	)
+	); err != nil {
+		return err
+	}
+	g.updateConversationStateLocked(claims.ConversationID, envelope.Event)
+	return nil
 }
 
 // EventCatchUp returns the durable event suffix after lastConsumedSeq. It
@@ -576,6 +592,9 @@ func (g *DurableGateway) appendDurableEventLocked(conversationID string, record 
 	if record.Seq != st.eventSeq+1 {
 		return fmt.Errorf("event seq is not contiguous: got %d, want %d", record.Seq, st.eventSeq+1)
 	}
+	if record.Event.Seq == nil || *record.Event.Seq != record.Seq {
+		return fmt.Errorf("durable event record seq mismatch: outer %d, inner %v", record.Seq, record.Event.Seq)
+	}
 	line, err := json.Marshal(record)
 	if err != nil {
 		return err
@@ -611,6 +630,105 @@ func (g *DurableGateway) appendDurableEventLocked(conversationID string, record 
 	st.eventSize = preWriteOffset + int64(len(data))
 	st.eventCRC = updateCRC(st.eventCRC, data)
 	return nil
+}
+
+func (g *DurableGateway) updateConversationStateLocked(conversationID string, event json.RawMessage) {
+	g.stateMu.Lock()
+	defer g.stateMu.Unlock()
+	g.applyEventStateLocked(conversationID, event)
+}
+
+func (g *DurableGateway) applyEventStateLocked(conversationID string, event json.RawMessage) {
+	type eventHead struct {
+		Type      string `json:"type"`
+		RequestID string `json:"request_id"`
+		Request   struct {
+			ID string `json:"id"`
+		} `json:"request"`
+	}
+	var head eventHead
+	if err := json.Unmarshal(event, &head); err != nil {
+		return
+	}
+
+	switch head.Type {
+	case "message_start":
+		g.inFlight[conversationID] = true
+	case "message_end", "turn_end":
+		g.inFlight[conversationID] = false
+	case "approval_requested":
+		if head.Request.ID == "" {
+			return
+		}
+		if g.pendingApprovals[conversationID] == nil {
+			g.pendingApprovals[conversationID] = make(map[string]bool)
+		}
+		g.pendingApprovals[conversationID][head.Request.ID] = true
+	case "approval_resolved":
+		if head.RequestID == "" {
+			return
+		}
+		if g.pendingApprovals[conversationID] != nil {
+			delete(g.pendingApprovals[conversationID], head.RequestID)
+			if len(g.pendingApprovals[conversationID]) == 0 {
+				delete(g.pendingApprovals, conversationID)
+			}
+		}
+	}
+}
+
+// EnsureConversationStateRebuilt reconstructs the in-flight and pending-approval
+// command guard state for conversationID from the durable event log. It is called
+// by the browser WebSocket before command admission begins so that guards remain
+// authoritative across API process restarts. If the durable log is corrupt,
+// non-contiguous, or otherwise unreadable, reconstruction returns an error and
+// the caller must fail closed rather than admitting commands.
+func (g *DurableGateway) EnsureConversationStateRebuilt(ctx context.Context, conversationID string) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.stateRebuilt[conversationID] {
+		return nil
+	}
+
+	events, err := g.EventCatchUp(ctx, conversationID, 0)
+	if err != nil {
+		return fmt.Errorf("rebuild conversation state: %w", err)
+	}
+
+	g.stateMu.Lock()
+	for _, envelope := range events {
+		g.applyEventStateLocked(conversationID, envelope.Event)
+	}
+	g.stateRebuilt[conversationID] = true
+	g.stateMu.Unlock()
+
+	return nil
+}
+
+// IsAssistantTurnInFlight reports whether a durable message_start has not yet
+// been matched by a message_end or turn_end for the conversation. It is used by
+// the browser WebSocket to reject abort commands sent outside an active turn.
+func (g *DurableGateway) IsAssistantTurnInFlight(conversationID string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.stateMu.RLock()
+	defer g.stateMu.RUnlock()
+	return g.inFlight[conversationID]
+}
+
+// IsApprovalPending reports whether an approval with requestID is still awaiting
+// a decision in the conversation. It is used by the browser WebSocket to reject
+// approval_decision commands for unknown or already-resolved requests.
+func (g *DurableGateway) IsApprovalPending(conversationID, requestID string) bool {
+	if requestID == "" {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.stateMu.RLock()
+	defer g.stateMu.RUnlock()
+	return g.pendingApprovals[conversationID] != nil && g.pendingApprovals[conversationID][requestID]
 }
 
 func (g *DurableGateway) appendCommandAckLocked(conversationID string, ack CommandAck) error {

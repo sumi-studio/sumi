@@ -1,6 +1,7 @@
 package agentevents
 
 import (
+	"fmt"
 	"log"
 	"net/http"
 )
@@ -19,20 +20,26 @@ func NewProductionMux(
 	sv UserSessionVerifier,
 	agentOrigins,
 	browserOrigins []string,
-) (*http.ServeMux, *BrowserServer, *Server) {
+) (*http.ServeMux, *BrowserServer, *Server, error) {
 	mux := http.NewServeMux()
 
 	agent := newAgentWebSocketHandler(tv, runtime, agentOrigins)
 	mux.Handle("GET /agent/ws", agent)
 
-	ingress, _ := NewUserCommandIngress(store, sv)
+	if store == nil {
+		return nil, nil, nil, fmt.Errorf("user command ingress: %w", errCommandAppenderRequired)
+	}
+	ingress, err := NewUserCommandIngress(store, sv)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("user command ingress: %w", err)
+	}
 	mux.Handle("POST /conversations/{conversation_id}/commands", ingress)
 
 	browser := NewBrowserServer(sv, store, runtime)
 	browser.AllowedOrigins = browserOrigins
 	mux.Handle("GET /conversations/{conversation_id}/ws", browser)
 
-	return mux, browser, agent
+	return mux, browser, agent, nil
 }
 
 func newAgentWebSocketHandler(tv TokenVerifier, runtime *DurableGateway, allowedOrigins []string) *Server {
