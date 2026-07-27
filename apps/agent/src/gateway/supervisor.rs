@@ -677,8 +677,10 @@ where
                     .last_received_event_seq
                     .checked_add(1)
                     .ok_or_else(|| {
-                        SupervisorError::Fatal(anyhow!(
-                            "API event cursor exhausted before DeliveryPump install"
+                        SupervisorError::Fatal(anyhow::Error::new(
+                            DurableReplayInvariantError::new(
+                                "API event cursor exhausted before DeliveryPump install",
+                            ),
                         ))
                     })?,
                 events,
@@ -815,6 +817,9 @@ where
         if let Some(e) = first_oversized_error(&writer_result) {
             return Err(SupervisorError::Fatal(anyhow::Error::new(e)));
         }
+        if let Some(e) = first_durable_replay_invariant_error(&writer_result) {
+            return Err(SupervisorError::Fatal(anyhow::Error::new(e)));
+        }
 
         match (reader_result, writer_result) {
             (Ok(()), Ok(())) => on_both_ok(),
@@ -859,6 +864,15 @@ fn first_oversized_error(result: &Result<()>) -> Option<OversizedFrameError> {
         .as_ref()
         .err()
         .and_then(|e| e.downcast_ref::<OversizedFrameError>().copied())
+}
+
+fn first_durable_replay_invariant_error(
+    result: &Result<()>,
+) -> Option<DurableReplayInvariantError> {
+    result
+        .as_ref()
+        .err()
+        .and_then(|error| error.downcast_ref::<DurableReplayInvariantError>().cloned())
 }
 
 async fn build_agent_hello<S: DurableSource>(
@@ -931,10 +945,12 @@ async fn validate_hello<S: DurableSource>(
     // Applied/Superseded/Rejected ACK. Only zero (command seq starts at one) or
     // a claim beyond the complete received prefix is impossible.
     let max_next_command_seq = command_cursor.received.checked_add(1).ok_or_else(|| {
-        SupervisorError::Fatal(anyhow!(
-            "command received cursor overflow: received={}",
-            command_cursor.received
-        ))
+        SupervisorError::Fatal(anyhow::Error::new(DurableReplayInvariantError::new(
+            format!(
+                "command received cursor overflow: received={}",
+                command_cursor.received
+            ),
+        )))
     })?;
     if api.next_command_seq == 0 || api.next_command_seq > max_next_command_seq {
         return Err(SupervisorError::Fatal(anyhow!(
@@ -954,6 +970,25 @@ enum SupervisorError {
     Fatal(anyhow::Error),
     Reconnect { reason: String },
     EstablishedReconnect { reason: String, healthy: bool },
+}
+
+/// A permanent inconsistency in the local durable replay source.
+///
+/// Reconnecting cannot repair these failures because every epoch reads the
+/// same canonical event log and cursor. Keep this type distinct from transport
+/// writer errors, which remain reconnectable.
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("durable replay invariant violated: {message}")]
+struct DurableReplayInvariantError {
+    message: String,
+}
+
+impl DurableReplayInvariantError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
 }
 
 /// Classifies errors from `reader_task` so the supervisor can decide whether
@@ -1365,35 +1400,24 @@ where
         };
 
         if page.is_empty() {
-            cursor = match await_cursor(
-                &source,
-                &token,
-                &mut writer_rx,
-                &mut next_arrival_id,
-                &mut outbox,
-                &mut pending_events,
-                last_received,
-                is_online,
+            return Err(DurableReplayInvariantError::new(
+                "event source returned empty page before advertised cursor",
             )
-            .await?
-            {
-                Some(c) => c,
-                None => return Ok(()),
-            };
-            if cursor.last_sent > last_received {
-                continue;
-            }
-            bail!("event source returned empty page before cursor");
+            .into());
         }
 
         for frame in page {
-            let seq =
-                outbound_frame_event_seq(&frame).context("catch-up frame missing durable seq")?;
-            let expected = last_received
-                .checked_add(1)
-                .context("durable event sequence exhausted during catch-up")?;
+            let seq = outbound_frame_event_seq(&frame).map_err(|_| {
+                DurableReplayInvariantError::new("catch-up frame missing durable seq")
+            })?;
+            let expected = last_received.checked_add(1).ok_or_else(|| {
+                DurableReplayInvariantError::new("durable event sequence exhausted during catch-up")
+            })?;
             if seq != expected {
-                bail!("durable catch-up event gap: expected {expected}, got {seq}");
+                return Err(DurableReplayInvariantError::new(format!(
+                    "durable catch-up event gap: expected {expected}, got {seq}"
+                ))
+                .into());
             }
             send_with_interleave(
                 &mut writer,
@@ -1489,34 +1513,25 @@ where
             None => return Ok(()),
         };
         if page.is_empty() {
-            cursor = match await_cursor(
-                &source,
-                &token,
-                &mut writer_rx,
-                &mut next_arrival_id,
-                &mut outbox,
-                &mut pending_events,
-                last_received,
-                is_online,
+            return Err(DurableReplayInvariantError::new(
+                "event source returned empty page before advertised cursor during final catch-up",
             )
-            .await?
-            {
-                Some(c) => c,
-                None => return Ok(()),
-            };
-            if cursor.last_sent > last_received {
-                continue;
-            }
-            bail!("event source returned empty page before cursor");
+            .into());
         }
         for frame in page {
-            let seq =
-                outbound_frame_event_seq(&frame).context("catch-up frame missing durable seq")?;
-            let expected = last_received
-                .checked_add(1)
-                .context("durable event sequence exhausted during final catch-up")?;
+            let seq = outbound_frame_event_seq(&frame).map_err(|_| {
+                DurableReplayInvariantError::new("final catch-up frame missing durable sequence")
+            })?;
+            let expected = last_received.checked_add(1).ok_or_else(|| {
+                DurableReplayInvariantError::new(
+                    "durable event sequence exhausted during final catch-up",
+                )
+            })?;
             if seq != expected {
-                bail!("durable catch-up event gap: expected {expected}, got {seq}");
+                return Err(DurableReplayInvariantError::new(format!(
+                    "durable catch-up event gap during final catch-up: expected {expected}, got {seq}"
+                ))
+                .into());
             }
             send_with_interleave(
                 &mut writer,
@@ -4202,11 +4217,15 @@ mod tests {
             last_received_event_seq: 0,
             next_command_seq: u64::MAX,
         };
+        let error = validate_hello(&MockDurableSource::new(cursor), &agent, &api)
+            .await
+            .expect_err("received cursor at u64::MAX must fail closed");
         assert!(
-            validate_hello(&MockDurableSource::new(cursor), &agent, &api)
-                .await
-                .is_err(),
-            "received cursor at u64::MAX must fail closed"
+            matches!(
+                &error,
+                SupervisorError::Fatal(error) if error.is::<DurableReplayInvariantError>()
+            ),
+            "cursor exhaustion must preserve the typed permanent failure: {error:?}"
         );
     }
 
@@ -4754,13 +4773,12 @@ mod tests {
     #[tokio::test]
     async fn writer_task_rechecks_cursor_before_publishing_online() {
         // The durable source commits event 2 while the first page is being sent,
-        // then returns an empty page for the updated cursor. The writer must
-        // re-check the cursor and include the racing commit before Online.
+        // so the writer must re-check the cursor and include the racing commit
+        // before Online.
         struct RacingSource {
             events: Arc<std::sync::Mutex<VecDeque<OutboundFrame>>>,
             first_page_started: Arc<Notify>,
             first_page_release: Arc<Notify>,
-            second_page_attempts: Arc<AtomicU64>,
         }
 
         impl Clone for RacingSource {
@@ -4769,7 +4787,6 @@ mod tests {
                     events: self.events.clone(),
                     first_page_started: self.first_page_started.clone(),
                     first_page_release: self.first_page_release.clone(),
-                    second_page_attempts: self.second_page_attempts.clone(),
                 }
             }
         }
@@ -4805,13 +4822,6 @@ mod tests {
                     return Ok(snapshot.into_iter().collect());
                 }
 
-                let attempt = self.second_page_attempts.fetch_add(1, Ordering::SeqCst) + 1;
-                if attempt == 1 {
-                    // Simulate a stale snapshot: the cursor advanced to 2 but the
-                    // page read still sees nothing. The next recheck will retry.
-                    return Ok(Vec::new());
-                }
-
                 let events = self.events.lock().unwrap();
                 Ok(events
                     .iter()
@@ -4835,7 +4845,6 @@ mod tests {
             events: events.clone(),
             first_page_started: first_page_started.clone(),
             first_page_release: first_page_release.clone(),
-            second_page_attempts: Arc::new(AtomicU64::new(0)),
         };
 
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -5558,6 +5567,56 @@ mod tests {
             vec![1],
             "catch-up must stop at the last contiguous seq"
         );
+    }
+
+    #[tokio::test]
+    async fn durable_catch_up_gap_is_fatal_without_unlimited_reconnect() {
+        let source = ReplaySource::new(
+            vec![event_frame(1), event_frame(3)],
+            CommandCursors::default(),
+        );
+        let sent_hellos = Arc::new(Mutex::new(Vec::new()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut gateway = MockGateway::new(VecDeque::new());
+        gateway.writer.sent = sent.clone();
+        let connector = MockConnector::new(sent_hellos.clone(), VecDeque::from([Ok(gateway)]));
+        let credentials = CountingCredentialProvider::new("token");
+        let credential_count = credentials.counter.clone();
+        let latch = StaticHydrationLatch(HydrationReady {
+            generation: ProcessGeneration::from_wire(7).unwrap(),
+            receipt_identity: "receipt-1".to_owned(),
+        });
+        let mut config = make_config();
+        config.max_reconnect_attempts = None;
+
+        let supervisor = ConnectionSupervisor::new(connector, credentials, source, latch, config);
+        let handle = supervisor.start();
+        let result = tokio::time::timeout(Duration::from_secs(1), handle.join())
+            .await
+            .expect("durable replay invariant must terminate the supervisor");
+        let error = result.expect_err("durable replay gap must be fatal");
+
+        assert!(
+            error.is::<DurableReplayInvariantError>(),
+            "supervisor must preserve the typed permanent failure: {error:?}"
+        );
+        assert_eq!(
+            credential_count.load(Ordering::SeqCst),
+            1,
+            "a permanent durable replay failure must not fetch another credential"
+        );
+        assert_eq!(
+            sent_hellos.lock().unwrap().len(),
+            1,
+            "a permanent durable replay failure must not start another epoch"
+        );
+        let seqs: Vec<_> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|frame| outbound_frame_event_seq(frame).ok())
+            .collect();
+        assert_eq!(seqs, vec![1], "the gap must not advance past seq 1");
     }
 
     /// A durable source that blocks a configurable `event_cursor` call so a test
