@@ -163,7 +163,8 @@ overflow、transportの各境界から再検証した。レビュー指摘への
 - cancel時にpartialを捨てる: ハードステアで部分応答を保持する製品契約に反する。
 - MFJS numberを`as_f64()`可能なら互換とする: 丸め後の値が有限でも元JSON値と異なり得る。
 - credentialなしにlive captureを合成・推定する: provenanceを偽り、gatewayと直APIの
-  方言差を検出できない。未取得証拠はnamed release gateとして残す。
+  方言差を検出できない。未取得証拠は未取得と明記し、将来取得できた場合だけ
+  provenance付きの任意な開発証拠として保存する。
 
 ## 影響
 
