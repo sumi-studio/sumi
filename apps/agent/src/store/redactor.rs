@@ -72,8 +72,10 @@ impl Redactor {
                     replacement: "[REDACTED:aws_access_key_id]",
                 },
                 RedactionRule {
-                    pattern: Regex::new(r"gh[pousr]_[A-Za-z0-9_]{36,}")
-                        .expect("static GitHub token pattern is valid"),
+                    pattern: Regex::new(
+                        r"(?:github_pat_[A-Za-z0-9_]{20,}|ghs_[A-Za-z0-9]+_[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|gh[pousr]_[A-Za-z0-9_]{36,})",
+                    )
+                    .expect("static GitHub token pattern is valid"),
                     replacement: "[REDACTED:github_token]",
                 },
                 RedactionRule {
@@ -547,6 +549,8 @@ mod tests {
         let redactor = Redactor::v1();
         let aws = "AKIAIOSFODNN7EXAMPLE";
         let gh = "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        let fine_grained = format!("github_pat_{}", "x".repeat(82));
+        let stateless_installation = "ghs_123456_eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature";
         // Build synthetic fixture from fragments so secret scanners cannot match
         // the literal slack token below.
         let slack = format!(
@@ -559,11 +563,15 @@ mod tests {
         let basic = "Basic c29tZTpzZWNyZXQ=";
         let pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----";
 
-        let text = format!("{aws} {gh} {slack} {jwt} {url} {query} {basic} {pem}");
+        let text = format!(
+            "{aws} {gh} {fine_grained} {stateless_installation} {slack} {jwt} {url} {query} {basic} {pem}"
+        );
         let redacted = redactor.redact_text(&text);
 
         assert!(!redacted.contains(aws));
         assert!(!redacted.contains(gh));
+        assert!(!redacted.contains(&fine_grained));
+        assert!(!redacted.contains(stateless_installation));
         assert!(!redacted.contains(slack.as_str()));
         assert!(!redacted.contains(jwt));
         assert!(!redacted.contains("p4ssw0rd"));
@@ -715,6 +723,7 @@ mod tests {
             }),
             wire_item_index: Some(0),
             ordinal: 1,
+            provider_origin: provider_origin(),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({"secret": "plain-secret"})],
                 coverage: NativeCompactionCoverage {

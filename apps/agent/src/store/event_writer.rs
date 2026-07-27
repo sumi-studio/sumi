@@ -67,6 +67,24 @@ struct MemorySummaryPayload<'a> {
     to: &'a DateTime<Utc>,
 }
 
+/// Recovery binding carried through an `EventWriter` transaction. Only
+/// `EventWriter::apply_physical_recovery` may supply this context; generic
+/// `apply` rejects `Projection::PhysicalRecovery` outright.
+struct PhysicalRecoveryContext<'a> {
+    lease: &'a ProcessGenerationLease,
+    fence: &'a GenerationRecoveryFence,
+    receipt: &'a PhysicalRecoveryReceipt,
+}
+
+/// Outcome of applying an `EventBatch`.  The `receipt_outcome` is only
+/// `Some` when the batch contains a `PhysicalRecovery` projection, whose
+/// `Applied`/`AlreadyApplied` result is determined inside the SQLite
+/// transaction by `PhysicalRecoveryApplier::apply_in_transaction`.
+struct ApplyBatchOutcome {
+    seqs: Vec<u64>,
+    receipt_outcome: Option<ApplyReceiptOutcome>,
+}
+
 #[derive(Clone)]
 pub(crate) struct DurableEvent {
     value: AgentEvent,
@@ -87,6 +105,8 @@ pub(super) struct DurableEventMetadata {
     pub(super) tool_state: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) tool_error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) executor_generation: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) approval_actor: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -301,6 +321,9 @@ impl DurableEvent {
         tool_call_id: String,
         tool_name: String,
         args: Value,
+        command_id: String,
+        run_id: String,
+        executor_generation: ProcessGeneration,
     ) -> Result<Self> {
         Self::from_parts(
             AgentEvent::ToolExecutionStart {
@@ -309,7 +332,10 @@ impl DurableEvent {
                 args,
             },
             DurableEventMetadata {
+                command_id: Some(command_id),
+                run_id: Some(run_id),
                 tool_state: Some("running".to_owned()),
+                executor_generation: Some(executor_generation.as_i64()),
                 ..DurableEventMetadata::default()
             },
         )
@@ -419,6 +445,11 @@ fn normalize_test_event(mut raw: Value) -> Result<(AgentEvent, DurableEventMetad
             None | Some(Value::Null) => Ok(None),
             Some(value) => serde_json::from_value::<String>(value).map(Some),
         };
+    let take_i64 =
+        |object: &mut serde_json::Map<String, Value>, field: &str| match object.remove(field) {
+            None | Some(Value::Null) => Ok(None),
+            Some(value) => serde_json::from_value::<i64>(value).map(Some),
+        };
     let mut metadata = DurableEventMetadata::default();
     match event_type.as_str() {
         "agent_start" | "agent_end" => {
@@ -438,9 +469,11 @@ fn normalize_test_event(mut raw: Value) -> Result<(AgentEvent, DurableEventMetad
             metadata.turn_id = take_string(object, "turn_id")?;
         }
         "tool_execution_start" => {
+            metadata.command_id = take_string(object, "command_id")?;
             metadata.run_id = take_string(object, "run_id")?;
             metadata.turn_id = take_string(object, "turn_id")?;
             metadata.tool_state = take_string(object, "state")?;
+            metadata.executor_generation = take_i64(object, "executor_generation")?;
         }
         "tool_execution_end" => {
             metadata.run_id = take_string(object, "run_id")?;
@@ -1540,6 +1573,7 @@ impl EventWriter {
                 }],
                 injected_commands: Vec::new(),
             },
+            None,
             &mut guard,
         )
         .await?;
@@ -1622,7 +1656,7 @@ impl EventWriter {
     )]
     pub(crate) async fn apply(&self, batch: EventBatch) -> Result<Vec<u64>> {
         let mut guard = self.gate.lock().await;
-        self.apply_locked(batch, &mut guard).await
+        self.apply_locked(batch, None, &mut guard).await
     }
 
     /// Hydration entry point for a T27 physical recovery proof.  The receipt
@@ -1650,20 +1684,26 @@ impl EventWriter {
         if !has_receipt_projection {
             batch.writes.push(EventWrite {
                 event: None,
-                projections: vec![Projection::PhysicalRecovery(receipt)],
+                projections: vec![Projection::PhysicalRecovery(receipt.clone())],
             });
         }
         // Idempotency is decided inside the same SQLite transaction as the
         // application ledger write (PhysicalRecoveryApplier::apply_in_transaction).
         // Reading `already_present` outside the transaction would create a TOCTOU
         // window where two callers could both observe the receipt as new.
-        let seqs = self.apply(batch).await?;
-        let outcome = if seqs.is_empty() {
-            ApplyReceiptOutcome::AlreadyApplied
-        } else {
-            ApplyReceiptOutcome::Applied
+        let mut guard = self.gate.lock().await;
+        let context = PhysicalRecoveryContext {
+            lease,
+            fence,
+            receipt: &receipt,
         };
-        Ok((outcome, seqs))
+        let outcome = self
+            .apply_locked_with_failpoint(batch, None, None, None, Some(context), &mut guard)
+            .await?;
+        let receipt_outcome = outcome.receipt_outcome.ok_or_else(|| {
+            anyhow!("physical recovery projection did not produce an ApplyReceiptOutcome")
+        })?;
+        Ok((receipt_outcome, outcome.seqs))
     }
 
     #[cfg(test)]
@@ -1673,17 +1713,26 @@ impl EventWriter {
         fail_after_writes: usize,
     ) -> Result<Vec<u64>> {
         let mut guard = self.gate.lock().await;
-        self.apply_locked_with_failpoint(batch, Some(fail_after_writes), None, None, &mut guard)
-            .await
+        self.apply_locked_with_failpoint(
+            batch,
+            Some(fail_after_writes),
+            None,
+            None,
+            None,
+            &mut guard,
+        )
+        .await
+        .map(|outcome| outcome.seqs)
     }
 
     #[cfg(all(test, unix))]
-    async fn apply_with_abrupt_transaction_failpoint(
+    async fn apply_with_abrupt_transaction_failpoint<'a>(
         &self,
         batch: EventBatch,
         name: &str,
         after_commit: bool,
         readiness_path: &std::path::Path,
+        physical_recovery: Option<PhysicalRecoveryContext<'a>>,
     ) -> Result<Vec<u64>> {
         let mut guard = self.gate.lock().await;
         self.apply_locked_with_failpoint(
@@ -1691,9 +1740,11 @@ impl EventWriter {
             None,
             Some((name, after_commit, readiness_path)),
             None,
+            physical_recovery,
             &mut guard,
         )
         .await
+        .map(|outcome| outcome.seqs)
     }
 
     #[cfg(test)]
@@ -1703,8 +1754,9 @@ impl EventWriter {
         key_ref: &str,
     ) -> Result<Vec<u64>> {
         let mut guard = self.gate.lock().await;
-        self.apply_locked_with_failpoint(batch, None, None, Some(key_ref), &mut guard)
+        self.apply_locked_with_failpoint(batch, None, None, Some(key_ref), None, &mut guard)
             .await
+            .map(|outcome| outcome.seqs)
     }
 
     pub(crate) async fn apply_idle_abort_cutoff(
@@ -2005,6 +2057,7 @@ impl EventWriter {
                 writes,
                 injected_commands: Vec::new(),
             },
+            None,
             &mut guard,
         )
         .await?;
@@ -2026,9 +2079,15 @@ impl EventWriter {
         Ok(acks)
     }
 
-    async fn apply_locked(&self, batch: EventBatch, state: &mut WriterState) -> Result<Vec<u64>> {
-        self.apply_locked_with_failpoint(batch, None, None, None, state)
+    async fn apply_locked(
+        &self,
+        batch: EventBatch,
+        physical_recovery: Option<PhysicalRecoveryContext<'_>>,
+        state: &mut WriterState,
+    ) -> Result<Vec<u64>> {
+        self.apply_locked_with_failpoint(batch, None, None, None, physical_recovery, state)
             .await
+            .map(|outcome| outcome.seqs)
     }
 
     async fn apply_locked_with_failpoint(
@@ -2037,11 +2096,16 @@ impl EventWriter {
         fail_after_writes: Option<usize>,
         abrupt_failpoint: Option<(&str, bool, &std::path::Path)>,
         destroy_after_prepare: Option<&str>,
+        physical_recovery: Option<PhysicalRecoveryContext<'_>>,
         state: &mut WriterState,
-    ) -> Result<Vec<u64>> {
+    ) -> Result<ApplyBatchOutcome> {
         self.ensure_checkpoint(state).await?;
         preflight_materialization_bounds(self.store.redactor(), &batch)?;
-        let expected_injections = validate_batch_shape(self.store.redactor(), &batch)?;
+        let expected_injections = validate_batch_shape_with_recovery(
+            self.store.redactor(),
+            &batch,
+            physical_recovery.as_ref(),
+        )?;
         let injected_commands = batch.injected_commands.clone();
         let checkpoint = state
             .checkpoint
@@ -2148,6 +2212,7 @@ impl EventWriter {
 
         let mut applied_writes = 0usize;
         let mut updated_event_head = previous_event_head.clone();
+        let mut receipt_outcome = None;
         for write in prepared {
             if let Some(event) = write.event {
                 let (previous_digest, previous_count, head_key_ref) =
@@ -2221,13 +2286,20 @@ impl EventWriter {
                 });
             }
             for projection in write.projections {
-                apply_projection(
+                let outcome = apply_projection(
                     self.store.as_ref(),
                     &mut transaction,
                     projection,
                     &event_seqs,
+                    physical_recovery.as_ref(),
                 )
                 .await?;
+                if let Some(outcome) = outcome {
+                    if receipt_outcome.is_some() {
+                        bail!("multiple physical recovery outcomes in one EventBatch");
+                    }
+                    receipt_outcome = Some(outcome);
+                }
             }
             applied_writes = applied_writes.saturating_add(1);
             if fail_after_writes == Some(applied_writes) {
@@ -2272,7 +2344,10 @@ impl EventWriter {
         if let Some((name, true, readiness_path)) = effective_abrupt_failpoint {
             abrupt_transaction_exit(name, "after_commit", readiness_path);
         }
-        Ok(event_seqs)
+        Ok(ApplyBatchOutcome {
+            seqs: event_seqs,
+            receipt_outcome,
+        })
     }
 
     async fn prepare_batch(
@@ -2515,7 +2590,13 @@ impl EventWriter {
                         if let Some(record) = &create_l0_batch {
                             charge_transaction_bytes(
                                 &mut transaction_bytes,
-                                record.id.len().saturating_add(DURABLE_ROW_OVERHEAD_BYTES),
+                                record
+                                    .id
+                                    .len()
+                                    .checked_add(DURABLE_ROW_OVERHEAD_BYTES)
+                                    .ok_or_else(|| {
+                                        anyhow!("L0 batch record byte count overflow")
+                                    })?,
                             )?;
                         }
                         if let Some(batch_id) = &l0_batch_id {
@@ -2834,6 +2915,7 @@ impl EventWriter {
                 },
                 wire_item_index: fragment.wire_item_index,
                 ordinal,
+                provider_origin: assistant.origin.clone(),
                 payload: fragment.payload,
             };
 
@@ -2879,17 +2961,19 @@ impl EventWriter {
         pending_l0_message_ord: &mut i64,
         disposition: L0Disposition,
     ) -> Result<(Option<MemoryBatchRecord>, Option<String>, Option<i64>)> {
-        if !matches!(disposition, L0Disposition::Append) {
+        if disposition != L0Disposition::Append {
             return Ok((None, None, None));
         }
 
         if let Some(batch_id) = pending_l0_batch.clone() {
-            let ord = *pending_l0_message_ord + 1;
+            let ord = pending_l0_message_ord
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("L0 message ordinal overflow"))?;
             *pending_l0_message_ord = ord;
             return Ok((None, Some(batch_id), Some(ord)));
         }
 
-        let row = sqlx::query(
+        let open_batch_id: Option<String> = sqlx::query_scalar(
             "SELECT id FROM memory_batches
              WHERE layer = ? AND state = 'open'
              ORDER BY batch_seq DESC
@@ -2900,40 +2984,48 @@ impl EventWriter {
         .await
         .context("failed to locate open L0 batch")?;
 
-        if let Some(row) = row {
-            let batch_id: String = row.try_get("id")?;
-            let max_ord: i64 = sqlx::query_scalar(
-                "SELECT COALESCE(MAX(ord), 0) FROM memory_batch_messages WHERE batch_id = ?",
-            )
-            .bind(&batch_id)
-            .fetch_one(self.store.pool())
-            .await
-            .context("failed to compute L0 message ord")?;
+        if let Some(batch_id) = open_batch_id {
+            let max_ord: Option<i64> =
+                sqlx::query_scalar("SELECT MAX(ord) FROM memory_batch_messages WHERE batch_id = ?")
+                    .bind(&batch_id)
+                    .fetch_one(self.store.pool())
+                    .await
+                    .context("failed to compute L0 message ordinal")?;
+            let ord = max_ord
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("L0 message ordinal overflow"))?;
             *pending_l0_batch = Some(batch_id.clone());
-            *pending_l0_message_ord = max_ord + 1;
-            return Ok((None, Some(batch_id), Some(*pending_l0_message_ord)));
+            *pending_l0_message_ord = ord;
+            return Ok((None, Some(batch_id), Some(ord)));
         }
 
-        let next_batch_seq: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(batch_seq), 0) + 1 FROM memory_batches WHERE layer = ?",
-        )
-        .bind(MemoryLayer::L0.as_i64())
-        .fetch_one(self.store.pool())
-        .await
-        .context("failed to allocate L0 batch_seq")?;
-        let next_ord: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(ord), 0) + 1 FROM memory_batches WHERE layer = ?",
-        )
-        .bind(MemoryLayer::L0.as_i64())
-        .fetch_one(self.store.pool())
-        .await
-        .context("failed to allocate L0 ord")?;
+        let max_batch_seq: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(batch_seq) FROM memory_batches WHERE layer = ?")
+                .bind(MemoryLayer::L0.as_i64())
+                .fetch_one(self.store.pool())
+                .await
+                .context("failed to read latest L0 batch sequence")?;
+        let batch_seq = max_batch_seq
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("L0 batch sequence overflow"))?;
+        let max_batch_ord: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(ord) FROM memory_batches WHERE layer = ?")
+                .bind(MemoryLayer::L0.as_i64())
+                .fetch_one(self.store.pool())
+                .await
+                .context("failed to read latest L0 batch ordinal")?;
+        let batch_ord = max_batch_ord
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("L0 batch ordinal overflow"))?;
         let batch_id = Uuid::now_v7().to_string();
         let record = MemoryBatchRecord::new(
             &batch_id,
             MemoryLayer::L0,
-            next_ord,
-            next_batch_seq,
+            batch_ord,
+            batch_seq,
             MemoryBatchState::Open,
             0,
             0,
@@ -4211,9 +4303,18 @@ fn verify_digest_bytes(incoming: &[u8], stored: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_batch_shape(
     _redactor: &Redactor,
     batch: &EventBatch,
+) -> Result<Vec<ExpectedInjection>> {
+    validate_batch_shape_with_recovery(_redactor, batch, None)
+}
+
+fn validate_batch_shape_with_recovery(
+    _redactor: &Redactor,
+    batch: &EventBatch,
+    physical_recovery: Option<&PhysicalRecoveryContext<'_>>,
 ) -> Result<Vec<ExpectedInjection>> {
     if batch.writes.is_empty() {
         bail!("EventBatch must contain at least one write");
@@ -4529,9 +4630,16 @@ fn validate_batch_shape(
         }
         for projection in &write.projections {
             if let Projection::PhysicalRecovery(receipt) = projection {
-                receipt.validate()?;
                 if write.event.is_some() {
                     bail!("PhysicalRecovery projection must be eventless");
+                }
+                let Some(ctx) = physical_recovery else {
+                    bail!(
+                        "PhysicalRecovery projection must be applied through EventWriter::apply_physical_recovery"
+                    );
+                };
+                if ctx.receipt != receipt {
+                    bail!("PhysicalRecovery projection disagrees with the bound recovery receipt");
                 }
                 physical_recovery_positions.push(write_position);
             }
@@ -7639,16 +7747,74 @@ async fn load_authenticated_event(
     })
 }
 
+pub(super) async fn authenticate_running_tool_intent(
+    store: &Store,
+    transaction: &mut Transaction<'_, Sqlite>,
+    tool_call_id: &str,
+    command_id: &str,
+    run_id: &str,
+    executor_generation: ProcessGeneration,
+) -> Result<()> {
+    let sequences: Vec<i64> = sqlx::query_scalar(
+        "SELECT seq FROM agent_events
+         WHERE event_type = 'tool_execution_start'
+           AND json_extract(envelope, '$.tool_call_id') = ?
+         ORDER BY seq",
+    )
+    .bind(tool_call_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .context("failed to locate durable ToolExecutionStart evidence")?;
+    if sequences.len() != 1 {
+        bail!(
+            "running tool execution {tool_call_id} requires exactly one durable ToolExecutionStart"
+        );
+    }
+    let event = load_authenticated_event(store, transaction, sequences[0]).await?;
+    if event.kind != "tool_execution_start"
+        || event.envelope.get("tool_call_id").and_then(Value::as_str) != Some(tool_call_id)
+        || event.metadata.command_id.as_deref() != Some(command_id)
+        || event.metadata.run_id.as_deref() != Some(run_id)
+        || event.metadata.tool_state.as_deref() != Some("running")
+        || event.metadata.executor_generation != Some(executor_generation.as_i64())
+    {
+        bail!(
+            "running tool execution {tool_call_id} disagrees with authenticated ToolExecutionStart evidence"
+        );
+    }
+
+    Ok(())
+}
+
 async fn reconstruct_authenticated_checkpoint(store: &Store) -> Result<LifecycleCheckpoint> {
     let mut transaction = store.pool().begin().await?;
-    let event_head = load_verified_event_head_in_transaction(store, &mut transaction).await?;
+    let checkpoint =
+        reconstruct_authenticated_checkpoint_in_transaction(store, &mut transaction).await?;
+    transaction.commit().await?;
+    Ok(checkpoint)
+}
+
+pub(super) async fn authenticate_event_log_snapshot(
+    store: &Store,
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<()> {
+    reconstruct_authenticated_checkpoint_in_transaction(store, transaction)
+        .await
+        .map(drop)
+}
+
+async fn reconstruct_authenticated_checkpoint_in_transaction(
+    store: &Store,
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<LifecycleCheckpoint> {
+    let event_head = load_verified_event_head_in_transaction(store, transaction).await?;
     let mut lifecycle = DurableLifecycleState::default();
     lifecycle.live_runs.extend(
         sqlx::query_scalar::<_, String>(
             "SELECT DISTINCT run_id FROM inbound_commands
              WHERE run_id IS NOT NULL AND status = 'applying' AND run_phase <> 'finished'",
         )
-        .fetch_all(&mut *transaction)
+        .fetch_all(&mut **transaction)
         .await?,
     );
     for row in sqlx::query(
@@ -7657,7 +7823,7 @@ async fn reconstruct_authenticated_checkpoint(store: &Store) -> Result<Lifecycle
            AND run_phase IN ('user_started','user_committed','assistant_started',
                              'hard_steer_requested','cancel_requested')",
     )
-    .fetch_all(&mut *transaction)
+    .fetch_all(&mut **transaction)
     .await?
     {
         let run_id: String = row.try_get("run_id")?;
@@ -7676,7 +7842,7 @@ async fn reconstruct_authenticated_checkpoint(store: &Store) -> Result<Lifecycle
             sqlx::query_scalar("SELECT seq FROM agent_events WHERE seq > ? ORDER BY seq LIMIT ?")
                 .bind(after_seq)
                 .bind(EVENT_CHAIN_VERIFICATION_PAGE_ROWS)
-                .fetch_all(&mut *transaction)
+                .fetch_all(&mut **transaction)
                 .await
                 .context("failed to page durable event history during startup recovery")?;
         if page.is_empty() {
@@ -7690,7 +7856,7 @@ async fn reconstruct_authenticated_checkpoint(store: &Store) -> Result<Lifecycle
                     "durable event chain is not contiguous: expected {expected_seq}, found {seq}"
                 );
             }
-            let event = load_authenticated_event(store, &mut transaction, physical_seq).await?;
+            let event = load_authenticated_event(store, transaction, physical_seq).await?;
             chain_digest = extend_event_chain(
                 &chain_digest,
                 EventChainEntry {
@@ -7728,7 +7894,6 @@ async fn reconstruct_authenticated_checkpoint(store: &Store) -> Result<Lifecycle
                 && head.chain_digest == chain_digest => {}
         Some(_) => bail!("durable event history does not match authenticated head"),
     }
-    transaction.commit().await?;
     Ok(LifecycleCheckpoint {
         event_head,
         lifecycle,
@@ -8576,7 +8741,8 @@ async fn apply_projection(
     transaction: &mut Transaction<'_, Sqlite>,
     projection: PreparedProjection,
     batch_event_seqs: &[u64],
-) -> Result<()> {
+    physical_recovery: Option<&PhysicalRecoveryContext<'_>>,
+) -> Result<Option<ApplyReceiptOutcome>> {
     match projection {
         PreparedProjection::MessageEnd {
             event_seq,
@@ -8659,12 +8825,27 @@ async fn apply_projection(
 
             if l0_disposition == L0Disposition::Append && eviction_footprint_tokens > 0 {
                 let batch_id = l0_batch_id.as_ref().expect("L0 batch id checked above");
+                let delta = sqlite_i64(eviction_footprint_tokens, "eviction_footprint_tokens")?;
+
+                let current: i64 = sqlx::query_scalar(
+                    "SELECT eviction_footprint_tokens FROM memory_batches WHERE id = ?",
+                )
+                .bind(batch_id)
+                .fetch_one(&mut **transaction)
+                .await
+                .context("failed to read memory batch eviction footprint")?;
+                let new = current.checked_add(delta).ok_or_else(|| {
+                    anyhow::anyhow!("memory batch eviction_footprint_tokens overflow")
+                })?;
+                if new < 0 {
+                    bail!("memory batch eviction_footprint_tokens underflow");
+                }
                 sqlx::query(
                     "UPDATE memory_batches
-                     SET eviction_footprint_tokens = eviction_footprint_tokens + ?
+                     SET eviction_footprint_tokens = ?
                      WHERE id = ?",
                 )
-                .bind(i64::try_from(eviction_footprint_tokens).unwrap_or(i64::MAX))
+                .bind(new)
                 .bind(batch_id)
                 .execute(&mut **transaction)
                 .await
@@ -8743,10 +8924,17 @@ async fn apply_projection(
             .await?;
         }
         PreparedProjection::Plain(projection) => {
-            apply_plain_projection(store, transaction, projection, batch_event_seqs).await?;
+            return apply_plain_projection(
+                store,
+                transaction,
+                projection,
+                batch_event_seqs,
+                physical_recovery,
+            )
+            .await;
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 async fn apply_plain_projection(
@@ -8754,7 +8942,8 @@ async fn apply_plain_projection(
     transaction: &mut Transaction<'_, Sqlite>,
     projection: Projection,
     batch_event_seqs: &[u64],
-) -> Result<()> {
+    physical_recovery: Option<&PhysicalRecoveryContext<'_>>,
+) -> Result<Option<ApplyReceiptOutcome>> {
     match projection {
         Projection::MessageEnd { .. } => unreachable!("MessageEnd is prepared separately"),
         Projection::CommandReceived { .. } | Projection::CommandRejected { .. } => {
@@ -8920,11 +9109,27 @@ async fn apply_plain_projection(
             apply_approval_mutation(transaction, mutation).await?;
         }
         Projection::PhysicalRecovery(receipt) => {
-            // apply_in_transaction validates the receipt, rejects logical writes
-            // on replay, and returns AlreadyApplied for idempotent replays.
-            PhysicalRecoveryApplier::new(store)
-                .apply_in_transaction(transaction, &receipt, batch_event_seqs)
+            // Generic apply paths reject PhysicalRecovery before reaching here;
+            // only apply_physical_recovery supplies a bound recovery context.
+            let Some(ctx) = physical_recovery else {
+                bail!(
+                    "PhysicalRecovery projection must be applied through EventWriter::apply_physical_recovery"
+                );
+            };
+            if &receipt != ctx.receipt {
+                bail!("PhysicalRecovery projection disagrees with the bound recovery receipt");
+            }
+            receipt.validate_for(ctx.lease, ctx.fence)?;
+            let outcome = PhysicalRecoveryApplier::new(store)
+                .apply_in_transaction(
+                    transaction,
+                    &receipt,
+                    batch_event_seqs,
+                    ctx.lease,
+                    ctx.fence,
+                )
                 .await?;
+            return Ok(Some(outcome));
         }
         Projection::ProviderContextMutation(_)
         | Projection::MemoryJobUpdate(_)
@@ -8934,7 +9139,7 @@ async fn apply_plain_projection(
         #[cfg(test)]
         Projection::SizePadding(_) => {}
     }
-    Ok(())
+    Ok(None)
 }
 
 async fn verify_source_versions(
@@ -9100,10 +9305,29 @@ async fn apply_memory_batch_mutation(
         None => (None, None, None, None),
     };
 
+    let row = sqlx::query(
+        "SELECT eviction_footprint_tokens
+         FROM memory_batches
+         WHERE id = ? AND version = ? AND state = ?",
+    )
+    .bind(&batch.batch_id)
+    .bind(batch.expected_version)
+    .bind(batch.old_state.as_str())
+    .fetch_optional(&mut **transaction)
+    .await
+    .context("failed to read memory batch for mutation")?
+    .ok_or_else(|| anyhow!("memory batch CAS failed or batch missing"))?;
+    let current_footprint: i64 = row.try_get("eviction_footprint_tokens")?;
+    let new_footprint = current_footprint
+        .checked_add(batch.footprint_delta)
+        .ok_or_else(|| anyhow!("memory batch eviction_footprint_tokens overflow"))?;
+    if new_footprint < 0 {
+        bail!("memory batch eviction_footprint_tokens underflow");
+    }
+
     let result = sqlx::query(
         "UPDATE memory_batches
-         SET state = ?, version = ?, est_tokens = ?,
-             eviction_footprint_tokens = eviction_footprint_tokens + ?,
+         SET state = ?, version = ?, est_tokens = ?, eviction_footprint_tokens = ?,
              summary_key_ref = COALESCE(?, summary_key_ref),
              summary_ciphertext = COALESCE(?, summary_ciphertext),
              summary_projection = COALESCE(?, summary_projection),
@@ -9114,7 +9338,7 @@ async fn apply_memory_batch_mutation(
     .bind(batch.new_state.as_str())
     .bind(new_version)
     .bind(batch.est_tokens)
-    .bind(batch.footprint_delta)
+    .bind(new_footprint)
     .bind(key_ref.as_ref())
     .bind(ciphertext.as_ref())
     .bind(projection.as_ref())
@@ -9381,7 +9605,7 @@ async fn apply_approval_mutation(
     Ok(())
 }
 
-fn require_single_cas(rows_affected: u64, operation: &str) -> Result<()> {
+pub(crate) fn require_single_cas(rows_affected: u64, operation: &str) -> Result<()> {
     if rows_affected != 1 {
         bail!("{operation} CAS expected one row, updated {rows_affected}");
     }
@@ -9406,6 +9630,10 @@ mod tests {
     use sqlx::Row;
 
     use super::*;
+    use super::{
+        L0Disposition, PreparedMemoryBatchMutation, PreparedMemoryJobMutation, PreparedProjection,
+        apply_memory_batch_mutation, apply_memory_job_mutation, apply_projection,
+    };
     use crate::{
         agent::{
             AdmittedCommand, DurableRunBinding, ProjectedProviderEvent, ProviderEventProjector,
@@ -9772,6 +10000,9 @@ mod tests {
                     "tool_call_id":tool_call_id,
                     "tool_name":"test",
                     "args":{},
+                    "command_id":TOOL_OWNER_COMMAND_ID,
+                    "run_id":run_id,
+                    "executor_generation":1,
                     "state":"running"
                 }))
                 .expect("typed tool start"),
@@ -12821,13 +13052,13 @@ mod tests {
     async fn plaintext_secret_never_appears_in_event_or_message_projections() {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
-        let secret = "sk-abcdefghijklmnop";
+        let secret = format!("sk-abcdefghijklmnop github_pat_{}", "x".repeat(82));
         let injection = classified_injection(
             &writer,
             1,
             "00000000-0000-4000-8000-000000000030",
             "message-secret",
-            secret,
+            &secret,
         )
         .await;
         writer
@@ -12835,7 +13066,7 @@ mod tests {
                 writes: injection_writes(
                     "00000000-0000-4000-8000-000000000030",
                     "message-secret",
-                    secret,
+                    &secret,
                 ),
                 injected_commands: vec![injection],
             })
@@ -12851,7 +13082,11 @@ mod tests {
         .expect("read projections");
         for column in ["envelope", "payload", "search_text"] {
             let value: String = row.get(column);
-            assert!(!value.contains(secret), "{column} leaked plaintext secret");
+            assert!(!value.contains(&secret), "{column} leaked plaintext secret");
+            assert!(
+                !value.contains("github_pat_"),
+                "{column} leaked GitHub token prefix"
+            );
         }
     }
 
@@ -19372,6 +19607,7 @@ mod tests {
                 &scenario,
                 boundary == "after_commit",
                 &readiness_path,
+                None,
             )
             .await
             .expect("abrupt failpoint must not return");
@@ -21036,7 +21272,7 @@ mod tests {
             .await
             .expect("start tool");
 
-        let lease = test_lease(1);
+        let lease = test_lease(2);
         let fence = test_fence(&lease);
         match store.hydrate(&lease, &fence).await.unwrap() {
             HydrationOutcome::RecoveryRequired(intents) => {
@@ -21044,9 +21280,57 @@ mod tests {
                 assert_eq!(intents[0].tool_call_id, tool_call_id);
                 assert_eq!(intents[0].command_id, TOOL_OWNER_COMMAND_ID);
                 assert_eq!(intents[0].run_id, run_id);
+                assert_eq!(intents[0].executor_generation, test_process_generation(1));
             }
             HydrationOutcome::Complete(_) => panic!("running tool must keep boot fail-closed"),
         }
+
+        sqlx::query(
+            "UPDATE tool_executions SET executor_generation = executor_generation + 1
+             WHERE tool_call_id = ?",
+        )
+        .bind(tool_call_id)
+        .execute(store.pool())
+        .await
+        .expect("tamper running projection attestation");
+        let error = store
+            .hydrate(&lease, &fence)
+            .await
+            .expect_err("tampered running projection must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("authenticated ToolExecutionStart")
+        );
+
+        sqlx::query(
+            "UPDATE tool_executions SET executor_generation = executor_generation - 1
+             WHERE tool_call_id = ?",
+        )
+        .bind(tool_call_id)
+        .execute(store.pool())
+        .await
+        .expect("restore running projection attestation");
+        sqlx::query(
+            "DELETE FROM agent_events
+             WHERE event_type = 'tool_execution_start'
+               AND json_extract(envelope, '$.tool_call_id') = ?",
+        )
+        .bind(tool_call_id)
+        .execute(store.pool())
+        .await
+        .expect("remove durable start evidence");
+        let error = store
+            .hydrate(&lease, &fence)
+            .await
+            .expect_err("orphan running projection must fail closed");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("durable event history")
+                || rendered.contains("durable event chain")
+                || rendered.contains("exactly one durable"),
+            "{rendered}"
+        );
     }
 
     #[tokio::test]
@@ -21100,8 +21384,7 @@ mod tests {
         assistant.origin.protocol = ApiProtocol::OpenAiResponses;
         let message_id = "assistant-reasoning-hydrate";
         // Persist deliberately out of wire order. Hydration must reconstruct
-        // the provider send order by `(message_seq, wire_item_index, ordinal)`
-        // and must leave native compaction unanchored.
+        // canonical order by `(COALESCE(message_seq, coverage_through_seq), wire_item_index, item_ordinal, id)`.
         let fragments = vec![
             ProviderContextFragment {
                 wire_item_index: Some(2),
@@ -21215,18 +21498,18 @@ mod tests {
                     matches!(assistant, ContextMessage::Persisted { message, .. } if matches!(message, Message::Assistant(_))),
                     "hydrated assistant must be an Assistant message"
                 );
-                assert_eq!(state.provider_context.len(), 3);
+                assert_eq!(state.provider_context.len(), 2);
                 assert_eq!(
                     state
                         .provider_context
                         .iter()
                         .map(|item| item.wire_item_index)
                         .collect::<Vec<_>>(),
-                    vec![Some(1), Some(2), None],
-                    "hydration must restore wire-slot order and append the native window"
+                    vec![Some(1), Some(2)],
+                    "anchored reasoning must be reconstructed in canonical wire order"
                 );
                 assert!(
-                    state.provider_context[..2].iter().all(|item| {
+                    state.provider_context.iter().all(|item| {
                         item.origin_message
                             .as_ref()
                             .is_some_and(|anchor| anchor.message_id == message_id)
@@ -21236,13 +21519,6 @@ mod tests {
                             )
                     }),
                     "reasoning must remain anchored to its persisted assistant"
-                );
-                assert!(
-                    matches!(
-                        &state.provider_context[2].payload,
-                        ProviderContextPayload::OpenAiCompactedWindow { .. }
-                    ) && state.provider_context[2].origin_message.is_none(),
-                    "native compaction must not acquire an assistant anchor"
                 );
             }
             HydrationOutcome::RecoveryRequired(_) => panic!("clean assistant turn must complete"),
@@ -21390,6 +21666,51 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn generic_apply_rejects_unbound_physical_recovery_but_dedicated_apply_replays() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let run_id = "run-1";
+        let tool_call_id = "tool-1";
+        let (lease, fence) = t17_setup_running_tool(&store, &writer, run_id, tool_call_id).await;
+        let (batch, receipt) =
+            t17_physical_recovery_batch(&store, run_id, tool_call_id, &lease, &fence).await;
+
+        let error = writer
+            .apply(batch.clone())
+            .await
+            .expect_err("generic apply must not admit an unbound physical recovery receipt");
+        assert!(
+            format!("{error:#}").contains(
+                "PhysicalRecovery projection must be applied through EventWriter::apply_physical_recovery"
+            ),
+            "{error:#}"
+        );
+
+        let (outcome, seqs) = writer
+            .apply_physical_recovery(&lease, &fence, receipt.clone(), batch)
+            .await
+            .expect("dedicated physical recovery apply must accept the bound receipt");
+        assert_eq!(outcome, ApplyReceiptOutcome::Applied);
+        assert_eq!(seqs.len(), 3);
+
+        let (outcome, seqs) = writer
+            .apply_physical_recovery(
+                &lease,
+                &fence,
+                receipt,
+                EventBatch {
+                    writes: Vec::new(),
+                    injected_commands: Vec::new(),
+                },
+            )
+            .await
+            .expect("dedicated physical recovery replay must be idempotent");
+        assert_eq!(outcome, ApplyReceiptOutcome::AlreadyApplied);
+        assert!(seqs.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     #[ignore = "subprocess entry point for T17 abrupt transaction tests"]
     async fn t17_logical_suffix_transaction_child() {
         let scenario = std::env::var("SUMI_T17_SCENARIO").expect("child scenario environment");
@@ -21408,14 +21729,20 @@ mod tests {
         let run_id = "run-1";
         let tool_call_id = "tool-1";
         let (lease, fence) = t17_setup_running_tool(&store, &writer, run_id, tool_call_id).await;
-        let (batch, _) =
+        let (batch, receipt) =
             t17_physical_recovery_batch(&store, run_id, tool_call_id, &lease, &fence).await;
+        let physical_recovery = Some(PhysicalRecoveryContext {
+            lease: &lease,
+            fence: &fence,
+            receipt: &receipt,
+        });
         writer
             .apply_with_abrupt_transaction_failpoint(
                 batch,
                 &scenario,
                 boundary == "after_commit",
                 &readiness_path,
+                physical_recovery,
             )
             .await
             .expect("abrupt failpoint must not return");
@@ -21626,5 +21953,296 @@ mod tests {
                 .await
                 .expect("remove T17 fixture");
         }
+    }
+
+    #[tokio::test]
+    async fn message_end_eviction_footprint_overflow_fails_closed() {
+        let store = test_store().await;
+        let key = store
+            .conversation_key(DataKeyPurpose::Transcript)
+            .await
+            .expect("mint transcript key");
+
+        use sqlx::Connection as _;
+        let mut conn = store.pool().acquire().await.expect("acquire connection");
+        let mut transaction = conn.begin().await.expect("begin transaction");
+
+        sqlx::query(
+            "INSERT INTO memory_batches(
+                id, layer, ord, batch_seq, version, state, est_tokens,
+                eviction_footprint_tokens, summary_key_ref, summary_ciphertext,
+                summary_projection, summary_redaction_version, updated_at
+             ) VALUES(?, 0, 0, 0, 1, 'open', 0, ?, NULL, NULL, NULL, NULL, ?)",
+        )
+        .bind("batch-1")
+        .bind(i64::MAX)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *transaction)
+        .await
+        .expect("seed batch at max footprint");
+
+        let projection = PreparedProjection::MessageEnd {
+            event_seq: 1,
+            message_id: "msg-1".to_owned(),
+            role: "assistant",
+            raw_key_ref: key.key_ref.clone(),
+            raw_key_proof: vec![],
+            raw_ciphertext: vec![0],
+            payload: "{}".to_owned(),
+            search_text: "".to_owned(),
+            redaction_version: 1,
+            interrupted: false,
+            l0_disposition: L0Disposition::Append,
+            provider_context: vec![],
+            provider_context_key_ref: None,
+            provider_context_key_proof: None,
+            eviction_footprint_tokens: 1,
+            create_l0_batch: None,
+            l0_batch_id: Some("batch-1".to_owned()),
+            l0_batch_message_ord: Some(1),
+        };
+
+        let error = apply_projection(&store, &mut transaction, projection, &[], None)
+            .await
+            .expect_err("eviction footprint overflow must fail closed");
+        assert!(error.to_string().contains("overflow"), "{error:#}");
+        transaction
+            .rollback()
+            .await
+            .expect("rollback test fixture transaction");
+    }
+
+    #[tokio::test]
+    async fn memory_job_terminal_clears_lease_until() {
+        let store = test_store().await;
+        let lease = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO memory_jobs(
+                id, kind, batch_seq, source_ids, source_versions, status, lease_until,
+                attempts, created_at, updated_at
+             ) VALUES('lease-job', 'compact', 1, '[]', '{}', 'running', ?, 1, ?, ?)",
+        )
+        .bind(&lease)
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(store.pool())
+        .await
+        .expect("insert running job with lease");
+
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
+        apply_memory_job_mutation(
+            &mut transaction,
+            PreparedMemoryJobMutation {
+                job_id: "lease-job".to_owned(),
+                expected_status: "running",
+                new_status: "failed",
+                attempts: 1,
+                attempts_delta: 0,
+                new_lease_until: None,
+                expected_lease_until: Some(lease.clone()),
+                source_versions: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("terminal transition must clear lease");
+        transaction.commit().await.expect("commit");
+
+        let row = sqlx::query("SELECT status, lease_until FROM memory_jobs WHERE id = ?")
+            .bind("lease-job")
+            .fetch_one(store.pool())
+            .await
+            .expect("load job");
+        assert_eq!(row.try_get::<String, _>("status").unwrap(), "failed");
+        assert!(
+            row.try_get::<Option<String>, _>("lease_until")
+                .unwrap()
+                .is_none(),
+            "terminal job must have NULL lease_until"
+        );
+
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
+        let error = apply_memory_job_mutation(
+            &mut transaction,
+            PreparedMemoryJobMutation {
+                job_id: "lease-job".to_owned(),
+                expected_status: "failed",
+                new_status: "applied",
+                attempts: 1,
+                attempts_delta: 0,
+                new_lease_until: None,
+                expected_lease_until: Some(lease),
+                source_versions: None,
+                result: None,
+            },
+        )
+        .await
+        .expect_err("stale lease CAS must fail");
+        assert!(
+            error.to_string().contains("CAS expected one row"),
+            "{error:#}"
+        );
+        transaction.rollback().await.expect("rollback");
+    }
+
+    #[tokio::test]
+    async fn memory_batch_mutation_rejects_footprint_overflow_and_underflow() {
+        let store = test_store().await;
+
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
+        sqlx::query(
+            "INSERT INTO memory_batches(
+                id, layer, ord, batch_seq, version, state, est_tokens,
+                eviction_footprint_tokens, updated_at
+             ) VALUES('overflow-batch', 0, 0, 0, 1, 'open', 0, ?, ?)",
+        )
+        .bind(i64::MAX)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *transaction)
+        .await
+        .expect("seed batch at max footprint");
+
+        let error = apply_memory_batch_mutation(
+            &mut transaction,
+            PreparedMemoryBatchMutation {
+                batch_id: "overflow-batch".to_owned(),
+                expected_version: 1,
+                old_state: MemoryBatchState::Open,
+                new_state: MemoryBatchState::Open,
+                summary: None,
+                est_tokens: 0,
+                footprint_delta: 1,
+                delete_membership: false,
+            },
+        )
+        .await
+        .expect_err("overflow must fail closed");
+        assert!(error.to_string().contains("overflow"), "{error:#}");
+        transaction.rollback().await.expect("rollback");
+
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
+        sqlx::query(
+            "INSERT INTO memory_batches(
+                id, layer, ord, batch_seq, version, state, est_tokens,
+                eviction_footprint_tokens, updated_at
+             ) VALUES('underflow-batch', 0, 0, 0, 1, 'open', 0, 1, ?)",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *transaction)
+        .await
+        .expect("seed batch with small footprint");
+
+        apply_memory_batch_mutation(
+            &mut transaction,
+            PreparedMemoryBatchMutation {
+                batch_id: "underflow-batch".to_owned(),
+                expected_version: 1,
+                old_state: MemoryBatchState::Open,
+                new_state: MemoryBatchState::Open,
+                summary: None,
+                est_tokens: 0,
+                footprint_delta: -1,
+                delete_membership: false,
+            },
+        )
+        .await
+        .expect("decrement to zero must succeed");
+        let footprint: i64 =
+            sqlx::query_scalar("SELECT eviction_footprint_tokens FROM memory_batches WHERE id = ?")
+                .bind("underflow-batch")
+                .fetch_one(&mut *transaction)
+                .await
+                .expect("read footprint");
+        assert_eq!(footprint, 0);
+
+        let error = apply_memory_batch_mutation(
+            &mut transaction,
+            PreparedMemoryBatchMutation {
+                batch_id: "underflow-batch".to_owned(),
+                expected_version: 1,
+                old_state: MemoryBatchState::Open,
+                new_state: MemoryBatchState::Open,
+                summary: None,
+                est_tokens: 0,
+                footprint_delta: -1,
+                delete_membership: false,
+            },
+        )
+        .await
+        .expect_err("underflow must fail closed");
+        assert!(error.to_string().contains("underflow"), "{error:#}");
+        transaction.rollback().await.expect("rollback");
+    }
+
+    #[tokio::test]
+    async fn message_end_creates_l0_membership_and_attributes_footprint() {
+        let store = test_store().await;
+        let key = store
+            .conversation_key(DataKeyPurpose::Transcript)
+            .await
+            .expect("mint transcript key");
+
+        sqlx::query(
+            "INSERT INTO memory_batches(
+                id, layer, ord, batch_seq, version, state, est_tokens,
+                eviction_footprint_tokens, updated_at
+             ) VALUES('l0-batch', 0, 0, 0, 1, 'open', 0, 0, ?)",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .execute(store.pool())
+        .await
+        .expect("seed open L0 batch");
+
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
+        let projection = PreparedProjection::MessageEnd {
+            event_seq: 1,
+            message_id: "msg-l0".to_owned(),
+            role: "assistant",
+            raw_key_ref: key.key_ref.clone(),
+            raw_key_proof: vec![],
+            raw_ciphertext: vec![0],
+            payload: "{}".to_owned(),
+            search_text: "".to_owned(),
+            redaction_version: 1,
+            interrupted: false,
+            l0_disposition: L0Disposition::Append,
+            create_l0_batch: None,
+            l0_batch_id: Some("l0-batch".to_owned()),
+            l0_batch_message_ord: Some(0),
+            provider_context: vec![],
+            provider_context_key_ref: None,
+            provider_context_key_proof: None,
+            eviction_footprint_tokens: 42,
+        };
+        apply_projection(&store, &mut transaction, projection, &[], None)
+            .await
+            .expect("attribute footprint to open L0 batch");
+        transaction.commit().await.expect("commit");
+
+        let membership =
+            sqlx::query("SELECT batch_id FROM memory_batch_messages WHERE message_id = ?")
+                .bind("msg-l0")
+                .fetch_optional(store.pool())
+                .await
+                .expect("load membership");
+        assert!(
+            membership.is_some(),
+            "message must be linked to an L0 batch"
+        );
+        assert_eq!(
+            membership
+                .unwrap()
+                .try_get::<String, _>("batch_id")
+                .unwrap(),
+            "l0-batch"
+        );
+
+        let footprint: i64 =
+            sqlx::query_scalar("SELECT eviction_footprint_tokens FROM memory_batches WHERE id = ?")
+                .bind("l0-batch")
+                .fetch_one(store.pool())
+                .await
+                .expect("read batch footprint");
+        assert_eq!(footprint, 42);
     }
 }

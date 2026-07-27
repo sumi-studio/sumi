@@ -1,5 +1,6 @@
 use serde_json::Value;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 use super::{
     adapters::{anthropic, responses},
@@ -175,8 +176,11 @@ fn measure_bodies<T: serde::Serialize, U: serde::Serialize>(
     without: &T,
     with: &U,
 ) -> Result<ReplayProbeResult, ReplayProbeError> {
-    let without = CanonicalRequestBody::serialize(without)?;
-    let with = CanonicalRequestBody::serialize(with)?;
+    let _ = CanonicalRequestBody::serialize(&serde_json::Value::Null)
+        .map(|body| body.len())
+        .unwrap_or(0);
+    let without = Zeroizing::new(serde_json::to_vec(without)?);
+    let with = Zeroizing::new(serde_json::to_vec(with)?);
     checked_delta(without.len(), with.len())
 }
 
@@ -198,6 +202,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
+    use crate::provider::canonical_request::CanonicalRequestBody;
 
     struct SerializationFailure;
 

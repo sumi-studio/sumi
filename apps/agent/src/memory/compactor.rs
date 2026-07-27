@@ -153,6 +153,7 @@ impl CompactError {
 /// use sumi_agent_doctest::memory::compactor::CompactionInput;
 /// use sumi_agent_doctest::provider::types::{
 ///     ApiProtocol, ProviderContextAnchor, ProviderContextItem, ProviderContextPayload,
+///     ProviderOrigin,
 /// };
 ///
 /// let item = ProviderContextItem {
@@ -162,6 +163,11 @@ impl CompactError {
 ///     }),
 ///     wire_item_index: None,
 ///     ordinal: 0,
+///     provider_origin: ProviderOrigin {
+///         provider_instance_id: "doctest".into(),
+///         protocol: ApiProtocol::OpenAiResponses,
+///         model: "doctest".into(),
+///     },
 ///     payload: ProviderContextPayload::EncryptedReasoning {
 ///         protocol: ApiProtocol::OpenAiResponses,
 ///         item: serde_json::Value::String("secret".into()),
@@ -2056,6 +2062,13 @@ mod tests {
         }
     }
 
+    fn assistant_origin(assistant: &PublicMessage) -> ProviderOrigin {
+        match assistant {
+            PublicMessage::Assistant(a) => a.origin.clone(),
+            _ => panic!("expected assistant message"),
+        }
+    }
+
     fn args(value: Value) -> ValidatedToolArguments {
         serde_json::from_value(value).expect("object arguments")
     }
@@ -2174,6 +2187,7 @@ mod tests {
                 }),
                 wire_item_index: Some(0),
                 ordinal: 0,
+                provider_origin: origin(),
                 payload: ProviderContextPayload::EncryptedReasoning {
                     protocol: ApiProtocol::OpenAiResponses,
                     item: json!({"sentinel": ENCRYPTED_REASONING_SENTINEL}),
@@ -2186,6 +2200,7 @@ mod tests {
                 }),
                 wire_item_index: Some(1),
                 ordinal: 0,
+                provider_origin: origin(),
                 payload: ProviderContextPayload::OpenAiCompactedWindow {
                     items: vec![json!({"sentinel": OPENAI_COMPACTED_SENTINEL})],
                     coverage: NativeCompactionCoverage {
@@ -2201,6 +2216,7 @@ mod tests {
                 }),
                 wire_item_index: Some(2),
                 ordinal: 0,
+                provider_origin: origin(),
                 payload: ProviderContextPayload::AnthropicCompaction {
                     block: json!({"sentinel": ANTHROPIC_COMPACTION_SENTINEL}),
                     coverage: NativeCompactionCoverage {
@@ -3729,7 +3745,8 @@ mod tests {
             interrupted: false,
             timestamp: timestamp(),
         });
-        let (source_id, _target_id) = insert_l0_batch(&store, &[assistant]).await;
+        let (source_id, _target_id) =
+            insert_l0_batch(&store, std::slice::from_ref(&assistant)).await;
         let message_id = format!("{source_id}-msg-0");
         let message_seq = 100u64;
 
@@ -3747,6 +3764,7 @@ mod tests {
             }),
             wire_item_index: Some(0),
             ordinal: 1,
+            provider_origin: assistant_origin(&assistant),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::OpenAiResponses,
                 item: json!({
@@ -4001,7 +4019,8 @@ mod tests {
             interrupted: false,
             timestamp: timestamp(),
         });
-        let (source_id, _target_id) = insert_l0_batch(&store, &[assistant]).await;
+        let (source_id, _target_id) =
+            insert_l0_batch(&store, std::slice::from_ref(&assistant)).await;
         let message_id = format!("{source_id}-msg-0");
         let message_seq = 100u64;
 
@@ -4017,6 +4036,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 1,
+            provider_origin: assistant_origin(&assistant),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({"type": "message", "role": "assistant", "content": []})],
                 coverage: NativeCompactionCoverage {
@@ -4044,6 +4064,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 1,
+            provider_origin: assistant_origin(&assistant),
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({"type": "message", "role": "assistant", "content": []})],
                 coverage: NativeCompactionCoverage {
@@ -4125,7 +4146,8 @@ mod tests {
             interrupted: false,
             timestamp: timestamp(),
         });
-        let (source_id, _target_id) = insert_l0_batch(&store, &[assistant]).await;
+        let (source_id, _target_id) =
+            insert_l0_batch(&store, std::slice::from_ref(&assistant)).await;
         let message_id = format!("{source_id}-msg-0");
         let message_seq = 100u64;
 
@@ -4141,6 +4163,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 1,
+            provider_origin: assistant_origin(&assistant),
             payload: ProviderContextPayload::AnthropicCompaction {
                 block: json!({"type": "compaction", "content": "anthropic summary"}),
                 coverage: NativeCompactionCoverage {
@@ -4168,6 +4191,7 @@ mod tests {
             origin_message: None,
             wire_item_index: None,
             ordinal: 1,
+            provider_origin: assistant_origin(&assistant),
             payload: ProviderContextPayload::AnthropicCompaction {
                 block: json!({"type": "compaction", "content": "anthropic summary"}),
                 coverage: NativeCompactionCoverage {
