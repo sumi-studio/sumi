@@ -16,10 +16,10 @@ use super::supervisor::TerminalGatewayClosed;
 use super::wire::to_wire_frame;
 use super::{
     AgentHello, ApiHello, CommandDigestFactory, CommandEnvelope, CommandId, CommandRejectReason,
-    ConnectorError, Gateway, GatewayClosed, GatewayConnector, GatewayCredential, GatewayReader,
-    GatewayWriter, HelloError, InboundCommand, IncrementalCommandDigest, KeyedCommandDigest,
-    MAX_FRAME_BYTES, OutboundFrame, OversizedFrameError, RejectedCommandPayload,
-    SensitiveCommandPayload,
+    ConnectorError, DeliveryAuthorization, Gateway, GatewayClosed, GatewayConnector,
+    GatewayCredential, GatewayReader, GatewayWriter, HelloError, InboundCommand,
+    IncrementalCommandDigest, KeyedCommandDigest, MAX_FRAME_BYTES, OutboundFrame,
+    OversizedFrameError, RejectedCommandPayload, SensitiveCommandPayload,
 };
 
 const MAX_USER_COMMAND_BYTES: usize = 1024 * 1024;
@@ -233,6 +233,7 @@ pub(crate) fn stdio_hello(hello: &AgentHello) -> std::result::Result<ApiHello, H
         accepted_generation: hello.generation,
         last_received_event_seq: hello.last_sent_event_seq,
         next_command_seq,
+        delivery_authorization: DeliveryAuthorization::Raw,
     })
 }
 
@@ -1770,7 +1771,7 @@ mod tests {
         );
         let mut connector = SingleConnectionConnector::new(gateway);
 
-        let credential = GatewayCredential::new("test-token");
+        let credential = GatewayCredential::new("test-token", DeliveryAuthorization::Raw);
         assert!(connector.connect(credential.clone()).await.is_ok());
 
         let result = connector.connect(credential).await;

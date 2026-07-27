@@ -7,10 +7,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use sqlx::Row;
 use tokio::sync::{mpsc, watch};
+use tokio_util::sync::CancellationToken;
 
 use super::{
-    CommandCursors, CredentialProvider, DeliveryEpoch, DurableSource, EventCursors, EventSender,
-    GatewayCredential, HydrationLatch, HydrationReady, OutboundFrame,
+    CommandCursors, CredentialProvider, DeliveryAuthorization, DeliveryEpoch, DeliveryEpochRuntime,
+    DurableSource, EventCursors, EventSender, GatewayCredential, HydrationLatch, HydrationReady,
+    OutboundFrame,
 };
 use crate::gateway::Envelope;
 use crate::runtime::contracts::ProcessGeneration;
@@ -87,9 +89,8 @@ impl HydrationLatch for T17HydrationLatch {
 #[derive(Clone)]
 pub struct T17StoreAdapter {
     store: Arc<Store>,
-    mode: DeliveryMode,
-    pump: Arc<tokio::sync::Mutex<DeliveryPump>>,
-    delivery_rx: Arc<Mutex<Option<mpsc::Receiver<DeliveryFrame>>>>,
+    authorization: Option<DeliveryAuthorization>,
+    pump: Arc<tokio::sync::Mutex<Option<DeliveryPump>>>,
     #[cfg(test)]
     replay_page_lengths: Arc<Mutex<Vec<usize>>>,
 }
@@ -101,29 +102,44 @@ impl fmt::Debug for T17StoreAdapter {
 }
 
 impl T17StoreAdapter {
-    /// `mode` must come from the authenticated connection authorization. It is
-    /// explicit so a projection-only connection can never silently inherit raw
-    /// decryption authority.
-    pub(crate) fn new(store: Arc<Store>, mode: DeliveryMode) -> Self {
-        let (channel, delivery_rx) = DeliveryChannelBuilder::with_mode(mode).build();
+    /// Delivery authorization is deliberately absent here. The supervisor
+    /// binds it from each authenticated credential before replay or install.
+    pub(crate) fn new(store: Arc<Store>) -> Self {
         Self {
-            store: store.clone(),
-            mode,
-            pump: Arc::new(tokio::sync::Mutex::new(DeliveryPump::new(store, channel))),
-            delivery_rx: Arc::new(Mutex::new(Some(delivery_rx))),
+            store,
+            authorization: None,
+            pump: Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(test)]
             replay_page_lengths: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    fn start_forwarder(&self, sink: EventSender) {
-        let Some(mut rx) = self.delivery_rx.lock().unwrap().take() else {
-            return;
-        };
+    fn start_forwarder(
+        &self,
+        mut rx: mpsc::Receiver<DeliveryFrame>,
+        sink: EventSender,
+        mode: DeliveryMode,
+        cancel: CancellationToken,
+        failure_tx: mpsc::UnboundedSender<String>,
+    ) -> tokio::task::JoinHandle<()> {
         let conversation_id = self.store.scope().conversation_id.clone();
-        let mode = self.mode;
         tokio::spawn(async move {
-            while let Some(frame) = rx.recv().await {
+            loop {
+                let frame = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    frame = rx.recv() => match frame {
+                        Some(frame) => frame,
+                        None => {
+                            if !cancel.is_cancelled() {
+                                let _ = failure_tx.send(
+                                    "delivery channel closed before epoch cancellation".to_owned()
+                                );
+                            }
+                            break;
+                        }
+                    }
+                };
                 let (epoch, seq, event) = match (mode, frame) {
                     (
                         DeliveryMode::Raw,
@@ -159,21 +175,22 @@ impl T17StoreAdapter {
                             .context("serialize volatile T17 delivery event"),
                     ),
                     (DeliveryMode::RedactionOnly, DeliveryFrame::Volatile { .. }) => {
-                        tracing::error!(
-                            "redaction-only T17 delivery received a forbidden volatile frame"
-                        );
+                        let _ = failure_tx
+                            .send("redaction-only delivery received a volatile frame".to_owned());
                         break;
                     }
                     (DeliveryMode::Raw, DeliveryFrame::Durable { .. })
                     | (DeliveryMode::RedactionOnly, DeliveryFrame::Durable { .. }) => {
-                        tracing::error!("T17 gateway delivery frame did not match authorization");
+                        let _ = failure_tx
+                            .send("delivery frame did not match epoch authorization".to_owned());
                         break;
                     }
                 };
                 let event = match event {
                     Ok(event) => event,
                     Err(error) => {
-                        tracing::error!(%error, "failed to project T17 delivery event");
+                        let _ =
+                            failure_tx.send(format!("failed to project delivery event: {error:#}"));
                         break;
                     }
                 };
@@ -184,26 +201,48 @@ impl T17StoreAdapter {
                         event,
                     },
                 };
-                if sink.send((epoch, outbound)).await.is_err() {
-                    break;
+                let send = sink.send((epoch, outbound));
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    result = send => {
+                        if result.is_err() {
+                            let _ = failure_tx.send("supervisor event sink closed".to_owned());
+                            break;
+                        }
+                    }
                 }
             }
-        });
+        })
     }
 
+    /// Called by T26's ordered post-commit pump task. EventWriter must not
+    /// await this bounded delivery path inside its database transaction.
     pub(crate) async fn on_durable_committed(&self, seq: u64) -> Result<()> {
-        self.pump.lock().await.on_durable_committed(seq).await
+        let mut pump = self.pump.lock().await;
+        let Some(pump) = pump.as_mut() else {
+            return Ok(());
+        };
+        pump.on_durable_committed(seq).await
     }
 
     /// Deliver an Online-only delta through the same pump/FIFO as durable
     /// notifications. Redaction-only authorization suppresses it in the pump.
     pub(crate) async fn on_volatile(&self, event: crate::agent::AgentEvent) -> Result<()> {
-        self.pump.lock().await.on_volatile(event).await
+        let mut pump = self.pump.lock().await;
+        let Some(pump) = pump.as_mut() else {
+            return Ok(());
+        };
+        pump.on_volatile(event).await
     }
 
     #[cfg(test)]
     pub(crate) async fn active_delivery_epoch(&self) -> Option<DeliveryEpoch> {
-        self.pump.lock().await.epoch().copied()
+        self.pump
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|pump| pump.epoch().copied())
     }
 
     #[cfg(test)]
@@ -245,6 +284,12 @@ async fn projected_events_after(
 
 #[async_trait]
 impl DurableSource for T17StoreAdapter {
+    fn bind_delivery_authorization(&self, authorization: DeliveryAuthorization) -> Result<Self> {
+        let mut bound = self.clone();
+        bound.authorization = Some(authorization);
+        Ok(bound)
+    }
+
     async fn event_cursor(&self) -> Result<EventCursors> {
         Ok(EventCursors {
             last_sent: current_event_head_seq(self.store.pool()).await?,
@@ -252,8 +297,11 @@ impl DurableSource for T17StoreAdapter {
     }
 
     async fn events_after(&self, after_seq: u64, limit: usize) -> Result<Vec<OutboundFrame>> {
-        let page: Vec<_> = match self.mode {
-            DeliveryMode::Raw => raw_events_after(&self.store, after_seq, limit)
+        let authorization = self
+            .authorization
+            .context("delivery source used before authenticated authorization was bound")?;
+        let page: Vec<_> = match authorization {
+            DeliveryAuthorization::Raw => raw_events_after(&self.store, after_seq, limit)
                 .await?
                 .into_iter()
                 .map(|(seq, event)| {
@@ -267,20 +315,22 @@ impl DurableSource for T17StoreAdapter {
                     })
                 })
                 .collect::<Result<_>>()?,
-            DeliveryMode::RedactionOnly => projected_events_after(&self.store, after_seq, limit)
-                .await?
-                .into_iter()
-                .map(|(seq, projection)| {
-                    Ok(OutboundFrame::Event {
-                        envelope: Envelope {
-                            seq: Some(seq),
-                            conversation_id: self.store.scope().conversation_id.clone(),
-                            event: serde_json::from_str(&projection)
-                                .context("parse projected durable T17 event for gateway")?,
-                        },
+            DeliveryAuthorization::RedactionOnly => {
+                projected_events_after(&self.store, after_seq, limit)
+                    .await?
+                    .into_iter()
+                    .map(|(seq, projection)| {
+                        Ok(OutboundFrame::Event {
+                            envelope: Envelope {
+                                seq: Some(seq),
+                                conversation_id: self.store.scope().conversation_id.clone(),
+                                event: serde_json::from_str(&projection)
+                                    .context("parse projected durable T17 event for gateway")?,
+                            },
+                        })
                     })
-                })
-                .collect::<Result<_>>()?,
+                    .collect::<Result<_>>()?
+            }
         };
         #[cfg(test)]
         self.replay_page_lengths.lock().unwrap().push(page.len());
@@ -328,19 +378,47 @@ impl DurableSource for T17StoreAdapter {
         epoch: DeliveryEpoch,
         _catch_up_from_seq: u64,
         sink: EventSender,
-    ) -> Result<()> {
-        self.start_forwarder(sink);
-        self.pump.lock().await.install_epoch(epoch);
-        Ok(())
+        cancel: CancellationToken,
+    ) -> Result<Option<DeliveryEpochRuntime>> {
+        let authorization = self
+            .authorization
+            .context("delivery epoch installed before authenticated authorization was bound")?;
+        let mode = match authorization {
+            DeliveryAuthorization::Raw => DeliveryMode::Raw,
+            DeliveryAuthorization::RedactionOnly => DeliveryMode::RedactionOnly,
+        };
+        let (channel, delivery_rx) = DeliveryChannelBuilder::with_mode(mode).build();
+        let (failure_tx, failure_rx) = mpsc::unbounded_channel();
+        let mut pump = DeliveryPump::new(self.store.clone(), channel);
+        pump.install_supervised_epoch(epoch, failure_tx.clone());
+        let mut slot = self.pump.lock().await;
+        if let Some(current) = slot.as_ref()
+            && current.epoch().is_some()
+        {
+            bail!("delivery epoch installed while another epoch is active");
+        }
+        *slot = Some(pump);
+        drop(slot);
+        let task = self.start_forwarder(delivery_rx, sink, mode, cancel, failure_tx);
+        Ok(Some(DeliveryEpochRuntime::new(failure_rx, task)))
     }
 
     async fn invalidate_delivery_epoch(&self, epoch: DeliveryEpoch) -> Result<()> {
-        if !self.pump.lock().await.invalidate_epoch(epoch) {
+        let mut slot = self.pump.lock().await;
+        let Some(pump) = slot.as_mut() else {
+            return Ok(());
+        };
+        if pump.epoch().is_none() {
+            *slot = None;
+            return Ok(());
+        }
+        if !pump.invalidate_epoch(epoch) {
             return Err(anyhow!(
                 "T17 DeliveryPump epoch invalidation mismatch for {}",
                 epoch.as_u64()
             ));
         }
+        *slot = None;
         Ok(())
     }
 }
@@ -354,7 +432,8 @@ impl CredentialProvider for T26CredentialProvider {
     async fn fresh_credential(&mut self) -> Result<GatewayCredential> {
         bail!(
             "T26 integration seam: CredentialProvider is not wired. \
-             Contract: read the current short-lived agent token from the control-plane source."
+             Contract: read the current short-lived agent token and its typed delivery \
+             authorization from the same authenticated control-plane credential."
         )
     }
 }

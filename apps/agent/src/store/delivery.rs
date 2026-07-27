@@ -88,7 +88,10 @@ impl DeliveryChannelBuilder {
 
 enum PumpState {
     Idle,
-    Online { epoch: DeliveryEpoch },
+    Online {
+        epoch: DeliveryEpoch,
+        failure_tx: Option<mpsc::UnboundedSender<String>>,
+    },
 }
 
 pub(crate) struct DeliveryPump {
@@ -109,7 +112,7 @@ impl DeliveryPump {
     pub(crate) fn epoch(&self) -> Option<&DeliveryEpoch> {
         match &self.state {
             PumpState::Idle => None,
-            PumpState::Online { epoch } => Some(epoch),
+            PumpState::Online { epoch, .. } => Some(epoch),
         }
     }
 
@@ -120,7 +123,21 @@ impl DeliveryPump {
     /// Install the live-delivery epoch. Initial durable replay is owned by the
     /// supervisor writer, which reads bounded pages from `DurableSource`.
     pub(crate) fn install_epoch(&mut self, epoch: DeliveryEpoch) {
-        self.state = PumpState::Online { epoch };
+        self.state = PumpState::Online {
+            epoch,
+            failure_tx: None,
+        };
+    }
+
+    pub(crate) fn install_supervised_epoch(
+        &mut self,
+        epoch: DeliveryEpoch,
+        failure_tx: mpsc::UnboundedSender<String>,
+    ) {
+        self.state = PumpState::Online {
+            epoch,
+            failure_tx: Some(failure_tx),
+        };
     }
 
     pub(crate) fn invalidate_epoch(&mut self, epoch: DeliveryEpoch) -> bool {
@@ -132,11 +149,14 @@ impl DeliveryPump {
     }
 
     pub(crate) async fn on_durable_committed(&mut self, seq: u64) -> Result<()> {
-        let epoch = match &self.state {
+        let (epoch, failure_tx) = match &self.state {
             PumpState::Idle => return Ok(()),
-            PumpState::Online { epoch } => *epoch,
+            PumpState::Online { epoch, failure_tx } => (*epoch, failure_tx.clone()),
         };
         if let Err(err) = send_event_range(&self.store, &self.channel, &epoch, seq, seq).await {
+            if let Some(failure_tx) = failure_tx {
+                let _ = failure_tx.send(format!("durable delivery failed: {err:#}"));
+            }
             self.state = PumpState::Idle;
             return Err(err);
         }
@@ -147,22 +167,27 @@ impl DeliveryPump {
         if let Some(kind) = event.durable_kind() {
             bail!("volatile delivery rejected durable event of kind {kind}");
         }
-        let epoch = match &self.state {
-            PumpState::Online { epoch } => *epoch,
+        let (epoch, failure_tx) = match &self.state {
+            PumpState::Online { epoch, failure_tx } => (*epoch, failure_tx.clone()),
             PumpState::Idle => return Ok(()),
         };
         if matches!(self.channel.mode, DeliveryMode::RedactionOnly) {
             return Ok(());
         }
-        if let Err(err) = self
+        match self
             .channel
-            .send(DeliveryFrame::Volatile { epoch, event })
-            .await
+            .sender
+            .try_send(DeliveryFrame::Volatile { epoch, event })
         {
-            self.state = PumpState::Idle;
-            return Err(err);
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                if let Some(failure_tx) = failure_tx {
+                    let _ = failure_tx.send("volatile delivery receiver closed".to_owned());
+                }
+                self.state = PumpState::Idle;
+                bail!("delivery receiver closed")
+            }
         }
-        Ok(())
     }
 }
 
@@ -593,6 +618,43 @@ mod tests {
         assert!(
             pump.epoch().is_none(),
             "volatile send failure must clear the active epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn volatile_queue_full_drops_immediately_without_disabling_epoch() {
+        let store = store().await;
+        let (channel, mut receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw)
+            .capacity(1)
+            .build();
+        let mut pump = DeliveryPump::new(store, channel);
+        let epoch = DeliveryEpoch::for_test("epoch-1");
+        pump.install_epoch(epoch);
+
+        let volatile = |suffix: &str| AgentEvent::ToolExecutionUpdate {
+            tool_call_id: format!("tool-{suffix}"),
+            partial: serde_json::json!({"stdout": suffix}),
+        };
+        pump.on_volatile(volatile("first")).await.unwrap();
+        timeout(
+            Duration::from_millis(50),
+            pump.on_volatile(volatile("dropped")),
+        )
+        .await
+        .expect("full volatile queue must not block")
+        .unwrap();
+
+        assert_eq!(pump.epoch(), Some(&epoch));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(DeliveryFrame::Volatile { event: AgentEvent::ToolExecutionUpdate { tool_call_id, .. }, .. })
+                if tool_call_id == "tool-first"
+        ));
+        assert!(
+            timeout(Duration::from_millis(50), receiver.recv())
+                .await
+                .is_err(),
+            "the overflow volatile must be dropped"
         );
     }
 

@@ -319,16 +319,20 @@ mod tests {
     use tokio_tungstenite::{accept_async, accept_hdr_async};
 
     use super::super::{
-        AgentHello, ApiHello, Command, CommandDigestFactory, CommandEnvelope, Envelope, Gateway,
-        GatewayConnector, GatewayCredential, GatewayReader, GatewayWriter, HelloError,
-        InboundCommand, IncrementalCommandDigest, MAX_FRAME_BYTES, OutboundFrame,
-        OversizedFrameError,
+        AgentHello, ApiHello, Command, CommandDigestFactory, CommandEnvelope,
+        DeliveryAuthorization, Envelope, Gateway, GatewayConnector, GatewayCredential,
+        GatewayReader, GatewayWriter, HelloError, InboundCommand, IncrementalCommandDigest,
+        MAX_FRAME_BYTES, OutboundFrame, OversizedFrameError,
     };
     use super::{WebSocketConnector, decode_command_bytes};
     use crate::gateway::wire::to_wire_frame;
     use crate::runtime::contracts::ProcessGeneration;
 
     struct TestDigestFactory;
+
+    fn test_credential(token: impl Into<String>) -> GatewayCredential {
+        GatewayCredential::new(token, DeliveryAuthorization::Raw)
+    }
 
     impl CommandDigestFactory for TestDigestFactory {
         fn start(&self) -> Box<dyn IncrementalCommandDigest> {
@@ -352,7 +356,7 @@ mod tests {
     async fn rejects_insecure_ws_without_explicit_flag() {
         let mut connector =
             WebSocketConnector::new("ws://localhost:1234", Arc::new(TestDigestFactory));
-        let result = connector.connect(GatewayCredential::new("token")).await;
+        let result = connector.connect(test_credential("token")).await;
         let err = result.err().expect("connect must fail");
         assert!(
             matches!(err, super::super::ConnectorError::InvalidConfiguration(ref e) if e.to_string().contains("insecure ws://")),
@@ -368,7 +372,7 @@ mod tests {
             "wS://localhost:1234",
         ] {
             let mut connector = WebSocketConnector::new(url, Arc::new(TestDigestFactory));
-            let result = connector.connect(GatewayCredential::new("token")).await;
+            let result = connector.connect(test_credential("token")).await;
             let err = result.err().expect("connect must fail");
             assert!(
                 matches!(err, super::super::ConnectorError::InvalidConfiguration(ref e) if e.to_string().contains("insecure ws://")),
@@ -387,7 +391,7 @@ mod tests {
         ];
         for (url, expected) in cases {
             let mut connector = WebSocketConnector::new(url, Arc::new(TestDigestFactory));
-            let result = connector.connect(GatewayCredential::new("token")).await;
+            let result = connector.connect(test_credential("token")).await;
             let err = result.err().expect("connect must fail");
             let msg = err.to_string().to_ascii_lowercase();
             assert!(
@@ -405,7 +409,7 @@ mod tests {
     async fn rejects_malformed_websocket_url_as_fatal_configuration() {
         let mut connector = WebSocketConnector::new("wss://[::1", Arc::new(TestDigestFactory));
         let err = connector
-            .connect(GatewayCredential::new("token"))
+            .connect(test_credential("token"))
             .await
             .err()
             .expect("malformed URL must fail before connection attempts");
@@ -472,6 +476,7 @@ mod tests {
             accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
             last_received_event_seq: 1,
             next_command_seq: 2,
+            delivery_authorization: DeliveryAuthorization::Raw,
         }
     }
 
@@ -566,10 +571,7 @@ mod tests {
 
         let mut connector =
             WebSocketConnector::new_insecure(format!("ws://{addr}"), Arc::new(TestDigestFactory));
-        let mut gateway = connector
-            .connect(GatewayCredential::new("valid"))
-            .await
-            .unwrap();
+        let mut gateway = connector.connect(test_credential("valid")).await.unwrap();
         let api_hello = gateway
             .authenticate_hello(test_agent_hello())
             .await
@@ -612,7 +614,7 @@ mod tests {
         let mut connector =
             WebSocketConnector::new_insecure(format!("ws://{addr}"), Arc::new(TestDigestFactory));
         let err = connector
-            .connect(GatewayCredential::new("expired"))
+            .connect(test_credential("expired"))
             .await
             .err()
             .expect("connect must fail");
@@ -639,10 +641,7 @@ mod tests {
 
         let mut connector =
             WebSocketConnector::new_insecure(format!("ws://{addr}"), Arc::new(TestDigestFactory));
-        let mut gateway = connector
-            .connect(GatewayCredential::new("valid"))
-            .await
-            .unwrap();
+        let mut gateway = connector.connect(test_credential("valid")).await.unwrap();
         let result = timeout(
             Duration::from_millis(50),
             gateway.authenticate_hello(test_agent_hello()),
@@ -678,10 +677,7 @@ mod tests {
 
         let mut connector =
             WebSocketConnector::new_insecure(format!("ws://{addr}"), Arc::new(TestDigestFactory));
-        let mut gateway = connector
-            .connect(GatewayCredential::new("valid"))
-            .await
-            .unwrap();
+        let mut gateway = connector.connect(test_credential("valid")).await.unwrap();
         let _ = gateway
             .authenticate_hello(test_agent_hello())
             .await
@@ -713,10 +709,7 @@ mod tests {
 
         let mut connector =
             WebSocketConnector::new_insecure(format!("ws://{addr}"), Arc::new(TestDigestFactory));
-        let mut gateway = connector
-            .connect(GatewayCredential::new("valid"))
-            .await
-            .unwrap();
+        let mut gateway = connector.connect(test_credential("valid")).await.unwrap();
         let _ = gateway
             .authenticate_hello(test_agent_hello())
             .await
@@ -771,10 +764,7 @@ mod tests {
             WebSocketConnector::new_insecure(format!("ws://{addr}"), Arc::new(TestDigestFactory));
 
         // First epoch.
-        let mut gateway = connector
-            .connect(GatewayCredential::new("valid"))
-            .await
-            .unwrap();
+        let mut gateway = connector.connect(test_credential("valid")).await.unwrap();
         let _ = gateway
             .authenticate_hello(test_agent_hello())
             .await
@@ -788,10 +778,7 @@ mod tests {
         );
 
         // Reconnect to the same listener (API restart).
-        let mut gateway = connector
-            .connect(GatewayCredential::new("valid"))
-            .await
-            .unwrap();
+        let mut gateway = connector.connect(test_credential("valid")).await.unwrap();
         let _ = gateway
             .authenticate_hello(test_agent_hello())
             .await
@@ -823,10 +810,7 @@ mod tests {
 
         let mut connector =
             WebSocketConnector::new_insecure(format!("ws://{addr}"), Arc::new(TestDigestFactory));
-        let mut gateway = connector
-            .connect(GatewayCredential::new("valid"))
-            .await
-            .unwrap();
+        let mut gateway = connector.connect(test_credential("valid")).await.unwrap();
         let api_hello = timeout(
             Duration::from_millis(200),
             gateway.authenticate_hello(test_agent_hello()),
@@ -858,10 +842,7 @@ mod tests {
 
         let mut connector =
             WebSocketConnector::new_insecure(format!("ws://{addr}"), Arc::new(TestDigestFactory));
-        let mut gateway = connector
-            .connect(GatewayCredential::new("valid"))
-            .await
-            .unwrap();
+        let mut gateway = connector.connect(test_credential("valid")).await.unwrap();
         let result = gateway.authenticate_hello(test_agent_hello()).await;
         assert!(
             matches!(result, Err(HelloError::Reconnect(_))),
@@ -896,10 +877,7 @@ mod tests {
                 format!("ws://{addr}"),
                 Arc::new(TestDigestFactory),
             );
-            let mut gateway = connector
-                .connect(GatewayCredential::new("valid"))
-                .await
-                .unwrap();
+            let mut gateway = connector.connect(test_credential("valid")).await.unwrap();
             let result = gateway.authenticate_hello(test_agent_hello()).await;
             assert!(
                 matches!(result, Err(HelloError::Reconnect(_))),
@@ -928,10 +906,7 @@ mod tests {
 
         let mut connector =
             WebSocketConnector::new_insecure(format!("ws://{addr}"), Arc::new(TestDigestFactory));
-        let mut gateway = connector
-            .connect(GatewayCredential::new("valid"))
-            .await
-            .unwrap();
+        let mut gateway = connector.connect(test_credential("valid")).await.unwrap();
         let result = gateway.authenticate_hello(test_agent_hello()).await;
         assert!(
             matches!(result, Err(HelloError::Fatal(_))),
@@ -966,10 +941,7 @@ mod tests {
 
         let mut connector =
             WebSocketConnector::new_insecure(format!("ws://{addr}"), Arc::new(TestDigestFactory));
-        let mut gateway = connector
-            .connect(GatewayCredential::new("valid"))
-            .await
-            .unwrap();
+        let mut gateway = connector.connect(test_credential("valid")).await.unwrap();
         let _ = gateway
             .authenticate_hello(test_agent_hello())
             .await
@@ -1011,9 +983,7 @@ mod tests {
 
         let mut connector =
             WebSocketConnector::new_insecure(format!("ws://{addr}"), Arc::new(TestDigestFactory));
-        let result = connector
-            .connect(GatewayCredential::new("test-token"))
-            .await;
+        let result = connector.connect(test_credential("test-token")).await;
         assert!(
             result.is_ok(),
             "connector must present the expected bearer token"
@@ -1024,7 +994,7 @@ mod tests {
 
     #[test]
     fn gateway_credential_debug_redacts_token() {
-        let cred = GatewayCredential::new("super-secret-token");
+        let cred = test_credential("super-secret-token");
         let debug = format!("{cred:?}");
         assert!(
             !debug.contains("super-secret-token"),
@@ -1047,7 +1017,7 @@ mod tests {
             Arc::new(TestDigestFactory),
         );
         let result = connector
-            .connect(GatewayCredential::new(secret_with_control))
+            .connect(test_credential(secret_with_control))
             .await;
         let err = match result {
             Err(e) => e,
@@ -1118,10 +1088,7 @@ mod tests {
 
         let mut connector =
             WebSocketConnector::new_insecure(format!("ws://{addr}"), Arc::new(TestDigestFactory));
-        let mut gateway = connector
-            .connect(GatewayCredential::new("valid"))
-            .await
-            .unwrap();
+        let mut gateway = connector.connect(test_credential("valid")).await.unwrap();
         let _ = gateway
             .authenticate_hello(test_agent_hello())
             .await
@@ -1158,10 +1125,7 @@ mod tests {
 
         let mut connector =
             WebSocketConnector::new_insecure(format!("ws://{addr}"), Arc::new(TestDigestFactory));
-        let mut gateway = connector
-            .connect(GatewayCredential::new("valid"))
-            .await
-            .unwrap();
+        let mut gateway = connector.connect(test_credential("valid")).await.unwrap();
         let _ = gateway
             .authenticate_hello(test_agent_hello())
             .await
@@ -1203,7 +1167,7 @@ mod tests {
 
         let mut connector =
             WebSocketConnector::new(format!("wss://{addr}"), Arc::new(TestDigestFactory));
-        let result = connector.connect(GatewayCredential::new("valid")).await;
+        let result = connector.connect(test_credential("valid")).await;
         assert!(result.is_err(), "expected TLS/handshake error");
 
         let _ = server.await;

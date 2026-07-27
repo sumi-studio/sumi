@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -75,17 +76,23 @@ impl ConnectionEpoch {
 #[derive(Clone)]
 pub struct GatewayCredential {
     token: String,
+    delivery_authorization: DeliveryAuthorization,
 }
 
 impl GatewayCredential {
-    pub fn new(token: impl Into<String>) -> Self {
+    pub fn new(token: impl Into<String>, delivery_authorization: DeliveryAuthorization) -> Self {
         Self {
             token: token.into(),
+            delivery_authorization,
         }
     }
 
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    pub const fn delivery_authorization(&self) -> DeliveryAuthorization {
+        self.delivery_authorization
     }
 }
 
@@ -93,8 +100,16 @@ impl fmt::Debug for GatewayCredential {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GatewayCredential")
             .field("token", &"[REDACTED]")
+            .field("delivery_authorization", &self.delivery_authorization)
             .finish()
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryAuthorization {
+    Raw,
+    RedactionOnly,
 }
 
 impl Drop for GatewayCredential {
@@ -136,6 +151,7 @@ pub struct ApiHello {
     pub last_received_event_seq: u64,
     #[serde(with = "lossless_u64")]
     pub next_command_seq: u64,
+    pub delivery_authorization: DeliveryAuthorization,
 }
 
 /// Parses a canonical decimal string: optional leading `'0'`, then one or more
@@ -282,6 +298,10 @@ pub enum ConnectorError {
 /// exact integration contract without duplicating store state.
 #[async_trait]
 pub trait DurableSource: Clone + Send + Sync + 'static {
+    fn bind_delivery_authorization(&self, _authorization: DeliveryAuthorization) -> Result<Self> {
+        Ok(self.clone())
+    }
+
     async fn event_cursor(&self) -> Result<EventCursors>;
     async fn events_after(&self, after_seq: u64, limit: usize) -> Result<Vec<OutboundFrame>>;
     async fn command_cursors(&self) -> Result<CommandCursors>;
@@ -291,12 +311,53 @@ pub trait DurableSource: Clone + Send + Sync + 'static {
         _epoch: DeliveryEpoch,
         _catch_up_from_seq: u64,
         _sink: EventSender,
-    ) -> Result<()> {
-        Ok(())
+        _cancel: CancellationToken,
+    ) -> Result<Option<DeliveryEpochRuntime>> {
+        Ok(None)
     }
 
     async fn invalidate_delivery_epoch(&self, _epoch: DeliveryEpoch) -> Result<()> {
         Ok(())
+    }
+}
+
+pub struct DeliveryEpochRuntime {
+    failure_rx: mpsc::UnboundedReceiver<String>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl DeliveryEpochRuntime {
+    pub(crate) fn new(failure_rx: mpsc::UnboundedReceiver<String>, task: JoinHandle<()>) -> Self {
+        Self {
+            failure_rx,
+            task: Some(task),
+        }
+    }
+
+    async fn failed(&mut self) -> String {
+        let Some(task) = self.task.as_mut() else {
+            return "delivery epoch task ended without a terminal signal".to_owned();
+        };
+
+        tokio::select! {
+            failure = self.failure_rx.recv() => failure.unwrap_or_else(|| {
+                "delivery epoch failure channel closed without a terminal signal".to_owned()
+            }),
+            result = task => {
+                self.task = None;
+                match result {
+                    Ok(()) => "delivery epoch task ended without a terminal signal".to_owned(),
+                    Err(join_err) => format!("delivery epoch task failed: {join_err}"),
+                }
+            }
+        }
+    }
+
+    async fn join(mut self) -> Result<(), JoinError> {
+        match self.task.take() {
+            Some(task) => task.await,
+            None => Ok(()),
+        }
     }
 }
 
@@ -314,9 +375,9 @@ pub struct SupervisorConfig {
     pub initial_backoff: Duration,
     pub max_backoff: Duration,
     pub send_timeout: Duration,
-    pub event_buffer_size: usize,
-    pub command_buffer_size: usize,
-    pub catch_up_page_size: usize,
+    pub event_buffer_size: NonZeroUsize,
+    pub command_buffer_size: NonZeroUsize,
+    pub catch_up_page_size: NonZeroUsize,
     pub max_reconnect_attempts: Option<u32>,
     pub max_auth_attempts: Option<u32>,
     pub hello_timeout: Duration,
@@ -331,9 +392,9 @@ impl Default for SupervisorConfig {
             initial_backoff: Duration::from_millis(500),
             max_backoff: Duration::from_secs(30),
             send_timeout: Duration::from_secs(30),
-            event_buffer_size: 64,
-            command_buffer_size: 64,
-            catch_up_page_size: 64,
+            event_buffer_size: NonZeroUsize::new(64).expect("64 is nonzero"),
+            command_buffer_size: NonZeroUsize::new(64).expect("64 is nonzero"),
+            catch_up_page_size: NonZeroUsize::new(64).expect("64 is nonzero"),
             max_reconnect_attempts: None,
             max_auth_attempts: Some(3),
             hello_timeout: Duration::from_secs(30),
@@ -473,8 +534,8 @@ where
     /// observation. `events` must carry the current `DeliveryEpoch` from
     /// `handle.epochs`.
     pub fn start(self) -> SupervisorHandle {
-        let (commands_tx, commands_rx) = mpsc::channel(self.config.command_buffer_size);
-        let (events_tx, events_rx) = mpsc::channel(self.config.event_buffer_size);
+        let (commands_tx, commands_rx) = mpsc::channel(self.config.command_buffer_size.get());
+        let (events_tx, events_rx) = mpsc::channel(self.config.event_buffer_size.get());
         let epochs_rx = self.current_epoch.subscribe();
         let online_rx = self.online.subscribe();
         let cancel = self.cancel.clone();
@@ -614,6 +675,7 @@ where
                 reason: format!("failed to obtain credential: {e}"),
             })?,
         };
+        let delivery_authorization = credential.delivery_authorization();
 
         let mut gateway = tokio::select! {
             biased;
@@ -653,12 +715,21 @@ where
             _ = cancel.cancelled() => return Ok(()),
             result = validate_hello(&source, &agent_hello, &api_hello) => result?,
         }
+        if api_hello.delivery_authorization != delivery_authorization {
+            return Err(SupervisorError::Fatal(anyhow!(
+                "delivery authorization mismatch: credential={delivery_authorization:?}, api={:?}",
+                api_hello.delivery_authorization
+            )));
+        }
+        let source = source
+            .bind_delivery_authorization(delivery_authorization)
+            .map_err(SupervisorError::Fatal)?;
 
         let (connection_epoch, delivery_epoch) = self.next_epoch();
         let (reader, writer) = gateway.split();
 
         let epoch_token = cancel.child_token();
-        let (writer_tx, writer_rx) = mpsc::channel(config.event_buffer_size);
+        let (writer_tx, writer_rx) = mpsc::channel(config.event_buffer_size.get());
 
         *self.current_writer.lock().unwrap() = Some((delivery_epoch, writer_tx));
         self.current_epoch.send_replace(Some(delivery_epoch));
@@ -676,7 +747,7 @@ where
             delivery_ready_rx,
         ));
 
-        if let Err(error) = source
+        let mut delivery_runtime = match source
             .install_delivery_epoch(
                 delivery_epoch,
                 api_hello
@@ -690,21 +761,25 @@ where
                         ))
                     })?,
                 events,
+                epoch_token.child_token(),
             )
             .await
         {
-            let reason = format!("failed to install T17 delivery epoch: {error:#}");
-            let _ = delivery_ready_tx.send(Err(anyhow!(reason.clone())));
-            epoch_token.cancel();
-            let _ = writer_handle.await;
-            *self.current_writer.lock().unwrap() = None;
-            self.current_epoch.send_replace(None);
-            let _ = self.online.send(false);
-            return Err(SupervisorError::EstablishedReconnect {
-                reason,
-                healthy: false,
-            });
-        }
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let reason = format!("failed to install T17 delivery epoch: {error:#}");
+                let _ = delivery_ready_tx.send(Err(anyhow!(reason.clone())));
+                epoch_token.cancel();
+                let _ = writer_handle.await;
+                *self.current_writer.lock().unwrap() = None;
+                self.current_epoch.send_replace(None);
+                let _ = self.online.send(false);
+                return Err(SupervisorError::EstablishedReconnect {
+                    reason,
+                    healthy: false,
+                });
+            }
+        };
         let _ = delivery_ready_tx.send(Ok(()));
 
         let command_send_blocked_notify = self.command_send_blocked_notify.clone();
@@ -768,7 +843,38 @@ where
                     })
                 })
             }
+            reason = wait_delivery_failure(&mut delivery_runtime) => {
+                epoch_token.cancel();
+                *self.current_writer.lock().unwrap() = None;
+                self.current_epoch.send_replace(None);
+                let _ = self.online.send(false);
+                let reader_result = reader_handle.await;
+                let writer_result = writer_handle.await;
+                Self::inspect_epoch_results(reader_result, writer_result, || {
+                    Err(SupervisorError::EstablishedReconnect {
+                        reason: format!("delivery epoch failed: {reason}"),
+                        healthy: false,
+                    })
+                })
+            }
         };
+
+        if let Some(runtime) = delivery_runtime {
+            match runtime.join().await {
+                Ok(()) => {}
+                Err(join_err) if join_err.is_panic() => {
+                    return Err(SupervisorError::Fatal(anyhow!(
+                        "delivery epoch task panicked: {join_err}"
+                    )));
+                }
+                Err(join_err) if !join_err.is_cancelled() => {
+                    return Err(SupervisorError::Fatal(anyhow!(
+                        "delivery epoch task join error: {join_err}"
+                    )));
+                }
+                Err(_) => {}
+            }
+        }
 
         if let Err(error) = source.invalidate_delivery_epoch(delivery_epoch).await {
             return Err(SupervisorError::Fatal(error.context(format!(
@@ -865,6 +971,13 @@ where
             rand::rng().random_range(lower_ms..=upper_ms)
         };
         time::sleep(Duration::from_millis(jitter)).await;
+    }
+}
+
+async fn wait_delivery_failure(runtime: &mut Option<DeliveryEpochRuntime>) -> String {
+    match runtime {
+        Some(runtime) => runtime.failed().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -1384,7 +1497,7 @@ where
         let page = match await_page(
             &source,
             last_received,
-            config.catch_up_page_size,
+            config.catch_up_page_size.get(),
             &token,
             &mut writer_rx,
             &mut next_arrival_id,
@@ -1498,7 +1611,7 @@ where
         let page = match await_page(
             &source,
             last_received,
-            config.catch_up_page_size,
+            config.catch_up_page_size.get(),
             &token,
             &mut writer_rx,
             &mut next_arrival_id,
@@ -1690,15 +1803,16 @@ where
                         break 'task Err(ReaderError::Terminal);
                     }
                 }
-                result = cmd_rx.recv(), if !terminal_after_pending => {
+                result = cmd_rx.recv(),
+                    if !terminal_after_pending
+                        && (ready.is_some() || pending.len() < MAX_PENDING_BEFORE_READY) =>
+                {
                     match result {
                         Some(Ok(cmd)) => {
                             if ready.is_some() {
                                 next_expected = send_validated(cmd, next_expected, &mut command_tx, &token, command_send_blocked_notify.clone()).await?;
-                            } else if pending.len() < MAX_PENDING_BEFORE_READY {
-                                pending.push(cmd);
                             } else {
-                                break 'task Err(ReaderError::Fatal(anyhow!("max pending commands before hydration reached")));
+                                pending.push(cmd);
                             }
                         }
                         Some(Err(e)) if e.is::<TerminalGatewayClosed>() => {
@@ -1864,7 +1978,7 @@ mod tests {
         OutboundFrame,
     };
     use crate::runtime::contracts::{GenerationRecoveryFence, ProcessGenerationLease};
-    use crate::store::{DeliveryMode, HydrationOutcome, Store, insert_test_durable_event};
+    use crate::store::{HydrationOutcome, Store, insert_test_durable_event};
 
     struct TestDigestFactory;
 
@@ -2024,6 +2138,7 @@ mod tests {
         counter: Arc<AtomicU64>,
         prefix: String,
         tokens: Arc<std::sync::Mutex<Vec<String>>>,
+        delivery_authorization: DeliveryAuthorization,
     }
 
     impl CountingCredentialProvider {
@@ -2032,7 +2147,16 @@ mod tests {
                 counter: Arc::new(AtomicU64::new(0)),
                 prefix: prefix.into(),
                 tokens: Arc::new(std::sync::Mutex::new(Vec::new())),
+                delivery_authorization: DeliveryAuthorization::Raw,
             }
+        }
+
+        fn with_delivery_authorization(
+            mut self,
+            delivery_authorization: DeliveryAuthorization,
+        ) -> Self {
+            self.delivery_authorization = delivery_authorization;
+            self
         }
     }
 
@@ -2042,7 +2166,7 @@ mod tests {
             let n = self.counter.fetch_add(1, Ordering::SeqCst);
             let token = format!("{}-{}", self.prefix, n);
             self.tokens.lock().unwrap().push(token.clone());
-            Ok(GatewayCredential::new(token))
+            Ok(GatewayCredential::new(token, self.delivery_authorization))
         }
     }
 
@@ -2143,6 +2267,7 @@ mod tests {
         last_received_event_seq: u64,
         hello_delay: Option<Duration>,
         hello_error: Option<HelloError>,
+        delivery_authorization: DeliveryAuthorization,
     }
 
     impl MockGateway {
@@ -2166,6 +2291,7 @@ mod tests {
                 last_received_event_seq: 0,
                 hello_delay: None,
                 hello_error: None,
+                delivery_authorization: DeliveryAuthorization::Raw,
             }
         }
 
@@ -2186,6 +2312,14 @@ mod tests {
 
         fn with_hello_error(mut self, err: HelloError) -> Self {
             self.hello_error = Some(err);
+            self
+        }
+
+        fn with_delivery_authorization(
+            mut self,
+            delivery_authorization: DeliveryAuthorization,
+        ) -> Self {
+            self.delivery_authorization = delivery_authorization;
             self
         }
 
@@ -2220,6 +2354,7 @@ mod tests {
                 accepted_generation,
                 last_received_event_seq: self.last_received_event_seq,
                 next_command_seq: hello.last_applied_command_seq.saturating_add(1),
+                delivery_authorization: self.delivery_authorization,
             })
         }
 
@@ -2258,6 +2393,7 @@ mod tests {
                 accepted_generation: hello.generation,
                 last_received_event_seq: 0,
                 next_command_seq: self.next_command_seq,
+                delivery_authorization: DeliveryAuthorization::Raw,
             })
         }
 
@@ -2318,9 +2454,9 @@ mod tests {
             initial_backoff: Duration::from_millis(1),
             max_backoff: Duration::from_millis(5),
             send_timeout: Duration::from_millis(50),
-            event_buffer_size: 16,
-            command_buffer_size: 16,
-            catch_up_page_size: 16,
+            event_buffer_size: NonZeroUsize::new(16).unwrap(),
+            command_buffer_size: NonZeroUsize::new(16).unwrap(),
+            catch_up_page_size: NonZeroUsize::new(16).unwrap(),
             max_reconnect_attempts: Some(10),
             max_auth_attempts: Some(3),
             hello_timeout: Duration::from_secs(5),
@@ -2431,6 +2567,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delivery_authorization_mismatch_is_fatal_before_source_binding() {
+        #[derive(Clone)]
+        struct BindingSource {
+            binds: Arc<AtomicU64>,
+        }
+
+        #[async_trait]
+        impl DurableSource for BindingSource {
+            fn bind_delivery_authorization(
+                &self,
+                _authorization: DeliveryAuthorization,
+            ) -> Result<Self> {
+                self.binds.fetch_add(1, Ordering::SeqCst);
+                Ok(self.clone())
+            }
+
+            async fn event_cursor(&self) -> Result<EventCursors> {
+                Ok(EventCursors::default())
+            }
+
+            async fn events_after(
+                &self,
+                _after_seq: u64,
+                _limit: usize,
+            ) -> Result<Vec<OutboundFrame>> {
+                panic!("authorization mismatch must fail before durable replay")
+            }
+
+            async fn command_cursors(&self) -> Result<CommandCursors> {
+                Ok(CommandCursors::default())
+            }
+        }
+
+        let binds = Arc::new(AtomicU64::new(0));
+        let gateway = MockGateway::new(VecDeque::new())
+            .with_delivery_authorization(DeliveryAuthorization::RedactionOnly);
+        let connector = MockConnector::new(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            VecDeque::from([Ok(gateway)]),
+        );
+        let supervisor = ConnectionSupervisor::new(
+            connector,
+            CountingCredentialProvider::new("token"),
+            BindingSource {
+                binds: binds.clone(),
+            },
+            StaticHydrationLatch(HydrationReady {
+                generation: ProcessGeneration::from_wire(7).unwrap(),
+                receipt_identity: "receipt-1".to_owned(),
+            }),
+            make_config(),
+        );
+
+        let error = supervisor.start().join().await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("delivery authorization mismatch"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            binds.load(Ordering::SeqCst),
+            0,
+            "mismatched authorization must fail before raw-capable source binding"
+        );
+    }
+
+    #[tokio::test]
+    async fn delivery_epoch_runtime_observes_task_panic_with_live_failure_sender() {
+        let (failure_tx, failure_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async {
+            panic!("test delivery forwarder panic");
+        });
+        let mut runtime = DeliveryEpochRuntime::new(failure_rx, task);
+
+        let reason = tokio::time::timeout(Duration::from_secs(1), runtime.failed())
+            .await
+            .expect("task termination must wake the delivery failure branch");
+
+        assert!(reason.contains("delivery epoch task failed"));
+        assert!(reason.contains("panicked"));
+        assert!(!failure_tx.is_closed());
+        assert!(runtime.join().await.is_ok());
+    }
+
+    #[tokio::test]
     async fn reader_eof_triggers_reconnect() {
         let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
         let responses = VecDeque::from_iter((0..5).map(|_| {
@@ -2491,6 +2711,7 @@ mod tests {
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
+            delivery_authorization: DeliveryAuthorization::Raw,
         };
         let gateway2 = MockGateway {
             reader: MockGatewayReader {
@@ -2511,6 +2732,7 @@ mod tests {
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
+            delivery_authorization: DeliveryAuthorization::Raw,
         };
 
         let connector = MockConnector::new(
@@ -2585,6 +2807,7 @@ mod tests {
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
+            delivery_authorization: DeliveryAuthorization::Raw,
         };
 
         let connector = MockConnector::new(
@@ -2637,6 +2860,7 @@ mod tests {
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
+            delivery_authorization: DeliveryAuthorization::Raw,
         };
         let gateway2 = MockGateway {
             reader: MockGatewayReader {
@@ -2657,6 +2881,7 @@ mod tests {
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
+            delivery_authorization: DeliveryAuthorization::Raw,
         };
 
         let connector = MockConnector::new(
@@ -2737,6 +2962,7 @@ mod tests {
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
+            delivery_authorization: DeliveryAuthorization::Raw,
         };
 
         let connector = MockConnector::new(
@@ -2800,6 +3026,7 @@ mod tests {
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
+            delivery_authorization: DeliveryAuthorization::Raw,
         };
 
         let connector = MockConnector::new(
@@ -3588,6 +3815,7 @@ mod tests {
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
+            delivery_authorization: DeliveryAuthorization::Raw,
         };
         let connector = MockConnector::new(sent_hellos, VecDeque::from([Ok(gateway)]));
         let credentials = CountingCredentialProvider::new("token");
@@ -3628,6 +3856,7 @@ mod tests {
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
+            delivery_authorization: DeliveryAuthorization::Raw,
         };
         let connector = MockConnector::new(
             Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -3728,6 +3957,7 @@ mod tests {
             accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
             last_received_event_seq: 0,
             next_command_seq: 6,
+            delivery_authorization: DeliveryAuthorization::Raw,
         };
 
         // The first legal resend point is applied + 1, not received + 1.
@@ -3812,6 +4042,7 @@ mod tests {
             accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
             last_received_event_seq: 0,
             next_command_seq: 6,
+            delivery_authorization: DeliveryAuthorization::Raw,
         };
         validate_hello(&source, &agent, &api)
             .await
@@ -3823,6 +4054,7 @@ mod tests {
             accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
             last_received_event_seq: 0,
             next_command_seq: 5,
+            delivery_authorization: DeliveryAuthorization::Raw,
         };
         validate_hello(&source, &agent, &api)
             .await
@@ -3832,6 +4064,7 @@ mod tests {
             accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
             last_received_event_seq: 0,
             next_command_seq: 0,
+            delivery_authorization: DeliveryAuthorization::Raw,
         };
         assert!(
             validate_hello(&source, &agent, &api).await.is_err(),
@@ -3873,6 +4106,7 @@ mod tests {
                 accepted_generation: ProcessGeneration::from_wire(0).unwrap(),
                 last_received_event_seq: seq,
                 next_command_seq: seq,
+                delivery_authorization: DeliveryAuthorization::Raw,
             };
             let text = serde_json::to_string(&api).expect("serialize api hello");
             let parsed: ApiHello = serde_json::from_str(&text).expect("deserialize api hello");
@@ -3900,7 +4134,7 @@ mod tests {
         assert!(serde_json::from_str::<AgentHello>(&agent_json).is_err());
 
         let api_json = format!(
-            r#"{{"accepted_generation":"{over_i64}","last_received_event_seq":"0","next_command_seq":"1"}}"#
+            r#"{{"accepted_generation":"{over_i64}","last_received_event_seq":"0","next_command_seq":"1","delivery_authorization":"raw"}}"#
         );
         assert!(serde_json::from_str::<ApiHello>(&api_json).is_err());
 
@@ -3911,23 +4145,21 @@ mod tests {
         assert!(serde_json::from_str::<AgentHello>(&agent_overflow).is_err());
 
         let api_overflow = format!(
-            r#"{{"accepted_generation":"0","last_received_event_seq":"{over_u64}","next_command_seq":"1"}}"#
+            r#"{{"accepted_generation":"0","last_received_event_seq":"{over_u64}","next_command_seq":"1","delivery_authorization":"raw"}}"#
         );
         assert!(serde_json::from_str::<ApiHello>(&api_overflow).is_err());
 
         // Old numeric encodings are no longer accepted; the wire uses strings.
         let agent_numeric = r#"{"agent_id":"a","generation":1,"last_sent_event_seq":0,"last_received_command_seq":0,"last_applied_command_seq":0}"#;
         assert!(serde_json::from_str::<AgentHello>(agent_numeric).is_err());
-        let api_numeric =
-            r#"{"accepted_generation":1,"last_received_event_seq":0,"next_command_seq":1}"#;
+        let api_numeric = r#"{"accepted_generation":1,"last_received_event_seq":0,"next_command_seq":1,"delivery_authorization":"raw"}"#;
         assert!(serde_json::from_str::<ApiHello>(api_numeric).is_err());
     }
 
     #[test]
     fn hello_dto_rejects_malformed_unknown_and_trailing_data() {
         let agent_base = r#"{"agent_id":"a","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}"#;
-        let api_base =
-            r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1"}"#;
+        let api_base = r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1","delivery_authorization":"raw"}"#;
 
         assert!(serde_json::from_str::<AgentHello>(agent_base).is_ok());
         assert!(serde_json::from_str::<ApiHello>(api_base).is_ok());
@@ -3978,14 +4210,14 @@ mod tests {
         let agent_unknown = r#"{"agent_id":"a","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0","extra":1}"#;
         assert!(serde_json::from_str::<AgentHello>(agent_unknown).is_err());
 
-        let api_unknown = r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1","extra":1}"#;
+        let api_unknown = r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1","delivery_authorization":"raw","extra":1}"#;
         assert!(serde_json::from_str::<ApiHello>(api_unknown).is_err());
 
         // Trailing data after a valid object must also be rejected.
         let agent_trailing = r#"{"agent_id":"a","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}{"extra":1}"#;
         assert!(serde_json::from_str::<AgentHello>(agent_trailing).is_err());
 
-        let api_trailing = r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1"}{"extra":1}"#;
+        let api_trailing = r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1","delivery_authorization":"raw"}{"extra":1}"#;
         assert!(serde_json::from_str::<ApiHello>(api_trailing).is_err());
     }
 
@@ -4040,6 +4272,7 @@ mod tests {
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 1,
+            delivery_authorization: DeliveryAuthorization::Raw,
         };
 
         let result = validate_hello(
@@ -4114,6 +4347,7 @@ mod tests {
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 5,
+            delivery_authorization: DeliveryAuthorization::Raw,
         };
         validate_hello(&StaticSource(cursor), &agent, &api)
             .await
@@ -4124,6 +4358,7 @@ mod tests {
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 6,
+            delivery_authorization: DeliveryAuthorization::Raw,
         };
         validate_hello(&StaticSource(cursor), &agent, &api)
             .await
@@ -4134,6 +4369,7 @@ mod tests {
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 7,
+            delivery_authorization: DeliveryAuthorization::Raw,
         };
         assert!(
             validate_hello(&StaticSource(cursor), &agent, &api)
@@ -4145,6 +4381,7 @@ mod tests {
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 11,
+            delivery_authorization: DeliveryAuthorization::Raw,
         };
         assert!(
             validate_hello(&StaticSource(cursor), &agent, &api)
@@ -4157,6 +4394,7 @@ mod tests {
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 12,
+            delivery_authorization: DeliveryAuthorization::Raw,
         };
         assert!(
             validate_hello(&StaticSource(cursor), &agent, &api)
@@ -4169,6 +4407,7 @@ mod tests {
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 0,
+            delivery_authorization: DeliveryAuthorization::Raw,
         };
         assert!(
             validate_hello(&StaticSource(cursor), &agent, &api)
@@ -4225,6 +4464,7 @@ mod tests {
                     accepted_generation: hello.generation,
                     last_received_event_seq: 0,
                     next_command_seq: self.terminal_seq,
+                    delivery_authorization: DeliveryAuthorization::Raw,
                 })
             }
 
@@ -4373,6 +4613,7 @@ mod tests {
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: u64::MAX,
+            delivery_authorization: DeliveryAuthorization::Raw,
         };
         let error = validate_hello(&MockDurableSource::new(cursor), &agent, &api)
             .await
@@ -4622,6 +4863,7 @@ mod tests {
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
+            delivery_authorization: DeliveryAuthorization::Raw,
         };
         let connector = MockConnector::new(
             Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -4853,7 +5095,7 @@ mod tests {
         }
 
         let mut config = make_config();
-        config.catch_up_page_size = 2;
+        config.catch_up_page_size = NonZeroUsize::new(2).unwrap();
         config.send_timeout = Duration::from_secs(1);
 
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -4876,6 +5118,7 @@ mod tests {
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
+            delivery_authorization: DeliveryAuthorization::Raw,
         };
         let connector = MockConnector::new(
             Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -5061,6 +5304,7 @@ mod tests {
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
+            delivery_authorization: DeliveryAuthorization::Raw,
         };
         let connector = MockConnector::new(
             Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -5174,13 +5418,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hydration_hold_limit_fails_closed() {
-        // Latch never becomes ready, so the reader must fail closed once the
-        // pre-hydration command ceiling is reached instead of stalling or
-        // looping. The single queued gateway response must be consumed by the
-        // first (and only) connect attempt.
-        let latch = DynamicHydrationLatch::new().0;
-        let commands: VecDeque<_> = (1..=17)
+    async fn hydration_hold_limit_backpressures_then_drains_arbitrary_burst() {
+        let generation = ProcessGeneration::from_wire(7).unwrap();
+        let (latch, latch_tx) = DynamicHydrationLatch::new();
+        let commands: VecDeque<_> = (1..=64)
             .map(|seq| {
                 Ok(valid_command(
                     seq,
@@ -5196,23 +5437,39 @@ mod tests {
 
         let supervisor =
             ConnectionSupervisor::new(connector, credentials, source, latch, make_config());
-        let handle = supervisor.start();
+        let mut handle = supervisor.start();
 
-        let result = tokio::time::timeout(Duration::from_secs(1), handle.join()).await;
-        assert!(result.is_ok(), "exceeding the pending limit must not hang");
-        let err = result
-            .unwrap()
-            .expect_err("exceeding the pending limit must fail closed");
-        let msg = format!("{:#}", err);
         assert!(
-            msg.contains("max pending commands before hydration reached"),
-            "expected fatal pre-hydration overflow, got: {msg}"
+            tokio::time::timeout(Duration::from_millis(50), handle.commands.recv())
+                .await
+                .is_err(),
+            "pre-hydration commands must remain behind the readiness gate"
+        );
+        latch_tx
+            .send(HydrationState::Ready(HydrationReady {
+                generation,
+                receipt_identity: "burst-ready".to_owned(),
+            }))
+            .unwrap();
+
+        for expected in 1..=64 {
+            let command = tokio::time::timeout(Duration::from_secs(1), handle.commands.recv())
+                .await
+                .expect("delayed hydration burst must drain")
+                .expect("command channel must remain open");
+            assert_eq!(cmd_seq(&command), expected);
+        }
+        assert!(
+            !handle.task.as_ref().expect("supervisor task").is_finished(),
+            "a valid replay burst must not terminate the supervisor"
         );
         assert_eq!(
             sent_hellos.lock().unwrap().len(),
             1,
-            "must not attempt a second connection after fatal overflow"
+            "backpressure must not manufacture a reconnect"
         );
+        handle.abort();
+        handle.join().await.unwrap();
     }
 
     #[tokio::test]
@@ -5426,7 +5683,7 @@ mod tests {
         // channel and the second send_validated blocks. Abort must release the
         // blocked send and the pending command must not be delivered.
         let mut config = make_config();
-        config.command_buffer_size = 1;
+        config.command_buffer_size = NonZeroUsize::new(1).unwrap();
 
         let blocked = Arc::new(Notify::new());
         let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -5489,7 +5746,7 @@ mod tests {
         };
 
         let mut config = make_config();
-        config.event_buffer_size = 2;
+        config.event_buffer_size = NonZeroUsize::new(2).unwrap();
         config.send_timeout = Duration::from_secs(1);
 
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -5512,6 +5769,7 @@ mod tests {
             last_received_event_seq: 0,
             hello_delay: None,
             hello_error: None,
+            delivery_authorization: DeliveryAuthorization::Raw,
         };
         let connector = MockConnector::new(
             Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -5663,7 +5921,7 @@ mod tests {
 
     #[test]
     fn api_hello_rejects_unknown_fields() {
-        let json = r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1","extra":1}"#;
+        let json = r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1","delivery_authorization":"raw","extra":1}"#;
         assert!(
             serde_json::from_str::<ApiHello>(json).is_err(),
             "ApiHello must reject unknown fields"
@@ -5675,8 +5933,7 @@ mod tests {
         let agent_json = r#"{"agent_id":"a","generation":"1","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}"#;
         assert!(serde_json::from_str::<AgentHello>(agent_json).is_ok());
 
-        let api_json =
-            r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1"}"#;
+        let api_json = r#"{"accepted_generation":"1","last_received_event_seq":"0","next_command_seq":"1","delivery_authorization":"raw"}"#;
         assert!(serde_json::from_str::<ApiHello>(api_json).is_ok());
     }
 
@@ -5743,6 +6000,7 @@ mod tests {
             accepted_generation: ProcessGeneration::from_wire(7).unwrap(),
             last_received_event_seq: 0,
             next_command_seq: 1,
+            delivery_authorization: DeliveryAuthorization::Raw,
         };
         let (delivery_ready_tx, delivery_ready_rx) = oneshot::channel();
         delivery_ready_tx.send(Ok(())).unwrap();
@@ -6103,7 +6361,7 @@ mod tests {
                 .unwrap();
         }
 
-        let adapter = seams::T17StoreAdapter::new(store.clone(), DeliveryMode::Raw);
+        let adapter = seams::T17StoreAdapter::new(store.clone());
         let (hydration_tx, hydration_rx) = watch::channel(None);
         let latch = seams::T17HydrationLatch::new(hydration_rx);
 
@@ -6126,7 +6384,7 @@ mod tests {
         let mut config = make_config();
         config.initial_backoff = Duration::ZERO;
         config.max_backoff = Duration::ZERO;
-        config.catch_up_page_size = 3;
+        config.catch_up_page_size = NonZeroUsize::new(3).unwrap();
         let supervisor = ConnectionSupervisor::new(
             connector,
             CountingCredentialProvider::new("token"),
@@ -6227,10 +6485,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let adapter = seams::T17StoreAdapter::new(store.clone(), DeliveryMode::RedactionOnly);
+        let adapter = seams::T17StoreAdapter::new(store.clone());
 
         let sent = Arc::new(Mutex::new(Vec::new()));
-        let mut gateway = MockGateway::new(VecDeque::new());
+        let mut gateway = MockGateway::new(VecDeque::new())
+            .with_delivery_authorization(DeliveryAuthorization::RedactionOnly);
         gateway.writer.sent = sent.clone();
         let connector = MockConnector::new(
             Arc::new(Mutex::new(Vec::new())),
@@ -6238,7 +6497,8 @@ mod tests {
         );
         let supervisor = ConnectionSupervisor::new(
             connector,
-            CountingCredentialProvider::new("token"),
+            CountingCredentialProvider::new("token")
+                .with_delivery_authorization(DeliveryAuthorization::RedactionOnly),
             adapter.clone(),
             StaticHydrationLatch(HydrationReady {
                 generation: ProcessGeneration::from_wire(7).unwrap(),
@@ -6319,6 +6579,71 @@ mod tests {
                 |frame| matches!(frame, OutboundFrame::Event { envelope } if envelope.seq.is_none())
             ),
             "projection-only authorization must suppress every volatile frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_forwarder_failure_cancels_epoch_and_reconnects() {
+        let store = Arc::new(
+            Store::session_test_store("t17-t24-forwarder-failure")
+                .await
+                .unwrap(),
+        );
+        let adapter = seams::T17StoreAdapter::new(store.clone());
+        let sent_hellos = Arc::new(Mutex::new(Vec::new()));
+        let responses = (0..5)
+            .map(|_| {
+                Ok(MockGateway::new(VecDeque::new())
+                    .with_delivery_authorization(DeliveryAuthorization::RedactionOnly))
+            })
+            .collect();
+        let connector = MockConnector::new(sent_hellos.clone(), responses);
+        let mut config = make_config();
+        config.initial_backoff = Duration::ZERO;
+        config.max_backoff = Duration::ZERO;
+        let supervisor = ConnectionSupervisor::new(
+            connector,
+            CountingCredentialProvider::new("token")
+                .with_delivery_authorization(DeliveryAuthorization::RedactionOnly),
+            adapter.clone(),
+            StaticHydrationLatch(HydrationReady {
+                generation: ProcessGeneration::from_wire(7).unwrap(),
+                receipt_identity: "redaction-ready".to_owned(),
+            }),
+            config,
+        );
+        let handle = supervisor.start();
+        let mut online = handle.online.clone();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !*online.borrow() {
+                online.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("first delivery epoch must become Online");
+
+        insert_test_durable_event(&store, 1, &crate::agent::AgentEvent::AgentStart)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE agent_events SET envelope = 'not-json' WHERE seq = 1")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        adapter.on_durable_committed(1).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while sent_hellos.lock().unwrap().len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("forwarder projection failure must force a fresh authenticated epoch");
+        handle.abort();
+        handle.join().await.unwrap();
+        assert_eq!(
+            adapter.active_delivery_epoch().await,
+            None,
+            "failed epoch must be invalidated idempotently after pump/forwarder teardown"
         );
     }
 
@@ -6479,6 +6804,7 @@ mod tests {
                 accepted_generation: hello.generation,
                 last_received_event_seq: 0,
                 next_command_seq: hello.last_applied_command_seq.saturating_add(1),
+                delivery_authorization: DeliveryAuthorization::Raw,
             })
         }
 
