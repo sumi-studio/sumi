@@ -603,7 +603,7 @@ impl Reviewer {
             }
         }
 
-        {
+        if request.mode != ReviewerMode::StrictAutoReview {
             let mut allow_cache = self.allow_cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(decision) = allow_cache.get(
                 &request.policy_hash,
@@ -777,9 +777,10 @@ impl Reviewer {
         self.record_outcome(&request.run_id, decision.outcome);
         match decision.outcome {
             AuditOutcome::Allow => {
-                if request
-                    .policy_cache_expires_at
-                    .is_none_or(|expires_at| Utc::now() < expires_at)
+                if request.mode != ReviewerMode::StrictAutoReview
+                    && request
+                        .policy_cache_expires_at
+                        .is_none_or(|expires_at| Utc::now() < expires_at)
                 {
                     self.allow_cache
                         .lock()
@@ -1459,6 +1460,47 @@ mod tests {
         let outcome2 = reviewer.review(req, CancellationToken::new()).await;
         assert!(matches!(outcome2, ReviewOutcome::Allow(_)));
         assert_eq!(fake.called_count(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn strict_review_does_not_reuse_or_seed_shared_allow_cache() {
+        let fake =
+            FakeTransport::sequence(vec![Ok(allow_json()), Ok(allow_json()), Ok(allow_json())]);
+        let reviewer = make_reviewer(fake.clone());
+
+        let auto = review_request(reviewable_projection());
+        assert!(matches!(
+            reviewer.review(auto, CancellationToken::new()).await,
+            ReviewOutcome::Allow(_)
+        ));
+
+        let mut strict = review_request(reviewable_projection());
+        strict.mode = ReviewerMode::StrictAutoReview;
+        assert!(matches!(
+            reviewer.review(strict, CancellationToken::new()).await,
+            ReviewOutcome::Allow(_)
+        ));
+        assert_eq!(
+            fake.called_count(),
+            2,
+            "StrictAutoReview must call the reviewer even when AutoReview populated the shared cache"
+        );
+        assert_eq!(reviewer.allow_cache_entry_count(), 1);
+
+        let mut strict_repeat = review_request(reviewable_projection());
+        strict_repeat.mode = ReviewerMode::StrictAutoReview;
+        assert!(matches!(
+            reviewer
+                .review(strict_repeat, CancellationToken::new())
+                .await,
+            ReviewOutcome::Allow(_)
+        ));
+        assert_eq!(
+            fake.called_count(),
+            3,
+            "StrictAutoReview must call the reviewer for every action, not just the first"
+        );
+        assert_eq!(reviewer.allow_cache_entry_count(), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
