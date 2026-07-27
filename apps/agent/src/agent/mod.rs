@@ -6,6 +6,7 @@
 
 use std::{
     any::Any,
+    collections::HashSet,
     future::Future,
     marker::PhantomData,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -17,8 +18,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use serde_json::json;
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot, watch},
@@ -27,24 +29,30 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
+    approval::ApprovalBroker,
     gateway::{
-        Command, CommandAckStatus, CommandEnvelope, Gateway, GatewayClosed, GatewayReader,
-        GatewayWriter, InboundCommand, OutboundFrame,
+        Command, CommandAck, CommandAckStatus, CommandEnvelope, Gateway, GatewayClosed,
+        GatewayReader, GatewayWriter, InboundCommand, OutboundFrame,
     },
     provider::{
         overflow::OverflowSource,
-        types::{ContextMessage, PublicMessage, StopReason},
+        types::{
+            ContextMessage, ProviderContextItem, PublicMessage, StopReason, ToolResultMessage,
+            UserContent,
+        },
     },
     runtime::contracts::ProcessGeneration,
     store::{
-        ApplicationKind, DataKeyPurpose, EventWriter, InboundAdmission, InboundReceiptOrigin,
+        ApplicationKind, ApprovalMutation, DataKeyPurpose, DurableEvent, EventBatch, EventWrite,
+        EventWriter, InboundAdmission, InboundReceiptOrigin, Projection,
         RecoveryRequired as AdmissionRecoveryRequired, RecoveryStep, Store, SuffixRecovery,
+        ToolExecutionMutation,
     },
 };
 
 mod driver;
 mod durable_bridge;
-mod events;
+pub(crate) mod events;
 mod provider_projection;
 mod queue;
 mod run;
@@ -54,7 +62,7 @@ pub(crate) use durable_bridge::DurableRunBinding;
 
 use durable_bridge::{
     CommittedOutput, DurableBridge, MessageCommitBarrier, MessageCommitReceipt,
-    RetryWaitCommitBarrier, RunOutput, ToolStartCommitBarrier,
+    RetryWaitCommitBarrier, RunOutput, ToolStartCommitBarrier, ToolStartCommitResult,
 };
 use queue::MessageQueue;
 
@@ -203,12 +211,16 @@ pub(crate) struct RunCore {
     /// production; keeping this injected representation in `RunCore` prevents
     /// a second Session run from silently losing the first run.
     runtime_context: Vec<ContextMessage>,
+    provider_context: Vec<ProviderContextItem>,
     durable_binding: Option<DurableRunBinding>,
     worker_phase: Option<watch::Sender<WorkerPhase>>,
     /// Shared cancellation registry for the one live provider attempt. The
     /// Session reserves the token around `bind_hard_steer` so the provider is
     /// only cancelled after the durable step-zero commit succeeds.
     attempt_cancellation: Option<Arc<AttemptCancellation>>,
+    approval: Option<Arc<ApprovalBroker>>,
+    #[cfg(test)]
+    fixture_bypass_approval: bool,
 }
 
 impl RunCore {
@@ -219,9 +231,13 @@ impl RunCore {
             pending_controls: MessageQueue::bounded(PENDING_CONTROL_CAPACITY),
             pending_overflow_apply: None,
             runtime_context: Vec::new(),
+            provider_context: Vec::new(),
             durable_binding: None,
             worker_phase: None,
             attempt_cancellation: None,
+            approval: None,
+            #[cfg(test)]
+            fixture_bypass_approval: false,
         }
     }
 
@@ -235,6 +251,17 @@ impl RunCore {
 
     pub(crate) fn mark_mutated(&mut self) {
         self.mutation_epoch = self.mutation_epoch.saturating_add(1);
+    }
+
+    pub(crate) fn set_approval(&mut self, broker: Arc<ApprovalBroker>) {
+        self.approval = Some(broker);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_with_unapproved_tools() -> Self {
+        let mut core = Self::new();
+        core.fixture_bypass_approval = true;
+        core
     }
 
     pub(crate) fn queue_followup(&mut self, command: AdmittedCommand) -> Result<()> {
@@ -251,12 +278,26 @@ impl RunCore {
         Ok(())
     }
 
+    pub(crate) fn has_pending_controls(&self) -> bool {
+        !self.pending_controls.is_empty()
+    }
+
     pub(crate) fn defer_overflow_apply(&mut self, source: OverflowSource) {
         self.pending_overflow_apply.get_or_insert(source);
     }
 
     pub(crate) fn pending_overflow_apply(&self) -> Option<OverflowSource> {
         self.pending_overflow_apply
+    }
+
+    pub(crate) fn install_hydrated_context(
+        &mut self,
+        messages: Vec<ContextMessage>,
+        provider_context: Vec<ProviderContextItem>,
+    ) {
+        self.runtime_context = messages;
+        self.provider_context = provider_context;
+        self.mark_mutated();
     }
 }
 
@@ -334,6 +375,7 @@ pub(crate) enum RunControl {
 pub(crate) enum WorkerPhase {
     #[default]
     Active,
+    Approval,
     RetryWait,
 }
 
@@ -475,6 +517,8 @@ pub(crate) struct ActiveRun {
     join: JoinHandle<()>,
     bridge: DurableBridge,
     attempt_cancellation: Arc<AttemptCancellation>,
+    approval: Option<Arc<ApprovalBroker>>,
+    resolving_approvals: HashSet<String>,
 }
 
 impl Drop for ActiveRun {
@@ -483,9 +527,30 @@ impl Drop for ActiveRun {
     }
 }
 
+impl ActiveRun {
+    fn finish_committed_approval_resolutions(&mut self, outputs: &[CommittedOutput]) {
+        let committed: Vec<_> = outputs
+            .iter()
+            .filter_map(|output| match &output.event {
+                AgentEvent::ApprovalResolved { request_id, .. } => Some(request_id.clone()),
+                _ => None,
+            })
+            .collect();
+        for request_id in committed {
+            self.resolving_approvals.remove(&request_id);
+            if let Some(broker) = self.approval.as_ref() {
+                broker.finish_resolution(&request_id);
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
+// RunCore owns the durable replay state and is moved through this enum only at
+// worker completion; boxing it would add an allocation to every run.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum RunOwnership {
-    Recovered(RunCore),
+    Recovered(Box<RunCore>),
     Lost,
 }
 
@@ -639,9 +704,9 @@ impl<G: Gateway + 'static> Session<G> {
                     self.core.take();
                     RunOwnership::Lost
                 } else {
-                    self.core
-                        .take()
-                        .map_or(RunOwnership::Lost, RunOwnership::Recovered)
+                    self.core.take().map_or(RunOwnership::Lost, |core| {
+                        RunOwnership::Recovered(Box::new(core))
+                    })
                 };
                 SessionResult::Failed { failure, ownership }
             }
@@ -677,6 +742,7 @@ impl<G: Gateway + 'static> Session<G> {
                 continue;
             }
 
+            #[allow(clippy::large_enum_variant)]
             enum Selected {
                 Completion(std::result::Result<RunCompletion, oneshot::error::RecvError>),
                 Command(Result<InboundCommand>),
@@ -791,6 +857,16 @@ impl<G: Gateway + 'static> Session<G> {
                 return Ok(());
             }
             if self.route_active_control(command.clone()).await? {
+                return Ok(());
+            }
+            if matches!(command.envelope().command, Command::ApprovalDecision { .. }) {
+                if !self.deferred_commands.is_empty() {
+                    self.defer_active_command(command)?;
+                    return Ok(());
+                }
+                if !self.route_active_approval_decision(command.clone()).await? {
+                    self.defer_active_command(command)?;
+                }
                 return Ok(());
             }
             self.defer_active_command(command)?;
@@ -1015,6 +1091,51 @@ impl<G: Gateway + 'static> Session<G> {
         Ok(true)
     }
 
+    async fn route_active_approval_decision(
+        &mut self,
+        command: AdmittedCommand,
+    ) -> Result<bool, SessionFailure> {
+        let active = self
+            .active
+            .as_ref()
+            .ok_or(SessionFailure::CompletionChannelClosed)?;
+        let request_id = match &command.envelope().command {
+            Command::ApprovalDecision { request_id, .. } => request_id,
+            _ => unreachable!("caller matched ApprovalDecision"),
+        };
+        if active.resolving_approvals.contains(request_id)
+            || active
+                .approval
+                .as_ref()
+                .is_some_and(|broker| broker.is_resolving(request_id))
+        {
+            return Ok(false);
+        }
+        let is_pending = active
+            .approval
+            .as_ref()
+            .is_some_and(|broker| broker.has_pending(request_id));
+        if !is_pending {
+            self.apply_idle_approval_decision(command).await?;
+            return Ok(true);
+        }
+        let request_id = request_id.clone();
+        let control = RunControl::Command(command);
+        self.active
+            .as_mut()
+            .expect("active approval route retains its run")
+            .resolving_approvals
+            .insert(request_id);
+        self.active
+            .as_ref()
+            .expect("active approval route retains its run")
+            .control_tx
+            .send(control)
+            .await
+            .map_err(|_| SessionFailure::CompletionChannelClosed)?;
+        Ok(true)
+    }
+
     fn defer_active_command(&mut self, command: AdmittedCommand) -> Result<(), SessionFailure> {
         let is_abort = matches!(command.envelope().command, Command::Abort {});
         let ordinary_count = self
@@ -1051,6 +1172,8 @@ impl<G: Gateway + 'static> Session<G> {
     /// overtake an earlier deferred one.
     async fn reclassify_deferred(&mut self) -> Result<(), SessionFailure> {
         while let Some(command) = self.deferred_commands.pop_one() {
+            let was_user_message =
+                matches!(command.envelope().command, Command::UserMessage { .. });
             let routed = match &command.envelope().command {
                 Command::UserMessage { .. } => {
                     if self.route_retry_wait_command(&command).await? {
@@ -1060,7 +1183,9 @@ impl<G: Gateway + 'static> Session<G> {
                     }
                 }
                 Command::Abort {} => self.route_active_abort(command.clone()).await?,
-                _ => false,
+                Command::ApprovalDecision { .. } => {
+                    self.route_active_approval_decision(command.clone()).await?
+                }
             };
             if !routed {
                 self.deferred_commands
@@ -1068,7 +1193,160 @@ impl<G: Gateway + 'static> Session<G> {
                     .map_err(anyhow::Error::from)?;
                 break;
             }
+            if was_user_message
+                && self.deferred_commands.front().is_some_and(|next| {
+                    matches!(next.envelope().command, Command::ApprovalDecision { .. })
+                })
+            {
+                // The user message has just cancelled or superseded the
+                // pending action. Wait for its durable ApprovalResolved before
+                // applying a later decision as a terminal no-op.
+                break;
+            }
         }
+        Ok(())
+    }
+
+    async fn apply_idle_approval_decision(
+        &mut self,
+        command: AdmittedCommand,
+    ) -> Result<(), SessionFailure> {
+        let command_id = command.envelope().command_id.to_string();
+        let seq = command.envelope().seq;
+        let request_id = match &command.envelope().command {
+            Command::ApprovalDecision { request_id, .. } => request_id,
+            _ => unreachable!("caller matched ApprovalDecision"),
+        };
+
+        let pending_broker = self.core.as_ref().and_then(|core| core.approval.clone());
+        let pending_summary = pending_broker
+            .as_ref()
+            .and_then(|broker| broker.pending_summary(request_id));
+        if let Some(summary) = pending_summary.as_ref() {
+            // Keep the in-memory pending entry intact until this entire durable
+            // cancellation batch commits. A failed transaction must leave both
+            // the broker and approval_log/tool state pending for an idempotent
+            // retry; only the successful commit may release its waiter.
+            //
+            // The late user decision itself is deliberately not part of this
+            // batch. EventWriter correctly requires an active approval command
+            // to resolve to that command's exact decision; this run has already
+            // ended. Terminalize the abandoned request as a runtime cancellation
+            // first, then apply the now-terminal command as a durable no-op.
+            // In particular, a late ApproveAlways must not install a rule.
+            let mut writes = Vec::with_capacity(4);
+
+            let result_message = ToolResultMessage {
+                tool_call_id: summary.tool_call_id.clone(),
+                tool_name: summary.tool_name.clone(),
+                content: vec![UserContent::Text {
+                    text: "Approval decision arrived after the owning run ended; the tool was not started.".to_owned(),
+                }],
+                details: json!({"error": "approval_cancelled"}),
+                is_error: true,
+                timestamp: Utc::now(),
+            };
+            let result_value = serde_json::to_value(&result_message)
+                .context("failed to serialize idle tool result")?;
+            let message_id = format!("{}-idle-result", summary.tool_call_id);
+            let tool_result = PublicMessage::ToolResult(result_message);
+
+            writes.push(EventWrite {
+                event: Some(DurableEvent::tool_execution_end(
+                    summary.tool_call_id.clone(),
+                    result_value,
+                    true,
+                    "cancelled".to_owned(),
+                    Some("approval_cancelled".to_owned()),
+                )?),
+                projections: vec![Projection::ToolExecution(ToolExecutionMutation::Finish {
+                    tool_call_id: summary.tool_call_id.clone(),
+                    expected: "prepared",
+                    state: "cancelled",
+                    error_code: Some("approval_cancelled"),
+                })],
+            });
+            writes.push(EventWrite {
+                event: Some(DurableEvent::message(
+                    "message_start",
+                    &message_id,
+                    &tool_result,
+                )?),
+                projections: vec![],
+            });
+            writes.push(EventWrite {
+                event: Some(DurableEvent::message(
+                    "message_end",
+                    &message_id,
+                    &tool_result,
+                )?),
+                projections: vec![Projection::MessageEnd {
+                    message_id,
+                    role: "tool_result",
+                    message: tool_result,
+                    append_to_l0: true,
+                    provider_context: Vec::new(),
+                    eviction_footprint_tokens: 0,
+                }],
+            });
+            writes.push(EventWrite {
+                event: Some(DurableEvent::approval_resolved(
+                    request_id.clone(),
+                    ApprovalResolution::Cancelled,
+                    "runtime".to_owned(),
+                )?),
+                projections: vec![Projection::Approval(ApprovalMutation::Resolve {
+                    request_id: request_id.clone(),
+                    state: "cancelled",
+                    actor: "runtime".to_owned(),
+                })],
+            });
+            if let Err(error) = self
+                .writer
+                .apply(EventBatch {
+                    writes,
+                    injected_commands: Vec::new(),
+                })
+                .await
+            {
+                tracing::error!(%error, %command_id, "idle approval cancellation could not be committed");
+                return Err(error.into());
+            }
+
+            pending_broker
+                .as_ref()
+                .expect("pending summary has its broker")
+                .cancel(request_id);
+        }
+
+        // Once the cancellation transaction is durable, this command cannot
+        // carry ApprovalResolved and is validated as the intended terminal
+        // no-op. Retrying after a failure here is safe: the broker and durable
+        // approval/tool state already agree on the cancellation.
+        self.writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![Projection::CommandApplied {
+                        command_id: command_id.clone(),
+                        command_seq: seq,
+                        run_id: None,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, %command_id, "approval decision could not be applied");
+                SessionFailure::from(error)
+            })?;
+        let ack = CommandAck {
+            seq,
+            command_id,
+            status: CommandAckStatus::Applied,
+            reject_reason: None,
+        };
+        self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack }])?;
         Ok(())
     }
 
@@ -1085,6 +1363,9 @@ impl<G: Gateway + 'static> Session<G> {
                 self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack }])?;
             }
             return Ok(());
+        }
+        if matches!(command.envelope().command, Command::ApprovalDecision { .. }) {
+            return self.apply_idle_approval_decision(command).await;
         }
         if !matches!(command.envelope().command, Command::UserMessage { .. }) {
             return Err(SessionFailure::IdleControl);
@@ -1157,6 +1438,7 @@ impl<G: Gateway + 'static> Session<G> {
         core.worker_phase = Some(phase_tx);
         let attempt_cancellation = Arc::new(AttemptCancellation::default());
         core.attempt_cancellation = Some(attempt_cancellation.clone());
+        let approval = core.approval.clone();
         let (completion_tx, completion_rx) = oneshot::channel();
         let future = catch_unwind(AssertUnwindSafe(|| {
             self.worker.run(core, initial, control_rx, events_tx)
@@ -1176,6 +1458,8 @@ impl<G: Gateway + 'static> Session<G> {
             join,
             bridge: DurableBridge::new(binding),
             attempt_cancellation,
+            approval,
+            resolving_approvals: HashSet::new(),
         });
         Ok(())
     }
@@ -1313,6 +1597,7 @@ impl<G: Gateway + 'static> Session<G> {
             if let Some(barrier) = retry_wait_commit_barrier {
                 barrier.committed();
             }
+            active.finish_committed_approval_resolutions(&outputs);
             if deliver && delivery_failure.is_none() {
                 delivery_failure = self
                     .send_committed(
@@ -1328,6 +1613,11 @@ impl<G: Gateway + 'static> Session<G> {
     }
 
     async fn persist_active_event(&mut self, output: RunOutput) -> Result<(), SessionFailure> {
+        // Approved decisions are intentionally staged until the matching
+        // ToolExecutionStart. Even though that ApprovalResolved produces no
+        // public output yet, it is still a routing boundary: a queued steer or
+        // Abort must get the chance to win before the tool start commits.
+        let staged_approval_boundary = matches!(&output.event, AgentEvent::ApprovalResolved { .. });
         let committed = {
             let active = self.active.as_mut().expect("event requires active run");
             match active.bridge.commit(&self.writer, output).await {
@@ -1346,6 +1636,10 @@ impl<G: Gateway + 'static> Session<G> {
         if let Some(barrier) = retry_wait_commit_barrier {
             barrier.committed();
         }
+        self.active
+            .as_mut()
+            .expect("committed event retains active run")
+            .finish_committed_approval_resolutions(&outputs);
         let assistant_started = outputs.iter().any(|output| {
             matches!(
                 &output.event,
@@ -1360,13 +1654,20 @@ impl<G: Gateway + 'static> Session<G> {
                     )
             )
         });
+        let approval_boundary = staged_approval_boundary
+            || outputs.iter().any(|output| {
+                matches!(
+                    &output.event,
+                    AgentEvent::ApprovalRequested { .. } | AgentEvent::ApprovalResolved { .. }
+                )
+            });
         let command_id = self
             .active
             .as_ref()
             .map(|active| active.bridge.command_id().to_owned());
         self.send_committed(outputs, command_id, terminal_command_ids)
             .await?;
-        if assistant_started {
+        if assistant_started || approval_boundary {
             self.reclassify_deferred().await?;
         }
         Ok(())
@@ -1560,3 +1861,5 @@ fn panic_message(panic: Box<dyn Any + Send>) -> String {
 
 #[cfg(test)]
 mod session_tests;
+#[cfg(test)]
+pub(crate) use session_tests::run_canonical_live_responses_roundtrip;

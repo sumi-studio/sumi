@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-07-20
+- Amended: 2026-07-27 (Cloud release live profileをResponses-onlyへ変更)
 - Amends: [実装計画](../agent/implementation-plan.md) §3.1〜§4.5、§7.8、§13 M1
 
 ## コンテキスト
@@ -103,7 +104,10 @@ overflow、transportの各境界から再検証した。レビュー指摘への
     固定し、`reasoning_content`、usage/costの配置、`[DONE]`後cost trailerを保持する。
     `[DONE]`をcanonical terminalとし、後続trailerはfixtureには残すが正規化eventにはしない。
     Moonshot直API、Z.ai直API、Umansのraw captureと2ターンlive証拠はcredential不在のため
-    未完了であり、T25 provider releaseのrelease-blocking gateへ明示的に移管する。
+    未取得である。将来取得した場合だけ、capture時刻・endpoint・sanitization前SHA-256を
+    伴うprovenance付きの任意な開発証拠として保存する。T25のCloud release live profileは
+    Responses-onlyとし、Chat Completions / Responses / Anthropicの3 protocol対応は
+    fixture/contract gateで維持する。
 
 ## 根拠
 
@@ -159,7 +163,8 @@ overflow、transportの各境界から再検証した。レビュー指摘への
 - cancel時にpartialを捨てる: ハードステアで部分応答を保持する製品契約に反する。
 - MFJS numberを`as_f64()`可能なら互換とする: 丸め後の値が有限でも元JSON値と異なり得る。
 - credentialなしにlive captureを合成・推定する: provenanceを偽り、gatewayと直APIの
-  方言差を検出できない。未取得証拠はnamed release gateとして残す。
+  方言差を検出できない。未取得証拠は未取得と明記し、将来取得できた場合だけ
+  provenance付きの任意な開発証拠として保存する。
 
 ## 影響
 
@@ -167,5 +172,7 @@ overflow、transportの各境界から再検証した。レビュー指摘への
 fixture結合テストを同じPRで更新する。wire/persistence型の追加はpre-release中に
 必須化し、由来不明の旧thinkingを安全と仮定するdefaultは設けない。response budgetは
 config検証、transport、全adapter、assemblerへ同じrequest token予算から渡すため、T9/T10も
-この境界を再利用する。T25はprovider context durable round-tripに加え、Moonshot/Z.ai/Umans
-直APIのraw capture provenanceとlive 2-turnを満たすまで完了扱いにしない。
+この境界を再利用する。T25はprovider context durable round-tripに加え、Responses経路で
+tool 1往復、encrypted reasoning、kill/restart後の2ターン継続、native compactionを同じ
+release profileで実証するまで完了扱いにしない。他providerのdirect live証拠はこのgateの
+代替にも追加必須条件にもならない。

@@ -1,51 +1,32 @@
 //! Tool execution approval broker and deterministic policy.
 
-// T23: remove these module-wide allows once gateway/persistence integration
-// wires all action and policy exports; they currently suppress skeleton code.
-#[allow(dead_code, unused_imports)]
 pub mod action;
-// T23: remove these module-wide allows once gateway/persistence integration
-// wires all action and policy exports; they currently suppress skeleton code.
-#[allow(dead_code, unused_imports)]
+pub mod broker;
 pub mod policy;
+pub mod prompt;
+pub mod reviewer;
 
 #[allow(unused_imports)]
 pub use action::{
     CanonicalAction, Permission, RedactedText, ReviewPath, ReviewPathComponent, ReviewProjection,
     ReviewToken, ReviewableAction, SandboxSummary, SecretAwareActionProjector, SecretDigestKey,
 };
+pub use broker::{ApprovalBroker, ApprovalOutcome, WaiterResult};
+pub(crate) use broker::{ExecutableGrant, GrantLease, GrantRevalidation};
 #[allow(unused_imports)]
 pub use policy::{
-    ApprovalRule, Policy, PolicyDecision, ResolvedDecision, RuleEffect, RuleValidationError,
-    UserDecision,
+    ApprovalPolicyBundle, ApprovalPolicyCacheStatus, ApprovalPolicyTrustStore, ApprovalRule,
+    LoadedApprovalPolicy, Policy, PolicyDecision, ResolvedDecision, RuleEffect,
+    RuleValidationError, SignedApprovalPolicyBundle, UserDecision,
 };
-
-/// Runtime-internal approval broker. T23 will wire persistence and gateway
-/// integration; this skeleton exposes the pure T22 projection/evaluation seam.
-#[allow(dead_code)]
-pub struct ApprovalBroker {
-    policy: Policy,
-    projector: SecretAwareActionProjector,
-}
-
-#[allow(dead_code)]
-impl ApprovalBroker {
-    pub fn new(policy: Policy, projector: SecretAwareActionProjector) -> Self {
-        Self { policy, projector }
-    }
-
-    pub fn project(&self, action: &CanonicalAction) -> ReviewProjection {
-        self.projector.project(action)
-    }
-
-    pub fn evaluate(&self, action: &CanonicalAction) -> PolicyDecision {
-        self.policy.evaluate(action)
-    }
-
-    pub fn resolve(&self, action: &CanonicalAction, decision: UserDecision) -> ResolvedDecision {
-        self.policy.resolve(action, decision, &self.projector)
-    }
-}
+#[allow(unused_imports)]
+pub use prompt::{PromptLimits, ReviewerMessage, ReviewerPrompt, ReviewerRole, TrustedEnvironment};
+#[allow(unused_imports)]
+pub use reviewer::{
+    AuditDecision, AuditOutcome, CircuitBreaker, CircuitState, ReviewOutcome, ReviewRequest,
+    Reviewer, ReviewerMode, ReviewerModelSpec, ReviewerTransport, ReviewerTransportError,
+    ReviewerTrustSet, RiskLevel, UserAuthorization,
+};
 
 #[cfg(test)]
 mod tests {
@@ -65,12 +46,10 @@ mod tests {
         serde_json::from_value(value).expect("valid args")
     }
 
-    fn default_broker() -> ApprovalBroker {
-        ApprovalBroker::new(Policy::new("/workspace"), projector())
-    }
-
     #[test]
     fn adversarial_table() {
+        let policy = Policy::new("/workspace");
+
         // D3 workspace read fast path
         let read = CanonicalAction::from_tool_call(
             PathBuf::from("/workspace"),
@@ -78,7 +57,7 @@ mod tests {
             &args(json!({"path": "notes.txt"})),
         )
         .expect("read_file");
-        assert!(default_broker().evaluate(&read).is_allow());
+        assert!(policy.evaluate(&read).is_allow());
 
         // Workspace escape through write_file
         let escape = CanonicalAction::from_tool_call(
@@ -87,7 +66,7 @@ mod tests {
             &args(json!({"path": "/etc/passwd", "content": "x"})),
         )
         .expect("write_file");
-        assert!(default_broker().evaluate(&escape).is_forbidden());
+        assert!(policy.evaluate(&escape).is_forbidden());
 
         // Multi-segment: strictest result dominates (Allow + Forbidden -> Forbidden)
         let multi = CanonicalAction::from_tool_call(
@@ -107,8 +86,7 @@ mod tests {
                 allowed_network_domains: vec![],
             })
             .unwrap();
-        let broker = ApprovalBroker::new(p, projector());
-        let decision = broker.evaluate(&multi);
+        let decision = p.evaluate(&multi);
         assert!(
             decision.is_forbidden(),
             "forbidden segment must dominate: {decision:?}"
@@ -132,8 +110,7 @@ mod tests {
                 allowed_network_domains: vec![],
             })
             .unwrap();
-        let broker2 = ApprovalBroker::new(p2, projector());
-        assert!(broker2.evaluate(&quoted).is_allow());
+        assert!(p2.evaluate(&quoted).is_allow());
 
         // Nested/dynamic constructs require approval
         let dynamic = CanonicalAction::from_tool_call(
@@ -142,7 +119,7 @@ mod tests {
             &args(json!({"command": "echo $(date)"})),
         )
         .expect("bash");
-        assert!(!default_broker().evaluate(&dynamic).is_allow());
+        assert!(!policy.evaluate(&dynamic).is_allow());
 
         // Broad prefixes downgrade ApproveAlways rather than persisting it.
         let broad_action = CanonicalAction::from_tool_call(
@@ -160,8 +137,11 @@ mod tests {
             allowed_permissions: vec![Permission::Exec],
             allowed_network_domains: vec![],
         };
-        let resolved =
-            default_broker().resolve(&broad_action, UserDecision::ApproveAlways { rule: broad });
+        let resolved = policy.resolve(
+            &broad_action,
+            UserDecision::ApproveAlways { rule: broad },
+            &projector(),
+        );
         assert!(matches!(resolved, ResolvedDecision::ApproveOnce));
 
         // A forbidden action is rejected rather than downgraded to executable ApproveOnce.
@@ -174,11 +154,12 @@ mod tests {
             allowed_permissions: vec![Permission::Exec],
             allowed_network_domains: vec![],
         };
-        let resolved = default_broker().resolve(
+        let resolved = policy.resolve(
             &multi,
             UserDecision::ApproveAlways {
                 rule: forbidden_rule,
             },
+            &projector(),
         );
         assert!(matches!(resolved, ResolvedDecision::Rejected { .. }));
 
@@ -189,7 +170,7 @@ mod tests {
             &args(json!({"command": "curl -H \"Authorization: Bearer abcdef1234567890\" https://example.com"})),
         )
         .expect("bash");
-        let projection = default_broker().project(&curl_secret);
+        let projection = projector().project(&curl_secret);
         let ReviewProjection::Reviewable(review) = projection else {
             panic!("expected reviewable projection");
         };
@@ -205,7 +186,7 @@ mod tests {
             ),
         )
         .expect("bash");
-        let ReviewProjection::Reviewable(signed_review) = default_broker().project(&signed) else {
+        let ReviewProjection::Reviewable(signed_review) = projector().project(&signed) else {
             panic!("expected reviewable projection");
         };
         let signed_text = serde_json::to_string(&signed_review.argv).unwrap();
@@ -220,7 +201,7 @@ mod tests {
         )
         .expect("bash");
         assert!(matches!(
-            default_broker().project(&hidden_host),
+            projector().project(&hidden_host),
             ReviewProjection::InsufficientEvidence { .. }
         ));
     }

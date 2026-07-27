@@ -28,6 +28,14 @@ const PENDING_COMMAND_MAX_BYTES: usize = 4 * 1024 * 1024;
 const RECOVERY_GROUP_MAX_COMMANDS: usize = 16;
 const RECOVERY_GROUP_MAX_BYTES: usize = 1024 * 1024;
 
+/// Typed identity for one durably pending approval whose prepared tool must be
+/// closed during logical suffix recovery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingApprovalRecovery {
+    pub request_id: String,
+    pub tool_call_id: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RecoveryStep {
     Reclassify {
@@ -66,6 +74,17 @@ pub(crate) enum RecoveryStep {
         run_id: String,
         turn_id: String,
     },
+    /// T23/T26 restart seam for an assistant turn that crashed while a real
+    /// ApprovalBroker request was durably pending. T26 must consume this before
+    /// resuming the assistant: atomically close the approval/prepared tool as
+    /// Cancelled, then continue any separately planned stored steer group.
+    CancelPendingApproval {
+        command_id: String,
+        run_id: String,
+        turn_id: String,
+        request_id: String,
+        tool_call_id: String,
+    },
     ResumeHardSteerFromDurableEvents {
         command_id: String,
         run_id: String,
@@ -75,6 +94,14 @@ pub(crate) enum RecoveryStep {
         command_id: String,
         run_id: String,
         turn_id: String,
+        /// Present when Abort already committed `cancel_requested` but the
+        /// worker crashed before emitting the approval cancellation/result.
+        ///
+        /// T26 must consume this as one cancellation suffix transaction:
+        /// `ApprovalResolved(Cancelled)`, the prepared tool terminal/result,
+        /// and the Abort owner close must all commit together. This packet does
+        /// not claim that the T26 consumer exists.
+        pending_approval: Option<PendingApprovalRecovery>,
     },
 }
 
@@ -252,7 +279,42 @@ impl SuffixRecovery {
         let mut steps = Vec::with_capacity(commands.len());
         let mut injected_groups = HashSet::new();
         for command in &commands {
-            let step = plan_one_command(store, command, &events).await?;
+            let mut step = plan_one_command(store, command, &events).await?;
+            match &step {
+                RecoveryStep::ResumeAssistantFromDurableEvents {
+                    command_id,
+                    run_id,
+                    turn_id,
+                } => {
+                    if let Some(pending) =
+                        pending_approval_for_recovery(store, run_id, turn_id).await?
+                    {
+                        step = RecoveryStep::CancelPendingApproval {
+                            command_id: command_id.clone(),
+                            run_id: run_id.clone(),
+                            turn_id: turn_id.clone(),
+                            request_id: pending.request_id,
+                            tool_call_id: pending.tool_call_id,
+                        };
+                    }
+                }
+                RecoveryStep::ResumeCancellationFromDurableEvents {
+                    command_id,
+                    run_id,
+                    turn_id,
+                    ..
+                } => {
+                    let pending_approval =
+                        pending_approval_for_recovery(store, run_id, turn_id).await?;
+                    step = RecoveryStep::ResumeCancellationFromDurableEvents {
+                        command_id: command_id.clone(),
+                        run_id: run_id.clone(),
+                        turn_id: turn_id.clone(),
+                        pending_approval,
+                    };
+                }
+                _ => {}
+            }
             if let RecoveryStep::InjectStoredGroup {
                 ref run_id,
                 ref turn_id,
@@ -311,6 +373,45 @@ impl SuffixRecovery {
         }
         Ok(vec![plan_one_command(store, &command, &events).await?])
     }
+}
+
+async fn pending_approval_for_recovery(
+    store: &Store,
+    run_id: &str,
+    turn_id: &str,
+) -> Result<Option<PendingApprovalRecovery>> {
+    let rows = sqlx::query(
+        "SELECT a.id, a.tool_call_id, t.state
+         FROM approval_log a
+         JOIN tool_executions t ON t.tool_call_id = a.tool_call_id
+         WHERE a.run_id = ? AND a.turn_id = ? AND a.state = 'pending'
+         ORDER BY a.created_at, a.id",
+    )
+    .bind(run_id)
+    .bind(turn_id)
+    .fetch_all(store.pool())
+    .await
+    .context("failed to inspect pending approval recovery state")?;
+    if rows.len() > 1 {
+        bail!(
+            "run {run_id}/{turn_id} has multiple pending approvals despite sequential one-at-a-time execution"
+        );
+    }
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let request_id: String = row.try_get("id")?;
+    let tool_call_id: String = row.try_get("tool_call_id")?;
+    let tool_state: String = row.try_get("state")?;
+    if tool_state != "prepared" {
+        bail!(
+            "pending approval {request_id} recovery requires prepared tool {tool_call_id}, found {tool_state}"
+        );
+    }
+    Ok(Some(PendingApprovalRecovery {
+        request_id,
+        tool_call_id,
+    }))
 }
 
 async fn plan_one_command(
@@ -407,6 +508,7 @@ async fn plan_one_command(
             command_id: command.command_id.clone(),
             run_id: required(command.run_id.as_deref(), "run_id", command)?.to_owned(),
             turn_id: required(command.turn_id.as_deref(), "turn_id", command)?.to_owned(),
+            pending_approval: None,
         }),
         RunPhase::Finished => {
             bail!(
@@ -1011,10 +1113,13 @@ mod tests {
     use std::sync::Arc;
 
     use anyhow::{Result, bail};
+    use serde_json::json;
 
     use super::*;
     use crate::{
-        gateway::{ApprovalDecision, Command, CommandEnvelope, InboundCommand},
+        gateway::{
+            ApprovalDecision, Command, CommandEnvelope, DeferredApprovalRule, InboundCommand,
+        },
         store::{
             AgentScope, DurableEvent, EventBatch, EventWrite, EventWriter, Projection,
             crypto::{DATA_KEY_BYTES, WrappingKey},
@@ -1054,6 +1159,44 @@ mod tests {
         .into();
         let writer = EventWriter::new(store.clone());
         (store, writer)
+    }
+
+    async fn seed_pending_approval_decision(
+        store: &Store,
+        writer: &EventWriter,
+        command_id: &str,
+        request_id: &str,
+        decision: ApprovalDecision,
+    ) {
+        writer
+            .persist_inbound(&InboundCommand::Valid(CommandEnvelope {
+                seq: 1,
+                command_id: crate::gateway::CommandId::parse(command_id).expect("command ID"),
+                command: Command::ApprovalDecision {
+                    request_id: request_id.to_owned(),
+                    decision,
+                },
+            }))
+            .await
+            .expect("persist approval decision before simulated restart");
+
+        let suffix = request_id
+            .strip_prefix("request-approve-")
+            .unwrap_or(request_id);
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO approval_log
+             (id, tool_call_id, run_id, turn_id, state, request_projection, redaction_version, created_at)
+             VALUES (?, ?, ?, ?, 'pending', '{}', 1, ?)",
+        )
+        .bind(request_id)
+        .bind(format!("tool-call-{suffix}"))
+        .bind(format!("run-{suffix}"))
+        .bind(format!("turn-{suffix}"))
+        .bind(now)
+        .execute(store.pool())
+        .await
+        .expect("seed pending approval log");
     }
 
     async fn persist_user(writer: &EventWriter, seq: u64, id: &str) {
@@ -1498,6 +1641,105 @@ mod tests {
                 .expect("command row")
                 .status,
             crate::gateway::CommandAckStatus::Applied
+        );
+    }
+
+    #[tokio::test]
+    async fn t12_prefix_preserves_pending_approved_once_for_recovery() {
+        let (store, writer) = setup().await;
+        let command_id = "00000000-0000-4000-8000-000000000002";
+        // Simulate a crash where the approval decision was received but the
+        // tool was never started: approval_log is still pending and the command
+        // must not be silently applied as a no-op.
+        seed_pending_approval_decision(
+            &store,
+            &writer,
+            command_id,
+            "request-approve-once",
+            ApprovalDecision::ApproveOnce,
+        )
+        .await;
+
+        let steps = SuffixRecovery::recover_t12_prefix(&store, &writer)
+            .await
+            .expect("plan recovery for pending approved tool");
+        assert_eq!(
+            steps.len(),
+            1,
+            "pending approval must produce a recovery step"
+        );
+        assert!(
+            matches!(steps[0], RecoveryStep::ApplyControl { command_id: ref id } if id == command_id),
+            "pending approved decision must return ApplyControl, not no-op: {steps:?}"
+        );
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM inbound_commands WHERE command_id=?")
+                .bind(command_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("command row");
+        assert_eq!(
+            status, "received",
+            "approval decision must remain received while pending"
+        );
+
+        let state: String = sqlx::query_scalar("SELECT state FROM approval_log WHERE id=?")
+            .bind("request-approve-once")
+            .fetch_one(store.pool())
+            .await
+            .expect("approval log row");
+        assert_eq!(
+            state, "pending",
+            "approval log must remain pending for recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn t12_prefix_preserves_pending_approved_always_for_recovery() {
+        let (store, writer) = setup().await;
+        let command_id = "00000000-0000-4000-8000-000000000003";
+        let rule = json!({
+            "id": "rule-fixture-always",
+            "tool": "bash",
+            "literal_prefix": ["git", "status"],
+            "effect": "allow",
+            "workspace_only": true,
+            "allowed_permissions": ["exec"],
+            "allowed_network_domains": []
+        });
+        seed_pending_approval_decision(
+            &store,
+            &writer,
+            command_id,
+            "request-approve-always",
+            ApprovalDecision::ApproveAlways {
+                rule: serde_json::from_value::<DeferredApprovalRule>(rule).expect("deferred rule"),
+            },
+        )
+        .await;
+
+        let steps = SuffixRecovery::recover_t12_prefix(&store, &writer)
+            .await
+            .expect("plan recovery for pending approved-always tool");
+        assert_eq!(
+            steps.len(),
+            1,
+            "pending approval must produce a recovery step"
+        );
+        assert!(
+            matches!(steps[0], RecoveryStep::ApplyControl { command_id: ref id } if id == command_id),
+            "pending approved-always decision must return ApplyControl, not no-op: {steps:?}"
+        );
+
+        let state: String = sqlx::query_scalar("SELECT state FROM approval_log WHERE id=?")
+            .bind("request-approve-always")
+            .fetch_one(store.pool())
+            .await
+            .expect("approval log row");
+        assert_eq!(
+            state, "pending",
+            "approval log must remain pending for recovery"
         );
     }
 

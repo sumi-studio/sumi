@@ -22,6 +22,19 @@ use store::{
     SuffixRecovery,
 };
 
+#[cfg(test)]
+pub(crate) const fn canonical_live_responses_harness_available() -> bool {
+    true
+}
+
+#[cfg(test)]
+pub(crate) async fn run_canonical_live_responses_roundtrip(
+    spec: provider::ModelSpec,
+    api_key: String,
+) {
+    agent::run_canonical_live_responses_roundtrip(spec, api_key).await;
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()

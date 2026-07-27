@@ -384,6 +384,8 @@ fn convert_messages(
     native_compaction: bool,
 ) -> Result<Vec<Value>, AnthropicAdapterError> {
     let compat = ensure_anthropic_spec(spec)?;
+    crate::provider::types::validate_provider_context_ordinals(&context.provider_context)
+        .map_err(AnthropicAdapterError::InvalidContext)?;
     let mut messages = Vec::<Value>::new();
     for memory in &context.memory_blocks {
         let layer = match memory.layer {
@@ -1120,9 +1122,11 @@ impl AnthropicReceiveState {
         let response_id = required_str(message, "id")?.to_owned();
         let model = required_str(message, "model")?;
         if model != self.expected_model {
-            return Err(AnthropicAdapterError::InvalidEvent(
-                "response model does not match requested model".into(),
-            ));
+            tracing::debug!(
+                observed_model = model,
+                canonical_model = self.expected_model,
+                "provider reported a different model string; using canonical spec model"
+            );
         }
         let response_model = model.to_owned();
         if required_str(message, "role")? != "assistant" {
@@ -2001,6 +2005,7 @@ mod tests {
     use chrono::TimeZone;
 
     use super::*;
+    use crate::provider::assembler::{MessageAssembler, TerminalMetadata};
     use crate::provider::types::{AssistantMessage, MemoryBlock, ToolResultMessage, UserMessage};
 
     fn spec() -> ModelSpec {
@@ -4372,6 +4377,100 @@ mod tests {
             error
                 .to_string()
                 .contains("unsupported content block type fallback")
+        );
+    }
+
+    #[test]
+    fn observed_model_different_from_canonical_still_produces_normal_terminal() {
+        let mut spec = spec();
+        spec.id = "claude-3-opus-20240229".to_owned();
+        let schemas = FrozenToolSchemaRegistry::compile(&[]).unwrap();
+        let mut state = AnthropicReceiveState::with_budget(
+            schemas,
+            ResponseBudget::for_output_tokens(1024).unwrap(),
+            None,
+            spec.id.clone(),
+        );
+        // Provider may report a dated or resolved variant; the adapter must not
+        // reject an otherwise valid response because of this.
+        let observed_model = "claude-3-opus-20240229-0:0";
+        let mut events = Vec::new();
+        events.extend(
+            state
+                .push_named(
+                    Some("message_start"),
+                    &format!(
+                        r#"{{"type":"message_start","message":{{"id":"m","model":"{observed_model}","role":"assistant","content":[],"usage":{{"input_tokens":3,"output_tokens":0}}}}}}"#
+                    ),
+                )
+                .unwrap()
+                .events,
+        );
+        events.extend(
+            state
+                .push_named(
+                    Some("content_block_start"),
+                    r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+                )
+                .unwrap()
+                .events,
+        );
+        events.extend(
+            state
+                .push_named(
+                    Some("content_block_delta"),
+                    r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}"#,
+                )
+                .unwrap()
+                .events,
+        );
+        events.extend(
+            state
+                .push_named(
+                    Some("content_block_stop"),
+                    r#"{"type":"content_block_stop","index":0}"#,
+                )
+                .unwrap()
+                .events,
+        );
+        events.extend(
+            state
+                .push_named(
+                    Some("message_delta"),
+                    r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}"#,
+                )
+                .unwrap()
+                .events,
+        );
+        let terminal = state
+            .push_named(Some("message_stop"), r#"{"type":"message_stop"}"#)
+            .unwrap()
+            .terminal
+            .expect("terminal");
+        assert_eq!(terminal.reason, StopReason::Stop);
+
+        let mut assembler = MessageAssembler::new();
+        assembler.apply(&ProviderEvent::Start).unwrap();
+        for event in events {
+            assembler.apply(&event).unwrap();
+        }
+        let message = assembler
+            .finish(TerminalMetadata {
+                provider: spec.provider.clone(),
+                origin: spec.origin(),
+                usage: terminal.usage,
+                stop_reason: terminal.reason,
+                error_message: None,
+                provider_code: None,
+                interrupted: false,
+                timestamp: Utc::now(),
+            })
+            .unwrap();
+        assert_eq!(message.model, spec.id);
+        assert_eq!(message.origin, spec.origin());
+        assert_eq!(message.content.len(), 1);
+        assert!(
+            matches!(&message.content[0], AssistantContent::Text { text, .. } if text == "hello")
         );
     }
 

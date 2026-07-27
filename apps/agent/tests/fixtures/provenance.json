@@ -128,6 +128,64 @@
     }
   },
   "evidence_gaps": {
+    "codex_responses_live_bridge_release_gate": {
+      "provider": "openai-responses-via-codex-oauth-bridge",
+      "model": "gpt-5.6-luna",
+      "required_cases": [
+        "store_false_two_turn_tool_call_result_round_trip",
+        "encrypted_provider_context_preservation_and_replay",
+        "non_empty_second_turn_text",
+        "bounded_evidence_without_tokens_or_raw_secrets"
+      ],
+      "gate_tests": [
+        "provider::tests::live_codex_responses_provider_release_gate",
+        "provider::tests::live_codex_responses_release_opt_in_without_bridge_url_fails_before_network",
+        "provider::tests::live_codex_responses_release_opt_in_with_empty_bridge_url_fails_before_network",
+        "provider::tests::live_codex_responses_release_opt_in_without_proxy_secret_fails_before_network",
+        "provider::tests::live_codex_responses_release_opt_in_with_empty_proxy_secret_fails_before_network",
+        "provider::tests::codex_responses_proxy_self_test_passes"
+      ],
+      "status": "required_for_T25_release",
+      "release_blocking": true,
+      "bridge": "scripts/dev/codex-responses-proxy.py",
+      "note": "This is the T25 release live proof. It runs through the local development-only Codex OAuth bridge. The bridge mutates the public OpenAI Responses request shape (removes max_output_tokens, forces stream=true/store=false, validates Authorization: Bearer <proxy-secret> in constant time before reading the body, then replaces it with Codex OAuth for the upstream request). It validates the Responses adapter against the ChatGPT Codex subscription endpoint, not the public OpenAI API-key contract. It is not a production provider path and not a substitute for fixture/durable proof."
+    },
+    "responses_fixture_and_durable_round_trip": {
+      "provider": "openai-responses",
+      "model": "gpt-5.6-luna",
+      "required_cases": [
+        "encrypted_reasoning_durable_round_trip",
+        "store_false_two_turn_tool_fixture",
+        "native_compaction_ordered_output"
+      ],
+      "gate_tests": [
+        "provider::adapters::responses::tests::official_sse_fixture_normalizes_all_supported_events",
+        "provider::tests::responses_dispatch_normalizes_fixture_and_preserves_context",
+        "store::event_writer::tests::message_end_persists_encrypted_provider_context_and_eviction_tokens",
+        "store::event_writer::tests::hydrate_round_trips_assistant_and_provider_context",
+        "provider::adapters::responses::tests::request_uses_instructions_three_layer_items_and_store_false",
+        "provider::adapters::responses::tests::native_compacted_window_replays_exact_order_then_only_uncovered_suffix",
+        "provider::adapters::responses::tests::replay_rejects_duplicate_public_indexes_and_orders_trailing_opaque_items"
+      ],
+      "status": "required_for_T25_release",
+      "release_blocking": true,
+      "note": "Fixture and durable restart proofs are mandatory and distinct from the live bridge proof. The OAuth bridge mutates the public request shape, so it cannot substitute for fixture/durable proof."
+    },
+    "opencode_go_live_two_turn_tool_reasoning": {
+      "provider": "opencode-go",
+      "model": "kimi-k2.7-code",
+      "required_cases": [
+        "two_turn_tool_call_result_round_trip",
+        "reasoning_exposure_and_replay"
+      ],
+      "status": "post_deadline_provider_qualification_debt",
+      "latest_attempt": {
+        "observed_at": "2026-07-25T23:39:09Z",
+        "result": "http_429_weekly_usage_limit"
+      },
+      "release_blocking": false,
+      "note": "OpenCode Go is confirmed unavailable for the T25 deadline. Moved to explicit post-deadline provider-qualification debt. The ignored developer probe is preserved; it is not completed, deleted, or substituted by the Responses bridge."
+    },
     "moonshot_direct_text_tool_reasoning": {
       "provider": "moonshot",
       "model": "kimi-k3",
@@ -137,9 +195,10 @@
         "reasoning",
         "two_turn_reasoning_content_replay"
       ],
-      "status": "blocked_missing_MOONSHOT_API_KEY",
+      "status": "release_blocking_missing_evidence",
       "deferred_gate": "T25_provider_release",
-      "release_blocking": true
+      "release_blocking": true,
+      "note": "Direct Moonshot proof remains release-blocking missing evidence for the Chat Completions provider track. It is not completed, deleted, skipped, or substituted by the Responses T25 release gate."
     },
     "zai_direct_tool_and_finish_reasons": {
       "provider": "zai",
@@ -151,9 +210,10 @@
         "provider_finish_reason_model_context_window_exceeded",
         "two_turn_tool_reasoning"
       ],
-      "status": "blocked_missing_ZAI_API_KEY",
+      "status": "release_blocking_missing_evidence",
       "deferred_gate": "T25_provider_release",
-      "release_blocking": true
+      "release_blocking": true,
+      "note": "Direct Z.ai proof remains release-blocking missing evidence for the Chat Completions provider track. It is not completed, deleted, skipped, or substituted by the Responses T25 release gate."
     },
     "umans_direct_text_tool_reasoning": {
       "provider": "umans",
@@ -164,9 +224,10 @@
         "reasoning",
         "two_turn_tool_reasoning"
       ],
-      "status": "blocked_missing_UMANS_API_KEY",
+      "status": "release_blocking_missing_evidence",
       "deferred_gate": "T25_provider_release",
-      "release_blocking": true
+      "release_blocking": true,
+      "note": "Direct Umans proof remains release-blocking missing evidence for the Chat Completions provider track. It is not completed, deleted, skipped, or substituted by the Responses T25 release gate."
     }
   }
 }

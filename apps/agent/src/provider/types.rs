@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     pin::Pin,
     sync::{
         Arc,
@@ -102,7 +103,7 @@ pub struct MemoryBlock {
     pub time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiProtocol {
     OpenAiChatCompletions,
@@ -123,9 +124,118 @@ pub struct ProviderOrigin {
 pub struct ProviderContextItem {
     pub origin_message: Option<ProviderContextAnchor>,
     pub wire_item_index: Option<u32>,
+    /// Tie-breaker within the same `wire_item_index`, zero-based and assigned
+    /// deterministically by the consumer that assembles the context list.
     pub ordinal: u32,
     pub provider_origin: ProviderOrigin,
     pub payload: ProviderContextPayload,
+}
+
+/// Validates the stable ordering metadata shared by durable hydration and
+/// provider replay. Every authenticated anchor/wire group starts at ordinal
+/// zero and has no duplicate or missing ordinal. Native windows form an
+/// unanchored group scoped by their exact provider origin and payload kind.
+pub fn validate_provider_context_ordinals(items: &[ProviderContextItem]) -> Result<(), String> {
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+    enum Group {
+        Anchored {
+            message_id: String,
+            message_seq: u64,
+            wire_item_index: u32,
+        },
+        Native {
+            provider_instance_id: String,
+            protocol: ApiProtocol,
+            model: String,
+            kind: u8,
+        },
+    }
+
+    let mut groups = BTreeMap::<Group, Vec<u32>>::new();
+    for item in items {
+        let group = match &item.payload {
+            ProviderContextPayload::EncryptedReasoning { .. } => {
+                let anchor = item
+                    .origin_message
+                    .as_ref()
+                    .ok_or_else(|| "encrypted reasoning is missing an origin message".to_owned())?;
+                let wire_item_index = item
+                    .wire_item_index
+                    .ok_or_else(|| "encrypted reasoning is missing a wire_item_index".to_owned())?;
+                Group::Anchored {
+                    message_id: anchor.message_id.clone(),
+                    message_seq: anchor.message_seq,
+                    wire_item_index,
+                }
+            }
+            ProviderContextPayload::OpenAiCompactedWindow { .. }
+            | ProviderContextPayload::AnthropicCompaction { .. } => {
+                if item.origin_message.is_some() || item.wire_item_index.is_some() {
+                    return Err(
+                        "native provider context must be unanchored and have no wire_item_index"
+                            .to_owned(),
+                    );
+                }
+                Group::Native {
+                    provider_instance_id: item.provider_origin.provider_instance_id.clone(),
+                    protocol: item.provider_origin.protocol,
+                    model: item.provider_origin.model.clone(),
+                    kind: match &item.payload {
+                        ProviderContextPayload::OpenAiCompactedWindow { .. } => 1,
+                        ProviderContextPayload::AnthropicCompaction { .. } => 2,
+                        ProviderContextPayload::EncryptedReasoning { .. } => unreachable!(),
+                    },
+                }
+            }
+        };
+        groups.entry(group).or_default().push(item.ordinal);
+    }
+
+    for (group, mut ordinals) in groups {
+        ordinals.sort_unstable();
+        for (expected, actual) in ordinals.into_iter().enumerate() {
+            let expected = u32::try_from(expected).map_err(|_| {
+                format!("provider context ordinal count overflows u32 for {group:?}")
+            })?;
+            if actual != expected {
+                return Err(format!(
+                    "provider context ordinals for {group:?} must be unique and contiguous from zero; expected {expected}, found {actual}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Binds terminal fragments to the exact durable MessageEnd receipt anchor.
+/// Ordinals are assigned independently within each wire slot.
+pub fn bind_provider_context_fragments(
+    fragments: Vec<ProviderContextFragment>,
+    anchor: ProviderContextAnchor,
+    provider_origin: ProviderOrigin,
+) -> Result<Vec<ProviderContextItem>, String> {
+    let mut next_ordinal = BTreeMap::<Option<u32>, u32>::new();
+    let mut items = Vec::with_capacity(fragments.len());
+    for fragment in fragments {
+        let ordinal = next_ordinal.entry(fragment.wire_item_index).or_insert(0);
+        let item = ProviderContextItem {
+            origin_message: match &fragment.payload {
+                ProviderContextPayload::EncryptedReasoning { .. } => Some(anchor.clone()),
+                ProviderContextPayload::OpenAiCompactedWindow { .. }
+                | ProviderContextPayload::AnthropicCompaction { .. } => None,
+            },
+            wire_item_index: fragment.wire_item_index,
+            ordinal: *ordinal,
+            provider_origin: provider_origin.clone(),
+            payload: fragment.payload,
+        };
+        *ordinal = ordinal
+            .checked_add(1)
+            .ok_or_else(|| "provider context ordinal overflows u32".to_owned())?;
+        items.push(item);
+    }
+    validate_provider_context_ordinals(&items)?;
+    Ok(items)
 }
 
 #[cfg(test)]
@@ -1870,5 +1980,56 @@ mod tests {
             },
         ];
         assert!(validate_native_suffix(&synthetic_after_persisted, Some(4)).is_err());
+    }
+
+    #[test]
+    fn provider_context_ordinals_are_zero_based_unique_and_contiguous_per_wire() {
+        let anchor = ProviderContextAnchor {
+            message_id: "assistant-1".to_owned(),
+            message_seq: 7,
+        };
+        let item = |wire_item_index, ordinal| ProviderContextItem {
+            origin_message: Some(anchor.clone()),
+            wire_item_index: Some(wire_item_index),
+            ordinal,
+            provider_origin: origin(),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiResponses,
+                item: json!({
+                    "id": format!("reasoning-{wire_item_index}-{ordinal}"),
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": "opaque",
+                }),
+            },
+        };
+
+        validate_provider_context_ordinals(&[item(0, 0), item(0, 1), item(2, 0)])
+            .expect("each wire group is independently contiguous");
+        for invalid in [
+            vec![item(0, 1)],
+            vec![item(0, 0), item(0, 0)],
+            vec![item(0, 0), item(0, 2)],
+        ] {
+            assert!(
+                validate_provider_context_ordinals(&invalid).is_err(),
+                "{invalid:?}"
+            );
+        }
+
+        let native = ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 1,
+            provider_origin: origin(),
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({"type":"compaction","encrypted_content":"opaque"})],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 7,
+                    context_fingerprint: "fingerprint".to_owned(),
+                },
+            },
+        };
+        assert!(validate_provider_context_ordinals(&[native]).is_err());
     }
 }
