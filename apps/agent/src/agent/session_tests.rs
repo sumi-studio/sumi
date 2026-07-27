@@ -6329,6 +6329,30 @@ fn live_responses_driver(
     )
 }
 
+fn live_responses_approval_broker() -> Arc<ApprovalBroker> {
+    let workspace_root = std::env::temp_dir();
+    let policy = crate::approval::Policy::new(&workspace_root)
+        .try_with_rule(ApprovalRule {
+            id: "live-responses-echo-value".to_owned(),
+            tool: "echo_value".to_owned(),
+            literal_prefix: vec!["echo_value".to_owned(), "responses-live-ok".to_owned()],
+            effect: RuleEffect::Allow,
+            workspace_only: true,
+            allowed_permissions: vec![Permission::ReadWorkspace],
+            allowed_network_domains: Vec::new(),
+        })
+        .expect("valid bounded live Responses approval rule");
+    Arc::new(ApprovalBroker::headless(
+        policy,
+        SecretAwareActionProjector::new(Redactor::v1(), SecretDigestKey::fixture()),
+    ))
+}
+
+#[test]
+fn live_responses_approval_broker_constructs_bounded_policy() {
+    let _ = live_responses_approval_broker();
+}
+
 fn live_responses_user(seq: u64, text: &str) -> InboundCommand {
     let command_id = format!("25000000-0000-4000-8000-{seq:012}");
     InboundCommand::Valid(CommandEnvelope {
@@ -6529,7 +6553,11 @@ pub(crate) async fn run_canonical_live_responses_roundtrip(spec: ModelSpec, api_
     let tool = live_responses_tool();
     let first_core = run_live_responses_session(
         store,
-        RunCore::new(),
+        {
+            let mut core = RunCore::new();
+            core.set_approval(live_responses_approval_broker());
+            core
+        },
         live_responses_driver(
             spec.clone(),
             tool.clone(),
@@ -6597,6 +6625,7 @@ pub(crate) async fn run_canonical_live_responses_roundtrip(spec: ModelSpec, api_
     assert_live_provider_context_private(&reopened, &hydrated.messages, &markers).await;
     let replayed_context_items = hydrated.provider_context.len();
     let mut restarted_core = RunCore::new();
+    restarted_core.set_approval(live_responses_approval_broker());
     restarted_core.install_hydrated_context(hydrated.messages, hydrated.provider_context);
 
     let second_pool = reopened.pool().clone();

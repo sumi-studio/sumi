@@ -69,10 +69,10 @@ OpenCode Zen Go is confirmed unavailable for the T25 deadline and is moved to
 post-deadline provider-qualification debt; the Codex OAuth bridge OpenAI
 Responses live proof replaces it for the T25 provider-release gate.
 
-Direct Moonshot, Z.ai, and Umans live/raw proofs remain release-blocking
-missing evidence for the Chat Completions provider track. They are not
-completed, deleted, or substituted by the Responses bridge, and their
-credential-gated developer probes are preserved.
+Direct Moonshot, Z.ai, and Umans live/raw proofs remain credential-gated
+developer/provider-qualification probes for the Chat Completions track. They
+are not completed, deleted, or substituted by the Responses bridge, and are
+not blockers for the Responses-only Cloud release gate.
 
 The OpenCode capture script below is retained for future qualification. Capture
 only after explicitly loading the `opencode-go` credential from the local
