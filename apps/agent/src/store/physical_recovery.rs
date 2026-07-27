@@ -58,6 +58,26 @@ pub(crate) struct HydrationReceiptIdentity {
     pub intent_count: usize,
 }
 
+impl HydrationReceiptIdentity {
+    pub(crate) fn stable_id(&self) -> String {
+        let mut hasher = Sha256::new();
+        fn field(hasher: &mut Sha256, value: &[u8]) {
+            hasher.update((value.len() as u64).to_be_bytes());
+            hasher.update(value);
+        }
+        field(&mut hasher, b"sumi-hydration-receipt/v1");
+        field(&mut hasher, self.lease_id.as_bytes());
+        hasher.update(self.generation.as_i64().to_be_bytes());
+        field(&mut hasher, self.fence_id.as_bytes());
+        hasher.update((self.intent_count as u64).to_be_bytes());
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+}
+
 /// A T27 physical recovery receipt, bound to a `ProcessGeneration` lease and a
 /// `GenerationRecoveryFence`.
 #[derive(Clone, Debug, PartialEq, Eq)]

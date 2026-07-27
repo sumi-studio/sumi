@@ -1,44 +1,94 @@
-//! Compile-safe adapter seams for T17 and T26 integrations.
-//!
-//! These types compile against `ConnectionSupervisor` but return descriptive
-//! errors until the concrete T17/T26 boundary is wired. The error messages
-//! document the exact integration contract.
+//! Store/runtime adapters for the T17 and T26 integration boundaries.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
+use sqlx::Row;
+use tokio::sync::{mpsc, watch};
 
 use super::{
-    CommandCursors, CredentialProvider, DurableSource, EventCursors, GatewayCredential,
-    HydrationLatch, HydrationReady, OutboundFrame,
+    CommandCursors, CredentialProvider, DeliveryEpoch, DurableSource, EventCursors, EventSender,
+    GatewayCredential, HydrationLatch, HydrationReady, OutboundFrame,
 };
+use crate::gateway::Envelope;
 use crate::runtime::contracts::ProcessGeneration;
+use crate::store::{
+    DeliveryChannelBuilder, DeliveryFrame, DeliveryMode, DeliveryPump, HydrationReceiptIdentity,
+    Store, current_event_head_seq, raw_events_after,
+};
 
-/// Compile-safe T17 hydration seam. T17 will replace this with a
-/// `WatchHydrationLatch` driven by the production hydration receipt.
-#[derive(Clone, Debug)]
-pub struct T17HydrationLatch;
+/// T17's typed hydration receipt projected into T24's latched readiness boundary.
+#[derive(Clone)]
+pub struct T17HydrationLatch {
+    rx: watch::Receiver<Option<HydrationReceiptIdentity>>,
+    observed: Arc<Mutex<Option<HydrationReady>>>,
+}
+
+impl fmt::Debug for T17HydrationLatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("T17HydrationLatch").finish_non_exhaustive()
+    }
+}
+
+impl T17HydrationLatch {
+    pub(crate) fn new(rx: watch::Receiver<Option<HydrationReceiptIdentity>>) -> Self {
+        Self {
+            rx,
+            observed: Arc::new(Mutex::new(None)),
+        }
+    }
+}
 
 #[async_trait]
 impl HydrationLatch for T17HydrationLatch {
     async fn wait_for(&self, generation: ProcessGeneration) -> Result<HydrationReady> {
-        let _ = generation;
-        bail!(
-            "T17 integration seam: HydrationLatch::wait_for({generation}) is not wired. \
-             T17 must emit HydrationReady{{generation, receipt_identity}} through a watch channel."
-        )
+        let mut rx = self.rx.clone();
+        loop {
+            let receipt = rx.borrow().clone();
+            if let Some(receipt) = receipt {
+                if receipt.generation != generation {
+                    bail!(
+                        "T17 hydration receipt generation mismatch: expected {generation}, got {}",
+                        receipt.generation
+                    );
+                }
+                let ready = HydrationReady {
+                    generation,
+                    receipt_identity: receipt.stable_id(),
+                };
+                let mut observed = self.observed.lock().unwrap();
+                if let Some(previous) = observed.as_ref()
+                    && previous.generation == generation
+                    && previous.receipt_identity != ready.receipt_identity
+                {
+                    bail!("T17 hydration receipt changed for generation {generation}");
+                }
+                if observed
+                    .as_ref()
+                    .is_some_and(|previous| previous.generation == generation)
+                {
+                    return Ok(observed.clone().expect("observed receipt exists"));
+                }
+                *observed = Some(ready.clone());
+                return Ok(ready);
+            }
+            drop(receipt);
+            rx.changed()
+                .await
+                .context("T17 hydration receipt channel dropped before Ready")?;
+        }
     }
 }
 
-/// Compile-safe T17 durable source seam. T17 will replace this with a
-/// store-backed adapter. The exact integration contract is documented in
-/// the error messages so the T17 boundary can be filled without ambiguity.
+/// Real T17 Store adapter used by the T24 supervisor for durable cursors,
+/// catch-up pages, and the DeliveryPump epoch lifecycle.
 #[derive(Clone)]
 pub struct T17StoreAdapter {
-    #[allow(dead_code)]
-    store: Arc<crate::store::Store>,
+    store: Arc<Store>,
+    pump: Arc<tokio::sync::Mutex<DeliveryPump>>,
+    delivery_rx: Arc<Mutex<Option<mpsc::Receiver<DeliveryFrame>>>>,
 }
 
 impl fmt::Debug for T17StoreAdapter {
@@ -48,46 +98,155 @@ impl fmt::Debug for T17StoreAdapter {
 }
 
 impl T17StoreAdapter {
-    #[allow(dead_code)]
-    pub(crate) fn new(store: Arc<crate::store::Store>) -> Self {
-        Self { store }
+    pub(crate) fn new(store: Arc<Store>) -> Self {
+        let (channel, delivery_rx) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
+        Self {
+            store: store.clone(),
+            pump: Arc::new(tokio::sync::Mutex::new(DeliveryPump::new(store, channel))),
+            delivery_rx: Arc::new(Mutex::new(Some(delivery_rx))),
+        }
+    }
+
+    fn start_forwarder(&self, sink: EventSender) {
+        let Some(mut rx) = self.delivery_rx.lock().unwrap().take() else {
+            return;
+        };
+        let conversation_id = self.store.scope().conversation_id.clone();
+        tokio::spawn(async move {
+            while let Some(frame) = rx.recv().await {
+                let (epoch, seq, event) = match frame {
+                    DeliveryFrame::Durable {
+                        seq,
+                        epoch,
+                        raw: Some(event),
+                        projection: None,
+                    } => (epoch, Some(seq), event),
+                    DeliveryFrame::Volatile { epoch, event } => (epoch, None, event),
+                    DeliveryFrame::Durable { .. } => {
+                        tracing::error!(
+                            "raw T17 gateway delivery received a projection-only frame"
+                        );
+                        break;
+                    }
+                };
+                let event = match serde_json::to_value(event) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        tracing::error!(%error, "failed to serialize T17 delivery event");
+                        break;
+                    }
+                };
+                let outbound = OutboundFrame::Event {
+                    envelope: Envelope {
+                        seq,
+                        conversation_id: conversation_id.clone(),
+                        event,
+                    },
+                };
+                if sink.send((epoch, outbound)).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    pub(crate) async fn on_durable_committed(&self, seq: u64) -> Result<()> {
+        self.pump.lock().await.on_durable_committed(seq).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn active_delivery_epoch(&self) -> Option<DeliveryEpoch> {
+        self.pump.lock().await.epoch().copied()
     }
 }
 
 #[async_trait]
 impl DurableSource for T17StoreAdapter {
     async fn event_cursor(&self) -> Result<EventCursors> {
-        bail!(
-            "T17 integration seam: Store::event_cursor() is not wired. \
-             Contract: SELECT MAX(seq) FROM agent_events WHERE conversation_id = <scope.conversation_id>; \
-             return EventCursors{{ last_sent: <max or 0> }}."
-        )
+        Ok(EventCursors {
+            last_sent: current_event_head_seq(self.store.pool()).await?,
+        })
     }
 
     async fn events_after(&self, after_seq: u64, limit: usize) -> Result<Vec<OutboundFrame>> {
-        let _ = (after_seq, limit);
-        bail!(
-            "T17 integration seam: Store::events_after(after_seq, limit) is not wired. \
-             Contract: SELECT seq, raw_ciphertext, raw_key_ref FROM agent_events \
-             WHERE conversation_id = <scope.conversation_id> AND seq > ? ORDER BY seq LIMIT ?; \
-             decrypt raw_ciphertext with the conversation event data key, deserialize to OutboundFrame."
-        )
+        raw_events_after(&self.store, after_seq, limit)
+            .await?
+            .into_iter()
+            .map(|(seq, event)| {
+                Ok(OutboundFrame::Event {
+                    envelope: Envelope {
+                        seq: Some(seq),
+                        conversation_id: self.store.scope().conversation_id.clone(),
+                        event: serde_json::to_value(event)
+                            .context("serialize durable T17 event for gateway")?,
+                    },
+                })
+            })
+            .collect()
     }
 
     async fn command_cursors(&self) -> Result<CommandCursors> {
-        bail!(
-            "T17 integration seam: Store::command_cursors() is not wired. \
-             Contract: SELECT MAX(seq) FROM inbound_commands AS received over every status, \
-             and verify that rows form the complete persisted prefix 1..=received; \
-             derive applied as the largest contiguous prefix whose rows all have status \
-             IN ('applied','superseded','rejected'), not merely MAX(seq) over terminal rows; \
-             return CommandCursors{{ received, applied }}."
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS row_count,
+                    COALESCE(MIN(seq), 0) AS min_seq,
+                    COALESCE(MAX(seq), 0) AS max_seq,
+                    MIN(CASE WHEN status NOT IN ('applied', 'superseded', 'rejected')
+                             THEN seq END) AS first_nonterminal
+             FROM inbound_commands",
         )
+        .fetch_one(self.store.pool())
+        .await
+        .context("failed to read durable command cursors")?;
+        let row_count: i64 = row.try_get("row_count")?;
+        let min_seq: i64 = row.try_get("min_seq")?;
+        let max_seq: i64 = row.try_get("max_seq")?;
+        let first_nonterminal: Option<i64> = row.try_get("first_nonterminal")?;
+        if row_count < 0 || min_seq < 0 || max_seq < 0 {
+            bail!("stored command cursor contains a negative value");
+        }
+        if row_count == 0 {
+            return Ok(CommandCursors::default());
+        }
+        if min_seq != 1 || row_count != max_seq {
+            bail!(
+                "stored commands do not form a complete prefix: count={row_count}, min={min_seq}, max={max_seq}"
+            );
+        }
+        let received = u64::try_from(max_seq).context("command received cursor is negative")?;
+        let applied = match first_nonterminal {
+            Some(seq) if seq <= 0 => bail!("first nonterminal command seq is not positive"),
+            Some(seq) => u64::try_from(seq - 1).context("command applied cursor is negative")?,
+            None => received,
+        };
+        Ok(CommandCursors { received, applied })
+    }
+
+    async fn install_delivery_epoch(
+        &self,
+        epoch: DeliveryEpoch,
+        catch_up_from_seq: u64,
+        sink: EventSender,
+    ) -> Result<()> {
+        self.start_forwarder(sink);
+        self.pump
+            .lock()
+            .await
+            .install_epoch(epoch, catch_up_from_seq)
+            .await
+    }
+
+    async fn invalidate_delivery_epoch(&self, epoch: DeliveryEpoch) -> Result<()> {
+        if !self.pump.lock().await.invalidate_epoch(epoch) {
+            return Err(anyhow!(
+                "T17 DeliveryPump epoch invalidation mismatch for {}",
+                epoch.as_u64()
+            ));
+        }
+        Ok(())
     }
 }
 
-/// Placeholder credential provider for the compile-safe seam. T26 will
-/// replace this with a workload-identity / rotating-file implementation.
+/// Placeholder credential provider for T26's workload-identity integration.
 #[derive(Clone, Debug)]
 pub struct T26CredentialProvider;
 

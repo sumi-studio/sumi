@@ -8,28 +8,15 @@ use tokio::{sync::mpsc, time::timeout};
 use zeroize::Zeroizing;
 
 use crate::agent::AgentEvent;
+use crate::gateway::supervisor::DeliveryEpoch;
 
 use super::{DataKeyPurpose, Store, crypto::decrypt_content};
 
 #[cfg(test)]
 use super::PublicProjectionBuilder;
 
-const MAX_EPOCH_BYTES: usize = 128;
 const DELIVERY_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_CHANNEL_CAPACITY: usize = 64;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DeliveryEpoch(pub(crate) String);
-
-impl DeliveryEpoch {
-    pub(crate) fn new(value: impl Into<String>) -> Result<Self> {
-        let value = value.into();
-        if value.is_empty() || value.len() > MAX_EPOCH_BYTES {
-            bail!("DeliveryEpoch must be 1..={MAX_EPOCH_BYTES} bytes");
-        }
-        Ok(Self(value))
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeliveryMode {
@@ -139,9 +126,7 @@ impl DeliveryPump {
         if catch_up_from_seq == 0 {
             bail!("catch-up must start from a positive next-seq");
         }
-        self.state = PumpState::CatchingUp {
-            epoch: epoch.clone(),
-        };
+        self.state = PumpState::CatchingUp { epoch };
 
         let head_seq = match current_event_head_seq(self.store.pool()).await {
             Ok(seq) => seq,
@@ -168,14 +153,18 @@ impl DeliveryPump {
         Ok(())
     }
 
-    pub(crate) fn invalidate_epoch(&mut self) {
+    pub(crate) fn invalidate_epoch(&mut self, epoch: DeliveryEpoch) -> bool {
+        if self.epoch() != Some(&epoch) {
+            return false;
+        }
         self.state = PumpState::Idle;
+        true
     }
 
     pub(crate) async fn on_durable_committed(&mut self, seq: u64) -> Result<()> {
         let epoch = match &self.state {
             PumpState::Idle | PumpState::CatchingUp { .. } => return Ok(()),
-            PumpState::Online { epoch } => epoch.clone(),
+            PumpState::Online { epoch } => *epoch,
         };
         if let Err(err) = send_event_range(&self.store, &self.channel, &epoch, seq, seq).await {
             self.state = PumpState::Idle;
@@ -189,7 +178,7 @@ impl DeliveryPump {
             bail!("volatile delivery rejected durable event of kind {kind}");
         }
         let epoch = match &self.state {
-            PumpState::Online { epoch } => epoch.clone(),
+            PumpState::Online { epoch } => *epoch,
             PumpState::Idle | PumpState::CatchingUp { .. } => return Ok(()),
         };
         if matches!(self.channel.mode, DeliveryMode::RedactionOnly) {
@@ -201,13 +190,48 @@ impl DeliveryPump {
     }
 }
 
-async fn current_event_head_seq(pool: &sqlx::SqlitePool) -> Result<u64> {
+pub(crate) async fn current_event_head_seq(pool: &sqlx::SqlitePool) -> Result<u64> {
     let row = sqlx::query("SELECT COALESCE(MAX(seq), 0) AS head FROM agent_events")
         .fetch_one(pool)
         .await
         .context("failed to read event head")?;
     let head: i64 = row.try_get("head")?;
     u64::try_from(head).context("event head seq is negative")
+}
+
+pub(crate) async fn raw_events_after(
+    store: &Store,
+    after_seq: u64,
+    limit: usize,
+) -> Result<Vec<(u64, AgentEvent)>> {
+    if limit == 0 {
+        bail!("delivery event page size must be positive");
+    }
+    let rows = sqlx::query(
+        "SELECT seq, raw_key_ref, raw_ciphertext
+         FROM agent_events
+         WHERE seq > ?
+         ORDER BY seq
+         LIMIT ?",
+    )
+    .bind(i64::try_from(after_seq).context("after_seq exceeds SQLite INTEGER range")?)
+    .bind(i64::try_from(limit).context("event page size exceeds SQLite INTEGER range")?)
+    .fetch_all(store.pool())
+    .await
+    .context("failed to fetch durable event page")?;
+
+    let mut events = Vec::with_capacity(rows.len());
+    for row in rows {
+        let seq: i64 = row.try_get("seq")?;
+        let seq = u64::try_from(seq).context("stored event seq is negative")?;
+        let key_ref: String = row.try_get("raw_key_ref")?;
+        let ciphertext: Vec<u8> = row.try_get("raw_ciphertext")?;
+        let event = decrypt_event(store, seq, &key_ref, &ciphertext)
+            .await
+            .context("failed to decrypt durable event page row")?;
+        events.push((seq, event));
+    }
+    Ok(events)
 }
 
 async fn send_event_range(
@@ -253,7 +277,7 @@ async fn send_event_range(
         channel
             .send(DeliveryFrame::Durable {
                 seq,
-                epoch: epoch.clone(),
+                epoch: *epoch,
                 raw,
                 projection,
             })
@@ -375,9 +399,8 @@ mod tests {
 
         let (channel, mut receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
         let mut pump = DeliveryPump::new(store.clone(), channel);
-        pump.install_epoch(DeliveryEpoch::new("epoch-1").unwrap(), 1)
-            .await
-            .unwrap();
+        let epoch = DeliveryEpoch::for_test("epoch-1");
+        pump.install_epoch(epoch, 1).await.unwrap();
 
         let frame = timeout(Duration::from_secs(1), receiver.recv())
             .await
@@ -403,7 +426,7 @@ mod tests {
         let (channel, mut receiver) =
             DeliveryChannelBuilder::with_mode(DeliveryMode::RedactionOnly).build();
         let mut pump = DeliveryPump::new(store.clone(), channel);
-        pump.install_epoch(DeliveryEpoch::new("epoch-1").unwrap(), 1)
+        pump.install_epoch(DeliveryEpoch::for_test("epoch-1"), 1)
             .await
             .unwrap();
 
@@ -454,7 +477,7 @@ mod tests {
         let event2 = assistant_event("msg-2", "second");
         insert_test_durable_event(&store, 2, &event2).await.unwrap();
 
-        pump.install_epoch(DeliveryEpoch::new("epoch-1").unwrap(), 1)
+        pump.install_epoch(DeliveryEpoch::for_test("epoch-1"), 1)
             .await
             .unwrap();
 
@@ -492,7 +515,7 @@ mod tests {
         insert_test_durable_event(&store, 1, &assistant_event("msg-1", "a"))
             .await
             .unwrap();
-        pump.install_epoch(DeliveryEpoch::new("epoch-1").unwrap(), 1)
+        pump.install_epoch(DeliveryEpoch::for_test("epoch-1"), 1)
             .await
             .unwrap();
 
@@ -519,9 +542,8 @@ mod tests {
 
         let (channel, mut receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
         let mut pump = DeliveryPump::new(store.clone(), channel);
-        pump.install_epoch(DeliveryEpoch::new("epoch-1").unwrap(), 1)
-            .await
-            .unwrap();
+        let epoch = DeliveryEpoch::for_test("epoch-1");
+        pump.install_epoch(epoch, 1).await.unwrap();
         receiver.recv().await.unwrap();
         assert!(pump.is_online());
 
@@ -530,7 +552,7 @@ mod tests {
         pump.on_durable_committed(2).await.unwrap();
 
         assert!(pump.is_online());
-        assert_eq!(pump.epoch().unwrap().0, "epoch-1");
+        assert_eq!(pump.epoch(), Some(&epoch));
 
         let frame = receiver.recv().await.unwrap();
         match frame {
@@ -548,7 +570,7 @@ mod tests {
 
         let (channel, mut receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
         let mut pump = DeliveryPump::new(store.clone(), channel);
-        pump.install_epoch(DeliveryEpoch::new("epoch-1").unwrap(), 1)
+        pump.install_epoch(DeliveryEpoch::for_test("epoch-1"), 1)
             .await
             .unwrap();
         assert!(pump.is_online());
@@ -583,12 +605,11 @@ mod tests {
         insert_test_durable_event(&store, 1, &assistant_event("msg-1", "a"))
             .await
             .unwrap();
-        pump.install_epoch(DeliveryEpoch::new("epoch-1").unwrap(), 1)
-            .await
-            .unwrap();
+        let epoch_1 = DeliveryEpoch::for_test("epoch-1");
+        pump.install_epoch(epoch_1, 1).await.unwrap();
         receiver.recv().await.unwrap();
 
-        pump.invalidate_epoch();
+        assert!(pump.invalidate_epoch(epoch_1));
         let event2 = assistant_event("msg-2", "b");
         insert_test_durable_event(&store, 2, &event2).await.unwrap();
         pump.on_durable_committed(2).await.unwrap();
@@ -599,7 +620,7 @@ mod tests {
                 .is_err()
         );
 
-        pump.install_epoch(DeliveryEpoch::new("epoch-2").unwrap(), 1)
+        pump.install_epoch(DeliveryEpoch::for_test("epoch-2"), 1)
             .await
             .unwrap();
         let mut count = 0;
@@ -615,7 +636,7 @@ mod tests {
         let (channel, mut receiver) =
             DeliveryChannelBuilder::with_mode(DeliveryMode::RedactionOnly).build();
         let mut pump = DeliveryPump::new(store.clone(), channel);
-        pump.install_epoch(DeliveryEpoch::new("epoch-1").unwrap(), 1)
+        pump.install_epoch(DeliveryEpoch::for_test("epoch-1"), 1)
             .await
             .unwrap();
 
@@ -658,7 +679,7 @@ mod tests {
         let (channel, mut receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
         let mut pump = DeliveryPump::new(store.clone(), channel);
 
-        let epoch_a = DeliveryEpoch::new("epoch-a").unwrap();
+        let epoch_a = DeliveryEpoch::for_test("epoch-a");
         pump.install_epoch(epoch_a, 1).await.unwrap();
 
         let volatile_a = AgentEvent::MessageUpdate {
@@ -670,14 +691,14 @@ mod tests {
         };
         pump.on_volatile(volatile_a).await.unwrap();
 
-        pump.invalidate_epoch();
+        assert!(pump.invalidate_epoch(epoch_a));
 
         let durable_b = assistant_event("msg-b", "b");
         insert_test_durable_event(&store, 1, &durable_b)
             .await
             .unwrap();
 
-        let epoch_b = DeliveryEpoch::new("epoch-b").unwrap();
+        let epoch_b = DeliveryEpoch::for_test("epoch-b");
         pump.install_epoch(epoch_b, 1).await.unwrap();
 
         let volatile_b = AgentEvent::MessageUpdate {
@@ -693,7 +714,7 @@ mod tests {
         let frame = receiver.recv().await.unwrap();
         match frame {
             DeliveryFrame::Volatile { epoch, .. } => {
-                assert_eq!(epoch, DeliveryEpoch::new("epoch-a").unwrap());
+                assert_eq!(epoch, DeliveryEpoch::for_test("epoch-a"));
             }
             other => panic!("expected volatile frame from epoch A: {other:?}"),
         }
@@ -702,7 +723,7 @@ mod tests {
         let frame = receiver.recv().await.unwrap();
         match frame {
             DeliveryFrame::Durable { seq: 1, epoch, .. } => {
-                assert_eq!(epoch, DeliveryEpoch::new("epoch-b").unwrap());
+                assert_eq!(epoch, DeliveryEpoch::for_test("epoch-b"));
             }
             other => panic!("expected durable catch-up frame from epoch B: {other:?}"),
         }
@@ -711,7 +732,7 @@ mod tests {
         let frame = receiver.recv().await.unwrap();
         match frame {
             DeliveryFrame::Volatile { epoch, .. } => {
-                assert_eq!(epoch, DeliveryEpoch::new("epoch-b").unwrap());
+                assert_eq!(epoch, DeliveryEpoch::for_test("epoch-b"));
             }
             other => panic!("expected volatile frame from epoch B: {other:?}"),
         }
@@ -733,7 +754,7 @@ mod tests {
         let (channel, _receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
         let mut pump = DeliveryPump::new(store.clone(), channel);
         let result = pump
-            .install_epoch(DeliveryEpoch::new("epoch-1").unwrap(), 1)
+            .install_epoch(DeliveryEpoch::for_test("epoch-1"), 1)
             .await;
         assert!(result.is_err(), "raw decrypt failure must propagate");
         assert!(
@@ -767,7 +788,7 @@ mod tests {
         let (channel, _receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
         let mut pump = DeliveryPump::new(store.clone(), channel);
         let result = pump
-            .install_epoch(DeliveryEpoch::new("epoch-1").unwrap(), 1)
+            .install_epoch(DeliveryEpoch::for_test("epoch-1"), 1)
             .await;
         let message = result.expect_err("invalid json must fail").to_string();
         assert!(

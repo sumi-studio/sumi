@@ -46,6 +46,16 @@ impl DeliveryEpoch {
     pub const fn as_u64(self) -> u64 {
         self.0
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(label: &str) -> Self {
+        let mut value = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in label.bytes() {
+            value ^= u64::from(byte);
+            value = value.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        Self(value)
+    }
 }
 
 impl ConnectionEpoch {
@@ -269,6 +279,19 @@ pub trait DurableSource: Clone + Send + Sync + 'static {
     async fn event_cursor(&self) -> Result<EventCursors>;
     async fn events_after(&self, after_seq: u64, limit: usize) -> Result<Vec<OutboundFrame>>;
     async fn command_cursors(&self) -> Result<CommandCursors>;
+
+    async fn install_delivery_epoch(
+        &self,
+        _epoch: DeliveryEpoch,
+        _catch_up_from_seq: u64,
+        _sink: EventSender,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn invalidate_delivery_epoch(&self, _epoch: DeliveryEpoch) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// `HydrationReady` is a per-generation latched state. T17 will drive the
@@ -449,13 +472,14 @@ where
         let epochs_rx = self.current_epoch.subscribe();
         let online_rx = self.online.subscribe();
         let cancel = self.cancel.clone();
-        let task = tokio::spawn(self.run(commands_tx, events_rx));
+        let events = EventSender {
+            tx: events_tx,
+            online: online_rx.clone(),
+        };
+        let task = tokio::spawn(self.run(commands_tx, events_rx, events.clone()));
         SupervisorHandle {
             commands: commands_rx,
-            events: EventSender {
-                tx: events_tx,
-                online: online_rx.clone(),
-            },
+            events,
             epochs: epochs_rx,
             online: online_rx,
             cancel,
@@ -467,6 +491,7 @@ where
         mut self,
         commands_tx: mpsc::Sender<InboundCommand>,
         events_rx: mpsc::Receiver<(DeliveryEpoch, bool, OutboundFrame)>,
+        events: EventSender,
     ) -> Result<()> {
         let current_writer = self.current_writer.clone();
         let cancel = self.cancel.clone();
@@ -475,7 +500,7 @@ where
         // run_loop owns all per-epoch cancellation and cleanup; await it so that
         // connect_and_run_epoch gets a chance to publish Online=false and clear
         // the current writer/epoch before the supervisor task exits.
-        let result = self.run_loop(commands_tx).await;
+        let result = self.run_loop(commands_tx, events).await;
 
         forwarder.abort();
         if let Err(join_err) = forwarder.await
@@ -487,7 +512,11 @@ where
         result
     }
 
-    async fn run_loop(&mut self, commands_tx: mpsc::Sender<InboundCommand>) -> Result<()> {
+    async fn run_loop(
+        &mut self,
+        commands_tx: mpsc::Sender<InboundCommand>,
+        events: EventSender,
+    ) -> Result<()> {
         const DEFAULT_MAX_AUTH_ATTEMPTS: u32 = 3;
 
         let mut auth_attempt: u32 = 0;
@@ -498,7 +527,10 @@ where
                 return Ok(());
             }
 
-            match self.connect_and_run_epoch(commands_tx.clone()).await {
+            match self
+                .connect_and_run_epoch(commands_tx.clone(), events.clone())
+                .await
+            {
                 Ok(()) => return Ok(()),
                 Err(SupervisorError::Fatal(e)) => return Err(e),
                 Err(SupervisorError::AuthRejected) => {
@@ -558,6 +590,7 @@ where
     async fn connect_and_run_epoch(
         &mut self,
         commands_tx: mpsc::Sender<InboundCommand>,
+        events: EventSender,
     ) -> Result<(), SupervisorError> {
         // Every new epoch starts offline; writer_task publishes online once catch-up
         // reaches the durable cursor, and cleanup resets it on epoch end.
@@ -624,24 +657,56 @@ where
         *self.current_writer.lock().unwrap() = Some((delivery_epoch, writer_tx));
         self.current_epoch.send_replace(Some(delivery_epoch));
 
+        let (delivery_ready_tx, delivery_ready_rx) = oneshot::channel();
+        let writer_source = source.clone();
+        let mut writer_handle = tokio::spawn(writer_task(
+            writer,
+            writer_rx,
+            writer_source,
+            api_hello.clone(),
+            config.clone(),
+            online,
+            epoch_token.child_token(),
+            delivery_ready_rx,
+        ));
+
+        if let Err(error) = source
+            .install_delivery_epoch(
+                delivery_epoch,
+                api_hello
+                    .last_received_event_seq
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        SupervisorError::Fatal(anyhow!(
+                            "API event cursor exhausted before DeliveryPump install"
+                        ))
+                    })?,
+                events,
+            )
+            .await
+        {
+            let reason = format!("failed to install T17 delivery epoch: {error:#}");
+            let _ = delivery_ready_tx.send(Err(anyhow!(reason.clone())));
+            epoch_token.cancel();
+            let _ = writer_handle.await;
+            *self.current_writer.lock().unwrap() = None;
+            self.current_epoch.send_replace(None);
+            let _ = self.online.send(false);
+            return Err(SupervisorError::EstablishedReconnect {
+                reason,
+                healthy: false,
+            });
+        }
+        let _ = delivery_ready_tx.send(Ok(()));
+
         let command_send_blocked_notify = self.command_send_blocked_notify.clone();
         let mut reader_handle = tokio::spawn(reader_task(
             reader,
             commands_tx,
             self.latch.clone(),
-            api_hello.clone(),
+            api_hello,
             epoch_token.child_token(),
             command_send_blocked_notify,
-        ));
-
-        let mut writer_handle = tokio::spawn(writer_task(
-            writer,
-            writer_rx,
-            source,
-            api_hello,
-            config,
-            online,
-            epoch_token.child_token(),
         ));
 
         let result = tokio::select! {
@@ -696,6 +761,13 @@ where
                 })
             }
         };
+
+        if let Err(error) = source.invalidate_delivery_epoch(delivery_epoch).await {
+            return Err(SupervisorError::Fatal(error.context(format!(
+                "failed to invalidate T17 delivery epoch {}",
+                delivery_epoch.as_u64()
+            ))));
+        }
 
         if let Err(SupervisorError::EstablishedReconnect { .. }) = &result {
             tracing::debug!(
@@ -1236,6 +1308,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn writer_task<W, S>(
     mut writer: W,
     mut writer_rx: mpsc::Receiver<OutboundFrame>,
@@ -1244,6 +1317,7 @@ async fn writer_task<W, S>(
     config: SupervisorConfig,
     online: Arc<watch::Sender<bool>>,
     token: CancellationToken,
+    delivery_ready: oneshot::Receiver<Result<()>>,
 ) -> Result<()>
 where
     W: GatewayWriter,
@@ -1364,6 +1438,16 @@ where
             Some(c) => c,
             None => return Ok(()),
         };
+    }
+
+    tokio::select! {
+        biased;
+        _ = token.cancelled() => return Ok(()),
+        result = delivery_ready => {
+            result
+                .context("T17 delivery epoch installer dropped")?
+                .context("T17 delivery epoch installation failed")?;
+        }
     }
 
     // Final cursor recheck right before publishing Online: catch any durable
@@ -1746,6 +1830,8 @@ mod tests {
         Envelope, Gateway, GatewayClosed, GatewayReader, GatewayWriter, InboundCommand,
         OutboundFrame,
     };
+    use crate::runtime::contracts::{GenerationRecoveryFence, ProcessGenerationLease};
+    use crate::store::{HydrationOutcome, Store, insert_test_durable_event};
 
     struct TestDigestFactory;
 
@@ -5439,6 +5525,8 @@ mod tests {
             last_received_event_seq: 0,
             next_command_seq: 1,
         };
+        let (delivery_ready_tx, delivery_ready_rx) = oneshot::channel();
+        delivery_ready_tx.send(Ok(())).unwrap();
 
         let error = writer_task(
             writer,
@@ -5448,6 +5536,7 @@ mod tests {
             make_config(),
             Arc::new(online),
             token,
+            delivery_ready_rx,
         )
         .await
         .expect_err("catch-up must fail closed on missing seq 2");
@@ -5721,6 +5810,127 @@ mod tests {
 
         handle.abort();
         assert!(handle.join().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn merged_t17_store_drives_catchup_hydration_and_epoch_replacement() {
+        let store = Arc::new(
+            Store::session_test_store("t17-t24-integration")
+                .await
+                .unwrap(),
+        );
+        let generation = ProcessGeneration::from_wire(7).unwrap();
+        let lease = ProcessGenerationLease::new(generation, "lease-t17-t24").unwrap();
+        let fence = GenerationRecoveryFence::new(&lease, "fence-t17-t24").unwrap();
+        let receipt = match store.hydrate(&lease, &fence).await.unwrap() {
+            HydrationOutcome::Complete(state) => state.receipt,
+            HydrationOutcome::RecoveryRequired(_) => {
+                panic!("empty test store must hydrate without physical recovery")
+            }
+        };
+        insert_test_durable_event(&store, 1, &crate::agent::AgentEvent::AgentStart)
+            .await
+            .unwrap();
+
+        let adapter = seams::T17StoreAdapter::new(store.clone());
+        let (hydration_tx, hydration_rx) = watch::channel(None);
+        let latch = seams::T17HydrationLatch::new(hydration_rx);
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent_hellos = Arc::new(Mutex::new(Vec::new()));
+        let mut gateway1 =
+            MockGateway::new(VecDeque::from([Err(anyhow::Error::new(GatewayClosed))]));
+        gateway1.writer.sent = sent.clone();
+        gateway1.sent_hellos = sent_hellos.clone();
+
+        let mut gateway2 = MockGateway::new(VecDeque::from([Ok(valid_command(
+            1,
+            "00000000-0000-4000-8000-000000000001",
+        ))]));
+        gateway2.writer.sent = sent.clone();
+        gateway2.sent_hellos = sent_hellos.clone();
+
+        let connector =
+            MockConnector::new(sent_hellos, VecDeque::from([Ok(gateway1), Ok(gateway2)]));
+        let mut config = make_config();
+        config.initial_backoff = Duration::ZERO;
+        config.max_backoff = Duration::ZERO;
+        let supervisor = ConnectionSupervisor::new(
+            connector,
+            CountingCredentialProvider::new("token"),
+            adapter.clone(),
+            latch,
+            config,
+        );
+        let mut handle = supervisor.start();
+
+        let mut epochs = handle.epochs.clone();
+        let epoch2 = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(epoch) = *epochs.borrow()
+                    && epoch.as_u64() > 0
+                {
+                    return epoch;
+                }
+                epochs.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("second Store-backed delivery epoch must install");
+        assert_eq!(
+            adapter.active_delivery_epoch().await,
+            Some(epoch2),
+            "old T17 DeliveryPump epoch must be invalidated before replacement"
+        );
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), handle.commands.recv())
+                .await
+                .is_err(),
+            "commands must remain held until the typed T17 receipt is published"
+        );
+        hydration_tx.send(Some(receipt)).unwrap();
+        let command = tokio::time::timeout(Duration::from_secs(1), handle.commands.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(inbound_command_seq(&command), 1);
+
+        let epoch1 = DeliveryEpoch(epoch2.as_u64() - 1);
+        handle.events.send((epoch1, event_frame(99))).await.unwrap();
+        insert_test_durable_event(&store, 2, &crate::agent::AgentEvent::TurnStart)
+            .await
+            .unwrap();
+        adapter.on_durable_committed(2).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let seqs: Vec<_> = sent
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|frame| outbound_frame_event_seq(frame).ok())
+                    .collect();
+                if seqs.contains(&1) && seqs.contains(&2) {
+                    assert!(
+                        !seqs.contains(&99),
+                        "late frame from invalidated epoch must be rejected by T24"
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("real Store catch-up and live durable delivery must complete");
+
+        handle.abort();
+        assert!(handle.join().await.is_ok());
+        assert_eq!(
+            adapter.active_delivery_epoch().await,
+            None,
+            "final supervisor shutdown must invalidate the T17 DeliveryPump epoch"
+        );
     }
 
     #[tokio::test]
