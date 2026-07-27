@@ -268,6 +268,11 @@ pub(super) struct DurableBridge {
     /// `ApprovalResolved` and `CommandApplied` projections atomically. `AgentEnd`
     /// cannot commit while this queue is non-empty.
     pending_approval_resolved: Vec<(String, ApprovalResolution, AdmittedCommand)>,
+    /// Approved decisions preempted before their tool start. The matching
+    /// runtime cancellation, prepared-tool terminal, ToolResult, and this
+    /// authenticated command's terminal no-op commit together when the worker
+    /// supplies the cancellation result.
+    pending_cancelled_approval_commands: HashMap<String, (String, AdmittedCommand)>,
     committed_terminal_command_ids: Vec<String>,
 }
 
@@ -311,6 +316,7 @@ impl DurableBridge {
             approval_request_tools: HashMap::new(),
             approval_prepared_tools: HashSet::new(),
             pending_approval_resolved: Vec::new(),
+            pending_cancelled_approval_commands: HashMap::new(),
             committed_terminal_command_ids: Vec::new(),
         }
     }
@@ -331,6 +337,7 @@ impl DurableBridge {
             || !self.pending_tool_calls.is_empty()
             || !self.approval_prepared_tools.is_empty()
             || !self.pending_approval_resolved.is_empty()
+            || !self.pending_cancelled_approval_commands.is_empty()
         {
             return SteerStage::ToolOrApproval;
         }
@@ -1204,11 +1211,28 @@ impl DurableBridge {
                     .iter()
                     .position(|(rid, _, _)| rid == &request_id)
                 {
-                    let (request_id, _, _) = self.pending_approval_resolved.remove(pos);
-                    if let Some(tool_call_id) = self.approval_request_tools.get(&request_id) {
-                        self.approval_cancelled.insert(tool_call_id.clone());
-                        self.approval_prepared_tools.remove(tool_call_id);
+                    let (request_id, _, command) = self.pending_approval_resolved.remove(pos);
+                    let tool_call_id = self
+                        .approval_request_tools
+                        .get(&request_id)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("cancelled approval has no tool binding"))?;
+                    if self
+                        .pending_cancelled_approval_commands
+                        .insert(tool_call_id, (request_id, command))
+                        .is_some()
+                    {
+                        bail!("duplicate pre-start cancelled approval command");
                     }
+                    return Ok(CommittedRunOutput {
+                        outputs: Vec::new(),
+                        tool_start_barrier: None,
+                        message_receipts: Vec::new(),
+                        retry_wait_commit_barrier: None,
+                        terminal_command_ids: std::mem::take(
+                            &mut self.committed_terminal_command_ids,
+                        ),
+                    });
                 } else if let Some(tool_call_id) = self.approval_request_tools.get(&request_id) {
                     self.approval_cancelled.insert(tool_call_id.clone());
                     self.approval_prepared_tools.remove(tool_call_id);
@@ -1581,6 +1605,36 @@ impl DurableBridge {
                 }
                 self.approval_prepared_tools.remove(&tool_call_id);
                 let result_value = serde_json::to_value(result)?;
+                if let Some((request_id, command)) = self
+                    .pending_cancelled_approval_commands
+                    .remove(&tool_call_id)
+                {
+                    let command_id = command.envelope().command_id.to_string();
+                    writes.push(EventWrite {
+                        event: Some(DurableEvent::approval_resolved(
+                            request_id.clone(),
+                            ApprovalResolution::Cancelled,
+                            "runtime".to_owned(),
+                        )?),
+                        projections: vec![
+                            Projection::Approval(ApprovalMutation::Resolve {
+                                request_id: request_id.clone(),
+                                state: "cancelled",
+                                actor: "runtime".to_owned(),
+                            }),
+                            Projection::CommandApplied {
+                                command_id: command_id.clone(),
+                                command_seq: command.envelope().seq,
+                                run_id: None,
+                            },
+                        ],
+                    });
+                    self.committed_terminal_command_ids.push(command_id);
+                    public_prefix.push(AgentEvent::ApprovalResolved {
+                        request_id,
+                        resolution: ApprovalResolution::Cancelled,
+                    });
+                }
                 writes.push(EventWrite {
                     event: Some(DurableEvent::tool_execution_end(
                         tool_call_id.clone(),
@@ -3965,7 +4019,16 @@ mod tests {
             .await
             .expect("commit ApprovalResolved Cancelled");
         assert!(bridge.pending_approval_resolved.is_empty());
-        assert!(bridge.approval_cancelled.contains("tool-call-1"));
+        let (request_id, command) = bridge
+            .pending_cancelled_approval_commands
+            .get("tool-call-1")
+            .expect("cancelled approved command remains staged until its result commits");
+        assert_eq!(request_id, "request-1");
+        assert_eq!(command.envelope().seq, 3);
+        assert!(
+            !bridge.approval_cancelled.contains("tool-call-1"),
+            "the worker's cancelled ToolResult marker selects the atomic terminal commit"
+        );
     }
 
     /// If a soft-steer group is durably bound before the matching

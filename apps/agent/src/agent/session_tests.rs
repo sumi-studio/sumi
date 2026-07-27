@@ -2111,7 +2111,6 @@ async fn idle_approval_cancellation_keeps_broker_pending_until_durable_retry_com
         .await
         .expect("session startup");
     let decision = approval_always_decision(2, &request.id);
-    let replay = decision.clone();
     session
         .writer
         .persist_inbound(&decision)
@@ -2125,7 +2124,7 @@ async fn idle_approval_cancellation_keeps_broker_pending_until_durable_retry_com
     session
         .apply_idle_approval_decision(command.clone())
         .await
-        .expect("failed durable cancellation returns a rejected ACK, not Session failure");
+        .expect_err("failed durable cancellation must force safe session replay");
     assert!(
         broker.has_pending(&request.id),
         "broker must remain pending after rollback"
@@ -2144,60 +2143,119 @@ async fn idle_approval_cancellation_keeps_broker_pending_until_durable_retry_com
         ("pending".to_owned(), "prepared".to_owned(), 0)
     );
     assert!(
-        frames.lock().expect("frames").iter().any(|frame| matches!(
+        !frames.lock().expect("frames").iter().any(|frame| matches!(
             frame,
-            OutboundFrame::CommandAck { ack } if ack.status == CommandAckStatus::Rejected
+            OutboundFrame::CommandAck { ack }
+                if ack.command_id == command.envelope().command_id.as_str()
+                    && matches!(
+                        ack.status,
+                        CommandAckStatus::Applied | CommandAckStatus::Rejected
+                    )
         )),
-        "failed batch must reject rather than falsely apply the command"
-    );
-
-    sqlx::query("DROP TRIGGER reject_idle_approval_cancel")
-        .execute(&pool)
-        .await
-        .expect("remove cancellation failpoint");
-    session
-        .apply_idle_approval_decision(command)
-        .await
-        .expect("retry idle approval cancellation");
-    assert!(
-        !broker.has_pending(&request.id),
-        "retry must release broker pending entry; frames={:?}",
-        frames.lock().expect("frames")
-    );
-    assert_eq!(
-        sqlx::query_as::<_, (String, String, String, i64)>(
-            "SELECT
-                (SELECT state FROM approval_log WHERE id = ?),
-                (SELECT state FROM tool_executions WHERE tool_call_id = 'approval-tool'),
-                (SELECT status FROM inbound_commands WHERE seq = 2),
-                (SELECT COUNT(*) FROM approval_rules)",
-        )
-        .bind(&request.id)
-        .fetch_one(&pool)
-        .await
-        .expect("committed retry state"),
-        (
-            "cancelled".to_owned(),
-            "cancelled".to_owned(),
-            "applied".to_owned(),
-            0,
-        )
-    );
-    session
-        .admit_and_route(replay)
-        .await
-        .expect("replaying an applied idle approval decision");
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM agent_events WHERE event_type = 'approval_resolved'",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("replayed command must not create a second cancellation"),
-        1,
-        "the applied command must replay its durable ACK without rerunning terminalization"
+        "failed persistence must emit no terminal ACK"
     );
     drop(pending);
+}
+
+#[tokio::test]
+async fn late_approval_storage_failure_replays_through_durable_ingress_without_terminal_reject() {
+    let store = Store::session_test_store("late-approval-storage-replay")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (gateway, _commands, frames) = gateway();
+    let worker: Arc<dyn RunWorker> = Arc::new(
+        |_core: RunCore,
+         _initial: AdmittedCommand,
+         _controls: mpsc::Receiver<RunControl>,
+         _events: mpsc::Sender<AgentEvent>| async move { pending::<RunCompletion>().await },
+    );
+    let mut session = Session::start(
+        store,
+        gateway,
+        RunCore::new(),
+        worker,
+        test_executor_generation(),
+    )
+    .await
+    .expect("session startup");
+    sqlx::query(
+        "CREATE TRIGGER reject_late_approval_apply
+         BEFORE UPDATE OF status ON inbound_commands
+         WHEN OLD.seq = 1 AND NEW.status = 'applied'
+         BEGIN SELECT RAISE(ABORT, 'fixture rejects late approval apply'); END",
+    )
+    .execute(&pool)
+    .await
+    .expect("install no-op apply failpoint");
+    let command = approval_decision(1, "unknown-request");
+    let command_id = match &command {
+        InboundCommand::Valid(envelope) => envelope.command_id.to_string(),
+        _ => unreachable!("approval fixture is valid"),
+    };
+
+    session
+        .admit_and_route(command.clone())
+        .await
+        .expect_err("storage refusal must fail the production ingress path");
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM inbound_commands WHERE seq = 1")
+            .fetch_one(&pool)
+            .await
+            .expect("received command row"),
+        "received"
+    );
+    assert!(
+        !frames.lock().expect("frames").iter().any(|frame| matches!(
+            frame,
+            OutboundFrame::CommandAck { ack }
+                if ack.command_id == command_id
+                    && matches!(
+                        ack.status,
+                        CommandAckStatus::Applied | CommandAckStatus::Rejected
+                    )
+        )),
+        "failed production ingress must expose no terminal ACK"
+    );
+
+    sqlx::query("DROP TRIGGER reject_late_approval_apply")
+        .execute(&pool)
+        .await
+        .expect("remove no-op apply failpoint");
+    assert!(
+        SuffixRecovery::recover_t12_prefix(session.writer.store(), &session.writer)
+            .await
+            .expect("startup recovery applies the durable no-op")
+            .is_empty()
+    );
+    session
+        .admit_and_route(command)
+        .await
+        .expect("production ingress replays the recovered terminal ACK");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if frames.lock().expect("frames").iter().any(|frame| {
+                matches!(
+                    frame,
+                    OutboundFrame::CommandAck { ack }
+                        if ack.command_id == command_id
+                            && ack.status == CommandAckStatus::Applied
+                )
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("replayed Applied ACK");
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM inbound_commands WHERE seq = 1")
+            .fetch_one(&pool)
+            .await
+            .expect("recovered command row"),
+        "applied"
+    );
 }
 
 #[tokio::test]
@@ -7691,6 +7749,7 @@ enum ApprovalTestScript {
 struct ApprovalTestDriver {
     scripts: Mutex<VecDeque<ApprovalTestScript>>,
     executed: Arc<AtomicBool>,
+    provider_attempts: AtomicUsize,
     result_text: String,
 }
 
@@ -7702,7 +7761,79 @@ impl ApprovalTestDriver {
         Arc::new(Self {
             scripts: Mutex::new(scripts),
             executed,
+            provider_attempts: AtomicUsize::new(0),
             result_text: "ok".to_owned(),
+        })
+    }
+}
+
+struct HoldPreStartWorker {
+    inner: Arc<dyn RunWorker>,
+    tool_start_staged: Arc<Notify>,
+}
+
+impl RunWorker for HoldPreStartWorker {
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+        self.inner.validate_executor_generation(generation)
+    }
+
+    fn run(
+        &self,
+        core: RunCore,
+        initial: AdmittedCommand,
+        controls: mpsc::Receiver<RunControl>,
+        events: mpsc::Sender<RunOutput>,
+    ) -> WorkerFuture {
+        let (inner_tx, mut inner_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let inner = self.inner.run(core, initial, controls, inner_tx);
+        let tool_start_staged = self.tool_start_staged.clone();
+        Box::pin(async move {
+            tokio::pin!(inner);
+            loop {
+                tokio::select! {
+                    biased;
+                    completion = &mut inner => {
+                        while let Ok(output) = inner_rx.try_recv() {
+                            if events.send(output).await.is_err() {
+                                break;
+                            }
+                        }
+                        return completion;
+                    }
+                    output = inner_rx.recv() => {
+                        let Some(output) = output else {
+                            return inner.await;
+                        };
+                        if matches!(&output.event, AgentEvent::ToolExecutionStart { .. }) {
+                            tool_start_staged.notify_one();
+                            let preempted = tokio::select! {
+                                biased;
+                                completion = &mut inner => {
+                                    drop(output);
+                                    while let Ok(output) = inner_rx.try_recv() {
+                                        if events.send(output).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    return completion;
+                                }
+                                output = inner_rx.recv() => output,
+                            };
+                            let Some(preempted) = preempted else {
+                                return inner.await;
+                            };
+                            drop(output);
+                            if events.send(preempted).await.is_err() {
+                                return inner.await;
+                            }
+                            continue;
+                        }
+                        if events.send(output).await.is_err() {
+                            return inner.await;
+                        }
+                    }
+                }
+            }
         })
     }
 }
@@ -7715,11 +7846,12 @@ impl RunDriver for ApprovalTestDriver {
 
     async fn start_provider_for_command(
         &self,
-        attempt: usize,
+        _attempt: usize,
         _context: &[ContextMessage],
         _command_received_at: Option<std::time::Instant>,
         _cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
+        let attempt = self.provider_attempts.fetch_add(1, Ordering::SeqCst);
         let script = self
             .scripts
             .lock()
@@ -7840,7 +7972,7 @@ fn approval_core(broker: Arc<ApprovalBroker>) -> RunCore {
 }
 
 async fn wait_for_agent_end(frames: &Arc<Mutex<Vec<OutboundFrame>>>) {
-    tokio::time::timeout(Duration::from_secs(3), async {
+    let reached_end = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if frames.lock().expect("frame mutex").iter().any(|frame| {
                 matches!(frame, OutboundFrame::Event { envelope }
@@ -7851,8 +7983,12 @@ async fn wait_for_agent_end(frames: &Arc<Mutex<Vec<OutboundFrame>>>) {
             tokio::task::yield_now().await;
         }
     })
-    .await
-    .expect("session reached agent_end within timeout");
+    .await;
+    assert!(
+        reached_end.is_ok(),
+        "session did not reach agent_end within timeout; frames: {:#?}",
+        frames.lock().expect("frame mutex")
+    );
     assert!(
         frames.lock().expect("frame mutex").iter().any(|frame| {
             matches!(frame, OutboundFrame::Event { envelope }
@@ -7860,6 +7996,45 @@ async fn wait_for_agent_end(frames: &Arc<Mutex<Vec<OutboundFrame>>>) {
         }),
         "session completed without emitting agent_end"
     );
+}
+
+async fn wait_for_approval_request(
+    frames: &Arc<Mutex<Vec<OutboundFrame>>>,
+    task: &tokio::task::JoinHandle<SessionResult>,
+) -> String {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let request_id = frames
+                .lock()
+                .expect("frame mutex")
+                .iter()
+                .find_map(|frame| {
+                    let OutboundFrame::Event { envelope } = frame else {
+                        return None;
+                    };
+                    (envelope.event.get("type").and_then(Value::as_str)
+                        == Some("approval_requested"))
+                    .then(|| {
+                        envelope
+                            .event
+                            .get("request")?
+                            .get("id")?
+                            .as_str()
+                            .map(str::to_owned)
+                    })
+                    .flatten()
+                });
+            if let Some(request_id) = request_id {
+                break request_id;
+            }
+            if task.is_finished() {
+                panic!("session ended without approval request");
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("approval request emitted")
 }
 
 #[tokio::test]
@@ -8266,4 +8441,190 @@ async fn session_user_approve_always_persists_rule_and_executes() {
     assert_eq!(rule_count, 1);
     assert_eq!(requested, 1);
     assert_eq!(resolved, 1);
+}
+
+async fn assert_pre_start_approval_control_race(store_name: &str, control: InboundCommand) {
+    let store = Store::session_test_store(store_name)
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let policy = store
+        .load_approval_policy("/workspace")
+        .await
+        .expect("seed broker policy from durable rules");
+    let broker = Arc::new(ApprovalBroker::new(
+        policy,
+        make_projector(),
+        None,
+        ReviewerMode::User,
+        false,
+        trusted_env(),
+    ));
+    let executed = Arc::new(AtomicBool::new(false));
+    let tool_start_staged = Arc::new(Notify::new());
+    let production_worker: Arc<dyn RunWorker> = Arc::new(SequentialRunWorker::new(
+        ApprovalTestDriver::with_tool_call(executed.clone()),
+    ));
+    let worker: Arc<dyn RunWorker> = Arc::new(HoldPreStartWorker {
+        inner: production_worker,
+        tool_start_staged: tool_start_staged.clone(),
+    });
+    let (gateway, commands, frames) = gateway();
+    let session = Session::start(
+        store,
+        gateway,
+        approval_core(broker),
+        worker,
+        test_executor_generation(),
+    )
+    .await
+    .expect("session startup");
+    let mut task = tokio::spawn(session.run());
+
+    commands.send(user(1)).await.expect("user command");
+    let request_id = wait_for_approval_request(&frames, &task).await;
+    let decision = approval_always_decision(2, &request_id);
+    commands
+        .send(decision.clone())
+        .await
+        .expect("approve-always decision");
+    tokio::time::timeout(Duration::from_secs(3), tool_start_staged.notified())
+        .await
+        .expect("approved ToolExecutionStart reached the pre-commit race window");
+    commands.send(control).await.expect("pre-start control");
+
+    wait_for_agent_end(&frames).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM inbound_commands WHERE seq = 3")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("control status");
+            if status == "applied" {
+                break;
+            }
+            if task.is_finished() {
+                match (&mut task).await.expect("session join") {
+                    SessionResult::Completed(_) => {
+                        panic!("session completed before the winning control became terminal")
+                    }
+                    SessionResult::Failed { failure, .. } => {
+                        panic!(
+                            "session failed before the winning control became terminal: {failure:?}"
+                        )
+                    }
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("winning control became terminal");
+    assert!(
+        !executed.load(Ordering::SeqCst),
+        "a control accepted before ToolExecutionStart must prevent execution"
+    );
+
+    let durable: (
+        String,
+        String,
+        Option<String>,
+        i64,
+        i64,
+        i64,
+        String,
+        String,
+    ) = sqlx::query_as(
+        "SELECT
+                (SELECT state FROM approval_log WHERE id = ?),
+                (SELECT state FROM tool_executions WHERE tool_call_id = 'call-1'),
+                (SELECT error_code FROM tool_executions WHERE tool_call_id = 'call-1'),
+                (SELECT COUNT(*) FROM approval_rules WHERE id = 'rule-git-status'),
+                (SELECT COUNT(*) FROM agent_events
+                 WHERE event_type = 'tool_execution_start'
+                   AND json_extract(envelope, '$.tool_call_id') = 'call-1'),
+                (SELECT COUNT(*) FROM agent_events
+                 WHERE event_type = 'approval_resolved'
+                   AND json_extract(envelope, '$.request_id') = ?),
+                (SELECT status FROM inbound_commands WHERE seq = 2),
+                (SELECT status FROM inbound_commands WHERE seq = 3)",
+    )
+    .bind(&request_id)
+    .bind(&request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("atomic pre-start cancellation state");
+    assert_eq!(durable.0, "cancelled");
+    assert_eq!(durable.1, "cancelled");
+    assert_eq!(durable.2.as_deref(), Some("approval_cancelled"));
+    assert_eq!(durable.3, 0, "ApproveAlways rule must never install");
+    assert_eq!(durable.4, 0, "ToolExecutionStart must not commit");
+    assert_eq!(durable.5, 1, "approval cancellation must commit once");
+    assert_eq!(durable.6, "applied", "approval command must be terminal");
+    assert_eq!(durable.7, "applied", "winning control must be terminal");
+
+    commands
+        .send(decision)
+        .await
+        .expect("replay exact approval decision");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let applied_replays = frames
+                .lock()
+                .expect("frame mutex")
+                .iter()
+                .filter(|frame| {
+                    matches!(
+                        frame,
+                        OutboundFrame::CommandAck { ack }
+                            if ack.command_id == "20000000-0000-4000-8000-000000000002"
+                                && ack.status == CommandAckStatus::Applied
+                    )
+                })
+                .count();
+            if applied_replays >= 2 {
+                break;
+            }
+            if task.is_finished() {
+                panic!("session ended before replay ACK");
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal approval replay ACK");
+
+    assert_eq!(
+        sqlx::query_as::<_, (i64, i64)>(
+            "SELECT
+                (SELECT COUNT(*) FROM approval_rules WHERE id = 'rule-git-status'),
+                (SELECT COUNT(*) FROM agent_events
+                 WHERE event_type = 'approval_resolved'
+                   AND json_extract(envelope, '$.request_id') = ?)",
+        )
+        .bind(&request_id)
+        .fetch_one(&pool)
+        .await
+        .expect("replay remains a durable no-op"),
+        (0, 1)
+    );
+
+    drop(commands);
+    match task.await.expect("session join") {
+        SessionResult::Completed(_) => {}
+        SessionResult::Failed { failure, .. } => {
+            panic!("pre-start approval control race failed: {failure}")
+        }
+    }
+}
+
+#[tokio::test]
+async fn session_soft_steer_terminalizes_pre_start_approve_always_without_installing_rule() {
+    assert_pre_start_approval_control_race("session-pre-start-approval-soft-steer", user(3)).await;
+}
+
+#[tokio::test]
+async fn session_abort_terminalizes_pre_start_approve_always_without_installing_rule() {
+    assert_pre_start_approval_control_race("session-pre-start-approval-abort", abort(3)).await;
 }

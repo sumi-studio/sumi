@@ -7221,18 +7221,26 @@ async fn validate_required_projection_sets(
                         }
                         consumed_approval_resolutions.insert(request_id);
                     }
-                    None if approval_resolutions.contains_key(request_id.as_str()) => {
-                        bail!(
-                            "no-op ApprovalDecision cannot carry ApprovalResolved for {request_id}"
-                        );
-                    }
                     None => {
+                        if let Some((resolution, actor)) =
+                            approval_resolutions.get(request_id.as_str())
+                            && (*resolution != "cancelled" || *actor != "runtime")
+                        {
+                            bail!(
+                                "no-op ApprovalDecision can co-commit only its runtime cancellation for {request_id}"
+                            );
+                        }
                         let approval_state: Option<String> =
                             sqlx::query_scalar("SELECT state FROM approval_log WHERE id = ?")
                                 .bind(&request_id)
                                 .fetch_optional(&mut **transaction)
                                 .await?;
                         if approval_state.as_deref() == Some("pending")
+                            && !approval_resolutions.get(request_id.as_str()).is_some_and(
+                                |(resolution, actor)| {
+                                    *resolution == "cancelled" && *actor == "runtime"
+                                },
+                            )
                             && !has_later_abort_cutoff(
                                 transaction,
                                 &applied_controls,
@@ -17922,30 +17930,32 @@ mod tests {
 
         writer
             .apply(EventBatch {
-                writes: vec![approval_resolution_write(
-                    "request-1",
-                    "cancelled",
-                    "runtime",
-                    None,
-                )],
+                writes: vec![
+                    approval_resolution_write("request-1", "cancelled", "runtime", None),
+                    EventWrite {
+                        event: None,
+                        projections: vec![Projection::CommandApplied {
+                            command_id: "00000000-0000-4000-8000-000000000020".to_owned(),
+                            command_seq: 2,
+                            run_id: None,
+                        }],
+                    },
+                ],
                 injected_commands: Vec::new(),
             })
             .await
-            .expect("terminalize approval");
-        writer
-            .apply(EventBatch {
-                writes: vec![EventWrite {
-                    event: None,
-                    projections: vec![Projection::CommandApplied {
-                        command_id: "00000000-0000-4000-8000-000000000020".to_owned(),
-                        command_seq: 2,
-                        run_id: None,
-                    }],
-                }],
-                injected_commands: Vec::new(),
-            })
+            .expect("same-batch runtime cancellation permits the terminal no-op");
+        assert_eq!(
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT
+                    (SELECT status FROM inbound_commands WHERE seq=2),
+                    (SELECT state FROM approval_log WHERE id='request-1')",
+            )
+            .fetch_one(store.pool())
             .await
-            .expect("terminal approval permits a no-op");
+            .expect("atomic cancellation and command state"),
+            ("applied".to_owned(), "cancelled".to_owned())
+        );
         assert_eq!(
             writer
                 .persist_inbound(&pending_decision)

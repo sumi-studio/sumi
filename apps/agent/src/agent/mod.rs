@@ -1241,14 +1241,7 @@ impl<G: Gateway + 'static> Session<G> {
                 .await
             {
                 tracing::error!(%error, %command_id, "idle approval cancellation could not be committed");
-                let ack = CommandAck {
-                    seq,
-                    command_id,
-                    status: CommandAckStatus::Rejected,
-                    reject_reason: Some("approval decision could not be applied".to_owned()),
-                };
-                self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack }])?;
-                return Ok(());
+                return Err(error.into());
             }
 
             pending_broker
@@ -1261,8 +1254,7 @@ impl<G: Gateway + 'static> Session<G> {
         // carry ApprovalResolved and is validated as the intended terminal
         // no-op. Retrying after a failure here is safe: the broker and durable
         // approval/tool state already agree on the cancellation.
-        let ack = match self
-            .writer
+        self.writer
             .apply(EventBatch {
                 writes: vec![EventWrite {
                     event: None,
@@ -1275,22 +1267,15 @@ impl<G: Gateway + 'static> Session<G> {
                 injected_commands: Vec::new(),
             })
             .await
-        {
-            Ok(_) => CommandAck {
-                seq,
-                command_id: command_id.clone(),
-                status: CommandAckStatus::Applied,
-                reject_reason: None,
-            },
-            Err(error) => {
+            .map_err(|error| {
                 tracing::error!(%error, %command_id, "approval decision could not be applied");
-                CommandAck {
-                    seq,
-                    command_id,
-                    status: CommandAckStatus::Rejected,
-                    reject_reason: Some("approval decision could not be applied".to_owned()),
-                }
-            }
+                SessionFailure::from(error)
+            })?;
+        let ack = CommandAck {
+            seq,
+            command_id,
+            status: CommandAckStatus::Applied,
+            reject_reason: None,
         };
         self.enqueue_reliable(vec![OutboundFrame::CommandAck { ack }])?;
         Ok(())
@@ -1557,6 +1542,11 @@ impl<G: Gateway + 'static> Session<G> {
     }
 
     async fn persist_active_event(&mut self, output: RunOutput) -> Result<(), SessionFailure> {
+        // Approved decisions are intentionally staged until the matching
+        // ToolExecutionStart. Even though that ApprovalResolved produces no
+        // public output yet, it is still a routing boundary: a queued steer or
+        // Abort must get the chance to win before the tool start commits.
+        let staged_approval_boundary = matches!(&output.event, AgentEvent::ApprovalResolved { .. });
         let committed = {
             let active = self.active.as_mut().expect("event requires active run");
             match active.bridge.commit(&self.writer, output).await {
@@ -1589,12 +1579,13 @@ impl<G: Gateway + 'static> Session<G> {
                     )
             )
         });
-        let approval_boundary = outputs.iter().any(|output| {
-            matches!(
-                &output.event,
-                AgentEvent::ApprovalRequested { .. } | AgentEvent::ApprovalResolved { .. }
-            )
-        });
+        let approval_boundary = staged_approval_boundary
+            || outputs.iter().any(|output| {
+                matches!(
+                    &output.event,
+                    AgentEvent::ApprovalRequested { .. } | AgentEvent::ApprovalResolved { .. }
+                )
+            });
         let command_id = self
             .active
             .as_ref()

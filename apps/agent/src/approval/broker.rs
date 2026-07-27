@@ -604,12 +604,29 @@ impl ApprovalBroker {
             });
         }
 
-        let trusted_environment = self
-            .trusted_environment
-            .current()
-            .context("capture trusted environment for reviewer")?;
+        let trusted_environment = match self.trusted_environment.current() {
+            Ok(environment) => environment,
+            Err(_) => {
+                return Ok(ApprovalOutcome::Denied {
+                    reason: "trusted reviewer environment is unavailable".to_owned(),
+                    audit: Some(synthetic_audit(
+                        "trusted reviewer environment is unavailable",
+                    )),
+                });
+            }
+        };
         let environment_version =
-            trusted_environment_version(context_version, &trusted_environment)?;
+            match trusted_environment_version(context_version, &trusted_environment) {
+                Ok(version) => version,
+                Err(_) => {
+                    return Ok(ApprovalOutcome::Denied {
+                        reason: "trusted reviewer environment cannot be versioned".to_owned(),
+                        audit: Some(synthetic_audit(
+                            "trusted reviewer environment cannot be versioned",
+                        )),
+                    });
+                }
+            };
         let request = ReviewRequest {
             mode: self.mode,
             projection: projection.clone(),
@@ -836,6 +853,14 @@ mod tests {
         }
     }
 
+    struct FailingEnvironmentProvider;
+
+    impl TrustedEnvironmentProvider for FailingEnvironmentProvider {
+        fn current(&self) -> Result<TrustedEnvironment> {
+            Err(anyhow::anyhow!("fixture environment capture failure"))
+        }
+    }
+
     #[async_trait]
     impl ReviewerTransport for CountingTransport {
         async fn complete(
@@ -1035,6 +1060,85 @@ mod tests {
                 .any(|message| message.content.contains("M src/critical.rs")),
             "cache version and prompt must use the same updated environment"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn environment_capture_failure_falls_back_without_reviewer_or_cache_reuse() {
+        let model = ReviewerModelSpec::new(
+            "reviewer-model",
+            "reviewer-provider",
+            "https://reviewer.example.test/v1",
+            "default",
+            "reviewer-domain",
+            "tenant-policy",
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let trust = ReviewerTrustSet::new(model.clone(), Vec::new());
+        let reviewer = Arc::new(Reviewer::new(
+            model,
+            trust,
+            Arc::new(CountingTransport {
+                response: allow_json(),
+                calls: calls.clone(),
+            }),
+            Arc::new(projector()),
+        ));
+        let interactive = ApprovalBroker::new_with_environment_provider(
+            Policy::new("/workspace"),
+            projector(),
+            Some(reviewer.clone()),
+            ReviewerMode::AutoReview,
+            false,
+            Arc::new(FailingEnvironmentProvider),
+        );
+
+        let outcome = interactive
+            .start_request(
+                &bash_call("git status"),
+                &[],
+                "run-1",
+                "turn-1",
+                "context-1",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("environment failure falls back to manual approval");
+        let ApprovalOutcome::Pending { pending } = outcome else {
+            panic!("interactive environment failure must request manual approval");
+        };
+        assert_eq!(
+            pending.request().audit.as_ref().map(|audit| audit.risk),
+            Some(events::RiskLevel::High)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(reviewer.allow_cache_entry_count(), 0);
+
+        let headless = ApprovalBroker::new_with_environment_provider(
+            Policy::new("/workspace"),
+            projector(),
+            Some(reviewer.clone()),
+            ReviewerMode::AutoReview,
+            true,
+            Arc::new(FailingEnvironmentProvider),
+        );
+        assert!(matches!(
+            headless
+                .start_request(
+                    &bash_call("git status"),
+                    &[],
+                    "run-2",
+                    "turn-1",
+                    "context-1",
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("headless environment failure blocks"),
+            ApprovalOutcome::Denied { audit: Some(audit), .. }
+                if audit.risk == RiskLevel::High
+                    && audit.authorization == UserAuthorization::Unknown
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(reviewer.allow_cache_entry_count(), 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
