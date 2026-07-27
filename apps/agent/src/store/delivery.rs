@@ -94,10 +94,12 @@ enum PumpState {
     },
 }
 
+#[derive(Clone)]
 pub(crate) struct DeliveryPump {
     store: Arc<Store>,
     channel: DeliveryChannel,
-    state: PumpState,
+    state: Arc<std::sync::Mutex<PumpState>>,
+    durable_serial: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl DeliveryPump {
@@ -105,69 +107,80 @@ impl DeliveryPump {
         Self {
             store,
             channel,
-            state: PumpState::Idle,
+            state: Arc::new(std::sync::Mutex::new(PumpState::Idle)),
+            durable_serial: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
-    pub(crate) fn epoch(&self) -> Option<&DeliveryEpoch> {
-        match &self.state {
+    pub(crate) fn epoch(&self) -> Option<DeliveryEpoch> {
+        match &*self.state.lock().unwrap() {
             PumpState::Idle => None,
-            PumpState::Online { epoch, .. } => Some(epoch),
+            PumpState::Online { epoch, .. } => Some(*epoch),
         }
     }
 
     pub(crate) fn is_online(&self) -> bool {
-        matches!(self.state, PumpState::Online { .. })
+        matches!(*self.state.lock().unwrap(), PumpState::Online { .. })
     }
 
     /// Install the live-delivery epoch. Initial durable replay is owned by the
     /// supervisor writer, which reads bounded pages from `DurableSource`.
-    pub(crate) fn install_epoch(&mut self, epoch: DeliveryEpoch) {
-        self.state = PumpState::Online {
+    pub(crate) fn install_epoch(&self, epoch: DeliveryEpoch) {
+        *self.state.lock().unwrap() = PumpState::Online {
             epoch,
             failure_tx: None,
         };
     }
 
     pub(crate) fn install_supervised_epoch(
-        &mut self,
+        &self,
         epoch: DeliveryEpoch,
         failure_tx: mpsc::UnboundedSender<String>,
     ) {
-        self.state = PumpState::Online {
+        *self.state.lock().unwrap() = PumpState::Online {
             epoch,
             failure_tx: Some(failure_tx),
         };
     }
 
-    pub(crate) fn invalidate_epoch(&mut self, epoch: DeliveryEpoch) -> bool {
-        if self.epoch() != Some(&epoch) {
+    pub(crate) fn invalidate_epoch(&self, epoch: DeliveryEpoch) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if !matches!(&*state, PumpState::Online { epoch: current, .. } if *current == epoch) {
             return false;
         }
-        self.state = PumpState::Idle;
+        *state = PumpState::Idle;
         true
     }
 
-    pub(crate) async fn on_durable_committed(&mut self, seq: u64) -> Result<()> {
-        let (epoch, failure_tx) = match &self.state {
+    pub(crate) async fn on_durable_committed(&self, seq: u64) -> Result<()> {
+        // Preserve the EventWriter's post-commit durable FIFO while keeping the
+        // shared adapter selection/state lock out of the bounded channel await.
+        let _serial = self.durable_serial.lock().await;
+        let (epoch, failure_tx) = match &*self.state.lock().unwrap() {
             PumpState::Idle => return Ok(()),
             PumpState::Online { epoch, failure_tx } => (*epoch, failure_tx.clone()),
         };
         if let Err(err) = send_event_range(&self.store, &self.channel, &epoch, seq, seq).await {
-            if let Some(failure_tx) = failure_tx {
-                let _ = failure_tx.send(format!("durable delivery failed: {err:#}"));
+            let mut state = self.state.lock().unwrap();
+            // A replacement epoch may have been installed while the bounded
+            // durable send was waiting. Only the epoch that initiated the send
+            // may transition itself to Idle or notify its failure supervisor.
+            if matches!(&*state, PumpState::Online { epoch: current, .. } if *current == epoch) {
+                *state = PumpState::Idle;
+                if let Some(failure_tx) = failure_tx {
+                    let _ = failure_tx.send(format!("durable delivery failed: {err:#}"));
+                }
             }
-            self.state = PumpState::Idle;
             return Err(err);
         }
         Ok(())
     }
 
-    pub(crate) async fn on_volatile(&mut self, event: AgentEvent) -> Result<()> {
+    pub(crate) async fn on_volatile(&self, event: AgentEvent) -> Result<()> {
         if let Some(kind) = event.durable_kind() {
             bail!("volatile delivery rejected durable event of kind {kind}");
         }
-        let (epoch, failure_tx) = match &self.state {
+        let (epoch, failure_tx) = match &*self.state.lock().unwrap() {
             PumpState::Online { epoch, failure_tx } => (*epoch, failure_tx.clone()),
             PumpState::Idle => return Ok(()),
         };
@@ -181,10 +194,14 @@ impl DeliveryPump {
         {
             Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                if let Some(failure_tx) = failure_tx {
-                    let _ = failure_tx.send("volatile delivery receiver closed".to_owned());
+                let mut state = self.state.lock().unwrap();
+                if matches!(&*state, PumpState::Online { epoch: current, .. } if *current == epoch)
+                {
+                    *state = PumpState::Idle;
+                    if let Some(failure_tx) = failure_tx {
+                        let _ = failure_tx.send("volatile delivery receiver closed".to_owned());
+                    }
                 }
-                self.state = PumpState::Idle;
                 bail!("delivery receiver closed")
             }
         }
@@ -425,7 +442,7 @@ mod tests {
         insert_test_durable_event(&store, 1, &event).await.unwrap();
 
         let (channel, mut receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
-        let mut pump = DeliveryPump::new(store.clone(), channel);
+        let pump = DeliveryPump::new(store.clone(), channel);
         let epoch = DeliveryEpoch::for_test("epoch-1");
         pump.install_epoch(epoch);
         pump.on_durable_committed(1).await.unwrap();
@@ -453,7 +470,7 @@ mod tests {
 
         let (channel, mut receiver) =
             DeliveryChannelBuilder::with_mode(DeliveryMode::RedactionOnly).build();
-        let mut pump = DeliveryPump::new(store.clone(), channel);
+        let pump = DeliveryPump::new(store.clone(), channel);
         pump.install_epoch(DeliveryEpoch::for_test("epoch-1"));
         pump.on_durable_committed(1).await.unwrap();
 
@@ -483,7 +500,7 @@ mod tests {
         insert_test_durable_event(&store, 1, &event).await.unwrap();
 
         let (channel, mut receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
-        let mut pump = DeliveryPump::new(store.clone(), channel);
+        let pump = DeliveryPump::new(store.clone(), channel);
 
         pump.on_volatile(AgentEvent::MessageUpdate {
             message_id: "msg-1".to_owned(),
@@ -533,7 +550,7 @@ mod tests {
         let (channel, mut receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw)
             .capacity(1)
             .build();
-        let mut pump = DeliveryPump::new(store.clone(), channel);
+        let pump = DeliveryPump::new(store.clone(), channel);
 
         insert_test_durable_event(&store, 1, &assistant_event("msg-1", "a"))
             .await
@@ -556,6 +573,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn volatile_try_send_is_not_blocked_by_in_flight_durable_send() {
+        let store = store().await;
+        insert_test_durable_event(&store, 1, &assistant_event("msg-1", "a"))
+            .await
+            .unwrap();
+        insert_test_durable_event(&store, 2, &assistant_event("msg-2", "b"))
+            .await
+            .unwrap();
+
+        let (channel, mut receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw)
+            .capacity(1)
+            .build();
+        let pump = DeliveryPump::new(store.clone(), channel);
+        pump.install_epoch(DeliveryEpoch::for_test("epoch-1"));
+        pump.on_durable_committed(1).await.unwrap();
+
+        // The full channel makes seq 2 wait in the bounded durable send. The
+        // concurrent volatile path must still snapshot state and use try_send
+        // without waiting behind that await; the full channel drops it.
+        let durable = {
+            let pump = pump.clone();
+            tokio::spawn(async move { pump.on_durable_committed(2).await })
+        };
+        tokio::task::yield_now().await;
+
+        let volatile = tokio::time::timeout(
+            Duration::from_millis(100),
+            pump.on_volatile(AgentEvent::MessageUpdate {
+                message_id: "msg-1".to_owned(),
+                event: PublicStreamEvent::TextDelta {
+                    content_index: 0,
+                    delta: "typing".to_owned(),
+                },
+            }),
+        )
+        .await
+        .expect("volatile try_send must not wait for durable backpressure");
+        volatile.unwrap();
+
+        assert!(matches!(
+            receiver.recv().await,
+            Some(DeliveryFrame::Durable { seq: 1, .. })
+        ));
+        durable
+            .await
+            .expect("durable task must join")
+            .expect("durable send must recover after receiver consumes");
+        assert!(matches!(
+            receiver.recv().await,
+            Some(DeliveryFrame::Durable { seq: 2, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_durable_failure_cannot_idle_a_replacement_epoch() {
+        let store = store().await;
+        insert_test_durable_event(&store, 1, &assistant_event("msg-1", "a"))
+            .await
+            .unwrap();
+        insert_test_durable_event(&store, 2, &assistant_event("msg-2", "b"))
+            .await
+            .unwrap();
+
+        let (channel, receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw)
+            .capacity(1)
+            .build();
+        let pump = DeliveryPump::new(store.clone(), channel);
+        let epoch_1 = DeliveryEpoch::for_test("epoch-1");
+        let epoch_2 = DeliveryEpoch::for_test("epoch-2");
+        pump.install_epoch(epoch_1);
+        pump.on_durable_committed(1).await.unwrap();
+
+        let durable = {
+            let pump = pump.clone();
+            tokio::spawn(async move { pump.on_durable_committed(2).await })
+        };
+        tokio::task::yield_now().await;
+
+        assert!(pump.invalidate_epoch(epoch_1));
+        pump.install_epoch(epoch_2);
+        drop(receiver);
+
+        assert!(durable.await.unwrap().is_err());
+        assert_eq!(pump.epoch(), Some(epoch_2));
+        assert!(
+            pump.is_online(),
+            "stale epoch failure must not idle replacement"
+        );
+    }
+
+    #[tokio::test]
     async fn durable_send_success_keeps_pump_online() {
         let store = store().await;
         insert_test_durable_event(&store, 1, &assistant_event("msg-1", "a"))
@@ -563,7 +671,7 @@ mod tests {
             .unwrap();
 
         let (channel, mut receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
-        let mut pump = DeliveryPump::new(store.clone(), channel);
+        let pump = DeliveryPump::new(store.clone(), channel);
         let epoch = DeliveryEpoch::for_test("epoch-1");
         pump.install_epoch(epoch);
         pump.on_durable_committed(1).await.unwrap();
@@ -575,7 +683,7 @@ mod tests {
         pump.on_durable_committed(2).await.unwrap();
 
         assert!(pump.is_online());
-        assert_eq!(pump.epoch(), Some(&epoch));
+        assert_eq!(pump.epoch(), Some(epoch));
 
         let frame = receiver.recv().await.unwrap();
         match frame {
@@ -592,7 +700,7 @@ mod tests {
             .unwrap();
 
         let (channel, mut receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
-        let mut pump = DeliveryPump::new(store.clone(), channel);
+        let pump = DeliveryPump::new(store.clone(), channel);
         pump.install_epoch(DeliveryEpoch::for_test("epoch-1"));
         pump.on_durable_committed(1).await.unwrap();
         assert!(pump.is_online());
@@ -622,7 +730,7 @@ mod tests {
     async fn volatile_send_failure_transitions_to_idle() {
         let store = store().await;
         let (channel, receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
-        let mut pump = DeliveryPump::new(store, channel);
+        let pump = DeliveryPump::new(store, channel);
         pump.install_epoch(DeliveryEpoch::for_test("epoch-1"));
         drop(receiver);
 
@@ -653,7 +761,7 @@ mod tests {
         let (channel, mut receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw)
             .capacity(1)
             .build();
-        let mut pump = DeliveryPump::new(store, channel);
+        let pump = DeliveryPump::new(store, channel);
         let epoch = DeliveryEpoch::for_test("epoch-1");
         pump.install_epoch(epoch);
 
@@ -670,7 +778,7 @@ mod tests {
         .expect("full volatile queue must not block")
         .unwrap();
 
-        assert_eq!(pump.epoch(), Some(&epoch));
+        assert_eq!(pump.epoch(), Some(epoch));
         assert!(matches!(
             receiver.recv().await,
             Some(DeliveryFrame::Volatile { event: AgentEvent::ToolExecutionUpdate { tool_call_id, .. }, .. })
@@ -688,7 +796,7 @@ mod tests {
     async fn new_epoch_invalidates_old_and_late_frames_from_old_epoch_are_ignored() {
         let store = store().await;
         let (channel, mut receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
-        let mut pump = DeliveryPump::new(store.clone(), channel);
+        let pump = DeliveryPump::new(store.clone(), channel);
 
         insert_test_durable_event(&store, 1, &assistant_event("msg-1", "a"))
             .await
@@ -723,7 +831,7 @@ mod tests {
         let store = store().await;
         let (channel, mut receiver) =
             DeliveryChannelBuilder::with_mode(DeliveryMode::RedactionOnly).build();
-        let mut pump = DeliveryPump::new(store.clone(), channel);
+        let pump = DeliveryPump::new(store.clone(), channel);
         pump.install_epoch(DeliveryEpoch::for_test("epoch-1"));
 
         pump.on_volatile(AgentEvent::MessageUpdate {
@@ -763,7 +871,7 @@ mod tests {
     async fn queued_frame_retains_attached_epoch_across_invalidation() {
         let store = store().await;
         let (channel, mut receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
-        let mut pump = DeliveryPump::new(store.clone(), channel);
+        let pump = DeliveryPump::new(store.clone(), channel);
 
         let epoch_a = DeliveryEpoch::for_test("epoch-a");
         pump.install_epoch(epoch_a);
@@ -839,7 +947,7 @@ mod tests {
             .unwrap();
 
         let (channel, _receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
-        let mut pump = DeliveryPump::new(store.clone(), channel);
+        let pump = DeliveryPump::new(store.clone(), channel);
         pump.install_epoch(DeliveryEpoch::for_test("epoch-1"));
         let result = pump.on_durable_committed(1).await;
         assert!(result.is_err(), "raw decrypt failure must propagate");
@@ -872,7 +980,7 @@ mod tests {
             .unwrap();
 
         let (channel, _receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
-        let mut pump = DeliveryPump::new(store.clone(), channel);
+        let pump = DeliveryPump::new(store.clone(), channel);
         pump.install_epoch(DeliveryEpoch::for_test("epoch-1"));
         let result = pump.on_durable_committed(1).await;
         let message = result.expect_err("invalid json must fail").to_string();

@@ -229,8 +229,8 @@ impl T17StoreAdapter {
     /// Called by T26's ordered post-commit pump task. EventWriter must not
     /// await this bounded delivery path inside its database transaction.
     pub(crate) async fn on_durable_committed(&self, seq: u64) -> Result<()> {
-        let mut pump = self.pump.lock().await;
-        let Some(pump) = pump.as_mut() else {
+        let pump = self.pump.lock().await.as_ref().cloned();
+        let Some(pump) = pump else {
             return Ok(());
         };
         pump.on_durable_committed(seq).await
@@ -239,8 +239,8 @@ impl T17StoreAdapter {
     /// Deliver an Online-only delta through the same pump/FIFO as durable
     /// notifications. Redaction-only authorization suppresses it in the pump.
     pub(crate) async fn on_volatile(&self, event: crate::agent::AgentEvent) -> Result<()> {
-        let mut pump = self.pump.lock().await;
-        let Some(pump) = pump.as_mut() else {
+        let pump = self.pump.lock().await.as_ref().cloned();
+        let Some(pump) = pump else {
             return Ok(());
         };
         pump.on_volatile(event).await
@@ -252,7 +252,7 @@ impl T17StoreAdapter {
             .lock()
             .await
             .as_ref()
-            .and_then(|pump| pump.epoch().copied())
+            .and_then(DeliveryPump::epoch)
     }
 
     #[cfg(test)]
@@ -409,7 +409,7 @@ impl DurableSource for T17StoreAdapter {
         };
         let (channel, delivery_rx) = DeliveryChannelBuilder::with_mode(mode).build();
         let (failure_tx, failure_rx) = mpsc::unbounded_channel();
-        let mut pump = DeliveryPump::new(self.store.clone(), channel);
+        let pump = DeliveryPump::new(self.store.clone(), channel);
         pump.install_supervised_epoch(epoch, failure_tx.clone());
         let mut slot = self.pump.lock().await;
         if let Some(current) = slot.as_ref()

@@ -154,9 +154,10 @@ pub struct ApiHello {
     pub delivery_authorization: DeliveryAuthorization,
 }
 
-/// Parses a canonical decimal string: optional leading `'0'`, then one or more
-/// ASCII digits, with no sign, no leading zeros, no fractional/exponent notation,
-/// and no surrounding whitespace. Rejects empty and overflow.
+/// Parses a canonical decimal string: either exactly `'0'` or a nonzero ASCII
+/// digit followed by zero or more ASCII digits, with no sign, leading zeros,
+/// fractional/exponent notation, or surrounding whitespace. Rejects empty and
+/// overflow.
 fn parse_canonical_decimal_u64(s: &str) -> Result<u64, String> {
     if s.is_empty() {
         return Err("empty decimal string".to_string());
