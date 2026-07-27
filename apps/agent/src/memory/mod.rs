@@ -94,6 +94,16 @@ pub struct CompactResult {
     pub time_range: (DateTime<Utc>, DateTime<Utc>),
 }
 
+impl Clone for CompactResult {
+    fn clone(&self) -> Self {
+        Self {
+            summary: DecryptedMemorySummary::new(self.summary.expose().to_owned()),
+            est_tokens: self.est_tokens,
+            time_range: self.time_range,
+        }
+    }
+}
+
 /// In-memory representation of the three memory layers and the speculative
 /// compaction shelf.  Durable persistence and promotion are intentionally
 /// owned by later tasks.

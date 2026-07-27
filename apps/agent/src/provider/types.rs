@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     pin::Pin,
     sync::{
         Arc,
@@ -32,6 +33,62 @@ pub enum PublicMessage {
     ToolResult(ToolResultMessage),
 }
 
+impl From<PublicMessage> for Message {
+    fn from(message: PublicMessage) -> Self {
+        match message {
+            PublicMessage::User(message) => Message::User(message),
+            PublicMessage::ToolResult(message) => Message::ToolResult(message),
+            PublicMessage::Assistant(assistant) => Message::Assistant(AssistantMessage {
+                content: assistant
+                    .content
+                    .into_iter()
+                    .map(|content| match content {
+                        PublicAssistantContent::Text {
+                            text,
+                            wire_item_index,
+                        } => AssistantContent::Text {
+                            text,
+                            wire_item_index,
+                        },
+                        PublicAssistantContent::Thinking {
+                            thinking,
+                            signature_field,
+                            wire_item_index,
+                        } => AssistantContent::Thinking {
+                            thinking,
+                            signature_field,
+                            wire_item_index,
+                        },
+                        PublicAssistantContent::ToolCall {
+                            tool_call,
+                            wire_item_index,
+                        } => AssistantContent::ToolCall {
+                            tool_call,
+                            wire_item_index,
+                        },
+                        PublicAssistantContent::RejectedToolCall {
+                            rejected,
+                            wire_item_index,
+                        } => AssistantContent::RejectedToolCall {
+                            rejected,
+                            wire_item_index,
+                        },
+                    })
+                    .collect(),
+                model: assistant.model,
+                provider: assistant.provider,
+                origin: assistant.origin,
+                usage: assistant.usage,
+                stop_reason: assistant.stop_reason,
+                error_message: assistant.error_message,
+                provider_code: assistant.provider_code,
+                interrupted: assistant.interrupted,
+                timestamp: assistant.timestamp,
+            }),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryLayer {
@@ -46,7 +103,7 @@ pub struct MemoryBlock {
     pub time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiProtocol {
     OpenAiChatCompletions,
@@ -67,8 +124,132 @@ pub struct ProviderOrigin {
 pub struct ProviderContextItem {
     pub origin_message: Option<ProviderContextAnchor>,
     pub wire_item_index: Option<u32>,
+    /// Tie-breaker within the same `wire_item_index`, zero-based and assigned
+    /// deterministically by the consumer that assembles the context list.
     pub ordinal: u32,
+    pub provider_origin: ProviderOrigin,
     pub payload: ProviderContextPayload,
+}
+
+/// Validates the stable ordering metadata shared by durable hydration and
+/// provider replay. Every authenticated anchor/wire group starts at ordinal
+/// zero and has no duplicate or missing ordinal. Native windows form an
+/// unanchored group scoped by their exact provider origin and payload kind.
+pub fn validate_provider_context_ordinals(items: &[ProviderContextItem]) -> Result<(), String> {
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+    enum Group {
+        Anchored {
+            message_id: String,
+            message_seq: u64,
+            wire_item_index: u32,
+        },
+        Native {
+            provider_instance_id: String,
+            protocol: ApiProtocol,
+            model: String,
+            kind: u8,
+        },
+    }
+
+    let mut groups = BTreeMap::<Group, Vec<u32>>::new();
+    for item in items {
+        let group = match &item.payload {
+            ProviderContextPayload::EncryptedReasoning { .. } => {
+                let anchor = item
+                    .origin_message
+                    .as_ref()
+                    .ok_or_else(|| "encrypted reasoning is missing an origin message".to_owned())?;
+                let wire_item_index = item
+                    .wire_item_index
+                    .ok_or_else(|| "encrypted reasoning is missing a wire_item_index".to_owned())?;
+                Group::Anchored {
+                    message_id: anchor.message_id.clone(),
+                    message_seq: anchor.message_seq,
+                    wire_item_index,
+                }
+            }
+            ProviderContextPayload::OpenAiCompactedWindow { .. }
+            | ProviderContextPayload::AnthropicCompaction { .. } => {
+                if item.origin_message.is_some() || item.wire_item_index.is_some() {
+                    return Err(
+                        "native provider context must be unanchored and have no wire_item_index"
+                            .to_owned(),
+                    );
+                }
+                Group::Native {
+                    provider_instance_id: item.provider_origin.provider_instance_id.clone(),
+                    protocol: item.provider_origin.protocol,
+                    model: item.provider_origin.model.clone(),
+                    kind: match &item.payload {
+                        ProviderContextPayload::OpenAiCompactedWindow { .. } => 1,
+                        ProviderContextPayload::AnthropicCompaction { .. } => 2,
+                        ProviderContextPayload::EncryptedReasoning { .. } => unreachable!(),
+                    },
+                }
+            }
+        };
+        groups.entry(group).or_default().push(item.ordinal);
+    }
+
+    for (group, mut ordinals) in groups {
+        ordinals.sort_unstable();
+        for (expected, actual) in ordinals.into_iter().enumerate() {
+            let expected = u32::try_from(expected).map_err(|_| {
+                format!("provider context ordinal count overflows u32 for {group:?}")
+            })?;
+            if actual != expected {
+                return Err(format!(
+                    "provider context ordinals for {group:?} must be unique and contiguous from zero; expected {expected}, found {actual}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Binds terminal fragments to the exact durable MessageEnd receipt anchor.
+/// Ordinals are assigned independently within each wire slot.
+pub fn bind_provider_context_fragments(
+    fragments: Vec<ProviderContextFragment>,
+    anchor: ProviderContextAnchor,
+    provider_origin: ProviderOrigin,
+) -> Result<Vec<ProviderContextItem>, String> {
+    let mut next_ordinal = BTreeMap::<Option<u32>, u32>::new();
+    let mut items = Vec::with_capacity(fragments.len());
+    for fragment in fragments {
+        let ordinal = next_ordinal.entry(fragment.wire_item_index).or_insert(0);
+        let item = ProviderContextItem {
+            origin_message: match &fragment.payload {
+                ProviderContextPayload::EncryptedReasoning { .. } => Some(anchor.clone()),
+                ProviderContextPayload::OpenAiCompactedWindow { .. }
+                | ProviderContextPayload::AnthropicCompaction { .. } => None,
+            },
+            wire_item_index: fragment.wire_item_index,
+            ordinal: *ordinal,
+            provider_origin: provider_origin.clone(),
+            payload: fragment.payload,
+        };
+        *ordinal = ordinal
+            .checked_add(1)
+            .ok_or_else(|| "provider context ordinal overflows u32".to_owned())?;
+        items.push(item);
+    }
+    validate_provider_context_ordinals(&items)?;
+    Ok(items)
+}
+
+#[cfg(test)]
+impl ProviderContextItem {
+    /// Test-only origin fixture for provider-context item construction.
+    /// Production callers must supply the real provider origin that produced
+    /// the assistant turn or compaction window.
+    pub fn test_origin() -> ProviderOrigin {
+        ProviderOrigin {
+            provider_instance_id: "test-provider-instance".to_owned(),
+            protocol: ApiProtocol::OpenAiResponses,
+            model: "test-model".to_owned(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -809,6 +990,70 @@ pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub parameters: Value,
+}
+
+/// Validate native compaction invariants for `messages`.
+///
+/// Persisted message `seq` values are the global `agent_events.seq` assigned to
+/// each `MessageEnd`, so non-message durable events create gaps. This validator
+/// enforces:
+///
+/// 1. Persisted messages are strictly increasing with positive `seq`.
+/// 2. Synthetic messages may appear only before the first persisted message.
+/// 3. If `coverage` is `Some(seq)`, that `seq` must identify one of the persisted
+///    messages — it is the global event sequence of the last transcript message
+///    replaced by the window.
+///
+/// Returns the maximum persisted `seq` when at least one persisted message
+/// exists and validation succeeds. Returns `None` only when `coverage` is
+/// `None` and there are no persisted messages, so callers that only need
+/// coverage can treat that as "no persisted history".
+pub fn validate_native_suffix(
+    messages: &[ContextMessage],
+    coverage: Option<u64>,
+) -> Result<Option<u64>, String> {
+    let mut previous: Option<u64> = None;
+    let mut persisted_started = false;
+    let mut coverage_seen = false;
+    for message in messages {
+        let ContextMessage::Persisted { seq, .. } = message else {
+            if persisted_started {
+                return Err(
+                    "native suffix contains synthetic content after persisted history".into(),
+                );
+            }
+            continue;
+        };
+        persisted_started = true;
+        if *seq == 0 {
+            return Err("persisted native replay sequence must be greater than zero".into());
+        }
+        if previous.is_some_and(|value: u64| value >= *seq) {
+            return Err(
+                "persisted native replay sequence is duplicated, reordered, or not strictly increasing".into(),
+            );
+        }
+        if coverage.is_some_and(|value| value == *seq) {
+            coverage_seen = true;
+        }
+        previous = Some(*seq);
+    }
+    if coverage.is_some() && !coverage_seen {
+        return Err("native compaction coverage does not identify a persisted message".into());
+    }
+    Ok(previous)
+}
+
+/// Hydration alias for [`validate_native_suffix`].
+///
+/// This is a convenience wrapper that retains the old `coverage: u64` signature
+/// used by T17 hydration; it returns the maximum persisted `seq` on success.
+pub fn validate_native_suffix_for_hydration(
+    messages: &[ContextMessage],
+    coverage: u64,
+) -> Result<u64, String> {
+    validate_native_suffix(messages, Some(coverage))?
+        .ok_or_else(|| "native compaction requires persisted replay history".into())
 }
 
 #[cfg(test)]
@@ -1626,5 +1871,165 @@ mod tests {
 
         assert_eq!(usage.input, u64::MAX);
         assert_eq!(usage.total_tokens, u64::MAX);
+    }
+
+    #[test]
+    fn validate_native_suffix_accepts_gapped_positive_sequences() {
+        let messages = vec![
+            ContextMessage::Persisted {
+                id: "m-4".to_owned(),
+                seq: 4,
+                message: Message::Assistant(assistant_message()),
+            },
+            ContextMessage::Persisted {
+                id: "m-6".to_owned(),
+                seq: 6,
+                message: Message::Assistant(assistant_message()),
+            },
+        ];
+        assert_eq!(
+            validate_native_suffix(&messages, Some(4))
+                .expect("gapped coverage must identify a persisted message"),
+            Some(6)
+        );
+        assert_eq!(
+            validate_native_suffix(&messages, Some(6))
+                .expect("coverage may be the last persisted message"),
+            Some(6)
+        );
+        assert_eq!(
+            validate_native_suffix(&messages, None)
+                .expect("gapped messages without coverage should return max seq"),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn validate_native_suffix_accepts_leading_synthetic_then_positive_seq() {
+        let messages = vec![
+            ContextMessage::Synthetic {
+                message: Message::Assistant(assistant_message()),
+            },
+            ContextMessage::Persisted {
+                id: "m-2".to_owned(),
+                seq: 2,
+                message: Message::Assistant(assistant_message()),
+            },
+            ContextMessage::Persisted {
+                id: "m-5".to_owned(),
+                seq: 5,
+                message: Message::Assistant(assistant_message()),
+            },
+        ];
+        validate_native_suffix(&messages, Some(5))
+            .expect("leading synthetic + gapped persisted must pass");
+    }
+
+    #[test]
+    fn validate_native_suffix_returns_none_when_no_persisted_messages_and_no_coverage() {
+        assert_eq!(validate_native_suffix(&[], None), Ok(None));
+    }
+
+    #[test]
+    fn validate_native_suffix_rejects_invalid_order_and_missing_coverage() {
+        let ordered = vec![
+            ContextMessage::Persisted {
+                id: "m-4".to_owned(),
+                seq: 4,
+                message: Message::Assistant(assistant_message()),
+            },
+            ContextMessage::Persisted {
+                id: "m-6".to_owned(),
+                seq: 6,
+                message: Message::Assistant(assistant_message()),
+            },
+        ];
+        let error = validate_native_suffix(&ordered, Some(5))
+            .expect_err("coverage must identify a persisted message");
+        assert!(
+            error.contains("does not identify a persisted message"),
+            "{error}"
+        );
+
+        let reordered = vec![ordered[1].clone(), ordered[0].clone()];
+        let error = validate_native_suffix(&reordered, Some(4))
+            .expect_err("persisted messages must remain ordered");
+        assert!(error.contains("reordered"), "{error}");
+
+        let duplicate = vec![
+            ordered[0].clone(),
+            ContextMessage::Persisted {
+                id: "m-4b".to_owned(),
+                seq: 4,
+                message: Message::Assistant(assistant_message()),
+            },
+        ];
+        assert!(validate_native_suffix(&duplicate, Some(4)).is_err());
+
+        let seq_zero = vec![ContextMessage::Persisted {
+            id: "m-0".to_owned(),
+            seq: 0,
+            message: Message::Assistant(assistant_message()),
+        }];
+        assert!(validate_native_suffix(&seq_zero, Some(0)).is_err());
+
+        let synthetic_after_persisted = vec![
+            ordered[0].clone(),
+            ContextMessage::Synthetic {
+                message: Message::Assistant(assistant_message()),
+            },
+        ];
+        assert!(validate_native_suffix(&synthetic_after_persisted, Some(4)).is_err());
+    }
+
+    #[test]
+    fn provider_context_ordinals_are_zero_based_unique_and_contiguous_per_wire() {
+        let anchor = ProviderContextAnchor {
+            message_id: "assistant-1".to_owned(),
+            message_seq: 7,
+        };
+        let item = |wire_item_index, ordinal| ProviderContextItem {
+            origin_message: Some(anchor.clone()),
+            wire_item_index: Some(wire_item_index),
+            ordinal,
+            provider_origin: origin(),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiResponses,
+                item: json!({
+                    "id": format!("reasoning-{wire_item_index}-{ordinal}"),
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": "opaque",
+                }),
+            },
+        };
+
+        validate_provider_context_ordinals(&[item(0, 0), item(0, 1), item(2, 0)])
+            .expect("each wire group is independently contiguous");
+        for invalid in [
+            vec![item(0, 1)],
+            vec![item(0, 0), item(0, 0)],
+            vec![item(0, 0), item(0, 2)],
+        ] {
+            assert!(
+                validate_provider_context_ordinals(&invalid).is_err(),
+                "{invalid:?}"
+            );
+        }
+
+        let native = ProviderContextItem {
+            origin_message: None,
+            wire_item_index: None,
+            ordinal: 1,
+            provider_origin: origin(),
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({"type":"compaction","encrypted_content":"opaque"})],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 7,
+                    context_fingerprint: "fingerprint".to_owned(),
+                },
+            },
+        };
+        assert!(validate_provider_context_ordinals(&[native]).is_err());
     }
 }

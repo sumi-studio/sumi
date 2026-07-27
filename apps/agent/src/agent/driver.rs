@@ -212,6 +212,58 @@ impl InjectedRunDriver {
             timestamp: Utc::now(),
         })
     }
+
+    fn start_provider_attempt(
+        &self,
+        attempt: usize,
+        context: &[ContextMessage],
+        provider_context: Option<&[crate::provider::types::ProviderContextItem]>,
+        command_received_at: Option<Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        let mut prompt = self.prompt.clone();
+        if let Some(provider_context) = provider_context {
+            prompt.provider_context = provider_context.to_vec();
+        }
+        // Derive the send view immediately before the provider call. The
+        // runner's retained durable anchors must not be mutated.
+        prompt.messages = transform::transform(context, &self.spec.origin());
+        // Re-check at use time: the frozen registry remains the authority.
+        if prompt.tools != self.registry.definitions() {
+            bail!("provider prompt tools diverged from the frozen registry");
+        }
+        // A `tool_choice` of `required` must be limited to the first attempt of
+        // a user turn. After a tool call and its result, the same driver will
+        // be asked to continue the turn; continuing to force a tool causes an
+        // infinite tool loop.
+        let mut options = self.options.clone();
+        if attempt > 0
+            && options
+                .tool_choice
+                .as_ref()
+                .is_some_and(|choice| choice == "required")
+        {
+            options.tool_choice = None;
+        }
+        let (observer, observations) = timing_observation_channel();
+        let timing_cancel = cancel.clone();
+        let events = (self.stream_starter)(self.spec.clone(), prompt, options, cancel, observer);
+        let samples = self.timings.clone();
+        let timing_task = tokio::spawn(collect_timing(
+            observations,
+            samples,
+            command_received_at,
+            timing_cancel,
+        ));
+        let mut timing_tasks = self.timing_tasks.lock().expect("timing tasks lock");
+        timing_tasks.retain(|task| !task.is_finished());
+        timing_tasks.push(timing_task);
+        Ok(ProviderAttempt {
+            message_id: Uuid::now_v7().to_string(),
+            initial_message: self.initial_message(),
+            events,
+        })
+    }
 }
 
 #[async_trait]
@@ -228,43 +280,29 @@ impl RunDriver for InjectedRunDriver {
 
     async fn start_provider_for_command(
         &self,
-        _attempt: usize,
+        attempt: usize,
         context: &[ContextMessage],
         command_received_at: Option<Instant>,
         cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
-        let mut prompt = self.prompt.clone();
-        // Derive the send view immediately before the provider call.  The
-        // runner's retained runtime_context anchors must not be mutated.
-        prompt.messages = transform::transform(context, &self.spec.origin());
-        // Re-check at use time: the frozen registry remains the authority.
-        if prompt.tools != self.registry.definitions() {
-            bail!("provider prompt tools diverged from the frozen registry");
-        }
-        let (observer, observations) = timing_observation_channel();
-        let timing_cancel = cancel.clone();
-        let events = (self.stream_starter)(
-            self.spec.clone(),
-            prompt,
-            self.options.clone(),
-            cancel,
-            observer,
-        );
-        let samples = self.timings.clone();
-        let timing_task = tokio::spawn(collect_timing(
-            observations,
-            samples,
+        self.start_provider_attempt(attempt, context, None, command_received_at, cancel)
+    }
+
+    async fn start_provider_with_context(
+        &self,
+        attempt: usize,
+        context: &[ContextMessage],
+        provider_context: &[crate::provider::types::ProviderContextItem],
+        command_received_at: Option<Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.start_provider_attempt(
+            attempt,
+            context,
+            Some(provider_context),
             command_received_at,
-            timing_cancel,
-        ));
-        let mut timing_tasks = self.timing_tasks.lock().expect("timing tasks lock");
-        timing_tasks.retain(|task| !task.is_finished());
-        timing_tasks.push(timing_task);
-        Ok(ProviderAttempt {
-            message_id: Uuid::now_v7().to_string(),
-            initial_message: self.initial_message(),
-            events,
-        })
+            cancel,
+        )
     }
 
     async fn execute_tool_observed(
@@ -785,7 +823,7 @@ mod tests {
         let session = Session::start(
             store,
             zero_gateway,
-            RunCore::new(),
+            RunCore::fixture_with_unapproved_tools(),
             Arc::new(SequentialRunWorker::new(driver)),
             generation(0),
         )
@@ -823,7 +861,7 @@ mod tests {
         let error = match Session::start(
             store,
             mismatch_gateway,
-            RunCore::new(),
+            RunCore::fixture_with_unapproved_tools(),
             Arc::new(SequentialRunWorker::new(driver)),
             generation(11),
         )
@@ -1026,6 +1064,52 @@ mod tests {
                 .iter()
                 .all(|sample| sample.request_sent_to_first_public_delta
                     == Some(Duration::from_millis(100)))
+        );
+    }
+
+    #[tokio::test]
+    async fn required_tool_choice_applies_only_to_the_first_attempt() {
+        let (spec, prompt, registry, workspace) = dependencies();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let sink = observed.clone();
+        let starter: Arc<StreamStarter> =
+            Arc::new(move |spec, _context, options, cancel, observer| {
+                sink.lock()
+                    .expect("observed options")
+                    .push(options.tool_choice);
+                let sent = Instant::now();
+                observer.observe(ProviderTimingObservation::RequestSent(sent));
+                let (tx, rx) = mpsc::channel(1);
+                tx.try_send(ProviderEvent::Start).expect("start");
+                drop(tx);
+                ProviderEventStream::new(rx, cancel, spec.provider.clone(), spec.origin())
+            });
+        let driver = InjectedRunDriver::with_stream_starter(
+            spec,
+            RequestOptions {
+                tool_choice: Some(json!("required")),
+                ..RequestOptions::default()
+            },
+            Some(prompt),
+            Some(registry),
+            Some(workspace),
+            Some(generation(1)),
+            starter,
+        )
+        .expect("driver");
+
+        driver
+            .start_provider_for_command(0, &[], None, CancellationToken::new())
+            .await
+            .expect("first attempt");
+        driver
+            .start_provider_for_command(1, &[], None, CancellationToken::new())
+            .await
+            .expect("continuation attempt");
+
+        assert_eq!(
+            *observed.lock().expect("observed options"),
+            vec![Some(json!("required")), None]
         );
     }
 
@@ -1277,7 +1361,7 @@ mod tests {
         let session = Session::start(
             store,
             gateway,
-            RunCore::new(),
+            RunCore::fixture_with_unapproved_tools(),
             Arc::new(SequentialRunWorker::new(driver)),
             generation(11),
         )
@@ -1461,9 +1545,15 @@ mod tests {
             .expect("driver"),
         );
         let worker = Arc::new(SequentialRunWorker::new(driver.clone()));
-        let session = Session::start(store, gateway, RunCore::new(), worker, generation(11))
-            .await
-            .expect("session");
+        let session = Session::start(
+            store,
+            gateway,
+            RunCore::fixture_with_unapproved_tools(),
+            worker,
+            generation(11),
+        )
+        .await
+        .expect("session");
         let session_task = tokio::spawn(session.run());
 
         command_write
@@ -1808,7 +1898,7 @@ mod tests {
         let session = Session::start(
             store,
             gateway,
-            RunCore::new(),
+            RunCore::fixture_with_unapproved_tools(),
             Arc::new(SequentialRunWorker::new(driver.clone())),
             generation(11),
         )
@@ -1910,7 +2000,7 @@ mod tests {
         let session = Session::start(
             store,
             gateway,
-            RunCore::new(),
+            RunCore::fixture_with_unapproved_tools(),
             Arc::new(SequentialRunWorker::new(driver)),
             generation(11),
         )
@@ -2029,7 +2119,7 @@ mod tests {
         let session = Session::start(
             store,
             gateway,
-            RunCore::new(),
+            RunCore::fixture_with_unapproved_tools(),
             Arc::new(SequentialRunWorker::new(driver)),
             generation(11),
         )

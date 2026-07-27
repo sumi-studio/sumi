@@ -439,54 +439,54 @@
     "kind": "agent_hello",
     "wire": {
       "agent_id": "agent-1",
-      "generation": 7,
-      "last_sent_event_seq": 0,
-      "last_received_command_seq": 0,
-      "last_applied_command_seq": 1
+      "generation": "7",
+      "last_sent_event_seq": "0",
+      "last_received_command_seq": "0",
+      "last_applied_command_seq": "1"
     }
   },
   "api_hello": {
     "kind": "api_hello",
     "wire": {
-      "accepted_generation": 7,
-      "last_received_event_seq": 3,
-      "next_command_seq": 2
+      "accepted_generation": "7",
+      "last_received_event_seq": "3",
+      "next_command_seq": "2"
     }
   },
   "agent_hello_max_seq": {
     "kind": "agent_hello",
     "wire": {
       "agent_id": "agent-1",
-      "generation": 7,
-      "last_sent_event_seq": 9007199254740991,
-      "last_received_command_seq": 9007199254740991,
-      "last_applied_command_seq": 9007199254740991
+      "generation": "7",
+      "last_sent_event_seq": "9007199254740991",
+      "last_received_command_seq": "9007199254740991",
+      "last_applied_command_seq": "9007199254740991"
     }
   },
   "api_hello_max_seq": {
     "kind": "api_hello",
     "wire": {
-      "accepted_generation": 7,
-      "last_received_event_seq": 9007199254740991,
-      "next_command_seq": 9007199254740991
+      "accepted_generation": "7",
+      "last_received_event_seq": "9007199254740991",
+      "next_command_seq": "9007199254740991"
     }
   },
   "agent_hello_max_safe_generation": {
     "kind": "agent_hello",
     "wire": {
       "agent_id": "agent-1",
-      "generation": 9007199254740991,
-      "last_sent_event_seq": 0,
-      "last_received_command_seq": 0,
-      "last_applied_command_seq": 0
+      "generation": "9007199254740991",
+      "last_sent_event_seq": "0",
+      "last_received_command_seq": "0",
+      "last_applied_command_seq": "0"
     }
   },
   "api_hello_max_safe_generation": {
     "kind": "api_hello",
     "wire": {
-      "accepted_generation": 9007199254740991,
-      "last_received_event_seq": 0,
-      "next_command_seq": 1
+      "accepted_generation": "9007199254740991",
+      "last_received_event_seq": "0",
+      "next_command_seq": "1"
     }
   }
 }

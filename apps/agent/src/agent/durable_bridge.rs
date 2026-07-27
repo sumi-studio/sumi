@@ -6,12 +6,17 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::{
-    gateway::{Command, CommandAck},
-    provider::types::{PublicAssistantContent, PublicMessage, StopReason, ToolResultMessage},
+    approval::{ExecutableGrant, GrantLease, GrantRevalidation},
+    gateway::{ApprovalDecision, Command, CommandAck},
+    provider::types::{
+        ProviderContextFragment, PublicAssistantContent, PublicMessage, StopReason,
+        ToolResultMessage,
+    },
     runtime::contracts::ProcessGeneration,
     store::{
-        ApplicationKind, ApprovalMutation, DurableEvent, EventBatch, EventWrite, EventWriter,
-        InjectedCommand, Projection, RunPhase, ToolExecutionMutation,
+        ApplicationKind, ApprovalMutation, ApprovalRuleMutation, DurableEvent, EventBatch,
+        EventWrite, EventWriter, InjectedCommand, Projection, ProviderContextEvictionEstimate,
+        RunPhase, ToolExecutionMutation,
     },
 };
 
@@ -60,6 +65,15 @@ pub(crate) struct RunOutput {
     pub commit_barrier: Option<ToolStartCommitBarrier>,
     pub message_commit_barrier: Option<MessageCommitBarrier>,
     pub retry_wait_commit_barrier: Option<RetryWaitCommitBarrier>,
+    /// For `ApprovalResolved` decisions, the authenticated `AdmittedCommand`
+    /// whose `CommandApplied` projection must accompany the resolution.
+    pub approval_command: Option<AdmittedCommand>,
+    /// Tool-call ID whose `ToolResult` should be durably skipped as
+    /// approval-denied before any matching `ToolExecutionStart`.
+    pub approval_not_started: Option<String>,
+    /// Tool-call ID whose `ToolResult` should be durably skipped as
+    /// approval-cancelled before any matching `ToolExecutionStart`.
+    pub approval_cancelled: Option<String>,
 }
 
 impl RunOutput {
@@ -85,6 +99,9 @@ impl RunOutput {
             commit_barrier,
             message_commit_barrier,
             retry_wait_commit_barrier,
+            approval_command: None,
+            approval_not_started: None,
+            approval_cancelled: None,
         }
     }
 }
@@ -98,29 +115,103 @@ pub(crate) struct MessageCommitReceipt {
     pub new_turn_id: Option<String>,
 }
 
-pub(crate) struct MessageCommitBarrier(oneshot::Sender<MessageCommitReceipt>);
+pub(crate) struct MessageCommitBarrier {
+    sender: oneshot::Sender<MessageCommitReceipt>,
+    provider_context: Vec<ProviderContextFragment>,
+}
 
 impl MessageCommitBarrier {
     pub(crate) fn channel() -> (Self, oneshot::Receiver<MessageCommitReceipt>) {
+        Self::channel_with_provider_context(Vec::new())
+    }
+
+    pub(crate) fn channel_with_provider_context(
+        provider_context: Vec<ProviderContextFragment>,
+    ) -> (Self, oneshot::Receiver<MessageCommitReceipt>) {
         let (sender, receiver) = oneshot::channel();
-        (Self(sender), receiver)
+        (
+            Self {
+                sender,
+                provider_context,
+            },
+            receiver,
+        )
+    }
+
+    fn provider_context(&self) -> &[ProviderContextFragment] {
+        &self.provider_context
+    }
+
+    #[cfg(test)]
+    pub(crate) fn provider_context_for_test(&self) -> &[ProviderContextFragment] {
+        self.provider_context()
     }
 
     pub(crate) fn resolve(self, receipt: MessageCommitReceipt) {
-        let _ = self.0.send(receipt);
+        let _ = self.sender.send(receipt);
     }
 }
 
-pub(crate) struct ToolStartCommitBarrier(oneshot::Sender<()>);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolStartCommitResult {
+    Committed,
+    Reauthorize,
+}
+
+pub(crate) struct ToolStartCommitBarrier {
+    sender: oneshot::Sender<ToolStartCommitResult>,
+    grant: Option<ExecutableGrant>,
+}
 
 impl ToolStartCommitBarrier {
-    pub(crate) fn channel() -> (Self, oneshot::Receiver<()>) {
+    pub(crate) fn channel() -> (Self, oneshot::Receiver<ToolStartCommitResult>) {
         let (sender, receiver) = oneshot::channel();
-        (Self(sender), receiver)
+        (
+            Self {
+                sender,
+                grant: None,
+            },
+            receiver,
+        )
+    }
+
+    pub(crate) fn channel_with_grant(
+        grant: ExecutableGrant,
+    ) -> (Self, oneshot::Receiver<ToolStartCommitResult>) {
+        let (sender, receiver) = oneshot::channel();
+        (
+            Self {
+                sender,
+                grant: Some(grant),
+            },
+            receiver,
+        )
+    }
+
+    async fn revalidate_grant(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        args: &Value,
+        run_id: &str,
+        turn_id: &str,
+    ) -> Result<(GrantRevalidation, GrantLease<'_>)> {
+        match self.grant.as_ref() {
+            Some(grant) => {
+                grant
+                    .authorize(tool_call_id, tool_name, args, run_id, turn_id)
+                    .await
+            }
+            None => Ok((GrantRevalidation::Valid, GrantLease::empty())),
+        }
     }
 
     pub(super) fn committed(self) {
-        let _ = self.0.send(());
+        let _ = self.sender.send(ToolStartCommitResult::Committed);
+    }
+
+    fn reauthorize(self) {
+        let _ = self.sender.send(ToolStartCommitResult::Reauthorize);
     }
 }
 
@@ -224,6 +315,43 @@ pub(super) struct DurableBridge {
     /// Original owner command cut off by an active Abort; applied alongside the
     /// final AgentEnd so the owner terminates with the aborted run.
     aborted_owner: Option<(String, u64)>,
+    /// Tool-call IDs that were approval-denied and must be durably skipped as
+    /// `approval_denied` when their `ToolResult` arrives, before any matching
+    /// `ToolExecutionStart`. Inserted by `ApprovalResolved` Deny; removed when
+    /// the skip/finish projection is committed.
+    approval_not_started: HashSet<String>,
+    /// Tool-call IDs that were approval-cancelled and must be durably finished
+    /// as `approval_cancelled` when their `ToolResult` arrives. Inserted by
+    /// `ApprovalResolved` Cancelled or idle cancellation; removed when the finish
+    /// projection is committed.
+    approval_cancelled: HashSet<String>,
+    /// The authenticated `ApprovalDecision` command for the currently pending
+    /// approval. Set from the worker's `RunOutput` when `ApprovalResolved` is
+    /// emitted and consumed when the Decision is committed so the matching
+    /// `CommandApplied` projection can be emitted. At most one command is kept.
+    approval_command: Option<AdmittedCommand>,
+    /// Maps an active approval `request_id` to the `tool_call_id` it controls.
+    /// Inserted when `ApprovalRequested` commits; consumed by the matching
+    /// `ApprovalResolved` to locate the affected tool.
+    approval_request_tools: HashMap<String, String>,
+    /// Tool-call IDs that have been prepared for approval and are waiting for
+    /// an `ApprovalResolved` before they may start execution. Inserted when
+    /// `ApprovalRequested` commits; removed when the tool starts (then it is
+    /// running) or when the approval is denied/cancelled and cleaned up.
+    approval_prepared_tools: HashSet<String>,
+    /// Approved approvals that have resolved but whose tools have not yet started.
+    /// Each tuple holds the `request_id`, the `ApprovalResolution`, and the
+    /// authenticated `ApprovalDecision` command. Entries are pushed by
+    /// `ApprovalResolved` Decision (ApproveOnce/ApproveAlways) and consumed in
+    /// order by the matching `ToolExecutionStart`, which emits the
+    /// `ApprovalResolved` and `CommandApplied` projections atomically. `AgentEnd`
+    /// cannot commit while this queue is non-empty.
+    pending_approval_resolved: Vec<(String, ApprovalResolution, AdmittedCommand)>,
+    /// Approved decisions preempted before their tool start. The matching
+    /// runtime cancellation, prepared-tool terminal, ToolResult, and this
+    /// authenticated command's terminal no-op commit together when the worker
+    /// supplies the cancellation result.
+    pending_cancelled_approval_commands: HashMap<String, (String, AdmittedCommand)>,
     committed_terminal_command_ids: Vec<String>,
 }
 
@@ -261,6 +389,13 @@ impl DurableBridge {
             pending_hard_steer_user_message_id: None,
             pending_hard_steer_message_barrier: None,
             aborted_owner: None,
+            approval_not_started: HashSet::new(),
+            approval_cancelled: HashSet::new(),
+            approval_command: None,
+            approval_request_tools: HashMap::new(),
+            approval_prepared_tools: HashSet::new(),
+            pending_approval_resolved: Vec::new(),
+            pending_cancelled_approval_commands: HashMap::new(),
             committed_terminal_command_ids: Vec::new(),
         }
     }
@@ -279,6 +414,9 @@ impl DurableBridge {
         if !self.pending_tool_end.is_empty()
             || !self.length_not_started.is_empty()
             || !self.pending_tool_calls.is_empty()
+            || !self.approval_prepared_tools.is_empty()
+            || !self.pending_approval_resolved.is_empty()
+            || !self.pending_cancelled_approval_commands.is_empty()
         {
             return SteerStage::ToolOrApproval;
         }
@@ -511,6 +649,10 @@ impl DurableBridge {
         self.retry_wait_ready
     }
 
+    pub(super) fn take_terminal_command_ids(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.committed_terminal_command_ids)
+    }
+
     pub(super) async fn bind_retry_steer(
         &mut self,
         writer: &EventWriter,
@@ -575,7 +717,7 @@ impl DurableBridge {
     pub(super) async fn commit(
         &mut self,
         writer: &EventWriter,
-        output: RunOutput,
+        mut output: RunOutput,
     ) -> Result<CommittedRunOutput> {
         let has_barrier = output.commit_barrier.is_some();
         let is_tool_start = matches!(output.event, AgentEvent::ToolExecutionStart { .. });
@@ -598,6 +740,15 @@ impl DurableBridge {
             bail!("run output durable binding changed while the worker was active");
         }
         let steer_group_active = self.pending_steer_group.is_some();
+        if output.approval_command.is_some() {
+            self.approval_command = output.approval_command;
+        }
+        if let Some(tool_call_id) = output.approval_not_started {
+            self.approval_not_started.insert(tool_call_id);
+        }
+        if let Some(tool_call_id) = output.approval_cancelled {
+            self.approval_cancelled.insert(tool_call_id);
+        }
         let next_turn = matches!(output.event, AgentEvent::TurnStart)
             && !self.turn_open
             && self.phase != RunPhase::RunStarted
@@ -822,46 +973,193 @@ impl DurableBridge {
                 if self.assistant_open.is_some() {
                     bail!("ToolExecutionStart cannot precede assistant MessageEnd");
                 }
-                writer
-                    .apply(EventBatch {
-                        writes: vec![EventWrite {
-                            event: None,
-                            projections: vec![Projection::ToolExecution(
-                                ToolExecutionMutation::Prepare {
-                                    tool_call_id: tool_call_id.clone(),
-                                    command_id: self.binding.command_id.clone(),
-                                    run_id: self.binding.run_id.clone(),
-                                    executor_generation: self.binding.executor_generation,
-                                    idempotency_key: self
-                                        .binding
-                                        .tool_execution_idempotency_key(&tool_call_id),
-                                },
-                            )],
-                        }],
-                        injected_commands: Vec::new(),
-                    })
+                // If a soft/retry steer group has already been durably bound,
+                // a `Steered` event has already been durably committed, or an
+                // abort has been durably bound, any not-yet-started tool is
+                // superseded. Drop this start so the worker can emit the
+                // skipped ToolResult instead.
+                if self.pending_steer_collecting
+                    || self.pending_steer_group.is_some()
+                    || self.phase == RunPhase::CancelRequested
+                {
+                    let superseded = self.pending_approval_resolved.iter().any(|(req, _, _)| {
+                        self.approval_request_tools.get(req) == Some(&tool_call_id)
+                    }) || self.pending_tool_calls.contains(&tool_call_id);
+                    if superseded {
+                        return Ok(CommittedRunOutput {
+                            outputs: Vec::new(),
+                            tool_start_barrier: None,
+                            message_receipts: Vec::new(),
+                            retry_wait_commit_barrier: None,
+                            terminal_command_ids: std::mem::take(
+                                &mut self.committed_terminal_command_ids,
+                            ),
+                        });
+                    }
+                }
+                let (grant_status, grant_lease) = output
+                    .commit_barrier
+                    .as_ref()
+                    .expect("ToolExecutionStart barrier checked")
+                    .revalidate_grant(
+                        &tool_call_id,
+                        &tool_name,
+                        &args,
+                        &self.binding.run_id,
+                        &self.binding.turn_id,
+                    )
                     .await?;
+                if grant_status == GrantRevalidation::Reauthorize {
+                    drop(grant_lease);
+                    output
+                        .commit_barrier
+                        .take()
+                        .expect("ToolExecutionStart barrier checked")
+                        .reauthorize();
+                    return Ok(CommittedRunOutput {
+                        outputs: Vec::new(),
+                        tool_start_barrier: None,
+                        message_receipts: Vec::new(),
+                        retry_wait_commit_barrier: None,
+                        terminal_command_ids: std::mem::take(
+                            &mut self.committed_terminal_command_ids,
+                        ),
+                    });
+                }
                 self.pending_tool_end
                     .insert(tool_call_id.clone(), (Value::Null, false));
                 self.pending_tool_calls.remove(&tool_call_id);
-                self.commit_single(
-                    writer,
-                    DurableEvent::tool_execution_start(
-                        tool_call_id.clone(),
-                        tool_name.clone(),
-                        args.clone(),
-                    )?,
-                    vec![Projection::ToolExecution(ToolExecutionMutation::Start {
+                if let Some(pos) = self
+                    .pending_approval_resolved
+                    .iter()
+                    .position(|(req, _, _)| {
+                        self.approval_request_tools.get(req) == Some(&tool_call_id)
+                    })
+                {
+                    let (request_id, resolution, command) =
+                        self.pending_approval_resolved.remove(pos);
+                    let expected_tool_call_id = self
+                        .approval_request_tools
+                        .get(&request_id)
+                        .ok_or_else(|| anyhow!("pending approval has no tool_call_id binding"))?;
+                    if *expected_tool_call_id != tool_call_id {
+                        bail!("ToolExecutionStart does not match the pending approval resolution");
+                    }
+                    let state = approval_state(&resolution);
+                    let command_id = command.envelope().command_id.to_string();
+                    let command_seq = command.envelope().seq;
+                    let run_id = self.binding.run_id.clone();
+                    let public_resolution = resolution.clone();
+                    let mut resolution_projections = vec![
+                        Projection::Approval(ApprovalMutation::Resolve {
+                            request_id: request_id.clone(),
+                            state,
+                            actor: "user".to_owned(),
+                        }),
+                        Projection::CommandApplied {
+                            command_id: command_id.clone(),
+                            command_seq,
+                            run_id: Some(run_id.clone()),
+                        },
+                    ];
+                    if let Some(rule) = approval_rule_projection(&public_resolution)? {
+                        resolution_projections.push(Projection::ApprovalRule(rule));
+                    }
+                    let writes = vec![
+                        EventWrite {
+                            event: Some(DurableEvent::approval_resolved(
+                                request_id.clone(),
+                                resolution,
+                                "user".to_owned(),
+                            )?),
+                            projections: resolution_projections,
+                        },
+                        EventWrite {
+                            event: Some(DurableEvent::tool_execution_start(
+                                tool_call_id.clone(),
+                                tool_name.clone(),
+                                args.clone(),
+                                self.binding.command_id.clone(),
+                                run_id.clone(),
+                                self.binding.executor_generation,
+                            )?),
+                            projections: vec![Projection::ToolExecution(
+                                ToolExecutionMutation::Start {
+                                    tool_call_id: tool_call_id.clone(),
+                                    run_id: run_id.clone(),
+                                },
+                            )],
+                        },
+                    ];
+                    self.approval_prepared_tools.remove(&tool_call_id);
+                    self.committed_terminal_command_ids.push(command_id);
+                    let public = vec![
+                        AgentEvent::ApprovalResolved {
+                            request_id: request_id.clone(),
+                            resolution: public_resolution,
+                        },
+                        AgentEvent::ToolExecutionStart {
+                            tool_call_id: tool_call_id.clone(),
+                            tool_name: tool_name.clone(),
+                            args: args.clone(),
+                        },
+                    ];
+                    let outputs = self
+                        .commit_batch(
+                            writer,
+                            EventBatch {
+                                writes,
+                                injected_commands: Vec::new(),
+                            },
+                            public,
+                        )
+                        .await?;
+                    drop(grant_lease);
+                    return Ok(CommittedRunOutput {
+                        outputs,
+                        tool_start_barrier: output.commit_barrier,
+                        message_receipts: Vec::new(),
+                        retry_wait_commit_barrier: None,
+                        terminal_command_ids: std::mem::take(
+                            &mut self.committed_terminal_command_ids,
+                        ),
+                    });
+                }
+                let mut projections = Vec::with_capacity(2);
+                if !self.approval_prepared_tools.remove(&tool_call_id) {
+                    projections.push(Projection::ToolExecution(ToolExecutionMutation::Prepare {
                         tool_call_id: tool_call_id.clone(),
+                        command_id: self.binding.command_id.clone(),
                         run_id: self.binding.run_id.clone(),
-                    })],
-                    AgentEvent::ToolExecutionStart {
-                        tool_call_id,
-                        tool_name,
-                        args,
-                    },
-                )
-                .await
+                        executor_generation: self.binding.executor_generation,
+                        idempotency_key: self.binding.tool_execution_idempotency_key(&tool_call_id),
+                    }));
+                }
+                projections.push(Projection::ToolExecution(ToolExecutionMutation::Start {
+                    tool_call_id: tool_call_id.clone(),
+                    run_id: self.binding.run_id.clone(),
+                }));
+                let committed = self
+                    .commit_single(
+                        writer,
+                        DurableEvent::tool_execution_start(
+                            tool_call_id.clone(),
+                            tool_name.clone(),
+                            args.clone(),
+                            self.binding.command_id.clone(),
+                            self.binding.run_id.clone(),
+                            self.binding.executor_generation,
+                        )?,
+                        projections,
+                        AgentEvent::ToolExecutionStart {
+                            tool_call_id,
+                            tool_name,
+                            args,
+                        },
+                    )
+                    .await?;
+                drop(grant_lease);
+                Ok(committed)
             }
             AgentEvent::RetryScheduled {
                 attempt,
@@ -927,6 +1225,9 @@ impl DurableBridge {
                 if self.turn_open {
                     bail!("AgentEnd requires the current TurnEnd to be durable first");
                 }
+                if !self.pending_approval_resolved.is_empty() {
+                    bail!("AgentEnd cannot commit while approved tools have not started");
+                }
                 let abort_cutoff = self.phase == RunPhase::CancelRequested;
                 self.phase = RunPhase::Finished;
                 let mut projections = Vec::with_capacity(2);
@@ -945,13 +1246,15 @@ impl DurableBridge {
                         run_id: Some(self.binding.run_id.clone()),
                     });
                 }
-                self.commit_single(
-                    writer,
-                    DurableEvent::agent_end(&self.binding.run_id)?,
-                    projections,
-                    AgentEvent::AgentEnd,
-                )
-                .await
+                let (agent_end_outputs, message_receipts) = self
+                    .commit_single(
+                        writer,
+                        DurableEvent::agent_end(&self.binding.run_id)?,
+                        projections,
+                        AgentEvent::AgentEnd,
+                    )
+                    .await?;
+                Ok((agent_end_outputs, message_receipts))
             }
             AgentEvent::Steered {
                 mode: super::SteerMode::Hard,
@@ -981,6 +1284,12 @@ impl DurableBridge {
                 }
                 let request_id = request.id.clone();
                 let tool_call_id = request.tool_call_id.clone();
+                if !self.pending_tool_calls.remove(&tool_call_id) {
+                    bail!("ApprovalRequested does not match an unprepared tool call");
+                }
+                self.approval_request_tools
+                    .insert(request_id.clone(), tool_call_id.clone());
+                self.approval_prepared_tools.insert(tool_call_id.clone());
                 self.commit_single(
                     writer,
                     DurableEvent::approval_requested(request.clone())?,
@@ -1009,6 +1318,37 @@ impl DurableBridge {
                 request_id,
                 resolution: ApprovalResolution::Cancelled,
             } => {
+                if let Some(pos) = self
+                    .pending_approval_resolved
+                    .iter()
+                    .position(|(rid, _, _)| rid == &request_id)
+                {
+                    let (request_id, _, command) = self.pending_approval_resolved.remove(pos);
+                    let tool_call_id = self
+                        .approval_request_tools
+                        .get(&request_id)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("cancelled approval has no tool binding"))?;
+                    if self
+                        .pending_cancelled_approval_commands
+                        .insert(tool_call_id, (request_id, command))
+                        .is_some()
+                    {
+                        bail!("duplicate pre-start cancelled approval command");
+                    }
+                    return Ok(CommittedRunOutput {
+                        outputs: Vec::new(),
+                        tool_start_barrier: None,
+                        message_receipts: Vec::new(),
+                        retry_wait_commit_barrier: None,
+                        terminal_command_ids: std::mem::take(
+                            &mut self.committed_terminal_command_ids,
+                        ),
+                    });
+                } else if let Some(tool_call_id) = self.approval_request_tools.get(&request_id) {
+                    self.approval_cancelled.insert(tool_call_id.clone());
+                    self.approval_prepared_tools.remove(tool_call_id);
+                }
                 self.commit_single(
                     writer,
                     DurableEvent::approval_resolved(
@@ -1028,8 +1368,78 @@ impl DurableBridge {
                 )
                 .await
             }
-            AgentEvent::ApprovalResolved { .. } => {
-                bail!("user approval decisions require the later T23 ApprovalBroker")
+            AgentEvent::ApprovalResolved {
+                request_id,
+                resolution: resolution @ ApprovalResolution::Decision(..),
+            } => {
+                if self.phase != RunPhase::AssistantStarted
+                    || !self.turn_open
+                    || self.assistant_open.is_some()
+                {
+                    bail!(
+                        "ApprovalResolved Decision requires a durable assistant tool call in the active turn"
+                    );
+                }
+                let state = approval_state(&resolution);
+                if matches!(
+                    resolution,
+                    ApprovalResolution::Decision(ApprovalDecision::Deny)
+                ) && let Some(tool_call_id) = self.approval_request_tools.get(&request_id)
+                {
+                    self.approval_not_started.insert(tool_call_id.clone());
+                }
+                let command = self.approval_command.take().ok_or_else(|| {
+                    anyhow!("ApprovalResolved Decision requires a pending command")
+                })?;
+                if matches!(
+                    resolution,
+                    ApprovalResolution::Decision(
+                        ApprovalDecision::ApproveOnce | ApprovalDecision::ApproveAlways { .. }
+                    )
+                ) {
+                    self.pending_approval_resolved
+                        .push((request_id, resolution, command));
+                    return Ok(CommittedRunOutput {
+                        outputs: Vec::new(),
+                        tool_start_barrier: None,
+                        message_receipts: Vec::new(),
+                        retry_wait_commit_barrier: None,
+                        terminal_command_ids: std::mem::take(
+                            &mut self.committed_terminal_command_ids,
+                        ),
+                    });
+                } else {
+                    let command_id = command.envelope().command_id.to_string();
+                    let command_seq = command.envelope().seq;
+                    let run_id = self.binding.run_id.clone();
+                    let projections = vec![
+                        Projection::Approval(ApprovalMutation::Resolve {
+                            request_id: request_id.clone(),
+                            state,
+                            actor: "user".to_owned(),
+                        }),
+                        Projection::CommandApplied {
+                            command_id: command_id.clone(),
+                            command_seq,
+                            run_id: Some(run_id),
+                        },
+                    ];
+                    self.committed_terminal_command_ids.push(command_id);
+                    self.commit_single(
+                        writer,
+                        DurableEvent::approval_resolved(
+                            request_id.clone(),
+                            resolution.clone(),
+                            "user".to_owned(),
+                        )?,
+                        projections,
+                        AgentEvent::ApprovalResolved {
+                            request_id,
+                            resolution,
+                        },
+                    )
+                    .await
+                }
             }
             AgentEvent::Steered { .. } | AgentEvent::MemoryMaintenance { .. } => {
                 bail!("event requires a later T15/T16/T17 durable bridge extension")
@@ -1055,6 +1465,7 @@ impl DurableBridge {
         Vec<CommittedOutput>,
         Vec<(MessageCommitBarrier, MessageCommitReceipt)>,
     )> {
+        let provider_context = barrier.provider_context().to_vec();
         if self.assistant_open.as_deref() != Some(message_id.as_str()) {
             bail!("assistant MessageEnd does not close its exact durable MessageStart");
         }
@@ -1085,6 +1496,9 @@ impl DurableBridge {
             &message,
             PublicMessage::Assistant(assistant) if assistant.stop_reason == StopReason::Error
         );
+        if !append_to_l0 && !provider_context.is_empty() {
+            bail!("L0-excluded assistant MessageEnd cannot carry provider context");
+        }
         if self.pending_hard_steer.is_some()
             && matches!(
                 &message,
@@ -1119,6 +1533,14 @@ impl DurableBridge {
                         role: "assistant",
                         message: message.clone(),
                         append_to_l0,
+                        eviction_footprint_tokens: provider_context
+                            .iter()
+                            .map(|fragment| {
+                                ProviderContextEvictionEstimate::from_payload(&fragment.payload)
+                                    .tokens
+                            })
+                            .fold(0u64, |total, tokens| total.saturating_add(tokens)),
+                        provider_context,
                     }],
                 }],
                 injected_commands: Vec::new(),
@@ -1159,6 +1581,8 @@ impl DurableBridge {
             },
             message: message.clone(),
             append_to_l0: true,
+            provider_context: Vec::new(),
+            eviction_footprint_tokens: 0,
         }];
         let mut writes = Vec::new();
         let mut public_prefix = Vec::new();
@@ -1231,6 +1655,23 @@ impl DurableBridge {
                     result: serde_json::to_value(result)?,
                     is_error,
                 });
+            } else if self.approval_not_started.contains(&tool_call_id)
+                && self.pending_tool_calls.contains(&tool_call_id)
+            {
+                if !result.is_error {
+                    bail!("Approval-not-started ToolResult must be is_error=true");
+                }
+                self.approval_not_started.remove(&tool_call_id);
+                self.pending_tool_calls.remove(&tool_call_id);
+                projections.push(Projection::ToolExecution(ToolExecutionMutation::Skip {
+                    tool_call_id: tool_call_id.clone(),
+                    command_id: self.binding.command_id.clone(),
+                    run_id: self.binding.run_id.clone(),
+                    turn_id: self.binding.turn_id.clone(),
+                    executor_generation: self.binding.executor_generation,
+                    idempotency_key: self.binding.tool_execution_idempotency_key(&tool_call_id),
+                    error_code: "approval_denied",
+                }));
             } else if self.pending_tool_calls.remove(&tool_call_id) {
                 if !result.is_error {
                     bail!("Cancelled ToolResult must be is_error=true");
@@ -1280,6 +1721,88 @@ impl DurableBridge {
                     idempotency_key: format!("{owner_id}/{tool_call_id}"),
                     error_code,
                 }));
+            } else if self.approval_cancelled.remove(&tool_call_id) {
+                if !result.is_error {
+                    bail!("Approval-cancelled ToolResult must be is_error=true");
+                }
+                self.approval_prepared_tools.remove(&tool_call_id);
+                let result_value = serde_json::to_value(result)?;
+                if let Some((request_id, command)) = self
+                    .pending_cancelled_approval_commands
+                    .remove(&tool_call_id)
+                {
+                    let command_id = command.envelope().command_id.to_string();
+                    writes.push(EventWrite {
+                        event: Some(DurableEvent::approval_resolved(
+                            request_id.clone(),
+                            ApprovalResolution::Cancelled,
+                            "runtime".to_owned(),
+                        )?),
+                        projections: vec![
+                            Projection::Approval(ApprovalMutation::Resolve {
+                                request_id: request_id.clone(),
+                                state: "cancelled",
+                                actor: "runtime".to_owned(),
+                            }),
+                            Projection::CommandApplied {
+                                command_id: command_id.clone(),
+                                command_seq: command.envelope().seq,
+                                run_id: None,
+                            },
+                        ],
+                    });
+                    self.committed_terminal_command_ids.push(command_id);
+                    public_prefix.push(AgentEvent::ApprovalResolved {
+                        request_id,
+                        resolution: ApprovalResolution::Cancelled,
+                    });
+                }
+                writes.push(EventWrite {
+                    event: Some(DurableEvent::tool_execution_end(
+                        tool_call_id.clone(),
+                        result_value.clone(),
+                        true,
+                        "cancelled".to_owned(),
+                        Some("approval_cancelled".to_owned()),
+                    )?),
+                    projections: vec![Projection::ToolExecution(ToolExecutionMutation::Finish {
+                        tool_call_id: tool_call_id.clone(),
+                        expected: "prepared",
+                        state: "cancelled",
+                        error_code: Some("approval_cancelled"),
+                    })],
+                });
+                public_prefix.push(AgentEvent::ToolExecutionEnd {
+                    tool_call_id: tool_call_id.clone(),
+                    result: result_value,
+                    is_error: true,
+                });
+            } else if self.approval_not_started.remove(&tool_call_id) {
+                if !result.is_error {
+                    bail!("Approval-not-started ToolResult must be is_error=true");
+                }
+                self.approval_prepared_tools.remove(&tool_call_id);
+                let result_value = serde_json::to_value(result)?;
+                writes.push(EventWrite {
+                    event: Some(DurableEvent::tool_execution_end(
+                        tool_call_id.clone(),
+                        result_value.clone(),
+                        true,
+                        "cancelled".to_owned(),
+                        Some("approval_denied".to_owned()),
+                    )?),
+                    projections: vec![Projection::ToolExecution(ToolExecutionMutation::Finish {
+                        tool_call_id: tool_call_id.clone(),
+                        expected: "prepared",
+                        state: "cancelled",
+                        error_code: Some("approval_denied"),
+                    })],
+                });
+                public_prefix.push(AgentEvent::ToolExecutionEnd {
+                    tool_call_id: tool_call_id.clone(),
+                    result: result_value,
+                    is_error: true,
+                });
             } else if let Some((_, _, pending_ids, _)) = self.pending_rejected_end.as_mut()
                 && pending_ids.remove(&tool_call_id)
             {
@@ -1294,7 +1817,7 @@ impl DurableBridge {
                 return self.commit_rejected_pair_batch(writer).await;
             } else {
                 bail!(
-                    "tool result has neither execution lifecycle nor Length not-started disposition"
+                    "tool result has neither execution lifecycle nor known not-started disposition"
                 );
             }
         }
@@ -1351,6 +1874,10 @@ impl DurableBridge {
             &assistant,
             PublicMessage::Assistant(value) if value.stop_reason == StopReason::Error
         );
+        let provider_context = assistant_barrier.provider_context().to_vec();
+        if !append_to_l0 && !provider_context.is_empty() {
+            bail!("L0-excluded rejected assistant cannot carry provider context");
+        }
         let mut writes = vec![EventWrite {
             event: Some(DurableEvent::message_in_turn(
                 "message_end",
@@ -1364,6 +1891,13 @@ impl DurableBridge {
                 role: "assistant",
                 message: assistant.clone(),
                 append_to_l0,
+                eviction_footprint_tokens: provider_context
+                    .iter()
+                    .map(|fragment| {
+                        ProviderContextEvictionEstimate::from_payload(&fragment.payload).tokens
+                    })
+                    .fold(0u64, |total, tokens| total.saturating_add(tokens)),
+                provider_context,
             }],
         }];
         let mut receipt_requests = vec![(assistant_id.clone(), assistant_barrier)];
@@ -1387,6 +1921,8 @@ impl DurableBridge {
                     role: "tool_result",
                     message: message.clone(),
                     append_to_l0: true,
+                    provider_context: Vec::new(),
+                    eviction_footprint_tokens: 0,
                 }],
             });
             public.push(AgentEvent::MessageStart {
@@ -1891,12 +2427,50 @@ impl DurableBridge {
     }
 }
 
+fn approval_state(resolution: &ApprovalResolution) -> &'static str {
+    use crate::gateway::ApprovalDecision;
+    match resolution {
+        ApprovalResolution::Decision(ApprovalDecision::ApproveOnce) => "approved_once",
+        ApprovalResolution::Decision(ApprovalDecision::ApproveAlways { .. }) => "approved_always",
+        ApprovalResolution::Decision(ApprovalDecision::Deny) => "denied",
+        ApprovalResolution::Cancelled => "cancelled",
+    }
+}
+
+fn approval_rule_projection(
+    resolution: &ApprovalResolution,
+) -> Result<Option<ApprovalRuleMutation>> {
+    let ApprovalResolution::Decision(ApprovalDecision::ApproveAlways { rule }) = resolution else {
+        return Ok(None);
+    };
+    let value = serde_json::to_value(rule)?;
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("ApproveAlways rule has no id"))?
+        .to_owned();
+    let tool = value
+        .get("tool")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("ApproveAlways rule has no tool"))?
+        .to_owned();
+    Ok(Some(ApprovalRuleMutation {
+        id,
+        tool,
+        pattern: serde_json::to_string(&value)?,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use crate::{
-        gateway::{Command, CommandEnvelope, CommandId, InboundCommand},
+        agent::{
+            AdmittedCommand,
+            events::{ApprovalRequest, ApprovalResolution, ReviewProjection},
+        },
+        gateway::{ApprovalDecision, Command, CommandEnvelope, CommandId, InboundCommand},
         provider::types::{
             PublicAssistantContent, PublicAssistantMessage, PublicMessage, StopReason, ToolCall,
             ToolResultMessage, UserContent, UserMessage, ValidatedToolArguments,
@@ -1952,6 +2526,25 @@ mod tests {
                 seq,
                 command_id: CommandId::parse(command_id).expect("canonical test UUID"),
                 command: Command::Abort {},
+            },
+            test_timestamp(),
+        )
+    }
+
+    fn test_admitted_approval_decision(
+        seq: u64,
+        command_id: &str,
+        request_id: &str,
+        decision: ApprovalDecision,
+    ) -> AdmittedCommand {
+        AdmittedCommand::new(
+            CommandEnvelope {
+                seq,
+                command_id: CommandId::parse(command_id).expect("canonical test UUID"),
+                command: Command::ApprovalDecision {
+                    request_id: request_id.to_owned(),
+                    decision,
+                },
             },
             test_timestamp(),
         )
@@ -2072,6 +2665,8 @@ mod tests {
                                 role: "user",
                                 message,
                                 append_to_l0: true,
+                                provider_context: Vec::new(),
+                                eviction_footprint_tokens: 0,
                             },
                             Projection::RunPhase {
                                 command_id: command_id.to_owned(),
@@ -2183,6 +2778,9 @@ mod tests {
             commit_barrier: None,
             message_commit_barrier: None,
             retry_wait_commit_barrier: None,
+            approval_command: None,
+            approval_not_started: None,
+            approval_cancelled: None,
         };
         assert_eq!(output.binding.executor_generation.to_wire(), 73);
         let public = serde_json::to_value(output.event).expect("serialize public event");
@@ -2299,6 +2897,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: Some(partial_barrier),
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2325,6 +2926,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: None,
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2339,6 +2943,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: None,
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2455,6 +3062,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: Some(assistant_barrier),
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2481,6 +3091,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: None,
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2499,6 +3112,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: Some(user_barrier),
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2535,6 +3151,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: None,
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2638,19 +3257,14 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: Some(assistant_barrier),
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
             .expect("commit assistant MessageEnd with tool call");
         committed.resolve_message_receipts();
-
-        let steer_id = "00000000-0000-4000-8000-000000000302";
-        persist_and_pin(&store, &writer, 2, steer_id, "steer now").await;
-        let steer_command = test_admitted(2, steer_id, "steer now");
-        bridge
-            .bind_soft_steer(&writer, steer_command)
-            .await
-            .expect("bind soft steer after tool call pending");
 
         let (tool_start_barrier, _) = ToolStartCommitBarrier::channel();
         let committed = bridge
@@ -2666,6 +3280,9 @@ mod tests {
                     commit_barrier: Some(tool_start_barrier),
                     message_commit_barrier: None,
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2674,6 +3291,14 @@ mod tests {
         if let Some(barrier) = tool_barrier {
             barrier.committed();
         }
+
+        let steer_id = "00000000-0000-4000-8000-000000000302";
+        persist_and_pin(&store, &writer, 2, steer_id, "steer now").await;
+        let steer_command = test_admitted(2, steer_id, "steer now");
+        bridge
+            .bind_soft_steer(&writer, steer_command)
+            .await
+            .expect("bind soft steer after tool call pending");
 
         let result_message = ToolResultMessage {
             tool_call_id: tool_call.id.clone(),
@@ -2698,6 +3323,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: None,
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2716,6 +3344,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: None,
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2734,6 +3365,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: Some(tool_result_barrier),
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2752,6 +3386,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: None,
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2766,6 +3403,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: None,
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2790,6 +3430,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: None,
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2808,6 +3451,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: Some(user_barrier),
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2894,6 +3540,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: Some(assistant_barrier),
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2935,6 +3584,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: None,
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2953,6 +3605,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: Some(result_barrier),
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2971,6 +3626,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: None,
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -2985,6 +3643,9 @@ mod tests {
                     commit_barrier: None,
                     message_commit_barrier: None,
                     retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
                 },
             )
             .await
@@ -3029,6 +3690,141 @@ mod tests {
         assert_eq!(
             owner_status.1, "finished",
             "original owner must be finished"
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_denial_is_not_swallowed_by_pending_tool_cleanup() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let owner_id = "00000000-0000-4000-8000-000000000451";
+        let run_id = "run-policy-denial";
+        let turn_id = "turn-policy-denial";
+        let (binding, assistant) = owner_in_phase(
+            &store,
+            &writer,
+            owner_id,
+            run_id,
+            turn_id,
+            RunPhase::AssistantStarted,
+        )
+        .await;
+        let (assistant_id, assistant_base) = assistant.expect("assistant MessageStart");
+        let tool_call = ToolCall {
+            id: "policy-denied-call".to_owned(),
+            name: "fixture-tool".to_owned(),
+            arguments: serde_json::from_value::<ValidatedToolArguments>(
+                serde_json::json!({"safe": true}),
+            )
+            .expect("validated arguments"),
+        };
+        let mut assistant = match assistant_base {
+            PublicMessage::Assistant(assistant) => assistant,
+            _ => unreachable!(),
+        };
+        assistant.content = vec![PublicAssistantContent::ToolCall {
+            tool_call: tool_call.clone(),
+            wire_item_index: 0,
+        }];
+        assistant.stop_reason = StopReason::Stop;
+        let assistant = PublicMessage::Assistant(assistant);
+
+        let mut bridge = DurableBridge::new(binding.clone());
+        bridge.phase = RunPhase::AssistantStarted;
+        bridge.turn_open = true;
+        bridge.assistant_open = Some(assistant_id.clone());
+        let (assistant_barrier, _) = MessageCommitBarrier::channel();
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::MessageEnd {
+                        message_id: assistant_id,
+                        message: Box::new(assistant),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: Some(assistant_barrier),
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit assistant tool call")
+            .resolve_message_receipts();
+
+        let result = ToolResultMessage {
+            tool_call_id: tool_call.id.clone(),
+            tool_name: tool_call.name,
+            content: vec![UserContent::Text {
+                text: "policy denied".to_owned(),
+            }],
+            details: serde_json::json!({"error": "approval_denied"}),
+            is_error: true,
+            timestamp: test_timestamp(),
+        };
+        let result_id = "policy-denied-result".to_owned();
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::MessageStart {
+                        message_id: result_id.clone(),
+                        message: Box::new(PublicMessage::ToolResult(result.clone())),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("buffer denied result start");
+        let (result_barrier, _) = MessageCommitBarrier::channel();
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding,
+                    event: AgentEvent::MessageEnd {
+                        message_id: result_id,
+                        message: Box::new(PublicMessage::ToolResult(result)),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: Some(result_barrier),
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: Some(tool_call.id.clone()),
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit policy denial")
+            .resolve_message_receipts();
+
+        assert_eq!(
+            sqlx::query_as::<_, (String, Option<String>, i64)>(
+                "SELECT state, error_code,
+                    (SELECT COUNT(*) FROM agent_events
+                     WHERE event_type='tool_execution_start'
+                       AND json_extract(envelope, '$.tool_call_id')=?)
+                 FROM tool_executions WHERE tool_call_id=?",
+            )
+            .bind(&tool_call.id)
+            .bind(&tool_call.id)
+            .fetch_one(store.pool())
+            .await
+            .expect("policy denial durable state"),
+            (
+                "not_started".to_owned(),
+                Some("approval_denied".to_owned()),
+                0
+            )
         );
     }
 
@@ -3124,5 +3920,903 @@ mod tests {
         assert!(!bridge.pending_steer_collecting);
         assert!(bridge.pending_steer_messages.is_empty());
         assert!(bridge.pending_steer_open_start.is_none());
+    }
+
+    #[tokio::test]
+    async fn agent_end_rejects_pending_approved_resolution_without_tool_start() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let (binding, _) = owner_in_phase(
+            &store,
+            &writer,
+            "00000000-0000-4000-8000-000000000001",
+            "run-pending",
+            "turn-1",
+            RunPhase::AssistantStarted,
+        )
+        .await;
+        let mut bridge = DurableBridge::new(binding);
+
+        let decision_command = AdmittedCommand::new(
+            CommandEnvelope {
+                seq: 2,
+                command_id: CommandId::parse("00000000-0000-4000-8000-000000000002")
+                    .expect("canonical test UUID"),
+                command: Command::ApprovalDecision {
+                    request_id: "request-1".to_owned(),
+                    decision: ApprovalDecision::ApproveOnce,
+                },
+            },
+            test_timestamp(),
+        );
+        bridge.pending_approval_resolved = vec![(
+            "request-1".to_owned(),
+            ApprovalResolution::Decision(ApprovalDecision::ApproveOnce),
+            decision_command,
+        )];
+
+        let result = bridge
+            .commit(
+                &writer,
+                RunOutput::detached(bridge.binding.clone(), AgentEvent::AgentEnd, None),
+            )
+            .await;
+        assert!(
+            result.is_err_and(|e| e.to_string().contains("approved tools have not started")),
+            "AgentEnd must not commit an approved decision before ToolExecutionStart"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_queued_approval_resolutions_are_consumed_in_order() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let (binding, _) = owner_in_phase(
+            &store,
+            &writer,
+            "00000000-0000-4000-8000-000000000001",
+            "run-pending",
+            "turn-1",
+            RunPhase::AssistantStarted,
+        )
+        .await;
+        let mut bridge = DurableBridge::new(binding);
+        bridge.phase = RunPhase::AssistantStarted;
+        bridge.turn_open = true;
+        bridge.assistant_open = None;
+
+        let decision_command = |seq: u64, request_id: &str| {
+            AdmittedCommand::new(
+                CommandEnvelope {
+                    seq,
+                    command_id: CommandId::parse(&format!("00000000-0000-4000-8000-{seq:012}"))
+                        .expect("canonical test UUID"),
+                    command: Command::ApprovalDecision {
+                        request_id: request_id.to_owned(),
+                        decision: ApprovalDecision::ApproveOnce,
+                    },
+                },
+                test_timestamp(),
+            )
+        };
+
+        for (seq, request_id) in [(2u64, "request-1"), (3u64, "request-2")] {
+            bridge
+                .commit(
+                    &writer,
+                    RunOutput {
+                        binding: bridge.binding.clone(),
+                        event: AgentEvent::ApprovalResolved {
+                            request_id: request_id.to_owned(),
+                            resolution: ApprovalResolution::Decision(ApprovalDecision::ApproveOnce),
+                        },
+                        commit_barrier: None,
+                        message_commit_barrier: None,
+                        retry_wait_commit_barrier: None,
+                        approval_command: Some(decision_command(seq, request_id)),
+                        approval_not_started: None,
+                        approval_cancelled: None,
+                    },
+                )
+                .await
+                .expect("commit ApprovalResolved approve");
+        }
+
+        assert_eq!(bridge.pending_approval_resolved.len(), 2);
+        assert_eq!(bridge.pending_approval_resolved[0].0, "request-1");
+        assert_eq!(bridge.pending_approval_resolved[1].0, "request-2");
+
+        bridge.turn_open = false;
+        let result = bridge
+            .commit(
+                &writer,
+                RunOutput::detached(bridge.binding.clone(), AgentEvent::AgentEnd, None),
+            )
+            .await;
+        assert!(
+            result.is_err_and(|e| e.to_string().contains("approved tools have not started")),
+            "AgentEnd must not commit while approved resolutions are still queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_execution_start_dropped_when_superseded_by_soft_steer() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+
+        let (mut bridge, binding, _assistant_message, tool_call) = setup_pending_approval(
+            &store,
+            &writer,
+            "00000000-0000-4000-8000-000000000001",
+            "run-soft-steer",
+            "turn-1",
+            "tool-call-1",
+            "request-1",
+        )
+        .await;
+
+        let decision_command = AdmittedCommand::new(
+            CommandEnvelope {
+                seq: 3,
+                command_id: CommandId::parse("00000000-0000-4000-8000-000000000003")
+                    .expect("canonical test UUID"),
+                command: Command::ApprovalDecision {
+                    request_id: "request-1".to_owned(),
+                    decision: ApprovalDecision::ApproveOnce,
+                },
+            },
+            test_timestamp(),
+        );
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::ApprovalResolved {
+                        request_id: "request-1".to_owned(),
+                        resolution: ApprovalResolution::Decision(ApprovalDecision::ApproveOnce),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                    approval_command: Some(decision_command),
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit ApprovalResolved approve");
+
+        let steer_command = AdmittedCommand::new(
+            CommandEnvelope {
+                seq: 2,
+                command_id: CommandId::parse("00000000-0000-4000-8000-000000000002")
+                    .expect("canonical test UUID"),
+                command: Command::UserMessage {
+                    text: "stop".to_owned(),
+                    attachments: Vec::new(),
+                },
+            },
+            test_timestamp(),
+        );
+        let mut group = SteerGroup::new(
+            ApplicationKind::SoftSteer,
+            binding.run_id.clone(),
+            binding.turn_id.clone(),
+        )
+        .expect("create soft steer group");
+        group
+            .push(steer_command, writer.store().redactor())
+            .expect("push steer command");
+        bridge.pending_steer_group = Some(group);
+        bridge.pending_steer_collecting = true;
+
+        let (barrier, _barrier_rx) = ToolStartCommitBarrier::channel();
+        let dropped = bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::ToolExecutionStart {
+                        tool_call_id: tool_call.id.clone(),
+                        tool_name: tool_call.name.clone(),
+                        args: serde_json::to_value(&tool_call.arguments).unwrap_or_default(),
+                    },
+                    commit_barrier: Some(barrier),
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit dropped ToolExecutionStart");
+        assert!(dropped.outputs.is_empty());
+        assert_eq!(bridge.pending_approval_resolved.len(), 1);
+
+        bridge
+            .commit(
+                &writer,
+                RunOutput::detached(
+                    binding.clone(),
+                    AgentEvent::ApprovalResolved {
+                        request_id: "request-1".to_owned(),
+                        resolution: ApprovalResolution::Cancelled,
+                    },
+                    None,
+                ),
+            )
+            .await
+            .expect("commit ApprovalResolved Cancelled");
+        assert!(bridge.pending_approval_resolved.is_empty());
+        let (request_id, command) = bridge
+            .pending_cancelled_approval_commands
+            .get("tool-call-1")
+            .expect("cancelled approved command remains staged until its result commits");
+        assert_eq!(request_id, "request-1");
+        assert_eq!(command.envelope().seq, 3);
+        assert!(
+            !bridge.approval_cancelled.contains("tool-call-1"),
+            "the worker's cancelled ToolResult marker selects the atomic terminal commit"
+        );
+    }
+
+    /// If a soft-steer group is durably bound before the matching
+    /// `ToolExecutionStart` is committed, the bridge must drop the start so the
+    /// durable history does not claim a started tool that was preempted.
+    #[tokio::test]
+    async fn tool_execution_start_dropped_when_soft_steer_bound_before_start() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let owner_id = "00000000-0000-4000-8000-000000000901";
+        let run_id = "run-soft-steer-bound";
+        let turn_id = "turn-1";
+
+        let (binding, assistant) = owner_in_phase(
+            &store,
+            &writer,
+            owner_id,
+            run_id,
+            turn_id,
+            RunPhase::AssistantStarted,
+        )
+        .await;
+        let (assistant_id, assistant_base) = assistant.expect("assistant MessageStart");
+        let tool_call = ToolCall {
+            id: "soft-bound-call".to_owned(),
+            name: "fixture-tool".to_owned(),
+            arguments: serde_json::from_value::<ValidatedToolArguments>(
+                serde_json::json!({"safe": true}),
+            )
+            .expect("validated arguments"),
+        };
+        let mut assistant_with_tool = match assistant_base {
+            PublicMessage::Assistant(a) => a,
+            _ => unreachable!(),
+        };
+        assistant_with_tool.content = vec![PublicAssistantContent::ToolCall {
+            tool_call: tool_call.clone(),
+            wire_item_index: 0,
+        }];
+        assistant_with_tool.stop_reason = StopReason::Stop;
+        let assistant_message = PublicMessage::Assistant(assistant_with_tool);
+
+        let mut bridge = DurableBridge::new(binding.clone());
+        bridge.phase = RunPhase::AssistantStarted;
+        bridge.turn_open = true;
+        bridge.assistant_open = Some(assistant_id.clone());
+
+        let (assistant_barrier, _) = MessageCommitBarrier::channel();
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::MessageEnd {
+                        message_id: assistant_id.clone(),
+                        message: Box::new(assistant_message.clone()),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: Some(assistant_barrier),
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit assistant MessageEnd with tool call")
+            .resolve_message_receipts();
+
+        bridge.assistant_open = None;
+        bridge.pending_tool_calls.insert(tool_call.id.clone());
+
+        let steer_id = "00000000-0000-4000-8000-000000000902";
+        persist_and_pin(&store, &writer, 2, steer_id, "steer now").await;
+        let steer_command = test_admitted(2, steer_id, "steer now");
+        bridge
+            .bind_soft_steer(&writer, steer_command)
+            .await
+            .expect("bind soft steer before tool start");
+
+        let (barrier, _) = ToolStartCommitBarrier::channel();
+        let dropped = bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::ToolExecutionStart {
+                        tool_call_id: tool_call.id.clone(),
+                        tool_name: tool_call.name.clone(),
+                        args: serde_json::json!({"safe": true}),
+                    },
+                    commit_barrier: Some(barrier),
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit dropped ToolExecutionStart");
+        assert!(dropped.outputs.is_empty(), "start must be dropped");
+
+        let start_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_events WHERE event_type='tool_execution_start'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("count tool_execution_start events");
+        assert_eq!(
+            start_count, 0,
+            "durable history must not contain a tool_execution_start when soft steer bound first"
+        );
+    }
+
+    /// Same complement as above, but for an abort bound before the
+    /// `ToolExecutionStart` is committed.
+    #[tokio::test]
+    async fn tool_execution_start_dropped_when_abort_bound_before_start() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let owner_id = "00000000-0000-4000-8000-000000000911";
+        let run_id = "run-abort-bound";
+        let turn_id = "turn-1";
+
+        let (binding, assistant) = owner_in_phase(
+            &store,
+            &writer,
+            owner_id,
+            run_id,
+            turn_id,
+            RunPhase::AssistantStarted,
+        )
+        .await;
+        let (assistant_id, assistant_base) = assistant.expect("assistant MessageStart");
+        let tool_call = ToolCall {
+            id: "abort-bound-call".to_owned(),
+            name: "fixture-tool".to_owned(),
+            arguments: serde_json::from_value::<ValidatedToolArguments>(
+                serde_json::json!({"safe": true}),
+            )
+            .expect("validated arguments"),
+        };
+        let mut assistant_with_tool = match assistant_base {
+            PublicMessage::Assistant(a) => a,
+            _ => unreachable!(),
+        };
+        assistant_with_tool.content = vec![PublicAssistantContent::ToolCall {
+            tool_call: tool_call.clone(),
+            wire_item_index: 0,
+        }];
+        assistant_with_tool.stop_reason = StopReason::Stop;
+        let assistant_message = PublicMessage::Assistant(assistant_with_tool);
+
+        let mut bridge = DurableBridge::new(binding.clone());
+        bridge.phase = RunPhase::AssistantStarted;
+        bridge.turn_open = true;
+        bridge.assistant_open = Some(assistant_id.clone());
+
+        let (assistant_barrier, _) = MessageCommitBarrier::channel();
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::MessageEnd {
+                        message_id: assistant_id.clone(),
+                        message: Box::new(assistant_message.clone()),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: Some(assistant_barrier),
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit assistant MessageEnd with tool call")
+            .resolve_message_receipts();
+
+        bridge.assistant_open = None;
+        bridge.pending_tool_calls.insert(tool_call.id.clone());
+
+        let abort_id = "00000000-0000-4000-8000-000000000912";
+        writer
+            .persist_inbound(&test_abort_command(2, abort_id))
+            .await
+            .expect("persist abort");
+        let abort_command = test_admitted_abort(2, abort_id);
+        bridge
+            .bind_abort(&writer, abort_command)
+            .await
+            .expect("bind abort before tool start");
+
+        let (barrier, _) = ToolStartCommitBarrier::channel();
+        let dropped = bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::ToolExecutionStart {
+                        tool_call_id: tool_call.id.clone(),
+                        tool_name: tool_call.name.clone(),
+                        args: serde_json::json!({"safe": true}),
+                    },
+                    commit_barrier: Some(barrier),
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit dropped ToolExecutionStart");
+        assert!(dropped.outputs.is_empty(), "start must be dropped");
+
+        let start_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_events WHERE event_type='tool_execution_start'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("count tool_execution_start events");
+        assert_eq!(
+            start_count, 0,
+            "durable history must not contain a tool_execution_start when abort bound first"
+        );
+    }
+
+    #[test]
+    fn steer_stage_treats_approval_prepared_tools_as_tool_or_approval() {
+        let mut bridge = DurableBridge::new(binding("00000000-0000-4000-8000-000000000001"));
+        bridge.phase = RunPhase::AssistantStarted;
+        bridge.turn_open = true;
+        bridge.assistant_open = None;
+        bridge
+            .approval_prepared_tools
+            .insert("tool-call-1".to_owned());
+        assert_eq!(bridge.steer_stage(), SteerStage::ToolOrApproval);
+    }
+
+    async fn setup_pending_approval(
+        store: &Store,
+        writer: &EventWriter,
+        owner_id: &str,
+        run_id: &str,
+        turn_id: &str,
+        tool_call_id: &str,
+        request_id: &str,
+    ) -> (DurableBridge, DurableRunBinding, PublicMessage, ToolCall) {
+        let (binding, assistant) = owner_in_phase(
+            store,
+            writer,
+            owner_id,
+            run_id,
+            turn_id,
+            RunPhase::AssistantStarted,
+        )
+        .await;
+        let (assistant_id, assistant_base) = assistant.expect("assistant MessageStart");
+        let mut assistant = match assistant_base {
+            PublicMessage::Assistant(a) => a,
+            _ => unreachable!(),
+        };
+        let tool_call = ToolCall {
+            id: tool_call_id.to_owned(),
+            name: "bash".to_owned(),
+            arguments: serde_json::from_value::<ValidatedToolArguments>(
+                serde_json::json!({"command": "echo hello", "description": "test"}),
+            )
+            .expect("validated arguments"),
+        };
+        assistant.content = vec![PublicAssistantContent::ToolCall {
+            tool_call: tool_call.clone(),
+            wire_item_index: 0,
+        }];
+        assistant.stop_reason = StopReason::Stop;
+        let assistant_message = PublicMessage::Assistant(assistant);
+
+        let mut bridge = DurableBridge::new(binding.clone());
+        bridge.phase = RunPhase::AssistantStarted;
+        bridge.turn_open = true;
+        bridge.assistant_open = Some(assistant_id.clone());
+
+        let (assistant_barrier, _) = MessageCommitBarrier::channel();
+        bridge
+            .commit(
+                writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::MessageEnd {
+                        message_id: assistant_id.clone(),
+                        message: Box::new(assistant_message.clone()),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: Some(assistant_barrier),
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit assistant MessageEnd with tool call")
+            .resolve_message_receipts();
+
+        let request = ApprovalRequest {
+            id: request_id.to_owned(),
+            tool_call_id: tool_call.id.clone(),
+            tool_name: tool_call.name.clone(),
+            action: ReviewProjection::Reviewable(serde_json::json!({
+                "command": "echo hello",
+                "argv": ["echo", "hello"],
+            })),
+            args_summary: serde_json::json!({}),
+            reason: Some("bash requires approval".to_owned()),
+            audit: None,
+        };
+        bridge
+            .commit(
+                writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::ApprovalRequested { request },
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit ApprovalRequested");
+
+        assert!(bridge.approval_prepared_tools.contains(tool_call_id));
+        (bridge, binding, assistant_message, tool_call)
+    }
+
+    #[tokio::test]
+    async fn approval_denied_releases_prepared_tools_and_allows_agent_end() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+
+        let owner_id = "00000000-0000-4000-8000-000000000801";
+        let run_id = "run-denied-cleanup";
+        let turn_id = "turn-denied-cleanup";
+        let tool_call_id = "denied-call";
+        let request_id = "request-denied";
+
+        let (mut bridge, binding, assistant_message, tool_call) = setup_pending_approval(
+            &store,
+            &writer,
+            owner_id,
+            run_id,
+            turn_id,
+            tool_call_id,
+            request_id,
+        )
+        .await;
+
+        let decision_id = "00000000-0000-4000-8000-000000000802";
+        let decision_command =
+            test_admitted_approval_decision(2, decision_id, request_id, ApprovalDecision::Deny);
+        writer
+            .persist_inbound(&InboundCommand::Valid(decision_command.envelope().clone()))
+            .await
+            .expect("persist approval decision");
+
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::ApprovalResolved {
+                        request_id: request_id.to_owned(),
+                        resolution: ApprovalResolution::Decision(ApprovalDecision::Deny),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                    approval_command: Some(decision_command),
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit ApprovalResolved Deny");
+
+        let result = ToolResultMessage {
+            tool_call_id: tool_call.id.clone(),
+            tool_name: tool_call.name.clone(),
+            content: Vec::new(),
+            details: serde_json::json!({"error": "approval_denied"}),
+            is_error: true,
+            timestamp: test_timestamp(),
+        };
+        let result_for_turn = result.clone();
+        let result_id = "denied-result".to_owned();
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::MessageStart {
+                        message_id: result_id.clone(),
+                        message: Box::new(PublicMessage::ToolResult(result.clone())),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit tool result MessageStart");
+
+        let (result_barrier, _) = MessageCommitBarrier::channel();
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::MessageEnd {
+                        message_id: result_id,
+                        message: Box::new(PublicMessage::ToolResult(result)),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: Some(result_barrier),
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: Some(tool_call.id.clone()),
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit tool result MessageEnd")
+            .resolve_message_receipts();
+
+        assert!(
+            bridge.approval_prepared_tools.is_empty(),
+            "approval_prepared_tools must be released after denied ToolResult"
+        );
+
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::TurnEnd {
+                        message: Some(Box::new(assistant_message.clone())),
+                        tool_results: vec![result_for_turn],
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("close denied turn");
+
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding,
+                    event: AgentEvent::AgentEnd,
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("AgentEnd after denied approval");
+        assert_eq!(bridge.phase, RunPhase::Finished);
+
+        let (state, error_code, start_count) = sqlx::query_as::<_, (String, Option<String>, i64)>(
+            "SELECT state, error_code,
+                (SELECT COUNT(*) FROM agent_events WHERE event_type='tool_execution_start'
+                 AND json_extract(envelope, '$.tool_call_id')=?)
+             FROM tool_executions WHERE tool_call_id=?",
+        )
+        .bind(&tool_call.id)
+        .bind(&tool_call.id)
+        .fetch_one(store.pool())
+        .await
+        .expect("read denied tool execution");
+        assert_eq!(state, "cancelled");
+        assert_eq!(error_code.as_deref(), Some("approval_denied"));
+        assert_eq!(
+            start_count, 0,
+            "denied approval must not emit ToolExecutionStart"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_cancelled_releases_prepared_tools_and_allows_agent_end() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+
+        let owner_id = "00000000-0000-4000-8000-000000000901";
+        let run_id = "run-cancelled-cleanup";
+        let turn_id = "turn-cancelled-cleanup";
+        let tool_call_id = "cancelled-call";
+        let request_id = "request-cancelled";
+
+        let (mut bridge, binding, assistant_message, tool_call) = setup_pending_approval(
+            &store,
+            &writer,
+            owner_id,
+            run_id,
+            turn_id,
+            tool_call_id,
+            request_id,
+        )
+        .await;
+
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::ApprovalResolved {
+                        request_id: request_id.to_owned(),
+                        resolution: ApprovalResolution::Cancelled,
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit ApprovalResolved Cancelled");
+
+        let result = ToolResultMessage {
+            tool_call_id: tool_call.id.clone(),
+            tool_name: tool_call.name.clone(),
+            content: Vec::new(),
+            details: serde_json::json!({"error": "approval_cancelled"}),
+            is_error: true,
+            timestamp: test_timestamp(),
+        };
+        let result_for_turn = result.clone();
+        let result_id = "cancelled-result".to_owned();
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::MessageStart {
+                        message_id: result_id.clone(),
+                        message: Box::new(PublicMessage::ToolResult(result.clone())),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit tool result MessageStart");
+
+        let (result_barrier, _) = MessageCommitBarrier::channel();
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::MessageEnd {
+                        message_id: result_id,
+                        message: Box::new(PublicMessage::ToolResult(result)),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: Some(result_barrier),
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: Some(tool_call.id.clone()),
+                },
+            )
+            .await
+            .expect("commit tool result MessageEnd")
+            .resolve_message_receipts();
+
+        assert!(
+            bridge.approval_prepared_tools.is_empty(),
+            "approval_prepared_tools must be released after cancelled ToolResult"
+        );
+
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: binding.clone(),
+                    event: AgentEvent::TurnEnd {
+                        message: Some(Box::new(assistant_message.clone())),
+                        tool_results: vec![result_for_turn],
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("close cancelled turn");
+
+        bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding,
+                    event: AgentEvent::AgentEnd,
+                    commit_barrier: None,
+                    message_commit_barrier: None,
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("AgentEnd after cancelled approval");
+        assert_eq!(bridge.phase, RunPhase::Finished);
+
+        let (state, error_code, start_count) = sqlx::query_as::<_, (String, Option<String>, i64)>(
+            "SELECT state, error_code,
+                (SELECT COUNT(*) FROM agent_events WHERE event_type='tool_execution_start'
+                 AND json_extract(envelope, '$.tool_call_id')=?)
+             FROM tool_executions WHERE tool_call_id=?",
+        )
+        .bind(&tool_call.id)
+        .bind(&tool_call.id)
+        .fetch_one(store.pool())
+        .await
+        .expect("read cancelled tool execution");
+        assert_eq!(state, "cancelled");
+        assert_eq!(error_code.as_deref(), Some("approval_cancelled"));
+        assert_eq!(
+            start_count, 0,
+            "cancelled approval must not emit ToolExecutionStart"
+        );
     }
 }

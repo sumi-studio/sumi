@@ -45,7 +45,13 @@ CREATE TABLE tool_executions (
   )
 );
 
-INSERT INTO tool_executions SELECT * FROM tool_executions_old;
+INSERT INTO tool_executions(
+  tool_call_id, command_id, run_id, executor_generation, state,
+  idempotency_key, started_at, finished_at, error_code
+) SELECT
+  tool_call_id, command_id, run_id, executor_generation, state,
+  idempotency_key, started_at, finished_at, error_code
+FROM tool_executions_old;
 
 DROP TABLE tool_executions_old;
 

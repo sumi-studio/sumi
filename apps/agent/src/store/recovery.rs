@@ -7,13 +7,18 @@ use zeroize::Zeroizing;
 
 use crate::agent::AgentEvent;
 use crate::gateway::Command;
+use crate::provider::types::{ContextMessage, ProviderContextItem};
+use crate::runtime::contracts::{GenerationRecoveryFence, ProcessGenerationLease};
 
 use super::{
-    ApplicationKind, DataKeyPurpose, EventBatch, EventWrite, EventWriter, Projection, RunPhase,
-    Store,
+    ApplicationKind, ApplyReceiptOutcome, DataKeyPurpose, EventBatch, EventWrite, EventWriter,
+    PhysicalRecoveryReceipt, Projection, RunPhase, Store,
     crypto::decrypt_content,
     event_log::{EVENT_DIGEST_BYTES, EventChainEntry, extend_event_chain, verify_event_head},
     event_writer::DurableEventMetadata,
+    memory_state::{
+        MemoryApplyCursorRecord, MemoryBatchMessageRecord, MemoryBatchRecord, MemoryJobRecord,
+    },
     verify_command_payload_digest,
 };
 
@@ -22,6 +27,14 @@ const PENDING_COMMAND_MAX_COUNT: usize = 32;
 const PENDING_COMMAND_MAX_BYTES: usize = 4 * 1024 * 1024;
 const RECOVERY_GROUP_MAX_COMMANDS: usize = 16;
 const RECOVERY_GROUP_MAX_BYTES: usize = 1024 * 1024;
+
+/// Typed identity for one durably pending approval whose prepared tool must be
+/// closed during logical suffix recovery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingApprovalRecovery {
+    pub request_id: String,
+    pub tool_call_id: String,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RecoveryStep {
@@ -61,6 +74,17 @@ pub(crate) enum RecoveryStep {
         run_id: String,
         turn_id: String,
     },
+    /// T23/T26 restart seam for an assistant turn that crashed while a real
+    /// ApprovalBroker request was durably pending. T26 must consume this before
+    /// resuming the assistant: atomically close the approval/prepared tool as
+    /// Cancelled, then continue any separately planned stored steer group.
+    CancelPendingApproval {
+        command_id: String,
+        run_id: String,
+        turn_id: String,
+        request_id: String,
+        tool_call_id: String,
+    },
     ResumeHardSteerFromDurableEvents {
         command_id: String,
         run_id: String,
@@ -70,7 +94,53 @@ pub(crate) enum RecoveryStep {
         command_id: String,
         run_id: String,
         turn_id: String,
+        /// Present when Abort already committed `cancel_requested` but the
+        /// worker crashed before emitting the approval cancellation/result.
+        ///
+        /// T26 must consume this as one cancellation suffix transaction:
+        /// `ApprovalResolved(Cancelled)`, the prepared tool terminal/result,
+        /// and the Abort owner close must all commit together. This packet does
+        /// not claim that the T26 consumer exists.
+        pending_approval: Option<PendingApprovalRecovery>,
     },
+}
+
+/// Authenticated cold-boot hydration boundary returned by T17.
+///
+/// T17 decrypts and validates persisted transcript anchors, provider context,
+/// and Store-owned memory/command/phase state, then completes the logical
+/// suffix plan. T26 consumes this typed boundary and composes the production
+/// RunCore without T17 taking ownership of T19-T21 memory, T23 ApprovalBroker,
+/// production ToolRegistry, or T26 composition.
+#[derive(Clone, Debug)]
+#[allow(
+    dead_code,
+    reason = "T17 boundary payload consumed by T26 bootstrap composition"
+)]
+pub(crate) struct HydratedRunState {
+    pub scope: super::AgentScope,
+    pub lease: ProcessGenerationLease,
+    pub fence: GenerationRecoveryFence,
+    pub receipt: super::HydrationReceiptIdentity,
+    pub messages: Vec<ContextMessage>,
+    pub provider_context: Vec<ProviderContextItem>,
+    pub memory_batches: Vec<MemoryBatchRecord>,
+    pub memory_batch_messages: Vec<MemoryBatchMessageRecord>,
+    pub memory_jobs: Vec<MemoryJobRecord>,
+    pub memory_apply_cursors: Vec<MemoryApplyCursorRecord>,
+    pub recovery_steps: Vec<RecoveryStep>,
+}
+
+/// Result of a T17 hydration attempt.
+///
+/// Non-empty physical recovery intents keep the boot fail-closed until T27
+/// supplies a valid `PhysicalRecoveryReceipt` and the logical suffix is
+/// completed in one EventWriter transaction.
+#[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum HydrationOutcome {
+    RecoveryRequired(Vec<super::PhysicalRecoveryIntentRequest>),
+    Complete(HydratedRunState),
 }
 
 #[derive(Clone, Debug)]
@@ -86,6 +156,23 @@ struct PendingCommand {
 pub(crate) struct SuffixRecovery;
 
 impl SuffixRecovery {
+    /// Complete a T17 hydration suffix after T27 has supplied an authenticated
+    /// physical recovery receipt.  EventWriter owns the transaction boundary;
+    /// this wrapper intentionally does not kill/reap processes or persist the
+    /// T27 proof store.
+    #[allow(dead_code, reason = "T26 hydration composes this T17 boundary")]
+    pub(crate) async fn apply_physical_receipt(
+        writer: &EventWriter,
+        lease: &ProcessGenerationLease,
+        fence: &GenerationRecoveryFence,
+        receipt: PhysicalRecoveryReceipt,
+        batch: EventBatch,
+    ) -> Result<(ApplyReceiptOutcome, Vec<u64>)> {
+        writer
+            .apply_physical_recovery(lease, fence, receipt, batch)
+            .await
+    }
+
     /// Plans and persists only the restart prefix owned by T12.
     ///
     /// T15 uses this boundary only as a startup gate: after the T12-safe prefix
@@ -159,16 +246,98 @@ impl SuffixRecovery {
         }
     }
 
-    /// Plans only the next missing durable action for each pending command/group.
-    /// It deliberately does not manufacture a fixed MessageEnd/TurnEnd/AgentEnd
-    /// suffix; assistant/tool/approval/cancel recovery must inspect the durable
-    /// events and phase-specific state at execution time.
+    /// Plans only the next missing durable action for the oldest pending
+    /// command/group.
     #[allow(
         dead_code,
         reason = "T12 persists prefix work; T15 only gates and returns RecoveryRequired; T17 consumes the full suffix plan"
     )]
     pub(crate) async fn plan(store: &Store) -> Result<Vec<RecoveryStep>> {
         Self::plan_next_without_history_scan(store, None).await
+    }
+
+    /// Plans the complete ordered suffix for all pending commands.
+    ///
+    /// This is the T17-owned durable recovery boundary: it returns every
+    /// remaining recovery step, including the runtime integration packets
+    /// (`ResumeAssistantFromDurableEvents`, `ResumeHardSteerFromDurableEvents`,
+    /// `ResumeCancellationFromDurableEvents`) that T16/T26 consume.  It does
+    /// not itself execute runtime behavior.
+    #[allow(
+        dead_code,
+        reason = "T17 hydration boundary consumed by T16/T26 runtime startup"
+    )]
+    pub(crate) async fn plan_full_suffix(store: &Store) -> Result<Vec<RecoveryStep>> {
+        validate_pending_window(store).await?;
+        let commands = all_pending_commands(store).await?;
+        if commands.is_empty() {
+            durable_event_evidence(store, EventEvidence::default()).await?;
+            return Ok(Vec::new());
+        }
+        let mut events = EventEvidence::required_for(&commands)?;
+        events = durable_event_evidence(store, events).await?;
+        let mut steps = Vec::with_capacity(commands.len());
+        let mut injected_groups = HashSet::new();
+        for command in &commands {
+            let mut step = plan_one_command(store, command, &events).await?;
+            match &step {
+                RecoveryStep::ResumeAssistantFromDurableEvents {
+                    command_id,
+                    run_id,
+                    turn_id,
+                } => {
+                    if let Some(pending) =
+                        pending_approval_for_recovery(store, run_id, turn_id).await?
+                    {
+                        step = RecoveryStep::CancelPendingApproval {
+                            command_id: command_id.clone(),
+                            run_id: run_id.clone(),
+                            turn_id: turn_id.clone(),
+                            request_id: pending.request_id,
+                            tool_call_id: pending.tool_call_id,
+                        };
+                    }
+                }
+                RecoveryStep::ResumeCancellationFromDurableEvents {
+                    command_id,
+                    run_id,
+                    turn_id,
+                    ..
+                } => {
+                    let pending_approval =
+                        pending_approval_for_recovery(store, run_id, turn_id).await?;
+                    step = RecoveryStep::ResumeCancellationFromDurableEvents {
+                        command_id: command_id.clone(),
+                        run_id: run_id.clone(),
+                        turn_id: turn_id.clone(),
+                        pending_approval,
+                    };
+                }
+                _ => {}
+            }
+            if let RecoveryStep::InjectStoredGroup {
+                ref run_id,
+                ref turn_id,
+                application_kind,
+                ref command_ids,
+            } = step
+            {
+                if command_ids.is_empty() {
+                    bail!("InjectStoredGroup for {run_id}/{turn_id} produced no command_ids");
+                }
+                let key = (
+                    run_id.clone(),
+                    turn_id.clone(),
+                    application_kind,
+                    command.phase,
+                );
+                if !injected_groups.insert(key) {
+                    continue;
+                }
+            }
+            steps.push(step);
+        }
+        Ok(steps)
     }
 
     async fn plan_next_without_history_scan(
@@ -202,110 +371,151 @@ impl SuffixRecovery {
         } else {
             events = durable_event_evidence(store, events).await?;
         }
-        let step = match command.phase {
-            RunPhase::Received => {
-                if command.command_kind == "user_message" {
-                    RecoveryStep::Reclassify {
-                        command_id: command.command_id.clone(),
-                    }
-                } else {
-                    RecoveryStep::ApplyControl {
-                        command_id: command.command_id.clone(),
-                    }
-                }
+        Ok(vec![plan_one_command(store, &command, &events).await?])
+    }
+}
+
+async fn pending_approval_for_recovery(
+    store: &Store,
+    run_id: &str,
+    turn_id: &str,
+) -> Result<Option<PendingApprovalRecovery>> {
+    let rows = sqlx::query(
+        "SELECT a.id, a.tool_call_id, t.state
+         FROM approval_log a
+         JOIN tool_executions t ON t.tool_call_id = a.tool_call_id
+         WHERE a.run_id = ? AND a.turn_id = ? AND a.state = 'pending'
+         ORDER BY a.created_at, a.id",
+    )
+    .bind(run_id)
+    .bind(turn_id)
+    .fetch_all(store.pool())
+    .await
+    .context("failed to inspect pending approval recovery state")?;
+    if rows.len() > 1 {
+        bail!(
+            "run {run_id}/{turn_id} has multiple pending approvals despite sequential one-at-a-time execution"
+        );
+    }
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let request_id: String = row.try_get("id")?;
+    let tool_call_id: String = row.try_get("tool_call_id")?;
+    let tool_state: String = row.try_get("state")?;
+    if tool_state != "prepared" {
+        bail!(
+            "pending approval {request_id} recovery requires prepared tool {tool_call_id}, found {tool_state}"
+        );
+    }
+    Ok(Some(PendingApprovalRecovery {
+        request_id,
+        tool_call_id,
+    }))
+}
+
+async fn plan_one_command(
+    store: &Store,
+    command: &PendingCommand,
+    events: &EventEvidence,
+) -> Result<RecoveryStep> {
+    match command.phase {
+        RunPhase::Received => {
+            if command.command_kind == "user_message" {
+                Ok(RecoveryStep::Reclassify {
+                    command_id: command.command_id.clone(),
+                })
+            } else {
+                Ok(RecoveryStep::ApplyControl {
+                    command_id: command.command_id.clone(),
+                })
             }
-            RunPhase::Classified => {
-                let kind = required_kind(&command)?;
-                let run_id = required(command.run_id.as_deref(), "run_id", &command)?;
-                let turn_id = required(command.turn_id.as_deref(), "turn_id", &command)?;
-                if kind == ApplicationKind::IdleRun {
-                    RecoveryStep::EmitAgentStart {
-                        command_id: command.command_id.clone(),
-                        run_id: run_id.to_owned(),
-                    }
-                } else {
-                    RecoveryStep::InjectStoredGroup {
-                        run_id: run_id.to_owned(),
-                        turn_id: turn_id.to_owned(),
-                        application_kind: kind,
-                        command_ids: load_bounded_group(
-                            store,
-                            run_id,
-                            turn_id,
-                            kind,
-                            command.phase,
-                        )
-                        .await?,
-                    }
-                }
-            }
-            RunPhase::RunStarted => {
-                let run_id = required(command.run_id.as_deref(), "run_id", &command)?;
-                if !events.has("agent_start", Some(run_id), None) {
-                    bail!(
-                        "run_started command {} has no durable AgentStart evidence",
-                        command.command_id
-                    );
-                }
-                RecoveryStep::EmitTurnStart {
+        }
+        RunPhase::Classified => {
+            let kind = required_kind(command)?;
+            let run_id = required(command.run_id.as_deref(), "run_id", command)?;
+            let turn_id = required(command.turn_id.as_deref(), "turn_id", command)?;
+            if kind == ApplicationKind::IdleRun {
+                Ok(RecoveryStep::EmitAgentStart {
                     command_id: command.command_id.clone(),
                     run_id: run_id.to_owned(),
-                    turn_id: required(command.turn_id.as_deref(), "turn_id", &command)?.to_owned(),
-                }
-            }
-            RunPhase::TurnStarted => {
-                let kind = required_kind(&command)?;
-                let run_id = required(command.run_id.as_deref(), "run_id", &command)?;
-                let turn_id = required(command.turn_id.as_deref(), "turn_id", &command)?;
-                if kind != ApplicationKind::RetrySteer
-                    && !events.has("turn_start", Some(run_id), Some(turn_id))
-                {
-                    bail!(
-                        "turn_started command {} has no durable TurnStart evidence",
-                        command.command_id
-                    );
-                }
-                RecoveryStep::InjectStoredGroup {
+                })
+            } else {
+                Ok(RecoveryStep::InjectStoredGroup {
                     run_id: run_id.to_owned(),
                     turn_id: turn_id.to_owned(),
                     application_kind: kind,
                     command_ids: load_bounded_group(store, run_id, turn_id, kind, command.phase)
                         .await?,
-                }
+                })
             }
-            RunPhase::UserStarted => RecoveryStep::EmitUserMessageEnd {
-                command_id: command.command_id.clone(),
-                run_id: required(command.run_id.as_deref(), "run_id", &command)?.to_owned(),
-                turn_id: required(command.turn_id.as_deref(), "turn_id", &command)?.to_owned(),
-            },
-            RunPhase::UserCommitted => RecoveryStep::StartAssistant {
-                command_id: command.command_id.clone(),
-                run_id: required(command.run_id.as_deref(), "run_id", &command)?.to_owned(),
-                turn_id: required(command.turn_id.as_deref(), "turn_id", &command)?.to_owned(),
-            },
-            RunPhase::AssistantStarted => RecoveryStep::ResumeAssistantFromDurableEvents {
-                command_id: command.command_id.clone(),
-                run_id: required(command.run_id.as_deref(), "run_id", &command)?.to_owned(),
-                turn_id: required(command.turn_id.as_deref(), "turn_id", &command)?.to_owned(),
-            },
-            RunPhase::HardSteerRequested => RecoveryStep::ResumeHardSteerFromDurableEvents {
-                command_id: command.command_id.clone(),
-                run_id: required(command.run_id.as_deref(), "run_id", &command)?.to_owned(),
-                turn_id: required(command.turn_id.as_deref(), "turn_id", &command)?.to_owned(),
-            },
-            RunPhase::CancelRequested => RecoveryStep::ResumeCancellationFromDurableEvents {
-                command_id: command.command_id.clone(),
-                run_id: required(command.run_id.as_deref(), "run_id", &command)?.to_owned(),
-                turn_id: required(command.turn_id.as_deref(), "turn_id", &command)?.to_owned(),
-            },
-            RunPhase::Finished => {
+        }
+        RunPhase::RunStarted => {
+            let run_id = required(command.run_id.as_deref(), "run_id", command)?;
+            if !events.has("agent_start", Some(run_id), None) {
                 bail!(
-                    "finished command {} must have terminal status",
+                    "run_started command {} has no durable AgentStart evidence",
                     command.command_id
                 );
             }
-        };
-        Ok(vec![step])
+            Ok(RecoveryStep::EmitTurnStart {
+                command_id: command.command_id.clone(),
+                run_id: run_id.to_owned(),
+                turn_id: required(command.turn_id.as_deref(), "turn_id", command)?.to_owned(),
+            })
+        }
+        RunPhase::TurnStarted => {
+            let kind = required_kind(command)?;
+            let run_id = required(command.run_id.as_deref(), "run_id", command)?;
+            let turn_id = required(command.turn_id.as_deref(), "turn_id", command)?;
+            if kind != ApplicationKind::RetrySteer
+                && !events.has("turn_start", Some(run_id), Some(turn_id))
+            {
+                bail!(
+                    "turn_started command {} has no durable TurnStart evidence",
+                    command.command_id
+                );
+            }
+            Ok(RecoveryStep::InjectStoredGroup {
+                run_id: run_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                application_kind: kind,
+                command_ids: load_bounded_group(store, run_id, turn_id, kind, command.phase)
+                    .await?,
+            })
+        }
+        RunPhase::UserStarted => Ok(RecoveryStep::EmitUserMessageEnd {
+            command_id: command.command_id.clone(),
+            run_id: required(command.run_id.as_deref(), "run_id", command)?.to_owned(),
+            turn_id: required(command.turn_id.as_deref(), "turn_id", command)?.to_owned(),
+        }),
+        RunPhase::UserCommitted => Ok(RecoveryStep::StartAssistant {
+            command_id: command.command_id.clone(),
+            run_id: required(command.run_id.as_deref(), "run_id", command)?.to_owned(),
+            turn_id: required(command.turn_id.as_deref(), "turn_id", command)?.to_owned(),
+        }),
+        RunPhase::AssistantStarted => Ok(RecoveryStep::ResumeAssistantFromDurableEvents {
+            command_id: command.command_id.clone(),
+            run_id: required(command.run_id.as_deref(), "run_id", command)?.to_owned(),
+            turn_id: required(command.turn_id.as_deref(), "turn_id", command)?.to_owned(),
+        }),
+        RunPhase::HardSteerRequested => Ok(RecoveryStep::ResumeHardSteerFromDurableEvents {
+            command_id: command.command_id.clone(),
+            run_id: required(command.run_id.as_deref(), "run_id", command)?.to_owned(),
+            turn_id: required(command.turn_id.as_deref(), "turn_id", command)?.to_owned(),
+        }),
+        RunPhase::CancelRequested => Ok(RecoveryStep::ResumeCancellationFromDurableEvents {
+            command_id: command.command_id.clone(),
+            run_id: required(command.run_id.as_deref(), "run_id", command)?.to_owned(),
+            turn_id: required(command.turn_id.as_deref(), "turn_id", command)?.to_owned(),
+            pending_approval: None,
+        }),
+        RunPhase::Finished => {
+            bail!(
+                "finished command {} must have terminal status",
+                command.command_id
+            );
+        }
     }
 }
 
@@ -348,6 +558,23 @@ fn pending_command_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<PendingComm
         turn_id: row.try_get("turn_id")?,
         phase: RunPhase::parse(row.try_get("run_phase")?)?,
     })
+}
+
+#[allow(
+    dead_code,
+    reason = "consumed by plan_full_suffix; kept separate for testability"
+)]
+async fn all_pending_commands(store: &Store) -> Result<Vec<PendingCommand>> {
+    let rows = sqlx::query(
+        "SELECT seq, command_id, command_kind, application_kind, run_id, turn_id, run_phase
+         FROM inbound_commands
+         WHERE status IN ('received','applying')
+         ORDER BY (command_kind = 'abort') DESC, seq ASC",
+    )
+    .fetch_all(store.pool())
+    .await
+    .context("failed to load pending commands for suffix recovery")?;
+    rows.iter().map(pending_command_from_row).collect()
 }
 
 async fn validate_pending_window(store: &Store) -> Result<()> {
@@ -831,8 +1058,7 @@ async fn durable_event_evidence(
             if event.durable_kind() != Some(event_type.as_str())
                 || matches!(
                     event,
-                    AgentEvent::MemoryMaintenance { .. }
-                        | AgentEvent::MessageUpdate { .. }
+                    AgentEvent::MessageUpdate { .. }
                         | AgentEvent::ToolExecutionUpdate { .. }
                         | AgentEvent::Error { .. }
                 )
@@ -887,10 +1113,13 @@ mod tests {
     use std::sync::Arc;
 
     use anyhow::{Result, bail};
+    use serde_json::json;
 
     use super::*;
     use crate::{
-        gateway::{ApprovalDecision, Command, CommandEnvelope, InboundCommand},
+        gateway::{
+            ApprovalDecision, Command, CommandEnvelope, DeferredApprovalRule, InboundCommand,
+        },
         store::{
             AgentScope, DurableEvent, EventBatch, EventWrite, EventWriter, Projection,
             crypto::{DATA_KEY_BYTES, WrappingKey},
@@ -930,6 +1159,44 @@ mod tests {
         .into();
         let writer = EventWriter::new(store.clone());
         (store, writer)
+    }
+
+    async fn seed_pending_approval_decision(
+        store: &Store,
+        writer: &EventWriter,
+        command_id: &str,
+        request_id: &str,
+        decision: ApprovalDecision,
+    ) {
+        writer
+            .persist_inbound(&InboundCommand::Valid(CommandEnvelope {
+                seq: 1,
+                command_id: crate::gateway::CommandId::parse(command_id).expect("command ID"),
+                command: Command::ApprovalDecision {
+                    request_id: request_id.to_owned(),
+                    decision,
+                },
+            }))
+            .await
+            .expect("persist approval decision before simulated restart");
+
+        let suffix = request_id
+            .strip_prefix("request-approve-")
+            .unwrap_or(request_id);
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO approval_log
+             (id, tool_call_id, run_id, turn_id, state, request_projection, redaction_version, created_at)
+             VALUES (?, ?, ?, ?, 'pending', '{}', 1, ?)",
+        )
+        .bind(request_id)
+        .bind(format!("tool-call-{suffix}"))
+        .bind(format!("run-{suffix}"))
+        .bind(format!("turn-{suffix}"))
+        .bind(now)
+        .execute(store.pool())
+        .await
+        .expect("seed pending approval log");
     }
 
     async fn persist_user(writer: &EventWriter, seq: u64, id: &str) {
@@ -1378,6 +1645,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn t12_prefix_preserves_pending_approved_once_for_recovery() {
+        let (store, writer) = setup().await;
+        let command_id = "00000000-0000-4000-8000-000000000002";
+        // Simulate a crash where the approval decision was received but the
+        // tool was never started: approval_log is still pending and the command
+        // must not be silently applied as a no-op.
+        seed_pending_approval_decision(
+            &store,
+            &writer,
+            command_id,
+            "request-approve-once",
+            ApprovalDecision::ApproveOnce,
+        )
+        .await;
+
+        let steps = SuffixRecovery::recover_t12_prefix(&store, &writer)
+            .await
+            .expect("plan recovery for pending approved tool");
+        assert_eq!(
+            steps.len(),
+            1,
+            "pending approval must produce a recovery step"
+        );
+        assert!(
+            matches!(steps[0], RecoveryStep::ApplyControl { command_id: ref id } if id == command_id),
+            "pending approved decision must return ApplyControl, not no-op: {steps:?}"
+        );
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM inbound_commands WHERE command_id=?")
+                .bind(command_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("command row");
+        assert_eq!(
+            status, "received",
+            "approval decision must remain received while pending"
+        );
+
+        let state: String = sqlx::query_scalar("SELECT state FROM approval_log WHERE id=?")
+            .bind("request-approve-once")
+            .fetch_one(store.pool())
+            .await
+            .expect("approval log row");
+        assert_eq!(
+            state, "pending",
+            "approval log must remain pending for recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn t12_prefix_preserves_pending_approved_always_for_recovery() {
+        let (store, writer) = setup().await;
+        let command_id = "00000000-0000-4000-8000-000000000003";
+        let rule = json!({
+            "id": "rule-fixture-always",
+            "tool": "bash",
+            "literal_prefix": ["git", "status"],
+            "effect": "allow",
+            "workspace_only": true,
+            "allowed_permissions": ["exec"],
+            "allowed_network_domains": []
+        });
+        seed_pending_approval_decision(
+            &store,
+            &writer,
+            command_id,
+            "request-approve-always",
+            ApprovalDecision::ApproveAlways {
+                rule: serde_json::from_value::<DeferredApprovalRule>(rule).expect("deferred rule"),
+            },
+        )
+        .await;
+
+        let steps = SuffixRecovery::recover_t12_prefix(&store, &writer)
+            .await
+            .expect("plan recovery for pending approved-always tool");
+        assert_eq!(
+            steps.len(),
+            1,
+            "pending approval must produce a recovery step"
+        );
+        assert!(
+            matches!(steps[0], RecoveryStep::ApplyControl { command_id: ref id } if id == command_id),
+            "pending approved-always decision must return ApplyControl, not no-op: {steps:?}"
+        );
+
+        let state: String = sqlx::query_scalar("SELECT state FROM approval_log WHERE id=?")
+            .bind("request-approve-always")
+            .fetch_one(store.pool())
+            .await
+            .expect("approval log row");
+        assert_eq!(
+            state, "pending",
+            "approval log must remain pending for recovery"
+        );
+    }
+
+    #[tokio::test]
     async fn no_pending_commands_still_require_authenticated_event_history() {
         let (store, writer) = setup().await;
         persist_valid_history(&store, &writer, 2).await;
@@ -1701,6 +2067,34 @@ mod tests {
         assert!(matches!(
             SuffixRecovery::plan(&store).await.expect("cancel plan")[0],
             RecoveryStep::ResumeCancellationFromDurableEvents { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn full_suffix_plan_collects_all_pending_steps_in_order() {
+        let (store, writer) = setup().await;
+        persist_run_started(&store, &writer).await;
+        persist_user(&writer, 2, "00000000-0000-4000-8000-000000000002").await;
+
+        let steps = SuffixRecovery::plan_full_suffix(&store)
+            .await
+            .expect("full suffix plan");
+
+        assert_eq!(steps.len(), 2);
+        assert!(matches!(
+            &steps[0],
+            RecoveryStep::EmitTurnStart {
+                command_id,
+                run_id,
+                turn_id,
+            } if command_id == "00000000-0000-4000-8000-000000000001"
+                && run_id == "run-1"
+                && turn_id == "turn-1"
+        ));
+        assert!(matches!(
+            &steps[1],
+            RecoveryStep::Reclassify { command_id }
+                if command_id == "00000000-0000-4000-8000-000000000002"
         ));
     }
 

@@ -6,6 +6,9 @@
 
 use std::fmt;
 
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
 pub const MAX_PROCESS_GENERATION: u64 = i64::MAX as u64;
 pub const MAX_OPAQUE_ID_BYTES: usize = 128;
 
@@ -90,6 +93,39 @@ impl From<ProcessGeneration> for i64 {
 impl fmt::Display for ProcessGeneration {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
+    }
+}
+
+impl Serialize for ProcessGeneration {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u64(self.as_u64())
+    }
+}
+
+impl<'de> Deserialize<'de> for ProcessGeneration {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ProcessGenerationVisitor;
+
+        impl<'de> Visitor<'de> for ProcessGenerationVisitor {
+            type Value = ProcessGeneration;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(
+                    formatter,
+                    "a process generation in 0..={MAX_PROCESS_GENERATION}"
+                )
+            }
+
+            fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                ProcessGeneration::from_sqlite(value).map_err(|e| E::custom(e.to_string()))
+            }
+
+            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                ProcessGeneration::from_wire(value).map_err(|e| E::custom(e.to_string()))
+            }
+        }
+
+        deserializer.deserialize_u64(ProcessGenerationVisitor)
     }
 }
 

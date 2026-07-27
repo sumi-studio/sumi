@@ -4,9 +4,13 @@
 pub mod wire;
 
 pub(crate) mod duplicate;
+
 pub mod stdio;
 pub mod supervisor;
 pub mod ws;
+
+/// Maximum size in bytes of a single gateway frame/message.
+pub(crate) const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
 use std::fmt;
 
@@ -23,6 +27,8 @@ use zeroize::Zeroize;
 )]
 pub(crate) use stdio::{InjectedStdioGateway, read_command};
 
+#[allow(unused_imports)]
+pub use supervisor::DeliveryAuthorization;
 pub use supervisor::{AgentHello, ApiHello, ConnectorError, GatewayConnector, GatewayCredential};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -324,6 +330,40 @@ pub enum OutboundFrame {
 #[error("gateway input closed")]
 pub struct GatewayClosed;
 
+/// Errors raised during the agent/API hello exchange.
+///
+/// `AuthRejected` is reserved for authentication failures that should be retried
+/// with a fresh credential, subject to `max_auth_attempts`. `Fatal` is for
+/// non-recoverable claim mismatches. `Reconnect` covers transient failures.
+#[derive(Debug, Error)]
+pub enum HelloError {
+    // `AuthRejected` is only constructed by test gateways today; keep it
+    // available for the T26 authentication-rejection wiring.
+    #[allow(dead_code, reason = "T26 gateway authentication path")]
+    #[error("authentication rejected")]
+    AuthRejected,
+    #[error("fatal: {0}")]
+    Fatal(#[source] anyhow::Error),
+    #[error("hello failed: {0}")]
+    Reconnect(#[source] anyhow::Error),
+}
+
+impl From<anyhow::Error> for HelloError {
+    fn from(e: anyhow::Error) -> Self {
+        HelloError::Reconnect(e)
+    }
+}
+
+/// A permanent outbound-frame size violation. The supervisor treats this as a
+/// fatal error because retrying from the same durable cursor would replay the
+/// same oversized frame forever.
+#[derive(Debug, Error, Clone, Copy)]
+#[error("outbound frame exceeds MAX_FRAME_BYTES: {actual} bytes (limit {max})")]
+pub struct OversizedFrameError {
+    pub actual: usize,
+    pub max: usize,
+}
+
 #[async_trait]
 pub trait GatewayReader: Send {
     async fn next_command(&mut self) -> Result<InboundCommand>;
@@ -342,7 +382,10 @@ pub trait Gateway: Send + 'static {
     type Reader: GatewayReader + 'static;
     type Writer: GatewayWriter + 'static;
 
-    async fn authenticate_hello(&mut self, hello: AgentHello) -> Result<ApiHello>;
+    async fn authenticate_hello(
+        &mut self,
+        hello: AgentHello,
+    ) -> std::result::Result<ApiHello, HelloError>;
     fn split(self) -> (Self::Reader, Self::Writer);
 }
 
