@@ -33,7 +33,7 @@ use sqlx::{
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::provider::types::{
     ApiProtocol, ContextMessage, Message, ProviderContextItem, ProviderContextPayload,
@@ -284,16 +284,40 @@ impl Store {
             .validate_exact(lease, fence.fence_id())
             .map_err(|error| anyhow!("invalid recovery fence binding: {error}"))?;
 
-        let intents = self.hydrate_running_intents().await?;
+        // T17 cold-boot hydration must read all durable state under a single transaction
+        // so that the transcript, provider context, and memory layers observe one
+        // consistent snapshot.  Plaintext buffers are zeroized as they are processed
+        // to avoid retaining duplicate decrypted copies while the remaining rows are
+        // still being authenticated.
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .context("failed to begin hydration snapshot transaction")?;
+
+        let intents = self.hydrate_running_intents(&mut transaction).await?;
         if !intents.is_empty() {
+            transaction
+                .rollback()
+                .await
+                .context("failed to roll back hydration transaction")?;
             return Ok(HydrationOutcome::RecoveryRequired(intents));
         }
 
-        let messages = self.hydrate_messages().await?;
-        let provider_context = self.hydrate_provider_context(&messages).await?;
+        let messages = self.hydrate_messages(&mut transaction).await?;
+        let provider_context = self
+            .hydrate_provider_context(&messages, &mut transaction)
+            .await?;
         let (memory_batches, memory_batch_messages, memory_jobs, memory_apply_cursors) =
-            self.hydrate_memory_state().await?;
+            self.hydrate_memory_state(&mut transaction).await?;
 
+        // Recovery planning reads the command/event suffix.  It already uses bounded,
+        // paged reads and its own transaction; releasing the snapshot transaction here
+        // lets it acquire the single SQLite connection.
+        transaction
+            .commit()
+            .await
+            .context("failed to commit hydration snapshot transaction")?;
         let recovery_steps = SuffixRecovery::plan_full_suffix(self).await?;
 
         let receipt = HydrationReceiptIdentity {
@@ -339,12 +363,15 @@ impl Store {
         }
     }
 
-    async fn hydrate_running_intents(&self) -> Result<Vec<PhysicalRecoveryIntentRequest>> {
+    async fn hydrate_running_intents(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+    ) -> Result<Vec<PhysicalRecoveryIntentRequest>> {
         let rows = sqlx::query(
             "SELECT tool_call_id, command_id, run_id, executor_generation
              FROM tool_executions WHERE state = 'running' ORDER BY tool_call_id",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut **transaction)
         .await
         .context("failed to hydrate running tool executions")?;
         let mut intents = Vec::with_capacity(rows.len());
@@ -367,7 +394,10 @@ impl Store {
         Ok(intents)
     }
 
-    async fn hydrate_messages(&self) -> Result<Vec<ContextMessage>> {
+    async fn hydrate_messages(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+    ) -> Result<Vec<ContextMessage>> {
         let mut key_cache: HashMap<String, Arc<DataKeyMaterial>> = HashMap::new();
 
         let rows = sqlx::query(
@@ -375,7 +405,7 @@ impl Store {
                     redaction_version, interrupted
              FROM messages ORDER BY seq",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut **transaction)
         .await
         .context("failed to hydrate transcript messages")?;
 
@@ -397,14 +427,21 @@ impl Store {
             let stored_search_text: String = row.try_get("search_text")?;
 
             let key = self
-                .load_hydration_key(&mut key_cache, &key_ref, DataKeyPurpose::Transcript)
+                .load_hydration_key(
+                    &mut key_cache,
+                    transaction,
+                    &key_ref,
+                    DataKeyPurpose::Transcript,
+                )
                 .await?;
             let ciphertext: Vec<u8> = row.try_get("raw_ciphertext")?;
             let aad = self
                 .scope
                 .row_aad("messages", &id, DataKeyPurpose::Transcript);
-            let mut plaintext = decrypt_content(&key, &ciphertext, &aad)
-                .with_context(|| format!("failed to decrypt transcript message {id}"))?;
+            let plaintext = Zeroizing::new(
+                decrypt_content(&key, &ciphertext, &aad)
+                    .with_context(|| format!("failed to decrypt transcript message {id}"))?,
+            );
             let public: PublicMessage = serde_json::from_slice(&plaintext)
                 .with_context(|| format!("transcript message {id} is not a valid PublicMessage"))?;
 
@@ -429,8 +466,6 @@ impl Store {
                 bail!("message {id} stored search_text does not match re-derived search text");
             }
 
-            plaintext.zeroize();
-
             messages.push(ContextMessage::Persisted {
                 id: id.clone(),
                 seq,
@@ -443,6 +478,7 @@ impl Store {
     pub(crate) async fn hydrate_provider_context(
         &self,
         messages: &[ContextMessage],
+        transaction: &mut Transaction<'_, Sqlite>,
     ) -> Result<Vec<ProviderContextItem>> {
         let mut key_cache: HashMap<String, Arc<DataKeyMaterial>> = HashMap::new();
 
@@ -457,7 +493,7 @@ impl Store {
                       item_ordinal,
                       id",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut **transaction)
         .await
         .context("failed to hydrate provider context")?;
 
@@ -490,7 +526,12 @@ impl Store {
                 row.try_get("eviction_estimator_version")?;
 
             let key = self
-                .load_hydration_key(&mut key_cache, &key_ref, DataKeyPurpose::ProviderContext)
+                .load_hydration_key(
+                    &mut key_cache,
+                    transaction,
+                    &key_ref,
+                    DataKeyPurpose::ProviderContext,
+                )
                 .await?;
             let ciphertext: Vec<u8> = row.try_get("ciphertext")?;
             let aad = self
@@ -616,7 +657,7 @@ impl Store {
                             anchor.message_seq
                         )
                     })?;
-                    let (id, assistant) = match anchor_message {
+                    let (anchor_id, assistant) = match anchor_message {
                         ContextMessage::Persisted {
                             id,
                             message: Message::Assistant(assistant),
@@ -630,7 +671,7 @@ impl Store {
                             );
                         }
                     };
-                    if id != &anchor.message_id {
+                    if anchor_id != &anchor.message_id {
                         bail!(
                             "provider-context record {id} anchor {}:{} resolves to a different message id",
                             anchor.message_id,
@@ -742,6 +783,7 @@ impl Store {
 
     async fn hydrate_memory_state(
         &self,
+        transaction: &mut Transaction<'_, Sqlite>,
     ) -> Result<(
         Vec<MemoryBatchRecord>,
         Vec<MemoryBatchMessageRecord>,
@@ -756,7 +798,7 @@ impl Store {
                     summary_projection, summary_redaction_version, updated_at
              FROM memory_batches ORDER BY layer, ord",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut **transaction)
         .await
         .context("failed to hydrate memory batches")?;
 
@@ -774,6 +816,7 @@ impl Store {
                         .with_context(|| "memory batch redaction version out of u32 range")?;
                     self.verify_memory_projection(
                         &mut key_cache,
+                        transaction,
                         &key_ref,
                         &ciphertext,
                         &projection,
@@ -817,7 +860,7 @@ impl Store {
         let batch_message_rows = sqlx::query(
             "SELECT batch_id, message_id, ord FROM memory_batch_messages ORDER BY batch_id, ord",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut **transaction)
         .await
         .context("failed to hydrate memory batch messages")?;
         let mut memory_batch_messages = Vec::with_capacity(batch_message_rows.len());
@@ -835,7 +878,7 @@ impl Store {
                     created_at, updated_at
              FROM memory_jobs ORDER BY id",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut **transaction)
         .await
         .context("failed to hydrate memory jobs")?;
         let mut memory_jobs = Vec::with_capacity(job_rows.len());
@@ -852,6 +895,7 @@ impl Store {
                         .with_context(|| "memory job result redaction version out of u32 range")?;
                     self.verify_memory_projection(
                         &mut key_cache,
+                        transaction,
                         &key_ref,
                         &ciphertext,
                         &projection,
@@ -901,7 +945,7 @@ impl Store {
 
         let cursor_rows =
             sqlx::query("SELECT kind, next_batch_seq FROM memory_apply_cursors ORDER BY kind")
-                .fetch_all(&self.pool)
+                .fetch_all(&mut **transaction)
                 .await
                 .context("failed to hydrate memory apply cursors")?;
         let mut memory_apply_cursors = Vec::with_capacity(cursor_rows.len());
@@ -923,6 +967,7 @@ impl Store {
     async fn load_hydration_key(
         &self,
         cache: &mut HashMap<String, Arc<DataKeyMaterial>>,
+        transaction: &mut Transaction<'_, Sqlite>,
         key_ref: &str,
         expected_purpose: DataKeyPurpose,
     ) -> Result<Arc<DataKeyMaterial>> {
@@ -937,7 +982,7 @@ impl Store {
             return Ok(key.clone());
         }
         let key = self
-            .data_key_by_ref(key_ref)
+            .data_key_by_ref_in_transaction(transaction, key_ref)
             .await
             .with_context(|| format!("failed to load hydration data key {key_ref}"))?;
         if key.purpose != expected_purpose {
@@ -956,6 +1001,7 @@ impl Store {
     async fn verify_memory_projection(
         &self,
         key_cache: &mut HashMap<String, Arc<DataKeyMaterial>>,
+        transaction: &mut Transaction<'_, Sqlite>,
         key_ref: &str,
         ciphertext: &[u8],
         projection: &str,
@@ -969,19 +1015,25 @@ impl Store {
             );
         }
         let key = self
-            .load_hydration_key(key_cache, key_ref, DataKeyPurpose::MemorySummary)
+            .load_hydration_key(
+                key_cache,
+                transaction,
+                key_ref,
+                DataKeyPurpose::MemorySummary,
+            )
             .await
             .with_context(|| format!("failed to load data key for {table} {row_id}"))?;
         let aad = self
             .scope
             .row_aad(table, row_id, DataKeyPurpose::MemorySummary);
-        let mut plaintext = decrypt_content(&key, ciphertext, &aad)
-            .with_context(|| format!("failed to decrypt {table} projection for {row_id}"))?;
+        let plaintext = Zeroizing::new(
+            decrypt_content(&key, ciphertext, &aad)
+                .with_context(|| format!("failed to decrypt {table} projection for {row_id}"))?,
+        );
         let derived = self
             .redactor
             .redact_serialized(&plaintext)
             .with_context(|| format!("failed to redact {table} plaintext for {row_id}"))?;
-        plaintext.zeroize();
         if derived != projection {
             bail!("{table} projection for {row_id} does not match re-derived redacted plaintext");
         }
@@ -2493,10 +2545,12 @@ mod tests {
             .await
             .expect("mint transcript key");
 
+        let mut transaction = store.pool().begin().await.expect("begin test transaction");
         let mut cache = HashMap::new();
         let error = store
             .load_hydration_key(
                 &mut cache,
+                &mut transaction,
                 &transcript_key.key_ref,
                 DataKeyPurpose::ProviderContext,
             )
@@ -2670,10 +2724,11 @@ mod tests {
         )
         .await;
 
-        let (batches, _messages, _jobs, _cursors) = store
-            .hydrate_memory_state()
-            .await
-            .expect("hydrate authenticated memory state");
+        let (batches, _messages, _jobs, _cursors) = {
+            let mut transaction = store.pool().begin().await.expect("begin test transaction");
+            store.hydrate_memory_state(&mut transaction).await
+        }
+        .expect("hydrate authenticated memory state");
         assert_eq!(batches.len(), 1);
         let summary = batches[0].summary.as_ref().expect("batch has a summary");
         assert_eq!(summary.key_ref, key.key_ref);
@@ -2702,10 +2757,11 @@ mod tests {
         )
         .await;
 
-        let error = store
-            .hydrate_memory_state()
-            .await
-            .expect_err("tampered ciphertext must fail hydration");
+        let error = {
+            let mut transaction = store.pool().begin().await.expect("begin test transaction");
+            store.hydrate_memory_state(&mut transaction).await
+        }
+        .expect_err("tampered ciphertext must fail hydration");
         let message = format!("{error:#}");
         assert!(
             message.contains("failed to decrypt memory_batches projection"),
@@ -2742,10 +2798,11 @@ mod tests {
         )
         .await;
 
-        let error = store
-            .hydrate_memory_state()
-            .await
-            .expect_err("wrong key reference must fail hydration");
+        let error = {
+            let mut transaction = store.pool().begin().await.expect("begin test transaction");
+            store.hydrate_memory_state(&mut transaction).await
+        }
+        .expect_err("wrong key reference must fail hydration");
         let message = format!("{error:#}");
         assert!(
             message.contains("has purpose transcript")
@@ -2780,10 +2837,11 @@ mod tests {
         )
         .await;
 
-        let error = store
-            .hydrate_memory_state()
-            .await
-            .expect_err("mismatched projection must fail hydration");
+        let error = {
+            let mut transaction = store.pool().begin().await.expect("begin test transaction");
+            store.hydrate_memory_state(&mut transaction).await
+        }
+        .expect_err("mismatched projection must fail hydration");
         let message = format!("{error:#}");
         assert!(
             message.contains("does not match re-derived redacted plaintext"),
@@ -2811,10 +2869,11 @@ mod tests {
         )
         .await;
 
-        let error = store
-            .hydrate_memory_state()
-            .await
-            .expect_err("stale redaction version must fail hydration");
+        let error = {
+            let mut transaction = store.pool().begin().await.expect("begin test transaction");
+            store.hydrate_memory_state(&mut transaction).await
+        }
+        .expect_err("stale redaction version must fail hydration");
         let message = format!("{error:#}");
         assert!(
             message.contains("unsupported redaction version"),
@@ -2842,10 +2901,11 @@ mod tests {
         )
         .await;
 
-        let (_batches, _messages, jobs, _cursors) = store
-            .hydrate_memory_state()
-            .await
-            .expect("hydrate authenticated memory state");
+        let (_batches, _messages, jobs, _cursors) = {
+            let mut transaction = store.pool().begin().await.expect("begin test transaction");
+            store.hydrate_memory_state(&mut transaction).await
+        }
+        .expect("hydrate authenticated memory state");
         assert_eq!(jobs.len(), 1);
         let result = jobs[0].result.as_ref().expect("job has a result");
         assert_eq!(result.key_ref, key.key_ref);
@@ -2874,10 +2934,11 @@ mod tests {
         )
         .await;
 
-        let error = store
-            .hydrate_memory_state()
-            .await
-            .expect_err("tampered ciphertext must fail hydration");
+        let error = {
+            let mut transaction = store.pool().begin().await.expect("begin test transaction");
+            store.hydrate_memory_state(&mut transaction).await
+        }
+        .expect_err("tampered ciphertext must fail hydration");
         let message = format!("{error:#}");
         assert!(
             message.contains("failed to decrypt memory_jobs projection"),
@@ -2914,10 +2975,11 @@ mod tests {
         )
         .await;
 
-        let error = store
-            .hydrate_memory_state()
-            .await
-            .expect_err("wrong key reference must fail hydration");
+        let error = {
+            let mut transaction = store.pool().begin().await.expect("begin test transaction");
+            store.hydrate_memory_state(&mut transaction).await
+        }
+        .expect_err("wrong key reference must fail hydration");
         let message = format!("{error:#}");
         assert!(
             message.contains("has purpose transcript")
@@ -2947,10 +3009,11 @@ mod tests {
         )
         .await;
 
-        let error = store
-            .hydrate_memory_state()
-            .await
-            .expect_err("mismatched projection must fail hydration");
+        let error = {
+            let mut transaction = store.pool().begin().await.expect("begin test transaction");
+            store.hydrate_memory_state(&mut transaction).await
+        }
+        .expect_err("mismatched projection must fail hydration");
         let message = format!("{error:#}");
         assert!(
             message.contains("does not match re-derived redacted plaintext"),
@@ -2978,10 +3041,11 @@ mod tests {
         )
         .await;
 
-        let error = store
-            .hydrate_memory_state()
-            .await
-            .expect_err("stale redaction version must fail hydration");
+        let error = {
+            let mut transaction = store.pool().begin().await.expect("begin test transaction");
+            store.hydrate_memory_state(&mut transaction).await
+        }
+        .expect_err("stale redaction version must fail hydration");
         let message = format!("{error:#}");
         assert!(
             message.contains("unsupported redaction version"),
@@ -3023,6 +3087,48 @@ mod tests {
         };
         assert_eq!(state.memory_batches.len(), 1);
         assert!(state.memory_batches[0].summary.is_some());
+    }
+
+    #[tokio::test]
+    async fn hydrate_loads_transcript_and_memory_in_one_snapshot() {
+        let store = store().await;
+        insert_user_message(&store, "msg-snapshot", 1, "hello snapshot").await;
+
+        let key = store
+            .conversation_key(DataKeyPurpose::MemorySummary)
+            .await
+            .expect("mint memory summary key");
+        let payload = test_memory_payload();
+        let (ciphertext, projection, version) =
+            encrypt_memory_projection(&store, &key, "memory_batches", "batch-snapshot", &payload);
+        insert_memory_batch(
+            &store,
+            "batch-snapshot",
+            &key.key_ref,
+            &ciphertext,
+            &projection,
+            i64::from(version),
+        )
+        .await;
+
+        let outcome = store
+            .hydrate(&test_lease(), &test_fence())
+            .await
+            .expect("hydrate must return a complete state from one snapshot");
+        let HydrationOutcome::Complete(state) = outcome else {
+            panic!("expected complete hydration outcome");
+        };
+
+        assert_eq!(state.messages.len(), 1);
+        match &state.messages[0] {
+            ContextMessage::Persisted { id, .. } => assert_eq!(id, "msg-snapshot"),
+            _ => panic!("expected persisted message"),
+        }
+        assert_eq!(state.memory_batches.len(), 1);
+        assert_eq!(state.memory_batches[0].id, "batch-snapshot");
+        assert!(state.memory_batches[0].summary.is_some());
+        assert!(state.provider_context.is_empty());
+        assert!(state.recovery_steps.is_empty());
     }
 
     #[tokio::test]
@@ -3097,10 +3203,11 @@ mod tests {
             .await
             .expect("tamper payload");
 
-        let error = store
-            .hydrate_messages()
-            .await
-            .expect_err("tampered payload must fail hydration");
+        let error = {
+            let mut transaction = store.pool().begin().await.expect("begin test transaction");
+            store.hydrate_messages(&mut transaction).await
+        }
+        .expect_err("tampered payload must fail hydration");
         let message = format!("{error:#}");
         assert!(message.contains("stored payload"), "{message}");
     }
@@ -3117,10 +3224,11 @@ mod tests {
             .await
             .expect("tamper search text");
 
-        let error = store
-            .hydrate_messages()
-            .await
-            .expect_err("tampered search text must fail hydration");
+        let error = {
+            let mut transaction = store.pool().begin().await.expect("begin test transaction");
+            store.hydrate_messages(&mut transaction).await
+        }
+        .expect_err("tampered search text must fail hydration");
         let message = format!("{error:#}");
         assert!(message.contains("stored search_text"), "{message}");
     }

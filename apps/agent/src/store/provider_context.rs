@@ -168,10 +168,8 @@ impl ProviderContextEvictionEstimate {
     pub(crate) fn from_payload(payload: &ProviderContextPayload) -> Self {
         let tokens = match payload {
             ProviderContextPayload::EncryptedReasoning { item, .. } => {
-                let mut bytes = serde_json::to_vec(item).unwrap_or_default();
-                let tokens = (bytes.len() as u64).div_ceil(4);
-                bytes.zeroize();
-                tokens
+                let bytes = Zeroizing::new(serde_json::to_vec(item).unwrap_or_default());
+                (bytes.len() as u64).div_ceil(4)
             }
             _ => 0,
         };
@@ -292,10 +290,10 @@ impl EncryptedProviderContextRecord {
         }
 
         let aad = scope.row_aad("provider_context", &id, DataKeyPurpose::ProviderContext);
-        let mut plaintext =
-            serde_json::to_vec(item).context("failed to serialize provider-context plaintext")?;
+        let plaintext = Zeroizing::new(
+            serde_json::to_vec(item).context("failed to serialize provider-context plaintext")?,
+        );
         let ciphertext = encrypt_content(data_key, &plaintext, &aad)?;
-        plaintext.zeroize();
 
         let (coverage_through_seq, context_fingerprint) = match &item.payload {
             ProviderContextPayload::OpenAiCompactedWindow { coverage, .. }
@@ -549,6 +547,7 @@ fn opt_u32_bytes(opt: Option<u32>) -> Vec<u8> {
 }
 
 /// A prepared `Replace`/`Invalidate` intent ready to be persisted and applied.
+#[derive(Debug)]
 pub(crate) struct PreparedProviderContextMutation {
     mutation_id: String,
     intent_key_ref: String,
@@ -612,11 +611,12 @@ impl ProviderContextMutationBuilder {
         window_ordinal: u64,
     ) -> Result<PreparedProviderContextMutation> {
         let sorted = unique_sorted(invalidate_ids)?;
-        let mut plaintext_bytes = serde_json::to_vec(plaintext)
-            .context("failed to serialize provider-context plaintext for intent")?;
+        let plaintext_bytes = Zeroizing::new(
+            serde_json::to_vec(plaintext)
+                .context("failed to serialize provider-context plaintext for intent")?,
+        );
         let intent_key = hkdf_intent_hmac_key(&self.mutation_key, &self.scope.conversation_id);
         let plaintext_hmac = hmac_sha256(&intent_key, PLAINTEXT_HMAC_DOMAIN, &plaintext_bytes);
-        plaintext_bytes.zeroize();
 
         self.build_full(
             "replace",
@@ -688,10 +688,10 @@ impl ProviderContextMutationBuilder {
             &self.mutation_id,
             DataKeyPurpose::Mutation,
         );
-        let mut full_json =
-            serde_json::to_vec(&full).context("failed to serialize full mutation intent")?;
+        let full_json = Zeroizing::new(
+            serde_json::to_vec(&full).context("failed to serialize full mutation intent")?,
+        );
         let intent_ciphertext = encrypt_content(&self.mutation_key, &full_json, &aad)?;
-        full_json.zeroize();
 
         Ok(PreparedProviderContextMutation {
             mutation_id: self.mutation_id,
@@ -2643,10 +2643,13 @@ mod tests {
             seq: 7,
             message: assistant_message(reasoning_origin()),
         }];
-        let hydrated = store
-            .hydrate_provider_context(&messages)
-            .await
-            .expect("hydration should succeed with matching origin");
+        let hydrated = {
+            let mut transaction = store.pool().begin().await.expect("begin test transaction");
+            store
+                .hydrate_provider_context(&messages, &mut transaction)
+                .await
+        }
+        .expect("hydration should succeed with matching origin");
         assert_eq!(hydrated.len(), 1);
         assert_eq!(hydrated[0].origin_message.as_ref().unwrap().message_seq, 7);
     }
@@ -2672,10 +2675,13 @@ mod tests {
             seq: 7,
             message: assistant_message(reasoning_origin()),
         }];
-        let error = store
-            .hydrate_provider_context(&messages)
-            .await
-            .expect_err("hydration must reject origin mismatch");
+        let error = {
+            let mut transaction = store.pool().begin().await.expect("begin test transaction");
+            store
+                .hydrate_provider_context(&messages, &mut transaction)
+                .await
+        }
+        .expect_err("hydration must reject origin mismatch");
         let message = format!("{error:#}");
         assert!(
             message
@@ -2764,10 +2770,13 @@ mod tests {
                 message: assistant_message(origin),
             },
         ];
-        let hydrated = store
-            .hydrate_provider_context(&messages)
-            .await
-            .expect("hydration should succeed");
+        let hydrated = {
+            let mut transaction = store.pool().begin().await.expect("begin test transaction");
+            store
+                .hydrate_provider_context(&messages, &mut transaction)
+                .await
+        }
+        .expect("hydration should succeed");
         assert_eq!(hydrated.len(), 2);
         // Native compaction is unanchored; sort order is by coverage seq.
         let coverage_seq = |item: &ProviderContextItem| match &item.payload {
@@ -2842,10 +2851,13 @@ mod tests {
             },
         ];
 
-        let hydrated = store
-            .hydrate_provider_context(&messages)
-            .await
-            .expect("hydration should succeed");
+        let hydrated = {
+            let mut transaction = store.pool().begin().await.expect("begin test transaction");
+            store
+                .hydrate_provider_context(&messages, &mut transaction)
+                .await
+        }
+        .expect("hydration should succeed");
 
         assert_eq!(hydrated.len(), 2);
         assert!(
@@ -3014,10 +3026,11 @@ mod tests {
 
         record.insert(store.pool()).await.unwrap();
 
-        let error = store
-            .hydrate_provider_context(&[])
-            .await
-            .expect_err("hydration must reject native compaction with an origin message");
+        let error = {
+            let mut transaction = store.pool().begin().await.expect("begin test transaction");
+            store.hydrate_provider_context(&[], &mut transaction).await
+        }
+        .expect_err("hydration must reject native compaction with an origin message");
         let message = format!("{error:#}");
         assert!(
             message.contains("native compaction must not have an origin message"),
@@ -3064,10 +3077,11 @@ mod tests {
 
         record.insert(store.pool()).await.unwrap();
 
-        let error = store
-            .hydrate_provider_context(&[])
-            .await
-            .expect_err("hydration must reject native compaction with a wire_item_index");
+        let error = {
+            let mut transaction = store.pool().begin().await.expect("begin test transaction");
+            store.hydrate_provider_context(&[], &mut transaction).await
+        }
+        .expect_err("hydration must reject native compaction with a wire_item_index");
         let message = format!("{error:#}");
         assert!(
             message.contains("native compaction must not have a wire_item_index"),
@@ -3120,10 +3134,13 @@ mod tests {
             seq: 7,
             message: assistant_message(reasoning_origin()),
         }];
-        let error = store
-            .hydrate_provider_context(&messages)
-            .await
-            .expect_err("hydration must reject encrypted reasoning without a wire_item_index");
+        let error = {
+            let mut transaction = store.pool().begin().await.expect("begin test transaction");
+            store
+                .hydrate_provider_context(&messages, &mut transaction)
+                .await
+        }
+        .expect_err("hydration must reject encrypted reasoning without a wire_item_index");
         let message = format!("{error:#}");
         assert!(
             message.contains("encrypted reasoning must have a wire_item_index"),
@@ -3194,10 +3211,13 @@ mod tests {
             seq: 7,
             message: assistant_message(reasoning_origin()),
         }];
-        let error = store
-            .hydrate_provider_context(&messages)
-            .await
-            .expect_err("hydration must reject encrypted reasoning without an origin message");
+        let error = {
+            let mut transaction = store.pool().begin().await.expect("begin test transaction");
+            store
+                .hydrate_provider_context(&messages, &mut transaction)
+                .await
+        }
+        .expect_err("hydration must reject encrypted reasoning without an origin message");
         let message = format!("{error:#}");
         assert!(
             message.contains("encrypted reasoning must have an origin message"),
@@ -3225,10 +3245,13 @@ mod tests {
             seq: 7,
             message: assistant_message(reasoning_origin()),
         }];
-        let error = store
-            .hydrate_provider_context(&messages)
-            .await
-            .expect_err("hydration must reject mismatched eviction tokens");
+        let error = {
+            let mut transaction = store.pool().begin().await.expect("begin test transaction");
+            store
+                .hydrate_provider_context(&messages, &mut transaction)
+                .await
+        }
+        .expect_err("hydration must reject mismatched eviction tokens");
         let message = format!("{error:#}");
         assert!(
             message.contains("eviction_tokens do not match the decrypted payload"),
@@ -3256,10 +3279,13 @@ mod tests {
             seq: 7,
             message: assistant_message(reasoning_origin()),
         }];
-        let error = store
-            .hydrate_provider_context(&messages)
-            .await
-            .expect_err("hydration must reject unsupported eviction estimator version");
+        let error = {
+            let mut transaction = store.pool().begin().await.expect("begin test transaction");
+            store
+                .hydrate_provider_context(&messages, &mut transaction)
+                .await
+        }
+        .expect_err("hydration must reject unsupported eviction estimator version");
         let message = format!("{error:#}");
         assert!(
             message.contains("uses unsupported eviction estimator version"),
@@ -3285,13 +3311,80 @@ mod tests {
             message: assistant_message(wrong_origin),
         }];
 
-        let error = store
-            .hydrate_provider_context(&messages)
-            .await
-            .expect_err("hydration must reject reasoning with mismatched assistant origin");
+        let error = {
+            let mut transaction = store.pool().begin().await.expect("begin test transaction");
+            store
+                .hydrate_provider_context(&messages, &mut transaction)
+                .await
+        }
+        .expect_err("hydration must reject reasoning with mismatched assistant origin");
         let message = format!("{error:#}");
         assert!(
             message.contains("provider_origin does not match the anchored assistant origin"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_anchor_error_uses_provider_context_record_id() {
+        let store = store().await;
+        seed_message(&store, "message-1", 7).await.unwrap();
+
+        let record = reasoning_record(&store, "message-1", 7, "pc-1").await;
+        record.insert(store.pool()).await.unwrap();
+
+        // The persisted message at seq 7 has a different id than the anchor claims.
+        // Before the id-shadow fix the outer provider-context record id would be
+        // overwritten by the inner message id in the match arm, causing the error
+        // to name the wrong record.
+        let messages = vec![ContextMessage::Persisted {
+            id: "message-2".to_owned(),
+            seq: 7,
+            message: assistant_message(reasoning_origin()),
+        }];
+        let error = {
+            let mut transaction = store.pool().begin().await.expect("begin test transaction");
+            store
+                .hydrate_provider_context(&messages, &mut transaction)
+                .await
+        }
+        .expect_err("hydration must reject an anchor that resolves to a different message id");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("pc-1"),
+            "error should name the provider-context record id: {message}"
+        );
+        assert!(
+            !message.contains("message-2"),
+            "error must not leak the mismatched persisted message id as the record id: {message}"
+        );
+        assert!(
+            message.contains("resolves to a different message id"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_replace_zeroizes_plaintext_on_empty_mutation_id() {
+        let store = store().await;
+        seed_message(&store, "message-1", 7).await.unwrap();
+
+        let record = reasoning_record(&store, "message-1", 7, "pc-1").await;
+        let mutation_key = store
+            .conversation_key(DataKeyPurpose::Mutation)
+            .await
+            .expect("mint mutation key");
+        let plaintext = reasoning_item("message-1", 7);
+
+        // plaintext_bytes is serialized and then build_full fails on the empty
+        // mutation_id.  Wrapping it in Zeroizing from creation ensures the buffer
+        // is cleared even on this error path.
+        let error = ProviderContextMutationBuilder::new(mutation_key, store.scope().clone(), "")
+            .build_replace(None, vec!["pc-0".to_owned()], &record, &plaintext, 0, 0)
+            .expect_err("empty mutation_id must fail");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("mutation_id must not be empty"),
             "{message}"
         );
     }
@@ -3504,10 +3597,13 @@ mod tests {
                 },
             ];
 
-            let hydrated = store
-                .hydrate_provider_context(&messages)
-                .await
-                .expect("global event gaps must not invalidate native compaction hydration");
+            let hydrated = {
+                let mut transaction = store.pool().begin().await.expect("begin test transaction");
+                store
+                    .hydrate_provider_context(&messages, &mut transaction)
+                    .await
+            }
+            .expect("global event gaps must not invalidate native compaction hydration");
             assert_eq!(hydrated, vec![item]);
         }
     }
@@ -3538,10 +3634,13 @@ mod tests {
                     message: assistant_message(item.provider_origin.clone()),
                 },
             ];
-            let error = store
-                .hydrate_provider_context(&messages)
-                .await
-                .expect_err("tampered native idempotency key must fail hydration");
+            let error = {
+                let mut transaction = store.pool().begin().await.expect("begin test transaction");
+                store
+                    .hydrate_provider_context(&messages, &mut transaction)
+                    .await
+            }
+            .expect_err("tampered native idempotency key must fail hydration");
             assert!(
                 format!("{error:#}")
                     .contains("idempotency key does not match authenticated native item"),
@@ -3569,10 +3668,13 @@ mod tests {
                 message: assistant_message(item.provider_origin.clone()),
             },
         ];
-        let error = store
-            .hydrate_provider_context(&messages)
-            .await
-            .expect_err("reordered persisted messages must fail hydration");
+        let error = {
+            let mut transaction = store.pool().begin().await.expect("begin test transaction");
+            store
+                .hydrate_provider_context(&messages, &mut transaction)
+                .await
+        }
+        .expect_err("reordered persisted messages must fail hydration");
         assert!(format!("{error:#}").contains("reordered"), "{error:#}");
     }
 
@@ -3631,10 +3733,13 @@ mod tests {
             },
         ];
 
-        let error = store
-            .hydrate_provider_context(&messages)
-            .await
-            .expect_err("hydration must reject out-of-range native compaction coverage");
+        let error = {
+            let mut transaction = store.pool().begin().await.expect("begin test transaction");
+            store
+                .hydrate_provider_context(&messages, &mut transaction)
+                .await
+        }
+        .expect_err("hydration must reject out-of-range native compaction coverage");
         let message = format!("{error:#}");
         assert!(
             message.contains("coverage does not identify a persisted message"),
