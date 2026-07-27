@@ -693,6 +693,7 @@ impl Runner {
                                 &attempt.message_id,
                                 message_started,
                                 attempt.initial_message.clone(),
+                                Vec::new(),
                             ).await;
                         }
                         return self.close_broken_attempt(
@@ -746,6 +747,9 @@ impl Runner {
                         ProjectedProviderEvent::Terminal(terminal) => {
                             let provider_context = terminal.provider_context().to_vec();
                             if terminal.kind() == ProviderTerminalKind::Error
+                                && terminal_message
+                                    .as_ref()
+                                    .is_some_and(|message| message.stop_reason == StopReason::Error)
                                 && !provider_context.is_empty()
                             {
                                 rejected_results.clear();
@@ -825,6 +829,7 @@ impl Runner {
                                         &attempt.message_id,
                                         message_started,
                                         public,
+                                        provider_context,
                                     )
                                     .await;
                             }
@@ -833,6 +838,7 @@ impl Runner {
                                     &attempt.message_id,
                                     message_started,
                                     public,
+                                    provider_context,
                                     command,
                                 )
                                 .await;
@@ -962,6 +968,7 @@ impl Runner {
         message_id: &str,
         started: bool,
         partial: PublicMessage,
+        provider_context: Vec<ProviderContextFragment>,
         command: AdmittedCommand,
     ) -> Result<AttemptOutcome, WorkerFailure> {
         let partial = steer::normalize_partial_assistant(partial)
@@ -974,7 +981,13 @@ impl Runner {
             .await?;
         }
         let receipt = self
-            .emit_message_end(message_id.to_owned(), partial.clone(), None, None)
+            .emit_message_end_with_provider_context(
+                message_id.to_owned(),
+                partial.clone(),
+                provider_context,
+                None,
+                None,
+            )
             .await?;
         let receipt = self.await_message_receipt(receipt).await?;
         // Give a queued Abort its durable authorization turn before deciding
@@ -1010,6 +1023,7 @@ impl Runner {
         message_id: &str,
         started: bool,
         partial: PublicMessage,
+        provider_context: Vec<ProviderContextFragment>,
     ) -> Result<AttemptOutcome, WorkerFailure> {
         let partial = steer::normalize_partial_assistant(partial)
             .map_err(|error| WorkerFailure::Error(error.to_string()))?;
@@ -1021,7 +1035,13 @@ impl Runner {
             .await?;
         }
         let receipt = self
-            .emit_message_end(message_id.to_owned(), partial.clone(), None, None)
+            .emit_message_end_with_provider_context(
+                message_id.to_owned(),
+                partial.clone(),
+                provider_context,
+                None,
+                None,
+            )
             .await?;
         Ok(AttemptOutcome::ClosedError {
             assistant_message_id: message_id.to_owned(),

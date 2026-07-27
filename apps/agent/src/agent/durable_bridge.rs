@@ -142,6 +142,11 @@ impl MessageCommitBarrier {
         &self.provider_context
     }
 
+    #[cfg(test)]
+    pub(crate) fn provider_context_for_test(&self) -> &[ProviderContextFragment] {
+        self.provider_context()
+    }
+
     pub(crate) fn resolve(self, receipt: MessageCommitReceipt) {
         let _ = self.sender.send(receipt);
     }

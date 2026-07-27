@@ -967,6 +967,141 @@ async fn nonempty_provider_context_flows_to_the_durable_message_barrier() {
     assert!(matches!(emitted.last(), Some(AgentEvent::AgentEnd)));
 }
 
+fn cancellation_provider_context() -> Vec<ProviderContextFragment> {
+    vec![ProviderContextFragment {
+        wire_item_index: Some(0),
+        payload: ProviderContextPayload::EncryptedReasoning {
+            protocol: ApiProtocol::OpenAiChatCompletions,
+            item: json!({"encrypted_content":"cancelled-opaque"}),
+        },
+    }]
+}
+
+#[tokio::test]
+async fn aborted_message_end_keeps_verified_provider_context_on_barrier() {
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(4);
+    let mut runner = Runner::new(
+        bound_core(1),
+        Arc::new(CancellingProbeDriver::new()),
+        control_rx,
+        events_tx,
+    );
+    let partial = public_message(&assistant(StopReason::Aborted, Vec::new(), None, None));
+    let task = tokio::spawn(async move {
+        runner
+            .close_aborted_attempt(
+                "assistant-aborted",
+                true,
+                partial,
+                cancellation_provider_context(),
+            )
+            .await
+    });
+    let mut output = events_rx.recv().await.expect("aborted MessageEnd output");
+    let barrier = output
+        .message_commit_barrier
+        .take()
+        .expect("MessageEnd barrier");
+    assert_eq!(barrier.provider_context_for_test().len(), 1);
+    barrier.resolve(MessageCommitReceipt {
+        message_id: "assistant-aborted".to_owned(),
+        message_seq: 1,
+        new_turn_id: None,
+    });
+    drop(control_tx);
+    assert!(matches!(
+        task.await.expect("close task").expect("close outcome"),
+        AttemptOutcome::ClosedError { .. }
+    ));
+}
+
+#[tokio::test]
+async fn hard_steer_message_end_keeps_verified_provider_context_on_barrier() {
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(4);
+    let mut runner = Runner::new(
+        bound_core(1),
+        Arc::new(CancellingProbeDriver::new()),
+        control_rx,
+        events_tx,
+    );
+    let partial = public_message(&assistant(StopReason::Aborted, Vec::new(), None, None));
+    let task = tokio::spawn(async move {
+        runner
+            .close_hard_steer_attempt(
+                "assistant-steered",
+                true,
+                partial,
+                cancellation_provider_context(),
+                admitted_user(2),
+            )
+            .await
+    });
+    let mut output = events_rx
+        .recv()
+        .await
+        .expect("hard-steer MessageEnd output");
+    let barrier = output
+        .message_commit_barrier
+        .take()
+        .expect("MessageEnd barrier");
+    assert_eq!(barrier.provider_context_for_test().len(), 1);
+    barrier.resolve(MessageCommitReceipt {
+        message_id: "assistant-steered".to_owned(),
+        message_seq: 1,
+        new_turn_id: None,
+    });
+    drop(control_tx);
+    assert!(matches!(
+        task.await.expect("close task").expect("close outcome"),
+        AttemptOutcome::HardSteer
+    ));
+}
+
+#[tokio::test]
+async fn error_terminal_with_context_fails_closed_without_context_on_barrier() {
+    let message = assistant(StopReason::Error, Vec::new(), Some("provider error"), None);
+    let driver = Arc::new(FixtureDriver::new(vec![Script::Events(vec![
+        ProviderEvent::Start,
+        ProviderEvent::Error {
+            reason: StopReason::Error,
+            output: ProviderOutput {
+                message,
+                provider_context: cancellation_provider_context(),
+            },
+        },
+    ])]));
+    let (_control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(4);
+    let mut runner = Runner::new(bound_core(1), driver, control_rx, events_tx);
+    let task = tokio::spawn(async move { runner.provider_attempt().await });
+    let message_seq = 1;
+    let outcome = loop {
+        let mut output = events_rx.recv().await.expect("provider output");
+        if let Some(barrier) = output.message_commit_barrier.take() {
+            assert_eq!(
+                barrier.provider_context_for_test().len(),
+                0,
+                "genuine error terminals must not retain provider context"
+            );
+            let AgentEvent::MessageEnd { message_id, .. } = &output.event else {
+                panic!("receipt barrier without MessageEnd");
+            };
+            barrier.resolve(MessageCommitReceipt {
+                message_id: message_id.clone(),
+                message_seq,
+                new_turn_id: None,
+            });
+            break task.await.expect("provider attempt task");
+        }
+    };
+    assert!(matches!(
+        outcome.expect("provider attempt outcome"),
+        AttemptOutcome::ClosedError { .. }
+    ));
+}
+
 #[tokio::test]
 async fn retry_wait_control_is_injected_mid_turn_before_next_attempt() {
     let driver = Arc::new(
