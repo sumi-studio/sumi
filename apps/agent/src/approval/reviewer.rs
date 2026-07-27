@@ -876,6 +876,7 @@ mod tests {
             Permission, ReviewPath, ReviewPathComponent, ReviewToken, ReviewableAction,
             SandboxSummary, SecretAwareActionProjector, SecretDigestKey,
         },
+        approval::policy::{APPROVAL_POLICY_BUNDLE_SCHEMA_VERSION, ApprovalPolicyBundle, Policy},
         provider::types::{
             ApiProtocol, ProviderOrigin, PublicAssistantContent, PublicAssistantMessage,
             PublicMessage, StopReason, ToolCall, Usage, UserContent, UserMessage,
@@ -1594,6 +1595,50 @@ mod tests {
             ReviewOutcome::Allow(_)
         ));
         assert_eq!(fake.called_count(), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn allow_cache_does_not_cross_verified_authority_scope() {
+        let fake = FakeTransport::sequence(vec![Ok(allow_json()), Ok(allow_json())]);
+        let reviewer = make_reviewer(fake.clone());
+        let now = chrono::Utc::now();
+        let bundle = |tenant_id: &str| ApprovalPolicyBundle {
+            schema_version: APPROVAL_POLICY_BUNDLE_SCHEMA_VERSION,
+            tenant_id: tenant_id.to_owned(),
+            agent_id: "agent-1".to_owned(),
+            version: 1,
+            issued_at: now - chrono::Duration::minutes(1),
+            expires_at: now + chrono::Duration::hours(1),
+            rules: Vec::new(),
+        };
+        let policy_a =
+            Policy::from_verified_bundle("/workspace", &bundle("tenant-a")).expect("policy a");
+        let policy_b =
+            Policy::from_verified_bundle("/workspace", &bundle("tenant-b")).expect("policy b");
+        assert_ne!(
+            policy_a.hash_at(now),
+            policy_b.hash_at(now),
+            "verified authority scope must be part of policy identity"
+        );
+
+        let mut first = review_request(reviewable_projection());
+        first.policy_hash = policy_a.hash_at(now);
+        assert!(matches!(
+            reviewer.review(first, CancellationToken::new()).await,
+            ReviewOutcome::Allow(_)
+        ));
+
+        let mut second = review_request(reviewable_projection());
+        second.policy_hash = policy_b.hash_at(now);
+        assert!(matches!(
+            reviewer.review(second, CancellationToken::new()).await,
+            ReviewOutcome::Allow(_)
+        ));
+        assert_eq!(
+            fake.called_count(),
+            2,
+            "a shared reviewer must not reuse an allow across authority scopes"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

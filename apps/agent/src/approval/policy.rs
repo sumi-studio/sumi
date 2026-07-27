@@ -289,6 +289,8 @@ pub enum RuleValidationError {
     DuplicateId,
     #[error("approval rule must be workspace-only")]
     WorkspaceOnlyRequired,
+    #[error("verified approval authority identity could not be canonicalized")]
+    InvalidAuthorityIdentity,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -298,6 +300,20 @@ pub struct Policy {
     authority_available: bool,
     verified_bundle_version: Option<u64>,
     verified_bundle_expires_at: Option<DateTime<Utc>>,
+    verified_authority: Option<VerifiedAuthorityIdentity>,
+}
+
+/// Identity of the control-plane authority that authenticated a policy.
+///
+/// The digest is derived from the canonical bundle payload bytes, so two
+/// bundles with the same effective rules but different tenant/agent scope or
+/// version cannot share reviewer cache entries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VerifiedAuthorityIdentity {
+    tenant_id: String,
+    agent_id: String,
+    bundle_version: u64,
+    bundle_digest: String,
 }
 
 impl Policy {
@@ -308,6 +324,7 @@ impl Policy {
             authority_available: true,
             verified_bundle_version: None,
             verified_bundle_expires_at: None,
+            verified_authority: None,
         }
     }
 
@@ -320,6 +337,7 @@ impl Policy {
             authority_available: false,
             verified_bundle_version: None,
             verified_bundle_expires_at: None,
+            verified_authority: None,
         }
     }
 
@@ -373,6 +391,12 @@ impl Policy {
             "authority_available": self.authority_is_available_at(now),
             "verified_bundle_version": self.verified_bundle_version,
             "verified_bundle_expires_at": self.verified_bundle_expires_at,
+            "verified_authority": self.verified_authority.as_ref().map(|identity| json!({
+                "tenant_id": identity.tenant_id,
+                "agent_id": identity.agent_id,
+                "bundle_version": identity.bundle_version,
+                "bundle_digest": identity.bundle_digest,
+            })),
         });
         let bytes = match serde_json::to_vec(&canonical) {
             Ok(bytes) => bytes,
@@ -460,10 +484,38 @@ impl Policy {
         workspace_root: impl Into<PathBuf>,
         bundle: &ApprovalPolicyBundle,
     ) -> Result<Self, RuleValidationError> {
+        if bundle.tenant_id.is_empty()
+            || bundle.agent_id.is_empty()
+            || bundle.expires_at <= bundle.issued_at
+            || bundle.schema_version != APPROVAL_POLICY_BUNDLE_SCHEMA_VERSION
+        {
+            return Err(RuleValidationError::InvalidAuthorityIdentity);
+        }
         let mut policy = Self::from_rules(workspace_root, bundle.rules.clone())?;
         policy.verified_bundle_version = Some(bundle.version);
         policy.verified_bundle_expires_at = Some(bundle.expires_at);
+        let bundle_digest = bundle
+            .signing_bytes()
+            .map(|bytes| Self::hex_digest(&Sha256::digest(bytes)))
+            .map_err(|_| RuleValidationError::InvalidAuthorityIdentity)?;
+        policy.verified_authority = Some(VerifiedAuthorityIdentity {
+            tenant_id: bundle.tenant_id.clone(),
+            agent_id: bundle.agent_id.clone(),
+            bundle_version: bundle.version,
+            bundle_digest,
+        });
         Ok(policy)
+    }
+
+    pub(crate) fn authority_binding(&self) -> Option<(&str, &str, u64, &str)> {
+        self.verified_authority.as_ref().map(|identity| {
+            (
+                identity.tenant_id.as_str(),
+                identity.agent_id.as_str(),
+                identity.bundle_version,
+                identity.bundle_digest.as_str(),
+            )
+        })
     }
 
     pub fn evaluate(&self, action: &CanonicalAction) -> PolicyDecision {

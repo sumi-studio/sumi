@@ -292,17 +292,35 @@ impl ApprovalBroker {
     /// Existing executable grants observe the same `RwLock`, so the durable
     /// start boundary detects a replacement instead of trusting its snapshot.
     pub(crate) fn replace_policy(&self, policy: Policy) -> Result<()> {
-        let workspace_root = self
-            .policy
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .workspace_root()
-            .to_path_buf();
+        // Hold the write lock through validation and installation so concurrent
+        // replacements cannot both validate against the same stale authority
+        // version and then install a rollback out of order.
+        let mut current = self.policy.write().unwrap_or_else(|e| e.into_inner());
         anyhow::ensure!(
-            policy.workspace_root() == workspace_root,
+            policy.workspace_root() == current.workspace_root(),
             "replacement policy changed workspace root"
         );
-        *self.policy.write().unwrap_or_else(|e| e.into_inner()) = policy;
+        match (current.authority_binding(), policy.authority_binding()) {
+            (
+                Some((current_tenant, current_agent, current_version, current_digest)),
+                Some((next_tenant, next_agent, next_version, next_digest)),
+            ) => {
+                anyhow::ensure!(
+                    current_tenant == next_tenant && current_agent == next_agent,
+                    "replacement policy changed approval authority scope"
+                );
+                anyhow::ensure!(
+                    next_version > current_version
+                        || (next_version == current_version && next_digest == current_digest),
+                    "replacement policy is not a strictly newer or exact replayed authority bundle"
+                );
+            }
+            (Some(_), None) => {
+                anyhow::bail!("replacement policy dropped verified approval authority scope");
+            }
+            (None, _) => {}
+        }
+        *current = policy;
         if let Some(reviewer) = self.reviewer.as_ref() {
             reviewer.clear_allow_cache();
         }
@@ -895,6 +913,7 @@ mod tests {
                 Permission, ReviewPath, ReviewPathComponent, ReviewProjection, ReviewToken,
                 ReviewableAction, SandboxSummary, SecretDigestKey,
             },
+            policy::{APPROVAL_POLICY_BUNDLE_SCHEMA_VERSION, ApprovalPolicyBundle},
             prompt::{ReviewerPrompt, TrustedEnvironment},
             reviewer::{
                 ReviewRequest, Reviewer, ReviewerMode, ReviewerModelSpec, ReviewerTransport,
@@ -1351,6 +1370,63 @@ mod tests {
             GrantRevalidation::Reauthorize,
             "a live policy replacement must invalidate an already-issued grant"
         );
+    }
+
+    #[test]
+    fn replacement_rejects_a_different_verified_authority_scope() {
+        let now = Utc::now();
+        let bundle = |tenant_id: &str, agent_id: &str, version: u64| ApprovalPolicyBundle {
+            schema_version: APPROVAL_POLICY_BUNDLE_SCHEMA_VERSION,
+            tenant_id: tenant_id.to_owned(),
+            agent_id: agent_id.to_owned(),
+            version,
+            issued_at: now - chrono::Duration::minutes(1),
+            expires_at: now + chrono::Duration::hours(1),
+            rules: Vec::new(),
+        };
+        let current = Policy::from_verified_bundle("/workspace", &bundle("tenant-a", "agent-a", 1))
+            .expect("current verified policy");
+        let same_scope =
+            Policy::from_verified_bundle("/workspace", &bundle("tenant-a", "agent-a", 2))
+                .expect("same-scope replacement policy");
+        let replacement =
+            Policy::from_verified_bundle("/workspace", &bundle("tenant-b", "agent-a", 3))
+                .expect("replacement verified policy");
+        let broker = ApprovalBroker::headless(current, projector());
+
+        broker
+            .replace_policy(same_scope)
+            .expect("same-scope policy replacement must remain allowed");
+
+        let rollback =
+            Policy::from_verified_bundle("/workspace", &bundle("tenant-a", "agent-a", 1))
+                .expect("rollback policy");
+        let rollback_error = broker
+            .replace_policy(rollback)
+            .expect_err("authority bundle rollback must fail closed");
+        assert!(rollback_error.to_string().contains("strictly newer"));
+
+        let mut conflicting_bundle = bundle("tenant-a", "agent-a", 2);
+        conflicting_bundle.rules.push(ApprovalRule {
+            id: "conflict".to_owned(),
+            tool: "bash".to_owned(),
+            literal_prefix: vec!["git".to_owned(), "status".to_owned()],
+            effect: crate::approval::RuleEffect::Allow,
+            workspace_only: true,
+            allowed_permissions: vec![Permission::Exec],
+            allowed_network_domains: Vec::new(),
+        });
+        let conflicting = Policy::from_verified_bundle("/workspace", &conflicting_bundle)
+            .expect("same-version conflicting policy");
+        let conflict_error = broker
+            .replace_policy(conflicting)
+            .expect_err("same-version conflicting authority bundle must fail closed");
+        assert!(conflict_error.to_string().contains("strictly newer"));
+
+        let error = broker
+            .replace_policy(replacement)
+            .expect_err("cross-authority replacement must fail closed");
+        assert!(error.to_string().contains("authority scope"));
     }
 
     #[tokio::test(flavor = "current_thread")]
