@@ -17,6 +17,8 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
+#[cfg(test)]
+use crate::provider::types::ProviderContextItem;
 use crate::{
     agent::{AgentEvent, ApprovalRequest, ApprovalResolution, SteerMode},
     gateway::{
@@ -25,9 +27,9 @@ use crate::{
     },
     memory::{BatchId, CompactResult},
     provider::types::{
-        ApiProtocol, ProviderContextAnchor, ProviderContextFragment, ProviderContextItem,
-        ProviderContextPayload, PublicAssistantContent, PublicAssistantMessage, PublicMessage,
-        StopReason, ToolResultMessage,
+        ApiProtocol, ProviderContextAnchor, ProviderContextFragment, ProviderContextPayload,
+        PublicAssistantContent, PublicAssistantMessage, PublicMessage, StopReason,
+        ToolResultMessage,
     },
     runtime::contracts::{GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease},
 };
@@ -2816,6 +2818,19 @@ impl EventWriter {
             bail!("provider context may only accompany an assistant MessageEnd");
         };
 
+        for fragment in &fragments {
+            Self::validate_provider_context_fragment(fragment, assistant)?;
+        }
+        let items = crate::provider::types::bind_provider_context_fragments(
+            fragments,
+            ProviderContextAnchor {
+                message_id: message_id.to_owned(),
+                message_seq,
+            },
+            assistant.origin.clone(),
+        )
+        .map_err(anyhow::Error::msg)?;
+
         let anchor_id = format!("{message_id}:{message_seq}");
         let key = self
             .store
@@ -2832,41 +2847,13 @@ impl EventWriter {
             PREPARED_KEY_MATERIAL_PROOF,
         );
 
-        let mut records = Vec::with_capacity(fragments.len());
+        let mut records = Vec::with_capacity(items.len());
         let mut eviction_footprint_tokens = 0u64;
-        let mut ordinal_counter: HashMap<Option<u32>, u32> = HashMap::new();
-        for fragment in fragments {
-            Self::validate_provider_context_fragment(&fragment, assistant)?;
-
-            let next = ordinal_counter.entry(fragment.wire_item_index).or_insert(1);
-            let ordinal = *next;
-            *next += 1;
-
-            let item = ProviderContextItem {
-                // Native compaction is a replacement window, not content at an
-                // assistant wire slot. Provider serializers reject an anchor on
-                // this form, so retain the MessageEnd transaction/key boundary
-                // without inventing a transcript anchor during persistence.
-                origin_message: match &fragment.payload {
-                    ProviderContextPayload::OpenAiCompactedWindow { .. }
-                    | ProviderContextPayload::AnthropicCompaction { .. } => None,
-                    ProviderContextPayload::EncryptedReasoning { .. } => {
-                        Some(ProviderContextAnchor {
-                            message_id: message_id.to_owned(),
-                            message_seq,
-                        })
-                    }
-                },
-                wire_item_index: fragment.wire_item_index,
-                ordinal,
-                provider_origin: assistant.origin.clone(),
-                payload: fragment.payload,
-            };
-
-            let wire_label = fragment
+        for item in items {
+            let wire_label = item
                 .wire_item_index
                 .map_or_else(|| "_".to_owned(), |index| index.to_string());
-            let id = format!("{message_id}:{message_seq}:{wire_label}:{ordinal}");
+            let id = format!("{message_id}:{message_seq}:{wire_label}:{}", item.ordinal);
             let idempotency_key = provider_context_idempotency_key(message_id, &item);
             let record = EncryptedProviderContextRecord::encrypt(
                 &item,
@@ -9406,7 +9393,7 @@ fn sqlite_u64(value: i64, field: &str) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{path::Path, sync::Arc};
 
     use anyhow::{Result, bail};
     use chrono::{Duration, Utc};
@@ -9424,12 +9411,17 @@ mod tests {
             ProviderTerminalKind, SteerGroup, steer_group_injection_batch,
         },
         gateway::{Command, CommandEnvelope, CommandId, SensitiveCommandPayload},
-        provider::types::{
-            ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, Message,
-            NativeCompactionCoverage, ProviderContextFragment, ProviderContextPayload,
-            ProviderEvent, ProviderOrigin, ProviderOutput, PublicAssistantContent,
-            PublicAssistantMessage, PublicMessage, RejectedToolCall, StopReason, ToolArgumentError,
-            ToolCall, ToolResultMessage, Usage, UserContent, UserMessage,
+        provider::{
+            ModelSpec, RequestOptions,
+            adapters::responses::build_request as build_responses_request,
+            types::{
+                ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, Message,
+                NativeCompactionCoverage, PromptContext, ProviderContextFragment,
+                ProviderContextPayload, ProviderEvent, ProviderOrigin, ProviderOutput,
+                PublicAssistantContent, PublicAssistantMessage, PublicMessage, RejectedToolCall,
+                StopReason, ToolArgumentError, ToolCall, ToolResultMessage, Usage, UserContent,
+                UserMessage,
+            },
         },
         runtime::contracts::{GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease},
         store::{
@@ -9544,6 +9536,13 @@ mod tests {
         Store::in_memory(scope(), test_provider())
             .await
             .expect("open test store")
+            .into()
+    }
+
+    async fn file_test_store(path: &Path) -> Arc<Store> {
+        Store::open(path, scope(), test_provider())
+            .await
+            .expect("open file-backed test store")
             .into()
     }
 
@@ -19551,7 +19550,14 @@ mod tests {
 
     #[tokio::test]
     async fn message_end_persists_encrypted_provider_context_and_eviction_tokens() {
-        let store = test_store().await;
+        let path = std::env::current_dir()
+            .expect("current package directory")
+            .join("target")
+            .join(format!(
+                "sumi-message-end-provider-context-{}.sqlite",
+                Uuid::now_v7()
+            ));
+        let store = file_test_store(&path).await;
         let writer = EventWriter::new(store.clone());
         let command_id = "00000000-0000-4000-8000-000000000073";
         let run_id = format!("run-{command_id}");
@@ -19566,19 +19572,16 @@ mod tests {
             .await
             .expect("persist user injection");
 
+        let spec = ModelSpec::preset("openai-responses").expect("Responses preset");
         let timestamp = durable_test_timestamp();
         let message = AssistantMessage {
             content: vec![AssistantContent::Text {
                 text: "answer with reasoning".to_owned(),
                 wire_item_index: 0,
             }],
-            model: "model-context".to_owned(),
-            provider: "provider-context".to_owned(),
-            origin: ProviderOrigin {
-                provider_instance_id: "provider-instance-context".to_owned(),
-                protocol: ApiProtocol::OpenAiResponses,
-                model: "model-context".to_owned(),
-            },
+            model: spec.id.clone(),
+            provider: spec.provider.clone(),
+            origin: spec.origin(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
             error_message: None,
@@ -19593,11 +19596,23 @@ mod tests {
             ProjectedProviderEvent::Started
         ));
 
+        let coverage_seq: i64 =
+            sqlx::query_scalar("SELECT seq FROM messages WHERE role = 'user' ORDER BY seq DESC")
+                .fetch_one(store.pool())
+                .await
+                .expect("load durable user message coverage");
+        let coverage_seq =
+            u64::try_from(coverage_seq).expect("durable user message coverage is positive");
         let reasoning = ProviderContextFragment {
-            wire_item_index: Some(0),
+            wire_item_index: Some(1),
             payload: ProviderContextPayload::EncryptedReasoning {
                 protocol: ApiProtocol::OpenAiResponses,
-                item: json!({"text": "plain reasoning"}),
+                item: json!({
+                    "id": "rs-durable-context",
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": "opaque-durable-reasoning",
+                }),
             },
         };
         let window = ProviderContextFragment {
@@ -19605,8 +19620,375 @@ mod tests {
             payload: ProviderContextPayload::OpenAiCompactedWindow {
                 items: vec![json!({"summary": "compact"})],
                 coverage: NativeCompactionCoverage {
-                    through_message_seq: 1,
+                    through_message_seq: coverage_seq,
                     context_fingerprint: "fp-1".to_owned(),
+                },
+            },
+        };
+        let expected_context = vec![
+            ProviderContextItem {
+                origin_message: None,
+                wire_item_index: window.wire_item_index,
+                ordinal: 0,
+                provider_origin: spec.origin(),
+                payload: window.payload.clone(),
+            },
+            ProviderContextItem {
+                origin_message: Some(ProviderContextAnchor {
+                    message_id: assistant_id.to_owned(),
+                    message_seq: 0,
+                }),
+                wire_item_index: reasoning.wire_item_index,
+                ordinal: 0,
+                provider_origin: spec.origin(),
+                payload: reasoning.payload.clone(),
+            },
+        ];
+
+        let ProjectedProviderEvent::Terminal(terminal) = projector
+            .project(ProviderEvent::Done {
+                reason: StopReason::Stop,
+                output: ProviderOutput {
+                    message,
+                    provider_context: vec![reasoning, window],
+                },
+            })
+            .expect("terminal projection")
+        else {
+            panic!("expected terminal");
+        };
+
+        let terminal_message = terminal.message().clone();
+        let terminal_write = terminal
+            .into_t12_write(run_id.clone(), turn_id.clone(), true)
+            .expect("terminal write with context");
+
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            assistant_id,
+                            &terminal_message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("assistant MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("open assistant attempt");
+
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    terminal_write,
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::turn_end(
+                                run_id.clone(),
+                                turn_id.clone(),
+                                terminal_message.clone(),
+                                Vec::new(),
+                            )
+                            .expect("TurnEnd"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(DurableEvent::agent_end(run_id.clone()).expect("AgentEnd")),
+                        projections: vec![Projection::CommandApplied {
+                            command_id: command_id.to_owned(),
+                            command_seq: 1,
+                            run_id: Some(run_id),
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("persist terminal with provider context");
+
+        let rows = sqlx::query(
+            "SELECT id, message_id, message_seq, item_ordinal, wire_item_index, kind,
+                    coverage_through_seq, context_fingerprint, eviction_tokens,
+                    key_ref, ciphertext
+             FROM provider_context
+             ORDER BY id",
+        )
+        .fetch_all(store.pool())
+        .await
+        .expect("fetch provider context rows");
+        assert_eq!(rows.len(), 2, "expected two provider-context records");
+
+        for row in &rows {
+            let ordinal: i64 = row.get("item_ordinal");
+            assert_eq!(ordinal, 0, "item_ordinal must be zero");
+        }
+
+        let kinds: Vec<String> = rows
+            .iter()
+            .map(|row| row.get::<String, _>("kind"))
+            .collect();
+        assert!(kinds.contains(&"encrypted_reasoning".to_owned()));
+        assert!(kinds.contains(&"open_ai_compacted_window".to_owned()));
+
+        let reasoning_row = rows
+            .iter()
+            .find(|row| row.get::<String, _>("kind") == "encrypted_reasoning")
+            .expect("reasoning row");
+        let reasoning_eviction: i64 = reasoning_row.get("eviction_tokens");
+        assert!(
+            reasoning_eviction > 0,
+            "encrypted reasoning must pay eviction tokens"
+        );
+
+        let window_row = rows
+            .iter()
+            .find(|row| row.get::<String, _>("kind") == "open_ai_compacted_window")
+            .expect("window row");
+        let window_eviction: i64 = window_row.get("eviction_tokens");
+        assert_eq!(
+            window_eviction, 0,
+            "compaction window has zero eviction tokens"
+        );
+        assert_eq!(
+            window_row
+                .get::<Option<String>, _>("context_fingerprint")
+                .as_deref(),
+            Some("fp-1")
+        );
+        assert_eq!(
+            window_row.get::<Option<i64>, _>("coverage_through_seq"),
+            Some(i64::try_from(coverage_seq).expect("coverage fits SQLite INTEGER"))
+        );
+
+        let message_seq: i64 = reasoning_row.get("message_seq");
+        assert!(
+            message_seq > 0,
+            "reasoning provider context must be bound to message seq"
+        );
+        assert_eq!(
+            window_row.get::<Option<String>, _>("message_id"),
+            None,
+            "native compaction must not acquire an assistant anchor"
+        );
+        assert_eq!(
+            window_row.get::<Option<i64>, _>("message_seq"),
+            None,
+            "native compaction must not acquire an assistant sequence"
+        );
+
+        // Plaintext must never appear in any textual column; ciphertext is opaque.
+        let mut leak_check = String::new();
+        for row in &rows {
+            let id: String = row.get("id");
+            let message_id: Option<String> = row.get("message_id");
+            let context_fingerprint: Option<String> = row.get("context_fingerprint");
+            leak_check.push_str(&id);
+            if let Some(value) = message_id {
+                leak_check.push_str(&value);
+            }
+            if let Some(value) = context_fingerprint {
+                leak_check.push_str(&value);
+            }
+        }
+        for secret in ["opaque-durable-reasoning", "compact"] {
+            assert!(
+                !leak_check.contains(secret),
+                "provider_context textual columns leaked plaintext: {secret}"
+            );
+        }
+
+        // Round-trip: decrypt each record and verify it matches the original item.
+        for row in &rows {
+            let id: String = row.get("id");
+            let key_ref: String = row.get("key_ref");
+            let ciphertext: Vec<u8> = row.get("ciphertext");
+            let data_key = store
+                .data_key_by_ref(&key_ref)
+                .await
+                .expect("provider-context data key");
+            let aad =
+                store
+                    .scope()
+                    .row_aad("provider_context", &id, DataKeyPurpose::ProviderContext);
+            let plaintext = decrypt_content(&data_key, &ciphertext, &aad)
+                .expect("decrypt provider-context ciphertext");
+            let item: ProviderContextItem =
+                serde_json::from_slice(&plaintext).expect("deserialize provider-context plaintext");
+            match &item.payload {
+                ProviderContextPayload::EncryptedReasoning { item, .. } => {
+                    assert_eq!(
+                        item.get("encrypted_content"),
+                        Some(&json!("opaque-durable-reasoning"))
+                    );
+                }
+                ProviderContextPayload::OpenAiCompactedWindow { items, .. } => {
+                    assert_eq!(items, &vec![json!({"summary": "compact"})]);
+                }
+                _ => panic!("unexpected provider-context payload"),
+            }
+        }
+
+        let message_seq = u64::try_from(message_seq).expect("positive SQLite message sequence");
+        let mut expected_context = expected_context;
+        for item in &mut expected_context {
+            if let Some(anchor) = item.origin_message.as_mut() {
+                anchor.message_seq = message_seq;
+            }
+        }
+        drop(writer);
+        store.pool().close().await;
+        drop(store);
+        let reopened = file_test_store(&path).await;
+        let lease = test_lease(1);
+        let fence = test_fence(&lease);
+        let hydrated = match reopened
+            .hydrate(&lease, &fence)
+            .await
+            .expect("canonical cold-boot hydration after MessageEnd reopen")
+        {
+            HydrationOutcome::Complete(state) => state,
+            HydrationOutcome::RecoveryRequired(_) => {
+                panic!("completed assistant turn must not require physical recovery")
+            }
+        };
+        assert_eq!(hydrated.provider_context, expected_context);
+
+        let mut second_turn_messages = hydrated.messages.clone();
+        second_turn_messages.push(ContextMessage::Synthetic {
+            message: Message::User(UserMessage {
+                content: vec![UserContent::Text {
+                    text: "continue after restart".to_owned(),
+                }],
+                timestamp: durable_test_timestamp(),
+            }),
+        });
+        let second_turn = build_responses_request(
+            &spec,
+            &PromptContext {
+                system_prompt: "continue the durable conversation".to_owned(),
+                memory_blocks: Vec::new(),
+                messages: second_turn_messages,
+                provider_context: hydrated.provider_context,
+                tools: Vec::new(),
+            },
+            &RequestOptions::default(),
+        )
+        .expect("build second-turn Responses request from canonical HydratedRunState");
+        let second_turn_wire = second_turn.to_string();
+        assert_eq!(second_turn["store"], false);
+        assert!(second_turn_wire.contains("opaque-durable-reasoning"));
+        assert!(second_turn_wire.contains("continue after restart"));
+
+        sqlx::query(
+            "UPDATE provider_context
+             SET provider_instance_id = 'tampered-provider-origin'
+             WHERE kind = 'encrypted_reasoning'",
+        )
+        .execute(reopened.pool())
+        .await
+        .expect("tamper stored provider origin after successful restart proof");
+        let error = reopened
+            .hydrate(&lease, &fence)
+            .await
+            .expect_err("canonical hydration must reject tampered provider origin metadata");
+        assert!(
+            error
+                .to_string()
+                .contains("stored provider origin does not match authenticated plaintext origin"),
+            "{error:#}"
+        );
+        reopened.pool().close().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    }
+
+    #[tokio::test]
+    async fn message_end_opaque_provider_context_does_not_leak_to_public_transcript() {
+        let path = std::env::current_dir()
+            .expect("current package directory")
+            .join("target")
+            .join(format!(
+                "sumi-message-end-opaque-leak-{}.sqlite",
+                Uuid::now_v7()
+            ));
+        let store = file_test_store(&path).await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000079";
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let injected =
+            classified_injection(&writer, 1, command_id, "ignored", "leak fixture").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "ignored", "leak fixture"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("persist user injection");
+
+        let timestamp = durable_test_timestamp();
+        let message = AssistantMessage {
+            content: vec![AssistantContent::Text {
+                text: "visible answer".to_owned(),
+                wire_item_index: 0,
+            }],
+            model: "model-leak".to_owned(),
+            provider: "provider-leak".to_owned(),
+            origin: ProviderOrigin {
+                provider_instance_id: "provider-instance-leak".to_owned(),
+                protocol: ApiProtocol::OpenAiResponses,
+                model: "model-leak".to_owned(),
+            },
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp,
+        };
+        let assistant_id = "assistant-with-opaque";
+        let mut projector = ProviderEventProjector::new(assistant_id).expect("projector");
+        assert!(matches!(
+            projector.project(ProviderEvent::Start).expect("Start"),
+            ProjectedProviderEvent::Started
+        ));
+
+        let reasoning_marker = "OPAQUE_PROVIDER_REASONING_a1b2c3d4";
+        let compact_marker = "OPAQUE_PROVIDER_COMPACT_e5f6a7b8";
+
+        let reasoning = ProviderContextFragment {
+            wire_item_index: Some(0),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiResponses,
+                item: json!({
+                    "text": reasoning_marker,
+                    "encrypted_content": reasoning_marker,
+                }),
+            },
+        };
+        let window = ProviderContextFragment {
+            wire_item_index: None,
+            payload: ProviderContextPayload::OpenAiCompactedWindow {
+                items: vec![json!({
+                    "summary": compact_marker,
+                    "encrypted_content": compact_marker,
+                })],
+                coverage: NativeCompactionCoverage {
+                    through_message_seq: 1,
+                    context_fingerprint: "fp-2".to_owned(),
                 },
             },
         };
@@ -19663,7 +20045,7 @@ mod tests {
                             DurableEvent::turn_end(
                                 run_id.clone(),
                                 turn_id.clone(),
-                                terminal_message,
+                                terminal_message.clone(),
                                 Vec::new(),
                             )
                             .expect("TurnEnd"),
@@ -19682,126 +20064,64 @@ mod tests {
                 injected_commands: Vec::new(),
             })
             .await
-            .expect("persist terminal with provider context");
+            .expect("persist terminal with opaque provider context");
 
-        let rows = sqlx::query(
-            "SELECT id, message_id, message_seq, item_ordinal, wire_item_index, kind,
-                    coverage_through_seq, context_fingerprint, eviction_tokens,
-                    key_ref, ciphertext
-             FROM provider_context
-             ORDER BY id",
-        )
-        .fetch_all(store.pool())
-        .await
-        .expect("fetch provider context rows");
-        assert_eq!(rows.len(), 2, "expected two provider-context records");
-
-        for row in &rows {
-            let ordinal: i64 = row.get("item_ordinal");
-            assert!(ordinal >= 1, "item_ordinal must be positive");
-        }
-
-        let kinds: Vec<String> = rows
-            .iter()
-            .map(|row| row.get::<String, _>("kind"))
-            .collect();
-        assert!(kinds.contains(&"encrypted_reasoning".to_owned()));
-        assert!(kinds.contains(&"open_ai_compacted_window".to_owned()));
-
-        let reasoning_row = rows
-            .iter()
-            .find(|row| row.get::<String, _>("kind") == "encrypted_reasoning")
-            .expect("reasoning row");
-        let reasoning_eviction: i64 = reasoning_row.get("eviction_tokens");
+        // Ensure the public transcript actually recorded the visible assistant message.
+        let message_payload: String =
+            sqlx::query_scalar("SELECT payload FROM messages WHERE id=? AND role='assistant'")
+                .bind(assistant_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("durable message projection");
         assert!(
-            reasoning_eviction > 0,
-            "encrypted reasoning must pay eviction tokens"
+            message_payload.contains("visible answer"),
+            "public payload must contain the visible assistant text"
         );
 
-        let window_row = rows
-            .iter()
-            .find(|row| row.get::<String, _>("kind") == "open_ai_compacted_window")
-            .expect("window row");
-        let window_eviction: i64 = window_row.get("eviction_tokens");
-        assert_eq!(
-            window_eviction, 0,
-            "compaction window has zero eviction tokens"
-        );
-        assert_eq!(
-            window_row
-                .get::<Option<String>, _>("context_fingerprint")
-                .as_deref(),
-            Some("fp-1")
-        );
-        assert_eq!(
-            window_row.get::<Option<i64>, _>("coverage_through_seq"),
-            Some(1)
-        );
+        for marker in [reasoning_marker, compact_marker] {
+            let like = format!("%{marker}%");
 
-        let message_seq: i64 = reasoning_row.get("message_seq");
-        assert!(
-            message_seq > 0,
-            "reasoning provider context must be bound to message seq"
-        );
-        assert_eq!(
-            window_row.get::<Option<String>, _>("message_id"),
-            None,
-            "native compaction must not acquire an assistant anchor"
-        );
-        assert_eq!(
-            window_row.get::<Option<i64>, _>("message_seq"),
-            None,
-            "native compaction must not acquire an assistant sequence"
-        );
+            let message_hits: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM messages WHERE payload LIKE ? OR search_text LIKE ?",
+            )
+            .bind(&like)
+            .bind(&like)
+            .fetch_one(store.pool())
+            .await
+            .expect("scan messages for opaque marker");
 
-        // Plaintext must never appear in any textual column; ciphertext is opaque.
-        let mut leak_check = String::new();
-        for row in &rows {
-            let id: String = row.get("id");
-            let message_id: Option<String> = row.get("message_id");
-            let context_fingerprint: Option<String> = row.get("context_fingerprint");
-            leak_check.push_str(&id);
-            if let Some(value) = message_id {
-                leak_check.push_str(&value);
-            }
-            if let Some(value) = context_fingerprint {
-                leak_check.push_str(&value);
-            }
-        }
-        for secret in ["plain reasoning", "compact"] {
-            assert!(
-                !leak_check.contains(secret),
-                "provider_context textual columns leaked plaintext: {secret}"
+            let event_hits: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE envelope LIKE ?")
+                    .bind(&like)
+                    .fetch_one(store.pool())
+                    .await
+                    .expect("scan agent_events for opaque marker");
+
+            let fts_hits: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM messages_fts WHERE search_text LIKE ?")
+                    .bind(&like)
+                    .fetch_one(store.pool())
+                    .await
+                    .expect("scan messages_fts for opaque marker");
+
+            assert_eq!(
+                message_hits, 0,
+                "opaque provider bytes leaked into messages.payload or search_text: {marker}"
+            );
+            assert_eq!(
+                event_hits, 0,
+                "opaque provider bytes leaked into agent_events.envelope: {marker}"
+            );
+            assert_eq!(
+                fts_hits, 0,
+                "opaque provider bytes leaked into messages_fts: {marker}"
             );
         }
 
-        // Round-trip: decrypt each record and verify it matches the original item.
-        for row in &rows {
-            let id: String = row.get("id");
-            let key_ref: String = row.get("key_ref");
-            let ciphertext: Vec<u8> = row.get("ciphertext");
-            let data_key = store
-                .data_key_by_ref(&key_ref)
-                .await
-                .expect("provider-context data key");
-            let aad =
-                store
-                    .scope()
-                    .row_aad("provider_context", &id, DataKeyPurpose::ProviderContext);
-            let plaintext = decrypt_content(&data_key, &ciphertext, &aad)
-                .expect("decrypt provider-context ciphertext");
-            let item: ProviderContextItem =
-                serde_json::from_slice(&plaintext).expect("deserialize provider-context plaintext");
-            match &item.payload {
-                ProviderContextPayload::EncryptedReasoning { item, .. } => {
-                    assert_eq!(item.get("text"), Some(&json!("plain reasoning")));
-                }
-                ProviderContextPayload::OpenAiCompactedWindow { items, .. } => {
-                    assert_eq!(items, &vec![json!({"summary": "compact"})]);
-                }
-                _ => panic!("unexpected provider-context payload"),
-            }
-        }
+        store.pool().close().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
     }
 
     #[cfg(not(unix))]
