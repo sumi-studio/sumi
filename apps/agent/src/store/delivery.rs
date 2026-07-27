@@ -88,7 +88,6 @@ impl DeliveryChannelBuilder {
 
 enum PumpState {
     Idle,
-    CatchingUp { epoch: DeliveryEpoch },
     Online { epoch: DeliveryEpoch },
 }
 
@@ -110,7 +109,7 @@ impl DeliveryPump {
     pub(crate) fn epoch(&self) -> Option<&DeliveryEpoch> {
         match &self.state {
             PumpState::Idle => None,
-            PumpState::CatchingUp { epoch } | PumpState::Online { epoch } => Some(epoch),
+            PumpState::Online { epoch } => Some(epoch),
         }
     }
 
@@ -118,39 +117,10 @@ impl DeliveryPump {
         matches!(self.state, PumpState::Online { .. })
     }
 
-    pub(crate) async fn install_epoch(
-        &mut self,
-        epoch: DeliveryEpoch,
-        catch_up_from_seq: u64,
-    ) -> Result<()> {
-        if catch_up_from_seq == 0 {
-            bail!("catch-up must start from a positive next-seq");
-        }
-        self.state = PumpState::CatchingUp { epoch };
-
-        let head_seq = match current_event_head_seq(self.store.pool()).await {
-            Ok(seq) => seq,
-            Err(err) => {
-                self.state = PumpState::Idle;
-                return Err(err);
-            }
-        };
-        if head_seq >= catch_up_from_seq
-            && let Err(err) = send_event_range(
-                &self.store,
-                &self.channel,
-                &epoch,
-                catch_up_from_seq,
-                head_seq,
-            )
-            .await
-        {
-            self.state = PumpState::Idle;
-            return Err(err);
-        }
-
+    /// Install the live-delivery epoch. Initial durable replay is owned by the
+    /// supervisor writer, which reads bounded pages from `DurableSource`.
+    pub(crate) fn install_epoch(&mut self, epoch: DeliveryEpoch) {
         self.state = PumpState::Online { epoch };
-        Ok(())
     }
 
     pub(crate) fn invalidate_epoch(&mut self, epoch: DeliveryEpoch) -> bool {
@@ -163,7 +133,7 @@ impl DeliveryPump {
 
     pub(crate) async fn on_durable_committed(&mut self, seq: u64) -> Result<()> {
         let epoch = match &self.state {
-            PumpState::Idle | PumpState::CatchingUp { .. } => return Ok(()),
+            PumpState::Idle => return Ok(()),
             PumpState::Online { epoch } => *epoch,
         };
         if let Err(err) = send_event_range(&self.store, &self.channel, &epoch, seq, seq).await {
@@ -179,7 +149,7 @@ impl DeliveryPump {
         }
         let epoch = match &self.state {
             PumpState::Online { epoch } => *epoch,
-            PumpState::Idle | PumpState::CatchingUp { .. } => return Ok(()),
+            PumpState::Idle => return Ok(()),
         };
         if matches!(self.channel.mode, DeliveryMode::RedactionOnly) {
             return Ok(());
@@ -400,7 +370,8 @@ mod tests {
         let (channel, mut receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
         let mut pump = DeliveryPump::new(store.clone(), channel);
         let epoch = DeliveryEpoch::for_test("epoch-1");
-        pump.install_epoch(epoch, 1).await.unwrap();
+        pump.install_epoch(epoch);
+        pump.on_durable_committed(1).await.unwrap();
 
         let frame = timeout(Duration::from_secs(1), receiver.recv())
             .await
@@ -426,9 +397,8 @@ mod tests {
         let (channel, mut receiver) =
             DeliveryChannelBuilder::with_mode(DeliveryMode::RedactionOnly).build();
         let mut pump = DeliveryPump::new(store.clone(), channel);
-        pump.install_epoch(DeliveryEpoch::for_test("epoch-1"), 1)
-            .await
-            .unwrap();
+        pump.install_epoch(DeliveryEpoch::for_test("epoch-1"));
+        pump.on_durable_committed(1).await.unwrap();
 
         let frame = timeout(Duration::from_secs(1), receiver.recv())
             .await
@@ -450,7 +420,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn volatiles_dropped_while_offline_and_catch_up_discards_deltas() {
+    async fn install_does_not_replay_backlog_and_offline_volatiles_are_dropped() {
         let store = store().await;
         let event = assistant_event("msg-1", "first");
         insert_test_durable_event(&store, 1, &event).await.unwrap();
@@ -477,18 +447,14 @@ mod tests {
         let event2 = assistant_event("msg-2", "second");
         insert_test_durable_event(&store, 2, &event2).await.unwrap();
 
-        pump.install_epoch(DeliveryEpoch::for_test("epoch-1"), 1)
-            .await
-            .unwrap();
+        pump.install_epoch(DeliveryEpoch::for_test("epoch-1"));
 
-        let mut seqs = Vec::new();
-        while let Ok(Some(frame)) = timeout(Duration::from_millis(200), receiver.recv()).await {
-            match frame {
-                DeliveryFrame::Durable { seq, .. } => seqs.push(seq),
-                DeliveryFrame::Volatile { .. } => panic!("volatile must not appear in catch-up"),
-            }
-        }
-        assert_eq!(seqs, vec![1, 2]);
+        assert!(
+            timeout(Duration::from_millis(100), receiver.recv())
+                .await
+                .is_err(),
+            "DeliveryPump install must not duplicate supervisor-owned catch-up"
+        );
 
         let event3 = assistant_event("msg-3", "third");
         insert_test_durable_event(&store, 3, &event3).await.unwrap();
@@ -515,9 +481,8 @@ mod tests {
         insert_test_durable_event(&store, 1, &assistant_event("msg-1", "a"))
             .await
             .unwrap();
-        pump.install_epoch(DeliveryEpoch::for_test("epoch-1"), 1)
-            .await
-            .unwrap();
+        pump.install_epoch(DeliveryEpoch::for_test("epoch-1"));
+        pump.on_durable_committed(1).await.unwrap();
 
         let event2 = assistant_event("msg-2", "b");
         insert_test_durable_event(&store, 2, &event2).await.unwrap();
@@ -543,7 +508,8 @@ mod tests {
         let (channel, mut receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
         let mut pump = DeliveryPump::new(store.clone(), channel);
         let epoch = DeliveryEpoch::for_test("epoch-1");
-        pump.install_epoch(epoch, 1).await.unwrap();
+        pump.install_epoch(epoch);
+        pump.on_durable_committed(1).await.unwrap();
         receiver.recv().await.unwrap();
         assert!(pump.is_online());
 
@@ -570,9 +536,8 @@ mod tests {
 
         let (channel, mut receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
         let mut pump = DeliveryPump::new(store.clone(), channel);
-        pump.install_epoch(DeliveryEpoch::for_test("epoch-1"), 1)
-            .await
-            .unwrap();
+        pump.install_epoch(DeliveryEpoch::for_test("epoch-1"));
+        pump.on_durable_committed(1).await.unwrap();
         assert!(pump.is_online());
         receiver.recv().await.unwrap();
 
@@ -606,7 +571,8 @@ mod tests {
             .await
             .unwrap();
         let epoch_1 = DeliveryEpoch::for_test("epoch-1");
-        pump.install_epoch(epoch_1, 1).await.unwrap();
+        pump.install_epoch(epoch_1);
+        pump.on_durable_committed(1).await.unwrap();
         receiver.recv().await.unwrap();
 
         assert!(pump.invalidate_epoch(epoch_1));
@@ -620,14 +586,13 @@ mod tests {
                 .is_err()
         );
 
-        pump.install_epoch(DeliveryEpoch::for_test("epoch-2"), 1)
-            .await
-            .unwrap();
-        let mut count = 0;
-        while let Ok(Some(_)) = timeout(Duration::from_millis(200), receiver.recv()).await {
-            count += 1;
+        let epoch_2 = DeliveryEpoch::for_test("epoch-2");
+        pump.install_epoch(epoch_2);
+        pump.on_durable_committed(2).await.unwrap();
+        match receiver.recv().await.unwrap() {
+            DeliveryFrame::Durable { seq: 2, epoch, .. } => assert_eq!(epoch, epoch_2),
+            other => panic!("unexpected frame {other:?}"),
         }
-        assert_eq!(count, 2);
     }
 
     #[tokio::test]
@@ -636,9 +601,7 @@ mod tests {
         let (channel, mut receiver) =
             DeliveryChannelBuilder::with_mode(DeliveryMode::RedactionOnly).build();
         let mut pump = DeliveryPump::new(store.clone(), channel);
-        pump.install_epoch(DeliveryEpoch::for_test("epoch-1"), 1)
-            .await
-            .unwrap();
+        pump.install_epoch(DeliveryEpoch::for_test("epoch-1"));
 
         pump.on_volatile(AgentEvent::MessageUpdate {
             message_id: "msg-1".to_owned(),
@@ -680,7 +643,7 @@ mod tests {
         let mut pump = DeliveryPump::new(store.clone(), channel);
 
         let epoch_a = DeliveryEpoch::for_test("epoch-a");
-        pump.install_epoch(epoch_a, 1).await.unwrap();
+        pump.install_epoch(epoch_a);
 
         let volatile_a = AgentEvent::MessageUpdate {
             message_id: "msg-a".to_owned(),
@@ -699,7 +662,8 @@ mod tests {
             .unwrap();
 
         let epoch_b = DeliveryEpoch::for_test("epoch-b");
-        pump.install_epoch(epoch_b, 1).await.unwrap();
+        pump.install_epoch(epoch_b);
+        pump.on_durable_committed(1).await.unwrap();
 
         let volatile_b = AgentEvent::MessageUpdate {
             message_id: "msg-b".to_owned(),
@@ -753,9 +717,8 @@ mod tests {
 
         let (channel, _receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
         let mut pump = DeliveryPump::new(store.clone(), channel);
-        let result = pump
-            .install_epoch(DeliveryEpoch::for_test("epoch-1"), 1)
-            .await;
+        pump.install_epoch(DeliveryEpoch::for_test("epoch-1"));
+        let result = pump.on_durable_committed(1).await;
         assert!(result.is_err(), "raw decrypt failure must propagate");
         assert!(
             pump.epoch().is_none(),
@@ -787,9 +750,8 @@ mod tests {
 
         let (channel, _receiver) = DeliveryChannelBuilder::with_mode(DeliveryMode::Raw).build();
         let mut pump = DeliveryPump::new(store.clone(), channel);
-        let result = pump
-            .install_epoch(DeliveryEpoch::for_test("epoch-1"), 1)
-            .await;
+        pump.install_epoch(DeliveryEpoch::for_test("epoch-1"));
+        let result = pump.on_durable_committed(1).await;
         let message = result.expect_err("invalid json must fail").to_string();
         assert!(
             !message.contains("this-is-not-valid-json-and-must-not-leak"),

@@ -89,6 +89,8 @@ pub struct T17StoreAdapter {
     store: Arc<Store>,
     pump: Arc<tokio::sync::Mutex<DeliveryPump>>,
     delivery_rx: Arc<Mutex<Option<mpsc::Receiver<DeliveryFrame>>>>,
+    #[cfg(test)]
+    replay_page_lengths: Arc<Mutex<Vec<usize>>>,
 }
 
 impl fmt::Debug for T17StoreAdapter {
@@ -104,6 +106,8 @@ impl T17StoreAdapter {
             store: store.clone(),
             pump: Arc::new(tokio::sync::Mutex::new(DeliveryPump::new(store, channel))),
             delivery_rx: Arc::new(Mutex::new(Some(delivery_rx))),
+            #[cfg(test)]
+            replay_page_lengths: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -158,6 +162,11 @@ impl T17StoreAdapter {
     pub(crate) async fn active_delivery_epoch(&self) -> Option<DeliveryEpoch> {
         self.pump.lock().await.epoch().copied()
     }
+
+    #[cfg(test)]
+    pub(crate) fn replay_page_lengths(&self) -> Vec<usize> {
+        self.replay_page_lengths.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
@@ -169,7 +178,7 @@ impl DurableSource for T17StoreAdapter {
     }
 
     async fn events_after(&self, after_seq: u64, limit: usize) -> Result<Vec<OutboundFrame>> {
-        raw_events_after(&self.store, after_seq, limit)
+        let page: Vec<_> = raw_events_after(&self.store, after_seq, limit)
             .await?
             .into_iter()
             .map(|(seq, event)| {
@@ -182,7 +191,10 @@ impl DurableSource for T17StoreAdapter {
                     },
                 })
             })
-            .collect()
+            .collect::<Result<_>>()?;
+        #[cfg(test)]
+        self.replay_page_lengths.lock().unwrap().push(page.len());
+        Ok(page)
     }
 
     async fn command_cursors(&self) -> Result<CommandCursors> {
@@ -224,15 +236,12 @@ impl DurableSource for T17StoreAdapter {
     async fn install_delivery_epoch(
         &self,
         epoch: DeliveryEpoch,
-        catch_up_from_seq: u64,
+        _catch_up_from_seq: u64,
         sink: EventSender,
     ) -> Result<()> {
         self.start_forwarder(sink);
-        self.pump
-            .lock()
-            .await
-            .install_epoch(epoch, catch_up_from_seq)
-            .await
+        self.pump.lock().await.install_epoch(epoch);
+        Ok(())
     }
 
     async fn invalidate_delivery_epoch(&self, epoch: DeliveryEpoch) -> Result<()> {

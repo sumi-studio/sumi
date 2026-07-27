@@ -42,6 +42,12 @@ pub struct ConnectionEpoch(u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DeliveryEpoch(u64);
 
+/// Normal terminal boundary for a local single-connection transport.
+/// WebSocket closure continues to use `GatewayClosed` and remains reconnectable.
+#[derive(Debug, thiserror::Error)]
+#[error("single-connection gateway reached terminal EOF")]
+pub(crate) struct TerminalGatewayClosed;
+
 impl DeliveryEpoch {
     pub const fn as_u64(self) -> u64 {
         self.0
@@ -823,13 +829,16 @@ where
 
         match (reader_result, writer_result) {
             (Ok(()), Ok(())) => on_both_ok(),
+            (Err(ReaderError::Terminal), Ok(())) => Ok(()),
             (Err(ReaderError::Fatal(e)), _) => Err(SupervisorError::Fatal(e)),
-            (Err(ReaderError::Reconnect(e)), _) | (_, Err(e)) => {
-                Err(SupervisorError::EstablishedReconnect {
-                    reason: format!("epoch task error: {e}"),
-                    healthy: false,
-                })
-            }
+            (Err(ReaderError::Reconnect(e)), _) => Err(SupervisorError::EstablishedReconnect {
+                reason: format!("epoch task error: {e}"),
+                healthy: false,
+            }),
+            (_, Err(e)) => Err(SupervisorError::EstablishedReconnect {
+                reason: format!("epoch task error: {e}"),
+                healthy: false,
+            }),
         }
     }
 
@@ -942,16 +951,20 @@ async fn validate_hello<S: DurableSource>(
     // The API may not have durably recorded a terminal ACK that the agent
     // already committed. In that case it must restart replay at that locally
     // terminal command so the durable consumer can return the saved
-    // Applied/Superseded/Rejected ACK. Only zero (command seq starts at one) or
-    // a claim beyond the complete received prefix is impossible.
-    let max_next_command_seq = command_cursor.received.checked_add(1).ok_or_else(|| {
-        SupervisorError::Fatal(anyhow::Error::new(DurableReplayInvariantError::new(
-            format!(
-                "command received cursor overflow: received={}",
-                command_cursor.received
-            ),
-        )))
-    })?;
+    // Applied/Superseded/Rejected ACK. Older positive cursors remain valid for
+    // terminal ACK recovery, but the peer may not skip the first command that
+    // was nonterminal in the AgentHello snapshot.
+    let max_next_command_seq = agent
+        .last_applied_command_seq
+        .checked_add(1)
+        .ok_or_else(|| {
+            SupervisorError::Fatal(anyhow::Error::new(DurableReplayInvariantError::new(
+                format!(
+                    "command applied cursor overflow: applied={}",
+                    agent.last_applied_command_seq
+                ),
+            )))
+        })?;
     if api.next_command_seq == 0 || api.next_command_seq > max_next_command_seq {
         return Err(SupervisorError::Fatal(anyhow!(
             "command cursor claim outside durable bounds: next_command_seq {} not in 1..={}; agent_applied={}, received={}",
@@ -995,6 +1008,8 @@ impl DurableReplayInvariantError {
 /// to reconnect or fail closed.
 #[derive(Debug, thiserror::Error)]
 enum ReaderError {
+    #[error("terminal single-connection EOF")]
+    Terminal,
     #[error("fatal reader error: {0}")]
     Fatal(#[source] anyhow::Error),
     #[error("reconnectable reader error: {0}")]
@@ -1003,7 +1018,11 @@ enum ReaderError {
 
 impl From<anyhow::Error> for ReaderError {
     fn from(e: anyhow::Error) -> Self {
-        ReaderError::Reconnect(e)
+        if e.is::<DurableReplayInvariantError>() {
+            ReaderError::Fatal(e)
+        } else {
+            ReaderError::Reconnect(e)
+        }
     }
 }
 
@@ -1697,6 +1716,9 @@ where
                                 break 'task Err(ReaderError::Fatal(anyhow!("max pending commands before hydration reached")));
                             }
                         }
+                        Some(Err(e)) if e.is::<TerminalGatewayClosed>() => {
+                            break 'task Err(ReaderError::Terminal)
+                        }
                         Some(Err(e)) if e.is::<GatewayClosed>() => break 'task Ok(()),
                         Some(Err(e)) => break 'task Err(ReaderError::Reconnect(e)),
                         None => break 'task Err(ReaderError::Reconnect(anyhow!("command reader closed unexpectedly"))),
@@ -1743,7 +1765,11 @@ async fn send_validated(
             // seq < next_expected is a legitimate retransmission; the durable consumer
             // (EventWriter) deduplicates by command_id and re-ACKs the same canonical seq.
             if seq == next_expected {
-                Ok(next_expected.saturating_add(1))
+                next_expected.checked_add(1).ok_or_else(|| {
+                    anyhow::Error::new(DurableReplayInvariantError::new(
+                        "command sequence exhausted after forwarding u64::MAX",
+                    ))
+                })
             } else {
                 Ok(next_expected)
             }
@@ -1838,7 +1864,7 @@ mod tests {
     use tokio::sync::{mpsc, watch};
 
     use super::*;
-    use crate::gateway::stdio::SingleConnectionConnector;
+    use crate::gateway::stdio::{InjectedStdioGateway, SingleConnectionConnector};
     use crate::gateway::wire::to_wire_frame;
     use crate::gateway::{
         Command, CommandAck, CommandAckStatus, CommandEnvelope, CommandId, CommandRejectReason,
@@ -2202,6 +2228,44 @@ mod tests {
                 accepted_generation,
                 last_received_event_seq: self.last_received_event_seq,
                 next_command_seq: hello.last_applied_command_seq.saturating_add(1),
+            })
+        }
+
+        fn split(self) -> (Self::Reader, Self::Writer) {
+            (self.reader, self.writer)
+        }
+    }
+
+    struct FixedNextGateway {
+        next_command_seq: u64,
+        reader: MockGatewayReader,
+        writer: MockGatewayWriter,
+    }
+
+    impl FixedNextGateway {
+        fn new(next_command_seq: u64, commands: VecDeque<Result<InboundCommand>>) -> Self {
+            let gateway = MockGateway::new(commands);
+            Self {
+                next_command_seq,
+                reader: gateway.reader,
+                writer: gateway.writer,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Gateway for FixedNextGateway {
+        type Reader = MockGatewayReader;
+        type Writer = MockGatewayWriter;
+
+        async fn authenticate_hello(
+            &mut self,
+            hello: AgentHello,
+        ) -> std::result::Result<ApiHello, HelloError> {
+            Ok(ApiHello {
+                accepted_generation: hello.generation,
+                last_received_event_seq: 0,
+                next_command_seq: self.next_command_seq,
             })
         }
 
@@ -2817,9 +2881,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_validated_saturates_at_maximum_command_sequence() {
+    async fn send_validated_forwards_maximum_then_returns_typed_exhaustion() {
         let (mut tx, mut rx) = mpsc::channel::<InboundCommand>(1);
-        let next = send_validated(
+        let error = send_validated(
             valid_command(u64::MAX, "00000000-0000-4000-8000-000000000001"),
             u64::MAX,
             &mut tx,
@@ -2827,8 +2891,8 @@ mod tests {
             None,
         )
         .await
-        .expect("maximum command sequence is accepted");
-        assert_eq!(next, u64::MAX);
+        .expect_err("maximum command sequence must exhaust the cursor");
+        assert!(error.is::<DurableReplayInvariantError>());
         assert_eq!(inbound_command_seq(&rx.recv().await.unwrap()), u64::MAX);
     }
 
@@ -3172,6 +3236,30 @@ mod tests {
             "supervisor must stop on a fatal connector error"
         );
         assert!(result.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn stdio_single_connection_eof_is_terminal_success() {
+        let gateway = InjectedStdioGateway::new(
+            tokio::io::BufReader::new(tokio::io::empty()),
+            tokio::io::sink(),
+            Arc::new(TestDigestFactory),
+        );
+        let supervisor = ConnectionSupervisor::new(
+            SingleConnectionConnector::new(gateway),
+            CountingCredentialProvider::new("token"),
+            MockDurableSource::new(CommandCursors::default()),
+            StaticHydrationLatch(HydrationReady {
+                generation: ProcessGeneration::from_wire(7).unwrap(),
+                receipt_identity: "receipt-1".to_owned(),
+            }),
+            make_config(),
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), supervisor.start().join())
+            .await
+            .expect("stdio EOF must terminate promptly")
+            .expect("stdio EOF must be a successful terminal boundary");
     }
 
     #[tokio::test]
@@ -3944,7 +4032,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_hello_command_cursor_requires_nonzero_and_received_upper_bound() {
+    async fn validate_hello_command_cursor_cannot_skip_nonterminal_prefix() {
         let cursor = CommandCursors {
             received: 10,
             applied: 5,
@@ -4001,26 +4089,30 @@ mod tests {
             .await
             .unwrap();
 
-        // Any cursor through received+1 is a valid replay/catch-up boundary.
+        // A cursor after applied+1 skips a locally nonterminal command.
         let api = ApiHello {
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 7,
         };
-        validate_hello(&StaticSource(cursor), &agent, &api)
-            .await
-            .expect("next_command_seq within the received range must be allowed");
+        assert!(
+            validate_hello(&StaticSource(cursor), &agent, &api)
+                .await
+                .is_err()
+        );
 
         let api = ApiHello {
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
             next_command_seq: 11,
         };
-        validate_hello(&StaticSource(cursor), &agent, &api)
-            .await
-            .expect("received+1 must be allowed");
+        assert!(
+            validate_hello(&StaticSource(cursor), &agent, &api)
+                .await
+                .is_err()
+        );
 
-        // Ahead of received+1 skips a durable command and is fatal.
+        // Ahead of received+1 is also fatal.
         let api = ApiHello {
             accepted_generation: agent.generation,
             last_received_event_seq: 0,
@@ -4043,6 +4135,32 @@ mod tests {
                 .await
                 .is_err(),
             "command seq zero must be fatal"
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_rejects_hello_that_skips_nonterminal_commands() {
+        let cursor = CommandCursors {
+            received: 10,
+            applied: 5,
+        };
+        let supervisor = ConnectionSupervisor::new(
+            SingleConnectionConnector::new(FixedNextGateway::new(7, VecDeque::new())),
+            CountingCredentialProvider::new("token"),
+            MockDurableSource::new(cursor),
+            StaticHydrationLatch(HydrationReady {
+                generation: ProcessGeneration::from_wire(7).unwrap(),
+                receipt_identity: "receipt-1".to_owned(),
+            }),
+            make_config(),
+        );
+        let error = tokio::time::timeout(Duration::from_secs(1), supervisor.start().join())
+            .await
+            .expect("invalid hello must terminate promptly")
+            .expect_err("skipping seq 6 must be fatal");
+        assert!(
+            format!("{error:#}").contains("outside durable bounds"),
+            "unexpected error: {error:#}"
         );
     }
 
@@ -4198,12 +4316,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_hello_command_received_cursor_u64_max_fail_closed() {
-        // received = u64::MAX leaves no room for a legal next_command_seq
-        // (received + 1 would overflow). The validation must fail closed.
+    async fn validate_hello_command_applied_cursor_u64_max_fail_closed() {
+        // applied = u64::MAX leaves no room for a legal next_command_seq.
         let cursor = CommandCursors {
             received: u64::MAX,
-            applied: u64::MAX - 1,
+            applied: u64::MAX,
         };
         let agent = AgentHello {
             agent_id: "test".to_owned(),
@@ -4219,13 +4336,50 @@ mod tests {
         };
         let error = validate_hello(&MockDurableSource::new(cursor), &agent, &api)
             .await
-            .expect_err("received cursor at u64::MAX must fail closed");
+            .expect_err("applied cursor at u64::MAX must fail closed");
         assert!(
             matches!(
                 &error,
                 SupervisorError::Fatal(error) if error.is::<DurableReplayInvariantError>()
             ),
             "cursor exhaustion must preserve the typed permanent failure: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_forwards_u64_max_once_then_fails_typed_permanent() {
+        let command_id = "00000000-0000-4000-8000-000000000001";
+        let gateway = FixedNextGateway::new(
+            u64::MAX,
+            VecDeque::from([Ok(valid_command(u64::MAX, command_id))]),
+        );
+        let supervisor = ConnectionSupervisor::new(
+            SingleConnectionConnector::new(gateway),
+            CountingCredentialProvider::new("token"),
+            MockDurableSource::new(CommandCursors {
+                received: u64::MAX - 1,
+                applied: u64::MAX - 1,
+            }),
+            StaticHydrationLatch(HydrationReady {
+                generation: ProcessGeneration::from_wire(7).unwrap(),
+                receipt_identity: "receipt-1".to_owned(),
+            }),
+            make_config(),
+        );
+        let mut handle = supervisor.start();
+        let command = tokio::time::timeout(Duration::from_secs(1), handle.commands.recv())
+            .await
+            .expect("maximum command must be forwarded")
+            .expect("maximum command must be present");
+        assert_eq!(inbound_command_seq(&command), u64::MAX);
+
+        let error = tokio::time::timeout(Duration::from_secs(1), handle.join())
+            .await
+            .expect("cursor exhaustion must terminate promptly")
+            .expect_err("cursor exhaustion must be fatal");
+        assert!(
+            error.is::<DurableReplayInvariantError>(),
+            "typed permanent error must survive supervisor join: {error:#}"
         );
     }
 
@@ -5887,9 +6041,11 @@ mod tests {
                 panic!("empty test store must hydrate without physical recovery")
             }
         };
-        insert_test_durable_event(&store, 1, &crate::agent::AgentEvent::AgentStart)
-            .await
-            .unwrap();
+        for seq in 1..=9 {
+            insert_test_durable_event(&store, seq, &crate::agent::AgentEvent::AgentStart)
+                .await
+                .unwrap();
+        }
 
         let adapter = seams::T17StoreAdapter::new(store.clone());
         let (hydration_tx, hydration_rx) = watch::channel(None);
@@ -5914,6 +6070,7 @@ mod tests {
         let mut config = make_config();
         config.initial_backoff = Duration::ZERO;
         config.max_backoff = Duration::ZERO;
+        config.catch_up_page_size = 3;
         let supervisor = ConnectionSupervisor::new(
             connector,
             CountingCredentialProvider::new("token"),
@@ -5957,10 +6114,10 @@ mod tests {
 
         let epoch1 = DeliveryEpoch(epoch2.as_u64() - 1);
         handle.events.send((epoch1, event_frame(99))).await.unwrap();
-        insert_test_durable_event(&store, 2, &crate::agent::AgentEvent::TurnStart)
+        insert_test_durable_event(&store, 10, &crate::agent::AgentEvent::TurnStart)
             .await
             .unwrap();
-        adapter.on_durable_committed(2).await.unwrap();
+        adapter.on_durable_committed(10).await.unwrap();
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -5970,7 +6127,7 @@ mod tests {
                     .iter()
                     .filter_map(|frame| outbound_frame_event_seq(frame).ok())
                     .collect();
-                if seqs.contains(&1) && seqs.contains(&2) {
+                if seqs.contains(&9) && seqs.contains(&10) {
                     assert!(
                         !seqs.contains(&99),
                         "late frame from invalidated epoch must be rejected by T24"
@@ -5982,6 +6139,11 @@ mod tests {
         })
         .await
         .expect("real Store catch-up and live durable delivery must complete");
+        let page_lengths = adapter.replay_page_lengths();
+        assert!(
+            page_lengths.len() >= 3 && page_lengths.iter().all(|length| *length <= 3),
+            "Store replay must be split into catch_up_page_size-bounded pages: {page_lengths:?}"
+        );
 
         handle.abort();
         assert!(handle.join().await.is_ok());

@@ -12,6 +12,7 @@ use tokio::io::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
+use super::supervisor::TerminalGatewayClosed;
 use super::wire::to_wire_frame;
 use super::{
     AgentHello, ApiHello, CommandDigestFactory, CommandEnvelope, CommandId, CommandRejectReason,
@@ -958,6 +959,48 @@ pub struct SingleConnectionConnector<G> {
     gateway: Option<G>,
 }
 
+pub struct SingleConnectionGateway<G> {
+    gateway: G,
+}
+
+pub struct SingleConnectionReader<R> {
+    reader: R,
+}
+
+#[async_trait]
+impl<R> GatewayReader for SingleConnectionReader<R>
+where
+    R: GatewayReader,
+{
+    async fn next_command(&mut self) -> Result<InboundCommand> {
+        match self.reader.next_command().await {
+            Err(error) if error.is::<GatewayClosed>() => Err(TerminalGatewayClosed.into()),
+            other => other,
+        }
+    }
+}
+
+#[async_trait]
+impl<G> Gateway for SingleConnectionGateway<G>
+where
+    G: Gateway,
+{
+    type Reader = SingleConnectionReader<G::Reader>;
+    type Writer = G::Writer;
+
+    async fn authenticate_hello(
+        &mut self,
+        hello: AgentHello,
+    ) -> std::result::Result<ApiHello, HelloError> {
+        self.gateway.authenticate_hello(hello).await
+    }
+
+    fn split(self) -> (Self::Reader, Self::Writer) {
+        let (reader, writer) = self.gateway.split();
+        (SingleConnectionReader { reader }, writer)
+    }
+}
+
 impl<G: Gateway> SingleConnectionConnector<G> {
     pub fn new(gateway: G) -> Self {
         Self {
@@ -968,15 +1011,18 @@ impl<G: Gateway> SingleConnectionConnector<G> {
 
 #[async_trait]
 impl<G: Gateway> GatewayConnector for SingleConnectionConnector<G> {
-    type Connection = G;
+    type Connection = SingleConnectionGateway<G>;
 
     async fn connect(
         &mut self,
         _credential: GatewayCredential,
     ) -> Result<Self::Connection, ConnectorError> {
-        self.gateway.take().ok_or_else(|| {
-            ConnectorError::Fatal(anyhow!("single stdio connection already consumed"))
-        })
+        self.gateway
+            .take()
+            .map(|gateway| SingleConnectionGateway { gateway })
+            .ok_or_else(|| {
+                ConnectorError::Fatal(anyhow!("single stdio connection already consumed"))
+            })
     }
 }
 
