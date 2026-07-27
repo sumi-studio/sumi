@@ -326,6 +326,44 @@ pub struct DeliveryEpochRuntime {
     task: Option<JoinHandle<()>>,
 }
 
+enum DeliveryEpochCompletion {
+    /// The delivery pump itself reported a recoverable channel failure.
+    Reported(String),
+    /// The failure channel disappeared without reporting why.
+    FailureChannelClosed,
+    /// The delivery forwarder terminated before reporting a channel failure.
+    /// Keep the join result intact: a `JoinError` carries the distinction
+    /// between cancellation and a task panic.
+    Task(Result<(), JoinError>),
+}
+
+impl DeliveryEpochCompletion {
+    fn into_supervisor_error(self) -> Option<SupervisorError> {
+        match self {
+            Self::Reported(reason) => Some(SupervisorError::EstablishedReconnect {
+                reason: format!("delivery epoch failed: {reason}"),
+                healthy: false,
+            }),
+            Self::FailureChannelClosed => Some(SupervisorError::Fatal(anyhow!(
+                "delivery epoch failure channel closed without a terminal signal"
+            ))),
+            Self::Task(Ok(())) => Some(SupervisorError::Fatal(anyhow!(
+                "delivery epoch task ended without a terminal signal"
+            ))),
+            Self::Task(Err(join_err)) if join_err.is_panic() => Some(SupervisorError::Fatal(
+                anyhow!("delivery epoch task panicked: {join_err}"),
+            )),
+            Self::Task(Err(join_err)) if !join_err.is_cancelled() => Some(SupervisorError::Fatal(
+                anyhow!("delivery epoch task join error: {join_err}"),
+            )),
+            // A cancelled task cannot be retried as a delivery-channel failure.
+            // It is already a terminal epoch result, so let normal epoch cleanup
+            // return without initiating another connection attempt.
+            Self::Task(Err(_)) => None,
+        }
+    }
+}
+
 impl DeliveryEpochRuntime {
     pub(crate) fn new(failure_rx: mpsc::UnboundedReceiver<String>, task: JoinHandle<()>) -> Self {
         Self {
@@ -334,20 +372,29 @@ impl DeliveryEpochRuntime {
         }
     }
 
-    async fn failed(&mut self) -> String {
+    async fn failed(&mut self) -> DeliveryEpochCompletion {
         let Some(task) = self.task.as_mut() else {
-            return "delivery epoch task ended without a terminal signal".to_owned();
+            return DeliveryEpochCompletion::Task(Ok(()));
         };
 
         tokio::select! {
-            failure = self.failure_rx.recv() => failure.unwrap_or_else(|| {
-                "delivery epoch failure channel closed without a terminal signal".to_owned()
-            }),
+            failure = self.failure_rx.recv() => match failure {
+                Some(failure) => DeliveryEpochCompletion::Reported(failure),
+                None => DeliveryEpochCompletion::FailureChannelClosed,
+            },
             result = task => {
                 self.task = None;
                 match result {
-                    Ok(()) => "delivery epoch task ended without a terminal signal".to_owned(),
-                    Err(join_err) => format!("delivery epoch task failed: {join_err}"),
+                    // The forwarder reports recoverable delivery failures before
+                    // returning. Prefer that queued report over its consequent
+                    // clean task completion when both are ready together.
+                    Ok(()) => match self.failure_rx.try_recv() {
+                        Ok(failure) => DeliveryEpochCompletion::Reported(failure),
+                        Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                            DeliveryEpochCompletion::Task(Ok(()))
+                        }
+                    },
+                    Err(join_err) => DeliveryEpochCompletion::Task(Err(join_err)),
                 }
             }
         }
@@ -794,6 +841,7 @@ where
             command_send_blocked_notify,
         ));
 
+        let mut delivery_completion = None;
         let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
@@ -845,19 +893,15 @@ where
                     })
                 })
             }
-            reason = wait_delivery_failure(&mut delivery_runtime) => {
+            completion = wait_delivery_failure(&mut delivery_runtime) => {
+                delivery_completion = Some(completion);
                 epoch_token.cancel();
                 *self.current_writer.lock().unwrap() = None;
                 self.current_epoch.send_replace(None);
                 let _ = self.online.send(false);
                 let reader_result = reader_handle.await;
                 let writer_result = writer_handle.await;
-                Self::inspect_epoch_results(reader_result, writer_result, || {
-                    Err(SupervisorError::EstablishedReconnect {
-                        reason: format!("delivery epoch failed: {reason}"),
-                        healthy: false,
-                    })
-                })
+                Self::inspect_epoch_results(reader_result, writer_result, || Ok(()))
             }
         };
 
@@ -883,6 +927,14 @@ where
             ))));
         }
         if let Some(error) = delivery_join_error {
+            return Err(error);
+        }
+        if matches!(&result, Err(SupervisorError::Fatal(_))) {
+            return result;
+        }
+        if let Some(completion) = delivery_completion
+            && let Some(error) = completion.into_supervisor_error()
+        {
             return Err(error);
         }
 
@@ -977,7 +1029,9 @@ where
     }
 }
 
-async fn wait_delivery_failure(runtime: &mut Option<DeliveryEpochRuntime>) -> String {
+async fn wait_delivery_failure(
+    runtime: &mut Option<DeliveryEpochRuntime>,
+) -> DeliveryEpochCompletion {
     match runtime {
         Some(runtime) => runtime.failed().await,
         None => std::future::pending().await,
@@ -2628,21 +2682,108 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delivery_epoch_runtime_observes_task_panic_with_live_failure_sender() {
+    async fn delivery_epoch_runtime_preserves_task_panic_with_live_failure_sender() {
         let (failure_tx, failure_rx) = mpsc::unbounded_channel();
         let task = tokio::spawn(async {
             panic!("test delivery forwarder panic");
         });
         let mut runtime = DeliveryEpochRuntime::new(failure_rx, task);
 
-        let reason = tokio::time::timeout(Duration::from_secs(1), runtime.failed())
+        let completion = tokio::time::timeout(Duration::from_secs(1), runtime.failed())
             .await
             .expect("task termination must wake the delivery failure branch");
 
-        assert!(reason.contains("delivery epoch task failed"));
-        assert!(reason.contains("panicked"));
+        assert!(matches!(
+            &completion,
+            DeliveryEpochCompletion::Task(Err(join_err)) if join_err.is_panic()
+        ));
         assert!(!failure_tx.is_closed());
         assert!(runtime.join().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn delivery_task_panic_is_fatal_after_one_epoch_invalidation() {
+        #[derive(Clone)]
+        struct PanickingDeliverySource {
+            installs: Arc<AtomicU64>,
+            invalidations: Arc<AtomicU64>,
+            failure_tx: Arc<Mutex<Option<mpsc::UnboundedSender<String>>>>,
+        }
+
+        #[async_trait]
+        impl DurableSource for PanickingDeliverySource {
+            async fn event_cursor(&self) -> Result<EventCursors> {
+                Ok(EventCursors::default())
+            }
+
+            async fn events_after(
+                &self,
+                _after_seq: u64,
+                _limit: usize,
+            ) -> Result<Vec<OutboundFrame>> {
+                Ok(Vec::new())
+            }
+
+            async fn command_cursors(&self) -> Result<CommandCursors> {
+                Ok(CommandCursors::default())
+            }
+
+            async fn install_delivery_epoch(
+                &self,
+                _epoch: DeliveryEpoch,
+                _catch_up_from_seq: u64,
+                _sink: EventSender,
+                _cancel: CancellationToken,
+            ) -> Result<Option<DeliveryEpochRuntime>> {
+                self.installs.fetch_add(1, Ordering::SeqCst);
+                let (failure_tx, failure_rx) = mpsc::unbounded_channel();
+                *self.failure_tx.lock().unwrap() = Some(failure_tx);
+                let task = tokio::spawn(async {
+                    panic!("test delivery forwarder panic");
+                });
+                Ok(Some(DeliveryEpochRuntime::new(failure_rx, task)))
+            }
+
+            async fn invalidate_delivery_epoch(&self, _epoch: DeliveryEpoch) -> Result<()> {
+                self.invalidations.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let source = PanickingDeliverySource {
+            installs: Arc::new(AtomicU64::new(0)),
+            invalidations: Arc::new(AtomicU64::new(0)),
+            failure_tx: Arc::new(Mutex::new(None)),
+        };
+        let installs = source.installs.clone();
+        let invalidations = source.invalidations.clone();
+        let sent_hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let credentials = CountingCredentialProvider::new("token");
+        let connect_attempts = credentials.counter.clone();
+        let supervisor = ConnectionSupervisor::new(
+            MockConnector::new(
+                sent_hellos.clone(),
+                VecDeque::from([Ok(MockGateway::new(VecDeque::new()))]),
+            ),
+            credentials,
+            source,
+            StaticHydrationLatch(HydrationReady {
+                generation: ProcessGeneration::from_wire(7).unwrap(),
+                receipt_identity: "receipt-1".to_owned(),
+            }),
+            make_config(),
+        );
+
+        let error = tokio::time::timeout(Duration::from_secs(1), supervisor.start().join())
+            .await
+            .expect("delivery task panic must terminate the supervisor")
+            .expect_err("delivery task panic must be fatal");
+
+        assert!(format!("{error:#}").contains("delivery epoch task panicked"));
+        assert_eq!(installs.load(Ordering::SeqCst), 1);
+        assert_eq!(invalidations.load(Ordering::SeqCst), 1);
+        assert_eq!(connect_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(sent_hellos.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
