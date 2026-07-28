@@ -8560,33 +8560,612 @@ async fn t16_active_abort_provider_is_atomic_before_and_after_commit() {
     }
 }
 
+struct SaturatedTerminalTailDriver {
+    release_terminal_tail: Arc<Notify>,
+    starts: AtomicUsize,
+}
+
+impl SaturatedTerminalTailDriver {
+    fn new() -> Self {
+        Self {
+            release_terminal_tail: Arc::new(Notify::new()),
+            starts: AtomicUsize::new(0),
+        }
+    }
+
+    fn origin() -> ProviderOrigin {
+        ProviderOrigin {
+            provider_instance_id: "saturated-terminal-tail".to_owned(),
+            protocol: ApiProtocol::OpenAiChatCompletions,
+            model: "bridge-model".to_owned(),
+        }
+    }
+
+    fn terminal_message(text: String) -> AssistantMessage {
+        AssistantMessage {
+            content: if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![AssistantContent::Text {
+                    text,
+                    wire_item_index: 0,
+                }]
+            },
+            model: "bridge-model".to_owned(),
+            provider: "fixture".to_owned(),
+            origin: Self::origin(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: Utc::now(),
+        }
+    }
+}
+
+#[async_trait]
+impl RunDriver for SaturatedTerminalTailDriver {
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+        validate_test_generation(generation)
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        _attempt: usize,
+        _context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        let start = self.starts.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY + 2);
+        tx.try_send(ProviderEvent::Start)?;
+        if start == 0 {
+            let release_terminal_tail = self.release_terminal_tail.clone();
+            tokio::spawn(async move {
+                release_terminal_tail.notified().await;
+                tx.send(ProviderEvent::TextStart { content_index: 0 })
+                    .await
+                    .expect("terminal-tail provider remains connected");
+                let mut text = String::new();
+                for ordinal in 0..61 {
+                    let delta = format!("{ordinal:02}");
+                    text.push_str(&delta);
+                    tx.send(ProviderEvent::TextDelta {
+                        content_index: 0,
+                        delta,
+                    })
+                    .await
+                    .expect("terminal-tail provider remains connected");
+                }
+                tx.send(ProviderEvent::TextEnd {
+                    content_index: 0,
+                    content: text.clone(),
+                })
+                .await
+                .expect("terminal-tail provider remains connected");
+                tx.send(ProviderEvent::Done {
+                    reason: StopReason::Stop,
+                    output: ProviderOutput {
+                        message: SaturatedTerminalTailDriver::terminal_message(text),
+                        provider_context: Vec::new(),
+                    },
+                })
+                .await
+                .expect("terminal-tail provider remains connected");
+            });
+        } else {
+            tx.try_send(ProviderEvent::Done {
+                reason: StopReason::Stop,
+                output: ProviderOutput {
+                    message: Self::terminal_message(String::new()),
+                    provider_context: Vec::new(),
+                },
+            })?;
+        }
+        Ok(ProviderAttempt {
+            message_id: format!("saturated-terminal-tail-assistant-{start}"),
+            initial_message: bridge_assistant(StopReason::Stop),
+            events: ProviderEventStream::new(rx, cancel, "fixture", Self::origin()),
+        })
+    }
+
+    async fn execute_tool_observed(
+        &self,
+        _flow_id: &str,
+        _call: &ToolCall,
+        _cancel: CancellationToken,
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage, ToolError> {
+        Err(ToolError::Protocol(
+            "terminal-tail fixture has no tools".to_owned(),
+        ))
+    }
+
+    fn synthetic_error(&self, message: &str) -> PublicMessage {
+        let PublicMessage::Assistant(mut assistant) = bridge_assistant(StopReason::Error) else {
+            unreachable!()
+        };
+        assistant.error_message = Some(message.to_owned());
+        PublicMessage::Assistant(assistant)
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        _active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        Err(anyhow!("terminal-tail fixture has no overflow recovery"))
+    }
+}
+
+#[tokio::test]
+async fn saturated_terminal_tail_rejects_stale_hard_steer_without_failing_session() {
+    let store = Store::session_test_store("saturated-terminal-tail-hard-steer")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (gateway, _commands, frames) = gateway();
+    let driver = Arc::new(SaturatedTerminalTailDriver::new());
+    let mut session = Session::start(
+        store,
+        gateway,
+        RunCore::fixture_with_unapproved_tools(),
+        Arc::new(SequentialRunWorker::new(driver.clone())),
+        test_executor_generation(),
+    )
+    .await
+    .expect("session");
+
+    session
+        .admit_and_route(user(1))
+        .await
+        .expect("initial user command");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if session.active.as_ref().is_some_and(|active| {
+                active.bridge.steer_stage() == SteerStage::AssistantGeneration
+            }) {
+                break;
+            }
+            let output = session
+                .active
+                .as_mut()
+                .expect("initial run remains active")
+                .events_rx
+                .recv()
+                .await
+                .expect("initial lifecycle event");
+            session
+                .persist_active_event(output)
+                .await
+                .expect("persist initial lifecycle");
+        }
+    })
+    .await
+    .expect("assistant generation became observable");
+
+    driver.release_terminal_tail.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let active = session.active.as_ref().expect("initial run remains active");
+            if active.events_rx.len() == EVENT_CHANNEL_CAPACITY
+                && !active.attempt_cancellation.has_registered_attempt()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal MessageEnd filled the bounded event lane and retired its attempt");
+    let active = session.active.as_ref().expect("initial run remains active");
+    assert_eq!(active.events_rx.len(), EVENT_CHANNEL_CAPACITY);
+    assert_eq!(
+        active.bridge.steer_stage(),
+        SteerStage::AssistantGeneration,
+        "the unread terminal tail leaves Session observing the old assistant stage"
+    );
+
+    session
+        .admit_and_route(user(2))
+        .await
+        .expect("stale hard-steer handshake must fail closed into deferral");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while session.active.is_some() {
+            drive_active_to_completion(&mut session).await?;
+        }
+        Ok::<(), SessionFailure>(())
+    })
+    .await
+    .expect("both runs remain live")
+    .expect("both runs complete without SessionFailure");
+    session.wait_outbound_idle().await;
+
+    assert_eq!(
+        driver.starts.load(Ordering::SeqCst),
+        2,
+        "the rejected hard steer must run once as the next idle command"
+    );
+    let command_states: Vec<(i64, String, String)> =
+        sqlx::query_as("SELECT seq, application_kind, status FROM inbound_commands ORDER BY seq")
+            .fetch_all(&pool)
+            .await
+            .expect("command states");
+    assert_eq!(
+        command_states,
+        vec![
+            (1, "idle_run".to_owned(), "applied".to_owned()),
+            (2, "idle_run".to_owned(), "applied".to_owned()),
+        ],
+        "the stale hard steer must be deferred exactly once"
+    );
+    let first_attempt_events: Vec<String> = frames
+        .lock()
+        .expect("frame mutex")
+        .iter()
+        .filter_map(|frame| {
+            let OutboundFrame::Event { envelope } = frame else {
+                return None;
+            };
+            (envelope.event["message_id"] == "saturated-terminal-tail-assistant-0")
+                .then(|| envelope.event["type"].as_str().map(str::to_owned))
+                .flatten()
+        })
+        .collect();
+    // All 63 updates had to leave the FIFO worker lane before its terminal
+    // tail could commit. The independent outbound lane deliberately retains
+    // only its bounded volatile prefix, followed by the reliable MessageEnd.
+    let mut expected = vec!["message_start".to_owned()];
+    expected.extend(std::iter::repeat_n(
+        "message_update".to_owned(),
+        VOLATILE_OUTBOUND_BUDGET,
+    ));
+    expected.push("message_end".to_owned());
+    assert_eq!(
+        first_attempt_events, expected,
+        "draining the stale handshake must preserve and order the saturated terminal tail"
+    );
+    let first_terminal: (String, i64, String) = sqlx::query_as(
+        "SELECT
+             json_extract(payload, '$.stop_reason'),
+             interrupted,
+             json_extract(payload, '$.content[0].text')
+         FROM messages
+         WHERE id='saturated-terminal-tail-assistant-0'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("first terminal assistant");
+    let expected_text = (0..61)
+        .map(|ordinal| format!("{ordinal:02}"))
+        .collect::<String>();
+    assert_eq!(first_terminal, ("stop".to_owned(), 0, expected_text));
+}
+
+struct SaturatedActiveControlWorker {
+    control_observed: Arc<AtomicBool>,
+    phase_unchanged: Arc<AtomicBool>,
+    acceptance_live: Arc<AtomicBool>,
+    authorization_committed: Arc<AtomicBool>,
+}
+
+impl RunWorker for SaturatedActiveControlWorker {
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+        validate_test_generation(generation)
+    }
+
+    fn run(
+        &self,
+        core: RunCore,
+        initial: AdmittedCommand,
+        mut controls: mpsc::Receiver<RunControl>,
+        events: mpsc::Sender<RunOutput>,
+    ) -> WorkerFuture {
+        let control_observed = self.control_observed.clone();
+        let phase_unchanged = self.phase_unchanged.clone();
+        let acceptance_live = self.acceptance_live.clone();
+        let authorization_committed = self.authorization_committed.clone();
+        Box::pin(async move {
+            let binding = core
+                .durable_binding
+                .clone()
+                .expect("Session binds the direct worker output");
+            let Command::UserMessage { text, .. } = &initial.envelope().command else {
+                panic!("saturation fixture requires an initial user command")
+            };
+            let user_message = PublicMessage::User(UserMessage {
+                content: vec![UserContent::Text { text: text.clone() }],
+                timestamp: initial.received_at(),
+            });
+            let user_message_id = user_message_id(&initial.envelope().command_id);
+            let assistant_message_id = "saturated-active-control-assistant".to_owned();
+            let assistant = bridge_assistant(StopReason::Stop);
+            for event in [
+                AgentEvent::AgentStart,
+                AgentEvent::TurnStart,
+                AgentEvent::MessageStart {
+                    message_id: user_message_id.clone(),
+                    message: Box::new(user_message.clone()),
+                },
+                AgentEvent::MessageEnd {
+                    message_id: user_message_id,
+                    message: Box::new(user_message),
+                },
+                AgentEvent::MessageStart {
+                    message_id: assistant_message_id.clone(),
+                    message: Box::new(assistant.clone()),
+                },
+            ] {
+                events
+                    .send(RunOutput::detached(binding.clone(), event, None))
+                    .await
+                    .expect("Session receives the startup lifecycle");
+            }
+
+            while controls.is_empty() {
+                tokio::task::yield_now().await;
+            }
+            control_observed.store(true, Ordering::SeqCst);
+            let phase_before = *core
+                .worker_phase
+                .as_ref()
+                .expect("Session phase sender")
+                .borrow();
+
+            // Leave the observed control unread while filling the production
+            // Session-to-worker event lane. The final send cannot complete
+            // until Session drains at least one output.
+            for ordinal in 0..=EVENT_CHANNEL_CAPACITY {
+                events
+                    .send(RunOutput::detached(
+                        binding.clone(),
+                        AgentEvent::MessageUpdate {
+                            message_id: assistant_message_id.clone(),
+                            event: PublicStreamEvent::TextDelta {
+                                content_index: 0,
+                                delta: ordinal.to_string(),
+                            },
+                        },
+                        None,
+                    ))
+                    .await
+                    .expect("bounded event lane remains connected");
+            }
+
+            let phase_after = *core
+                .worker_phase
+                .as_ref()
+                .expect("Session phase sender")
+                .borrow();
+            phase_unchanged.store(
+                phase_before == WorkerPhase::Active && phase_after == WorkerPhase::Active,
+                Ordering::SeqCst,
+            );
+            let control = controls
+                .recv()
+                .await
+                .expect("queued active Abort remains available");
+            let RunControl::Abort {
+                accepted,
+                committed,
+                ..
+            } = control
+            else {
+                panic!("saturation fixture requires an active Abort")
+            };
+            let acceptance_succeeded = accepted.send(true).is_ok();
+            acceptance_live.store(acceptance_succeeded, Ordering::SeqCst);
+            let authorization_succeeded = committed.await.is_ok();
+            authorization_committed.store(authorization_succeeded, Ordering::SeqCst);
+
+            let terminal = if acceptance_succeeded && authorization_succeeded {
+                let mut aborted = match bridge_assistant(StopReason::Aborted) {
+                    PublicMessage::Assistant(message) => message,
+                    _ => unreachable!(),
+                };
+                aborted.interrupted = true;
+                PublicMessage::Assistant(aborted)
+            } else {
+                assistant
+            };
+            for event in [
+                AgentEvent::MessageEnd {
+                    message_id: assistant_message_id,
+                    message: Box::new(terminal.clone()),
+                },
+                AgentEvent::TurnEnd {
+                    message: Some(Box::new(terminal)),
+                    tool_results: Vec::new(),
+                },
+                AgentEvent::AgentEnd,
+            ] {
+                events
+                    .send(RunOutput::detached(binding.clone(), event, None))
+                    .await
+                    .expect("Session receives the terminal lifecycle");
+            }
+            RunCompletion::Completed(core)
+        })
+    }
+}
+
+#[tokio::test]
+async fn active_control_acceptance_stays_live_while_the_worker_event_lane_is_saturated() {
+    let store = Store::session_test_store("saturated-active-control-acceptance")
+        .await
+        .expect("test store");
+    let pool = store.pool().clone();
+    let (gateway, commands, frames) = gateway();
+    let control_observed = Arc::new(AtomicBool::new(false));
+    let phase_unchanged = Arc::new(AtomicBool::new(false));
+    let acceptance_live = Arc::new(AtomicBool::new(false));
+    let authorization_committed = Arc::new(AtomicBool::new(false));
+    let worker: Arc<dyn RunWorker> = Arc::new(SaturatedActiveControlWorker {
+        control_observed: control_observed.clone(),
+        phase_unchanged: phase_unchanged.clone(),
+        acceptance_live: acceptance_live.clone(),
+        authorization_committed: authorization_committed.clone(),
+    });
+    let session = Session::start(
+        store,
+        gateway,
+        RunCore::fixture_with_unapproved_tools(),
+        worker,
+        test_executor_generation(),
+    )
+    .await
+    .expect("session");
+    let task = tokio::spawn(session.run());
+
+    commands.send(user(1)).await.expect("initial user command");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let startup_events = frames
+                .lock()
+                .expect("frame mutex")
+                .iter()
+                .filter(|frame| matches!(frame, OutboundFrame::Event { .. }))
+                .count();
+            if startup_events >= 5 || task.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("assistant startup reached the active control phase");
+    commands.send(abort(2)).await.expect("active Abort");
+
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if applied_acks(&frames).len() == 2 || task.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("active Abort and owner reach terminal ACKs");
+    drop(commands);
+    completed(task.await.expect("session join"));
+
+    assert!(
+        control_observed.load(Ordering::SeqCst),
+        "the active control must have been successfully enqueued"
+    );
+    assert!(
+        phase_unchanged.load(Ordering::SeqCst),
+        "event-lane saturation must not rely on a worker phase transition"
+    );
+    assert!(
+        acceptance_live.load(Ordering::SeqCst),
+        "Session must keep draining worker events while the enqueued control awaits acceptance"
+    );
+    assert!(
+        authorization_committed.load(Ordering::SeqCst),
+        "accepted Abort must retain its durability authorization rendezvous"
+    );
+    let abort_status: String =
+        sqlx::query_scalar("SELECT status FROM inbound_commands WHERE seq=2")
+            .fetch_one(&pool)
+            .await
+            .expect("active Abort state");
+    assert_eq!(abort_status, "applied");
+    let assistant_state: (String, i64) = sqlx::query_as(
+        "SELECT json_extract(payload, '$.stop_reason'), interrupted
+         FROM messages WHERE id='saturated-active-control-assistant'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("active Abort assistant projection");
+    assert_eq!(
+        assistant_state,
+        ("aborted".to_owned(), 1),
+        "the Abort must close the live assistant instead of being deferred to Idle"
+    );
+}
+
 #[tokio::test]
 async fn control_acceptance_selects_accepted_or_phase_change() {
     use tokio::sync::watch;
 
     // Phase change before accepted returns false without awaiting accepted.
     let (phase_tx, mut phase_rx) = watch::channel(WorkerPhase::Active);
-    let (_accepted_tx, accepted_rx) = oneshot::channel();
+    let (_accepted_tx, mut accepted_rx) = oneshot::channel();
+    let (_events_tx, mut events_rx) = mpsc::channel(1);
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(1)).await;
         phase_tx.send(WorkerPhase::RetryWait).ok();
     });
-    let accepted = super::await_control_acceptance(&mut phase_rx, accepted_rx).await;
-    assert!(!accepted, "phase change must close the control acceptance");
+    let timeout = tokio::time::sleep(STEER_HANDSHAKE_TIMEOUT);
+    tokio::pin!(timeout);
+    let progress = super::await_control_acceptance(
+        &mut phase_rx,
+        &mut accepted_rx,
+        timeout.as_mut(),
+        &mut events_rx,
+    )
+    .await;
+    assert!(
+        matches!(progress, ControlAcceptanceProgress::PhaseChanged),
+        "phase change must close the control acceptance"
+    );
 
-    // Accepted true returns true without waiting for a phase change.
-    let (_phase_tx, mut phase_rx) = watch::channel(WorkerPhase::Active);
-    let (accepted_tx, accepted_rx) = oneshot::channel();
+    // Accepted true wins when a phase notification is also ready.
+    let (phase_tx, mut phase_rx) = watch::channel(WorkerPhase::Active);
+    let (accepted_tx, mut accepted_rx) = oneshot::channel();
+    let (_events_tx, mut events_rx) = mpsc::channel(1);
+    phase_tx.send(WorkerPhase::RetryWait).ok();
     accepted_tx.send(true).ok();
-    let accepted = super::await_control_acceptance(&mut phase_rx, accepted_rx).await;
-    assert!(accepted, "accepted=true must win the control acceptance");
+    let timeout = tokio::time::sleep(STEER_HANDSHAKE_TIMEOUT);
+    tokio::pin!(timeout);
+    let progress = super::await_control_acceptance(
+        &mut phase_rx,
+        &mut accepted_rx,
+        timeout.as_mut(),
+        &mut events_rx,
+    )
+    .await;
+    assert!(
+        matches!(progress, ControlAcceptanceProgress::Accepted(true)),
+        "accepted=true must win the control acceptance"
+    );
 
     // Closed accepted channel returns false rather than hanging.
     let (_phase_tx, mut phase_rx) = watch::channel(WorkerPhase::Active);
-    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let (accepted_tx, mut accepted_rx) = oneshot::channel();
+    let (_events_tx, mut events_rx) = mpsc::channel(1);
     drop(accepted_tx);
-    let accepted = super::await_control_acceptance(&mut phase_rx, accepted_rx).await;
-    assert!(!accepted, "closed accepted channel must fail closed");
+    let timeout = tokio::time::sleep(STEER_HANDSHAKE_TIMEOUT);
+    tokio::pin!(timeout);
+    let progress = super::await_control_acceptance(
+        &mut phase_rx,
+        &mut accepted_rx,
+        timeout.as_mut(),
+        &mut events_rx,
+    )
+    .await;
+    assert!(
+        matches!(progress, ControlAcceptanceProgress::Accepted(false)),
+        "closed accepted channel must fail closed"
+    );
+
+    // The original deadline remains bounded when neither side makes progress.
+    let (_phase_tx, mut phase_rx) = watch::channel(WorkerPhase::Active);
+    let (_accepted_tx, mut accepted_rx) = oneshot::channel();
+    let (_events_tx, mut events_rx) = mpsc::channel(1);
+    let timeout = tokio::time::sleep(Duration::from_millis(1));
+    tokio::pin!(timeout);
+    let progress = super::await_control_acceptance(
+        &mut phase_rx,
+        &mut accepted_rx,
+        timeout.as_mut(),
+        &mut events_rx,
+    )
+    .await;
+    assert!(matches!(progress, ControlAcceptanceProgress::TimedOut));
 }
 
 // ---------------------------------------------------------------------------

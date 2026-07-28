@@ -2293,12 +2293,13 @@ impl Runner {
                         .map_err(|error| WorkerFailure::Error(error.to_string()))?;
                     return Ok(());
                 }
-                RunControl::HardSteer { command, accepted } => {
-                    if accepted.send(true).is_ok() {
-                        self.cancel_provider();
-                        self.core
-                            .queue_followup(command)
-                            .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+                RunControl::HardSteer { accepted, .. } => {
+                    // A hard steer is valid only when the active provider
+                    // attempt consumes it in `provider_attempt_loop`. Reaching
+                    // a later safe point means that attempt has already
+                    // terminalized, so accepting here would hand Session a
+                    // stale cancellation reservation.
+                    if accepted.send(false).is_ok() {
                         return Ok(());
                     }
                 }
