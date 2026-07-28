@@ -154,6 +154,21 @@ async fn read_frame(reader: &mut BufReader<tokio::process::ChildStdout>) -> Valu
     serde_json::from_str(&line).unwrap()
 }
 
+// Backpressure tests intentionally produce many drop warnings. Drain stderr
+// while the child runs so its diagnostic pipe cannot become a second,
+// unintended source of service backpressure.
+fn drain_executor_stderr(child: &mut Child) -> tokio::task::JoinHandle<String> {
+    let mut stderr = child.stderr.take().expect("piped executor stderr");
+    tokio::spawn(async move {
+        let mut output = String::new();
+        stderr
+            .read_to_string(&mut output)
+            .await
+            .expect("read executor stderr");
+        output
+    })
+}
+
 #[tokio::test]
 async fn service_mode_dispatch_precedes_runtime_config() {
     let output = Command::new(env!("CARGO_BIN_EXE_sumi-agent"))
@@ -479,6 +494,7 @@ async fn bash_cancel_emits_one_terminal_per_request_and_no_late_update() {
 async fn slow_progress_consumer_drops_overflow_but_receives_authoritative_terminal() {
     let fixture = Fixture::new().await;
     let mut child = fixture.executor_with_stderr(Stdio::piped());
+    let stderr = drain_executor_stderr(&mut child);
     let mut stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
     assert_ne!(
@@ -540,14 +556,7 @@ async fn slow_progress_consumer_drops_overflow_but_receives_authoritative_termin
 
     drop(stdin);
     assert!(child.wait().await.unwrap().success());
-    let mut stderr = String::new();
-    child
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut stderr)
-        .await
-        .unwrap();
+    let stderr = stderr.await.expect("stderr drain task");
     assert!(
         stderr.contains("dropping volatile executor progress update"),
         "test did not drive either bounded progress queue beyond capacity: {stderr}"
@@ -655,6 +664,7 @@ async fn unconsumed_executor_stdout_cannot_block_cancel_and_reap() {
     let fixture = Fixture::new().await;
     let secret_id = "request-secret-must-not-enter-stderr";
     let mut child = fixture.executor_with_stderr(Stdio::piped());
+    let stderr = drain_executor_stderr(&mut child);
     let mut stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
     send_request(
@@ -679,14 +689,7 @@ async fn unconsumed_executor_stdout_cannot_block_cancel_and_reap() {
         .expect("executor must cancel/reap despite stdout backpressure")
         .unwrap();
     assert!(!status.success(), "output failure closes the service epoch");
-    let mut stderr = String::new();
-    child
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut stderr)
-        .await
-        .unwrap();
+    let stderr = stderr.await.expect("stderr drain task");
     assert!(
         stderr.contains("executor output") || stderr.contains("terminal write deadline"),
         "{stderr}"
