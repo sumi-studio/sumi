@@ -26,10 +26,14 @@ use crate::{
         },
     },
     gateway::{ApprovalDecision, CommandEnvelope, CommandId},
-    provider::types::{
-        ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, ProviderContextFragment,
-        ProviderContextPayload, ProviderOrigin, ProviderOutput, PublicAssistantMessage,
-        RejectedToolCall, ToolArgumentError, Usage, ValidatedToolArguments,
+    provider::{
+        assembler::ResponseBudget,
+        types::{
+            ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, ProviderContextAnchor,
+            ProviderContextFragment, ProviderContextPayload, ProviderOrigin, ProviderOutput,
+            PublicAssistantMessage, RejectedToolCall, SuccessTerminalCommit, ToolArgumentError,
+            Usage, ValidatedToolArguments,
+        },
     },
     runtime::contracts::ProcessGeneration,
     store::Redactor,
@@ -1057,6 +1061,223 @@ async fn hard_steer_message_end_keeps_verified_provider_context_on_barrier() {
         task.await.expect("close task").expect("close outcome"),
         AttemptOutcome::HardSteer
     ));
+}
+
+struct HardSteerProviderContextDriver {
+    started_provider_contexts: Mutex<Vec<Vec<ProviderContextItem>>>,
+}
+
+impl HardSteerProviderContextDriver {
+    fn new() -> Self {
+        Self {
+            started_provider_contexts: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn attempt(&self, attempt: usize, cancel: CancellationToken) -> Result<ProviderAttempt> {
+        if attempt > 0 {
+            return Ok(provider_attempt(
+                attempt,
+                assistant(StopReason::Stop, Vec::new(), None, None),
+            ));
+        }
+
+        let (normal_tx, normal_rx) = mpsc::channel(1);
+        let (priority_terminal_tx, priority_terminal_rx) = mpsc::channel(1);
+        let terminal_cancel = cancel.clone();
+        let producer = tokio::spawn(async move {
+            terminal_cancel.cancelled().await;
+            let _normal_tx = normal_tx;
+            priority_terminal_tx
+                .send(ProviderEvent::Error {
+                    reason: StopReason::Aborted,
+                    output: ProviderOutput {
+                        message: assistant(
+                            StopReason::Aborted,
+                            Vec::new(),
+                            Some("cancelled"),
+                            Some("cancelled"),
+                        ),
+                        provider_context: cancellation_provider_context(),
+                    },
+                })
+                .await
+                .expect("priority terminal receiver");
+        });
+
+        Ok(ProviderAttempt {
+            message_id: format!("assistant-{attempt}"),
+            initial_message: public_message(&assistant(StopReason::Stop, Vec::new(), None, None)),
+            events: ProviderEventStream::with_priority_terminal(
+                normal_rx,
+                priority_terminal_rx,
+                cancel,
+                "fixture",
+                origin(),
+                ResponseBudget::default(),
+                Arc::new(SuccessTerminalCommit::new()),
+            )
+            .own_producer(producer),
+        })
+    }
+}
+
+#[async_trait]
+impl RunDriver for HardSteerProviderContextDriver {
+    fn validate_executor_generation(&self, _generation: ProcessGeneration) -> Result<()> {
+        Ok(())
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        attempt: usize,
+        _context: &[ContextMessage],
+        _command_received_at: Option<std::time::Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.attempt(attempt, cancel)
+    }
+
+    async fn start_provider_with_context(
+        &self,
+        attempt: usize,
+        _context: &[ContextMessage],
+        provider_context: &[ProviderContextItem],
+        _command_received_at: Option<std::time::Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.started_provider_contexts
+            .lock()
+            .expect("provider contexts")
+            .push(provider_context.to_vec());
+        self.attempt(attempt, cancel)
+    }
+
+    async fn execute_tool_observed(
+        &self,
+        _flow_id: &str,
+        _call: &ToolCall,
+        _cancel: CancellationToken,
+        _on_update: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Result<ToolResultMessage, ToolError> {
+        Err(ToolError::Protocol(
+            "HardSteerProviderContextDriver has no tools".to_owned(),
+        ))
+    }
+
+    fn synthetic_error(&self, message: &str) -> PublicMessage {
+        public_message(&assistant(
+            StopReason::Error,
+            Vec::new(),
+            Some(message),
+            None,
+        ))
+    }
+
+    async fn plan_overflow_recovery(
+        &self,
+        _core: &RunCore,
+        _request: OverflowRecoveryRequest,
+        _active_context: &[ContextMessage],
+    ) -> Result<OverflowRecoveryOutcome> {
+        Err(anyhow!(
+            "HardSteerProviderContextDriver has no overflow recovery"
+        ))
+    }
+}
+
+#[tokio::test]
+async fn hard_steer_provider_context_reaches_the_next_live_provider_attempt() {
+    let driver = Arc::new(HardSteerProviderContextDriver::new());
+    let cancellation = Arc::new(AttemptCancellation::default());
+    let mut core = bound_core(1);
+    core.attempt_cancellation = Some(cancellation.clone());
+    let worker = SequentialRunWorker::new(driver.clone());
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let (events_tx, mut events_rx) = mpsc::channel(256);
+    let completion = tokio::spawn(async move {
+        worker
+            .run(core, admitted_user(1), control_rx, events_tx)
+            .await
+    });
+
+    let mut message_seq = 1;
+    let mut hard_steer_seq = None;
+    let mut steer_sent = false;
+    while let Some(mut output) = events_rx.recv().await {
+        if matches!(
+            &output.event,
+            AgentEvent::MessageStart { message_id, .. } if message_id == "assistant-0"
+        ) && !steer_sent
+        {
+            let (accepted_tx, accepted_rx) = oneshot::channel();
+            control_tx
+                .send(RunControl::HardSteer {
+                    command: admitted_user(2),
+                    accepted: accepted_tx,
+                })
+                .await
+                .expect("send hard steer");
+            assert!(accepted_rx.await.expect("worker accepts hard steer"));
+            cancellation
+                .reserve()
+                .expect("reserve provider cancellation")
+                .cancel_after_commit();
+            steer_sent = true;
+        }
+
+        if let Some(barrier) = output.message_commit_barrier.take() {
+            let AgentEvent::MessageEnd { message_id, .. } = &output.event else {
+                panic!("message receipt barrier without MessageEnd");
+            };
+            let new_turn_id = if message_id == "assistant-0" {
+                hard_steer_seq = Some(message_seq);
+                Some("turn-after-hard-steer".to_owned())
+            } else {
+                None
+            };
+            barrier.resolve(MessageCommitReceipt {
+                message_id: message_id.clone(),
+                message_seq,
+                new_turn_id,
+            });
+            message_seq += 1;
+        }
+        if let Some(barrier) = output.commit_barrier.take() {
+            barrier.committed();
+        }
+        if let Some(barrier) = output.retry_wait_commit_barrier.take() {
+            barrier.committed();
+        }
+    }
+
+    assert_completed(completion.await.expect("worker join"));
+    let hard_steer_seq = hard_steer_seq.expect("hard-steer assistant receipt");
+    let fragment = cancellation_provider_context()
+        .into_iter()
+        .next()
+        .expect("provider context fragment");
+    let expected = ProviderContextItem {
+        origin_message: Some(ProviderContextAnchor {
+            message_id: "assistant-0".to_owned(),
+            message_seq: hard_steer_seq,
+        }),
+        wire_item_index: fragment.wire_item_index,
+        ordinal: 0,
+        provider_origin: origin(),
+        payload: fragment.payload,
+    };
+    let snapshots = driver
+        .started_provider_contexts
+        .lock()
+        .expect("provider contexts");
+    assert_eq!(snapshots.len(), 2, "hard steer must start a new attempt");
+    assert!(snapshots[0].is_empty());
+    assert_eq!(
+        snapshots[1],
+        vec![expected],
+        "the next live provider attempt must receive the context committed with the hard-steer partial exactly once"
+    );
 }
 
 #[tokio::test]
