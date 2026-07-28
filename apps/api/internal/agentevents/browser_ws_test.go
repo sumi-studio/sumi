@@ -6,7 +6,10 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -40,11 +43,19 @@ func TestBrowserWebSocketAdmitsCommandsAndStreamsDurableAndVolatileEvents(t *tes
 
 	seq := uint64(1)
 	agentClaims := TokenClaims{TenantID: "tenant-1", AgentID: "agent-1", ConversationID: "conversation-1", Generation: 7}
-	if err := gateway.Receive(context.Background(), agentClaims, Envelope{Seq: &seq, ConversationID: "conversation-1", Event: json.RawMessage(`{"type":"tool_execution_start","tool_call_id":"call-1","tool_name":"read_file","args":{}}`)}); err != nil {
-		t.Fatalf("persist durable tool event: %v", err)
+	// Drive the abort guard from the durable run lifecycle, not internal map
+	// mutation.
+	if err := gateway.Receive(context.Background(), agentClaims, Envelope{Seq: &seq, ConversationID: "conversation-1", Event: json.RawMessage(`{"type":"agent_start"}`)}); err != nil {
+		t.Fatalf("persist durable agent_start: %v", err)
 	}
 	if replay, err := gateway.EventCatchUp(context.Background(), "conversation-1", 0); err != nil || len(replay) != 1 {
 		t.Fatalf("read durable event for browser replay: events=%d err=%v", len(replay), err)
+	}
+	assertBrowserEvent(t, conn, "agent_start", true)
+
+	seq = 2
+	if err := gateway.Receive(context.Background(), agentClaims, Envelope{Seq: &seq, ConversationID: "conversation-1", Event: json.RawMessage(`{"type":"tool_execution_start","tool_call_id":"call-1","tool_name":"read_file","args":{}}`)}); err != nil {
+		t.Fatalf("persist durable tool event: %v", err)
 	}
 	assertBrowserEvent(t, conn, "tool_execution_start", true)
 	volatile := Envelope{ConversationID: "conversation-1", Event: json.RawMessage(`{"type":"message_update","message_id":"00000000-0000-4000-8000-000000000001","event":{"type":"text_delta","content_index":0,"delta":"stream"}}`)}
@@ -53,16 +64,14 @@ func TestBrowserWebSocketAdmitsCommandsAndStreamsDurableAndVolatileEvents(t *tes
 	}
 	assertBrowserEvent(t, conn, "message_update", false)
 
-	// The abort and approval_decision variants are only accepted when an
-	// assistant turn is in flight and an approval is pending, respectively.
-	gateway.stateMu.Lock()
-	gateway.inFlight["conversation-1"] = true
-	if gateway.pendingApprovals["conversation-1"] == nil {
-		gateway.pendingApprovals["conversation-1"] = make(map[string]bool)
+	seq = 3
+	if err := gateway.Receive(context.Background(), agentClaims, Envelope{Seq: &seq, ConversationID: "conversation-1", Event: json.RawMessage(`{"type":"approval_requested","request":{"id":"request-1","tool_call_id":"call-1","tool_name":"read_file","action":{"reviewable":"read"},"args_summary":"read"}}`)}); err != nil {
+		t.Fatalf("publish durable approval_requested: %v", err)
 	}
-	gateway.pendingApprovals["conversation-1"]["request-1"] = true
-	gateway.stateMu.Unlock()
+	assertBrowserEvent(t, conn, "approval_requested", true)
 
+	// The abort and approval_decision variants are only accepted when a run is
+	// in flight and an approval is pending, respectively.
 	for index, command := range []json.RawMessage{
 		json.RawMessage(`{"type":"user_message","text":"steer me","attachments":[]}`),
 		json.RawMessage(`{"type":"abort"}`),
@@ -76,7 +85,7 @@ func TestBrowserWebSocketAdmitsCommandsAndStreamsDurableAndVolatileEvents(t *tes
 		if err := conn.ReadJSON(&accepted); err != nil {
 			t.Fatalf("read command admission: %v", err)
 		}
-		if accepted.Type != "command_accepted" || len(accepted.Envelope.Command) == 0 {
+		if accepted.Type != "command_accepted" || accepted.Envelope.Seq == 0 || accepted.Envelope.CommandID == "" || len(accepted.Envelope.Command) == 0 {
 			t.Fatalf("unexpected command admission: %+v", accepted)
 		}
 	}
@@ -139,21 +148,39 @@ func TestBrowserWebSocketReconnectsFromDurableCursor(t *testing.T) {
 		t.Fatal(err)
 	}
 	first := dialBrowserWS(t, httpServer, cookie, "conversation-1")
+	waitForBrowserConnectionStats(t, server, BrowserConnectionStats{Active: 1, Accepted: 1})
 	if err := first.WriteJSON(browserHello{Type: "hello", LastEventSeq: 0}); err != nil {
 		t.Fatal(err)
 	}
 	assertBrowserEvent(t, first, "agent_start", true)
 	_ = first.Close()
+	waitForBrowserConnectionStats(t, server, BrowserConnectionStats{Active: 0, Accepted: 1})
 	seq = 2
 	if err := gateway.Receive(context.Background(), claims, Envelope{Seq: &seq, ConversationID: "conversation-1", Event: json.RawMessage(`{"type":"agent_end"}`)}); err != nil {
 		t.Fatal(err)
 	}
 	second := dialBrowserWS(t, httpServer, cookie, "conversation-1")
 	defer second.Close()
+	waitForBrowserConnectionStats(t, server, BrowserConnectionStats{Active: 1, Accepted: 2})
 	if err := second.WriteJSON(browserHello{Type: "hello", LastEventSeq: 1}); err != nil {
 		t.Fatal(err)
 	}
 	assertBrowserEvent(t, second, "agent_end", true)
+}
+
+func waitForBrowserConnectionStats(t *testing.T, server *BrowserServer, want BrowserConnectionStats) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		got := server.ConnectionStats()
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("browser connection stats did not settle: got %+v, want %+v", got, want)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 func dialBrowserWS(t *testing.T, server *httptest.Server, cookie, conversationID string) *websocket.Conn {
@@ -210,7 +237,7 @@ func TestBrowserServerCommandStateGuards(t *testing.T) {
 	claims := TokenClaims{TenantID: "tenant", AgentID: "agent", ConversationID: conversationID, Generation: 1}
 
 	if reason, reject := server.checkCommandState(conversationID, browserCommandHead{Type: "abort"}); !reject {
-		t.Fatal("expected abort to be rejected when no turn is in flight")
+		t.Fatal("expected abort to be rejected when no run is in flight")
 	} else if reason != RejectNotAllowed {
 		t.Fatalf("expected not_allowed, got %q", reason)
 	}
@@ -222,11 +249,11 @@ func TestBrowserServerCommandStateGuards(t *testing.T) {
 	}
 
 	seq := uint64(1)
-	if err := gateway.Receive(context.Background(), claims, Envelope{Seq: &seq, ConversationID: conversationID, Event: json.RawMessage(`{"type":"message_start","message_id":"00000000-0000-4000-8000-000000000001","message":{"role":"user","content":[{"type":"text","text":"ok"}],"timestamp":"2026-07-28T00:00:00Z"}}`)}); err != nil {
-		t.Fatalf("receive message_start: %v", err)
+	if err := gateway.Receive(context.Background(), claims, Envelope{Seq: &seq, ConversationID: conversationID, Event: json.RawMessage(`{"type":"agent_start"}`)}); err != nil {
+		t.Fatalf("receive agent_start: %v", err)
 	}
 	if reason, reject := server.checkCommandState(conversationID, browserCommandHead{Type: "abort"}); reject {
-		t.Fatalf("expected abort to be accepted during in-flight turn, got %q", reason)
+		t.Fatalf("expected abort to be accepted during in-flight run, got %q", reason)
 	}
 
 	seq = 2
@@ -258,9 +285,9 @@ func TestBrowserWebSocketAdmitsCommandsAfterGatewayRestart(t *testing.T) {
 	if err := gateway.Receive(context.Background(), claims, Envelope{
 		Seq:            &seq,
 		ConversationID: conversationID,
-		Event:          json.RawMessage(`{"type":"message_start","message_id":"00000000-0000-4000-8000-000000000001","message":{"role":"user","content":[{"type":"text","text":"ok"}],"timestamp":"2026-07-28T00:00:00Z"}}`),
+		Event:          json.RawMessage(`{"type":"agent_start"}`),
 	}); err != nil {
-		t.Fatalf("receive message_start: %v", err)
+		t.Fatalf("receive agent_start: %v", err)
 	}
 
 	seq = 2
@@ -317,8 +344,8 @@ func TestBrowserWebSocketAdmitsCommandsAfterGatewayRestart(t *testing.T) {
 		if err := conn.ReadJSON(&accepted); err != nil {
 			t.Fatalf("read command admission for accepted command %d: %v", i, err)
 		}
-		if accepted.Type != "command_accepted" || len(accepted.Envelope.Command) == 0 {
-			t.Fatalf("expected command_accepted, got %+v", accepted)
+		if accepted.Type != "command_accepted" || accepted.Envelope.Seq == 0 || accepted.Envelope.CommandID == "" || len(accepted.Envelope.Command) == 0 {
+			t.Fatalf("expected command_accepted with allocated seq and command_id, got %+v", accepted)
 		}
 	}
 
@@ -387,9 +414,21 @@ func TestBrowserWebSocketFailsClosedOnCorruptDurableState(t *testing.T) {
 	// After the server attempts to rebuild from the corrupt durable log it must
 	// fail closed and close the connection instead of defaulting to an empty
 	// "no turn / no approval" state that would admit the next command.
+	// The close may win the race with this write. Either outcome is acceptable,
+	// but the following read must observe a prompt close rather than a timeout.
+	_ = conn.WriteJSON(browserCommandFrame{Type: "command", IdempotencyKey: "ignored", Command: json.RawMessage(`{"type":"abort"}`)})
 	conn.SetReadDeadline(time.Now().Add(time.Second))
 	var ignored browserCommandAcceptedFrame
-	if err := conn.ReadJSON(&ignored); err == nil {
+	err = conn.ReadJSON(&ignored)
+	if err == nil {
 		t.Fatal("expected connection to close after corrupt state, got a command acceptance")
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		t.Fatalf("server hung instead of closing after corrupt state: %v", err)
+	}
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("expected websocket close/EOF after corrupt state, got %T: %v", err, err)
 	}
 }

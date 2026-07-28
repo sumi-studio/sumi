@@ -161,6 +161,9 @@ func TestNewRouter_RequiresCommandLogDir(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected newRouter to fail without SUMI_COMMAND_LOG_DIR")
 	}
+	if !strings.Contains(err.Error(), "SUMI_COMMAND_LOG_DIR") {
+		t.Fatalf("expected error to mention SUMI_COMMAND_LOG_DIR, got %v", err)
+	}
 }
 
 func TestNewRouter_RequiresAgentRuntimeStateDir(t *testing.T) {

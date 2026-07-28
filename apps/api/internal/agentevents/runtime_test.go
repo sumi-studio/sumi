@@ -542,19 +542,23 @@ func TestDurableGatewayEventLogRejectsCorruptButCompleteRecords(t *testing.T) {
 	}
 
 	corrupt := []string{
-		`{"seq":2,"event":{"seq":2,"conversation_id":"conversation-1","event":{"type":"agent_end"}},"seq":2}\n`,
-		`{"seq":2,"event":{"seq":2,"conversation_id":"conversation-1","event":{"type":"agent_end"}},"extra":true}\n`,
-		`{"seq":9007199254740992,"event":{"seq":9007199254740992,"conversation_id":"conversation-1","event":{"type":"agent_end"}}}\n`,
+		`{"seq":2,"event":{"seq":2,"conversation_id":"conversation-1","event":{"type":"agent_end"}},"seq":2}` + "\n",
+		`{"seq":2,"event":{"seq":2,"conversation_id":"conversation-1","event":{"type":"agent_end"}},"extra":true}` + "\n",
+		`{"seq":9007199254740992,"event":{"seq":9007199254740992,"conversation_id":"conversation-1","event":{"type":"agent_end"}}}` + "\n",
 	}
-	for _, line := range corrupt {
+	for index, line := range corrupt {
 		if err := os.WriteFile(gateway.eventPath(claims.ConversationID), append([]byte(nil), []byte(line)...), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		seq = 2
 		event.Seq = &seq
 		event.Event = json.RawMessage(`{"type":"agent_end"}`)
-		if err := gateway.Receive(context.Background(), claims, event); err == nil {
+		err := gateway.Receive(context.Background(), claims, event)
+		if err == nil {
 			t.Fatalf("corrupt event log line must be rejected: %s", line)
+		}
+		if index == 2 && !strings.Contains(err.Error(), "JSON-safe integer") {
+			t.Fatalf("overflow record must fail for its sequence range, got %v", err)
 		}
 	}
 }
@@ -940,6 +944,54 @@ func TestDurableGatewayAppendRejectsInnerOuterSeqMismatch(t *testing.T) {
 	}
 }
 
+func TestDurableGatewayTracksRunLifecycleAcrossTurnBoundaries(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	const conversationID = "conversation-1"
+	claims := TokenClaims{TenantID: "tenant-1", AgentID: "agent-1", ConversationID: conversationID, Generation: 1}
+	var seq uint64
+	receive := func(raw string) {
+		t.Helper()
+		seq++
+		if err := gateway.Receive(context.Background(), claims, Envelope{
+			Seq:            &seq,
+			ConversationID: conversationID,
+			Event:          json.RawMessage(raw),
+		}); err != nil {
+			t.Fatalf("receive event %d: %v", seq, err)
+		}
+	}
+	assertInFlight := func(want bool) {
+		t.Helper()
+		if got := gateway.IsRunInFlight(conversationID); got != want {
+			t.Fatalf("in-flight state after event %d = %v, want %v", seq, got, want)
+		}
+	}
+
+	assertInFlight(false)
+	receive(`{"type":"agent_start"}`)
+	assertInFlight(true)
+	receive(`{"type":"turn_start"}`)
+	assertInFlight(true)
+	receive(`{"type":"message_start","message_id":"00000000-0000-4000-8000-000000000001","message":{"role":"user","content":[{"type":"text","text":"hello"}],"timestamp":"2026-07-28T00:00:00Z"}}`)
+	assertInFlight(true)
+	receive(`{"type":"message_end","message_id":"00000000-0000-4000-8000-000000000001","message":{"role":"user","content":[{"type":"text","text":"hello"}],"timestamp":"2026-07-28T00:00:00Z"}}`)
+	assertInFlight(true)
+	receive(`{"type":"message_start","message_id":"00000000-0000-4000-8000-000000000003","message":{"role":"assistant","content":[],"model":"m","provider":"p","origin":{"provider_instance_id":"x","protocol":"open_ai_responses","model":"m"},"usage":{"input":0,"output":0,"cache_read":0,"cache_write":0,"reasoning":0,"total_tokens":0},"stop_reason":"stop","error_message":null,"provider_code":null,"interrupted":false,"timestamp":"2026-07-28T00:00:00Z"}}`)
+	assertInFlight(true)
+	receive(`{"type":"message_end","message_id":"00000000-0000-4000-8000-000000000003","message":{"role":"assistant","content":[],"model":"m","provider":"p","origin":{"provider_instance_id":"x","protocol":"open_ai_responses","model":"m"},"usage":{"input":0,"output":0,"cache_read":0,"cache_write":0,"reasoning":0,"total_tokens":0},"stop_reason":"tool_use","error_message":null,"provider_code":null,"interrupted":false,"timestamp":"2026-07-28T00:00:00Z"}}`)
+	assertInFlight(true)
+	receive(`{"type":"message_start","message_id":"00000000-0000-4000-8000-000000000002","message":{"role":"tool_result","tool_call_id":"call-1","tool_name":"read_file","content":[{"type":"text","text":"ok"}],"details":{},"is_error":false,"timestamp":"2026-07-28T00:00:00Z"}}`)
+	assertInFlight(true)
+	receive(`{"type":"message_end","message_id":"00000000-0000-4000-8000-000000000002","message":{"role":"tool_result","tool_call_id":"call-1","tool_name":"read_file","content":[{"type":"text","text":"ok"}],"details":{},"is_error":false,"timestamp":"2026-07-28T00:00:00Z"}}`)
+	assertInFlight(true)
+	receive(`{"type":"turn_end","message":null,"tool_results":[]}`)
+	assertInFlight(true)
+	receive(`{"type":"turn_start"}`)
+	assertInFlight(true)
+	receive(`{"type":"agent_end"}`)
+	assertInFlight(false)
+}
+
 func TestDurableGatewayReconstructsCommandGuardStateAcrossRestart(t *testing.T) {
 	tmp := t.TempDir()
 	storeDir := filepath.Join(tmp, "commands")
@@ -957,12 +1009,30 @@ func TestDurableGatewayReconstructsCommandGuardStateAcrossRestart(t *testing.T) 
 	if err := gateway.Receive(context.Background(), claims, Envelope{
 		Seq:            &seq,
 		ConversationID: conversationID,
-		Event:          json.RawMessage(`{"type":"message_start","message_id":"00000000-0000-4000-8000-000000000001","message":{"role":"user","content":[{"type":"text","text":"ok"}],"timestamp":"2026-07-28T00:00:00Z"}}`),
+		Event:          json.RawMessage(`{"type":"agent_start"}`),
 	}); err != nil {
-		t.Fatalf("receive message_start: %v", err)
+		t.Fatalf("receive agent_start: %v", err)
 	}
 
 	seq = 2
+	if err := gateway.Receive(context.Background(), claims, Envelope{
+		Seq:            &seq,
+		ConversationID: conversationID,
+		Event:          json.RawMessage(`{"type":"turn_start"}`),
+	}); err != nil {
+		t.Fatalf("receive turn_start: %v", err)
+	}
+
+	seq = 3
+	if err := gateway.Receive(context.Background(), claims, Envelope{
+		Seq:            &seq,
+		ConversationID: conversationID,
+		Event:          json.RawMessage(`{"type":"message_end","message_id":"00000000-0000-4000-8000-000000000002","message":{"role":"user","content":[{"type":"text","text":"do not clear assistant state"}],"timestamp":"2026-07-28T00:00:00Z"}}`),
+	}); err != nil {
+		t.Fatalf("receive user message_end: %v", err)
+	}
+
+	seq = 4
 	if err := gateway.Receive(context.Background(), claims, Envelope{
 		Seq:            &seq,
 		ConversationID: conversationID,
@@ -971,7 +1041,7 @@ func TestDurableGatewayReconstructsCommandGuardStateAcrossRestart(t *testing.T) 
 		t.Fatalf("receive approval_requested: %v", err)
 	}
 
-	seq = 3
+	seq = 5
 	if err := gateway.Receive(context.Background(), claims, Envelope{
 		Seq:            &seq,
 		ConversationID: conversationID,
@@ -980,7 +1050,7 @@ func TestDurableGatewayReconstructsCommandGuardStateAcrossRestart(t *testing.T) 
 		t.Fatalf("receive second approval_requested: %v", err)
 	}
 
-	seq = 4
+	seq = 6
 	if err := gateway.Receive(context.Background(), claims, Envelope{
 		Seq:            &seq,
 		ConversationID: conversationID,
@@ -1002,8 +1072,8 @@ func TestDurableGatewayReconstructsCommandGuardStateAcrossRestart(t *testing.T) 
 	// Before reconstruction the guard state must appear empty. This is safe
 	// only because EnsureConversationStateRebuilt is invoked before command
 	// admission in the browser WebSocket path.
-	if gateway.IsAssistantTurnInFlight(conversationID) {
-		t.Fatal("expected no in-flight turn before state rebuild")
+	if gateway.IsRunInFlight(conversationID) {
+		t.Fatal("expected no in-flight run before state rebuild")
 	}
 	if gateway.IsApprovalPending(conversationID, "request-1") {
 		t.Fatal("expected no pending approvals before state rebuild")
@@ -1013,8 +1083,8 @@ func TestDurableGatewayReconstructsCommandGuardStateAcrossRestart(t *testing.T) 
 		t.Fatalf("rebuild conversation state: %v", err)
 	}
 
-	if !gateway.IsAssistantTurnInFlight(conversationID) {
-		t.Fatal("expected in-flight turn after state rebuild")
+	if !gateway.IsRunInFlight(conversationID) {
+		t.Fatal("expected in-flight run after state rebuild")
 	}
 	if !gateway.IsApprovalPending(conversationID, "request-1") {
 		t.Fatal("expected request-1 to be pending after state rebuild")
@@ -1039,7 +1109,7 @@ func TestDurableGatewayReconstructionFailsClosedOnCorruptState(t *testing.T) {
 
 	const conversationID = "conversation-1"
 	// A non-contiguous durable event log must fail reconstruction rather than
-	// defaulting to an empty "no turn / no approval" state.
+	// defaulting to an empty "no run / no approval" state.
 	if err := os.WriteFile(
 		gateway.eventPath(conversationID),
 		[]byte(`{"seq":2,"event":{"seq":2,"conversation_id":"conversation-1","event":{"type":"agent_start"}}}`+"\n"),
@@ -1067,7 +1137,7 @@ func TestDurableGatewayReconstructionFailsClosedOnCorruptState(t *testing.T) {
 	// The guard must remain closed after failed reconstruction; it must not
 	// silently default to an empty state that would admit abort or
 	// approval_decision commands.
-	if gateway.IsAssistantTurnInFlight(conversationID) {
+	if gateway.IsRunInFlight(conversationID) {
 		t.Fatal("expected in-flight flag to remain false after failed reconstruction")
 	}
 	if gateway.IsApprovalPending(conversationID, "request-1") {

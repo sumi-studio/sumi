@@ -23,11 +23,10 @@ import (
 var secret = []byte("browser-e2e-session-secret-32-bytes")
 
 func main() {
-	dir, err := os.MkdirTemp("", "sumi-browser-e2e-")
-	if err != nil {
-		log.Fatal(err)
+	dir := os.Getenv("SUMI_E2E_RUNTIME_DIR")
+	if dir == "" || !filepath.IsAbs(dir) {
+		log.Fatal("SUMI_E2E_RUNTIME_DIR must be an absolute parent-owned directory")
 	}
-	defer os.RemoveAll(dir)
 	store, err := agentevents.OpenCommandStore(filepath.Join(dir, "commands"))
 	if err != nil {
 		log.Fatal(err)
@@ -61,13 +60,40 @@ func main() {
 		browser.CloseBrowserConnections()
 		w.WriteHeader(http.StatusNoContent)
 	})
+	mux.HandleFunc("GET /__e2e__/connection-stats", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(browser.ConnectionStats()); err != nil {
+			log.Printf("encode browser connection stats: %v", err)
+		}
+	})
+	mux.HandleFunc("POST /__e2e__/disconnect-and-emit-terminal", func(w http.ResponseWriter, r *http.Request) {
+		if err := fixture.waitForAbort(); err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		browser.CloseBrowserConnections()
+		deadline := time.Now().Add(2 * time.Second)
+		for browser.ConnectionStats().Active != 0 {
+			if time.Now().After(deadline) {
+				http.Error(w, "browser websocket did not disconnect", http.StatusGatewayTimeout)
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if err := fixture.emitTerminalEvent(); err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		log.Fatal(err)
 	}
 	fmt.Printf("E2E_FIXTURE=http://%s\n", listener.Addr().String())
-	if err := http.Serve(listener, mux); err != nil {
+	srv := &http.Server{Handler: mux}
+	if err := srv.Serve(listener); err != nil {
 		log.Print(err)
 	}
 }
@@ -115,6 +141,8 @@ func (f *fixture) react(kind string) {
 	switch {
 	case kind == "user_message" && f.stage == 0:
 		f.stage = 1
+		f.durable(`{"type":"agent_start"}`)
+		f.durable(`{"type":"turn_start"}`)
 		f.volatile(`{"type":"message_update","message_id":"00000000-0000-4000-8000-000000000001","event":{"type":"text_delta","content_index":0,"delta":"streamed assistant"}}`)
 		f.durable(`{"type":"tool_execution_start","tool_call_id":"call-1","tool_name":"read_file","args":{}}`)
 		f.durable(`{"type":"tool_execution_end","tool_call_id":"call-1","result":"ok","is_error":false}`)
@@ -133,21 +161,39 @@ func (f *fixture) react(kind string) {
 }
 
 func (f *fixture) emitTerminal(w http.ResponseWriter, r *http.Request) {
+	if err := f.waitForAbort(); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	if err := f.emitTerminalEvent(); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (f *fixture) waitForAbort() error {
 	select {
 	case <-f.aborted:
 	case <-time.After(2 * time.Second):
-		http.Error(w, "abort command was not admitted", http.StatusConflict)
-		return
+		return fmt.Errorf("abort command was not admitted")
 	}
+	return nil
+}
+
+func (f *fixture) emitTerminalEvent() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.stage != 4 {
-		http.Error(w, "terminal already emitted", http.StatusConflict)
-		return
+		return fmt.Errorf("terminal already emitted")
 	}
 	f.stage = 5
 	f.durable(`{"type":"message_end","message_id":"00000000-0000-4000-8000-000000000002","message":{"role":"assistant","content":[{"type":"text","text":"Terminal replay","wire_item_index":0}],"model":"fixture","provider":"fixture","origin":{"provider_instance_id":"fixture","protocol":"open_ai_responses","model":"fixture"},"usage":{"input":0,"output":0,"cache_read":0,"cache_write":0,"reasoning":0,"total_tokens":0},"stop_reason":"aborted","error_message":null,"provider_code":null,"interrupted":true,"timestamp":"2026-07-28T00:00:00Z"}}`)
-	w.WriteHeader(http.StatusNoContent)
+	// The ordered durable event after message_end is an E2E replay barrier:
+	// once the browser observes it, every earlier replay frame has settled.
+	f.durable(`{"type":"turn_end","message":null,"tool_results":[]}`)
+	f.durable(`{"type":"agent_end"}`)
+	return nil
 }
 
 func (f *fixture) durable(event string) {

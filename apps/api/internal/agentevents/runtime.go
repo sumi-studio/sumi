@@ -44,13 +44,13 @@ type DurableGateway struct {
 	clock                 uint64
 	newFile               func(string, int, os.FileMode) (durableFileHandle, error)
 
-	// stateMu protects in-flight and pending-approval state derived from
+	// stateMu protects run-in-flight and pending-approval state derived from
 	// durable events. Readers also take mu first so they cannot observe the
 	// interval after an event is durably appended but before its derived state
 	// is updated.
 	stateMu          sync.RWMutex
 	stateRebuilt     map[string]bool
-	inFlight         map[string]bool
+	runInFlight      map[string]bool
 	pendingApprovals map[string]map[string]bool
 }
 
@@ -175,7 +175,7 @@ func OpenDurableGateway(dir string, commands *CommandStore) (*DurableGateway, er
 		tails:                make(map[string]*conversationLogState),
 		browserSubscribers:   make(map[string]map[uint64]chan Envelope),
 		stateRebuilt:         make(map[string]bool),
-		inFlight:             make(map[string]bool),
+		runInFlight:          make(map[string]bool),
 		pendingApprovals:     make(map[string]map[string]bool),
 		newFile: func(name string, flag int, perm os.FileMode) (durableFileHandle, error) {
 			return os.OpenFile(name, flag|syscall.O_NOFOLLOW, perm)
@@ -652,10 +652,13 @@ func (g *DurableGateway) applyEventStateLocked(conversationID string, event json
 	}
 
 	switch head.Type {
-	case "message_start":
-		g.inFlight[conversationID] = true
-	case "message_end", "turn_end":
-		g.inFlight[conversationID] = false
+	case "agent_start":
+		// One run spans turn replacement during hard/soft steering as well as
+		// assistant message, tool, and continuation boundaries. Only AgentEnd
+		// closes the abort-admission window.
+		g.runInFlight[conversationID] = true
+	case "agent_end":
+		g.runInFlight[conversationID] = false
 	case "approval_requested":
 		if head.Request.ID == "" {
 			return
@@ -706,15 +709,16 @@ func (g *DurableGateway) EnsureConversationStateRebuilt(ctx context.Context, con
 	return nil
 }
 
-// IsAssistantTurnInFlight reports whether a durable message_start has not yet
-// been matched by a message_end or turn_end for the conversation. It is used by
-// the browser WebSocket to reject abort commands sent outside an active turn.
-func (g *DurableGateway) IsAssistantTurnInFlight(conversationID string) bool {
+// IsRunInFlight reports whether a durable agent_start has not yet been closed
+// by agent_end. It is used by the browser command guard to reject meaningless
+// aborts without closing the window during tool execution, continuation calls,
+// or hard/soft-steer turn replacement.
+func (g *DurableGateway) IsRunInFlight(conversationID string) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.stateMu.RLock()
 	defer g.stateMu.RUnlock()
-	return g.inFlight[conversationID]
+	return g.runInFlight[conversationID]
 }
 
 // IsApprovalPending reports whether an approval with requestID is still awaiting

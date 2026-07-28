@@ -560,5 +560,12 @@
       "type": "command_rejected",
       "reject_reason": "unknown_command"
     }
+  },
+  "browser_command_rejected_not_allowed": {
+    "kind": "browser_command_rejected",
+    "wire": {
+      "type": "command_rejected",
+      "reject_reason": "not_allowed"
+    }
   }
 }

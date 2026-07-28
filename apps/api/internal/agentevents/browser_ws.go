@@ -31,6 +31,16 @@ type BrowserServer struct {
 	upgrader      websocket.Upgrader
 	connectionsMu sync.Mutex
 	connections   map[*websocket.Conn]struct{}
+	accepted      uint64
+}
+
+// BrowserConnectionStats is a point-in-time view of the browser WebSocket
+// lifecycle. Accepted is monotonic for the lifetime of this server instance,
+// which lets shutdown and reconnect checks distinguish a new connection from
+// a transient UI state.
+type BrowserConnectionStats struct {
+	Active   int    `json:"active"`
+	Accepted uint64 `json:"accepted"`
 }
 
 type browserHello struct {
@@ -84,7 +94,7 @@ func (s *BrowserServer) checkCommandState(conversationID string, head browserCom
 	}
 	switch head.Type {
 	case "abort":
-		if !s.Events.IsAssistantTurnInFlight(conversationID) {
+		if !s.Events.IsRunInFlight(conversationID) {
 			return RejectNotAllowed, true
 		}
 	case "approval_decision":
@@ -162,10 +172,20 @@ func (s *BrowserServer) CloseBrowserConnections() {
 	}
 }
 
+func (s *BrowserServer) ConnectionStats() BrowserConnectionStats {
+	s.connectionsMu.Lock()
+	defer s.connectionsMu.Unlock()
+	return BrowserConnectionStats{
+		Active:   len(s.connections),
+		Accepted: s.accepted,
+	}
+}
+
 func (s *BrowserServer) addConnection(conn *websocket.Conn) {
 	s.connectionsMu.Lock()
 	defer s.connectionsMu.Unlock()
 	s.connections[conn] = struct{}{}
+	s.accepted++
 }
 
 func (s *BrowserServer) removeConnection(conn *websocket.Conn) {
@@ -273,11 +293,11 @@ func (s *BrowserServer) browserEventPump(ctx context.Context, conversationID str
 			return fmt.Errorf("browser durable event catch-up: %w", err)
 		}
 		for _, envelope := range durable {
-			if err := write(browserEventFrame{Type: "event", Envelope: envelope}); err != nil {
-				return err
-			}
 			if envelope.Seq == nil {
 				return errors.New("durable replay returned a volatile event")
+			}
+			if err := write(browserEventFrame{Type: "event", Envelope: envelope}); err != nil {
+				return err
 			}
 			next = *envelope.Seq
 		}
