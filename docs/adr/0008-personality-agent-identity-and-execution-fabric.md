@@ -245,6 +245,11 @@ model turnをまたいでstdin、resize、signal、detach/reattach、終了を�
 terminalは一回のtool callに従属するcommand resultではなく、本人が時間の中で
 操作する持続的な道具である。
 
+人間がterminalを使う前に全command列、stdin列、期待outputを宣言しないのと
+同じく、predeclared command scriptやone-shot execution packetを正本にしない。
+観察したoutputに応じて次の入力、待機、signal、別terminalでの作業を選ぶ連続した
+interactionとして扱う。
+
 人格なしsubagentも、人間が使うAI harnessがその人のPCでshellを使うのと同じく、
 委譲されたauthorityの範囲で自分のterminalを持てる。親の人格agentがterminalを
 使うためにsubagentを作る必要はない。
