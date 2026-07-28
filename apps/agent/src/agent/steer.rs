@@ -17,7 +17,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     gateway::Command,
-    provider::types::{PublicAssistantContent, PublicMessage, StopReason, ToolResultMessage},
+    provider::types::{
+        ProviderContextFragment, PublicAssistantContent, PublicMessage, StopReason,
+        ToolResultMessage,
+    },
     store::{
         ApplicationKind, DurableEvent, EventBatch, EventWrite, InjectedCommand, Projection,
         Redactor, RunPhase,
@@ -259,11 +262,15 @@ pub(crate) fn hard_steer_step_zero_batch(
 /// Splitting into two batches is required because the partial assistant
 /// `MessageEnd` must see exactly one live owner; the new user message cannot
 /// open ownership until after that boundary.
+/// Verified provider context and its replay footprint remain on that same
+/// partial-assistant `MessageEnd` projection.
 pub(crate) fn finalize_hard_steer_batches(
     owner: &DurableRunBinding,
     command: &AdmittedCommand,
     partial_message_id: String,
     partial: PublicMessage,
+    provider_context: Vec<ProviderContextFragment>,
+    eviction_footprint_tokens: u64,
     new_turn_id: impl Into<String>,
 ) -> Result<Vec<EventBatch>> {
     if !matches!(command.envelope().command, Command::UserMessage { .. }) {
@@ -288,8 +295,8 @@ pub(crate) fn finalize_hard_steer_batches(
                     role: "assistant",
                     message: message.clone(),
                     append_to_l0: true,
-                    provider_context: Vec::new(),
-                    eviction_footprint_tokens: 0,
+                    provider_context,
+                    eviction_footprint_tokens,
                 }],
             },
             EventWrite {
@@ -1281,9 +1288,16 @@ mod tests {
             timestamp: test_timestamp(),
         });
 
-        let batches =
-            finalize_hard_steer_batches(&owner, &command, owner_assistant_id, partial, "turn-004")
-                .expect("build finalize batches");
+        let batches = finalize_hard_steer_batches(
+            &owner,
+            &command,
+            owner_assistant_id,
+            partial,
+            Vec::new(),
+            0,
+            "turn-004",
+        )
+        .expect("build finalize batches");
         assert_eq!(batches.len(), 2);
 
         // Concatenate the two batches to verify the §6.3.1 event type sequence.

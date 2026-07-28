@@ -888,26 +888,11 @@ impl Runner {
                             } else {
                                 provider_context
                             };
-                            if !durable_provider_context.is_empty() {
-                                let PublicMessage::Assistant(assistant) = &terminal_message else {
-                                    return Err(WorkerFailure::Error(
-                                        "provider context requires an assistant terminal".to_owned(),
-                                    ));
-                                };
-                                if self
-                                    .pending_provider_context
-                                    .insert(
-                                        terminal_message_id.clone(),
-                                        (assistant.origin.clone(), durable_provider_context.clone()),
-                                    )
-                                    .is_some()
-                                {
-                                    return Err(WorkerFailure::Error(
-                                        "duplicate pending provider-context message identity"
-                                            .to_owned(),
-                                    ));
-                                }
-                            }
+                            self.stage_provider_context(
+                                &terminal_message_id,
+                                &terminal_message,
+                                &durable_provider_context,
+                            )?;
                             let receipt = self
                                 .emit_provider_message_end(
                                     terminal_message_id,
@@ -1010,6 +995,7 @@ impl Runner {
             })
             .await?;
         }
+        self.stage_provider_context(message_id, &partial, &provider_context)?;
         let receipt = self
             .emit_message_end_with_provider_context(
                 message_id.to_owned(),
@@ -1020,6 +1006,10 @@ impl Runner {
             )
             .await?;
         let receipt = self.await_message_receipt(receipt).await?;
+        // MessageEnd is now durable. Promote its staged context before any
+        // post-commit control can close the live run, so warm continuation
+        // remains identical to cold hydration even when Abort wins below.
+        self.retain_committed(receipt.clone(), &partial)?;
         // Give a queued Abort its durable authorization turn before deciding
         // whether this close can hand off to a new turn.
         self.receive_control_safe_point().await?;
@@ -1043,7 +1033,6 @@ impl Runner {
                 rejected_results: Vec::new(),
             });
         }
-        self.retain_committed(receipt, &partial)?;
         self.claim_control(command)?;
         Ok(AttemptOutcome::HardSteer)
     }
@@ -2640,6 +2629,35 @@ impl Runner {
         committed
             .await
             .map_err(|_| WorkerFailure::Error("RetryScheduled durability commit failed".to_owned()))
+    }
+
+    fn stage_provider_context(
+        &mut self,
+        message_id: &str,
+        message: &PublicMessage,
+        fragments: &[ProviderContextFragment],
+    ) -> Result<(), WorkerFailure> {
+        if fragments.is_empty() {
+            return Ok(());
+        }
+        let PublicMessage::Assistant(assistant) = message else {
+            return Err(WorkerFailure::Error(
+                "provider context requires an assistant terminal".to_owned(),
+            ));
+        };
+        if self
+            .pending_provider_context
+            .insert(
+                message_id.to_owned(),
+                (assistant.origin.clone(), fragments.to_vec()),
+            )
+            .is_some()
+        {
+            return Err(WorkerFailure::Error(
+                "duplicate pending provider-context message identity".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     async fn await_message_receipt(
