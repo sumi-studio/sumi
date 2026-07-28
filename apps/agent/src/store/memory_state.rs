@@ -1127,10 +1127,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, sync::Arc};
 
     use super::*;
-    use crate::store::{DataKeyPurpose, Store};
+    use crate::store::{
+        DataKeyPurpose, DurableEvent, EventBatch, EventWrite, EventWriter,
+        MemoryApplyCursorAdvance, MemoryTransition, Projection, Store,
+    };
+    use uuid::Uuid;
 
     async fn store() -> Store {
         Store::session_test_store("conversation-1")
@@ -1138,68 +1142,228 @@ mod tests {
             .expect("open test store")
     }
 
+    async fn apply_transition(store: &Store, kind: &str, transition: MemoryTransition) -> u64 {
+        let seqs = EventWriter::new(Arc::new(store.clone()))
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::memory_maintenance(kind)
+                            .expect("memory-maintenance test event"),
+                    ),
+                    projections: vec![Projection::MemoryTransition(transition)],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("commit authenticated memory transition");
+        assert_eq!(seqs.len(), 1);
+        seqs[0]
+    }
+
+    async fn seed_batch(
+        store: &Store,
+        layer: MemoryLayer,
+        state: MemoryBatchState,
+    ) -> (String, i64, i64, u64) {
+        let id = Uuid::now_v7().to_string();
+        let event_seq = apply_transition(
+            store,
+            "fixture_seed_batch",
+            MemoryTransition {
+                batch_inserts: vec![MemoryBatchRecord::new(id.clone(), layer, 0, 0, state, 0, 0)],
+                ..Default::default()
+            },
+        )
+        .await;
+        let row = sqlx::query("SELECT ord, batch_seq FROM memory_batches WHERE id = ?")
+            .bind(&id)
+            .fetch_one(store.pool())
+            .await
+            .expect("load seeded memory batch");
+        (
+            id,
+            row.try_get("ord").expect("seeded batch ord"),
+            row.try_get("batch_seq").expect("seeded batch sequence"),
+            event_seq,
+        )
+    }
+
+    async fn seed_job(store: &Store) -> (String, String, String, i64, u64) {
+        let source_id = Uuid::now_v7().to_string();
+        let target_id = Uuid::now_v7().to_string();
+        let job_id = Uuid::now_v7().to_string();
+        let source = MemoryBatchRecord::new(
+            source_id.clone(),
+            MemoryLayer::L0,
+            0,
+            0,
+            MemoryBatchState::Compacting,
+            0,
+            0,
+        );
+        let target = MemoryBatchRecord::new(
+            target_id.clone(),
+            MemoryLayer::L1,
+            0,
+            0,
+            MemoryBatchState::Compacting,
+            0,
+            0,
+        );
+        let job = MemoryJobRecord::new(
+            job_id.clone(),
+            MemoryJobKind::CompactL0,
+            0,
+            vec![source_id.clone()],
+            BTreeMap::from([(source_id.clone(), 0), (target_id.clone(), 0)]),
+        );
+        let event_seq = apply_transition(
+            store,
+            "fixture_seed_job",
+            MemoryTransition {
+                batch_inserts: vec![source, target],
+                job_inserts: vec![job],
+                ..Default::default()
+            },
+        )
+        .await;
+        let batch_seq: i64 = sqlx::query_scalar("SELECT batch_seq FROM memory_jobs WHERE id = ?")
+            .bind(&job_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("load seeded memory job sequence");
+        (source_id, target_id, job_id, batch_seq, event_seq)
+    }
+
+    async fn seed_cursor(store: &Store, kind: &str, next_batch_seq: u64) -> u64 {
+        apply_transition(
+            store,
+            "fixture_seed_cursor",
+            MemoryTransition {
+                cursor_advance: Some(MemoryApplyCursorAdvance {
+                    kind: kind.to_owned(),
+                    expected: next_batch_seq,
+                    next: next_batch_seq,
+                    initialize: true,
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    fn assert_sql_error_contains<T>(result: std::result::Result<T, sqlx::Error>, expected: &str) {
+        let error = match result {
+            Ok(_) => panic!("statement must violate its intended constraint"),
+            Err(error) => error,
+        };
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains(expected),
+            "expected SQLite error containing {expected:?}, got {rendered}"
+        );
+    }
+
     #[tokio::test]
     async fn migration_enforces_memory_batch_constraints() {
         let store = store().await;
+        let (_, _, _, event_seq) =
+            seed_batch(&store, MemoryLayer::L0, MemoryBatchState::Open).await;
+        let event_seq = i64::try_from(event_seq).expect("test event sequence fits i64");
+        let summary_key = store
+            .conversation_key(DataKeyPurpose::MemorySummary)
+            .await
+            .expect("mint summary key");
 
         let invalid_layer = sqlx::query(
             "INSERT INTO memory_batches(
                 id, layer, ord, batch_seq, version, state, est_tokens,
-                eviction_footprint_tokens, updated_at
-             ) VALUES('batch-1', 5, 0, 0, 0, 'open', 0, 0, 'now')",
+                eviction_footprint_tokens, projection_event_seq, projection_digest, updated_at
+             ) VALUES('batch-invalid-layer', 5, 101, 101, 0, 'open', 0, 0, ?, zeroblob(32), 'now')",
         )
+        .bind(event_seq)
         .execute(store.pool())
         .await;
-        assert!(invalid_layer.is_err());
+        assert_sql_error_contains(invalid_layer, "layer IN");
 
         let invalid_state = sqlx::query(
             "INSERT INTO memory_batches(
                 id, layer, ord, batch_seq, version, state, est_tokens,
-                eviction_footprint_tokens, updated_at
-             ) VALUES('batch-2', 0, 0, 0, 0, 'unknown', 0, 0, 'now')",
+                eviction_footprint_tokens, projection_event_seq, projection_digest, updated_at
+             ) VALUES('batch-invalid-state', 0, 102, 102, 0, 'unknown', 0, 0, ?, zeroblob(32), 'now')",
         )
+        .bind(event_seq)
         .execute(store.pool())
         .await;
-        assert!(invalid_state.is_err());
+        assert_sql_error_contains(invalid_state, "state IN");
 
         let negative_tokens = sqlx::query(
             "INSERT INTO memory_batches(
                 id, layer, ord, batch_seq, version, state, est_tokens,
-                eviction_footprint_tokens, updated_at
-             ) VALUES('batch-3', 0, 0, 0, 0, 'open', -1, 0, 'now')",
+                eviction_footprint_tokens, projection_event_seq, projection_digest, updated_at
+             ) VALUES('batch-negative-tokens', 0, 103, 103, 0, 'open', -1, 0, ?, zeroblob(32), 'now')",
         )
+        .bind(event_seq)
         .execute(store.pool())
         .await;
-        assert!(negative_tokens.is_err());
+        assert_sql_error_contains(negative_tokens, "est_tokens >= 0");
 
         let partial_summary = sqlx::query(
             "INSERT INTO memory_batches(
                 id, layer, ord, batch_seq, version, state, est_tokens,
                 eviction_footprint_tokens, summary_key_ref, summary_ciphertext,
-                summary_projection, summary_redaction_version, updated_at
-             ) VALUES('batch-4', 0, 0, 0, 0, 'open', 0, 0, 'key', NULL, 'proj', 1, 'now')",
+                summary_projection, summary_redaction_version, projection_event_seq,
+                projection_digest, updated_at
+             ) VALUES(
+                'batch-partial-summary', 1, 104, 104, 0, 'compacting', 0, 0,
+                ?, NULL, 'proj', 1, ?, zeroblob(32), 'now'
+             )",
         )
+        .bind(&summary_key.key_ref)
+        .bind(event_seq)
         .execute(store.pool())
         .await;
-        assert!(partial_summary.is_err());
+        assert_sql_error_contains(partial_summary, "summary_key_ref IS NULL");
     }
 
     #[tokio::test]
     async fn memory_batch_record_round_trip_and_unique_layer_batch_seq() {
         let store = store().await;
-        let batch = MemoryBatchRecord::new(
-            "batch-1",
-            MemoryLayer::L0,
-            0,
-            1,
-            MemoryBatchState::Open,
-            100,
-            20,
+        let (batch_id, ord, batch_seq, event_seq) =
+            seed_batch(&store, MemoryLayer::L0, MemoryBatchState::Open).await;
+        let row = sqlx::query(
+            "SELECT layer, ord, batch_seq, version, state, projection_event_seq,
+                    length(projection_digest) AS digest_len
+             FROM memory_batches WHERE id = ?",
+        )
+        .bind(&batch_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("round-trip authenticated memory batch");
+        assert_eq!(row.try_get::<i64, _>("layer").unwrap(), 0);
+        assert_eq!(row.try_get::<i64, _>("ord").unwrap(), ord);
+        assert_eq!(row.try_get::<i64, _>("batch_seq").unwrap(), batch_seq);
+        assert_eq!(row.try_get::<i64, _>("version").unwrap(), 0);
+        assert_eq!(row.try_get::<String, _>("state").unwrap(), "open");
+        assert_eq!(
+            row.try_get::<i64, _>("projection_event_seq").unwrap(),
+            i64::try_from(event_seq).unwrap()
         );
-        assert!(
-            batch.insert(store.pool()).await.is_err(),
-            "memory batches must be staged and committed by EventWriter"
-        );
+        assert_eq!(row.try_get::<i64, _>("digest_len").unwrap(), 32);
+
+        let duplicate = sqlx::query(
+            "INSERT INTO memory_batches(
+                id, layer, ord, batch_seq, version, state, est_tokens,
+                eviction_footprint_tokens, projection_event_seq, projection_digest, updated_at
+             ) VALUES(?, 0, ?, ?, 0, 'open', 0, 0, ?, zeroblob(32), 'now')",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(ord.checked_add(1).expect("test ord"))
+        .bind(batch_seq)
+        .bind(i64::try_from(event_seq).unwrap())
+        .execute(store.pool())
+        .await;
+        assert_sql_error_contains(duplicate, "memory_batches.layer, memory_batches.batch_seq");
     }
 
     #[tokio::test]
@@ -1226,7 +1390,9 @@ mod tests {
             message_id: "message-1".to_owned(),
             ord: 0,
         };
-        assert!(orphan.insert(store.pool()).await.is_err());
+        let orphan = orphan.insert(store.pool()).await;
+        let error = orphan.expect_err("orphan membership must fail");
+        assert!(format!("{error:#}").contains("FOREIGN KEY"), "{error:#}");
 
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory_batch_messages")
@@ -1240,133 +1406,203 @@ mod tests {
     #[tokio::test]
     async fn memory_job_unique_kind_batch_seq_and_status_check() {
         let store = store().await;
-        let job = MemoryJobRecord::new(
-            "job-1",
-            MemoryJobKind::CompactL0,
-            1,
-            vec!["batch-1".to_owned()],
-            BTreeMap::new(),
+        let (source_id, target_id, job_id, batch_seq, event_seq) = seed_job(&store).await;
+        let row = sqlx::query(
+            "SELECT kind, batch_seq, source_ids, source_versions, status,
+                    projection_event_seq, length(projection_digest) AS digest_len
+             FROM memory_jobs WHERE id = ?",
+        )
+        .bind(&job_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("round-trip authenticated memory job");
+        assert_eq!(row.try_get::<String, _>("kind").unwrap(), "compact_l0");
+        assert_eq!(row.try_get::<i64, _>("batch_seq").unwrap(), batch_seq);
+        assert_eq!(row.try_get::<String, _>("status").unwrap(), "pending");
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&row.try_get::<String, _>("source_ids").unwrap())
+                .unwrap(),
+            vec![source_id.clone()]
         );
-        assert!(
-            job.insert(store.pool()).await.is_err(),
-            "memory jobs must be staged and committed by EventWriter"
+        assert_eq!(
+            serde_json::from_str::<BTreeMap<String, i64>>(
+                &row.try_get::<String, _>("source_versions").unwrap()
+            )
+            .unwrap(),
+            BTreeMap::from([(source_id.clone(), 0), (target_id, 0)])
         );
+        assert_eq!(
+            row.try_get::<i64, _>("projection_event_seq").unwrap(),
+            i64::try_from(event_seq).unwrap()
+        );
+        assert_eq!(row.try_get::<i64, _>("digest_len").unwrap(), 32);
+
+        let duplicate = sqlx::query(
+            "INSERT INTO memory_jobs(
+                id, kind, batch_seq, source_ids, source_versions, status, lease_until, attempts,
+                projection_event_seq, projection_digest, created_at, updated_at
+             ) VALUES(?, 'compact_l0', ?, ?, ?, 'pending', NULL, 0, ?, zeroblob(32), 'now', 'now')",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(batch_seq)
+        .bind(serde_json::to_string(&vec![source_id.clone()]).unwrap())
+        .bind(serde_json::to_string(&BTreeMap::from([(source_id, 0)])).unwrap())
+        .bind(i64::try_from(event_seq).unwrap())
+        .execute(store.pool())
+        .await;
+        assert_sql_error_contains(duplicate, "memory_jobs.kind, memory_jobs.batch_seq");
 
         let invalid_status = sqlx::query(
             "INSERT INTO memory_jobs(
                 id, kind, batch_seq, source_ids, source_versions, status, attempts,
-                created_at, updated_at
-             ) VALUES('job-bad', 'compact_l0', 2, '[]', '{}', 'unknown', 0, 'now', 'now')",
+                projection_event_seq, projection_digest, created_at, updated_at
+             ) VALUES(
+                ?, 'compact_l1', ?, '[\"source\"]', '{\"source\":0}', 'unknown', 0,
+                ?, zeroblob(32), 'now', 'now'
+             )",
         )
+        .bind(Uuid::now_v7().to_string())
+        .bind(batch_seq.checked_add(100).expect("test job sequence"))
+        .bind(i64::try_from(event_seq).unwrap())
         .execute(store.pool())
         .await;
-        assert!(invalid_status.is_err());
+        assert_sql_error_contains(invalid_status, "status IN");
     }
 
     #[tokio::test]
     async fn memory_apply_cursor_cas_advances_monotonically() {
         let store = store().await;
-        let cursor = MemoryApplyCursorRecord {
-            kind: "l1".to_owned(),
-            next_batch_seq: 0,
-        };
-        assert!(
-            cursor.insert(store.pool()).await.is_err(),
-            "memory cursors must be staged and committed by EventWriter"
+        let kind = MemoryJobKind::CompactL0.as_str();
+        seed_cursor(&store, kind, 0).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT next_batch_seq FROM memory_apply_cursors WHERE kind = ?"
+            )
+            .bind(kind)
+            .fetch_one(store.pool())
+            .await
+            .expect("load authenticated cursor"),
+            0
         );
+
+        let mut transaction = store.pool().begin().await.expect("begin cursor CAS test");
+        assert!(
+            MemoryApplyCursorRecord {
+                kind: kind.to_owned(),
+                next_batch_seq: 2,
+            }
+            .advance(&mut *transaction, 0)
+            .await
+            .expect("advance cursor")
+        );
+        assert!(
+            !MemoryApplyCursorRecord {
+                kind: kind.to_owned(),
+                next_batch_seq: 3,
+            }
+            .advance(&mut *transaction, 0)
+            .await
+            .expect("reject stale expected cursor")
+        );
+        assert!(
+            !MemoryApplyCursorRecord {
+                kind: kind.to_owned(),
+                next_batch_seq: 1,
+            }
+            .advance(&mut *transaction, 2)
+            .await
+            .expect("reject cursor regression")
+        );
+        transaction
+            .rollback()
+            .await
+            .expect("rollback unauthenticated primitive test writes");
     }
 
     #[tokio::test]
     async fn batch_state_version_cas_rejects_stale_expected_version() {
         let store = store().await;
-        let batch = MemoryBatchRecord::new(
-            "batch-1",
-            MemoryLayer::L0,
-            0,
-            1,
-            MemoryBatchState::Open,
-            0,
-            0,
-        );
+        let (batch_id, _, _, _) = seed_batch(&store, MemoryLayer::L0, MemoryBatchState::Open).await;
+        let mut transaction = store.pool().begin().await.expect("begin batch CAS test");
         assert!(
             !update_batch_state_version(
-                store.pool(),
-                "batch-1",
-                0,
+                &mut *transaction,
+                &batch_id,
+                1,
                 MemoryBatchState::Compacting,
                 0,
             )
             .await
             .unwrap()
         );
-
-        assert!(batch.insert(store.pool()).await.is_err());
+        assert!(
+            update_batch_state_version(
+                &mut *transaction,
+                &batch_id,
+                0,
+                MemoryBatchState::Compacting,
+                0,
+            )
+            .await
+            .expect("matching batch CAS")
+        );
+        assert!(
+            !update_batch_state_version(
+                &mut *transaction,
+                &batch_id,
+                0,
+                MemoryBatchState::CompactFailed,
+                0,
+            )
+            .await
+            .expect("stale batch CAS after version increment")
+        );
+        transaction
+            .rollback()
+            .await
+            .expect("rollback unauthenticated primitive test writes");
     }
 
     #[tokio::test]
     async fn memory_summary_requires_valid_data_key_foreign_key() {
         let store = store().await;
+        let (batch_id, _, _, _) =
+            seed_batch(&store, MemoryLayer::L1, MemoryBatchState::Compacting).await;
         let summary_key = store
             .conversation_key(DataKeyPurpose::MemorySummary)
             .await
             .expect("mint memory summary key");
 
-        let batch = MemoryBatchRecord {
-            id: "batch-1".to_owned(),
-            layer: MemoryLayer::L2,
-            ord: 0,
-            batch_seq: 1,
-            version: 0,
-            state: MemoryBatchState::Compacted,
-            est_tokens: 0,
-            eviction_footprint_tokens: 0,
-            summary: Some(MemoryBatchSummary {
-                key_ref: summary_key.key_ref.clone(),
-                ciphertext: vec![1, 2, 3],
-                projection: "{}".to_owned(),
-                redaction_version: 1,
-            }),
-            updated_at: Utc::now().to_rfc3339(),
-        };
-        assert!(
-            batch.insert(store.pool()).await.is_err(),
-            "even a valid summary row requires an EventWriter commitment"
-        );
+        let mut transaction = store
+            .pool()
+            .begin()
+            .await
+            .expect("begin valid summary FK test");
+        sqlx::query(
+            "UPDATE memory_batches
+             SET summary_key_ref = ?, summary_ciphertext = X'010203',
+                 summary_projection = '{}', summary_redaction_version = 1
+             WHERE id = ?",
+        )
+        .bind(&summary_key.key_ref)
+        .bind(&batch_id)
+        .execute(&mut *transaction)
+        .await
+        .expect("valid memory-summary key satisfies FK");
+        transaction
+            .rollback()
+            .await
+            .expect("rollback unauthenticated FK fixture update");
 
-        let invalid = MemoryBatchRecord {
-            id: "batch-2".to_owned(),
-            layer: MemoryLayer::L2,
-            ord: 1,
-            batch_seq: 2,
-            version: 0,
-            state: MemoryBatchState::Compacted,
-            est_tokens: 0,
-            eviction_footprint_tokens: 0,
-            summary: Some(MemoryBatchSummary {
-                key_ref: "missing-key".to_owned(),
-                ciphertext: vec![1, 2, 3],
-                projection: "{}".to_owned(),
-                redaction_version: 1,
-            }),
-            updated_at: Utc::now().to_rfc3339(),
-        };
-        assert!(invalid.insert(store.pool()).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn memory_apply_cursor_insert_does_not_regress() {
-        let store = store().await;
-
-        let forward = MemoryApplyCursorRecord {
-            kind: "layer-0".to_owned(),
-            next_batch_seq: 10,
-        };
-        assert!(forward.insert(store.pool()).await.is_err());
-
-        let backward = MemoryApplyCursorRecord {
-            kind: "layer-0".to_owned(),
-            next_batch_seq: 5,
-        };
-        assert!(backward.insert(store.pool()).await.is_err());
+        let invalid = sqlx::query(
+            "UPDATE memory_batches
+             SET summary_key_ref = 'missing-key', summary_ciphertext = X'010203',
+                 summary_projection = '{}', summary_redaction_version = 1
+             WHERE id = ?",
+        )
+        .bind(&batch_id)
+        .execute(store.pool())
+        .await;
+        assert_sql_error_contains(invalid, "FOREIGN KEY");
     }
 }

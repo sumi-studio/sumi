@@ -2783,6 +2783,8 @@ impl EventWriter {
         let mut l0_allocator: Option<L0BatchAllocator> = None;
         let mut prepared = Vec::with_capacity(batch.writes.len());
         let mut transaction_bytes = 0usize;
+        let mut prepared_components = 0usize;
+        charge_materialization_components(&mut prepared_components, batch.writes.len())?;
         let mut event_seqs = Vec::new();
         for write in batch.writes {
             let calibration_observed_prompt_tokens = write
@@ -2880,6 +2882,7 @@ impl EventWriter {
 
             let mut projections = Vec::with_capacity(write.projections.len());
             for projection in write.projections {
+                charge_materialization_components(&mut prepared_components, 1)?;
                 match projection {
                     Projection::MessageEnd {
                         message_id,
@@ -3104,20 +3107,26 @@ impl EventWriter {
                         let prepared = self
                             .prepare_memory_job_update(&mut memory_summary_key, update)
                             .await?;
-                        charge_transaction_bytes(
-                            &mut transaction_bytes,
-                            memory_projection_size(&prepared),
+                        let materialization =
+                            prepared_memory_projection_materialization(&prepared)?;
+                        charge_materialization_components(
+                            &mut prepared_components,
+                            materialization.components,
                         )?;
+                        charge_transaction_bytes(&mut transaction_bytes, materialization.bytes)?;
                         projections.push(prepared);
                     }
                     Projection::MemoryTransition(transition) => {
                         let prepared = self
                             .prepare_memory_transition(&mut memory_summary_key, transition)
                             .await?;
-                        charge_transaction_bytes(
-                            &mut transaction_bytes,
-                            memory_projection_size(&prepared),
+                        let materialization =
+                            prepared_memory_projection_materialization(&prepared)?;
+                        charge_materialization_components(
+                            &mut prepared_components,
+                            materialization.components,
                         )?;
+                        charge_transaction_bytes(&mut transaction_bytes, materialization.bytes)?;
                         projections.push(prepared);
                     }
                     Projection::MemoryCalibrationObservation {
@@ -3834,27 +3843,6 @@ impl EventWriter {
         memory_summary_key: &mut Option<super::crypto::DataKeyMaterial>,
         transition: MemoryTransition,
     ) -> Result<PreparedProjection> {
-        for insert in &transition.batch_inserts {
-            let Some(summary) = &insert.summary else {
-                continue;
-            };
-            let key = self.store.data_key_by_ref(&summary.key_ref).await?;
-            if key.purpose != DataKeyPurpose::MemorySummary {
-                bail!(
-                    "memory batch insert summary key {} has purpose {}, expected {}",
-                    key.key_ref,
-                    key.purpose.as_str(),
-                    DataKeyPurpose::MemorySummary.as_str()
-                );
-            }
-            if let Some(expected) = memory_summary_key.as_ref() {
-                if expected.key_ref != key.key_ref {
-                    bail!("MemoryTransition cannot mix memory-summary key references");
-                }
-            } else {
-                *memory_summary_key = Some(key);
-            }
-        }
         let pre_source_versions = convert_batch_versions(transition.expected_source_versions)?;
         let mut post_source_versions = pre_source_versions.clone();
         let mut batch_mutations = Vec::with_capacity(transition.batch_mutations.len());
@@ -6264,6 +6252,11 @@ fn validate_batch_shape_with_recovery(
                         if insert.version != 0 {
                             bail!("MemoryTransition batch_inserts must have version 0");
                         }
+                        if insert.summary.is_some() {
+                            bail!(
+                                "MemoryTransition batch_inserts must not carry caller-supplied summaries; summaries are encrypted by EventWriter from MemoryBatchMutation"
+                            );
+                        }
                     }
                     for mutation in &transition.job_mutations {
                         if !job_ids.insert(job_id_for_mutation(mutation).to_owned()) {
@@ -6490,23 +6483,68 @@ fn message_end_identity(event: &AgentEvent) -> Result<Option<MessageEndIdentity>
     }))
 }
 
-fn preflight_materialization_bounds(redactor: &Redactor, batch: &EventBatch) -> Result<()> {
-    let max_components = super::sizer::EVENT_BATCH_MAX_BYTES / DURABLE_ROW_OVERHEAD_BYTES;
-    if batch.writes.len() > max_components {
+const MEMORY_SUMMARY_CIPHERTEXT_OVERHEAD_BYTES: usize = 1 + 24 + 16;
+const MEMORY_SUMMARY_KEY_REF_BYTES: usize = "memory_summary".len() + 1 + 36;
+const MEMORY_MUTATION_TIMESTAMP_MAX_BYTES: usize = 40;
+const MAX_MEMORY_BATCH_STATE_BYTES: usize = "compact_failed".len();
+const MAX_MATERIALIZATION_COMPONENTS: usize =
+    super::sizer::EVENT_BATCH_MAX_BYTES / DURABLE_ROW_OVERHEAD_BYTES;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MemoryMaterialization {
+    components: usize,
+    bytes: usize,
+}
+
+impl MemoryMaterialization {
+    fn add_logical_component(&mut self, content_bytes: usize, label: &str) -> Result<()> {
+        self.components = self
+            .components
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("{label} component count overflow"))?;
+        self.bytes = self
+            .bytes
+            .checked_add(content_bytes)
+            .ok_or_else(|| anyhow!("{label} byte count overflow"))?;
+        Ok(())
+    }
+
+    fn add_durable_row(&mut self, content_bytes: usize, label: &str) -> Result<()> {
+        let row_bytes = content_bytes
+            .checked_add(DURABLE_ROW_OVERHEAD_BYTES)
+            .ok_or_else(|| anyhow!("{label} row byte count overflow"))?;
+        self.add_logical_component(row_bytes, label)
+    }
+}
+
+fn checked_byte_sum(label: &str, parts: impl IntoIterator<Item = usize>) -> Result<usize> {
+    parts.into_iter().try_fold(0usize, |total, part| {
+        total
+            .checked_add(part)
+            .ok_or_else(|| anyhow!("{label} byte count overflow"))
+    })
+}
+
+fn charge_materialization_components(total: &mut usize, additional: usize) -> Result<()> {
+    *total = total
+        .checked_add(additional)
+        .ok_or_else(|| anyhow!("EventBatch materialization component count overflow"))?;
+    if *total > MAX_MATERIALIZATION_COMPONENTS {
         bail!(
-            "EventBatch has {} writes, exceeding bounded materialization count {max_components}",
-            batch.writes.len()
+            "EventBatch has {} materialization components, limit is {}",
+            *total,
+            MAX_MATERIALIZATION_COMPONENTS
         );
     }
-    let mut components = batch.writes.len();
+    Ok(())
+}
+
+fn preflight_materialization_bounds(redactor: &Redactor, batch: &EventBatch) -> Result<()> {
+    let mut components = 0usize;
+    charge_materialization_components(&mut components, batch.writes.len())?;
     let mut preflight_bytes = 0usize;
     for write in &batch.writes {
-        components = components
-            .checked_add(write.projections.len())
-            .ok_or_else(|| anyhow!("EventBatch component count overflow"))?;
-        if components > max_components {
-            bail!("EventBatch has more than {max_components} event/projection components");
-        }
+        charge_materialization_components(&mut components, write.projections.len())?;
         if let Some(event) = &write.event {
             let metadata_bytes = event
                 .metadata
@@ -6582,6 +6620,18 @@ fn preflight_materialization_bounds(redactor: &Redactor, batch: &EventBatch) -> 
                         .and_then(|bytes| bytes.checked_add(DURABLE_ROW_OVERHEAD_BYTES))
                         .ok_or_else(|| anyhow!("MessageEnd preflight byte count overflow"))?
                 }
+                Projection::MemoryJobUpdate(update) => {
+                    let materialization =
+                        memory_job_update_preflight_materialization(redactor, update)?;
+                    charge_materialization_components(&mut components, materialization.components)?;
+                    materialization.bytes
+                }
+                Projection::MemoryTransition(transition) => {
+                    let materialization =
+                        memory_transition_preflight_materialization(redactor, transition)?;
+                    charge_materialization_components(&mut components, materialization.components)?;
+                    materialization.bytes
+                }
                 projection => projection_size_upper_bound(projection)?,
             };
             if projection_bytes > super::sizer::EVENT_BATCH_MAX_BYTES {
@@ -6599,6 +6649,410 @@ fn charge_transaction_bytes(total: &mut usize, bytes: usize) -> Result<()> {
         .ok_or_else(|| anyhow!("EventBatch durable byte count overflow"))?;
     EventBatchSizer::validate(BatchBounds::default(), *total)?;
     Ok(())
+}
+
+fn compact_result_preflight_bytes(redactor: &Redactor, result: &CompactResult) -> Result<usize> {
+    let raw = serde_json::to_vec(&MemorySummaryPayload {
+        summary: result.summary.expose(),
+        est_tokens: result.est_tokens,
+        from: &result.time_range.0,
+        to: &result.time_range.1,
+    })
+    .context("failed to serialize memory summary sizing payload")?;
+    let projection = redactor
+        .redact_serialized(&raw)
+        .context("failed to redact memory summary sizing payload")?;
+    checked_byte_sum(
+        "memory summary",
+        [
+            MEMORY_SUMMARY_KEY_REF_BYTES,
+            raw.len()
+                .checked_add(MEMORY_SUMMARY_CIPHERTEXT_OVERHEAD_BYTES)
+                .ok_or_else(|| anyhow!("memory summary ciphertext byte count overflow"))?,
+            projection.len(),
+            std::mem::size_of::<u32>(),
+        ],
+    )
+}
+
+fn encrypted_batch_summary_bytes(summary: &MemoryBatchSummary) -> Result<usize> {
+    checked_byte_sum(
+        "encrypted memory batch summary",
+        [
+            summary.key_ref.len(),
+            summary.ciphertext.len(),
+            summary.projection.len(),
+            std::mem::size_of::<u32>(),
+        ],
+    )
+}
+
+fn encrypted_job_result_bytes(result: &MemoryJobResult) -> Result<usize> {
+    checked_byte_sum(
+        "encrypted memory job result",
+        [
+            result.key_ref.len(),
+            result.ciphertext.len(),
+            result.projection.len(),
+            std::mem::size_of::<u32>(),
+        ],
+    )
+}
+
+fn memory_batch_record_bytes(record: &MemoryBatchRecord) -> Result<usize> {
+    let summary_bytes = record
+        .summary
+        .as_ref()
+        .map(encrypted_batch_summary_bytes)
+        .transpose()?
+        .unwrap_or(0);
+    checked_byte_sum(
+        "memory batch insert",
+        [
+            record.id.len(),
+            record.state.as_str().len(),
+            record.updated_at.len(),
+            summary_bytes,
+            8 * std::mem::size_of::<i64>(),
+            2 * super::memory_state::MEMORY_PROJECTION_DIGEST_BYTES,
+        ],
+    )
+}
+
+fn memory_job_record_bytes(record: &MemoryJobRecord) -> Result<usize> {
+    let source_ids = serde_json::to_vec(&record.source_ids)
+        .context("failed to serialize memory job source ids for sizing")?;
+    let source_versions = serde_json::to_vec(&record.source_versions)
+        .context("failed to serialize memory job source versions for sizing")?;
+    let result_bytes = record
+        .result
+        .as_ref()
+        .map(encrypted_job_result_bytes)
+        .transpose()?
+        .unwrap_or(0);
+    checked_byte_sum(
+        "memory job insert",
+        [
+            record.id.len(),
+            record.kind.as_str().len(),
+            record.status.as_str().len(),
+            record.lease_until.as_ref().map_or(0, String::len),
+            record.created_at.len(),
+            record.updated_at.len(),
+            source_ids.len(),
+            source_versions.len(),
+            result_bytes,
+            3 * std::mem::size_of::<i64>(),
+            super::memory_state::MEMORY_PROJECTION_DIGEST_BYTES,
+        ],
+    )
+}
+
+fn memory_job_mutation_preflight_bytes(
+    redactor: &Redactor,
+    mutation: &MemoryJobMutation,
+    source_versions_json_bytes: usize,
+) -> Result<usize> {
+    let (job_id, expected_status, new_status, expected_lease_bytes, new_lease_bytes, result_bytes) =
+        match mutation {
+            MemoryJobMutation::Claim {
+                job_id,
+                lease_until,
+            } => (job_id, "pending", "running", 0, lease_until.len(), 0),
+            MemoryJobMutation::Start {
+                job_id,
+                lease_witness,
+                lease_until,
+                ..
+            } => (
+                job_id,
+                "running",
+                "running",
+                lease_witness.as_ref().map_or(0, String::len),
+                lease_until.len(),
+                0,
+            ),
+            MemoryJobMutation::Complete {
+                job_id,
+                lease_witness,
+                result,
+                ..
+            } => (
+                job_id,
+                "running",
+                "completed",
+                lease_witness.as_ref().map_or(0, String::len),
+                0,
+                compact_result_preflight_bytes(redactor, result)?,
+            ),
+            MemoryJobMutation::Fail {
+                job_id,
+                lease_witness,
+                ..
+            } => (
+                job_id,
+                "running",
+                "failed",
+                lease_witness.as_ref().map_or(0, String::len),
+                0,
+                0,
+            ),
+            MemoryJobMutation::Apply {
+                job_id,
+                lease_witness,
+                ..
+            } => (
+                job_id,
+                "completed",
+                "applied",
+                lease_witness.as_ref().map_or(0, String::len),
+                0,
+                0,
+            ),
+            MemoryJobMutation::Reclaim {
+                job_id,
+                lease_until,
+                ..
+            } => (job_id, "failed", "running", 0, lease_until.len(), 0),
+            MemoryJobMutation::Discard {
+                job_id,
+                lease_witness,
+                ..
+            } => (
+                job_id,
+                "completed",
+                "discarded",
+                lease_witness.as_ref().map_or(0, String::len),
+                0,
+                0,
+            ),
+            MemoryJobMutation::Release {
+                job_id,
+                lease_witness,
+                ..
+            } => (
+                job_id,
+                "running",
+                "pending",
+                lease_witness.as_ref().map_or(0, String::len),
+                0,
+                0,
+            ),
+        };
+    memory_job_mutation_materialization_bytes(
+        job_id.len(),
+        expected_status.len(),
+        new_status.len(),
+        expected_lease_bytes,
+        new_lease_bytes,
+        source_versions_json_bytes,
+        result_bytes,
+    )
+}
+
+fn memory_job_mutation_materialization_bytes(
+    job_id_bytes: usize,
+    expected_status_bytes: usize,
+    new_status_bytes: usize,
+    expected_lease_bytes: usize,
+    new_lease_bytes: usize,
+    source_versions_bytes: usize,
+    result_bytes: usize,
+) -> Result<usize> {
+    checked_byte_sum(
+        "memory job mutation",
+        [
+            job_id_bytes,
+            expected_status_bytes,
+            new_status_bytes,
+            expected_lease_bytes,
+            new_lease_bytes,
+            source_versions_bytes,
+            result_bytes,
+            3 * std::mem::size_of::<i64>(),
+            MEMORY_MUTATION_TIMESTAMP_MAX_BYTES,
+            std::mem::size_of::<u64>(),
+            super::memory_state::MEMORY_PROJECTION_DIGEST_BYTES,
+        ],
+    )
+}
+
+fn memory_batch_mutation_materialization_bytes(
+    batch_id_bytes: usize,
+    old_state_bytes: usize,
+    new_state_bytes: usize,
+    summary_bytes: usize,
+) -> Result<usize> {
+    checked_byte_sum(
+        "memory batch mutation",
+        [
+            batch_id_bytes,
+            old_state_bytes,
+            new_state_bytes,
+            summary_bytes,
+            4 * std::mem::size_of::<i64>(),
+            std::mem::size_of::<bool>(),
+            MEMORY_MUTATION_TIMESTAMP_MAX_BYTES,
+            std::mem::size_of::<u64>(),
+            super::memory_state::MEMORY_PROJECTION_DIGEST_BYTES,
+        ],
+    )
+}
+
+fn mutation_writes_source_versions(mutation: &MemoryJobMutation) -> bool {
+    !matches!(
+        mutation,
+        MemoryJobMutation::Claim { .. }
+            | MemoryJobMutation::Start { .. }
+            | MemoryJobMutation::Release { .. }
+            | MemoryJobMutation::Discard { .. }
+    )
+}
+
+fn memory_job_update_preflight_materialization(
+    redactor: &Redactor,
+    update: &MemoryJobUpdate,
+) -> Result<MemoryMaterialization> {
+    let mut materialization = MemoryMaterialization::default();
+    let source_versions: BTreeMap<String, u64> = update
+        .expected_source_versions
+        .iter()
+        .map(|(id, version)| (id.to_string(), *version))
+        .collect();
+    let source_versions_json = serde_json::to_vec(&source_versions)
+        .context("failed to serialize memory job update source versions for sizing")?;
+    for id in update.expected_source_versions.keys() {
+        materialization.add_logical_component(
+            id.to_string()
+                .len()
+                .checked_add(std::mem::size_of::<u64>())
+                .ok_or_else(|| anyhow!("memory source-version witness byte count overflow"))?,
+            "memory source-version witness",
+        )?;
+    }
+    for mutation in &update.job_mutations {
+        materialization.add_durable_row(
+            memory_job_mutation_preflight_bytes(
+                redactor,
+                mutation,
+                if mutation_writes_source_versions(mutation) {
+                    source_versions_json.len()
+                } else {
+                    0
+                },
+            )?,
+            "memory job mutation",
+        )?;
+    }
+    Ok(materialization)
+}
+
+fn memory_transition_preflight_materialization(
+    redactor: &Redactor,
+    transition: &MemoryTransition,
+) -> Result<MemoryMaterialization> {
+    let mut materialization = MemoryMaterialization::default();
+    let mut post_source_versions: BTreeMap<String, u64> = transition
+        .expected_source_versions
+        .iter()
+        .map(|(id, version)| (id.to_string(), *version))
+        .collect();
+    for mutation in &transition.batch_mutations {
+        post_source_versions.insert(
+            mutation.batch_id.to_string(),
+            mutation
+                .expected_version
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("memory batch version sizing overflow"))?,
+        );
+    }
+    let source_versions_json = serde_json::to_vec(&post_source_versions)
+        .context("failed to serialize memory transition source versions for sizing")?;
+    for id in transition.expected_source_versions.keys() {
+        materialization.add_logical_component(
+            id.to_string()
+                .len()
+                .checked_add(std::mem::size_of::<u64>())
+                .ok_or_else(|| anyhow!("memory source-version witness byte count overflow"))?,
+            "memory source-version witness",
+        )?;
+    }
+    for (id, state) in &transition.expected_source_states {
+        materialization.add_logical_component(
+            checked_byte_sum(
+                "memory source-state witness",
+                [id.to_string().len(), state.as_str().len()],
+            )?,
+            "memory source-state witness",
+        )?;
+    }
+    for mutation in &transition.batch_mutations {
+        let summary_bytes = mutation
+            .summary
+            .as_ref()
+            .map(|summary| compact_result_preflight_bytes(redactor, summary))
+            .transpose()?
+            .unwrap_or(0);
+        materialization.add_durable_row(
+            memory_batch_mutation_materialization_bytes(
+                mutation.batch_id.to_string().len(),
+                MAX_MEMORY_BATCH_STATE_BYTES,
+                mutation.new_state.as_str().len(),
+                summary_bytes,
+            )?,
+            "memory batch mutation",
+        )?;
+    }
+    for mutation in &transition.job_mutations {
+        materialization.add_durable_row(
+            memory_job_mutation_preflight_bytes(
+                redactor,
+                mutation,
+                if mutation_writes_source_versions(mutation) {
+                    source_versions_json.len()
+                } else {
+                    0
+                },
+            )?,
+            "memory job mutation",
+        )?;
+    }
+    for record in &transition.batch_inserts {
+        materialization
+            .add_durable_row(memory_batch_record_bytes(record)?, "memory batch insert")?;
+    }
+    for record in &transition.job_inserts {
+        materialization.add_durable_row(memory_job_record_bytes(record)?, "memory job insert")?;
+    }
+    for membership in &transition.membership_inserts {
+        materialization.add_durable_row(
+            checked_byte_sum(
+                "memory membership insert",
+                [
+                    membership.batch_id.len(),
+                    membership.message_id.len(),
+                    std::mem::size_of::<i64>(),
+                ],
+            )?,
+            "memory membership insert",
+        )?;
+    }
+    if let Some(cursor) = &transition.cursor_advance {
+        materialization.add_durable_row(
+            checked_byte_sum(
+                "memory cursor mutation",
+                [
+                    cursor.kind.len(),
+                    2 * std::mem::size_of::<u64>(),
+                    std::mem::size_of::<bool>(),
+                    std::mem::size_of::<u64>(),
+                    super::memory_state::MEMORY_PROJECTION_DIGEST_BYTES,
+                ],
+            )?,
+            "memory cursor mutation",
+        )?;
+    }
+    Ok(materialization)
 }
 
 fn projection_size_upper_bound(projection: &Projection) -> Result<usize> {
@@ -6692,58 +7146,9 @@ fn projection_size_upper_bound(projection: &Projection) -> Result<usize> {
                     .sum::<usize>(),
             ),
         Projection::ProviderContextMutation(inner) => inner.mutation_id.len().saturating_add(4096),
-        Projection::MemoryJobUpdate(update) => update
-            .job_mutations
-            .iter()
-            .map(|mutation| {
-                let result_bytes = match mutation {
-                    MemoryJobMutation::Complete { result, .. } => {
-                        (result.est_tokens as usize).saturating_add(result.summary.expose().len())
-                    }
-                    _ => 0,
-                };
-                job_id_for_mutation(mutation)
-                    .len()
-                    .saturating_add(result_bytes)
-                    .saturating_add(512)
-            })
-            .sum::<usize>(),
-        Projection::MemoryTransition(transition) => transition
-            .batch_mutations
-            .iter()
-            .map(|batch| {
-                let summary_bytes = batch
-                    .summary
-                    .as_ref()
-                    .map_or(0, |result| {
-                        (result.est_tokens as usize).saturating_add(result.summary.expose().len())
-                    })
-                    .saturating_add(512);
-                batch
-                    .batch_id
-                    .to_string()
-                    .len()
-                    .saturating_add(summary_bytes)
-            })
-            .sum::<usize>()
-            .saturating_add(
-                transition
-                    .job_mutations
-                    .iter()
-                    .map(|mutation| {
-                        let result_bytes = match mutation {
-                            MemoryJobMutation::Complete { result, .. } => (result.est_tokens
-                                as usize)
-                                .saturating_add(result.summary.expose().len()),
-                            _ => 0,
-                        };
-                        job_id_for_mutation(mutation)
-                            .len()
-                            .saturating_add(result_bytes)
-                            .saturating_add(512)
-                    })
-                    .sum::<usize>(),
-            ),
+        Projection::MemoryJobUpdate(_) | Projection::MemoryTransition(_) => {
+            unreachable!("memory projections use checked dedicated sizing")
+        }
         Projection::MemoryCalibrationObservation { .. } => 16,
         Projection::ApprovalRule(rule) => rule
             .id
@@ -6795,26 +7200,152 @@ fn parse_memory_batch_state(value: &str) -> Result<MemoryBatchState> {
     }
 }
 
-fn memory_projection_size(projection: &PreparedProjection) -> usize {
-    match projection {
-        PreparedProjection::MemoryJobUpdate { job_mutations, .. }
-        | PreparedProjection::MemoryTransition { job_mutations, .. } => job_mutations
-            .iter()
-            .map(|job| {
-                job.job_id
-                    .len()
-                    .saturating_add(job.attempts as usize)
-                    .saturating_add(
-                        job.new_lease_until
-                            .as_ref()
-                            .map_or(0, String::len)
-                            .saturating_add(job.result.as_ref().map_or(0, |r| r.ciphertext.len())),
-                    )
-                    .saturating_add(512)
-            })
-            .sum::<usize>(),
-        _ => 0,
+fn prepared_memory_job_mutation_bytes(job: &PreparedMemoryJobMutation) -> Result<usize> {
+    let result_bytes = job
+        .result
+        .as_ref()
+        .map(encrypted_job_result_bytes)
+        .transpose()?
+        .unwrap_or(0);
+    memory_job_mutation_materialization_bytes(
+        job.job_id.len(),
+        job.expected_status.len(),
+        job.new_status.len(),
+        job.expected_lease_until.as_ref().map_or(0, String::len),
+        job.new_lease_until.as_ref().map_or(0, String::len),
+        job.source_versions.as_ref().map_or(0, String::len),
+        result_bytes,
+    )
+}
+
+fn prepared_memory_batch_mutation_bytes(batch: &PreparedMemoryBatchMutation) -> Result<usize> {
+    let summary_bytes = batch
+        .summary
+        .as_ref()
+        .map(encrypted_batch_summary_bytes)
+        .transpose()?
+        .unwrap_or(0);
+    memory_batch_mutation_materialization_bytes(
+        batch.batch_id.len(),
+        batch.old_state.as_str().len(),
+        batch.new_state.as_str().len(),
+        summary_bytes,
+    )
+}
+
+fn add_prepared_source_version_witnesses(
+    materialization: &mut MemoryMaterialization,
+    versions: &BTreeMap<String, i64>,
+) -> Result<()> {
+    for id in versions.keys() {
+        materialization.add_logical_component(
+            id.len()
+                .checked_add(std::mem::size_of::<i64>())
+                .ok_or_else(|| anyhow!("prepared source-version witness byte count overflow"))?,
+            "prepared source-version witness",
+        )?;
     }
+    Ok(())
+}
+
+fn prepared_memory_projection_materialization(
+    projection: &PreparedProjection,
+) -> Result<MemoryMaterialization> {
+    let mut materialization = MemoryMaterialization::default();
+    match projection {
+        PreparedProjection::MemoryJobUpdate {
+            expected_source_versions,
+            job_mutations,
+            ..
+        } => {
+            add_prepared_source_version_witnesses(&mut materialization, expected_source_versions)?;
+            for job in job_mutations {
+                materialization.add_durable_row(
+                    prepared_memory_job_mutation_bytes(job)?,
+                    "prepared memory job mutation",
+                )?;
+            }
+        }
+        PreparedProjection::MemoryTransition {
+            expected_source_versions,
+            expected_source_states,
+            batch_mutations,
+            job_mutations,
+            batch_inserts,
+            job_inserts,
+            membership_inserts,
+            cursor_advance,
+            ..
+        } => {
+            add_prepared_source_version_witnesses(&mut materialization, expected_source_versions)?;
+            for (id, state) in expected_source_states {
+                materialization.add_logical_component(
+                    checked_byte_sum(
+                        "prepared source-state witness",
+                        [id.len(), state.as_str().len()],
+                    )?,
+                    "prepared source-state witness",
+                )?;
+            }
+            for batch in batch_mutations {
+                materialization.add_durable_row(
+                    prepared_memory_batch_mutation_bytes(batch)?,
+                    "prepared memory batch mutation",
+                )?;
+            }
+            for job in job_mutations {
+                materialization.add_durable_row(
+                    prepared_memory_job_mutation_bytes(job)?,
+                    "prepared memory job mutation",
+                )?;
+            }
+            for batch in batch_inserts {
+                if batch.summary.is_some() {
+                    bail!(
+                        "prepared MemoryTransition batch insert carries a caller-supplied summary"
+                    );
+                }
+                materialization.add_durable_row(
+                    memory_batch_record_bytes(batch)?,
+                    "prepared memory batch insert",
+                )?;
+            }
+            for job in job_inserts {
+                materialization
+                    .add_durable_row(memory_job_record_bytes(job)?, "prepared memory job insert")?;
+            }
+            for membership in membership_inserts {
+                materialization.add_durable_row(
+                    checked_byte_sum(
+                        "prepared memory membership insert",
+                        [
+                            membership.batch_id.len(),
+                            membership.message_id.len(),
+                            std::mem::size_of::<i64>(),
+                        ],
+                    )?,
+                    "prepared memory membership insert",
+                )?;
+            }
+            if let Some(cursor) = cursor_advance {
+                materialization.add_durable_row(
+                    checked_byte_sum(
+                        "prepared memory cursor mutation",
+                        [
+                            cursor.kind.len(),
+                            2 * std::mem::size_of::<u64>(),
+                            std::mem::size_of::<bool>(),
+                            std::mem::size_of::<u64>(),
+                            super::memory_state::MEMORY_PROJECTION_DIGEST_BYTES,
+                        ],
+                    )?,
+                    "prepared memory cursor mutation",
+                )?;
+            }
+        }
+        _ => {}
+    }
+    Ok(materialization)
 }
 
 fn prepared_injection_bytes(
@@ -8811,6 +9342,22 @@ struct AuthenticatedDurableEvent {
     stored_envelope: String,
     redaction_version: u32,
     envelope: Value,
+    message_end: Option<AuthenticatedMessageProjection>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct AuthenticatedMessageProjection {
+    pub(super) message_id: String,
+    pub(super) role: String,
+    pub(super) message: PublicMessage,
+}
+
+#[allow(
+    dead_code,
+    reason = "Store hydration consumes the authenticated projection snapshot"
+)]
+pub(super) struct AuthenticatedProjectionSnapshot {
+    pub(super) messages: BTreeMap<u64, AuthenticatedMessageProjection>,
 }
 
 async fn load_authenticated_event(
@@ -8860,6 +9407,22 @@ async fn load_authenticated_event(
     if event.durable_kind() != Some(kind.as_str()) {
         bail!("durable lifecycle event {seq} type disagrees with authenticated raw event");
     }
+    let message_end = match &event {
+        AgentEvent::MessageEnd {
+            message_id,
+            message,
+        } => Some(AuthenticatedMessageProjection {
+            message_id: message_id.clone(),
+            role: match message.as_ref() {
+                PublicMessage::User(_) => "user",
+                PublicMessage::Assistant(_) => "assistant",
+                PublicMessage::ToolResult(_) => "tool_result",
+            }
+            .to_owned(),
+            message: message.as_ref().clone(),
+        }),
+        _ => None,
+    };
     let internal_metadata: String = row.try_get("internal_metadata")?;
     Ok(AuthenticatedDurableEvent {
         kind,
@@ -8872,6 +9435,7 @@ async fn load_authenticated_event(
         redaction_version,
         envelope: serde_json::from_str(&stored_envelope)
             .context("stored lifecycle envelope is invalid")?,
+        message_end,
     })
 }
 
@@ -8916,7 +9480,7 @@ pub(super) async fn authenticate_running_tool_intent(
 
 async fn reconstruct_authenticated_checkpoint(store: &Store) -> Result<LifecycleCheckpoint> {
     let mut transaction = store.pool().begin().await?;
-    let checkpoint =
+    let (checkpoint, _) =
         reconstruct_authenticated_checkpoint_in_transaction(store, &mut transaction).await?;
     transaction.commit().await?;
     Ok(checkpoint)
@@ -8925,19 +9489,21 @@ async fn reconstruct_authenticated_checkpoint(store: &Store) -> Result<Lifecycle
 pub(super) async fn authenticate_event_log_snapshot(
     store: &Store,
     transaction: &mut Transaction<'_, Sqlite>,
-) -> Result<()> {
+) -> Result<AuthenticatedProjectionSnapshot> {
     reconstruct_authenticated_checkpoint_in_transaction(store, transaction)
         .await
-        .map(drop)
+        .map(|(_, snapshot)| snapshot)
 }
 
 async fn reconstruct_authenticated_checkpoint_in_transaction(
     store: &Store,
     transaction: &mut Transaction<'_, Sqlite>,
-) -> Result<LifecycleCheckpoint> {
+) -> Result<(LifecycleCheckpoint, AuthenticatedProjectionSnapshot)> {
     let event_head = load_verified_event_head_in_transaction(store, transaction).await?;
     let mut lifecycle = DurableLifecycleState::default();
     let mut memory_projections = BTreeMap::new();
+    let mut messages = BTreeMap::new();
+    let mut message_ids = HashSet::new();
     lifecycle.live_runs.extend(
         sqlx::query_scalar::<_, String>(
             "SELECT DISTINCT run_id FROM inbound_commands
@@ -9011,6 +9577,9 @@ async fn reconstruct_authenticated_checkpoint_in_transaction(
                 &event.kind,
                 event.metadata.memory_projection.as_ref(),
             )?;
+            if let Some(message) = event.message_end {
+                record_authenticated_message(&mut messages, &mut message_ids, seq, message)?;
+            }
             observed_count = observed_count
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("durable event count overflow"))?;
@@ -9034,12 +9603,35 @@ async fn reconstruct_authenticated_checkpoint_in_transaction(
     if stored_memory_projections != memory_projections {
         bail!("memory projection rows do not exactly match authenticated event commitments");
     }
-    Ok(LifecycleCheckpoint {
-        event_head,
-        lifecycle,
-        memory_projections,
-        historical_rows_visited: observed_count,
-    })
+    let snapshot = AuthenticatedProjectionSnapshot { messages };
+    Ok((
+        LifecycleCheckpoint {
+            event_head,
+            lifecycle,
+            memory_projections,
+            historical_rows_visited: observed_count,
+        },
+        snapshot,
+    ))
+}
+
+fn record_authenticated_message(
+    messages: &mut BTreeMap<u64, AuthenticatedMessageProjection>,
+    message_ids: &mut HashSet<String>,
+    seq: u64,
+    message: AuthenticatedMessageProjection,
+) -> Result<()> {
+    if messages.contains_key(&seq) {
+        bail!("authenticated MessageEnd repeats durable event sequence {seq}");
+    }
+    if !message_ids.insert(message.message_id.clone()) {
+        bail!(
+            "authenticated MessageEnd repeats message id {}",
+            message.message_id
+        );
+    }
+    messages.insert(seq, message);
+    Ok(())
 }
 
 fn apply_memory_projection_delta(
@@ -18052,6 +18644,163 @@ mod tests {
         assert_eq!(event_count, 0);
     }
 
+    #[test]
+    fn memory_transition_nested_materialization_uses_exact_byte_boundary() {
+        let fixed_membership_bytes = DURABLE_ROW_OVERHEAD_BYTES + std::mem::size_of::<i64>();
+        let mut membership = MemoryBatchMessageRecord {
+            batch_id: String::new(),
+            message_id: "x".repeat(EVENT_BATCH_MAX_BYTES - fixed_membership_bytes),
+            ord: 1,
+        };
+        let transition = MemoryTransition {
+            membership_inserts: vec![membership.clone()],
+            ..Default::default()
+        };
+        let preflight = memory_transition_preflight_materialization(&Redactor::v1(), &transition)
+            .expect("size exact-boundary raw transition");
+        assert_eq!(preflight.bytes, EVENT_BATCH_MAX_BYTES);
+        EventBatchSizer::validate(BatchBounds::default(), preflight.bytes)
+            .expect("exact raw transition byte limit");
+        drop(transition);
+
+        let prepared = PreparedProjection::MemoryTransition {
+            expected_source_versions: BTreeMap::new(),
+            expected_source_states: BTreeMap::new(),
+            batch_mutations: Vec::new(),
+            job_mutations: Vec::new(),
+            batch_inserts: Vec::new(),
+            job_inserts: Vec::new(),
+            membership_inserts: vec![membership.clone()],
+            cursor_advance: None,
+            memory_summary_key_ref: None,
+            memory_summary_key_proof: None,
+        };
+        let prepared_size = prepared_memory_projection_materialization(&prepared)
+            .expect("size exact-boundary prepared transition");
+        assert_eq!(prepared_size.bytes, EVENT_BATCH_MAX_BYTES);
+        EventBatchSizer::validate(BatchBounds::default(), prepared_size.bytes)
+            .expect("exact prepared transition byte limit");
+        drop(prepared);
+
+        membership.message_id.push('x');
+        let over = memory_transition_preflight_materialization(
+            &Redactor::v1(),
+            &MemoryTransition {
+                membership_inserts: vec![membership],
+                ..Default::default()
+            },
+        )
+        .expect("size one-byte-over transition");
+        assert_eq!(over.bytes, EVENT_BATCH_MAX_BYTES + 1);
+        assert!(
+            EventBatchSizer::validate(BatchBounds::default(), over.bytes)
+                .expect_err("one byte over must fail")
+                .to_string()
+                .contains("durable bytes")
+        );
+    }
+
+    #[test]
+    fn memory_transition_nested_component_limit_is_checked_without_saturation() {
+        let mut components = 2;
+        charge_materialization_components(&mut components, MAX_MATERIALIZATION_COMPONENTS - 2)
+            .expect("exact component limit");
+        assert_eq!(components, MAX_MATERIALIZATION_COMPONENTS);
+        assert!(
+            charge_materialization_components(&mut components, 1)
+                .expect_err("one component over must fail")
+                .to_string()
+                .contains("materialization components")
+        );
+    }
+
+    #[test]
+    fn authenticated_message_snapshot_rejects_duplicate_sequence_and_message_id() {
+        let mut messages = BTreeMap::new();
+        let mut message_ids = HashSet::new();
+        let projection = |message_id: &str| AuthenticatedMessageProjection {
+            message_id: message_id.to_owned(),
+            role: "user".to_owned(),
+            message: user_message("authenticated"),
+        };
+
+        record_authenticated_message(&mut messages, &mut message_ids, 1, projection("message-1"))
+            .expect("first authenticated MessageEnd");
+        assert!(
+            record_authenticated_message(
+                &mut messages,
+                &mut message_ids,
+                1,
+                projection("message-2"),
+            )
+            .expect_err("duplicate event sequence must fail")
+            .to_string()
+            .contains("sequence")
+        );
+        assert!(
+            record_authenticated_message(
+                &mut messages,
+                &mut message_ids,
+                2,
+                projection("message-1"),
+            )
+            .expect_err("duplicate message id must fail")
+            .to_string()
+            .contains("message id")
+        );
+        assert_eq!(messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn memory_transition_rejects_caller_supplied_summary_ciphertext() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let batch_id = BatchId::from_u128(0x51);
+        let mut record = MemoryBatchRecord::new(
+            batch_id.to_string(),
+            MemoryLayer::L1,
+            0,
+            0,
+            MemoryBatchState::Compacted,
+            1,
+            0,
+        );
+        record.summary = Some(MemoryBatchSummary {
+            key_ref: "caller-key".to_owned(),
+            ciphertext: vec![1, 2, 3],
+            projection: "{}".to_owned(),
+            redaction_version: 1,
+        });
+
+        let error = writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::memory_maintenance("caller_summary_insert")
+                            .expect("memory-maintenance event"),
+                    ),
+                    projections: vec![Projection::MemoryTransition(MemoryTransition {
+                        batch_inserts: vec![record],
+                        ..Default::default()
+                    })],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("caller-supplied ciphertext must be rejected");
+        assert!(
+            error.to_string().contains("caller-supplied summaries"),
+            "{error:#}"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory_batches")
+                .fetch_one(store.pool())
+                .await
+                .expect("count memory batches"),
+            0
+        );
+    }
+
     #[tokio::test]
     async fn multi_write_materialization_stops_at_the_batch_limit() {
         let store = test_store().await;
@@ -23095,6 +23844,16 @@ mod tests {
         let durable = load_authenticated_event(&store, &mut transaction, terminal_message_end_seq)
             .await
             .expect("authenticated MessageEnd");
+        let snapshot = authenticate_event_log_snapshot(&store, &mut transaction)
+            .await
+            .expect("authenticated projection snapshot");
+        let authenticated_message = snapshot
+            .messages
+            .get(
+                &u64::try_from(terminal_message_end_seq)
+                    .expect("terminal MessageEnd sequence fits u64"),
+            )
+            .expect("authenticated MessageEnd projection");
         transaction.rollback().await.expect("rollback event read");
         assert_eq!(durable.kind, "message_end");
         assert_eq!(
@@ -23105,6 +23864,9 @@ mod tests {
                 })
                 .expect("terminal envelope")
         );
+        assert_eq!(authenticated_message.message_id, assistant_id);
+        assert_eq!(authenticated_message.role, "assistant");
+        assert_eq!(authenticated_message.message, terminal_message);
     }
 
     #[tokio::test]
