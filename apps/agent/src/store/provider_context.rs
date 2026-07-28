@@ -147,6 +147,97 @@ fn digest_optional_i64(hasher: &mut Sha256, value: Option<i64>) {
     }
 }
 
+async fn preflight_provider_context_projection_bounds(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<()> {
+    preflight_provider_context_projection_bounds_with_limits(
+        transaction,
+        super::HYDRATION_MAX_ROWS,
+        super::HYDRATION_MAX_ENCODED_BYTES,
+    )
+    .await
+}
+
+async fn preflight_provider_context_projection_bounds_with_limits(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    max_rows: u64,
+    max_encoded_bytes: u64,
+) -> Result<()> {
+    let row = sqlx::query(
+        "SELECT
+            COALESCE(SUM(row_count), 0) AS row_count,
+            COALESCE(SUM(encoded_bytes), 0) AS encoded_bytes
+         FROM (
+            SELECT COUNT(*) AS row_count,
+                   COALESCE(SUM(
+                     96 +
+                     length(CAST(id AS BLOB)) +
+                     COALESCE(length(CAST(message_id AS BLOB)), 0) +
+                     length(CAST(idempotency_key AS BLOB)) +
+                     length(CAST(provider_instance_id AS BLOB)) +
+                     length(CAST(protocol AS BLOB)) +
+                     length(CAST(model AS BLOB)) +
+                     length(CAST(kind AS BLOB)) +
+                     COALESCE(length(CAST(context_fingerprint AS BLOB)), 0) +
+                     length(CAST(key_ref AS BLOB)) +
+                     length(ciphertext) +
+                     length(CAST(created_at AS BLOB))
+                   ), 0) AS encoded_bytes
+            FROM provider_context
+            UNION ALL
+            SELECT COUNT(*),
+                   COALESCE(SUM(
+                     64 +
+                     length(CAST(mutation_id AS BLOB)) +
+                     length(CAST(state AS BLOB)) +
+                     length(CAST(intent_key_ref AS BLOB)) +
+                     length(intent_ciphertext) +
+                     length(CAST(hmac_key_id AS BLOB)) +
+                     length(intent_hmac) +
+                     length(CAST(prepared_at AS BLOB)) +
+                     COALESCE(length(CAST(finished_at AS BLOB)), 0) +
+                     COALESCE(length(CAST(terminal_reason AS BLOB)), 0)
+                   ), 0)
+            FROM provider_context_mutations
+            UNION ALL
+            SELECT COUNT(*),
+                   COALESCE(SUM(
+                     32 +
+                     length(CAST(scope_key AS BLOB)) +
+                     length(CAST(latest_insert_id AS BLOB)) +
+                     length(CAST(updated_at AS BLOB))
+                   ), 0)
+            FROM provider_context_replace_heads
+            UNION ALL
+            SELECT COUNT(*),
+                   COALESCE(SUM(
+                     48 +
+                     length(CAST(state AS BLOB)) +
+                     COALESCE(length(set_digest), 0) +
+                     COALESCE(length(CAST(key_ref AS BLOB)), 0) +
+                     COALESCE(length(head_hmac), 0)
+                   ), 0)
+            FROM provider_context_projection_head
+         )",
+    )
+    .fetch_one(&mut **transaction)
+    .await
+    .context("failed to preflight provider-context durable-state bounds")?;
+    let row_count = u64::try_from(row.try_get::<i64, _>("row_count")?)
+        .context("provider-context durable-state row count is negative")?;
+    let encoded_bytes = u64::try_from(row.try_get::<i64, _>("encoded_bytes")?)
+        .context("provider-context durable-state byte count is negative")?;
+    if row_count > max_rows {
+        bail!("provider-context durable state has {row_count} rows, limit is {max_rows}");
+    }
+    if encoded_bytes > max_encoded_bytes {
+        bail!(
+            "provider-context durable state has {encoded_bytes} encoded bytes, limit is {max_encoded_bytes}"
+        );
+    }
+    Ok(())
+}
+
 async fn provider_context_set_digest(
     store: &Store,
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -387,6 +478,7 @@ pub(super) async fn verify_provider_context_projection_set(
     store: &Store,
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
 ) -> Result<ProviderContextProjectionCheckpoint> {
+    preflight_provider_context_projection_bounds(transaction).await?;
     let checkpoint = load_authenticated_projection_head(store, transaction).await?;
     let (record_count, set_digest) = provider_context_set_digest(store, transaction).await?;
     if record_count != checkpoint.record_count
@@ -2429,7 +2521,73 @@ mod tests {
             .expect("open test store")
     }
 
+    #[tokio::test]
+    async fn projection_verifier_preflights_mutation_and_replace_head_bytes_before_paging() {
+        let store = store().await;
+        let mutation_key = store
+            .conversation_key(DataKeyPurpose::Mutation)
+            .await
+            .expect("mint mutation key");
+        sqlx::query(
+            "INSERT INTO provider_context_mutations(
+                mutation_id, state, intent_key_ref, intent_ciphertext,
+                hmac_key_id, intent_hmac, prepared_at, finished_at, terminal_reason
+             ) VALUES(
+                'oversized-intent', 'prepared', ?, zeroblob(2048),
+                'intent-hmac', zeroblob(32), 'now', NULL, NULL
+             )",
+        )
+        .bind(&mutation_key.key_ref)
+        .execute(store.pool())
+        .await
+        .expect("insert oversized mutation fixture");
+        let mut transaction = store
+            .pool()
+            .begin()
+            .await
+            .expect("begin verifier preflight");
+        let error =
+            preflight_provider_context_projection_bounds_with_limits(&mut transaction, 100, 1024)
+                .await
+                .expect_err("mutation ciphertext must be included in verifier preflight");
+        assert!(error.to_string().contains("encoded bytes"), "{error:#}");
+        transaction.rollback().await.expect("rollback preflight");
+
+        sqlx::query("DELETE FROM provider_context_mutations")
+            .execute(store.pool())
+            .await
+            .expect("remove mutation fixture");
+        sqlx::query(
+            "INSERT INTO provider_context_replace_heads(
+                scope_key, max_config_generation, max_window_ordinal,
+                latest_insert_id, updated_at
+             ) VALUES('oversized-head', 1, 1, ?, 'now')",
+        )
+        .bind("x".repeat(2048))
+        .execute(store.pool())
+        .await
+        .expect("insert oversized replace-head fixture");
+        let mut transaction = store
+            .pool()
+            .begin()
+            .await
+            .expect("begin verifier preflight");
+        let error =
+            preflight_provider_context_projection_bounds_with_limits(&mut transaction, 100, 1024)
+                .await
+                .expect_err("replace-head text must be included in verifier preflight");
+        assert!(error.to_string().contains("encoded bytes"), "{error:#}");
+    }
+
     async fn seed_message(store: &Store, id: &str, seq: u64) -> anyhow::Result<()> {
+        // These provider-context unit fixtures exercise row-local provider
+        // semantics rather than the transcript/event projection contract.
+        // Freeze the empty EventWriter checkpoint before the deliberate direct
+        // transcript insert so later provider mutation writes do not treat the
+        // fixture as authenticated lifecycle history.
+        EventWriter::new(std::sync::Arc::new(store.clone()))
+            .initialize_recovery_checkpoint()
+            .await?;
         let key = store
             .conversation_key(DataKeyPurpose::Transcript)
             .await
@@ -2487,6 +2645,9 @@ mod tests {
     }
 
     async fn seed_non_message_event(store: &Store, seq: u64) -> anyhow::Result<()> {
+        EventWriter::new(std::sync::Arc::new(store.clone()))
+            .initialize_recovery_checkpoint()
+            .await?;
         let key = store
             .conversation_key(DataKeyPurpose::Event)
             .await
@@ -3482,7 +3643,7 @@ mod tests {
             store.scope(),
         )
         .expect("encrypt native compaction")
-        .insert_committed(&store)
+        .insert_committed(store)
         .await
         .expect("insert native compaction");
         id

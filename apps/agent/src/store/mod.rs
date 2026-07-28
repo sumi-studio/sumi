@@ -348,7 +348,15 @@ impl Store {
             #[cfg(test)]
             _in_memory_anchor: None,
         });
+        // Scope and every pre-existing active key must authenticate before
+        // initialization is allowed to mint the Mutation key or commit the
+        // provider-context projection head. Otherwise a wrong-scope open of an
+        // uninitialized database could permanently bind genesis to the wrong
+        // runtime identity before startup eventually rejected that identity.
+        store.validate_startup().await?;
         provider_context::initialize_provider_context_projection_head(&store).await?;
+        // Also cover the newly minted projection key and the rest of startup
+        // invariants after initialization.
         store.validate_startup().await?;
         Arc::try_unwrap(store).map_err(|_| anyhow!("recovery must not retain Store references"))
     }
@@ -395,6 +403,8 @@ impl Store {
                 .context("failed to roll back hydration transaction")?;
             return Ok(HydrationOutcome::PhysicalRecoveryRequired(intents));
         }
+        self.preflight_hydration_budget(&mut transaction, HydrationBudget::default())
+            .await?;
         transaction
             .commit()
             .await
@@ -428,7 +438,10 @@ impl Store {
         }
         self.preflight_hydration_budget(&mut transaction, HydrationBudget::default())
             .await?;
-        let messages = self.hydrate_messages(&mut transaction).await?;
+        let messages = self
+            .hydrate_messages(&mut transaction)
+            .await
+            .context("failed to hydrate authenticated transcript rows")?;
         let provider_context = self
             .hydrate_provider_context(&messages, &mut transaction)
             .await?;
@@ -588,6 +601,40 @@ impl Store {
                          length(ciphertext)
                        ), 0)
                 FROM provider_context
+                UNION ALL
+                SELECT COUNT(*),
+                       COALESCE(SUM(
+                         64 +
+                         length(CAST(mutation_id AS BLOB)) +
+                         length(CAST(state AS BLOB)) +
+                         length(CAST(intent_key_ref AS BLOB)) +
+                         length(intent_ciphertext) +
+                         length(CAST(hmac_key_id AS BLOB)) +
+                         length(intent_hmac) +
+                         length(CAST(prepared_at AS BLOB)) +
+                         COALESCE(length(CAST(finished_at AS BLOB)), 0) +
+                         COALESCE(length(CAST(terminal_reason AS BLOB)), 0)
+                       ), 0)
+                FROM provider_context_mutations
+                UNION ALL
+                SELECT COUNT(*),
+                       COALESCE(SUM(
+                         32 +
+                         length(CAST(scope_key AS BLOB)) +
+                         length(CAST(latest_insert_id AS BLOB)) +
+                         length(CAST(updated_at AS BLOB))
+                       ), 0)
+                FROM provider_context_replace_heads
+                UNION ALL
+                SELECT COUNT(*),
+                       COALESCE(SUM(
+                         48 +
+                         length(CAST(state AS BLOB)) +
+                         COALESCE(length(set_digest), 0) +
+                         COALESCE(length(CAST(key_ref AS BLOB)), 0) +
+                         COALESCE(length(head_hmac), 0)
+                       ), 0)
+                FROM provider_context_projection_head
                 UNION ALL
                 SELECT COUNT(*),
                        COALESCE(SUM(
@@ -2325,6 +2372,7 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gateway::{Command, CommandEnvelope, CommandId, InboundCommand};
     use crate::memory::context_assembler::ContextAssembler;
     use crate::memory::estimate::eviction_footprint_for_payload;
     use crate::provider::model::ModelSpec;
@@ -3099,6 +3147,21 @@ mod tests {
             "mutation",
             "artifact",
         ] {
+            if purpose == "mutation" {
+                let active_mutation_keys: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM data_keys
+                     WHERE scope = 'conversation' AND purpose = 'mutation'
+                       AND conversation_id = 'conversation-1' AND state = 'active'",
+                )
+                .fetch_one(store.pool())
+                .await
+                .expect("count startup projection-authentication key");
+                assert_eq!(
+                    active_mutation_keys, 1,
+                    "startup projection authentication proves the valid conversation/mutation pair"
+                );
+                continue;
+            }
             sqlx::query(
                 "INSERT INTO data_keys(
                     key_ref, scope, purpose, conversation_id, algorithm, wrap_key_id,
@@ -3140,6 +3203,72 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("database scope does not match"));
+    }
+
+    #[tokio::test]
+    async fn wrong_scope_open_cannot_poison_uninitialized_provider_projection_genesis() {
+        let store = store().await;
+        sqlx::query(
+            "UPDATE provider_context_projection_head
+             SET state = 'uninitialized', revision = 0, record_count = 0,
+                 set_digest = NULL, key_ref = NULL, head_hmac = NULL
+             WHERE singleton = 1",
+        )
+        .execute(store.pool())
+        .await
+        .expect("simulate crash before provider projection genesis");
+        let pool = store.pool.clone();
+        drop(store);
+
+        let wrong_scope = AgentScope {
+            conversation_id: "conversation-2".to_owned(),
+            ..scope()
+        };
+        let error = match Store::finish_open(pool.clone(), wrong_scope, provider()).await {
+            Ok(_) => panic!("wrong scope must fail before projection initialization"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("database scope does not match"));
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM provider_context_projection_head WHERE singleton = 1",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("projection marker remains readable"),
+            "uninitialized"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM data_keys
+                 WHERE purpose = 'mutation' AND conversation_id = 'conversation-2'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count wrong-scope mutation keys"),
+            0
+        );
+
+        let reopened = Store::finish_open(pool, scope(), provider())
+            .await
+            .expect("correct scope initializes projection genesis after rejected wrong open");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM provider_context_projection_head WHERE singleton = 1",
+            )
+            .fetch_one(reopened.pool())
+            .await
+            .expect("load initialized projection state"),
+            "active"
+        );
+        let mut transaction = reopened
+            .pool()
+            .begin()
+            .await
+            .expect("begin projection verify");
+        provider_context::verify_provider_context_projection_set(&reopened, &mut transaction)
+            .await
+            .expect("correct-scope projection genesis authenticates");
     }
 
     #[tokio::test]
@@ -3435,7 +3564,7 @@ mod tests {
         )
         .expect("encrypt provider context record");
         record
-            .insert_committed(&store)
+            .insert_committed(store)
             .await
             .expect("insert provider context");
         let mut transaction = store.pool().begin().await.expect("begin fixture update");
@@ -3474,14 +3603,26 @@ mod tests {
         seed_persisted_assistant(&store, message_id, 1, &spec).await;
         insert_provider_context_record(&store, message_id, 1, saved_tokens).await;
 
-        let lease = test_lease(1);
-        let fence = test_fence(&lease);
-        let state = match store.hydrate(&lease, &fence).await {
-            Ok(HydrationOutcome::Complete(state)) => state,
-            other => panic!("expected complete hydration, got {other:?}"),
-        };
-        assert_eq!(state.provider_context.len(), 1);
-        let hydrated = &state.provider_context[0];
+        // This fixture isolates provider-context accounting. Its synthetic
+        // transcript row intentionally has no durable MessageEnd lifecycle, so
+        // exercise the provider hydration boundary directly instead of
+        // weakening full Store hydration's exact event/projection parity.
+        let mut transaction = store.pool().begin().await.expect("begin hydration");
+        let messages = store
+            .hydrate_messages(&mut transaction)
+            .await
+            .expect("hydrate fixture transcript");
+        let provider_context = store
+            .hydrate_provider_context(&messages, &mut transaction)
+            .await
+            .expect("hydrate provider context");
+        transaction
+            .commit()
+            .await
+            .expect("commit hydration snapshot");
+
+        assert_eq!(provider_context.len(), 1);
+        let hydrated = &provider_context[0];
         assert_eq!(hydrated.footprint.eviction_tokens(), saved_tokens);
 
         // The saved footprint must differ from what the current estimator would
@@ -3506,7 +3647,7 @@ mod tests {
             spec.clone(),
         )
         .expect("valid prompt");
-        assembler.set_provider_context(state.provider_context);
+        assembler.set_provider_context(provider_context);
 
         let assistant = ContextMessage::Persisted {
             id: message_id.to_owned(),
@@ -3552,19 +3693,35 @@ mod tests {
 
         seed_persisted_assistant(&store, message_id, 1, &spec).await;
         insert_provider_context_record(&store, message_id, 1, 0).await;
+        let mut transaction = store.pool().begin().await.expect("begin fixture update");
+        let checkpoint =
+            provider_context::verify_provider_context_projection_set(&store, &mut transaction)
+                .await
+                .expect("authenticate fixture provider-context set");
         sqlx::query(
             "UPDATE provider_context SET eviction_estimator_version = ? WHERE message_id = ?",
         )
         .bind(1_i64 << 40)
         .bind(message_id)
-        .execute(store.pool())
+        .execute(&mut *transaction)
         .await
         .expect("tamper estimator version");
+        provider_context::commit_provider_context_projection_set(
+            &store,
+            &mut transaction,
+            &checkpoint,
+        )
+        .await
+        .expect("commit validly authenticated out-of-range fixture");
+        transaction.commit().await.expect("commit fixture update");
 
-        let lease = test_lease(1);
-        let fence = test_fence(&lease);
+        let mut transaction = store.pool().begin().await.expect("begin hydration");
+        let messages = store
+            .hydrate_messages(&mut transaction)
+            .await
+            .expect("hydrate fixture transcript");
         let error = store
-            .hydrate(&lease, &fence)
+            .hydrate_provider_context(&messages, &mut transaction)
             .await
             .expect_err("hydration must fail closed for out-of-range version");
         assert!(
@@ -3572,10 +3729,6 @@ mod tests {
                 .to_string()
                 .contains("eviction_estimator_version out of u32 range")
         );
-    }
-
-    fn test_now() -> String {
-        Utc::now().to_rfc3339()
     }
 
     fn test_memory_payload() -> serde_json::Value {
@@ -3630,13 +3783,19 @@ mod tests {
             .await
     }
 
-    async fn insert_memory_batch(
+    fn fixture_compact_result(summary: &str, est_tokens: u64) -> crate::memory::CompactResult {
+        let now = Utc::now();
+        crate::memory::CompactResult {
+            summary: crate::memory::DecryptedMemorySummary::new(summary.to_owned()),
+            est_tokens,
+            time_range: (now, now),
+        }
+    }
+
+    async fn insert_authenticated_summary_batch(
         store: &Store,
         id: &str,
-        key_ref: &str,
-        ciphertext: &[u8],
-        projection: &str,
-        redaction_version: i64,
+        result: crate::memory::CompactResult,
     ) {
         EventWriter::new(std::sync::Arc::new(store.clone()))
             .apply(EventBatch {
@@ -3646,31 +3805,39 @@ mod tests {
                             .expect("fixture memory-maintenance event"),
                     ),
                     projections: vec![Projection::MemoryTransition(MemoryTransition {
-                        batch_inserts: vec![MemoryBatchRecord {
-                            id: id.to_owned(),
-                            layer: MemoryLayer::L1,
-                            ord: 0,
-                            batch_seq: 0,
-                            version: 0,
-                            state: MemoryBatchState::Compacted,
-                            est_tokens: 42,
-                            eviction_footprint_tokens: 0,
-                            summary: Some(MemoryBatchSummary {
-                                key_ref: key_ref.to_owned(),
-                                ciphertext: ciphertext.to_vec(),
-                                projection: projection.to_owned(),
-                                redaction_version: u32::try_from(redaction_version)
-                                    .expect("fixture redaction version must fit u32"),
-                            }),
-                            updated_at: test_now(),
-                        }],
+                        batch_inserts: vec![MemoryBatchRecord::new(
+                            id,
+                            MemoryLayer::L1,
+                            0,
+                            0,
+                            MemoryBatchState::Compacting,
+                            0,
+                            0,
+                        )],
                         ..Default::default()
                     })],
                 }],
                 injected_commands: Vec::new(),
             })
             .await
-            .expect("insert authenticated memory batch");
+            .expect("insert summaryless authenticated memory batch");
+        apply_memory_transition_fixture(
+            store,
+            "fixture_attach_memory_summary",
+            MemoryTransition {
+                batch_mutations: vec![MemoryBatchMutation {
+                    batch_id: Uuid::parse_str(id).expect("fixture batch UUID"),
+                    expected_version: 0,
+                    new_state: MemoryBatchState::Compacted,
+                    est_tokens: result.est_tokens,
+                    summary: Some(result),
+                    footprint_delta: 0,
+                    delete_membership: false,
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
     }
 
     async fn apply_memory_transition_fixture(
@@ -3705,30 +3872,59 @@ mod tests {
         let source_key = source_id.to_string();
         let target_key = target_id.to_string();
         let job_id = Uuid::now_v7().to_string();
-        let key = store
-            .conversation_key(DataKeyPurpose::MemorySummary)
-            .await
-            .expect("mint source summary key");
-        let source_payload = test_memory_payload();
-        let (ciphertext, projection, redaction_version) =
-            encrypt_memory_projection(store, &key, "memory_batches", &source_key, &source_payload);
-        let source = MemoryBatchRecord {
-            id: source_key.clone(),
-            layer: MemoryLayer::L1,
-            ord: 0,
-            batch_seq: 0,
-            version: 0,
-            state: MemoryBatchState::Compacting,
-            est_tokens: 42,
-            eviction_footprint_tokens: 0,
-            summary: Some(MemoryBatchSummary {
-                key_ref: key.key_ref.clone(),
-                ciphertext,
-                projection,
-                redaction_version,
-            }),
-            updated_at: test_now(),
-        };
+        let source = MemoryBatchRecord::new(
+            source_key.clone(),
+            MemoryLayer::L1,
+            0,
+            0,
+            MemoryBatchState::Compacting,
+            0,
+            0,
+        );
+        apply_memory_transition_fixture(
+            store,
+            "fixture_compact_l1_source",
+            MemoryTransition {
+                batch_inserts: vec![source],
+                ..Default::default()
+            },
+        )
+        .await;
+        let source_result = fixture_compact_result("Nothing of secret value here.", 42);
+        apply_memory_transition_fixture(
+            store,
+            "fixture_compact_l1_source_summary",
+            MemoryTransition {
+                batch_mutations: vec![MemoryBatchMutation {
+                    batch_id: source_id,
+                    expected_version: 0,
+                    new_state: MemoryBatchState::Compacted,
+                    summary: Some(source_result),
+                    est_tokens: 42,
+                    footprint_delta: 0,
+                    delete_membership: false,
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+        apply_memory_transition_fixture(
+            store,
+            "fixture_reopen_compact_l1_source",
+            MemoryTransition {
+                batch_mutations: vec![MemoryBatchMutation {
+                    batch_id: source_id,
+                    expected_version: 1,
+                    new_state: MemoryBatchState::Compacting,
+                    summary: None,
+                    est_tokens: 42,
+                    footprint_delta: 0,
+                    delete_membership: false,
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
         let target = MemoryBatchRecord::new(
             target_key.clone(),
             MemoryLayer::L2,
@@ -3742,13 +3938,13 @@ mod tests {
             store,
             "fixture_compact_l1_graph",
             MemoryTransition {
-                batch_inserts: vec![source, target],
+                batch_inserts: vec![target],
                 job_inserts: vec![MemoryJobRecord::new(
                     job_id.clone(),
                     MemoryJobKind::CompactL1,
                     0,
                     vec![source_key.clone()],
-                    BTreeMap::from([(source_key, 0), (target_key, 0)]),
+                    BTreeMap::from([(source_key, 2), (target_key, 0)]),
                 )],
                 cursor_advance: initialize_cursor.then_some(MemoryApplyCursorAdvance {
                     kind: MemoryJobKind::CompactL1.as_str().to_owned(),
@@ -3775,7 +3971,7 @@ mod tests {
             store,
             "fixture_compact_l1_claim",
             MemoryTransition {
-                expected_source_versions: BTreeMap::from([(source_id, 0), (target_id, 0)]),
+                expected_source_versions: BTreeMap::from([(source_id, 2), (target_id, 0)]),
                 job_mutations: vec![MemoryJobMutation::Claim {
                     job_id: job_id.clone(),
                     lease_until: lease_until.clone(),
@@ -3788,7 +3984,7 @@ mod tests {
             store,
             "fixture_compact_l1_start",
             MemoryTransition {
-                expected_source_versions: BTreeMap::from([(source_id, 0), (target_id, 0)]),
+                expected_source_versions: BTreeMap::from([(source_id, 2), (target_id, 0)]),
                 job_mutations: vec![MemoryJobMutation::Start {
                     job_id: job_id.clone(),
                     expected_attempt: 0,
@@ -3809,11 +4005,11 @@ mod tests {
             store,
             "fixture_compact_l1_complete",
             MemoryTransition {
-                expected_source_versions: BTreeMap::from([(source_id, 0), (target_id, 0)]),
+                expected_source_versions: BTreeMap::from([(source_id, 2), (target_id, 0)]),
                 batch_mutations: vec![
                     MemoryBatchMutation {
                         batch_id: source_id,
-                        expected_version: 0,
+                        expected_version: 2,
                         new_state: MemoryBatchState::Compacted,
                         summary: None,
                         est_tokens: 42,
@@ -3844,11 +4040,11 @@ mod tests {
             store,
             "fixture_compact_l1_apply",
             MemoryTransition {
-                expected_source_versions: BTreeMap::from([(source_id, 1), (target_id, 1)]),
+                expected_source_versions: BTreeMap::from([(source_id, 3), (target_id, 1)]),
                 batch_mutations: vec![
                     MemoryBatchMutation {
                         batch_id: source_id,
-                        expected_version: 1,
+                        expected_version: 3,
                         new_state: MemoryBatchState::Dropped,
                         summary: None,
                         est_tokens: 42,
@@ -4194,21 +4390,11 @@ mod tests {
     #[tokio::test]
     async fn hydrate_rejects_structurally_invalid_authentic_memory_graph() {
         let store = store().await;
-        let key = store
-            .conversation_key(DataKeyPurpose::MemorySummary)
-            .await
-            .expect("mint memory summary key");
-        let payload = test_memory_payload();
         let batch_id = Uuid::now_v7().to_string();
-        let (ciphertext, projection, version) =
-            encrypt_memory_projection(&store, &key, "memory_batches", &batch_id, &payload);
-        insert_memory_batch(
+        insert_authenticated_summary_batch(
             &store,
             &batch_id,
-            &key.key_ref,
-            &ciphertext,
-            &projection,
-            i64::from(version),
+            fixture_compact_result("Nothing of secret value here.", 42),
         )
         .await;
 
@@ -4414,6 +4600,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn store_hydration_restores_completed_compact_l0_result_to_speculative_shelf() {
+        let store = store().await;
+        let user = insert_user_message(&store, 1, "remember this before apply").await;
+        complete_user_message_fixture(&store, &user).await;
+        let source = sqlx::query(
+            "SELECT id, est_tokens FROM memory_batches
+             WHERE layer = 0 AND state = 'open'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("load canonical MessageEnd L0 source");
+        let source_key: String = source.get("id");
+        let source_id = Uuid::parse_str(&source_key).expect("canonical L0 batch UUID");
+        let source_est_tokens = u64::try_from(source.get::<i64, _>("est_tokens"))
+            .expect("fixture source estimate is non-negative");
+        let target_id = Uuid::now_v7();
+        let target_key = target_id.to_string();
+        let job_id = Uuid::now_v7().to_string();
+
+        apply_memory_transition_fixture(
+            &store,
+            "fixture_completed_shelf_graph",
+            MemoryTransition {
+                batch_inserts: vec![MemoryBatchRecord::new(
+                    target_key.clone(),
+                    MemoryLayer::L1,
+                    0,
+                    0,
+                    MemoryBatchState::Compacting,
+                    0,
+                    0,
+                )],
+                batch_mutations: vec![MemoryBatchMutation {
+                    batch_id: source_id,
+                    expected_version: 0,
+                    new_state: MemoryBatchState::Compacting,
+                    summary: None,
+                    est_tokens: source_est_tokens,
+                    footprint_delta: 0,
+                    delete_membership: false,
+                }],
+                job_inserts: vec![MemoryJobRecord::new(
+                    job_id.clone(),
+                    MemoryJobKind::CompactL0,
+                    0,
+                    vec![source_key.clone()],
+                    BTreeMap::from([(source_key, 1), (target_key, 0)]),
+                )],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let lease_until = "2099-01-01T00:00:00Z".to_owned();
+        for (kind, mutation) in [
+            (
+                "fixture_completed_shelf_claim",
+                MemoryJobMutation::Claim {
+                    job_id: job_id.clone(),
+                    lease_until: lease_until.clone(),
+                },
+            ),
+            (
+                "fixture_completed_shelf_start",
+                MemoryJobMutation::Start {
+                    job_id: job_id.clone(),
+                    expected_attempt: 0,
+                    lease_witness: Some(lease_until.clone()),
+                    lease_until: lease_until.clone(),
+                },
+            ),
+        ] {
+            apply_memory_transition_fixture(
+                &store,
+                kind,
+                MemoryTransition {
+                    expected_source_versions: BTreeMap::from([(source_id, 1), (target_id, 0)]),
+                    job_mutations: vec![mutation],
+                    ..Default::default()
+                },
+            )
+            .await;
+        }
+
+        let result = fixture_compact_result("completed L1 shelf", 7);
+        apply_memory_transition_fixture(
+            &store,
+            "fixture_completed_shelf_complete",
+            MemoryTransition {
+                expected_source_versions: BTreeMap::from([(source_id, 1), (target_id, 0)]),
+                batch_mutations: vec![
+                    MemoryBatchMutation {
+                        batch_id: source_id,
+                        expected_version: 1,
+                        new_state: MemoryBatchState::Compacted,
+                        summary: None,
+                        est_tokens: source_est_tokens,
+                        footprint_delta: 0,
+                        delete_membership: false,
+                    },
+                    MemoryBatchMutation {
+                        batch_id: target_id,
+                        expected_version: 0,
+                        new_state: MemoryBatchState::Compacted,
+                        summary: Some(result.clone()),
+                        est_tokens: result.est_tokens,
+                        footprint_delta: 0,
+                        delete_membership: false,
+                    },
+                ],
+                job_mutations: vec![MemoryJobMutation::Complete {
+                    job_id: job_id.clone(),
+                    expected_attempt: 1,
+                    lease_witness: Some(lease_until),
+                    result,
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let lease = test_lease(1);
+        let fence = test_fence(&lease);
+        let HydrationOutcome::Complete(state) = store
+            .hydrate(&lease, &fence)
+            .await
+            .expect("hydrate completed speculative shelf")
+        else {
+            panic!("completed CompactL0 shelf must hydrate without physical recovery");
+        };
+        let memory = crate::memory::ThreeLayerMemory::from_hydrated(state.memory)
+            .expect("completed shelf graph reconstructs");
+        let shelf = memory
+            .shelf()
+            .get(&source_id)
+            .expect("completed CompactL0 result is restored to its source shelf");
+        assert_eq!(shelf.summary.expose(), "completed L1 shelf");
+        assert_eq!(shelf.est_tokens, 7);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM memory_jobs WHERE id = ?")
+                .bind(job_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("load completed shelf job"),
+            "completed"
+        );
+    }
+
+    #[tokio::test]
     async fn store_hydration_folds_multiple_authenticated_l2_rows_in_order() {
         let store = store().await;
         apply_compact_l1_fixture(&store, "first durable L2", 3, 1, true).await;
@@ -4452,56 +4787,53 @@ mod tests {
     #[tokio::test]
     async fn hydrate_repairs_expired_memory_job_before_returning_complete_state() {
         let store = store().await;
-        let message_id = "memory-recovery-message";
         let message_text = "recover me";
-        insert_user_message(&store, message_id, 1, message_text).await;
-        let source_id = Uuid::now_v7();
+        let user = insert_user_message(&store, 1, message_text).await;
+        complete_user_message_fixture(&store, &user).await;
+        let source = sqlx::query(
+            "SELECT id, est_tokens FROM memory_batches
+             WHERE layer = 0 AND state = 'open'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("load canonical MessageEnd L0 source");
+        let source_key: String = source.get("id");
+        let source_id = Uuid::parse_str(&source_key).expect("canonical L0 batch UUID");
+        let est_tokens: i64 = source.get("est_tokens");
         let target_id = Uuid::now_v7();
         let job_id = Uuid::now_v7().to_string();
-        let source_key = source_id.to_string();
         let target_key = target_id.to_string();
-        let est_tokens = i64::try_from(
-            crate::memory::estimate::estimate_text_tokens(message_text)
-                .expect("estimate recovery fixture message"),
-        )
-        .expect("fixture estimate fits SQLite");
 
         apply_memory_transition_fixture(
             &store,
             "fixture_expired_job_graph",
             MemoryTransition {
-                batch_inserts: vec![
-                    MemoryBatchRecord::new(
-                        source_key.clone(),
-                        MemoryLayer::L0,
-                        0,
-                        0,
-                        MemoryBatchState::Compacting,
-                        est_tokens,
-                        0,
-                    ),
-                    MemoryBatchRecord::new(
-                        target_key.clone(),
-                        MemoryLayer::L1,
-                        0,
-                        0,
-                        MemoryBatchState::Compacting,
-                        0,
-                        0,
-                    ),
-                ],
+                batch_inserts: vec![MemoryBatchRecord::new(
+                    target_key.clone(),
+                    MemoryLayer::L1,
+                    0,
+                    0,
+                    MemoryBatchState::Compacting,
+                    0,
+                    0,
+                )],
+                batch_mutations: vec![MemoryBatchMutation {
+                    batch_id: source_id,
+                    expected_version: 0,
+                    new_state: MemoryBatchState::Compacting,
+                    summary: None,
+                    est_tokens: u64::try_from(est_tokens)
+                        .expect("fixture source estimate is non-negative"),
+                    footprint_delta: 0,
+                    delete_membership: false,
+                }],
                 job_inserts: vec![MemoryJobRecord::new(
                     job_id.clone(),
                     MemoryJobKind::CompactL0,
                     0,
                     vec![source_key.clone()],
-                    BTreeMap::from([(source_key.clone(), 0), (target_key, 0)]),
+                    BTreeMap::from([(source_key, 1), (target_key, 0)]),
                 )],
-                membership_inserts: vec![MemoryBatchMessageRecord {
-                    batch_id: source_key,
-                    message_id: message_id.to_owned(),
-                    ord: 1,
-                }],
                 ..Default::default()
             },
         )
@@ -4511,7 +4843,7 @@ mod tests {
             &store,
             "fixture_expired_job_claim",
             MemoryTransition {
-                expected_source_versions: BTreeMap::from([(source_id, 0), (target_id, 0)]),
+                expected_source_versions: BTreeMap::from([(source_id, 1), (target_id, 0)]),
                 job_mutations: vec![MemoryJobMutation::Claim {
                     job_id: job_id.clone(),
                     lease_until: expired_lease.clone(),
@@ -4524,7 +4856,7 @@ mod tests {
             &store,
             "fixture_expired_job_start",
             MemoryTransition {
-                expected_source_versions: BTreeMap::from([(source_id, 0), (target_id, 0)]),
+                expected_source_versions: BTreeMap::from([(source_id, 1), (target_id, 0)]),
                 job_mutations: vec![MemoryJobMutation::Start {
                     job_id: job_id.clone(),
                     expected_attempt: 0,
@@ -4574,25 +4906,8 @@ mod tests {
     #[tokio::test]
     async fn hydrate_loads_transcript_and_memory_in_one_snapshot() {
         let store = store().await;
-        insert_user_message(&store, "msg-snapshot", 1, "hello snapshot").await;
-
-        let key = store
-            .conversation_key(DataKeyPurpose::MemorySummary)
-            .await
-            .expect("mint memory summary key");
-        let payload = test_memory_payload();
-        let batch_id = Uuid::now_v7().to_string();
-        let (ciphertext, projection, version) =
-            encrypt_memory_projection(&store, &key, "memory_batches", &batch_id, &payload);
-        insert_memory_batch(
-            &store,
-            &batch_id,
-            &key.key_ref,
-            &ciphertext,
-            &projection,
-            i64::from(version),
-        )
-        .await;
+        let user = insert_user_message(&store, 1, "hello snapshot").await;
+        complete_user_message_fixture(&store, &user).await;
 
         let outcome = store
             .hydrate(&test_lease(1), &test_fence(&test_lease(1)))
@@ -4602,9 +4917,9 @@ mod tests {
             panic!("expected complete hydration outcome");
         };
 
-        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages.len(), 2);
         match &state.messages[0] {
-            ContextMessage::Persisted { id, .. } => assert_eq!(id, "msg-snapshot"),
+            ContextMessage::Persisted { id, .. } => assert_eq!(id, &user.message_id),
             _ => panic!("expected persisted message"),
         }
         assert!(!state.memory.is_empty());
@@ -4617,7 +4932,7 @@ mod tests {
         let store = store().await;
         const MESSAGE_COUNT: usize = 70;
         for i in 0..MESSAGE_COUNT {
-            insert_user_message(
+            insert_raw_user_message(
                 &store,
                 &format!("msg-page-{i}"),
                 (i + 1) as u64,
@@ -4650,34 +4965,343 @@ mod tests {
     #[tokio::test]
     async fn hydrate_rejects_tampered_memory_batch() {
         let store = store().await;
-        let key = store
-            .conversation_key(DataKeyPurpose::MemorySummary)
-            .await
-            .expect("mint memory summary key");
-        let payload = test_memory_payload();
         let batch_id = Uuid::now_v7().to_string();
-        let (mut ciphertext, projection, version) =
-            encrypt_memory_projection(&store, &key, "memory_batches", &batch_id, &payload);
-        ciphertext[0] ^= 0xff;
-        insert_memory_batch(
+        insert_authenticated_summary_batch(
             &store,
             &batch_id,
-            &key.key_ref,
-            &ciphertext,
-            &projection,
-            i64::from(version),
+            fixture_compact_result("Nothing of secret value here.", 42),
         )
         .await;
+        let mut ciphertext: Vec<u8> =
+            sqlx::query_scalar("SELECT summary_ciphertext FROM memory_batches WHERE id = ?")
+                .bind(&batch_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("load authenticated memory ciphertext");
+        ciphertext[0] ^= 0xff;
+        sqlx::query("UPDATE memory_batches SET summary_ciphertext = ? WHERE id = ?")
+            .bind(ciphertext)
+            .bind(&batch_id)
+            .execute(store.pool())
+            .await
+            .expect("tamper memory ciphertext");
 
         let error = store
             .hydrate(&test_lease(1), &test_fence(&test_lease(1)))
             .await
             .expect_err("tampered memory batch must fail hydrate");
         let message = format!("{error:#}");
-        assert!(message.contains("memory_batches projection"), "{message}");
+        assert!(
+            message.contains("authenticated memory projection digest mismatch"),
+            "{message}"
+        );
     }
 
-    async fn insert_user_message(
+    struct CanonicalUserFixture {
+        seq: u64,
+        command_id: String,
+        run_id: String,
+        turn_id: String,
+        message_id: String,
+    }
+
+    async fn insert_user_message(store: &Store, seq: u64, text: &str) -> CanonicalUserFixture {
+        let command_id = Uuid::now_v7().hyphenated().to_string();
+        let command_id = CommandId::parse(&command_id).expect("canonical command UUID");
+        let writer = EventWriter::new(Arc::new(store.clone()));
+        writer
+            .persist_inbound(&InboundCommand::Valid(CommandEnvelope {
+                seq,
+                command_id: command_id.clone(),
+                command: Command::UserMessage {
+                    text: text.to_owned(),
+                    attachments: Vec::new(),
+                },
+            }))
+            .await
+            .expect("persist fixture command");
+        let run_id = format!("run-{}", command_id.as_str());
+        let turn_id = format!("turn-{}", command_id.as_str());
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![Projection::CommandClassified {
+                        command_id: command_id.as_str().to_owned(),
+                        application_kind: ApplicationKind::IdleRun,
+                        run_id: run_id.clone(),
+                        turn_id: turn_id.clone(),
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("classify fixture command");
+        let received_at: String =
+            sqlx::query_scalar("SELECT received_at FROM inbound_commands WHERE command_id = ?")
+                .bind(command_id.as_str())
+                .fetch_one(store.pool())
+                .await
+                .expect("load canonical fixture receipt time");
+        let timestamp = DateTime::parse_from_rfc3339(&received_at)
+            .expect("fixture receipt time is RFC3339")
+            .with_timezone(&Utc);
+        let message_id = user_message_id(&command_id);
+        let message = PublicMessage::User(UserMessage {
+            content: vec![UserContent::Text {
+                text: text.to_owned(),
+            }],
+            timestamp,
+        });
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::new(&json!({
+                                "type": "agent_start",
+                                "run_id": run_id.clone(),
+                            }))
+                            .expect("fixture AgentStart"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: command_id.as_str().to_owned(),
+                            run_id: run_id.clone(),
+                            expected: RunPhase::Classified,
+                            next: RunPhase::RunStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::new(&json!({
+                                "type": "turn_start",
+                                "run_id": run_id.clone(),
+                                "turn_id": turn_id.clone(),
+                            }))
+                            .expect("fixture TurnStart"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: command_id.as_str().to_owned(),
+                            run_id: run_id.clone(),
+                            expected: RunPhase::RunStarted,
+                            next: RunPhase::TurnStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_start", &message_id, &message)
+                                .expect("fixture MessageStart"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: command_id.as_str().to_owned(),
+                            run_id: run_id.clone(),
+                            expected: RunPhase::TurnStarted,
+                            next: RunPhase::UserStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message("message_end", &message_id, &message)
+                                .expect("fixture MessageEnd"),
+                        ),
+                        projections: vec![
+                            Projection::MessageEnd {
+                                message_id: message_id.clone(),
+                                role: "user",
+                                message,
+                                append_to_l0: true,
+                                provider_context: Vec::new(),
+                                eviction_footprint_tokens: 0,
+                            },
+                            Projection::RunPhase {
+                                command_id: command_id.as_str().to_owned(),
+                                run_id: run_id.clone(),
+                                expected: RunPhase::UserStarted,
+                                next: RunPhase::UserCommitted,
+                            },
+                        ],
+                    },
+                ],
+                injected_commands: vec![InjectedCommand::new(seq, command_id.clone())],
+            })
+            .await
+            .expect("commit canonical fixture MessageEnd");
+        CanonicalUserFixture {
+            seq,
+            command_id: command_id.as_str().to_owned(),
+            run_id,
+            turn_id,
+            message_id,
+        }
+    }
+
+    async fn complete_user_message_fixture(store: &Store, user: &CanonicalUserFixture) {
+        let writer = EventWriter::new(Arc::new(store.clone()));
+        let message_id = Uuid::now_v7().hyphenated().to_string();
+        let message = PublicMessage::Assistant(PublicAssistantMessage {
+            content: Vec::new(),
+            model: "fixture-model".to_owned(),
+            provider: "fixture-provider".to_owned(),
+            origin: crate::provider::types::ProviderOrigin {
+                provider_instance_id: "fixture-provider".to_owned(),
+                protocol: ApiProtocol::OpenAiResponses,
+                model: "fixture-model".to_owned(),
+            },
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: Utc::now(),
+        });
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            &message_id,
+                            &message,
+                            Some(user.run_id.clone()),
+                            Some(user.turn_id.clone()),
+                        )
+                        .expect("fixture assistant MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: user.command_id.clone(),
+                        run_id: user.run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("open fixture assistant");
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_end",
+                                &message_id,
+                                &message,
+                                Some(user.run_id.clone()),
+                                Some(user.turn_id.clone()),
+                            )
+                            .expect("fixture assistant MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id,
+                            role: "assistant",
+                            message: message.clone(),
+                            append_to_l0: true,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::turn_end(
+                                user.run_id.clone(),
+                                user.turn_id.clone(),
+                                message,
+                                Vec::new(),
+                            )
+                            .expect("fixture TurnEnd"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::agent_end(user.run_id.clone()).expect("fixture AgentEnd"),
+                        ),
+                        projections: vec![Projection::CommandApplied {
+                            command_id: user.command_id.clone(),
+                            command_seq: user.seq,
+                            run_id: Some(user.run_id.clone()),
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("close fixture run");
+    }
+
+    async fn insert_excluded_assistant_message(
+        store: &Store,
+        user: &CanonicalUserFixture,
+    ) -> String {
+        let writer = EventWriter::new(Arc::new(store.clone()));
+        let message_id = Uuid::now_v7().hyphenated().to_string();
+        let message = PublicMessage::Assistant(PublicAssistantMessage {
+            content: Vec::new(),
+            model: "fixture-model".to_owned(),
+            provider: "fixture-provider".to_owned(),
+            origin: crate::provider::types::ProviderOrigin {
+                provider_instance_id: "fixture-provider".to_owned(),
+                protocol: ApiProtocol::OpenAiResponses,
+                model: "fixture-model".to_owned(),
+            },
+            usage: Usage::default(),
+            stop_reason: StopReason::Error,
+            error_message: Some("retryable fixture".to_owned()),
+            provider_code: None,
+            interrupted: false,
+            timestamp: Utc::now(),
+        });
+        writer
+            .apply(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_start",
+                                &message_id,
+                                &message,
+                                Some(user.run_id.clone()),
+                                Some(user.turn_id.clone()),
+                            )
+                            .expect("excluded fixture MessageStart"),
+                        ),
+                        projections: vec![Projection::RunPhase {
+                            command_id: user.command_id.clone(),
+                            run_id: user.run_id.clone(),
+                            expected: RunPhase::UserCommitted,
+                            next: RunPhase::AssistantStarted,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_end",
+                                &message_id,
+                                &message,
+                                Some(user.run_id.clone()),
+                                Some(user.turn_id.clone()),
+                            )
+                            .expect("excluded fixture MessageEnd"),
+                        ),
+                        projections: vec![Projection::MessageEnd {
+                            message_id: message_id.clone(),
+                            role: "assistant",
+                            message,
+                            append_to_l0: false,
+                            provider_context: Vec::new(),
+                            eviction_footprint_tokens: 0,
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("commit excluded assistant MessageEnd");
+        message_id
+    }
+
+    async fn insert_raw_user_message(
         store: &Store,
         id: &str,
         seq: u64,
@@ -4704,9 +5328,182 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hydrate_rejects_missing_historical_message_end_projection() {
+        let store = store().await;
+        let user = insert_user_message(&store, 1, "retained user").await;
+        let assistant_id = insert_excluded_assistant_message(&store, &user).await;
+
+        let deleted = sqlx::query("DELETE FROM messages WHERE id = ?")
+            .bind(&assistant_id)
+            .execute(store.pool())
+            .await
+            .expect("delete excluded transcript fixture");
+        assert_eq!(deleted.rows_affected(), 1);
+
+        let error = store
+            .hydrate(&test_lease(1), &test_fence(&test_lease(1)))
+            .await
+            .expect_err("authenticated MessageEnd deletion must fail closed");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("requires exactly one transcript row, found 0")
+                && message.contains(&assistant_id),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_transcript_row_without_message_end() {
+        let store = store().await;
+        insert_user_message(&store, 1, "authenticated user").await;
+        insert_raw_user_message(&store, "extra-transcript", 999, "not in event log").await;
+
+        let error = store
+            .hydrate(&test_lease(1), &test_fence(&test_lease(1)))
+            .await
+            .expect_err("extra transcript row must fail exact MessageEnd hydration");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("transcript row count")
+                && message.contains("authenticated MessageEnd count"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_validly_reencrypted_message_that_differs_from_message_end() {
+        let store = store().await;
+        let user = insert_user_message(&store, 1, "authenticated content").await;
+        let message_seq: i64 = sqlx::query_scalar("SELECT seq FROM messages WHERE id = ?")
+            .bind(&user.message_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("load canonical message sequence");
+        let message_seq = u64::try_from(message_seq).expect("message sequence is non-negative");
+        let replacement = PublicMessage::User(UserMessage {
+            content: vec![UserContent::Text {
+                text: "different but valid content".to_owned(),
+            }],
+            timestamp: Utc::now(),
+        });
+        let key = store
+            .conversation_key(DataKeyPurpose::Transcript)
+            .await
+            .expect("reuse transcript key");
+        let raw = serde_json::to_vec(&replacement).expect("serialize replacement message");
+        let aad = store
+            .scope()
+            .row_aad("messages", &user.message_id, DataKeyPurpose::Transcript);
+        let ciphertext = encrypt_content(&key, &raw, &aad).expect("encrypt replacement message");
+        let payload = store
+            .redactor()
+            .redact_serialized(&raw)
+            .expect("redact replacement message");
+        let search_text =
+            search_text_from_projection(&payload).expect("derive replacement search text");
+        let updated = sqlx::query(
+            "UPDATE messages
+             SET seq = ?, role = 'user', raw_key_ref = ?, raw_ciphertext = ?,
+                 payload = ?, search_text = ?, redaction_version = 1,
+                 interrupted = 0
+             WHERE id = ?",
+        )
+        .bind(i64::try_from(message_seq).expect("message sequence fits SQLite"))
+        .bind(&key.key_ref)
+        .bind(ciphertext)
+        .bind(payload)
+        .bind(search_text)
+        .bind(&user.message_id)
+        .execute(store.pool())
+        .await
+        .expect("replace transcript with a validly encrypted different message");
+        assert_eq!(updated.rows_affected(), 1);
+
+        let error = store
+            .hydrate(&test_lease(1), &test_fence(&test_lease(1)))
+            .await
+            .expect_err("valid row-local authentication must not override MessageEnd truth");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("content disagrees with authenticated MessageEnd"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_validly_reencrypted_message_id_that_differs_from_message_end() {
+        let store = store().await;
+        let user = insert_user_message(&store, 1, "authenticated user").await;
+        let assistant_id = insert_excluded_assistant_message(&store, &user).await;
+        let replacement_id = Uuid::now_v7().to_string();
+        let row = sqlx::query("SELECT raw_key_ref, raw_ciphertext FROM messages WHERE id = ?")
+            .bind(&assistant_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("load excluded authenticated assistant");
+        let key_ref: String = row.get("raw_key_ref");
+        let key = store
+            .data_key_by_ref(&key_ref)
+            .await
+            .expect("load transcript key");
+        let old_aad = store
+            .scope()
+            .row_aad("messages", &assistant_id, DataKeyPurpose::Transcript);
+        let raw = decrypt_content(&key, &row.get::<Vec<u8>, _>("raw_ciphertext"), &old_aad)
+            .expect("decrypt canonical assistant");
+        let new_aad =
+            store
+                .scope()
+                .row_aad("messages", &replacement_id, DataKeyPurpose::Transcript);
+        let ciphertext =
+            encrypt_content(&key, &raw, &new_aad).expect("reencrypt under replacement identity");
+        sqlx::query("UPDATE messages SET id = ?, raw_ciphertext = ? WHERE id = ?")
+            .bind(&replacement_id)
+            .bind(ciphertext)
+            .bind(&assistant_id)
+            .execute(store.pool())
+            .await
+            .expect("replace row identity with valid local authentication");
+
+        let error = store
+            .hydrate(&test_lease(1), &test_fence(&test_lease(1)))
+            .await
+            .expect_err("row-local id authentication must not override MessageEnd identity");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("disagrees with authenticated MessageEnd id")
+                && message.contains(&assistant_id)
+                && message.contains(&replacement_id),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_interrupted_projection_that_differs_from_message_end() {
+        let store = store().await;
+        let user = insert_user_message(&store, 1, "authenticated user").await;
+        let assistant_id = insert_excluded_assistant_message(&store, &user).await;
+        sqlx::query("UPDATE messages SET interrupted = 1 WHERE id = ?")
+            .bind(&assistant_id)
+            .execute(store.pool())
+            .await
+            .expect("tamper interrupted projection");
+
+        let error = store
+            .hydrate(&test_lease(1), &test_fence(&test_lease(1)))
+            .await
+            .expect_err("interrupted projection must match authenticated MessageEnd");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("interrupted flag does not match authenticated raw message"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
     async fn hydrate_rejects_tampered_message_payload() {
         let store = store().await;
-        insert_user_message(&store, "msg-tamper-payload", 1, "hello world").await;
+        insert_raw_user_message(&store, "msg-tamper-payload", 1, "hello world").await;
 
         sqlx::query("UPDATE messages SET payload = ? WHERE id = ?")
             .bind("tampered-payload")
@@ -4727,7 +5524,7 @@ mod tests {
     #[tokio::test]
     async fn hydrate_rejects_tampered_message_search_text() {
         let store = store().await;
-        insert_user_message(&store, "msg-tamper-search", 2, "hello world").await;
+        insert_raw_user_message(&store, "msg-tamper-search", 2, "hello world").await;
 
         sqlx::query("UPDATE messages SET search_text = ? WHERE id = ?")
             .bind("tampered-search")

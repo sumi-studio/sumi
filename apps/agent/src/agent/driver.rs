@@ -920,6 +920,20 @@ mod tests {
             .await
             .expect("store");
         let pool = store.pool().clone();
+        let tables = [
+            "data_keys",
+            "agent_events",
+            "inbound_commands",
+            "tool_executions",
+        ];
+        let mut counts_before_start = Vec::with_capacity(tables.len());
+        for table in tables {
+            let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(&pool)
+                .await
+                .expect("count before mismatched Session start");
+            counts_before_start.push((table, count));
+        }
         let gateway_store = Store::session_test_store("injected-generation-mismatch-gateway")
             .await
             .expect("gateway store");
@@ -942,17 +956,15 @@ mod tests {
                 .contains("does not match Session generation")
         );
         assert_eq!(starts.load(Ordering::SeqCst), 0);
-        for table in [
-            "data_keys",
-            "agent_events",
-            "inbound_commands",
-            "tool_executions",
-        ] {
+        for (table, count_before_start) in counts_before_start {
             let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
                 .fetch_one(&pool)
                 .await
                 .expect("count");
-            assert_eq!(count, 0, "mismatch mutated {table}");
+            assert_eq!(
+                count, count_before_start,
+                "generation mismatch mutated {table}"
+            );
         }
     }
 

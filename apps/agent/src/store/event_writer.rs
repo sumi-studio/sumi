@@ -63,7 +63,8 @@ use super::{
     physical_recovery::{ApplyReceiptOutcome, PhysicalRecoveryApplier, PhysicalRecoveryReceipt},
     provider_context::{
         EncryptedProviderContextRecord, ProviderContextMutation, ProviderContextMutationApplier,
-        provider_context_idempotency_key,
+        commit_provider_context_projection_set, provider_context_idempotency_key,
+        verify_provider_context_projection_set,
     },
     redactor::search_text_from_projection,
     verify_command_payload_digest,
@@ -6498,10 +6499,16 @@ struct MemoryMaterialization {
 
 impl MemoryMaterialization {
     fn add_logical_component(&mut self, content_bytes: usize, label: &str) -> Result<()> {
-        self.components = self
+        let next_components = self
             .components
             .checked_add(1)
             .ok_or_else(|| anyhow!("{label} component count overflow"))?;
+        if next_components > MAX_MATERIALIZATION_COMPONENTS {
+            bail!(
+                "EventBatch has more than {MAX_MATERIALIZATION_COMPONENTS} materialization components while sizing {label}"
+            );
+        }
+        self.components = next_components;
         self.bytes = self
             .bytes
             .checked_add(content_bytes)
@@ -6748,6 +6755,69 @@ fn memory_job_record_bytes(record: &MemoryJobRecord) -> Result<usize> {
     )
 }
 
+fn charge_and_validate_memory_job_sources(
+    materialization: &mut MemoryMaterialization,
+    record: &MemoryJobRecord,
+) -> Result<()> {
+    let mut unique_sources = BTreeSet::new();
+    for source_id in &record.source_ids {
+        materialization.add_logical_component(
+            source_id
+                .len()
+                .checked_add(std::mem::size_of::<i64>())
+                .ok_or_else(|| anyhow!("memory job source identity byte count overflow"))?,
+            "memory job source identity",
+        )?;
+        BatchId::parse_str(source_id).with_context(|| {
+            format!("memory job {} has invalid source id {source_id}", record.id)
+        })?;
+        if !unique_sources.insert(source_id.as_str()) {
+            bail!("memory job {} repeats source id {source_id}", record.id);
+        }
+        if !record.source_versions.contains_key(source_id) {
+            bail!(
+                "memory job {} source {source_id} is missing its version witness",
+                record.id
+            );
+        }
+    }
+
+    let mut target_count = 0usize;
+    for (batch_id, version) in &record.source_versions {
+        materialization.add_logical_component(
+            batch_id
+                .len()
+                .checked_add(std::mem::size_of::<i64>())
+                .ok_or_else(|| anyhow!("memory job source-version byte count overflow"))?,
+            "memory job source-version identity",
+        )?;
+        BatchId::parse_str(batch_id).with_context(|| {
+            format!(
+                "memory job {} has invalid source-version batch id {batch_id}",
+                record.id
+            )
+        })?;
+        if *version < 0 {
+            bail!(
+                "memory job {} batch {batch_id} has a negative version witness",
+                record.id
+            );
+        }
+        if !unique_sources.contains(batch_id.as_str()) {
+            target_count = target_count
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("memory job target count overflow"))?;
+        }
+    }
+    if target_count != 1 {
+        bail!(
+            "memory job {} must have exactly one target batch witness, found {target_count}",
+            record.id
+        );
+    }
+    Ok(())
+}
+
 fn memory_job_mutation_preflight_bytes(
     redactor: &Redactor,
     mutation: &MemoryJobMutation,
@@ -6919,8 +6989,6 @@ fn memory_job_update_preflight_materialization(
         .iter()
         .map(|(id, version)| (id.to_string(), *version))
         .collect();
-    let source_versions_json = serde_json::to_vec(&source_versions)
-        .context("failed to serialize memory job update source versions for sizing")?;
     for id in update.expected_source_versions.keys() {
         materialization.add_logical_component(
             id.to_string()
@@ -6930,6 +6998,8 @@ fn memory_job_update_preflight_materialization(
             "memory source-version witness",
         )?;
     }
+    let source_versions_json = serde_json::to_vec(&source_versions)
+        .context("failed to serialize memory job update source versions for sizing")?;
     for mutation in &update.job_mutations {
         materialization.add_durable_row(
             memory_job_mutation_preflight_bytes(
@@ -6966,8 +7036,6 @@ fn memory_transition_preflight_materialization(
                 .ok_or_else(|| anyhow!("memory batch version sizing overflow"))?,
         );
     }
-    let source_versions_json = serde_json::to_vec(&post_source_versions)
-        .context("failed to serialize memory transition source versions for sizing")?;
     for id in transition.expected_source_versions.keys() {
         materialization.add_logical_component(
             id.to_string()
@@ -6977,6 +7045,8 @@ fn memory_transition_preflight_materialization(
             "memory source-version witness",
         )?;
     }
+    let source_versions_json = serde_json::to_vec(&post_source_versions)
+        .context("failed to serialize memory transition source versions for sizing")?;
     for (id, state) in &transition.expected_source_states {
         materialization.add_logical_component(
             checked_byte_sum(
@@ -7022,6 +7092,7 @@ fn memory_transition_preflight_materialization(
             .add_durable_row(memory_batch_record_bytes(record)?, "memory batch insert")?;
     }
     for record in &transition.job_inserts {
+        charge_and_validate_memory_job_sources(&mut materialization, record)?;
         materialization.add_durable_row(memory_job_record_bytes(record)?, "memory job insert")?;
     }
     for membership in &transition.membership_inserts {
@@ -9342,22 +9413,7 @@ struct AuthenticatedDurableEvent {
     stored_envelope: String,
     redaction_version: u32,
     envelope: Value,
-    message_end: Option<AuthenticatedMessageProjection>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(super) struct AuthenticatedMessageProjection {
-    pub(super) message_id: String,
-    pub(super) role: String,
-    pub(super) message: PublicMessage,
-}
-
-#[allow(
-    dead_code,
-    reason = "Store hydration consumes the authenticated projection snapshot"
-)]
-pub(super) struct AuthenticatedProjectionSnapshot {
-    pub(super) messages: BTreeMap<u64, AuthenticatedMessageProjection>,
+    event: AgentEvent,
 }
 
 async fn load_authenticated_event(
@@ -9407,22 +9463,6 @@ async fn load_authenticated_event(
     if event.durable_kind() != Some(kind.as_str()) {
         bail!("durable lifecycle event {seq} type disagrees with authenticated raw event");
     }
-    let message_end = match &event {
-        AgentEvent::MessageEnd {
-            message_id,
-            message,
-        } => Some(AuthenticatedMessageProjection {
-            message_id: message_id.clone(),
-            role: match message.as_ref() {
-                PublicMessage::User(_) => "user",
-                PublicMessage::Assistant(_) => "assistant",
-                PublicMessage::ToolResult(_) => "tool_result",
-            }
-            .to_owned(),
-            message: message.as_ref().clone(),
-        }),
-        _ => None,
-    };
     let internal_metadata: String = row.try_get("internal_metadata")?;
     Ok(AuthenticatedDurableEvent {
         kind,
@@ -9435,8 +9475,91 @@ async fn load_authenticated_event(
         redaction_version,
         envelope: serde_json::from_str(&stored_envelope)
             .context("stored lifecycle envelope is invalid")?,
-        message_end,
+        event,
     })
+}
+
+async fn verify_authenticated_message_projection(
+    store: &Store,
+    transaction: &mut Transaction<'_, Sqlite>,
+    seq: u64,
+    message_id: &str,
+    message: &PublicMessage,
+) -> Result<()> {
+    let seq_i64 = i64::try_from(seq).context("authenticated MessageEnd sequence is outside i64")?;
+    let rows = sqlx::query(
+        "SELECT id, role, raw_key_ref, raw_ciphertext, payload, search_text,
+                redaction_version, interrupted
+         FROM messages WHERE seq = ?",
+    )
+    .bind(seq_i64)
+    .fetch_all(&mut **transaction)
+    .await
+    .with_context(|| format!("failed to load transcript projection for MessageEnd {seq}"))?;
+    let [row] = rows.as_slice() else {
+        bail!(
+            "authenticated MessageEnd {message_id} at sequence {seq} requires exactly one transcript row, found {}",
+            rows.len()
+        );
+    };
+
+    let stored_id: String = row.try_get("id")?;
+    if stored_id != message_id {
+        bail!(
+            "transcript message {stored_id} at sequence {seq} disagrees with authenticated MessageEnd id {message_id}"
+        );
+    }
+    let expected_role = super::public_message_role(message);
+    let stored_role: String = row.try_get("role")?;
+    if stored_role != expected_role {
+        bail!("transcript message {message_id} role disagrees with authenticated MessageEnd");
+    }
+    let redaction_version: i64 = row.try_get("redaction_version")?;
+    if redaction_version != i64::from(store.redactor().version()) {
+        bail!("message {message_id} uses an unsupported redaction version");
+    }
+
+    let key_ref: String = row.try_get("raw_key_ref")?;
+    let key = store
+        .data_key_by_ref_in_transaction(transaction, &key_ref)
+        .await
+        .with_context(|| format!("failed to load transcript data key {key_ref}"))?;
+    if key.purpose != DataKeyPurpose::Transcript {
+        bail!("transcript message {message_id} references a non-transcript data key");
+    }
+    let aad = store
+        .scope()
+        .row_aad("messages", message_id, DataKeyPurpose::Transcript);
+    let ciphertext: Vec<u8> = row.try_get("raw_ciphertext")?;
+    let plaintext = Zeroizing::new(
+        super::crypto::decrypt_content(&key, &ciphertext, &aad)
+            .with_context(|| format!("failed to decrypt transcript message {message_id}"))?,
+    );
+    let projected: PublicMessage = serde_json::from_slice(&plaintext)
+        .with_context(|| format!("transcript message {message_id} is not a valid PublicMessage"))?;
+    if projected != *message {
+        bail!("transcript message {message_id} content disagrees with authenticated MessageEnd");
+    }
+
+    let interrupted: i64 = row.try_get("interrupted")?;
+    if (interrupted != 0) != super::message_interrupted(&projected) {
+        bail!("message {message_id} interrupted flag does not match authenticated raw message");
+    }
+    let stored_payload: String = row.try_get("payload")?;
+    let derived_payload = store
+        .redactor()
+        .redact_serialized(&plaintext)
+        .with_context(|| format!("failed to re-derive payload for message {message_id}"))?;
+    if stored_payload != derived_payload {
+        bail!("message {message_id} stored payload does not match re-derived redacted projection");
+    }
+    let stored_search_text: String = row.try_get("search_text")?;
+    let derived_search_text = search_text_from_projection(&derived_payload)
+        .with_context(|| format!("failed to re-derive search text for message {message_id}"))?;
+    if stored_search_text != derived_search_text {
+        bail!("message {message_id} stored search_text does not match re-derived search text");
+    }
+    Ok(())
 }
 
 pub(super) async fn authenticate_running_tool_intent(
@@ -9480,7 +9603,7 @@ pub(super) async fn authenticate_running_tool_intent(
 
 async fn reconstruct_authenticated_checkpoint(store: &Store) -> Result<LifecycleCheckpoint> {
     let mut transaction = store.pool().begin().await?;
-    let (checkpoint, _) =
+    let checkpoint =
         reconstruct_authenticated_checkpoint_in_transaction(store, &mut transaction).await?;
     transaction.commit().await?;
     Ok(checkpoint)
@@ -9489,21 +9612,20 @@ async fn reconstruct_authenticated_checkpoint(store: &Store) -> Result<Lifecycle
 pub(super) async fn authenticate_event_log_snapshot(
     store: &Store,
     transaction: &mut Transaction<'_, Sqlite>,
-) -> Result<AuthenticatedProjectionSnapshot> {
+) -> Result<()> {
     reconstruct_authenticated_checkpoint_in_transaction(store, transaction)
         .await
-        .map(|(_, snapshot)| snapshot)
+        .map(|_| ())
 }
 
 async fn reconstruct_authenticated_checkpoint_in_transaction(
     store: &Store,
     transaction: &mut Transaction<'_, Sqlite>,
-) -> Result<(LifecycleCheckpoint, AuthenticatedProjectionSnapshot)> {
+) -> Result<LifecycleCheckpoint> {
     let event_head = load_verified_event_head_in_transaction(store, transaction).await?;
     let mut lifecycle = DurableLifecycleState::default();
     let mut memory_projections = BTreeMap::new();
-    let mut messages = BTreeMap::new();
-    let mut message_ids = HashSet::new();
+    let mut authenticated_message_count = 0_u64;
     lifecycle.live_runs.extend(
         sqlx::query_scalar::<_, String>(
             "SELECT DISTINCT run_id FROM inbound_commands
@@ -9577,8 +9699,22 @@ async fn reconstruct_authenticated_checkpoint_in_transaction(
                 &event.kind,
                 event.metadata.memory_projection.as_ref(),
             )?;
-            if let Some(message) = event.message_end {
-                record_authenticated_message(&mut messages, &mut message_ids, seq, message)?;
+            if let AgentEvent::MessageEnd {
+                message_id,
+                message,
+            } = &event.event
+            {
+                verify_authenticated_message_projection(
+                    store,
+                    transaction,
+                    seq,
+                    message_id,
+                    message,
+                )
+                .await?;
+                authenticated_message_count = authenticated_message_count
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("authenticated MessageEnd count overflow"))?;
             }
             observed_count = observed_count
                 .checked_add(1)
@@ -9603,35 +9739,23 @@ async fn reconstruct_authenticated_checkpoint_in_transaction(
     if stored_memory_projections != memory_projections {
         bail!("memory projection rows do not exactly match authenticated event commitments");
     }
-    let snapshot = AuthenticatedProjectionSnapshot { messages };
-    Ok((
-        LifecycleCheckpoint {
-            event_head,
-            lifecycle,
-            memory_projections,
-            historical_rows_visited: observed_count,
-        },
-        snapshot,
-    ))
-}
-
-fn record_authenticated_message(
-    messages: &mut BTreeMap<u64, AuthenticatedMessageProjection>,
-    message_ids: &mut HashSet<String>,
-    seq: u64,
-    message: AuthenticatedMessageProjection,
-) -> Result<()> {
-    if messages.contains_key(&seq) {
-        bail!("authenticated MessageEnd repeats durable event sequence {seq}");
-    }
-    if !message_ids.insert(message.message_id.clone()) {
+    let stored_message_count = u64::try_from(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages")
+            .fetch_one(&mut **transaction)
+            .await?,
+    )
+    .context("stored transcript row count is outside u64")?;
+    if stored_message_count != authenticated_message_count {
         bail!(
-            "authenticated MessageEnd repeats message id {}",
-            message.message_id
+            "transcript row count {stored_message_count} does not match authenticated MessageEnd count {authenticated_message_count}"
         );
     }
-    messages.insert(seq, message);
-    Ok(())
+    Ok(LifecycleCheckpoint {
+        event_head,
+        lifecycle,
+        memory_projections,
+        historical_rows_visited: observed_count,
+    })
 }
 
 fn apply_memory_projection_delta(
@@ -10798,11 +10922,19 @@ async fn apply_projection(
                 }
             }
 
+            let provider_projection_checkpoint = if provider_context.is_empty() {
+                None
+            } else {
+                Some(verify_provider_context_projection_set(store, transaction).await?)
+            };
             for record in provider_context {
                 record
                     .insert(&mut **transaction)
                     .await
                     .context("failed to apply provider-context record")?;
+            }
+            if let Some(checkpoint) = provider_projection_checkpoint.as_ref() {
+                commit_provider_context_projection_set(store, transaction, checkpoint).await?;
             }
 
             if l0_disposition == L0Disposition::Append && eviction_footprint_tokens > 0 {
@@ -11505,6 +11637,8 @@ async fn apply_memory_batch_mutation(
     store: &Store,
 ) -> Result<()> {
     if batch.delete_membership {
+        let provider_projection_checkpoint =
+            verify_provider_context_projection_set(store, transaction).await?;
         // Capture the data keys that are about to become unreferenced before
         // we overwrite/delete provider-context rows. We will destroy each key
         // only after confirming that no remaining provider-context row still
@@ -11649,6 +11783,14 @@ async fn apply_memory_batch_mutation(
         let protected_key_refs = ProviderContextMutationApplier::new(store)
             .scrub_erased_provider_context_intents(transaction, &erased_provider_context_ids)
             .await?;
+        if !erased_provider_context_ids.is_empty() {
+            commit_provider_context_projection_set(
+                store,
+                transaction,
+                &provider_projection_checkpoint,
+            )
+            .await?;
+        }
 
         // Destroy each candidate data key whose wrapped material is no longer
         // referenced by any provider-context row. This is done inside the same
@@ -14387,6 +14529,18 @@ mod tests {
             writer.historical_rows_visited().await,
             visited_before,
             "ordinary writes after a long history must not reload historical event rows"
+        );
+        drop(writer);
+        let restarted = EventWriter::new(store);
+        restarted
+            .reset_checkpoint_after_direct_fixture_mutation()
+            .await;
+        restarted
+            .initialize_recovery_checkpoint()
+            .await
+            .expect("restart verifies every paged MessageEnd projection without retaining history");
+        assert!(
+            restarted.historical_rows_visited().await > EVENT_CHAIN_VERIFICATION_PAGE_ROWS as u64
         );
     }
 
@@ -18715,40 +18869,110 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_message_snapshot_rejects_duplicate_sequence_and_message_id() {
-        let mut messages = BTreeMap::new();
-        let mut message_ids = HashSet::new();
-        let projection = |message_id: &str| AuthenticatedMessageProjection {
-            message_id: message_id.to_owned(),
-            role: "user".to_owned(),
-            message: user_message("authenticated"),
-        };
+    fn memory_job_source_identity_requires_unique_sources_and_exactly_one_target() {
+        let source = Uuid::from_u128(1).to_string();
+        let second_source = Uuid::from_u128(2).to_string();
+        let target = Uuid::from_u128(3).to_string();
+        let transition_for =
+            |source_ids: Vec<String>, source_versions: BTreeMap<String, i64>| MemoryTransition {
+                job_inserts: vec![MemoryJobRecord::new(
+                    Uuid::from_u128(4).to_string(),
+                    MemoryJobKind::CompactL0,
+                    1,
+                    source_ids,
+                    source_versions,
+                )],
+                ..Default::default()
+            };
 
-        record_authenticated_message(&mut messages, &mut message_ids, 1, projection("message-1"))
-            .expect("first authenticated MessageEnd");
-        assert!(
-            record_authenticated_message(
-                &mut messages,
-                &mut message_ids,
-                1,
-                projection("message-2"),
-            )
-            .expect_err("duplicate event sequence must fail")
-            .to_string()
-            .contains("sequence")
+        let duplicate = transition_for(
+            vec![source.clone(), source.clone()],
+            BTreeMap::from([(source.clone(), 0), (target.clone(), 0)]),
         );
         assert!(
-            record_authenticated_message(
-                &mut messages,
-                &mut message_ids,
-                2,
-                projection("message-1"),
-            )
-            .expect_err("duplicate message id must fail")
-            .to_string()
-            .contains("message id")
+            memory_transition_preflight_materialization(&Redactor::v1(), &duplicate)
+                .expect_err("duplicate source identity must fail")
+                .to_string()
+                .contains("repeats source id")
         );
-        assert_eq!(messages.len(), 1);
+
+        let missing_witness = transition_for(
+            vec![source.clone(), second_source],
+            BTreeMap::from([(source.clone(), 0), (target.clone(), 0)]),
+        );
+        assert!(
+            memory_transition_preflight_materialization(&Redactor::v1(), &missing_witness)
+                .expect_err("every source identity requires a version witness")
+                .to_string()
+                .contains("missing its version witness")
+        );
+
+        let no_target = transition_for(vec![source.clone()], BTreeMap::from([(source, 0)]));
+        assert!(
+            memory_transition_preflight_materialization(&Redactor::v1(), &no_target)
+                .expect_err("job requires one target identity outside its source set")
+                .to_string()
+                .contains("exactly one target batch witness")
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_transition_rejects_oversized_job_source_set_before_json_materialization() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let source_count = MAX_MATERIALIZATION_COMPONENTS / 2;
+        let mut source_ids = Vec::with_capacity(source_count);
+        let mut source_versions = BTreeMap::new();
+        for raw in 1..=source_count {
+            let source_id = Uuid::from_u128(raw as u128).to_string();
+            source_versions.insert(source_id.clone(), 0);
+            source_ids.push(source_id);
+        }
+        let target_id = Uuid::from_u128(u128::MAX).to_string();
+        source_versions.insert(target_id, 0);
+        let encoded_identity_bytes = source_ids
+            .iter()
+            .map(String::len)
+            .chain(source_versions.keys().map(String::len))
+            .sum::<usize>();
+        assert!(
+            encoded_identity_bytes < EVENT_BATCH_MAX_BYTES,
+            "fixture must exercise component count rather than byte count"
+        );
+
+        let error = writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::memory_maintenance("oversized_job_source_set")
+                            .expect("memory maintenance event"),
+                    ),
+                    projections: vec![Projection::MemoryTransition(MemoryTransition {
+                        job_inserts: vec![MemoryJobRecord::new(
+                            Uuid::now_v7().to_string(),
+                            MemoryJobKind::CompactL0,
+                            1,
+                            source_ids,
+                            source_versions,
+                        )],
+                        ..Default::default()
+                    })],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect_err("source identity components above the cap must fail before apply");
+        assert!(
+            error.to_string().contains("materialization components"),
+            "{error:#}"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory_jobs")
+                .fetch_one(store.pool())
+                .await
+                .expect("count memory jobs"),
+            0
+        );
     }
 
     #[tokio::test]
@@ -23844,17 +24068,11 @@ mod tests {
         let durable = load_authenticated_event(&store, &mut transaction, terminal_message_end_seq)
             .await
             .expect("authenticated MessageEnd");
-        let snapshot = authenticate_event_log_snapshot(&store, &mut transaction)
+        let authenticated: () = authenticate_event_log_snapshot(&store, &mut transaction)
             .await
-            .expect("authenticated projection snapshot");
-        let authenticated_message = snapshot
-            .messages
-            .get(
-                &u64::try_from(terminal_message_end_seq)
-                    .expect("terminal MessageEnd sequence fits u64"),
-            )
-            .expect("authenticated MessageEnd projection");
+            .expect("authenticate exact transcript projection set without retaining history");
         transaction.rollback().await.expect("rollback event read");
+        assert_eq!(authenticated, ());
         assert_eq!(durable.kind, "message_end");
         assert_eq!(
             durable.envelope,
@@ -23864,9 +24082,6 @@ mod tests {
                 })
                 .expect("terminal envelope")
         );
-        assert_eq!(authenticated_message.message_id, assistant_id);
-        assert_eq!(authenticated_message.role, "assistant");
-        assert_eq!(authenticated_message.message, terminal_message);
     }
 
     #[tokio::test]
@@ -24229,14 +24444,32 @@ mod tests {
         assert!(second_turn_wire.contains("opaque-durable-reasoning"));
         assert!(second_turn_wire.contains("continue after restart"));
 
+        // Re-authenticate the deliberately inconsistent metadata so this test
+        // reaches the inner plaintext/metadata binding check rather than being
+        // rejected first by the outer exact-set commitment.
+        let mut transaction = reopened
+            .pool()
+            .begin()
+            .await
+            .expect("begin validly authenticated metadata tamper");
+        let checkpoint = verify_provider_context_projection_set(&reopened, &mut transaction)
+            .await
+            .expect("authenticate provider-context set before metadata tamper");
         sqlx::query(
             "UPDATE provider_context
              SET provider_instance_id = 'tampered-provider-origin'
              WHERE kind = 'encrypted_reasoning'",
         )
-        .execute(reopened.pool())
+        .execute(&mut *transaction)
         .await
         .expect("tamper stored provider origin after successful restart proof");
+        commit_provider_context_projection_set(&reopened, &mut transaction, &checkpoint)
+            .await
+            .expect("commit authenticated inconsistent provider metadata");
+        transaction
+            .commit()
+            .await
+            .expect("commit provider metadata tamper");
         let error = reopened
             .hydrate(&lease, &fence)
             .await
@@ -26002,13 +26235,25 @@ mod tests {
         let writer = EventWriter::new(store.clone());
         seed_assistant_with_reasoning(&store, &writer).await;
 
+        let mut transaction = store
+            .pool()
+            .begin()
+            .await
+            .expect("begin validly authenticated kind tamper");
+        let checkpoint = verify_provider_context_projection_set(&store, &mut transaction)
+            .await
+            .expect("authenticate provider-context set before kind tamper");
         sqlx::query(
             "UPDATE provider_context SET kind = 'open_ai_compacted_window' WHERE message_id = ?",
         )
         .bind("assistant-reasoning-hydrate")
-        .execute(store.pool())
+        .execute(&mut *transaction)
         .await
         .expect("tamper stored provider-context kind");
+        commit_provider_context_projection_set(&store, &mut transaction, &checkpoint)
+            .await
+            .expect("commit authenticated inconsistent provider-context kind");
+        transaction.commit().await.expect("commit kind tamper");
 
         let lease = test_lease(1);
         let fence = test_fence(&lease);
@@ -26026,15 +26271,30 @@ mod tests {
         let writer = EventWriter::new(store.clone());
         seed_assistant_with_reasoning(&store, &writer).await;
 
+        let mut transaction = store
+            .pool()
+            .begin()
+            .await
+            .expect("begin validly authenticated idempotency tamper");
+        let checkpoint = verify_provider_context_projection_set(&store, &mut transaction)
+            .await
+            .expect("authenticate provider-context set before idempotency tamper");
         sqlx::query(
             "UPDATE provider_context
              SET idempotency_key = 'tampered'
              WHERE message_id = 'assistant-reasoning-hydrate'
                AND wire_item_index = 1",
         )
-        .execute(store.pool())
+        .execute(&mut *transaction)
         .await
         .expect("tamper provider-context idempotency key");
+        commit_provider_context_projection_set(&store, &mut transaction, &checkpoint)
+            .await
+            .expect("commit authenticated inconsistent idempotency key");
+        transaction
+            .commit()
+            .await
+            .expect("commit idempotency tamper");
 
         let lease = test_lease(1);
         let fence = test_fence(&lease);

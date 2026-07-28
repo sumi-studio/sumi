@@ -2413,10 +2413,9 @@ mod tests {
     };
     use crate::store::{
         DataKeyPurpose, EncryptedProviderContextRecord, MemoryBatchMessageRecord,
-        MemoryBatchRecord, MemoryBatchState, MemoryBatchSummary, MemoryJobKind, MemoryJobRecord,
-        MemoryLayer, ProviderContextKeyAnchor, ProviderContextMutationApplier,
-        ProviderContextMutationBuilder, Store, TranscriptRecord, encrypt_content,
-        provider_context_idempotency_key,
+        MemoryBatchRecord, MemoryBatchState, MemoryJobKind, MemoryJobRecord, MemoryLayer,
+        ProviderContextKeyAnchor, ProviderContextMutationApplier, ProviderContextMutationBuilder,
+        Store, TranscriptRecord, provider_context_idempotency_key,
     };
     use tokio_util::sync::CancellationToken;
 
@@ -3256,6 +3255,13 @@ mod tests {
         batch_seq: i64,
         messages: &[PublicMessage],
     ) -> (String, String) {
+        // This compactor fixture deliberately seeds transcript rows at
+        // synthetic sequences. Freeze the empty lifecycle checkpoint first;
+        // exact MessageEnd projection behavior is covered by Store tests.
+        EventWriter::new(Arc::new(store.clone()))
+            .initialize_recovery_checkpoint()
+            .await
+            .expect("initialize fixture EventWriter checkpoint");
         let key = store
             .conversation_key(DataKeyPurpose::Transcript)
             .await
@@ -3345,46 +3351,59 @@ mod tests {
         .await;
     }
 
-    async fn encrypt_summary(store: &Store, batch_id: &str, summary: &str) -> MemoryBatchSummary {
-        let key = store
-            .conversation_key(DataKeyPurpose::MemorySummary)
-            .await
-            .expect("memory summary key");
+    async fn attach_fixture_summary(store: &Store, batch_id: &str, summary: &str, est_tokens: u64) {
         let now = Utc::now();
-        let plaintext = serde_json::to_vec(&super::MemorySummaryPayload {
-            summary: summary.to_owned(),
-            est_tokens: 1,
-            from: now,
-            to: now,
-        })
-        .expect("serialize summary payload");
-        let aad = store
-            .scope()
-            .row_aad("memory_batches", batch_id, DataKeyPurpose::MemorySummary);
-        let ciphertext = encrypt_content(&key, &plaintext, &aad).expect("encrypt summary");
-        MemoryBatchSummary {
-            key_ref: key.key_ref.clone(),
-            ciphertext,
-            projection: summary.to_owned(),
-            redaction_version: 1,
-        }
+        insert_memory_fixture(
+            store,
+            "fixture_attach_summary",
+            MemoryTransition {
+                batch_mutations: vec![MemoryBatchMutation {
+                    batch_id: BatchId::parse_str(batch_id).expect("fixture batch UUID"),
+                    expected_version: 0,
+                    new_state: MemoryBatchState::Compacted,
+                    summary: Some(CompactResult {
+                        summary: DecryptedMemorySummary::new(summary.to_owned()),
+                        est_tokens,
+                        time_range: (now, now),
+                    }),
+                    est_tokens,
+                    footprint_delta: 0,
+                    delete_membership: false,
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+        insert_memory_fixture(
+            store,
+            "fixture_reopen_summary_source",
+            MemoryTransition {
+                batch_mutations: vec![MemoryBatchMutation {
+                    batch_id: BatchId::parse_str(batch_id).expect("fixture batch UUID"),
+                    expected_version: 1,
+                    new_state: MemoryBatchState::Compacting,
+                    summary: None,
+                    est_tokens,
+                    footprint_delta: 0,
+                    delete_membership: false,
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
     }
 
     async fn insert_l1_batch(store: &Store, batch_seq: i64, summary: &str) -> (String, String) {
         let source_id = Uuid::now_v7().to_string();
-        let summary = encrypt_summary(store, &source_id, summary).await;
-        let source = MemoryBatchRecord {
-            id: source_id.clone(),
-            layer: MemoryLayer::L1,
-            ord: 0,
+        let source = MemoryBatchRecord::new(
+            &source_id,
+            MemoryLayer::L1,
+            0,
             batch_seq,
-            version: 0,
-            state: MemoryBatchState::Compacting,
-            est_tokens: 50,
-            eviction_footprint_tokens: 0,
-            summary: Some(summary),
-            updated_at: Utc::now().to_rfc3339(),
-        };
+            MemoryBatchState::Compacting,
+            0,
+            0,
+        );
         let target_id = Uuid::now_v7().to_string();
         let target = MemoryBatchRecord::new(
             &target_id,
@@ -3404,6 +3423,7 @@ mod tests {
             },
         )
         .await;
+        attach_fixture_summary(store, &source_id, summary, 50).await;
 
         (source_id, target_id)
     }
@@ -3415,19 +3435,15 @@ mod tests {
         summary: &str,
     ) -> (String, String) {
         let source_id = Uuid::now_v7().to_string();
-        let summary = encrypt_summary(store, &source_id, summary).await;
-        let source = MemoryBatchRecord {
-            id: source_id.clone(),
-            layer: MemoryLayer::L2,
-            ord: 0,
-            batch_seq: source_seq,
-            version: 0,
-            state: MemoryBatchState::Compacting,
-            est_tokens: 50,
-            eviction_footprint_tokens: 0,
-            summary: Some(summary),
-            updated_at: Utc::now().to_rfc3339(),
-        };
+        let source = MemoryBatchRecord::new(
+            &source_id,
+            MemoryLayer::L2,
+            0,
+            source_seq,
+            MemoryBatchState::Compacting,
+            0,
+            0,
+        );
         let target_id = Uuid::now_v7().to_string();
         let target = MemoryBatchRecord::new(
             &target_id,
@@ -3447,6 +3463,7 @@ mod tests {
             },
         )
         .await;
+        attach_fixture_summary(store, &source_id, summary, 50).await;
 
         (source_id, target_id)
     }
@@ -3458,7 +3475,14 @@ mod tests {
                 .fetch_one(store.pool())
                 .await
                 .expect("load compact-l1 target");
-        let source_versions = BTreeMap::from([(source_id.to_owned(), 0), (target_id, 0)]);
+        let source_version: i64 =
+            sqlx::query_scalar("SELECT version FROM memory_batches WHERE id = ?")
+                .bind(source_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("load compact-l1 source version");
+        let source_versions =
+            BTreeMap::from([(source_id.to_owned(), source_version), (target_id, 0)]);
         let job = MemoryJobRecord::new(
             job_id,
             MemoryJobKind::CompactL1,
@@ -3489,7 +3513,16 @@ mod tests {
                 .fetch_one(store.pool())
                 .await
                 .expect("load consolidate-l2 target");
-        let mut source_versions = BTreeMap::from_iter(source_ids.iter().map(|id| (id.clone(), 0)));
+        let mut source_versions = BTreeMap::new();
+        for source_id in source_ids {
+            let source_version: i64 =
+                sqlx::query_scalar("SELECT version FROM memory_batches WHERE id = ?")
+                    .bind(source_id)
+                    .fetch_one(store.pool())
+                    .await
+                    .expect("load consolidate-l2 source version");
+            source_versions.insert(source_id.clone(), source_version);
+        }
         source_versions.insert(target_id, 0);
         let job = MemoryJobRecord::new(
             job_id,
@@ -4188,11 +4221,41 @@ mod tests {
     #[tokio::test]
     async fn recover_compacting_l1_and_l2_batches() {
         let store = test_store().await;
-        let (_l1_source, _l1_target) = insert_l1_batch(&store, 1, "lost l1").await;
-        let (_l2_source, _l2_target) = insert_l2_batch(&store, 2, 3, "lost l2").await;
+        let l1_source = Uuid::now_v7().to_string();
+        let l2_source = Uuid::now_v7().to_string();
+        insert_memory_fixture(
+            &store,
+            "fixture_lost_summary_sources",
+            MemoryTransition {
+                batch_inserts: vec![
+                    MemoryBatchRecord::new(
+                        &l1_source,
+                        MemoryLayer::L1,
+                        0,
+                        1,
+                        MemoryBatchState::Compacting,
+                        0,
+                        0,
+                    ),
+                    MemoryBatchRecord::new(
+                        &l2_source,
+                        MemoryLayer::L2,
+                        0,
+                        2,
+                        MemoryBatchState::Compacting,
+                        0,
+                        0,
+                    ),
+                ],
+                ..Default::default()
+            },
+        )
+        .await;
+        attach_fixture_summary(&store, &l1_source, "lost l1", 50).await;
+        attach_fixture_summary(&store, &l2_source, "lost l2", 50).await;
 
-        // The fixture inserts only the compacting source/target batches, which
-        // models the crash boundary before either job row was committed.
+        // Only authenticated compacting source rows survived the crash. Target
+        // allocation and job insertion must be recovered atomically.
 
         let worker = CompactWorker {
             store: store.clone(),
@@ -4231,29 +4294,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_skips_summary_less_in_flight_targets() {
+    async fn recover_skips_summary_less_in_flight_targets_with_authenticated_owner() {
         let store = test_store().await;
         // A summary-less compacting L1 row is an in-flight CompactL0 target,
-        // not a source, and must not be recovered as a new job.
-        let in_flight_target = Uuid::now_v7().to_string();
-        let target = MemoryBatchRecord::new(
-            &in_flight_target,
-            MemoryLayer::L1,
-            0,
-            1,
-            MemoryBatchState::Compacting,
-            0,
-            0,
-        );
-        insert_memory_fixture(
-            &store,
-            "fixture_in_flight_target",
-            MemoryTransition {
-                batch_inserts: vec![target],
-                ..Default::default()
-            },
-        )
-        .await;
+        // not a source, only when an authenticated CompactL0 job owns it.
+        let (source_id, _) = insert_l0_batch(&store, &[user("owned target")]).await;
+        insert_compact_l0_job(&store, "job-owned-target", &source_id, 1).await;
         recover_compacting_batches(&store)
             .await
             .expect("recover compacting batches");
@@ -4263,7 +4309,7 @@ mod tests {
                 .fetch_one(store.pool())
                 .await
                 .expect("count pending");
-        assert_eq!(pending, 0);
+        assert_eq!(pending, 1, "recovery must not duplicate the owning job");
     }
 
     #[test]
