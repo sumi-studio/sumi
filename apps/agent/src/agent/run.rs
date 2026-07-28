@@ -127,6 +127,29 @@ pub(crate) trait RunDriver: Send + Sync + 'static {
             .await
     }
 
+    /// Starts a provider request while keeping the Runner-global attempt
+    /// sequence distinct from the retry ordinal of the active user turn.
+    /// Drivers that derive request policy from the latter can override this;
+    /// the default preserves the established global attempt identity.
+    async fn start_provider_for_user_turn(
+        &self,
+        attempt_sequence: usize,
+        _user_turn_attempt: usize,
+        context: &[ContextMessage],
+        provider_context: &[ProviderContextItem],
+        command_received_at: Option<std::time::Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.start_provider_with_context(
+            attempt_sequence,
+            context,
+            provider_context,
+            command_received_at,
+            cancel,
+        )
+        .await
+    }
+
     async fn execute_tool_observed(
         &self,
         flow_id: &str,
@@ -205,7 +228,11 @@ struct Runner {
             Vec<ProviderContextFragment>,
         ),
     >,
+    /// Runner-global provider ordinal used for durable attempt identity.
     attempt_sequence: usize,
+    /// Provider ordinal within the latest injected user turn. Drivers use this
+    /// to scope retry-only request transformations without reusing identities.
+    user_turn_attempt: usize,
     ordinary_retries: usize,
     overflow_recoveries: u8,
     consecutive_length_batches: usize,
@@ -279,6 +306,7 @@ impl Runner {
             provider_context,
             pending_provider_context: HashMap::new(),
             attempt_sequence: 0,
+            user_turn_attempt: 0,
             ordinary_retries: 0,
             overflow_recoveries: 0,
             consecutive_length_batches: 0,
@@ -340,6 +368,7 @@ impl Runner {
             self.receive_control_safe_point().await?;
             let outcome = self.provider_attempt().await?;
             self.attempt_sequence = self.attempt_sequence.saturating_add(1);
+            self.user_turn_attempt = self.user_turn_attempt.saturating_add(1);
             match outcome {
                 AttemptOutcome::Retry {
                     assistant_message_id,
@@ -617,8 +646,9 @@ impl Runner {
         // Retries and tool continuations keep their own TTFT observation, but
         // must not fold provider/backoff/tool time into agent internal p95.
         let command_received_at = self.pending_command_received_at.take();
-        let start = self.driver.start_provider_with_context(
+        let start = self.driver.start_provider_for_user_turn(
             self.attempt_sequence,
+            self.user_turn_attempt,
             &self.context,
             &self.provider_context,
             command_received_at,
@@ -2026,6 +2056,10 @@ impl Runner {
         self.pending_command_received_at = injectables
             .first()
             .and_then(|command| command.received_monotonic());
+        // TurnStart is also emitted for tool-result continuations. A durable
+        // user injection, not that internal lifecycle event, is the boundary
+        // that restores first-attempt request policy.
+        self.user_turn_attempt = 0;
         self.in_flight_controls.clear();
         Ok(())
     }
