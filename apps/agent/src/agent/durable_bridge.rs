@@ -2045,6 +2045,9 @@ impl DurableBridge {
             .ok_or_else(|| anyhow!("hard-steer partial MessageEnd has no bound command"))?;
         let normalized = normalize_partial_assistant(message.clone())
             .map_err(|error| anyhow!("hard-steer partial normalization failed: {error}"))?;
+        let provider_context = barrier.provider_context().to_vec();
+        let eviction_footprint_tokens =
+            Self::provider_context_footprint(&normalized, &provider_context)?;
         let new_turn_id = self
             .pending_hard_steer_turn_id
             .take()
@@ -2054,6 +2057,8 @@ impl DurableBridge {
             &command,
             message_id.clone(),
             message,
+            provider_context,
+            eviction_footprint_tokens,
             &new_turn_id,
         )?;
         if batches.len() != 2 {
@@ -2489,9 +2494,16 @@ mod tests {
             events::{ApprovalRequest, ApprovalResolution, ReviewProjection},
         },
         gateway::{ApprovalDecision, Command, CommandEnvelope, CommandId, InboundCommand},
-        provider::types::{
-            PublicAssistantContent, PublicAssistantMessage, PublicMessage, StopReason, ToolCall,
-            ToolResultMessage, UserContent, UserMessage, ValidatedToolArguments,
+        memory::estimate::eviction_footprint_for_payload,
+        provider::{
+            ModelSpec,
+            types::{
+                ApiProtocol, ContextMessage, Message, ProviderContextAnchor,
+                ProviderContextFragment, ProviderContextItem, ProviderContextPayload,
+                ProviderOrigin, PublicAssistantContent, PublicAssistantMessage, PublicMessage,
+                StopReason, ToolCall, ToolResultMessage, UserContent, UserMessage,
+                ValidatedToolArguments,
+            },
         },
         store::{
             ApplicationKind, DurableEvent, EventBatch, EventWriter, InjectedCommand, Projection,
@@ -2604,6 +2616,31 @@ mod tests {
         turn_id: &str,
         phase: RunPhase,
     ) -> (DurableRunBinding, Option<(String, PublicMessage)>) {
+        owner_in_phase_with_origin(
+            store,
+            writer,
+            command_id,
+            run_id,
+            turn_id,
+            phase,
+            ProviderOrigin {
+                provider_instance_id: "test".to_owned(),
+                protocol: ApiProtocol::OpenAiChatCompletions,
+                model: "test".to_owned(),
+            },
+        )
+        .await
+    }
+
+    async fn owner_in_phase_with_origin(
+        store: &Store,
+        writer: &EventWriter,
+        command_id: &str,
+        run_id: &str,
+        turn_id: &str,
+        phase: RunPhase,
+        assistant_origin: ProviderOrigin,
+    ) -> (DurableRunBinding, Option<(String, PublicMessage)>) {
         let binding = DurableRunBinding {
             command_id: command_id.to_owned(),
             command_seq: 1,
@@ -2707,13 +2744,9 @@ mod tests {
         if phase == RunPhase::AssistantStarted {
             let assistant = PublicMessage::Assistant(PublicAssistantMessage {
                 content: Vec::new(),
-                model: "test".to_owned(),
+                model: assistant_origin.model.clone(),
                 provider: "test".to_owned(),
-                origin: crate::provider::types::ProviderOrigin {
-                    provider_instance_id: "test".to_owned(),
-                    protocol: crate::provider::types::ApiProtocol::OpenAiChatCompletions,
-                    model: "test".to_owned(),
-                },
+                origin: assistant_origin,
                 usage: crate::provider::types::Usage::default(),
                 stop_reason: StopReason::Stop,
                 error_message: None,
@@ -3176,6 +3209,166 @@ mod tests {
             )
             .await
             .expect("tool result MessageStart accepted after hard-steer user");
+    }
+
+    #[tokio::test]
+    async fn hard_steer_partial_preserves_provider_context_and_eviction_footprint() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let spec = ModelSpec::preset("openai-responses").expect("Responses preset");
+        let origin = spec.origin();
+
+        let owner_id = "00000000-0000-4000-8000-000000000081";
+        let run_id = "run-hard-steer-provider-context";
+        let turn_id = "turn-hard-steer-provider-context";
+        let (owner_binding, owner_assistant) = owner_in_phase_with_origin(
+            &store,
+            &writer,
+            owner_id,
+            run_id,
+            turn_id,
+            RunPhase::AssistantStarted,
+            origin.clone(),
+        )
+        .await;
+        let (owner_assistant_id, _) = owner_assistant.expect("owner assistant");
+
+        let mut bridge = DurableBridge::new(owner_binding);
+        bridge.phase = RunPhase::AssistantStarted;
+        bridge.turn_open = true;
+        bridge.assistant_open = Some(owner_assistant_id.clone());
+
+        let steer_id = "00000000-0000-4000-8000-000000000082";
+        persist_and_pin(&store, &writer, 2, steer_id, "steer with provider context").await;
+        bridge
+            .bind_hard_steer(
+                &writer,
+                test_admitted(2, steer_id, "steer with provider context"),
+            )
+            .await
+            .expect("bind hard steer");
+
+        let partial = PublicMessage::Assistant(PublicAssistantMessage {
+            content: vec![PublicAssistantContent::Text {
+                text: "verified partial".to_owned(),
+                wire_item_index: 0,
+            }],
+            model: spec.id.clone(),
+            provider: spec.provider.clone(),
+            origin: origin.clone(),
+            usage: crate::provider::types::Usage::default(),
+            stop_reason: StopReason::Aborted,
+            error_message: None,
+            provider_code: None,
+            interrupted: true,
+            timestamp: test_timestamp(),
+        });
+        let fragment = ProviderContextFragment {
+            wire_item_index: Some(1),
+            payload: ProviderContextPayload::EncryptedReasoning {
+                protocol: ApiProtocol::OpenAiResponses,
+                item: serde_json::json!({
+                    "id": "rs-hard-steer",
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": "opaque-hard-steer-reasoning",
+                }),
+            },
+        };
+        let expected_footprint = eviction_footprint_for_payload(&spec, &fragment.payload)
+            .expect("provider context footprint")
+            .eviction_tokens();
+        assert!(expected_footprint > 0);
+
+        let (assistant_barrier, assistant_receipt) =
+            MessageCommitBarrier::channel_with_provider_context(vec![fragment.clone()]);
+        let committed = bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding: bridge.binding.clone(),
+                    event: AgentEvent::MessageEnd {
+                        message_id: owner_assistant_id.clone(),
+                        message: Box::new(partial.clone()),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: Some(assistant_barrier),
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit hard-steer partial assistant");
+        assert_eq!(committed.outputs.len(), 2);
+
+        let receipt = assistant_receipt
+            .await
+            .expect("hard-steer MessageEnd receipt");
+        assert_eq!(receipt.message_id, owner_assistant_id);
+        assert!(receipt.new_turn_id.is_some());
+
+        let provider_row = sqlx::query_as::<_, (String, i64, i64, i64, i64)>(
+            "SELECT message_id, message_seq, wire_item_index, item_ordinal, eviction_tokens
+             FROM provider_context",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("hard-steer provider-context row");
+        assert_eq!(
+            provider_row,
+            (
+                owner_assistant_id.clone(),
+                i64::try_from(receipt.message_seq).expect("message seq fits SQLite"),
+                1,
+                0,
+                i64::try_from(expected_footprint).expect("footprint fits SQLite"),
+            )
+        );
+
+        let durable_footprint: i64 = sqlx::query_scalar(
+            "SELECT batches.eviction_footprint_tokens
+             FROM memory_batches AS batches
+             JOIN memory_batch_messages AS members ON members.batch_id = batches.id
+             WHERE members.message_id = ?",
+        )
+        .bind(&owner_assistant_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("hard-steer partial L0 footprint");
+        assert_eq!(
+            durable_footprint,
+            i64::try_from(expected_footprint).expect("footprint fits SQLite")
+        );
+
+        let normalized =
+            normalize_partial_assistant(partial).expect("normalize hard-steer partial assistant");
+        let expected_context = vec![ProviderContextItem {
+            origin_message: Some(ProviderContextAnchor {
+                message_id: owner_assistant_id.clone(),
+                message_seq: receipt.message_seq,
+            }),
+            wire_item_index: fragment.wire_item_index,
+            ordinal: 0,
+            provider_origin: origin,
+            payload: fragment.payload,
+        }];
+        let messages = vec![ContextMessage::Persisted {
+            id: owner_assistant_id,
+            seq: receipt.message_seq,
+            message: Message::from(normalized),
+        }];
+        let mut transaction = store.pool().begin().await.expect("replay transaction");
+        let replayed = store
+            .hydrate_provider_context(&messages, &mut transaction)
+            .await
+            .expect("authenticate and replay hard-steer provider context");
+        transaction
+            .rollback()
+            .await
+            .expect("rollback replay transaction");
+        assert_eq!(replayed, expected_context);
     }
 
     #[tokio::test]
