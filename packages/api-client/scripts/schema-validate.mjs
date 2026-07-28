@@ -7,9 +7,13 @@ import Ajv2020 from "@redocly/ajv/dist/2020.js";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, "..", "..", "..");
 const contractPath = join(repoRoot, "contracts", "agent-events.yaml");
+const openApiPath = join(repoRoot, "contracts", "openapi.yaml");
 const fixturesPath = join(repoRoot, "contracts", "agent-events-fixtures.json");
 
-const schema = await parse(contractPath);
+const [schema, openApi] = await Promise.all([
+  parse(contractPath),
+  parse(openApiPath),
+]);
 
 const ajv = new Ajv2020({ strict: false, allErrors: true, logger: false });
 ajv.addFormat(
@@ -69,6 +73,83 @@ function describeErrors(errors) {
 
 const fixtures = JSON.parse(readFileSync(fixturesPath, "utf8"));
 let failed = false;
+
+const boundedDecimalCases = [
+  {
+    name: "ProcessGeneration",
+    valid: [
+      ["zero", "0"],
+      ["exact maximum", "9223372036854775807"],
+    ],
+    invalid: [
+      ["maximum plus one", "9223372036854775808"],
+      ["same-length near overflow", "9223372036854775900"],
+      ["same-length high overflow", "9999999999999999999"],
+      ["leading zero", "01"],
+      ["zero with a leading zero", "00"],
+      ["negative", "-1"],
+      ["negative zero", "-0"],
+    ],
+  },
+  {
+    name: "CanonicalDecimalU64",
+    valid: [
+      ["zero", "0"],
+      ["exact maximum", "18446744073709551615"],
+    ],
+    invalid: [
+      ["maximum plus one", "18446744073709551616"],
+      ["same-length near overflow", "18446744073709551999"],
+      ["same-length high overflow", "99999999999999999999"],
+      ["leading zero", "01"],
+      ["zero with a leading zero", "00"],
+      ["negative", "-1"],
+      ["negative zero", "-0"],
+    ],
+  },
+];
+
+const schemaOnlyAjv = new Ajv2020({
+  strict: false,
+  allErrors: true,
+  logger: false,
+  validateFormats: false,
+});
+
+for (const { name, valid, invalid } of boundedDecimalCases) {
+  const agentEventsDefinition = schema.$defs[name];
+  const openApiDefinition = openApi.components.schemas[name];
+
+  if (
+    JSON.stringify(agentEventsDefinition) !== JSON.stringify(openApiDefinition)
+  ) {
+    console.error(`${name} differs between agent-events.yaml and openapi.yaml`);
+    failed = true;
+  }
+
+  for (const [source, definition] of [
+    ["agent-events.yaml", agentEventsDefinition],
+    ["openapi.yaml", openApiDefinition],
+  ]) {
+    const validate = schemaOnlyAjv.compile(definition);
+    for (const [caseName, value] of valid) {
+      if (!validate(value)) {
+        console.error(
+          `${source} ${name} rejected ${caseName} '${value}' with formats ignored: ${describeErrors(validate.errors)}`,
+        );
+        failed = true;
+      }
+    }
+    for (const [caseName, value] of invalid) {
+      if (validate(value)) {
+        console.error(
+          `${source} ${name} accepted ${caseName} '${value}' with formats ignored`,
+        );
+        failed = true;
+      }
+    }
+  }
+}
 
 for (const [name, fixture] of Object.entries(fixtures)) {
   const def = kindToDef[fixture.kind];
@@ -163,5 +244,5 @@ if (failed) {
 }
 
 console.log(
-  "All contract fixtures and extra-property counterexamples passed schema validation.",
+  "All contract fixtures, bounded-decimal cases, and extra-property counterexamples passed schema validation.",
 );
