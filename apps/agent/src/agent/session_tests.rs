@@ -2541,10 +2541,9 @@ async fn hydrated_recovery_exposes_pending_real_broker_cancellation_before_saved
         .hydrate(&lease, &fence)
         .await
         .expect("authenticated hydration");
-    let HydrationOutcome::Complete(hydrated) = hydrated else {
+    let HydrationOutcome::LogicalRecoveryRequired { steps, .. } = hydrated else {
         panic!("prepared approval requires logical-only recovery")
     };
-    let steps = hydrated.recovery_steps;
     assert_eq!(
         steps,
         vec![
@@ -2683,11 +2682,11 @@ async fn abort_cutoff_restart_carries_pending_approval_into_atomic_cancellation_
         .hydrate(&lease, &fence)
         .await
         .expect("authenticated restart hydration");
-    let HydrationOutcome::Complete(hydrated) = hydrated else {
+    let HydrationOutcome::LogicalRecoveryRequired { steps, .. } = hydrated else {
         panic!("prepared approval requires logical-only recovery")
     };
     assert_eq!(
-        hydrated.recovery_steps,
+        steps,
         vec![RecoveryStep::ResumeCancellationFromDurableEvents {
             command_id: binding.command_id,
             run_id: binding.run_id,
@@ -7149,9 +7148,7 @@ pub(crate) async fn run_canonical_live_responses_roundtrip(spec: ModelSpec, api_
         .expect("authenticate and hydrate live Responses restart state")
     {
         HydrationOutcome::Complete(state) => state,
-        HydrationOutcome::RecoveryRequired(intents) => {
-            panic!("completed live Responses turn unexpectedly requires recovery: {intents:?}")
-        }
+        other => panic!("completed live Responses turn unexpectedly requires recovery: {other:?}"),
     };
     assert!(
         !hydrated.provider_context.is_empty(),
@@ -7303,7 +7300,7 @@ async fn successful_provider_context_survives_session_restart_and_reaches_turn_t
         .expect("canonical restart hydration")
     {
         HydrationOutcome::Complete(state) => state,
-        HydrationOutcome::RecoveryRequired(_) => panic!("completed turn requires no recovery"),
+        other => panic!("completed turn requires no recovery: {other:?}"),
     };
     assert_eq!(hydrated.provider_context.len(), 1);
     let mut restarted_core = RunCore::new();
@@ -10480,10 +10477,10 @@ async fn duplicate_approval_decision_staged_race_is_terminal_after_restart() {
     let HydrationOutcome::Complete(hydrated) = hydrated else {
         panic!("fully terminal duplicate approval state must hydrate without physical recovery")
     };
-    assert!(
-        hydrated.recovery_steps.is_empty(),
-        "restart must not replay either approval decision or the tool: {:?}",
-        hydrated.recovery_steps
+    assert_eq!(
+        hydrated.resume,
+        crate::store::ResumeDirective::AdmitCommands,
+        "restart must not replay either approval decision or the tool"
     );
     assert_eq!(
         sqlx::query_as::<_, (String, String, String, String, i64, i64)>(

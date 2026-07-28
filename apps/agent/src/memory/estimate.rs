@@ -24,6 +24,11 @@ pub const EVICTION_ESTIMATOR_VERSION_SERIALIZED_BYTES: u32 = 1;
 pub const EVICTION_ESTIMATOR_VERSION_REPLAY_PROBE_V1: u32 =
     crate::provider::replay_probe::REPLAY_PROBE_EVICTION_ESTIMATOR_VERSION;
 
+/// The persisted prompt-token calibration EMA coefficient. Keeping this
+/// constant at the pure update boundary ensures EventWriter and tests cannot
+/// silently apply different calibration policies.
+pub(crate) const TOKEN_CALIBRATION_EMA_ALPHA: f64 = 0.3;
+
 const NO_TOOL_OUTPUT_PLACEHOLDER: &str = "(no tool output)";
 const TOOL_RESULT_IMAGE_PLACEHOLDER: &str = "(see attached image)";
 

@@ -766,6 +766,7 @@ async fn committed_context_mutation_advances_reviewer_cache_version_within_run()
             MessageCommitReceipt {
                 message_id: "persisted-user-2".to_owned(),
                 message_seq: 22,
+                calibration_ratio_bits: None,
                 new_turn_id: None,
             },
             &message,
@@ -853,6 +854,7 @@ fn resolve_message_output(output: &mut RunOutput, next_seq: &mut u64) {
         barrier.resolve(MessageCommitReceipt {
             message_id: message_id.clone(),
             message_seq: *next_seq,
+            calibration_ratio_bits: None,
             new_turn_id: None,
         });
         *next_seq += 1;
@@ -1053,6 +1055,7 @@ async fn aborted_message_end_keeps_verified_provider_context_on_barrier() {
         barrier.resolve(MessageCommitReceipt {
             message_id: "assistant-aborted".to_owned(),
             message_seq: 1,
+            calibration_ratio_bits: None,
             new_turn_id: None,
         });
         drop(control_tx);
@@ -1106,6 +1109,7 @@ async fn hard_steer_message_end_keeps_verified_provider_context_on_barrier() {
         barrier.resolve(MessageCommitReceipt {
             message_id: "assistant-steered".to_owned(),
             message_seq: 1,
+            calibration_ratio_bits: None,
             new_turn_id: None,
         });
         drop(control_tx);
@@ -1151,6 +1155,7 @@ async fn error_terminal_with_context_fails_closed_without_context_on_barrier() {
             barrier.resolve(MessageCommitReceipt {
                 message_id: message_id.clone(),
                 message_seq,
+                calibration_ratio_bits: None,
                 new_turn_id: None,
             });
             break task.await.expect("provider attempt task");

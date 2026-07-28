@@ -26,7 +26,10 @@ use crate::{
     gateway::Command,
     memory::{
         context_assembler::ProviderCallTrigger,
-        estimate::{ProviderContextItemWithFootprint, eviction_footprint_for_payload},
+        estimate::{
+            ProviderContextItemWithFootprint, eviction_footprint_for_payload,
+            observed_prompt_tokens,
+        },
     },
     provider::{
         model::ModelSpec,
@@ -35,7 +38,7 @@ use crate::{
         types::{
             AssistantContent, AssistantMessage, ContextMessage, Message, ProviderContextFragment,
             ProviderEvent, ProviderEventStream, PublicAssistantContent, PublicMessage, StopReason,
-            ToolCall, ToolResultMessage, Usage, UserContent, UserMessage,
+            ToolCall, ToolResultMessage, UserContent, UserMessage,
         },
     },
     runtime::contracts::ProcessGeneration,
@@ -172,10 +175,10 @@ pub(crate) trait RunDriver: Send + Sync + 'static {
         active_context: &[ContextMessage],
     ) -> Result<OverflowRecoveryOutcome>;
 
-    /// Record measured prompt usage so the assembler can update its token
-    /// calibration EMA.  Default is a no-op for test drivers that do not
-    /// perform calibration.
-    async fn record_usage(&self, _usage: Usage, _uncalibrated_prompt_estimate: u64) -> Result<()> {
+    /// Install the exact token calibration committed with a successful
+    /// provider terminal. Default is a no-op for test drivers that do not use
+    /// the T21 assembler.
+    fn install_committed_calibration(&self, _ratio_bits: [u8; 8]) -> Result<()> {
         Ok(())
     }
 
@@ -502,7 +505,6 @@ impl Runner {
                     message,
                     assistant_message,
                     provider_context,
-                    uncalibrated_prompt_estimate,
                     receipt,
                     rejected_results,
                     deferred_overflow,
@@ -522,6 +524,11 @@ impl Runner {
                     if calls.is_empty() && rejected_results.is_empty() {
                         self.consecutive_length_batches = 0;
                         let receipt = self.await_message_receipt(assistant_receipt_waiter).await?;
+                        if let Some(ratio_bits) = receipt.calibration_ratio_bits {
+                            self.driver
+                                .install_committed_calibration(ratio_bits)
+                                .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+                        }
                         self.driver
                             .apply_terminal(
                                 &receipt.message_id,
@@ -529,10 +536,6 @@ impl Runner {
                                 &assistant_message,
                                 &provider_context,
                             )
-                            .await
-                            .map_err(|error| WorkerFailure::Error(error.to_string()))?;
-                        self.driver
-                            .record_usage(message.usage(), uncalibrated_prompt_estimate)
                             .await
                             .map_err(|error| WorkerFailure::Error(error.to_string()))?;
                         self.retain_committed(receipt, &message)?;
@@ -554,6 +557,11 @@ impl Runner {
                         .emit_rejected_results(&assistant_message_id, &rejected_results)
                         .await?;
                     let receipt = self.await_message_receipt(assistant_receipt_waiter).await?;
+                    if let Some(ratio_bits) = receipt.calibration_ratio_bits {
+                        self.driver
+                            .install_committed_calibration(ratio_bits)
+                            .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+                    }
                     self.driver
                         .apply_terminal(
                             &receipt.message_id,
@@ -561,10 +569,6 @@ impl Runner {
                             &assistant_message,
                             &provider_context,
                         )
-                        .await
-                        .map_err(|error| WorkerFailure::Error(error.to_string()))?;
-                    self.driver
-                        .record_usage(message.usage(), uncalibrated_prompt_estimate)
                         .await
                         .map_err(|error| WorkerFailure::Error(error.to_string()))?;
                     let (executable_results, executable_receipts) = if is_length {
@@ -976,6 +980,8 @@ impl Runner {
                                     terminal_message_id,
                                     terminal_message,
                                     durable_provider_context,
+                                    kind,
+                                    attempt.uncalibrated_prompt_estimate,
                                 )
                                 .await?;
                             if let Some(OverflowClassification::ImmediateRecovery(source)) = overflow {
@@ -1009,7 +1015,6 @@ impl Runner {
                                 message: public,
                                 assistant_message: internal.clone(),
                                 provider_context: terminal.provider_context().to_vec(),
-                                uncalibrated_prompt_estimate: attempt.uncalibrated_prompt_estimate,
                                 receipt,
                                 rejected_results,
                                 deferred_overflow: match overflow {
@@ -1084,6 +1089,7 @@ impl Runner {
                 provider_context,
                 None,
                 None,
+                None,
             )
             .await?;
         let receipt = self.await_message_receipt(receipt).await?;
@@ -1137,6 +1143,7 @@ impl Runner {
                 message_id.to_owned(),
                 partial.clone(),
                 provider_context,
+                None,
                 None,
                 None,
             )
@@ -2649,6 +2656,7 @@ impl Runner {
             message_id,
             message,
             Vec::new(),
+            None,
             approval_not_started,
             approval_cancelled,
         )
@@ -2660,11 +2668,29 @@ impl Runner {
         message_id: String,
         message: PublicMessage,
         provider_context: Vec<crate::provider::types::ProviderContextFragment>,
+        terminal_kind: ProviderTerminalKind,
+        uncalibrated_prompt_estimate: u64,
     ) -> Result<oneshot::Receiver<MessageCommitReceipt>, WorkerFailure> {
+        let calibration_estimate = match &message {
+            PublicMessage::Assistant(assistant)
+                if terminal_kind == ProviderTerminalKind::Done
+                    && !matches!(
+                        assistant.stop_reason,
+                        StopReason::Error | StopReason::Aborted
+                    )
+                    && uncalibrated_prompt_estimate > 0 =>
+            {
+                let observed = observed_prompt_tokens(&assistant.usage)
+                    .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+                (observed > 0).then_some(uncalibrated_prompt_estimate)
+            }
+            _ => None,
+        };
         self.emit_message_end_with_provider_context(
             message_id,
             message,
             provider_context,
+            calibration_estimate,
             None,
             None,
         )
@@ -2676,14 +2702,20 @@ impl Runner {
         message_id: String,
         message: PublicMessage,
         provider_context: Vec<crate::provider::types::ProviderContextFragment>,
+        calibration_estimate: Option<u64>,
         approval_not_started: Option<String>,
         approval_cancelled: Option<String>,
     ) -> Result<oneshot::Receiver<MessageCommitReceipt>, WorkerFailure> {
         let binding = self.core.durable_binding.clone().ok_or_else(|| {
             WorkerFailure::Error("RunCore has no durable worker binding".to_owned())
         })?;
-        let (barrier, receipt) =
-            MessageCommitBarrier::channel_with_provider_context(provider_context);
+        let (barrier, receipt) = match calibration_estimate {
+            Some(estimate) => MessageCommitBarrier::channel_with_provider_context_and_calibration(
+                provider_context,
+                estimate,
+            ),
+            None => MessageCommitBarrier::channel_with_provider_context(provider_context),
+        };
         self.events
             .send(RunOutput {
                 binding,
@@ -2880,7 +2912,6 @@ enum AttemptOutcome {
         message: PublicMessage,
         assistant_message: AssistantMessage,
         provider_context: Vec<ProviderContextFragment>,
-        uncalibrated_prompt_estimate: u64,
         receipt: oneshot::Receiver<MessageCommitReceipt>,
         rejected_results: Vec<ToolResultMessage>,
         deferred_overflow: Option<OverflowSource>,

@@ -31,10 +31,11 @@ use crate::provider::{
     types::{ApiProtocol, PublicAssistantContent, PublicMessage, UserContent},
 };
 use crate::store::{
-    DataKeyMaterial, DataKeyPurpose, DurableEvent, EventBatch, EventWrite, EventWriter,
-    MemoryApplyCursorAdvance, MemoryApplyCursorRecord, MemoryBatchMutation, MemoryBatchRecord,
+    BootstrapRecoveryGuard, DataKeyMaterial, DataKeyPurpose, DurableEvent, EventBatch, EventWrite,
+    EventWriter, MemoryApplyCursorAdvance, MemoryBatchMutation, MemoryBatchRecord,
     MemoryBatchState, MemoryJobKind, MemoryJobMutation, MemoryJobRecord, MemoryJobStatus,
-    MemoryJobUpdate, MemoryLayer, MemoryTransition, Projection, Store, decrypt_content,
+    MemoryJobUpdate, MemoryLayer, MemoryTransition, Projection, RecoveryBatchWriter, Store,
+    decrypt_content,
 };
 
 use super::{BatchId, CompactResult, DecryptedMemorySummary, L1Entry};
@@ -1133,7 +1134,7 @@ async fn claim_next_pending_job(store: &Store) -> Result<Option<Job>> {
     };
     let batch = EventBatch {
         writes: vec![EventWrite {
-            event: None,
+            event: Some(DurableEvent::memory_maintenance("compact_claimed")?),
             projections: vec![Projection::MemoryJobUpdate(update)],
         }],
         injected_commands: Vec::new(),
@@ -1169,7 +1170,7 @@ async fn release_or_reset_job(store: &Store, job: &Job) -> Result<()> {
     EventWriter::new(Arc::new(store.clone()))
         .apply(EventBatch {
             writes: vec![EventWrite {
-                event: None,
+                event: Some(DurableEvent::memory_maintenance("compact_released")?),
                 projections: vec![Projection::MemoryJobUpdate(update)],
             }],
             injected_commands: Vec::new(),
@@ -1209,7 +1210,7 @@ async fn start_attempt(store: &Store, job: &mut Job) -> Result<()> {
     EventWriter::new(Arc::new(store.clone()))
         .apply(EventBatch {
             writes: vec![EventWrite {
-                event: None,
+                event: Some(DurableEvent::memory_maintenance("compact_started")?),
                 projections: vec![Projection::MemoryJobUpdate(update)],
             }],
             injected_commands: Vec::new(),
@@ -1473,22 +1474,56 @@ async fn fail_job(store: &Store, job: &Job) -> Result<(), WorkerError> {
     Ok(())
 }
 
-async fn recover_expired_running_jobs(store: &Store) -> Result<()> {
+async fn recover_expired_running_jobs_with<W: RecoveryBatchWriter>(writer: &mut W) -> Result<()> {
+    let store = writer.recovery_store().clone();
     let now = Utc::now().to_rfc3339();
-    sqlx::query(
-        "UPDATE memory_jobs
-         SET status = 'pending', lease_until = NULL, updated_at = ?
-         WHERE status = 'running' AND (lease_until IS NULL OR lease_until < ?)",
+    let rows = sqlx::query(
+        "SELECT id, attempts, lease_until
+         FROM memory_jobs
+         WHERE status = 'running' AND (lease_until IS NULL OR lease_until < ?)
+         ORDER BY batch_seq, id",
     )
     .bind(&now)
-    .bind(&now)
-    .execute(store.pool())
+    .fetch_all(store.pool())
     .await
-    .context("recover expired running jobs")?;
+    .context("list expired running memory jobs")?;
+    for row in rows {
+        let job_id: String = row.try_get("id")?;
+        let attempts: i64 = row.try_get("attempts")?;
+        if attempts < 0 {
+            bail!("expired memory job {job_id} attempts out of range");
+        }
+        let lease_witness: Option<String> = row.try_get("lease_until")?;
+        writer
+            .apply_recovery_batch(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(DurableEvent::memory_maintenance(
+                        "compact_expired_lease_recovered",
+                    )?),
+                    projections: vec![Projection::MemoryJobUpdate(MemoryJobUpdate {
+                        expected_source_versions: BTreeMap::new(),
+                        job_mutations: vec![MemoryJobMutation::Release {
+                            job_id: job_id.clone(),
+                            expected_attempt: attempts,
+                            lease_witness,
+                        }],
+                    })],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .with_context(|| format!("recover expired running memory job {job_id}"))?;
+    }
     Ok(())
 }
 
-async fn recover_compacting_batches(store: &Store) -> Result<()> {
+async fn recover_expired_running_jobs(store: &Store) -> Result<()> {
+    let mut writer = EventWriter::new(Arc::new(store.clone()));
+    recover_expired_running_jobs_with(&mut writer).await
+}
+
+async fn recover_compacting_batches_with<W: RecoveryBatchWriter>(writer: &mut W) -> Result<()> {
+    let store = writer.recovery_store().clone();
     let rows = sqlx::query(
         "SELECT id, layer, batch_seq, version, summary_key_ref
          FROM memory_batches
@@ -1548,7 +1583,7 @@ async fn recover_compacting_batches(store: &Store) -> Result<()> {
                 .await
                 .context("check existing memory job for orphan target batch")?;
                 if !target_referenced && source_referenced.is_none() {
-                    repair_orphan_compacting_target(store, &source_id, version).await?;
+                    repair_orphan_compacting_target_with(writer, &source_id, version).await?;
                 }
                 continue;
             }
@@ -1608,11 +1643,12 @@ async fn recover_compacting_batches(store: &Store) -> Result<()> {
             job_mutations: Vec::new(),
             batch_inserts: vec![target_record],
             job_inserts: vec![job_record],
+            membership_inserts: Vec::new(),
             cursor_advance: None,
         };
 
-        EventWriter::new(Arc::new(store.clone()))
-            .apply(EventBatch {
+        writer
+            .apply_recovery_batch(EventBatch {
                 writes: vec![EventWrite {
                     event: Some(DurableEvent::memory_maintenance("compact_recovered")?),
                     projections: vec![Projection::MemoryTransition(transition)],
@@ -1628,8 +1664,13 @@ async fn recover_compacting_batches(store: &Store) -> Result<()> {
     Ok(())
 }
 
-async fn repair_orphan_compacting_target(
-    store: &Store,
+async fn recover_compacting_batches(store: &Store) -> Result<()> {
+    let mut writer = EventWriter::new(Arc::new(store.clone()));
+    recover_compacting_batches_with(&mut writer).await
+}
+
+async fn repair_orphan_compacting_target_with<W: RecoveryBatchWriter>(
+    writer: &mut W,
     target_id: &str,
     version: i64,
 ) -> Result<()> {
@@ -1653,8 +1694,8 @@ async fn repair_orphan_compacting_target(
         ..Default::default()
     };
 
-    EventWriter::new(Arc::new(store.clone()))
-        .apply(EventBatch {
+    writer
+        .apply_recovery_batch(EventBatch {
             writes: vec![EventWrite {
                 event: Some(DurableEvent::memory_maintenance("compact_orphan_repair")?),
                 projections: vec![Projection::MemoryTransition(transition)],
@@ -1668,9 +1709,17 @@ async fn repair_orphan_compacting_target(
 }
 
 async fn recover_jobs(store: &Store) -> Result<()> {
-    recover_expired_running_jobs(store).await?;
-    recover_compacting_batches(store).await?;
+    let mut writer = EventWriter::new(Arc::new(store.clone()));
+    recover_expired_running_jobs_with(&mut writer).await?;
+    recover_compacting_batches_with(&mut writer).await?;
     Ok(())
+}
+
+pub(crate) async fn recover_boot_memory_jobs(
+    writer: &mut BootstrapRecoveryGuard<'_>,
+) -> Result<()> {
+    recover_expired_running_jobs_with(writer).await?;
+    recover_compacting_batches_with(writer).await
 }
 
 /// Apply completed shelves in durable sequence order. All cursor motion is
@@ -1711,13 +1760,28 @@ async fn apply_next_completed_job(store: Arc<Store>, kind: MemoryJobKind) -> Res
             let Some(first) = first else {
                 return Ok(ApplyProgress::None);
             };
-            MemoryApplyCursorRecord {
-                kind: kind_name.to_owned(),
-                next_batch_seq: first,
-            }
-            .insert(store.pool())
-            .await
-            .context("initialize memory apply cursor")?;
+            EventWriter::new(store.clone())
+                .apply(EventBatch {
+                    writes: vec![EventWrite {
+                        event: Some(DurableEvent::memory_maintenance(
+                            "compact_cursor_initialized",
+                        )?),
+                        projections: vec![Projection::MemoryTransition(MemoryTransition {
+                            cursor_advance: Some(MemoryApplyCursorAdvance {
+                                kind: kind_name.to_owned(),
+                                expected: u64::try_from(first)
+                                    .context("initial memory cursor out of range")?,
+                                next: u64::try_from(first)
+                                    .context("initial memory cursor out of range")?,
+                                initialize: true,
+                            }),
+                            ..Default::default()
+                        })],
+                    }],
+                    injected_commands: Vec::new(),
+                })
+                .await
+                .context("initialize memory apply cursor")?;
             first
         }
     };
@@ -1837,6 +1901,7 @@ async fn advance_apply_cursor(
             kind: kind.as_str().to_owned(),
             expected: expected as u64,
             next: next as u64,
+            initialize: false,
         }),
         ..Default::default()
     };
@@ -1901,6 +1966,7 @@ async fn discard_stale_completed_job(
             kind: job.kind.as_str().to_owned(),
             expected: initial_cursor as u64,
             next: next_batch_seq as u64,
+            initialize: false,
         }),
         ..Default::default()
     };
@@ -1935,7 +2001,10 @@ async fn apply_completed_job(
     .await
     .context("load apply target batch")?;
     let Some(target_row) = target_row else {
-        return discard_stale_completed_job(store, job, None, initial_cursor).await;
+        bail!(
+            "completed memory job {} target is missing; no authenticated GC/tombstone permits discard",
+            job.id
+        );
     };
     let target_id: String = target_row.try_get("id")?;
     let target_version: i64 = target_row.try_get("version")?;
@@ -1970,13 +2039,10 @@ async fn apply_completed_job(
         .await
         .with_context(|| format!("load apply source batch {source_id}"))?;
         let Some(row) = row else {
-            return discard_stale_completed_job(
-                store,
-                job,
-                Some((&target_id, target_version, &target_state)),
-                initial_cursor,
-            )
-            .await;
+            bail!(
+                "completed memory job {} source batch {source_id} is missing; no authenticated GC/tombstone permits discard",
+                job.id
+            );
         };
         let layer: i64 = row.try_get("layer")?;
         let version: i64 = row.try_get("version")?;
@@ -2043,6 +2109,7 @@ async fn apply_completed_job(
             kind: job.kind.as_str().to_owned(),
             expected: initial_cursor as u64,
             next: next_batch_seq as u64,
+            initialize: false,
         }),
         ..Default::default()
     };
@@ -3109,6 +3176,114 @@ mod tests {
         )
     }
 
+    async fn insert_memory_fixture(store: &Store, kind: &str, transition: MemoryTransition) {
+        EventWriter::new(Arc::new(store.clone()))
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::memory_maintenance(kind)
+                            .expect("fixture memory-maintenance event"),
+                    ),
+                    projections: vec![Projection::MemoryTransition(transition)],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("insert authenticated memory fixture");
+    }
+
+    async fn apply_job_fixture_mutation(store: &Store, kind: &str, mutation: MemoryJobMutation) {
+        EventWriter::new(Arc::new(store.clone()))
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::memory_maintenance(kind).expect("fixture job-mutation event"),
+                    ),
+                    projections: vec![Projection::MemoryJobUpdate(MemoryJobUpdate {
+                        expected_source_versions: BTreeMap::new(),
+                        job_mutations: vec![mutation],
+                    })],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("apply authenticated job fixture mutation");
+    }
+
+    async fn fixture_running_job(store: &Store, job_id: &str, attempts: i64, lease_until: &str) {
+        apply_job_fixture_mutation(
+            store,
+            "fixture_job_claim",
+            MemoryJobMutation::Claim {
+                job_id: job_id.to_owned(),
+                lease_until: lease_until.to_owned(),
+            },
+        )
+        .await;
+        let mut witness = lease_until.to_owned();
+        for expected_attempt in 0..attempts {
+            let next_lease = if expected_attempt + 1 == attempts {
+                lease_until.to_owned()
+            } else {
+                format!("2099-01-01T00:00:{expected_attempt:02}Z")
+            };
+            apply_job_fixture_mutation(
+                store,
+                "fixture_job_attempt",
+                MemoryJobMutation::Start {
+                    job_id: job_id.to_owned(),
+                    expected_attempt,
+                    lease_witness: Some(witness),
+                    lease_until: next_lease.clone(),
+                },
+            )
+            .await;
+            witness = next_lease;
+        }
+    }
+
+    async fn fixture_pending_job_with_attempts(store: &Store, job_id: &str, attempts: i64) {
+        let lease = "2000-01-01T00:00:00Z";
+        fixture_running_job(store, job_id, attempts, lease).await;
+        apply_job_fixture_mutation(
+            store,
+            "fixture_job_release",
+            MemoryJobMutation::Release {
+                job_id: job_id.to_owned(),
+                expected_attempt: attempts,
+                lease_witness: Some(lease.to_owned()),
+            },
+        )
+        .await;
+    }
+
+    async fn fixture_mutate_batch_state(
+        store: &Store,
+        batch_id: &str,
+        expected_version: u64,
+        new_state: MemoryBatchState,
+    ) {
+        let batch_id = BatchId::parse_str(batch_id).expect("fixture batch UUID");
+        insert_memory_fixture(
+            store,
+            "fixture_batch_state",
+            MemoryTransition {
+                expected_source_versions: BTreeMap::from([(batch_id, expected_version)]),
+                batch_mutations: vec![MemoryBatchMutation {
+                    batch_id,
+                    expected_version,
+                    new_state,
+                    summary: None,
+                    est_tokens: 0,
+                    footprint_delta: 0,
+                    delete_membership: false,
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+
     async fn insert_l0_batch(store: &Store, messages: &[PublicMessage]) -> (String, String) {
         insert_l0_batch_with_seq(store, 1, messages).await
     }
@@ -3135,11 +3310,6 @@ mod tests {
             100,
             0,
         );
-        batch
-            .insert(store.pool())
-            .await
-            .expect("insert source batch");
-
         let target_id = Uuid::now_v7().to_string();
         let target = MemoryBatchRecord::new(
             &target_id,
@@ -3150,11 +3320,7 @@ mod tests {
             0,
             0,
         );
-        target
-            .insert(store.pool())
-            .await
-            .expect("insert target batch");
-
+        let mut membership_inserts = Vec::with_capacity(messages.len());
         for (seq, message) in messages.iter().enumerate() {
             let message_id = format!("{source_id}-msg-{seq}");
             let record = TranscriptRecord::encrypt(
@@ -3169,21 +3335,35 @@ mod tests {
             )
             .expect("encrypt message");
             record.insert(store.pool()).await.expect("insert message");
-            MemoryBatchMessageRecord {
+            membership_inserts.push(MemoryBatchMessageRecord {
                 batch_id: source_id.clone(),
                 message_id: record.id().to_owned(),
-                ord: seq as i64,
-            }
-            .insert(store.pool())
-            .await
-            .expect("insert batch message");
+                ord: i64::try_from(seq + 1).expect("fixture membership ordinal"),
+            });
         }
+
+        insert_memory_fixture(
+            store,
+            "fixture_l0_batches",
+            MemoryTransition {
+                batch_inserts: vec![batch, target],
+                membership_inserts,
+                ..Default::default()
+            },
+        )
+        .await;
 
         (source_id, target_id)
     }
 
     async fn insert_compact_l0_job(store: &Store, job_id: &str, source_id: &str, batch_seq: i64) {
-        let source_versions = BTreeMap::from([(source_id.to_owned(), 0)]);
+        let target_id: String =
+            sqlx::query_scalar("SELECT id FROM memory_batches WHERE layer = 1 AND batch_seq = ?")
+                .bind(batch_seq)
+                .fetch_one(store.pool())
+                .await
+                .expect("load compact-l0 target");
+        let source_versions = BTreeMap::from([(source_id.to_owned(), 0), (target_id, 0)]);
         let job = MemoryJobRecord::new(
             job_id,
             MemoryJobKind::CompactL0,
@@ -3191,7 +3371,15 @@ mod tests {
             vec![source_id.to_owned()],
             source_versions,
         );
-        job.insert(store.pool()).await.expect("insert job");
+        insert_memory_fixture(
+            store,
+            "fixture_compact_l0_job",
+            MemoryTransition {
+                job_inserts: vec![job],
+                ..Default::default()
+            },
+        )
+        .await;
     }
 
     async fn encrypt_summary(store: &Store, batch_id: &str, summary: &str) -> MemoryBatchSummary {
@@ -3234,8 +3422,6 @@ mod tests {
             summary: Some(summary),
             updated_at: Utc::now().to_rfc3339(),
         };
-        source.insert(store.pool()).await.expect("insert l1 source");
-
         let target_id = Uuid::now_v7().to_string();
         let target = MemoryBatchRecord::new(
             &target_id,
@@ -3246,7 +3432,15 @@ mod tests {
             0,
             0,
         );
-        target.insert(store.pool()).await.expect("insert l2 target");
+        insert_memory_fixture(
+            store,
+            "fixture_l1_batches",
+            MemoryTransition {
+                batch_inserts: vec![source, target],
+                ..Default::default()
+            },
+        )
+        .await;
 
         (source_id, target_id)
     }
@@ -3271,8 +3465,6 @@ mod tests {
             summary: Some(summary),
             updated_at: Utc::now().to_rfc3339(),
         };
-        source.insert(store.pool()).await.expect("insert l2 source");
-
         let target_id = Uuid::now_v7().to_string();
         let target = MemoryBatchRecord::new(
             &target_id,
@@ -3283,13 +3475,27 @@ mod tests {
             0,
             0,
         );
-        target.insert(store.pool()).await.expect("insert l2 target");
+        insert_memory_fixture(
+            store,
+            "fixture_l2_batches",
+            MemoryTransition {
+                batch_inserts: vec![source, target],
+                ..Default::default()
+            },
+        )
+        .await;
 
         (source_id, target_id)
     }
 
     async fn insert_compact_l1_job(store: &Store, job_id: &str, source_id: &str, batch_seq: i64) {
-        let source_versions = BTreeMap::from([(source_id.to_owned(), 0)]);
+        let target_id: String =
+            sqlx::query_scalar("SELECT id FROM memory_batches WHERE layer = 2 AND batch_seq = ?")
+                .bind(batch_seq)
+                .fetch_one(store.pool())
+                .await
+                .expect("load compact-l1 target");
+        let source_versions = BTreeMap::from([(source_id.to_owned(), 0), (target_id, 0)]);
         let job = MemoryJobRecord::new(
             job_id,
             MemoryJobKind::CompactL1,
@@ -3297,7 +3503,15 @@ mod tests {
             vec![source_id.to_owned()],
             source_versions,
         );
-        job.insert(store.pool()).await.expect("insert job");
+        insert_memory_fixture(
+            store,
+            "fixture_compact_l1_job",
+            MemoryTransition {
+                job_inserts: vec![job],
+                ..Default::default()
+            },
+        )
+        .await;
     }
 
     async fn insert_consolidate_l2_job(
@@ -3306,7 +3520,14 @@ mod tests {
         source_ids: &[String],
         batch_seq: i64,
     ) {
-        let source_versions = BTreeMap::from_iter(source_ids.iter().map(|id| (id.clone(), 0)));
+        let target_id: String =
+            sqlx::query_scalar("SELECT id FROM memory_batches WHERE layer = 2 AND batch_seq = ?")
+                .bind(batch_seq)
+                .fetch_one(store.pool())
+                .await
+                .expect("load consolidate-l2 target");
+        let mut source_versions = BTreeMap::from_iter(source_ids.iter().map(|id| (id.clone(), 0)));
+        source_versions.insert(target_id, 0);
         let job = MemoryJobRecord::new(
             job_id,
             MemoryJobKind::ConsolidateL2,
@@ -3314,7 +3535,15 @@ mod tests {
             source_ids.to_owned(),
             source_versions,
         );
-        job.insert(store.pool()).await.expect("insert job");
+        insert_memory_fixture(
+            store,
+            "fixture_consolidate_l2_job",
+            MemoryTransition {
+                job_inserts: vec![job],
+                ..Default::default()
+            },
+        )
+        .await;
     }
 
     async fn run_worker(store: Arc<Store>, provider: Arc<dyn CompactProvider>) {
@@ -3496,11 +3725,7 @@ mod tests {
         insert_compact_l0_job(&store, "job-stale", &source_id, 1).await;
 
         // Simulate a concurrent update that advanced the source version.
-        sqlx::query("UPDATE memory_batches SET version = 1 WHERE id = ?")
-            .bind(&source_id)
-            .execute(store.pool())
-            .await
-            .expect("bump version");
+        fixture_mutate_batch_state(&store, &source_id, 0, MemoryBatchState::Promoted).await;
 
         let provider = Arc::new(FakeProvider {
             text: Mutex::new("stale summary".into()),
@@ -3522,8 +3747,8 @@ mod tests {
             .fetch_one(store.pool())
             .await
             .expect("fetch source batch");
-        assert_eq!(source.get::<String, _>("state"), "compact_failed");
-        assert_eq!(source.get::<i64, _>("version"), 2);
+        assert_eq!(source.get::<String, _>("state"), "promoted");
+        assert_eq!(source.get::<i64, _>("version"), 1);
 
         let target = sqlx::query("SELECT state FROM memory_batches WHERE id = ?")
             .bind(&target_id)
@@ -3548,10 +3773,15 @@ mod tests {
             100,
             0,
         );
-        source
-            .insert(store.pool())
-            .await
-            .expect("insert source batch");
+        insert_memory_fixture(
+            &store,
+            "fixture_orphan_l0_source",
+            MemoryTransition {
+                batch_inserts: vec![source],
+                ..Default::default()
+            },
+        )
+        .await;
 
         let cancel = CancellationToken::new();
         let worker = CompactWorker {
@@ -3602,10 +3832,15 @@ mod tests {
             100,
             0,
         );
-        source
-            .insert(store.pool())
-            .await
-            .expect("insert source batch");
+        insert_memory_fixture(
+            &store,
+            "fixture_concurrent_orphan_l0_source",
+            MemoryTransition {
+                batch_inserts: vec![source],
+                ..Default::default()
+            },
+        )
+        .await;
 
         // Spawn recovery and a concurrent EventWriter transition that inserts
         // an unrelated L1 batch. Under the old raw-transaction recovery, both
@@ -3672,15 +3907,7 @@ mod tests {
         let store = test_store().await;
         let (source_id, _target_id) = insert_l0_batch(&store, &[user("recover lease")]).await;
         insert_compact_l0_job(&store, "job-expired-lease", &source_id, 1).await;
-        sqlx::query(
-            "UPDATE memory_jobs
-             SET status = 'running', attempts = 1, lease_until = '2000-01-01T00:00:00Z'
-             WHERE id = ?",
-        )
-        .bind("job-expired-lease")
-        .execute(store.pool())
-        .await
-        .expect("expire lease");
+        fixture_running_job(&store, "job-expired-lease", 1, "2000-01-01T00:00:00Z").await;
 
         let worker = CompactWorker {
             store: store.clone(),
@@ -3703,15 +3930,7 @@ mod tests {
         let store = test_store().await;
         let (source_id, target_id) = insert_l0_batch(&store, &[user("live lease recovery")]).await;
         insert_compact_l0_job(&store, "job-live-expired", &source_id, 1).await;
-        sqlx::query(
-            "UPDATE memory_jobs
-             SET status = 'running', attempts = 0, lease_until = '2000-01-01T00:00:00Z'
-             WHERE id = ?",
-        )
-        .bind("job-live-expired")
-        .execute(store.pool())
-        .await
-        .expect("expire live lease");
+        fixture_running_job(&store, "job-live-expired", 0, "2000-01-01T00:00:00Z").await;
 
         let worker = CompactWorker {
             store: store.clone(),
@@ -3781,17 +4000,13 @@ mod tests {
         let (source_1, _target_1) = insert_l0_batch(&store, &[user("first")]).await;
         let (source_2, _target_2) = insert_l0_batch_with_seq(&store, 2, &[user("second")]).await;
         insert_compact_l0_job(&store, "job-apply-1", &source_1, 1).await;
-        let source_versions = BTreeMap::from([(source_2.clone(), 0)]);
-        MemoryJobRecord::new(
-            "job-apply-2",
-            MemoryJobKind::CompactL0,
-            2,
-            vec![source_2.clone()],
-            source_versions,
+        insert_compact_l0_job(&store, "job-apply-2", &source_2, 2).await;
+        let maintenance_before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_events WHERE event_type = 'memory_maintenance'",
         )
-        .insert(store.pool())
+        .fetch_one(store.pool())
         .await
-        .expect("insert second job");
+        .expect("count fixture maintenance events");
 
         let provider = Arc::new(FakeProvider {
             text: Mutex::new("summary".into()),
@@ -3843,15 +4058,15 @@ mod tests {
         .expect("apply cursor");
         assert_eq!(cursor, 3);
 
-        // Each job now produces a MemoryMaintenance event at completion and at
-        // apply, so the durable log records two maintenance events per job.
+        // Claim, start, completion, apply, and first cursor initialization are
+        // all authenticated MemoryMaintenance transitions.
         let maintenance_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM agent_events WHERE event_type = 'memory_maintenance'",
         )
         .fetch_one(store.pool())
         .await
         .expect("count maintenance events");
-        assert_eq!(maintenance_count, 4);
+        assert_eq!(maintenance_count - maintenance_before, 9);
     }
 
     #[tokio::test]
@@ -3949,20 +4164,25 @@ mod tests {
         let (source_1, _target_1) = insert_l2_batch(&store, 1, 20, "L2 first summary").await;
         let (source_2, _target_2) = insert_l2_batch(&store, 2, 21, "L2 second summary").await;
         let target_id = Uuid::now_v7().to_string();
-        MemoryBatchRecord::new(
+        let target = MemoryBatchRecord::new(
             &target_id,
             MemoryLayer::L2,
             0,
-            10,
+            5,
             MemoryBatchState::Compacting,
             0,
             0,
+        );
+        insert_memory_fixture(
+            &store,
+            "fixture_consolidate_target",
+            MemoryTransition {
+                batch_inserts: vec![target],
+                ..Default::default()
+            },
         )
-        .insert(store.pool())
-        .await
-        .expect("insert consolidate target");
-        insert_consolidate_l2_job(&store, "job-l2", &[source_1.clone(), source_2.clone()], 10)
-            .await;
+        .await;
+        insert_consolidate_l2_job(&store, "job-l2", &[source_1.clone(), source_2.clone()], 5).await;
 
         let provider = Arc::new(FakeProvider {
             text: Mutex::new("Consolidated L2 summary".into()),
@@ -4008,11 +4228,8 @@ mod tests {
         let (_l1_source, _l1_target) = insert_l1_batch(&store, 1, "lost l1").await;
         let (_l2_source, _l2_target) = insert_l2_batch(&store, 2, 3, "lost l2").await;
 
-        // Drop the jobs to simulate a crash where only compacting batches remain.
-        sqlx::query("DELETE FROM memory_jobs")
-            .execute(store.pool())
-            .await
-            .expect("delete jobs");
+        // The fixture inserts only the compacting source/target batches, which
+        // models the crash boundary before either job row was committed.
 
         let worker = CompactWorker {
             store: store.clone(),
@@ -4056,7 +4273,7 @@ mod tests {
         // A summary-less compacting L1 row is an in-flight CompactL0 target,
         // not a source, and must not be recovered as a new job.
         let in_flight_target = Uuid::now_v7().to_string();
-        MemoryBatchRecord::new(
+        let target = MemoryBatchRecord::new(
             &in_flight_target,
             MemoryLayer::L1,
             0,
@@ -4064,11 +4281,16 @@ mod tests {
             MemoryBatchState::Compacting,
             0,
             0,
+        );
+        insert_memory_fixture(
+            &store,
+            "fixture_in_flight_target",
+            MemoryTransition {
+                batch_inserts: vec![target],
+                ..Default::default()
+            },
         )
-        .insert(store.pool())
-        .await
-        .expect("insert in-flight target");
-
+        .await;
         recover_compacting_batches(&store)
             .await
             .expect("recover compacting batches");
@@ -4107,15 +4329,7 @@ mod tests {
 
         // A newer owner advances the first source after completion. Applying
         // the stale result must not overwrite that source.
-        sqlx::query(
-            "UPDATE memory_batches
-             SET version = version + 1, state = 'promoted'
-             WHERE id = ?",
-        )
-        .bind(&source_id)
-        .execute(store.pool())
-        .await
-        .expect("bump source version");
+        fixture_mutate_batch_state(&store, &source_id, 1, MemoryBatchState::Promoted).await;
 
         let worker = CompactWorker {
             store: store.clone(),
@@ -4214,12 +4428,18 @@ mod tests {
             .expect("claim")
             .expect("pending job");
 
-        // Another process changed the job row after it was claimed.
-        sqlx::query("UPDATE memory_jobs SET status = 'completed' WHERE id = ?")
-            .bind(&job.id)
-            .execute(store.pool())
-            .await
-            .expect("tamper with job");
+        // Another process advanced the authenticated row after it was claimed.
+        apply_job_fixture_mutation(
+            &store,
+            "fixture_competing_job_start",
+            MemoryJobMutation::Start {
+                job_id: job.id.clone(),
+                expected_attempt: 0,
+                lease_witness: job.lease_until.clone(),
+                lease_until: "2030-01-01T00:00:00Z".to_owned(),
+            },
+        )
+        .await;
 
         assert!(
             reset_job_to_pending(&store, &job).await.is_err(),
@@ -4242,12 +4462,25 @@ mod tests {
         // Expire A's durable lease, run the real recovery path, then let B
         // claim and start attempt 2. A retains its original attempt/lease
         // witness and must not be allowed to finish B's row.
-        sqlx::query("UPDATE memory_jobs SET lease_until = ? WHERE id = ?")
-            .bind("2000-01-01T00:00:00Z")
-            .bind(&job.id)
-            .execute(store.pool())
-            .await
-            .expect("expire A lease");
+        apply_job_fixture_mutation(
+            &store,
+            "fixture_release_a",
+            MemoryJobMutation::Release {
+                job_id: job.id.clone(),
+                expected_attempt: job.attempts,
+                lease_witness: job.lease_until.clone(),
+            },
+        )
+        .await;
+        apply_job_fixture_mutation(
+            &store,
+            "fixture_expire_a",
+            MemoryJobMutation::Claim {
+                job_id: job.id.clone(),
+                lease_until: "2000-01-01T00:00:00Z".to_owned(),
+            },
+        )
+        .await;
         recover_expired_running_jobs(&store)
             .await
             .expect("recover expired A");
@@ -4306,15 +4539,17 @@ mod tests {
             .expect("pending job");
         start_attempt(&store, &mut job).await.expect("start job");
 
-        sqlx::query(
-            "UPDATE memory_jobs
-             SET attempts = 2, lease_until = '2030-01-01T00:00:00Z'
-             WHERE id = ?",
+        apply_job_fixture_mutation(
+            &store,
+            "fixture_reclaim_fail_lease",
+            MemoryJobMutation::Start {
+                job_id: job.id.clone(),
+                expected_attempt: job.attempts,
+                lease_witness: job.lease_until.clone(),
+                lease_until: "2030-01-01T00:00:00Z".to_owned(),
+            },
         )
-        .bind(&job.id)
-        .execute(store.pool())
-        .await
-        .expect("reclaim lease");
+        .await;
 
         let error = fail_job(store.as_ref(), &job)
             .await
@@ -4336,15 +4571,17 @@ mod tests {
             .expect("pending job");
         start_attempt(&store, &mut job).await.expect("start job");
 
-        sqlx::query(
-            "UPDATE memory_jobs
-             SET attempts = 2, lease_until = '2030-01-01T00:00:00Z'
-             WHERE id = ?",
+        apply_job_fixture_mutation(
+            &store,
+            "fixture_reclaim_release_lease",
+            MemoryJobMutation::Start {
+                job_id: job.id.clone(),
+                expected_attempt: job.attempts,
+                lease_witness: job.lease_until.clone(),
+                lease_until: "2030-01-01T00:00:00Z".to_owned(),
+            },
         )
-        .bind(&job.id)
-        .execute(store.pool())
-        .await
-        .expect("reclaim lease");
+        .await;
 
         let error = reset_job_to_pending(store.as_ref(), &job)
             .await
@@ -4388,15 +4625,7 @@ mod tests {
         insert_compact_l0_job(&store, "job-crash-before", &source_id, 1).await;
 
         // Simulate a crash immediately after claim, before start_attempt.
-        sqlx::query(
-            "UPDATE memory_jobs
-             SET status = 'running', attempts = 0, lease_until = '2000-01-01T00:00:00Z'
-             WHERE id = ?",
-        )
-        .bind("job-crash-before")
-        .execute(store.pool())
-        .await
-        .expect("simulate crash after claim");
+        fixture_running_job(&store, "job-crash-before", 0, "2000-01-01T00:00:00Z").await;
 
         let provider = Arc::new(FakeProvider {
             fail_next: AtomicUsize::new(3),
@@ -4436,15 +4665,7 @@ mod tests {
 
         // Simulate a crash after start_attempt on the final retry consumed the
         // budget, but before fail_job could commit.
-        sqlx::query(
-            "UPDATE memory_jobs
-             SET status = 'running', attempts = 3, lease_until = '2000-01-01T00:00:00Z'
-             WHERE id = ?",
-        )
-        .bind("job-crash-after")
-        .execute(store.pool())
-        .await
-        .expect("simulate crash after failed attempt");
+        fixture_running_job(&store, "job-crash-after", 3, "2000-01-01T00:00:00Z").await;
 
         let provider = Arc::new(FakeProvider {
             fail_next: AtomicUsize::new(0),
@@ -4589,18 +4810,10 @@ mod tests {
         insert_compact_l0_job(&store, "job-exhausted-stale", &source_id, 1).await;
 
         // Exhaust the durable retry budget before the worker runs.
-        sqlx::query("UPDATE memory_jobs SET attempts = 3 WHERE id = ?")
-            .bind("job-exhausted-stale")
-            .execute(store.pool())
-            .await
-            .expect("set attempts to max");
+        fixture_pending_job_with_attempts(&store, "job-exhausted-stale", 3).await;
 
         // Simulate a concurrent update that advanced the source version.
-        sqlx::query("UPDATE memory_batches SET version = 1 WHERE id = ?")
-            .bind(&source_id)
-            .execute(store.pool())
-            .await
-            .expect("bump version");
+        fixture_mutate_batch_state(&store, &source_id, 0, MemoryBatchState::Promoted).await;
 
         let provider = Arc::new(FakeProvider {
             text: Mutex::new("never called".into()),
@@ -4627,8 +4840,8 @@ mod tests {
             .fetch_one(store.pool())
             .await
             .expect("fetch source batch");
-        assert_eq!(source.get::<String, _>("state"), "compact_failed");
-        assert_eq!(source.get::<i64, _>("version"), 2);
+        assert_eq!(source.get::<String, _>("state"), "promoted");
+        assert_eq!(source.get::<i64, _>("version"), 1);
 
         let target = sqlx::query("SELECT state FROM memory_batches WHERE id = ?")
             .bind(&target_id)
@@ -4643,16 +4856,8 @@ mod tests {
         let store = test_store().await;
         let (stale_source, _stale_target) = insert_l0_batch(&store, &[user("stale first")]).await;
         insert_compact_l0_job(&store, "job-stale-first", &stale_source, 1).await;
-        sqlx::query("UPDATE memory_jobs SET attempts = 3 WHERE id = ?")
-            .bind("job-stale-first")
-            .execute(store.pool())
-            .await
-            .expect("exhaust stale job");
-        sqlx::query("UPDATE memory_batches SET version = 1 WHERE id = ?")
-            .bind(&stale_source)
-            .execute(store.pool())
-            .await
-            .expect("advance stale source");
+        fixture_pending_job_with_attempts(&store, "job-stale-first", 3).await;
+        fixture_mutate_batch_state(&store, &stale_source, 0, MemoryBatchState::Promoted).await;
 
         let (later_source, _later_target) =
             insert_l0_batch_with_seq(&store, 2, &[user("later")]).await;
@@ -4810,14 +5015,7 @@ mod tests {
 
         // Simulate a crash: job was claimed but start_attempt had not yet refreshed.
         let expired = "2000-01-01T00:00:00Z";
-        sqlx::query(
-            "UPDATE memory_jobs SET status = 'running', attempts = 0, lease_until = ? WHERE id = ?",
-        )
-        .bind(expired)
-        .bind("job-lease")
-        .execute(store.pool())
-        .await
-        .expect("simulate running job with expired lease");
+        fixture_running_job(&store, "job-lease", 0, expired).await;
 
         let row = sqlx::query(
             "SELECT id, kind, batch_seq, source_ids, source_versions, status, attempts,
@@ -5218,24 +5416,36 @@ mod tests {
     #[tokio::test]
     async fn recover_repairs_orphan_l2_target_with_colliding_compact_l0_batch_seq() {
         let store = test_store().await;
-        let source_id = Uuid::now_v7().to_string();
+        let (source_id, _) = insert_l0_batch(&store, &[user("source")]).await;
         // A CompactL0 job whose target L1 happens to share batch_seq with a
         // stray L2 target must not prevent the L2 orphan from being repaired.
-        insert_compact_l0_job(&store, "job-collide", &source_id, 5).await;
+        insert_compact_l0_job(&store, "job-collide", &source_id, 1).await;
 
         let orphan_l2 = Uuid::now_v7().to_string();
-        MemoryBatchRecord::new(
+        let orphan = MemoryBatchRecord::new(
             &orphan_l2,
             MemoryLayer::L2,
             0,
-            5,
+            1,
             MemoryBatchState::Compacting,
             0,
             0,
+        );
+        insert_memory_fixture(
+            &store,
+            "fixture_orphan_l2_target",
+            MemoryTransition {
+                batch_inserts: vec![orphan],
+                ..Default::default()
+            },
         )
-        .insert(store.pool())
+        .await;
+        let maintenance_before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_events WHERE event_type = 'memory_maintenance'",
+        )
+        .fetch_one(store.pool())
         .await
-        .expect("insert orphan L2 target");
+        .expect("count fixture maintenance events");
 
         recover_compacting_batches(&store)
             .await
@@ -5255,7 +5465,8 @@ mod tests {
         .await
         .expect("count maintenance events");
         assert_eq!(
-            maintenance, 1,
+            maintenance - maintenance_before,
+            1,
             "orphan repair must emit one maintenance event"
         );
     }
@@ -5313,7 +5524,7 @@ mod tests {
         // discard branch for a Compacted source with version mismatch is
         // unreachable under existing CAS invariants.
         let source_id = Uuid::now_v7().to_string();
-        MemoryBatchRecord::new(
+        let source = MemoryBatchRecord::new(
             &source_id,
             MemoryLayer::L0,
             0,
@@ -5321,10 +5532,16 @@ mod tests {
             MemoryBatchState::Compacted,
             100,
             0,
+        );
+        insert_memory_fixture(
+            &store,
+            "fixture_compacted_source",
+            MemoryTransition {
+                batch_inserts: vec![source],
+                ..Default::default()
+            },
         )
-        .insert(store.pool())
-        .await
-        .expect("insert source batch");
+        .await;
 
         let source_uuid = BatchId::parse_str(&source_id).expect("source id is a valid batch UUID");
         let transition = MemoryTransition {

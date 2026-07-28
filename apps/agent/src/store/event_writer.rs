@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, Transaction};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -28,7 +28,10 @@ use crate::{
     memory::{
         BatchId, BatchState, CompactResult, L0Batch,
         batch::{BoundaryContext, SealReason, seal_before_next},
-        estimate::{TokenCalibration, estimate_public_message, eviction_footprint_for_payload},
+        estimate::{
+            TOKEN_CALIBRATION_EMA_ALPHA, TokenCalibration, estimate_public_message,
+            eviction_footprint_for_payload, observed_prompt_tokens,
+        },
     },
     provider::{
         model::ModelSpec,
@@ -50,9 +53,12 @@ use super::{
         verify_event_head,
     },
     memory_state::{
-        MemoryApplyCursorRecord, MemoryBatchMessageRecord, MemoryBatchRecord, MemoryBatchState,
-        MemoryBatchSummary, MemoryJobKind, MemoryJobRecord, MemoryJobResult, MemoryJobStatus,
-        MemoryLayer,
+        MEMORY_CALIBRATION_ID, MemoryApplyCursorRecord, MemoryBatchMessageRecord,
+        MemoryBatchRecord, MemoryBatchState, MemoryBatchSummary, MemoryJobKind, MemoryJobRecord,
+        MemoryJobResult, MemoryJobStatus, MemoryLayer, MemoryProjectionDeltaV1,
+        MemoryProjectionEntity, MemoryProjectionKey, MemoryProjectionRef,
+        capture_memory_projection_ref, commit_memory_projection, extend_memory_membership_digest,
+        load_verified_memory_projection_set, memory_membership_seed,
     },
     physical_recovery::{ApplyReceiptOutcome, PhysicalRecoveryApplier, PhysicalRecoveryReceipt},
     provider_context::{
@@ -118,6 +124,8 @@ pub(super) struct DurableEventMetadata {
     pub(super) approval_actor: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub(super) empty_turn: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) memory_projection: Option<MemoryProjectionDeltaV1>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -948,6 +956,7 @@ pub(crate) struct MemoryApplyCursorAdvance {
     pub kind: String,
     pub expected: u64,
     pub next: u64,
+    pub initialize: bool,
 }
 
 #[allow(
@@ -970,6 +979,9 @@ pub(crate) struct MemoryTransition {
     /// New jobs to insert atomically within the same EventWriter transaction.
     /// Their `batch_seq` is fixed to the matching inserted target batch.
     pub job_inserts: Vec<MemoryJobRecord>,
+    /// Existing transcript messages to attach atomically to authenticated
+    /// batch membership chains.
+    pub membership_inserts: Vec<MemoryBatchMessageRecord>,
     pub cursor_advance: Option<MemoryApplyCursorAdvance>,
 }
 
@@ -1033,6 +1045,12 @@ pub(crate) enum Projection {
     MemoryJobUpdate(MemoryJobUpdate),
     /// Atomic durable memory batch + job transition with source-version CAS.
     MemoryTransition(MemoryTransition),
+    /// A successful provider terminal's raw prompt estimate. EventWriter binds
+    /// this to the assistant MessageEnd usage and updates the persisted EMA in
+    /// that same transaction.
+    MemoryCalibrationObservation {
+        uncalibrated_prompt_estimate: u64,
+    },
     ApprovalRule(ApprovalRuleMutation),
     #[cfg(test)]
     SizePadding(usize),
@@ -1111,6 +1129,7 @@ pub(crate) enum ApprovalMutation {
 struct PreparedEvent {
     seq: u64,
     kind: String,
+    metadata: DurableEventMetadata,
     internal_metadata: String,
     command_id: Option<String>,
     run_id: Option<String>,
@@ -1281,9 +1300,14 @@ enum PreparedProjection {
         job_mutations: Vec<PreparedMemoryJobMutation>,
         batch_inserts: Vec<MemoryBatchRecord>,
         job_inserts: Vec<MemoryJobRecord>,
+        membership_inserts: Vec<MemoryBatchMessageRecord>,
         cursor_advance: Option<MemoryApplyCursorAdvance>,
         memory_summary_key_ref: Option<String>,
         memory_summary_key_proof: Option<Vec<u8>>,
+    },
+    MemoryCalibrationObservation {
+        observed_prompt_tokens: u64,
+        uncalibrated_prompt_estimate: u64,
     },
     Plain(Projection),
 }
@@ -1291,6 +1315,137 @@ enum PreparedProjection {
 struct PreparedWrite {
     event: Option<PreparedEvent>,
     projections: Vec<PreparedProjection>,
+}
+
+fn memory_projection_keys(write: &PreparedWrite) -> BTreeSet<MemoryProjectionKey> {
+    let mut keys = BTreeSet::new();
+    for projection in &write.projections {
+        match projection {
+            PreparedProjection::MessageEnd {
+                l0_disposition,
+                l0_batch_id,
+                seal_transition,
+                ..
+            } => {
+                if *l0_disposition != L0Disposition::Append {
+                    continue;
+                }
+                if let Some(batch_id) = l0_batch_id {
+                    keys.insert(MemoryProjectionKey {
+                        entity: MemoryProjectionEntity::Batch,
+                        id: batch_id.clone(),
+                    });
+                }
+                if let Some(seal) = seal_transition {
+                    keys.insert(MemoryProjectionKey {
+                        entity: MemoryProjectionEntity::Batch,
+                        id: seal.source_id.clone(),
+                    });
+                    keys.insert(MemoryProjectionKey {
+                        entity: MemoryProjectionEntity::Batch,
+                        id: seal.target_record.id.clone(),
+                    });
+                    keys.insert(MemoryProjectionKey {
+                        entity: MemoryProjectionEntity::Job,
+                        id: seal.job_record.id.clone(),
+                    });
+                }
+            }
+            PreparedProjection::MemoryJobUpdate { job_mutations, .. } => {
+                keys.extend(job_mutations.iter().map(|job| MemoryProjectionKey {
+                    entity: MemoryProjectionEntity::Job,
+                    id: job.job_id.clone(),
+                }));
+            }
+            PreparedProjection::MemoryTransition {
+                batch_mutations,
+                job_mutations,
+                batch_inserts,
+                job_inserts,
+                membership_inserts,
+                cursor_advance,
+                ..
+            } => {
+                keys.extend(batch_mutations.iter().map(|batch| MemoryProjectionKey {
+                    entity: MemoryProjectionEntity::Batch,
+                    id: batch.batch_id.clone(),
+                }));
+                keys.extend(batch_inserts.iter().map(|batch| MemoryProjectionKey {
+                    entity: MemoryProjectionEntity::Batch,
+                    id: batch.id.clone(),
+                }));
+                keys.extend(job_mutations.iter().map(|job| MemoryProjectionKey {
+                    entity: MemoryProjectionEntity::Job,
+                    id: job.job_id.clone(),
+                }));
+                keys.extend(job_inserts.iter().map(|job| MemoryProjectionKey {
+                    entity: MemoryProjectionEntity::Job,
+                    id: job.id.clone(),
+                }));
+                keys.extend(
+                    membership_inserts
+                        .iter()
+                        .map(|membership| MemoryProjectionKey {
+                            entity: MemoryProjectionEntity::Batch,
+                            id: membership.batch_id.clone(),
+                        }),
+                );
+                if let Some(cursor) = cursor_advance {
+                    keys.insert(MemoryProjectionKey {
+                        entity: MemoryProjectionEntity::Cursor,
+                        id: cursor.kind.clone(),
+                    });
+                }
+            }
+            PreparedProjection::MemoryCalibrationObservation { .. } => {
+                keys.insert(MemoryProjectionKey {
+                    entity: MemoryProjectionEntity::Calibration,
+                    id: MEMORY_CALIBRATION_ID.to_owned(),
+                });
+            }
+            _ => {}
+        }
+    }
+    keys
+}
+
+fn memory_projection_metadata_upper_bound(write: &PreparedWrite) -> Result<usize> {
+    let keys = memory_projection_keys(write);
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    let event = write
+        .event
+        .as_ref()
+        .ok_or_else(|| anyhow!("memory projection metadata reserve requires a durable event"))?;
+    let worst_case_previous = MemoryProjectionRef {
+        event_seq: u64::MAX,
+        digest: [u8::MAX; super::memory_state::MEMORY_PROJECTION_DIGEST_BYTES],
+    };
+    let changes = keys
+        .into_iter()
+        .map(|key| super::memory_state::MemoryProjectionChange {
+            entity: key.entity,
+            id: key.id,
+            previous: Some(worst_case_previous.clone()),
+            current_digest: [u8::MAX; super::memory_state::MEMORY_PROJECTION_DIGEST_BYTES],
+        })
+        .collect();
+    let mut metadata = event.metadata.clone();
+    metadata.memory_projection = Some(MemoryProjectionDeltaV1::new(changes)?);
+    let worst_case_len = serde_json::to_string(&metadata)
+        .context("failed to serialize memory projection metadata preflight")?
+        .len();
+    Ok(worst_case_len.saturating_sub(event.internal_metadata.len()))
+}
+
+fn prepared_write_has_physical_recovery(write: &PreparedWrite) -> bool {
+    write.projections.iter().any(|projection| {
+        matches!(
+            projection,
+            PreparedProjection::Plain(Projection::PhysicalRecovery(_))
+        )
+    })
 }
 
 struct ExpectedInjection {
@@ -1363,6 +1518,44 @@ pub(crate) struct EventWriter {
     gate: Arc<Mutex<WriterState>>,
 }
 
+/// EventWriter-owned single-writer guard for cold-boot repair and hydration.
+///
+/// The guard is held from the first authenticated recovery inspection through
+/// the post-repair snapshot and logical-suffix decision. Recovery code applies
+/// batches through `apply_recovery_batch`, which reuses this guard instead of
+/// trying to acquire the public writer gate recursively.
+pub(crate) struct BootstrapRecoveryGuard<'a> {
+    writer: &'a EventWriter,
+    state: MutexGuard<'a, WriterState>,
+}
+
+#[allow(async_fn_in_trait)]
+pub(crate) trait RecoveryBatchWriter {
+    fn recovery_store(&self) -> &Store;
+
+    async fn apply_recovery_batch(&mut self, batch: EventBatch) -> Result<Vec<u64>>;
+}
+
+impl RecoveryBatchWriter for EventWriter {
+    fn recovery_store(&self) -> &Store {
+        self.store.as_ref()
+    }
+
+    async fn apply_recovery_batch(&mut self, batch: EventBatch) -> Result<Vec<u64>> {
+        self.apply(batch).await
+    }
+}
+
+impl RecoveryBatchWriter for BootstrapRecoveryGuard<'_> {
+    fn recovery_store(&self) -> &Store {
+        self.writer.store.as_ref()
+    }
+
+    async fn apply_recovery_batch(&mut self, batch: EventBatch) -> Result<Vec<u64>> {
+        self.writer.apply_locked(batch, None, &mut self.state).await
+    }
+}
+
 #[derive(Default)]
 pub(super) struct WriterState {
     checkpoint: Option<LifecycleCheckpoint>,
@@ -1372,6 +1565,7 @@ pub(super) struct WriterState {
 struct LifecycleCheckpoint {
     event_head: Option<EventLogHead>,
     lifecycle: DurableLifecycleState,
+    memory_projections: BTreeMap<MemoryProjectionKey, MemoryProjectionRef>,
     historical_rows_visited: u64,
 }
 
@@ -1470,34 +1664,23 @@ impl EventWriter {
         Self { store, gate }
     }
 
-    pub(in crate::store) async fn recover_provider_context_mutations(&self) -> Result<()> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT mutation_id FROM provider_context_mutations
-             WHERE state = 'prepared'
-             ORDER BY prepared_at, mutation_id",
-        )
-        .fetch_all(self.store.pool())
-        .await
-        .context("failed to list prepared provider-context mutations")?;
-
-        for (mutation_id,) in rows {
-            self.apply(EventBatch {
-                writes: vec![EventWrite {
-                    event: None,
-                    projections: vec![Projection::ProviderContextMutation(
-                        super::provider_context::ProviderContextMutation {
-                            mutation_id: mutation_id.clone(),
-                        },
-                    )],
-                }],
-                injected_commands: Vec::new(),
-            })
-            .await
-            .with_context(|| {
-                format!("failed to recover provider-context mutation {mutation_id}")
-            })?;
-        }
-        Ok(())
+    pub(in crate::store) async fn begin_bootstrap_recovery<'a>(
+        &'a self,
+        lease: &ProcessGenerationLease,
+        fence: &GenerationRecoveryFence,
+    ) -> Result<BootstrapRecoveryGuard<'a>> {
+        lease
+            .validate_exact(fence.generation(), fence.lease_id())
+            .map_err(|error| anyhow!("invalid recovery lease/fence binding: {error}"))?;
+        fence
+            .validate_exact(lease, fence.fence_id())
+            .map_err(|error| anyhow!("invalid recovery fence binding: {error}"))?;
+        let mut state = self.gate.lock().await;
+        self.ensure_checkpoint(&mut state).await?;
+        Ok(BootstrapRecoveryGuard {
+            writer: self,
+            state,
+        })
     }
 
     pub(crate) fn store(&self) -> &Arc<Store> {
@@ -1782,6 +1965,40 @@ impl EventWriter {
     pub(crate) async fn apply(&self, batch: EventBatch) -> Result<Vec<u64>> {
         let mut guard = self.gate.lock().await;
         self.apply_locked(batch, None, &mut guard).await
+    }
+
+    /// Commit an EventBatch and, when it contains the one allowed calibration
+    /// observation, return the exact persisted ratio while still holding the
+    /// single-writer gate. This closes the commit-to-runtime race: a later
+    /// MessageEnd cannot advance the singleton before the caller receives the
+    /// value committed by this batch.
+    pub(crate) async fn apply_with_calibration_receipt(
+        &self,
+        batch: EventBatch,
+    ) -> Result<(Vec<u64>, Option<[u8; 8]>)> {
+        let has_calibration_observation = batch.writes.iter().any(|write| {
+            write.projections.iter().any(|projection| {
+                matches!(projection, Projection::MemoryCalibrationObservation { .. })
+            })
+        });
+        let mut guard = self.gate.lock().await;
+        let seqs = self.apply_locked(batch, None, &mut guard).await?;
+        let ratio_bits = if has_calibration_observation {
+            let bits: Vec<u8> =
+                sqlx::query_scalar("SELECT ratio_bits FROM memory_calibration WHERE singleton = 1")
+                    .fetch_optional(self.store.pool())
+                    .await
+                    .context("failed to load committed calibration receipt")?
+                    .ok_or_else(|| anyhow!("committed calibration row is missing"))?;
+            Some(
+                bits.as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("committed calibration ratio_bits has invalid length"))?,
+            )
+        } else {
+            None
+        };
+        Ok((seqs, ratio_bits))
     }
 
     /// Hydration entry point for a T27 physical recovery proof.  The receipt
@@ -2243,7 +2460,11 @@ impl EventWriter {
             .map_or(0, |head| head.last_seq)
             .checked_add(1)
             .ok_or_else(|| anyhow!("durable event sequence overflow"))?;
-        let (prepared, transaction_bytes, event_seqs) = self.prepare_batch(batch, next_seq).await?;
+        let (prepared, transaction_bytes, memory_metadata_reserve, event_seqs) =
+            self.prepare_batch(batch, next_seq).await?;
+        let preflight_transaction_bytes = transaction_bytes
+            .checked_add(memory_metadata_reserve)
+            .ok_or_else(|| anyhow!("memory metadata preflight byte count overflow"))?;
 
         #[cfg(all(test, unix))]
         let env_failpoint_storage = test_env_abrupt_failpoint_for_prepared(&prepared);
@@ -2298,7 +2519,7 @@ impl EventWriter {
                 );
             }
         }
-        EventBatchSizer::validate(command_bounds, transaction_bytes)?;
+        EventBatchSizer::validate(command_bounds, preflight_transaction_bytes)?;
         let mut owner_preconditions = HashSet::new();
         let mut owner_postconditions = HashSet::new();
         collect_owner_conditions(
@@ -2337,79 +2558,45 @@ impl EventWriter {
 
         let mut applied_writes = 0usize;
         let mut updated_event_head = previous_event_head.clone();
+        let mut updated_memory_projections = checkpoint.memory_projections.clone();
+        let mut finalized_metadata_growth = 0usize;
         let mut receipt_outcome = None;
-        for write in prepared {
-            if let Some(event) = write.event {
-                let (previous_digest, previous_count, head_key_ref) =
-                    match updated_event_head.as_ref() {
-                        Some(head) => {
-                            if head.key_ref != event.raw_key_ref {
-                                bail!("event-log key changed without an explicit rotation");
-                            }
-                            (head.chain_digest, head.event_count, head.key_ref.clone())
-                        }
-                        None => ([0_u8; EVENT_DIGEST_BYTES], 0, event.raw_key_ref.clone()),
-                    };
-                let expected_seq = updated_event_head
-                    .as_ref()
-                    .map_or(1, |head| head.last_seq.saturating_add(1));
-                if event.seq != expected_seq {
-                    bail!(
-                        "durable event sequence is not contiguous: expected {expected_seq}, prepared {}",
-                        event.seq
-                    );
-                }
-                let chain_digest = extend_event_chain(
-                    &previous_digest,
-                    EventChainEntry {
-                        seq: event.seq,
-                        event_type: &event.kind,
-                        internal_metadata: &event.internal_metadata,
-                        key_ref: &event.raw_key_ref,
-                        ciphertext: &event.raw_ciphertext,
-                        envelope: &event.envelope,
-                        redaction_version: event.redaction_version,
-                    },
-                );
-                sqlx::query(
-                    "INSERT INTO agent_events(
-                        seq, event_type, internal_metadata, raw_key_ref, raw_ciphertext,
-                        envelope, redaction_version, created_at
-                     ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
-                )
-                .bind(sqlite_i64(event.seq, "durable event sequence")?)
-                .bind(event.kind)
-                .bind(event.internal_metadata)
-                .bind(event.raw_key_ref)
-                .bind(event.raw_ciphertext)
-                .bind(event.envelope)
-                .bind(event.redaction_version as i64)
-                .bind(Utc::now().to_rfc3339())
-                .execute(&mut *transaction)
-                .await
-                .context("failed to append durable event")?;
-                let event_count = previous_count
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow!("durable event count overflow"))?;
-                let key = self
-                    .store
-                    .data_key_by_ref_in_transaction(&mut transaction, &head_key_ref)
-                    .await?;
-                let head_hmac = authenticate_event_head(
-                    self.store.scope(),
-                    &key,
-                    event.seq,
-                    event_count,
-                    &chain_digest,
-                )?;
-                updated_event_head = Some(EventLogHead {
-                    last_seq: event.seq,
-                    event_count,
-                    chain_digest,
-                    key_ref: head_key_ref,
-                    head_hmac,
-                });
+        for mut write in prepared {
+            let write_event_seq = write.event.as_ref().map(|event| event.seq);
+            let memory_keys = memory_projection_keys(&write);
+            let memory_bearing = !memory_keys.is_empty();
+            if memory_bearing && prepared_write_has_physical_recovery(&write) {
+                bail!("memory projection writes cannot carry PhysicalRecovery");
             }
+            if memory_bearing && write.event.is_none() {
+                bail!("memory projection write requires exactly one durable event");
+            }
+            if write
+                .event
+                .as_ref()
+                .is_some_and(|event| event.metadata.memory_projection.is_some())
+            {
+                bail!("callers cannot supply pre-finalized memory projection metadata");
+            }
+
+            let mut captured = Vec::with_capacity(memory_keys.len());
+            for key in memory_keys {
+                captured.push(
+                    capture_memory_projection_ref(self.store.scope(), &mut transaction, key)
+                        .await?,
+                );
+            }
+
+            if !memory_bearing && let Some(event) = write.event.take() {
+                append_prepared_event(
+                    self.store.as_ref(),
+                    &mut transaction,
+                    event,
+                    &mut updated_event_head,
+                )
+                .await?;
+            }
+
             for projection in write.projections {
                 let outcome = apply_projection(
                     self.store.as_ref(),
@@ -2417,6 +2604,7 @@ impl EventWriter {
                     projection,
                     &event_seqs,
                     physical_recovery.as_ref(),
+                    write_event_seq,
                 )
                 .await?;
                 if let Some(outcome) = outcome {
@@ -2425,6 +2613,60 @@ impl EventWriter {
                     }
                     receipt_outcome = Some(outcome);
                 }
+            }
+
+            if memory_bearing {
+                let mut event = write
+                    .event
+                    .take()
+                    .expect("memory-bearing write event was validated");
+                let initial_metadata_len = event.internal_metadata.len();
+                let mut changes = Vec::with_capacity(captured.len());
+                for previous in captured {
+                    changes.push(
+                        commit_memory_projection(
+                            self.store.scope(),
+                            &mut transaction,
+                            event.seq,
+                            previous,
+                        )
+                        .await?,
+                    );
+                }
+                let delta = MemoryProjectionDeltaV1::new(changes)?;
+                apply_memory_projection_delta(
+                    &mut updated_memory_projections,
+                    event.seq,
+                    &event.kind,
+                    Some(&delta),
+                )?;
+                event.metadata.memory_projection = Some(delta);
+                event.internal_metadata = serde_json::to_string(&event.metadata)
+                    .context("failed to finalize memory projection event metadata")?;
+                finalized_metadata_growth = finalized_metadata_growth
+                    .checked_add(
+                        event
+                            .internal_metadata
+                            .len()
+                            .saturating_sub(initial_metadata_len),
+                    )
+                    .ok_or_else(|| anyhow!("finalized event metadata byte count overflow"))?;
+                if finalized_metadata_growth > memory_metadata_reserve {
+                    bail!(
+                        "finalized memory projection metadata exceeded its deterministic preflight reserve"
+                    );
+                }
+                let finalized_transaction_bytes = transaction_bytes
+                    .checked_add(finalized_metadata_growth)
+                    .ok_or_else(|| anyhow!("finalized EventBatch byte count overflow"))?;
+                EventBatchSizer::validate(command_bounds, finalized_transaction_bytes)?;
+                append_prepared_event(
+                    self.store.as_ref(),
+                    &mut transaction,
+                    event,
+                    &mut updated_event_head,
+                )
+                .await?;
             }
             applied_writes = applied_writes.saturating_add(1);
             if fail_after_writes == Some(applied_writes) {
@@ -2464,6 +2706,7 @@ impl EventWriter {
         state.checkpoint = Some(LifecycleCheckpoint {
             event_head: updated_event_head,
             lifecycle: next_lifecycle.unwrap_or(checkpoint.lifecycle),
+            memory_projections: updated_memory_projections,
             historical_rows_visited: checkpoint.historical_rows_visited,
         });
         if let Some((name, true, readiness_path)) = effective_abrupt_failpoint {
@@ -2479,7 +2722,7 @@ impl EventWriter {
         &self,
         batch: EventBatch,
         first_seq: u64,
-    ) -> Result<(Vec<PreparedWrite>, usize, Vec<u64>)> {
+    ) -> Result<(Vec<PreparedWrite>, usize, usize, Vec<u64>)> {
         preflight_materialization_bounds(self.store.redactor(), &batch)?;
         let bounds = BatchBounds {
             command_count: batch.injected_commands.len(),
@@ -2542,6 +2785,20 @@ impl EventWriter {
         let mut transaction_bytes = 0usize;
         let mut event_seqs = Vec::new();
         for write in batch.writes {
+            let calibration_observed_prompt_tokens = write
+                .projections
+                .iter()
+                .find_map(|projection| match projection {
+                    Projection::MessageEnd {
+                        role: "assistant",
+                        message: PublicMessage::Assistant(message),
+                        ..
+                    } => Some(&message.usage),
+                    _ => None,
+                })
+                .map(observed_prompt_tokens)
+                .transpose()
+                .context("failed to derive calibration prompt usage")?;
             let assigned_seq = if write.event.is_some() {
                 let seq = next_seq;
                 sqlite_i64(seq, "durable event sequence")?;
@@ -2597,6 +2854,7 @@ impl EventWriter {
                     Some(PreparedEvent {
                         seq,
                         kind,
+                        metadata: event.metadata.clone(),
                         internal_metadata,
                         command_id,
                         run_id,
@@ -2862,6 +3120,24 @@ impl EventWriter {
                         )?;
                         projections.push(prepared);
                     }
+                    Projection::MemoryCalibrationObservation {
+                        uncalibrated_prompt_estimate,
+                    } => {
+                        let observed_prompt_tokens = calibration_observed_prompt_tokens
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "memory calibration observation has no assistant prompt usage"
+                                )
+                            })?;
+                        charge_transaction_bytes(
+                            &mut transaction_bytes,
+                            DURABLE_ROW_OVERHEAD_BYTES.saturating_add(16),
+                        )?;
+                        projections.push(PreparedProjection::MemoryCalibrationObservation {
+                            observed_prompt_tokens,
+                            uncalibrated_prompt_estimate,
+                        });
+                    }
                     projection => {
                         charge_transaction_bytes(
                             &mut transaction_bytes,
@@ -2873,8 +3149,21 @@ impl EventWriter {
             }
             prepared.push(PreparedWrite { event, projections });
         }
-        EventBatchSizer::validate(bounds, transaction_bytes)?;
-        Ok((prepared, transaction_bytes, event_seqs))
+        let memory_metadata_reserve = prepared.iter().try_fold(0usize, |total, write| {
+            total
+                .checked_add(memory_projection_metadata_upper_bound(write)?)
+                .ok_or_else(|| anyhow!("memory metadata preflight byte count overflow"))
+        })?;
+        let preflight_transaction_bytes = transaction_bytes
+            .checked_add(memory_metadata_reserve)
+            .ok_or_else(|| anyhow!("memory metadata preflight byte count overflow"))?;
+        EventBatchSizer::validate(bounds, preflight_transaction_bytes)?;
+        Ok((
+            prepared,
+            transaction_bytes,
+            memory_metadata_reserve,
+            event_seqs,
+        ))
     }
 
     fn prepare_command_insert(&self, input: CommandInsertInput<'_>) -> Result<PreparedProjection> {
@@ -3508,6 +3797,7 @@ impl EventWriter {
                 MemoryJobMutation::Claim { .. }
                     | MemoryJobMutation::Start { .. }
                     | MemoryJobMutation::Release { .. }
+                    | MemoryJobMutation::Discard { .. }
             ) {
                 None
             } else {
@@ -3544,6 +3834,27 @@ impl EventWriter {
         memory_summary_key: &mut Option<super::crypto::DataKeyMaterial>,
         transition: MemoryTransition,
     ) -> Result<PreparedProjection> {
+        for insert in &transition.batch_inserts {
+            let Some(summary) = &insert.summary else {
+                continue;
+            };
+            let key = self.store.data_key_by_ref(&summary.key_ref).await?;
+            if key.purpose != DataKeyPurpose::MemorySummary {
+                bail!(
+                    "memory batch insert summary key {} has purpose {}, expected {}",
+                    key.key_ref,
+                    key.purpose.as_str(),
+                    DataKeyPurpose::MemorySummary.as_str()
+                );
+            }
+            if let Some(expected) = memory_summary_key.as_ref() {
+                if expected.key_ref != key.key_ref {
+                    bail!("MemoryTransition cannot mix memory-summary key references");
+                }
+            } else {
+                *memory_summary_key = Some(key);
+            }
+        }
         let pre_source_versions = convert_batch_versions(transition.expected_source_versions)?;
         let mut post_source_versions = pre_source_versions.clone();
         let mut batch_mutations = Vec::with_capacity(transition.batch_mutations.len());
@@ -3638,6 +3949,7 @@ impl EventWriter {
                 MemoryJobMutation::Claim { .. }
                     | MemoryJobMutation::Start { .. }
                     | MemoryJobMutation::Release { .. }
+                    | MemoryJobMutation::Discard { .. }
             ) {
                 None
             } else {
@@ -3677,6 +3989,7 @@ impl EventWriter {
             job_mutations,
             batch_inserts: transition.batch_inserts,
             job_inserts: transition.job_inserts,
+            membership_inserts: transition.membership_inserts,
             cursor_advance: transition.cursor_advance,
             memory_summary_key_ref: key_ref,
             memory_summary_key_proof: key_proof,
@@ -4241,6 +4554,38 @@ impl EventWriter {
         DateTime::parse_from_rfc3339(&value)
             .map(|timestamp| timestamp.with_timezone(&Utc))
             .map_err(|error| anyhow!("persisted command received_at is invalid: {error}"))
+    }
+}
+
+impl BootstrapRecoveryGuard<'_> {
+    pub(in crate::store) async fn recover_provider_context_mutations(&mut self) -> Result<()> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT mutation_id FROM provider_context_mutations
+             WHERE state = 'prepared'
+             ORDER BY prepared_at, mutation_id",
+        )
+        .fetch_all(self.writer.store.pool())
+        .await
+        .context("failed to list prepared provider-context mutations")?;
+
+        for (mutation_id,) in rows {
+            self.apply_recovery_batch(EventBatch {
+                writes: vec![EventWrite {
+                    event: None,
+                    projections: vec![Projection::ProviderContextMutation(
+                        super::provider_context::ProviderContextMutation {
+                            mutation_id: mutation_id.clone(),
+                        },
+                    )],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .with_context(|| {
+                format!("failed to recover provider-context mutation {mutation_id}")
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -5776,6 +6121,7 @@ fn validate_batch_shape_with_recovery(
             bail!("approval resolution event and mutation disagree for {request_id}");
         }
     }
+    let mut calibration_observation_count = 0usize;
     for write in &batch.writes {
         let mut has_memory_maintenance = false;
         if let Some(event) = &write.event
@@ -5788,6 +6134,58 @@ fn validate_batch_shape_with_recovery(
         let mut provider_context_seen = false;
         let mut batch_ids: HashSet<String> = HashSet::new();
         let mut job_ids: HashSet<String> = HashSet::new();
+        let calibration_observations: Vec<u64> = write
+            .projections
+            .iter()
+            .filter_map(|projection| match projection {
+                Projection::MemoryCalibrationObservation {
+                    uncalibrated_prompt_estimate,
+                } => Some(*uncalibrated_prompt_estimate),
+                _ => None,
+            })
+            .collect();
+        if calibration_observations.len() > 1 {
+            bail!("only one memory calibration observation is allowed per EventWrite");
+        }
+        if let Some(uncalibrated_prompt_estimate) = calibration_observations.first().copied() {
+            calibration_observation_count = calibration_observation_count
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("memory calibration observation count overflow"))?;
+            if calibration_observation_count > 1 {
+                bail!("only one memory calibration observation is allowed per EventBatch");
+            }
+            if uncalibrated_prompt_estimate == 0 {
+                bail!("memory calibration estimate must be positive");
+            }
+            let mut assistant_messages = write.projections.iter().filter_map(|projection| {
+                let Projection::MessageEnd { role, message, .. } = projection else {
+                    return None;
+                };
+                match (role, message) {
+                    (&"assistant", PublicMessage::Assistant(message)) => Some(message),
+                    _ => None,
+                }
+            });
+            let assistant = assistant_messages.next().ok_or_else(|| {
+                anyhow!("memory calibration observation requires a same-write assistant MessageEnd")
+            })?;
+            if assistant_messages.next().is_some() {
+                bail!("memory calibration observation must bind exactly one assistant MessageEnd");
+            }
+            if matches!(
+                assistant.stop_reason,
+                StopReason::Error | StopReason::Aborted
+            ) || assistant.interrupted
+            {
+                bail!("memory calibration observation requires a successful provider terminal");
+            }
+            if observed_prompt_tokens(&assistant.usage)
+                .context("failed to derive calibration prompt usage")?
+                == 0
+            {
+                bail!("memory calibration observation requires reported prompt usage");
+            }
+        }
         for projection in &write.projections {
             match projection {
                 Projection::ProviderContextMutation(_) => {
@@ -5800,8 +6198,10 @@ fn validate_batch_shape_with_recovery(
                     provider_context_seen = true;
                 }
                 Projection::MemoryJobUpdate(update) => {
-                    if write.event.is_some() {
-                        bail!("MemoryJobUpdate projection must be eventless");
+                    if !has_memory_maintenance {
+                        bail!(
+                            "MemoryJobUpdate projection requires a same-write MemoryMaintenance event"
+                        );
                     }
                     if memory_transition_seen || memory_job_update_seen || provider_context_seen {
                         bail!("only one terminal mutation projection is allowed per EventWrite");
@@ -5861,17 +6261,8 @@ fn validate_batch_shape_with_recovery(
                                 insert.id
                             );
                         }
-                        if insert.state != MemoryBatchState::Compacting {
-                            bail!("MemoryTransition batch_inserts must be in Compacting state");
-                        }
                         if insert.version != 0 {
                             bail!("MemoryTransition batch_inserts must have version 0");
-                        }
-                        if insert.summary.is_some() {
-                            bail!("MemoryTransition batch_inserts must not carry a summary");
-                        }
-                        if insert.est_tokens != 0 || insert.eviction_footprint_tokens != 0 {
-                            bail!("MemoryTransition batch_inserts must have zero token estimates");
                         }
                     }
                     for mutation in &transition.job_mutations {
@@ -5900,9 +6291,9 @@ fn validate_batch_shape_with_recovery(
                             bail!("MemoryTransition job_inserts must have at least one source");
                         }
                     }
-                    if !has_memory_maintenance && write.event.is_some() {
+                    if !has_memory_maintenance {
                         bail!(
-                            "MemoryTransition projection must be eventless unless paired with a MemoryMaintenance event"
+                            "MemoryTransition projection requires a same-write MemoryMaintenance event"
                         );
                     }
                 }
@@ -6353,6 +6744,7 @@ fn projection_size_upper_bound(projection: &Projection) -> Result<usize> {
                     })
                     .sum::<usize>(),
             ),
+        Projection::MemoryCalibrationObservation { .. } => 16,
         Projection::ApprovalRule(rule) => rule
             .id
             .len()
@@ -8545,6 +8937,7 @@ async fn reconstruct_authenticated_checkpoint_in_transaction(
 ) -> Result<LifecycleCheckpoint> {
     let event_head = load_verified_event_head_in_transaction(store, transaction).await?;
     let mut lifecycle = DurableLifecycleState::default();
+    let mut memory_projections = BTreeMap::new();
     lifecycle.live_runs.extend(
         sqlx::query_scalar::<_, String>(
             "SELECT DISTINCT run_id FROM inbound_commands
@@ -8612,6 +9005,12 @@ async fn reconstruct_authenticated_checkpoint_in_transaction(
                 &event.envelope,
                 false,
             )?;
+            apply_memory_projection_delta(
+                &mut memory_projections,
+                seq,
+                &event.kind,
+                event.metadata.memory_projection.as_ref(),
+            )?;
             observed_count = observed_count
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("durable event count overflow"))?;
@@ -8630,11 +9029,65 @@ async fn reconstruct_authenticated_checkpoint_in_transaction(
                 && head.chain_digest == chain_digest => {}
         Some(_) => bail!("durable event history does not match authenticated head"),
     }
+    let stored_memory_projections =
+        load_verified_memory_projection_set(store.scope(), transaction).await?;
+    if stored_memory_projections != memory_projections {
+        bail!("memory projection rows do not exactly match authenticated event commitments");
+    }
     Ok(LifecycleCheckpoint {
         event_head,
         lifecycle,
+        memory_projections,
         historical_rows_visited: observed_count,
     })
+}
+
+fn apply_memory_projection_delta(
+    checkpoint: &mut BTreeMap<MemoryProjectionKey, MemoryProjectionRef>,
+    event_seq: u64,
+    event_kind: &str,
+    delta: Option<&MemoryProjectionDeltaV1>,
+) -> Result<()> {
+    let Some(delta) = delta else {
+        return Ok(());
+    };
+    if !matches!(event_kind, "memory_maintenance" | "message_end") {
+        bail!(
+            "durable event {event_seq} of kind {event_kind} cannot carry memory projection commitments"
+        );
+    }
+    if delta.changes.is_empty() {
+        bail!("durable event {event_seq} has an empty memory projection delta");
+    }
+    let mut previous_key: Option<MemoryProjectionKey> = None;
+    for change in &delta.changes {
+        let key = change.key();
+        if previous_key
+            .as_ref()
+            .is_some_and(|previous| previous >= &key)
+        {
+            bail!(
+                "durable event {event_seq} memory projection changes are not strictly sorted and unique"
+            );
+        }
+        let expected_previous = checkpoint.get(&key);
+        if expected_previous != change.previous.as_ref() {
+            bail!(
+                "durable event {event_seq} memory projection previous reference does not match {:?} {}",
+                key.entity,
+                key.id
+            );
+        }
+        checkpoint.insert(
+            key.clone(),
+            MemoryProjectionRef {
+                event_seq,
+                digest: change.current_digest,
+            },
+        );
+        previous_key = Some(key);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Default)]
@@ -9472,12 +9925,155 @@ async fn require_owner_count(
     Ok(())
 }
 
+async fn initialize_memory_batch_membership(
+    store: &Store,
+    transaction: &mut Transaction<'_, Sqlite>,
+    batch_id: &str,
+) -> Result<()> {
+    let seed = memory_membership_seed(store.scope(), batch_id);
+    let result = sqlx::query(
+        "UPDATE memory_batches
+         SET membership_count = 0, membership_digest = ?
+         WHERE id = ? AND membership_count = 0",
+    )
+    .bind(seed.as_slice())
+    .bind(batch_id)
+    .execute(&mut **transaction)
+    .await
+    .context("failed to initialize memory batch membership commitment")?;
+    require_single_cas(
+        result.rows_affected(),
+        "memory batch membership initialization",
+    )
+}
+
+async fn append_memory_batch_membership(
+    _store: &Store,
+    transaction: &mut Transaction<'_, Sqlite>,
+    batch_id: &str,
+    ord: i64,
+    message_id: &str,
+) -> Result<()> {
+    let row = sqlx::query(
+        "SELECT membership_count, membership_digest
+         FROM memory_batches WHERE id = ?",
+    )
+    .bind(batch_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .context("failed to load memory batch membership commitment")?;
+    let previous_count: i64 = row.try_get("membership_count")?;
+    let expected_ord = previous_count
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("memory batch membership count overflow"))?;
+    if ord != expected_ord {
+        bail!(
+            "memory batch {batch_id} append ordinal {ord} does not follow committed count {previous_count}"
+        );
+    }
+    let previous_digest: [u8; 32] = row
+        .try_get::<Vec<u8>, _>("membership_digest")?
+        .try_into()
+        .map_err(|_| anyhow!("memory batch {batch_id} membership digest has invalid length"))?;
+    let next_digest = extend_memory_membership_digest(
+        &previous_digest,
+        u64::try_from(ord).context("memory batch membership ordinal out of range")?,
+        message_id,
+    );
+    let result = sqlx::query(
+        "UPDATE memory_batches
+         SET membership_count = ?, membership_digest = ?
+         WHERE id = ? AND membership_count = ? AND membership_digest = ?",
+    )
+    .bind(expected_ord)
+    .bind(next_digest.as_slice())
+    .bind(batch_id)
+    .bind(previous_count)
+    .bind(previous_digest.as_slice())
+    .execute(&mut **transaction)
+    .await
+    .context("failed to append memory batch membership commitment")?;
+    require_single_cas(result.rows_affected(), "memory batch membership append")
+}
+
+async fn append_prepared_event(
+    store: &Store,
+    transaction: &mut Transaction<'_, Sqlite>,
+    event: PreparedEvent,
+    updated_event_head: &mut Option<EventLogHead>,
+) -> Result<()> {
+    let (previous_digest, previous_count, head_key_ref) = match updated_event_head.as_ref() {
+        Some(head) => {
+            if head.key_ref != event.raw_key_ref {
+                bail!("event-log key changed without an explicit rotation");
+            }
+            (head.chain_digest, head.event_count, head.key_ref.clone())
+        }
+        None => ([0_u8; EVENT_DIGEST_BYTES], 0, event.raw_key_ref.clone()),
+    };
+    let expected_seq = updated_event_head
+        .as_ref()
+        .map_or(1, |head| head.last_seq.saturating_add(1));
+    if event.seq != expected_seq {
+        bail!(
+            "durable event sequence is not contiguous: expected {expected_seq}, prepared {}",
+            event.seq
+        );
+    }
+    let chain_digest = extend_event_chain(
+        &previous_digest,
+        EventChainEntry {
+            seq: event.seq,
+            event_type: &event.kind,
+            internal_metadata: &event.internal_metadata,
+            key_ref: &event.raw_key_ref,
+            ciphertext: &event.raw_ciphertext,
+            envelope: &event.envelope,
+            redaction_version: event.redaction_version,
+        },
+    );
+    sqlx::query(
+        "INSERT INTO agent_events(
+            seq, event_type, internal_metadata, raw_key_ref, raw_ciphertext,
+            envelope, redaction_version, created_at
+         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(sqlite_i64(event.seq, "durable event sequence")?)
+    .bind(event.kind)
+    .bind(event.internal_metadata)
+    .bind(event.raw_key_ref)
+    .bind(event.raw_ciphertext)
+    .bind(event.envelope)
+    .bind(event.redaction_version as i64)
+    .bind(Utc::now().to_rfc3339())
+    .execute(&mut **transaction)
+    .await
+    .context("failed to append durable event")?;
+    let event_count = previous_count
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("durable event count overflow"))?;
+    let key = store
+        .data_key_by_ref_in_transaction(transaction, &head_key_ref)
+        .await?;
+    let head_hmac =
+        authenticate_event_head(store.scope(), &key, event.seq, event_count, &chain_digest)?;
+    *updated_event_head = Some(EventLogHead {
+        last_seq: event.seq,
+        event_count,
+        chain_digest,
+        key_ref: head_key_ref,
+        head_hmac,
+    });
+    Ok(())
+}
+
 async fn apply_projection(
     store: &Store,
     transaction: &mut Transaction<'_, Sqlite>,
     projection: PreparedProjection,
     batch_event_seqs: &[u64],
     physical_recovery: Option<&PhysicalRecoveryContext<'_>>,
+    memory_event_seq: Option<u64>,
 ) -> Result<Option<ApplyReceiptOutcome>> {
     match projection {
         PreparedProjection::MessageEnd {
@@ -9532,11 +10128,13 @@ async fn apply_projection(
                 require_single_cas(result.rows_affected(), "L0 source seal")?;
 
                 seal.target_record
-                    .insert(&mut **transaction)
+                    .insert_staged(transaction, event_seq)
                     .await
                     .context("failed to insert L1 target batch for L0 seal")?;
+                initialize_memory_batch_membership(store, transaction, &seal.target_record.id)
+                    .await?;
                 seal.job_record
-                    .insert(&mut **transaction)
+                    .insert_staged(transaction, event_seq)
                     .await
                     .context("failed to insert L0 compaction job for L0 seal")?;
             }
@@ -9573,9 +10171,10 @@ async fn apply_projection(
                 // explicit membership in the same transaction.
                 if let Some(record) = &create_l0_batch {
                     record
-                        .insert(&mut **transaction)
+                        .insert_staged(transaction, event_seq)
                         .await
                         .context("failed to insert open L0 batch for MessageEnd")?;
+                    initialize_memory_batch_membership(store, transaction, &record.id).await?;
                 }
 
                 MemoryBatchMessageRecord {
@@ -9586,6 +10185,8 @@ async fn apply_projection(
                 .insert(&mut **transaction)
                 .await
                 .context("failed to insert L0 batch membership")?;
+                append_memory_batch_membership(store, transaction, batch_id, ord, &message_id)
+                    .await?;
 
                 // Add this message's public transcript estimate to the batch.
                 // Newly-created batches already carry the first message's
@@ -9703,6 +10304,7 @@ async fn apply_projection(
             job_mutations,
             batch_inserts,
             job_inserts,
+            membership_inserts,
             cursor_advance,
             ..
         } => {
@@ -9715,7 +10317,26 @@ async fn apply_projection(
                 job_mutations,
                 batch_inserts,
                 job_inserts,
+                membership_inserts,
                 cursor_advance,
+                memory_event_seq.ok_or_else(|| {
+                    anyhow!("MemoryTransition is missing its durable event sequence")
+                })?,
+            )
+            .await?;
+        }
+        PreparedProjection::MemoryCalibrationObservation {
+            observed_prompt_tokens,
+            uncalibrated_prompt_estimate,
+        } => {
+            let event_seq = memory_event_seq.ok_or_else(|| {
+                anyhow!("memory calibration observation is missing its durable event sequence")
+            })?;
+            apply_memory_calibration_observation(
+                transaction,
+                event_seq,
+                observed_prompt_tokens,
+                uncalibrated_prompt_estimate,
             )
             .await?;
         }
@@ -9742,6 +10363,9 @@ async fn apply_plain_projection(
 ) -> Result<Option<ApplyReceiptOutcome>> {
     match projection {
         Projection::MessageEnd { .. } => unreachable!("MessageEnd is prepared separately"),
+        Projection::MemoryCalibrationObservation { .. } => {
+            unreachable!("memory calibration observation is prepared separately")
+        }
         Projection::CommandReceived { .. } | Projection::CommandRejected { .. } => {
             unreachable!("command insert is prepared separately")
         }
@@ -10036,6 +10660,58 @@ async fn apply_memory_job_update(
     Ok(())
 }
 
+async fn apply_memory_calibration_observation(
+    transaction: &mut Transaction<'_, Sqlite>,
+    event_seq: u64,
+    observed_prompt_tokens: u64,
+    uncalibrated_prompt_estimate: u64,
+) -> Result<()> {
+    let saved_bits: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT ratio_bits FROM memory_calibration WHERE singleton = 1")
+            .fetch_optional(&mut **transaction)
+            .await
+            .context("failed to load current memory calibration")?;
+    let mut calibration = match saved_bits.as_deref() {
+        Some(bits) => {
+            let bits: [u8; 8] = bits
+                .try_into()
+                .map_err(|_| anyhow!("memory calibration ratio_bits has invalid length"))?;
+            TokenCalibration::new(f64::from_bits(u64::from_be_bytes(bits)))
+                .context("stored memory calibration ratio is invalid")?
+        }
+        None => TokenCalibration::default(),
+    };
+    calibration
+        .update_ema(
+            observed_prompt_tokens,
+            uncalibrated_prompt_estimate,
+            TOKEN_CALIBRATION_EMA_ALPHA,
+        )
+        .context("failed to update memory calibration EMA")?;
+    let ratio_bits = calibration.ratio().to_bits().to_be_bytes();
+    if saved_bits.is_some() {
+        let result =
+            sqlx::query("UPDATE memory_calibration SET ratio_bits = ? WHERE singleton = 1")
+                .bind(ratio_bits.as_slice())
+                .execute(&mut **transaction)
+                .await
+                .context("failed to update memory calibration")?;
+        require_single_cas(result.rows_affected(), "memory calibration update")?;
+    } else {
+        sqlx::query(
+            "INSERT INTO memory_calibration(
+                singleton, ratio_bits, projection_event_seq, projection_digest
+             ) VALUES(1, ?, ?, zeroblob(32))",
+        )
+        .bind(ratio_bits.as_slice())
+        .bind(i64::try_from(event_seq).context("memory calibration event sequence out of range")?)
+        .execute(&mut **transaction)
+        .await
+        .context("failed to insert memory calibration")?;
+    }
+    Ok(())
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "prepared projection decomposition"
@@ -10049,7 +10725,9 @@ async fn apply_memory_transition(
     job_mutations: Vec<PreparedMemoryJobMutation>,
     batch_inserts: Vec<MemoryBatchRecord>,
     job_inserts: Vec<MemoryJobRecord>,
+    mut membership_inserts: Vec<MemoryBatchMessageRecord>,
     cursor_advance: Option<MemoryApplyCursorAdvance>,
+    event_seq: u64,
 ) -> Result<()> {
     verify_source_versions(transaction, &expected_source_versions, None).await?;
     verify_source_states(transaction, &expected_source_states).await?;
@@ -10114,9 +10792,10 @@ async fn apply_memory_transition(
         batch.ord = next_ord;
         assigned_batch_seqs.insert(batch.id.clone(), next_seq);
         batch
-            .insert(&mut **transaction)
+            .insert_staged(transaction, event_seq)
             .await
             .context("failed to insert memory batch in transition")?;
+        initialize_memory_batch_membership(store, transaction, &batch.id).await?;
     }
 
     for batch in batch_mutations {
@@ -10124,41 +10803,103 @@ async fn apply_memory_transition(
     }
 
     for mut job in job_inserts {
-        let target_id = job
+        let target_ids = job
             .source_versions
             .keys()
-            .find(|id| assigned_batch_seqs.contains_key(id.as_str()))
+            .filter(|id| !job.source_ids.contains(id))
             .cloned()
-            .ok_or_else(|| anyhow!("inserted job {} has no target batch witness", job.id))?;
-        let batch_seq = assigned_batch_seqs
-            .get(target_id.as_str())
-            .copied()
-            .ok_or_else(|| {
-                anyhow!(
-                    "inserted job {} references target batch {} not created in the same transition",
+            .collect::<Vec<_>>();
+        let [target_id] = target_ids.as_slice() else {
+            bail!(
+                "inserted job {} must have exactly one target batch witness",
+                job.id
+            );
+        };
+        if let Some(batch_seq) = assigned_batch_seqs.get(target_id).copied() {
+            job.batch_seq = batch_seq;
+        } else {
+            let stored_batch_seq: i64 =
+                sqlx::query_scalar("SELECT batch_seq FROM memory_batches WHERE id = ?")
+                    .bind(target_id)
+                    .fetch_optional(&mut **transaction)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "inserted job {} references missing target batch {}",
+                            job.id,
+                            target_id
+                        )
+                    })?;
+            if stored_batch_seq != job.batch_seq {
+                bail!(
+                    "inserted job {} target batch {} has sequence {}, expected {}",
                     job.id,
-                    target_id
-                )
-            })?;
-        job.batch_seq = batch_seq;
-        job.insert(&mut **transaction)
+                    target_id,
+                    stored_batch_seq,
+                    job.batch_seq
+                );
+            }
+        }
+        job.insert_staged(transaction, event_seq)
             .await
             .context("failed to insert memory job in transition")?;
+    }
+
+    membership_inserts.sort_by(|left, right| {
+        left.batch_id
+            .as_bytes()
+            .cmp(right.batch_id.as_bytes())
+            .then_with(|| left.ord.cmp(&right.ord))
+            .then_with(|| left.message_id.as_bytes().cmp(right.message_id.as_bytes()))
+    });
+    for membership in membership_inserts {
+        membership
+            .insert(&mut **transaction)
+            .await
+            .context("failed to insert memory batch membership in transition")?;
+        append_memory_batch_membership(
+            store,
+            transaction,
+            &membership.batch_id,
+            membership.ord,
+            &membership.message_id,
+        )
+        .await?;
     }
 
     for job in job_mutations {
         apply_memory_job_mutation(transaction, job).await?;
     }
     if let Some(cursor) = cursor_advance {
-        let advanced = MemoryApplyCursorRecord {
+        let cursor_record = MemoryApplyCursorRecord {
             kind: cursor.kind,
             next_batch_seq: sqlite_i64(cursor.next, "memory apply cursor next")?,
-        }
-        .advance(
-            &mut **transaction,
-            sqlite_i64(cursor.expected, "memory apply cursor expected")?,
-        )
-        .await?;
+        };
+        let advanced = if cursor.initialize {
+            let result = sqlx::query(
+                "INSERT INTO memory_apply_cursors(
+                    kind, next_batch_seq, projection_event_seq, projection_digest
+                 ) VALUES(?, ?, ?, zeroblob(32))
+                 ON CONFLICT(kind) DO NOTHING",
+            )
+            .bind(&cursor_record.kind)
+            .bind(cursor_record.next_batch_seq)
+            .bind(
+                i64::try_from(event_seq)
+                    .context("memory projection event sequence out of range")?,
+            )
+            .execute(&mut **transaction)
+            .await
+            .context("failed to initialize memory apply cursor")?;
+            result.rows_affected() == 1
+        } else {
+            cursor_record
+                .advance(
+                    &mut **transaction,
+                    sqlite_i64(cursor.expected, "memory apply cursor expected")?,
+                )
+                .await?
+        };
         if !advanced {
             bail!("memory apply cursor CAS failed");
         }
@@ -10301,6 +11042,17 @@ async fn apply_memory_batch_mutation(
             .execute(&mut **transaction)
             .await
             .context("failed to delete memory batch membership")?;
+        let empty_membership = memory_membership_seed(store.scope(), &batch.batch_id);
+        sqlx::query(
+            "UPDATE memory_batches
+             SET membership_count = 0, membership_digest = ?
+             WHERE id = ?",
+        )
+        .bind(empty_membership.as_slice())
+        .bind(&batch.batch_id)
+        .execute(&mut **transaction)
+        .await
+        .context("failed to reset memory batch membership commitment")?;
 
         let protected_key_refs = ProviderContextMutationApplier::new(store)
             .scrub_erased_provider_context_intents(transaction, &erased_provider_context_ids)
@@ -10765,7 +11517,7 @@ mod tests {
         runtime::contracts::{GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease},
         store::{
             AgentScope, ApplyReceiptOutcome, HydrationOutcome, KeyProvider, PhysicalRecoveryIntent,
-            PhysicalRecoveryReceipt, RecoveryStep, SuffixRecovery,
+            PhysicalRecoveryReceipt, RecoveryStep, ResumeDirective, SuffixRecovery,
             crypto::{
                 DATA_KEY_BYTES, DataKeyMaterial, DataKeyScope, KeyWrapAad, WrappingKey,
                 decrypt_content, encrypt_content, wrap_data_key,
@@ -11011,19 +11763,22 @@ mod tests {
     #[tokio::test]
     async fn memory_job_null_lease_cas_can_leave_running() {
         let store = test_store().await;
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
         sqlx::query(
             "INSERT INTO memory_jobs(
                 id, kind, batch_seq, source_ids, source_versions, status, lease_until,
-                attempts, created_at, updated_at
-             ) VALUES('null-lease-job', 'compact', 1, '[]', '{}', 'running', NULL, 0, ?, ?)",
+                attempts, projection_event_seq, projection_digest, created_at, updated_at
+             ) VALUES(
+                'null-lease-job', 'compact', 1, '[]', '{}', 'running', NULL, 0,
+                1, zeroblob(32), ?, ?
+             )",
         )
         .bind(Utc::now().to_rfc3339())
         .bind(Utc::now().to_rfc3339())
-        .execute(store.pool())
+        .execute(&mut *transaction)
         .await
         .expect("insert running job without lease");
 
-        let mut transaction = store.pool().begin().await.expect("begin transaction");
         apply_memory_job_mutation(
             &mut transaction,
             PreparedMemoryJobMutation {
@@ -11040,14 +11795,14 @@ mod tests {
         )
         .await
         .expect("NULL-safe lease CAS");
-        transaction.commit().await.expect("commit transition");
 
         let status: String =
             sqlx::query_scalar("SELECT status FROM memory_jobs WHERE id='null-lease-job'")
-                .fetch_one(store.pool())
+                .fetch_one(&mut *transaction)
                 .await
                 .expect("load transitioned job");
         assert_eq!(status, "failed");
+        transaction.rollback().await.expect("rollback test fixture");
     }
 
     fn user_command(seq: u64, command_id: &str, text: &str) -> InboundCommand {
@@ -11492,6 +12247,248 @@ mod tests {
         )
     }
 
+    async fn commit_calibrated_terminal(
+        writer: &EventWriter,
+        command_seq: u64,
+        command_id: &str,
+        observed_prompt_tokens: u64,
+        uncalibrated_prompt_estimate: u64,
+    ) -> (u64, [u8; 8]) {
+        let injected =
+            classified_injection(writer, command_seq, command_id, "", "calibration").await;
+        writer
+            .apply(EventBatch {
+                writes: injection_writes(command_id, "", "calibration"),
+                injected_commands: vec![injected],
+            })
+            .await
+            .expect("persist calibration user injection");
+
+        let run_id = format!("run-{command_id}");
+        let turn_id = format!("turn-{command_id}");
+        let message_id = format!("assistant-calibration-{command_id}");
+        let message = PublicMessage::Assistant(PublicAssistantMessage {
+            content: Vec::new(),
+            model: "test-model".to_owned(),
+            provider: "test-provider".to_owned(),
+            origin: test_provider_origin(),
+            usage: Usage {
+                input: observed_prompt_tokens,
+                total_tokens: observed_prompt_tokens,
+                ..Usage::default()
+            },
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: durable_test_timestamp(),
+        });
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::message_in_turn(
+                            "message_start",
+                            &message_id,
+                            &message,
+                            Some(run_id.clone()),
+                            Some(turn_id.clone()),
+                        )
+                        .expect("calibration assistant MessageStart"),
+                    ),
+                    projections: vec![Projection::RunPhase {
+                        command_id: command_id.to_owned(),
+                        run_id: run_id.clone(),
+                        expected: RunPhase::UserCommitted,
+                        next: RunPhase::AssistantStarted,
+                    }],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("open calibration assistant");
+
+        let (seqs, ratio_bits) = writer
+            .apply_with_calibration_receipt(EventBatch {
+                writes: vec![
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::message_in_turn(
+                                "message_end",
+                                &message_id,
+                                &message,
+                                Some(run_id.clone()),
+                                Some(turn_id.clone()),
+                            )
+                            .expect("calibration assistant MessageEnd"),
+                        ),
+                        projections: vec![
+                            Projection::MessageEnd {
+                                message_id: message_id.clone(),
+                                role: "assistant",
+                                message: message.clone(),
+                                append_to_l0: true,
+                                provider_context: Vec::new(),
+                                eviction_footprint_tokens: 0,
+                            },
+                            Projection::MemoryCalibrationObservation {
+                                uncalibrated_prompt_estimate,
+                            },
+                        ],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::turn_end(
+                                run_id.clone(),
+                                turn_id,
+                                message.clone(),
+                                Vec::new(),
+                            )
+                            .expect("calibration TurnEnd"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::agent_end(run_id.clone()).expect("calibration AgentEnd"),
+                        ),
+                        projections: vec![Projection::CommandApplied {
+                            command_id: command_id.to_owned(),
+                            command_seq,
+                            run_id: Some(run_id),
+                        }],
+                    },
+                ],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("commit calibration assistant terminal");
+        assert_eq!(seqs.len(), 3);
+        (
+            seqs[0],
+            ratio_bits.expect("calibration terminal must return exact committed bits"),
+        )
+    }
+
+    #[tokio::test]
+    async fn calibration_observations_commit_exact_ema_receipts_and_authenticate_on_restart() {
+        let path = std::env::current_dir()
+            .expect("current package directory")
+            .join("target")
+            .join(format!("sumi-memory-calibration-{}.sqlite", Uuid::now_v7()));
+        let store = file_test_store(&path).await;
+        let writer = EventWriter::new(store.clone());
+        let mut expected = TokenCalibration::default();
+
+        let (first_event_seq, first_bits) = commit_calibrated_terminal(
+            &writer,
+            1,
+            "00000000-0000-4000-8000-000000000091",
+            200,
+            100,
+        )
+        .await;
+        expected
+            .update_ema(200, 100, TOKEN_CALIBRATION_EMA_ALPHA)
+            .expect("first expected EMA");
+        assert_eq!(
+            first_bits,
+            expected.ratio().to_bits().to_be_bytes(),
+            "receipt must carry the exact first committed ratio"
+        );
+
+        let (second_event_seq, second_bits) =
+            commit_calibrated_terminal(&writer, 2, "00000000-0000-4000-8000-000000000092", 50, 100)
+                .await;
+        expected
+            .update_ema(50, 100, TOKEN_CALIBRATION_EMA_ALPHA)
+            .expect("second expected EMA");
+        assert_eq!(
+            second_bits,
+            expected.ratio().to_bits().to_be_bytes(),
+            "receipt must carry the exact second committed ratio"
+        );
+
+        let row = sqlx::query(
+            "SELECT ratio_bits, projection_event_seq, projection_digest
+             FROM memory_calibration WHERE singleton = 1",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("committed calibration row");
+        assert_eq!(row.get::<Vec<u8>, _>("ratio_bits"), second_bits);
+        assert_eq!(
+            row.get::<i64, _>("projection_event_seq"),
+            i64::try_from(second_event_seq).expect("event seq fits SQLite")
+        );
+        let row_digest = row.get::<Vec<u8>, _>("projection_digest");
+        assert_eq!(row_digest.len(), 32);
+        assert_ne!(row_digest, vec![0; 32]);
+
+        let metadata: DurableEventMetadata = serde_json::from_str(
+            &sqlx::query_scalar::<_, String>(
+                "SELECT internal_metadata FROM agent_events WHERE seq = ?",
+            )
+            .bind(i64::try_from(second_event_seq).expect("event seq fits SQLite"))
+            .fetch_one(store.pool())
+            .await
+            .expect("calibration event metadata"),
+        )
+        .expect("typed calibration event metadata");
+        let delta = metadata
+            .memory_projection
+            .expect("calibration MessageEnd carries a projection delta");
+        let change = delta
+            .changes
+            .iter()
+            .find(|change| change.entity == MemoryProjectionEntity::Calibration)
+            .expect("calibration delta entry");
+        assert_eq!(change.id, MEMORY_CALIBRATION_ID);
+        assert_eq!(
+            change
+                .previous
+                .as_ref()
+                .expect("second observation links the first")
+                .event_seq,
+            first_event_seq
+        );
+        assert_eq!(change.current_digest.as_slice(), row_digest.as_slice());
+
+        drop(writer);
+        store.pool().close().await;
+        drop(store);
+        let reopened = file_test_store(&path).await;
+        let reopened_writer = EventWriter::new(reopened.clone());
+        reopened_writer
+            .initialize_recovery_checkpoint()
+            .await
+            .expect("restart authenticates committed calibration");
+
+        sqlx::query("UPDATE memory_calibration SET ratio_bits = ? WHERE singleton = 1")
+            .bind(9.0_f64.to_bits().to_be_bytes().as_slice())
+            .execute(reopened.pool())
+            .await
+            .expect("tamper calibration ratio");
+        drop(reopened_writer);
+        reopened.pool().close().await;
+        drop(reopened);
+        let tampered = file_test_store(&path).await;
+        let error = EventWriter::new(tampered.clone())
+            .initialize_recovery_checkpoint()
+            .await
+            .expect_err("restart must reject calibration ratio tampering");
+        assert!(
+            format!("{error:#}").contains("memory projection digest mismatch"),
+            "{error:#}"
+        );
+
+        tampered.pool().close().await;
+        drop(tampered);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    }
+
     #[tokio::test]
     async fn event_batch_assigns_ordered_sequences_and_message_end_is_atomic() {
         let store = test_store().await;
@@ -11559,7 +12556,7 @@ mod tests {
             injected_commands: vec![injected.clone()],
         };
         validate_batch_shape(store.redactor(), &batch).expect("valid injection shape");
-        let (prepared, _, _) = writer
+        let (prepared, _, _, _) = writer
             .prepare_batch(batch, 1)
             .await
             .expect("prepare injection");
@@ -11721,7 +12718,7 @@ mod tests {
                 injected_commands: vec![injected.clone()],
             };
             validate_batch_shape(store.redactor(), &batch).expect("valid steer injection shape");
-            let (prepared, _, _) = writer
+            let (prepared, _, _, _) = writer
                 .prepare_batch(batch, 1)
                 .await
                 .expect("prepare steer injection");
@@ -11778,13 +12775,13 @@ mod tests {
             injected_commands: Vec::new(),
         };
         let projection_run_id = String::new();
-        let (_, adjusted_base, _) = writer
+        let (_, adjusted_base, _, _) = writer
             .prepare_batch(make_batch(String::new(), projection_run_id.clone()), 1)
             .await
             .expect("measure parity-adjusted real row base");
         let event_run_bytes = EVENT_BATCH_MAX_BYTES - adjusted_base;
         let exact_event_run_id = "x".repeat(event_run_bytes);
-        let (_, exact, _) = writer
+        let (_, exact, _, _) = writer
             .prepare_batch(
                 make_batch(exact_event_run_id.clone(), projection_run_id.clone()),
                 2,
@@ -17177,7 +18174,7 @@ mod tests {
             }],
             injected_commands: Vec::new(),
         };
-        let (prepared, _, _) = writer
+        let (prepared, _, _, _) = writer
             .prepare_batch(batch, 1)
             .await
             .expect("prepare ciphertext with original key material");
@@ -17261,7 +18258,7 @@ mod tests {
             }],
             injected_commands: Vec::new(),
         };
-        let (prepared, _, _) = writer
+        let (prepared, _, _, _) = writer
             .prepare_batch(batch, 1)
             .await
             .expect("prepare message_end with provider-context key material");
@@ -20620,19 +21617,21 @@ mod tests {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
 
-        // First user message creates an open L0 batch.
+        // A sufficiently large first user message creates an open L0 batch
+        // already beyond the ordinary boundary.
         let command_id_1 = "00000000-0000-4000-8000-000000000001";
-        let injection_1 = classified_injection(&writer, 1, command_id_1, "msg-1", "first").await;
+        let first = "x".repeat(
+            usize::try_from((L0_BATCH_MIN + 1) * 4).expect("fixture length must fit usize"),
+        );
+        let injection_1 = classified_injection(&writer, 1, command_id_1, "msg-1", &first).await;
         writer
             .apply(EventBatch {
-                writes: injection_writes(command_id_1, "msg-1", "first"),
+                writes: injection_writes(command_id_1, "msg-1", &first),
                 injected_commands: vec![injection_1],
             })
             .await
             .expect("apply first user message");
 
-        // Bump the open batch's estimate so the next user message crosses the
-        // ordinary L0 batch boundary (L0_BATCH_MIN).
         let (first_batch_id,): (String,) =
             sqlx::query_as("SELECT id FROM memory_batches WHERE layer = ? AND state = 'open'")
                 .bind(crate::store::MemoryLayer::L0.as_i64())
@@ -20640,12 +21639,6 @@ mod tests {
                 .await
                 .expect("load open L0 batch");
         let bumped_est = i64::try_from(L0_BATCH_MIN + 1).expect("test est_tokens fits i64");
-        sqlx::query("UPDATE memory_batches SET est_tokens = ? WHERE id = ?")
-            .bind(bumped_est)
-            .bind(&first_batch_id)
-            .execute(store.pool())
-            .await
-            .expect("set open batch est_tokens");
 
         // Second user message should seal the first batch, reserve an L1
         // compaction job, and append to a fresh open L0 batch.
@@ -20717,10 +21710,13 @@ mod tests {
         let command_id = "00000000-0000-4000-8000-000000000001";
         let run_id = format!("run-{command_id}");
         let turn_id = format!("turn-{command_id}");
-        let injection = classified_injection(&writer, 1, command_id, "msg-1", "first").await;
+        let first = "x".repeat(
+            usize::try_from((L0_BATCH_MIN - 1) * 4).expect("fixture length must fit usize"),
+        );
+        let injection = classified_injection(&writer, 1, command_id, "msg-1", &first).await;
         writer
             .apply(EventBatch {
-                writes: injection_writes(command_id, "msg-1", "first"),
+                writes: injection_writes(command_id, "msg-1", &first),
                 injected_commands: vec![injection],
             })
             .await
@@ -20776,22 +21772,15 @@ mod tests {
             .await
             .expect("append assistant message");
 
-        // Load the open batch and bump its estimate just below the ordinary
-        // L0 batch boundary so the first steer message does not seal, but the
-        // second one does after the first appends its tokens.
+        // The first persisted message is exactly one estimated token below the
+        // ordinary boundary, so the first steer does not seal and the second
+        // does after the first appends its token.
         let (first_batch_id,): (String,) =
             sqlx::query_as("SELECT id FROM memory_batches WHERE layer = ? AND state = 'open'")
                 .bind(crate::store::MemoryLayer::L0.as_i64())
                 .fetch_one(store.pool())
                 .await
                 .expect("load open L0 batch");
-        let pre_seal_est = i64::try_from(L0_BATCH_MIN - 1).expect("test est_tokens fits i64");
-        sqlx::query("UPDATE memory_batches SET est_tokens = ? WHERE id = ?")
-            .bind(pre_seal_est)
-            .bind(&first_batch_id)
-            .execute(store.pool())
-            .await
-            .expect("set open batch est_tokens");
 
         // Inject two user messages as a soft-steer group. The first appends to
         // the existing open batch; the second forces a normal seal/split.
@@ -20932,33 +21921,26 @@ mod tests {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
 
-        // Open an L0 batch with a user message.
+        // Open an L0 batch with a user message beyond the normal boundary.
         let command_id_1 = "00000000-0000-4000-8000-000000000001";
-        let injection_1 = classified_injection(&writer, 1, command_id_1, "msg-1", "first").await;
+        let first = "x".repeat(
+            usize::try_from((L0_BATCH_MIN + 1) * 4).expect("fixture length must fit usize"),
+        );
+        let injection_1 = classified_injection(&writer, 1, command_id_1, "msg-1", &first).await;
         writer
             .apply(EventBatch {
-                writes: injection_writes(command_id_1, "msg-1", "first"),
+                writes: injection_writes(command_id_1, "msg-1", &first),
                 injected_commands: vec![injection_1],
             })
             .await
             .expect("apply first user message");
 
-        // Bump the open batch so the next user message triggers a boundary
-        // decision that must load the existing message.
         let (first_batch_id,): (String,) =
             sqlx::query_as("SELECT id FROM memory_batches WHERE layer = ? AND state = 'open'")
                 .bind(crate::store::MemoryLayer::L0.as_i64())
                 .fetch_one(store.pool())
                 .await
                 .expect("load open L0 batch");
-        let bumped_est = i64::try_from(L0_BATCH_MIN + 1).expect("test est_tokens fits i64");
-        sqlx::query("UPDATE memory_batches SET est_tokens = ? WHERE id = ?")
-            .bind(bumped_est)
-            .bind(&first_batch_id)
-            .execute(store.pool())
-            .await
-            .expect("set open batch est_tokens");
-
         // Corrupt the durable ciphertext of the existing user message while
         // leaving the redacted payload intact. The old boundary decision
         // decrypted every row and would now fail; the new decision uses payload
@@ -22455,9 +23437,7 @@ mod tests {
             .expect("canonical cold-boot hydration after MessageEnd reopen")
         {
             HydrationOutcome::Complete(state) => state,
-            HydrationOutcome::RecoveryRequired(_) => {
-                panic!("completed assistant turn must not require physical recovery")
-            }
+            other => panic!("completed assistant turn must not require recovery: {other:?}"),
         };
         assert_eq!(hydrated.provider_context, expected_context);
 
@@ -22952,16 +23932,30 @@ mod tests {
         let store = test_store().await;
         let writer = EventWriter::new(store.clone());
         let batch_id = BatchId::from_u128(1);
-        sqlx::query(
-            "INSERT INTO memory_batches(
-                id, layer, ord, batch_seq, version, state, est_tokens,
-                eviction_footprint_tokens, updated_at
-             ) VALUES(?, 1, 0, 0, 1, 'open', 0, 0, 'now')",
-        )
-        .bind(batch_id.to_string())
-        .execute(store.pool())
-        .await
-        .expect("seed memory batch");
+        writer
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::memory_maintenance("fixture_batch_insert")
+                            .expect("fixture memory-maintenance event"),
+                    ),
+                    projections: vec![Projection::MemoryTransition(MemoryTransition {
+                        batch_inserts: vec![MemoryBatchRecord::new(
+                            batch_id.to_string(),
+                            MemoryLayer::L1,
+                            0,
+                            0,
+                            MemoryBatchState::Sealed,
+                            0,
+                            0,
+                        )],
+                        ..Default::default()
+                    })],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("seed authenticated memory batch");
 
         let batch = EventBatch {
             writes: vec![EventWrite {
@@ -22976,8 +23970,8 @@ mod tests {
                     expected_source_versions: BTreeMap::new(),
                     batch_mutations: vec![MemoryBatchMutation {
                         batch_id,
-                        expected_version: 1,
-                        new_state: MemoryBatchState::Sealed,
+                        expected_version: 0,
+                        new_state: MemoryBatchState::Compacting,
                         summary: None,
                         est_tokens: 0,
                         footprint_delta: 0,
@@ -23002,13 +23996,13 @@ mod tests {
             .fetch_one(store.pool())
             .await
             .expect("fetch batch");
-        assert_eq!(row.get::<i64, _>("version"), 1);
-        assert_eq!(row.get::<String, _>("state"), "open");
+        assert_eq!(row.get::<i64, _>("version"), 0);
+        assert_eq!(row.get::<String, _>("state"), "sealed");
         let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
             .fetch_one(store.pool())
             .await
             .expect("count agent events");
-        assert_eq!(events, 0);
+        assert_eq!(events, 1);
     }
 
     #[tokio::test]
@@ -23795,12 +24789,10 @@ mod tests {
                 assert!(state.messages.is_empty());
                 assert!(state.provider_context.is_empty());
                 assert!(state.memory.is_empty());
-                assert!(state.recovery_steps.is_empty());
+                assert_eq!(state.resume, ResumeDirective::AdmitCommands);
                 assert_eq!(state.receipt.intent_count, 0);
             }
-            HydrationOutcome::RecoveryRequired(_) => {
-                panic!("clean store must not require physical recovery")
-            }
+            other => panic!("clean store must not require recovery: {other:?}"),
         }
     }
 
@@ -23849,14 +24841,14 @@ mod tests {
         let lease = test_lease(2);
         let fence = test_fence(&lease);
         match store.hydrate(&lease, &fence).await.unwrap() {
-            HydrationOutcome::RecoveryRequired(intents) => {
+            HydrationOutcome::PhysicalRecoveryRequired(intents) => {
                 assert_eq!(intents.len(), 1);
                 assert_eq!(intents[0].tool_call_id, tool_call_id);
                 assert_eq!(intents[0].command_id, TOOL_OWNER_COMMAND_ID);
                 assert_eq!(intents[0].run_id, run_id);
                 assert_eq!(intents[0].executor_generation, test_process_generation(1));
             }
-            HydrationOutcome::Complete(_) => panic!("running tool must keep boot fail-closed"),
+            other => panic!("running tool must keep boot fail-closed: {other:?}"),
         }
 
         sqlx::query(
@@ -24007,6 +24999,7 @@ mod tests {
             },
         ];
         let footprint = eviction_footprint_for_test(&assistant.origin, &fragments);
+        let terminal_message = message.clone();
 
         writer
             .apply(EventBatch {
@@ -24043,10 +25036,30 @@ mod tests {
                         projections: vec![Projection::MessageEnd {
                             message_id: message_id.to_owned(),
                             role: "assistant",
-                            message,
+                            message: message.clone(),
                             append_to_l0: true,
                             provider_context: fragments,
                             eviction_footprint_tokens: footprint,
+                        }],
+                    },
+                    EventWrite {
+                        event: Some(
+                            DurableEvent::turn_end(
+                                run_id.clone(),
+                                turn_id.clone(),
+                                terminal_message,
+                                Vec::new(),
+                            )
+                            .expect("TurnEnd"),
+                        ),
+                        projections: Vec::new(),
+                    },
+                    EventWrite {
+                        event: Some(DurableEvent::agent_end(run_id.clone()).expect("AgentEnd")),
+                        projections: vec![Projection::CommandApplied {
+                            command_id: command_id.to_owned(),
+                            command_seq: 1,
+                            run_id: Some(run_id.clone()),
                         }],
                     },
                 ],
@@ -24127,7 +25140,97 @@ mod tests {
                 assert_eq!(memory.l0()[0].messages.len(), 2);
                 assert_eq!(memory.l0()[0].eviction_footprint_tokens, expected_footprint);
             }
-            HydrationOutcome::RecoveryRequired(_) => panic!("clean assistant turn must complete"),
+            other => panic!("clean assistant turn must complete: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hydrate_rejects_memory_row_and_membership_tampering() {
+        for tamper in ["row", "delete", "reorder", "extra"] {
+            let store = test_store().await;
+            let writer = EventWriter::new(store.clone());
+            seed_assistant_with_reasoning(&store, &writer).await;
+            let batch_id: String =
+                sqlx::query_scalar("SELECT id FROM memory_batches WHERE layer = 0")
+                    .fetch_one(store.pool())
+                    .await
+                    .expect("load authenticated L0 batch");
+
+            match tamper {
+                "row" => {
+                    sqlx::query(
+                        "UPDATE memory_batches
+                         SET est_tokens = est_tokens + 1
+                         WHERE id = ?",
+                    )
+                    .bind(&batch_id)
+                    .execute(store.pool())
+                    .await
+                    .expect("tamper committed memory row");
+                }
+                "delete" => {
+                    sqlx::query(
+                        "DELETE FROM memory_batch_messages
+                         WHERE batch_id = ? AND ord = 2",
+                    )
+                    .bind(&batch_id)
+                    .execute(store.pool())
+                    .await
+                    .expect("delete committed membership");
+                }
+                "reorder" => {
+                    sqlx::query(
+                        "UPDATE memory_batch_messages
+                         SET ord = 3
+                         WHERE batch_id = ? AND ord = 2",
+                    )
+                    .bind(&batch_id)
+                    .execute(store.pool())
+                    .await
+                    .expect("reorder committed membership");
+                }
+                "extra" => {
+                    let key = store
+                        .conversation_key(DataKeyPurpose::Transcript)
+                        .await
+                        .expect("mint transcript key");
+                    let message = user_message("uncommitted extra member");
+                    let record = crate::store::transcript::TranscriptRecord::encrypt(
+                        &message,
+                        "extra-memory-member",
+                        100,
+                        &key,
+                        store.scope(),
+                        store.redactor(),
+                    )
+                    .expect("encrypt extra transcript row");
+                    record
+                        .insert(store.pool())
+                        .await
+                        .expect("insert extra transcript row");
+                    sqlx::query(
+                        "INSERT INTO memory_batch_messages(batch_id, message_id, ord)
+                         VALUES(?, 'extra-memory-member', 3)",
+                    )
+                    .bind(&batch_id)
+                    .execute(store.pool())
+                    .await
+                    .expect("insert uncommitted extra membership");
+                }
+                _ => unreachable!(),
+            }
+
+            let lease = test_lease(1);
+            let fence = test_fence(&lease);
+            let error = store
+                .hydrate(&lease, &fence)
+                .await
+                .expect_err("tampered memory projection must fail hydration");
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains("memory") || rendered.contains("membership"),
+                "{tamper} tamper failed for an unexpected reason: {rendered}"
+            );
         }
     }
 
@@ -24577,8 +25680,12 @@ mod tests {
             "INSERT INTO memory_batches(
                 id, layer, ord, batch_seq, version, state, est_tokens,
                 eviction_footprint_tokens, summary_key_ref, summary_ciphertext,
-                summary_projection, summary_redaction_version, updated_at
-             ) VALUES(?, 0, 0, 0, 1, 'open', 0, ?, NULL, NULL, NULL, NULL, ?)",
+                summary_projection, summary_redaction_version,
+                projection_event_seq, projection_digest, updated_at
+             ) VALUES(
+                ?, 0, 0, 0, 1, 'open', 0, ?, NULL, NULL, NULL, NULL,
+                1, zeroblob(32), ?
+             )",
         )
         .bind("batch-1")
         .bind(i64::MAX)
@@ -24610,7 +25717,7 @@ mod tests {
             seal_transition: None,
         };
 
-        let error = apply_projection(&store, &mut transaction, projection, &[], None)
+        let error = apply_projection(&store, &mut transaction, projection, &[], None, Some(1))
             .await
             .expect_err("eviction footprint overflow must fail closed");
         assert!(error.to_string().contains("overflow"), "{error:#}");
@@ -24624,20 +25731,23 @@ mod tests {
     async fn memory_job_terminal_clears_lease_until() {
         let store = test_store().await;
         let lease = Utc::now().to_rfc3339();
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
         sqlx::query(
             "INSERT INTO memory_jobs(
                 id, kind, batch_seq, source_ids, source_versions, status, lease_until,
-                attempts, created_at, updated_at
-             ) VALUES('lease-job', 'compact', 1, '[]', '{}', 'running', ?, 1, ?, ?)",
+                attempts, projection_event_seq, projection_digest, created_at, updated_at
+             ) VALUES(
+                'lease-job', 'compact', 1, '[]', '{}', 'running', ?, 1,
+                1, zeroblob(32), ?, ?
+             )",
         )
         .bind(&lease)
         .bind(Utc::now().to_rfc3339())
         .bind(Utc::now().to_rfc3339())
-        .execute(store.pool())
+        .execute(&mut *transaction)
         .await
         .expect("insert running job with lease");
 
-        let mut transaction = store.pool().begin().await.expect("begin transaction");
         apply_memory_job_mutation(
             &mut transaction,
             PreparedMemoryJobMutation {
@@ -24654,11 +25764,10 @@ mod tests {
         )
         .await
         .expect("terminal transition must clear lease");
-        transaction.commit().await.expect("commit");
 
         let row = sqlx::query("SELECT status, lease_until FROM memory_jobs WHERE id = ?")
             .bind("lease-job")
-            .fetch_one(store.pool())
+            .fetch_one(&mut *transaction)
             .await
             .expect("load job");
         assert_eq!(row.try_get::<String, _>("status").unwrap(), "failed");
@@ -24669,7 +25778,6 @@ mod tests {
             "terminal job must have NULL lease_until"
         );
 
-        let mut transaction = store.pool().begin().await.expect("begin transaction");
         let error = apply_memory_job_mutation(
             &mut transaction,
             PreparedMemoryJobMutation {
@@ -24690,7 +25798,7 @@ mod tests {
             error.to_string().contains("CAS expected one row"),
             "{error:#}"
         );
-        transaction.rollback().await.expect("rollback");
+        transaction.rollback().await.expect("rollback test fixture");
     }
 
     #[tokio::test]
@@ -24701,8 +25809,11 @@ mod tests {
         sqlx::query(
             "INSERT INTO memory_batches(
                 id, layer, ord, batch_seq, version, state, est_tokens,
-                eviction_footprint_tokens, updated_at
-             ) VALUES('overflow-batch', 0, 0, 0, 1, 'open', 0, ?, ?)",
+                eviction_footprint_tokens, projection_event_seq, projection_digest, updated_at
+             ) VALUES(
+                'overflow-batch', 0, 0, 0, 1, 'open', 0, ?,
+                1, zeroblob(32), ?
+             )",
         )
         .bind(i64::MAX)
         .bind(Utc::now().to_rfc3339())
@@ -24733,8 +25844,11 @@ mod tests {
         sqlx::query(
             "INSERT INTO memory_batches(
                 id, layer, ord, batch_seq, version, state, est_tokens,
-                eviction_footprint_tokens, updated_at
-             ) VALUES('underflow-batch', 0, 0, 0, 1, 'open', 0, 1, ?)",
+                eviction_footprint_tokens, projection_event_seq, projection_digest, updated_at
+             ) VALUES(
+                'underflow-batch', 0, 0, 0, 1, 'open', 0, 1,
+                1, zeroblob(32), ?
+             )",
         )
         .bind(Utc::now().to_rfc3339())
         .execute(&mut *transaction)
@@ -24793,18 +25907,21 @@ mod tests {
             .await
             .expect("mint transcript key");
 
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
         sqlx::query(
             "INSERT INTO memory_batches(
                 id, layer, ord, batch_seq, version, state, est_tokens,
-                eviction_footprint_tokens, updated_at
-             ) VALUES('l0-batch', 0, 0, 0, 1, 'open', 0, 0, ?)",
+                eviction_footprint_tokens, projection_event_seq, projection_digest, updated_at
+             ) VALUES(
+                'l0-batch', 0, 0, 0, 1, 'open', 0, 0,
+                1, zeroblob(32), ?
+             )",
         )
         .bind(Utc::now().to_rfc3339())
-        .execute(store.pool())
+        .execute(&mut *transaction)
         .await
         .expect("seed open L0 batch");
 
-        let mut transaction = store.pool().begin().await.expect("begin transaction");
         let projection = PreparedProjection::MessageEnd {
             event_seq: 1,
             message_id: "msg-l0".to_owned(),
@@ -24819,7 +25936,7 @@ mod tests {
             l0_disposition: L0Disposition::Append,
             create_l0_batch: None,
             l0_batch_id: Some("l0-batch".to_owned()),
-            l0_batch_message_ord: Some(0),
+            l0_batch_message_ord: Some(1),
             provider_context: vec![],
             provider_context_key_ref: None,
             provider_context_key_proof: None,
@@ -24827,15 +25944,14 @@ mod tests {
             public_est: 0,
             seal_transition: None,
         };
-        apply_projection(&store, &mut transaction, projection, &[], None)
+        apply_projection(&store, &mut transaction, projection, &[], None, Some(1))
             .await
             .expect("attribute footprint to open L0 batch");
-        transaction.commit().await.expect("commit");
 
         let membership =
             sqlx::query("SELECT batch_id FROM memory_batch_messages WHERE message_id = ?")
                 .bind("msg-l0")
-                .fetch_optional(store.pool())
+                .fetch_optional(&mut *transaction)
                 .await
                 .expect("load membership");
         assert!(
@@ -24853,9 +25969,10 @@ mod tests {
         let footprint: i64 =
             sqlx::query_scalar("SELECT eviction_footprint_tokens FROM memory_batches WHERE id = ?")
                 .bind("l0-batch")
-                .fetch_one(store.pool())
+                .fetch_one(&mut *transaction)
                 .await
                 .expect("read batch footprint");
         assert_eq!(footprint, 42);
+        transaction.rollback().await.expect("rollback test fixture");
     }
 }

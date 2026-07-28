@@ -391,9 +391,8 @@ impl RunDriver for InjectedRunDriver {
         Ok(OverflowRecoveryOutcome::ReplacementContext(replacement))
     }
 
-    async fn record_usage(&self, usage: Usage, uncalibrated_prompt_estimate: u64) -> Result<()> {
-        self.assembler
-            .record_usage(usage, uncalibrated_prompt_estimate)
+    fn install_committed_calibration(&self, ratio_bits: [u8; 8]) -> Result<()> {
+        self.assembler.install_committed_calibration(ratio_bits)
     }
 
     async fn apply_terminal(

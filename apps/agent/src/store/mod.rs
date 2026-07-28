@@ -38,7 +38,8 @@ use crate::memory::{
     HydratedMemoryRuntime, HydratedMemorySummary,
     estimate::{
         EVICTION_ESTIMATOR_VERSION_REPLAY_PROBE_V1, EVICTION_ESTIMATOR_VERSION_SERIALIZED_BYTES,
-        EvictionFootprint, ProviderContextItemWithFootprint, eviction_footprint_for_payload,
+        EvictionFootprint, ProviderContextItemWithFootprint, TokenCalibration,
+        eviction_footprint_for_payload,
     },
 };
 use crate::provider::model::ModelSpec;
@@ -85,11 +86,11 @@ pub(crate) use crypto::{
     reason = "T12 freezes projection types consumed by T15 without duplicating EventWriter"
 )]
 pub(crate) use event_writer::{
-    ApplicationKind, ApprovalMutation, ApprovalRuleMutation, DurableEvent, EventBatch, EventWrite,
-    EventWriter, InboundAdmission, InboundReceipt, InboundReceiptOrigin, InjectedCommand,
-    MemoryApplyCursorAdvance, MemoryBatchMutation, MemoryJobMutation, MemoryJobUpdate,
-    MemoryTransition, Projection, RecoveryRequired, RunPhase, ToolExecutionMutation,
-    USER_MESSAGE_ID_NAMESPACE, user_message_id,
+    ApplicationKind, ApprovalMutation, ApprovalRuleMutation, BootstrapRecoveryGuard, DurableEvent,
+    EventBatch, EventWrite, EventWriter, InboundAdmission, InboundReceipt, InboundReceiptOrigin,
+    InjectedCommand, MemoryApplyCursorAdvance, MemoryBatchMutation, MemoryJobMutation,
+    MemoryJobUpdate, MemoryTransition, Projection, RecoveryBatchWriter, RecoveryRequired, RunPhase,
+    ToolExecutionMutation, USER_MESSAGE_ID_NAMESPACE, user_message_id,
 };
 #[allow(
     unused_imports,
@@ -105,7 +106,8 @@ pub(crate) use memory_state::{
     reason = "T12 exposes the recovery plan boundary consumed by T15"
 )]
 pub(crate) use recovery::{
-    HydratedRunState, HydrationOutcome, PendingApprovalRecovery, RecoveryStep, SuffixRecovery,
+    HydratedRunState, HydrationOutcome, PendingApprovalRecovery, RecoveryStep, ResumeDirective,
+    SuffixRecovery,
 };
 pub(crate) use redactor::{PublicProjectionBuilder, Redactor, search_text_from_projection};
 #[allow(
@@ -123,6 +125,44 @@ pub(crate) use transcript::TranscriptRecord;
 /// processed and dropped before the next page is requested, so decrypted
 /// plaintext and `SqliteRow` buffers are not retained for the whole history.
 const HYDRATION_PAGE_SIZE: i64 = 64;
+const HYDRATION_MAX_ROWS: u64 = 100_000;
+const HYDRATION_MAX_ENCODED_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug)]
+struct HydrationBudget {
+    max_rows: u64,
+    max_encoded_bytes: u64,
+}
+
+impl Default for HydrationBudget {
+    fn default() -> Self {
+        Self {
+            max_rows: HYDRATION_MAX_ROWS,
+            max_encoded_bytes: HYDRATION_MAX_ENCODED_BYTES,
+        }
+    }
+}
+
+impl HydrationBudget {
+    fn validate(self, rows: i64, encoded_bytes: i64) -> Result<()> {
+        let rows = u64::try_from(rows).context("hydration row count is negative")?;
+        let encoded_bytes =
+            u64::try_from(encoded_bytes).context("hydration encoded-byte count is negative")?;
+        if rows > self.max_rows {
+            bail!(
+                "hydration snapshot has {rows} rows, exceeding the {}-row budget",
+                self.max_rows
+            );
+        }
+        if encoded_bytes > self.max_encoded_bytes {
+            bail!(
+                "hydration snapshot has {encoded_bytes} encoded bytes, exceeding the {}-byte budget",
+                self.max_encoded_bytes
+            );
+        }
+        Ok(())
+    }
+}
 
 /// Canonical plaintext encrypted in `memory_batches` summaries and
 /// `memory_jobs` results. Store is the sole decryption/redaction verifier and
@@ -309,10 +349,6 @@ impl Store {
             _in_memory_anchor: None,
         });
         store.validate_startup().await?;
-        event_writer::EventWriter::new(store.clone())
-            .recover_provider_context_mutations()
-            .await
-            .context("failed to recover prepared provider-context mutations")?;
         Arc::try_unwrap(store).map_err(|_| anyhow!("recovery must not retain Store references"))
     }
 
@@ -336,18 +372,12 @@ impl Store {
     ) -> Result<HydrationOutcome> {
         self.validate_startup().await?;
 
-        lease
-            .validate_exact(fence.generation(), fence.lease_id())
-            .map_err(|error| anyhow!("invalid recovery lease/fence binding: {error}"))?;
-        fence
-            .validate_exact(lease, fence.fence_id())
-            .map_err(|error| anyhow!("invalid recovery fence binding: {error}"))?;
+        let writer = EventWriter::new(Arc::new(self.clone()));
+        let mut recovery = writer.begin_bootstrap_recovery(lease, fence).await?;
 
-        // T17 cold-boot hydration must read all durable state under a single transaction
-        // so that the transcript, provider context, and memory layers observe one
-        // consistent snapshot.  Plaintext buffers are zeroized as they are processed
-        // to avoid retaining duplicate decrypted copies while the remaining rows are
-        // still being authenticated.
+        // Inspect physical recovery first under the same writer fence used for
+        // boot repairs. No EventWriter or pool call is made while this
+        // transaction remains open, which preserves max_connections(1).
         let mut transaction = self
             .pool
             .begin()
@@ -361,9 +391,40 @@ impl Store {
                 .rollback()
                 .await
                 .context("failed to roll back hydration transaction")?;
-            return Ok(HydrationOutcome::RecoveryRequired(intents));
+            return Ok(HydrationOutcome::PhysicalRecoveryRequired(intents));
         }
+        transaction
+            .commit()
+            .await
+            .context("failed to commit initial hydration inspection")?;
 
+        // Prepared provider context and recoverable memory state are repaired
+        // through the already-held EventWriter gate. Each operation owns its
+        // own short transaction; none tries to reacquire the gate.
+        recovery
+            .recover_provider_context_mutations()
+            .await
+            .context("failed to recover prepared provider-context mutations")?;
+        crate::memory::compactor::recover_boot_memory_jobs(&mut recovery)
+            .await
+            .context("failed to recover durable memory maintenance state")?;
+
+        // Re-authenticate and materialize a fresh post-repair snapshot.
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .context("failed to begin post-recovery hydration snapshot")?;
+        event_writer::authenticate_event_log_snapshot(self, &mut transaction).await?;
+        let post_recovery_intents = self.hydrate_running_intents(&mut transaction).await?;
+        if !post_recovery_intents.is_empty() {
+            transaction.rollback().await?;
+            return Ok(HydrationOutcome::PhysicalRecoveryRequired(
+                post_recovery_intents,
+            ));
+        }
+        self.preflight_hydration_budget(&mut transaction, HydrationBudget::default())
+            .await?;
         let messages = self.hydrate_messages(&mut transaction).await?;
         let provider_context = self
             .hydrate_provider_context(&messages, &mut transaction)
@@ -372,10 +433,6 @@ impl Store {
             .hydrate_memory_runtime(&messages, &provider_context, &mut transaction)
             .await?;
 
-        // Recovery planning reads the command/event suffix after the snapshot transaction
-        // is released. It uses bounded, paged reads for the pending command window and
-        // durable event evidence, which is sufficient because boot/recovery runs before
-        // command admission and the canonical single EventWriter is not active.
         transaction
             .commit()
             .await
@@ -389,6 +446,13 @@ impl Store {
             intent_count: 0,
         };
 
+        if !recovery_steps.is_empty() {
+            return Ok(HydrationOutcome::LogicalRecoveryRequired {
+                receipt,
+                steps: recovery_steps,
+            });
+        }
+
         Ok(HydrationOutcome::Complete(HydratedRunState {
             scope: self.scope.clone(),
             lease: lease.clone(),
@@ -397,7 +461,7 @@ impl Store {
             messages,
             provider_context,
             memory,
-            recovery_steps,
+            resume: ResumeDirective::AdmitCommands,
         }))
     }
 
@@ -417,7 +481,10 @@ impl Store {
         Option<HydrationReceiptIdentity>,
     )> {
         match self.hydrate(lease, fence).await? {
-            HydrationOutcome::RecoveryRequired(intents) => Ok((intents, None)),
+            HydrationOutcome::PhysicalRecoveryRequired(intents) => Ok((intents, None)),
+            HydrationOutcome::LogicalRecoveryRequired { receipt, .. } => {
+                Ok((Vec::new(), Some(receipt)))
+            }
             HydrationOutcome::Complete(state) => Ok((Vec::new(), Some(state.receipt))),
         }
     }
@@ -472,6 +539,98 @@ impl Store {
             offset += HYDRATION_PAGE_SIZE;
         }
         Ok(intents)
+    }
+
+    async fn preflight_hydration_budget(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        budget: HydrationBudget,
+    ) -> Result<()> {
+        // Bound the total rows and encoded bytes that the typed hydration
+        // snapshot can materialize before decrypting any transcript, provider,
+        // or memory payload. Fixed-width integers are represented by a small
+        // per-row allowance; all variable-width columns are counted as their
+        // UTF-8/BLOB byte lengths.
+        let row = sqlx::query(
+            "SELECT
+                COALESCE(SUM(row_count), 0) AS row_count,
+                COALESCE(SUM(encoded_bytes), 0) AS encoded_bytes
+             FROM (
+                SELECT COUNT(*) AS row_count,
+                       COALESCE(SUM(
+                         64 +
+                         length(CAST(id AS BLOB)) +
+                         length(CAST(role AS BLOB)) +
+                         length(CAST(raw_key_ref AS BLOB)) +
+                         length(raw_ciphertext) +
+                         length(CAST(payload AS BLOB)) +
+                         length(CAST(search_text AS BLOB))
+                       ), 0) AS encoded_bytes
+                FROM messages
+                UNION ALL
+                SELECT COUNT(*),
+                       COALESCE(SUM(
+                         96 +
+                         length(CAST(id AS BLOB)) +
+                         COALESCE(length(CAST(message_id AS BLOB)), 0) +
+                         length(CAST(idempotency_key AS BLOB)) +
+                         length(CAST(kind AS BLOB)) +
+                         COALESCE(length(CAST(context_fingerprint AS BLOB)), 0) +
+                         length(CAST(provider_instance_id AS BLOB)) +
+                         length(CAST(protocol AS BLOB)) +
+                         length(CAST(model AS BLOB)) +
+                         length(CAST(key_ref AS BLOB)) +
+                         length(ciphertext)
+                       ), 0)
+                FROM provider_context
+                UNION ALL
+                SELECT COUNT(*),
+                       COALESCE(SUM(
+                         96 +
+                         length(CAST(id AS BLOB)) +
+                         length(CAST(state AS BLOB)) +
+                         COALESCE(length(CAST(summary_key_ref AS BLOB)), 0) +
+                         COALESCE(length(summary_ciphertext), 0) +
+                         COALESCE(length(CAST(summary_projection AS BLOB)), 0)
+                       ), 0)
+                FROM memory_batches
+                UNION ALL
+                SELECT COUNT(*),
+                       COALESCE(SUM(
+                         16 +
+                         length(CAST(batch_id AS BLOB)) +
+                         length(CAST(message_id AS BLOB))
+                       ), 0)
+                FROM memory_batch_messages
+                UNION ALL
+                SELECT COUNT(*),
+                       COALESCE(SUM(
+                         96 +
+                         length(CAST(id AS BLOB)) +
+                         length(CAST(kind AS BLOB)) +
+                         length(CAST(source_ids AS BLOB)) +
+                         length(CAST(source_versions AS BLOB)) +
+                         length(CAST(status AS BLOB)) +
+                         COALESCE(length(CAST(lease_until AS BLOB)), 0) +
+                         COALESCE(length(CAST(result_key_ref AS BLOB)), 0) +
+                         COALESCE(length(result_ciphertext), 0) +
+                         COALESCE(length(CAST(result_projection AS BLOB)), 0)
+                       ), 0)
+                FROM memory_jobs
+                UNION ALL
+                SELECT COUNT(*),
+                       COALESCE(SUM(16 + length(CAST(kind AS BLOB))), 0)
+                FROM memory_apply_cursors
+                UNION ALL
+                SELECT COUNT(*),
+                       COALESCE(SUM(40 + length(ratio_bits)), 0)
+                FROM memory_calibration
+             )",
+        )
+        .fetch_one(&mut **transaction)
+        .await
+        .context("failed to preflight hydration snapshot bounds")?;
+        budget.validate(row.try_get("row_count")?, row.try_get("encoded_bytes")?)
     }
 
     async fn hydrate_messages(
@@ -937,13 +1096,27 @@ impl Store {
             let ContextMessage::Persisted { id, .. } = message else {
                 bail!("hydrated transcript contains a synthetic message");
             };
-            if persisted_messages
-                .insert(id.clone(), message.clone())
-                .is_some()
-            {
+            if persisted_messages.insert(id.as_str(), message).is_some() {
                 bail!("hydrated transcript contains duplicate message id {id}");
             }
         }
+
+        let calibration = match sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT ratio_bits FROM memory_calibration WHERE singleton = 1",
+        )
+        .fetch_optional(&mut **transaction)
+        .await
+        .context("failed to hydrate token calibration")?
+        {
+            Some(bits) => {
+                let bits: [u8; 8] = bits
+                    .try_into()
+                    .map_err(|_| anyhow!("persisted calibration ratio_bits is not 8 bytes"))?;
+                TokenCalibration::new(f64::from_bits(u64::from_be_bytes(bits)))
+                    .with_context(|| "persisted calibration ratio is not positive and finite")?
+            }
+            None => TokenCalibration::default(),
+        };
 
         // `hydrate_provider_context` has authenticated the payload, its exact
         // transcript anchor, and the canonical provider footprint. Aggregate
@@ -954,7 +1127,7 @@ impl Store {
             let Some(anchor) = context.item.origin_message.as_ref() else {
                 continue;
             };
-            if !persisted_messages.contains_key(&anchor.message_id) {
+            if !persisted_messages.contains_key(anchor.message_id.as_str()) {
                 bail!(
                     "provider-context footprint references unknown transcript message {}",
                     anchor.message_id
@@ -1085,11 +1258,15 @@ impl Store {
                     format!("memory membership batch id {batch_id_text} is not a UUID")
                 })?;
                 let message_id: String = row.try_get("message_id")?;
-                let message = persisted_messages.get(&message_id).cloned().ok_or_else(|| {
-                    anyhow!(
-                        "memory membership for batch {batch_id} references unknown persisted message {message_id}"
-                    )
-                })?;
+                let message = persisted_messages
+                    .get(message_id.as_str())
+                    .copied()
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "memory membership for batch {batch_id} references unknown persisted message {message_id}"
+                        )
+                    })?;
                 let ord = u64::try_from(row.try_get::<i64, _>("ord")?).with_context(|| {
                     format!(
                         "memory membership for batch {batch_id} message {message_id} ord out of u64 range"
@@ -1254,13 +1431,10 @@ impl Store {
             offset += HYDRATION_PAGE_SIZE;
         }
 
-        Ok(HydratedMemoryRuntime::new(
-            batches,
-            memberships,
-            jobs,
-            cursors,
-            anchored_footprints,
-        ))
+        Ok(
+            HydratedMemoryRuntime::new(batches, memberships, jobs, cursors, anchored_footprints)
+                .with_calibration(calibration),
+        )
     }
 
     async fn load_hydration_key(
@@ -3446,49 +3620,248 @@ mod tests {
         projection: &str,
         redaction_version: i64,
     ) {
-        sqlx::query(
-            "INSERT INTO memory_batches(
-                id, layer, ord, batch_seq, version, state, est_tokens,
-                eviction_footprint_tokens, summary_key_ref, summary_ciphertext,
-                summary_projection, summary_redaction_version, updated_at
-             ) VALUES(?, 1, 1, 1, 0, 'compacted', 42, 0, ?, ?, ?, ?, ?)",
-        )
-        .bind(id)
-        .bind(key_ref)
-        .bind(ciphertext)
-        .bind(projection)
-        .bind(redaction_version)
-        .bind(test_now())
-        .execute(store.pool())
-        .await
-        .expect("seed memory batch");
+        EventWriter::new(std::sync::Arc::new(store.clone()))
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::memory_maintenance("fixture_compacted_l1")
+                            .expect("fixture memory-maintenance event"),
+                    ),
+                    projections: vec![Projection::MemoryTransition(MemoryTransition {
+                        batch_inserts: vec![MemoryBatchRecord {
+                            id: id.to_owned(),
+                            layer: MemoryLayer::L1,
+                            ord: 0,
+                            batch_seq: 0,
+                            version: 0,
+                            state: MemoryBatchState::Compacted,
+                            est_tokens: 42,
+                            eviction_footprint_tokens: 0,
+                            summary: Some(MemoryBatchSummary {
+                                key_ref: key_ref.to_owned(),
+                                ciphertext: ciphertext.to_vec(),
+                                projection: projection.to_owned(),
+                                redaction_version: u32::try_from(redaction_version)
+                                    .expect("fixture redaction version must fit u32"),
+                            }),
+                            updated_at: test_now(),
+                        }],
+                        ..Default::default()
+                    })],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("insert authenticated memory batch");
     }
 
-    async fn insert_memory_job(
+    async fn apply_memory_transition_fixture(
         store: &Store,
-        id: &str,
-        key_ref: &str,
-        ciphertext: &[u8],
-        projection: &str,
-        redaction_version: i64,
+        kind: &str,
+        transition: MemoryTransition,
     ) {
-        sqlx::query(
-            "INSERT INTO memory_jobs(
-                id, kind, batch_seq, source_ids, source_versions, status, attempts,
-                result_key_ref, result_ciphertext, result_projection, result_redaction_version,
-                created_at, updated_at
-             ) VALUES(?, 'compact_l0', 0, '[]', '{}', 'completed', 0, ?, ?, ?, ?, ?, ?)",
+        EventWriter::new(std::sync::Arc::new(store.clone()))
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(
+                        DurableEvent::memory_maintenance(kind)
+                            .expect("fixture memory-maintenance event"),
+                    ),
+                    projections: vec![Projection::MemoryTransition(transition)],
+                }],
+                injected_commands: Vec::new(),
+            })
+            .await
+            .expect("apply authenticated memory transition fixture");
+    }
+
+    async fn apply_compact_l1_fixture(
+        store: &Store,
+        summary_text: &str,
+        est_tokens: u64,
+        expected_batch_seq: u64,
+        initialize_cursor: bool,
+    ) {
+        let source_id = Uuid::now_v7();
+        let target_id = Uuid::now_v7();
+        let source_key = source_id.to_string();
+        let target_key = target_id.to_string();
+        let job_id = Uuid::now_v7().to_string();
+        let key = store
+            .conversation_key(DataKeyPurpose::MemorySummary)
+            .await
+            .expect("mint source summary key");
+        let source_payload = test_memory_payload();
+        let (ciphertext, projection, redaction_version) =
+            encrypt_memory_projection(store, &key, "memory_batches", &source_key, &source_payload);
+        let source = MemoryBatchRecord {
+            id: source_key.clone(),
+            layer: MemoryLayer::L1,
+            ord: 0,
+            batch_seq: 0,
+            version: 0,
+            state: MemoryBatchState::Compacting,
+            est_tokens: 42,
+            eviction_footprint_tokens: 0,
+            summary: Some(MemoryBatchSummary {
+                key_ref: key.key_ref.clone(),
+                ciphertext,
+                projection,
+                redaction_version,
+            }),
+            updated_at: test_now(),
+        };
+        let target = MemoryBatchRecord::new(
+            target_key.clone(),
+            MemoryLayer::L2,
+            0,
+            0,
+            MemoryBatchState::Compacting,
+            0,
+            0,
+        );
+        apply_memory_transition_fixture(
+            store,
+            "fixture_compact_l1_graph",
+            MemoryTransition {
+                batch_inserts: vec![source, target],
+                job_inserts: vec![MemoryJobRecord::new(
+                    job_id.clone(),
+                    MemoryJobKind::CompactL1,
+                    0,
+                    vec![source_key.clone()],
+                    BTreeMap::from([(source_key, 0), (target_key, 0)]),
+                )],
+                cursor_advance: initialize_cursor.then_some(MemoryApplyCursorAdvance {
+                    kind: MemoryJobKind::CompactL1.as_str().to_owned(),
+                    expected: expected_batch_seq,
+                    next: expected_batch_seq,
+                    initialize: true,
+                }),
+                ..Default::default()
+            },
         )
-        .bind(id)
-        .bind(key_ref)
-        .bind(ciphertext)
-        .bind(projection)
-        .bind(redaction_version)
-        .bind(test_now())
-        .bind(test_now())
-        .execute(store.pool())
-        .await
-        .expect("seed memory job");
+        .await;
+        let batch_seq: i64 = sqlx::query_scalar("SELECT batch_seq FROM memory_jobs WHERE id = ?")
+            .bind(&job_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("load inserted CompactL1 sequence");
+        assert_eq!(
+            u64::try_from(batch_seq).expect("fixture sequence is non-negative"),
+            expected_batch_seq
+        );
+
+        let lease_until = format!("2099-01-01T00:00:{expected_batch_seq:02}Z");
+        apply_memory_transition_fixture(
+            store,
+            "fixture_compact_l1_claim",
+            MemoryTransition {
+                expected_source_versions: BTreeMap::from([(source_id, 0), (target_id, 0)]),
+                job_mutations: vec![MemoryJobMutation::Claim {
+                    job_id: job_id.clone(),
+                    lease_until: lease_until.clone(),
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+        apply_memory_transition_fixture(
+            store,
+            "fixture_compact_l1_start",
+            MemoryTransition {
+                expected_source_versions: BTreeMap::from([(source_id, 0), (target_id, 0)]),
+                job_mutations: vec![MemoryJobMutation::Start {
+                    job_id: job_id.clone(),
+                    expected_attempt: 0,
+                    lease_witness: Some(lease_until.clone()),
+                    lease_until: lease_until.clone(),
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+        let now = Utc::now();
+        let result = crate::memory::CompactResult {
+            summary: crate::memory::DecryptedMemorySummary::new(summary_text.to_owned()),
+            est_tokens,
+            time_range: (now, now),
+        };
+        apply_memory_transition_fixture(
+            store,
+            "fixture_compact_l1_complete",
+            MemoryTransition {
+                expected_source_versions: BTreeMap::from([(source_id, 0), (target_id, 0)]),
+                batch_mutations: vec![
+                    MemoryBatchMutation {
+                        batch_id: source_id,
+                        expected_version: 0,
+                        new_state: MemoryBatchState::Compacted,
+                        summary: None,
+                        est_tokens: 42,
+                        footprint_delta: 0,
+                        delete_membership: false,
+                    },
+                    MemoryBatchMutation {
+                        batch_id: target_id,
+                        expected_version: 0,
+                        new_state: MemoryBatchState::Compacted,
+                        summary: Some(result.clone()),
+                        est_tokens,
+                        footprint_delta: 0,
+                        delete_membership: false,
+                    },
+                ],
+                job_mutations: vec![MemoryJobMutation::Complete {
+                    job_id: job_id.clone(),
+                    expected_attempt: 1,
+                    lease_witness: Some(lease_until),
+                    result,
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+        apply_memory_transition_fixture(
+            store,
+            "fixture_compact_l1_apply",
+            MemoryTransition {
+                expected_source_versions: BTreeMap::from([(source_id, 1), (target_id, 1)]),
+                batch_mutations: vec![
+                    MemoryBatchMutation {
+                        batch_id: source_id,
+                        expected_version: 1,
+                        new_state: MemoryBatchState::Dropped,
+                        summary: None,
+                        est_tokens: 42,
+                        footprint_delta: 0,
+                        delete_membership: false,
+                    },
+                    MemoryBatchMutation {
+                        batch_id: target_id,
+                        expected_version: 1,
+                        new_state: MemoryBatchState::Promoted,
+                        summary: None,
+                        est_tokens,
+                        footprint_delta: 0,
+                        delete_membership: false,
+                    },
+                ],
+                job_mutations: vec![MemoryJobMutation::Apply {
+                    job_id,
+                    expected_attempt: 1,
+                    lease_witness: None,
+                }],
+                cursor_advance: Some(MemoryApplyCursorAdvance {
+                    kind: MemoryJobKind::CompactL1.as_str().to_owned(),
+                    expected: expected_batch_seq,
+                    next: expected_batch_seq + 1,
+                    initialize: false,
+                }),
+                ..Default::default()
+            },
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -3501,16 +3874,6 @@ mod tests {
         let payload = test_memory_payload();
         let (ciphertext, projection, version) =
             encrypt_memory_projection(&store, &key, "memory_batches", "batch-ok", &payload);
-        insert_memory_batch(
-            &store,
-            "batch-ok",
-            &key.key_ref,
-            &ciphertext,
-            &projection,
-            i64::from(version),
-        )
-        .await;
-
         let summary = authenticate_memory_summary(
             &store,
             &key.key_ref,
@@ -3536,16 +3899,6 @@ mod tests {
         let (mut ciphertext, projection, version) =
             encrypt_memory_projection(&store, &key, "memory_batches", "batch-tamper", &payload);
         ciphertext[0] ^= 0xff;
-        insert_memory_batch(
-            &store,
-            "batch-tamper",
-            &key.key_ref,
-            &ciphertext,
-            &projection,
-            i64::from(version),
-        )
-        .await;
-
         let error = authenticate_memory_summary(
             &store,
             &key.key_ref,
@@ -3584,16 +3937,6 @@ mod tests {
             "batch-wrong-key",
             &payload,
         );
-        insert_memory_batch(
-            &store,
-            "batch-wrong-key",
-            &transcript_key.key_ref,
-            &ciphertext,
-            &projection,
-            i64::from(version),
-        )
-        .await;
-
         let error = authenticate_memory_summary(
             &store,
             &transcript_key.key_ref,
@@ -3630,16 +3973,6 @@ mod tests {
             &payload,
         );
         projection.push_str(" tampered");
-        insert_memory_batch(
-            &store,
-            "batch-bad-projection",
-            &key.key_ref,
-            &ciphertext,
-            &projection,
-            i64::from(version),
-        )
-        .await;
-
         let error = authenticate_memory_summary(
             &store,
             &key.key_ref,
@@ -3669,16 +4002,6 @@ mod tests {
         let payload = test_memory_payload();
         let (ciphertext, projection, _version) =
             encrypt_memory_projection(&store, &key, "memory_batches", "batch-stale", &payload);
-        insert_memory_batch(
-            &store,
-            "batch-stale",
-            &key.key_ref,
-            &ciphertext,
-            &projection,
-            2,
-        )
-        .await;
-
         let error = authenticate_memory_summary(
             &store,
             &key.key_ref,
@@ -3708,16 +4031,6 @@ mod tests {
         let payload = test_memory_payload();
         let (ciphertext, projection, version) =
             encrypt_memory_projection(&store, &key, "memory_jobs", "job-ok", &payload);
-        insert_memory_job(
-            &store,
-            "job-ok",
-            &key.key_ref,
-            &ciphertext,
-            &projection,
-            i64::from(version),
-        )
-        .await;
-
         let summary = authenticate_memory_summary(
             &store,
             &key.key_ref,
@@ -3743,16 +4056,6 @@ mod tests {
         let (mut ciphertext, projection, version) =
             encrypt_memory_projection(&store, &key, "memory_jobs", "job-tamper", &payload);
         ciphertext[0] ^= 0xff;
-        insert_memory_job(
-            &store,
-            "job-tamper",
-            &key.key_ref,
-            &ciphertext,
-            &projection,
-            i64::from(version),
-        )
-        .await;
-
         let error = authenticate_memory_summary(
             &store,
             &key.key_ref,
@@ -3791,16 +4094,6 @@ mod tests {
             "job-wrong-key",
             &payload,
         );
-        insert_memory_job(
-            &store,
-            "job-wrong-key",
-            &transcript_key.key_ref,
-            &ciphertext,
-            &projection,
-            i64::from(version),
-        )
-        .await;
-
         let error = authenticate_memory_summary(
             &store,
             &transcript_key.key_ref,
@@ -3832,16 +4125,6 @@ mod tests {
         let (ciphertext, mut projection, version) =
             encrypt_memory_projection(&store, &key, "memory_jobs", "job-bad-projection", &payload);
         projection.push_str(" tampered");
-        insert_memory_job(
-            &store,
-            "job-bad-projection",
-            &key.key_ref,
-            &ciphertext,
-            &projection,
-            i64::from(version),
-        )
-        .await;
-
         let error = authenticate_memory_summary(
             &store,
             &key.key_ref,
@@ -3871,16 +4154,6 @@ mod tests {
         let payload = test_memory_payload();
         let (ciphertext, projection, _version) =
             encrypt_memory_projection(&store, &key, "memory_jobs", "job-stale", &payload);
-        insert_memory_job(
-            &store,
-            "job-stale",
-            &key.key_ref,
-            &ciphertext,
-            &projection,
-            2,
-        )
-        .await;
-
         let error = authenticate_memory_summary(
             &store,
             &key.key_ref,
@@ -3934,88 +4207,170 @@ mod tests {
     #[tokio::test]
     async fn store_hydration_round_trips_applied_memory_into_runtime_layers() {
         let store = store().await;
-        let key = store
-            .conversation_key(DataKeyPurpose::MemorySummary)
-            .await
-            .expect("mint memory summary key");
         let source_id = Uuid::now_v7();
         let target_id = Uuid::now_v7();
         let job_id = Uuid::now_v7();
-        let payload = test_memory_payload();
-        let (target_ciphertext, target_projection, target_redaction_version) =
-            encrypt_memory_projection(
-                &store,
-                &key,
-                "memory_batches",
-                &target_id.to_string(),
-                &payload,
-            );
-        let (result_ciphertext, result_projection, result_redaction_version) =
-            encrypt_memory_projection(&store, &key, "memory_jobs", &job_id.to_string(), &payload);
+        let source_key = source_id.to_string();
+        let target_key = target_id.to_string();
+        let job_key = job_id.to_string();
+        let initial_source_versions =
+            BTreeMap::from([(source_key.clone(), 0_i64), (target_key.clone(), 0_i64)]);
 
-        sqlx::query(
-            "INSERT INTO memory_batches(
-                id, layer, ord, batch_seq, version, state, est_tokens,
-                eviction_footprint_tokens, updated_at
-             ) VALUES(?, 0, 1, 1, 1, 'dropped', 0, 0, ?)",
+        apply_memory_transition_fixture(
+            &store,
+            "fixture_compaction_graph",
+            MemoryTransition {
+                batch_inserts: vec![
+                    MemoryBatchRecord::new(
+                        source_key.clone(),
+                        MemoryLayer::L0,
+                        0,
+                        0,
+                        MemoryBatchState::Compacting,
+                        0,
+                        0,
+                    ),
+                    MemoryBatchRecord::new(
+                        target_key.clone(),
+                        MemoryLayer::L1,
+                        0,
+                        0,
+                        MemoryBatchState::Compacting,
+                        0,
+                        0,
+                    ),
+                ],
+                job_inserts: vec![MemoryJobRecord::new(
+                    job_key.clone(),
+                    MemoryJobKind::CompactL0,
+                    0,
+                    vec![source_key.clone()],
+                    initial_source_versions,
+                )],
+                cursor_advance: Some(MemoryApplyCursorAdvance {
+                    kind: MemoryJobKind::CompactL0.as_str().to_owned(),
+                    expected: 0,
+                    next: 1,
+                    initialize: true,
+                }),
+                ..Default::default()
+            },
         )
-        .bind(source_id.to_string())
-        .bind(test_now())
-        .execute(store.pool())
-        .await
-        .expect("insert applied L0 source");
-        sqlx::query(
-            "INSERT INTO memory_batches(
-                id, layer, ord, batch_seq, version, state, est_tokens,
-                eviction_footprint_tokens, summary_key_ref, summary_ciphertext,
-                summary_projection, summary_redaction_version, updated_at
-             ) VALUES(?, 1, 1, 1, 1, 'promoted', 42, 0, ?, ?, ?, ?, ?)",
-        )
-        .bind(target_id.to_string())
-        .bind(&key.key_ref)
-        .bind(target_ciphertext)
-        .bind(target_projection)
-        .bind(i64::from(target_redaction_version))
-        .bind(test_now())
-        .execute(store.pool())
-        .await
-        .expect("insert promoted L1 target");
+        .await;
 
-        let source_ids =
-            serde_json::to_string(&[source_id.to_string()]).expect("serialize source ids");
-        let source_versions = serde_json::to_string(&BTreeMap::from([
-            (source_id.to_string(), 1_i64),
-            (target_id.to_string(), 1_i64),
-        ]))
-        .expect("serialize exact source and target witnesses");
-        sqlx::query(
-            "INSERT INTO memory_jobs(
-                id, kind, batch_seq, source_ids, source_versions, status,
-                lease_until, attempts, result_key_ref, result_ciphertext,
-                result_projection, result_redaction_version, created_at, updated_at
-             ) VALUES(
-                ?, 'compact_l0', 1, ?, ?, 'applied', NULL, 1, ?, ?, ?, ?, ?, ?
-             )",
+        let lease_until = "2099-01-01T00:00:00Z".to_owned();
+        apply_memory_transition_fixture(
+            &store,
+            "fixture_compaction_claim",
+            MemoryTransition {
+                expected_source_versions: BTreeMap::from([(source_id, 0), (target_id, 0)]),
+                job_mutations: vec![MemoryJobMutation::Claim {
+                    job_id: job_key.clone(),
+                    lease_until: lease_until.clone(),
+                }],
+                ..Default::default()
+            },
         )
-        .bind(job_id.to_string())
-        .bind(source_ids)
-        .bind(source_versions)
-        .bind(&key.key_ref)
-        .bind(result_ciphertext)
-        .bind(result_projection)
-        .bind(i64::from(result_redaction_version))
-        .bind(test_now())
-        .bind(test_now())
-        .execute(store.pool())
-        .await
-        .expect("insert applied CompactL0 job");
-        sqlx::query(
-            "INSERT INTO memory_apply_cursors(kind, next_batch_seq)
-             VALUES('compact_l0', 2)",
+        .await;
+        apply_memory_transition_fixture(
+            &store,
+            "fixture_compaction_start",
+            MemoryTransition {
+                expected_source_versions: BTreeMap::from([(source_id, 0), (target_id, 0)]),
+                job_mutations: vec![MemoryJobMutation::Start {
+                    job_id: job_key.clone(),
+                    expected_attempt: 0,
+                    lease_witness: Some(lease_until.clone()),
+                    lease_until: lease_until.clone(),
+                }],
+                ..Default::default()
+            },
         )
-        .execute(store.pool())
-        .await
-        .expect("insert applied cursor");
+        .await;
+
+        let now = Utc::now();
+        let result = crate::memory::CompactResult {
+            summary: crate::memory::DecryptedMemorySummary::new(
+                "Nothing of secret value here.".to_owned(),
+            ),
+            est_tokens: 42,
+            time_range: (now, now),
+        };
+        apply_memory_transition_fixture(
+            &store,
+            "fixture_compaction_complete",
+            MemoryTransition {
+                expected_source_versions: BTreeMap::from([(source_id, 0), (target_id, 0)]),
+                batch_mutations: vec![
+                    MemoryBatchMutation {
+                        batch_id: source_id,
+                        expected_version: 0,
+                        new_state: MemoryBatchState::Compacted,
+                        summary: None,
+                        est_tokens: 0,
+                        footprint_delta: 0,
+                        delete_membership: false,
+                    },
+                    MemoryBatchMutation {
+                        batch_id: target_id,
+                        expected_version: 0,
+                        new_state: MemoryBatchState::Compacted,
+                        summary: Some(result.clone()),
+                        est_tokens: result.est_tokens,
+                        footprint_delta: 0,
+                        delete_membership: false,
+                    },
+                ],
+                job_mutations: vec![MemoryJobMutation::Complete {
+                    job_id: job_key.clone(),
+                    expected_attempt: 1,
+                    lease_witness: Some(lease_until),
+                    result,
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+        apply_memory_transition_fixture(
+            &store,
+            "fixture_compaction_apply",
+            MemoryTransition {
+                expected_source_versions: BTreeMap::from([(source_id, 1), (target_id, 1)]),
+                batch_mutations: vec![
+                    MemoryBatchMutation {
+                        batch_id: source_id,
+                        expected_version: 1,
+                        new_state: MemoryBatchState::Dropped,
+                        summary: None,
+                        est_tokens: 0,
+                        footprint_delta: 0,
+                        delete_membership: true,
+                    },
+                    MemoryBatchMutation {
+                        batch_id: target_id,
+                        expected_version: 1,
+                        new_state: MemoryBatchState::Promoted,
+                        summary: None,
+                        est_tokens: 42,
+                        footprint_delta: 0,
+                        delete_membership: false,
+                    },
+                ],
+                job_mutations: vec![MemoryJobMutation::Apply {
+                    job_id: job_key,
+                    expected_attempt: 1,
+                    lease_witness: None,
+                }],
+                cursor_advance: Some(MemoryApplyCursorAdvance {
+                    kind: MemoryJobKind::CompactL0.as_str().to_owned(),
+                    expected: 1,
+                    next: 2,
+                    initialize: false,
+                }),
+                ..Default::default()
+            },
+        )
+        .await;
 
         let lease = test_lease(1);
         let fence = test_fence(&lease);
@@ -4036,6 +4391,164 @@ mod tests {
             "Nothing of secret value here."
         );
         assert_eq!(memory.l2().summary.expose(), "");
+    }
+
+    #[tokio::test]
+    async fn store_hydration_folds_multiple_authenticated_l2_rows_in_order() {
+        let store = store().await;
+        apply_compact_l1_fixture(&store, "first durable L2", 3, 1, true).await;
+        apply_compact_l1_fixture(&store, "second durable L2", 5, 2, false).await;
+
+        let lease = test_lease(1);
+        let fence = test_fence(&lease);
+        let HydrationOutcome::Complete(state) = store
+            .hydrate(&lease, &fence)
+            .await
+            .expect("hydrate repeated authenticated L2 applies")
+        else {
+            panic!("fully applied L2 graph must hydrate completely");
+        };
+        let memory = crate::memory::ThreeLayerMemory::from_hydrated(state.memory)
+            .expect("multi-L2 Store handoff reconstructs");
+        assert!(memory.l0().is_empty());
+        assert!(memory.l1().is_empty());
+        assert_eq!(
+            memory.l2().summary.expose(),
+            "first durable L2\n\nsecond durable L2"
+        );
+        assert_eq!(memory.l2().est_tokens, 8);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM memory_batches
+                 WHERE layer = 2 AND state = 'promoted'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("count promoted L2 rows"),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_repairs_expired_memory_job_before_returning_complete_state() {
+        let store = store().await;
+        let message_id = "memory-recovery-message";
+        let message_text = "recover me";
+        insert_user_message(&store, message_id, 1, message_text).await;
+        let source_id = Uuid::now_v7();
+        let target_id = Uuid::now_v7();
+        let job_id = Uuid::now_v7().to_string();
+        let source_key = source_id.to_string();
+        let target_key = target_id.to_string();
+        let est_tokens = i64::try_from(
+            crate::memory::estimate::estimate_text_tokens(message_text)
+                .expect("estimate recovery fixture message"),
+        )
+        .expect("fixture estimate fits SQLite");
+
+        apply_memory_transition_fixture(
+            &store,
+            "fixture_expired_job_graph",
+            MemoryTransition {
+                batch_inserts: vec![
+                    MemoryBatchRecord::new(
+                        source_key.clone(),
+                        MemoryLayer::L0,
+                        0,
+                        0,
+                        MemoryBatchState::Compacting,
+                        est_tokens,
+                        0,
+                    ),
+                    MemoryBatchRecord::new(
+                        target_key.clone(),
+                        MemoryLayer::L1,
+                        0,
+                        0,
+                        MemoryBatchState::Compacting,
+                        0,
+                        0,
+                    ),
+                ],
+                job_inserts: vec![MemoryJobRecord::new(
+                    job_id.clone(),
+                    MemoryJobKind::CompactL0,
+                    0,
+                    vec![source_key.clone()],
+                    BTreeMap::from([(source_key.clone(), 0), (target_key, 0)]),
+                )],
+                membership_inserts: vec![MemoryBatchMessageRecord {
+                    batch_id: source_key,
+                    message_id: message_id.to_owned(),
+                    ord: 1,
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+        let expired_lease = "2000-01-01T00:00:00Z".to_owned();
+        apply_memory_transition_fixture(
+            &store,
+            "fixture_expired_job_claim",
+            MemoryTransition {
+                expected_source_versions: BTreeMap::from([(source_id, 0), (target_id, 0)]),
+                job_mutations: vec![MemoryJobMutation::Claim {
+                    job_id: job_id.clone(),
+                    lease_until: expired_lease.clone(),
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+        apply_memory_transition_fixture(
+            &store,
+            "fixture_expired_job_start",
+            MemoryTransition {
+                expected_source_versions: BTreeMap::from([(source_id, 0), (target_id, 0)]),
+                job_mutations: vec![MemoryJobMutation::Start {
+                    job_id: job_id.clone(),
+                    expected_attempt: 0,
+                    lease_witness: Some(expired_lease.clone()),
+                    lease_until: expired_lease,
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let lease = test_lease(1);
+        let fence = test_fence(&lease);
+        let HydrationOutcome::Complete(state) = store
+            .hydrate(&lease, &fence)
+            .await
+            .expect("hydration repairs recoverable memory state")
+        else {
+            panic!("expired memory maintenance must reach a complete fixed point");
+        };
+        let row = sqlx::query("SELECT status, attempts, lease_until FROM memory_jobs WHERE id = ?")
+            .bind(&job_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("load recovered memory job");
+        assert_eq!(row.get::<String, _>("status"), "pending");
+        assert_eq!(row.get::<i64, _>("attempts"), 1);
+        assert!(row.get::<Option<String>, _>("lease_until").is_none());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM agent_events
+                 WHERE event_type = 'memory_maintenance'
+                   AND json_extract(envelope, '$.kind') = 'compact_expired_lease_recovered'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("count durable recovery event"),
+            1
+        );
+
+        let memory = crate::memory::ThreeLayerMemory::from_hydrated(state.memory)
+            .expect("repaired memory graph reconstructs");
+        assert_eq!(memory.l0().len(), 1);
+        assert_eq!(memory.l0()[0].state, crate::memory::BatchState::Compacting);
     }
 
     #[tokio::test]
@@ -4076,7 +4589,7 @@ mod tests {
         }
         assert!(!state.memory.is_empty());
         assert!(state.provider_context.is_empty());
-        assert!(state.recovery_steps.is_empty());
+        assert_eq!(state.resume, ResumeDirective::AdmitCommands);
     }
 
     #[tokio::test]
@@ -4766,7 +5279,7 @@ mod tests {
         MIGRATOR
             .run(&pool)
             .await
-            .expect("apply migrations 0003 through 0008");
+            .expect("apply migrations 0003 through 0009");
 
         let applied: Vec<i64> = sqlx::query_scalar(
             "SELECT version FROM _sqlx_migrations WHERE success = TRUE ORDER BY version",
@@ -4774,7 +5287,7 @@ mod tests {
         .fetch_all(&pool)
         .await
         .expect("list applied migrations");
-        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
 
         let table_sql: String = sqlx::query_scalar(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='approval_rules'",
@@ -4828,6 +5341,146 @@ mod tests {
                 .await
                 .expect("foreign_key_check")
                 .is_none()
+        );
+    }
+
+    async fn migration_pool_through(version: i64) -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open migration fixture pool");
+        for migration in MIGRATOR
+            .migrations
+            .iter()
+            .filter(|migration| migration.version <= version)
+        {
+            sqlx::raw_sql(migration.sql.as_ref())
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "apply migration {} ({}): {error}",
+                        migration.version, migration.description
+                    )
+                });
+        }
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .expect("enable foreign keys for migration fixture");
+        pool
+    }
+
+    #[tokio::test]
+    async fn migration_0009_rejects_legacy_memory_state_and_calibration() {
+        let nine = MIGRATOR
+            .migrations
+            .iter()
+            .find(|migration| migration.version == 9)
+            .expect("migration 0009");
+
+        for fixture in ["memory_batch", "calibration"] {
+            let pool = migration_pool_through(8).await;
+            match fixture {
+                "memory_batch" => {
+                    sqlx::query(
+                        "INSERT INTO memory_batches(
+                            id, layer, ord, batch_seq, version, state, est_tokens,
+                            eviction_footprint_tokens, updated_at
+                         ) VALUES('legacy-batch', 0, 1, 1, 0, 'open', 1, 0, 'now')",
+                    )
+                    .execute(&pool)
+                    .await
+                    .expect("seed legacy memory batch");
+                }
+                "calibration" => {
+                    sqlx::query("INSERT INTO kv(key, value) VALUES('calib.ratio', '1.25')")
+                        .execute(&pool)
+                        .await
+                        .expect("seed legacy calibration");
+                }
+                _ => unreachable!(),
+            }
+
+            let error = sqlx::raw_sql(nine.sql.as_ref())
+                .execute(&pool)
+                .await
+                .expect_err("0009 must reject unauthenticated legacy memory state");
+            assert!(
+                format!("{error:#}").contains("CHECK constraint failed"),
+                "{fixture} upgrade failed for an unexpected reason: {error:#}"
+            );
+            pool.close().await;
+        }
+
+        let current = migration_pool_through(9).await;
+        let error = sqlx::query("INSERT INTO kv(key, value) VALUES('calib.ratio', '1.5')")
+            .execute(&current)
+            .await
+            .expect_err("legacy calibration key must remain reserved after 0009");
+        assert!(
+            format!("{error:#}").contains("calib.ratio is reserved"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_0009_memory_projection_event_foreign_keys_are_deferred() {
+        let store = store().await;
+        let event_key = store
+            .conversation_key(DataKeyPurpose::Event)
+            .await
+            .expect("mint event key");
+
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
+        sqlx::query(
+            "INSERT INTO memory_batches(
+                id, layer, ord, batch_seq, version, state, est_tokens,
+                eviction_footprint_tokens, projection_event_seq, projection_digest, updated_at
+             ) VALUES(
+                'deferred-positive', 0, 1, 1, 0, 'open', 0, 0,
+                500, zeroblob(32), 'now'
+             )",
+        )
+        .execute(&mut *transaction)
+        .await
+        .expect("memory row may precede its event inside one transaction");
+        sqlx::query(
+            "INSERT INTO agent_events(
+                seq, event_type, internal_metadata, raw_key_ref, raw_ciphertext,
+                envelope, redaction_version, created_at
+             ) VALUES(500, 'memory_maintenance', '{}', ?, X'00', '{}', 1, 'now')",
+        )
+        .bind(&event_key.key_ref)
+        .execute(&mut *transaction)
+        .await
+        .expect("insert deferred parent event");
+        transaction
+            .commit()
+            .await
+            .expect("deferred event reference resolves at commit");
+
+        let mut transaction = store.pool().begin().await.expect("begin transaction");
+        sqlx::query(
+            "INSERT INTO memory_batches(
+                id, layer, ord, batch_seq, version, state, est_tokens,
+                eviction_footprint_tokens, projection_event_seq, projection_digest, updated_at
+             ) VALUES(
+                'deferred-negative', 0, 2, 2, 0, 'open', 0, 0,
+                501, zeroblob(32), 'now'
+             )",
+        )
+        .execute(&mut *transaction)
+        .await
+        .expect("deferred missing parent is checked at commit");
+        let error = transaction
+            .commit()
+            .await
+            .expect_err("missing projection event must reject commit");
+        assert!(
+            format!("{error:#}").contains("FOREIGN KEY constraint failed"),
+            "{error:#}"
         );
     }
 

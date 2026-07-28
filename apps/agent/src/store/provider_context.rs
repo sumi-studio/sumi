@@ -1845,7 +1845,11 @@ mod tests {
         NativeCompactionCoverage, ProviderContextAnchor, ProviderContextItem,
         ProviderContextPayload, ProviderOrigin, StopReason, Usage,
     };
-    use crate::store::{DataKeyPurpose, ProviderContextKeyAnchor, Store};
+    use crate::store::{
+        DataKeyPurpose, DurableEvent, EventBatch, EventWrite, EventWriter,
+        MemoryBatchMessageRecord, MemoryBatchRecord, MemoryBatchState, MemoryTransition,
+        Projection, ProviderContextKeyAnchor, Store,
+    };
 
     fn dummy_footprint() -> EvictionFootprint {
         // Native compaction windows and many mutation/invalidation tests do not
@@ -1885,29 +1889,33 @@ mod tests {
         footprint_tokens: i64,
     ) -> anyhow::Result<String> {
         seed_message(store, message_id, seq).await?;
-        let batch_id = format!("l0-batch-{message_id}");
-        let batch_seq: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(batch_seq), 0) + 1 FROM memory_batches WHERE layer = ?",
-        )
-        .bind(MemoryLayer::L0.as_i64())
-        .fetch_one(store.pool())
-        .await?;
-        sqlx::query(
-            "INSERT INTO memory_batches(
-                id, layer, ord, batch_seq, version, state, est_tokens,
-                eviction_footprint_tokens, updated_at
-             ) VALUES(?, ?, 1, ?, 0, 'open', 0, ?, 'now')",
-        )
-        .bind(&batch_id)
-        .bind(MemoryLayer::L0.as_i64())
-        .bind(batch_seq)
-        .bind(footprint_tokens)
-        .execute(store.pool())
-        .await?;
-        sqlx::query("INSERT INTO memory_batch_messages(batch_id, message_id, ord) VALUES(?, ?, 1)")
-            .bind(&batch_id)
-            .bind(message_id)
-            .execute(store.pool())
+        let batch_id = uuid::Uuid::now_v7().to_string();
+        EventWriter::new(std::sync::Arc::new(store.clone()))
+            .apply(EventBatch {
+                writes: vec![EventWrite {
+                    event: Some(DurableEvent::memory_maintenance(
+                        "fixture_provider_context_batch",
+                    )?),
+                    projections: vec![Projection::MemoryTransition(MemoryTransition {
+                        batch_inserts: vec![MemoryBatchRecord::new(
+                            batch_id.clone(),
+                            MemoryLayer::L0,
+                            0,
+                            0,
+                            MemoryBatchState::Open,
+                            0,
+                            footprint_tokens,
+                        )],
+                        membership_inserts: vec![MemoryBatchMessageRecord {
+                            batch_id: batch_id.clone(),
+                            message_id: message_id.to_owned(),
+                            ord: 1,
+                        }],
+                        ..Default::default()
+                    })],
+                }],
+                injected_commands: Vec::new(),
+            })
             .await?;
         Ok(batch_id)
     }

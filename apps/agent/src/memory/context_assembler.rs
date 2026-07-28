@@ -10,27 +10,25 @@ use sha2::Digest;
 
 use crate::memory::estimate::{
     EstimateError, ProviderContextItemWithFootprint, TokenCalibration, estimate_public_messages,
-    estimate_text_tokens, eviction_footprint_for_payload, observed_prompt_tokens,
-    sum_saved_footprints,
+    estimate_text_tokens, eviction_footprint_for_payload, sum_saved_footprints,
 };
 use crate::memory::overflow::{
     AssemblyMode, Overflow, USER_ATTACHMENT_TRUNCATION_BYTES, context_message_to_public,
 };
 use crate::memory::transform;
 use crate::memory::{BatchState, L0Batch, ThreeLayerMemory};
+#[cfg(test)]
+use crate::provider::types::Usage;
 use crate::provider::{
     ModelSpec,
     context_fingerprint::compute_context_fingerprint,
     types::{
         ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, MemoryBlock, MemoryLayer,
         Message, PromptContext, ProviderContextAnchor, ProviderContextFragment,
-        ProviderContextItem, ProviderContextPayload, ProviderOrigin, ToolDefinition, Usage,
-        UserContent,
+        ProviderContextItem, ProviderContextPayload, ProviderOrigin, ToolDefinition, UserContent,
     },
 };
 use crate::tools::executor::ArtifactBrokerClient;
-
-const EMA_ALPHA: f64 = 0.3;
 
 pub struct ContextAssembler {
     spec: ModelSpec,
@@ -110,6 +108,7 @@ impl ContextAssembler {
     }
 
     pub fn with_three_layer_memory(mut self, memory: ThreeLayerMemory) -> Self {
+        *self.calib.get_mut().expect("calibration lock") = memory.calibration();
         *self.three_layer_memory.get_mut().expect("memory lock") = Some(memory);
         self
     }
@@ -225,20 +224,15 @@ impl ContextAssembler {
         )
     }
 
-    /// Feed one measured prompt usage back into the calibration EMA.
-    ///
-    /// A zero observed prompt count means the provider did not report usage
-    /// for this turn; the EMA is not updated in that case.
-    pub fn record_usage(&self, usage: Usage, estimate: u64) -> Result<()> {
-        if estimate == 0 {
-            return Ok(());
-        }
-        let observed = observed_prompt_tokens(&usage)?;
-        if observed == 0 {
-            return Ok(());
-        }
-        let mut calib = self.calib.lock().expect("calibration lock");
-        calib.update_ema(observed, estimate, EMA_ALPHA)?;
+    /// Install the exact calibration value returned by a committed
+    /// MessageEnd receipt. Runtime code must never independently replay the
+    /// EMA because a crash between durable commit and local mutation would
+    /// otherwise produce a different ratio after restart.
+    pub(crate) fn install_committed_calibration(&self, ratio_bits: [u8; 8]) -> Result<()> {
+        let ratio = f64::from_bits(u64::from_be_bytes(ratio_bits));
+        let calibration =
+            TokenCalibration::new(ratio).context("committed calibration ratio is invalid")?;
+        *self.calib.lock().expect("calibration lock") = calibration;
         Ok(())
     }
 
@@ -984,27 +978,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn calibration_uses_the_estimate_bound_to_the_terminal_attempt() {
+    async fn calibration_installs_exact_committed_ratio_bits() {
         let assembler = assembler();
-        let first = assembler
-            .assemble_with_estimate(&[user("short", 1)], 1)
-            .await
-            .unwrap();
-        let _second = assembler
-            .assemble_with_estimate(&[user(&"x".repeat(10_000), 2)], 1)
-            .await
-            .unwrap();
-        assert!(first.uncalibrated_prompt_estimate > 0);
         assembler
-            .record_usage(
-                Usage {
-                    input: first.uncalibrated_prompt_estimate * 2,
-                    ..Usage::default()
-                },
-                first.uncalibrated_prompt_estimate,
-            )
+            .install_committed_calibration(1.3_f64.to_bits().to_be_bytes())
             .unwrap();
-        assert!((assembler.calibration().ratio() - 1.3).abs() < 1e-12);
+        assert_eq!(assembler.calibration().ratio().to_bits(), 1.3_f64.to_bits());
     }
 
     #[tokio::test]

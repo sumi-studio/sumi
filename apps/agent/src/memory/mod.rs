@@ -336,6 +336,7 @@ pub(crate) struct HydratedMemoryRuntime {
     jobs: Vec<HydratedMemoryJob>,
     cursors: Vec<HydratedMemoryCursor>,
     anchored_footprints: HashMap<String, u64>,
+    calibration: TokenCalibration,
 }
 
 impl HydratedMemoryRuntime {
@@ -352,7 +353,13 @@ impl HydratedMemoryRuntime {
             jobs,
             cursors,
             anchored_footprints,
+            calibration: TokenCalibration::default(),
         }
+    }
+
+    pub(crate) fn with_calibration(mut self, calibration: TokenCalibration) -> Self {
+        self.calibration = calibration;
+        self
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -373,6 +380,7 @@ impl fmt::Debug for HydratedMemoryRuntime {
             .field("job_count", &self.jobs.len())
             .field("cursor_count", &self.cursors.len())
             .field("anchored_footprint_count", &self.anchored_footprints.len())
+            .field("calibration_ratio", &self.calibration.ratio())
             .finish()
     }
 }
@@ -417,6 +425,7 @@ impl ThreeLayerMemory {
             jobs,
             cursors,
             anchored_footprints,
+            calibration,
         } = hydrated;
 
         let mut batches_by_id = HashMap::with_capacity(batches.len());
@@ -645,10 +654,6 @@ impl ThreeLayerMemory {
                         && is_visible_summary_source_state(batch.state))
             })
             .collect::<Vec<_>>();
-        if l2_ids.len() > 1 {
-            bail!("hydrated memory has multiple visible L2 summaries");
-        }
-
         let next_l0_batch_seq = batches_by_id
             .values()
             .filter(|batch| batch.layer == MemoryLayer::L0)
@@ -708,22 +713,37 @@ impl ThreeLayerMemory {
             l1.push_back(summary.into_l1_entry(source_batch));
         }
 
-        let l2 = match l2_ids.into_iter().next() {
-            Some(batch_id) => {
+        // Repeated CompactL1 applies append independently authenticated L2
+        // rows. Until a ConsolidateL2 job is applied, all visible rows are
+        // live memory. Fold them into the runtime's single L2 block in
+        // durable ordinal order without dropping an older summary.
+        let l2 = if l2_ids.is_empty() {
+            ConsolidatedMemory {
+                summary: DecryptedMemorySummary::new(String::new()),
+                est_tokens: 0,
+            }
+        } else {
+            let mut combined = Zeroizing::new(String::new());
+            let mut total_est_tokens = 0_u64;
+            for batch_id in l2_ids {
                 let batch = batches_by_id
                     .remove(&batch_id)
                     .expect("validated visible L2 batch must remain present");
-                batch
-                    .summary
-                    .ok_or_else(|| {
-                        anyhow!("visible L2 batch {batch_id} is missing an authenticated summary")
-                    })?
-                    .into_consolidated()
+                let summary = batch.summary.ok_or_else(|| {
+                    anyhow!("visible L2 batch {batch_id} is missing an authenticated summary")
+                })?;
+                if !combined.is_empty() {
+                    combined.push_str("\n\n");
+                }
+                combined.push_str(summary.summary.expose());
+                total_est_tokens = total_est_tokens
+                    .checked_add(summary.est_tokens)
+                    .ok_or_else(|| anyhow!("hydrated visible L2 estimate overflow"))?;
             }
-            None => ConsolidatedMemory {
-                summary: DecryptedMemorySummary::new(String::new()),
-                est_tokens: 0,
-            },
+            ConsolidatedMemory {
+                summary: DecryptedMemorySummary(combined),
+                est_tokens: total_est_tokens,
+            }
         };
 
         let mut shelf = HashMap::new();
@@ -741,8 +761,7 @@ impl ThreeLayerMemory {
             }
         }
 
-        let calib = TokenCalibration::default();
-        let pending_apply = calib
+        let pending_apply = calibration
             .effective_tokens(l0_estimate, l0_footprint)
             .context("failed to derive hydrated L0 pending-apply state")?
             > L0_LIMIT;
@@ -752,7 +771,7 @@ impl ThreeLayerMemory {
             l1,
             l0,
             shelf,
-            calib,
+            calib: calibration,
             pending_apply,
             next_l0_batch_seq,
         })
@@ -1056,6 +1075,19 @@ fn validate_jobs(
     let mut job_ids = HashSet::new();
     let mut target_jobs = HashSet::new();
     let mut kind_sequences = HashSet::new();
+    let mut source_owner = HashMap::new();
+    for job in jobs
+        .iter()
+        .filter(|job| job.status != MemoryJobStatus::Discarded)
+    {
+        for source_id in &job.source_ids {
+            if source_owner.insert(*source_id, job).is_some() {
+                bail!(
+                    "hydrated memory batch {source_id} is owned as a source by more than one non-discarded job"
+                );
+            }
+        }
+    }
 
     for job in jobs {
         if !job_ids.insert(job.id) {
@@ -1091,41 +1123,18 @@ fn validate_jobs(
             }
         }
 
-        let target_id = batches_by_layer_seq
+        let target_id = *batches_by_layer_seq
             .get(&(layer_rank(target_layer(job.kind)), job.batch_seq))
-            .copied();
-
-        // Discard is the only terminal state permitted to outlive a stale or
-        // missing source/target snapshot. Its result remains authenticated,
-        // but it contributes no live memory. Its witness map describes the
-        // graph that was rejected and can therefore contain stale or already
-        // deleted source/target identities.
-        if job.status == MemoryJobStatus::Discarded {
-            if job.result.is_none() {
-                bail!(
-                    "discarded memory job {} is missing its completed result",
-                    job.id
-                );
-            }
-            if target_id.is_some_and(|target_id| unique_sources.contains(&target_id)) {
-                bail!(
-                    "hydrated discarded job {} uses its target batch as a source",
-                    job.id
-                );
-            }
-            continue;
-        }
-
-        let target_id = target_id.ok_or_else(|| {
-            anyhow!(
-                "hydrated memory job {} has no {:?} target at batch sequence {}",
-                job.id,
-                target_layer(job.kind),
-                job.batch_seq
-            )
-        })?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "hydrated memory job {} has no {:?} target at batch sequence {}",
+                    job.id,
+                    target_layer(job.kind),
+                    job.batch_seq
+                )
+            })?;
         if !target_jobs.insert(target_id) {
-            bail!("hydrated memory has more than one live job targeting batch {target_id}");
+            bail!("hydrated memory has more than one job targeting batch {target_id}");
         }
         if unique_sources.contains(&target_id) {
             bail!(
@@ -1164,17 +1173,6 @@ fn validate_jobs(
                 job.id
             );
         }
-        for batch_id in &version_ids {
-            let batch = batches
-                .get(batch_id)
-                .expect("exact source/target witness must resolve");
-            if job.source_versions.get(batch_id) != Some(&batch.version) {
-                bail!(
-                    "hydrated memory job {} version witness for batch {batch_id} does not match current version",
-                    job.id
-                );
-            }
-        }
 
         let (source_state, target_state, requires_result) = match job.status {
             MemoryJobStatus::Pending | MemoryJobStatus::Running => (
@@ -1195,35 +1193,12 @@ fn validate_jobs(
                 MemoryBatchState::CompactFailed,
                 false,
             ),
-            MemoryJobStatus::Discarded => unreachable!("discarded jobs returned above"),
+            MemoryJobStatus::Discarded => (
+                MemoryBatchState::CompactFailed,
+                MemoryBatchState::CompactFailed,
+                true,
+            ),
         };
-        if target.state != target_state {
-            bail!(
-                "hydrated memory job {} target {target_id} is {}, expected {} for {}",
-                job.id,
-                target.state.as_str(),
-                target_state.as_str(),
-                job.status.as_str()
-            );
-        }
-        // A failed stale job can witness a source already advanced by a newer
-        // owner. All other live statuses own the exact source state.
-        if job.status != MemoryJobStatus::Failed {
-            for source_id in &job.source_ids {
-                let source = batches
-                    .get(source_id)
-                    .expect("job source was validated above");
-                if source.state != source_state {
-                    bail!(
-                        "hydrated memory job {} source {source_id} is {}, expected {} for {}",
-                        job.id,
-                        source.state.as_str(),
-                        source_state.as_str(),
-                        job.status.as_str()
-                    );
-                }
-            }
-        }
 
         if requires_result {
             let result = job.result.as_ref().ok_or_else(|| {
@@ -1250,6 +1225,79 @@ fn validate_jobs(
                 job.status.as_str(),
                 job.id
             );
+        }
+
+        // Discard preserves the exact original graph and authenticated result,
+        // but its version witnesses intentionally describe the rejected
+        // snapshot rather than the current one.
+        if job.status == MemoryJobStatus::Discarded {
+            continue;
+        }
+
+        for source_id in &job.source_ids {
+            let source = batches
+                .get(source_id)
+                .expect("job source was validated above");
+            if job.source_versions.get(source_id) != Some(&source.version) {
+                bail!(
+                    "hydrated memory job {} source witness for batch {source_id} does not match current version",
+                    job.id
+                );
+            }
+            // A failed stale job can witness a source already advanced by a
+            // newer owner. Other statuses own the exact source state.
+            if job.status != MemoryJobStatus::Failed && source.state != source_state {
+                bail!(
+                    "hydrated memory job {} source {source_id} is {}, expected {} for {}",
+                    job.id,
+                    source.state.as_str(),
+                    source_state.as_str(),
+                    job.status.as_str()
+                );
+            }
+        }
+
+        if let Some(successor) = source_owner.get(&target_id).copied() {
+            if job.status != MemoryJobStatus::Applied {
+                bail!(
+                    "hydrated {} job {} target {target_id} is reused before the predecessor was applied",
+                    job.status.as_str(),
+                    job.id
+                );
+            }
+            let predecessor_version = job
+                .source_versions
+                .get(&target_id)
+                .copied()
+                .expect("exact target witness was validated above");
+            let successor_version = successor
+                .source_versions
+                .get(&target_id)
+                .copied()
+                .expect("successor exact source witness was validated above");
+            if successor_version <= predecessor_version {
+                bail!(
+                    "hydrated job {} does not advance target {target_id} beyond predecessor job {}",
+                    successor.id,
+                    job.id
+                );
+            }
+        } else {
+            if job.source_versions.get(&target_id) != Some(&target.version) {
+                bail!(
+                    "hydrated memory job {} target witness for batch {target_id} does not match current version",
+                    job.id
+                );
+            }
+            if target.state != target_state {
+                bail!(
+                    "hydrated memory job {} target {target_id} is {}, expected {} for {}",
+                    job.id,
+                    target.state.as_str(),
+                    target_state.as_str(),
+                    job.status.as_str()
+                );
+            }
         }
     }
     Ok(())
@@ -1792,7 +1840,7 @@ mod tests {
     }
 
     #[test]
-    fn discarded_job_can_reconstruct_after_obsolete_batches_are_gone() {
+    fn discarded_job_rejects_missing_original_graph() {
         let source_id = Uuid::now_v7();
         let obsolete_target_id = Uuid::now_v7();
         let discarded = HydratedMemoryJob::new(
@@ -1812,11 +1860,11 @@ mod tests {
             HashMap::new(),
         );
 
-        let memory = ThreeLayerMemory::from_hydrated(hydrated)
-            .expect("discarded work contributes no live memory graph");
-        assert!(memory.l0().is_empty());
-        assert!(memory.l1().is_empty());
-        assert_eq!(memory.l2().summary.expose(), "");
+        let error = match ThreeLayerMemory::from_hydrated(hydrated) {
+            Ok(_) => panic!("discarded work must retain its exact authenticated graph"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("has no L1 target"), "{error:#}");
     }
 
     #[test]
@@ -1849,7 +1897,7 @@ mod tests {
                     MemoryBatchState::CompactFailed,
                     0,
                     0,
-                    None,
+                    Some(hydrated_summary("obsolete", 1)),
                 ),
             ),
         ]);

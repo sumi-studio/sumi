@@ -125,7 +125,15 @@ pub(crate) struct HydratedRunState {
     /// Authenticated, ciphertext-free Store handoff. A future T26 consumer
     /// will pass this opaque value to `ThreeLayerMemory::from_hydrated`.
     pub memory: HydratedMemoryRuntime,
-    pub recovery_steps: Vec<RecoveryStep>,
+    pub resume: ResumeDirective,
+}
+
+/// Runtime instruction carried only by a hydration result that reached a
+/// durable fixed point. Any nonempty logical suffix is returned as the typed
+/// `LogicalRecoveryRequired` outcome instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResumeDirective {
+    AdmitCommands,
 }
 
 /// Result of a T17 hydration attempt.
@@ -136,7 +144,11 @@ pub(crate) struct HydratedRunState {
 #[derive(Clone, Debug)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum HydrationOutcome {
-    RecoveryRequired(Vec<super::PhysicalRecoveryIntentRequest>),
+    PhysicalRecoveryRequired(Vec<super::PhysicalRecoveryIntentRequest>),
+    LogicalRecoveryRequired {
+        receipt: super::HydrationReceiptIdentity,
+        steps: Vec<RecoveryStep>,
+    },
     Complete(HydratedRunState),
 }
 
