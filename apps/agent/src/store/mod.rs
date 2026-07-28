@@ -348,6 +348,7 @@ impl Store {
             #[cfg(test)]
             _in_memory_anchor: None,
         });
+        provider_context::initialize_provider_context_projection_head(&store).await?;
         store.validate_startup().await?;
         Arc::try_unwrap(store).map_err(|_| anyhow!("recovery must not retain Store references"))
     }
@@ -385,6 +386,7 @@ impl Store {
             .context("failed to begin hydration snapshot transaction")?;
 
         event_writer::authenticate_event_log_snapshot(self, &mut transaction).await?;
+        provider_context::verify_provider_context_projection_set(self, &mut transaction).await?;
         let intents = self.hydrate_running_intents(&mut transaction).await?;
         if !intents.is_empty() {
             transaction
@@ -416,6 +418,7 @@ impl Store {
             .await
             .context("failed to begin post-recovery hydration snapshot")?;
         event_writer::authenticate_event_log_snapshot(self, &mut transaction).await?;
+        provider_context::verify_provider_context_projection_set(self, &mut transaction).await?;
         let post_recovery_intents = self.hydrate_running_intents(&mut transaction).await?;
         if !post_recovery_intents.is_empty() {
             transaction.rollback().await?;
@@ -432,6 +435,8 @@ impl Store {
         let memory = self
             .hydrate_memory_runtime(&messages, &provider_context, &mut transaction)
             .await?;
+        crate::memory::ThreeLayerMemory::from_hydrated(memory.clone())
+            .context("hydrated memory graph is structurally invalid")?;
 
         transaction
             .commit()
@@ -3430,9 +3435,14 @@ mod tests {
         )
         .expect("encrypt provider context record");
         record
-            .insert(store.pool())
+            .insert_committed(&store)
             .await
             .expect("insert provider context");
+        let mut transaction = store.pool().begin().await.expect("begin fixture update");
+        let checkpoint =
+            provider_context::verify_provider_context_projection_set(store, &mut transaction)
+                .await
+                .expect("authenticate fixture provider-context set");
         sqlx::query(
             "UPDATE provider_context
              SET eviction_tokens = ?, eviction_estimator_version = ?
@@ -3441,9 +3451,17 @@ mod tests {
         .bind(i64::try_from(saved_tokens).expect("saved tokens fit SQLite"))
         .bind(i64::from(EVICTION_ESTIMATOR_VERSION_SERIALIZED_BYTES))
         .bind(id)
-        .execute(store.pool())
+        .execute(&mut *transaction)
         .await
         .expect("downgrade fixture to legacy saved footprint");
+        provider_context::commit_provider_context_projection_set(
+            store,
+            &mut transaction,
+            &checkpoint,
+        )
+        .await
+        .expect("commit fixture provider-context set");
+        transaction.commit().await.expect("commit fixture update");
     }
 
     #[tokio::test]
@@ -4174,7 +4192,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hydrate_authenticates_memory_state() {
+    async fn hydrate_rejects_structurally_invalid_authentic_memory_graph() {
         let store = store().await;
         let key = store
             .conversation_key(DataKeyPurpose::MemorySummary)
@@ -4194,14 +4212,16 @@ mod tests {
         )
         .await;
 
-        let outcome = store
+        let error = store
             .hydrate(&test_lease(1), &test_fence(&test_lease(1)))
             .await
-            .expect("hydrate must authenticate and return memory state");
-        let HydrationOutcome::Complete(state) = outcome else {
-            panic!("expected complete hydration outcome");
-        };
-        assert!(!state.memory.is_empty());
+            .expect_err("authenticated summary without a compaction owner must fail closed");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("hydrated memory graph is structurally invalid")
+                && message.contains("has no matching compaction job"),
+            "{message}"
+        );
     }
 
     #[tokio::test]

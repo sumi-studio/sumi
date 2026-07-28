@@ -16,7 +16,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
@@ -43,6 +43,11 @@ const INTENT_HMAC_INFO: &[u8] = b"provider-context-mutation-intent/v1";
 const INTENT_HMAC_KEY_ID: &str = "mutation-intent-hmac/v1";
 const PLAINTEXT_HMAC_DOMAIN: &[u8] = b"sumi-provider-context-plaintext/v1";
 const INTENT_HMAC_DOMAIN: &[u8] = b"sumi-provider-context-mutation-intent/v1";
+const PROJECTION_HMAC_INFO: &[u8] = b"provider-context-projection-head/v1";
+const PROJECTION_STATE_DIGEST_DOMAIN: &[u8] = b"sumi-provider-context-durable-state/v1";
+const PROJECTION_HEAD_HMAC_DOMAIN: &[u8] = b"sumi-provider-context-projection-head/v1";
+const PROJECTION_SCHEMA_VERSION: i64 = 1;
+const PROJECTION_PAGE_SIZE: i64 = 256;
 const SCOPE_KEY_DOMAIN: &[u8] = b"sumi-provider-context-scope/v1";
 const PREPARED_KEY_MATERIAL_PROOF_DOMAIN: &[u8] = b"sumi-event-batch-prepared-key-material/v1";
 const PREPARED_KEY_MATERIAL_PROOF: &[u8] = b"active-key-material";
@@ -51,6 +56,14 @@ const PREPARED_KEY_MATERIAL_PROOF: &[u8] = b"active-key-material";
 /// and conversation-scoped salt.  This key is used for both the plaintext HMAC
 /// and the canonical semantic-intent HMAC.
 pub(crate) fn hkdf_intent_hmac_key(data_key: &DataKeyMaterial, conversation_id: &str) -> [u8; 32] {
+    hkdf_hmac_key(data_key, conversation_id, INTENT_HMAC_INFO)
+}
+
+fn hkdf_projection_hmac_key(data_key: &DataKeyMaterial, conversation_id: &str) -> [u8; 32] {
+    hkdf_hmac_key(data_key, conversation_id, PROJECTION_HMAC_INFO)
+}
+
+fn hkdf_hmac_key(data_key: &DataKeyMaterial, conversation_id: &str, info: &[u8]) -> [u8; 32] {
     let mut prk_mac = <Hmac<Sha256> as Mac>::new_from_slice(conversation_id.as_bytes())
         .expect("HMAC accepts any salt length");
     prk_mac.update(data_key.bytes());
@@ -58,7 +71,7 @@ pub(crate) fn hkdf_intent_hmac_key(data_key: &DataKeyMaterial, conversation_id: 
 
     let mut t_mac =
         <Hmac<Sha256> as Mac>::new_from_slice(&prk).expect("HMAC output is a valid HMAC key");
-    t_mac.update(INTENT_HMAC_INFO);
+    t_mac.update(info);
     t_mac.update(&[1]);
     let t = t_mac.finalize().into_bytes();
     t.into()
@@ -70,6 +83,489 @@ fn hmac_sha256(key: &[u8], domain: &[u8], payload: &[u8]) -> Vec<u8> {
     mac.update(&(payload.len() as u64).to_be_bytes());
     mac.update(payload);
     mac.finalize().into_bytes().to_vec()
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ProviderContextProjectionCheckpoint {
+    revision: i64,
+    record_count: i64,
+    set_digest: [u8; 32],
+    key_ref: String,
+    head_hmac: Vec<u8>,
+}
+
+fn projection_head_hmac(
+    store: &Store,
+    projection_key: &[u8],
+    revision: i64,
+    record_count: i64,
+    set_digest: &[u8; 32],
+    key_ref: &str,
+) -> Vec<u8> {
+    let mut writer = CanonicalWriter::with_domain(PROJECTION_HEAD_HMAC_DOMAIN);
+    writer.field(PROJECTION_SCHEMA_VERSION.to_string().as_bytes());
+    writer.field(store.scope().tenant_id.as_bytes());
+    writer.field(store.scope().agent_id.as_bytes());
+    writer.field(store.scope().conversation_id.as_bytes());
+    writer.field(revision.to_string().as_bytes());
+    writer.field(record_count.to_string().as_bytes());
+    writer.field(set_digest);
+    writer.field(key_ref.as_bytes());
+    hmac_sha256(
+        projection_key,
+        PROJECTION_HEAD_HMAC_DOMAIN,
+        &writer.finish(),
+    )
+}
+
+fn digest_field(hasher: &mut Sha256, bytes: &[u8]) {
+    Digest::update(hasher, (bytes.len() as u64).to_be_bytes());
+    Digest::update(hasher, bytes);
+}
+
+fn digest_optional_field(hasher: &mut Sha256, bytes: Option<&[u8]>) {
+    match bytes {
+        None => Digest::update(hasher, [0]),
+        Some(bytes) => {
+            Digest::update(hasher, [1]);
+            digest_field(hasher, bytes);
+        }
+    }
+}
+
+fn digest_i64(hasher: &mut Sha256, value: i64) {
+    digest_field(hasher, &value.to_be_bytes());
+}
+
+fn digest_optional_i64(hasher: &mut Sha256, value: Option<i64>) {
+    match value {
+        None => Digest::update(hasher, [0]),
+        Some(value) => {
+            Digest::update(hasher, [1]);
+            digest_i64(hasher, value);
+        }
+    }
+}
+
+async fn provider_context_set_digest(
+    store: &Store,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(i64, [u8; 32])> {
+    let mut hasher = Sha256::new();
+    Digest::update(&mut hasher, PROJECTION_STATE_DIGEST_DOMAIN);
+    digest_field(
+        &mut hasher,
+        PROJECTION_SCHEMA_VERSION.to_string().as_bytes(),
+    );
+    digest_field(&mut hasher, store.scope().tenant_id.as_bytes());
+    digest_field(&mut hasher, store.scope().agent_id.as_bytes());
+    digest_field(&mut hasher, store.scope().conversation_id.as_bytes());
+
+    digest_field(&mut hasher, b"provider_context");
+    let mut after_id: Option<String> = None;
+    let mut record_count = 0_i64;
+    loop {
+        let rows = sqlx::query(
+            "SELECT id, message_id, message_seq, wire_item_index, item_ordinal,
+                    idempotency_key, provider_instance_id, protocol, model, kind,
+                    coverage_through_seq, context_fingerprint, key_ref, ciphertext,
+                    eviction_tokens, eviction_estimator_version, created_at
+             FROM provider_context
+             WHERE ? IS NULL OR id > ?
+             ORDER BY id
+             LIMIT ?",
+        )
+        .bind(after_id.as_deref())
+        .bind(after_id.as_deref())
+        .bind(PROJECTION_PAGE_SIZE)
+        .fetch_all(&mut **transaction)
+        .await
+        .context("failed to page provider-context projection set")?;
+        if rows.is_empty() {
+            break;
+        }
+
+        for row in rows {
+            let id: String = row.try_get("id")?;
+            digest_field(&mut hasher, id.as_bytes());
+
+            let message_id: Option<String> = row.try_get("message_id")?;
+            digest_optional_field(&mut hasher, message_id.as_deref().map(str::as_bytes));
+            digest_optional_i64(&mut hasher, row.try_get("message_seq")?);
+            digest_optional_i64(&mut hasher, row.try_get("wire_item_index")?);
+            digest_i64(&mut hasher, row.try_get("item_ordinal")?);
+
+            for field in [
+                "idempotency_key",
+                "provider_instance_id",
+                "protocol",
+                "model",
+                "kind",
+            ] {
+                let value: String = row.try_get(field)?;
+                digest_field(&mut hasher, value.as_bytes());
+            }
+            digest_optional_i64(&mut hasher, row.try_get("coverage_through_seq")?);
+            let fingerprint: Option<String> = row.try_get("context_fingerprint")?;
+            digest_optional_field(&mut hasher, fingerprint.as_deref().map(str::as_bytes));
+
+            let key_ref: String = row.try_get("key_ref")?;
+            digest_field(&mut hasher, key_ref.as_bytes());
+            let ciphertext: Vec<u8> = row.try_get("ciphertext")?;
+            digest_field(&mut hasher, &ciphertext);
+            digest_i64(&mut hasher, row.try_get("eviction_tokens")?);
+            digest_i64(&mut hasher, row.try_get("eviction_estimator_version")?);
+            let created_at: String = row.try_get("created_at")?;
+            digest_field(&mut hasher, created_at.as_bytes());
+
+            record_count = record_count
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("provider-context record count overflow"))?;
+            after_id = Some(id);
+        }
+    }
+
+    digest_field(&mut hasher, b"provider_context_mutations");
+    let mut after_mutation_id: Option<String> = None;
+    loop {
+        let rows = sqlx::query(
+            "SELECT mutation_id, state, intent_key_ref, intent_ciphertext,
+                    hmac_key_id, intent_hmac, prepared_at, finished_at,
+                    terminal_reason
+             FROM provider_context_mutations
+             WHERE ? IS NULL OR mutation_id > ?
+             ORDER BY mutation_id
+             LIMIT ?",
+        )
+        .bind(after_mutation_id.as_deref())
+        .bind(after_mutation_id.as_deref())
+        .bind(PROJECTION_PAGE_SIZE)
+        .fetch_all(&mut **transaction)
+        .await
+        .context("failed to page provider-context mutation state")?;
+        if rows.is_empty() {
+            break;
+        }
+
+        for row in rows {
+            let mutation_id: String = row.try_get("mutation_id")?;
+            digest_field(&mut hasher, mutation_id.as_bytes());
+            for field in ["state", "intent_key_ref"] {
+                let value: String = row.try_get(field)?;
+                digest_field(&mut hasher, value.as_bytes());
+            }
+            let intent_ciphertext: Vec<u8> = row.try_get("intent_ciphertext")?;
+            digest_field(&mut hasher, &intent_ciphertext);
+            let hmac_key_id: String = row.try_get("hmac_key_id")?;
+            digest_field(&mut hasher, hmac_key_id.as_bytes());
+            let intent_hmac: Vec<u8> = row.try_get("intent_hmac")?;
+            digest_field(&mut hasher, &intent_hmac);
+            let prepared_at: String = row.try_get("prepared_at")?;
+            digest_field(&mut hasher, prepared_at.as_bytes());
+            let finished_at: Option<String> = row.try_get("finished_at")?;
+            digest_optional_field(&mut hasher, finished_at.as_deref().map(str::as_bytes));
+            let terminal_reason: Option<String> = row.try_get("terminal_reason")?;
+            digest_optional_field(&mut hasher, terminal_reason.as_deref().map(str::as_bytes));
+
+            record_count = record_count
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("provider-context durable-state count overflow"))?;
+            after_mutation_id = Some(mutation_id);
+        }
+    }
+
+    digest_field(&mut hasher, b"provider_context_replace_heads");
+    let mut after_scope_key: Option<String> = None;
+    loop {
+        let rows = sqlx::query(
+            "SELECT scope_key, max_config_generation, max_window_ordinal,
+                    latest_insert_id, updated_at
+             FROM provider_context_replace_heads
+             WHERE ? IS NULL OR scope_key > ?
+             ORDER BY scope_key
+             LIMIT ?",
+        )
+        .bind(after_scope_key.as_deref())
+        .bind(after_scope_key.as_deref())
+        .bind(PROJECTION_PAGE_SIZE)
+        .fetch_all(&mut **transaction)
+        .await
+        .context("failed to page provider-context replace-head state")?;
+        if rows.is_empty() {
+            break;
+        }
+
+        for row in rows {
+            let scope_key: String = row.try_get("scope_key")?;
+            digest_field(&mut hasher, scope_key.as_bytes());
+            digest_i64(&mut hasher, row.try_get("max_config_generation")?);
+            digest_i64(&mut hasher, row.try_get("max_window_ordinal")?);
+            let latest_insert_id: String = row.try_get("latest_insert_id")?;
+            digest_field(&mut hasher, latest_insert_id.as_bytes());
+            let updated_at: String = row.try_get("updated_at")?;
+            digest_field(&mut hasher, updated_at.as_bytes());
+
+            record_count = record_count
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("provider-context durable-state count overflow"))?;
+            after_scope_key = Some(scope_key);
+        }
+    }
+
+    Digest::update(&mut hasher, record_count.to_be_bytes());
+    Ok((record_count, hasher.finalize().into()))
+}
+
+async fn load_authenticated_projection_head(
+    store: &Store,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<ProviderContextProjectionCheckpoint> {
+    let row = sqlx::query(
+        "SELECT schema_version, state, revision, record_count, set_digest,
+                key_ref, head_hmac
+         FROM provider_context_projection_head
+         WHERE singleton = 1",
+    )
+    .fetch_optional(&mut **transaction)
+    .await
+    .context("failed to load provider-context projection head")?
+    .ok_or_else(|| anyhow!("provider-context projection head is missing"))?;
+
+    let schema_version: i64 = row.try_get("schema_version")?;
+    if schema_version != PROJECTION_SCHEMA_VERSION {
+        bail!("provider-context projection head uses unsupported schema version {schema_version}");
+    }
+    let state: String = row.try_get("state")?;
+    if state != "active" {
+        bail!("provider-context projection head is not initialized");
+    }
+    let revision: i64 = row.try_get("revision")?;
+    let record_count: i64 = row.try_get("record_count")?;
+    if revision < 0 || record_count < 0 {
+        bail!("provider-context projection head has a negative counter");
+    }
+    let set_digest: [u8; 32] = row
+        .try_get::<Vec<u8>, _>("set_digest")?
+        .try_into()
+        .map_err(|_| anyhow!("provider-context projection digest has invalid length"))?;
+    let key_ref: String = row.try_get("key_ref")?;
+    let head_hmac: Vec<u8> = row.try_get("head_hmac")?;
+    if head_hmac.len() != 32 {
+        bail!("provider-context projection head HMAC has invalid length");
+    }
+
+    let key = store
+        .data_key_by_ref_in_transaction(transaction, &key_ref)
+        .await
+        .context("failed to load provider-context projection key")?;
+    if key.purpose != DataKeyPurpose::Mutation {
+        bail!("provider-context projection head references a non-mutation key");
+    }
+    let projection_key = hkdf_projection_hmac_key(&key, &store.scope().conversation_id);
+    let expected = projection_head_hmac(
+        store,
+        &projection_key,
+        revision,
+        record_count,
+        &set_digest,
+        &key_ref,
+    );
+    if expected.as_slice().ct_eq(&head_hmac).unwrap_u8() != 1 {
+        bail!("provider-context projection head HMAC mismatch");
+    }
+
+    Ok(ProviderContextProjectionCheckpoint {
+        revision,
+        record_count,
+        set_digest,
+        key_ref,
+        head_hmac,
+    })
+}
+
+pub(super) async fn verify_provider_context_projection_set(
+    store: &Store,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<ProviderContextProjectionCheckpoint> {
+    let checkpoint = load_authenticated_projection_head(store, transaction).await?;
+    let (record_count, set_digest) = provider_context_set_digest(store, transaction).await?;
+    if record_count != checkpoint.record_count
+        || set_digest.ct_eq(&checkpoint.set_digest).unwrap_u8() != 1
+    {
+        bail!("provider-context durable state does not exactly match its authenticated commitment");
+    }
+    Ok(checkpoint)
+}
+
+pub(super) async fn commit_provider_context_projection_set(
+    store: &Store,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    previous: &ProviderContextProjectionCheckpoint,
+) -> Result<()> {
+    let current = load_authenticated_projection_head(store, transaction).await?;
+    if current.revision != previous.revision
+        || current.record_count != previous.record_count
+        || current.set_digest != previous.set_digest
+        || current.key_ref != previous.key_ref
+        || current.head_hmac.ct_eq(&previous.head_hmac).unwrap_u8() != 1
+    {
+        bail!("provider-context projection head changed after verification");
+    }
+
+    let (record_count, set_digest) = provider_context_set_digest(store, transaction).await?;
+    if record_count == previous.record_count && set_digest == previous.set_digest {
+        bail!("provider-context projection commit did not change durable state");
+    }
+    let revision = previous
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("provider-context projection revision overflow"))?;
+    let key = store
+        .data_key_by_ref_in_transaction(transaction, &previous.key_ref)
+        .await
+        .context("failed to reload provider-context projection key")?;
+    if key.purpose != DataKeyPurpose::Mutation {
+        bail!("provider-context projection head references a non-mutation key");
+    }
+    let projection_key = hkdf_projection_hmac_key(&key, &store.scope().conversation_id);
+    let head_hmac = projection_head_hmac(
+        store,
+        &projection_key,
+        revision,
+        record_count,
+        &set_digest,
+        &previous.key_ref,
+    );
+
+    let result = sqlx::query(
+        "UPDATE provider_context_projection_head
+         SET revision = ?, record_count = ?, set_digest = ?, head_hmac = ?
+         WHERE singleton = 1
+           AND state = 'active'
+           AND schema_version = ?
+           AND revision = ?
+           AND record_count = ?
+           AND set_digest = ?
+           AND key_ref = ?
+           AND head_hmac = ?",
+    )
+    .bind(revision)
+    .bind(record_count)
+    .bind(set_digest.as_slice())
+    .bind(&head_hmac)
+    .bind(PROJECTION_SCHEMA_VERSION)
+    .bind(previous.revision)
+    .bind(previous.record_count)
+    .bind(previous.set_digest.as_slice())
+    .bind(&previous.key_ref)
+    .bind(&previous.head_hmac)
+    .execute(&mut **transaction)
+    .await
+    .context("failed to commit provider-context projection head")?;
+    require_single_cas(result.rows_affected(), "provider-context projection head")
+}
+
+pub(super) async fn initialize_provider_context_projection_head(store: &Store) -> Result<()> {
+    let state: Option<String> = sqlx::query_scalar(
+        "SELECT state FROM provider_context_projection_head WHERE singleton = 1",
+    )
+    .fetch_optional(store.pool())
+    .await
+    .context("failed to inspect provider-context projection marker")?;
+    match state.as_deref() {
+        Some("active") => return Ok(()),
+        Some("uninitialized") => {}
+        Some(other) => bail!("provider-context projection marker has unknown state {other}"),
+        None => bail!("provider-context projection marker is missing"),
+    }
+
+    let legacy_rows: i64 = sqlx::query_scalar(
+        "SELECT
+            (SELECT COUNT(*) FROM provider_context) +
+            (SELECT COUNT(*) FROM provider_context_mutations) +
+            (SELECT COUNT(*) FROM provider_context_replace_heads)",
+    )
+    .fetch_one(store.pool())
+    .await
+    .context("failed to inspect pre-commitment provider-context state")?;
+    if legacy_rows != 0 {
+        bail!(
+            "cannot initialize provider-context projection head from non-empty unauthenticated state"
+        );
+    }
+
+    let key = store
+        .conversation_key(DataKeyPurpose::Mutation)
+        .await
+        .context("failed to initialize provider-context projection key")?;
+    let mut transaction = store.pool().begin().await?;
+    let current_state: String = sqlx::query_scalar(
+        "SELECT state FROM provider_context_projection_head WHERE singleton = 1",
+    )
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or_else(|| anyhow!("provider-context projection marker disappeared"))?;
+    if current_state == "active" {
+        transaction.commit().await?;
+        return Ok(());
+    }
+    if current_state != "uninitialized" {
+        bail!("provider-context projection marker has unknown state {current_state}");
+    }
+    let legacy_rows: i64 = sqlx::query_scalar(
+        "SELECT
+            (SELECT COUNT(*) FROM provider_context) +
+            (SELECT COUNT(*) FROM provider_context_mutations) +
+            (SELECT COUNT(*) FROM provider_context_replace_heads)",
+    )
+    .fetch_one(&mut *transaction)
+    .await?;
+    if legacy_rows != 0 {
+        bail!(
+            "cannot initialize provider-context projection head from non-empty unauthenticated state"
+        );
+    }
+
+    let (record_count, set_digest) = provider_context_set_digest(store, &mut transaction).await?;
+    if record_count != 0 {
+        bail!("provider-context projection genesis is not empty");
+    }
+    let projection_key = hkdf_projection_hmac_key(&key, &store.scope().conversation_id);
+    let head_hmac = projection_head_hmac(
+        store,
+        &projection_key,
+        0,
+        record_count,
+        &set_digest,
+        &key.key_ref,
+    );
+    let result = sqlx::query(
+        "UPDATE provider_context_projection_head
+         SET state = 'active', record_count = ?, set_digest = ?,
+             key_ref = ?, head_hmac = ?
+         WHERE singleton = 1
+           AND state = 'uninitialized'
+           AND schema_version = ?
+           AND revision = 0
+           AND record_count = 0
+           AND set_digest IS NULL
+           AND key_ref IS NULL
+           AND head_hmac IS NULL",
+    )
+    .bind(record_count)
+    .bind(set_digest.as_slice())
+    .bind(&key.key_ref)
+    .bind(head_hmac)
+    .bind(PROJECTION_SCHEMA_VERSION)
+    .execute(&mut *transaction)
+    .await
+    .context("failed to initialize provider-context projection head")?;
+    require_single_cas(
+        result.rows_affected(),
+        "provider-context projection genesis",
+    )?;
+    transaction.commit().await?;
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -371,6 +867,16 @@ impl EncryptedProviderContextRecord {
         .execute(executor)
         .await
         .context("failed to insert provider-context record")?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn insert_committed(&self, store: &Store) -> Result<()> {
+        let mut transaction = store.pool().begin().await?;
+        let checkpoint = verify_provider_context_projection_set(store, &mut transaction).await?;
+        self.insert(&mut *transaction).await?;
+        commit_provider_context_projection_set(store, &mut transaction, &checkpoint).await?;
+        transaction.commit().await?;
         Ok(())
     }
 }
@@ -913,6 +1419,8 @@ impl<'a> ProviderContextMutationApplier<'a> {
         }
 
         let mut transaction = self.store.pool().begin().await?;
+        let projection_checkpoint =
+            verify_provider_context_projection_set(self.store, &mut transaction).await?;
 
         #[allow(clippy::type_complexity)]
         let existing: Option<(String, String, Vec<u8>, String, Vec<u8>, Vec<u8>)> = sqlx::query_as(
@@ -984,10 +1492,10 @@ impl<'a> ProviderContextMutationApplier<'a> {
                 );
             }
 
-            sqlx::query(
+            let result = sqlx::query(
                 "UPDATE provider_context_mutations
                  SET intent_ciphertext = ?, intent_hmac = ?, prepared_at = ?
-                 WHERE mutation_id = ?",
+                 WHERE mutation_id = ? AND state = 'prepared'",
             )
             .bind(&prepared.intent_ciphertext)
             .bind(&prepared.intent_hmac)
@@ -996,7 +1504,17 @@ impl<'a> ProviderContextMutationApplier<'a> {
             .execute(&mut *transaction)
             .await
             .context("failed to CAS-update provider-context mutation intent")?;
+            require_single_cas(
+                result.rows_affected(),
+                "ProviderContextMutationPrepareRefresh",
+            )?;
 
+            commit_provider_context_projection_set(
+                self.store,
+                &mut transaction,
+                &projection_checkpoint,
+            )
+            .await?;
             transaction.commit().await?;
             return Ok(());
         }
@@ -1034,6 +1552,12 @@ impl<'a> ProviderContextMutationApplier<'a> {
         .await
         .context("failed to prepare provider-context mutation")?;
 
+        commit_provider_context_projection_set(
+            self.store,
+            &mut transaction,
+            &projection_checkpoint,
+        )
+        .await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -1103,6 +1627,8 @@ impl<'a> ProviderContextMutationApplier<'a> {
         transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         mutation_id: &str,
     ) -> Result<ApplyOutcome> {
+        let projection_checkpoint =
+            verify_provider_context_projection_set(self.store, transaction).await?;
         let (full, _mutation_key, intent_key) = self
             .load_and_verify_full_intent(transaction, mutation_id)
             .await?;
@@ -1134,8 +1660,14 @@ impl<'a> ProviderContextMutationApplier<'a> {
             }
         }
 
-        self.apply_full_intent(transaction, &full, mutation_id, &intent_key)
-            .await
+        self.apply_full_intent(
+            transaction,
+            &full,
+            mutation_id,
+            &intent_key,
+            &projection_checkpoint,
+        )
+        .await
     }
 
     async fn load_and_verify_full_intent(
@@ -1196,6 +1728,7 @@ impl<'a> ProviderContextMutationApplier<'a> {
         full: &FullIntent,
         mutation_id: &str,
         intent_key: &[u8],
+        projection_checkpoint: &ProviderContextProjectionCheckpoint,
     ) -> Result<ApplyOutcome> {
         if full.is_replace() {
             let scope_key = replace_scope_key(
@@ -1216,17 +1749,22 @@ impl<'a> ProviderContextMutationApplier<'a> {
             .await?;
 
             if !expected_latest_matches_head(full, head.as_ref()) {
-                return self
-                    .finish_mutation(
-                        transaction,
-                        mutation_id,
-                        "superseded",
-                        Some("newer_replace"),
-                    )
-                    .await
-                    .map(|_| ApplyOutcome::Superseded {
-                        reason: "newer_replace".to_owned(),
-                    });
+                self.finish_mutation(
+                    transaction,
+                    mutation_id,
+                    "superseded",
+                    Some("newer_replace"),
+                )
+                .await?;
+                commit_provider_context_projection_set(
+                    self.store,
+                    transaction,
+                    projection_checkpoint,
+                )
+                .await?;
+                return Ok(ApplyOutcome::Superseded {
+                    reason: "newer_replace".to_owned(),
+                });
             }
 
             if let Some(expected) = &full.expected_latest_id
@@ -1241,45 +1779,60 @@ impl<'a> ProviderContextMutationApplier<'a> {
 
             if let Some((head_gen, head_ord, head_id)) = head {
                 if (candidate_gen, candidate_ord) < (head_gen, head_ord) {
-                    return self
-                        .finish_mutation(
-                            transaction,
-                            mutation_id,
-                            "superseded",
-                            Some("newer_replace"),
-                        )
-                        .await
-                        .map(|_| ApplyOutcome::Superseded {
-                            reason: "newer_replace".to_owned(),
-                        });
+                    self.finish_mutation(
+                        transaction,
+                        mutation_id,
+                        "superseded",
+                        Some("newer_replace"),
+                    )
+                    .await?;
+                    commit_provider_context_projection_set(
+                        self.store,
+                        transaction,
+                        projection_checkpoint,
+                    )
+                    .await?;
+                    return Ok(ApplyOutcome::Superseded {
+                        reason: "newer_replace".to_owned(),
+                    });
                 }
                 if (candidate_gen, candidate_ord) == (head_gen, head_ord)
                     && head_id == full.provider_context_id
                 {
-                    return self
-                        .finish_mutation(
-                            transaction,
-                            mutation_id,
-                            "applied",
-                            Some("already_satisfied"),
-                        )
-                        .await
-                        .map(|_| ApplyOutcome::AlreadySatisfied);
+                    self.finish_mutation(
+                        transaction,
+                        mutation_id,
+                        "applied",
+                        Some("already_satisfied"),
+                    )
+                    .await?;
+                    commit_provider_context_projection_set(
+                        self.store,
+                        transaction,
+                        projection_checkpoint,
+                    )
+                    .await?;
+                    return Ok(ApplyOutcome::AlreadySatisfied);
                 }
                 if (candidate_gen, candidate_ord) == (head_gen, head_ord)
                     && head_id != full.provider_context_id
                 {
-                    return self
-                        .finish_mutation(
-                            transaction,
-                            mutation_id,
-                            "superseded",
-                            Some("newer_replace"),
-                        )
-                        .await
-                        .map(|_| ApplyOutcome::Superseded {
-                            reason: "newer_replace".to_owned(),
-                        });
+                    self.finish_mutation(
+                        transaction,
+                        mutation_id,
+                        "superseded",
+                        Some("newer_replace"),
+                    )
+                    .await?;
+                    commit_provider_context_projection_set(
+                        self.store,
+                        transaction,
+                        projection_checkpoint,
+                    )
+                    .await?;
+                    return Ok(ApplyOutcome::Superseded {
+                        reason: "newer_replace".to_owned(),
+                    });
                 }
             }
 
@@ -1349,10 +1902,11 @@ impl<'a> ProviderContextMutationApplier<'a> {
             .execute(&mut **transaction)
             .await?;
 
-            self.destroy_unreferenced_provider_context_keys(transaction, invalidated.key_refs)
-                .await?;
-
             self.finish_mutation(transaction, mutation_id, "applied", None)
+                .await?;
+            commit_provider_context_projection_set(self.store, transaction, projection_checkpoint)
+                .await?;
+            self.destroy_unreferenced_provider_context_keys(transaction, invalidated.key_refs)
                 .await?;
             Ok(ApplyOutcome::Applied)
         } else {
@@ -1362,8 +1916,6 @@ impl<'a> ProviderContextMutationApplier<'a> {
             let invalidated = self
                 .invalidate_ids(transaction, &full.invalidate_ids)
                 .await?;
-            self.destroy_unreferenced_provider_context_keys(transaction, invalidated.key_refs)
-                .await?;
             if invalidated.deleted_ids.is_empty() {
                 self.finish_mutation(
                     transaction,
@@ -1372,9 +1924,23 @@ impl<'a> ProviderContextMutationApplier<'a> {
                     Some("already_satisfied"),
                 )
                 .await?;
+                commit_provider_context_projection_set(
+                    self.store,
+                    transaction,
+                    projection_checkpoint,
+                )
+                .await?;
                 Ok(ApplyOutcome::AlreadySatisfied)
             } else {
                 self.finish_mutation(transaction, mutation_id, "applied", None)
+                    .await?;
+                commit_provider_context_projection_set(
+                    self.store,
+                    transaction,
+                    projection_checkpoint,
+                )
+                .await?;
+                self.destroy_unreferenced_provider_context_keys(transaction, invalidated.key_refs)
                     .await?;
                 Ok(ApplyOutcome::Applied)
             }
@@ -2229,12 +2795,149 @@ mod tests {
 
         // Insert a valid reasoning row.
         let record = reasoning_record(&store, "message-1", 7, "pc-1").await;
-        record.insert(store.pool()).await.unwrap();
+        record.insert_committed(&store).await.unwrap();
 
         // Duplicate (message_id, wire_item_index, item_ordinal) must fail.
         let record2 = reasoning_record(&store, "message-1", 7, "pc-2").await;
-        let result = record2.insert(store.pool()).await;
+        let result = record2.insert_committed(&store).await;
         assert!(result.is_err(), "duplicate ordinal must be rejected");
+    }
+
+    #[tokio::test]
+    async fn durable_state_commitment_detects_deletion_of_lone_native_row() {
+        let store = store().await;
+        seed_message(&store, "coverage-message", 1).await.unwrap();
+        let id = insert_native_compaction(&store, "lone-native", &native_compaction_item(false, 1))
+            .await;
+
+        let mut transaction = store.pool().begin().await.unwrap();
+        verify_provider_context_projection_set(&store, &mut transaction)
+            .await
+            .expect("committed lone native row must verify");
+        transaction.commit().await.unwrap();
+
+        sqlx::query("DELETE FROM provider_context WHERE id = ?")
+            .bind(&id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let mut transaction = store.pool().begin().await.unwrap();
+        let error = verify_provider_context_projection_set(&store, &mut transaction)
+            .await
+            .expect_err("deleting the only row must not collapse to an authenticated empty set");
+        assert!(
+            format!("{error:#}").contains("authenticated commitment"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_state_commitment_detects_deletion_of_lone_prepared_mutation() {
+        let store = store().await;
+        let mutation_key = store
+            .conversation_key(DataKeyPurpose::Mutation)
+            .await
+            .expect("mint mutation key");
+        let applier = ProviderContextMutationApplier::new(&store);
+        let prepared = ProviderContextMutationBuilder::new(
+            mutation_key,
+            store.scope().clone(),
+            "prepared-only".to_owned(),
+        )
+        .build_invalidate(None, vec!["not-present".to_owned()])
+        .expect("build invalidate");
+        applier.prepare(&prepared).await.expect("prepare mutation");
+
+        sqlx::query("DELETE FROM provider_context_mutations WHERE mutation_id = ?")
+            .bind("prepared-only")
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let mut transaction = store.pool().begin().await.unwrap();
+        let error = verify_provider_context_projection_set(&store, &mut transaction)
+            .await
+            .expect_err("deleting a prepared replay intent must fail closed");
+        assert!(
+            format!("{error:#}").contains("authenticated commitment"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_state_commitment_detects_replace_head_deletion() {
+        let store = store().await;
+        seed_message_in_open_l0_batch(&store, "message-1", 7, 1_000_000)
+            .await
+            .unwrap();
+        let record = reasoning_record(&store, "message-1", 7, "replace-head-row").await;
+        let mutation_key = store
+            .conversation_key(DataKeyPurpose::Mutation)
+            .await
+            .expect("mint mutation key");
+        let applier = ProviderContextMutationApplier::new(&store);
+        let prepared = ProviderContextMutationBuilder::new(
+            mutation_key,
+            store.scope().clone(),
+            "replace-head-mutation".to_owned(),
+        )
+        .build_replace(
+            None,
+            Vec::new(),
+            &record,
+            &reasoning_item("message-1", 7),
+            1,
+            1,
+        )
+        .expect("build replace");
+        applier.prepare(&prepared).await.expect("prepare replace");
+        assert_eq!(
+            applier.apply("replace-head-mutation").await.unwrap(),
+            ApplyOutcome::Applied
+        );
+
+        let mut transaction = store.pool().begin().await.unwrap();
+        verify_provider_context_projection_set(&store, &mut transaction)
+            .await
+            .expect("applied Replace must leave committed durable state");
+        transaction.commit().await.unwrap();
+
+        let deleted = sqlx::query("DELETE FROM provider_context_replace_heads")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(deleted.rows_affected(), 1);
+
+        let mut transaction = store.pool().begin().await.unwrap();
+        let error = verify_provider_context_projection_set(&store, &mut transaction)
+            .await
+            .expect_err("deleting a Replace CAS head must fail closed");
+        assert!(
+            format!("{error:#}").contains("authenticated commitment"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_state_commitment_rejects_head_hmac_tamper() {
+        let store = store().await;
+        sqlx::query(
+            "UPDATE provider_context_projection_head
+             SET head_hmac = zeroblob(length(head_hmac))",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let mut transaction = store.pool().begin().await.unwrap();
+        let error = verify_provider_context_projection_set(&store, &mut transaction)
+            .await
+            .expect_err("projection-head HMAC tamper must fail closed");
+        assert!(
+            format!("{error:#}").contains("projection head HMAC mismatch"),
+            "{error:#}"
+        );
     }
 
     #[tokio::test]
@@ -2467,7 +3170,7 @@ mod tests {
         seed_message(&store, "message-1", 7).await.unwrap();
 
         let record = reasoning_record(&store, "message-1", 7, "pc-1").await;
-        record.insert(store.pool()).await.unwrap();
+        record.insert_committed(&store).await.unwrap();
 
         let mutation_key = store
             .conversation_key(DataKeyPurpose::Mutation)
@@ -2687,11 +3390,11 @@ mod tests {
         seed_message(&store, "message-1", 7).await.unwrap();
 
         let a = reasoning_record(&store, "message-1", 7, "pc-a").await;
-        a.insert(store.pool()).await.unwrap();
+        a.insert_committed(&store).await.unwrap();
 
         let b = reasoning_record(&store, "message-1", 7, "pc-b").await;
         let error = b
-            .insert(store.pool())
+            .insert_committed(&store)
             .await
             .expect_err("same canonical reasoning idempotency key must collide");
         let message = format!("{error:#}");
@@ -2779,7 +3482,7 @@ mod tests {
             store.scope(),
         )
         .expect("encrypt native compaction")
-        .insert(store.pool())
+        .insert_committed(&store)
         .await
         .expect("insert native compaction");
         id
@@ -2831,7 +3534,7 @@ mod tests {
             store.scope(),
         )
         .expect("encrypt compaction a");
-        a.insert(store.pool()).await.unwrap();
+        a.insert_committed(&store).await.unwrap();
 
         // Same request/coverage/fingerprint with a different ordinal still collides
         // on the canonical idempotency key, even though the (message_id, NULL, ordinal)
@@ -2850,7 +3553,7 @@ mod tests {
         )
         .expect("encrypt compaction b");
         let error = b
-            .insert(store.pool())
+            .insert_committed(&store)
             .await
             .expect_err("same canonical compaction idempotency key must collide");
         let message = format!("{error:#}");
@@ -2886,7 +3589,7 @@ mod tests {
             store.scope(),
         )
         .expect("encrypt compaction c");
-        c.insert(store.pool())
+        c.insert_committed(&store)
             .await
             .expect("different fingerprint must not collide");
     }
@@ -2897,7 +3600,7 @@ mod tests {
         seed_message(&store, "message-1", 7).await.unwrap();
         let record = reasoning_record(&store, "message-1", 7, "pc-1").await;
         let key_ref = record.key_ref.clone();
-        record.insert(store.pool()).await.unwrap();
+        record.insert_committed(&store).await.unwrap();
 
         let mutation_key = store
             .conversation_key(DataKeyPurpose::Mutation)
@@ -2937,7 +3640,7 @@ mod tests {
             .unwrap();
         let old_record = reasoning_record(&store, "message-1", 7, "pc-1").await;
         let key_ref = old_record.key_ref.clone();
-        old_record.insert(store.pool()).await.unwrap();
+        old_record.insert_committed(&store).await.unwrap();
 
         let new_record = reasoning_record_with(&store, "message-1", 7, "pc-2", 0, 1).await;
 
@@ -2992,10 +3695,10 @@ mod tests {
 
         let a = reasoning_record_with(&store, "message-1", 7, "pc-a", 0, 1).await;
         let key_ref = a.key_ref.clone();
-        a.insert(store.pool()).await.unwrap();
+        a.insert_committed(&store).await.unwrap();
 
         let b = reasoning_record_with(&store, "message-1", 7, "pc-b", 1, 2).await;
-        b.insert(store.pool()).await.unwrap();
+        b.insert_committed(&store).await.unwrap();
 
         let mutation_key_a = store
             .conversation_key(DataKeyPurpose::Mutation)
@@ -3048,7 +3751,7 @@ mod tests {
 
         let cross_record = reasoning_record(&store, "message-1", 7, "pc-cross").await;
         let cross_key_ref = cross_record.key_ref.clone();
-        cross_record.insert(store.pool()).await.unwrap();
+        cross_record.insert_committed(&store).await.unwrap();
 
         // Tamper with the data_keys row so it appears to belong to another conversation,
         // simulating a cross-conversation row referenced by this conversation's store.
@@ -3135,7 +3838,7 @@ mod tests {
         seed_message(&store, "message-1", 7).await.unwrap();
 
         let record = reasoning_record(&store, "message-1", 7, "pc-1").await;
-        record.insert(store.pool()).await.unwrap();
+        record.insert_committed(&store).await.unwrap();
 
         let messages = vec![ContextMessage::Persisted {
             id: "message-1".to_owned(),
@@ -3167,12 +3870,12 @@ mod tests {
         seed_message(&store, "message-1", 7).await.unwrap();
         reasoning_record_with(&store, "message-1", 7, "pc-0", 0, 0)
             .await
-            .insert(store.pool())
+            .insert_committed(&store)
             .await
             .unwrap();
         reasoning_record_with(&store, "message-1", 7, "pc-1", 0, 1)
             .await
-            .insert(store.pool())
+            .insert_committed(&store)
             .await
             .unwrap();
         sqlx::query("DELETE FROM provider_context WHERE id = 'pc-0'")
@@ -3204,7 +3907,7 @@ mod tests {
         seed_message(&store, "message-1", 7).await.unwrap();
 
         let record = reasoning_record(&store, "message-1", 7, "pc-1").await;
-        record.insert(store.pool()).await.unwrap();
+        record.insert_committed(&store).await.unwrap();
 
         // Tamper with the stored provider-origin metadata. The authenticated plaintext
         // still carries the real origin, so hydration must detect the mismatch.
@@ -3280,7 +3983,7 @@ mod tests {
             store.scope(),
         )
         .expect("encrypt later compaction");
-        later.insert(store.pool()).await.unwrap();
+        later.insert_committed(&store).await.unwrap();
 
         // A different model keeps this a distinct native-compaction scope so the
         // active-native-window unique index is respected while still testing sort order.
@@ -3309,7 +4012,7 @@ mod tests {
             store.scope(),
         )
         .expect("encrypt earlier compaction");
-        earlier_reasoning.insert(store.pool()).await.unwrap();
+        earlier_reasoning.insert_committed(&store).await.unwrap();
 
         let origin = openai_responses_origin();
         let messages = vec![
@@ -3391,11 +4094,11 @@ mod tests {
             store.scope(),
         )
         .expect("encrypt compaction");
-        compaction.insert(store.pool()).await.unwrap();
+        compaction.insert_committed(&store).await.unwrap();
 
         // Anchored reasoning at seq 2.
         let reasoning = reasoning_record_with(&store, "message-2", 2, "pc-reasoning", 0, 0).await;
-        reasoning.insert(store.pool()).await.unwrap();
+        reasoning.insert_committed(&store).await.unwrap();
 
         let messages = vec![
             ContextMessage::Persisted {
@@ -3436,19 +4139,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalidate_converges_when_all_targets_already_deleted() {
+    async fn invalidate_rejects_uncommitted_deletion_of_all_targets() {
         let store = store().await;
         seed_message(&store, "message-1", 7).await.unwrap();
 
         let record = reasoning_record(&store, "message-1", 7, "pc-1").await;
-        record.insert(store.pool()).await.unwrap();
-
-        // Simulate a previous successful apply (or external deletion) by removing the target.
-        sqlx::query("DELETE FROM provider_context WHERE id = ?")
-            .bind("pc-1")
-            .execute(store.pool())
-            .await
-            .unwrap();
+        record.insert_committed(&store).await.unwrap();
 
         let mutation_key = store
             .conversation_key(DataKeyPurpose::Mutation)
@@ -3464,9 +4160,21 @@ mod tests {
         .expect("build invalidate intent");
 
         applier.prepare(&intent).await.unwrap();
-        assert_eq!(
-            applier.apply("invalidate-all-gone").await.unwrap(),
-            ApplyOutcome::AlreadySatisfied
+
+        // Removing an authenticated target outside the mutation transaction is
+        // corruption, not an idempotent replay witness.
+        sqlx::query("DELETE FROM provider_context WHERE id = ?")
+            .bind("pc-1")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let error = applier
+            .apply("invalidate-all-gone")
+            .await
+            .expect_err("uncommitted target deletion must fail closed");
+        assert!(
+            format!("{error:#}").contains("authenticated commitment"),
+            "{error:#}"
         );
 
         let remaining: i64 =
@@ -3477,33 +4185,29 @@ mod tests {
                 .unwrap();
         assert_eq!(remaining, 0);
 
-        let reason: Option<String> = sqlx::query_scalar(
-            "SELECT terminal_reason FROM provider_context_mutations WHERE mutation_id = ?",
+        let state: String = sqlx::query_scalar(
+            "SELECT state FROM provider_context_mutations WHERE mutation_id = ?",
         )
         .bind("invalidate-all-gone")
         .fetch_one(store.pool())
         .await
         .unwrap();
-        assert_eq!(reason.as_deref(), Some("already_satisfied"));
+        assert_eq!(
+            state, "prepared",
+            "failed apply must not terminalize intent"
+        );
     }
 
     #[tokio::test]
-    async fn invalidate_converges_when_some_targets_already_deleted() {
+    async fn invalidate_rejects_uncommitted_deletion_of_some_targets() {
         let store = store().await;
         seed_message(&store, "message-1", 7).await.unwrap();
         seed_message(&store, "message-2", 9).await.unwrap();
 
         let record1 = reasoning_record_with(&store, "message-1", 7, "pc-1", 0, 1).await;
         let record2 = reasoning_record_with(&store, "message-2", 9, "pc-2", 0, 1).await;
-        record1.insert(store.pool()).await.unwrap();
-        record2.insert(store.pool()).await.unwrap();
-
-        // One target disappears before the intent is applied.
-        sqlx::query("DELETE FROM provider_context WHERE id = ?")
-            .bind("pc-1")
-            .execute(store.pool())
-            .await
-            .unwrap();
+        record1.insert_committed(&store).await.unwrap();
+        record2.insert_committed(&store).await.unwrap();
 
         let mutation_key = store
             .conversation_key(DataKeyPurpose::Mutation)
@@ -3519,9 +4223,19 @@ mod tests {
         .expect("build invalidate intent");
 
         applier.prepare(&intent).await.unwrap();
-        assert_eq!(
-            applier.apply("invalidate-partial").await.unwrap(),
-            ApplyOutcome::Applied
+
+        sqlx::query("DELETE FROM provider_context WHERE id = ?")
+            .bind("pc-1")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let error = applier
+            .apply("invalidate-partial")
+            .await
+            .expect_err("partial uncommitted deletion must fail closed");
+        assert!(
+            format!("{error:#}").contains("authenticated commitment"),
+            "{error:#}"
         );
 
         let remaining: i64 = sqlx::query_scalar(
@@ -3530,16 +4244,22 @@ mod tests {
         .fetch_one(store.pool())
         .await
         .unwrap();
-        assert_eq!(remaining, 0);
+        assert_eq!(
+            remaining, 1,
+            "failed apply must preserve the still-authenticated target"
+        );
 
-        let reason: Option<String> = sqlx::query_scalar(
-            "SELECT terminal_reason FROM provider_context_mutations WHERE mutation_id = ?",
+        let state: String = sqlx::query_scalar(
+            "SELECT state FROM provider_context_mutations WHERE mutation_id = ?",
         )
         .bind("invalidate-partial")
         .fetch_one(store.pool())
         .await
         .unwrap();
-        assert_eq!(reason, None);
+        assert_eq!(
+            state, "prepared",
+            "failed apply must not terminalize intent"
+        );
     }
 
     #[tokio::test]
@@ -3588,7 +4308,7 @@ mod tests {
         )
         .expect("encrypt compaction with origin");
 
-        record.insert(store.pool()).await.unwrap();
+        record.insert_committed(&store).await.unwrap();
 
         let error = {
             let mut transaction = store.pool().begin().await.expect("begin test transaction");
@@ -3644,7 +4364,7 @@ mod tests {
         )
         .expect("encrypt compaction with wire item index");
 
-        record.insert(store.pool()).await.unwrap();
+        record.insert_committed(&store).await.unwrap();
 
         let error = {
             let mut transaction = store.pool().begin().await.expect("begin test transaction");
@@ -3687,7 +4407,7 @@ mod tests {
         )
         .expect("encrypt reasoning without wire item index");
 
-        record.insert(store.pool()).await.unwrap();
+        record.insert_committed(&store).await.unwrap();
 
         let messages = vec![ContextMessage::Persisted {
             id: "message-1".to_owned(),
@@ -3785,7 +4505,7 @@ mod tests {
         seed_message(&store, "message-1", 7).await.unwrap();
 
         let record = reasoning_record(&store, "message-1", 7, "pc-1").await;
-        record.insert(store.pool()).await.unwrap();
+        record.insert_committed(&store).await.unwrap();
 
         sqlx::query("UPDATE provider_context SET eviction_tokens = ? WHERE id = ?")
             .bind(999i64)
@@ -3861,7 +4581,7 @@ mod tests {
             store.scope(),
         )
         .expect("encrypt legacy record")
-        .insert(store.pool())
+        .insert_committed(&store)
         .await
         .expect("insert legacy record");
 
@@ -3887,7 +4607,7 @@ mod tests {
         seed_message(&store, "message-1", 7).await.unwrap();
 
         let record = reasoning_record(&store, "message-1", 7, "pc-1").await;
-        record.insert(store.pool()).await.unwrap();
+        record.insert_committed(&store).await.unwrap();
 
         sqlx::query("UPDATE provider_context SET eviction_estimator_version = ? WHERE id = ?")
             .bind(99i64)
@@ -3921,7 +4641,7 @@ mod tests {
         seed_message(&store, "message-1", 7).await.unwrap();
 
         let record = reasoning_record(&store, "message-1", 7, "pc-1").await;
-        record.insert(store.pool()).await.unwrap();
+        record.insert_committed(&store).await.unwrap();
 
         // The reasoning record was bound to reasoning_origin(); supply an assistant
         // message whose origin differs so P1-1 authentication is violated.
@@ -3953,7 +4673,7 @@ mod tests {
         seed_message(&store, "message-1", 7).await.unwrap();
 
         let record = reasoning_record(&store, "message-1", 7, "pc-1").await;
-        record.insert(store.pool()).await.unwrap();
+        record.insert_committed(&store).await.unwrap();
 
         // The persisted message at seq 7 has a different id than the anchor claims.
         // Before the id-shadow fix the outer provider-context record id would be
@@ -4053,7 +4773,7 @@ mod tests {
             store.scope(),
         )
         .expect("encrypt first window");
-        first.insert(store.pool()).await.unwrap();
+        first.insert_committed(&store).await.unwrap();
 
         let mut second_item = item.clone();
         second_item.payload = ProviderContextPayload::OpenAiCompactedWindow {
@@ -4080,7 +4800,7 @@ mod tests {
         )
         .expect("encrypt second window");
         let error = second
-            .insert(store.pool())
+            .insert_committed(&store)
             .await
             .expect_err("second active native window for the same origin scope must fail");
         let message = format!("{error:#}");
@@ -4385,7 +5105,7 @@ mod tests {
             store.scope(),
         )
         .expect("encrypt compaction");
-        compaction.insert(store.pool()).await.unwrap();
+        compaction.insert_committed(&store).await.unwrap();
 
         let origin = openai_responses_origin();
         let messages = vec![
@@ -4453,10 +5173,10 @@ mod tests {
         let store2 = store().await;
         seed_message(&store2, "message-1", 1).await.unwrap();
         let first = reasoning_record(&store2, "message-1", 1, "dup-1").await;
-        first.insert(store2.pool()).await.unwrap();
+        first.insert_committed(&store2).await.unwrap();
         let second = reasoning_record(&store2, "message-1", 1, "dup-2").await;
         assert!(
-            second.insert(store2.pool()).await.is_err(),
+            second.insert_committed(&store2).await.is_err(),
             "duplicate idempotency key must fail closed"
         );
 
@@ -4493,8 +5213,8 @@ mod tests {
         // Two reasoning records for the same anchor share a data key.
         let a = reasoning_record_with(&store, "message-1", 7, "pc-a", 0, 0).await;
         let b = reasoning_record_with(&store, "message-1", 7, "pc-b", 0, 1).await;
-        a.insert(store.pool()).await.unwrap();
-        b.insert(store.pool()).await.unwrap();
+        a.insert_committed(&store).await.unwrap();
+        b.insert_committed(&store).await.unwrap();
 
         // Replace invalidates pc-a and inserts pc-c. All three share the anchor key.
         let c = reasoning_record_with(&store, "message-1", 7, "pc-c", 0, 2).await;
@@ -4634,7 +5354,7 @@ mod tests {
         .unwrap();
 
         let old_record = reasoning_record_from_item(&store, "pc-old", &old_item).await;
-        old_record.insert(store.pool()).await.unwrap();
+        old_record.insert_committed(&store).await.unwrap();
 
         let new_record = reasoning_record_from_item(&store, "pc-new", &new_item).await;
 

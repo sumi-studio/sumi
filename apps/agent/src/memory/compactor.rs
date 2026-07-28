@@ -1583,7 +1583,9 @@ async fn recover_compacting_batches_with<W: RecoveryBatchWriter>(writer: &mut W)
                 .await
                 .context("check existing memory job for orphan target batch")?;
                 if !target_referenced && source_referenced.is_none() {
-                    repair_orphan_compacting_target_with(writer, &source_id, version).await?;
+                    bail!(
+                        "summaryless compacting target {source_id} has no authenticated owning job; refusing recovery mutation"
+                    );
                 }
                 continue;
             }
@@ -1667,45 +1669,6 @@ async fn recover_compacting_batches_with<W: RecoveryBatchWriter>(writer: &mut W)
 async fn recover_compacting_batches(store: &Store) -> Result<()> {
     let mut writer = EventWriter::new(Arc::new(store.clone()));
     recover_compacting_batches_with(&mut writer).await
-}
-
-async fn repair_orphan_compacting_target_with<W: RecoveryBatchWriter>(
-    writer: &mut W,
-    target_id: &str,
-    version: i64,
-) -> Result<()> {
-    let batch_uuid = BatchId::parse_str(target_id)
-        .with_context(|| format!("orphan target batch id {target_id} is not a UUID"))?;
-    let expected_source_versions = BTreeMap::from([(batch_uuid, version as u64)]);
-
-    let transition = MemoryTransition {
-        expected_source_versions,
-        batch_mutations: vec![MemoryBatchMutation {
-            batch_id: batch_uuid,
-            expected_version: version as u64,
-            new_state: MemoryBatchState::CompactFailed,
-            summary: None,
-            est_tokens: 0,
-            footprint_delta: 0,
-            delete_membership: false,
-        }],
-        job_mutations: Vec::new(),
-        cursor_advance: None,
-        ..Default::default()
-    };
-
-    writer
-        .apply_recovery_batch(EventBatch {
-            writes: vec![EventWrite {
-                event: Some(DurableEvent::memory_maintenance("compact_orphan_repair")?),
-                projections: vec![Projection::MemoryTransition(transition)],
-            }],
-            injected_commands: Vec::new(),
-        })
-        .await
-        .context("repair orphan compacting target")?;
-    tracing::debug!("repaired orphan compacting target {target_id}");
-    Ok(())
 }
 
 async fn recover_jobs(store: &Store) -> Result<()> {
@@ -4763,7 +4726,7 @@ mod tests {
         )
         .expect("encrypt provider context");
         record
-            .insert(store.pool())
+            .insert_committed(&store)
             .await
             .expect("insert provider context");
 
@@ -5194,7 +5157,7 @@ mod tests {
         )
         .expect("encrypt uncovered");
         uncovered
-            .insert(store.pool())
+            .insert_committed(&store)
             .await
             .expect("insert uncovered");
 
@@ -5336,7 +5299,10 @@ mod tests {
             store.scope(),
         )
         .expect("encrypt covered");
-        covered.insert(store.pool()).await.expect("insert covered");
+        covered
+            .insert_committed(&store)
+            .await
+            .expect("insert covered");
 
         // Unrelated: coverage endpoint does not belong to this batch and lives in a
         // different provider scope, so it is not the same active native window as the
@@ -5372,7 +5338,7 @@ mod tests {
         )
         .expect("encrypt uncovered");
         uncovered
-            .insert(store.pool())
+            .insert_committed(&store)
             .await
             .expect("insert uncovered");
 
@@ -5414,7 +5380,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_repairs_orphan_l2_target_with_colliding_compact_l0_batch_seq() {
+    async fn recover_rejects_orphan_l2_target_without_mutating_a_false_fixed_point() {
         let store = test_store().await;
         let (source_id, _) = insert_l0_batch(&store, &[user("source")]).await;
         // A CompactL0 job whose target L1 happens to share batch_seq with a
@@ -5447,28 +5413,38 @@ mod tests {
         .await
         .expect("count fixture maintenance events");
 
-        recover_compacting_batches(&store)
-            .await
-            .expect("recover compacting batches");
+        for attempt in 1..=2 {
+            let error = recover_compacting_batches(&store)
+                .await
+                .expect_err("orphan target must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains("has no authenticated owning job"),
+                "attempt {attempt}: {error:#}"
+            );
 
-        let state: String = sqlx::query_scalar("SELECT state FROM memory_batches WHERE id = ?")
-            .bind(&orphan_l2)
+            let state: String = sqlx::query_scalar("SELECT state FROM memory_batches WHERE id = ?")
+                .bind(&orphan_l2)
+                .fetch_one(store.pool())
+                .await
+                .expect("fetch orphan state");
+            assert_eq!(
+                state, "compacting",
+                "fail-closed recovery must preserve the authenticated orphan for diagnosis"
+            );
+
+            let maintenance: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM agent_events WHERE event_type = 'memory_maintenance'",
+            )
             .fetch_one(store.pool())
             .await
-            .expect("fetch orphan state");
-        assert_eq!(state, "compact_failed");
-
-        let maintenance: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM agent_events WHERE event_type = 'memory_maintenance'",
-        )
-        .fetch_one(store.pool())
-        .await
-        .expect("count maintenance events");
-        assert_eq!(
-            maintenance - maintenance_before,
-            1,
-            "orphan repair must emit one maintenance event"
-        );
+            .expect("count maintenance events");
+            assert_eq!(
+                maintenance, maintenance_before,
+                "attempt {attempt} must not invent a durable repair event"
+            );
+        }
     }
 
     #[tokio::test]

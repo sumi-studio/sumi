@@ -11,7 +11,10 @@ SELECT
   (SELECT COUNT(*) FROM memory_batch_messages) +
   (SELECT COUNT(*) FROM memory_jobs) +
   (SELECT COUNT(*) FROM memory_apply_cursors) +
-  (SELECT COUNT(*) FROM kv WHERE key = 'calib.ratio');
+  (SELECT COUNT(*) FROM kv WHERE key = 'calib.ratio') +
+  (SELECT COUNT(*) FROM provider_context) +
+  (SELECT COUNT(*) FROM provider_context_mutations) +
+  (SELECT COUNT(*) FROM provider_context_replace_heads);
 
 DROP TABLE memory_projection_upgrade_guard;
 
@@ -120,6 +123,44 @@ CREATE TABLE memory_calibration (
   FOREIGN KEY(projection_event_seq) REFERENCES agent_events(seq)
     DEFERRABLE INITIALLY DEFERRED
 );
+
+-- Provider-context rows, mutation replay intents, and Replace CAS heads are
+-- independently committed because row-local AEAD cannot detect deletion.
+-- The migration creates a mandatory
+-- uninitialized marker rather than an optional head: Store may initialize it
+-- only while the prelaunch provider-context state is empty.  A missing marker
+-- or an uninitialized marker beside non-empty state fails closed.
+CREATE TABLE provider_context_projection_head (
+  singleton INTEGER NOT NULL PRIMARY KEY CHECK (singleton = 1),
+  schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+  state TEXT NOT NULL CHECK (state IN ('uninitialized', 'active')),
+  revision INTEGER NOT NULL CHECK (revision >= 0),
+  record_count INTEGER NOT NULL CHECK (record_count >= 0),
+  set_digest BLOB,
+  key_ref TEXT,
+  head_hmac BLOB,
+  CHECK (
+    (state = 'uninitialized'
+      AND revision = 0
+      AND record_count = 0
+      AND set_digest IS NULL
+      AND key_ref IS NULL
+      AND head_hmac IS NULL)
+    OR
+    (state = 'active'
+      AND set_digest IS NOT NULL
+      AND length(set_digest) = 32
+      AND key_ref IS NOT NULL
+      AND head_hmac IS NOT NULL
+      AND length(head_hmac) = 32)
+  ),
+  FOREIGN KEY(key_ref) REFERENCES data_keys(key_ref)
+);
+
+INSERT INTO provider_context_projection_head(
+  singleton, schema_version, state, revision, record_count,
+  set_digest, key_ref, head_hmac
+) VALUES(1, 1, 'uninitialized', 0, 0, NULL, NULL, NULL);
 
 CREATE TRIGGER reject_legacy_calibration_insert
 BEFORE INSERT ON kv
