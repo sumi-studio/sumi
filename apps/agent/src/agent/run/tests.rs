@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::*;
 use crate::{
-    agent::{AttemptCancellation, DurableRunBinding, PublicStreamEvent},
+    agent::{AttemptCancellation, DurableRunBinding, InjectedRunDriver, PublicStreamEvent},
     approval::{
         ApprovalBroker,
         action::{SandboxSummary, SecretAwareActionProjector, SecretDigestKey},
@@ -26,14 +26,18 @@ use crate::{
         },
     },
     gateway::{ApprovalDecision, CommandEnvelope, CommandId},
-    provider::types::{
-        ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, ProviderContextFragment,
-        ProviderContextPayload, ProviderOrigin, ProviderOutput, PublicAssistantMessage,
-        RejectedToolCall, ToolArgumentError, Usage, ValidatedToolArguments,
+    provider::{
+        ModelSpec, ProviderTimingObservation, ProviderTimingObserver, RequestOptions,
+        types::{
+            ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, PromptContext,
+            ProviderContextFragment, ProviderContextPayload, ProviderEventStream, ProviderOrigin,
+            ProviderOutput, PublicAssistantMessage, RejectedToolCall, ToolArgumentError, Usage,
+            ValidatedToolArguments,
+        },
     },
     runtime::contracts::ProcessGeneration,
     store::Redactor,
-    tools::ToolError,
+    tools::{ToolError, ToolRegistryBuilder, WorkspacePaths},
 };
 
 fn test_executor_generation() -> ProcessGeneration {
@@ -887,6 +891,106 @@ async fn successful_run_has_canonical_outer_order() {
         events[events.len() - 2],
         AgentEvent::TurnEnd { .. }
     ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn required_tool_choice_resets_after_retry_for_queued_user_turn() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let sink = observed.clone();
+    let (control_tx, control_rx) = mpsc::channel(1);
+    let followup_tx = control_tx.clone();
+    let starter = Arc::new(
+        move |spec: ModelSpec,
+              _prompt: PromptContext,
+              options: RequestOptions,
+              cancel: CancellationToken,
+              observer: ProviderTimingObserver| {
+            let request_index = {
+                let mut observed = sink.lock().expect("observed options");
+                let request_index = observed.len();
+                observed.push(options.tool_choice);
+                request_index
+            };
+            if request_index == 1 {
+                followup_tx
+                    .try_send(RunControl::Command(admitted_user(2)))
+                    .expect("queue followup during retry");
+            }
+            observer.observe(ProviderTimingObservation::RequestSent(
+                std::time::Instant::now(),
+            ));
+            let retryable = request_index == 0;
+            let reason = if retryable {
+                StopReason::Error
+            } else {
+                StopReason::Stop
+            };
+            let output = ProviderOutput {
+                message: AssistantMessage {
+                    content: Vec::new(),
+                    model: spec.id.clone(),
+                    provider: spec.provider.clone(),
+                    origin: spec.origin(),
+                    usage: Usage::default(),
+                    stop_reason: reason,
+                    error_message: retryable.then(|| "network error".to_owned()),
+                    provider_code: retryable.then(|| "network_error".to_owned()),
+                    interrupted: false,
+                    timestamp: timestamp(),
+                },
+                provider_context: Vec::new(),
+            };
+            let (tx, rx) = mpsc::channel(2);
+            tx.try_send(ProviderEvent::Start).expect("start");
+            let terminal = if retryable {
+                ProviderEvent::Error { reason, output }
+            } else {
+                ProviderEvent::Done { reason, output }
+            };
+            tx.try_send(terminal).expect("terminal");
+            drop(tx);
+            ProviderEventStream::new(rx, cancel, spec.provider.clone(), spec.origin())
+        },
+    );
+    let registry = ToolRegistryBuilder::default().build();
+    let prompt = PromptContext {
+        system_prompt: "fixture".to_owned(),
+        memory_blocks: Vec::new(),
+        messages: Vec::new(),
+        provider_context: Vec::new(),
+        tools: registry.definitions(),
+    };
+    let driver = Arc::new(
+        InjectedRunDriver::with_stream_starter(
+            ModelSpec::preset("kimi-k3").expect("preset"),
+            RequestOptions {
+                tool_choice: Some(json!("required")),
+                ..RequestOptions::default()
+            },
+            Some(prompt),
+            Some(registry),
+            Some(WorkspacePaths::new("/workspace").expect("workspace")),
+            Some(test_executor_generation()),
+            starter,
+        )
+        .expect("driver"),
+    );
+    let worker = SequentialRunWorker::new(driver);
+    let (events_tx, events_rx) = mpsc::channel(64);
+
+    let completion = complete_with_receipts(
+        worker.run(bound_core(1), admitted_user(1), control_rx, events_tx),
+        events_rx,
+    )
+    .await;
+    drop(control_tx);
+
+    assert_completed(completion);
+    assert_eq!(
+        *observed.lock().expect("observed options"),
+        vec![Some(json!("required")), None, Some(json!("required"))],
+        "required tool choice must be stripped on retry and restored for the queued user turn"
+    );
 }
 
 #[tokio::test]

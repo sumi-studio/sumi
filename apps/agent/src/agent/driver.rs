@@ -305,6 +305,24 @@ impl RunDriver for InjectedRunDriver {
         )
     }
 
+    async fn start_provider_for_user_turn(
+        &self,
+        _attempt_sequence: usize,
+        user_turn_attempt: usize,
+        context: &[ContextMessage],
+        provider_context: &[crate::provider::types::ProviderContextItem],
+        command_received_at: Option<Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.start_provider_attempt(
+            user_turn_attempt,
+            context,
+            Some(provider_context),
+            command_received_at,
+            cancel,
+        )
+    }
+
     async fn execute_tool_observed(
         &self,
         flow_id: &str,
