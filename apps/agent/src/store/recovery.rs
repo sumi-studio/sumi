@@ -7,7 +7,7 @@ use zeroize::Zeroizing;
 
 use crate::agent::AgentEvent;
 use crate::gateway::Command;
-use crate::memory::estimate::ProviderContextItemWithFootprint;
+use crate::memory::{HydratedMemoryRuntime, estimate::ProviderContextItemWithFootprint};
 use crate::provider::types::ContextMessage;
 use crate::runtime::contracts::{GenerationRecoveryFence, ProcessGenerationLease};
 
@@ -17,9 +17,6 @@ use super::{
     crypto::decrypt_content,
     event_log::{EVENT_DIGEST_BYTES, EventChainEntry, extend_event_chain, verify_event_head},
     event_writer::DurableEventMetadata,
-    memory_state::{
-        MemoryApplyCursorRecord, MemoryBatchMessageRecord, MemoryBatchRecord, MemoryJobRecord,
-    },
     verify_command_payload_digest,
 };
 
@@ -125,10 +122,9 @@ pub(crate) struct HydratedRunState {
     pub receipt: super::HydrationReceiptIdentity,
     pub messages: Vec<ContextMessage>,
     pub provider_context: Vec<ProviderContextItemWithFootprint>,
-    pub memory_batches: Vec<MemoryBatchRecord>,
-    pub memory_batch_messages: Vec<MemoryBatchMessageRecord>,
-    pub memory_jobs: Vec<MemoryJobRecord>,
-    pub memory_apply_cursors: Vec<MemoryApplyCursorRecord>,
+    /// Authenticated, ciphertext-free Store handoff. A future T26 consumer
+    /// will pass this opaque value to `ThreeLayerMemory::from_hydrated`.
+    pub memory: HydratedMemoryRuntime,
     pub recovery_steps: Vec<RecoveryStep>,
 }
 

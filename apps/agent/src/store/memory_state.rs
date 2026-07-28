@@ -102,6 +102,7 @@ pub(crate) enum MemoryJobStatus {
     Running,
     Completed,
     Applied,
+    Discarded,
     Failed,
 }
 
@@ -112,6 +113,7 @@ impl MemoryJobStatus {
             Self::Running => "running",
             Self::Completed => "completed",
             Self::Applied => "applied",
+            Self::Discarded => "discarded",
             Self::Failed => "failed",
         }
     }
@@ -122,6 +124,7 @@ impl MemoryJobStatus {
             "running" => Some(Self::Running),
             "completed" => Some(Self::Completed),
             "applied" => Some(Self::Applied),
+            "discarded" => Some(Self::Discarded),
             "failed" => Some(Self::Failed),
             _ => None,
         }

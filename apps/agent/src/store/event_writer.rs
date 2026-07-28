@@ -3805,7 +3805,7 @@ impl EventWriter {
             } => (
                 job_id,
                 "completed",
-                "failed",
+                "discarded",
                 0,
                 Some(expected_attempt),
                 lease_witness,
@@ -23794,8 +23794,7 @@ mod tests {
             HydrationOutcome::Complete(state) => {
                 assert!(state.messages.is_empty());
                 assert!(state.provider_context.is_empty());
-                assert!(state.memory_batches.is_empty());
-                assert!(state.memory_jobs.is_empty());
+                assert!(state.memory.is_empty());
                 assert!(state.recovery_steps.is_empty());
                 assert_eq!(state.receipt.intent_count, 0);
             }
@@ -24110,6 +24109,23 @@ mod tests {
                     ) && state.provider_context[0].item.origin_message.is_none(),
                     "native compaction must not acquire an assistant anchor"
                 );
+
+                let expected_footprint = state
+                    .provider_context
+                    .iter()
+                    .filter(|item| {
+                        item.item
+                            .origin_message
+                            .as_ref()
+                            .is_some_and(|anchor| anchor.message_id == message_id)
+                    })
+                    .map(|item| item.footprint.eviction_tokens())
+                    .sum::<u64>();
+                let memory = crate::memory::ThreeLayerMemory::from_hydrated(state.memory)
+                    .expect("EventWriter output must reconstruct as live memory");
+                assert_eq!(memory.l0().len(), 1);
+                assert_eq!(memory.l0()[0].messages.len(), 2);
+                assert_eq!(memory.l0()[0].eviction_footprint_tokens, expected_footprint);
             }
             HydrationOutcome::RecoveryRequired(_) => panic!("clean assistant turn must complete"),
         }

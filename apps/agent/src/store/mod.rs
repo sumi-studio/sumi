@@ -22,7 +22,8 @@ use std::{
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::{
     Row, Sqlite, SqlitePool, Transaction,
@@ -32,9 +33,13 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::memory::estimate::{
-    EVICTION_ESTIMATOR_VERSION_REPLAY_PROBE_V1, EVICTION_ESTIMATOR_VERSION_SERIALIZED_BYTES,
-    EvictionFootprint, ProviderContextItemWithFootprint, eviction_footprint_for_payload,
+use crate::memory::{
+    HydratedMemoryBatch, HydratedMemoryCursor, HydratedMemoryJob, HydratedMemoryMembership,
+    HydratedMemoryRuntime, HydratedMemorySummary,
+    estimate::{
+        EVICTION_ESTIMATOR_VERSION_REPLAY_PROBE_V1, EVICTION_ESTIMATOR_VERSION_SERIALIZED_BYTES,
+        EvictionFootprint, ProviderContextItemWithFootprint, eviction_footprint_for_payload,
+    },
 };
 use crate::provider::model::ModelSpec;
 use crate::provider::types::{
@@ -118,6 +123,18 @@ pub(crate) use transcript::TranscriptRecord;
 /// processed and dropped before the next page is requested, so decrypted
 /// plaintext and `SqliteRow` buffers are not retained for the whole history.
 const HYDRATION_PAGE_SIZE: i64 = 64;
+
+/// Canonical plaintext encrypted in `memory_batches` summaries and
+/// `memory_jobs` results. Store is the sole decryption/redaction verifier and
+/// immediately converts this DTO to a ciphertext-free runtime value.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemorySummaryPayload {
+    summary: String,
+    est_tokens: u64,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+}
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
@@ -351,8 +368,9 @@ impl Store {
         let provider_context = self
             .hydrate_provider_context(&messages, &mut transaction)
             .await?;
-        let (memory_batches, memory_batch_messages, memory_jobs, memory_apply_cursors) =
-            self.hydrate_memory_state(&mut transaction).await?;
+        let memory = self
+            .hydrate_memory_runtime(&messages, &provider_context, &mut transaction)
+            .await?;
 
         // Recovery planning reads the command/event suffix after the snapshot transaction
         // is released. It uses bounded, paged reads for the pending command window and
@@ -378,10 +396,7 @@ impl Store {
             receipt,
             messages,
             provider_context,
-            memory_batches,
-            memory_batch_messages,
-            memory_jobs,
-            memory_apply_cursors,
+            memory,
             recovery_steps,
         }))
     }
@@ -909,223 +924,342 @@ impl Store {
         Ok(provider_context)
     }
 
-    async fn hydrate_memory_state(
+    /// Project memory rows into typed, ciphertext-free runtime input under the
+    /// same authenticated snapshot as transcript and provider context.
+    async fn hydrate_memory_runtime(
         &self,
+        messages: &[ContextMessage],
+        provider_context: &[ProviderContextItemWithFootprint],
         transaction: &mut Transaction<'_, Sqlite>,
-    ) -> Result<(
-        Vec<MemoryBatchRecord>,
-        Vec<MemoryBatchMessageRecord>,
-        Vec<MemoryJobRecord>,
-        Vec<MemoryApplyCursorRecord>,
-    )> {
-        let mut key_cache: HashMap<String, Arc<DataKeyMaterial>> = HashMap::new();
+    ) -> Result<HydratedMemoryRuntime> {
+        let mut persisted_messages = HashMap::with_capacity(messages.len());
+        for message in messages {
+            let ContextMessage::Persisted { id, .. } = message else {
+                bail!("hydrated transcript contains a synthetic message");
+            };
+            if persisted_messages
+                .insert(id.clone(), message.clone())
+                .is_some()
+            {
+                bail!("hydrated transcript contains duplicate message id {id}");
+            }
+        }
 
-        let mut memory_batches = Vec::new();
+        // `hydrate_provider_context` has authenticated the payload, its exact
+        // transcript anchor, and the canonical provider footprint. Aggregate
+        // those verified values so runtime reconstruction can prove every
+        // live L0 batch total without reading redacted projections.
+        let mut anchored_footprints = HashMap::new();
+        for context in provider_context {
+            let Some(anchor) = context.item.origin_message.as_ref() else {
+                continue;
+            };
+            if !persisted_messages.contains_key(&anchor.message_id) {
+                bail!(
+                    "provider-context footprint references unknown transcript message {}",
+                    anchor.message_id
+                );
+            }
+            let total = anchored_footprints
+                .entry(anchor.message_id.clone())
+                .or_insert(0u64);
+            *total = total
+                .checked_add(context.footprint.eviction_tokens())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "provider-context footprint overflow for transcript message {}",
+                        anchor.message_id
+                    )
+                })?;
+        }
+
+        let mut key_cache: HashMap<String, Arc<DataKeyMaterial>> = HashMap::new();
+        let mut batches = Vec::new();
         let mut offset = 0_i64;
         loop {
-            let batch_rows = sqlx::query(
+            let rows = sqlx::query(
                 "SELECT id, layer, ord, batch_seq, version, state, est_tokens,
                     eviction_footprint_tokens, summary_key_ref, summary_ciphertext,
-                    summary_projection, summary_redaction_version, updated_at
-             FROM memory_batches ORDER BY layer, ord LIMIT ? OFFSET ?",
+                    summary_projection, summary_redaction_version
+                 FROM memory_batches ORDER BY layer, ord LIMIT ? OFFSET ?",
             )
             .bind(HYDRATION_PAGE_SIZE)
             .bind(offset)
             .fetch_all(&mut **transaction)
             .await
             .context("failed to hydrate memory batches")?;
-            if batch_rows.is_empty() {
+            if rows.is_empty() {
                 break;
             }
-            for row in batch_rows {
-                let id: String = row.try_get("id")?;
+
+            for row in rows {
+                let id_text: String = row.try_get("id")?;
+                let id = Uuid::parse_str(&id_text)
+                    .with_context(|| format!("memory batch id {id_text} is not a UUID"))?;
+                let layer_value: i64 = row.try_get("layer")?;
+                let layer = MemoryLayer::from_i64(layer_value).ok_or_else(|| {
+                    anyhow!("memory batch {id_text} has unknown layer {layer_value}")
+                })?;
+                let state_text: String = row.try_get("state")?;
+                let state = MemoryBatchState::from_str(&state_text).ok_or_else(|| {
+                    anyhow!("memory batch {id_text} has unknown state {state_text}")
+                })?;
                 let summary = match (
                     row.try_get::<Option<String>, _>("summary_key_ref")?,
                     row.try_get::<Option<Vec<u8>>, _>("summary_ciphertext")?,
                     row.try_get::<Option<String>, _>("summary_projection")?,
                     row.try_get::<Option<i64>, _>("summary_redaction_version")?,
                 ) {
-                    (Some(key_ref), Some(ciphertext), Some(projection), Some(version)) => {
-                        let redaction_version = u32::try_from(version)
-                            .with_context(|| "memory batch redaction version out of u32 range")?;
-                        self.verify_memory_projection(
+                    (Some(key_ref), Some(ciphertext), Some(projection), Some(version)) => Some(
+                        self.hydrate_memory_summary(
                             &mut key_cache,
                             transaction,
                             &key_ref,
                             &ciphertext,
                             &projection,
-                            redaction_version,
+                            version,
                             "memory_batches",
-                            &id,
+                            &id_text,
                         )
-                        .await?;
-                        Some(MemoryBatchSummary {
-                            key_ref,
-                            ciphertext,
-                            projection,
-                            redaction_version,
-                        })
-                    }
+                        .await?,
+                    ),
                     (None, None, None, None) => None,
-                    _ => bail!("memory batch summary fields are inconsistent"),
+                    _ => bail!("memory batch {id_text} summary fields are inconsistent"),
                 };
 
-                let layer = row.try_get::<i64, _>("layer")?;
-                let layer = MemoryLayer::from_i64(layer)
-                    .ok_or_else(|| anyhow!("memory batch has unknown layer {layer}"))?;
-                let state: String = row.try_get("state")?;
-                let state = MemoryBatchState::from_str(&state)
-                    .ok_or_else(|| anyhow!("memory batch has unknown state {state}"))?;
+                let ord = u64::try_from(row.try_get::<i64, _>("ord")?)
+                    .with_context(|| format!("memory batch {id_text} ord out of u64 range"))?;
+                let batch_seq =
+                    u64::try_from(row.try_get::<i64, _>("batch_seq")?).with_context(|| {
+                        format!("memory batch {id_text} batch_seq out of u64 range")
+                    })?;
+                let version = u64::try_from(row.try_get::<i64, _>("version")?)
+                    .with_context(|| format!("memory batch {id_text} version out of u64 range"))?;
+                let est_tokens =
+                    u64::try_from(row.try_get::<i64, _>("est_tokens")?).with_context(|| {
+                        format!("memory batch {id_text} est_tokens out of u64 range")
+                    })?;
+                let eviction_footprint_tokens =
+                    u64::try_from(row.try_get::<i64, _>("eviction_footprint_tokens")?)
+                        .with_context(|| {
+                            format!(
+                                "memory batch {id_text} eviction_footprint_tokens out of u64 range"
+                            )
+                        })?;
 
-                memory_batches.push(MemoryBatchRecord {
+                batches.push(HydratedMemoryBatch::new(
                     id,
                     layer,
-                    ord: row.try_get("ord")?,
-                    batch_seq: row.try_get("batch_seq")?,
-                    version: row.try_get("version")?,
+                    ord,
+                    batch_seq,
+                    version,
                     state,
-                    est_tokens: row.try_get("est_tokens")?,
-                    eviction_footprint_tokens: row.try_get("eviction_footprint_tokens")?,
+                    est_tokens,
+                    eviction_footprint_tokens,
                     summary,
-                    updated_at: row.try_get("updated_at")?,
-                });
+                ));
             }
             offset += HYDRATION_PAGE_SIZE;
         }
 
-        let mut memory_batch_messages = Vec::new();
+        let mut memberships = Vec::new();
         offset = 0;
         loop {
-            let batch_message_rows = sqlx::query(
-            "SELECT batch_id, message_id, ord FROM memory_batch_messages ORDER BY batch_id, ord LIMIT ? OFFSET ?",
-        )
-        .bind(HYDRATION_PAGE_SIZE)
-        .bind(offset)
-        .fetch_all(&mut **transaction)
-        .await
-        .context("failed to hydrate memory batch messages")?;
-            if batch_message_rows.is_empty() {
+            let rows = sqlx::query(
+                "SELECT batch_id, message_id, ord
+                 FROM memory_batch_messages
+                 ORDER BY batch_id, ord LIMIT ? OFFSET ?",
+            )
+            .bind(HYDRATION_PAGE_SIZE)
+            .bind(offset)
+            .fetch_all(&mut **transaction)
+            .await
+            .context("failed to hydrate memory batch messages")?;
+            if rows.is_empty() {
                 break;
             }
-            for row in batch_message_rows {
-                memory_batch_messages.push(MemoryBatchMessageRecord {
-                    batch_id: row.try_get("batch_id")?,
-                    message_id: row.try_get("message_id")?,
-                    ord: row.try_get("ord")?,
-                });
+
+            for row in rows {
+                let batch_id_text: String = row.try_get("batch_id")?;
+                let batch_id = Uuid::parse_str(&batch_id_text).with_context(|| {
+                    format!("memory membership batch id {batch_id_text} is not a UUID")
+                })?;
+                let message_id: String = row.try_get("message_id")?;
+                let message = persisted_messages.get(&message_id).cloned().ok_or_else(|| {
+                    anyhow!(
+                        "memory membership for batch {batch_id} references unknown persisted message {message_id}"
+                    )
+                })?;
+                let ord = u64::try_from(row.try_get::<i64, _>("ord")?).with_context(|| {
+                    format!(
+                        "memory membership for batch {batch_id} message {message_id} ord out of u64 range"
+                    )
+                })?;
+                memberships.push(HydratedMemoryMembership::new(batch_id, ord, message));
             }
             offset += HYDRATION_PAGE_SIZE;
         }
 
-        let mut memory_jobs = Vec::new();
+        let mut jobs = Vec::new();
         offset = 0;
         loop {
-            let job_rows = sqlx::query(
-                "SELECT id, kind, batch_seq, source_ids, source_versions, status, lease_until, attempts,
-                    result_key_ref, result_ciphertext, result_projection, result_redaction_version,
-                    created_at, updated_at
-             FROM memory_jobs ORDER BY id LIMIT ? OFFSET ?",
+            let rows = sqlx::query(
+                "SELECT id, kind, batch_seq, source_ids, source_versions, status,
+                    lease_until, attempts, result_key_ref, result_ciphertext,
+                    result_projection, result_redaction_version
+                 FROM memory_jobs ORDER BY id LIMIT ? OFFSET ?",
             )
             .bind(HYDRATION_PAGE_SIZE)
             .bind(offset)
             .fetch_all(&mut **transaction)
             .await
             .context("failed to hydrate memory jobs")?;
-            if job_rows.is_empty() {
+            if rows.is_empty() {
                 break;
             }
-            for row in job_rows {
-                let id: String = row.try_get("id")?;
+
+            for row in rows {
+                let id_text: String = row.try_get("id")?;
+                let id = Uuid::parse_str(&id_text)
+                    .with_context(|| format!("memory job id {id_text} is not a UUID"))?;
+                let kind_text: String = row.try_get("kind")?;
+                let kind = MemoryJobKind::from_str(&kind_text)
+                    .ok_or_else(|| anyhow!("memory job {id_text} has unknown kind {kind_text}"))?;
+                let status_text: String = row.try_get("status")?;
+                let status = MemoryJobStatus::from_str(&status_text).ok_or_else(|| {
+                    anyhow!("memory job {id_text} has unknown status {status_text}")
+                })?;
+                let batch_seq = u64::try_from(row.try_get::<i64, _>("batch_seq")?)
+                    .with_context(|| format!("memory job {id_text} batch_seq out of u64 range"))?;
+                let _attempts = u64::try_from(row.try_get::<i64, _>("attempts")?)
+                    .with_context(|| format!("memory job {id_text} attempts out of u64 range"))?;
+                let lease_until: Option<String> = row.try_get("lease_until")?;
+                match (status, lease_until.as_deref()) {
+                    (MemoryJobStatus::Running, Some(lease_until)) => {
+                        DateTime::parse_from_rfc3339(lease_until).with_context(|| {
+                            format!("running memory job {id_text} has an invalid lease timestamp")
+                        })?;
+                    }
+                    (MemoryJobStatus::Running, None) => {
+                        bail!("running memory job {id_text} is missing its lease");
+                    }
+                    (_, Some(_)) => {
+                        bail!("non-running memory job {id_text} retains a lease");
+                    }
+                    (_, None) => {}
+                }
+
+                let source_ids_json: String = row.try_get("source_ids")?;
+                let source_id_texts: Vec<String> = serde_json::from_str(&source_ids_json)
+                    .with_context(|| {
+                        format!("memory job {id_text} source_ids is not valid JSON")
+                    })?;
+                let source_ids = source_id_texts
+                    .into_iter()
+                    .map(|source_id| {
+                        Uuid::parse_str(&source_id).with_context(|| {
+                            format!(
+                                "memory job {id_text} source batch id {source_id} is not a UUID"
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                let source_versions_json: String = row.try_get("source_versions")?;
+                let source_version_texts: BTreeMap<String, i64> =
+                    serde_json::from_str(&source_versions_json).with_context(|| {
+                        format!("memory job {id_text} source_versions is not valid JSON")
+                    })?;
+                let mut source_versions = BTreeMap::new();
+                for (batch_id_text, version) in source_version_texts {
+                    let batch_id = Uuid::parse_str(&batch_id_text).with_context(|| {
+                        format!(
+                            "memory job {id_text} source-version batch id {batch_id_text} is not a UUID"
+                        )
+                    })?;
+                    let version = u64::try_from(version).with_context(|| {
+                        format!(
+                            "memory job {id_text} source version for {batch_id_text} is out of u64 range"
+                        )
+                    })?;
+                    if source_versions.insert(batch_id, version).is_some() {
+                        bail!(
+                            "memory job {id_text} has duplicate normalized source-version batch id {batch_id}"
+                        );
+                    }
+                }
+
                 let result = match (
                     row.try_get::<Option<String>, _>("result_key_ref")?,
                     row.try_get::<Option<Vec<u8>>, _>("result_ciphertext")?,
                     row.try_get::<Option<String>, _>("result_projection")?,
                     row.try_get::<Option<i64>, _>("result_redaction_version")?,
                 ) {
-                    (Some(key_ref), Some(ciphertext), Some(projection), Some(version)) => {
-                        let redaction_version = u32::try_from(version).with_context(
-                            || "memory job result redaction version out of u32 range",
-                        )?;
-                        self.verify_memory_projection(
+                    (Some(key_ref), Some(ciphertext), Some(projection), Some(version)) => Some(
+                        self.hydrate_memory_summary(
                             &mut key_cache,
                             transaction,
                             &key_ref,
                             &ciphertext,
                             &projection,
-                            redaction_version,
+                            version,
                             "memory_jobs",
-                            &id,
+                            &id_text,
                         )
-                        .await?;
-                        Some(MemoryJobResult {
-                            key_ref,
-                            ciphertext,
-                            projection,
-                            redaction_version,
-                        })
-                    }
+                        .await?,
+                    ),
                     (None, None, None, None) => None,
-                    _ => bail!("memory job result fields are inconsistent"),
+                    _ => bail!("memory job {id_text} result fields are inconsistent"),
                 };
 
-                let kind: String = row.try_get("kind")?;
-                let kind = MemoryJobKind::from_str(&kind)
-                    .ok_or_else(|| anyhow!("memory job has unknown kind {kind}"))?;
-                let status: String = row.try_get("status")?;
-                let status = MemoryJobStatus::from_str(&status)
-                    .ok_or_else(|| anyhow!("memory job has unknown status {status}"))?;
-                let source_ids: String = row.try_get("source_ids")?;
-                let source_ids: Vec<String> = serde_json::from_str(&source_ids)
-                    .context("memory job source_ids is not valid JSON")?;
-                let source_versions: String = row.try_get("source_versions")?;
-                let source_versions: std::collections::BTreeMap<String, i64> =
-                    serde_json::from_str(&source_versions)
-                        .context("memory job source_versions is not valid JSON")?;
-
-                memory_jobs.push(MemoryJobRecord {
+                jobs.push(HydratedMemoryJob::new(
                     id,
                     kind,
-                    batch_seq: row.try_get("batch_seq")?,
+                    batch_seq,
                     source_ids,
                     source_versions,
                     status,
-                    lease_until: row.try_get("lease_until")?,
-                    attempts: row.try_get("attempts")?,
                     result,
-                    created_at: row.try_get("created_at")?,
-                    updated_at: row.try_get("updated_at")?,
-                });
+                ));
             }
             offset += HYDRATION_PAGE_SIZE;
         }
 
-        let mut memory_apply_cursors = Vec::new();
+        let mut cursors = Vec::new();
         offset = 0;
         loop {
-            let cursor_rows =
-            sqlx::query("SELECT kind, next_batch_seq FROM memory_apply_cursors ORDER BY kind LIMIT ? OFFSET ?")
-                .bind(HYDRATION_PAGE_SIZE)
-                .bind(offset)
-                .fetch_all(&mut **transaction)
-                .await
-                .context("failed to hydrate memory apply cursors")?;
-            if cursor_rows.is_empty() {
+            let rows = sqlx::query(
+                "SELECT kind, next_batch_seq
+                 FROM memory_apply_cursors ORDER BY kind LIMIT ? OFFSET ?",
+            )
+            .bind(HYDRATION_PAGE_SIZE)
+            .bind(offset)
+            .fetch_all(&mut **transaction)
+            .await
+            .context("failed to hydrate memory apply cursors")?;
+            if rows.is_empty() {
                 break;
             }
-            for row in cursor_rows {
-                memory_apply_cursors.push(MemoryApplyCursorRecord {
-                    kind: row.try_get("kind")?,
-                    next_batch_seq: row.try_get("next_batch_seq")?,
-                });
+
+            for row in rows {
+                let kind_text: String = row.try_get("kind")?;
+                let kind = MemoryJobKind::from_str(&kind_text)
+                    .ok_or_else(|| anyhow!("memory apply cursor has unknown kind {kind_text}"))?;
+                let next_batch_seq = u64::try_from(row.try_get::<i64, _>("next_batch_seq")?)
+                    .with_context(|| {
+                        format!("memory apply cursor {kind_text} next_batch_seq out of u64 range")
+                    })?;
+                cursors.push(HydratedMemoryCursor::new(kind, next_batch_seq));
             }
             offset += HYDRATION_PAGE_SIZE;
         }
 
-        Ok((
-            memory_batches,
-            memory_batch_messages,
-            memory_jobs,
-            memory_apply_cursors,
+        Ok(HydratedMemoryRuntime::new(
+            batches,
+            memberships,
+            jobs,
+            cursors,
+            anchored_footprints,
         ))
     }
 
@@ -1163,17 +1297,20 @@ impl Store {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn verify_memory_projection(
+    async fn hydrate_memory_summary(
         &self,
         key_cache: &mut HashMap<String, Arc<DataKeyMaterial>>,
         transaction: &mut Transaction<'_, Sqlite>,
         key_ref: &str,
         ciphertext: &[u8],
         projection: &str,
-        redaction_version: u32,
+        stored_redaction_version: i64,
         table: &str,
         row_id: &str,
-    ) -> Result<()> {
+    ) -> Result<HydratedMemorySummary> {
+        let redaction_version = u32::try_from(stored_redaction_version).with_context(|| {
+            format!("{table} projection for {row_id} has redaction version out of u32 range")
+        })?;
         if redaction_version != self.redactor.version() {
             bail!(
                 "{table} projection for {row_id} uses unsupported redaction version {redaction_version}"
@@ -1202,7 +1339,17 @@ impl Store {
         if derived != projection {
             bail!("{table} projection for {row_id} does not match re-derived redacted plaintext");
         }
-        Ok(())
+        let payload: MemorySummaryPayload =
+            serde_json::from_slice(&plaintext).with_context(|| {
+                format!("{table} projection for {row_id} is not a valid MemorySummaryPayload")
+            })?;
+        HydratedMemorySummary::new(
+            payload.summary,
+            payload.est_tokens,
+            payload.from,
+            payload.to,
+        )
+        .with_context(|| format!("{table} projection for {row_id} has an invalid summary payload"))
     }
 
     pub(crate) fn scope(&self) -> &AgentScope {
@@ -3267,6 +3414,30 @@ mod tests {
         (ciphertext, projection, store.redactor().version())
     }
 
+    async fn authenticate_memory_summary(
+        store: &Store,
+        key_ref: &str,
+        ciphertext: &[u8],
+        projection: &str,
+        redaction_version: i64,
+        table: &str,
+        row_id: &str,
+    ) -> Result<HydratedMemorySummary> {
+        let mut transaction = store.pool().begin().await.expect("begin test transaction");
+        store
+            .hydrate_memory_summary(
+                &mut HashMap::new(),
+                &mut transaction,
+                key_ref,
+                ciphertext,
+                projection,
+                redaction_version,
+                table,
+                row_id,
+            )
+            .await
+    }
+
     async fn insert_memory_batch(
         store: &Store,
         id: &str,
@@ -3280,7 +3451,7 @@ mod tests {
                 id, layer, ord, batch_seq, version, state, est_tokens,
                 eviction_footprint_tokens, summary_key_ref, summary_ciphertext,
                 summary_projection, summary_redaction_version, updated_at
-             ) VALUES(?, 0, 0, 0, 0, 'open', 10, 0, ?, ?, ?, ?, ?)",
+             ) VALUES(?, 1, 1, 1, 0, 'compacted', 42, 0, ?, ?, ?, ?, ?)",
         )
         .bind(id)
         .bind(key_ref)
@@ -3340,16 +3511,18 @@ mod tests {
         )
         .await;
 
-        let (batches, _messages, _jobs, _cursors) = {
-            let mut transaction = store.pool().begin().await.expect("begin test transaction");
-            store.hydrate_memory_state(&mut transaction).await
-        }
-        .expect("hydrate authenticated memory state");
-        assert_eq!(batches.len(), 1);
-        let summary = batches[0].summary.as_ref().expect("batch has a summary");
-        assert_eq!(summary.key_ref, key.key_ref);
-        assert_eq!(summary.projection, projection);
-        assert_eq!(summary.redaction_version, version);
+        let summary = authenticate_memory_summary(
+            &store,
+            &key.key_ref,
+            &ciphertext,
+            &projection,
+            i64::from(version),
+            "memory_batches",
+            "batch-ok",
+        )
+        .await
+        .expect("authenticate memory batch summary");
+        assert_eq!(summary.test_plaintext(), "Nothing of secret value here.");
     }
 
     #[tokio::test]
@@ -3373,11 +3546,18 @@ mod tests {
         )
         .await;
 
-        let error = {
-            let mut transaction = store.pool().begin().await.expect("begin test transaction");
-            store.hydrate_memory_state(&mut transaction).await
-        }
-        .expect_err("tampered ciphertext must fail hydration");
+        let error = authenticate_memory_summary(
+            &store,
+            &key.key_ref,
+            &ciphertext,
+            &projection,
+            i64::from(version),
+            "memory_batches",
+            "batch-tamper",
+        )
+        .await
+        .err()
+        .expect("tampered ciphertext must fail hydration");
         let message = format!("{error:#}");
         assert!(
             message.contains("failed to decrypt memory_batches projection"),
@@ -3414,11 +3594,18 @@ mod tests {
         )
         .await;
 
-        let error = {
-            let mut transaction = store.pool().begin().await.expect("begin test transaction");
-            store.hydrate_memory_state(&mut transaction).await
-        }
-        .expect_err("wrong key reference must fail hydration");
+        let error = authenticate_memory_summary(
+            &store,
+            &transcript_key.key_ref,
+            &ciphertext,
+            &projection,
+            i64::from(version),
+            "memory_batches",
+            "batch-wrong-key",
+        )
+        .await
+        .err()
+        .expect("wrong key reference must fail hydration");
         let message = format!("{error:#}");
         assert!(
             message.contains("has purpose transcript")
@@ -3453,11 +3640,18 @@ mod tests {
         )
         .await;
 
-        let error = {
-            let mut transaction = store.pool().begin().await.expect("begin test transaction");
-            store.hydrate_memory_state(&mut transaction).await
-        }
-        .expect_err("mismatched projection must fail hydration");
+        let error = authenticate_memory_summary(
+            &store,
+            &key.key_ref,
+            &ciphertext,
+            &projection,
+            i64::from(version),
+            "memory_batches",
+            "batch-bad-projection",
+        )
+        .await
+        .err()
+        .expect("mismatched projection must fail hydration");
         let message = format!("{error:#}");
         assert!(
             message.contains("does not match re-derived redacted plaintext"),
@@ -3485,11 +3679,18 @@ mod tests {
         )
         .await;
 
-        let error = {
-            let mut transaction = store.pool().begin().await.expect("begin test transaction");
-            store.hydrate_memory_state(&mut transaction).await
-        }
-        .expect_err("stale redaction version must fail hydration");
+        let error = authenticate_memory_summary(
+            &store,
+            &key.key_ref,
+            &ciphertext,
+            &projection,
+            2,
+            "memory_batches",
+            "batch-stale",
+        )
+        .await
+        .err()
+        .expect("stale redaction version must fail hydration");
         let message = format!("{error:#}");
         assert!(
             message.contains("unsupported redaction version"),
@@ -3517,16 +3718,18 @@ mod tests {
         )
         .await;
 
-        let (_batches, _messages, jobs, _cursors) = {
-            let mut transaction = store.pool().begin().await.expect("begin test transaction");
-            store.hydrate_memory_state(&mut transaction).await
-        }
-        .expect("hydrate authenticated memory state");
-        assert_eq!(jobs.len(), 1);
-        let result = jobs[0].result.as_ref().expect("job has a result");
-        assert_eq!(result.key_ref, key.key_ref);
-        assert_eq!(result.projection, projection);
-        assert_eq!(result.redaction_version, version);
+        let summary = authenticate_memory_summary(
+            &store,
+            &key.key_ref,
+            &ciphertext,
+            &projection,
+            i64::from(version),
+            "memory_jobs",
+            "job-ok",
+        )
+        .await
+        .expect("authenticate memory job result");
+        assert_eq!(summary.test_plaintext(), "Nothing of secret value here.");
     }
 
     #[tokio::test]
@@ -3550,11 +3753,18 @@ mod tests {
         )
         .await;
 
-        let error = {
-            let mut transaction = store.pool().begin().await.expect("begin test transaction");
-            store.hydrate_memory_state(&mut transaction).await
-        }
-        .expect_err("tampered ciphertext must fail hydration");
+        let error = authenticate_memory_summary(
+            &store,
+            &key.key_ref,
+            &ciphertext,
+            &projection,
+            i64::from(version),
+            "memory_jobs",
+            "job-tamper",
+        )
+        .await
+        .err()
+        .expect("tampered ciphertext must fail hydration");
         let message = format!("{error:#}");
         assert!(
             message.contains("failed to decrypt memory_jobs projection"),
@@ -3591,11 +3801,18 @@ mod tests {
         )
         .await;
 
-        let error = {
-            let mut transaction = store.pool().begin().await.expect("begin test transaction");
-            store.hydrate_memory_state(&mut transaction).await
-        }
-        .expect_err("wrong key reference must fail hydration");
+        let error = authenticate_memory_summary(
+            &store,
+            &transcript_key.key_ref,
+            &ciphertext,
+            &projection,
+            i64::from(version),
+            "memory_jobs",
+            "job-wrong-key",
+        )
+        .await
+        .err()
+        .expect("wrong key reference must fail hydration");
         let message = format!("{error:#}");
         assert!(
             message.contains("has purpose transcript")
@@ -3625,11 +3842,18 @@ mod tests {
         )
         .await;
 
-        let error = {
-            let mut transaction = store.pool().begin().await.expect("begin test transaction");
-            store.hydrate_memory_state(&mut transaction).await
-        }
-        .expect_err("mismatched projection must fail hydration");
+        let error = authenticate_memory_summary(
+            &store,
+            &key.key_ref,
+            &ciphertext,
+            &projection,
+            i64::from(version),
+            "memory_jobs",
+            "job-bad-projection",
+        )
+        .await
+        .err()
+        .expect("mismatched projection must fail hydration");
         let message = format!("{error:#}");
         assert!(
             message.contains("does not match re-derived redacted plaintext"),
@@ -3657,11 +3881,18 @@ mod tests {
         )
         .await;
 
-        let error = {
-            let mut transaction = store.pool().begin().await.expect("begin test transaction");
-            store.hydrate_memory_state(&mut transaction).await
-        }
-        .expect_err("stale redaction version must fail hydration");
+        let error = authenticate_memory_summary(
+            &store,
+            &key.key_ref,
+            &ciphertext,
+            &projection,
+            2,
+            "memory_jobs",
+            "job-stale",
+        )
+        .await
+        .err()
+        .expect("stale redaction version must fail hydration");
         let message = format!("{error:#}");
         assert!(
             message.contains("unsupported redaction version"),
@@ -3677,16 +3908,12 @@ mod tests {
             .await
             .expect("mint memory summary key");
         let payload = test_memory_payload();
-        let (ciphertext, projection, version) = encrypt_memory_projection(
-            &store,
-            &key,
-            "memory_batches",
-            "batch-integration",
-            &payload,
-        );
+        let batch_id = Uuid::now_v7().to_string();
+        let (ciphertext, projection, version) =
+            encrypt_memory_projection(&store, &key, "memory_batches", &batch_id, &payload);
         insert_memory_batch(
             &store,
-            "batch-integration",
+            &batch_id,
             &key.key_ref,
             &ciphertext,
             &projection,
@@ -3701,8 +3928,114 @@ mod tests {
         let HydrationOutcome::Complete(state) = outcome else {
             panic!("expected complete hydration outcome");
         };
-        assert_eq!(state.memory_batches.len(), 1);
-        assert!(state.memory_batches[0].summary.is_some());
+        assert!(!state.memory.is_empty());
+    }
+
+    #[tokio::test]
+    async fn store_hydration_round_trips_applied_memory_into_runtime_layers() {
+        let store = store().await;
+        let key = store
+            .conversation_key(DataKeyPurpose::MemorySummary)
+            .await
+            .expect("mint memory summary key");
+        let source_id = Uuid::now_v7();
+        let target_id = Uuid::now_v7();
+        let job_id = Uuid::now_v7();
+        let payload = test_memory_payload();
+        let (target_ciphertext, target_projection, target_redaction_version) =
+            encrypt_memory_projection(
+                &store,
+                &key,
+                "memory_batches",
+                &target_id.to_string(),
+                &payload,
+            );
+        let (result_ciphertext, result_projection, result_redaction_version) =
+            encrypt_memory_projection(&store, &key, "memory_jobs", &job_id.to_string(), &payload);
+
+        sqlx::query(
+            "INSERT INTO memory_batches(
+                id, layer, ord, batch_seq, version, state, est_tokens,
+                eviction_footprint_tokens, updated_at
+             ) VALUES(?, 0, 1, 1, 1, 'dropped', 0, 0, ?)",
+        )
+        .bind(source_id.to_string())
+        .bind(test_now())
+        .execute(store.pool())
+        .await
+        .expect("insert applied L0 source");
+        sqlx::query(
+            "INSERT INTO memory_batches(
+                id, layer, ord, batch_seq, version, state, est_tokens,
+                eviction_footprint_tokens, summary_key_ref, summary_ciphertext,
+                summary_projection, summary_redaction_version, updated_at
+             ) VALUES(?, 1, 1, 1, 1, 'promoted', 42, 0, ?, ?, ?, ?, ?)",
+        )
+        .bind(target_id.to_string())
+        .bind(&key.key_ref)
+        .bind(target_ciphertext)
+        .bind(target_projection)
+        .bind(i64::from(target_redaction_version))
+        .bind(test_now())
+        .execute(store.pool())
+        .await
+        .expect("insert promoted L1 target");
+
+        let source_ids =
+            serde_json::to_string(&[source_id.to_string()]).expect("serialize source ids");
+        let source_versions = serde_json::to_string(&BTreeMap::from([
+            (source_id.to_string(), 1_i64),
+            (target_id.to_string(), 1_i64),
+        ]))
+        .expect("serialize exact source and target witnesses");
+        sqlx::query(
+            "INSERT INTO memory_jobs(
+                id, kind, batch_seq, source_ids, source_versions, status,
+                lease_until, attempts, result_key_ref, result_ciphertext,
+                result_projection, result_redaction_version, created_at, updated_at
+             ) VALUES(
+                ?, 'compact_l0', 1, ?, ?, 'applied', NULL, 1, ?, ?, ?, ?, ?, ?
+             )",
+        )
+        .bind(job_id.to_string())
+        .bind(source_ids)
+        .bind(source_versions)
+        .bind(&key.key_ref)
+        .bind(result_ciphertext)
+        .bind(result_projection)
+        .bind(i64::from(result_redaction_version))
+        .bind(test_now())
+        .bind(test_now())
+        .execute(store.pool())
+        .await
+        .expect("insert applied CompactL0 job");
+        sqlx::query(
+            "INSERT INTO memory_apply_cursors(kind, next_batch_seq)
+             VALUES('compact_l0', 2)",
+        )
+        .execute(store.pool())
+        .await
+        .expect("insert applied cursor");
+
+        let lease = test_lease(1);
+        let fence = test_fence(&lease);
+        let HydrationOutcome::Complete(state) = store
+            .hydrate(&lease, &fence)
+            .await
+            .expect("hydrate typed memory handoff")
+        else {
+            panic!("applied memory must not require physical recovery");
+        };
+        let memory = crate::memory::ThreeLayerMemory::from_hydrated(state.memory)
+            .expect("typed Store handoff reconstructs exact runtime layers");
+        assert!(memory.l0().is_empty());
+        assert_eq!(memory.l1().len(), 1);
+        assert_eq!(memory.l1()[0].source_batch, source_id);
+        assert_eq!(
+            memory.l1()[0].summary.expose(),
+            "Nothing of secret value here."
+        );
+        assert_eq!(memory.l2().summary.expose(), "");
     }
 
     #[tokio::test]
@@ -3715,11 +4048,12 @@ mod tests {
             .await
             .expect("mint memory summary key");
         let payload = test_memory_payload();
+        let batch_id = Uuid::now_v7().to_string();
         let (ciphertext, projection, version) =
-            encrypt_memory_projection(&store, &key, "memory_batches", "batch-snapshot", &payload);
+            encrypt_memory_projection(&store, &key, "memory_batches", &batch_id, &payload);
         insert_memory_batch(
             &store,
-            "batch-snapshot",
+            &batch_id,
             &key.key_ref,
             &ciphertext,
             &projection,
@@ -3740,9 +4074,7 @@ mod tests {
             ContextMessage::Persisted { id, .. } => assert_eq!(id, "msg-snapshot"),
             _ => panic!("expected persisted message"),
         }
-        assert_eq!(state.memory_batches.len(), 1);
-        assert_eq!(state.memory_batches[0].id, "batch-snapshot");
-        assert!(state.memory_batches[0].summary.is_some());
+        assert!(!state.memory.is_empty());
         assert!(state.provider_context.is_empty());
         assert!(state.recovery_steps.is_empty());
     }
@@ -3790,17 +4122,13 @@ mod tests {
             .await
             .expect("mint memory summary key");
         let payload = test_memory_payload();
-        let (mut ciphertext, projection, version) = encrypt_memory_projection(
-            &store,
-            &key,
-            "memory_batches",
-            "batch-bad-integration",
-            &payload,
-        );
+        let batch_id = Uuid::now_v7().to_string();
+        let (mut ciphertext, projection, version) =
+            encrypt_memory_projection(&store, &key, "memory_batches", &batch_id, &payload);
         ciphertext[0] ^= 0xff;
         insert_memory_batch(
             &store,
-            "batch-bad-integration",
+            &batch_id,
             &key.key_ref,
             &ciphertext,
             &projection,
@@ -4438,7 +4766,7 @@ mod tests {
         MIGRATOR
             .run(&pool)
             .await
-            .expect("apply migrations 0003 through 0007");
+            .expect("apply migrations 0003 through 0008");
 
         let applied: Vec<i64> = sqlx::query_scalar(
             "SELECT version FROM _sqlx_migrations WHERE success = TRUE ORDER BY version",
@@ -4446,7 +4774,7 @@ mod tests {
         .fetch_all(&pool)
         .await
         .expect("list applied migrations");
-        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8]);
 
         let table_sql: String = sqlx::query_scalar(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='approval_rules'",
@@ -4500,6 +4828,92 @@ mod tests {
                 .await
                 .expect("foreign_key_check")
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_0008_preserves_failed_jobs_and_adds_discarded_status() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open migration 0008 test pool");
+
+        for migration in MIGRATOR
+            .migrations
+            .iter()
+            .filter(|migration| migration.version < 8)
+        {
+            sqlx::raw_sql(migration.sql.as_ref())
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "apply migration {} before 0008 fixture: {error}",
+                        migration.version
+                    )
+                });
+        }
+
+        sqlx::query(
+            "INSERT INTO memory_jobs(
+                id, kind, batch_seq, source_ids, source_versions, status,
+                lease_until, attempts, created_at, updated_at
+             ) VALUES(
+                'failed-before-0008', 'compact_l0', 1, '[\"source\"]',
+                '{\"source\":1}', 'failed', NULL, 3, 'now', 'now'
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed pre-0008 failed job");
+
+        let migration = MIGRATOR
+            .migrations
+            .iter()
+            .find(|migration| migration.version == 8)
+            .expect("migration 0008");
+        sqlx::raw_sql(migration.sql.as_ref())
+            .execute(&pool)
+            .await
+            .expect("apply migration 0008");
+
+        let preserved: (String, i64) =
+            sqlx::query_as("SELECT status, attempts FROM memory_jobs WHERE id = ?")
+                .bind("failed-before-0008")
+                .fetch_one(&pool)
+                .await
+                .expect("read preserved failed job");
+        assert_eq!(preserved, ("failed".to_owned(), 3));
+
+        sqlx::query(
+            "INSERT INTO memory_jobs(
+                id, kind, batch_seq, source_ids, source_versions, status,
+                lease_until, attempts, created_at, updated_at
+             ) VALUES(
+                'discarded-after-0008', 'compact_l0', 2, '[\"source\"]',
+                '{}', 'discarded', NULL, 1, 'now', 'now'
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("0008 accepts discarded job");
+
+        let error = sqlx::query(
+            "INSERT INTO memory_jobs(
+                id, kind, batch_seq, source_ids, source_versions, status,
+                lease_until, attempts, created_at, updated_at
+             ) VALUES(
+                'invalid-after-0008', 'compact_l0', 3, '[\"source\"]',
+                '{}', 'terminal', NULL, 1, 'now', 'now'
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect_err("0008 must still reject unknown job statuses");
+        assert!(
+            error.to_string().contains("CHECK constraint failed"),
+            "{error}"
         );
     }
 

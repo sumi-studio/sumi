@@ -874,6 +874,7 @@ fn parse_job_status(value: &str) -> Result<MemoryJobStatus> {
         "running" => Ok(MemoryJobStatus::Running),
         "completed" => Ok(MemoryJobStatus::Completed),
         "applied" => Ok(MemoryJobStatus::Applied),
+        "discarded" => Ok(MemoryJobStatus::Discarded),
         "failed" => Ok(MemoryJobStatus::Failed),
         _ => bail!("unknown memory job status: {value}"),
     }
@@ -1260,13 +1261,15 @@ async fn supersede_stale_job(
             .ok_or_else(|| anyhow!("source batch {source_id} missing for supersede"))?;
         let version: i64 = row.try_get("version")?;
         let state: String = row.try_get("state")?;
+        let batch_uuid = BatchId::parse_str(source_id)
+            .with_context(|| format!("source batch id {source_id} is not a UUID"))?;
+        let version = u64::try_from(version)
+            .with_context(|| format!("source batch {source_id} version out of range"))?;
+        expected_source_versions.insert(batch_uuid, version);
         if state == MemoryBatchState::Compacting.as_str() {
-            let batch_uuid = BatchId::parse_str(source_id)
-                .with_context(|| format!("source batch id {source_id} is not a UUID"))?;
-            expected_source_versions.insert(batch_uuid, version as u64);
             batch_mutations.push(MemoryBatchMutation {
                 batch_id: batch_uuid,
-                expected_version: version as u64,
+                expected_version: version,
                 new_state: MemoryBatchState::CompactFailed,
                 summary: None,
                 est_tokens: 0,
@@ -1720,10 +1723,9 @@ async fn apply_next_completed_job(store: Arc<Store>, kind: MemoryJobKind) -> Res
     };
 
     // Scan forward from the cursor to find the first completed job, passing
-    // over applied rows. If we hit a failed job, the FIFO boundary must hold;
-    // any applied holes before it are advanced and we stop. If we hit a
-    // pending/running row after advancing over applied holes, commit a pure
-    // cursor-advance transition for those applied holes and stop.
+    // only applied or explicitly discarded rows. If we hit a failed job, the
+    // FIFO boundary must hold; any terminal holes before it are advanced and
+    // we stop. Pending/running rows likewise block later application.
     let rows = sqlx::query(
         "SELECT id, kind, batch_seq, source_ids, source_versions, status, attempts,
                 lease_until, created_at, updated_at
@@ -1744,9 +1746,12 @@ async fn apply_next_completed_job(store: Arc<Store>, kind: MemoryJobKind) -> Res
             continue;
         }
 
-        if job.status == MemoryJobStatus::Applied {
-            // Applied holes are skipped here and swept up by the cursor
-            // advance bundled with the next completed job's transition.
+        if matches!(
+            job.status,
+            MemoryJobStatus::Applied | MemoryJobStatus::Discarded
+        ) {
+            // Applied/discarded holes are swept up by the cursor advance
+            // bundled with the next completed job's transition.
             cursor = batch_seq
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("memory apply cursor overflow"))?;
@@ -1756,7 +1761,7 @@ async fn apply_next_completed_job(store: Arc<Store>, kind: MemoryJobKind) -> Res
         if job.status == MemoryJobStatus::Failed {
             // A failed job holds the FIFO boundary: later jobs cannot be
             // applied until the failed job is reclaimed or explicitly
-            // discarded. Advance any leading applied holes now.
+            // discarded. Advance any leading applied/discarded holes now.
             if cursor != initial_cursor {
                 advance_apply_cursor(
                     store.clone(),
@@ -1775,7 +1780,7 @@ async fn apply_next_completed_job(store: Arc<Store>, kind: MemoryJobKind) -> Res
         }
 
         if job.status != MemoryJobStatus::Completed {
-            // Pending or running job blocks further application. Any applied
+            // Pending or running job blocks further application. Any terminal
             // holes swept so far must advance the cursor in their own
             // transition so the stream does not drift.
             if cursor != initial_cursor {
@@ -1798,8 +1803,8 @@ async fn apply_next_completed_job(store: Arc<Store>, kind: MemoryJobKind) -> Res
         return apply_completed_job(store.clone(), &job, initial_cursor).await;
     }
 
-    // Reached the end of the durable job list. Advance the cursor over any
-    // trailing terminal holes so they are not revisited.
+    // Reached the end of the durable job list. Advance over any trailing
+    // applied/discarded holes so they are not revisited.
     if cursor != initial_cursor {
         advance_apply_cursor(
             store.clone(),
@@ -4129,7 +4134,7 @@ mod tests {
             .fetch_one(store.pool())
             .await
             .expect("load stale job");
-        assert_eq!(stale_job, "failed");
+        assert_eq!(stale_job, "discarded");
         let source: (String, i64) =
             sqlx::query_as("SELECT state, version FROM memory_batches WHERE id = ?")
                 .bind(&source_id)
