@@ -82,7 +82,7 @@ private VMはWorkspaceそのものではなく、agentの私物PCに相当する
 人格agent同士の協働は同じVMへ入ることではなく、Workspace上の共有resource、
 会話、task、権限付きaction、明示的なdelegationを通して行う。
 
-既存control planeの`tenant_id`はadministrative/security scopeを表すlegacy
+既存control planeの`tenant_id`はadministrative/security scopeを表す
 identityとして扱い、Sumi Workspace、agent、VM、Linux `/workspace`の別名には
 しない。tenantとWorkspaceのcardinalityは本ADRでは決めない。少なくとも
 `tenant_id`が同じであることを、同じVM・volume・private work environmentを
@@ -105,10 +105,10 @@ mail、calendar、app等は、source/resource/actor/correlation metadataを伴�
 ブラウザ、Gateway、command、event、token、artifact namespaceは
 `PersonalityAgentId`を宛先・ownerとして使う。
 
-既存SQLite/AAD/RPCの`conversation_id`というfield名を一時的に残す場合でも、
-値は`PersonalityAgentId`のexact aliasでなければならない。bootstrapは
-`agent_id != conversation_id`をfail-closedに拒否する。aliasは公開identityでも
-別lifecycleでもない。
+後方互換性を持たないpre-launch migrationとして、SQLite、AAD、RPC、token、
+route、fixtureから`conversation_id` fieldと独立conversation scopeを削除する。
+dual-read、dual-write、exact alias、旧AADのdecrypt/re-encrypt移行は実装しない。
+pre-launchのDB・鍵・wire fixtureは`PersonalityAgentId`だけを使って再生成する。
 
 ### 3. 破壊的conversation resetは存在しない
 
@@ -262,19 +262,16 @@ identity、reference、projection、resultだけを保存する。
 ## Migration
 
 1. 本ADRをreviewし、StatusをAcceptedへ変更する。
-2. #74でpublic `conversation_id`を`PersonalityAgentId`へ統合し、破壊的resetを
-   canon、contract、T29から除く。
-3. 実データ移行要件が存在しないpre-launch fixtureは新identityで再生成する。
-   暗号化済みrowが実在する場合だけ、authenticated decrypt/re-encrypt migrationを
-   設計する。AAD bytesをsilent rewriteしない。
-4. internal legacy fieldを残す最初の段階ではexact equalityをbootstrap、
-   Store、Gateway、testで強制し、public boundaryには漏らさない。
-5. #75でper-agent deployment namespaceと、同じWorkspaceかつ同じ
+2. #74でpublic/internal `conversation_id`と独立conversation scopeを
+   `PersonalityAgentId`へ統合し、破壊的resetをcanon、contract、T29から除く。
+3. 後方互換のschema、alias、dual-read、data migrationを作らず、pre-launchの
+   DB、鍵、AAD、wire fixtureを新identity contractで再生成する。
+4. #75でper-agent deployment namespaceと、同じWorkspaceかつ同じ
    administrative scopeに属する二agent間のisolationをT26へ固定する。
-6. #79、#80のendpoint/credential/readinessをT26へ組み込み、現在の直接agent
+5. #79、#80のendpoint/credential/readinessをT26へ組み込み、現在の直接agent
    verticalを完成させる。
-7. #77、#81、#82を段階導入し、parent direct pathを常に回帰fixtureで守る。
-8. #76でT29をagent-death lifecycleとして再設計する。
+6. #77、#81、#82を段階導入し、parent direct pathを常に回帰fixtureで守る。
+7. #76でT29をagent-death lifecycleとして再設計する。
 
 ## Consequences for current tasks
 
@@ -287,8 +284,9 @@ identity、reference、projection、resultだけを保存する。
 - Compose project、volume、IPC、credentialを人格agentごとに分離し、同じ
   Workspaceかつ同じadministrative scopeの二agent fixtureでprivate stateと
   failure domainのisolationを証明する。
-- legacy identityの不一致、既存agentでの予期しないhistory/memory欠落または
-  復号失敗、placeholder approval、no-tool fallbackをfail-closedに拒否する。
+- `PersonalityAgentId`以外のconversation-scoped identity/config、既存agentでの
+  予期しないhistory/memory欠落または復号失敗、placeholder approval、
+  no-tool fallbackをfail-closedに拒否する。
   新しくprovisionされたagentの正規な空history/memoryは許可する。
 - long-lived executor endpoint、fresh agent-scoped credential、central
   generation/Ready registryを実装する。
@@ -376,7 +374,7 @@ agent deathとして扱う。
 - T26 completionまでにsubagent、nested delegation、PTY、terminal UIをすべて
   実装すること。
 - cross-personality-agent / cross-VM subagent delegation。
-- terminal processをVM generation rollover後も生存させること。
+- terminal processを`ProcessGeneration` rollover後も生存させること。
 - 選択的忘却、法的retention、agent cloning、inheritanceのproduct semanticsを
   このADRだけで確定すること。
 
