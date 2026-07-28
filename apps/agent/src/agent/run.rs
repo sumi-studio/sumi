@@ -1006,6 +1006,10 @@ impl Runner {
             )
             .await?;
         let receipt = self.await_message_receipt(receipt).await?;
+        // MessageEnd is now durable. Promote its staged context before any
+        // post-commit control can close the live run, so warm continuation
+        // remains identical to cold hydration even when Abort wins below.
+        self.retain_committed(receipt.clone(), &partial)?;
         // Give a queued Abort its durable authorization turn before deciding
         // whether this close can hand off to a new turn.
         self.receive_control_safe_point().await?;
@@ -1029,7 +1033,6 @@ impl Runner {
                 rejected_results: Vec::new(),
             });
         }
-        self.retain_committed(receipt, &partial)?;
         self.claim_control(command)?;
         Ok(AttemptOutcome::HardSteer)
     }
