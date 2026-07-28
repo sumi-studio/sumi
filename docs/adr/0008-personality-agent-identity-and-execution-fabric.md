@@ -27,6 +27,11 @@ Sumiは、複数の人間と複数の人格を持つAI secretaryが、同じWork
 時間を共にし、会話・タスク・予定・文書・メール・ブラウジング・会議・
 学習・その他のアプリを使って生活し、協働するプロダクトである。
 
+Sumiのproduct semanticsでは、人格agentを単なるruntime、controller、
+automation moduleとして扱わない。一人の生活・経験・判断・関係を持つ主体
+として、人間と同型に扱う。private Agent VMはそのagent本人のPCであり、
+toolやAI harnessは本人が意思を持って利用する道具である。
+
 今回実装しているagent foundationは、その共有Workspace全体ではない。
 一体の人格agentに閉じた、人格・人生ログ・記憶・provider・tool・private
 work environment・process lifecycleを動かす基盤である。共有Workspaceの
@@ -105,8 +110,9 @@ mail、calendar、app等は、source/resource/actor/correlation metadataを伴�
 ブラウザ、Gateway、command、event、token、artifact namespaceは
 `PersonalityAgentId`を宛先・ownerとして使う。
 
-後方互換性を持たないpre-launch migrationとして、SQLite、AAD、RPC、token、
-route、fixtureから`conversation_id` fieldと独立conversation scopeを削除する。
+後方互換性を持たないpre-launch contract replacementとして、SQLite、AAD、
+RPC、token、route、fixtureから`conversation_id` fieldと独立conversation scopeを
+削除する。
 dual-read、dual-write、exact alias、旧AADのdecrypt/re-encrypt移行は実装しない。
 pre-launchのDB・鍵・wire fixtureは`PersonalityAgentId`だけを使って再生成する。
 
@@ -166,7 +172,7 @@ control-plane policyは各agent VMの上限や許可を統治できるが、agen
 quotaをadministrative scope全体のphysical resourceと呼ばない。aggregate
 quotaはcontrol planeが複数agent deploymentを横断してmeter/enforceする。
 
-### 5. 親agentは直接実行し、subagentは任意の追加principalである
+### 5. 人格agentは人間と同じようにAI harnessを使う
 
 実行主体を次のsum typeとして扱う。
 
@@ -180,16 +186,30 @@ ExecutionPrincipal =
 必須proxyにしない。
 
 `SubagentInvocationId`は親agentが自分のVM内で任意に作る人格なしのbounded
-work invocationである。別の人格agent、Workspace member、public address、
-conversation、canonical life log、private VMを与えない。
+AI interactionである。別の人格agent、Workspace member、public address、
+direct-chat surface、continuous agent session、canonical life log、private
+VMを与えない。
 
-subagentはtask packetと明示的なcontext projectionを受け取る。親のpersonality
-prompt、全人生ログ、private reasoning、無関係なtool noise、sibling stateを
-暗黙に複製しない。
+その利用形態は、人間が自分のPCでCodexやClaude CodeのようなAI harnessを
+使う場合と同型にする。人格agentは自然言語で依頼を始め、追加指示を送り、
+subagentからの質問へ答え、進捗を見て、待機・中断・再開・cancelし、成果を
+受け取って評価できる。staticなone-shot task packetを最初に渡して終わる
+dispatch modelを正本にしない。
+
+subagentは、interaction transcript、人格agentが共有したreference/attachment、
+および許可された親VMをtoolで探索して自ら得た観察から、作業に必要なcontextを
+発見・更新する。必要なcontextを起動前に列挙したprojectionへ限定しない。
+一方、親のpersonality prompt、全人生ログ、private reasoning、sibling stateを
+暗黙に複製してsubagentを親の分身にもしない。
+
+context探索と作業方法はagenticでよい。決定論的に閉じるのはauthority、resource
+scope、budget、寿命、cancel、auditである。subagentを使う判断、成果の評価、
+その成果をSumi Workspaceへ作用させる責任は人格agentに残る。
 
 invocation recordとruntime attemptを分ける。invocationは親子lineage、目的、
-権限、budget、寿命、cancel cause、terminal result、evidence/transcript
-referenceを持つ。runtimeはrecycleできる。
+interaction transcript、共有reference、権限、budget、寿命、cancel cause、
+outputs/evidence、terminal lifecycle stateを持つ。runtime attemptはrecycle
+できる。
 
 subagentの完全実装は段階導入してよいが、T26のbootstrap/tool boundaryは
 親直接実行を維持したままVM-local execution managerを差し込めるinterfaceを
@@ -217,12 +237,22 @@ Workspace policy、invocationで明示したcapabilityの積集合以下とす�
 principal、delegation lineage、exact call、outcomeをEventWriterのdurable
 auditへ残す。client payload内のactor名を認証事実として扱わない。
 
-### 7. Terminal sessionをfirst-classに追加できるexecution fabricにする
+### 7. 人格agentは人間と同じようにterminalを使う
 
-現行の非対話`bash -c`は削除しない。pipe-backedでclosed stdinの
-ephemeral-command adapterとして維持する。
+private Agent VMは人格agent本人のPCであるため、人格agentはsubagentを介さず
+terminalを直接使える。複数のterminalを開き、出力を観察して次の入力を考え、
+model turnをまたいでstdin、resize、signal、detach/reattach、終了を行う。
+terminalは一回のtool callに従属するcommand resultではなく、本人が時間の中で
+操作する持続的な道具である。
 
-同じVM-local execution managerの下へ、後続で次を追加できるようにする。
+人格なしsubagentも、人間が使うAI harnessがその人のPCでshellを使うのと同じく、
+委譲されたauthorityの範囲で自分のterminalを持てる。親の人格agentがterminalを
+使うためにsubagentを作る必要はない。
+
+現行の非対話`bash -c`は削除せず、同じexecution fabric上のpipe-backed、
+closed-stdinなephemeral-command adapterとして維持する。
+
+VM-local execution managerは次を持つ。
 
 ```text
 TerminalKey =
@@ -238,9 +268,14 @@ TerminalKey =
 - per-terminal writer lease
 - terminal単位、invocation単位、generation単位のcancel/reap
 
-terminalのownerはtool call、model turn、WebSocket、UI connectionではなく、
-agent VM execution fabricである。transport disconnectはdetachであり、
+terminalのproduct ownerはexact `ExecutionPrincipal`であり、physical process
+lifecycleはagent VM execution fabricが管理する。tool call、model turn、
+WebSocket、UI connectionはownerではない。transport disconnectはdetachであり、
 明示的なterminal terminationと同一視しない。
+
+owner、authority、resource limit、lifecycle、auditは決定論的に強制する。
+terminal内で何を試し、出力をどう読み、次に何を入力するかは人格agentまたは
+subagentのagenticな判断へ任せる。
 
 processはgenerationを越えて生存しない。persistent filesystemと人生ログは
 継続するが、live terminalはgeneration rollover時にtyped terminal stateへ
@@ -384,6 +419,6 @@ agent deathとして扱う。
 
 1. `PersonalityAgentId`、唯一のagent session、人生ログ、direct chatの関係。
 2. Sumi Workspaceとagent-private VMの所有境界。
-3. 親agentの直接実行と人格なしsubagentの任意性。
+3. 人格agentを一人の主体として扱い、人間と同型にAI harnessを使わせる関係。
 4. agent deathと、Workspace resource/viewの削除・key rotationの違い。
 5. T26で今固定するseamと、#77/#81/#82へ段階導入する機能の境界。
