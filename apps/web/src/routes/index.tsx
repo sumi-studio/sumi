@@ -229,17 +229,23 @@ function applyFrame(
   }
   if (type === "message_end") {
     const message = event.message as {
+      role?: string;
       content?: Array<{ type?: string; text?: string }>;
     };
+    if (message.role !== "assistant") return;
     const text = message.content
       ?.filter((content) => content.type === "text")
       .map((content) => content.text ?? "")
       .join("");
-    if (text)
+    if (text) {
+      const id = `message-${String(event.message_id)}`;
       setFeed((items) => [
-        ...items.filter((item) => !item.id.startsWith("stream-")),
-        { id: `message-${String(event.message_id)}`, kind: "assistant", text },
+        ...items.filter(
+          (item) => !item.id.startsWith("stream-") && item.id !== id,
+        ),
+        { id, kind: "assistant", text },
       ]);
+    }
     streamingText.current = "";
     streamingMessageID.current = undefined;
   }
@@ -268,5 +274,12 @@ function applyFrame(
         text: JSON.stringify(request.action ?? request),
       },
     ]);
+  } else if (type === "approval_resolved") {
+    const requestID = String(event.request_id);
+    setFeed((items) =>
+      items.filter(
+        (item) => item.kind !== "approval" || item.requestID !== requestID,
+      ),
+    );
   }
 }
