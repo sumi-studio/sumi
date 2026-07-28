@@ -89,6 +89,15 @@ impl From<PublicMessage> for Message {
     }
 }
 
+impl PublicMessage {
+    pub fn usage(&self) -> Usage {
+        match self {
+            PublicMessage::Assistant(assistant) => assistant.usage.clone(),
+            _ => Usage::default(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryLayer {
@@ -135,7 +144,15 @@ pub struct ProviderContextItem {
 /// provider replay. Every authenticated anchor/wire group starts at ordinal
 /// zero and has no duplicate or missing ordinal. Native windows form an
 /// unanchored group scoped by their exact provider origin and payload kind.
-pub fn validate_provider_context_ordinals(items: &[ProviderContextItem]) -> Result<(), String> {
+impl AsRef<ProviderContextItem> for ProviderContextItem {
+    fn as_ref(&self) -> &ProviderContextItem {
+        self
+    }
+}
+
+pub fn validate_provider_context_ordinals<T: AsRef<ProviderContextItem>>(
+    items: &[T],
+) -> Result<(), String> {
     #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
     enum Group {
         Anchored {
@@ -153,6 +170,7 @@ pub fn validate_provider_context_ordinals(items: &[ProviderContextItem]) -> Resu
 
     let mut groups = BTreeMap::<Group, Vec<u32>>::new();
     for item in items {
+        let item = item.as_ref();
         let group = match &item.payload {
             ProviderContextPayload::EncryptedReasoning { .. } => {
                 let anchor = item

@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -24,13 +24,21 @@ use uuid::Uuid;
 
 use crate::{
     gateway::Command,
+    memory::{
+        context_assembler::ProviderCallTrigger,
+        estimate::{
+            ProviderContextItemWithFootprint, eviction_footprint_for_payload,
+            observed_prompt_tokens,
+        },
+    },
     provider::{
+        model::ModelSpec,
         overflow::{OverflowClassification, OverflowSource, classify_context_overflow},
         retry::{is_retryable, retry_delay, sleep_or_cancel},
         types::{
-            AssistantContent, ContextMessage, Message, ProviderContextFragment,
-            ProviderContextItem, ProviderEvent, ProviderEventStream, PublicAssistantContent,
-            PublicMessage, StopReason, ToolCall, ToolResultMessage, UserContent, UserMessage,
+            AssistantContent, AssistantMessage, ContextMessage, Message, ProviderContextFragment,
+            ProviderEvent, ProviderEventStream, PublicAssistantContent, PublicMessage, StopReason,
+            ToolCall, ToolResultMessage, UserContent, UserMessage,
         },
     },
     runtime::contracts::ProcessGeneration,
@@ -91,7 +99,23 @@ pub(crate) struct ProviderAttempt {
     /// another run would collide with the Store's globally keyed message row.
     pub(crate) message_id: String,
     pub(crate) initial_message: PublicMessage,
+    /// Uncalibrated prompt-token estimate produced by the assembler before the
+    /// provider call.  This is the denominator for the calibration EMA.
+    pub(crate) uncalibrated_prompt_estimate: u64,
     pub(crate) events: ProviderEventStream,
+}
+
+/// Ordinals and context-assembly boundary for one provider call.
+///
+/// `attempt_sequence` remains run-global for durable attempt identity, while
+/// `user_turn_attempt` restarts only after a newly injected user message.
+/// `trigger` independently distinguishes the first call after that message
+/// from retries and tool continuations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProviderCallAttempt {
+    pub(crate) attempt_sequence: usize,
+    pub(crate) user_turn_attempt: usize,
+    pub(crate) trigger: ProviderCallTrigger,
 }
 
 /// Narrow runtime boundary. Production wiring may build provider context from
@@ -101,6 +125,14 @@ pub(crate) struct ProviderAttempt {
 pub(crate) trait RunDriver: Send + Sync + 'static {
     /// Fail closed before Session creates keys, recovery state, or a worker.
     fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()>;
+
+    /// T21 idle maintenance must return true only after its durable transition
+    /// and ContextAssembler refresh have both completed.
+    async fn apply_idle_memory_maintenance(&self, _core: &mut RunCore) -> Result<bool> {
+        Err(anyhow::anyhow!(
+            "idle memory maintenance is not wired to the authoritative Store/EventWriter path"
+        ))
+    }
 
     async fn start_provider_for_command(
         &self,
@@ -114,15 +146,11 @@ pub(crate) trait RunDriver: Send + Sync + 'static {
         &self,
         attempt: usize,
         context: &[ContextMessage],
-        provider_context: &[ProviderContextItem],
+        _provider_context: &[ProviderContextItemWithFootprint],
+        _trigger: ProviderCallTrigger,
         command_received_at: Option<std::time::Instant>,
         cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
-        if !provider_context.is_empty() {
-            return Err(anyhow!(
-                "run driver does not support durable provider-context replay"
-            ));
-        }
         self.start_provider_for_command(attempt, context, command_received_at, cancel)
             .await
     }
@@ -133,17 +161,17 @@ pub(crate) trait RunDriver: Send + Sync + 'static {
     /// the default preserves the established global attempt identity.
     async fn start_provider_for_user_turn(
         &self,
-        attempt_sequence: usize,
-        _user_turn_attempt: usize,
+        call: ProviderCallAttempt,
         context: &[ContextMessage],
-        provider_context: &[ProviderContextItem],
+        provider_context: &[ProviderContextItemWithFootprint],
         command_received_at: Option<std::time::Instant>,
         cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
         self.start_provider_with_context(
-            attempt_sequence,
+            call.attempt_sequence,
             context,
             provider_context,
+            call.trigger,
             command_received_at,
             cancel,
         )
@@ -164,6 +192,15 @@ pub(crate) trait RunDriver: Send + Sync + 'static {
         None
     }
 
+    /// Seed the driver's `ContextAssembler` with the hydrated provider context
+    /// carried in the `RunCore`. Default is a no-op for test drivers that do
+    /// not use the T21 assembler.
+    fn set_hydrated_provider_context(
+        &self,
+        _provider_context: Vec<ProviderContextItemWithFootprint>,
+    ) {
+    }
+
     /// Plans one bounded emergency recovery without mutating runtime state.
     /// There is intentionally no default. Implementations must be side-effect
     /// free; the runner validates the plan and installs it after scheduling.
@@ -173,6 +210,26 @@ pub(crate) trait RunDriver: Send + Sync + 'static {
         request: OverflowRecoveryRequest,
         active_context: &[ContextMessage],
     ) -> Result<OverflowRecoveryOutcome>;
+
+    /// Install the exact token calibration committed with a successful
+    /// provider terminal. Default is a no-op for test drivers that do not use
+    /// the T21 assembler.
+    fn install_committed_calibration(&self, _ratio_bits: [u8; 8]) -> Result<()> {
+        Ok(())
+    }
+
+    /// Apply the durable results of a terminal assistant turn.  The runner
+    /// supplies the authoritative assistant message, its durable identity, and
+    /// the opaque provider-context fragments generated for the turn.
+    async fn apply_terminal(
+        &self,
+        _message_id: &str,
+        _message_seq: u64,
+        _message: &AssistantMessage,
+        _provider_context: &[ProviderContextFragment],
+    ) -> Result<()> {
+        Ok(())
+    }
 
     async fn wait_retry(&self, delay: Duration, cancel: &CancellationToken) -> bool {
         sleep_or_cancel(delay, cancel).await
@@ -197,6 +254,13 @@ impl RunWorker for SequentialRunWorker {
         self.driver.validate_executor_generation(generation)
     }
 
+    fn apply_idle_memory_maintenance<'a>(
+        &'a self,
+        core: &'a mut RunCore,
+    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+        Box::pin(async move { self.driver.apply_idle_memory_maintenance(core).await })
+    }
+
     fn run(
         &self,
         core: RunCore,
@@ -205,7 +269,9 @@ impl RunWorker for SequentialRunWorker {
         events: mpsc::Sender<RunOutput>,
     ) -> WorkerFuture {
         let driver = self.driver.clone();
+        let provider_context = core.provider_context.clone();
         Box::pin(async move {
+            driver.set_hydrated_provider_context(provider_context);
             Runner::new(core, driver, controls, events)
                 .run(initial)
                 .await
@@ -220,7 +286,7 @@ struct Runner {
     events: mpsc::Sender<RunOutput>,
     phase: watch::Sender<WorkerPhase>,
     context: Vec<ContextMessage>,
-    provider_context: Vec<ProviderContextItem>,
+    provider_context: Vec<ProviderContextItemWithFootprint>,
     pending_provider_context: HashMap<
         String,
         (
@@ -238,6 +304,7 @@ struct Runner {
     consecutive_length_batches: usize,
     in_flight_controls: Vec<AdmittedCommand>,
     pending_command_received_at: Option<std::time::Instant>,
+    first_provider_call_after_user: bool,
     provider_cancel: Option<CancellationToken>,
     hard_steer_command: Option<AdmittedCommand>,
     abort_requested: bool,
@@ -312,6 +379,7 @@ impl Runner {
             consecutive_length_batches: 0,
             in_flight_controls: Vec::new(),
             pending_command_received_at: None,
+            first_provider_call_after_user: false,
             provider_cancel: None,
             hard_steer_command: None,
             abort_requested: false,
@@ -477,6 +545,8 @@ impl Runner {
                 AttemptOutcome::Terminal {
                     assistant_message_id,
                     message,
+                    assistant_message,
+                    provider_context,
                     receipt,
                     rejected_results,
                     deferred_overflow,
@@ -496,6 +566,20 @@ impl Runner {
                     if calls.is_empty() && rejected_results.is_empty() {
                         self.consecutive_length_batches = 0;
                         let receipt = self.await_message_receipt(assistant_receipt_waiter).await?;
+                        if let Some(ratio_bits) = receipt.calibration_ratio_bits {
+                            self.driver
+                                .install_committed_calibration(ratio_bits)
+                                .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+                        }
+                        self.driver
+                            .apply_terminal(
+                                &receipt.message_id,
+                                receipt.message_seq,
+                                &assistant_message,
+                                &provider_context,
+                            )
+                            .await
+                            .map_err(|error| WorkerFailure::Error(error.to_string()))?;
                         self.retain_committed(receipt, &message)?;
                         self.close_turn(message, Vec::new()).await?;
                         if !self.advance_followup().await? {
@@ -515,6 +599,20 @@ impl Runner {
                         .emit_rejected_results(&assistant_message_id, &rejected_results)
                         .await?;
                     let receipt = self.await_message_receipt(assistant_receipt_waiter).await?;
+                    if let Some(ratio_bits) = receipt.calibration_ratio_bits {
+                        self.driver
+                            .install_committed_calibration(ratio_bits)
+                            .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+                    }
+                    self.driver
+                        .apply_terminal(
+                            &receipt.message_id,
+                            receipt.message_seq,
+                            &assistant_message,
+                            &provider_context,
+                        )
+                        .await
+                        .map_err(|error| WorkerFailure::Error(error.to_string()))?;
                     let (executable_results, executable_receipts) = if is_length {
                         self.consecutive_length_batches += 1;
                         self.fail_length_calls(&assistant_message_id, &calls, length_guarded)
@@ -586,7 +684,13 @@ impl Runner {
                         .emit_rejected_results(&assistant_message_id, &rejected_results)
                         .await?;
                     self.retain_tool_results(&receipts, &rejected_results)?;
-                    self.await_message_receipt(receipt).await?;
+                    let receipt = self.await_message_receipt(receipt).await?;
+                    if self
+                        .pending_provider_context
+                        .contains_key(&receipt.message_id)
+                    {
+                        self.retain_committed(receipt, &message)?;
+                    }
                     self.close_turn(message, Vec::new()).await?;
                     break;
                 }
@@ -646,9 +750,17 @@ impl Runner {
         // Retries and tool continuations keep their own TTFT observation, but
         // must not fold provider/backoff/tool time into agent internal p95.
         let command_received_at = self.pending_command_received_at.take();
+        let trigger = if std::mem::take(&mut self.first_provider_call_after_user) {
+            ProviderCallTrigger::FirstAfterUser
+        } else {
+            ProviderCallTrigger::Continuation
+        };
         let start = self.driver.start_provider_for_user_turn(
-            self.attempt_sequence,
-            self.user_turn_attempt,
+            ProviderCallAttempt {
+                attempt_sequence: self.attempt_sequence,
+                user_turn_attempt: self.user_turn_attempt,
+                trigger,
+            },
             &self.context,
             &self.provider_context,
             command_received_at,
@@ -898,6 +1010,8 @@ impl Runner {
                                     terminal_message_id,
                                     terminal_message,
                                     durable_provider_context,
+                                    kind,
+                                    attempt.uncalibrated_prompt_estimate,
                                 )
                                 .await?;
                             if let Some(OverflowClassification::ImmediateRecovery(source)) = overflow {
@@ -929,6 +1043,8 @@ impl Runner {
                             return Ok(AttemptOutcome::Terminal {
                                 assistant_message_id: attempt.message_id.clone(),
                                 message: public,
+                                assistant_message: internal.clone(),
+                                provider_context: terminal.provider_context().to_vec(),
                                 receipt,
                                 rejected_results,
                                 deferred_overflow: match overflow {
@@ -988,6 +1104,7 @@ impl Runner {
     ) -> Result<AttemptOutcome, WorkerFailure> {
         let partial = steer::normalize_partial_assistant(partial)
             .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+        self.stage_provider_context(message_id, &partial, &provider_context)?;
         if !started {
             self.emit(AgentEvent::MessageStart {
                 message_id: message_id.to_owned(),
@@ -995,12 +1112,12 @@ impl Runner {
             })
             .await?;
         }
-        self.stage_provider_context(message_id, &partial, &provider_context)?;
         let receipt = self
             .emit_message_end_with_provider_context(
                 message_id.to_owned(),
                 partial.clone(),
                 provider_context,
+                None,
                 None,
                 None,
             )
@@ -1046,6 +1163,7 @@ impl Runner {
     ) -> Result<AttemptOutcome, WorkerFailure> {
         let partial = steer::normalize_partial_assistant(partial)
             .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+        self.stage_provider_context(message_id, &partial, &provider_context)?;
         if !started {
             self.emit(AgentEvent::MessageStart {
                 message_id: message_id.to_owned(),
@@ -1060,6 +1178,7 @@ impl Runner {
                 provider_context,
                 None,
                 None,
+                None,
             )
             .await?;
         Ok(AttemptOutcome::ClosedError {
@@ -1068,6 +1187,35 @@ impl Runner {
             receipt,
             rejected_results: Vec::new(),
         })
+    }
+
+    fn stage_provider_context(
+        &mut self,
+        message_id: &str,
+        message: &PublicMessage,
+        provider_context: &[ProviderContextFragment],
+    ) -> Result<(), WorkerFailure> {
+        if provider_context.is_empty() {
+            return Ok(());
+        }
+        let PublicMessage::Assistant(assistant) = message else {
+            return Err(WorkerFailure::Error(
+                "provider context requires an assistant terminal".to_owned(),
+            ));
+        };
+        if self
+            .pending_provider_context
+            .insert(
+                message_id.to_owned(),
+                (assistant.origin.clone(), provider_context.to_vec()),
+            )
+            .is_some()
+        {
+            return Err(WorkerFailure::Error(
+                "duplicate pending provider-context message identity".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     async fn close_broken_attempt(
@@ -2047,8 +2195,10 @@ impl Runner {
             .and_then(|command| command.received_monotonic());
         // TurnStart is also emitted for tool-result continuations. A durable
         // user injection, not that internal lifecycle event, is the boundary
-        // that restores first-attempt request policy.
+        // that restores first-attempt request policy and first-user-call
+        // context assembly.
         self.user_turn_attempt = 0;
+        self.first_provider_call_after_user = true;
         self.in_flight_controls.clear();
         Ok(())
     }
@@ -2545,6 +2695,7 @@ impl Runner {
             message_id,
             message,
             Vec::new(),
+            None,
             approval_not_started,
             approval_cancelled,
         )
@@ -2556,11 +2707,29 @@ impl Runner {
         message_id: String,
         message: PublicMessage,
         provider_context: Vec<crate::provider::types::ProviderContextFragment>,
+        terminal_kind: ProviderTerminalKind,
+        uncalibrated_prompt_estimate: u64,
     ) -> Result<oneshot::Receiver<MessageCommitReceipt>, WorkerFailure> {
+        let calibration_estimate = match &message {
+            PublicMessage::Assistant(assistant)
+                if terminal_kind == ProviderTerminalKind::Done
+                    && !matches!(
+                        assistant.stop_reason,
+                        StopReason::Error | StopReason::Aborted
+                    )
+                    && uncalibrated_prompt_estimate > 0 =>
+            {
+                let observed = observed_prompt_tokens(&assistant.usage)
+                    .map_err(|error| WorkerFailure::Error(error.to_string()))?;
+                (observed > 0).then_some(uncalibrated_prompt_estimate)
+            }
+            _ => None,
+        };
         self.emit_message_end_with_provider_context(
             message_id,
             message,
             provider_context,
+            calibration_estimate,
             None,
             None,
         )
@@ -2572,14 +2741,20 @@ impl Runner {
         message_id: String,
         message: PublicMessage,
         provider_context: Vec<crate::provider::types::ProviderContextFragment>,
+        calibration_estimate: Option<u64>,
         approval_not_started: Option<String>,
         approval_cancelled: Option<String>,
     ) -> Result<oneshot::Receiver<MessageCommitReceipt>, WorkerFailure> {
         let binding = self.core.durable_binding.clone().ok_or_else(|| {
             WorkerFailure::Error("RunCore has no durable worker binding".to_owned())
         })?;
-        let (barrier, receipt) =
-            MessageCommitBarrier::channel_with_provider_context(provider_context);
+        let (barrier, receipt) = match calibration_estimate {
+            Some(estimate) => MessageCommitBarrier::channel_with_provider_context_and_calibration(
+                provider_context,
+                estimate,
+            ),
+            None => MessageCommitBarrier::channel_with_provider_context(provider_context),
+        };
         self.events
             .send(RunOutput {
                 binding,
@@ -2632,35 +2807,6 @@ impl Runner {
             .map_err(|_| WorkerFailure::Error("RetryScheduled durability commit failed".to_owned()))
     }
 
-    fn stage_provider_context(
-        &mut self,
-        message_id: &str,
-        message: &PublicMessage,
-        fragments: &[ProviderContextFragment],
-    ) -> Result<(), WorkerFailure> {
-        if fragments.is_empty() {
-            return Ok(());
-        }
-        let PublicMessage::Assistant(assistant) = message else {
-            return Err(WorkerFailure::Error(
-                "provider context requires an assistant terminal".to_owned(),
-            ));
-        };
-        if self
-            .pending_provider_context
-            .insert(
-                message_id.to_owned(),
-                (assistant.origin.clone(), fragments.to_vec()),
-            )
-            .is_some()
-        {
-            return Err(WorkerFailure::Error(
-                "duplicate pending provider-context message identity".to_owned(),
-            ));
-        }
-        Ok(())
-    }
-
     async fn await_message_receipt(
         &self,
         receipt: oneshot::Receiver<MessageCommitReceipt>,
@@ -2686,10 +2832,23 @@ impl Runner {
                     message_id: receipt.message_id.clone(),
                     message_seq: receipt.message_seq,
                 },
-                origin,
+                origin.clone(),
             )
             .map_err(WorkerFailure::Error)?;
-            self.provider_context.extend(items);
+            let Some(spec) = ModelSpec::from_origin(&origin) else {
+                return Err(WorkerFailure::Error(format!(
+                    "no canonical ModelSpec for provider origin {origin:?}"
+                )));
+            };
+            let items: Result<Vec<_>, _> = items
+                .into_iter()
+                .map(|item| {
+                    let footprint = eviction_footprint_for_payload(&spec, &item.payload)
+                        .map_err(|e| WorkerFailure::Error(e.to_string()))?;
+                    Ok(ProviderContextItemWithFootprint::new(item, footprint))
+                })
+                .collect();
+            self.provider_context.extend(items?);
             crate::provider::types::validate_provider_context_ordinals(&self.provider_context)
                 .map_err(WorkerFailure::Error)?;
         }
@@ -2772,6 +2931,7 @@ impl<F> Drop for CancelOnDrop<F> {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum AttemptOutcome {
     Retry {
         assistant_message_id: String,
@@ -2789,6 +2949,8 @@ enum AttemptOutcome {
     Terminal {
         assistant_message_id: String,
         message: PublicMessage,
+        assistant_message: AssistantMessage,
+        provider_context: Vec<ProviderContextFragment>,
         receipt: oneshot::Receiver<MessageCommitReceipt>,
         rejected_results: Vec<ToolResultMessage>,
         deferred_overflow: Option<OverflowSource>,

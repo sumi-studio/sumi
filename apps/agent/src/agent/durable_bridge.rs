@@ -113,6 +113,9 @@ impl RunOutput {
 pub(crate) struct MessageCommitReceipt {
     pub message_id: String,
     pub message_seq: u64,
+    /// Exact big-endian IEEE-754 bits committed by EventWriter for the
+    /// prompt-token calibration observation carried by this MessageEnd.
+    pub calibration_ratio_bits: Option<[u8; 8]>,
     /// When a hard-steer close batch creates a new turn, the worker needs the
     /// durable turn identity to bind subsequent MessageStart/End events.
     pub new_turn_id: Option<String>,
@@ -121,6 +124,7 @@ pub(crate) struct MessageCommitReceipt {
 pub(crate) struct MessageCommitBarrier {
     sender: oneshot::Sender<MessageCommitReceipt>,
     provider_context: Vec<ProviderContextFragment>,
+    calibration_estimate: Option<u64>,
 }
 
 impl MessageCommitBarrier {
@@ -136,6 +140,22 @@ impl MessageCommitBarrier {
             Self {
                 sender,
                 provider_context,
+                calibration_estimate: None,
+            },
+            receiver,
+        )
+    }
+
+    pub(crate) fn channel_with_provider_context_and_calibration(
+        provider_context: Vec<ProviderContextFragment>,
+        uncalibrated_prompt_estimate: u64,
+    ) -> (Self, oneshot::Receiver<MessageCommitReceipt>) {
+        let (sender, receiver) = oneshot::channel();
+        (
+            Self {
+                sender,
+                provider_context,
+                calibration_estimate: Some(uncalibrated_prompt_estimate),
             },
             receiver,
         )
@@ -143,6 +163,10 @@ impl MessageCommitBarrier {
 
     fn provider_context(&self) -> &[ProviderContextFragment] {
         &self.provider_context
+    }
+
+    fn calibration_estimate(&self) -> Option<u64> {
+        self.calibration_estimate
     }
 
     #[cfg(test)]
@@ -1540,6 +1564,22 @@ impl DurableBridge {
             self.pending_rejected_end = Some((message_id, message, rejected, barrier));
             return Ok((Vec::new(), Vec::new()));
         }
+        let mut projections = vec![Projection::MessageEnd {
+            message_id: message_id.clone(),
+            role: "assistant",
+            message: message.clone(),
+            append_to_l0,
+            eviction_footprint_tokens: Self::provider_context_footprint(
+                &message,
+                &provider_context,
+            )?,
+            provider_context,
+        }];
+        if let Some(uncalibrated_prompt_estimate) = barrier.calibration_estimate() {
+            projections.push(Projection::MemoryCalibrationObservation {
+                uncalibrated_prompt_estimate,
+            });
+        }
         self.commit_message_batch(
             writer,
             EventBatch {
@@ -1551,17 +1591,7 @@ impl DurableBridge {
                         Some(self.binding.run_id.clone()),
                         Some(self.binding.turn_id.clone()),
                     )?),
-                    projections: vec![Projection::MessageEnd {
-                        message_id: message_id.clone(),
-                        role: "assistant",
-                        message: message.clone(),
-                        append_to_l0,
-                        eviction_footprint_tokens: Self::provider_context_footprint(
-                            &message,
-                            &provider_context,
-                        )?,
-                        provider_context,
-                    }],
+                    projections,
                 }],
                 injected_commands: Vec::new(),
             },
@@ -1898,6 +1928,22 @@ impl DurableBridge {
         if !append_to_l0 && !provider_context.is_empty() {
             bail!("L0-excluded rejected assistant cannot carry provider context");
         }
+        let mut assistant_projections = vec![Projection::MessageEnd {
+            message_id: assistant_id.clone(),
+            role: "assistant",
+            message: assistant.clone(),
+            append_to_l0,
+            eviction_footprint_tokens: Self::provider_context_footprint(
+                &assistant,
+                &provider_context,
+            )?,
+            provider_context,
+        }];
+        if let Some(uncalibrated_prompt_estimate) = assistant_barrier.calibration_estimate() {
+            assistant_projections.push(Projection::MemoryCalibrationObservation {
+                uncalibrated_prompt_estimate,
+            });
+        }
         let mut writes = vec![EventWrite {
             event: Some(DurableEvent::message_in_turn(
                 "message_end",
@@ -1906,17 +1952,7 @@ impl DurableBridge {
                 Some(self.binding.run_id.clone()),
                 Some(self.binding.turn_id.clone()),
             )?),
-            projections: vec![Projection::MessageEnd {
-                message_id: assistant_id.clone(),
-                role: "assistant",
-                message: assistant.clone(),
-                append_to_l0,
-                eviction_footprint_tokens: Self::provider_context_footprint(
-                    &assistant,
-                    &provider_context,
-                )?,
-                provider_context,
-            }],
+            projections: assistant_projections,
         }];
         let mut receipt_requests = vec![(assistant_id.clone(), assistant_barrier)];
         let mut public = vec![AgentEvent::MessageEnd {
@@ -1977,7 +2013,35 @@ impl DurableBridge {
         Vec<CommittedOutput>,
         Vec<(MessageCommitBarrier, MessageCommitReceipt)>,
     )> {
-        let outputs = self.commit_batch(writer, batch, public).await?;
+        self.collect_terminal_command_ids(&batch);
+        let (seqs, calibration_ratio_bits) = writer.apply_with_calibration_receipt(batch).await?;
+        if seqs.len() != public.len() {
+            bail!("durable EventBatch/public event cardinality mismatch");
+        }
+        let outputs: Vec<_> = public
+            .into_iter()
+            .zip(seqs)
+            .map(|(event, seq)| CommittedOutput {
+                event,
+                seq: Some(seq),
+            })
+            .collect();
+        let calibration_receipt_count = receipt_requests
+            .iter()
+            .filter(|(_, barrier)| barrier.calibration_estimate().is_some())
+            .count();
+        match (calibration_receipt_count, calibration_ratio_bits) {
+            (0, None) | (1, Some(_)) => {}
+            (0, Some(_)) => {
+                bail!("calibration projection has no receipt-bound MessageEnd");
+            }
+            (_, None) => {
+                bail!("calibration receipt-bound MessageEnd committed no calibration");
+            }
+            (_, Some(_)) => {
+                bail!("multiple MessageEnd receipts requested one calibration value");
+            }
+        }
         let mut committed_by_id = HashMap::new();
         for output in &outputs {
             if let AgentEvent::MessageEnd { message_id, .. } = &output.event {
@@ -1997,11 +2061,15 @@ impl DurableBridge {
             let message_seq = committed_by_id.remove(&message_id).ok_or_else(|| {
                 anyhow!("atomic batch omitted receipt-bound MessageEnd {message_id}")
             })?;
+            let receipt_calibration_ratio_bits = barrier
+                .calibration_estimate()
+                .map(|_| calibration_ratio_bits.expect("calibration receipt was checked"));
             receipts.push((
                 barrier,
                 MessageCommitReceipt {
                     message_id,
                     message_seq,
+                    calibration_ratio_bits: receipt_calibration_ratio_bits,
                     new_turn_id: new_turn_id.clone(),
                 },
             ));
@@ -2075,6 +2143,7 @@ impl DurableBridge {
         barrier.resolve(MessageCommitReceipt {
             message_id: message_id.clone(),
             message_seq: partial_message_seq,
+            calibration_ratio_bits: None,
             new_turn_id: Some(new_turn_id.clone()),
         });
 
@@ -2191,6 +2260,7 @@ impl DurableBridge {
                 MessageCommitReceipt {
                     message_id,
                     message_seq: user_message_seq,
+                    calibration_ratio_bits: None,
                     new_turn_id: None,
                 },
             )],
@@ -2366,6 +2436,7 @@ impl DurableBridge {
                 MessageCommitReceipt {
                     message_id: pending.message_id,
                     message_seq,
+                    calibration_ratio_bits: None,
                     new_turn_id: None,
                 },
             ));
@@ -2494,7 +2565,7 @@ mod tests {
             events::{ApprovalRequest, ApprovalResolution, ReviewProjection},
         },
         gateway::{ApprovalDecision, Command, CommandEnvelope, CommandId, InboundCommand},
-        memory::estimate::eviction_footprint_for_payload,
+        memory::estimate::{ProviderContextItemWithFootprint, eviction_footprint_for_payload},
         provider::{
             ModelSpec,
             types::{
@@ -2794,6 +2865,71 @@ mod tests {
             turn_id: "turn-a".to_owned(),
             executor_generation: ProcessGeneration::from_wire(73).unwrap(),
         }
+    }
+
+    #[tokio::test]
+    async fn assistant_message_receipt_carries_exact_committed_calibration_bits() {
+        let store = test_store().await;
+        let writer = EventWriter::new(store.clone());
+        let command_id = "00000000-0000-4000-8000-000000000031";
+        let (binding, assistant) = owner_in_phase(
+            &store,
+            &writer,
+            command_id,
+            "run-calibration",
+            "turn-calibration",
+            RunPhase::AssistantStarted,
+        )
+        .await;
+        let (assistant_id, mut assistant) = assistant.expect("assistant-started fixture");
+        let PublicMessage::Assistant(message) = &mut assistant else {
+            panic!("assistant-started fixture returned a non-assistant message");
+        };
+        message.usage.input = 200;
+        message.usage.total_tokens = 200;
+
+        let mut bridge = DurableBridge::new(binding.clone());
+        bridge.phase = RunPhase::AssistantStarted;
+        bridge.turn_open = true;
+        bridge.assistant_open = Some(assistant_id.clone());
+        let (barrier, receiver) =
+            MessageCommitBarrier::channel_with_provider_context_and_calibration(Vec::new(), 100);
+        let committed = bridge
+            .commit(
+                &writer,
+                RunOutput {
+                    binding,
+                    event: AgentEvent::MessageEnd {
+                        message_id: assistant_id.clone(),
+                        message: Box::new(assistant),
+                    },
+                    commit_barrier: None,
+                    message_commit_barrier: Some(barrier),
+                    retry_wait_commit_barrier: None,
+                    approval_command: None,
+                    approval_not_started: None,
+                    approval_cancelled: None,
+                },
+            )
+            .await
+            .expect("commit calibrated assistant MessageEnd");
+        committed.resolve_message_receipts();
+        let receipt = receiver.await.expect("calibration receipt");
+
+        assert_eq!(receipt.message_id, assistant_id);
+        let receipt_bits = receipt
+            .calibration_ratio_bits
+            .expect("calibrated MessageEnd receipt carries ratio bits");
+        let stored_bits: Vec<u8> =
+            sqlx::query_scalar("SELECT ratio_bits FROM memory_calibration WHERE singleton = 1")
+                .fetch_one(store.pool())
+                .await
+                .expect("committed calibration row");
+        assert_eq!(stored_bits, receipt_bits);
+        assert!(
+            (f64::from_bits(u64::from_be_bytes(receipt_bits)) - 1.3).abs() < 1.0e-12,
+            "default 1.0 ratio updated from a 200/100 observation with alpha 0.3"
+        );
     }
 
     #[test]
@@ -3276,9 +3412,9 @@ mod tests {
             },
         };
         let expected_footprint = eviction_footprint_for_payload(&spec, &fragment.payload)
-            .expect("provider context footprint")
-            .eviction_tokens();
-        assert!(expected_footprint > 0);
+            .expect("provider context footprint");
+        let expected_footprint_tokens = expected_footprint.eviction_tokens();
+        assert!(expected_footprint_tokens > 0);
 
         let (assistant_barrier, assistant_receipt) =
             MessageCommitBarrier::channel_with_provider_context(vec![fragment.clone()]);
@@ -3323,7 +3459,7 @@ mod tests {
                 i64::try_from(receipt.message_seq).expect("message seq fits SQLite"),
                 1,
                 0,
-                i64::try_from(expected_footprint).expect("footprint fits SQLite"),
+                i64::try_from(expected_footprint_tokens).expect("footprint fits SQLite"),
             )
         );
 
@@ -3339,21 +3475,24 @@ mod tests {
         .expect("hard-steer partial L0 footprint");
         assert_eq!(
             durable_footprint,
-            i64::try_from(expected_footprint).expect("footprint fits SQLite")
+            i64::try_from(expected_footprint_tokens).expect("footprint fits SQLite")
         );
 
         let normalized =
             normalize_partial_assistant(partial).expect("normalize hard-steer partial assistant");
-        let expected_context = vec![ProviderContextItem {
-            origin_message: Some(ProviderContextAnchor {
-                message_id: owner_assistant_id.clone(),
-                message_seq: receipt.message_seq,
-            }),
-            wire_item_index: fragment.wire_item_index,
-            ordinal: 0,
-            provider_origin: origin,
-            payload: fragment.payload,
-        }];
+        let expected_context = vec![ProviderContextItemWithFootprint::new(
+            ProviderContextItem {
+                origin_message: Some(ProviderContextAnchor {
+                    message_id: owner_assistant_id.clone(),
+                    message_seq: receipt.message_seq,
+                }),
+                wire_item_index: fragment.wire_item_index,
+                ordinal: 0,
+                provider_origin: origin,
+                payload: fragment.payload,
+            },
+            expected_footprint,
+        )];
         let messages = vec![ContextMessage::Persisted {
             id: owner_assistant_id,
             seq: receipt.message_seq,

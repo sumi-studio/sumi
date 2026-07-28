@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::Utc;
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::provider::{
@@ -323,21 +322,22 @@ fn context_fingerprint(
     context: &PromptContext,
 ) -> Result<String, ResponsesAdapterError> {
     ensure_responses_spec(spec)?;
-    let tools = serde_json::to_vec(&context.tools)
-        .map_err(|error| ResponsesAdapterError::InvalidContext(error.to_string()))?;
-    let mut hasher = Sha256::new();
-    for bytes in [
-        spec.provider_instance_id().as_bytes(),
-        b"open_ai_responses",
-        spec.id.as_bytes(),
-        context.system_prompt.as_bytes(),
-        tools.as_slice(),
-        b"", // Responses currently has no request beta header.
-    ] {
-        hasher.update(bytes.len().to_be_bytes());
-        hasher.update(bytes);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
+    crate::provider::context_fingerprint::compute_context_fingerprint(
+        spec,
+        &context.system_prompt,
+        &context.tools,
+    )
+    .map_err(|error| match error {
+        crate::provider::context_fingerprint::ContextFingerprintError::UnsupportedProtocol(_) => {
+            ResponsesAdapterError::UnsupportedProtocol
+        }
+        crate::provider::context_fingerprint::ContextFingerprintError::ToolsSerialize(error) => {
+            ResponsesAdapterError::InvalidContext(error.to_string())
+        }
+        crate::provider::context_fingerprint::ContextFingerprintError::ProtocolCompatMismatch {
+            ..
+        } => ResponsesAdapterError::UnsupportedProtocol,
+    })
 }
 
 pub(in crate::provider) fn parse_compact_response(

@@ -218,7 +218,7 @@ Cloud release (T25〜T29): M1P・M0〜M5 と依存が満たされた範囲で並
 
 - 読む: §7.4 **全体**、#29、pi: `compaction.ts:383-522`
 - 作る: `src/memory/compactor.rs`
-- やること: ワーカー1本(mpsc は wake-up のみ、**ジョブ正典は `memory_jobs`**)。`CompactionInput` 型境界(private field、`from_public_batch`(**Thinking 除去**)/`from_decrypted_summaries`(unredacted 正本入力)以外の constructor なし、provider context を型レベルで送信不能に)。**framing tag(`</conversation>` 等)の escape**(§7.4)。Compact プロンプト(pi 構造化チェックポイント形式の秘書ドメイン版、圧縮率 1/8〜1/15・上限 ~800tok 明示、D2=既定は会話と同モデル+trust domain 制約)。claim/CAS/completion(`MemoryProjectionBuilder` で暗号化正本+redacted projection 同時生成、source_versions CAS、`UNIQUE(kind,batch_seq)`)、失敗2リトライ→CompactFailed、lease 回収
+- やること: ワーカー1本(mpsc は wake-up のみ、**ジョブ正典は `memory_jobs`**)。`CompactionInput` 型境界(private field、`from_public_batch`(**Thinking 除去**)/`from_decrypted_summaries`(unredacted 正本入力)以外の constructor なし、provider context を型レベルで送信不能に)。**framing tag(`</conversation>` 等)の escape**(§7.4)。Compact プロンプト(pi 構造化チェックポイント形式の秘書ドメイン版、圧縮率 1/8〜1/15・上限 ~800tok 明示、D2=既定は会話と同モデル+trust domain 制約)。claim/CAS/completion(`MemoryProjectionBuilder` で暗号化正本+redacted projection 同時生成、source+target exact version witness、`UNIQUE(kind,batch_seq)`)、失敗2リトライ→CompactFailed、lease 回収。retry exhaustionの`failed`はFIFO cursorを保持し、stale完了結果だけをdistinct `discarded`としてcursor通過可能にする
 - 受け入れ: M4 ゲート7(kill/restart で一度だけ適用)、ゲート9(全 provider-context variant+Thinking を紐付けても HTTP body に1byteも出ない+compile-fail テスト)、ゲート10(要約 secret の redaction/crypto-erase)、ゲート4後半(framing escape の adversarial fixture)
 - コミット: `agent: 非同期Compactワーカーと耐久ジョブ (M4 2/3)`
 

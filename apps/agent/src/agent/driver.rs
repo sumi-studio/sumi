@@ -18,21 +18,28 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    memory::transform,
+    memory::{
+        context_assembler::{AssembledPrompt, ContextAssembler, ProviderCallTrigger},
+        estimate::{ProviderContextItemWithFootprint, TokenCalibration},
+        overflow::AssemblyMode,
+    },
     provider::{
         ModelSpec, ProviderTimingObservation, ProviderTimingObservations, ProviderTimingObserver,
         RequestOptions, stream_observed, timing_observation_channel,
         types::{
-            ContextMessage, PromptContext, ProviderEventStream, PublicAssistantMessage,
-            PublicMessage, StopReason, ToolCall, ToolResultMessage, Usage,
+            AssistantMessage, ContextMessage, PromptContext, ProviderContextFragment,
+            ProviderEventStream, PublicAssistantMessage, PublicMessage, StopReason, ToolCall,
+            ToolResultMessage, Usage,
         },
     },
     runtime::contracts::ProcessGeneration,
+    tools::executor::ArtifactBrokerClient,
     tools::{ToolCtx, ToolError, ToolRegistry, WorkspacePaths},
 };
 
 use super::{
     OverflowRecoveryOutcome, OverflowRecoveryRequest, ProviderAttempt, RunCore, RunDriver,
+    run::ProviderCallAttempt,
 };
 
 type StreamStarter = dyn Fn(
@@ -129,7 +136,7 @@ impl RunTimingSamples {
 pub(crate) struct InjectedRunDriver {
     spec: ModelSpec,
     options: RequestOptions,
-    prompt: PromptContext,
+    assembler: ContextAssembler,
     registry: ToolRegistry,
     workspace: WorkspacePaths,
     executor_generation: ProcessGeneration,
@@ -173,6 +180,14 @@ impl InjectedRunDriver {
         if prompt.tools != registry.definitions() {
             bail!("prompt tool definitions do not exactly match the frozen tool registry");
         }
+        let mode = if options.native_compaction {
+            AssemblyMode::ProviderNative
+        } else {
+            AssemblyMode::SumiThreeLayer
+        };
+        let assembler = ContextAssembler::from_prompt_with_spec(prompt, spec.clone())?
+            .with_calibration(TokenCalibration::default())
+            .with_mode(mode);
         let workspace = workspace.ok_or_else(|| anyhow!("workspace paths were not supplied"))?;
         let executor_generation = executor_generation
             .ok_or_else(|| anyhow!("executor generation identity was not supplied"))?;
@@ -180,7 +195,7 @@ impl InjectedRunDriver {
         Ok(Self {
             spec,
             options,
-            prompt,
+            assembler,
             registry,
             workspace,
             executor_generation,
@@ -198,6 +213,11 @@ impl InjectedRunDriver {
         self.executor_generation
     }
 
+    pub(crate) fn with_broker(mut self, broker: ArtifactBrokerClient) -> Self {
+        self.assembler.set_broker(broker);
+        self
+    }
+
     fn initial_message(&self) -> PublicMessage {
         PublicMessage::Assistant(PublicAssistantMessage {
             content: Vec::new(),
@@ -213,29 +233,19 @@ impl InjectedRunDriver {
         })
     }
 
-    fn start_provider_attempt(
+    async fn start_provider_from_assembled(
         &self,
         attempt: usize,
-        context: &[ContextMessage],
-        provider_context: Option<&[crate::provider::types::ProviderContextItem]>,
+        assembled: AssembledPrompt,
         command_received_at: Option<Instant>,
         cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
-        let mut prompt = self.prompt.clone();
-        if let Some(provider_context) = provider_context {
-            prompt.provider_context = provider_context.to_vec();
-        }
-        // Derive the send view immediately before the provider call. The
-        // runner's retained durable anchors must not be mutated.
-        prompt.messages = transform::transform(context, &self.spec.origin());
+        let prompt = assembled.prompt;
+        let uncalibrated_prompt_estimate = assembled.uncalibrated_prompt_estimate;
         // Re-check at use time: the frozen registry remains the authority.
         if prompt.tools != self.registry.definitions() {
             bail!("provider prompt tools diverged from the frozen registry");
         }
-        // A `tool_choice` of `required` must be limited to the first attempt of
-        // a user turn. After a tool call and its result, the same driver will
-        // be asked to continue the turn; continuing to force a tool causes an
-        // infinite tool loop.
         let mut options = self.options.clone();
         if attempt > 0
             && options
@@ -261,6 +271,7 @@ impl InjectedRunDriver {
         Ok(ProviderAttempt {
             message_id: Uuid::now_v7().to_string(),
             initial_message: self.initial_message(),
+            uncalibrated_prompt_estimate,
             events,
         })
     }
@@ -278,6 +289,13 @@ impl RunDriver for InjectedRunDriver {
         Ok(())
     }
 
+    fn set_hydrated_provider_context(
+        &self,
+        provider_context: Vec<ProviderContextItemWithFootprint>,
+    ) {
+        self.assembler.set_provider_context(provider_context);
+    }
+
     async fn start_provider_for_command(
         &self,
         attempt: usize,
@@ -285,42 +303,56 @@ impl RunDriver for InjectedRunDriver {
         command_received_at: Option<Instant>,
         cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
-        self.start_provider_attempt(attempt, context, None, command_received_at, cancel)
+        // Derive the send view immediately before the provider call.  The
+        // runner's retained runtime_context anchors must not be mutated.
+        let assembled = self
+            .assembler
+            .assemble_with_estimate(context, attempt)
+            .await?;
+        self.start_provider_from_assembled(attempt, assembled, command_received_at, cancel)
+            .await
     }
 
     async fn start_provider_with_context(
         &self,
         attempt: usize,
         context: &[ContextMessage],
-        provider_context: &[crate::provider::types::ProviderContextItem],
+        provider_context: &[ProviderContextItemWithFootprint],
+        trigger: ProviderCallTrigger,
         command_received_at: Option<Instant>,
         cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
-        self.start_provider_attempt(
-            attempt,
-            context,
-            Some(provider_context),
-            command_received_at,
-            cancel,
-        )
+        self.assembler
+            .set_provider_context(provider_context.to_vec());
+        let assembled = self
+            .assembler
+            .assemble_for_call_with_estimate(context, trigger)
+            .await?;
+        self.start_provider_from_assembled(attempt, assembled, command_received_at, cancel)
+            .await
     }
 
     async fn start_provider_for_user_turn(
         &self,
-        _attempt_sequence: usize,
-        user_turn_attempt: usize,
+        call: ProviderCallAttempt,
         context: &[ContextMessage],
-        provider_context: &[crate::provider::types::ProviderContextItem],
+        provider_context: &[ProviderContextItemWithFootprint],
         command_received_at: Option<Instant>,
         cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
-        self.start_provider_attempt(
-            user_turn_attempt,
-            context,
-            Some(provider_context),
+        self.assembler
+            .set_provider_context(provider_context.to_vec());
+        let assembled = self
+            .assembler
+            .assemble_for_call_with_estimate(context, call.trigger)
+            .await?;
+        self.start_provider_from_assembled(
+            call.user_turn_attempt,
+            assembled,
             command_received_at,
             cancel,
         )
+        .await
     }
 
     async fn execute_tool_observed(
@@ -377,9 +409,25 @@ impl RunDriver for InjectedRunDriver {
         &self,
         _core: &RunCore,
         _request: OverflowRecoveryRequest,
-        _active_context: &[ContextMessage],
+        active_context: &[ContextMessage],
     ) -> Result<OverflowRecoveryOutcome> {
-        bail!("overflow context assembly is not supplied; T21 must provide it explicitly")
+        let replacement = self.assembler.recover_overflow(active_context)?;
+        Ok(OverflowRecoveryOutcome::ReplacementContext(replacement))
+    }
+
+    fn install_committed_calibration(&self, ratio_bits: [u8; 8]) -> Result<()> {
+        self.assembler.install_committed_calibration(ratio_bits)
+    }
+
+    async fn apply_terminal(
+        &self,
+        message_id: &str,
+        message_seq: u64,
+        message: &AssistantMessage,
+        provider_context: &[ProviderContextFragment],
+    ) -> Result<()> {
+        self.assembler
+            .apply_terminal(message_id, message_seq, message, provider_context)
     }
 }
 

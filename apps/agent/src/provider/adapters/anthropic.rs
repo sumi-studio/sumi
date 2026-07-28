@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, HashSet};
 
 use chrono::Utc;
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::provider::{
@@ -18,7 +17,6 @@ use crate::provider::{
     },
 };
 
-const ANTHROPIC_VERSION: &str = "2023-06-01";
 const REDACTED_PLACEHOLDER: &str = "[Reasoning redacted]";
 
 #[derive(Debug, Error)]
@@ -904,23 +902,23 @@ pub fn context_fingerprint(
     spec: &ModelSpec,
     context: &PromptContext,
 ) -> Result<String, AnthropicAdapterError> {
-    let compat = ensure_anthropic_spec(spec)?;
-    let tools = serde_json::to_vec(&context.tools)
-        .map_err(|error| AnthropicAdapterError::InvalidContext(error.to_string()))?;
-    let mut hasher = Sha256::new();
-    for bytes in [
-        spec.provider_instance_id().as_bytes(),
-        b"anthropic_messages",
-        spec.id.as_bytes(),
-        context.system_prompt.as_bytes(),
-        tools.as_slice(),
-        compat.beta_headers.join("\0").as_bytes(),
-        ANTHROPIC_VERSION.as_bytes(),
-    ] {
-        hasher.update(bytes.len().to_be_bytes());
-        hasher.update(bytes);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
+    ensure_anthropic_spec(spec)?;
+    crate::provider::context_fingerprint::compute_context_fingerprint(
+        spec,
+        &context.system_prompt,
+        &context.tools,
+    )
+    .map_err(|error| match error {
+        crate::provider::context_fingerprint::ContextFingerprintError::UnsupportedProtocol(_) => {
+            AnthropicAdapterError::UnsupportedProtocol
+        }
+        crate::provider::context_fingerprint::ContextFingerprintError::ToolsSerialize(error) => {
+            AnthropicAdapterError::InvalidContext(error.to_string())
+        }
+        crate::provider::context_fingerprint::ContextFingerprintError::ProtocolCompatMismatch {
+            ..
+        } => AnthropicAdapterError::UnsupportedProtocol,
+    })
 }
 
 #[derive(Debug)]
