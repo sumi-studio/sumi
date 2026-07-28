@@ -961,25 +961,75 @@ impl<G: Gateway + 'static> Session<G> {
         }
     }
 
+    async fn await_active_control_acceptance(
+        &mut self,
+        phase_rx: &mut watch::Receiver<WorkerPhase>,
+        accepted_rx: oneshot::Receiver<bool>,
+    ) -> Result<bool, SessionFailure> {
+        let mut accepted_rx = accepted_rx;
+        let timeout = tokio::time::sleep(STEER_HANDSHAKE_TIMEOUT);
+        tokio::pin!(timeout);
+        loop {
+            let progress = {
+                let active = self
+                    .active
+                    .as_mut()
+                    .ok_or(SessionFailure::CompletionChannelClosed)?;
+                await_control_acceptance(
+                    phase_rx,
+                    &mut accepted_rx,
+                    timeout.as_mut(),
+                    &mut active.events_rx,
+                )
+                .await
+            };
+            match progress {
+                ControlAcceptanceProgress::Accepted(accepted) => return Ok(accepted),
+                ControlAcceptanceProgress::PhaseChanged | ControlAcceptanceProgress::TimedOut => {
+                    return Ok(false);
+                }
+                ControlAcceptanceProgress::Event(Some(event)) => {
+                    // Persistence can reclassify a deferred control and
+                    // re-enter this wait, so this edge needs type indirection.
+                    Box::pin(self.persist_active_event(event)).await?
+                }
+                ControlAcceptanceProgress::Event(None) => {
+                    self.resolve_closed_event_channel().await?;
+                    return Ok(false);
+                }
+            }
+        }
+    }
+
     async fn route_hard_steer(&mut self, command: AdmittedCommand) -> Result<bool, SessionFailure> {
-        let Some(active) = self.active.as_mut() else {
-            return Ok(false);
+        let (mut phase_rx, accepted_rx) = {
+            let Some(active) = self.active.as_mut() else {
+                return Ok(false);
+            };
+            if !active.bridge.can_bind_hard_steer() {
+                return Ok(false);
+            }
+            let (accepted_tx, accepted_rx) = oneshot::channel();
+            let control = RunControl::HardSteer {
+                command: command.clone(),
+                accepted: accepted_tx,
+            };
+            let phase_rx = active.phase_rx.clone();
+            if active.control_tx.try_send(control).is_err() {
+                return Ok(false);
+            }
+            (phase_rx, accepted_rx)
         };
-        if !active.bridge.can_bind_hard_steer() {
+        if !self
+            .await_active_control_acceptance(&mut phase_rx, accepted_rx)
+            .await?
+        {
             return Ok(false);
         }
-        let (accepted_tx, accepted_rx) = oneshot::channel();
-        let control = RunControl::HardSteer {
-            command: command.clone(),
-            accepted: accepted_tx,
-        };
-        let mut phase_rx = active.phase_rx.clone();
-        if active.control_tx.try_send(control).is_err() {
-            return Ok(false);
-        }
-        if !await_control_acceptance(&mut phase_rx, accepted_rx).await {
-            return Ok(false);
-        }
+        let active = self
+            .active
+            .as_mut()
+            .ok_or(SessionFailure::CompletionChannelClosed)?;
         // Reserve the provider attempt cancellation token before the durable
         // step-zero commit. If the commit succeeds, cancel the provider; if it
         // fails, the reservation restores the token on drop so the provider can
@@ -998,26 +1048,36 @@ impl<G: Gateway + 'static> Session<G> {
     }
 
     async fn route_soft_steer(&mut self, command: AdmittedCommand) -> Result<bool, SessionFailure> {
-        let Some(active) = self.active.as_mut() else {
-            return Ok(false);
-        };
-        if !active.bridge.can_bind_soft_steer(&self.writer, &command) {
-            return Ok(false);
-        }
-        let (accepted_tx, accepted_rx) = oneshot::channel();
         let (committed_tx, committed_rx) = oneshot::channel();
-        let control = RunControl::SoftSteer {
-            command: command.clone(),
-            accepted: accepted_tx,
-            committed: committed_rx,
+        let (mut phase_rx, accepted_rx) = {
+            let Some(active) = self.active.as_mut() else {
+                return Ok(false);
+            };
+            if !active.bridge.can_bind_soft_steer(&self.writer, &command) {
+                return Ok(false);
+            }
+            let (accepted_tx, accepted_rx) = oneshot::channel();
+            let control = RunControl::SoftSteer {
+                command: command.clone(),
+                accepted: accepted_tx,
+                committed: committed_rx,
+            };
+            let phase_rx = active.phase_rx.clone();
+            if active.control_tx.try_send(control).is_err() {
+                return Ok(false);
+            }
+            (phase_rx, accepted_rx)
         };
-        let mut phase_rx = active.phase_rx.clone();
-        if active.control_tx.try_send(control).is_err() {
+        if !self
+            .await_active_control_acceptance(&mut phase_rx, accepted_rx)
+            .await?
+        {
             return Ok(false);
         }
-        if !await_control_acceptance(&mut phase_rx, accepted_rx).await {
-            return Ok(false);
-        }
+        let active = self
+            .active
+            .as_mut()
+            .ok_or(SessionFailure::CompletionChannelClosed)?;
         active
             .bridge
             .bind_soft_steer(&self.writer, command)
@@ -1035,26 +1095,36 @@ impl<G: Gateway + 'static> Session<G> {
         &mut self,
         command: AdmittedCommand,
     ) -> Result<bool, SessionFailure> {
-        let Some(active) = self.active.as_mut() else {
-            return Ok(false);
-        };
-        if !active.bridge.can_bind_abort() {
-            return Ok(false);
-        }
-        let (accepted_tx, accepted_rx) = oneshot::channel();
         let (committed_tx, committed_rx) = oneshot::channel();
-        let control = RunControl::Abort {
-            command: command.clone(),
-            accepted: accepted_tx,
-            committed: committed_rx,
+        let (mut phase_rx, accepted_rx) = {
+            let Some(active) = self.active.as_mut() else {
+                return Ok(false);
+            };
+            if !active.bridge.can_bind_abort() {
+                return Ok(false);
+            }
+            let (accepted_tx, accepted_rx) = oneshot::channel();
+            let control = RunControl::Abort {
+                command: command.clone(),
+                accepted: accepted_tx,
+                committed: committed_rx,
+            };
+            let phase_rx = active.phase_rx.clone();
+            if active.control_tx.try_send(control).is_err() {
+                return Ok(false);
+            }
+            (phase_rx, accepted_rx)
         };
-        let mut phase_rx = active.phase_rx.clone();
-        if active.control_tx.try_send(control).is_err() {
+        if !self
+            .await_active_control_acceptance(&mut phase_rx, accepted_rx)
+            .await?
+        {
             return Ok(false);
         }
-        if !await_control_acceptance(&mut phase_rx, accepted_rx).await {
-            return Ok(false);
-        }
+        let active = self
+            .active
+            .as_mut()
+            .ok_or(SessionFailure::CompletionChannelClosed)?;
         let mut acks = active
             .bridge
             .bind_abort(&self.writer, command)
@@ -1824,18 +1894,36 @@ async fn await_retry_steer_acceptance(
     accepted
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the one-iteration select result moves RunOutput directly without per-event allocation"
+)]
+enum ControlAcceptanceProgress {
+    Accepted(bool),
+    PhaseChanged,
+    TimedOut,
+    Event(Option<RunOutput>),
+}
+
 async fn await_control_acceptance(
     phase_rx: &mut watch::Receiver<WorkerPhase>,
-    accepted_rx: oneshot::Receiver<bool>,
-) -> bool {
+    accepted_rx: &mut oneshot::Receiver<bool>,
+    mut timeout: Pin<&mut tokio::time::Sleep>,
+    events_rx: &mut mpsc::Receiver<RunOutput>,
+) -> ControlAcceptanceProgress {
     tokio::select! {
         biased;
-        accepted = accepted_rx => accepted.unwrap_or(false),
+        accepted = &mut *accepted_rx => {
+            ControlAcceptanceProgress::Accepted(accepted.unwrap_or(false))
+        }
         changed = phase_rx.changed() => {
             let _ = changed;
-            false
+            ControlAcceptanceProgress::PhaseChanged
         }
-        () = tokio::time::sleep(STEER_HANDSHAKE_TIMEOUT) => false,
+        // Keep the original bounded wait authoritative even when the worker
+        // continuously produces ready events.
+        () = timeout.as_mut() => ControlAcceptanceProgress::TimedOut,
+        event = events_rx.recv() => ControlAcceptanceProgress::Event(event),
     }
 }
 
