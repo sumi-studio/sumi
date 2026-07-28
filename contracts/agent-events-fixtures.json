@@ -1,0 +1,571 @@
+{
+  "durable_agent_start": {
+    "kind": "outbound_frame",
+    "wire": {
+      "frame_type": "event",
+      "envelope": {
+        "seq": 1,
+        "conversation_id": "conversation-1",
+        "event": { "type": "agent_start" }
+      }
+    }
+  },
+  "durable_turn_end": {
+    "kind": "outbound_frame",
+    "wire": {
+      "frame_type": "event",
+      "envelope": {
+        "seq": 2,
+        "conversation_id": "conversation-1",
+        "event": {
+          "type": "turn_end",
+          "message": null,
+          "tool_results": []
+        }
+      }
+    }
+  },
+  "durable_message_start": {
+    "kind": "outbound_frame",
+    "wire": {
+      "frame_type": "event",
+      "envelope": {
+        "seq": 3,
+        "conversation_id": "conversation-1",
+        "event": {
+          "type": "message_start",
+          "message_id": "00000000-0000-4000-8000-000000000002",
+          "message": {
+            "role": "user",
+            "content": [{ "type": "text", "text": "hello" }],
+            "timestamp": "2026-07-25T20:00:00Z"
+          }
+        }
+      }
+    }
+  },
+  "durable_message_end_assistant": {
+    "kind": "outbound_frame",
+    "wire": {
+      "frame_type": "event",
+      "envelope": {
+        "seq": 4,
+        "conversation_id": "conversation-1",
+        "event": {
+          "type": "message_end",
+          "message_id": "00000000-0000-4000-8000-000000000003",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "thinking",
+                "thinking": "...",
+                "signature_field": "reasoning_content",
+                "wire_item_index": 0
+              },
+              {
+                "type": "text",
+                "text": "ok",
+                "wire_item_index": 1
+              },
+              {
+                "type": "tool_call",
+                "tool_call": {
+                  "id": "call-1",
+                  "name": "read_file",
+                  "arguments": { "path": "notes.txt" }
+                },
+                "wire_item_index": 2
+              },
+              {
+                "type": "rejected_tool_call",
+                "rejected": {
+                  "id": "call-2",
+                  "name": "read_file",
+                  "error": "schema_violation"
+                },
+                "wire_item_index": 3
+              }
+            ],
+            "model": "kimi-k3",
+            "provider": "moonshot",
+            "origin": {
+              "provider_instance_id": "moonshot:https://api.moonshot.ai/v1",
+              "protocol": "open_ai_chat_completions",
+              "model": "kimi-k3"
+            },
+            "usage": {
+              "input": 90,
+              "output": 12,
+              "cache_read": 10,
+              "cache_write": 0,
+              "reasoning": 4,
+              "total_tokens": 112
+            },
+            "stop_reason": "tool_use",
+            "error_message": null,
+            "provider_code": "tool_calls",
+            "interrupted": false,
+            "timestamp": "2026-07-25T20:00:00Z"
+          }
+        }
+      }
+    }
+  },
+  "volatile_message_update": {
+    "kind": "outbound_frame",
+    "wire": {
+      "frame_type": "event",
+      "envelope": {
+        "conversation_id": "conversation-1",
+        "event": {
+          "type": "message_update",
+          "message_id": "00000000-0000-4000-8000-000000000003",
+          "event": {
+            "type": "text_delta",
+            "content_index": 0,
+            "delta": "world"
+          }
+        }
+      }
+    }
+  },
+  "volatile_error": {
+    "kind": "outbound_frame",
+    "wire": {
+      "frame_type": "event",
+      "envelope": {
+        "conversation_id": "conversation-1",
+        "event": {
+          "type": "error",
+          "message": "bad"
+        }
+      }
+    }
+  },
+  "command_ack_received": {
+    "kind": "outbound_frame",
+    "wire": {
+      "frame_type": "command_ack",
+      "ack": {
+        "seq": 5,
+        "command_id": "00000000-0000-4000-8000-000000000001",
+        "status": "received"
+      }
+    }
+  },
+  "command_ack_rejected_oversized": {
+    "kind": "outbound_frame",
+    "wire": {
+      "frame_type": "command_ack",
+      "ack": {
+        "seq": 6,
+        "command_id": "00000000-0000-4000-8000-000000000001",
+        "status": "rejected",
+        "reject_reason": "oversized"
+      }
+    }
+  },
+  "user_message_command": {
+    "kind": "command_envelope",
+    "wire": {
+      "seq": 1,
+      "command_id": "00000000-0000-4000-8000-000000000001",
+      "command": {
+        "type": "user_message",
+        "text": "hi",
+        "attachments": []
+      }
+    }
+  },
+  "abort_command": {
+    "kind": "command_envelope",
+    "wire": {
+      "seq": 2,
+      "command_id": "00000000-0000-4000-8000-000000000002",
+      "command": { "type": "abort" }
+    }
+  },
+  "approval_decision_command": {
+    "kind": "command_envelope",
+    "wire": {
+      "seq": 3,
+      "command_id": "00000000-0000-4000-8000-000000000003",
+      "command": {
+        "type": "approval_decision",
+        "request_id": "req-1",
+        "decision": { "type": "approve_once" }
+      }
+    }
+  },
+  "approval_decision_always_command": {
+    "kind": "command_envelope",
+    "wire": {
+      "seq": 4,
+      "command_id": "00000000-0000-4000-8000-000000000004",
+      "command": {
+        "type": "approval_decision",
+        "request_id": "req-2",
+        "decision": {
+          "type": "approve_always",
+          "rule": { "tool_name": "test", "literal_prefix": ["test"] }
+        }
+      }
+    }
+  },
+  "approval_requested_event": {
+    "kind": "agent_event",
+    "wire": {
+      "type": "approval_requested",
+      "request": {
+        "id": "req-1",
+        "tool_call_id": "call-1",
+        "tool_name": "bash",
+        "action": { "reviewable": { "cmd": "ls" } },
+        "args_summary": { "cmd": "ls" },
+        "reason": null,
+        "audit": null
+      }
+    }
+  },
+  "approval_resolved_event": {
+    "kind": "agent_event",
+    "wire": {
+      "type": "approval_resolved",
+      "request_id": "req-1",
+      "resolution": { "decision": { "type": "approve_once" } }
+    }
+  },
+  "public_message_user_with_image": {
+    "kind": "public_message",
+    "wire": {
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "hi" },
+        {
+          "type": "image",
+          "data": "aGVsbG8=",
+          "mime_type": "image/png"
+        }
+      ],
+      "timestamp": "2026-07-25T20:00:00Z"
+    }
+  },
+  "public_message_tool_result": {
+    "kind": "public_message",
+    "wire": {
+      "role": "tool_result",
+      "tool_call_id": "call-1",
+      "tool_name": "read_file",
+      "content": [{ "type": "text", "text": "contents" }],
+      "details": { "exit": 0 },
+      "is_error": false,
+      "timestamp": "2026-07-25T20:00:00Z"
+    }
+  },
+  "steered_event": {
+    "kind": "agent_event",
+    "wire": {
+      "type": "steered",
+      "mode": "hard"
+    }
+  },
+  "retry_scheduled_event": {
+    "kind": "agent_event",
+    "wire": {
+      "type": "retry_scheduled",
+      "attempt": 1,
+      "delay_ms": 2000,
+      "retry_at": "2026-07-25T20:00:02Z",
+      "error_message": "rate limited"
+    }
+  },
+  "memory_maintenance_event": {
+    "kind": "agent_event",
+    "wire": {
+      "type": "memory_maintenance",
+      "kind": "compact"
+    }
+  },
+  "tool_execution_start_event": {
+    "kind": "agent_event",
+    "wire": {
+      "type": "tool_execution_start",
+      "tool_call_id": "call-1",
+      "tool_name": "read_file",
+      "args": { "path": "notes.txt" }
+    }
+  },
+  "tool_execution_update_event": {
+    "kind": "agent_event",
+    "wire": {
+      "type": "tool_execution_update",
+      "tool_call_id": "call-1",
+      "partial": { "chunk": "x" }
+    }
+  },
+  "tool_execution_end_event": {
+    "kind": "agent_event",
+    "wire": {
+      "type": "tool_execution_end",
+      "tool_call_id": "call-1",
+      "result": { "ok": true },
+      "is_error": false
+    }
+  },
+  "durable_seq_max_safe_integer": {
+    "kind": "outbound_frame",
+    "wire": {
+      "frame_type": "event",
+      "envelope": {
+        "seq": 9007199254740991,
+        "conversation_id": "conversation-1",
+        "event": { "type": "agent_start" }
+      }
+    }
+  },
+  "tool_execution_update_scalar_partial": {
+    "kind": "agent_event",
+    "wire": {
+      "type": "tool_execution_update",
+      "tool_call_id": "call-1",
+      "partial": "raw stdout chunk"
+    }
+  },
+  "tool_execution_end_array_result": {
+    "kind": "agent_event",
+    "wire": {
+      "type": "tool_execution_end",
+      "tool_call_id": "call-1",
+      "result": [1, 2, 3],
+      "is_error": false
+    }
+  },
+  "any_json_safe_number_boundaries": {
+    "kind": "agent_event",
+    "wire": {
+      "type": "tool_execution_update",
+      "tool_call_id": "call-1",
+      "partial": {
+        "minimum": -9007199254740991,
+        "maximum": 9007199254740991,
+        "fraction": 0.5,
+        "nested": [{ "fraction": -1.25 }]
+      }
+    }
+  },
+  "message_update_tool_call_preview_null": {
+    "kind": "outbound_frame",
+    "wire": {
+      "frame_type": "event",
+      "envelope": {
+        "conversation_id": "conversation-1",
+        "event": {
+          "type": "message_update",
+          "message_id": "00000000-0000-4000-8000-000000000003",
+          "event": {
+            "type": "tool_call_preview",
+            "content_index": 0,
+            "preview": null
+          }
+        }
+      }
+    }
+  },
+  "public_message_tool_result_number_details": {
+    "kind": "public_message",
+    "wire": {
+      "role": "tool_result",
+      "tool_call_id": "call-1",
+      "tool_name": "read_file",
+      "content": [{ "type": "text", "text": "contents" }],
+      "details": 42,
+      "is_error": false,
+      "timestamp": "2026-07-25T20:00:00Z"
+    }
+  },
+  "public_message_tool_result_safe_fractional_details": {
+    "kind": "public_message",
+    "wire": {
+      "role": "tool_result",
+      "tool_call_id": "call-1",
+      "tool_name": "read_file",
+      "content": [{ "type": "text", "text": "contents" }],
+      "details": -0.5,
+      "is_error": false,
+      "timestamp": "2026-07-25T20:00:00Z"
+    }
+  },
+  "turn_end_tool_result_boolean_details": {
+    "kind": "outbound_frame",
+    "wire": {
+      "frame_type": "event",
+      "envelope": {
+        "seq": 10,
+        "conversation_id": "conversation-1",
+        "event": {
+          "type": "turn_end",
+          "message": null,
+          "tool_results": [
+            {
+              "tool_call_id": "call-1",
+              "tool_name": "read_file",
+              "content": [{ "type": "text", "text": "contents" }],
+              "details": true,
+              "is_error": false,
+              "timestamp": "2026-07-25T20:00:00Z"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "approval_requested_scalar_and_array": {
+    "kind": "agent_event",
+    "wire": {
+      "type": "approval_requested",
+      "request": {
+        "id": "req-2",
+        "tool_call_id": "call-2",
+        "tool_name": "bash",
+        "action": { "reviewable": ["arg1", "arg2"] },
+        "args_summary": "string summary",
+        "reason": null,
+        "audit": null
+      }
+    }
+  },
+  "agent_hello": {
+    "kind": "agent_hello",
+    "wire": {
+      "agent_id": "agent-1",
+      "generation": "7",
+      "last_sent_event_seq": "0",
+      "last_received_command_seq": "0",
+      "last_applied_command_seq": "1"
+    }
+  },
+  "api_hello": {
+    "kind": "api_hello",
+    "wire": {
+      "accepted_generation": "7",
+      "last_received_event_seq": "3",
+      "next_command_seq": "2"
+    }
+  },
+  "agent_hello_max_seq": {
+    "kind": "agent_hello",
+    "wire": {
+      "agent_id": "agent-1",
+      "generation": "7",
+      "last_sent_event_seq": "9007199254740991",
+      "last_received_command_seq": "9007199254740991",
+      "last_applied_command_seq": "9007199254740991"
+    }
+  },
+  "api_hello_max_seq": {
+    "kind": "api_hello",
+    "wire": {
+      "accepted_generation": "7",
+      "last_received_event_seq": "9007199254740991",
+      "next_command_seq": "9007199254740991"
+    }
+  },
+  "agent_hello_max_safe_generation": {
+    "kind": "agent_hello",
+    "wire": {
+      "agent_id": "agent-1",
+      "generation": "9007199254740991",
+      "last_sent_event_seq": "0",
+      "last_received_command_seq": "0",
+      "last_applied_command_seq": "0"
+    }
+  },
+  "api_hello_max_safe_generation": {
+    "kind": "api_hello",
+    "wire": {
+      "accepted_generation": "9007199254740991",
+      "last_received_event_seq": "0",
+      "next_command_seq": "1"
+    }
+  },
+  "browser_hello": {
+    "kind": "browser_hello",
+    "wire": {
+      "type": "hello",
+      "last_event_seq": 0
+    }
+  },
+  "browser_command_frame_user_message": {
+    "kind": "browser_command_frame",
+    "wire": {
+      "type": "command",
+      "idempotency_key": "00000000-0000-4000-8000-000000000001",
+      "command": {
+        "type": "user_message",
+        "text": "hello",
+        "attachments": []
+      }
+    }
+  },
+  "browser_command_frame_abort": {
+    "kind": "browser_command_frame",
+    "wire": {
+      "type": "command",
+      "idempotency_key": "00000000-0000-4000-8000-000000000002",
+      "command": { "type": "abort" }
+    }
+  },
+  "browser_command_frame_approval": {
+    "kind": "browser_command_frame",
+    "wire": {
+      "type": "command",
+      "idempotency_key": "00000000-0000-4000-8000-000000000003",
+      "command": {
+        "type": "approval_decision",
+        "request_id": "00000000-0000-4000-8000-000000000004",
+        "decision": { "type": "approve_once" }
+      }
+    }
+  },
+  "browser_event_frame": {
+    "kind": "browser_event_frame",
+    "wire": {
+      "type": "event",
+      "envelope": {
+        "seq": 1,
+        "conversation_id": "conversation-1",
+        "event": { "type": "agent_start" }
+      }
+    }
+  },
+  "browser_command_accepted": {
+    "kind": "browser_command_accepted",
+    "wire": {
+      "type": "command_accepted",
+      "envelope": {
+        "seq": 1,
+        "command_id": "00000000-0000-4000-8000-000000000001",
+        "command": {
+          "type": "user_message",
+          "text": "hello",
+          "attachments": []
+        }
+      }
+    }
+  },
+  "browser_command_rejected": {
+    "kind": "browser_command_rejected",
+    "wire": {
+      "type": "command_rejected",
+      "reject_reason": "unknown_command"
+    }
+  },
+  "browser_command_rejected_not_allowed": {
+    "kind": "browser_command_rejected",
+    "wire": {
+      "type": "command_rejected",
+      "reject_reason": "not_allowed"
+    }
+  }
+}

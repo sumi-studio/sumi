@@ -3,6 +3,8 @@
 #[allow(dead_code)]
 pub mod wire;
 
+pub(crate) mod duplicate;
+
 pub mod stdio;
 pub mod supervisor;
 pub mod ws;

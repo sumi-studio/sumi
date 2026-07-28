@@ -219,7 +219,7 @@ impl Gateway for WebSocketGateway {
             }
         };
 
-        let api_hello: ApiHello = serde_json::from_slice(&bytes)
+        let api_hello: ApiHello = wire::from_json_bytes(&bytes)
             .context("parse api hello")
             .map_err(HelloError::Fatal)?;
         // Generation claim validation is the supervisor's responsibility so it
@@ -1252,5 +1252,15 @@ mod tests {
         assert!(result.is_err(), "expected TLS/handshake error");
 
         let _ = server.await;
+    }
+
+    #[test]
+    fn api_hello_from_json_bytes_rejects_duplicate_keys() {
+        // Production hello parsing rejects duplicate object keys before the
+        // typed deserialization layer so a peer cannot smuggle two generation
+        // or cursor values.
+        let raw = br#"{"accepted_generation":"1","accepted_generation":"2","last_received_event_seq":"0","next_command_seq":"1"}"#;
+        let err = crate::gateway::wire::from_json_bytes::<ApiHello>(raw).unwrap_err();
+        assert!(err.to_string().contains("duplicate object key"), "{err}");
     }
 }

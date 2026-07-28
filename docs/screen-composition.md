@@ -141,6 +141,12 @@ UI 要件というよりアーキテクチャ制約。最初から効かせる�
 4. エージェント側: 3 層メモリの圧縮・昇格はリクエスト経路に乗せず非同期バッチ。システムプロンプト + メモリ層はプロンプトキャッシュが効く順序で組む
 5. 単一スレッドで会話が無限に伸びるため、メッセージリストは最初から仮想化 (TanStack Virtual)
 
+#### WebSocket と認証境界
+
+- 画面ごとに `GET /conversations/{conversation_id}/ws` を1本だけ常時接続し、送信・durable event replay・live-only delta を同じ接続で扱う。再接続時は最後に消費した durable event seq を hello で送り、API はその次から catch-up する。volatile delta は replay しない。
+- この接続は `sumi_session` HttpOnly cookie の別署名 session (`tenant_id`、`user_id`、`conversation_id`、expiry、`sumi:web:conversation` audience) だけを受け入れる。agent の short-lived bearer token、`agent_id`、`ProcessGeneration` は browser へ渡さない。
+- API は `SUMI_BROWSER_SESSION_SECRET`（base64 HMAC key）、任意の `SUMI_BROWSER_SESSION_AUDIENCE`、および browser origin allowlist `SUMI_BROWSER_WS_ALLOWED_ORIGINS` を必要とする。session の発行/login は control plane/account の責務であり、この接続境界では実装しない。
+
 ### C. 権限リクエストフロー
 
 「権限を要求する権限」の受け皿。専用画面は作らず、**チャット内のシステムカード + 通知タブのキュー**の 2 箇所に同じ承認 UI を出す。
