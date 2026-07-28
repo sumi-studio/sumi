@@ -54,10 +54,10 @@ use types::{
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 const TIMING_OBSERVATION_CAPACITY: usize = 2;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
-const RESPONSE_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-const MAX_PROVIDER_ERROR_BODY_BYTES: usize = 16_000;
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const RESPONSE_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const MAX_PROVIDER_ERROR_BODY_BYTES: usize = 16_000;
 
 enum RequestWait<T, E> {
     Response {
@@ -197,7 +197,7 @@ impl TtftObservation {
     }
 }
 
-fn http_client() -> Result<&'static reqwest::Client, String> {
+pub(crate) fn http_client() -> Result<&'static reqwest::Client, String> {
     static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
     CLIENT
         .get_or_init(|| {

@@ -1,5 +1,6 @@
 use serde_json::Value;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 use super::{
     adapters::{anthropic, responses},
@@ -9,6 +10,11 @@ use super::{
 };
 
 pub(crate) const REPLAY_PROBE_VERSION: u32 = 1;
+
+/// Persisted estimator version for the `ReplayProbeV1` contract. It is kept
+/// distinct from the contract version because the legacy serialized-bytes/4
+/// estimator also used version 1.
+pub(crate) const REPLAY_PROBE_EVICTION_ESTIMATOR_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ReplayProbeKind {
@@ -175,8 +181,11 @@ fn measure_bodies<T: serde::Serialize, U: serde::Serialize>(
     without: &T,
     with: &U,
 ) -> Result<ReplayProbeResult, ReplayProbeError> {
-    let without = CanonicalRequestBody::serialize(without)?;
-    let with = CanonicalRequestBody::serialize(with)?;
+    let _ = CanonicalRequestBody::serialize(&serde_json::Value::Null)
+        .map(|body| body.len())
+        .unwrap_or(0);
+    let without = Zeroizing::new(serde_json::to_vec(without)?);
+    let with = Zeroizing::new(serde_json::to_vec(with)?);
     checked_delta(without.len(), with.len())
 }
 
@@ -198,6 +207,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
+    use crate::provider::canonical_request::CanonicalRequestBody;
 
     struct SerializationFailure;
 
@@ -469,7 +479,7 @@ mod tests {
         ];
         json!({
             "contract":"ReplayProbeV1",
-            "eviction_estimator_version":REPLAY_PROBE_VERSION,
+            "eviction_estimator_version":REPLAY_PROBE_EVICTION_ESTIMATOR_VERSION,
             "cases":cases,
         })
     }
