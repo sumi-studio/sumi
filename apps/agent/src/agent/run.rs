@@ -24,7 +24,10 @@ use uuid::Uuid;
 
 use crate::{
     gateway::Command,
-    memory::estimate::{ProviderContextItemWithFootprint, eviction_footprint_for_payload},
+    memory::{
+        context_assembler::ProviderCallTrigger,
+        estimate::{ProviderContextItemWithFootprint, eviction_footprint_for_payload},
+    },
     provider::{
         model::ModelSpec,
         overflow::{OverflowClassification, OverflowSource, classify_context_overflow},
@@ -128,6 +131,7 @@ pub(crate) trait RunDriver: Send + Sync + 'static {
         attempt: usize,
         context: &[ContextMessage],
         _provider_context: &[ProviderContextItemWithFootprint],
+        _trigger: ProviderCallTrigger,
         command_received_at: Option<std::time::Instant>,
         cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
@@ -257,6 +261,7 @@ struct Runner {
     consecutive_length_batches: usize,
     in_flight_controls: Vec<AdmittedCommand>,
     pending_command_received_at: Option<std::time::Instant>,
+    first_provider_call_after_user: bool,
     provider_cancel: Option<CancellationToken>,
     hard_steer_command: Option<AdmittedCommand>,
     abort_requested: bool,
@@ -330,6 +335,7 @@ impl Runner {
             consecutive_length_batches: 0,
             in_flight_controls: Vec::new(),
             pending_command_received_at: None,
+            first_provider_call_after_user: false,
             provider_cancel: None,
             hard_steer_command: None,
             abort_requested: false,
@@ -698,10 +704,16 @@ impl Runner {
         // Retries and tool continuations keep their own TTFT observation, but
         // must not fold provider/backoff/tool time into agent internal p95.
         let command_received_at = self.pending_command_received_at.take();
+        let trigger = if std::mem::take(&mut self.first_provider_call_after_user) {
+            ProviderCallTrigger::FirstAfterUser
+        } else {
+            ProviderCallTrigger::Continuation
+        };
         let start = self.driver.start_provider_with_context(
             self.attempt_sequence,
             &self.context,
             &self.provider_context,
+            trigger,
             command_received_at,
             cancel.clone(),
         );
@@ -2141,6 +2153,7 @@ impl Runner {
         self.pending_command_received_at = injectables
             .first()
             .and_then(|command| command.received_monotonic());
+        self.first_provider_call_after_user = true;
         self.in_flight_controls.clear();
         Ok(())
     }

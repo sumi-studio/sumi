@@ -26,6 +26,7 @@ use crate::{
         },
     },
     gateway::{ApprovalDecision, CommandEnvelope, CommandId},
+    memory::context_assembler::ProviderCallTrigger,
     provider::types::{
         ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, ProviderContextFragment,
         ProviderContextPayload, ProviderOrigin, ProviderOutput, PublicAssistantMessage,
@@ -54,6 +55,7 @@ fn output(message: AssistantMessage) -> Script {
 struct FixtureDriver {
     scripts: Mutex<VecDeque<Script>>,
     started_contexts: Mutex<Vec<Vec<ContextMessage>>>,
+    started_triggers: Mutex<Vec<ProviderCallTrigger>>,
     started_command_times: Mutex<Vec<Option<std::time::Instant>>>,
     tool_order: Mutex<Vec<String>>,
     tool_failures: Mutex<VecDeque<Option<&'static str>>>,
@@ -75,6 +77,7 @@ impl FixtureDriver {
         Self {
             scripts: Mutex::new(scripts.into()),
             started_contexts: Mutex::new(Vec::new()),
+            started_triggers: Mutex::new(Vec::new()),
             started_command_times: Mutex::new(Vec::new()),
             tool_order: Mutex::new(Vec::new()),
             tool_failures: Mutex::new(VecDeque::new()),
@@ -169,6 +172,23 @@ impl RunDriver for FixtureDriver {
             Script::Events(events) => Ok(provider_attempt_from_events(attempt, events)),
             Script::StartFailure(error) => Err(anyhow!(error)),
         }
+    }
+
+    async fn start_provider_with_context(
+        &self,
+        attempt: usize,
+        context: &[ContextMessage],
+        _provider_context: &[ProviderContextItemWithFootprint],
+        trigger: ProviderCallTrigger,
+        command_received_at: Option<std::time::Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        self.started_triggers
+            .lock()
+            .expect("provider call triggers")
+            .push(trigger);
+        self.start_provider_for_command(attempt, context, command_received_at, cancel)
+            .await
     }
 
     async fn execute_tool_observed(
@@ -923,6 +943,14 @@ async fn retry_closes_error_before_schedule_and_does_not_append_error_context() 
         command_times[1], None,
         "retry backoff is not internal overhead"
     );
+    assert_eq!(
+        *driver.started_triggers.lock().expect("provider triggers"),
+        [
+            ProviderCallTrigger::FirstAfterUser,
+            ProviderCallTrigger::Continuation,
+        ],
+        "a retry without a newly injected user is a continuation"
+    );
 }
 
 #[tokio::test]
@@ -1196,6 +1224,14 @@ async fn retry_wait_control_is_injected_mid_turn_before_next_attempt() {
             .iter()
             .all(|message| matches!(context_message(message), Message::User(_)))
     );
+    assert_eq!(
+        *driver.started_triggers.lock().expect("provider triggers"),
+        [
+            ProviderCallTrigger::FirstAfterUser,
+            ProviderCallTrigger::FirstAfterUser,
+        ],
+        "retry-wait user injection must restore TTFT protection even at attempt ordinal one"
+    );
 }
 
 #[tokio::test]
@@ -1397,6 +1433,14 @@ async fn tool_calls_execute_strictly_sequentially_and_continue_provider() {
     );
     assert_eq!(driver.max_active_tools.load(Ordering::SeqCst), 1);
     assert_eq!(driver.started_contexts.lock().expect("contexts").len(), 2);
+    assert_eq!(
+        *driver.started_triggers.lock().expect("provider triggers"),
+        [
+            ProviderCallTrigger::FirstAfterUser,
+            ProviderCallTrigger::Continuation,
+        ],
+        "tool-loop calls without a newly injected user are continuations"
+    );
     let command_times = driver.started_command_times.lock().expect("command times");
     assert_eq!(command_times.len(), 2);
     assert!(command_times[0].is_some());

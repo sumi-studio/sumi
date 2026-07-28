@@ -4509,6 +4509,7 @@ impl RunDriver for OpaqueContextDriver {
         attempt: usize,
         context: &[ContextMessage],
         provider_context: &[ProviderContextItemWithFootprint],
+        _trigger: crate::memory::context_assembler::ProviderCallTrigger,
         command_received_at: Option<std::time::Instant>,
         cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {

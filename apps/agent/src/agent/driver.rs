@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use crate::{
     memory::{
-        context_assembler::ContextAssembler,
+        context_assembler::{AssembledPrompt, ContextAssembler, ProviderCallTrigger},
         estimate::{ProviderContextItemWithFootprint, TokenCalibration},
         overflow::AssemblyMode,
     },
@@ -231,40 +231,14 @@ impl InjectedRunDriver {
             timestamp: Utc::now(),
         })
     }
-}
 
-#[async_trait]
-impl RunDriver for InjectedRunDriver {
-    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
-        if generation != self.executor_generation {
-            bail!(
-                "injected driver executor generation {} does not match Session generation {generation}",
-                self.executor_generation
-            );
-        }
-        Ok(())
-    }
-
-    fn set_hydrated_provider_context(
-        &self,
-        provider_context: Vec<ProviderContextItemWithFootprint>,
-    ) {
-        self.assembler.set_provider_context(provider_context);
-    }
-
-    async fn start_provider_for_command(
+    async fn start_provider_from_assembled(
         &self,
         attempt: usize,
-        context: &[ContextMessage],
+        assembled: AssembledPrompt,
         command_received_at: Option<Instant>,
         cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
-        // Derive the send view immediately before the provider call.  The
-        // runner's retained runtime_context anchors must not be mutated.
-        let assembled = self
-            .assembler
-            .assemble_with_estimate(context, attempt)
-            .await?;
         let prompt = assembled.prompt;
         let uncalibrated_prompt_estimate = assembled.uncalibrated_prompt_estimate;
         // Re-check at use time: the frozen registry remains the authority.
@@ -300,18 +274,60 @@ impl RunDriver for InjectedRunDriver {
             events,
         })
     }
+}
+
+#[async_trait]
+impl RunDriver for InjectedRunDriver {
+    fn validate_executor_generation(&self, generation: ProcessGeneration) -> Result<()> {
+        if generation != self.executor_generation {
+            bail!(
+                "injected driver executor generation {} does not match Session generation {generation}",
+                self.executor_generation
+            );
+        }
+        Ok(())
+    }
+
+    fn set_hydrated_provider_context(
+        &self,
+        provider_context: Vec<ProviderContextItemWithFootprint>,
+    ) {
+        self.assembler.set_provider_context(provider_context);
+    }
+
+    async fn start_provider_for_command(
+        &self,
+        attempt: usize,
+        context: &[ContextMessage],
+        command_received_at: Option<Instant>,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttempt> {
+        // Derive the send view immediately before the provider call.  The
+        // runner's retained runtime_context anchors must not be mutated.
+        let assembled = self
+            .assembler
+            .assemble_with_estimate(context, attempt)
+            .await?;
+        self.start_provider_from_assembled(attempt, assembled, command_received_at, cancel)
+            .await
+    }
 
     async fn start_provider_with_context(
         &self,
         attempt: usize,
         context: &[ContextMessage],
         provider_context: &[ProviderContextItemWithFootprint],
+        trigger: ProviderCallTrigger,
         command_received_at: Option<Instant>,
         cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
         self.assembler
             .set_provider_context(provider_context.to_vec());
-        self.start_provider_for_command(attempt, context, command_received_at, cancel)
+        let assembled = self
+            .assembler
+            .assemble_for_call_with_estimate(context, trigger)
+            .await?;
+        self.start_provider_from_assembled(attempt, assembled, command_received_at, cancel)
             .await
     }
 

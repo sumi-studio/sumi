@@ -42,8 +42,9 @@ pub struct ContextAssembler {
     calib: Mutex<TokenCalibration>,
     mode: AssemblyMode,
     // The text itself may be arbitrarily large. Cache only its fixed-size
-    // digest so this optimization cannot retain a second unbounded copy.
-    attachment_handles: Mutex<HashMap<[u8; 32], String>>,
+    // digest alongside the deterministic artifact identity so equal content
+    // from different messages cannot reuse the wrong handle.
+    attachment_handles: Mutex<HashMap<String, ([u8; 32], String)>>,
     three_layer_memory: Mutex<Option<ThreeLayerMemory>>,
 }
 
@@ -53,6 +54,12 @@ pub struct ContextAssembler {
 pub struct AssembledPrompt {
     pub prompt: PromptContext,
     pub uncalibrated_prompt_estimate: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProviderCallTrigger {
+    FirstAfterUser,
+    Continuation,
 }
 
 impl ContextAssembler {
@@ -117,9 +124,10 @@ impl ContextAssembler {
 
     /// Assemble a send-ready `PromptContext` for the configured destination.
     ///
-    /// `attempt` mirrors `RunDriver::start_provider_for_command`; the first
-    /// attempt (`attempt == 0`) is the first user call of the turn and is
-    /// shielded from ordinary overflow fallback to protect TTFT.
+    /// `attempt` preserves the direct-call compatibility surface. Production
+    /// runner calls use `assemble_for_call_with_estimate` so a later user
+    /// injection is not mistaken for a continuation merely because its global
+    /// attempt ordinal is nonzero.
     pub async fn assemble(
         &self,
         context: &[ContextMessage],
@@ -135,8 +143,21 @@ impl ContextAssembler {
         context: &[ContextMessage],
         attempt: usize,
     ) -> Result<AssembledPrompt> {
+        let trigger = if attempt == 0 {
+            ProviderCallTrigger::FirstAfterUser
+        } else {
+            ProviderCallTrigger::Continuation
+        };
+        self.assemble_for_call_with_estimate(context, trigger).await
+    }
+
+    pub(crate) async fn assemble_for_call_with_estimate(
+        &self,
+        context: &[ContextMessage],
+        trigger: ProviderCallTrigger,
+    ) -> Result<AssembledPrompt> {
         let overflow = Overflow::new(self.calibration(), self.mode);
-        let is_first_user_call = attempt == 0;
+        let is_first_user_call = trigger == ProviderCallTrigger::FirstAfterUser;
 
         let provider_context = self
             .provider_context
@@ -318,15 +339,22 @@ impl ContextAssembler {
                 let artifact_id = format!("{id_prefix}-{content_index}");
                 let content_digest: [u8; 32] = sha2::Sha256::digest(full_text.as_bytes()).into();
 
-                let handle = {
+                let cached = {
                     let handles = self
                         .attachment_handles
                         .lock()
                         .expect("attachment handle lock");
-                    handles.get(&content_digest).cloned()
+                    handles.get(&artifact_id).cloned()
                 };
-                let handle = match handle {
-                    Some(cached) => cached,
+                let handle = match cached {
+                    Some((cached_digest, cached_handle)) if cached_digest == content_digest => {
+                        cached_handle
+                    }
+                    Some(_) => {
+                        return Err(anyhow::anyhow!(
+                            "attachment identity {artifact_id} was reused with different content"
+                        ));
+                    }
                     None => {
                         let broker = self.broker.as_ref().ok_or_else(|| {
                             anyhow::anyhow!("oversized user input requires an attachment broker")
@@ -339,7 +367,7 @@ impl ContextAssembler {
                             .attachment_handles
                             .lock()
                             .expect("attachment handle lock");
-                        handles.insert(content_digest, handle.clone());
+                        handles.insert(artifact_id, (content_digest, handle.clone()));
                         handle
                     }
                 };
@@ -876,6 +904,55 @@ mod tests {
             }),
         };
         assert_ne!(attachment_id_prefix(&first), attachment_id_prefix(&second));
+    }
+
+    #[tokio::test]
+    async fn attachment_cache_binds_handle_to_artifact_id_and_content_digest() {
+        let full_text = "x".repeat(USER_ATTACHMENT_TRUNCATION_BYTES + 1);
+        let digest: [u8; 32] = sha2::Sha256::digest(full_text.as_bytes()).into();
+        let handle = "artifact://conversation/attachments/msg-1-0".to_owned();
+        let assembler = assembler();
+        assembler
+            .attachment_handles
+            .lock()
+            .expect("attachment handle lock")
+            .insert("msg-1-0".to_owned(), (digest, handle.clone()));
+
+        let mut replay = vec![user(&full_text, 1)];
+        assembler
+            .apply_user_attachment_truncation(&mut replay)
+            .await
+            .expect("same identity and content reuse the cached handle");
+        assert!(matches!(
+            &replay[0],
+            ContextMessage::Persisted {
+                message: Message::User(UserMessage { content, .. }),
+                ..
+            } if matches!(&content[0], UserContent::Text { text } if text.contains(&handle))
+        ));
+
+        let mut equal_content_different_message = vec![user(&full_text, 2)];
+        let missing_broker = assembler
+            .apply_user_attachment_truncation(&mut equal_content_different_message)
+            .await
+            .expect_err("equal content under a different artifact ID must not reuse the handle");
+        assert!(
+            missing_broker
+                .to_string()
+                .contains("requires an attachment broker")
+        );
+
+        let mut conflicting_replay =
+            vec![user(&"y".repeat(USER_ATTACHMENT_TRUNCATION_BYTES + 1), 1)];
+        let conflict = assembler
+            .apply_user_attachment_truncation(&mut conflicting_replay)
+            .await
+            .expect_err("one artifact ID must never alias different content");
+        assert!(
+            conflict
+                .to_string()
+                .contains("attachment identity msg-1-0 was reused with different content")
+        );
     }
 
     #[test]

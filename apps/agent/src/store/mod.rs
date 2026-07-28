@@ -2000,7 +2000,7 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
 mod tests {
     use super::*;
     use crate::memory::context_assembler::ContextAssembler;
-    use crate::memory::estimate::{EvictionFootprint, eviction_footprint_for_payload};
+    use crate::memory::estimate::eviction_footprint_for_payload;
     use crate::provider::model::ModelSpec;
     use crate::provider::types::{
         ApiProtocol, AssistantMessage, ContextMessage, Message, ProviderContextAnchor,
@@ -3084,7 +3084,8 @@ mod tests {
             provider_origin: spec.origin(),
             payload: responses_reasoning_payload("opaque"),
         };
-        let footprint = EvictionFootprint::from_saved(1, 0, saved_tokens).expect("saved footprint");
+        let footprint =
+            eviction_footprint_for_payload(&spec, &item.payload).expect("canonical footprint");
         let anchor_id = format!("{message_id}:{message_seq}");
         let key = store
             .provider_context_key(&ProviderContextKeyAnchor {
@@ -3111,6 +3112,17 @@ mod tests {
             .insert(store.pool())
             .await
             .expect("insert provider context");
+        sqlx::query(
+            "UPDATE provider_context
+             SET eviction_tokens = ?, eviction_estimator_version = ?
+             WHERE id = ?",
+        )
+        .bind(i64::try_from(saved_tokens).expect("saved tokens fit SQLite"))
+        .bind(i64::from(EVICTION_ESTIMATOR_VERSION_SERIALIZED_BYTES))
+        .bind(id)
+        .execute(store.pool())
+        .await
+        .expect("downgrade fixture to legacy saved footprint");
     }
 
     #[tokio::test]
