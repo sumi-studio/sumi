@@ -9,7 +9,7 @@
   - [エージェントワークスペース設計](../agent/workspace.md)
   - [3層メモリ設計](../agent/memory.md)
   - [エージェント実装計画](../agent/implementation-plan.md)
-  - [実装タスク](../../apps/agent/TASKS.md) T26〜T29
+  - [実装タスク](../../apps/agent/TASKS.md)
 - Related:
   - [#74](https://github.com/sumi-studio/sumi/issues/74)
   - [#75](https://github.com/sumi-studio/sumi/issues/75)
@@ -111,11 +111,10 @@ resource・authority・durability境界を決定論的に強制する。人格�
 parallel workerへfan-outしたり、本人に代わって複数の約束の意味や優先順位を
 暗黙に決めたりしない。
 
-この前提から導く正本のcontainmentは次とする。
+この前提から導く正本のactorとmembership関係は次とする。
 
 ```text
-Sumi Workspace
-├── Human member 0..N
+Sumi
 ├── PersonalityAgent 0..N
 │   ├── PersonalityAgentId 1
 │   ├── one continuous agent session
@@ -125,8 +124,15 @@ Sumi Workspace
 │   └── one VM execution fabric
 │       ├── direct tool execution 0..N
 │       └── TerminalSession 0..N
-└── shared conversations, tasks, calendars, documents, apps and permissions
+└── Sumi Workspace 0..N
+    ├── HumanMembership 0..N → Human
+    ├── PersonalityAgentMembership 0..N → PersonalityAgentId
+    └── shared conversations, tasks, calendars, documents, apps and permissions
 ```
+
+`PersonalityAgentMembership`は、Workspaceからglobalな本人を参照するmutableな
+relationであり、本人、session、life log、VMをWorkspaceごとに複製しない。
+membershipのcardinality、workflow、storageは今回実装しない。
 
 `Sumi Workspace`は共有のproduct/domain resourceである。各人格agentの
 private VMはWorkspaceそのものではなく、agentの私物PCに相当する。
@@ -134,17 +140,70 @@ private VMはWorkspaceそのものではなく、agentの私物PCに相当する
 人格agent同士の協働は同じVMへ入ることではなく、Workspace上の共有resource、
 会話、task、権限付きaction、明示的なdelegationを通して行う。
 
-既存control planeの`tenant_id`はadministrative/security scopeを表す
-identityとして扱い、Sumi Workspace、agent、VM、Linux `/workspace`の別名には
-しない。tenantとWorkspaceのcardinalityは本ADRでは決めない。少なくとも
-`tenant_id`が同じであることを、同じVM・volume・private work environmentを
-共有する根拠には使わない。
+既存control planeの`tenant_id`は、その時点のadministrative/security contextを
+表し、Sumi Workspace、agent、VM、Linux `/workspace`の別名にはしない。
+人格agent本人のidentityはtenant、Workspace、orgから独立する。将来、一人の
+人格agentが複数scopeへ所属し、異動・出張・所属変更しても同じ本人として継続
+できなければならない。
+
+そのmembership、transfer、複数scope coordination自体は今回実装しない。current
+direct verticalが一つのadministrative contextだけで動くことは許す。ただし
+`tenant_id`を人格identityやagent-private stateの恒久ownerにせず、同じ
+`tenant_id`であることをVM、volume、private work environment共有の根拠にも
+使わない。
 
 ### 2. PersonalityAgentIdと人生ログは同じ寿命を持つ
 
 `PersonalityAgentId`を人格を持つ持続的なproduct actorの正本identityとする。
 `PersonalityAgentId`は主体本人ではなく、その一人を時間とsystem境界を越えて
 識別し、その人のprivate resourceを所有させるためのidentity/owner keyである。
+Sumi全体でglobalに一意なlowercase hyphenated UUIDv7として表現し、tenant、
+Workspace、orgのlocal namespaceへ従属させない。
+
+trusted provisioning boundaryだけが一度mintし、global collisionを拒否する。
+Rust、Go、TypeScript、SQLite、token、route、RPC、artifactの全境界でUUIDの
+version 7とRFC variantをtyped validationし、canonical lowercase-hyphenated
+表現とraw inputが完全一致しない値を拒否する。永続化とAADにはvalidated canonical
+bytesだけを使い、callerのraw表現を使わない。
+
+このIDはcredentialやcapabilityではなくpublic identifierである。UUIDv7から
+provision時刻を概算できることを受容し、認可やsecret性をIDの推測困難性へ
+依存させない。
+
+`PersonalityAgentId`は現行の`agent_id`と`conversation_id`の両方を置換する。
+どちらもlegacy aliasとして残さず、別のdurable `AgentDeploymentId`も今回
+導入しない。runtimeとRPC processは次のephemeral identityで区別する。
+
+```text
+RuntimeKey = (PersonalityAgentId, ProcessGeneration)
+RpcProcessKey = (PersonalityAgentId, ProcessGeneration, RpcBootNonce)
+```
+
+VM交換、runtime restart、executor/broker restartは本人を作り直さず、これらの
+ephemeral identityを前進させる。同じ人格agentについてcommandを受理する
+runtime generationは一つだけとし、replacementは旧generationをfenceしてから
+Readyになる。provider側のinstance IDや将来のdeployment recordが必要になっても、
+private state、life log、public addressのowner identityにはしない。
+
+`ProcessGeneration` allocator、current-generation fence、Ready registryの
+identityと一意性は、administrative contextを含めずglobal
+`PersonalityAgentId`単位とする。tenant／Workspace／orgはcredentialのauthorization
+contextやquery partitionには使えても、別のcurrent generationを作るkeyには
+しない。
+
+agent-private DB、data key、key-wrap/row AADの恒久identityには
+`PersonalityAgentId`を使い、mutableなtenant／Workspace／org membershipを
+焼き込まない。scope、human actor、source resource、policy/authorityは、各出来事
+の時点でcontrol planeが認証したprovenanceとして別に束縛する。これにより将来の
+所属変更を人格deathやlife-log再暗号化の必須条件にしない。
+
+tenant KEKがagent keyをwrapする場合、そのwrapは置換可能なcontrol-plane
+authority relationであり、人格agentやdataのowner identityではない。所属変更時の
+outer agent-key rewrapはlife logやdata本体の再暗号化ではない。multi-wrap、
+transfer、recovery ceremony自体は今回実装しない。AADのowner成分だけを
+`PersonalityAgentId`へ置換し、table、row、key reference、purpose、
+schema versionとimmutableなevent-time provenanceのcryptographic integrityは
+維持する。current membershipから過去rowのAADを再構成しない。
 
 人格agentには一つの連続したagent sessionがある。そのsessionで経験した
 direct chat、Workspace由来の出来事、判断、actionがagentの人生ログになる。
@@ -173,8 +232,8 @@ mail、calendar、app等は、source/resource/actor/correlation metadataを伴�
 `PersonalityAgentId`を宛先・ownerとして使う。
 
 後方互換性を持たないpre-launch contract replacementとして、SQLite、AAD、
-RPC、token、route、fixtureから`conversation_id` fieldと独立conversation scopeを
-削除する。
+RPC、token、route、fixtureからlegacy `agent_id`、`conversation_id` field、
+独立conversation scopeを削除する。
 dual-read、dual-write、exact alias、旧AADのdecrypt/re-encrypt移行は実装しない。
 pre-launchのDB・鍵・wire fixtureは`PersonalityAgentId`だけを使って再生成する。
 
@@ -339,10 +398,12 @@ identity、reference、projection、resultだけを保存する。
 ## Migration
 
 1. 本ADRをreviewし、StatusをAcceptedへ変更する。
-2. #74でpublic/internal `conversation_id`と独立conversation scopeを
-   `PersonalityAgentId`へ統合し、破壊的resetをcanon、contract、T29から除く。
+2. #74でpublic/internalのlegacy `agent_id`、`conversation_id`、独立conversation
+   scopeをglobal UUIDv7 `PersonalityAgentId`へ統合し、破壊的resetをcanon、
+   contract、T29から除く。
 3. 後方互換のschema、alias、dual-read、data migrationを作らず、pre-launchの
-   DB、鍵、AAD、wire fixtureを新identity contractで再生成する。
+   DB、鍵、AAD、wire fixtureを新identity contractで再生成する。agent-private
+   owner/AADへmutableなtenant／Workspace／org membershipを残さない。
 4. #75でper-agent deployment namespaceと、同じWorkspaceかつ同じ
    administrative scopeに属する二agent間のisolationをT26へ固定する。
 5. #79、#80のendpoint/credential/readinessをT26へ組み込み、現在の直接agent
@@ -366,10 +427,14 @@ identity、reference、projection、resultだけを保存する。
 - Compose project、volume、IPC、credentialを人格agentごとに分離し、同じ
   Workspaceかつ同じadministrative scopeの二agent fixtureでprivate stateと
   failure domainのisolationを証明する。
-- `PersonalityAgentId`以外のconversation-scoped identity/config、既存agentでの
-  予期しないhistory/memory欠落または復号失敗、placeholder approval、
-  no-tool fallbackをfail-closedに拒否する。
+- legacy `agent_id`、legacy `conversation_id`、`PersonalityAgentId`とは独立した
+  conversation-scoped identity/config、既存agentでの予期しないhistory/memory
+  欠落または復号失敗、placeholder approval、no-tool fallbackをfail-closedに
+  拒否する。
   新しくprovisionされたagentの正規な空history/memoryは許可する。
+- current deploymentは一つのadministrative contextでよい。複数scope membership、
+  org/Workspace間の異動・出張・transfer orchestrationをT26へ追加せず、global
+  identityとagent-private owner/AADで将来を妨げない。
 - long-lived executor endpoint、fresh agent-scoped credential、central
   generation/Ready registryを実装する。
 - 人格agent本人の直接tool pathをproduction verticalで証明する。
@@ -466,6 +531,8 @@ agent deathとして扱う。
 ## Non-goals
 
 - 本ADRだけで共有Sumi Workspaceを実装すること。
+- 複数tenant／Workspace／org membership、異動、出張、transfer UI・workflow・
+  orchestrationを今回実装すること。
 - 今回のagent-foundation completionを全Issue完了へ拡張すること。
 - 今回のagent-foundation completionでsubagent、nested delegation、
   `ExecutionPrincipal` sum type、subagent用authority、result collectionを
@@ -482,10 +549,12 @@ agent deathとして扱う。
 1. runtimeやowner labelではなく、一人の主体からidentity、session、memory、
    action、VM、lifecycleが導かれているか。
 2. `PersonalityAgentId`、唯一のagent session、人生ログ、direct chatの関係。
-3. 人格を複製せず、複数の呼びかけ・約束・外部actionを同じ本人が経験する関係。
-4. Sumi Workspaceとagent-private VMの所有境界。
-5. 人格agent本人がtool、terminal、将来のAI harnessを使い、必須proxyや
+3. globalな人格identityと、mutableなtenant／Workspace／org membershipを
+   混同せず、future mobilityを妨げないcurrent boundary。
+4. 人格を複製せず、複数の呼びかけ・約束・外部actionを同じ本人が経験する関係。
+5. Sumi Workspaceとagent-private VMの所有境界。
+6. 人格agent本人がtool、terminal、将来のAI harnessを使い、必須proxyや
    worker-poolの一員にされない関係。
-6. agent deathと、Workspace resource/viewの削除・key rotationの違い。
-7. T26で今固定するdirect-agent contractと、#77/#81/#82/#87へ延期する設計の
+7. agent deathと、Workspace resource/viewの削除・key rotationの違い。
+8. T26で今固定するdirect-agent contractと、#77/#81/#82/#87へ延期する設計の
    境界。
