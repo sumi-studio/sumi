@@ -263,8 +263,8 @@ fn timestamp() -> chrono::DateTime<Utc> {
 fn origin() -> ProviderOrigin {
     ProviderOrigin {
         provider_instance_id: "fixture:https://example.invalid".to_owned(),
-        protocol: ApiProtocol::OpenAiChatCompletions,
-        model: "fixture-model".to_owned(),
+        protocol: ApiProtocol::OpenAiResponses,
+        model: "openai-responses".to_owned(),
     }
 }
 
@@ -498,6 +498,7 @@ fn provider_attempt(attempt: usize, message: AssistantMessage) -> ProviderAttemp
     ProviderAttempt {
         message_id: format!("assistant-{attempt}"),
         initial_message: public_message(&assistant(StopReason::Stop, Vec::new(), None, None)),
+        uncalibrated_prompt_estimate: 0,
         events: ProviderEventStream::new(rx, CancellationToken::new(), "fixture", origin()),
     }
 }
@@ -511,6 +512,7 @@ fn provider_attempt_from_events(attempt: usize, events: Vec<ProviderEvent>) -> P
     ProviderAttempt {
         message_id: format!("assistant-{attempt}"),
         initial_message: public_message(&assistant(StopReason::Stop, Vec::new(), None, None)),
+        uncalibrated_prompt_estimate: 0,
         events: ProviderEventStream::new(rx, CancellationToken::new(), "fixture", origin()),
     }
 }
@@ -936,7 +938,12 @@ async fn nonempty_provider_context_flows_to_the_durable_message_barrier() {
                     wire_item_index: Some(0),
                     payload: ProviderContextPayload::EncryptedReasoning {
                         protocol: ApiProtocol::OpenAiResponses,
-                        item: json!({"encrypted_content":"opaque"}),
+                        item: json!({
+                            "id": "rs-test-opaque",
+                            "type": "reasoning",
+                            "summary": [],
+                            "encrypted_content": "opaque",
+                        }),
                     },
                 }],
             },
@@ -971,10 +978,24 @@ fn cancellation_provider_context() -> Vec<ProviderContextFragment> {
     vec![ProviderContextFragment {
         wire_item_index: Some(0),
         payload: ProviderContextPayload::EncryptedReasoning {
-            protocol: ApiProtocol::OpenAiChatCompletions,
-            item: json!({"encrypted_content":"cancelled-opaque"}),
+            protocol: ApiProtocol::OpenAiResponses,
+            item: json!({
+                "type": "reasoning",
+                "id": "cancelled-reasoning",
+                "summary": [],
+                "encrypted_content": "cancelled-opaque"
+            }),
         },
     }]
+}
+
+fn cancellation_assistant(reason: StopReason) -> AssistantMessage {
+    let spec = ModelSpec::preset("openai-responses").expect("Responses fixture spec");
+    let mut message = assistant(reason, Vec::new(), None, None);
+    message.model = spec.id.clone();
+    message.provider = spec.provider.clone();
+    message.origin = spec.origin();
+    message
 }
 
 #[tokio::test]
@@ -987,33 +1008,43 @@ async fn aborted_message_end_keeps_verified_provider_context_on_barrier() {
         control_rx,
         events_tx,
     );
-    let partial = public_message(&assistant(StopReason::Aborted, Vec::new(), None, None));
-    let task = tokio::spawn(async move {
-        runner
-            .close_aborted_attempt(
-                "assistant-aborted",
-                true,
-                partial,
-                cancellation_provider_context(),
-            )
-            .await
-    });
-    let mut output = events_rx.recv().await.expect("aborted MessageEnd output");
-    let barrier = output
-        .message_commit_barrier
-        .take()
-        .expect("MessageEnd barrier");
-    assert_eq!(barrier.provider_context_for_test().len(), 1);
-    barrier.resolve(MessageCommitReceipt {
-        message_id: "assistant-aborted".to_owned(),
-        message_seq: 1,
-        new_turn_id: None,
-    });
-    drop(control_tx);
-    assert!(matches!(
-        task.await.expect("close task").expect("close outcome"),
-        AttemptOutcome::ClosedError { .. }
-    ));
+    let partial = public_message(&cancellation_assistant(StopReason::Aborted));
+    let close = runner.close_aborted_attempt(
+        "assistant-aborted",
+        true,
+        partial,
+        cancellation_provider_context(),
+    );
+    let receive = async {
+        let mut output = events_rx.recv().await.expect("aborted MessageEnd output");
+        let barrier = output
+            .message_commit_barrier
+            .take()
+            .expect("MessageEnd barrier");
+        assert_eq!(barrier.provider_context_for_test().len(), 1);
+        barrier.resolve(MessageCommitReceipt {
+            message_id: "assistant-aborted".to_owned(),
+            message_seq: 1,
+            new_turn_id: None,
+        });
+        drop(control_tx);
+    };
+    let (outcome, ()) = tokio::join!(close, receive);
+    let AttemptOutcome::ClosedError {
+        message, receipt, ..
+    } = outcome.expect("close outcome")
+    else {
+        panic!("aborted close must return ClosedError");
+    };
+    let receipt = runner
+        .await_message_receipt(receipt)
+        .await
+        .expect("aborted receipt");
+    runner
+        .retain_committed(receipt, &message)
+        .expect("retain aborted context");
+    assert_eq!(runner.provider_context.len(), 1);
+    assert!(runner.provider_context[0].footprint.eviction_tokens() > 0);
 }
 
 #[tokio::test]
@@ -1026,37 +1057,38 @@ async fn hard_steer_message_end_keeps_verified_provider_context_on_barrier() {
         control_rx,
         events_tx,
     );
-    let partial = public_message(&assistant(StopReason::Aborted, Vec::new(), None, None));
-    let task = tokio::spawn(async move {
-        runner
-            .close_hard_steer_attempt(
-                "assistant-steered",
-                true,
-                partial,
-                cancellation_provider_context(),
-                admitted_user(2),
-            )
+    let partial = public_message(&cancellation_assistant(StopReason::Aborted));
+    let close = runner.close_hard_steer_attempt(
+        "assistant-steered",
+        true,
+        partial,
+        cancellation_provider_context(),
+        admitted_user(2),
+    );
+    let receive = async {
+        let mut output = events_rx
+            .recv()
             .await
-    });
-    let mut output = events_rx
-        .recv()
-        .await
-        .expect("hard-steer MessageEnd output");
-    let barrier = output
-        .message_commit_barrier
-        .take()
-        .expect("MessageEnd barrier");
-    assert_eq!(barrier.provider_context_for_test().len(), 1);
-    barrier.resolve(MessageCommitReceipt {
-        message_id: "assistant-steered".to_owned(),
-        message_seq: 1,
-        new_turn_id: None,
-    });
-    drop(control_tx);
+            .expect("hard-steer MessageEnd output");
+        let barrier = output
+            .message_commit_barrier
+            .take()
+            .expect("MessageEnd barrier");
+        assert_eq!(barrier.provider_context_for_test().len(), 1);
+        barrier.resolve(MessageCommitReceipt {
+            message_id: "assistant-steered".to_owned(),
+            message_seq: 1,
+            new_turn_id: None,
+        });
+        drop(control_tx);
+    };
+    let (outcome, ()) = tokio::join!(close, receive);
     assert!(matches!(
-        task.await.expect("close task").expect("close outcome"),
+        outcome.expect("close outcome"),
         AttemptOutcome::HardSteer
     ));
+    assert_eq!(runner.provider_context.len(), 1);
+    assert!(runner.provider_context[0].footprint.eviction_tokens() > 0);
 }
 
 #[tokio::test]
@@ -2979,6 +3011,7 @@ impl RunDriver for CancellingProbeDriver {
         Ok(ProviderAttempt {
             message_id: format!("assistant-{attempt}"),
             initial_message: public_message(&assistant(StopReason::Stop, Vec::new(), None, None)),
+            uncalibrated_prompt_estimate: 0,
             events: crate::provider::types::ProviderEventStream::new(
                 rx,
                 cancel,

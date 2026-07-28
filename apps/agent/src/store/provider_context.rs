@@ -1836,7 +1836,7 @@ mod tests {
 
     use super::*;
     use crate::memory::estimate::{
-        EvictionFootprint, eviction_footprint_for_payload,
+        EvictionFootprint, ProviderContextItemWithFootprint, eviction_footprint_for_payload,
         legacy_serialized_bytes_eviction_footprint, native_canonical_window_footprint,
     };
     use crate::provider::model::ModelSpec;
@@ -3142,7 +3142,15 @@ mod tests {
         }
         .expect("hydration should succeed with matching origin");
         assert_eq!(hydrated.len(), 1);
-        assert_eq!(hydrated[0].origin_message.as_ref().unwrap().message_seq, 7);
+        assert_eq!(
+            hydrated[0]
+                .item
+                .origin_message
+                .as_ref()
+                .unwrap()
+                .message_seq,
+            7
+        );
     }
 
     #[tokio::test]
@@ -3317,7 +3325,7 @@ mod tests {
         .expect("hydration should succeed");
         assert_eq!(hydrated.len(), 2);
         // Native compaction is unanchored; sort order is by coverage seq.
-        let coverage_seq = |item: &ProviderContextItem| match &item.payload {
+        let coverage_seq = |item: &ProviderContextItemWithFootprint| match &item.item.payload {
             ProviderContextPayload::OpenAiCompactedWindow { coverage, .. } => {
                 coverage.through_message_seq
             }
@@ -3405,14 +3413,14 @@ mod tests {
         assert_eq!(hydrated.len(), 2);
         assert!(
             matches!(
-                &hydrated[0].payload,
+                &hydrated[0].item.payload,
                 ProviderContextPayload::OpenAiCompactedWindow { .. }
             ),
             "native compaction with lower coverage seq must sort before anchored reasoning"
         );
         assert!(
             matches!(
-                &hydrated[1].payload,
+                &hydrated[1].item.payload,
                 ProviderContextPayload::EncryptedReasoning { .. }
             ),
             "anchored reasoning at higher message seq must sort after native compaction"
@@ -3861,7 +3869,8 @@ mod tests {
                 .await
                 .expect("legacy V1 record remains hydratable")
         };
-        assert_eq!(hydrated, vec![item]);
+        assert_eq!(hydrated.len(), 1);
+        assert_eq!(hydrated[0].item, item);
     }
 
     #[tokio::test]
@@ -4247,7 +4256,10 @@ mod tests {
                     .await
             }
             .expect("global event gaps must not invalidate native compaction hydration");
-            assert_eq!(hydrated, vec![item]);
+            assert_eq!(
+                hydrated.iter().map(|h| h.item.clone()).collect::<Vec<_>>(),
+                vec![item]
+            );
         }
     }
 
@@ -4396,6 +4408,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hydrate_rejects_provider_context_gap_duplicate_and_tamper() {
+        // Gap: a native compaction claims coverage through a missing message seq.
+        let store1 = store().await;
+        seed_message(&store1, "message-1", 1).await.unwrap();
+        seed_message(&store1, "message-3", 3).await.unwrap();
+        let gap_item = native_compaction_item(false, 2);
+        insert_native_compaction(&store1, "gap", &gap_item).await;
+        let origin = reasoning_origin();
+        let messages = vec![
+            ContextMessage::Persisted {
+                id: "message-1".to_owned(),
+                seq: 1,
+                message: assistant_message(origin.clone()),
+            },
+            ContextMessage::Persisted {
+                id: "message-3".to_owned(),
+                seq: 3,
+                message: assistant_message(origin),
+            },
+        ];
+        let error = {
+            let mut tx = store1.pool().begin().await.expect("begin test transaction");
+            store1.hydrate_provider_context(&messages, &mut tx).await
+        };
+        assert!(
+            error.is_err(),
+            "gap in native compaction coverage must fail closed"
+        );
+        assert!(
+            error.unwrap_err().to_string().contains("coverage"),
+            "error must describe coverage gap"
+        );
+
+        // Duplicate: the idempotency key must be unique across provider-context records.
+        let store2 = store().await;
+        seed_message(&store2, "message-1", 1).await.unwrap();
+        let first = reasoning_record(&store2, "message-1", 1, "dup-1").await;
+        first.insert(store2.pool()).await.unwrap();
+        let second = reasoning_record(&store2, "message-1", 1, "dup-2").await;
+        assert!(
+            second.insert(store2.pool()).await.is_err(),
+            "duplicate idempotency key must fail closed"
+        );
+
+        // Tamper: changing the stored kind after insert must be caught on hydration.
+        sqlx::query("UPDATE provider_context SET kind = 'open_ai_compacted_window' WHERE id = ?")
+            .bind("dup-1")
+            .execute(store2.pool())
+            .await
+            .expect("tamper stored provider-context kind");
+        let messages = vec![ContextMessage::Persisted {
+            id: "message-1".to_owned(),
+            seq: 1,
+            message: assistant_message(reasoning_origin()),
+        }];
+        let error = {
+            let mut tx = store2.pool().begin().await.expect("begin test transaction");
+            store2.hydrate_provider_context(&messages, &mut tx).await
+        };
+        assert!(
+            error.is_err(),
+            "tampered provider-context kind must fail closed"
+        );
+        assert!(
+            error.unwrap_err().to_string().contains("kind"),
+            "error must describe kind mismatch"
+        );
+    }
     async fn invalidate_zeroes_ciphertext_before_delete_and_preserves_shared_key() {
         let store = store().await;
         let batch_id = seed_message_in_open_l0_batch(&store, "message-1", 7, 1_000_000)

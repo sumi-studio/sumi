@@ -11,6 +11,8 @@ use crate::tools::{bash::BashExecutionResult, fs::GrepMatch, truncate::Truncatio
 
 pub const MAX_RPC_LINE_BYTES: usize = 1024 * 1024;
 pub const MAX_RPC_READ_BYTES: usize = 50 * 1024;
+/// Kept well below the JSON-line envelope after `Vec<u8>` serialization.
+pub const MAX_ATTACHMENT_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_RPC_ID_BYTES: usize = 128;
 const MAX_RPC_ERROR_CODE_BYTES: usize = 128;
 const RPC_ACTIVE_REQUEST_CAPACITY: usize = 4_096;
@@ -174,6 +176,31 @@ pub enum ArtifactOperation {
         handle: String,
         pattern: String,
     },
+    PutAttachment {
+        conversation_id: String,
+        artifact_id: String,
+        content: String,
+    },
+    BeginAttachment {
+        conversation_id: String,
+        artifact_id: String,
+        total_bytes: u64,
+        content_digest: String,
+    },
+    AppendAttachment {
+        conversation_id: String,
+        artifact_id: String,
+        total_bytes: u64,
+        content_digest: String,
+        offset: u64,
+        content: Vec<u8>,
+    },
+    FinishAttachment {
+        conversation_id: String,
+        artifact_id: String,
+        total_bytes: u64,
+        content_digest: String,
+    },
 }
 
 pub trait RpcOperationValidation {
@@ -276,6 +303,51 @@ impl RpcOperationValidation for ArtifactOperation {
                     return Err(ToolError::Protocol(
                         "RPC grep pattern must be non-empty".to_owned(),
                     ));
+                }
+                Ok(())
+            }
+            Self::PutAttachment {
+                conversation_id,
+                artifact_id,
+                ..
+            } => {
+                validate_artifact_handle_component(conversation_id)?;
+                validate_rpc_id(conversation_id, "conversation_id")?;
+                validate_artifact_handle_component(artifact_id)?;
+                Ok(())
+            }
+            Self::BeginAttachment {
+                conversation_id,
+                artifact_id,
+                content_digest,
+                ..
+            }
+            | Self::FinishAttachment {
+                conversation_id,
+                artifact_id,
+                content_digest,
+                ..
+            } => {
+                validate_artifact_handle_component(conversation_id)?;
+                validate_rpc_id(conversation_id, "conversation_id")?;
+                validate_artifact_handle_component(artifact_id)?;
+                validate_attachment_digest(content_digest)
+            }
+            Self::AppendAttachment {
+                conversation_id,
+                artifact_id,
+                content_digest,
+                content,
+                ..
+            } => {
+                validate_artifact_handle_component(conversation_id)?;
+                validate_rpc_id(conversation_id, "conversation_id")?;
+                validate_artifact_handle_component(artifact_id)?;
+                validate_attachment_digest(content_digest)?;
+                if content.is_empty() || content.len() > MAX_ATTACHMENT_CHUNK_BYTES {
+                    return Err(ToolError::Protocol(format!(
+                        "attachment chunk must contain 1..={MAX_ATTACHMENT_CHUNK_BYTES} bytes"
+                    )));
                 }
                 Ok(())
             }
@@ -545,6 +617,15 @@ fn validate_bounded_text(value: &str, name: &str, max_bytes: usize) -> Result<()
         return Err(ToolError::Protocol(format!(
             "RPC {name} must contain 1..={max_bytes} bytes"
         )));
+    }
+    Ok(())
+}
+
+fn validate_attachment_digest(value: &str) -> Result<(), ToolError> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ToolError::Protocol(
+            "attachment content_digest must be a SHA-256 hex digest".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -1975,6 +2056,30 @@ mod tests {
         assert_eq!(
             resolve_input("grep", "workspace/artifact://literal").unwrap(),
             InputRoute::Workspace,
+        );
+    }
+
+    #[test]
+    fn attachment_chunks_are_valid_and_fit_a_single_rpc_line() {
+        let identity = RpcIdentity::from_wire(1, "nonce").unwrap();
+        let request = RpcRequest {
+            generation: 1,
+            nonce: "nonce".to_owned(),
+            request_id: "attachment-chunk".to_owned(),
+            operation: ArtifactOperation::AppendAttachment {
+                conversation_id: "conversation-1".to_owned(),
+                artifact_id: "input-1".to_owned(),
+                total_bytes: (MAX_ATTACHMENT_CHUNK_BYTES * 2) as u64,
+                content_digest: "a".repeat(64),
+                offset: 0,
+                content: vec![b'x'; MAX_ATTACHMENT_CHUNK_BYTES],
+            },
+        };
+        let encoded = serde_json::to_vec(&request).unwrap();
+        assert!(framed_rpc_len(encoded.len()).is_some());
+        assert_eq!(
+            decode_rpc_line::<ArtifactOperation>(&encoded, &identity).unwrap(),
+            request
         );
     }
 }

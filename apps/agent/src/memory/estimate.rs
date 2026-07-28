@@ -5,7 +5,10 @@ use std::borrow::Borrow;
 use crate::provider::{
     model::ModelSpec,
     replay_probe::{ReplayProbeResult, ReplayProbeV1},
-    types::{ProviderContextPayload, PublicAssistantContent, PublicMessage, Usage, UserContent},
+    types::{
+        ProviderContextItem, ProviderContextPayload, PublicAssistantContent, PublicMessage, Usage,
+        UserContent,
+    },
 };
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -129,6 +132,29 @@ impl EvictionFootprint {
             replay_wire_bytes,
             eviction_tokens,
         })
+    }
+}
+
+/// A `ProviderContextItem` paired with its authoritative `EvictionFootprint`.
+///
+/// This is the crate-internal boundary that lets T17 cold-boot hydration carry
+/// saved footprint values into T21 overflow/prompt accounting without exposing
+/// persistence metadata on the public provider wire type.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ProviderContextItemWithFootprint {
+    pub item: ProviderContextItem,
+    pub footprint: EvictionFootprint,
+}
+
+impl ProviderContextItemWithFootprint {
+    pub(crate) fn new(item: ProviderContextItem, footprint: EvictionFootprint) -> Self {
+        Self { item, footprint }
+    }
+}
+
+impl AsRef<ProviderContextItem> for ProviderContextItemWithFootprint {
+    fn as_ref(&self) -> &ProviderContextItem {
+        &self.item
     }
 }
 
@@ -809,6 +835,44 @@ mod tests {
                 estimate_text_tokens(TOOL_RESULT_IMAGE_PLACEHOLDER)
                     .expect("image placeholder estimate")
             ])
+        );
+    }
+
+    #[test]
+    fn eviction_estimator_version_migration_keeps_legacy_and_current_additive() {
+        let spec = ModelSpec::preset("openai-responses").expect("preset");
+        let payload = ProviderContextPayload::EncryptedReasoning {
+            protocol: ApiProtocol::OpenAiResponses,
+            item: json!({
+                "type": "reasoning",
+                "id": "rs",
+                "encrypted_content": "opaque",
+                "summary": [],
+            }),
+        };
+
+        // Newly computed footprints use the bumped current V1 (version 2), not
+        // the legacy T17 estimator V1 (version 1) formula.
+        let current = eviction_footprint_for_payload(&spec, &payload).expect("footprint");
+        assert_eq!(
+            current.estimator_version(),
+            EVICTION_ESTIMATOR_VERSION_REPLAY_PROBE_V1
+        );
+        assert!(current.estimator_version() > EVICTION_ESTIMATOR_VERSION_SERIALIZED_BYTES);
+
+        // Saved footprints from both the legacy and the current estimator must
+        // be additive and never silently recomputed.
+        let legacy =
+            EvictionFootprint::from_saved(EVICTION_ESTIMATOR_VERSION_SERIALIZED_BYTES, 0, 7)
+                .expect("legacy");
+        let saved_current =
+            EvictionFootprint::from_saved(EVICTION_ESTIMATOR_VERSION_REPLAY_PROBE_V1, 0, 5)
+                .expect("saved current");
+        let native = native_canonical_window_footprint();
+        let sum = sum_saved_footprints([current, legacy, saved_current, native]).expect("sum");
+        assert_eq!(
+            sum,
+            current.eviction_tokens() + 7 + 5 + native.eviction_tokens()
         );
     }
 }

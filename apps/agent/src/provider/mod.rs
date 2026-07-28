@@ -3,6 +3,7 @@
 pub mod adapters;
 pub mod assembler;
 pub(crate) mod canonical_request;
+pub(crate) mod context_fingerprint;
 pub mod model;
 pub mod overflow;
 pub mod partial_json;

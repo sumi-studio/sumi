@@ -10746,7 +10746,10 @@ mod tests {
             ApprovalDecision, Command, CommandEnvelope, CommandId, DeferredApprovalRule,
             SensitiveCommandPayload,
         },
-        memory::L0_BATCH_MIN,
+        memory::{
+            L0_BATCH_MIN,
+            estimate::{ProviderContextItemWithFootprint, eviction_footprint_for_payload},
+        },
         provider::{
             ModelSpec, RequestOptions,
             adapters::responses::build_request as build_responses_request,
@@ -22203,7 +22206,7 @@ mod tests {
                 },
             },
         };
-        let expected_context = vec![
+        let expected_items = vec![
             ProviderContextItem {
                 origin_message: None,
                 wire_item_index: window.wire_item_index,
@@ -22222,6 +22225,14 @@ mod tests {
                 payload: reasoning.payload.clone(),
             },
         ];
+        let expected_context: Vec<ProviderContextItemWithFootprint> = expected_items
+            .into_iter()
+            .map(|item| {
+                let footprint = eviction_footprint_for_payload(&spec, &item.payload)
+                    .expect("valid footprint for expected context");
+                ProviderContextItemWithFootprint::new(item, footprint)
+            })
+            .collect();
 
         let ProjectedProviderEvent::Terminal(terminal) = projector
             .project(ProviderEvent::Done {
@@ -22428,7 +22439,7 @@ mod tests {
         let message_seq = u64::try_from(message_seq).expect("positive SQLite message sequence");
         let mut expected_context = expected_context;
         for item in &mut expected_context {
-            if let Some(anchor) = item.origin_message.as_mut() {
+            if let Some(anchor) = item.item.origin_message.as_mut() {
                 anchor.message_seq = message_seq;
             }
         }
@@ -22465,7 +22476,7 @@ mod tests {
                 system_prompt: "continue the durable conversation".to_owned(),
                 memory_blocks: Vec::new(),
                 messages: second_turn_messages,
-                provider_context: hydrated.provider_context,
+                provider_context: expected_context.iter().map(|i| i.item.clone()).collect(),
                 tools: Vec::new(),
             },
             &RequestOptions::default(),
@@ -23947,6 +23958,13 @@ mod tests {
         };
         assistant.origin.protocol = ApiProtocol::OpenAiResponses;
         let message_id = "assistant-reasoning-hydrate";
+        // Native compaction coverage must identify an actual persisted message.
+        let user_message_id = user_message_id(command_id);
+        let user_seq: i64 = sqlx::query_scalar("SELECT seq FROM messages WHERE id = ?")
+            .bind(&user_message_id)
+            .fetch_one(writer.store.pool())
+            .await
+            .expect("user message seq");
         // Persist deliberately out of wire order. Hydration must reconstruct
         // canonical order by `(COALESCE(message_seq, coverage_through_seq), wire_item_index, item_ordinal, id)`.
         let fragments = vec![
@@ -23972,6 +23990,20 @@ mod tests {
                         "encrypted_content": "opaque-earlier",
                         "summary": [],
                     }),
+                },
+            },
+            ProviderContextFragment {
+                wire_item_index: None,
+                payload: ProviderContextPayload::OpenAiCompactedWindow {
+                    items: vec![json!({
+                        "type": "compaction",
+                        "id": "cmp-hydrate",
+                        "encrypted_content": "opaque",
+                    })],
+                    coverage: NativeCompactionCoverage {
+                        through_message_seq: user_seq as u64,
+                        context_fingerprint: "hydrate-fingerprint".to_owned(),
+                    },
                 },
             },
         ];
@@ -24048,27 +24080,35 @@ mod tests {
                     matches!(assistant, ContextMessage::Persisted { message, .. } if matches!(message, Message::Assistant(_))),
                     "hydrated assistant must be an Assistant message"
                 );
-                assert_eq!(state.provider_context.len(), 2);
+                assert_eq!(state.provider_context.len(), 3);
                 assert_eq!(
                     state
                         .provider_context
                         .iter()
-                        .map(|item| item.wire_item_index)
+                        .map(|item| item.item.wire_item_index)
                         .collect::<Vec<_>>(),
-                    vec![Some(1), Some(2)],
-                    "anchored reasoning must be reconstructed in canonical wire order"
+                    vec![None, Some(1), Some(2)],
+                    "hydration must place the native window before reasoning with a later message seq"
                 );
                 assert!(
-                    state.provider_context.iter().all(|item| {
-                        item.origin_message
+                    state.provider_context[1..].iter().all(|item| {
+                        item.item
+                            .origin_message
                             .as_ref()
                             .is_some_and(|anchor| anchor.message_id == message_id)
                             && matches!(
-                                &item.payload,
+                                &item.item.payload,
                                 ProviderContextPayload::EncryptedReasoning { .. }
                             )
                     }),
                     "reasoning must remain anchored to its persisted assistant"
+                );
+                assert!(
+                    matches!(
+                        &state.provider_context[0].item.payload,
+                        ProviderContextPayload::OpenAiCompactedWindow { .. }
+                    ) && state.provider_context[0].item.origin_message.is_none(),
+                    "native compaction must not acquire an assistant anchor"
                 );
             }
             HydrationOutcome::RecoveryRequired(_) => panic!("clean assistant turn must complete"),

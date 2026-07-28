@@ -1935,6 +1935,7 @@ async fn apply_completed_job(
     let target_id: String = target_row.try_get("id")?;
     let target_version: i64 = target_row.try_get("version")?;
     let target_state: String = target_row.try_get("state")?;
+    let target_est_tokens: i64 = target_row.try_get("est_tokens")?;
     let target_expected = job
         .source_versions
         .get(&target_id)
@@ -2014,7 +2015,8 @@ async fn apply_completed_job(
         expected_version: target_version as u64,
         new_state: MemoryBatchState::Promoted,
         summary: None,
-        est_tokens: 0,
+        est_tokens: u64::try_from(target_est_tokens)
+            .with_context(|| format!("target batch {target_id} est_tokens out of range"))?,
         footprint_delta: 0,
         delete_membership: false,
     });
@@ -3889,6 +3891,51 @@ mod tests {
                 .await
                 .expect("fetch target");
         assert_eq!(target_state, "promoted");
+    }
+
+    #[tokio::test]
+    async fn apply_completed_job_preserves_target_est_tokens() {
+        let store = test_store().await;
+        let (source_id, target_id) = insert_l0_batch(&store, &[user("hello")]).await;
+        insert_compact_l0_job(&store, "job-est-tokens", &source_id, 1).await;
+
+        let provider = Arc::new(FakeProvider {
+            text: Mutex::new("promoted estimate check".into()),
+            ..FakeProvider::default()
+        });
+        run_worker(store.clone(), provider).await;
+
+        let completed = sqlx::query("SELECT state, est_tokens FROM memory_batches WHERE id = ?")
+            .bind(&target_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch completed target");
+        assert_eq!(completed.get::<String, _>("state"), "compacted");
+        let expected_est: i64 = completed.get("est_tokens");
+        assert!(
+            expected_est > 0,
+            "completed target must carry a real estimate"
+        );
+
+        let worker = CompactWorker {
+            store: store.clone(),
+            spec: select_compact_model(&chat_model(), None, &[]).expect("select model"),
+            provider: Arc::new(FakeProvider::default()),
+            cancel: CancellationToken::new(),
+        };
+        assert_eq!(worker.apply_ready().await.expect("apply"), 1);
+
+        let promoted = sqlx::query("SELECT state, est_tokens FROM memory_batches WHERE id = ?")
+            .bind(&target_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch promoted target");
+        assert_eq!(promoted.get::<String, _>("state"), "promoted");
+        assert_eq!(
+            promoted.get::<i64, _>("est_tokens"),
+            expected_est,
+            "promoted target must keep the estimate produced at completion"
+        );
     }
 
     #[tokio::test]

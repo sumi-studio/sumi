@@ -34,12 +34,10 @@ use crate::{
         Command, CommandAck, CommandAckStatus, CommandEnvelope, Gateway, GatewayClosed,
         GatewayReader, GatewayWriter, InboundCommand, OutboundFrame,
     },
+    memory::estimate::ProviderContextItemWithFootprint,
     provider::{
         overflow::OverflowSource,
-        types::{
-            ContextMessage, ProviderContextItem, PublicMessage, StopReason, ToolResultMessage,
-            UserContent,
-        },
+        types::{ContextMessage, PublicMessage, StopReason, ToolResultMessage, UserContent},
     },
     runtime::contracts::ProcessGeneration,
     store::{
@@ -211,7 +209,11 @@ pub(crate) struct RunCore {
     /// production; keeping this injected representation in `RunCore` prevents
     /// a second Session run from silently losing the first run.
     runtime_context: Vec<ContextMessage>,
-    provider_context: Vec<ProviderContextItem>,
+    /// Authenticated provider-context fragments with their authoritative saved
+    /// eviction footprints, carried from T17 cold-boot hydration into the T21
+    /// runtime assembler. This is the production seam that replaces test-only
+    /// `ContextAssembler::set_provider_context` calls.
+    provider_context: Vec<ProviderContextItemWithFootprint>,
     durable_binding: Option<DurableRunBinding>,
     worker_phase: Option<watch::Sender<WorkerPhase>>,
     /// Shared cancellation registry for the one live provider attempt. The
@@ -239,6 +241,16 @@ impl RunCore {
             #[cfg(test)]
             fixture_bypass_approval: false,
         }
+    }
+
+    /// Hydrated T17 cold-boot provider context. The saved eviction footprints
+    /// are authoritative and are handed to the T21 assembler at worker start.
+    pub(crate) fn with_hydrated_provider_context(
+        mut self,
+        provider_context: Vec<ProviderContextItemWithFootprint>,
+    ) -> Self {
+        self.provider_context = provider_context;
+        self
     }
 
     pub(crate) fn ownership_id(&self) -> Uuid {
@@ -293,7 +305,7 @@ impl RunCore {
     pub(crate) fn install_hydrated_context(
         &mut self,
         messages: Vec<ContextMessage>,
-        provider_context: Vec<ProviderContextItem>,
+        provider_context: Vec<ProviderContextItemWithFootprint>,
     ) {
         self.runtime_context = messages;
         self.provider_context = provider_context;

@@ -7,7 +7,8 @@ use zeroize::Zeroizing;
 
 use crate::agent::AgentEvent;
 use crate::gateway::Command;
-use crate::provider::types::{ContextMessage, ProviderContextItem};
+use crate::memory::estimate::ProviderContextItemWithFootprint;
+use crate::provider::types::ContextMessage;
 use crate::runtime::contracts::{GenerationRecoveryFence, ProcessGenerationLease};
 
 use super::{
@@ -123,7 +124,7 @@ pub(crate) struct HydratedRunState {
     pub fence: GenerationRecoveryFence,
     pub receipt: super::HydrationReceiptIdentity,
     pub messages: Vec<ContextMessage>,
-    pub provider_context: Vec<ProviderContextItem>,
+    pub provider_context: Vec<ProviderContextItemWithFootprint>,
     pub memory_batches: Vec<MemoryBatchRecord>,
     pub memory_batch_messages: Vec<MemoryBatchMessageRecord>,
     pub memory_jobs: Vec<MemoryJobRecord>,

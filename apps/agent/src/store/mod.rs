@@ -34,7 +34,7 @@ use zeroize::Zeroizing;
 
 use crate::memory::estimate::{
     EVICTION_ESTIMATOR_VERSION_REPLAY_PROBE_V1, EVICTION_ESTIMATOR_VERSION_SERIALIZED_BYTES,
-    eviction_footprint_for_payload, legacy_serialized_bytes_eviction_footprint,
+    EvictionFootprint, ProviderContextItemWithFootprint, eviction_footprint_for_payload,
 };
 use crate::provider::model::ModelSpec;
 use crate::provider::types::{
@@ -556,7 +556,7 @@ impl Store {
         &self,
         messages: &[ContextMessage],
         transaction: &mut Transaction<'_, Sqlite>,
-    ) -> Result<Vec<ProviderContextItem>> {
+    ) -> Result<Vec<ProviderContextItemWithFootprint>> {
         let mut key_cache: HashMap<String, Arc<DataKeyMaterial>> = HashMap::new();
 
         let mut provider_context = Vec::new();
@@ -579,7 +579,7 @@ impl Store {
                     eviction_tokens, eviction_estimator_version
              FROM provider_context
              ORDER BY COALESCE(message_seq, coverage_through_seq),
-                      wire_item_index,
+                      wire_item_index NULLS FIRST,
                       item_ordinal,
                       id
              LIMIT ? OFFSET ?",
@@ -599,9 +599,9 @@ impl Store {
                 let stored_message_seq: Option<i64> = row.try_get("message_seq")?;
                 let stored_wire_item_index: Option<i64> = row.try_get("wire_item_index")?;
                 let stored_item_ordinal: i64 = row.try_get("item_ordinal")?;
+                let stored_coverage_seq: Option<i64> = row.try_get("coverage_through_seq")?;
                 let stored_idempotency_key: String = row.try_get("idempotency_key")?;
                 let stored_kind: String = row.try_get("kind")?;
-                let stored_coverage_seq: Option<i64> = row.try_get("coverage_through_seq")?;
                 let stored_fingerprint: Option<String> = row.try_get("context_fingerprint")?;
                 let stored_provider_instance_id: String = row.try_get("provider_instance_id")?;
                 let stored_protocol: String = row.try_get("protocol")?;
@@ -852,46 +852,54 @@ impl Store {
                 }
 
                 let stored_eviction_version = u32::try_from(stored_eviction_estimator_version)
-                .with_context(|| {
-                    format!(
-                        "provider-context record {id} eviction_estimator_version out of u32 range"
-                    )
-                })?;
-                let expected_eviction = match stored_eviction_version {
-                    EVICTION_ESTIMATOR_VERSION_SERIALIZED_BYTES => {
-                        legacy_serialized_bytes_eviction_footprint(&item.payload).with_context(
-                            || {
-                                format!(
-                                    "provider-context record {id} failed legacy footprint computation"
-                                )
-                            },
-                        )?
-                    }
-                    EVICTION_ESTIMATOR_VERSION_REPLAY_PROBE_V1 => {
-                        let spec = ModelSpec::from_origin(&item.provider_origin).ok_or_else(|| {
-                            anyhow!(
-                                "provider-context record {id} has no known model spec for its origin"
-                            )
-                        })?;
-                        eviction_footprint_for_payload(&spec, &item.payload)?
-                    }
-                    _ => {
-                        bail!(
-                            "provider-context record {id} uses unsupported eviction estimator version {stored_eviction_version}"
-                        );
-                    }
-                };
+                    .with_context(|| {
+                        format!(
+                            "provider-context record {id} eviction_estimator_version out of u32 range"
+                        )
+                    })?;
                 let stored_eviction_tokens_u64 = u64::try_from(stored_eviction_tokens)
                     .with_context(|| {
                         format!("provider-context record {id} eviction_tokens out of u64 range")
                     })?;
-                if stored_eviction_tokens_u64 != expected_eviction.eviction_tokens() {
-                    bail!(
-                        "provider-context record {id} eviction_tokens do not match the decrypted payload"
-                    );
-                }
 
-                provider_context.push(item);
+                // Old T17 estimator v1 and ReplayProbeV1 must not share version 1 with
+                // different formulas. Version 1 is the legacy serialized-bytes estimator
+                // and its saved token value is authoritative; version 2 is the
+                // provider-owned ReplayProbeV1 and is recomputed on hydration so
+                // tampering is detected.
+                let footprint = if stored_eviction_version
+                    == EVICTION_ESTIMATOR_VERSION_SERIALIZED_BYTES
+                {
+                    EvictionFootprint::from_saved(
+                        EVICTION_ESTIMATOR_VERSION_SERIALIZED_BYTES,
+                        0,
+                        stored_eviction_tokens_u64,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "provider-context record {id} has an invalid saved eviction footprint"
+                        )
+                    })?
+                } else if stored_eviction_version == EVICTION_ESTIMATOR_VERSION_REPLAY_PROBE_V1 {
+                    let spec = ModelSpec::from_origin(&item.provider_origin).ok_or_else(|| {
+                        anyhow!(
+                            "provider-context record {id} has no known model spec for its origin"
+                        )
+                    })?;
+                    let expected_eviction = eviction_footprint_for_payload(&spec, &item.payload)?;
+                    if stored_eviction_tokens_u64 != expected_eviction.eviction_tokens() {
+                        bail!(
+                            "provider-context record {id} eviction_tokens do not match the decrypted payload"
+                        );
+                    }
+                    expected_eviction
+                } else {
+                    bail!(
+                        "provider-context record {id} uses unsupported eviction estimator version {stored_eviction_version}"
+                    );
+                };
+
+                provider_context.push(ProviderContextItemWithFootprint::new(item, footprint));
             }
             offset += HYDRATION_PAGE_SIZE;
         }
@@ -1991,7 +1999,17 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::types::{PublicMessage, UserContent, UserMessage};
+    use crate::memory::context_assembler::ContextAssembler;
+    use crate::memory::estimate::{EvictionFootprint, eviction_footprint_for_payload};
+    use crate::provider::model::ModelSpec;
+    use crate::provider::types::{
+        ApiProtocol, AssistantMessage, ContextMessage, Message, ProviderContextAnchor,
+        ProviderContextItem, ProviderContextPayload, PublicAssistantMessage, PublicMessage,
+        StopReason, Usage, UserContent, UserMessage,
+    };
+    use crate::runtime::contracts::{
+        GenerationRecoveryFence, ProcessGeneration, ProcessGenerationLease,
+    };
     use crate::store::crypto::{DATA_KEY_BYTES, WrappingKey, decrypt_content, encrypt_content};
     use crate::store::transcript::TranscriptRecord;
     use chrono::{Duration as ChronoDuration, Utc};
@@ -2972,16 +2990,237 @@ mod tests {
         );
     }
 
-    fn test_lease() -> ProcessGenerationLease {
+    fn test_lease(raw: u64) -> ProcessGenerationLease {
         ProcessGenerationLease::new(
-            ProcessGeneration::from_wire(1).expect("valid test process generation"),
+            ProcessGeneration::from_wire(raw).expect("valid generation"),
             "test-lease",
         )
-        .expect("valid test process generation lease")
+        .expect("valid lease")
     }
 
-    fn test_fence() -> GenerationRecoveryFence {
-        GenerationRecoveryFence::new(&test_lease(), "test-fence").expect("valid test fence")
+    fn test_fence(lease: &ProcessGenerationLease) -> GenerationRecoveryFence {
+        GenerationRecoveryFence::new(lease, "test-fence").expect("valid fence")
+    }
+
+    fn responses_spec() -> ModelSpec {
+        ModelSpec::preset("openai-responses").expect("preset")
+    }
+
+    fn responses_reasoning_payload(value: &str) -> ProviderContextPayload {
+        ProviderContextPayload::EncryptedReasoning {
+            protocol: ApiProtocol::OpenAiResponses,
+            item: serde_json::json!({
+                "type": "reasoning",
+                "id": "rs-test",
+                "encrypted_content": value,
+                "summary": [],
+            }),
+        }
+    }
+
+    async fn seed_persisted_assistant(store: &Store, message_id: &str, seq: u64, spec: &ModelSpec) {
+        let transcript_key = store
+            .conversation_key(DataKeyPurpose::Transcript)
+            .await
+            .expect("mint transcript key");
+        let public = PublicMessage::Assistant(PublicAssistantMessage {
+            content: vec![],
+            model: spec.id.clone(),
+            provider: spec.provider.clone(),
+            origin: spec.origin(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider_code: None,
+            interrupted: false,
+            timestamp: Utc::now(),
+        });
+        let plaintext = serde_json::to_vec(&public).expect("serialize public message");
+        let aad = store
+            .scope
+            .row_aad("messages", message_id, DataKeyPurpose::Transcript);
+        let ciphertext = encrypt_content(&transcript_key, &plaintext, &aad)
+            .expect("encrypt assistant transcript");
+        let projection = store
+            .redactor()
+            .redact_serialized(&plaintext)
+            .expect("redact assistant transcript");
+        let search_text =
+            super::redactor::search_text_from_projection(&projection).expect("search text");
+        sqlx::query(
+            "INSERT INTO messages(
+                id, seq, role, raw_key_ref, raw_ciphertext, payload, search_text,
+                redaction_version, interrupted, created_at
+             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'now')",
+        )
+        .bind(message_id)
+        .bind(i64::try_from(seq).expect("seq in i64"))
+        .bind(public_message_role(&public))
+        .bind(&transcript_key.key_ref)
+        .bind(ciphertext)
+        .bind(projection)
+        .bind(search_text)
+        .bind(i64::from(store.redactor.version()))
+        .bind(if message_interrupted(&public) { 1 } else { 0 })
+        .execute(store.pool())
+        .await
+        .expect("insert assistant message");
+    }
+
+    async fn insert_provider_context_record(
+        store: &Store,
+        message_id: &str,
+        message_seq: u64,
+        saved_tokens: u64,
+    ) {
+        let spec = responses_spec();
+        let item = ProviderContextItem {
+            origin_message: Some(ProviderContextAnchor {
+                message_id: message_id.to_owned(),
+                message_seq,
+            }),
+            wire_item_index: Some(0),
+            ordinal: 0,
+            provider_origin: spec.origin(),
+            payload: responses_reasoning_payload("opaque"),
+        };
+        let footprint = EvictionFootprint::from_saved(1, 0, saved_tokens).expect("saved footprint");
+        let anchor_id = format!("{message_id}:{message_seq}");
+        let key = store
+            .provider_context_key(&ProviderContextKeyAnchor {
+                conversation_id: store.scope().conversation_id.clone(),
+                anchor_id,
+            })
+            .await
+            .expect("mint provider context key");
+        let id = format!("{message_id}:{message_seq}:0:0");
+        let idempotency_key = provider_context_idempotency_key(message_id, &item);
+        let record = EncryptedProviderContextRecord::encrypt(
+            &item,
+            &spec.origin().provider_instance_id,
+            spec.protocol,
+            &spec.id,
+            &id,
+            idempotency_key,
+            footprint,
+            &key,
+            &store.scope,
+        )
+        .expect("encrypt provider context record");
+        record
+            .insert(store.pool())
+            .await
+            .expect("insert provider context");
+    }
+
+    #[tokio::test]
+    async fn hydration_preserves_saved_eviction_footprint_for_t21_accounting() {
+        let store = store().await;
+        let message_id = "saved-footprint-msg";
+        let saved_tokens = 100_000u64;
+        let spec = responses_spec();
+
+        seed_persisted_assistant(&store, message_id, 1, &spec).await;
+        insert_provider_context_record(&store, message_id, 1, saved_tokens).await;
+
+        let lease = test_lease(1);
+        let fence = test_fence(&lease);
+        let state = match store.hydrate(&lease, &fence).await {
+            Ok(HydrationOutcome::Complete(state)) => state,
+            other => panic!("expected complete hydration, got {other:?}"),
+        };
+        assert_eq!(state.provider_context.len(), 1);
+        let hydrated = &state.provider_context[0];
+        assert_eq!(hydrated.footprint.eviction_tokens(), saved_tokens);
+
+        // The saved footprint must differ from what the current estimator would
+        // recompute for the same payload, proving we are not silently
+        // recomputing on cold boot.
+        let recomputed = eviction_footprint_for_payload(&spec, &hydrated.item.payload)
+            .expect("recompute footprint")
+            .eviction_tokens();
+        assert_ne!(recomputed, saved_tokens);
+
+        // T21 overflow accounting must use the saved value.  A heavy saved
+        // footprint anchored to the assistant forces the assistant to drop,
+        // leaving the later user message.
+        let assembler = ContextAssembler::from_prompt_with_spec(
+            crate::provider::types::PromptContext {
+                system_prompt: "System.".to_owned(),
+                memory_blocks: vec![],
+                messages: vec![],
+                provider_context: vec![],
+                tools: vec![],
+            },
+            spec.clone(),
+        )
+        .expect("valid prompt");
+        assembler.set_provider_context(state.provider_context);
+
+        let assistant = ContextMessage::Persisted {
+            id: message_id.to_owned(),
+            seq: 1,
+            message: Message::Assistant(AssistantMessage {
+                content: vec![],
+                model: spec.id.clone(),
+                provider: spec.provider.clone(),
+                origin: spec.origin(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                provider_code: None,
+                interrupted: false,
+                timestamp: Utc::now(),
+            }),
+        };
+        let user = ContextMessage::Persisted {
+            id: "user-2".to_owned(),
+            seq: 2,
+            message: Message::User(UserMessage {
+                content: vec![UserContent::Text {
+                    text: "ack".to_owned(),
+                }],
+                timestamp: Utc::now(),
+            }),
+        };
+        let recovered = assembler
+            .recover_overflow(&[assistant, user])
+            .expect("recover overflow");
+        assert_eq!(recovered.len(), 1);
+        assert!(
+            matches!(&recovered[0], ContextMessage::Persisted { id, .. } if id == "user-2"),
+            "saved footprint must drive overflow and drop the anchored assistant"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydration_rejects_out_of_range_eviction_estimator_version() {
+        let store = store().await;
+        let message_id = "range-version-msg";
+        let spec = responses_spec();
+
+        seed_persisted_assistant(&store, message_id, 1, &spec).await;
+        insert_provider_context_record(&store, message_id, 1, 0).await;
+        sqlx::query(
+            "UPDATE provider_context SET eviction_estimator_version = ? WHERE message_id = ?",
+        )
+        .bind(1_i64 << 40)
+        .bind(message_id)
+        .execute(store.pool())
+        .await
+        .expect("tamper estimator version");
+
+        let lease = test_lease(1);
+        let fence = test_fence(&lease);
+        let error = store
+            .hydrate(&lease, &fence)
+            .await
+            .expect_err("hydration must fail closed for out-of-range version");
+        assert!(
+            error
+                .to_string()
+                .contains("eviction_estimator_version out of u32 range")
+        );
     }
 
     fn test_now() -> String {
@@ -3444,7 +3683,7 @@ mod tests {
         .await;
 
         let outcome = store
-            .hydrate(&test_lease(), &test_fence())
+            .hydrate(&test_lease(1), &test_fence(&test_lease(1)))
             .await
             .expect("hydrate must authenticate and return memory state");
         let HydrationOutcome::Complete(state) = outcome else {
@@ -3477,7 +3716,7 @@ mod tests {
         .await;
 
         let outcome = store
-            .hydrate(&test_lease(), &test_fence())
+            .hydrate(&test_lease(1), &test_fence(&test_lease(1)))
             .await
             .expect("hydrate must return a complete state from one snapshot");
         let HydrationOutcome::Complete(state) = outcome else {
@@ -3558,7 +3797,7 @@ mod tests {
         .await;
 
         let error = store
-            .hydrate(&test_lease(), &test_fence())
+            .hydrate(&test_lease(1), &test_fence(&test_lease(1)))
             .await
             .expect_err("tampered memory batch must fail hydrate");
         let message = format!("{error:#}");

@@ -21,13 +21,13 @@ use crate::store::KeyProvider;
 use crate::store::{PendingApprovalRecovery, Redactor};
 use crate::{
     gateway::{AgentHello, ApiHello, CommandAck, CommandId, HelloError},
+    memory::estimate::ProviderContextItemWithFootprint,
     provider::types::{
         ApiProtocol, AssistantContent, AssistantMessage, ContextMessage, Message, PromptContext,
-        ProviderContextFragment, ProviderContextItem, ProviderContextPayload, ProviderEvent,
-        ProviderEventStream, ProviderOrigin, ProviderOutput, PublicAssistantContent,
-        PublicAssistantMessage, PublicMessage, RejectedToolCall, StopReason, ToolArgumentError,
-        ToolCall, ToolDefinition, ToolResultMessage, Usage, UserContent, UserMessage,
-        ValidatedToolArguments,
+        ProviderContextFragment, ProviderContextPayload, ProviderEvent, ProviderEventStream,
+        ProviderOrigin, ProviderOutput, PublicAssistantContent, PublicAssistantMessage,
+        PublicMessage, RejectedToolCall, StopReason, ToolArgumentError, ToolCall, ToolDefinition,
+        ToolResultMessage, Usage, UserContent, UserMessage, ValidatedToolArguments,
     },
     provider::{ModelSpec, RequestOptions},
     runtime::contracts::{
@@ -3399,6 +3399,7 @@ impl RunDriver for MultiRejectedReceiptDriver {
         Ok(ProviderAttempt {
             message_id: format!("multi-rejected-assistant-{attempt}"),
             initial_message: bridge_assistant(StopReason::Stop),
+            uncalibrated_prompt_estimate: 0,
             events: ProviderEventStream::new(rx, cancel, "fixture", Self::origin()),
         })
     }
@@ -3523,6 +3524,7 @@ impl RunDriver for DurableToolBarrierDriver {
         Ok(ProviderAttempt {
             message_id: format!("barrier-assistant-{attempt}"),
             initial_message: bridge_assistant(StopReason::Stop),
+            uncalibrated_prompt_estimate: 0,
             events: ProviderEventStream::new(rx, cancel, "fixture", Self::origin()),
         })
     }
@@ -3675,6 +3677,7 @@ impl RunDriver for IndeterminateToolDriver {
         Ok(ProviderAttempt {
             message_id: format!("indeterminate-assistant-{attempt}"),
             initial_message: bridge_assistant(reason),
+            uncalibrated_prompt_estimate: 0,
             events: ProviderEventStream::new(rx, cancel, "fixture", Self::origin()),
         })
     }
@@ -4491,6 +4494,7 @@ impl RunDriver for OpaqueContextDriver {
                 interrupted: false,
                 timestamp: Utc::now(),
             }),
+            uncalibrated_prompt_estimate: 0,
             events: ProviderEventStream::new(
                 rx,
                 CancellationToken::new(),
@@ -4504,7 +4508,7 @@ impl RunDriver for OpaqueContextDriver {
         &self,
         attempt: usize,
         context: &[ContextMessage],
-        provider_context: &[crate::provider::types::ProviderContextItem],
+        provider_context: &[ProviderContextItemWithFootprint],
         command_received_at: Option<std::time::Instant>,
         cancel: CancellationToken,
     ) -> Result<ProviderAttempt> {
@@ -5422,6 +5426,7 @@ impl RunDriver for SessionRetrySteerDriver {
         Ok(ProviderAttempt {
             message_id: format!("session-retry-steer-assistant-{attempt}"),
             initial_message,
+            uncalibrated_prompt_estimate: 0,
             events: ProviderEventStream::new(rx, cancel, "fixture", Self::origin()),
         })
     }
@@ -5523,6 +5528,7 @@ impl RunDriver for SessionImmediateOverflowDriver {
         Ok(ProviderAttempt {
             message_id: format!("session-immediate-overflow-{attempt}"),
             initial_message: PublicMessage::Assistant(initial),
+            uncalibrated_prompt_estimate: 0,
             events: ProviderEventStream::new(
                 rx,
                 cancel,
@@ -6646,10 +6652,10 @@ fn collect_encrypted_content(value: &Value, markers: &mut Vec<String>) {
     }
 }
 
-fn live_opaque_markers(items: &[ProviderContextItem]) -> Vec<String> {
+fn live_opaque_markers(items: &[ProviderContextItemWithFootprint]) -> Vec<String> {
     let mut markers = Vec::new();
     for item in items {
-        match &item.payload {
+        match &item.item.payload {
             ProviderContextPayload::EncryptedReasoning { item, .. } => {
                 collect_encrypted_content(item, &mut markers);
             }
@@ -7358,6 +7364,7 @@ impl RunDriver for RetryGroupDriver {
         Ok(ProviderAttempt {
             message_id: format!("retry-group-assistant-{attempt}"),
             initial_message: Self::assistant_with(reason),
+            uncalibrated_prompt_estimate: 0,
             events: ProviderEventStream::new(rx, cancel, "fixture", Self::origin()),
         })
     }
@@ -7741,6 +7748,7 @@ impl RunDriver for HardSteerKillDriver {
         Ok(ProviderAttempt {
             message_id: "kill-restart-assistant".to_owned(),
             initial_message: PublicMessage::Assistant(initial),
+            uncalibrated_prompt_estimate: 0,
             events: ProviderEventStream::new(rx, cancel, "fixture", Self::origin()),
         })
     }
@@ -7835,6 +7843,7 @@ impl RunDriver for TurnEndKillDriver {
         Ok(ProviderAttempt {
             message_id: "turn-end-assistant".to_owned(),
             initial_message: bridge_assistant(StopReason::Stop),
+            uncalibrated_prompt_estimate: 0,
             events: ProviderEventStream::new(rx, cancel, "fixture", Self::origin()),
         })
     }
@@ -7908,6 +7917,7 @@ impl RunDriver for AbortProviderKillDriver {
         Ok(ProviderAttempt {
             message_id: "abort-provider-assistant".to_owned(),
             initial_message: bridge_assistant(StopReason::Stop),
+            uncalibrated_prompt_estimate: 0,
             events: ProviderEventStream::new(rx, cancel, "fixture", Self::origin()),
         })
     }
@@ -8682,6 +8692,7 @@ fn provider_attempt_from_tool_call(attempt: usize, tool_call: ToolCall) -> Provi
     ProviderAttempt {
         message_id: format!("assistant-{attempt}"),
         initial_message: public_initial_message(),
+        uncalibrated_prompt_estimate: 0,
         events: ProviderEventStream::new(rx, CancellationToken::new(), "fixture", fixture_origin()),
     }
 }
@@ -8702,6 +8713,7 @@ fn provider_attempt_stop(attempt: usize) -> ProviderAttempt {
     ProviderAttempt {
         message_id: format!("assistant-{attempt}"),
         initial_message: public_initial_message(),
+        uncalibrated_prompt_estimate: 0,
         events: ProviderEventStream::new(rx, CancellationToken::new(), "fixture", fixture_origin()),
     }
 }
