@@ -15090,6 +15090,7 @@ mod tests {
             let previous_owner = DurableRunBinding {
                 command_id: owner_id.to_owned(),
                 command_seq: 1,
+                provenance: test_provenance(),
                 run_id: run_id.clone(),
                 turn_id: old_turn_id.clone(),
                 executor_generation: ProcessGeneration::MIN,
@@ -23948,6 +23949,7 @@ mod tests {
         let previous_owner = DurableRunBinding {
             command_id: command_id.to_owned(),
             command_seq: 1,
+            provenance: test_provenance(),
             run_id: run_id.clone(),
             turn_id: turn_id.clone(),
             executor_generation: ProcessGeneration::MIN,
